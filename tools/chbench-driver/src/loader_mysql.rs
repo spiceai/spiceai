@@ -25,13 +25,16 @@ limitations under the License.
 //! from the seed set using server-side `INSERT ... SELECT` (rotating across
 //! seed warehouses for slight variation).
 //!
-//! Unlike the Postgres loader, the whole load runs serially on a single
-//! connection: parallelism adds no benefit because the warehouse scaling is
-//! server-side `INSERT ... SELECT` (server-side I/O bound), and the seed phase
-//! is a small fraction of total work at large scale factors.
+//! Like the Postgres loader, the seed warehouses (phase 1) are loaded in
+//! parallel — each on its own connection — and the cloned warehouses (phase 2)
+//! are cloned in parallel across a bounded pool of connections. Every loader
+//! connection runs with bulk-load session flags (`unique_checks=0`,
+//! `foreign_key_checks=0`, and best-effort `sql_log_bin=0`) and is pinned to
+//! UTC so `_bench_ts` defaults line up with the CDC replication session.
 //!
-//! The `_bench_ts` column is never listed or set in any INSERT here — it is
-//! populated by the triggers/default created in `schema_mysql`.
+//! The `_bench_ts` column is never listed or set in any INSERT here — seed rows
+//! are stamped by the column default created in `schema_mysql`; the per-row
+//! triggers are attached *after* the load so they never fire during the seed.
 
 use std::fmt::Write as _;
 use std::time::Instant;
@@ -42,6 +45,111 @@ use rand::{Rng, RngExt, SeedableRng};
 
 use crate::Result;
 use crate::rand as tpcc_rand;
+
+/// `MySQL` 1227 = `ER_SPECIFIC_ACCESS_DENIED_ERROR` — the session lacks a
+/// required privilege (here, `SESSION_VARIABLES_ADMIN` for `SET sql_log_bin`).
+fn is_privilege_denied(e: &mysql_async::Error) -> bool {
+    matches!(e, mysql_async::Error::Server(se) if se.code == 1227)
+}
+
+/// Apply session-level settings that speed up bulk loading on `conn`. Every
+/// connection this is applied to is short-lived — opened per load and dropped
+/// when the load finishes — so the flags never need restoring.
+///
+/// `unique_checks=0` and `foreign_key_checks=0` need no special privilege.
+/// `sql_log_bin=0` skips writing the multi-GB seed to the binary log — the Spice
+/// CDC path snapshots the seeded tables when spiced starts, so the seed rows do
+/// not need to be in the binlog — but it requires `SESSION_VARIABLES_ADMIN`.
+/// Returns whether `sql_log_bin` was disabled.
+async fn apply_bulk_load_session(conn: &mut mysql_async::Conn) -> Result<bool> {
+    conn.query_drop("SET unique_checks=0, foreign_key_checks=0")
+        .await
+        .map_err(|source| crate::Error::MySql {
+            action: "set bulk-load session flags".into(),
+            source,
+        })?;
+    // Only swallow the specific "privilege missing" error (1227): losing the
+    // binlog skip merely makes the seed slower, never wrong. Any other error
+    // (e.g. a broken connection) is propagated so real failures are not masked.
+    match conn.query_drop("SET sql_log_bin=0").await {
+        Ok(()) => Ok(true),
+        Err(e) if is_privilege_denied(&e) => Ok(false),
+        Err(source) => Err(crate::Error::MySql {
+            action: "disable binlogging for the seed session".into(),
+            source,
+        }),
+    }
+}
+
+/// Open a fresh connection from `opts`, pinned to UTC via [`crate::set_mysql_utc`]
+/// (the same helper the CDC session uses).
+async fn open_conn(opts: &mysql_async::Opts) -> Result<mysql_async::Conn> {
+    let mut conn = mysql_async::Conn::new(opts.clone())
+        .await
+        .map_err(|source| crate::Error::MySql {
+            action: "open MySQL loader connection".into(),
+            source,
+        })?;
+    crate::set_mysql_utc(&mut conn).await?;
+    Ok(conn)
+}
+
+/// Open a loader worker connection: like [`open_conn`] but also configured with
+/// the bulk-load session flags. Used for the parallel seed/clone workers.
+async fn open_worker(opts: &mysql_async::Opts) -> Result<mysql_async::Conn> {
+    let mut conn = open_conn(opts).await?;
+    apply_bulk_load_session(&mut conn).await?;
+    Ok(conn)
+}
+
+/// Max concurrent connections for the parallel *clone* phase. The seed phase is
+/// not bounded by this — it spawns one connection per seed warehouse (at most
+/// `SEED_WAREHOUSES`).
+fn loader_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map_or(4, std::num::NonZeroUsize::get)
+        .min(8)
+}
+
+/// `InnoDB` deadlock (1213) and lock-wait-timeout (1205) are transient under the
+/// concurrent loaders — especially on `history`, which has no primary key, so
+/// concurrent inserts contend on its hidden clustered index. Under autocommit
+/// each statement is its own transaction, so the server rolls the whole
+/// statement back on such an error (no partial rows); re-running it therefore
+/// produces byte-identical data. Retry these statements instead of failing.
+fn is_retriable_lock_error(e: &mysql_async::Error) -> bool {
+    matches!(e, mysql_async::Error::Server(se) if se.code == 1213 || se.code == 1205)
+}
+
+/// Execute `sql` on `conn`, retrying transient `InnoDB` lock errors (see
+/// [`is_retriable_lock_error`]) up to a bounded number of attempts with a small
+/// linear backoff. Non-lock errors fail immediately.
+///
+/// `action` is only invoked to build the error message on the failure path, so
+/// the happy path (once per 1024-row batch on the hot loaders) allocates nothing.
+async fn exec_with_lock_retry(
+    conn: &mut mysql_async::Conn,
+    sql: &str,
+    action: impl FnOnce() -> String,
+) -> Result<()> {
+    const MAX_ATTEMPTS: u32 = 32;
+    let mut attempt: u32 = 0;
+    loop {
+        match conn.query_drop(sql).await {
+            Ok(()) => return Ok(()),
+            Err(e) if is_retriable_lock_error(&e) && attempt < MAX_ATTEMPTS => {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(5 * u64::from(attempt))).await;
+            }
+            Err(source) => {
+                return Err(crate::Error::MySql {
+                    action: action(),
+                    source,
+                });
+            }
+        }
+    }
+}
 
 const MAX_ITEMS: i32 = 100_000;
 const STOCK_PER_WAREHOUSE: i32 = 100_000;
@@ -94,12 +202,10 @@ impl BatchSink {
         if self.buffered_rows == 0 {
             return Ok(());
         }
-        conn.query_drop(self.buf.as_str())
-            .await
-            .map_err(|source| crate::Error::MySql {
-                action: format!("batch insert into {table}"),
-                source,
-            })?;
+        exec_with_lock_retry(conn, self.buf.as_str(), || {
+            format!("batch insert into {table}")
+        })
+        .await?;
         self.buf.clear();
         self.buffered_rows = 0;
         Ok(())
@@ -163,6 +269,9 @@ const WAREHOUSE_TABLES: &[(&str, &str, &str)] = &[
         "c_w_id",
         "c_id, c_d_id, c_first, c_middle, c_last, c_street_1, c_street_2, c_city, c_state, c_zip, c_phone, c_since, c_credit, c_credit_lim, c_discount, c_balance, c_ytd_payment, c_payment_cnt, c_delivery_cnt, c_data",
     ),
+    // `history` has no primary key, so its concurrent clones deadlock on the
+    // hidden clustered index — it is cloned on an isolated connection (see the
+    // phase-2 clone and `ClonePhase` in `load_all`).
     (
         "history",
         "h_c_w_id",
@@ -181,109 +290,180 @@ const WAREHOUSE_TABLES: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// Load all seed data for the given number of warehouses.
+/// Load all seed data for the given number of warehouses, opening every
+/// connection from `opts` (the caller's connection is never touched).
 ///
 /// Strategy:
-/// - Shared tables (item, nation, region, supplier) are loaded once on `conn`.
-/// - The first `min(warehouses, SEED_WAREHOUSES)` warehouses are loaded
-///   **serially** on the single `conn`. Each warehouse gets a deterministic
+/// - A coordinator connection loads the shared tables (item, nation, region,
+///   supplier).
+/// - The first `min(warehouses, SEED_WAREHOUSES)` warehouses are loaded **in
+///   parallel**, each on its own connection. Each warehouse gets a deterministic
 ///   per-warehouse RNG derived from `seed`.
-/// - Remaining warehouses are cloned from the seed set using server-side
-///   `INSERT ... SELECT` (rotating source across seed warehouses).
+/// - Remaining warehouses are cloned from the seed set with server-side
+///   `INSERT ... SELECT` (rotating source across seed warehouses), across a
+///   bounded pool of connections; the primary-key-less `history` table is cloned
+///   on its own connection to avoid `InnoDB` deadlocks (see `ClonePhase`).
 ///
-/// Everything runs on the single `conn`: parallelism adds no benefit because
-/// the dominant clone phase is server-side `INSERT ... SELECT`.
+/// Every connection is opened here and dropped when this function returns, so the
+/// bulk-load session flags from [`apply_bulk_load_session`] never leak to the
+/// caller and nothing needs restoring. Concurrent inserts on `history` retry
+/// transient `InnoDB` lock errors (see [`exec_with_lock_retry`]).
 ///
 /// When `seed` is `Some`, a deterministic RNG is used so that the same seed
-/// always produces the same dataset.
+/// always produces the same dataset — independent of loader parallelism.
 ///
 /// # Errors
 ///
 /// Returns an error if any database operation fails.
 pub async fn load_all(
-    conn: &mut mysql_async::Conn,
+    opts: &mysql_async::Opts,
     warehouses: usize,
     seed: Option<u64>,
 ) -> Result<()> {
+    // Coordinator connection for the shared tables — opened from `opts` and
+    // dropped when this function returns, so its bulk-load session flags never
+    // leak to the caller.
+    let mut coordinator = open_conn(opts).await?;
+    let sql_log_bin_off = apply_bulk_load_session(&mut coordinator).await?;
+    println!(
+        "  bulk-load session: unique_checks=0 foreign_key_checks=0 sql_log_bin={}",
+        if sql_log_bin_off {
+            "0"
+        } else {
+            "1 (no SESSION_VARIABLES_ADMIN; seed is binlogged)"
+        }
+    );
+
     let mut rng: StdRng = match seed {
         Some(s) => StdRng::seed_from_u64(s),
         None => StdRng::from_rng(&mut rand::rng()),
     };
 
+    let conn = &mut coordinator;
     load_item(conn, &mut rng).await?;
     load_nation(conn).await?;
     load_region(conn).await?;
     load_supplier(conn, &mut rng).await?;
 
     let seed_count = warehouses.min(SEED_WAREHOUSES);
+    let concurrency = loader_concurrency();
 
-    // Phase 1: Load seed warehouses serially on the single connection.
+    // Phase 1: Load seed warehouses in parallel, each on its own connection.
     let phase1_start = Instant::now();
     println!(
-        "  loading {seed_count} seed warehouse(s) ({DISTRICTS_PER_WAREHOUSE} districts, \
+        "  loading {seed_count} seed warehouse(s) in parallel ({DISTRICTS_PER_WAREHOUSE} districts, \
          {}K customers, {}K orders, ~{}K order lines each)...",
         DISTRICTS_PER_WAREHOUSE * CUSTOMERS_PER_DISTRICT / 1000,
         DISTRICTS_PER_WAREHOUSE * ORDERS_PER_DISTRICT / 1000,
         DISTRICTS_PER_WAREHOUSE * ORDERS_PER_DISTRICT * 10 / 1000,
     );
 
+    let mut handles = Vec::with_capacity(seed_count);
     for w in 1..=seed_count {
+        let opts = opts.clone();
         // Derive a deterministic per-warehouse seed: base_seed XOR warehouse index.
         // This ensures each warehouse gets different random data while remaining
-        // reproducible across runs.
+        // reproducible across runs (independent of loader parallelism).
         let warehouse_seed = seed.map(|s| s ^ (w as u64));
 
-        let w_id = i32::try_from(w).unwrap_or(i32::MAX);
+        handles.push(tokio::spawn(async move {
+            let mut wh = open_worker(&opts).await?;
+            let w_id = i32::try_from(w).unwrap_or(i32::MAX);
 
-        let mut wh_rng: StdRng = match warehouse_seed {
-            Some(s) => StdRng::seed_from_u64(s),
-            None => StdRng::from_rng(&mut rand::rng()),
-        };
-        let wh_c_load: usize = wh_rng.random_range(0..256);
+            let mut wh_rng: StdRng = match warehouse_seed {
+                Some(s) => StdRng::seed_from_u64(s),
+                None => StdRng::from_rng(&mut rand::rng()),
+            };
+            let wh_c_load: usize = wh_rng.random_range(0..256);
 
-        load_warehouse(conn, &mut wh_rng, w_id).await?;
-        load_district(conn, &mut wh_rng, w_id).await?;
-        load_stock(conn, &mut wh_rng, w_id).await?;
+            load_warehouse(&mut wh, &mut wh_rng, w_id).await?;
+            load_district(&mut wh, &mut wh_rng, w_id).await?;
+            load_stock(&mut wh, &mut wh_rng, w_id).await?;
 
-        for d in 1..=DISTRICTS_PER_WAREHOUSE {
-            load_customer(conn, &mut wh_rng, w_id, d, wh_c_load).await?;
-            load_history(conn, &mut wh_rng, w_id, d).await?;
-            let ol_cnts = load_orders(conn, &mut wh_rng, w_id, d).await?;
-            load_new_order(conn, w_id, d).await?;
-            load_order_line(conn, &mut wh_rng, w_id, d, &ol_cnts).await?;
-        }
+            for d in 1..=DISTRICTS_PER_WAREHOUSE {
+                load_customer(&mut wh, &mut wh_rng, w_id, d, wh_c_load).await?;
+                load_history(&mut wh, &mut wh_rng, w_id, d).await?;
+                let ol_cnts = load_orders(&mut wh, &mut wh_rng, w_id, d).await?;
+                load_new_order(&mut wh, w_id, d).await?;
+                load_order_line(&mut wh, &mut wh_rng, w_id, d, &ol_cnts).await?;
+            }
+
+            Ok::<(), crate::Error>(())
+        }));
     }
+
+    crate::join_loader_tasks(handles, "seed warehouse").await?;
 
     println!(
         "  seed phase complete ({seed_count} warehouses in {:.1?})",
         phase1_start.elapsed()
     );
 
-    // Phase 2: Clone remaining warehouses from the seed set.
-    // Parallelism adds no benefit here since INSERT...SELECT is
-    // server-side I/O bound (shared redo log, buffer pool, disk).
+    // Phase 2: Clone remaining warehouses from the seed set. Each target
+    // warehouse clones from a fixed seed warehouse (rotating by target id), so
+    // the dataset is identical regardless of scheduling.
+    //
+    // Only `history` lacks a primary key, so concurrent INSERT...SELECTs into it
+    // contend on its hidden clustered index and deadlock. The 7 PK-bearing tables
+    // clone into disjoint key ranges (distinct target w_id) and never conflict,
+    // so they run in parallel (phase 2a); `history` is cloned on a single
+    // connection (phase 2b) to avoid the deadlocks entirely. `history` is small
+    // relative to `order_line`/`stock`, so the serial pass is cheap.
     if warehouses > seed_count {
         let clone_start = Instant::now();
         let to_clone = warehouses - seed_count;
+        let workers = concurrency.min(to_clone);
+        let targets: Vec<usize> = ((seed_count + 1)..=warehouses).collect();
+
         println!(
             "  cloning {to_clone} warehouse(s) from {seed_count} seed warehouse(s) \
-             using server-side INSERT...SELECT..."
+             across {workers}+1 connection(s) (history isolated) using server-side INSERT...SELECT..."
         );
 
-        for w in (seed_count + 1)..=warehouses {
-            let target_w_id = i32::try_from(w).unwrap_or(i32::MAX);
-            // Rotate source across seed warehouses (1-based).
-            let source_w_id = i32::try_from((w - 1) % seed_count + 1).unwrap_or(1);
+        // `history` writes only to `history`; the PK-table workers never touch
+        // `history`. The two sets are disjoint, so the single-connection history
+        // clone runs concurrently with the parallel PK-table workers — no
+        // deadlocks, and no serial tail.
+        //
+        // Note the deliberate asymmetry with phase 1: there, each seed worker
+        // owns a whole warehouse (including its history rows), so history writes
+        // are unavoidably concurrent and rely on `exec_with_lock_retry`. Here the
+        // clone is decomposed by table, so history can be isolated onto one
+        // connection — which avoids the deadlock (and its retry cost) entirely,
+        // and matters at high scale factors where a retry storm would thrash.
+        let mut handles = Vec::with_capacity(workers + 1);
 
-            clone_warehouse(conn, source_w_id, target_w_id).await?;
-
-            // Progress reporting every 50 warehouses.
-            let done = w - seed_count;
-            if done.is_multiple_of(50) || w == warehouses {
-                let elapsed = clone_start.elapsed();
-                println!("    cloned {done}/{to_clone} warehouses ({elapsed:.1?} elapsed)");
-            }
+        // PK-table workers: round-robin the targets (targets[k], targets[k+workers], ...).
+        for k in 0..workers {
+            let opts = opts.clone();
+            let my_targets: Vec<usize> = targets.iter().copied().skip(k).step_by(workers).collect();
+            handles.push(tokio::spawn(async move {
+                let mut wc = open_worker(&opts).await?;
+                for w in my_targets {
+                    let target_w_id = i32::try_from(w).unwrap_or(i32::MAX);
+                    // Rotate source across seed warehouses (1-based) — same mapping
+                    // as the serial loader, so the data is unchanged.
+                    let source_w_id = i32::try_from((w - 1) % seed_count + 1).unwrap_or(1);
+                    clone_warehouse(&mut wc, source_w_id, target_w_id, ClonePhase::PkTables)
+                        .await?;
+                }
+                Ok::<(), crate::Error>(())
+            }));
         }
+
+        // history clone: single connection, all targets in order.
+        let hist_opts = opts.clone();
+        handles.push(tokio::spawn(async move {
+            let mut hc = open_worker(&hist_opts).await?;
+            for w in targets {
+                let target_w_id = i32::try_from(w).unwrap_or(i32::MAX);
+                let source_w_id = i32::try_from((w - 1) % seed_count + 1).unwrap_or(1);
+                clone_warehouse(&mut hc, source_w_id, target_w_id, ClonePhase::HistoryOnly).await?;
+            }
+            Ok::<(), crate::Error>(())
+        }));
+
+        crate::join_loader_tasks(handles, "clone warehouse").await?;
 
         println!(
             "  clone phase complete ({to_clone} warehouses in {:.1?})",
@@ -294,17 +474,38 @@ pub async fn load_all(
     Ok(())
 }
 
-/// Clone all warehouse-scoped data from `source_w_id` to `target_w_id` using
-/// server-side `INSERT ... SELECT` with the `w_id` column substituted.
+/// Which subset of the warehouse-scoped tables a `clone_warehouse` call handles.
+///
+/// The `history` table has no primary key, so its concurrent clones deadlock;
+/// it is cloned separately on a single connection while the primary-key-bearing
+/// tables clone in parallel.
+#[derive(Clone, Copy)]
+enum ClonePhase {
+    /// Every warehouse-scoped table except `history`.
+    PkTables,
+    /// Only `history`.
+    HistoryOnly,
+}
+
+/// Clone the warehouse-scoped data selected by `phase` from `source_w_id` to
+/// `target_w_id` using server-side `INSERT ... SELECT` with the `w_id` column
+/// substituted.
 async fn clone_warehouse(
     conn: &mut mysql_async::Conn,
     source_w_id: i32,
     target_w_id: i32,
+    phase: ClonePhase,
 ) -> Result<()> {
     for &(table, wid_col, cols) in WAREHOUSE_TABLES {
+        // Skip tables not selected by this phase (history is cloned separately).
+        let is_history = table == "history";
+        if is_history != matches!(phase, ClonePhase::HistoryOnly) {
+            continue;
+        }
+
         // For `history`, h_w_id is a separate column that also references the
         // warehouse — substitute both h_c_w_id (filter) and h_w_id (value).
-        let select_cols = if table == "history" {
+        let select_cols = if is_history {
             cols.replace("h_w_id", &target_w_id.to_string())
         } else if table == "order_line" {
             // ol_supply_w_id should point to the target warehouse too.
@@ -318,12 +519,10 @@ async fn clone_warehouse(
              SELECT {target_w_id}, {select_cols} FROM {table} WHERE {wid_col} = {source_w_id}"
         );
 
-        conn.query_drop(sql.as_str())
-            .await
-            .map_err(|source| crate::Error::MySql {
-                action: format!("clone {table} from warehouse {source_w_id} to {target_w_id}"),
-                source,
-            })?;
+        exec_with_lock_retry(conn, &sql, || {
+            format!("clone {table} from warehouse {source_w_id} to {target_w_id}")
+        })
+        .await?;
     }
     Ok(())
 }

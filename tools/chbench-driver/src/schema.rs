@@ -110,12 +110,13 @@ pub async fn drop_tables(client: &Client) -> Result<()> {
     Ok(())
 }
 
-/// Create all 12 CH-benCH tables (9 TPC-C + 3 supplemental).
+/// Create all 12 CH-benCH tables (9 TPC-C + 3 supplemental) and add the
+/// `_bench_ts` columns. Secondary indexes and triggers are created separately
+/// (see [`create_indexes`] and [`create_triggers`]) *after* the bulk load.
 ///
 /// # Errors
 ///
-/// Returns an error if any table or index cannot be created.
-#[expect(clippy::too_many_lines)]
+/// Returns an error if any table or `_bench_ts` column cannot be created.
 pub async fn create_tables(client: &Client) -> Result<()> {
     let ddl_statements: &[(&str, &str)] = &[
         (
@@ -298,7 +299,7 @@ pub async fn create_tables(client: &Client) -> Result<()> {
         ),
     ];
 
-    println!("  creating {} tables + 4 indexes", ddl_statements.len());
+    println!("  creating {} tables", ddl_statements.len());
     for (table, ddl) in ddl_statements {
         client
             .execute(*ddl, &[])
@@ -309,7 +310,24 @@ pub async fn create_tables(client: &Client) -> Result<()> {
             })?;
     }
 
-    // Indexes (matching go-tpc Postgres DDL)
+    // Add the _bench_ts column (with default) to all mutated TPC-C tables so the
+    // seed rows are stamped by the column default. The BEFORE INSERT/UPDATE
+    // triggers are created *after* the load (see `create_triggers`) so they do
+    // not fire per-row during the bulk seed/clone.
+    add_bench_ts_columns(client).await?;
+
+    Ok(())
+}
+
+/// Create the 4 secondary indexes (matching go-tpc Postgres DDL).
+///
+/// Called *after* the bulk load so the indexes are built once, in bulk, instead
+/// of being maintained incrementally on every seed/clone insert.
+///
+/// # Errors
+///
+/// Returns an error if any index cannot be created.
+pub async fn create_indexes(client: &Client) -> Result<()> {
     let indexes: &[(&str, &str)] = &[
         (
             "idx_customer",
@@ -329,6 +347,7 @@ pub async fn create_tables(client: &Client) -> Result<()> {
         ),
     ];
 
+    println!("  creating {} secondary indexes", indexes.len());
     for (name, ddl) in indexes {
         client
             .execute(*ddl, &[])
@@ -338,11 +357,6 @@ pub async fn create_tables(client: &Client) -> Result<()> {
                 source,
             })?;
     }
-
-    // Add _bench_ts column and trigger to all mutated TPC-C tables.
-    // Used for staleness gap measurement between Postgres and Spice accelerated copy.
-    add_bench_ts_column_and_triggers(client).await?;
-
     Ok(())
 }
 
@@ -373,12 +387,43 @@ pub const STALENESS_PROBE_TABLES: &[&str] = &[
     "warehouse",
 ];
 
-/// Add `_bench_ts TIMESTAMPTZ` column with `clock_timestamp()` default and
-/// a `BEFORE INSERT OR UPDATE` trigger to all mutated TPC-C tables.
+/// Add the `_bench_ts TIMESTAMPTZ` column (with `clock_timestamp()` default) to
+/// all mutated TPC-C tables. The default stamps the seed rows; the per-row
+/// trigger for live mutations is created separately by [`create_triggers`]
+/// *after* the load.
+async fn add_bench_ts_columns(client: &Client) -> Result<()> {
+    for table in MUTATED_TABLES {
+        let add_col = format!(
+            "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS _bench_ts TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()"
+        );
+        client
+            .execute(&add_col, &[])
+            .await
+            .map_err(|source| crate::Error::Sql {
+                action: format!("add _bench_ts column to {table}"),
+                source,
+            })?;
+    }
+
+    println!(
+        "  added _bench_ts column to {} tables",
+        MUTATED_TABLES.len()
+    );
+    Ok(())
+}
+
+/// Create the `_bench_ts` `BEFORE INSERT OR UPDATE` trigger on all mutated
+/// TPC-C tables. Called *after* the bulk load so the trigger does not fire
+/// per-row during the seed/clone — the seed rows are already stamped by the
+/// column default (see [`add_bench_ts_columns`]).
 ///
 /// Uses `clock_timestamp()` (wall-clock time per statement) instead of `now()`
 /// (transaction-start time) for accurate per-row timing.
-async fn add_bench_ts_column_and_triggers(client: &Client) -> Result<()> {
+///
+/// # Errors
+///
+/// Returns an error if the trigger function or any trigger cannot be created.
+pub async fn create_triggers(client: &Client) -> Result<()> {
     // Create the shared trigger function once.
     client
         .execute(
@@ -398,18 +443,6 @@ async fn add_bench_ts_column_and_triggers(client: &Client) -> Result<()> {
         })?;
 
     for table in MUTATED_TABLES {
-        // Add column with default for seed data rows.
-        let add_col = format!(
-            "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS _bench_ts TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()"
-        );
-        client
-            .execute(&add_col, &[])
-            .await
-            .map_err(|source| crate::Error::Sql {
-                action: format!("add _bench_ts column to {table}"),
-                source,
-            })?;
-
         // Attach the trigger (idempotent via DROP IF EXISTS + CREATE).
         let trigger_name = format!("trg_bench_ts_{table}");
         let drop_trg = format!("DROP TRIGGER IF EXISTS {trigger_name} ON {table}");
@@ -434,7 +467,7 @@ async fn add_bench_ts_column_and_triggers(client: &Client) -> Result<()> {
     }
 
     println!(
-        "  added _bench_ts column + trigger to {} tables",
+        "  added _bench_ts trigger to {} tables",
         MUTATED_TABLES.len()
     );
     Ok(())
