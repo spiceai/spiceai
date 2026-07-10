@@ -50,7 +50,8 @@ use crate::mysql::common;
 
 // 13324/13325 (the purged-position test uses `+ 1`): distinct from the other
 // MySQL suites (comments 13320, e2e 13322/13323, refresh_retry 13327,
-// rehydration 13337) so parallel test binaries never fight over a container.
+// schema_inference 13328/13329, rehydration 13337) so parallel test binaries
+// never fight over a container.
 const MYSQL_REPLICATION_PORT: u16 = 13324;
 
 /// In-memory [`PositionStore`] standing in for the accelerator sidecar.

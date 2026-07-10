@@ -250,7 +250,7 @@ fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
 // columns — still buffer via `to_http_response`.
 pub async fn sql_to_http_response(
     df: Arc<DataFusion>,
-    sql: &str,
+    sql: Arc<str>,
     parameters: Option<ParamValues>,
     format: ResponseMimeType,
     read_only: bool,
@@ -260,7 +260,7 @@ pub async fn sql_to_http_response(
     // under (see `EgressAccount`).
     let memory_pool = Arc::clone(&df.ctx.runtime_env().memory_pool);
 
-    let query_res = match QueryBuilder::new(sql, df)
+    let query_res = match QueryBuilder::new_arc(sql, df)
         .parameters(parameters)
         .read_only(read_only)
         .build()

@@ -98,8 +98,8 @@ limitations under the License.
 //!   subscriber starts a fresh pump that resumes from the slot.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock};
 
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -119,13 +119,23 @@ use rustc_hash::FxHashMap;
 use crate::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError, StreamError};
 use crate::postgres_replication::pgoutput::RelationId;
 
-/// Per-connection routing table: relation id -> (member key, resolved handle).
-/// `FxHashMap` (not the `SipHash` default) since the keys are trusted internal
-/// relation ids and this is on the per-event pump hot path — a `u32` `FxHash`
-/// is ~1-2ns vs `SipHash`'s ~10-20ns, and bit-mixing keeps `hashbrown`'s SIMD
-/// filter effective (unlike an identity `nohash`, whose zero high bits defeat
-/// it as the map grows).
-type RouteMap = FxHashMap<RelationId, (MemberKey, Arc<MemberHandle>)>;
+/// A resolved route for one relation, cached at `Relation` time. Bundling the
+/// member handle with its ack slot keeps the hot per-commit ack path
+/// (`already_committed` / `deliver` / committer construction) off the
+/// [`AckTable`] lock entirely — a pointer clone, no key hash or map lookup.
+struct Route {
+    key: MemberKey,
+    member: Arc<MemberHandle>,
+    slot: Arc<AckSlot>,
+}
+
+/// Per-connection routing table: relation id -> resolved [`Route`]. `FxHashMap`
+/// (not the `SipHash` default) since the keys are trusted internal relation ids
+/// and this is on the per-event pump hot path — a `u32` `FxHash` is ~1-2ns vs
+/// `SipHash`'s ~10-20ns, and bit-mixing keeps `hashbrown`'s SIMD filter
+/// effective (unlike an identity `nohash`, whose zero high bits defeat it as the
+/// map grows).
+type RouteMap = FxHashMap<RelationId, Route>;
 
 /// Per-transaction buffer of raw pgoutput change bytes, keyed by relation id.
 /// `FxHashMap` for the same hot-path reason as [`RouteMap`].
@@ -203,6 +213,18 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Poison-shrugging read/write helpers for the [`AckTable`] `RwLock`, same
+/// rationale as [`lock`]: every critical section is a short read-modify-write
+/// over plain data behind refcounted slots, so a panicking peer cannot leave the
+/// map logically broken.
+fn read_lock<T>(m: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    m.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn write_lock<T>(m: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    m.write().unwrap_or_else(PoisonError::into_inner)
+}
+
 struct MemberHandle {
     dataset_name: String,
     schema: SchemaRef,
@@ -220,34 +242,107 @@ struct MemberHandle {
     ready_lag: std::time::Duration,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct AckEntry {
+/// `LIVE`: the member is attached and routing to it is allowed. Cleared on
+/// detach, at which point its `committed` becomes a held floor the shared ack
+/// can never pass.
+const LIVE: u8 = 0b001;
+/// `SNAPSHOTTING`: the member's initial snapshot is still running. Cleared by
+/// the snapshot-completion hook; a member that detaches with this still set has
+/// an accelerator missing base rows.
+const SNAPSHOTTING: u8 = 0b010;
+/// `STREAMING`: the pump has (re)connected at or below this member's floor, so
+/// it is now routed and creditable. Members are *held* (no routing, never
+/// credited, floor pinned) from registration until this promotion: crediting a
+/// member before a connection provably covers its gap would acknowledge WAL it
+/// never received (changes decoded while it had no route), losing them
+/// permanently. See [`AckTable::promote_ready_members`].
+const STREAMING: u8 = 0b100;
+
+/// Per-member LSN accounting — one cache-line-isolated slot per member. The
+/// consumer commit path (the hot ~5.5M/run write) is a single lock-free atomic
+/// advance on the member's own `committed`, never a shared mutex; the pump
+/// advances `delivered` (and, for idle members, both — see
+/// [`AckTable::credit_idle`]). During streaming both fields advance monotonically,
+/// so a torn pair-read across a concurrent writer can only under-observe, never
+/// invent a value that was never written. The one non-monotonic step is a
+/// deliberate rejoin reset: [`AckTable::register`] lowers `delivered` back to the
+/// held `committed` floor, but only under the table write lock while the member
+/// is detached (not streaming), so no concurrent pump/committer read races it.
+///
+/// `#[repr(align(64))]` isolates each member's slot on its own cache line: with
+/// up to ~8 members committing on different consumer threads, adjacent
+/// `committed` writes would otherwise false-share one line. Load-bearing — do
+/// not "clean up".
+#[repr(align(64))]
+struct AckSlot {
     /// Highest commit LSN durably applied by this member's sink.
-    committed: u64,
+    committed: AtomicU64,
     /// Highest commit LSN delivered into this member's channel.
-    delivered: u64,
-    /// `false` once the member detached; its `committed` then becomes a held
-    /// floor the shared ack can never pass.
-    live: bool,
-    /// `true` while the member's initial snapshot runs. Cleared by the
-    /// snapshot-completion hook; a member that detaches with this still set
-    /// has an accelerator missing base rows.
-    snapshotting: bool,
-    /// `true` once the pump has (re)connected at or below this member's floor
-    /// — only then is the member routed and creditable. Members are *held*
-    /// (no routing, never credited, floor pinned) from registration until
-    /// that promotion: crediting a member before a connection provably covers
-    /// its gap would acknowledge WAL it never received (changes decoded while
-    /// it had no route), losing them permanently.
-    streaming: bool,
+    delivered: AtomicU64,
+    /// [`LIVE`] | [`SNAPSHOTTING`] | [`STREAMING`] bitflags. Mutated only under
+    /// the [`AckTable`] write lock (register/detach/promote/snapshot-finished);
+    /// read lock-free everywhere else.
+    state: AtomicU8,
 }
 
-/// Per-member LSN accounting. The slot-level acknowledgment
-/// (`shared_flush`) is the minimum `committed` over **all** entries — live or
-/// held — advanced monotonically.
+impl AckSlot {
+    fn new(at: u64, snapshotting: bool) -> Self {
+        Self {
+            committed: AtomicU64::new(at),
+            delivered: AtomicU64::new(at),
+            state: AtomicU8::new(LIVE | if snapshotting { SNAPSHOTTING } else { 0 }),
+        }
+    }
+
+    fn committed(&self) -> u64 {
+        self.committed.load(Ordering::Acquire)
+    }
+
+    fn delivered(&self) -> u64 {
+        self.delivered.load(Ordering::Acquire)
+    }
+
+    /// Advance this member's committed floor (monotonic). Called lock-free from
+    /// the consumer commit path via [`SharedLsnCommitter`].
+    fn commit(&self, lsn: u64) {
+        advance_monotonic(&self.committed, lsn);
+    }
+
+    /// Record an envelope delivered into this member's channel (monotonic).
+    /// The pump is the only caller; the CAS loop is kept for uniformity.
+    fn deliver(&self, lsn: u64) {
+        advance_monotonic(&self.delivered, lsn);
+    }
+
+    /// Whether the member has already durably applied this commit — used to
+    /// suppress re-delivery of envelopes during a reconnect replay (the replay
+    /// always starts at the *minimum* floor, so caught-up members would
+    /// otherwise see every commit since the slowest member's position again).
+    fn already_committed(&self, lsn: u64) -> bool {
+        self.committed.load(Ordering::Acquire) >= lsn
+    }
+
+    fn has(&self, flag: u8) -> bool {
+        self.state.load(Ordering::Acquire) & flag != 0
+    }
+}
+
+/// Per-member LSN accounting for a shared slot. The slot-level acknowledgment
+/// (`shared_flush`) is the minimum `committed` over **all** members — live or
+/// held — advanced monotonically and recomputed *lazily on read*
+/// ([`Self::flush_lsn`]), not eagerly on every commit.
+///
+/// `members` is read-locked for the hot per-boundary sweeps (`credit_idle`,
+/// `flush_lsn`), the `slot` lookup that caches a member's `Arc<AckSlot>` into the
+/// route map, and the lock-free slot mutations they drive; the write lock is
+/// taken only for the rare
+/// structural/state transitions (register, detach, promote, snapshot-finished),
+/// so in steady state the read path is an uncontended atomic. The per-member
+/// `committed`/`delivered` atomics live behind the `Arc<AckSlot>`, so a committer
+/// advances its floor without touching this lock at all.
 #[derive(Default)]
 struct AckTable {
-    entries: Mutex<HashMap<MemberKey, AckEntry>>,
+    members: RwLock<HashMap<MemberKey, Arc<AckSlot>>>,
     shared_flush: AtomicU64,
 }
 
@@ -257,31 +352,28 @@ impl AckTable {
     /// it is about to be replayed.
     fn register(&self, key: &MemberKey, snapshotting: bool) {
         let at = self.flush_lsn();
-        let mut entries = lock(&self.entries);
-        entries
-            .entry(key.clone())
-            .and_modify(|e| {
-                e.live = true;
-                e.delivered = e.committed;
-                e.snapshotting = snapshotting;
-                e.streaming = false;
-            })
-            .or_insert(AckEntry {
-                committed: at,
-                delivered: at,
-                live: true,
-                snapshotting,
-                streaming: false,
-            });
+        let held = LIVE | if snapshotting { SNAPSHOTTING } else { 0 };
+        let mut members = write_lock(&self.members);
+        match members.get(key) {
+            Some(slot) => {
+                // Rejoin: keep the held `committed` floor, reset `delivered` to
+                // it (everything after is about to be replayed), and drop back
+                // to the held (non-streaming) state.
+                slot.delivered.store(slot.committed(), Ordering::Release);
+                slot.state.store(held, Ordering::Release);
+            }
+            None => {
+                members.insert(key.clone(), Arc::new(AckSlot::new(at, snapshotting)));
+            }
+        }
     }
 
     /// The member's initial snapshot finished cleanly. It stays *held* until
     /// the pump's next (re)connect promotes it — the caller must also request
     /// that reconnect.
     fn snapshot_finished(&self, key: &MemberKey) {
-        let mut entries = lock(&self.entries);
-        if let Some(e) = entries.get_mut(key) {
-            e.snapshotting = false;
+        if let Some(slot) = write_lock(&self.members).get(key) {
+            slot.state.fetch_and(!SNAPSHOTTING, Ordering::AcqRel);
         }
     }
 
@@ -290,88 +382,56 @@ impl AckTable {
     /// included): every held, snapshot-complete member's gap is covered by
     /// this connection's replay, so they become routable and creditable.
     fn promote_ready_members(&self) {
-        let mut entries = lock(&self.entries);
-        for e in entries.values_mut() {
-            if e.live && !e.snapshotting {
-                e.streaming = true;
+        for slot in write_lock(&self.members).values() {
+            let s = slot.state.load(Ordering::Acquire);
+            if s & LIVE != 0 && s & SNAPSHOTTING == 0 {
+                slot.state.fetch_or(STREAMING, Ordering::AcqRel);
             }
         }
     }
 
-    fn is_streaming(&self, key: &MemberKey) -> bool {
-        lock(&self.entries).get(key).is_some_and(|e| e.streaming)
-    }
-
-    /// Whether the member has already durably applied this commit — used to
-    /// suppress re-delivery of envelopes during a reconnect replay (the replay
-    /// always starts at the *minimum* floor, so caught-up members would
-    /// otherwise see every commit since the slowest member's position again).
-    fn already_committed(&self, key: &MemberKey, lsn: u64) -> bool {
-        lock(&self.entries)
-            .get(key)
-            .is_some_and(|e| e.committed >= lsn)
-    }
-
-    fn deliver(&self, key: &MemberKey, lsn: u64) {
-        let mut entries = lock(&self.entries);
-        if let Some(e) = entries.get_mut(key) {
-            e.delivered = e.delivered.max(lsn);
-        }
-    }
-
-    fn commit(&self, key: &MemberKey, lsn: u64) {
-        {
-            let mut entries = lock(&self.entries);
-            if let Some(e) = entries.get_mut(key) {
-                e.committed = e.committed.max(lsn);
-            }
-        }
-        self.recompute();
+    /// Resolve a member's slot so the per-connection route map can cache it,
+    /// keeping the hot commit/deliver paths off this lock entirely. The pump
+    /// then reads streaming/committed state straight off the cached
+    /// [`AckSlot`] — no further table lookups.
+    fn slot(&self, key: &MemberKey) -> Option<Arc<AckSlot>> {
+        read_lock(&self.members).get(key).map(Arc::clone)
     }
 
     /// Credit streaming members with no in-flight envelopes up to `upto` —
     /// the connection's in-order replay guarantees their routed changes below
-    /// `upto` were already delivered. Detached entries are never credited
+    /// `upto` were already delivered. Detached members are never credited
     /// (that's the point of the hold), and neither are held (not-yet-promoted)
     /// members — they have no route yet, so "no in-flight envelopes" says
     /// nothing about what they've missed.
     fn credit_idle(&self, upto: u64) {
-        {
-            let mut entries = lock(&self.entries);
-            for e in entries.values_mut() {
-                if e.live && e.streaming && e.delivered == e.committed {
-                    let lsn = e.committed.max(upto);
-                    e.committed = lsn;
-                    e.delivered = lsn;
-                }
+        for slot in read_lock(&self.members).values() {
+            let s = slot.state.load(Ordering::Acquire);
+            if s & (LIVE | STREAMING) == (LIVE | STREAMING) && slot.delivered() == slot.committed()
+            {
+                // Advance `committed` BEFORE `delivered` (both Release): a torn
+                // observation must never show `delivered > committed`. Writing
+                // committed first means a concurrent sweep/credit can only
+                // under-credit (skip one opportunity, corrected at the next
+                // keepalive), never credit past an in-flight envelope. This is
+                // the one memory-ordering subtlety here; any future edit MUST
+                // preserve the order.
+                advance_monotonic(&slot.committed, upto);
+                advance_monotonic(&slot.delivered, upto);
             }
         }
-        self.recompute();
     }
 
     /// Detach a member, returning whether it was still snapshotting (its
-    /// snapshot never completed cleanly).
+    /// snapshot never completed cleanly). The slot stays in the map with its
+    /// `committed` frozen as a held floor — WAL retention by design.
     fn detach(&self, key: &MemberKey) -> bool {
-        let mut entries = lock(&self.entries);
-        match entries.get_mut(key) {
-            Some(e) => {
-                e.live = false;
-                e.streaming = false;
-                e.snapshotting
+        match write_lock(&self.members).get(key) {
+            Some(slot) => {
+                let prev = slot.state.fetch_and(!(LIVE | STREAMING), Ordering::AcqRel);
+                prev & SNAPSHOTTING != 0
             }
             None => false,
-        }
-    }
-
-    /// Recompute the slot-level floor and advance `shared_flush` to it
-    /// (monotonic — never regresses).
-    fn recompute(&self) {
-        let floor = {
-            let entries = lock(&self.entries);
-            entries.values().map(|e| e.committed).min()
-        };
-        if let Some(floor) = floor {
-            advance_monotonic(&self.shared_flush, floor);
         }
     }
 
@@ -380,8 +440,53 @@ impl AckTable {
         advance_monotonic(&self.shared_flush, lsn);
     }
 
+    /// Read-time slot-level floor: the minimum `committed` over all members
+    /// (held members included — their frozen floor pins WAL by design), advanced
+    /// monotonically into `shared_flush`. Recomputed on read, so nobody should
+    /// cache the result expecting eager freshness. The monotonic CAS preserves
+    /// the never-regress guarantee even if a `register` seeds a slot below the
+    /// last reported floor mid-sweep. The sweep is ≤ 8 atomic loads under an
+    /// uncontended read lock — it replaces the old per-commit `recompute`.
     fn flush_lsn(&self) -> u64 {
+        let floor = read_lock(&self.members)
+            .values()
+            .map(|slot| slot.committed())
+            .min();
+        if let Some(floor) = floor {
+            advance_monotonic(&self.shared_flush, floor);
+        }
         self.shared_flush.load(Ordering::Acquire)
+    }
+}
+
+/// Key-addressed conveniences for tests, mirroring the production paths that
+/// operate on a resolved [`AckSlot`] (the committer holds its slot; the pump
+/// caches it in the route map). Kept test-only so production never pays the
+/// key→slot lookup on the hot path.
+#[cfg(test)]
+impl AckTable {
+    fn commit(&self, key: &MemberKey, lsn: u64) {
+        if let Some(slot) = self.slot(key) {
+            slot.commit(lsn);
+        }
+    }
+
+    fn deliver(&self, key: &MemberKey, lsn: u64) {
+        if let Some(slot) = self.slot(key) {
+            slot.deliver(lsn);
+        }
+    }
+
+    fn is_streaming(&self, key: &MemberKey) -> bool {
+        self.slot(key).is_some_and(|slot| slot.has(STREAMING))
+    }
+
+    fn committed(&self, key: &MemberKey) -> u64 {
+        self.slot(key).map_or(0, |slot| slot.committed())
+    }
+
+    fn delivered(&self, key: &MemberKey) -> u64 {
+        self.slot(key).map_or(0, |slot| slot.delivered())
     }
 }
 
@@ -399,10 +504,11 @@ fn advance_monotonic(flush: &AtomicU64, to: u64) {
 }
 
 /// `CommitChange` impl for shared-slot envelopes: advances this member's
-/// committed LSN and recomputes the slot-level floor.
+/// committed LSN via its own cache-line-isolated [`AckSlot`] — a single
+/// lock-free atomic, no shared mutex and no floor recompute (the floor is read
+/// lazily at the next boundary by [`AckTable::flush_lsn`]).
 struct SharedLsnCommitter {
-    ack: Arc<AckTable>,
-    key: MemberKey,
+    slot: Arc<AckSlot>,
     flush_to: u64,
     /// Member dataset name, for the committer-progress log line.
     dataset: String,
@@ -414,7 +520,7 @@ struct SharedLsnCommitter {
 #[async_trait]
 impl CommitChange for SharedLsnCommitter {
     async fn commit(&self) -> std::result::Result<(), CommitError> {
-        self.ack.commit(&self.key, self.flush_to);
+        self.slot.commit(self.flush_to);
         crate::cdc::log_committer_progress(
             "postgres",
             &self.dataset,
@@ -429,6 +535,29 @@ impl CommitChange for SharedLsnCommitter {
     /// deferred commit re-streams the un-acked tail. Safe to defer.
     fn supports_deferral(&self) -> bool {
         true
+    }
+
+    /// Fold another shared-slot commit that targets the *same* member slot into
+    /// this one by keeping the higher LSN. Sound because [`Self::commit`] is a
+    /// monotonic `max` into the slot's `committed` — infallible and
+    /// order-insensitive, so folding N consecutive commits to their max is
+    /// identical to running them in order. A different slot (or a non-shared
+    /// committer) is refused, so a mixed run never coalesces across members.
+    fn try_absorb(&mut self, other: &dyn CommitChange) -> bool {
+        match other
+            .as_any()
+            .and_then(|a| a.downcast_ref::<SharedLsnCommitter>())
+        {
+            Some(other) if Arc::ptr_eq(&self.slot, &other.slot) => {
+                self.flush_to = self.flush_to.max(other.flush_to);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
     }
 }
 
@@ -1497,7 +1626,13 @@ async fn handle_relation(
         );
         return;
     };
-    if !source.ack.is_streaming(&member_key) {
+    // Resolve the member's ack slot once (reused for the streaming gate below and
+    // cached in the route), so the per-commit ack path is a pointer, not a lock.
+    let Some(slot) = source.ack.slot(&member_key) else {
+        routes.remove(&rel.relation_id);
+        return;
+    };
+    if !slot.has(STREAMING) {
         // The member is still held — snapshotting, or joined after this
         // connection started. Don't route WAL at it (a snapshotting member's
         // channel isn't drained until the snapshot ends). Its held ack floor
@@ -1528,9 +1663,16 @@ async fn handle_relation(
         return;
     }
     decoder.apply_declared_primary_keys(rel.relation_id, &member.primary_keys);
-    // Cache the resolved handle alongside the key so the per-event path skips
-    // the `members` lock + string hash (see `buffer_raw_change`).
-    routes.insert(rel.relation_id, (member_key, member));
+    // Cache the resolved handle + ack slot alongside the key so the per-event
+    // path skips the `members` lock + string hash (see `buffer_raw_change`).
+    routes.insert(
+        rel.relation_id,
+        Route {
+            key: member_key,
+            member,
+            slot,
+        },
+    );
 }
 
 /// Route an Insert/Update/Delete by its peeked relation id and buffer the raw
@@ -1545,7 +1687,7 @@ fn buffer_raw_change(routes: &RouteMap, txn: &mut TxnBuffer, tag: u8, data: Byte
     };
     // Cached at Relation time: a `u32` lookup yields the member handle directly,
     // so the per-event hot path takes no `members` lock and hashes no strings.
-    let Some((_member_key, member)) = routes.get(&relation_id) else {
+    let Some(Route { member, .. }) = routes.get(&relation_id) else {
         return;
     };
     match tag {
@@ -1567,7 +1709,7 @@ fn buffer_raw_truncate(
     data: &Bytes,
 ) {
     for &relation_id in relation_ids {
-        if let Some((_member_key, member)) = routes.get(&relation_id) {
+        if let Some(Route { member, .. }) = routes.get(&relation_id) {
             member.metrics.inc_truncate();
             txn.entry(relation_id).or_default().push(data.clone());
             tracing::info!(
@@ -1687,13 +1829,18 @@ async fn deliver_commit(
         // its last applied LSN, breaking the "stop routing but hold the floor"
         // detach contract (and delivering changes after a fatal error). This is
         // a per-commit gate, not the per-event hot path, so the lookup is fine.
-        let Some((member_key, member)) = routes.get(&relation_id) else {
+        let Some(Route {
+            key: member_key,
+            member,
+            slot,
+        }) = routes.get(&relation_id)
+        else {
             continue;
         };
-        if !source.ack.is_streaming(member_key) {
+        if !slot.has(STREAMING) {
             continue;
         }
-        if source.ack.already_committed(member_key, end_lsn) {
+        if slot.already_committed(end_lsn) {
             // Reconnect replay of a commit this member already durably
             // applied (replays start at the minimum floor across members).
             continue;
@@ -1730,8 +1877,7 @@ async fn deliver_commit(
         let is_ready = crate::cdc::source_commit_within_ready_lag(commit_ts_ms, member.ready_lag);
         let envelope = ChangeEnvelope::new_from_rows(
             Box::new(SharedLsnCommitter {
-                ack: Arc::clone(&source.ack),
-                key: member_key.clone(),
+                slot: Arc::clone(slot),
                 flush_to: end_lsn,
                 dataset: member.dataset_name.clone(),
                 source_commit_ts_ms: commit_ts_ms,
@@ -1739,7 +1885,7 @@ async fn deliver_commit(
             Box::new(rows),
             is_ready,
         );
-        source.ack.deliver(member_key, end_lsn);
+        slot.deliver(end_lsn);
         match deliver_to_member(
             &member.metrics,
             &member.dataset_name,
@@ -2085,8 +2231,7 @@ mod tests {
         ack.seed(10);
         ack.register(&key("a"), false);
         let committer = SharedLsnCommitter {
-            ack: Arc::clone(&ack),
-            key: key("a"),
+            slot: ack.slot(&key("a")).expect("slot registered"),
             flush_to: 42,
             dataset: "test".to_string(),
             source_commit_ts_ms: None,
@@ -2117,5 +2262,294 @@ mod tests {
         let mut h2 = DefaultHasher::new();
         base.clone().hash(&mut h2);
         assert_eq!(h1.finish(), h2.finish());
+    }
+
+    /// Seeded xorshift64* PRNG — zero-dependency and reproducible by seed, so a
+    /// differential failure re-runs deterministically (§5.2). Not
+    /// cryptographic; just needs a well-spread `u64` stream.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// Reference model: a direct, deliberately naive reimplementation of the
+    /// *pre-`AckSlot`* semantics (mutex-`HashMap` + eager `recompute` on every
+    /// commit/credit, `flush_lsn` = the eagerly-maintained floor). The
+    /// differential test (below) asserts the new lock-free `AckTable` is
+    /// byte-identical to this on every operation.
+    #[derive(Default)]
+    struct Model {
+        entries: HashMap<MemberKey, ModelEntry>,
+        shared_flush: u64,
+    }
+    #[derive(Clone, Copy)]
+    struct ModelEntry {
+        committed: u64,
+        delivered: u64,
+        live: bool,
+        snapshotting: bool,
+        streaming: bool,
+    }
+    impl Model {
+        fn seed(&mut self, lsn: u64) {
+            self.shared_flush = self.shared_flush.max(lsn);
+        }
+        fn register(&mut self, key: &MemberKey, snapshotting: bool) {
+            let at = self.shared_flush;
+            self.entries
+                .entry(key.clone())
+                .and_modify(|e| {
+                    e.live = true;
+                    e.delivered = e.committed;
+                    e.snapshotting = snapshotting;
+                    e.streaming = false;
+                })
+                .or_insert(ModelEntry {
+                    committed: at,
+                    delivered: at,
+                    live: true,
+                    snapshotting,
+                    streaming: false,
+                });
+        }
+        fn snapshot_finished(&mut self, key: &MemberKey) {
+            if let Some(e) = self.entries.get_mut(key) {
+                e.snapshotting = false;
+            }
+        }
+        fn promote_ready_members(&mut self) {
+            for e in self.entries.values_mut() {
+                if e.live && !e.snapshotting {
+                    e.streaming = true;
+                }
+            }
+        }
+        fn deliver(&mut self, key: &MemberKey, lsn: u64) {
+            if let Some(e) = self.entries.get_mut(key) {
+                e.delivered = e.delivered.max(lsn);
+            }
+        }
+        fn commit(&mut self, key: &MemberKey, lsn: u64) {
+            if let Some(e) = self.entries.get_mut(key) {
+                e.committed = e.committed.max(lsn);
+            }
+            self.recompute();
+        }
+        fn credit_idle(&mut self, upto: u64) {
+            for e in self.entries.values_mut() {
+                if e.live && e.streaming && e.delivered == e.committed {
+                    let lsn = e.committed.max(upto);
+                    e.committed = lsn;
+                    e.delivered = lsn;
+                }
+            }
+            self.recompute();
+        }
+        fn detach(&mut self, key: &MemberKey) {
+            if let Some(e) = self.entries.get_mut(key) {
+                e.live = false;
+                e.streaming = false;
+            }
+        }
+        fn recompute(&mut self) {
+            if let Some(floor) = self.entries.values().map(|e| e.committed).min() {
+                self.shared_flush = self.shared_flush.max(floor);
+            }
+        }
+        fn flush_lsn(&self) -> u64 {
+            self.shared_flush
+        }
+    }
+
+    /// §5.2 — the main correctness instrument. Drive the new [`AckTable`] and the
+    /// reference [`Model`] with the same randomized operation sequences and
+    /// assert identical `flush_lsn` and per-member `committed`/`delivered` after
+    /// every op. Single-threaded — this pins the *semantics*; concurrency is
+    /// [`credit_idle_interleaving_never_over_credits`]'s job.
+    #[test]
+    fn differential_matches_reference_model() {
+        const MEMBERS: u64 = 4;
+        let members: Vec<MemberKey> = (0..MEMBERS).map(|i| key(&format!("t{i}"))).collect();
+        // Seeded so a failure is reproducible; a spread of seeds covers more
+        // interleavings while keeping the run cheap.
+        for seed in 1..=400_u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let ack = AckTable::default();
+            let mut model = Model::default();
+            // Per-member monotonic LSN generators.
+            let mut next_lsn = vec![100_u64; members.len()];
+            let mut upto = 100_u64;
+
+            ack.seed(100);
+            model.seed(100);
+
+            for _ in 0..800 {
+                let m = usize::try_from(rng.below(MEMBERS)).expect("member index fits usize");
+                let k = &members[m];
+                match rng.below(7) {
+                    0 => {
+                        let snap = rng.below(2) == 0;
+                        ack.register(k, snap);
+                        model.register(k, snap);
+                    }
+                    1 => {
+                        ack.promote_ready_members();
+                        model.promote_ready_members();
+                    }
+                    2 => {
+                        next_lsn[m] += rng.below(50) + 1;
+                        ack.deliver(k, next_lsn[m]);
+                        model.deliver(k, next_lsn[m]);
+                    }
+                    3 => {
+                        // Commit at or below what has been delivered to this
+                        // member (the real invariant: a commit never outruns
+                        // delivery). Occasionally replay an older LSN.
+                        let lsn = if rng.below(4) == 0 {
+                            next_lsn[m].saturating_sub(rng.below(30))
+                        } else {
+                            next_lsn[m]
+                        };
+                        ack.commit(k, lsn);
+                        model.commit(k, lsn);
+                    }
+                    4 => {
+                        upto += rng.below(40) + 1;
+                        ack.credit_idle(upto);
+                        model.credit_idle(upto);
+                    }
+                    5 => {
+                        ack.snapshot_finished(k);
+                        model.snapshot_finished(k);
+                    }
+                    _ => {
+                        ack.detach(k);
+                        model.detach(k);
+                    }
+                }
+
+                assert_eq!(
+                    ack.flush_lsn(),
+                    model.flush_lsn(),
+                    "flush_lsn diverged (seed {seed})"
+                );
+                for (i, mk) in members.iter().enumerate() {
+                    // Only compare registered members (both register in lockstep).
+                    if model.entries.contains_key(mk) {
+                        assert_eq!(
+                            ack.committed(mk),
+                            model.entries[mk].committed,
+                            "committed[t{i}] diverged (seed {seed})"
+                        );
+                        assert_eq!(
+                            ack.delivered(mk),
+                            model.entries[mk].delivered,
+                            "delivered[t{i}] diverged (seed {seed})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// §5.3 — the `credit_idle` write-ordering invariant under real threads.
+    /// One thread commits a member forward while another races `credit_idle`
+    /// ahead of it; a third observer asserts the slot-level floor never runs
+    /// past the member's own committed LSN, and everything converges to the
+    /// final LSN once quiescent. Exercises the `committed`-before-`delivered`
+    /// Release ordering against genuine cross-thread writes (run this in
+    /// `--release` with a high count to shake out torn reads).
+    #[test]
+    fn credit_idle_interleaving_never_over_credits() {
+        use std::sync::atomic::AtomicBool;
+
+        const N: u64 = 20_000;
+        let ack = Arc::new(AckTable::default());
+        ack.seed(1);
+        ack.register(&key("a"), false);
+        ack.promote_ready_members();
+        let slot = ack.slot(&key("a")).expect("slot");
+        let done = Arc::new(AtomicBool::new(false));
+
+        std::thread::scope(|s| {
+            // Committer: deliver then commit, strictly increasing. Signals
+            // `done` on completion so the crediter's busy loop terminates —
+            // setting `done` after the scope would deadlock, since the scope
+            // only joins once the crediter has already exited.
+            {
+                let slot = Arc::clone(&slot);
+                let done = Arc::clone(&done);
+                s.spawn(move || {
+                    for lsn in 2..=N {
+                        slot.deliver(lsn);
+                        slot.commit(lsn);
+                    }
+                    done.store(true, Ordering::Release);
+                });
+            }
+            // Idle-crediter: race `upto` ahead of the committer until it's done.
+            {
+                let ack = Arc::clone(&ack);
+                let done = Arc::clone(&done);
+                s.spawn(move || {
+                    while !done.load(Ordering::Acquire) {
+                        ack.credit_idle(N + 1000);
+                    }
+                });
+            }
+            // Observer: two continuously-checked invariants under contention —
+            // (1) the slot-level floor never *exceeds* the member's own
+            // committed LSN (acking past what a member durably applied is the
+            // data-loss bug this whole design guards against), and (2) the floor
+            // never regresses (contract #1). Read the floor *before* committed:
+            // both are monotonic, so a later committed read can only be ≥ the
+            // committed the floor was computed from — a floor that jumped past a
+            // real in-flight commit is thus observable, not masked.
+            {
+                let ack = Arc::clone(&ack);
+                let slot = Arc::clone(&slot);
+                s.spawn(move || {
+                    let mut last_floor = 0;
+                    for _ in 0..200_000 {
+                        let floor = ack.flush_lsn();
+                        let committed = slot.committed();
+                        assert!(
+                            floor <= committed,
+                            "floor {floor} ran past committed {committed}"
+                        );
+                        assert!(
+                            floor >= last_floor,
+                            "floor regressed {last_floor} -> {floor}"
+                        );
+                        last_floor = floor;
+                    }
+                });
+            }
+        });
+
+        // Quiescence: `credit_idle` may legitimately have advanced an idle
+        // member up to its `upto` (N+1000), so `committed` lands somewhere in
+        // [N, N+1000]. What must hold is convergence: the floor equals the
+        // member's committed (single member ⇒ the floor *is* its committed).
+        let final_committed = slot.committed();
+        assert!(
+            (N..=N + 1000).contains(&final_committed),
+            "committed {final_committed} outside any writer's range"
+        );
+        assert_eq!(
+            ack.flush_lsn(),
+            final_committed,
+            "floor converged to the member's committed"
+        );
     }
 }
