@@ -47,7 +47,8 @@ merge. That is slow feedback and a lot of duplicated CI. With sign-off:
 
 ### Sign off on your change
 
-From a clean checkout, with your branch pushed and up to date:
+From a clean Git checkout or JJ workspace, with your branch/bookmark pushed
+and up to date:
 
 ```bash
 make signoff          # runs `make lint-rust` + `make build-cli nextest`, then attests
@@ -68,6 +69,29 @@ scripts/signoff --no-verify   # attest without running the checks (honor system)
 scripts/signoff status        # is HEAD signed off?
 scripts/signoff --help        # full usage
 ```
+
+### Jujutsu workspaces
+
+`make signoff` also works in non-colocated JJ workspaces (where there is a
+`.jj` directory but no `.git` directory). Commit/bookmark your change and push
+it normally before signing off:
+
+```bash
+jj commit -m "describe the change"
+jj bookmark set my-branch -r @-
+jj git push --bookmark my-branch
+make signoff
+```
+
+After `jj commit`, JJ normally leaves an empty working-copy commit (`@`) on top
+of the bookmarked commit. The sign-off tool recognizes that layout and attests
+the pushed parent (`@-`). If `@` itself is bookmarked and pushed, it attests `@`
+instead. In either case, the selected commit must exactly match a bookmark tip
+on the configured remote.
+
+The JJ remote defaults to `origin`. Set `SIGNOFF_REMOTE=<remote>` when the PR
+branch is pushed elsewhere. Colocated JJ repositories continue to use the Git
+path, so existing Git behavior is unchanged.
 
 ### "No developer sign-off found for &lt;sha&gt;"
 

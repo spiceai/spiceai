@@ -25,6 +25,7 @@
 #
 # Environment:
 #   SIGNOFF_BRANCH    Branch/ruleset to target for install/check (default: trunk)
+#   SIGNOFF_REMOTE    Git remote to use in a JJ workspace (default: origin)
 #   SIGNOFF_DEBUG     Set to any value for verbose debug logging
 
 set -euo pipefail
@@ -34,7 +35,10 @@ readonly VERSION="1.0.0"
 # workflow (pr.yml) looks for, so an env override would silently break the gate.
 readonly STATUS_CONTEXT="signoff"
 readonly TARGET_BRANCH="${SIGNOFF_BRANCH:-trunk}"
+readonly TARGET_REMOTE="${SIGNOFF_REMOTE:-origin}"
 DEBUG="${SIGNOFF_DEBUG:-}"
+VCS=""
+JJ_REMOTE_URL=""
 
 # The single source of truth for the checks required to merge. `install` writes
 # exactly this list into the trunk ruleset's required status checks. Every name
@@ -72,11 +76,44 @@ bullet() { local prefix="$1" line; while IFS= read -r line; do [[ -n "$line" ]] 
 
 # --- preconditions -----------------------------------------------------------
 
-# git + gh cover every path; the default `signoff` flow uses only these (it parses
-# JSON via `gh --jq`, not the jq binary).
+# Detect Git first so colocated JJ repositories retain the existing Git behavior.
+# Fall back to JJ for non-colocated workspaces, which intentionally have no .git
+# directory for Git or gh to discover.
+detect_vcs() {
+  if command -v git >/dev/null 2>&1 && git rev-parse --show-toplevel >/dev/null 2>&1; then
+    VCS="git"
+    return
+  fi
+
+  if command -v jj >/dev/null 2>&1 && jj root >/dev/null 2>&1; then
+    VCS="jj"
+    [[ "$TARGET_REMOTE" =~ ^[[:alnum:]_.:/-]+$ ]] \
+      || fail "invalid JJ remote name: '${TARGET_REMOTE}'"
+
+    local name url remotes
+    remotes=$(jj --color=never git remote list) \
+      || fail "could not list JJ remotes"
+    while read -r name url; do
+      if [[ "$name" == "$TARGET_REMOTE" ]]; then
+        JJ_REMOTE_URL="$url"
+        break
+      fi
+    done <<<"$remotes"
+    [[ -n "$JJ_REMOTE_URL" ]] \
+      || fail "JJ remote '${TARGET_REMOTE}' not found — add it with 'jj git remote add', or set SIGNOFF_REMOTE"
+    [[ "$JJ_REMOTE_URL" != -* ]] \
+      || fail "invalid URL for JJ remote '${TARGET_REMOTE}'"
+    return
+  fi
+
+  fail "not inside a Git checkout or JJ workspace"
+}
+
+# gh covers every path; Git is used in a Git checkout and JJ in a non-colocated
+# workspace. The default signoff flow parses JSON via `gh --jq`, not jq itself.
 require_tools() {
-  command -v git >/dev/null 2>&1 || fail "git not found"
-  command -v gh  >/dev/null 2>&1 || fail "GitHub CLI (gh) not found — install from https://cli.github.com"
+  command -v gh >/dev/null 2>&1 || fail "GitHub CLI (gh) not found — install from https://cli.github.com"
+  detect_vcs
   gh auth status >/dev/null 2>&1 || fail "not logged in to GitHub — run 'gh auth login'"
 }
 
@@ -85,15 +122,88 @@ require_jq() {
   command -v jq >/dev/null 2>&1 || fail "jq not found — install from https://jqlang.github.io/jq"
 }
 
-# owner/repo of the current checkout, from the gh context.
+# owner/repo of the current checkout, from the gh context. gh cannot infer a
+# repository from a non-colocated JJ workspace, so give it that workspace's
+# configured remote URL explicitly.
 repo_slug() {
-  gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null \
-    || fail "could not determine the GitHub repository — run this inside a clone of the repo"
+  if [[ "$VCS" == "jj" ]]; then
+    gh repo view "$JJ_REMOTE_URL" --json nameWithOwner --jq .nameWithOwner 2>/dev/null \
+      || fail "could not determine the GitHub repository from JJ remote '${TARGET_REMOTE}'"
+  else
+    gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null \
+      || fail "could not determine the GitHub repository — run this inside a clone of the repo"
+  fi
+}
+
+jj_revision_is_remote() {
+  local revision="$1" sha
+  sha=$(jj --color=never --no-pager log \
+    -r "${revision} & remote_bookmarks(remote=exact:\"${TARGET_REMOTE}\")" \
+    --no-graph -T 'commit_id') \
+    || fail "could not inspect JJ bookmarks on '${TARGET_REMOTE}'"
+  [[ -n "$sha" ]]
+}
+
+# A normal `jj commit` leaves an empty working-copy commit on top of the commit
+# that was bookmarked and pushed. Treat that parent as HEAD. If @ itself has a
+# bookmark, contains changes, or is already a remote bookmark, it is the commit
+# the developer is trying to attest instead.
+current_revision() {
+  local force="${1:-false}"
+  if [[ "$VCS" == "git" ]]; then
+    echo "HEAD"
+    return
+  fi
+
+  local at_bookmark at_empty
+  at_bookmark=$(jj --color=never --no-pager log -r '@ & bookmarks()' --no-graph -T 'commit_id') \
+    || fail "could not inspect JJ bookmarks"
+  at_empty=$(jj --color=never --no-pager log -r '@ & empty()' --no-graph -T 'commit_id') \
+    || fail "could not inspect the JJ working-copy commit"
+  if jj_revision_is_remote "@" || [[ -n "$at_bookmark" ]] || [[ -z "$at_empty" ]]; then
+    echo "@"
+    return
+  fi
+
+  local parent_count
+  parent_count=$(jj --color=never --no-pager log -r '@' --no-graph -T 'parents.len()') \
+    || fail "could not inspect the JJ working-copy parent"
+  if [[ "$parent_count" == "1" ]]; then
+    echo "@-"
+  elif $force; then
+    echo "@"
+  else
+    fail "empty JJ working-copy commit has ${parent_count} parents — select the commit to sign off, or pass -f"
+  fi
+}
+
+revision_sha() {
+  local revision="$1"
+  if [[ "$VCS" == "jj" ]]; then
+    jj --color=never --no-pager log -r "$revision" --no-graph -T 'commit_id'
+  else
+    git rev-parse "$revision"
+  fi
+}
+
+local_user_name() {
+  if [[ "$VCS" == "jj" ]]; then
+    jj config get user.name 2>/dev/null
+  else
+    git config user.name 2>/dev/null
+  fi
 }
 
 # Refuse to sign off on a tree that isn't exactly what's pushed: the attestation
 # is bound to a single commit SHA, so it must match the commit under review.
 ensure_clean_and_pushed() {
+  local revision="$1"
+  if [[ "$VCS" == "jj" ]]; then
+    jj_revision_is_remote "$revision" \
+      || fail "JJ revision ${revision} is not a bookmark tip on '${TARGET_REMOTE}' — bookmark and push it with 'jj git push', or pass -f"
+    return
+  fi
+
   if [[ -n "$(git status --porcelain)" ]]; then
     fail "working tree has uncommitted changes — commit or stash them, or pass -f"
   fi
@@ -137,11 +247,12 @@ cmd_signoff() {
   done
 
   require_tools
-  $force || ensure_clean_and_pushed
 
-  local sha user repo description start
-  sha=$(git rev-parse HEAD) || fail "could not resolve HEAD"
-  user=$(gh api user --jq .login 2>/dev/null || git config user.name || echo "unknown")
+  local revision sha user repo description start
+  revision=$(current_revision "$force")
+  $force || ensure_clean_and_pushed "$revision"
+  sha=$(revision_sha "$revision") || fail "could not resolve ${revision}"
+  user=$(gh api user --jq .login 2>/dev/null || local_user_name || echo "unknown")
   repo=$(repo_slug)
 
   if $verify; then
@@ -168,8 +279,9 @@ cmd_signoff() {
 cmd_status() {
   require_tools
   require_jq
-  local sha repo combined state desc
-  sha=$(git rev-parse HEAD)
+  local revision sha repo combined state desc
+  revision=$(current_revision)
+  sha=$(revision_sha "$revision")
   repo=$(repo_slug)
   # Fetch the combined status once, then pick the first matching entry with jq.
   # (Piping `gh --jq ... | head -n1` would SIGPIPE the writer under pipefail.)
