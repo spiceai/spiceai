@@ -2548,7 +2548,10 @@ impl CayenneTableProvider {
         );
 
         let cold_base = cold_location.trim_end_matches('/');
-        let cold_prefix_url = format!("{cold_base}/{}/data/", self.table_metadata.table_id);
+        let cold_prefix_url = format!(
+            "{cold_base}/{}/data/",
+            self.table_metadata.datalake_dir_segment()
+        );
         let cold_url = match ListingTableUrl::parse(&cold_prefix_url) {
             Ok(url) => url,
             Err(error) => {
@@ -13331,7 +13334,7 @@ impl CayenneTableProvider {
         let cold_base = cold_location.trim_end_matches('/');
         let cold_dir_url = format!(
             "{cold_base}/{}/data/{promotion_id}/",
-            self.table_metadata.table_id
+            self.table_metadata.datalake_dir_segment()
         );
 
         // A local `file://` cold tier needs its target directory created before

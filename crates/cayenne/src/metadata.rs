@@ -74,6 +74,69 @@ pub struct TableMetadata {
     pub current_sequence_number: i64,
 }
 
+impl TableMetadata {
+    /// Physical directory segment for the **datalake (cold) tier**:
+    /// `{sanitized_table_name}-{table_id}`.
+    ///
+    /// The datalake tier groups a table's objects under this segment
+    /// (`{cayenne_datalake_location}/{segment}/data/{promotion_id}/…`). Prepending
+    /// a human-readable slug of the table name makes a shared datalake bucket
+    /// navigable, while the trailing `UUIDv7` `table_id` preserves the collision-free
+    /// namespacing that lets multiple tables/instances safely share one location.
+    ///
+    /// Because the `table_id` suffix already guarantees uniqueness, the name slug
+    /// may be **lossy**: any character outside `[A-Za-z0-9_-]` becomes `_`, leading
+    /// and trailing `_`/`-` are trimmed, and the slug is capped at
+    /// [`Self::DATALAKE_SLUG_MAX_LEN`] characters. A name that slugs to nothing
+    /// (e.g. all symbols) falls back to the bare `table_id`.
+    ///
+    /// The segment is a pure function of two immutable fields (`table_name` never
+    /// changes for a given `table_id` — a rename is a drop + recreate that mints a
+    /// new id), so it is derived on demand and never persisted. The warm tier is
+    /// intentionally left keyed by the bare `table_id`.
+    #[must_use]
+    pub fn datalake_dir_segment(&self) -> String {
+        let slug = Self::sanitize_name_slug(&self.table_name);
+        if slug.is_empty() {
+            self.table_id.clone()
+        } else {
+            format!("{slug}-{}", self.table_id)
+        }
+    }
+
+    /// Lossy, path-safe slug of a table name for [`Self::datalake_dir_segment`]:
+    /// non-`[A-Za-z0-9_-]` characters become `_`, leading/trailing `_`/`-` are
+    /// trimmed, and the result is capped at [`Self::DATALAKE_SLUG_MAX_LEN`]. May
+    /// return an empty string (e.g. an all-symbol name); callers fall back to the
+    /// bare `table_id`, which alone keeps segments unique.
+    fn sanitize_name_slug(name: &str) -> String {
+        let mapped: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        mapped
+            .trim_matches(['_', '-'])
+            .chars()
+            .take(Self::DATALAKE_SLUG_MAX_LEN)
+            .collect::<String>()
+            // Re-trim: truncation can re-expose a trailing separator.
+            .trim_end_matches(['_', '-'])
+            .to_string()
+    }
+
+    /// Maximum length (in characters) of the sanitized table-name slug used in
+    /// [`Self::datalake_dir_segment`]. Keeps the full segment well under the
+    /// 255-byte path-component limit on common filesystems even with a 36-char
+    /// UUID and a separator appended.
+    pub const DATALAKE_SLUG_MAX_LEN: usize = 64;
+}
+
 /// Represents a data file containing table rows.
 ///
 /// In Cayenne, a "file" is actually a virtual file represented by a Vortex `ListingTable`
@@ -1587,6 +1650,92 @@ mod tests {
             Some(PkConflictDetection::None)
         );
         assert_eq!(PkConflictDetection::parse("invalid"), None);
+    }
+
+    /// The datalake name slug is lossy but always path/S3-safe: only
+    /// `[A-Za-z0-9_-]` survives, edges are trimmed, and length is capped. These
+    /// cases pin the exact contract the datalake directory segment depends on.
+    #[test]
+    fn test_sanitize_name_slug() {
+        use super::TableMetadata;
+
+        // Plain names pass through unchanged.
+        assert_eq!(TableMetadata::sanitize_name_slug("orders"), "orders");
+        assert_eq!(TableMetadata::sanitize_name_slug("taxi_trips-1"), "taxi_trips-1");
+
+        // Unsafe characters (dots, spaces, slashes, schema qualifiers) become `_`.
+        assert_eq!(TableMetadata::sanitize_name_slug("public.orders"), "public_orders");
+        assert_eq!(TableMetadata::sanitize_name_slug("my table"), "my_table");
+        assert_eq!(TableMetadata::sanitize_name_slug("a/b\\c"), "a_b_c");
+
+        // Non-ASCII is replaced (lossy is fine — the UUID suffix disambiguates).
+        assert_eq!(TableMetadata::sanitize_name_slug("naïve"), "na_ve");
+
+        // Leading/trailing separators are trimmed.
+        assert_eq!(TableMetadata::sanitize_name_slug("__orders__"), "orders");
+        assert_eq!(TableMetadata::sanitize_name_slug(".orders."), "orders");
+
+        // An all-symbol name slugs to empty (caller falls back to the id).
+        assert_eq!(TableMetadata::sanitize_name_slug("***"), "");
+        assert_eq!(TableMetadata::sanitize_name_slug(""), "");
+    }
+
+    /// Truncation to `DATALAKE_SLUG_MAX_LEN` must not leave a dangling separator.
+    #[test]
+    fn test_sanitize_name_slug_caps_length_and_retrims() {
+        use super::TableMetadata;
+
+        let long = "a".repeat(200);
+        let slug = TableMetadata::sanitize_name_slug(&long);
+        assert_eq!(slug.chars().count(), TableMetadata::DATALAKE_SLUG_MAX_LEN);
+
+        // A separator sitting exactly at the truncation boundary is re-trimmed.
+        let boundary = format!("{}_tail", "a".repeat(TableMetadata::DATALAKE_SLUG_MAX_LEN - 1));
+        let slug = TableMetadata::sanitize_name_slug(&boundary);
+        assert!(
+            !slug.ends_with('_') && !slug.ends_with('-'),
+            "truncated slug must not end in a separator, got {slug:?}"
+        );
+    }
+
+    /// The full datalake segment is `{slug}-{table_id}`, and falls back to the
+    /// bare `table_id` when the name slugs to nothing. The `table_id` suffix is
+    /// what keeps two distinct tables that slug identically from colliding.
+    #[test]
+    fn test_datalake_dir_segment() {
+        use super::TableMetadata;
+        use arrow_schema::Schema;
+        use std::sync::Arc;
+
+        let md = |name: &str, id: &str| TableMetadata {
+            table_id: id.to_string(),
+            table_name: name.to_string(),
+            path: String::new(),
+            path_is_relative: false,
+            schema: Arc::new(Schema::empty()),
+            primary_key: Vec::new(),
+            on_conflict: None,
+            current_snapshot_id: String::new(),
+            partition_column: None,
+            vortex_config: VortexConfig::default(),
+            current_sequence_number: 0,
+        };
+
+        let id = "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+        assert_eq!(md("orders", id).datalake_dir_segment(), format!("orders-{id}"));
+        assert_eq!(md("public.orders", id).datalake_dir_segment(), format!("public_orders-{id}"));
+
+        // All-symbol name → bare id (still unique).
+        assert_eq!(md("***", id).datalake_dir_segment(), id);
+
+        // Two tables that slug identically stay distinct via their ids.
+        let a = "0190a1b2-c3d4-7e5f-8a9b-000000000001";
+        let b = "0190a1b2-c3d4-7e5f-8a9b-000000000002";
+        assert_ne!(
+            md("my table", a).datalake_dir_segment(),
+            md("my.table", b).datalake_dir_segment(),
+            "identical slugs must remain distinct segments via the table_id suffix"
+        );
     }
 }
 

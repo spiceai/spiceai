@@ -180,6 +180,19 @@ async fn test_cold_tier_promotion_cross_tier_scan_and_delete_impl(
         "expected at least one physical .vortex file on the cold store, got {physical_cold_files}"
     );
 
+    // Physical layout is grouped under `{sanitized_table_name}-{table_id}/data/`:
+    // the name prefix makes a shared datalake location navigable, and the UUIDv7
+    // suffix keeps the prefix collision-free across tables/instances.
+    let expected_segment = format!("cold_t-{}", table.table_id());
+    assert!(
+        cold_dir.join(&expected_segment).join("data").is_dir(),
+        "expected cold objects under '{expected_segment}/data/'; cold dir entries: {:?}",
+        std::fs::read_dir(&cold_dir).map(|d| d
+            .flatten()
+            .map(|e| e.file_name())
+            .collect::<Vec<_>>())
+    );
+
     // Cross-tier scan: warm is now an empty snapshot, so returning all rows
     // proves the cold branch is read + unioned correctly.
     assert_eq!(
