@@ -732,6 +732,11 @@ pub struct DataFusion {
     /// `Acquire`-ordered atomic load and skip the lookup entirely.
     pending_initializations_count: std::sync::atomic::AtomicUsize,
     query_cancel_registry: Arc<QueryCancelRegistry>,
+    /// When set (from task-history tracing init), local/distributed query
+    /// completion hooks emit `plan` child rows with metrics from the executed
+    /// plan instead of re-running `EXPLAIN ANALYZE`. Default (unset) behaves
+    /// as `TaskHistoryCapturedPlan::None`.
+    plan_capture: OnceLock<query::plan_capture::PlanCaptureConfig>,
 
     /// Signalled after each completed streaming write; the cluster executor
     /// statistics reporter listens so scheduler-side stats (and the COUNT(*)
@@ -935,6 +940,21 @@ impl DataFusion {
     #[must_use]
     pub fn query_cancel_registry(&self) -> Arc<QueryCancelRegistry> {
         Arc::clone(&self.query_cancel_registry)
+    }
+
+    /// Install plan-capture config used by local/distributed query completion
+    /// hooks. Idempotent-tolerant: a second call is ignored with a warning.
+    pub fn set_plan_capture_config(&self, cfg: query::plan_capture::PlanCaptureConfig) {
+        if self.plan_capture.set(cfg).is_err() {
+            tracing::warn!(
+                "plan_capture config already set on DataFusion; ignoring duplicate set_plan_capture_config"
+            );
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn plan_capture_config(&self) -> Option<&query::plan_capture::PlanCaptureConfig> {
+        self.plan_capture.get()
     }
 
     pub async fn get_table(

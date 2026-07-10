@@ -229,6 +229,10 @@ impl TaskHistoryExporter {
     /// This runs on a separate tokio task to avoid blocking the original query.
     /// The spans passed to this method have already been filtered by the caller.
     ///
+    /// Only used for `TaskHistoryCapturedPlan::Explain` (plan-only, no body
+    /// execution). `ExplainAnalyze` is captured at query completion from the
+    /// executed plan — see `datafusion::query::plan_capture`.
+    ///
     /// For each span, this runs an EXPLAIN query which will create a new `task_history` entry
     /// with `task="sql_query"` and the original query's `span_id` as `parent_span_id`.
     /// The output is always captured in full regardless of the global `captured_output` setting.
@@ -240,12 +244,12 @@ impl TaskHistoryExporter {
     ) {
         for span in spans {
             let explain_query = match captured_plan {
-                TaskHistoryCapturedPlan::None => continue,
+                TaskHistoryCapturedPlan::None | TaskHistoryCapturedPlan::ExplainAnalyze => {
+                    // ExplainAnalyze is handled at execution time in plan_capture.
+                    continue;
+                }
                 TaskHistoryCapturedPlan::Explain => {
                     format!("EXPLAIN {}", span.input.as_ref())
-                }
-                TaskHistoryCapturedPlan::ExplainAnalyze => {
-                    format!("EXPLAIN ANALYZE {}", span.input.as_ref())
                 }
             };
 
@@ -472,8 +476,10 @@ impl SpanExporter for TaskHistoryExporter {
         let spans: Vec<TaskSpan> = candidates.into_iter().filter(should_include).collect();
 
         async move {
-            // Separate logic: if plan capture is disabled, write all spans directly
-            if matches!(captured_plan, TaskHistoryCapturedPlan::None) {
+            // ExplainAnalyze is captured at execution time (see
+            // `datafusion::query::plan_capture`); only the Explain
+            // (plan-only) path still re-plans in the background here.
+            if !matches!(captured_plan, TaskHistoryCapturedPlan::Explain) {
                 return TaskSpan::write(Arc::clone(&df), spans)
                     .await
                     .map_err(|e| OTelSdkError::InternalFailure(e.to_string()));
@@ -481,21 +487,12 @@ impl SpanExporter for TaskHistoryExporter {
 
             // Filter spans that need plan capture before cloning
             let should_capture_plan = |span: &TaskSpan| {
-                // Check min_plan_duration threshold
-                if !min_plan_duration_ms
-                    .is_none_or(|min_duration| span.execution_duration_ms >= min_duration)
-                {
-                    return false;
-                }
-
-                // Only capture plans for sql_query tasks with non-empty input
-                if span.task.as_ref() != "sql_query" || span.input.is_empty() {
-                    return false;
-                }
-
-                // Don't capture plans for queries that are already EXPLAIN queries
-                let input_trimmed = span.input.trim_start();
-                !(input_trimmed.len() >= 7 && input_trimmed[..7].eq_ignore_ascii_case("explain"))
+                crate::datafusion::query::plan_capture::should_capture_explain_plan(
+                    span.task.as_ref(),
+                    span.input.as_ref(),
+                    span.execution_duration_ms,
+                    min_plan_duration_ms,
+                )
             };
 
             // Clone only the spans that need plan capture

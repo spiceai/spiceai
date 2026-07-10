@@ -58,6 +58,7 @@ pub use builder::QueryBuilder;
 mod cache;
 pub mod error_code;
 mod handle;
+pub mod plan_capture;
 pub mod registry;
 pub mod stage_history;
 mod tracker;
@@ -585,6 +586,11 @@ impl Query {
         // Get the scheduler server
         let scheduler = Self::get_scheduler_server(&self.df)?;
         let tracker = self.tracker;
+        let query_start = std::time::Instant::now();
+        let sql_preview: Arc<str> = match &self.sql {
+            QueryMethod::Text { sql, .. } => Arc::clone(sql),
+            QueryMethod::Plan(_) => Arc::from("<logical plan>"),
+        };
 
         // Create session for this job. The
         // `SpiceRequestContextConfig` extension propagates the originating
@@ -670,6 +676,7 @@ impl Query {
                                 None, // Cache key already used for lookup
                                 cached_result.data,
                                 Arc::clone(&request_context),
+                                Arc::clone(&sql_preview),
                             ));
                         }
                         cache::PlanOrCached::Plan(plan, tracker, cache_manager) => {
@@ -725,6 +732,7 @@ impl Query {
                             None,
                             Box::pin(stream),
                             Arc::clone(&request_context),
+                            Arc::clone(&sql_preview),
                         ));
                     }
                 }
@@ -824,6 +832,9 @@ impl Query {
             tracker,
             request_context,
             span,
+            sql_preview,
+            query_start,
+            plan_capture::logical_plan_is_explain(&plan),
         ))
     }
 
@@ -874,6 +885,7 @@ impl Query {
     }
 
     async fn run_internal(self, request_context: Arc<RequestContext>) -> Result<QueryResult> {
+        let query_start = std::time::Instant::now();
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
 
         if let Some(traceparent) = request_context.trace_parent() {
@@ -1359,6 +1371,12 @@ impl Query {
                     physical_plan,
                     Arc::clone(&request_context),
                     inner_span.clone(),
+                    plan_capture_context(
+                        &ctx.df,
+                        Arc::clone(&sql_preview),
+                        query_start,
+                        plan.as_ref(),
+                    ),
                 );
 
                 let final_stream = attach_query_active_guard_to_stream(
@@ -1809,6 +1827,7 @@ fn attach_physical_plan_metrics_to_stream(
     physical_plan: Arc<dyn ExecutionPlan>,
     request_context: Arc<RequestContext>,
     span: Span,
+    plan_capture: Option<PlanCaptureStreamContext>,
 ) -> SendableRecordBatchStream {
     let schema = stream.schema();
 
@@ -1823,12 +1842,45 @@ fn attach_physical_plan_metrics_to_stream(
         runtime_metrics::telemetry::track_produced_spills(totals.produced_spills, &request_context.to_dimensions());
         runtime_metrics::telemetry::track_spilled_bytes(totals.spilled_bytes, &request_context.to_dimensions());
         runtime_metrics::telemetry::track_spilled_rows(totals.spilled_rows, &request_context.to_dimensions());
+
+        if let Some(ctx) = plan_capture.as_ref() {
+            let elapsed_ms = ctx.query_start.elapsed().as_secs_f64() * 1000.0;
+            if plan_capture::plan_capture_eligible(elapsed_ms, &ctx.config) {
+                let output =
+                    plan_capture::render_local_plan_with_metrics(physical_plan.as_ref());
+                plan_capture::emit_plan_span(ctx.sql.as_ref(), &output);
+            }
+        }
     };
 
     Box::pin(RecordBatchStreamAdapter::new(
         schema,
         Box::pin(updated_stream.instrument(span)),
     ))
+}
+
+/// Context for emitting a `plan` child row at local stream completion.
+struct PlanCaptureStreamContext {
+    sql: Arc<str>,
+    query_start: std::time::Instant,
+    config: plan_capture::PlanCaptureConfig,
+}
+
+fn plan_capture_context(
+    df: &crate::datafusion::DataFusion,
+    sql: Arc<str>,
+    query_start: std::time::Instant,
+    plan: &LogicalPlan,
+) -> Option<PlanCaptureStreamContext> {
+    let config = df.plan_capture_config()?;
+    if !config.analyze_enabled() || plan_capture::logical_plan_is_explain(plan) {
+        return None;
+    }
+    Some(PlanCaptureStreamContext {
+        sql,
+        query_start,
+        config: config.clone(),
+    })
 }
 
 #[derive(Default, Debug)]
