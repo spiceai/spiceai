@@ -457,6 +457,13 @@ impl AckTable {
         }
         self.shared_flush.load(Ordering::Acquire)
     }
+
+    /// Whether `key`'s member has been promoted to the streaming phase (past its
+    /// initial snapshot). Cold-path only (idle-heartbeat readiness gating); the
+    /// hot commit/deliver paths read `STREAMING` off the cached `AckSlot`.
+    fn is_streaming(&self, key: &MemberKey) -> bool {
+        self.slot(key).is_some_and(|slot| slot.has(STREAMING))
+    }
 }
 
 /// Key-addressed conveniences for tests, mirroring the production paths that
@@ -475,10 +482,6 @@ impl AckTable {
         if let Some(slot) = self.slot(key) {
             slot.deliver(lsn);
         }
-    }
-
-    fn is_streaming(&self, key: &MemberKey) -> bool {
-        self.slot(key).is_some_and(|slot| slot.has(STREAMING))
     }
 
     fn committed(&self, key: &MemberKey) -> u64 {
