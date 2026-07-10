@@ -114,7 +114,7 @@ merge queue is still the real gate.
 | Stage | Trigger | Checks |
 | --- | --- | --- |
 | Local | `make signoff` | `make lint-rust`, `make build-cli nextest` |
-| Pull request | `pull_request` | **Attestation** (validates the `signoff` status) + PR hygiene (`enforce-pull-with-spice`) |
+| Pull request | `pull_request` | **Attestation** + PR hygiene; merge-queue check names report lightweight skipped/passthrough results |
 | Merge queue | `merge_group` | the full required suite (below) + advisory niche checks |
 
 Required checks in the merge queue (the `trunk` ruleset):
@@ -134,22 +134,22 @@ Advisory checks that also run on `merge_group` but don't block (they can be
 promoted to required with a gate job later): `integration tests (llms)`,
 `Elasticsearch Integration Tests`, `Helm Lint`.
 
-`Attestation` is the only *quality* check produced on `pull_request` (the
-`enforce-pull-with-spice` hygiene check runs there too), so it plus reviews
-gates entry to the queue. Every required check is produced on `merge_group`, so
-the queue enforces the full suite on the merged commit. `check_changes` still
-lets docs-only merges skip the build and report success.
+GitHub uses one required-checks list both before queue entry and on the merge
+queue commit. Therefore every required workflow triggers on both `pull_request`
+and `merge_group`. On a pull request, `Attestation` is the only *quality* work
+(the `enforce-pull-with-spice` hygiene check also runs); the expensive required
+jobs report skipped or lightweight passthrough results under their stable check
+names. On `merge_group`, those same names run the real suite, so any failure
+blocks the merge. `check_changes` still lets docs-only merge groups skip work
+and report success.
 
 ### Enabling it (one-time rollout)
 
-Because this changes the checks that gate `trunk`, and the gating PR itself stops
-producing the old PR checks, roll it out deliberately:
+Because this changes the checks that gate `trunk`, roll it out deliberately:
 
-1. Review and merge the PR that adds `scripts/signoff` and moves the workflows to
-   `merge_group`. That PR intentionally no longer produces the old required
-   checks (`Rust Lint`, `Build and Test`, …) on the pull request, so merge it
-   with an admin merge (or briefly relax the `trunk` required checks), since the
-   full suite still runs for it in the merge queue.
+1. Review and merge the PR that adds `scripts/signoff`. Its pull-request
+   workflows still report every currently required check name, allowing it to
+   enter the merge queue normally; the queue runs the real suite.
 2. Immediately run `scripts/signoff install --yes` so `trunk` requires
    `Attestation` plus the full merge-queue suite.
 3. From then on, contributors run `make signoff`, the PR gates on `Attestation`,
@@ -172,16 +172,17 @@ untouched. The single source of truth for the required list is the
 `REQUIRED_CHECKS` array in [`scripts/signoff`](/scripts/signoff); if you add a
 required merge-queue check, add its (stable) job name there and re-run `install`.
 
-> **Every required check must be produced by a workflow that triggers on
-> `merge_group`.** A required check that never runs in the queue will stall it.
-> Matrix workflows (E2E, LLMs) use a summary "gate" job with a stable name so one
-> ruleset entry can require the whole matrix.
+> **Every required check must be produced under the same stable name on both
+> the PR head (`pull_request` or `pull_request_target`) and `merge_group`.** A
+> missing PR check blocks queue entry; a missing merge-group check stalls the
+> queue. Matrix workflows use a summary
+> "gate" job with a stable name so one ruleset entry can require the whole matrix.
 
 ### Rollback
 
 Sign-off is enabled by the ruleset, not the workflows, so you can revert the gate
 without touching code: edit the `trunk` ruleset's required status checks back to
-the previous list (drop `Attestation` and re-add the heavy checks) and re-add the
-`pull_request` triggers to the workflows in `.github/workflows/`. Because the
-heavy jobs still exist and still run on `merge_group`, the queue keeps working
+the previous list (drop `Attestation` and re-add the heavy checks), then restore
+the heavy jobs on `pull_request` by removing their PR-only skip conditions.
+Because the jobs continue to run on `merge_group`, the queue keeps working
 throughout.

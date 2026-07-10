@@ -6,6 +6,12 @@ on:
       - trunk
     paths:
       - '**/Cargo.toml'
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
   merge_group:
     branches:
       - trunk
@@ -35,6 +41,9 @@ jobs:
   # latency ever becomes a concern.
   build:
     name: Features Check
+    # Emit the required context on pull requests without running the expensive
+    # feature matrix; the real check runs on the merge-group commit.
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-macos
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}

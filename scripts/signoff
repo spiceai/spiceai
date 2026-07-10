@@ -42,8 +42,8 @@ JJ_REMOTE_URL=""
 
 # The single source of truth for the checks required to merge. `install` writes
 # exactly this list into the trunk ruleset's required status checks. Every name
-# here must be produced by a workflow that triggers on `merge_group` (see the
-# .github/workflows/*.yml gate jobs) or the merge queue will stall.
+# here must be produced under the same name on both the PR head (to allow
+# queue entry) and `merge_group` (to gate the merged result).
 readonly REQUIRED_CHECKS=(
   "Attestation"              # sign-off gate (pr.yml) — the PR's only quality check
   "enforce-pull-with-spice"  # PR hygiene (enforce-pulls-with-spice.yml)

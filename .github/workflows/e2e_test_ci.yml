@@ -25,6 +25,13 @@ on:
       - 'acknowledgements.md'
       - 'Dockerfile*'
 
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+
   merge_group:
     branches:
       - trunk
@@ -52,6 +59,7 @@ jobs:
   # etc.). `build` — which every test job depends on — is gated on this, so the
   # whole matrix cascades to "skipped" while the E2E Test CI gate still reports.
   check_changes:
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-dev-runners
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes == 'true' || github.event_name == 'workflow_dispatch' }}
@@ -66,6 +74,7 @@ jobs:
 
   setup-matrix:
     name: Setup strategy matrix
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-dev-runners
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
@@ -160,6 +169,7 @@ jobs:
 
   setup-model-matrix:
     name: Setup model strategy matrix
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
@@ -2212,10 +2222,11 @@ jobs:
             exit 1
           fi
 
-  # Stable, matrix-proof summary check. This is the single required "E2E Test CI"
-  # status in the merge queue: it succeeds only if every E2E job above succeeded
-  # (or was skipped), so the whole E2E matrix is gated by one ruleset entry rather
-  # than dozens of shifting matrix names.
+  # Stable, matrix-proof summary check. On pull requests, the upstream jobs are
+  # skipped and this lightweight gate reports the required context. In the merge
+  # queue it succeeds only if every E2E job above succeeded (or was skipped), so
+  # the whole matrix is gated by one ruleset entry rather than dozens of shifting
+  # matrix names.
   e2e-gate:
     name: E2E Test CI
     runs-on: ubuntu-latest

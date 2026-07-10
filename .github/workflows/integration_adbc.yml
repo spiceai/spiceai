@@ -6,6 +6,12 @@ on:
     branches:
       - trunk
       - release/*
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
   merge_group:
     branches:
       - trunk
@@ -28,28 +34,39 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
+  # Report the required job name on pull requests without running ADBC tests;
+  # the real check runs against the merge-group commit.
   check_changes:
-    runs-on: spiceai-dev-runners
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:
+      - name: Pull request passthrough
+        if: ${{ github.event_name == 'pull_request' }}
+        run: echo "ADBC integration tests run on the merge-group commit"
+
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        if: ${{ github.event_name != 'pull_request' }}
         with:
           persist-credentials: false
-          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
+          fetch-depth: 0
 
       - name: Check for code changes
+        if: ${{ github.event_name != 'pull_request' }}
         id: check
         uses: ./.github/actions/check-code-changes
 
   test:
     name: ADBC Integration Tests
     needs: check_changes
-    # Required check: run unconditionally and gate each step, so on docs-only
-    # merges the job still reports success rather than a skipped required check
-    # (which can stall the merge queue). Mirrors the pr.yml / integration.yml pattern.
-    runs-on: spiceai-dev-runners
+    # On non-PR events, run the required check unconditionally and gate each
+    # step so docs-only merge groups still report success.
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
     steps:
+      - name: Pull request passthrough
+        if: ${{ github.event_name == 'pull_request' }}
+        run: echo "ADBC integration tests run on the merge-group commit"
+
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
