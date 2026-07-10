@@ -82,6 +82,7 @@ use super::column_stats::ColumnStatsAccumulator;
 use super::context::CayenneContext;
 use super::mem_tier_budget;
 use super::on_conflict::{PostValidationState, PreparedShardedInsertStream};
+use super::pk_index::PkDigestSet;
 use super::staging_wal::{CayenneStagedAppend, PreparedStagedAppend, StagingWalTargetKind};
 use super::table::{CayenneCdcWrite, CayenneTableProvider, record_cayenne_write_phase};
 
@@ -1120,12 +1121,7 @@ impl<'a> AppendMutationWriter<'a> {
         prepared_stream: SendableRecordBatchStream,
         post_validation: &Arc<ParkingMutex<Option<PostValidationState>>>,
         estimated_bytes: Option<u64>,
-    ) -> Result<(
-        u64,
-        Arc<ColumnStatsAccumulator>,
-        std::collections::HashSet<crate::row_converter::OwnedRow>,
-        usize,
-    )> {
+    ) -> Result<(u64, Arc<ColumnStatsAccumulator>, PkDigestSet, usize)> {
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
         let target_size_bytes = self.context.target_file_size_bytes();
         let write_start = Instant::now();

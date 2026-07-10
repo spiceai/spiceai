@@ -1369,6 +1369,11 @@ impl CayenneAccelerator {
                 &["cayenne_cold_tier_background_interval_ms"],
                 config.cold_tier_background_interval_ms,
             );
+            config.cold_tier_gc_interval_ms = autotune::auto_or_u64(
+                acceleration,
+                &["cayenne_datalake_gc_interval_ms"],
+                config.cold_tier_gc_interval_ms,
+            );
             // Default promotion trigger when the tier is enabled but neither
             // expert trigger is set (both `VortexConfig` defaults are 0 = never
             // promote, which would leave a location-only config silently
@@ -2158,8 +2163,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    61,
-    { S3_PARAMS_LEN + 61 },
+    62,
+    { S3_PARAMS_LEN + 62 },
 >(
     S3_PARAMETERS,
     [
@@ -2227,6 +2232,8 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("The warm tier graduates to cold once its Vortex file count reaches this threshold. 0 (default) disables the file-count trigger."),
         ParameterSpec::component("cold_tier_background_interval_ms")
             .description("How often the background loop evaluates the warm→cold promotion trigger. Cold tiering is not latency-critical, so this is coarser than compaction. Default: 60000 (60s)."),
+        ParameterSpec::component("datalake_gc_interval_ms")
+            .description("Physical-GC cadence and orphan grace for superseded datalake objects: the background sweep runs about this often and deletes an object no longer referenced by the manifest only once it has been observed orphaned for at least this long (so an in-flight scan has a full interval to finish). Default: 300000 (5min)."),
         ParameterSpec::component("sort_columns")
             .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
         ParameterSpec::component("shard_key_columns")
