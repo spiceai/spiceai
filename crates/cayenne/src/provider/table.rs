@@ -2625,10 +2625,26 @@ impl CayenneTableProvider {
 
         // Mark newly-seen orphans, and select those that have aged past the
         // grace for deletion (pure, testable — see `plan_cold_gc_deletions`).
-        let to_delete = {
+        let (to_delete, orphans_tracked) = {
             let mut first_seen = self.cold_gc_orphaned_first_seen.lock();
-            Self::plan_cold_gc_deletions(&on_store, &live, &mut first_seen, Instant::now(), grace)
+            let planned = Self::plan_cold_gc_deletions(
+                &on_store,
+                &live,
+                &mut first_seen,
+                Instant::now(),
+                grace,
+            );
+            (planned, first_seen.len())
         };
+        tracing::debug!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            objects_on_store = on_store.len(),
+            live_manifest_files = live.len(),
+            orphans_tracked,
+            deletable = to_delete.len(),
+            "Cold-tier GC pass"
+        );
 
         let mut deleted = 0u64;
         let mut skipped_errors = 0u64;
@@ -6722,6 +6738,8 @@ impl CayenneTableProvider {
                 )
                 .await?
         {
+            let scan_start = Instant::now();
+            let keys_before = keyset.len();
             let cold_stream = datafusion_physical_plan::execute_stream(cold_plan, ctx.task_ctx())?;
             Self::process_stream_into_keyset(
                 cold_stream,
@@ -6737,6 +6755,13 @@ impl CayenneTableProvider {
                 &mut row_id_base,
             )
             .await?;
+            tracing::info!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                cold_keys_folded = keyset.len().saturating_sub(keys_before),
+                duration_ms = u64::try_from(scan_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "Keyset rebuild folded the datalake tier via exact object-store scan"
+            );
         }
 
         if self.cached_inlined_row_count() > 0 {
@@ -13626,6 +13651,9 @@ impl CayenneTableProvider {
             return Ok(ColdFilePartition {
                 dirty: Vec::new(),
                 clean: Vec::new(),
+                tombstones: 0,
+                cleared_by_min_max: 0,
+                cleared_by_bloom: 0,
             });
         }
 
@@ -13639,6 +13667,9 @@ impl CayenneTableProvider {
             return Ok(ColdFilePartition {
                 dirty: Vec::new(),
                 clean: cold_files,
+                tombstones: 0,
+                cleared_by_min_max: 0,
+                cleared_by_bloom: 0,
             });
         }
         let (_, deleted_row_keys, _, _) = tokio::task::spawn_blocking(move || {
@@ -13654,6 +13685,9 @@ impl CayenneTableProvider {
             return Ok(ColdFilePartition {
                 dirty: Vec::new(),
                 clean: cold_files,
+                tombstones: 0,
+                cleared_by_min_max: 0,
+                cleared_by_bloom: 0,
             });
         }
 
@@ -13733,9 +13767,19 @@ impl CayenneTableProvider {
         let over_files =
             vc.cold_tier_warm_max_files > 0 && warm_files >= vc.cold_tier_warm_max_files;
         if !(over_bytes || over_files) {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                warm_bytes,
+                warm_files,
+                max_bytes = vc.cold_tier_warm_max_bytes,
+                max_files = vc.cold_tier_warm_max_files,
+                "Datalake promotion not triggered; warm tier below thresholds"
+            );
             return Ok(false);
         }
 
+        let promotion_start = Instant::now();
         tracing::info!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
@@ -13781,6 +13825,16 @@ impl CayenneTableProvider {
                 return Ok(false);
             }
         };
+        tracing::debug!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            tombstones = partition.tombstones,
+            dirty_files = partition.dirty.len(),
+            carried_files = partition.clean.len(),
+            cleared_by_min_max = partition.cleared_by_min_max,
+            cleared_by_bloom = partition.cleared_by_bloom,
+            "Classified datalake manifest for carry-forward"
+        );
         // Deliberately no dirty-fraction guardrail: clean files are always
         // carried, so carried files' PK ranges may increasingly overlap new
         // files' across promotions. Watch `datalake_rewrite_selectivity`; if it
@@ -13906,7 +13960,8 @@ impl CayenneTableProvider {
             written_files,
             written_bytes,
             total_rows,
-            "Datalake-tier promotion committed (carry-forward)"
+            duration_ms = u64::try_from(promotion_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "Datalake-tier promotion committed"
         );
         Ok(true)
     }
