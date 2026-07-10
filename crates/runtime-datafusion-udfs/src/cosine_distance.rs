@@ -105,6 +105,8 @@ impl ScalarUDFImpl for CosineDistance {
     }
 
     fn coerce_types(&self, arg_types: &[DataType]) -> DataFusionResult<Vec<DataType>> {
+        use crate::vector_simd::is_fixed_size_list_f32;
+
         if arg_types.len() != 2 {
             return exec_err!("{COSINE_DISTANCE_UDF_NAME} expects exactly two arguments");
         }
@@ -119,20 +121,20 @@ impl ScalarUDFImpl for CosineDistance {
         // Case 2: one is List<Float32>/LargeList<Float32>, the other is
         // FixedSizeList<Float32, N> → promote the List/LargeList to FSL so the
         // SIMD path handles it. Only promote if the FSL is actually Float32.
-        use crate::vector_simd::is_fixed_size_list_f32;
-
         let fsl_field = Arc::new(arrow_schema::Field::new("item", DataType::Float32, true));
-        if is_list_f32(lhs) && is_fixed_size_list_f32(rhs) {
-            if let FixedSizeList(_, n) = rhs {
-                let fsl = DataType::FixedSizeList(Arc::clone(&fsl_field), *n);
-                return Ok(vec![fsl.clone(), fsl]);
-            }
+        if is_list_f32(lhs)
+            && is_fixed_size_list_f32(rhs)
+            && let FixedSizeList(_, n) = rhs
+        {
+            let fsl = DataType::FixedSizeList(Arc::clone(&fsl_field), *n);
+            return Ok(vec![fsl.clone(), fsl]);
         }
-        if is_fixed_size_list_f32(lhs) && is_list_f32(rhs) {
-            if let FixedSizeList(_, n) = lhs {
-                let fsl = DataType::FixedSizeList(Arc::clone(&fsl_field), *n);
-                return Ok(vec![fsl.clone(), fsl]);
-            }
+        if is_fixed_size_list_f32(lhs)
+            && is_list_f32(rhs)
+            && let FixedSizeList(_, n) = lhs
+        {
+            let fsl = DataType::FixedSizeList(Arc::clone(&fsl_field), *n);
+            return Ok(vec![fsl.clone(), fsl]);
         }
 
         // Case 3: both are List/LargeList/FixedSizeList (any element type) →
@@ -190,7 +192,7 @@ pub(crate) fn cosine_distance_inner(args: &[ArrayRef]) -> DataFusionResult<Array
     }
 }
 
-/// Compute cosine distance for FixedSizeList<Float32> with NULL-on-non-finite guard.
+/// Compute cosine distance for `FixedSizeList<Float32>` with NULL-on-non-finite guard.
 fn compute_fsl_f32_cosine(args: &[ArrayRef]) -> DataFusionResult<ArrayRef> {
     let result = compute_fsl_f32(args, Kernel::Cosine, |v| v / 2.0)?;
     let float64 = result
