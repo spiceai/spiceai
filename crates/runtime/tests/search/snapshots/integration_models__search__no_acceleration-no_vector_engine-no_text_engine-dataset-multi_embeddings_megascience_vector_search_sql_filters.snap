@@ -6,7 +6,7 @@ description: "SELECT id, answer, trunc(_score, 3) as _score FROM vector_search(q
   {
     "id": 890,
     "answer": "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume.",
-    "_score": 0.632
+    "_score": 0.631
   },
   {
     "id": 1303,
@@ -16,7 +16,7 @@ description: "SELECT id, answer, trunc(_score, 3) as _score FROM vector_search(q
   {
     "id": 449,
     "answer": "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients.",
-    "_score": 0.58
+    "_score": 0.579
   },
   {
     "id": 819,

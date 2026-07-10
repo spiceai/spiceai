@@ -34,3 +34,6 @@ tokio.workspace = true
 default = ["object-store"]
 schemars = ["dep:schemars"]
 object-store = ["dep:aws-sdk-credential-bridge", "dep:object_store"]
+
+[lints]
+workspace = true

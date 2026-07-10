@@ -15,7 +15,6 @@ description: "SELECT id, answer FROM vector_search(qs, 'second', answer) order b
 |               |       CooperativeExec                                                                                                                                            |
 |               |         BytesProcessedExec                                                                                                                                       |
 |               |           RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                   |
-|               |             CooperativeExec                                                                                                                                      |
-|               |               DuckDBVectorQueryExec embedded_column=answer_embedding, metric=cosine, dims=64, scan=hnsw, projection=[id, answer, _score]                         |
+|               |             DuckDBVectorQueryExec embedded_column=answer_embedding, metric=cosine, dims=64, scan=hnsw, projection=[id, answer, _score]                           |
 |               |                                                                                                                                                                  |
 +---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------+

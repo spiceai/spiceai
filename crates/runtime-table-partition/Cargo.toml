@@ -33,3 +33,6 @@ tempfile.workspace = true
 [[bench]]
 name = "scan_benchmark"
 harness = false
+
+[lints]
+workspace = true

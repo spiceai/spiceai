@@ -54,7 +54,9 @@ use datafusion::{execution::context::SessionContext, physical_plan::collect};
 use futures::{StreamExt, stream};
 use opentelemetry::KeyValue;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
-use runtime_datafusion_index::IndexedTableProvider;
+use runtime_datafusion_index::{
+    INDEXED_INNER, IndexedTableProvider, InnerProviderFn, find_concrete_table_provider_with,
+};
 use runtime_metrics::acceleration as metrics;
 use runtime_search::embeddings::table::EmbeddingTable;
 use runtime_table_partition::provider::PartitionTableProvider;
@@ -1239,8 +1241,8 @@ impl RefreshTask {
                 // Exclude heartbeats: their server-clock timestamp would advance the
                 // received frontier past data not actually received mid-backlog,
                 // corrupting the rate ladder (see ChangeBatch::is_heartbeat).
-                && !env.change_batch.is_heartbeat()
-                && let Some(commit_ts_ms) = env.change_batch.source_commit_ts_ms()
+                && !env.is_heartbeat()
+                && let Some(commit_ts_ms) = env.source_commit_ts_ms()
             {
                 // Ingress frontier (received commit ts) is recorded once per burst in
                 // `apply_burst` using the freshest commit timestamp across the coalesced
@@ -1297,7 +1299,7 @@ impl RefreshTask {
             // (`last_cycle_start`) is reached.
             let mut burst: Vec<Result<cdc::ChangeEnvelope, cdc::StreamError>> =
                 Vec::with_capacity(8);
-            let mut burst_bytes = cdc_item_memory_size(&first);
+            let mut burst_bytes = cdc_item_budget_bytes(&first);
             burst.push(first);
             let max_burst = cdc_cfg.max_coalesced_envelopes;
             let max_burst_bytes = cdc_cfg.max_coalesced_bytes;
@@ -1309,7 +1311,7 @@ impl RefreshTask {
             while burst.len() < max_burst {
                 match rx.try_recv() {
                     Ok(item) => {
-                        let item_bytes = cdc_item_memory_size(&item);
+                        let item_bytes = cdc_item_budget_bytes(&item);
                         if burst_bytes > 0
                             && item_bytes > 0
                             && burst_bytes.saturating_add(item_bytes) > max_burst_bytes
@@ -1356,7 +1358,7 @@ impl RefreshTask {
                     // `rx.recv()` is cancel-safe, so a timeout drops no envelope.
                     match tokio::time::timeout(remaining, rx.recv()).await {
                         Ok(Some(item)) => {
-                            let item_bytes = cdc_item_memory_size(&item);
+                            let item_bytes = cdc_item_budget_bytes(&item);
                             if burst_bytes > 0
                                 && item_bytes > 0
                                 && burst_bytes.saturating_add(item_bytes) > max_burst_bytes
@@ -1570,21 +1572,15 @@ impl RefreshTask {
         let burst_envelopes = u64::try_from(burst.len()).unwrap_or(u64::MAX);
         let burst_bytes = burst
             .iter()
-            .map(cdc_item_memory_size)
+            .map(cdc_item_budget_bytes)
             .fold(0_usize, usize::saturating_add);
-        // Row-level change count: each Ok envelope's ChangeBatch carries one row
-        // per source change event, so summing num_rows across the burst yields
-        // the true number of records applied.
-        let burst_rows: u64 = burst
-            .iter()
-            .filter_map(|item| item.as_ref().ok())
-            .map(|env| env.change_batch.record.num_rows() as u64)
-            .fold(0_u64, u64::saturating_add);
         let labels = context.metric_labels.dataset();
         metrics::CDC_APPLY_BURST_ENVELOPES.record(burst_envelopes, labels);
         metrics::CDC_APPLY_BURST_BYTES
             .record(u64::try_from(burst_bytes).unwrap_or(u64::MAX), labels);
-        metrics::CDC_APPLY_BURST_ROWS_TOTAL.add(burst_rows, labels);
+        // CDC_APPLY_BURST_ROWS_TOTAL is recorded from the built batches in
+        // `apply_envelope_run` (exact applied-row count) — `num_rows_hint()`
+        // over-counts a PK-changing UPDATE's delete+upsert as two rows.
 
         // Freshest upstream commit timestamp in this burst, for the CDC
         // replication-lag gauge. Computed here (before the burst is consumed by the
@@ -1600,8 +1596,8 @@ impl RefreshTask {
             // Exclude heartbeats: a keepalive interleaved in a backlogged burst carries
             // the server clock, which would inflate the applied frontier + lag gauge
             // (applied appearing to outrun received). See ChangeBatch::is_heartbeat.
-            .filter(|env| !env.change_batch.is_heartbeat())
-            .filter_map(|env| env.change_batch.source_commit_ts_ms())
+            .filter(|env| !env.is_heartbeat())
+            .filter_map(cdc::ChangeEnvelope::source_commit_ts_ms)
             .max();
         if let Some(ts) = max_commit_ts_ms {
             metrics::CDC_RECEIVED_COMMIT_UNIX_TIME_MS.record(ts, labels);
@@ -1647,11 +1643,13 @@ impl RefreshTask {
                 }
             }
         }
+        // Per-burst row count is not logged here: it's the exact
+        // `CDC_APPLY_BURST_ROWS_TOTAL` metric recorded in `apply_envelope_run`
+        // (from the built batches), not the pre-apply `num_rows_hint` upper bound.
         tracing::debug!(
             dataset = %context.dataset_name,
             envelopes = burst_envelopes,
             bytes = burst_bytes,
-            rows = burst_rows,
             close_reason,
             apply_ms = elapsed_ms(burst_start),
             "Applied coalesced CDC change burst"
@@ -1785,7 +1783,29 @@ impl RefreshTask {
             Vec::with_capacity(envelopes.len());
         let mut batches: Vec<ChangeBatch> = Vec::with_capacity(envelopes.len());
         for env in envelopes {
-            let (committer, batch, _is_ready) = env.into_parts();
+            // Build the (possibly deferred) batch here, on the per-dataset apply
+            // task — off the source's shared read/route path. A deferred build
+            // can fail on per-row value typing that only surfaces at build time
+            // (e.g. an unmergeable unchanged-TOAST column under REPLICA IDENTITY
+            // DEFAULT); treat it as a terminal error for this dataset, mirroring
+            // the eager path's pump-side fatal. Committers collected so far are
+            // dropped without acking, so the source re-streams on reconnect.
+            let (committer, batch, _is_ready) = match env.into_parts_offloaded().await {
+                Ok(parts) => parts,
+                Err(e) => {
+                    let error_message = format!(
+                        "Failed to build CDC change batch for {}: {e}",
+                        context.dataset_name,
+                    );
+                    tracing::error!("{error_message}");
+                    self.set_refresh_status(
+                        context.refresh_sql,
+                        status::ComponentStatus::error_with_message(error_message),
+                    )
+                    .await;
+                    return false;
+                }
+            };
             committers.push(committer);
             batches.push(batch);
         }
@@ -1801,6 +1821,17 @@ impl RefreshTask {
         let groups = group_run_by_schema(batches, committers, split_on_schema_change);
         let last_group = groups.len().saturating_sub(1);
         for (group_idx, (group_batches, group_committers)) in groups.into_iter().enumerate() {
+            // Exact applied-row count for this group, summed from the just-built
+            // batches (no extra build — `into_parts` already built them);
+            // `num_rows_hint()` would over-count a PK-changing UPDATE as two
+            // rows. Computed before `apply_coalesced_run` consumes the batches,
+            // but recorded only AFTER the group applies, so a SkipRun/Stop
+            // failure can't inflate the throughput metric with rows that were
+            // never written.
+            let group_rows = group_batches
+                .iter()
+                .map(|b| b.record.num_rows() as u64)
+                .fold(0_u64, u64::saturating_add);
             match self
                 .apply_coalesced_run(
                     context,
@@ -1810,7 +1841,10 @@ impl RefreshTask {
                 )
                 .await
             {
-                CoalescedRunOutcome::Applied => {}
+                CoalescedRunOutcome::Applied => {
+                    metrics::CDC_APPLY_BURST_ROWS_TOTAL
+                        .add(group_rows, context.metric_labels.dataset());
+                }
                 // A skipped group's committers were dropped without acking —
                 // later groups must not apply (their commits would advance the
                 // source offset past the skipped, unapplied envelopes).
@@ -2478,35 +2512,31 @@ impl RefreshTask {
     /// `CayenneTableProvider` misses through any of these, so without peeling the
     /// CDC apply silently falls back to the synchronous `insert_into` path and
     /// loses pipelined finalization (backgrounded publish, no blocking
-    /// `apply_on_conflict_deletions`). Mirrors the wrapper-peeling done by
-    /// `search::util::find_concrete_table_provider`.
+    /// `apply_on_conflict_deletions`).
+    ///
+    /// Uses [`find_concrete_table_provider_with`] with a *write-transparent* set
+    /// of accessors rather than the runtime-wide `DEFAULT_INNER_FNS`: only
+    /// wrappers whose `insert_into` is a pass-through may be peeled here.
+    ///
+    /// NOTE: `UpsertDedupTableProvider` is intentionally absent from the set.
+    /// Unlike `PolyTableProvider` (delegates writes) and `IndexedTableProvider`
+    /// (`insert_into` is a pass-through), it *rewrites* the write on insert
+    /// (dedup / last-write-wins via `UpsertDedupExec`). Routing CDC past it to the
+    /// inner provider would bypass that transform, so a dedup-configured table
+    /// instead stays on the synchronous path (through the wrapper, preserving its
+    /// semantics) and emits the fallback warning below.
     #[cfg(not(windows))]
     fn cayenne_accelerator(&self) -> Option<&CayenneTableProvider> {
-        let mut current: &Arc<dyn TableProvider> = &self.accelerator;
-        loop {
-            if let Some(cayenne) = current.downcast_ref::<CayenneTableProvider>() {
-                return Some(cayenne);
-            }
-            if let Some(poly) = current.downcast_ref::<data_components::poly::PolyTableProvider>() {
-                current = poly.writer_ref();
-                continue;
-            }
-            // NOTE: `UpsertDedupTableProvider` is intentionally NOT peeled. Unlike
-            // `PolyTableProvider` (delegates writes) and `IndexedTableProvider`
-            // (`insert_into` is a pass-through), it *rewrites* the write on insert
-            // (dedup / last-write-wins via `UpsertDedupExec`). Routing CDC past it to
-            // the inner provider would bypass that transform, so a dedup-configured
-            // table instead stays on the synchronous path (through the wrapper,
-            // preserving its semantics) and emits the fallback warning below. Only
-            // write-transparent wrappers are peeled here.
-            if let Some(indexed) =
-                current.downcast_ref::<runtime_datafusion_index::IndexedTableProvider>()
-            {
-                current = indexed.get_underlying_ref();
-                continue;
-            }
-            return None;
-        }
+        /// Peels [`PolyTableProvider`] to its writer side (write-transparent).
+        const POLY_WRITER_INNER: InnerProviderFn = |tbl| {
+            tbl.downcast_ref::<data_components::poly::PolyTableProvider>()
+                .map(data_components::poly::PolyTableProvider::writer_ref)
+        };
+
+        find_concrete_table_provider_with::<CayenneTableProvider>(
+            &self.accelerator,
+            &[POLY_WRITER_INNER, INDEXED_INNER],
+        )
     }
 
     /// Effective per-plan delete-key cap for this dataset: the process-global
@@ -2871,9 +2901,14 @@ fn concat_change_batches(batches: &[ChangeBatch]) -> crate::accelerated_table::R
     })
 }
 
-fn cdc_item_memory_size(item: &Result<cdc::ChangeEnvelope, cdc::StreamError>) -> usize {
-    item.as_ref()
-        .map_or(0, |env| env.change_batch.record.get_array_memory_size())
+fn cdc_item_budget_bytes(item: &Result<cdc::ChangeEnvelope, cdc::StreamError>) -> usize {
+    // A coalescing byte-budget proxy, NOT a true in-memory Arrow size:
+    // `encoded_len` answers WITHOUT forcing a build — a deferred (e.g. Postgres)
+    // envelope from a schema-aware estimate of its buffered wire size, a built
+    // one from its actual Arrow size. Used only to bound how much a single burst
+    // accumulates before applying; the real Arrow build is deferred to apply
+    // time (`into_parts_offloaded`), off the source's shared read path.
+    item.as_ref().map_or(0, cdc::ChangeEnvelope::encoded_len)
 }
 
 fn elapsed_ms(start: Instant) -> f64 {

@@ -12,9 +12,10 @@ Full workspace and release builds take 20–35 minutes. Minimize large builds:
 
 - **Batch all related edits first, then run one build/lint/test pass at the end.** Never build after each edit.
 - **Scope cargo to touched crates**: `cargo check -p <crate>`, `cargo test -p <crate> --lib <filter>`, `cargo clippy -p <crate> --no-deps`. Validate compilation with incremental `cargo check`; run `cargo build --release -p spiced` once, only after everything is green.
+- **New crates must opt into the workspace lints**: clippy lint levels live in `[workspace.lints.clippy]` in the root `Cargo.toml` (pedantic + `unwrap_used`/`expect_used`/`clone_on_ref_ptr`/…). Every member crate inherits them via `[lints]\nworkspace = true` in its `Cargo.toml` — add this to any new crate, or scoped `cargo clippy -p <crate>` and rust-analyzer will silently under-lint it. Additional shared lint config belongs in `[workspace.lints.*]` in the root `Cargo.toml` (a crate can’t inherit with `workspace = true` and also define per-crate `[lints.*]` overrides). `make lint-rust` re-applies the flags over `--workspace` as a backstop, so a forgotten opt-in fails CI, not silently ships.
 - **Fix the feature set for the whole session.** Cargo re-fingerprints incremental artifacts on the exact `--features` (and profile, and `RUSTFLAGS`/wrapper), and features flow through the entire dependency graph — so alternating flag sets between `check`/`test`/`clippy`, or diverging from the `make lint-rust` gate's `--features adbc,…,release,…`, silently forces full recompiles. At the start of a branch, identify the features your touched crates need, reuse the *same* `--features` on every `cargo` invocation, and scope the gate to match: `make lint-rust-fix PACKAGES="<crates>" FEATURES="<same set>"`. Keep the profile and the sccache-bypass env constant for the same reason. (`clippy` and `check` still recompile the workspace crates when alternated even with matching features — deps are reused, so the win is still large.)
 - **One cargo invocation at a time**: a second blocks on the target-dir lock, and concurrent heavy builds contaminate bench timings.
-- **Lint covers tests too**: `make lint-rust` runs a second clippy pass over `--tests` with pedantic lints, so test code and its doc comments must pass (e.g. `doc_markdown`: backtick product names like `PostgreSQL`, `DuckDB`). Green tests ≠ lint green; run `make lint-rust-fix` before pushing.
+- **Lint covers tests too**: `make lint-rust` runs a second clippy pass over `--tests` with pedantic lints, so test code and its doc comments must pass (e.g. `doc_markdown`: backtick product names like `PostgreSQL`, `DuckDB`). Green tests ≠ lint green; the scoped clippy above now inherits the same lint *levels*, but `make lint-rust` is still the gate (it adds the full release feature set + the `--tests` pass) — run `make lint-rust-fix` before pushing.
 - **If sccache fails** (unwritable volume breaks the `aws-lc-sys` C compile): `env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CC=cc CXX=c++ cargo …`.
 
 ```bash
@@ -36,13 +37,14 @@ make lint-rust-fix      # Auto-fix lint issues
 ## Architecture
 
 - **Separate Tokio runtimes** isolate the HTTP server (health checks, endpoints) from query execution (DataFusion is CPU/IO heavy and shares one thread pool). Never share runtime handles; `/health` must respond quickly regardless of query load.
-- **Layout**: source in `crates/` — most-touched: `runtime/` (orchestration), `data_components/` (`TableProvider` impls), `app/` (Spicepod parsing), `datafusion/` (extensions), `llms/`, `search/`, `model_components/`; acceleration engines in `runtime-acceleration/` and `cayenne/` (native CDC-fed accelerator); per-concern `runtime-*` crates. Authoritative map: workspace `members` in root `Cargo.toml`.
+- **Layout**: source in `crates/` — most-touched: `runtime/` (orchestration), `data_components/` (`TableProvider` impls), `app/` (Spicepod parsing), `datafusion/` (extensions), `llms/`, `search/`; acceleration engines in `runtime-acceleration/` and `cayenne/` (native CDC-fed accelerator); per-concern `runtime-*` crates. Authoritative map: workspace `members` in root `Cargo.toml`.
 - **Extension points** (`docs/EXTENSIBILITY.md`): Data Connector, Data Accelerator, Catalog Connector, Secret Store, Model, Embedding.
 - **Acceleration wraps**: `AcceleratedTable` → `FederatedTable` → connector `TableProvider`.
+- **Cayenne doc**: `docs/cayenne/` holds a breadth-first technical reference for the `cayenne` crate (`cayenne.md`, source-grounded against `crates/cayenne`), built to a PDF artifact by `.github/workflows/cayenne_doc.yml`. **A PR that changes `crates/cayenne` behavior, config params, the metastore schema, or the CDC/compaction flows must be reviewed for whether it merits a `docs/cayenne/cayenne.md` update — make that update in the same PR where practical, and add a *Document changelog* row referencing the reviewed commit.** The doc must stay source-accurate; never let it state something the code no longer does.
 
 ## Rust standards
 
-Workspace is edition 2024, rust-version 1.95.0 — use stable features and modern std APIs through 1.95; don't code to older subsets. Runtime is 64-bit minimum: assume `usize` is at least (never exactly) 64 bits. New `.rs` files need the copyright header (`Copyright 2024-2026 The Spice.ai OSS Authors`; vendored code in `crates/vendor/` exempt).
+Workspace is edition 2024, rust-version 1.96.1 — use stable features and modern std APIs through 1.96; don't code to older subsets. Runtime is 64-bit minimum: assume `usize` is at least (never exactly) 64 bits. New `.rs` files need the copyright header (`Copyright 2024-2026 The Spice.ai OSS Authors`; vendored code in `crates/vendor/` exempt).
 
 ### Error handling (critical)
 

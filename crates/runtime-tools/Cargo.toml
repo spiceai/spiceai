@@ -48,3 +48,6 @@ util = { path = "../util" }
 default = []
 mcp = ["dep:rmcp"]
 openapi = ["dep:utoipa"]
+
+[lints]
+workspace = true

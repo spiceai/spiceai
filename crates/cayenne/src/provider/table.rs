@@ -96,8 +96,8 @@ use datafusion_catalog::{Session, TableProvider};
 use datafusion_common::stats::Precision as DFPrecision;
 use datafusion_common::tree_node::TreeNode;
 use datafusion_common::{
-    ColumnStatistics, Constraints, DFSchema, DataFusionError, Result as DataFusionResult,
-    ScalarValue, Statistics, project_schema,
+    ColumnStatistics, Constraint, Constraints, DFSchema, DataFusionError,
+    Result as DataFusionResult, ScalarValue, Statistics, project_schema,
 };
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_groups::FileGroup;
@@ -917,7 +917,10 @@ pub(crate) async fn reserve_sequences_in(
 /// Keyed the SAME way as [`MergedScanDeletions`] — (file-index `Arc` ptr, the
 /// per-shard content `version` hash, structural epoch) — so any concurrent
 /// append/clear/publish forces a rebuild and a stale pairing can never be
-/// served. Where `merged_scan_deletions` memoizes the merged tombstone
+/// served. Like `MergedScanDeletions`, the file-index `Arc` is RETAINED here
+/// (`file_index`) so its address cannot be freed and reused by a later index
+/// generation, keeping the ptr comparison ABA-safe (#11303). Where
+/// `merged_scan_deletions` memoizes the merged tombstone
 /// *snapshot*, this memoizes the merge-on-read *output*: the visible batches
 /// after `filter_inlined_batch_for_deletions` has already run.
 ///
@@ -930,10 +933,13 @@ pub(crate) async fn reserve_sequences_in(
 /// reference, and lets repeated same-version queries skip merge-on-read
 /// entirely.
 struct MemTierVisibleMemo {
-    /// `PkDeletionSnapshot::index_ptr()` of the file-side index the visibility
-    /// was filtered against (`None` for position-based, which does not filter
-    /// here).
-    file_index_ptr: Option<usize>,
+    /// The file-side deletion snapshot the visibility was filtered against,
+    /// RETAINED for the lifetime of the memo (`None` for position-based, which
+    /// does not filter here). Retaining the `Arc` — not merely its address —
+    /// pins the index generation so its address cannot be freed and reused by a
+    /// later generation, making the [`Self::file_index_ptr`] identity ABA-safe;
+    /// see [`MergedScanDeletions::file_index`] and #11303.
+    file_index: Option<PkDeletionSnapshot>,
     /// [`crate::provider::mem_tier::ShardedMemTier::version_hash_of`] of the
     /// shards the batches were built from.
     tier_version: u64,
@@ -942,6 +948,18 @@ struct MemTierVisibleMemo {
     /// Per-segment deletion-filtered visible batches, unpruned. `Arc<[_]>` so a
     /// memo hit is an `Arc`-pointer clone, never an O(segments) copy.
     segments: Arc<[VisibleMemTierSegment]>,
+}
+
+impl MemTierVisibleMemo {
+    /// `Arc::as_ptr` identity of the retained file-side index — the memo key's
+    /// file-side component (`None` for position-based). Read from
+    /// [`Self::file_index`] so the compared pointer and the pinned allocation
+    /// can never diverge.
+    fn file_index_ptr(&self) -> Option<usize> {
+        self.file_index
+            .as_ref()
+            .and_then(PkDeletionSnapshot::index_ptr)
+    }
 }
 
 /// One retained mem-tier segment's deletion-filtered visible batches plus the
@@ -1161,7 +1179,10 @@ pub struct CayenneTableProvider {
     /// Memo for the per-scan merged (file ∪ mem-tier) deletion snapshot. Keyed
     /// by (file-index `Arc` ptr, tier content `version`, structural epoch) — a
     /// hit requires all three, so any concurrent append/clear/publish forces a
-    /// rebuild and a stale pairing can never be served. Kills the per-scan
+    /// rebuild and a stale pairing can never be served. The file-index `Arc` is
+    /// RETAINED in the memo (`MergedScanDeletions::file_index`) so its address
+    /// cannot be freed and reused by a later index generation, keeping the ptr
+    /// comparison ABA-safe (#11303). Kills the per-scan
     /// O(tier-tombstones) `with_mem_tier_tombstones` extend that correlated
     /// plans (q20: 322ms -> 74s) paid per outer-group rescan.
     merged_scan_deletions: Arc<arc_swap::ArcSwapOption<MergedScanDeletions>>,
@@ -1547,6 +1568,11 @@ pub struct CayenneTableProvider {
     /// decoupled from the compaction tick.
     background_cold_tier_promoter:
         Arc<std::sync::OnceLock<super::compaction::BackgroundColdTierPromoter>>,
+    /// `DataFusion` table constraints advertising the primary key (unverified),
+    /// so runtime features gated on `TableProvider::constraints()` — e.g.
+    /// append-mode refresh's primary-key dedup path — can see it. `None` when
+    /// the table has no primary key.
+    pk_constraints: Option<Constraints>,
 }
 
 /// Builder for constructing a `CayenneTableProvider` with optional configuration.
@@ -4337,6 +4363,20 @@ impl CayenneTableProvider {
         // also clamps, but pin it here so the field decl and lock-slice sizing agree.
         let mem_tier_shards = table_metadata.vortex_config.cdc_mem_tier_shards.max(1);
 
+        // Advertise the primary key as an (unverified) DataFusion constraint so
+        // `TableProvider::constraints()` reflects it — runtime features gate on
+        // it (e.g. append-mode refresh requires a time column or a primary key).
+        let pk_constraints = if table_metadata.primary_key.is_empty() {
+            None
+        } else {
+            table_metadata
+                .primary_key
+                .iter()
+                .map(|col| table_metadata.schema.index_of(col).ok())
+                .collect::<Option<Vec<usize>>>()
+                .map(|indices| Constraints::new_unverified(vec![Constraint::PrimaryKey(indices)]))
+        };
+
         let provider = Self {
             current_snapshot_id: Arc::new(RwLock::new(table_metadata.current_snapshot_id.clone())),
             table_schema: Arc::new(ArcSwap::new(Arc::<arrow_schema::Schema>::clone(
@@ -4453,6 +4493,7 @@ impl CayenneTableProvider {
             background_compactor: Arc::new(std::sync::OnceLock::new()),
             background_mem_tier_checkpointer: Arc::new(std::sync::OnceLock::new()),
             background_cold_tier_promoter: Arc::new(std::sync::OnceLock::new()),
+            pk_constraints,
         };
 
         provider.refresh_deletion_memory_accounting();
@@ -5392,6 +5433,7 @@ impl CayenneTableProvider {
             // original `Arc`) survives writer clones and its drop signal is shared.
             background_mem_tier_checkpointer: Arc::clone(&self.background_mem_tier_checkpointer),
             background_cold_tier_promoter: Arc::clone(&self.background_cold_tier_promoter),
+            pk_constraints: self.pk_constraints.clone(),
         }
     }
 
@@ -6318,6 +6360,43 @@ impl CayenneTableProvider {
                 deleted_pk_i64.as_deref(),
                 deleted_row_keys.as_deref(),
                 Some(*max_delete_seq_at_creation), // only deletions with seq > threshold apply
+                &self.table_metadata.table_name,
+                &mut keyset,
+                &mut row_id_base,
+            )
+            .await?;
+        }
+
+        // Fold in the datalake (cold) tier: promoted rows are still live PK
+        // holders, so an upsert of a cold-resident key must supersede-tombstone
+        // it. Without this pass a post-promotion rebuild (warm just cleared by
+        // the graduation) produces an EMPTY keyset, upserts false-negative, and
+        // every re-ingested key double-counts against its cold copy (caught by
+        // the datalake e2e's restart + re-append phase). The FULL deletion
+        // filter (None threshold) mirrors the main-tier handling: a tombstoned
+        // cold key is dead here, and its re-inserted copy is picked up by the
+        // warm/mem-tier passes above.
+        if let Some(cold_plan) = self
+            .build_cold_tier_scan_plan(
+                &ctx.state(),
+                Some(&pk_projection),
+                &[],
+                None,
+                &ctx.copied_config(),
+                None,
+            )
+            .await?
+        {
+            let cold_stream = datafusion_physical_plan::execute_stream(cold_plan, ctx.task_ctx())?;
+            Self::process_stream_into_keyset(
+                cold_stream,
+                &self.pk_deletion_strategy,
+                pk_indices,
+                converter,
+                &projected_pk_indices,
+                deleted_pk_i64.as_deref(),
+                deleted_row_keys.as_deref(),
+                None, // all deletions apply to cold-resident keys
                 &self.table_metadata.table_name,
                 &mut keyset,
                 &mut row_id_base,
@@ -9935,7 +10014,7 @@ impl CayenneTableProvider {
     /// Uses `DataFusion`'s `SortExec` which provides:
     /// - **Automatic disk spilling**: Handles datasets larger than available memory
     /// - **Streaming external merge sort**: Processes data incrementally without loading all into RAM
-    /// - **SIMD-optimized kernels**: Hardware-accelerated sorting (NEON on arm64, AVX2/AVX-512 on amd64)
+    /// - **SIMD-optimized kernels**: Hardware-accelerated sorting (NEON on arm64, AVX2 on amd64)
     /// - **Configurable spill compression**: Supports zstd, `lz4_frame`, or uncompressed spill files
     /// - **Memory management**: Integrates with `DataFusion`'s memory pool and reservation system
     ///
@@ -12761,9 +12840,13 @@ impl CayenneTableProvider {
             Self::ensure_snapshot_dir_exists(std::path::Path::new(local)).await?;
         }
 
-        let target_size_bytes =
-            self.table_metadata.vortex_config.cold_target_file_size_mb * 1024 * 1024;
-        let write_format = self.write_shard_format(1, target_size_bytes, None);
+        let cold_target_file_size_mb = self.table_metadata.vortex_config.cold_target_file_size_mb;
+        let target_size_bytes = cold_target_file_size_mb.saturating_mul(1024 * 1024);
+
+        let shard = self.write_shard_config(1, target_size_bytes, None);
+        let write_format = self
+            .context
+            .cold_write_format(cold_target_file_size_mb, shard);
         let cold_listing_table = Self::create_listing_table(
             &cold_dir_url,
             self.table_schema(),
@@ -12872,7 +12955,45 @@ impl CayenneTableProvider {
     /// Holds `write_lock` for the whole graduation (mirrors `begin_overwrite`), so
     /// no append races the capture→write→commit and the generation fence is
     /// unnecessary. Heavy + infrequent (gated by the warm-size thresholds).
+    ///
+    /// Records promotion telemetry under `kind="datalake"`, mirroring the
+    /// `kind="full"`/`"subset"` compaction passes: duration with a
+    /// `completed`/`failed` result label for passes that promoted or failed
+    /// (`Ok(false)` no-ops are not counted), plus the memory-exhausted counter.
     pub async fn promote_warm_to_cold(&self) -> Result<bool> {
+        let pass_start = Instant::now();
+        let result = self.promote_warm_to_cold_inner().await;
+        if matches!(result, Ok(true) | Err(_)) {
+            let table = self.table_metadata.table_name.clone();
+            let result_label = if result.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            };
+            telemetry::cayenne::track_compaction_duration(
+                pass_start.elapsed(),
+                &[
+                    telemetry::KeyValue::new("table", table.clone()),
+                    telemetry::KeyValue::new("kind", "datalake"),
+                    telemetry::KeyValue::new("result", result_label),
+                ],
+            );
+            if matches!(
+                &result,
+                Result::Err(Error::DataFusion {
+                    source: DataFusionError::ResourcesExhausted(_)
+                })
+            ) {
+                telemetry::cayenne::track_compaction_memory_exhausted(&[
+                    telemetry::KeyValue::new("table", table),
+                    telemetry::KeyValue::new("kind", "datalake"),
+                ]);
+            }
+        }
+        result
+    }
+
+    async fn promote_warm_to_cold_inner(&self) -> Result<bool> {
         let vc = &self.table_metadata.vortex_config;
         if !vc.cold_tier_enabled() {
             return Ok(false);
@@ -12911,7 +13032,7 @@ impl CayenneTableProvider {
             table = self.table_metadata.table_name.as_str(),
             warm_bytes,
             warm_files,
-            "Promoting warm tier to cold object store (Z-order clustered graduation)"
+            "Promoting warm tier to datalake store (Z-order clustered graduation)"
         );
 
         // Exclude writers for the whole graduation (mirrors begin_overwrite).
@@ -12978,12 +13099,28 @@ impl CayenneTableProvider {
         }
         self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
 
+        // Publish telemetry: bytes written to the cold store this promotion —
+        // the production check that promotion cost tracks the promoted data,
+        // not total table size. The last successful publish time is derivable
+        // from `cayenne_compaction_duration_ms{kind="datalake", result="completed"}`.
+        let cold_bytes: u64 = cold_files
+            .iter()
+            .map(|f| u64::try_from(f.file_size_bytes.max(0)).unwrap_or(0))
+            .sum();
+        telemetry::cayenne::track_compaction_merged_bytes(
+            cold_bytes,
+            &[
+                telemetry::KeyValue::new("table", self.table_metadata.table_name.clone()),
+                telemetry::KeyValue::new("kind", "datalake"),
+            ],
+        );
+
         tracing::info!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             cold_files = cold_files.len(),
             total_rows,
-            "Cold-tier promotion committed"
+            "Datalake-tier promotion committed"
         );
         Ok(true)
     }
@@ -16660,7 +16797,7 @@ impl CayenneTableProvider {
         let tier_version = crate::provider::mem_tier::ShardedMemTier::version_hash_of(shards);
         let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
         if let Some(memo) = self.merged_scan_deletions.load_full()
-            && memo.file_index_ptr == file_index_ptr
+            && memo.file_index_ptr() == Some(file_index_ptr)
             && memo.tier_version == tier_version
             && memo.structural_epoch == structural_epoch
         {
@@ -16669,7 +16806,10 @@ impl CayenneTableProvider {
         let merged = deletion_snapshot.with_mem_tier_tombstones_map(&union);
         self.merged_scan_deletions
             .store(Some(Arc::new(MergedScanDeletions {
-                file_index_ptr,
+                // Retain the file-side source snapshot (pins its index `Arc` so
+                // the `file_index_ptr` identity above stays ABA-safe — #11303);
+                // `deletion_snapshot` is unused past this point.
+                file_index: deletion_snapshot,
                 tier_version,
                 structural_epoch,
                 merged: merged.clone(),
@@ -17730,12 +17870,15 @@ impl CayenneTableProvider {
             if self.mem_tier_shard_count() == 1
                 && let Some(memo) = self.merged_scan_deletions.load_full()
                 && memo.tier_version == cur.version
-                && Some(memo.file_index_ptr) == self.pk_deletion_snapshot().index_ptr()
+                && memo.file_index_ptr() == self.pk_deletion_snapshot().index_ptr()
             {
                 let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
                 self.merged_scan_deletions
                     .store(Some(Arc::new(MergedScanDeletions {
-                        file_index_ptr: memo.file_index_ptr,
+                        // The file-side index is unchanged by a tier append —
+                        // carry the retained source snapshot forward (keeps its
+                        // `Arc` pinned so the ptr identity stays ABA-safe, #11303).
+                        file_index: memo.file_index.clone(),
                         tier_version: next_version,
                         structural_epoch,
                         merged: memo.merged.extended_by_delta(&tombstones),
@@ -18942,12 +19085,15 @@ impl CayenneTableProvider {
         // `filter_inlined_batch_for_deletions` reads live (`pk_deletion_strategy`
         // via `pk_deletion_snapshot`), so the key reflects what the memoized
         // batches were filtered against.
-        let file_index_ptr = self.pk_deletion_snapshot().index_ptr();
+        // Retain the file-side source snapshot in the memo (pins its index `Arc`
+        // so the `file_index_ptr` identity stays ABA-safe — #11303).
+        let file_index = self.pk_deletion_snapshot();
+        let file_index_ptr = file_index.index_ptr();
         let tier_version = crate::provider::mem_tier::ShardedMemTier::version_hash_of(shards);
         let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
 
         let segments = if let Some(memo) = self.mem_tier_visible_memo.load_full()
-            && memo.file_index_ptr == file_index_ptr
+            && memo.file_index_ptr() == file_index_ptr
             && memo.tier_version == tier_version
             && memo.structural_epoch == structural_epoch
         {
@@ -18964,7 +19110,7 @@ impl CayenneTableProvider {
             );
             self.mem_tier_visible_memo
                 .store(Some(Arc::new(MemTierVisibleMemo {
-                    file_index_ptr,
+                    file_index: Some(file_index),
                     tier_version,
                     structural_epoch,
                     segments: Arc::clone(&built),
@@ -20697,11 +20843,19 @@ impl CayenneTableProvider {
         scan_config: &SessionConfig,
         read_schema_override: Option<SchemaRef>,
     ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
-        // Cold tier disabled (no location) → no branch. The object store for the
-        // cold URLs is resolved from the session registry: the default local
-        // store for `file://` cold, or the cold S3 store registered at scan top.
+        // Cold tier disabled (no location) → no branch.
         if !self.table_metadata.vortex_config.cold_tier_enabled() {
             return Ok(None);
+        }
+
+        // Register the cold object store on THIS session's registry
+        // (idempotent). `scan()` also registers it at scan top, but other
+        // callers — e.g. the PK keyset rebuild — build fresh session contexts,
+        // and an unregistered s3:// URL falls back to a default-region S3
+        // client (region-redirect failures on non-us-east-1 buckets). A local
+        // `file://` cold location needs no registration.
+        if let Some(ref cold_config) = self.cold_object_store_config {
+            Self::register_object_store_if_needed(state.runtime_env(), cold_config);
         }
 
         let cold_files = self
@@ -21851,7 +22005,7 @@ impl TableProvider for CayenneTableProvider {
     }
 
     fn constraints(&self) -> Option<&Constraints> {
-        None
+        self.pk_constraints.as_ref()
     }
 
     async fn scan(
@@ -34372,6 +34526,107 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&first, &third),
             "an append must invalidate the visible-batch memo (tier version changed)"
+        );
+    }
+
+    /// Strong count of the file-side deletion index held inside a
+    /// `PkDeletionSnapshot` (the allocation the scan memos key on by
+    /// `Arc::as_ptr`). `0` for position-based (no index).
+    fn file_index_strong_count(snapshot: &PkDeletionSnapshot) -> usize {
+        match snapshot {
+            PkDeletionSnapshot::Int64Pk { tombstones } => Arc::strong_count(tombstones),
+            PkDeletionSnapshot::RowConverterBased { tombstones } => Arc::strong_count(tombstones),
+            PkDeletionSnapshot::PositionBased => 0,
+        }
+    }
+
+    /// #11303 regression: the per-scan deletion memos must RETAIN (pin) the
+    /// file-side deletion index they key on, not merely cache its raw
+    /// `Arc::as_ptr`.
+    ///
+    /// The memo key compares `Arc::as_ptr(file_index)`. If the memo does not
+    /// keep that `Arc` alive, a deletion publish can free the index and a later
+    /// publish can reuse its freed address for a new generation — a false
+    /// pointer match (ABA) that serves a stale merged deletion view and
+    /// resurrects deleted rows. Pinning the source `Arc` makes the address
+    /// non-reusable while the memo is live, so a pointer match can only mean
+    /// "same generation".
+    ///
+    /// The ABA itself is allocator-dependent and non-deterministic to trigger,
+    /// so this asserts the retention INVARIANT that eliminates it: after a scan
+    /// builds the memos, clearing them must drop the file-side index's strong
+    /// count (the memos were holding references to it). On the pre-fix code the
+    /// memos held no reference, so clearing them would not move the count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deletion_memos_pin_file_index_against_aba() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "aba_pin",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+
+        // Durable rows + checkpoint (a file-side deletion index exists), then a
+        // RAM upsert tombstoning a durable key so a scan builds BOTH the merged
+        // and the visible-batch deletion memos.
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20]),
+        )
+        .await;
+        provider
+            .checkpoint_inlined_data()
+            .await
+            .expect("flush inline rows to the file tier");
+        let write = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[100])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("RAM upsert");
+        assert!(
+            write.in_memory_epoch().is_some(),
+            "upsert engaged the RAM tier"
+        );
+
+        // Build the memos and re-assert visibility over the memoized path.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "aba_pin").await,
+            vec![(1, 100), (2, 20)],
+            "tier tombstone must hide the durable copy of PK 1"
+        );
+        assert!(
+            provider.merged_scan_deletions.load_full().is_some(),
+            "the scan must have stored the merged-deletions memo"
+        );
+
+        // The live file-side deletion index. `pk_deletion_snapshot()` clones its
+        // inner `Arc`, giving the test exactly one reference to count against;
+        // no write happens after this, so the live cell still holds the same
+        // generation the memos keyed on.
+        let live = provider.pk_deletion_snapshot();
+        let count_with_memos = file_index_strong_count(&live);
+        // Clearing the memos must release the reference(s) they were PINNING.
+        provider.merged_scan_deletions.store(None);
+        provider.mem_tier_visible_memo.store(None);
+        let count_without_memos = file_index_strong_count(&live);
+
+        assert!(
+            count_with_memos > count_without_memos,
+            "the scan deletion memos must PIN the file-side index (ABA guard, #11303): \
+             strong count was {count_with_memos} with the memos present and \
+             {count_without_memos} after clearing them — a pre-fix memo that cached only \
+             the raw pointer would leave the count unchanged"
         );
     }
 

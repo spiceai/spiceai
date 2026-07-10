@@ -52,7 +52,7 @@ use snafu::{OptionExt, prelude::*};
 use tokio::{fs::create_dir_all, sync::Mutex};
 
 use super::{
-    AccelerationSource, BootstrapStatus, DataAccelerator,
+    AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator,
     duckdb::{DuckDBAccelerator, create_factory, create_table_provider},
 };
 use crate::{
@@ -64,37 +64,7 @@ use crate::{
 
 pub mod tables_mode;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DuckDBPartitionMode {
-    Tables,
-    Files,
-}
-
-impl DuckDBPartitionMode {
-    pub fn parse_str(s: &str) -> Self {
-        match s {
-            "tables" => DuckDBPartitionMode::Tables,
-            "files" => DuckDBPartitionMode::Files,
-            other => {
-                tracing::warn!(
-                    "Unknown `partition_mode` '{}', defaulting to 'files' mode.",
-                    other
-                );
-                DuckDBPartitionMode::Files
-            }
-        }
-    }
-}
-
-#[must_use]
-pub fn get_duckdb_partition_mode(params: &Option<spicepod::param::Params>) -> DuckDBPartitionMode {
-    params
-        .as_ref()
-        .and_then(|p| p.as_string_map().get("partition_mode").cloned())
-        .map_or(DuckDBPartitionMode::Files, |v| {
-            DuckDBPartitionMode::parse_str(&v)
-        })
-}
+pub use runtime_acceleration::acceleration::{DuckDBPartitionMode, get_duckdb_partition_mode};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -274,6 +244,7 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
     async fn init(
         &self,
         source: &dyn AccelerationSource,
+        _registry: Arc<AcceleratorEngineRegistry>,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(acceleration_settings) = source.acceleration() {
             ensure!(
