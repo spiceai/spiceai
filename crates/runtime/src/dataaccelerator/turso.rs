@@ -905,18 +905,32 @@ mod tests {
 
     fn cleanup_turso_test_files(path: &str) {
         let db_path = std::path::Path::new(path);
-        let mut candidates = vec![db_path.to_path_buf()];
+        std::fs::remove_file(db_path).ok();
 
-        if let (Some(parent), Some(file_name)) = (db_path.parent(), db_path.file_name()) {
-            for suffix in ["-wal", "-shm", "-journal"] {
-                let mut sidecar = file_name.to_os_string();
-                sidecar.push(suffix);
-                candidates.push(parent.join(sidecar));
+        // Remove every sidecar turso/libsql may leave next to the database: the
+        // WAL/SHM/journal files and the MVCC logical log (`<stem>.db-log`). A
+        // stale MVCC log from a previous run makes the next open fail with a
+        // `Corrupt("MVCC logical log file exists ... but header indicates WAL
+        // mode")` error, so match by file-name stem to catch them all regardless
+        // of exact suffix — otherwise these tests only pass on a pristine tree.
+        let (Some(parent), Some(stem)) = (
+            db_path.parent(),
+            db_path.file_stem().and_then(std::ffi::OsStr::to_str),
+        ) else {
+            return;
+        };
+        let prefix = format!("{stem}.");
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(&prefix))
+            {
+                std::fs::remove_file(entry.path()).ok();
             }
-        }
-
-        for candidate in candidates {
-            std::fs::remove_file(candidate).ok();
         }
     }
 
