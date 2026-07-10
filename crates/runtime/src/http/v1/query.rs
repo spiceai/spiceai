@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use axum::{
     body::Bytes,
     http::StatusCode,
@@ -205,7 +207,8 @@ pub(crate) async fn post(
                     }
                 };
 
-                (sql, Some(parameters))
+                // Move the deserialized String into Arc<str> without a second copy.
+                (Arc::<str>::from(sql), Some(parameters))
             }
             Err(e) => {
                 tracing::debug!("Error parsing JSON: {e}");
@@ -213,9 +216,9 @@ pub(crate) async fn post(
             }
         }
     } else {
-        // Use &body directly to avoid unnecessary copy of Bytes
+        // Decode once into Arc<str> so QueryBuilder does not re-copy the SQL body.
         let sql = match std::str::from_utf8(&body) {
-            Ok(query) => query.to_string(),
+            Ok(query) => Arc::<str>::from(query),
             Err(e) => {
                 tracing::debug!("Error reading query: {e}");
                 return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
@@ -226,7 +229,7 @@ pub(crate) async fn post(
 
     sql_to_http_response(
         df,
-        &sql,
+        sql,
         parameters,
         ResponseMimeType::from_accept_header(accept.as_ref()),
         current_principal_requires_read_only().await,

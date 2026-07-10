@@ -112,6 +112,8 @@ datafusion-functions = { workspace = true }
 insta = { workspace = true, features = ["json"] }
 paste.workspace = true
 rstest = "0.26.1"
+# Only for the `pk_key_hashing` bench, to evaluate FxHash for native integer PK keys.
+rustc-hash = "2.1.2"
 tempfile = { workspace = true }
 test-framework = { path = "../test-framework" }
 test-log = { version = "0.2", features = ["trace"] }
@@ -443,6 +445,10 @@ name = "cdc_apply_simd"
 [[bench]]
 harness = false
 name = "compaction_io_hygiene"
+
+[[bench]]
+harness = false
+name = "pk_key_hashing"
 
 [lints]
 workspace = true

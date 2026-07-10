@@ -172,6 +172,26 @@ pub trait CommitChange {
     fn supports_deferral(&self) -> bool {
         false
     }
+
+    /// Fold `other` into `self`, returning whether it was absorbed. Used to
+    /// coalesce a run of consecutive commits that target the same stream
+    /// position into one before they are run (see the consumer's burst-apply and
+    /// deferred-checkpoint drain). An implementor MUST be **infallible** and
+    /// **order-insensitive** in [`Self::commit`] for this to be sound: absorbing
+    /// re-orders and drops intermediate commits, keeping only the folded result.
+    /// Order-sensitive or fallible committers (per-partition offsets, resume
+    /// tokens) MUST NOT override this — the default refuses to fold, so they stay
+    /// byte-identical.
+    fn try_absorb(&mut self, _other: &dyn CommitChange) -> bool {
+        false
+    }
+
+    /// Downcast hook enabling [`Self::try_absorb`] to recognise a compatible
+    /// sibling. Default `None` = "not coalesce-identifiable"; only committers
+    /// that override `try_absorb` need override this (to `Some(self)`).
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 }
 
 /// Destination-passing-style source of the change rows carried by a
