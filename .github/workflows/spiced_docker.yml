@@ -233,7 +233,7 @@ jobs:
         run: |
           echo "IMAGE_TAG=default" >> $GITHUB_ENV
           echo "BINARY_VARIANT=default" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,mssql-kerberos-unix" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
       - &build-amd64-image
         name: Package AMD64 ${{ env.IMAGE_TAG }} image
@@ -314,7 +314,7 @@ jobs:
         run: |
           echo "IMAGE_TAG=default" >> $GITHUB_ENV
           echo "BINARY_VARIANT=default" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,mssql-kerberos-unix" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
       - &build-arm64-image
         name: Package ARM64 ${{ env.IMAGE_TAG }} image
