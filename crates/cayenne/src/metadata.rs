@@ -1661,10 +1661,16 @@ mod tests {
 
         // Plain names pass through unchanged.
         assert_eq!(TableMetadata::sanitize_name_slug("orders"), "orders");
-        assert_eq!(TableMetadata::sanitize_name_slug("taxi_trips-1"), "taxi_trips-1");
+        assert_eq!(
+            TableMetadata::sanitize_name_slug("taxi_trips-1"),
+            "taxi_trips-1"
+        );
 
         // Unsafe characters (dots, spaces, slashes, schema qualifiers) become `_`.
-        assert_eq!(TableMetadata::sanitize_name_slug("public.orders"), "public_orders");
+        assert_eq!(
+            TableMetadata::sanitize_name_slug("public.orders"),
+            "public_orders"
+        );
         assert_eq!(TableMetadata::sanitize_name_slug("my table"), "my_table");
         assert_eq!(TableMetadata::sanitize_name_slug("a/b\\c"), "a_b_c");
 
@@ -1690,7 +1696,10 @@ mod tests {
         assert_eq!(slug.chars().count(), TableMetadata::DATALAKE_SLUG_MAX_LEN);
 
         // A separator sitting exactly at the truncation boundary is re-trimmed.
-        let boundary = format!("{}_tail", "a".repeat(TableMetadata::DATALAKE_SLUG_MAX_LEN - 1));
+        let boundary = format!(
+            "{}_tail",
+            "a".repeat(TableMetadata::DATALAKE_SLUG_MAX_LEN - 1)
+        );
         let slug = TableMetadata::sanitize_name_slug(&boundary);
         assert!(
             !slug.ends_with('_') && !slug.ends_with('-'),
@@ -1722,8 +1731,14 @@ mod tests {
         };
 
         let id = "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
-        assert_eq!(md("orders", id).datalake_dir_segment(), format!("orders-{id}"));
-        assert_eq!(md("public.orders", id).datalake_dir_segment(), format!("public_orders-{id}"));
+        assert_eq!(
+            md("orders", id).datalake_dir_segment(),
+            format!("orders-{id}")
+        );
+        assert_eq!(
+            md("public.orders", id).datalake_dir_segment(),
+            format!("public_orders-{id}")
+        );
 
         // All-symbol name → bare id (still unique).
         assert_eq!(md("***", id).datalake_dir_segment(), id);

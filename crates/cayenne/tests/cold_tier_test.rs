@@ -187,10 +187,8 @@ async fn test_cold_tier_promotion_cross_tier_scan_and_delete_impl(
     assert!(
         cold_dir.join(&expected_segment).join("data").is_dir(),
         "expected cold objects under '{expected_segment}/data/'; cold dir entries: {:?}",
-        std::fs::read_dir(&cold_dir).map(|d| d
-            .flatten()
-            .map(|e| e.file_name())
-            .collect::<Vec<_>>())
+        std::fs::read_dir(&cold_dir)
+            .map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
     );
 
     // Cross-tier scan: warm is now an empty snapshot, so returning all rows
