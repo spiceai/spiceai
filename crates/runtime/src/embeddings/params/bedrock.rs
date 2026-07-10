@@ -51,5 +51,6 @@ pub(crate) const BEDROCK_PARAMETERS: [ParameterSpec; BEDROCK_PARAM_LEN] = [
     ParameterSpec::runtime("input_type")
         .description("The input type for Cohere embedding models."),
     ParameterSpec::runtime("embedding_purpose")
-        .description("The embedding purpose for Nova multimodal embedding models."),
+        .description("The embedding purpose for Nova multimodal embedding models.")
+        .one_of(&["GENERIC_INDEX", "GENERIC_RETRIEVAL", "TEXT_RETRIEVAL", "IMAGE_RETRIEVAL", "VIDEO_RETRIEVAL", "DOCUMENT_RETRIEVAL", "AUDIO_RETRIEVAL", "CLASSIFICATION", "CLUSTERING"]),
 ];
