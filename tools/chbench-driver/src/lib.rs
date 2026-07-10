@@ -83,6 +83,9 @@ pub enum Error {
     #[snafu(display("Failed to {action}: {message}"))]
     Arrow { action: String, message: String },
 
+    #[snafu(display("Background loader task failed: {message}"))]
+    TaskJoin { message: String },
+
     #[snafu(display(
         "--skip-prepare source has {found} warehouse(s) but --scale-factor expects {expected}; \
          restore a matching template or drop --skip-prepare to re-seed"
@@ -241,6 +244,10 @@ impl ChBenchDriver for PostgresChBenchDriver {
             self.config.seed,
         )
         .await?;
+        // Build secondary indexes and attach the _bench_ts triggers *after* the
+        // bulk load so neither is maintained per-row during the seed/clone.
+        schema::create_indexes(&self.client).await?;
+        schema::create_triggers(&self.client).await?;
 
         Ok(())
     }
@@ -460,7 +467,7 @@ async fn run_terminal(
 /// Pin a `MySQL` session's time zone to UTC so `NOW(3)`/`_bench_ts` writes and
 /// reads line up with how the Spice CDC path interprets timestamps (which pins
 /// the replication session to UTC).
-async fn set_mysql_utc(conn: &mut mysql_async::Conn) -> Result<()> {
+pub(crate) async fn set_mysql_utc(conn: &mut mysql_async::Conn) -> Result<()> {
     conn.query_drop("SET time_zone = '+00:00'")
         .await
         .map_err(|source| Error::MySql {
@@ -584,7 +591,17 @@ impl ChBenchDriver for MysqlChBenchDriver {
         let mut conn = self.new_conn().await?;
         schema_mysql::drop_tables(&mut conn).await?;
         schema_mysql::create_tables(&mut conn).await?;
-        loader_mysql::load_all(&mut conn, self.config.warehouses, self.config.seed).await?;
+        loader_mysql::load_all(
+            &mut conn,
+            &self.opts,
+            self.config.warehouses,
+            self.config.seed,
+        )
+        .await?;
+        // Build secondary indexes and attach the _bench_ts triggers *after* the
+        // bulk load so neither is maintained per-row during the seed/clone.
+        schema_mysql::create_indexes(&mut conn).await?;
+        schema_mysql::create_triggers(&mut conn).await?;
 
         Ok(())
     }

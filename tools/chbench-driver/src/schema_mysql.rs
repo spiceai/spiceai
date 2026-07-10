@@ -69,7 +69,6 @@ pub async fn drop_tables(conn: &mut mysql_async::Conn) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if any table or index cannot be created.
-#[expect(clippy::too_many_lines)]
 pub async fn create_tables(conn: &mut mysql_async::Conn) -> Result<()> {
     let ddl_statements: &[(&str, &str)] = &[
         (
@@ -252,7 +251,7 @@ pub async fn create_tables(conn: &mut mysql_async::Conn) -> Result<()> {
         ),
     ];
 
-    println!("  creating {} tables + 4 indexes", ddl_statements.len());
+    println!("  creating {} tables", ddl_statements.len());
     for (table, ddl) in ddl_statements {
         conn.query_drop(*ddl)
             .await
@@ -262,7 +261,25 @@ pub async fn create_tables(conn: &mut mysql_async::Conn) -> Result<()> {
             })?;
     }
 
-    // Indexes (matching go-tpc MySQL DDL)
+    // Add the _bench_ts column (with default) to all mutated TPC-C tables so the
+    // seed rows are stamped by the column default. The BEFORE INSERT/UPDATE
+    // triggers are created *after* the load (see `create_triggers`) so they do
+    // not fire per-row during the bulk seed/clone.
+    add_bench_ts_columns(conn).await?;
+
+    Ok(())
+}
+
+/// Create the 4 secondary indexes (matching go-tpc `MySQL` DDL).
+///
+/// Called *after* the bulk load so `InnoDB` builds each index once via its sorted
+/// bulk-index build, instead of maintaining the B-trees incrementally on every
+/// seed/clone insert.
+///
+/// # Errors
+///
+/// Returns an error if any index cannot be created.
+pub async fn create_indexes(conn: &mut mysql_async::Conn) -> Result<()> {
     let indexes: &[(&str, &str)] = &[
         (
             "idx_customer",
@@ -279,6 +296,7 @@ pub async fn create_tables(conn: &mut mysql_async::Conn) -> Result<()> {
         ),
     ];
 
+    println!("  creating {} secondary indexes", indexes.len());
     for (name, ddl) in indexes {
         conn.query_drop(*ddl)
             .await
@@ -287,10 +305,6 @@ pub async fn create_tables(conn: &mut mysql_async::Conn) -> Result<()> {
                 source,
             })?;
     }
-
-    // Add _bench_ts column and triggers to all mutated TPC-C tables.
-    // Used for staleness gap measurement between MySQL and Spice accelerated copy.
-    add_bench_ts_column_and_triggers(conn).await?;
 
     Ok(())
 }
@@ -308,14 +322,11 @@ const MUTATED_TABLES: &[&str] = &[
     "stock",
 ];
 
-/// Add a `_bench_ts DATETIME(3)` column defaulting to `CURRENT_TIMESTAMP(3)`
-/// plus `BEFORE INSERT` and `BEFORE UPDATE` triggers to all mutated TPC-C
-/// tables.
-///
-/// `MySQL` cannot combine INSERT and UPDATE into a single trigger, so two
-/// triggers are created per table. `NOW(3)` provides millisecond wall-clock
-/// timing per row.
-async fn add_bench_ts_column_and_triggers(conn: &mut mysql_async::Conn) -> Result<()> {
+/// Add a `_bench_ts DATETIME(3)` column defaulting to `CURRENT_TIMESTAMP(3)` to
+/// all mutated TPC-C tables. The default stamps the seed rows; the per-row
+/// triggers for live mutations are created separately by [`create_triggers`]
+/// *after* the load.
+async fn add_bench_ts_columns(conn: &mut mysql_async::Conn) -> Result<()> {
     for table in MUTATED_TABLES {
         // Add column with default for seed data rows. Tables are freshly
         // created by `create_tables`, so a plain ADD COLUMN is safe (MySQL
@@ -329,7 +340,29 @@ async fn add_bench_ts_column_and_triggers(conn: &mut mysql_async::Conn) -> Resul
                 action: format!("add _bench_ts column to {table}"),
                 source,
             })?;
+    }
 
+    println!(
+        "  added _bench_ts column to {} tables",
+        MUTATED_TABLES.len()
+    );
+    Ok(())
+}
+
+/// Create the `_bench_ts` `BEFORE INSERT` and `BEFORE UPDATE` triggers on all
+/// mutated TPC-C tables. Called *after* the bulk load so the triggers do not
+/// fire per-row during the seed/clone — the seed rows are already stamped by
+/// the column default (see [`add_bench_ts_columns`]).
+///
+/// `MySQL` cannot combine INSERT and UPDATE into a single trigger, so two
+/// triggers are created per table. `NOW(3)` provides millisecond wall-clock
+/// timing per row.
+///
+/// # Errors
+///
+/// Returns an error if any trigger cannot be created.
+pub async fn create_triggers(conn: &mut mysql_async::Conn) -> Result<()> {
+    for table in MUTATED_TABLES {
         // Attach the INSERT trigger (idempotent via DROP IF EXISTS + CREATE).
         let ins_trigger = format!("trg_bench_ts_ins_{table}");
         let drop_ins = format!("DROP TRIGGER IF EXISTS {ins_trigger}");
@@ -372,7 +405,7 @@ async fn add_bench_ts_column_and_triggers(conn: &mut mysql_async::Conn) -> Resul
     }
 
     println!(
-        "  added _bench_ts column + trigger to {} tables",
+        "  added _bench_ts triggers to {} tables",
         MUTATED_TABLES.len()
     );
     Ok(())

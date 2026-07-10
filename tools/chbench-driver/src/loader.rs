@@ -269,9 +269,8 @@ pub async fn load_all(
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(e),
             Err(e) => {
-                return Err(crate::Error::Sql {
-                    action: format!("seed warehouse loader task panicked: {e}"),
-                    source: tokio_postgres::Error::__private_api_timeout(),
+                return Err(crate::Error::TaskJoin {
+                    message: format!("seed warehouse loader task panicked: {e}"),
                 });
             }
         }
