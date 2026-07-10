@@ -102,7 +102,9 @@ async fn open_worker(opts: &mysql_async::Opts) -> Result<mysql_async::Conn> {
     Ok(conn)
 }
 
-/// Max concurrent loader connections for the parallel seed/clone phases.
+/// Max concurrent connections for the parallel *clone* phase. The seed phase is
+/// not bounded by this — it spawns one connection per seed warehouse (at most
+/// `SEED_WAREHOUSES`).
 fn loader_concurrency() -> usize {
     std::thread::available_parallelism()
         .map_or(4, std::num::NonZeroUsize::get)
