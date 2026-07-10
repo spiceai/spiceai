@@ -204,7 +204,7 @@ async fn login_spiceai(
     }
 
     // Try to open browser automatically
-    let _ = open::that(&auth_url);
+    let _ = system_open::that(&auth_url);
 
     tracing::info!("Waiting for authentication...");
 

@@ -59,6 +59,7 @@ members = [
     "crates/spice_cloud",
     "crates/spice-cloud-client",
     "crates/spicepod",
+    "crates/system-open",
     "crates/telemetry",
     "crates/test-framework",
     "crates/token_provider",

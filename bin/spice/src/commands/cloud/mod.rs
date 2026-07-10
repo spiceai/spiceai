@@ -974,7 +974,7 @@ async fn execute_login_device_flow(open_browser: bool) -> Result<()> {
     println!("\n  {auth_url}\n");
 
     if open_browser {
-        let _ = open::that(&auth_url);
+        let _ = system_open::that(&auth_url);
     }
 
     println!("Waiting for authentication...");

@@ -507,7 +507,7 @@ async fn msal_device_code_flow(
     println!("\nAnd enter the code: {user_code}\n");
 
     // Try to open browser automatically
-    let _ = open::that(verification_uri);
+    let _ = system_open::that(verification_uri);
 
     println!("Waiting for authentication...");
 
