@@ -19,3 +19,6 @@ tokio = { workspace = true, features = ["rt", "sync"] }
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

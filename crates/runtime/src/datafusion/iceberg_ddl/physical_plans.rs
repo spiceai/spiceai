@@ -122,8 +122,8 @@ impl AccelerationSource for IcebergDdlAccelerationSource {
         Arc::clone(&self.app)
     }
 
-    fn runtime(&self) -> Arc<crate::Runtime> {
-        unreachable!("DDL-created Iceberg acceleration source does not provide a runtime")
+    fn secrets(&self) -> Arc<tokio::sync::RwLock<crate::secrets::Secrets>> {
+        Arc::new(tokio::sync::RwLock::new(crate::secrets::Secrets::new()))
     }
 
     fn acceleration(&self) -> Option<&RuntimeAcceleration> {

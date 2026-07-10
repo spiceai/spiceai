@@ -1,9 +1,9 @@
 //! TLS support using rustls.
 //!
-//! This module provides TLS/SSL connection upgrade for PostgreSQL connections
+//! This module provides TLS/SSL connection upgrade for `PostgreSQL` connections
 //! using the rustls library. It supports:
 //!
-//! - All PostgreSQL SSL modes (disable, prefer, require, verify-ca, verify-full)
+//! - All `PostgreSQL` SSL modes (disable, prefer, require, verify-ca, verify-full)
 //! - Custom CA certificates
 //! - Client certificate authentication (mTLS)
 //! - SNI hostname override
@@ -54,7 +54,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use rustls::{ClientConfig, RootCertStore};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::{client::TlsStream, TlsConnector};
 
@@ -140,8 +140,8 @@ impl AsyncWrite for MaybeTlsStream {
 
 /// Attempt to upgrade a TCP connection to TLS based on configuration.
 ///
-/// This function implements PostgreSQL's SSL negotiation protocol:
-/// 1. Send SSLRequest message
+/// This function implements `PostgreSQL`'s SSL negotiation protocol:
+/// 1. Send `SSLRequest` message
 /// 2. Read single-byte response ('S' = proceed, 'N' = rejected)
 /// 3. If proceeding, perform TLS handshake
 ///
@@ -176,7 +176,6 @@ pub async fn maybe_upgrade_to_tls(
     write_ssl_request(&mut tcp).await?;
 
     let mut resp = [0u8; 1];
-    use tokio::io::AsyncReadExt;
     tcp.read_exact(&mut resp).await?;
 
     if resp[0] != b'S' {
@@ -209,7 +208,7 @@ pub async fn maybe_upgrade_to_tls(
     Ok(MaybeTlsStream::Tls(Box::new(tls_stream)))
 }
 
-/// Build rustls ClientConfig based on TLS settings.
+/// Build rustls `ClientConfig` based on TLS settings.
 fn build_rustls_config(
     tls: &TlsConfig,
     verify_chain: bool,
@@ -243,10 +242,12 @@ fn build_rustls_config(
     let builder = ClientConfig::builder().with_root_certificates(roots);
 
     // ---- Client authentication (mTLS) ----
-    let mut cfg: ClientConfig = if has_cert {
-        let cert_path = tls.client_cert_pem_path.as_ref().unwrap();
-        let key_path = tls.client_key_pem_path.as_ref().unwrap();
-
+    // The XOR check above guarantees cert and key are both set or both unset,
+    // so matching both `Some` is equivalent to the earlier `has_cert` test.
+    let mut cfg: ClientConfig = if let (Some(cert_path), Some(key_path)) = (
+        tls.client_cert_pem_path.as_ref(),
+        tls.client_key_pem_path.as_ref(),
+    ) {
         let cert_chain = load_cert_chain(cert_path)?;
         let key = load_private_key(key_path)?;
 
@@ -497,7 +498,7 @@ mod tests {
             client_key_pem_path: None,
             ..Default::default()
         };
-        let err = build_rustls_config(&tls, false, false, "localhost").unwrap_err();
+        let err = build_rustls_config(&tls, false, false, "localhost").expect_err("should error");
         assert!(err.to_string().contains("mTLS requires both"));
 
         // Key without cert
@@ -506,7 +507,7 @@ mod tests {
             client_key_pem_path: Some("/path/to/key.pem".into()),
             ..Default::default()
         };
-        let err = build_rustls_config(&tls, false, false, "localhost").unwrap_err();
+        let err = build_rustls_config(&tls, false, false, "localhost").expect_err("should error");
         assert!(err.to_string().contains("mTLS requires both"));
     }
 
@@ -521,7 +522,7 @@ mod tests {
         };
 
         // Should fail early: IP address can't match certificate hostname
-        let err = build_rustls_config(&tls, true, true, "192.168.1.1").unwrap_err();
+        let err = build_rustls_config(&tls, true, true, "192.168.1.1").expect_err("should error");
         assert!(err.to_string().contains("IP address"));
     }
 
@@ -538,38 +539,45 @@ mod tests {
             ..Default::default()
         };
 
-        let err = build_root_store(&tls).unwrap_err().to_string();
+        let err = build_root_store(&tls)
+            .expect_err("should error")
+            .to_string();
         assert!(err.contains("failed to open"));
         assert!(err.contains("ca.pem"));
     }
 
     #[test]
     fn empty_ca_file_gives_clear_error() {
-        let f = NamedTempFile::new().unwrap();
+        let f = NamedTempFile::new().expect("should succeed");
         let tls = TlsConfig {
             ca_pem_path: Some(f.path().to_path_buf()),
             ..Default::default()
         };
 
-        let err = build_root_store(&tls).unwrap_err().to_string();
+        let err = build_root_store(&tls)
+            .expect_err("should error")
+            .to_string();
         assert!(err.contains("no valid CA certificates"));
     }
 
     #[test]
     fn empty_key_file_gives_clear_error() {
-        let f = NamedTempFile::new().unwrap();
+        let f = NamedTempFile::new().expect("should succeed");
 
-        let err = load_private_key(f.path()).unwrap_err().to_string();
+        let err = load_private_key(f.path())
+            .expect_err("should error")
+            .to_string();
         assert!(err.contains("failed to load private key"));
     }
 
     #[test]
     fn invalid_pem_gives_clear_error() {
-        let mut f = NamedTempFile::new().unwrap();
-        f.write_all(b"this is not a valid PEM file").unwrap();
+        let mut f = NamedTempFile::new().expect("should succeed");
+        f.write_all(b"this is not a valid PEM file")
+            .expect("should succeed");
 
         // Should fail gracefully, not panic
-        assert!(load_private_key(f.path()).is_err());
-        assert!(load_cert_chain(f.path()).is_err());
+        load_private_key(f.path()).expect_err("should error");
+        load_cert_chain(f.path()).expect_err("should error");
     }
 }

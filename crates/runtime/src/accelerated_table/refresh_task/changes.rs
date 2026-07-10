@@ -13,8 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use super::DatasetMetricLabels;
 use super::RefreshTask;
-use crate::accelerated_table::metrics;
 use crate::accelerated_table::refresh::Refresh;
 use crate::accelerated_table::refresh_task::deletion::build_batch_delete_expr_from_change_batch;
 use crate::component::dataset::OnSchemaChange;
@@ -54,7 +54,10 @@ use datafusion::{execution::context::SessionContext, physical_plan::collect};
 use futures::{StreamExt, stream};
 use opentelemetry::KeyValue;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
-use runtime_datafusion_index::IndexedTableProvider;
+use runtime_datafusion_index::{
+    INDEXED_INNER, IndexedTableProvider, InnerProviderFn, find_concrete_table_provider_with,
+};
+use runtime_metrics::acceleration as metrics;
 use runtime_search::embeddings::table::EmbeddingTable;
 use runtime_table_partition::provider::PartitionTableProvider;
 #[cfg(test)]
@@ -187,7 +190,7 @@ fn change_batch_requires_durable_cdc_path(
         match ChangeOperationType::from_operation(&change_batch.op(row)) {
             ChangeOperationType::Truncate | ChangeOperationType::Unknown => true,
             ChangeOperationType::Delete => {
-                !sink_absorbs_in_memory_deletes || change_batch.primary_keys(row).is_empty()
+                !sink_absorbs_in_memory_deletes || !change_batch.has_primary_keys(row)
             }
             ChangeOperationType::Upsert => false,
         }
@@ -201,42 +204,66 @@ async fn checkpoint_pending_memory_cdc_commits(
     dataset_name: &TableReference,
     runtime_status: &status::RuntimeStatus,
 ) -> Option<String> {
+    // Bounded checkpoint retries before a still-non-empty queue is declared
+    // fatal (declared before the first statement to satisfy pedantic
+    // `items_after_statements`).
+    const MAX_CHECKPOINT_ATTEMPTS: usize = 3;
+
     if deferred_commit_queue_is_empty(queue).await {
         return None;
     }
 
-    match cayenne.checkpoint_mem_tier().await {
-        Ok(_) => {
-            if deferred_commit_queue_is_empty(queue).await {
-                None
-            } else if runtime_status.is_shutdown() {
-                tracing::debug!(
-                    "Deferred CDC commits remain for {dataset_name} during shutdown after mem-tier checkpoint"
-                );
-                None
-            } else {
-                let error_message = format!(
-                    "Failed to checkpoint in-memory CDC tier for {dataset_name}: deferred source commits remain after durable checkpoint"
-                );
-                tracing::error!("{error_message}");
-                Some(error_message)
+    // A queue still non-empty AFTER a successful checkpoint is, in practice,
+    // transient rather than a real invariant violation: the apply loop enqueues a
+    // batch's committer only AFTER `write_change` returns its epoch, so the
+    // covering checkpoint can fire (and drain nothing) before the committer is
+    // queued — the late-enqueue race. `checkpoint_mem_tier` re-fires the slot
+    // advancer for the last durable epoch even on an empty tier (Cayenne #11644
+    // fix), which releases such a committer; but a concurrent background
+    // checkpoint or a straggler epoch can still need one more checkpoint to seal.
+    // Retry a bounded number of times before declaring failure — the only
+    // correctness requirement is that the source slot must NOT advance past a
+    // still-un-durable RAM batch, and waiting (re-checkpointing) preserves that
+    // trivially. Only a queue that survives every attempt is fatal (#11644).
+    for attempt in 1..=MAX_CHECKPOINT_ATTEMPTS {
+        match cayenne.checkpoint_mem_tier().await {
+            Ok(_) => {
+                if deferred_commit_queue_is_empty(queue).await {
+                    return None;
+                }
+                if runtime_status.is_shutdown() {
+                    tracing::debug!(
+                        "Deferred CDC commits remain for {dataset_name} during shutdown after mem-tier checkpoint"
+                    );
+                    return None;
+                }
+                if attempt < MAX_CHECKPOINT_ATTEMPTS {
+                    tracing::debug!(
+                        "Deferred CDC commits still queued for {dataset_name} after checkpoint attempt {attempt}/{MAX_CHECKPOINT_ATTEMPTS}; re-checkpointing to seal the straggler epoch"
+                    );
+                }
             }
-        }
-        Err(e) => {
-            if runtime_status.is_shutdown() {
-                tracing::debug!(
-                    "Failed to checkpoint in-memory CDC tier for {dataset_name} during shutdown: {e}"
-                );
-                None
-            } else {
+            Err(e) => {
+                if runtime_status.is_shutdown() {
+                    tracing::debug!(
+                        "Failed to checkpoint in-memory CDC tier for {dataset_name} during shutdown: {e}"
+                    );
+                    return None;
+                }
                 let error_message = format!(
                     "Failed to checkpoint in-memory CDC tier for {dataset_name} before advancing source commit: {e}"
                 );
                 tracing::error!("{error_message}");
-                Some(error_message)
+                return Some(error_message);
             }
         }
     }
+
+    let error_message = format!(
+        "Failed to checkpoint in-memory CDC tier for {dataset_name}: deferred source commits remain after {MAX_CHECKPOINT_ATTEMPTS} durable checkpoints"
+    );
+    tracing::error!("{error_message}");
+    Some(error_message)
 }
 
 pub(super) struct CdcInsertPlanCache {
@@ -279,6 +306,9 @@ impl CdcInsertPlanCache {
 struct ApplyContext<'a> {
     refresh_sql: Option<&'a str>,
     dataset_name: &'a TableReference,
+    /// Prebuilt per-dataset metric labels reused by hot record sites in the apply loop
+    /// (see [`DatasetMetricLabels`]).
+    metric_labels: &'a DatasetMetricLabels,
     caching: Option<&'a Weak<Caching>>,
     ready_sender: Option<&'a Arc<Notify>>,
     initial_load_completed: &'a Arc<AtomicBool>,
@@ -410,6 +440,14 @@ pub struct CdcConfig {
     /// Maximum time to wait for the previous source-side commit before
     /// surfacing ingestion as stalled.
     pub commit_timeout: Duration,
+    /// Upper bound on the number of primary keys packed into a single durable
+    /// `delete_from` execution. A Delete sub-batch of `N` keyed rows is applied
+    /// as `⌈N/cap⌉` independent delete plans instead of one monolithic
+    /// predicate (a `~50k`-comparison OR-tree over 16,384 keys pegged prefetch
+    /// and triggered walsender timeouts). Chunking makes the cost linear and
+    /// interruptible; keys across chunks are distinct, so semantics are
+    /// preserved (each key deleted exactly once).
+    pub delete_subbatch_max: usize,
 }
 
 const CDC_PREFETCH_BUFFER_DEFAULT: usize = 128;
@@ -429,6 +467,13 @@ const CDC_MAX_COALESCED_BYTES_MAX: usize = 1024 * 1024 * 1024;
 const CDC_MAX_COALESCE_AGE_MS_DEFAULT: u64 = 0;
 const CDC_COMMIT_TIMEOUT_MS_DEFAULT: usize = 30_000;
 const CDC_COMMIT_TIMEOUT_MS_MAX: usize = 3_600_000;
+// A delete burst can be as large as a coalesced burst's row count, so bound the
+// per-plan key count well below that. 2,048 keeps each durable `delete_from`
+// cheap and interruptible while still amortizing plan construction; the MAX is
+// a sanity guard on operator overrides (a larger value re-approaches the
+// monolithic predicate this cap exists to avoid).
+const CDC_DELETE_SUBBATCH_MAX_DEFAULT: usize = 2_048;
+const CDC_DELETE_SUBBATCH_MAX_MAX: usize = 65_536;
 const CAYENNE_CDC_SYNCHRONOUS_FALLBACK_WARNING_KEY_LIMIT: usize = 1024;
 
 #[derive(Debug, Default)]
@@ -462,6 +507,7 @@ impl Default for CdcConfig {
             max_coalesced_bytes: CDC_MAX_COALESCED_BYTES_DEFAULT,
             max_coalesce_age_ms: CDC_MAX_COALESCE_AGE_MS_DEFAULT,
             commit_timeout: Duration::from_millis(CDC_COMMIT_TIMEOUT_MS_DEFAULT as u64),
+            delete_subbatch_max: CDC_DELETE_SUBBATCH_MAX_DEFAULT,
         }
     }
 }
@@ -663,6 +709,11 @@ fn cdc_config() -> CdcConfig {
             CDC_COMMIT_TIMEOUT_MS_DEFAULT,
             CDC_COMMIT_TIMEOUT_MS_MAX,
         ) as u64),
+        delete_subbatch_max: parse_env_usize(
+            "SPICE_CDC_DELETE_SUBBATCH_MAX",
+            CDC_DELETE_SUBBATCH_MAX_DEFAULT,
+            CDC_DELETE_SUBBATCH_MAX_MAX,
+        ),
     }
 }
 
@@ -727,6 +778,7 @@ pub(crate) const CDC_RUNTIME_PARAMS: &[&str] = &[
     "cdc_max_coalesced_bytes",
     "cdc_max_coalesce_age_ms",
     "cdc_commit_timeout_ms",
+    "cdc_delete_subbatch_max",
 ];
 
 /// Build a [`CdcConfig`] from the spicepod `runtime.params` map, reading
@@ -772,6 +824,13 @@ pub fn cdc_config_from_params(params: &std::collections::HashMap<String, String>
             CDC_COMMIT_TIMEOUT_MS_DEFAULT,
             CDC_COMMIT_TIMEOUT_MS_MAX,
         ) as u64),
+        delete_subbatch_max: resolve_cdc_param(
+            params,
+            "cdc_delete_subbatch_max",
+            "SPICE_CDC_DELETE_SUBBATCH_MAX",
+            CDC_DELETE_SUBBATCH_MAX_DEFAULT,
+            CDC_DELETE_SUBBATCH_MAX_MAX,
+        ),
     }
 }
 
@@ -827,6 +886,12 @@ pub(crate) fn cdc_config_overlay(
             usize::try_from(base.commit_timeout.as_millis()).unwrap_or(CDC_COMMIT_TIMEOUT_MS_MAX),
             CDC_COMMIT_TIMEOUT_MS_MAX,
         ) as u64),
+        delete_subbatch_max: overlay_usize(
+            dataset_params,
+            "cdc_delete_subbatch_max",
+            base.delete_subbatch_max,
+            CDC_DELETE_SUBBATCH_MAX_MAX,
+        ),
     }
 }
 
@@ -950,6 +1015,10 @@ impl RefreshTask {
         initial_load_completed: Arc<AtomicBool>,
     ) -> crate::accelerated_table::Result<()> {
         let dataset_name = self.dataset_name.clone();
+        // Prebuilt dataset metric labels reused by this stream's hot record sites
+        // (reader send-wait, apply cycle, coalesce flush, burst, fixed-cost
+        // phases). Clone is an `Arc` refcount bump — see `DatasetMetricLabels`.
+        let metric_labels = self.dataset_metric_labels.clone();
         let sql = refresh.read().await.display_sql();
 
         self.set_refresh_status(sql.as_deref(), status::ComponentStatus::Refreshing)
@@ -966,10 +1035,19 @@ impl RefreshTask {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<
             Result<cdc::ChangeEnvelope, cdc::StreamError>,
         >(cdc_cfg.prefetch_buffer);
+        // Weak handle so the apply loop can read the channel's live occupancy
+        // (`max_capacity - capacity`) for the backpressure gauge without keeping a
+        // strong `Sender` alive — an extra strong sender would stop `rx.recv()`
+        // ever returning `None`, hanging end-of-stream. `upgrade()` only succeeds
+        // while the reader's real sender lives, so it can never resurrect a closed
+        // channel.
+        let tx_probe = tx.downgrade();
 
         let reader_dataset = dataset_name.clone();
+        let reader_metric_labels = metric_labels.clone();
         let reader_handle = tokio::spawn(async move {
             let mut stream = changes_stream;
+            let send_labels = reader_metric_labels.dataset();
             // `select!` on `tx.closed()` lets the reader exit promptly even
             // when it is parked in `stream.next()`. This matters at shutdown:
             // when the parent task is aborted, its locals (including `rx`)
@@ -989,7 +1067,12 @@ impl RefreshTask {
                     }
                     item = stream.next() => {
                         let Some(item) = item else { return; };
-                        if tx.send(item).await.is_err() {
+                        // Time blocked on send: non-zero => the prefetch channel is
+                        // full and the apply loop can't drain fast enough (apply-bound).
+                        let send_start = Instant::now();
+                        let send_res = tx.send(item).await;
+                        metrics::CDC_READER_SEND_WAIT_MS.record(elapsed_ms(send_start), send_labels);
+                        if send_res.is_err() {
                             tracing::debug!(
                                 "CDC consumer for {reader_dataset} dropped; reader exiting"
                             );
@@ -1011,11 +1094,21 @@ impl RefreshTask {
         // silently stop advancing.
         let mut pending_commit: Option<tokio::task::JoinHandle<Result<(), String>>> = None;
         let mut pending_finalize: Option<PendingFinalizeCommit> = None;
+        // Previous iteration's recv-start, for the apply-cadence metric
+        // (`cdc_apply_cycle_ms`): the period between successive burst applies.
+        let mut prev_recv_start: Option<Instant> = None;
         let mut carried_item: Option<Result<cdc::ChangeEnvelope, cdc::StreamError>> = None;
+        // Receipt time of `carried_item`, captured when it is carried so the next
+        // iteration attributes its wait from true receipt rather than after it sat
+        // through this burst's apply. `_ms` (wall clock) feeds the arrival-lag gauge;
+        // `_at` (monotonic) feeds the coalesce batch-age. Only read when the next burst
+        // starts from the carry; always set together alongside `carried_item`.
+        let mut carried_received_ms: Option<i64> = None;
+        let mut carried_received_at: Option<Instant> = None;
         let mut last_cycle_start = Instant::now();
         let write_ctx = SessionContext::new();
         let write_session_state = write_ctx.state();
-        let recv_wait_labels = [KeyValue::new("dataset", dataset_name.to_string())];
+        let recv_wait_labels = metric_labels.dataset();
 
         // In-memory CDC durability (`cdc_durability: memory`): if this stream's
         // Cayenne provider is memory-capable, set up the deferred-commit queue.
@@ -1045,6 +1138,13 @@ impl RefreshTask {
             // record ~0, which is correct — no wait occurred. Pairs with
             // CDC_APPLY_BURST_DURATION_MS for full per-batch attribution.
             let recv_start = Instant::now();
+            // Apply cadence: period between successive burst recv-starts (ground-truths
+            // the per-stage attribution, which overstates the cycle where phases overlap).
+            if let Some(prev) = prev_recv_start {
+                metrics::CDC_APPLY_CYCLE_MS.record(elapsed_ms(prev), recv_wait_labels);
+            }
+            prev_recv_start = Some(recv_start);
+            let from_carried = carried_item.is_some();
             let next_item = match carried_item.take() {
                 Some(item) => Some(item),
                 // While waiting for the next source item, also drive any deferred
@@ -1092,6 +1192,7 @@ impl RefreshTask {
                             let mut context = ApplyContext {
                                 refresh_sql: sql.as_deref(),
                                 dataset_name: &dataset_name,
+                                metric_labels: &metric_labels,
                                 caching: caching.as_ref(),
                                 ready_sender: ready_sender.as_ref(),
                                 initial_load_completed: &initial_load_completed,
@@ -1120,10 +1221,70 @@ impl RefreshTask {
                     }
                 },
             };
-            metrics::CDC_SOURCE_RECV_WAIT_MS.record(elapsed_ms(recv_start), &recv_wait_labels);
+            metrics::CDC_SOURCE_RECV_WAIT_MS.record(elapsed_ms(recv_start), recv_wait_labels);
+            // Sample prefetch-channel occupancy at the moment the apply loop wakes
+            // (the just-received `first` is out of the buffer; whatever remains is
+            // the backlog the reader has queued ahead). Near capacity => apply-bound.
+            if let Some(tx) = tx_probe.upgrade() {
+                let capacity = tx.max_capacity() as u64;
+                let occupancy = capacity.saturating_sub(tx.capacity() as u64);
+                metrics::CDC_PREFETCH_BUFFER_OCCUPANCY.record(occupancy, recv_wait_labels);
+                metrics::CDC_PREFETCH_BUFFER_CAPACITY.record(capacity, recv_wait_labels);
+            }
             let Some(first) = next_item else {
                 break;
             };
+            // Staleness of this envelope AT ARRIVAL (now − its source commit ts):
+            // lag already present before the accelerator acts, separating source-side
+            // lag from lag the apply path adds (`cdc_source_arrival_lag_ms`).
+            if let Ok(env) = &first
+                // Exclude heartbeats: their server-clock timestamp would advance the
+                // received frontier past data not actually received mid-backlog,
+                // corrupting the rate ladder (see ChangeBatch::is_heartbeat).
+                && !env.is_heartbeat()
+                && let Some(commit_ts_ms) = env.source_commit_ts_ms()
+            {
+                // Ingress frontier (received commit ts) is recorded once per burst in
+                // `apply_burst` using the freshest commit timestamp across the coalesced
+                // burst, so it can be compared to the applied frontier (egress) without
+                // ever appearing to lag it.
+                //
+                // Arrival lag is per-burst-first: a carried first was received on the
+                // PREVIOUS iteration, so use its captured receipt time; a fresh first is
+                // arriving now. Measuring a carried item at process time would fold this
+                // burst's apply wait into its arrival lag and — because byte-cap pressure
+                // carries an item on nearly every burst — systematically under-sample the
+                // histogram in exactly the backlogged regime the metric is meant to diagnose.
+                let received_ms = if from_carried {
+                    carried_received_ms
+                } else {
+                    util::time::system_time_to_unix_ms(std::time::SystemTime::now())
+                };
+                if let Some(now_ms) = received_ms {
+                    // `saturating_sub` guards against overflow; `.max(0)` clamps future timestamps
+                    // (clock skew / bad source clock) to 0 so we never record negative arrival lag.
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        reason = "arrival lag in ms as f64 for the histogram; sub-ms precision is irrelevant at second/minute-scale backlogs"
+                    )]
+                    let arrival_lag_ms = now_ms.saturating_sub(commit_ts_ms).max(0) as f64;
+                    metrics::CDC_SOURCE_ARRIVAL_LAG_MS.record(arrival_lag_ms, recv_wait_labels);
+                }
+            }
+            // First envelope of this burst is now in hand; time from here until the
+            // apply below is the per-batch queued/coalescing latency
+            // (`cdc_coalesce_batch_age_ms`). `flush_reason` records what ended the
+            // coalesce (`cdc_coalesce_flush_total`). A carried first was received on the
+            // previous iteration and waited through the prior burst's apply, so anchor
+            // its batch age at that captured receipt rather than "now" (which would
+            // undercount the queued term exactly under byte-cap backlog).
+            let batch_first_received = if from_carried {
+                carried_received_at.unwrap_or_else(Instant::now)
+            } else {
+                Instant::now()
+            };
+            let mut linger_hit_deadline = false;
+            let mut shutdown_flush = false;
             // Coalesce a contiguous run of buffered envelopes into one
             // accelerator write, in two phases.
             //
@@ -1138,7 +1299,7 @@ impl RefreshTask {
             // (`last_cycle_start`) is reached.
             let mut burst: Vec<Result<cdc::ChangeEnvelope, cdc::StreamError>> =
                 Vec::with_capacity(8);
-            let mut burst_bytes = cdc_item_memory_size(&first);
+            let mut burst_bytes = cdc_item_budget_bytes(&first);
             burst.push(first);
             let max_burst = cdc_cfg.max_coalesced_envelopes;
             let max_burst_bytes = cdc_cfg.max_coalesced_bytes;
@@ -1150,12 +1311,15 @@ impl RefreshTask {
             while burst.len() < max_burst {
                 match rx.try_recv() {
                     Ok(item) => {
-                        let item_bytes = cdc_item_memory_size(&item);
+                        let item_bytes = cdc_item_budget_bytes(&item);
                         if burst_bytes > 0
                             && item_bytes > 0
                             && burst_bytes.saturating_add(item_bytes) > max_burst_bytes
                         {
                             carried_item = Some(item);
+                            carried_received_ms =
+                                util::time::system_time_to_unix_ms(std::time::SystemTime::now());
+                            carried_received_at = Some(Instant::now());
                             break;
                         }
                         burst_bytes = burst_bytes.saturating_add(item_bytes);
@@ -1183,21 +1347,27 @@ impl RefreshTask {
                     // Flush immediately on shutdown rather than waiting out the
                     // window — teardown must not block on intentional linger.
                     if self.runtime_status.is_shutdown() {
+                        shutdown_flush = true;
                         break;
                     }
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
+                        linger_hit_deadline = true;
                         break;
                     }
                     // `rx.recv()` is cancel-safe, so a timeout drops no envelope.
                     match tokio::time::timeout(remaining, rx.recv()).await {
                         Ok(Some(item)) => {
-                            let item_bytes = cdc_item_memory_size(&item);
+                            let item_bytes = cdc_item_budget_bytes(&item);
                             if burst_bytes > 0
                                 && item_bytes > 0
                                 && burst_bytes.saturating_add(item_bytes) > max_burst_bytes
                             {
                                 carried_item = Some(item);
+                                carried_received_ms = util::time::system_time_to_unix_ms(
+                                    std::time::SystemTime::now(),
+                                );
+                                carried_received_at = Some(Instant::now());
                                 break;
                             }
                             burst_bytes = burst_bytes.saturating_add(item_bytes);
@@ -1207,11 +1377,39 @@ impl RefreshTask {
                             channel_closed = true;
                             break;
                         }
-                        Err(_elapsed) => break,
+                        // The linger window elapsed with no further envelope — this
+                        // is a deadline flush (the common low-volume case), the same
+                        // outcome as the `remaining.is_zero()` check above.
+                        Err(_elapsed) => {
+                            linger_hit_deadline = true;
+                            break;
+                        }
                     }
                 }
-                metrics::CDC_LINGER_WAIT_MS.record(elapsed_ms(linger_start), &recv_wait_labels);
+                metrics::CDC_LINGER_WAIT_MS.record(elapsed_ms(linger_start), recv_wait_labels);
             }
+
+            // Attribute what ended coalescing and how long the head-of-batch
+            // envelope was queued, before the write begins. Priority: a carried
+            // item means the next envelope overflowed the byte budget; else a full
+            // burst is the envelope cap; else channel-close / shutdown / the linger
+            // deadline; else Phase-1 drained the buffer (or linger was disabled).
+            let flush_reason = if carried_item.is_some() {
+                "byte_cap"
+            } else if burst.len() >= max_burst {
+                "envelope_cap"
+            } else if channel_closed {
+                "channel_closed"
+            } else if shutdown_flush {
+                "shutdown"
+            } else if linger_hit_deadline {
+                "deadline"
+            } else {
+                "buffer_drained"
+            };
+            metrics::CDC_COALESCE_BATCH_AGE_MS
+                .record(elapsed_ms(batch_first_received), recv_wait_labels);
+            metrics::CDC_COALESCE_FLUSH_TOTAL.add(1, &metric_labels.tagged("reason", flush_reason));
 
             // Mark the start of this burst's processing cycle: the next burst's
             // linger deadline is measured from here, so the apply below counts as
@@ -1221,6 +1419,7 @@ impl RefreshTask {
             let mut apply_context = ApplyContext {
                 refresh_sql: sql.as_deref(),
                 dataset_name: &dataset_name,
+                metric_labels: &metric_labels,
                 caching: caching.as_ref(),
                 ready_sender: ready_sender.as_ref(),
                 initial_load_completed: &initial_load_completed,
@@ -1278,6 +1477,7 @@ impl RefreshTask {
                 let mut context = ApplyContext {
                     refresh_sql: sql.as_deref(),
                     dataset_name: &dataset_name,
+                    metric_labels: &metric_labels,
                     caching: caching.as_ref(),
                     ready_sender: ready_sender.as_ref(),
                     initial_load_completed: &initial_load_completed,
@@ -1372,21 +1572,36 @@ impl RefreshTask {
         let burst_envelopes = u64::try_from(burst.len()).unwrap_or(u64::MAX);
         let burst_bytes = burst
             .iter()
-            .map(cdc_item_memory_size)
+            .map(cdc_item_budget_bytes)
             .fold(0_usize, usize::saturating_add);
-        // Row-level change count: each Ok envelope's ChangeBatch carries one row
-        // per source change event, so summing num_rows across the burst yields
-        // the true number of records applied.
-        let burst_rows: u64 = burst
+        let labels = context.metric_labels.dataset();
+        metrics::CDC_APPLY_BURST_ENVELOPES.record(burst_envelopes, labels);
+        metrics::CDC_APPLY_BURST_BYTES
+            .record(u64::try_from(burst_bytes).unwrap_or(u64::MAX), labels);
+        // CDC_APPLY_BURST_ROWS_TOTAL is recorded from the built batches in
+        // `apply_envelope_run` (exact applied-row count) — `num_rows_hint()`
+        // over-counts a PK-changing UPDATE's delete+upsert as two rows.
+
+        // Freshest upstream commit timestamp in this burst, for the CDC
+        // replication-lag gauge. Computed here (before the burst is consumed by the
+        // apply loop below) but RECORDED only after the burst's Ok runs apply
+        // successfully — the gauge reflects APPLIED data, so a failed apply must not
+        // report artificially fresh lag. `source_commit_ts_ms` is stamped by the
+        // source connector (Postgres commit time, MongoDB change-stream cluster
+        // time, Debezium source ts); the max over the burst is the most recent.
+        // Sources that don't stamp a timestamp leave it `None`.
+        let max_commit_ts_ms = burst
             .iter()
             .filter_map(|item| item.as_ref().ok())
-            .map(|env| env.change_batch.record.num_rows() as u64)
-            .fold(0_u64, u64::saturating_add);
-        let labels = [KeyValue::new("dataset", context.dataset_name.to_string())];
-        metrics::CDC_APPLY_BURST_ENVELOPES.record(burst_envelopes, &labels);
-        metrics::CDC_APPLY_BURST_BYTES
-            .record(u64::try_from(burst_bytes).unwrap_or(u64::MAX), &labels);
-        metrics::CDC_APPLY_BURST_ROWS_TOTAL.add(burst_rows, &labels);
+            // Exclude heartbeats: a keepalive interleaved in a backlogged burst carries
+            // the server clock, which would inflate the applied frontier + lag gauge
+            // (applied appearing to outrun received). See ChangeBatch::is_heartbeat.
+            .filter(|env| !env.is_heartbeat())
+            .filter_map(cdc::ChangeEnvelope::source_commit_ts_ms)
+            .max();
+        if let Some(ts) = max_commit_ts_ms {
+            metrics::CDC_RECEIVED_COMMIT_UNIX_TIME_MS.record(ts, labels);
+        }
 
         // Walk the burst preserving arrival order, processing contiguous
         // runs of Ok envelopes together and Err items individually so error
@@ -1406,7 +1621,7 @@ impl RefreshTask {
 
                     if !self.apply_envelope_run(context, envelopes).await {
                         metrics::CDC_APPLY_BURST_DURATION_MS
-                            .record(elapsed_ms(burst_start), &labels);
+                            .record(elapsed_ms(burst_start), labels);
                         return false;
                     }
                 }
@@ -1428,16 +1643,32 @@ impl RefreshTask {
                 }
             }
         }
+        // Per-burst row count is not logged here: it's the exact
+        // `CDC_APPLY_BURST_ROWS_TOTAL` metric recorded in `apply_envelope_run`
+        // (from the built batches), not the pre-apply `num_rows_hint` upper bound.
         tracing::debug!(
             dataset = %context.dataset_name,
             envelopes = burst_envelopes,
             bytes = burst_bytes,
-            rows = burst_rows,
             close_reason,
             apply_ms = elapsed_ms(burst_start),
             "Applied coalesced CDC change burst"
         );
-        metrics::CDC_APPLY_BURST_DURATION_MS.record(elapsed_ms(burst_start), &labels);
+        metrics::CDC_APPLY_BURST_DURATION_MS.record(elapsed_ms(burst_start), labels);
+
+        // Record CDC progress only now that the burst's Ok runs have applied (the
+        // early `return false` above skips it, so a failed apply never reports fresh
+        // progress). The raw applied-commit watermark is emitted whenever the burst
+        // carried a source timestamp; the derived lag additionally needs a readable
+        // wall clock (skipped on pre-epoch / overflow rather than reporting a
+        // misleading 0ms).
+        if let Some(max_commit_ts_ms) = max_commit_ts_ms {
+            metrics::CDC_APPLIED_COMMIT_UNIX_TIME_MS.record(max_commit_ts_ms, labels);
+            if let Some(now_ms) = util::time::system_time_to_unix_ms(std::time::SystemTime::now()) {
+                metrics::CDC_REPLICATION_LAG_MS
+                    .record(now_ms.saturating_sub(max_commit_ts_ms).max(0), labels);
+            }
+        }
         true
     }
 
@@ -1518,7 +1749,7 @@ impl RefreshTask {
                     .await;
                     return false;
                 }
-                record_cdc_fixed_cost(context.dataset_name, "commit_wait", commit_wait_start);
+                record_cdc_fixed_cost(context.metric_labels, "commit_wait", commit_wait_start);
             }
 
             *context.pending_commit = Some(spawn_ordered_commit_task(
@@ -1552,7 +1783,29 @@ impl RefreshTask {
             Vec::with_capacity(envelopes.len());
         let mut batches: Vec<ChangeBatch> = Vec::with_capacity(envelopes.len());
         for env in envelopes {
-            let (committer, batch, _is_ready) = env.into_parts();
+            // Build the (possibly deferred) batch here, on the per-dataset apply
+            // task — off the source's shared read/route path. A deferred build
+            // can fail on per-row value typing that only surfaces at build time
+            // (e.g. an unmergeable unchanged-TOAST column under REPLICA IDENTITY
+            // DEFAULT); treat it as a terminal error for this dataset, mirroring
+            // the eager path's pump-side fatal. Committers collected so far are
+            // dropped without acking, so the source re-streams on reconnect.
+            let (committer, batch, _is_ready) = match env.into_parts_offloaded().await {
+                Ok(parts) => parts,
+                Err(e) => {
+                    let error_message = format!(
+                        "Failed to build CDC change batch for {}: {e}",
+                        context.dataset_name,
+                    );
+                    tracing::error!("{error_message}");
+                    self.set_refresh_status(
+                        context.refresh_sql,
+                        status::ComponentStatus::error_with_message(error_message),
+                    )
+                    .await;
+                    return false;
+                }
+            };
             committers.push(committer);
             batches.push(batch);
         }
@@ -1568,6 +1821,17 @@ impl RefreshTask {
         let groups = group_run_by_schema(batches, committers, split_on_schema_change);
         let last_group = groups.len().saturating_sub(1);
         for (group_idx, (group_batches, group_committers)) in groups.into_iter().enumerate() {
+            // Exact applied-row count for this group, summed from the just-built
+            // batches (no extra build — `into_parts` already built them);
+            // `num_rows_hint()` would over-count a PK-changing UPDATE as two
+            // rows. Computed before `apply_coalesced_run` consumes the batches,
+            // but recorded only AFTER the group applies, so a SkipRun/Stop
+            // failure can't inflate the throughput metric with rows that were
+            // never written.
+            let group_rows = group_batches
+                .iter()
+                .map(|b| b.record.num_rows() as u64)
+                .fold(0_u64, u64::saturating_add);
             match self
                 .apply_coalesced_run(
                     context,
@@ -1577,7 +1841,10 @@ impl RefreshTask {
                 )
                 .await
             {
-                CoalescedRunOutcome::Applied => {}
+                CoalescedRunOutcome::Applied => {
+                    metrics::CDC_APPLY_BURST_ROWS_TOTAL
+                        .add(group_rows, context.metric_labels.dataset());
+                }
                 // A skipped group's committers were dropped without acking —
                 // later groups must not apply (their commits would advance the
                 // source offset past the skipped, unapplied envelopes).
@@ -1627,7 +1894,7 @@ impl RefreshTask {
                 }
             }
         };
-        record_cdc_fixed_cost(context.dataset_name, "coalesce", coalesce_start);
+        record_cdc_fixed_cost(context.metric_labels, "coalesce", coalesce_start);
 
         #[cfg(not(windows))]
         let can_defer_current_burst = committers_all_support_deferral(&committers);
@@ -1688,7 +1955,7 @@ impl RefreshTask {
             .await
         {
             Ok(write_outcome) => {
-                record_cdc_fixed_cost(context.dataset_name, "write", write_start);
+                record_cdc_fixed_cost(context.metric_labels, "write", write_start);
 
                 if let Some(previous_pending) = context.pending_finalize.take() {
                     let finalize_start = Instant::now();
@@ -1706,7 +1973,7 @@ impl RefreshTask {
                         .await;
                         return CoalescedRunOutcome::Stop;
                     }
-                    record_cdc_fixed_cost(context.dataset_name, "finalize_wait", finalize_start);
+                    record_cdc_fixed_cost(context.metric_labels, "finalize_wait", finalize_start);
 
                     if !self
                         .run_finalize_side_effects(
@@ -1774,7 +2041,7 @@ impl RefreshTask {
                             return CoalescedRunOutcome::Stop;
                         }
                         record_cdc_fixed_cost(
-                            context.dataset_name,
+                            context.metric_labels,
                             "commit_wait",
                             commit_wait_start,
                         );
@@ -2027,11 +2294,13 @@ impl RefreshTask {
                 // A pending finalize is the durable Stage-B path — never memory
                 // mode (an in-memory-staged write has nothing to finalize), so no
                 // epoch to defer here.
+                record_cdc_apply_path(&self.dataset_metric_labels, "durable_append");
                 return Ok(UpsertOutcome {
                     pending_finalize: Some(spawn_cayenne_finalize(cayenne_write)),
                     in_memory_epoch: None,
                 });
             }
+            record_cdc_apply_path(&self.dataset_metric_labels, "inmem_append");
 
             cayenne_write
                 .finish()
@@ -2243,35 +2512,45 @@ impl RefreshTask {
     /// `CayenneTableProvider` misses through any of these, so without peeling the
     /// CDC apply silently falls back to the synchronous `insert_into` path and
     /// loses pipelined finalization (backgrounded publish, no blocking
-    /// `apply_on_conflict_deletions`). Mirrors the wrapper-peeling done by
-    /// `search::util::find_concrete_table_provider`.
+    /// `apply_on_conflict_deletions`).
+    ///
+    /// Uses [`find_concrete_table_provider_with`] with a *write-transparent* set
+    /// of accessors rather than the runtime-wide `DEFAULT_INNER_FNS`: only
+    /// wrappers whose `insert_into` is a pass-through may be peeled here.
+    ///
+    /// NOTE: `UpsertDedupTableProvider` is intentionally absent from the set.
+    /// Unlike `PolyTableProvider` (delegates writes) and `IndexedTableProvider`
+    /// (`insert_into` is a pass-through), it *rewrites* the write on insert
+    /// (dedup / last-write-wins via `UpsertDedupExec`). Routing CDC past it to the
+    /// inner provider would bypass that transform, so a dedup-configured table
+    /// instead stays on the synchronous path (through the wrapper, preserving its
+    /// semantics) and emits the fallback warning below.
     #[cfg(not(windows))]
     fn cayenne_accelerator(&self) -> Option<&CayenneTableProvider> {
-        let mut current: &Arc<dyn TableProvider> = &self.accelerator;
-        loop {
-            if let Some(cayenne) = current.downcast_ref::<CayenneTableProvider>() {
-                return Some(cayenne);
-            }
-            if let Some(poly) = current.downcast_ref::<data_components::poly::PolyTableProvider>() {
-                current = poly.writer_ref();
-                continue;
-            }
-            // NOTE: `UpsertDedupTableProvider` is intentionally NOT peeled. Unlike
-            // `PolyTableProvider` (delegates writes) and `IndexedTableProvider`
-            // (`insert_into` is a pass-through), it *rewrites* the write on insert
-            // (dedup / last-write-wins via `UpsertDedupExec`). Routing CDC past it to
-            // the inner provider would bypass that transform, so a dedup-configured
-            // table instead stays on the synchronous path (through the wrapper,
-            // preserving its semantics) and emits the fallback warning below. Only
-            // write-transparent wrappers are peeled here.
-            if let Some(indexed) =
-                current.downcast_ref::<runtime_datafusion_index::IndexedTableProvider>()
-            {
-                current = indexed.get_underlying_ref();
-                continue;
-            }
-            return None;
-        }
+        /// Peels [`PolyTableProvider`] to its writer side (write-transparent).
+        const POLY_WRITER_INNER: InnerProviderFn = |tbl| {
+            tbl.downcast_ref::<data_components::poly::PolyTableProvider>()
+                .map(data_components::poly::PolyTableProvider::writer_ref)
+        };
+
+        find_concrete_table_provider_with::<CayenneTableProvider>(
+            &self.accelerator,
+            &[POLY_WRITER_INNER, INDEXED_INNER],
+        )
+    }
+
+    /// Effective per-plan delete-key cap for this dataset: the process-global
+    /// [`CdcConfig`] with any per-dataset `cdc_*` overrides layered on. Read
+    /// once per Delete sub-batch (not per row), so runtime overrides apply
+    /// without threading config through the write path. Floored at 1 so
+    /// `chunks()` never sees a zero.
+    fn cdc_delete_subbatch_max(&self) -> usize {
+        let base = cdc_config();
+        let effective = match self.cdc_param_overrides.as_ref() {
+            Some(overrides) => cdc_config_overlay(base, overrides),
+            None => base,
+        };
+        effective.delete_subbatch_max.max(1)
     }
 
     /// Warn once per table when the CDC apply takes the synchronous fallback for
@@ -2353,22 +2632,51 @@ impl RefreshTask {
     ) -> crate::accelerated_table::Result<Option<u64>> {
         let dataset_name = &self.dataset_name;
 
+        if row_indices.is_empty() {
+            return Ok(None);
+        }
+
+        // Distribution of delete-burst sizes — the count of primary-keyed rows,
+        // i.e. the keys that feed the chunked durable `delete_from`. Recorded
+        // once per sub-batch on both the absorb and durable paths so the fleet
+        // can see how large delete bursts get — i.e. whether
+        // `cdc_delete_subbatch_max` ever binds. Keyless delete rows carry no key
+        // (they take the row-match path, not `delete_from`) and are excluded, so
+        // a mixed keyed+keyless burst is not over-counted as keys.
+        let keyed_count = row_indices
+            .iter()
+            .filter(|&&row| change_batch.has_primary_keys(row))
+            .count();
+        metrics::CDC_KEYS_PER_DELETE_BURST.record(
+            u64::try_from(keyed_count).unwrap_or(u64::MAX),
+            self.dataset_metric_labels.dataset(),
+        );
+
         // In-memory absorption: when the burst-level gate kept this burst on
         // the mem path, the slot advancer is armed and a capable Cayenne sink
         // turns the delete rows into mem-tier tombstones, deferring their
-        // durability to the covering checkpoint. `Ok(None)` from the absorb
-        // call (capability lost, inextractable keys, budget refusal after
-        // spill) falls through to the durable path below — safe in either ack
-        // mode, since durable deletes never sit ahead of the source slot.
+        // durability to the covering checkpoint. Any fall-through (capability
+        // lost, inextractable keys, budget refusal after spill) lands on the
+        // durable path below — safe in either ack mode, since durable deletes
+        // never sit ahead of the source slot — and records the reason so the
+        // eventual composite-key absorb fix can be aimed at the right cause.
         #[cfg(not(windows))]
-        if let Some(cayenne) = self.cayenne_accelerator()
-            && cayenne.supports_in_memory_cdc_deletes()
-            && cayenne.has_slot_advancer()
-            && !row_indices.is_empty()
-            && row_indices
+        let fallthrough_reason: &'static str = 'absorb: {
+            let Some(cayenne) = self.cayenne_accelerator() else {
+                break 'absorb "no_capability";
+            };
+            if !cayenne.supports_in_memory_cdc_deletes() {
+                break 'absorb "no_capability";
+            }
+            if !cayenne.has_slot_advancer() {
+                break 'absorb "no_advancer";
+            }
+            if !row_indices
                 .iter()
-                .all(|&row| !change_batch.primary_keys(row).is_empty())
-        {
+                .all(|&row| change_batch.has_primary_keys(row))
+            {
+                break 'absorb "inextractable_keys";
+            }
             let selected_batch = select_rows(&change_batch.data_batch(), row_indices)?;
             let absorbed = cayenne
                 .write_cdc_delete_keys_in_memory(&selected_batch)
@@ -2383,18 +2691,52 @@ impl RefreshTask {
                     epoch,
                     "Delete sub-batch absorbed into the in-memory CDC tier"
                 );
+                record_cdc_apply_path(&self.dataset_metric_labels, "inmem_delete");
                 self.update_last_updated_at();
                 return Ok(Some(epoch));
             }
-        }
+            // Gate passed but the sink declined the RAM write. In practice this
+            // is the mem-tier byte budget refusing after a spill attempt; a
+            // deeper key-extraction miss (all rows carried PKs at this layer) is
+            // far rarer, so attribute the fall-through to `budget`.
+            "budget"
+        };
 
+        // On Windows the in-memory absorb path is compiled out entirely, so
+        // every delete is durable — attribute it to the missing capability.
+        #[cfg(windows)]
+        let fallthrough_reason: &'static str = "no_capability";
+
+        metrics::CDC_DELETE_ABSORB_FALLTHROUGH.add(
+            1,
+            &self
+                .dataset_metric_labels
+                .tagged("reason", fallthrough_reason),
+        );
+
+        // Durable delete fallback (in-memory absorb declined, e.g. deletes cleared
+        // the slot-advancer). This synchronous path — lock wait, delete, then
+        // whole-burst maintenance — is far more expensive than in-memory absorption
+        // and, before these sub-phases, was invisible in the write-phase breakdown
+        // (it is not a cayenne write_phase). Decompose it so a table pinned here
+        // (new_order) shows WHERE its apply time goes.
+        record_cdc_apply_path(&self.dataset_metric_labels, "durable_delete");
         let (keyless_rows, keyed_rows): (Vec<_>, Vec<_>) = row_indices
             .iter()
             .copied()
-            .partition(|row| change_batch.primary_keys(*row).is_empty());
+            .partition(|row| !change_batch.has_primary_keys(*row));
 
         let mut wrote = false;
+        // Serialized with every other writer (and compaction); under contention this
+        // acquire alone can dominate a delete burst.
+        let lock_start = Instant::now();
         let _lock_guard = self.accelerator_write_mutex.lock().await;
+        record_cdc_fixed_cost(
+            &self.dataset_metric_labels,
+            "durable_delete_lock_wait",
+            lock_start,
+        );
+        let apply_start = Instant::now();
 
         if !keyless_rows.is_empty() {
             let selected_batch = select_rows(&change_batch.data_batch(), &keyless_rows)?;
@@ -2410,54 +2752,80 @@ impl RefreshTask {
             }
         }
 
-        let combined = build_batch_delete_expr_from_change_batch(
-            change_batch,
-            &keyed_rows,
-            dataset_name.to_string().as_str(),
-        )?;
+        // Cap the number of keys per durable `delete_from`: a burst of N keyed
+        // rows becomes ⌈N/cap⌉ independent, interruptible plans instead of one
+        // monolithic OR-tree predicate (the ~89s / ~50k-comparison execution
+        // that pegged prefetch and tripped walsender timeouts). The keys across
+        // chunks are distinct PKs, so each is deleted exactly once and
+        // cross-chunk ordering is not load-bearing; all chunks run under the
+        // single `_lock_guard` held for this call, so the burst stays isolated.
+        let cap = self.cdc_delete_subbatch_max();
+        let dataset_name_str = dataset_name.to_string();
+        for chunk in keyed_rows.chunks(cap) {
+            let combined = build_batch_delete_expr_from_change_batch(
+                change_batch,
+                chunk,
+                dataset_name_str.as_str(),
+            )?;
 
-        if let Some(combined) = combined {
-            // The CDC apply loop discards the "rows affected" count. Cayenne can
-            // handle key-delete CDC batches through a count-skipping path; non-
-            // Cayenne accelerators and shapes Cayenne declines fall back to the
-            // generic `delete_from` below.
-            let handled_by_cayenne_cdc_path = {
-                #[cfg(not(windows))]
-                {
-                    if let Some(cayenne) = self.cayenne_accelerator() {
-                        cayenne
-                            .delete_from_cdc_fast(std::slice::from_ref(&combined))
-                            .await
-                            .map_err(find_datafusion_root)
-                            .context(crate::accelerated_table::FailedToWriteDataSnafu)?
-                            .is_some()
-                    } else {
+            if let Some(combined) = combined {
+                // The CDC apply loop discards the "rows affected" count. Cayenne can
+                // handle key-delete CDC batches through a count-skipping path; non-
+                // Cayenne accelerators and shapes Cayenne declines fall back to the
+                // generic `delete_from` below. The predicate handed to either path
+                // is this chunk's (≤ `cap` keys), so the per-plan bound holds on
+                // both the fast and fallback paths.
+                let handled_by_cayenne_cdc_path = {
+                    #[cfg(not(windows))]
+                    {
+                        if let Some(cayenne) = self.cayenne_accelerator() {
+                            cayenne
+                                .delete_from_cdc_fast(std::slice::from_ref(&combined))
+                                .await
+                                .map_err(find_datafusion_root)
+                                .context(crate::accelerated_table::FailedToWriteDataSnafu)?
+                                .is_some()
+                        } else {
+                            false
+                        }
+                    }
+                    #[cfg(windows)]
+                    {
                         false
                     }
-                }
-                #[cfg(windows)]
-                {
-                    false
-                }
-            };
+                };
 
-            if !handled_by_cayenne_cdc_path {
-                let delete_plan = self
-                    .accelerator
-                    .delete_from(session_state, vec![combined])
-                    .await
-                    .map_err(find_datafusion_root)
-                    .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
-                collect(delete_plan, ctx.task_ctx())
-                    .await
-                    .map_err(find_datafusion_root)
-                    .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+                if !handled_by_cayenne_cdc_path {
+                    let delete_plan = self
+                        .accelerator
+                        .delete_from(session_state, vec![combined])
+                        .await
+                        .map_err(find_datafusion_root)
+                        .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+                    collect(delete_plan, ctx.task_ctx())
+                        .await
+                        .map_err(find_datafusion_root)
+                        .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+                }
+                wrote = true;
             }
-            wrote = true;
         }
+        record_cdc_fixed_cost(
+            &self.dataset_metric_labels,
+            "durable_delete_apply",
+            apply_start,
+        );
 
         if wrote {
+            // Whole-burst maintenance (compaction trigger) runs synchronously here —
+            // a prime contributor to a long durable-delete burst; time it separately.
+            let maint_start = Instant::now();
             perform_change_write_maintenance(&self.accelerator).await?;
+            record_cdc_fixed_cost(
+                &self.dataset_metric_labels,
+                "durable_delete_maintenance",
+                maint_start,
+            );
             self.update_last_updated_at();
         }
 
@@ -2533,21 +2901,32 @@ fn concat_change_batches(batches: &[ChangeBatch]) -> crate::accelerated_table::R
     })
 }
 
-fn cdc_item_memory_size(item: &Result<cdc::ChangeEnvelope, cdc::StreamError>) -> usize {
-    item.as_ref()
-        .map_or(0, |env| env.change_batch.record.get_array_memory_size())
+fn cdc_item_budget_bytes(item: &Result<cdc::ChangeEnvelope, cdc::StreamError>) -> usize {
+    // A coalescing byte-budget proxy, NOT a true in-memory Arrow size:
+    // `encoded_len` answers WITHOUT forcing a build — a deferred (e.g. Postgres)
+    // envelope from a schema-aware estimate of its buffered wire size, a built
+    // one from its actual Arrow size. Used only to bound how much a single burst
+    // accumulates before applying; the real Arrow build is deferred to apply
+    // time (`into_parts_offloaded`), off the source's shared read path.
+    item.as_ref().map_or(0, cdc::ChangeEnvelope::encoded_len)
 }
 
 fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
 
-fn record_cdc_fixed_cost(dataset_name: &TableReference, phase: &'static str, start: Instant) {
-    let labels = [
-        KeyValue::new("dataset", dataset_name.to_string()),
-        KeyValue::new("phase", phase),
-    ];
-    metrics::CDC_APPLY_FIXED_COST_MS.record(elapsed_ms(start), &labels);
+fn record_cdc_fixed_cost(labels: &DatasetMetricLabels, phase: &'static str, start: Instant) {
+    metrics::CDC_APPLY_FIXED_COST_MS.record(elapsed_ms(start), &labels.tagged("phase", phase));
+}
+
+/// Count which apply path a change sub-batch took. `inmem_append` / `inmem_delete`
+/// defer durability to the checkpoint (cheap); `durable_append` / `durable_delete`
+/// take the synchronous durable path (whole-burst commit + maintenance) — the
+/// expensive path a table is forced onto when a burst can't defer (e.g. deletes
+/// clear the slot-advancer). Reveals WHY a table's apply time is high, which the
+/// phase-coverage gap can only hint at.
+fn record_cdc_apply_path(labels: &DatasetMetricLabels, path: &'static str) {
+    metrics::CDC_APPLY_PATH_TOTAL.add(1, &labels.tagged("path", path));
 }
 
 fn select_rows(
@@ -3398,6 +3777,7 @@ mod tests {
             max_coalesced_bytes: 64 * 1024 * 1024,
             max_coalesce_age_ms: 250,
             commit_timeout: Duration::from_secs(30),
+            delete_subbatch_max: CDC_DELETE_SUBBATCH_MAX_DEFAULT,
         };
         let overlaid = cdc_config_overlay(
             base,
@@ -4022,6 +4402,32 @@ mod tests {
         .build()
     }
 
+    /// `make_refresh_task` with per-dataset `cdc_*` param overrides applied, so
+    /// a test can pin `cdc_delete_subbatch_max` regardless of the process-global
+    /// [`CdcConfig`].
+    fn make_refresh_task_with_cdc_params(
+        accelerator: Arc<dyn TableProvider>,
+        cdc_params: std::collections::HashMap<String, String>,
+    ) -> RefreshTask {
+        use crate::accelerated_table::refresh_task::RefreshTaskBuilder;
+        use crate::federated_table::FederatedTable;
+        use tokio::runtime::Handle;
+        use tokio::sync::Mutex;
+
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
+        RefreshTaskBuilder::new(
+            crate::status::RuntimeStatus::new(),
+            datafusion::sql::TableReference::bare("test".to_string()),
+            federated,
+            None,
+            accelerator,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .with_cdc_param_overrides(Some(Arc::new(cdc_params)))
+        .build()
+    }
+
     #[tokio::test]
     async fn test_write_change_upsert_returns_data_written() {
         let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
@@ -4147,6 +4553,73 @@ mod tests {
             .expect("collect should succeed");
         let remaining_rows: usize = remaining.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(remaining_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn test_delete_burst_chunks_at_subbatch_cap() {
+        // A single Delete sub-batch of N keyed rows must be applied as
+        // ⌈N/cap⌉ independent durable `delete_from` plans, and every cap must
+        // reach the identical end state (each key deleted exactly once).
+        const N: usize = 10;
+        let schema = Arc::new(create_test_data_schema());
+
+        for cap in [1usize, 3, 4, 10, 100] {
+            let ids: Vec<i32> = (0..i32::try_from(N).expect("N fits in i32")).collect();
+            let names: Vec<Option<&str>> = vec![Some("row"); N];
+            let initial = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int32Array::from(ids.clone())) as ArrayRef,
+                    Arc::new(StringArray::from(names.clone())) as ArrayRef,
+                ],
+            )
+            .expect("initial batch should be created");
+            let mem = Arc::new(
+                MemTable::try_new(Arc::clone(&schema), vec![vec![initial]])
+                    .expect("mem table should be created"),
+            );
+            let delete_plan_calls = Arc::new(AtomicUsize::new(0));
+            let provider = Arc::new(CountingDeleteProvider {
+                inner: Arc::clone(&mem) as Arc<dyn TableProvider>,
+                delete_plan_calls: Arc::clone(&delete_plan_calls),
+            }) as Arc<dyn TableProvider>;
+            let task = make_refresh_task_with_cdc_params(
+                provider,
+                std::collections::HashMap::from([(
+                    "cdc_delete_subbatch_max".to_string(),
+                    cap.to_string(),
+                )]),
+            );
+
+            let ops = vec!["d"; N];
+            let pks: Vec<Vec<&str>> = vec![vec!["id"]; N];
+            let change_batch = create_test_change_batch(ops, &pks, ids, names);
+
+            assert_eq!(
+                task.write_change(change_batch)
+                    .await
+                    .expect("delete burst should succeed"),
+                WriteChangeResult::DataWritten
+            );
+
+            let expected_plans = N.div_ceil(cap);
+            assert_eq!(
+                delete_plan_calls.load(AtomicOrdering::SeqCst),
+                expected_plans,
+                "N={N} keys with cap={cap} should execute ceil(N/cap)={expected_plans} delete plans"
+            );
+
+            let ctx = SessionContext::new();
+            let scan = mem
+                .scan(&ctx.state(), None, &[], None)
+                .await
+                .expect("scan should succeed");
+            let remaining = collect(scan, ctx.task_ctx())
+                .await
+                .expect("collect should succeed");
+            let remaining_rows: usize = remaining.iter().map(RecordBatch::num_rows).sum();
+            assert_eq!(remaining_rows, 0, "cap={cap}: every key should be deleted");
+        }
     }
 
     #[tokio::test]
@@ -4772,6 +5245,7 @@ mod tests {
             max_coalesced_bytes: 128 * 1024 * 1024,
             max_coalesce_age_ms,
             commit_timeout: Duration::from_secs(30),
+            delete_subbatch_max: CDC_DELETE_SUBBATCH_MAX_DEFAULT,
         }
     }
 
@@ -4923,6 +5397,7 @@ mod tests {
             max_coalesced_bytes: 1,
             max_coalesce_age_ms: 60_000,
             commit_timeout: Duration::from_secs(30),
+            delete_subbatch_max: CDC_DELETE_SUBBATCH_MAX_DEFAULT,
         };
 
         let stream: ChangesStream = YieldOnceThenParkStream {
@@ -5089,6 +5564,73 @@ mod tests {
             self.insert_execution_calls
                 .fetch_add(1, AtomicOrdering::SeqCst);
             self.inner.execute(partition, context)
+        }
+    }
+
+    /// Wraps a `TableProvider` and counts each `delete_from` call, delegating
+    /// the delete to the inner provider. Lets a test assert that an N-key
+    /// delete burst is applied as `⌈N/cap⌉` independent durable plans.
+    #[derive(Debug)]
+    struct CountingDeleteProvider {
+        inner: Arc<dyn TableProvider>,
+        delete_plan_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl TableProvider for CountingDeleteProvider {
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            self.inner.schema()
+        }
+
+        fn table_type(&self) -> datafusion::datasource::TableType {
+            self.inner.table_type()
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.inner.scan(state, projection, filters, limit).await
+        }
+
+        async fn insert_into(
+            &self,
+            state: &dyn Session,
+            input: Arc<dyn ExecutionPlan>,
+            insert_op: InsertOp,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.inner.insert_into(state, input, insert_op).await
+        }
+
+        async fn delete_from(
+            &self,
+            state: &dyn Session,
+            filters: Vec<Expr>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.delete_plan_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.inner.delete_from(state, filters).await
+        }
+
+        // Forward the behaviorally-meaningful optional methods to `inner` so the
+        // wrapper mirrors the wrapped provider rather than silently reverting to
+        // trait defaults (the wrapper-delegation footgun — statistics in
+        // particular changes planning).
+        fn constraints(&self) -> Option<&datafusion::common::Constraints> {
+            self.inner.constraints()
+        }
+
+        fn supports_filters_pushdown(
+            &self,
+            filters: &[&Expr],
+        ) -> DataFusionResult<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
+            self.inner.supports_filters_pushdown(filters)
+        }
+
+        fn statistics(&self) -> Option<datafusion::common::Statistics> {
+            self.inner.statistics()
         }
     }
 
@@ -5287,6 +5829,7 @@ mod tests {
         let task = make_refresh_task(provider as Arc<dyn TableProvider>);
         let log = CommitLog::new();
         let dataset_name = TableReference::bare("test");
+        let metric_labels = DatasetMetricLabels::new(&dataset_name);
         let initial_load_completed = Arc::new(AtomicBool::new(false));
         let mut pending_finalize = None;
         let mut pending_commit = None;
@@ -5295,6 +5838,7 @@ mod tests {
         let mut context = ApplyContext {
             refresh_sql: None,
             dataset_name: &dataset_name,
+            metric_labels: &metric_labels,
             caching: None,
             ready_sender: None,
             initial_load_completed: &initial_load_completed,
@@ -5520,6 +6064,7 @@ mod tests {
     #[tokio::test]
     async fn test_apply_envelope_run_mixed_schemas_applies_per_group_under_policy() {
         let dataset_name = TableReference::bare("schema_evo_mixed_groups");
+        let metric_labels = DatasetMetricLabels::new(&dataset_name);
         install_cdc_schema_evolution(
             &dataset_name,
             CdcSchemaEvolution {
@@ -5541,6 +6086,7 @@ mod tests {
         let mut context = ApplyContext {
             refresh_sql: None,
             dataset_name: &dataset_name,
+            metric_labels: &metric_labels,
             caching: None,
             ready_sender: None,
             initial_load_completed: &initial_load_completed,
@@ -5585,6 +6131,7 @@ mod tests {
     #[tokio::test]
     async fn test_apply_envelope_run_mixed_schemas_without_policy_keeps_error_skip() {
         let dataset_name = TableReference::bare("schema_evo_mixed_block");
+        let metric_labels = DatasetMetricLabels::new(&dataset_name);
         let task = make_refresh_task_named(
             "schema_evo_mixed_block",
             make_mem_table() as Arc<dyn TableProvider>,
@@ -5598,6 +6145,7 @@ mod tests {
         let mut context = ApplyContext {
             refresh_sql: None,
             dataset_name: &dataset_name,
+            metric_labels: &metric_labels,
             caching: None,
             ready_sender: None,
             initial_load_completed: &initial_load_completed,

@@ -23,7 +23,8 @@ use tokio::time::Instant;
 
 use runtime_request_context::RequestContext;
 
-use super::{error_code::ErrorCode, metrics};
+use super::error_code::ErrorCode;
+use runtime_metrics::query as metrics;
 
 #[derive(Clone)]
 pub(crate) struct QueryTracker {
@@ -80,17 +81,19 @@ impl QueryTracker {
             tags.push("error");
         }
 
+        // Build the datasets label once and reuse it for OTel metrics and
+        // task-history logging. Sort so the same set of datasets always
+        // produces the same joined string — HashSet iteration order would
+        // otherwise split identical workloads across multiple telemetry series
+        // (e.g. "a,b" vs "b,a").
         let mut dataset_names: Vec<String> =
             self.datasets.iter().map(ToString::to_string).collect();
-        // Sort so that the same set of datasets always produces the same
-        // joined string. Without this, HashSet iteration order would cause
-        // identical workloads to land on multiple distinct telemetry series
-        // (e.g. "a,b" vs "b,a").
         dataset_names.sort();
+        let datasets_label = dataset_names.join(",");
 
         let mut labels = vec![
             KeyValue::new("tags", tags.join(",")),
-            KeyValue::new("datasets", dataset_names.join(",")),
+            KeyValue::new("datasets", datasets_label.clone()),
         ];
 
         labels.extend(request_context.to_dimensions());
@@ -100,9 +103,9 @@ impl QueryTracker {
         // below. `finish` is the single terminal step for every tracked query
         // (normal completion, cache hit, and error paths all route through it),
         // so this counts each execution exactly once.
-        crate::metrics::telemetry::track_query_count(&labels);
-        crate::metrics::telemetry::track_query_duration(query_duration, &labels);
-        crate::metrics::telemetry::track_query_execution_duration(
+        runtime_metrics::telemetry::track_query_count(&labels);
+        runtime_metrics::telemetry::track_query_duration(query_duration, &labels);
+        runtime_metrics::telemetry::track_query_execution_duration(
             query_execution_duration,
             &labels,
         );
@@ -135,7 +138,7 @@ impl QueryTracker {
             metrics::FAILURES.add(1, &labels);
         }
 
-        trace_query(request_context, &self, captured_output);
+        trace_query(request_context, &self, captured_output, &datasets_label);
     }
 
     #[must_use]
@@ -167,6 +170,7 @@ fn trace_query(
     request_context: &RequestContext,
     query_tracker: &QueryTracker,
     captured_output: &str,
+    datasets_label: &str,
 ) {
     if let Some(error_code) = &query_tracker.error_code {
         tracing::info!(target: "task_history", error_code = %error_code, "labels");
@@ -190,12 +194,6 @@ fn trace_query(
         tracing::info!(target: "task_history", accelerated = true, "labels");
     }
 
-    let datasets_str = query_tracker
-        .datasets
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<String>>()
-        .join(",");
-    tracing::info!(target: "task_history", protocol = ?request_context.protocol(), datasets = datasets_str, "labels");
+    tracing::info!(target: "task_history", protocol = ?request_context.protocol(), datasets = datasets_label, "labels");
     tracing::info!(target: "task_history", captured_output = %captured_output);
 }

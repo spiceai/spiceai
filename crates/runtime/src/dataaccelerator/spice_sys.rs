@@ -23,7 +23,6 @@ limitations under the License.
     feature = "postgres-accel"
 ))]
 use std::path::Path;
-#[cfg(any(feature = "duckdb", feature = "turso"))]
 use std::sync::Arc;
 
 use super::AccelerationSource;
@@ -63,13 +62,7 @@ use {
 };
 
 use crate::component::dataset::acceleration::Engine;
-#[cfg(any(
-    feature = "duckdb",
-    feature = "sqlite",
-    feature = "turso",
-    feature = "postgres-accel"
-))]
-use crate::dataaccelerator::get_registered_accelerator;
+use crate::dataaccelerator::AcceleratorEngineRegistry;
 
 pub mod dataset_checkpoint;
 #[cfg(feature = "debezium")]
@@ -83,6 +76,9 @@ pub mod dynamodb;
 
 #[cfg(feature = "mongodb")]
 pub mod mongodb;
+
+#[cfg(feature = "mysql")]
+pub mod mysql_binlog;
 
 #[cfg(any(feature = "kafka", feature = "debezium"))]
 mod offsets;
@@ -208,7 +204,8 @@ impl Error {
         feature = "postgres",
         feature = "turso",
         feature = "kafka",
-        feature = "mongodb"
+        feature = "mongodb",
+        feature = "mysql"
     ))]
     fn external(err: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
         Self::External { source: err.into() }
@@ -229,13 +226,19 @@ async fn acceleration_connection(
         not(any(feature = "duckdb", feature = "sqlite", feature = "turso")),
         expect(unused_variables)
     )]
+    registry: Arc<AcceleratorEngineRegistry>,
+    #[cfg_attr(
+        not(any(feature = "duckdb", feature = "sqlite", feature = "turso")),
+        expect(unused_variables)
+    )]
     open_option: OpenOption,
 ) -> Result<AccelerationConnection> {
     let acceleration_settings = source.acceleration().context(AccelerationNotEnabledSnafu)?;
     match acceleration_settings.engine {
         #[cfg(feature = "duckdb")]
         Engine::DuckDB => {
-            let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
+            let accelerator = registry
+                .get_accelerator_engine(acceleration_settings.engine)
                 .await
                 .context(AcceleratorEngineUnavailableSnafu {
                     engine: Engine::DuckDB,
@@ -264,7 +267,8 @@ async fn acceleration_connection(
         }
         #[cfg(feature = "duckdb")]
         Engine::PartitionedDuckDB => {
-            let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
+            let accelerator = registry
+                .get_accelerator_engine(acceleration_settings.engine)
                 .await
                 .context(AcceleratorEngineUnavailableSnafu {
                     engine: Engine::PartitionedDuckDB,
@@ -287,7 +291,8 @@ async fn acceleration_connection(
         Engine::TableModePartitionedDuckDB => {
             use crate::dataaccelerator::partitioned_duckdb::tables_mode::TablesModePartitionedDuckDBAccelerator;
 
-            let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
+            let accelerator = registry
+                .get_accelerator_engine(acceleration_settings.engine)
                 .await
                 .context(AcceleratorEngineUnavailableSnafu {
                     engine: Engine::TableModePartitionedDuckDB,
@@ -312,7 +317,8 @@ async fn acceleration_connection(
         }
         #[cfg(feature = "sqlite")]
         Engine::Sqlite => {
-            let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
+            let accelerator = registry
+                .get_accelerator_engine(acceleration_settings.engine)
                 .await
                 .context(AcceleratorEngineUnavailableSnafu {
                     engine: Engine::Sqlite,
@@ -355,7 +361,8 @@ async fn acceleration_connection(
 
         #[cfg(feature = "turso")]
         Engine::Turso => {
-            let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
+            let accelerator = registry
+                .get_accelerator_engine(acceleration_settings.engine)
                 .await
                 .context(AcceleratorEngineUnavailableSnafu {
                     engine: Engine::Turso,
@@ -386,9 +393,9 @@ async fn acceleration_connection(
         #[cfg(all(not(windows), feature = "sqlite"))]
         Engine::Cayenne => {
             use datafusion_table_providers::sqlite::SqliteTableProviderFactory;
-            use std::sync::Arc;
 
-            let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
+            let accelerator = registry
+                .get_accelerator_engine(acceleration_settings.engine)
                 .await
                 .context(AcceleratorEngineUnavailableSnafu {
                     engine: Engine::Cayenne,

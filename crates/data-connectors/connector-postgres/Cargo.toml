@@ -32,6 +32,8 @@ fundu.workspace = true
 futures.workspace = true
 opentelemetry.workspace = true
 runtime = { path = "../../runtime" }
+runtime-api-types = { path = "../../runtime-api-types" }
+runtime-metrics = { path = "../../runtime-metrics" }
 secrecy.workspace = true
 snafu.workspace = true
 tokio.workspace = true
@@ -40,3 +42,6 @@ tracing.workspace = true
 
 [features]
 default = []
+
+[lints]
+workspace = true

@@ -515,10 +515,10 @@ impl Query {
                 return;
             };
 
-            if batches_to_cache.is_empty() {
-                return;
-            }
-
+            // Empty (0-row) revalidation results are cached too. The schema is
+            // preserved separately in `CachedQueryResult`, so an empty result
+            // refreshes the entry correctly rather than leaving the previous
+            // (now stale) value in place.
             let cached_at = std::time::Instant::now();
             let encoder = cache_provider.encoder();
 
@@ -1170,6 +1170,67 @@ mod tests {
                 // Since cache-control is set, an invalid key with repeated query will fall back
                 // to the default plan-key behavior and result in a cache hit
                 assert_eq!(result.cache_status, CacheStatus::CacheHit);
+            })
+            .await;
+    }
+
+    /// Regression test for empty (0-row) result sets not being cached.
+    ///
+    /// `SELECT 1 WHERE 1=0` is optimized to an `EmptyRelation`/`EmptyExec`,
+    /// which yields **zero** record batches. Such a result must still be cached
+    /// so the second identical request is served from cache instead of being
+    /// re-executed against the source.
+    #[tokio::test]
+    async fn test_empty_result_set_is_cached() {
+        let df = prepare_runtime(Some(SQLResultsCacheConfig {
+            item_ttl: Some("10m".to_string()),
+            cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+            ..Default::default()
+        }))
+        .await;
+
+        let request_context =
+            create_test_request_context(CacheControl::Cache(CacheKeyType::Raw), None);
+
+        // First request: cache miss, populates the cache when drained.
+        let query = QueryBuilder::new("SELECT 1 WHERE 1=0", Arc::clone(&df)).build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                assert_eq!(result.cache_status, CacheStatus::CacheMiss);
+                let records = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should collect");
+                let total_rows: usize = records
+                    .iter()
+                    .map(arrow::array::RecordBatch::num_rows)
+                    .sum();
+                assert_eq!(total_rows, 0, "result set should be empty");
+            })
+            .await;
+
+        // Second request: must be a cache hit for the empty result set.
+        let query = QueryBuilder::new("SELECT 1 WHERE 1=0", Arc::clone(&df)).build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                assert_eq!(
+                    result.cache_status,
+                    CacheStatus::CacheHit,
+                    "empty result sets should be served from cache on repeat requests"
+                );
+                let records = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should collect");
+                let total_rows: usize = records
+                    .iter()
+                    .map(arrow::array::RecordBatch::num_rows)
+                    .sum();
+                assert_eq!(total_rows, 0, "cached empty result should still be empty");
             })
             .await;
     }

@@ -218,7 +218,8 @@ pub fn build_changes_stream(
                 )))?;
             let ready = build_ready_signal_envelope(&schema)
                 .map_err(|error| StreamError::Arrow(error.to_string()))?;
-            let (_, batch, is_ready) = ready.into_parts();
+            let (_, batch, is_ready) = ready.into_parts()
+                .map_err(|error| StreamError::Arrow(error.to_string()))?;
             let committer: Box<dyn CommitChange + Send + Sync> = match mongo_sys.as_ref() {
                 Some(sys) => Box::new(MongoResumeTokenCommitter::new(
                     Arc::clone(sys),

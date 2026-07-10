@@ -73,6 +73,7 @@ pub(crate) async fn provision_scp_app(
         executor_storage_size_gb: res.executor_storage_size_gb,
         ephemeral_storage_limit_gb: res.ephemeral_storage_gb.clone(),
         organization_tag: scp.organization_tag.clone(),
+        cluster_name: scp.cluster_name.clone(),
     };
     eprintln!(
         "[stdio] App resource config: \

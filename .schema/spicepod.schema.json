@@ -1161,12 +1161,66 @@
             "null"
           ]
         },
+        "batch_size": {
+          "description": "Controls how `DataFusion` execution batch size is selected for Flight `DoGet` result streams.\nDefaults to adaptive sizing capped at 131072 rows per batch.",
+          "$ref": "#/$defs/FlightBatchSize"
+        },
+        "ipc_compression": {
+          "description": "Arrow IPC compression to use for Flight `DoGet` result batches.\nDefaults to `none` for broad client compatibility.",
+          "$ref": "#/$defs/FlightIpcCompression"
+        },
         "do_put_rate_limit_enabled": {
           "description": "Whether to enable rate limiting on Flight `DoPut` (write) requests.\nDefaults to `true`. Set to `false` to disable write rate limiting for bulk ingest workloads.",
           "type": "boolean",
           "default": true
         }
       }
+    },
+    "FlightBatchSize": {
+      "oneOf": [
+        {
+          "description": "Use the session's configured `DataFusion` execution batch size.",
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "default"
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "Increase the batch size for large estimated Flight result sets, capped by `max`.",
+          "type": "object",
+          "properties": {
+            "max": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "mode": {
+              "type": "string",
+              "const": "adaptive"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "mode",
+            "max"
+          ]
+        }
+      ]
+    },
+    "FlightIpcCompression": {
+      "type": "string",
+      "enum": [
+        "none",
+        "lz4_frame",
+        "zstd"
+      ]
     },
     "McpConfig": {
       "description": "Configuration for the MCP (Model Context Protocol) HTTP endpoint.",
@@ -1244,6 +1298,22 @@
           ],
           "format": "uint",
           "minimum": 0
+        },
+        "max_concurrent_queries": {
+          "description": "Bounds the number of query-executing plans that may run concurrently —\nordinary queries, DDL/DML, and `EXECUTE`; lightweight session-state\nstatements (`PREPARE`/`DEALLOCATE`/`SET`) are not gated. Excess plans wait\n(admission control) rather than oversubscribing the shared query runtime\nand memory pool and starving each other under load (e.g. analytical\nqueries alongside CDC ingestion and compaction). The permit is held for\nthe plan's full execution and result-streaming lifetime; a results-cache\nhit is never gated. Unset = unbounded (the prior behavior). A configured\nvalue is clamped to a minimum of `1` in the runtime builder, so `0` means\none concurrent query (not unbounded).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "prefer_hash_join": {
+          "description": "Prefer hash joins over sort-merge joins during physical planning. Maps to\n`datafusion.optimizer.prefer_hash_join`; defaults to `true` (hash joins).\nSet to `false` for very large analytical joins that would otherwise\nexhaust the query memory pool: `HashJoinExec` build sides are not\nspillable, whereas sort-merge joins spill to disk.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       }
     },
@@ -1850,6 +1920,9 @@
             },
             "check_availability": {
               "$ref": "#/$defs/CheckAvailability"
+            },
+            "schema_inference": {
+              "$ref": "#/$defs/SchemaInference"
             },
             "mode": {
               "$ref": "#/$defs/AccessMode"
@@ -2505,6 +2578,9 @@
             "$ref": "#/$defs/OnConflictBehavior"
           }
         },
+        "maintained_aggregates": {
+          "$ref": "#/$defs/MaintainedAggregates"
+        },
         "write_mode": {
           "description": "Controls write behavior for read-write accelerated datasets.\nOnly applies when `access: read_write` and the dataset is accelerated.",
           "$ref": "#/$defs/WriteMode"
@@ -2833,6 +2909,103 @@
         "upsert_dedup_by_row_id"
       ]
     },
+    "MaintainedAggregates": {
+      "description": "Maintained aggregate configuration.\n\nAccepts the original list form:\n`maintained_aggregates: [{ group_by: ..., aggregates: ... }]`, or a policy\nform with `mode` and `views` when the configured specs should be kept but\nnot maintained.",
+      "anyOf": [
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MaintainedAggregate"
+          }
+        },
+        {
+          "$ref": "#/$defs/MaintainedAggregatesConfig"
+        },
+        {
+          "$ref": "#/$defs/MaintainAggregates"
+        }
+      ]
+    },
+    "MaintainedAggregate": {
+      "description": "A Cayenne-maintained aggregate view declaration.",
+      "type": "object",
+      "properties": {
+        "group_by": {
+          "description": "Columns used as the `GROUP BY` key, in query output order.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "aggregates": {
+          "description": "Aggregate expressions maintained for each group, in query output order.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MaintainedAggregateExpr"
+          }
+        },
+        "filter_sql": {
+          "description": "Optional SQL row predicate (a `WHERE` expression over the dataset's\ncolumns, e.g. `ol_delivery_d > '2007-01-02'`) selecting which rows\ncontribute to the view. When set, an accelerator that supports it\nmaintains the aggregate over only the matching rows and serves a query\ncarrying the identical predicate from that maintained state — letting a\nfiltered analytical query (the common dashboard shape) be answered from\nthe incrementally-maintained view instead of a full re-scan.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "MaintainedAggregateExpr": {
+      "description": "One aggregate expression inside a maintained aggregate view.",
+      "type": "object",
+      "properties": {
+        "function": {
+          "$ref": "#/$defs/MaintainedAggregateFunction"
+        },
+        "column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "function"
+      ]
+    },
+    "MaintainedAggregateFunction": {
+      "description": "Aggregate functions supported by Cayenne maintained aggregate views.",
+      "type": "string",
+      "enum": [
+        "count",
+        "sum",
+        "avg"
+      ]
+    },
+    "MaintainedAggregatesConfig": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/MaintainAggregates",
+          "default": "disabled"
+        },
+        "views": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MaintainedAggregate"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "MaintainAggregates": {
+      "description": "Controls whether configured maintained aggregates are materialized and\nupdated incrementally by accelerators that support them.",
+      "type": "string",
+      "enum": [
+        "disabled",
+        "enabled"
+      ]
+    },
     "WriteMode": {
       "description": "Controls the write behavior for accelerated read-write datasets.\n\n- `write_through` (default): Writes go to the federated source (e.g. Postgres)\n  synchronously. The user receives confirmation after a full ACID commit to the\n  source. The local accelerator is updated via the normal refresh mechanism\n  (e.g. WAL replication with `refresh_mode: changes`).\n\n- `write_back`: Writes commit to the local accelerator first and return after\n  that accelerator commit completes. The same mutation is then forwarded to\n  the federated source asynchronously, so the source may lag and source\n  persistence failures are logged rather than returned to the caller. This\n  mode requires `replication.enabled: true` as an explicit opt-in to those\n  asynchronous source durability semantics.",
       "type": "string",
@@ -3129,6 +3302,21 @@
         }
       ]
     },
+    "SchemaInference": {
+      "description": "Selects the depth of source-schema inference.\n\nBase column/type inference is always performed and required — this knob only\ncontrols whether the runtime *additionally* infers the table's primary key,\nsecondary indexes, and sort/clustering columns to fill acceleration settings\nthe user did not specify in the Spicepod.\n\nApplies to all refresh modes. Only connectors that emit inferred-schema\nmetadata (currently `PostgreSQL` and `MongoDB`) are affected; others treat\n`extended` as a no-op.",
+      "oneOf": [
+        {
+          "description": "Base column/type inference only (default) — exactly as before. The column\nschema is always inferred from the source; no primary-key/index/sort\ndetection is performed.",
+          "type": "string",
+          "const": "standard"
+        },
+        {
+          "description": "In addition to the base column schema, auto-detect and apply the primary\nkey, secondary indexes, and sort/clustering columns from the source when\nthey are not explicitly configured.",
+          "type": "string",
+          "const": "extended"
+        }
+      ]
+    },
     "ComponentOrReference3": {
       "anyOf": [
         {
@@ -3192,6 +3380,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "params": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Params"
             },
             {
               "type": "null"
@@ -4567,6 +4765,21 @@
           "type": "string",
           "x-secret": true
         },
+        "kafka_ssl_certificate_location": {
+          "description": "Path to the client SSL/TLS certificate file for mTLS authentication.",
+          "type": "string",
+          "x-secret": true
+        },
+        "kafka_ssl_key_location": {
+          "description": "Path to the client SSL/TLS private key file for mTLS authentication.",
+          "type": "string",
+          "x-secret": true
+        },
+        "kafka_ssl_key_password": {
+          "description": "Password for the client SSL/TLS private key, if encrypted.",
+          "type": "string",
+          "x-secret": true
+        },
         "kafka_enable_ssl_certificate_verification": {
           "description": "Enable SSL/TLS certificate verification. Default: 'true'.",
           "type": "string",
@@ -5728,6 +5941,24 @@
           "description": "Timeout for idle connections in the pool (in seconds). Default: 90",
           "type": "string"
         },
+        "http_tls_client_certificate_file": {
+          "description": "Path to a PEM client certificate chain to present during the TLS handshake when the upstream HTTP server requires mutual TLS. Must be set together with 'tls_client_key_file'. Mutually exclusive with 'tls_client_certificate' and 'tls_client_key'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params.",
+          "type": "string"
+        },
+        "http_tls_client_key_file": {
+          "description": "Path to the PEM private key matching 'tls_client_certificate_file'. Must be set together with 'tls_client_certificate_file'. Mutually exclusive with 'tls_client_certificate' and 'tls_client_key'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params.",
+          "type": "string"
+        },
+        "http_tls_client_certificate": {
+          "description": "Inline PEM client certificate chain (or ${ secrets:... } reference) to present during the TLS handshake for mutual TLS. Must be set together with 'tls_client_key'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params.",
+          "type": "string",
+          "x-secret": true
+        },
+        "http_tls_client_key": {
+          "description": "Inline PEM private key (or ${ secrets:... } reference) matching 'tls_client_certificate'. Must be set together with 'tls_client_certificate'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params.",
+          "type": "string",
+          "x-secret": true
+        },
         "http_headers": {
           "description": "Custom HTTP headers to include in requests. Format: 'Header1: Value1, Header2: Value2'. Headers are applied to all requests.",
           "type": "string"
@@ -6059,6 +6290,24 @@
         "pool_idle_timeout": {
           "description": "Timeout for idle connections in the pool (in seconds). Default: 90",
           "type": "string"
+        },
+        "http_tls_client_certificate_file": {
+          "description": "Path to a PEM client certificate chain to present during the TLS handshake when the upstream HTTP server requires mutual TLS. Must be set together with 'tls_client_key_file'. Mutually exclusive with 'tls_client_certificate' and 'tls_client_key'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params.",
+          "type": "string"
+        },
+        "http_tls_client_key_file": {
+          "description": "Path to the PEM private key matching 'tls_client_certificate_file'. Must be set together with 'tls_client_certificate_file'. Mutually exclusive with 'tls_client_certificate' and 'tls_client_key'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params.",
+          "type": "string"
+        },
+        "http_tls_client_certificate": {
+          "description": "Inline PEM client certificate chain (or ${ secrets:... } reference) to present during the TLS handshake for mutual TLS. Must be set together with 'tls_client_key'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params.",
+          "type": "string",
+          "x-secret": true
+        },
+        "http_tls_client_key": {
+          "description": "Inline PEM private key (or ${ secrets:... } reference) matching 'tls_client_certificate'. Must be set together with 'tls_client_certificate'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params.",
+          "type": "string",
+          "x-secret": true
         },
         "http_headers": {
           "description": "Custom HTTP headers to include in requests. Format: 'Header1: Value1, Header2: Value2'. Headers are applied to all requests.",
@@ -6456,6 +6705,11 @@
           "description": "Configure socket connection timeout, in seconds (default: 60).",
           "type": "string"
         },
+        "iceberg_s3_path_style_access": {
+          "description": "Controls S3 addressing style. Defaults to 'true' (path-style: endpoint/bucket), which is required for object stores such as MinIO. Set to 'false' to use virtual-hosted-style (bucket.endpoint).",
+          "type": "string",
+          "default": "true"
+        },
         "iceberg_gcs_project_id": {
           "description": "The Google Cloud project ID for GCS storage.",
           "type": "string"
@@ -6525,6 +6779,21 @@
         },
         "kafka_ssl_ca_location": {
           "description": "Path to the SSL/TLS CA certificate file for server verification.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
+          "type": "string",
+          "x-secret": true
+        },
+        "kafka_ssl_certificate_location": {
+          "description": "Path to the client SSL/TLS certificate file for mTLS authentication.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
+          "type": "string",
+          "x-secret": true
+        },
+        "kafka_ssl_key_location": {
+          "description": "Path to the client SSL/TLS private key file for mTLS authentication.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
+          "type": "string",
+          "x-secret": true
+        },
+        "kafka_ssl_key_password": {
+          "description": "Password for the client SSL/TLS private key, if encrypted.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
           "type": "string",
           "x-secret": true
         },
@@ -6843,20 +7112,20 @@
           "type": "string"
         },
         "spiceai_tls_client_certificate_file": {
-          "description": "Path to a PEM client certificate chain to present during the TLS handshake when the upstream Spice runtime requires mutual TLS. Must be set together with 'tls_client_key_file'. Mutually exclusive with 'tls_client_certificate'.",
+          "description": "Path to a PEM client certificate chain to present during the TLS handshake when the upstream Spice runtime requires mutual TLS. Must be set together with 'tls_client_key_file'. Mutually exclusive with 'tls_client_certificate' and 'tls_client_key'.",
           "type": "string"
         },
         "spiceai_tls_client_key_file": {
-          "description": "Path to the PEM private key matching 'tls_client_certificate_file'. Must be set together with 'tls_client_certificate_file'. Mutually exclusive with 'tls_client_key'.",
+          "description": "Path to the PEM private key matching 'tls_client_certificate_file'. Must be set together with 'tls_client_certificate_file'. Mutually exclusive with 'tls_client_certificate' and 'tls_client_key'.",
           "type": "string"
         },
         "spiceai_tls_client_certificate": {
-          "description": "Inline PEM client certificate chain (or ${ secrets:... } reference) to present during the TLS handshake for mutual TLS. Must be set together with 'tls_client_key'. Mutually exclusive with 'tls_client_certificate_file'.",
+          "description": "Inline PEM client certificate chain (or ${ secrets:... } reference) to present during the TLS handshake for mutual TLS. Must be set together with 'tls_client_key'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'.",
           "type": "string",
           "x-secret": true
         },
         "spiceai_tls_client_key": {
-          "description": "Inline PEM private key (or ${ secrets:... } reference) matching 'tls_client_certificate'. Must be set together with 'tls_client_certificate'. Mutually exclusive with 'tls_client_key_file'.",
+          "description": "Inline PEM private key (or ${ secrets:... } reference) matching 'tls_client_certificate'. Must be set together with 'tls_client_certificate'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'.",
           "type": "string",
           "x-secret": true
         }
@@ -6889,20 +7158,20 @@
           "type": "string"
         },
         "spiceai_tls_client_certificate_file": {
-          "description": "Path to a PEM client certificate chain to present during the TLS handshake when the upstream Spice runtime requires mutual TLS. Must be set together with 'tls_client_key_file'. Mutually exclusive with 'tls_client_certificate'.",
+          "description": "Path to a PEM client certificate chain to present during the TLS handshake when the upstream Spice runtime requires mutual TLS. Must be set together with 'tls_client_key_file'. Mutually exclusive with 'tls_client_certificate' and 'tls_client_key'.",
           "type": "string"
         },
         "spiceai_tls_client_key_file": {
-          "description": "Path to the PEM private key matching 'tls_client_certificate_file'. Must be set together with 'tls_client_certificate_file'. Mutually exclusive with 'tls_client_key'.",
+          "description": "Path to the PEM private key matching 'tls_client_certificate_file'. Must be set together with 'tls_client_certificate_file'. Mutually exclusive with 'tls_client_certificate' and 'tls_client_key'.",
           "type": "string"
         },
         "spiceai_tls_client_certificate": {
-          "description": "Inline PEM client certificate chain (or ${ secrets:... } reference) to present during the TLS handshake for mutual TLS. Must be set together with 'tls_client_key'. Mutually exclusive with 'tls_client_certificate_file'.",
+          "description": "Inline PEM client certificate chain (or ${ secrets:... } reference) to present during the TLS handshake for mutual TLS. Must be set together with 'tls_client_key'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'.",
           "type": "string",
           "x-secret": true
         },
         "spiceai_tls_client_key": {
-          "description": "Inline PEM private key (or ${ secrets:... } reference) matching 'tls_client_certificate'. Must be set together with 'tls_client_certificate'. Mutually exclusive with 'tls_client_key_file'.",
+          "description": "Inline PEM private key (or ${ secrets:... } reference) matching 'tls_client_certificate'. Must be set together with 'tls_client_certificate'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'.",
           "type": "string",
           "x-secret": true
         }
@@ -7010,17 +7279,34 @@
           ]
         },
         "cayenne_segment_cache_mb": {
-          "description": "Size of the in-memory Vortex segment cache in MB. Set > 0 to cache decompressed data segments. Default: 256 MB",
+          "description": "Size of the in-memory Vortex decompressed-segment cache in MB. 'auto' (default, or when unset) scales with machine memory (~1/128 of RAM) but never below 256 MB and never above 1024 MB. Set an explicit MB value to override.",
           "type": "string",
-          "default": "256"
+          "default": "auto"
+        },
+        "cayenne_pk_keyset_cache_mb": {
+          "description": "Byte budget (in MB) for the in-memory primary-key index used to detect upsert conflicts during CDC ingestion. Within budget an exact keyset is kept; over budget, upsert tables fall back to a bounded bloom existence filter (avoiding the per-batch full-table rebuild) while DoNothing tables rebuild from a scan. When unset, an optimal default is derived from available machine memory.",
+          "type": "string"
         },
         "cayenne_target_file_size_mb": {
-          "description": "Target size for Vortex data files in MB. Default: 256 MB. Adjust as needed for S3 Express or remote upload scenarios.",
+          "description": "Target size for Vortex data files in MB. 'auto' (default, or when unset) is storage-aware: 256 MB on EBS-class network storage, 64 MB on RAM-backed (tmpfs) mounts, and the 256 MB engine default on local SSD / unknown / S3. Set an explicit MB value to override.",
           "type": "string",
-          "default": "256"
+          "default": "auto"
+        },
+        "cayenne_force_view_types": {
+          "description": "When 'true' (default), Cayenne advertises and decodes string and binary columns as Arrow view types (Utf8View/BinaryView) on the query/scan path so DataFusion plans joins and aggregates on view arrays, avoiding the i32 2 GiB offset overflow in hash-join build-side batch concatenation at scale. The stored schema keeps Utf8/Binary for writes, CDC, and stats. Set 'false' to opt out.",
+          "type": "string",
+          "default": "true",
+          "enum": [
+            "true",
+            "false"
+          ]
         },
         "cayenne_sort_columns": {
           "description": "Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id').",
+          "type": "string"
+        },
+        "cayenne_shard_key_columns": {
+          "description": "Comma-separated list of columns to hash-cluster rows by during intra-write sharding (the parallel encode fan-out), e.g. 'tenant_id'. When unset, the shard key derives from the primary key (PK-hash clustering); tables without a primary key shard round-robin. Extended schema inference (schema_inference: extended) fills this from the source's declared partition/shard key when the user leaves it unset. Ignored for sorted tables: sort_columns forces a single serial writer.",
           "type": "string"
         },
         "cayenne_compression_strategy": {
@@ -7032,6 +7318,11 @@
             "zstd"
           ]
         },
+        "cayenne_delta_encoding": {
+          "description": "Encoding effort for fresh delta writes (CDC/append snapshot files), zstd-style. 'auto' (default) size-gates: deltas smaller than a quarter of the target file size encode with a light scheme set (skipping the per-file encoder-strategy search and FSST training) and are re-encoded by compaction; larger or unknown-size writes use the full default. Explicit levels 0..=10 pin the effort (0 = uncompressed canonical, 7 = the full default cascade i.e. the explicit opt-out, 8..=10 reserved). Compaction and rewrite outputs always use the full default encoding regardless of this setting.",
+          "type": "string",
+          "default": "auto"
+        },
         "cayenne_pk_conflict_detection": {
           "description": "Whether Cayenne scans existing primary keys on insert. 'auto' (default) detects conflicts and applies on_conflict behavior. 'none' skips conflict detection and is only safe when the source enforces primary-key uniqueness and the ingestion path cannot replay existing rows, such as steady-state append-only CDC after bootstrap.",
           "type": "string",
@@ -7041,16 +7332,34 @@
             "none"
           ]
         },
+        "cayenne_deletion_mode": {
+          "description": "How primary-key deletions are recorded and applied. 'auto' (default) resolves to 'key' for refresh_mode: changes tables with a primary key (key-based deletes compact concurrently with writers and ride the in-memory CDC tier, where position-delete compaction must serialize with continuous writes), and to 'position' (merge-on-read) everywhere else: per-file row-position bitmaps are pushed into the Vortex scan, skipping deleted pages at the storage layer with no per-row CPU. For a primary-key table positions are captured via a row_idx() read-back after each write, with key-based fallback for any row whose position is not yet known; a table without a primary key uses the existing position-based strategy. 'key' applies deletes above the Vortex scan via a per-row RowConverter probe; 'position' explicitly opts a CDC table back into merge-on-read.",
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "key",
+            "position"
+          ]
+        },
         "cayenne_upload_concurrency": {
-          "description": "Maximum number of concurrent file uploads when writing multiple Vortex files. Defaults to available CPU parallelism.",
+          "description": "Maximum number of concurrent file uploads when writing multiple Vortex files. 'auto' (or unset) uses available CPU parallelism. The aggregate encode concurrency across all Cayenne tables is separately bounded by a process-global budget sized to the host core count.",
           "type": "string"
         },
         "cayenne_write_concurrency": {
-          "description": "Optional writer partition override for unsorted Cayenne ingests. Defaults to runtime.query.target_partitions.",
+          "description": "Writer partition override (parallel encoders) for unsorted Cayenne ingests. 'auto' (or unset) uses a small fixed default of 4, capped at the host core count (= runtime.query.target_partitions) and the process-global encode budget — deliberately not the full core count, because each table is sized independently and the per-table values sum across tables under concurrent CDC. Raise it explicitly for a table that needs more encode parallelism.",
           "type": "string"
         },
         "cayenne_compaction_trigger_files": {
           "description": "Minimum number of small Vortex files in the current snapshot before tiered compaction runs. A 'small' file is one whose size is below cayenne_target_file_size_mb / 4. Default: 4 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 8 otherwise.",
+          "type": "string"
+        },
+        "cayenne_bake_deletion_index_trigger": {
+          "description": "Deletion-index size (count of live primary-key tombstones) at or above which the seq-prefix bake (key-delete merge-on-read compaction) runs. The bake consolidates the settled older prefix of protected snapshots so their tombstones drop out of the live deletion index, lowering per-query merge-on-read probe cost at the cost of write amplification. A larger value bakes less often (bounds write-amp); a smaller value bakes more often (smaller index, cheaper probe). Key-delete tables only. Default: 50000.",
+          "type": "string"
+        },
+        "cayenne_orphaned_dv_cleanup_min_files": {
+          "description": "Number of orphan-eligible key-based deletion vectors (cayenne_delete_file rows) that must accumulate before a background cleanup sweep reclaims their .arrow files. A key deletion vector becomes orphaned once time-based retention empties the protected snapshot(s) it shadowed. The sweep is lock-free and runs off the write path on the dedicated compaction runtime, so this only trades sweep frequency against lingering disk — never ingest latency. Set to 0 (or leave unset) to disable cleanup entirely (the default, pre-feature behavior); a value >= 1 enables it. Default: 0 (disabled).",
           "type": "string"
         },
         "cayenne_compaction_trigger_protected_snapshots": {
@@ -7097,6 +7406,79 @@
         },
         "cayenne_inline_flush_max_bytes": {
           "description": "Maximum inline IPC bytes before checkpointing inline data to Vortex. Default: 2097152 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 8388608 otherwise.",
+          "type": "string"
+        },
+        "cayenne_cdc_durability": {
+          "description": "Durability mode for the inline CDC write path. 'memory' (default, eligibility-gated) appends batches to an in-RAM tier and defers the source slot ack to a periodic/cap-triggered checkpoint, collapsing per-batch durability cost; on crash the un-checkpointed tail is replayed from the source slot (the apply is PK-idempotent, so exactly-once). Bounded by a per-table byte cap and a process-global byte budget so it cannot OOM. The memory path applies only to the small-write/CDC profile and non-partitioned tables; other profiles use 'file'. 'file' persists each CDC batch durably before advancing the source slot and remains the explicit conservative opt-out.",
+          "type": "string",
+          "default": "memory",
+          "enum": [
+            "file",
+            "memory"
+          ]
+        },
+        "cayenne_cdc_mem_tier_max_bytes": {
+          "description": "Per-table RAM-tier byte cap before a forced spill (checkpoint) and slot advance, in cdc_durability: memory mode only. Auto-derived from host memory (~1/64 of RAM, clamped to 256 MiB - 1 GiB; 256 MiB on hosts at or under 16 GiB) — a rare backstop now that the non-fence-blocking background checkpointer is the primary flush. Set 0 to disable the per-table cap; the process-global byte budget still bounds aggregate resident memory. When both are set, whichever is breached first triggers the spill.",
+          "type": "string"
+        },
+        "cayenne_cdc_mem_tier_max_age_ms": {
+          "description": "Max wall-clock milliseconds a RAM-tier epoch may age before a forced checkpoint, in cdc_durability: memory mode only. Bounds the crash-replay window and the deferred source-slot ack for tables that never reach a byte threshold. Default 10000 (10 s). Set 0 to disable the age trigger.",
+          "type": "string"
+        },
+        "cayenne_cdc_mem_tier_min_flush_bytes": {
+          "description": "Minimum resident RAM-tier bytes before the periodic background tick durably checkpoints, in cdc_durability: memory mode only. Bounds snapshot/delete-file churn: below this size a tick is skipped unless the tier age reached cdc_mem_tier_max_age_ms. Query freshness is unaffected (RAM rows are visible immediately); only the deferred slot ack waits. The write-path byte-cap spill is not gated. Auto-derived as 1/8 of the derived cdc_mem_tier_max_bytes (clamped to 32-128 MiB; 32 MiB on hosts at or under 16 GiB). Set 0 to flush on every tick.",
+          "type": "string"
+        },
+        "cayenne_cdc_mem_tier_checkpoint_interval_ms": {
+          "description": "Periodic background mem-tier checkpoint interval in milliseconds, in cdc_durability: memory mode only. The accelerator spawns a per-table background task that checkpoints the RAM tier every interval (mirroring the background compactor); this advances the deferred source slot ack on an idle or pure-upsert stream that never trips a delete/truncate event trigger or a write-path cap. Default 1000 (1 s). Set 0 to disable the periodic task.",
+          "type": "string"
+        },
+        "cayenne_cdc_mem_tier_shards": {
+          "description": "Number of PK-hash shards the in-RAM CDC tier is partitioned into, in cdc_durability: memory mode only (non-partitioned, key-based merge-on-read tables). Each shard is an independent serial validate->append domain keyed by the RowConverter OwnedRow bytes, so disjoint keys validate and append in parallel within one apply (intra-apply fan-out) while a key's whole version history — upserts AND delete tombstones — stays confined to its one owning shard (last-writer-wins preserved). Checkpoints are always all-shards-atomic on a single source-position axis. Default 1 (the byte-identical serial path). Raise (e.g. 4) on update/insert-heavy CDC tables to lift the per-apply serialization ceiling.",
+          "type": "string"
+        },
+        "cayenne_tuning": {
+          "description": "Auto-tuning mode. 'auto': derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate, delete fraction, and arrival burstiness AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adapts the inline-memtable flush caps, the in-memory CDC tier byte cap, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. DEFAULT: when this is unset, the mode is 'adaptive' if extended schema inference produced metadata (the dataset set 'schema_inference: extended' and the source emitted it) — opting into extended schema enables self-tuning, and that metadata is the adaptive warm-start — otherwise 'auto'. Set 'cayenne_tuning: auto' explicitly to opt out of the closed loop even with extended schema. 'schema_inference: extended' also sharpens the 'adaptive' warm-start (inferred cardinality/size) but is not required for an explicit 'adaptive' — without it the controller relearns the row width from observed ingest and converges from the hardware-derived warm-start. In BOTH modes an explicit per-parameter value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set actuator is pinned (the loop will not move it).",
+          "type": "string",
+          "enum": [
+            "auto",
+            "adaptive"
+          ]
+        },
+        "cayenne_goal_replication_lag": {
+          "description": "Goal-driven adaptive tuning: target end-to-end CDC replication lag as a duration (e.g. '5s'). Best set GLOBALLY at runtime.params (cayenne_goal_replication_lag) and overridden here per-dataset. When set (and cayenne_tuning is not 'auto'), the closed-loop controller converges toward this SLO in small, bounded steps.",
+          "type": "string"
+        },
+        "cayenne_goal_freshness": {
+          "description": "Goal-driven adaptive tuning: target data freshness — age of the newest queryable data — as a duration (e.g. '30s'). Settable globally at runtime.params and overridden here per-dataset.",
+          "type": "string"
+        },
+        "cayenne_goal_query_latency": {
+          "description": "Goal-driven adaptive tuning: target p99 query latency on this table as a duration (e.g. '10s' or '250ms'). Settable globally at runtime.params and overridden here per-dataset.",
+          "type": "string"
+        },
+        "cayenne_goal_convergence_window": {
+          "description": "Advanced: the control-loop pacing window — the time budget over which the loop steps toward the configured cayenne_goal_* SLOs, as a duration (e.g. '1m'). Default 60s. This paces HOW fast the loop chases the goals, not a target outcome; it is a per-dataset knob, not part of the global SLO surface.",
+          "type": "string"
+        },
+        "cdc_prefetch_buffer": {
+          "description": "Per-dataset override for the CDC source-reader prefetch channel depth (envelopes).",
+          "type": "string"
+        },
+        "cdc_max_coalesced_envelopes": {
+          "description": "Per-dataset override for the maximum number of CDC envelopes coalesced into a single accelerator write.",
+          "type": "string"
+        },
+        "cdc_max_coalesced_bytes": {
+          "description": "Per-dataset override for the byte budget (in bytes) of a coalesced CDC burst.",
+          "type": "string"
+        },
+        "cdc_max_coalesce_age_ms": {
+          "description": "Per-dataset override for the linger window (ms) the CDC apply loop waits for additional envelopes before flushing.",
+          "type": "string"
+        },
+        "cdc_commit_timeout_ms": {
+          "description": "Per-dataset override for the CDC source-side commit timeout (ms).",
           "type": "string"
         }
       },
@@ -7324,6 +7706,11 @@
           "description": "Configure socket connection timeout, in seconds (default: 60).",
           "type": "string"
         },
+        "iceberg_s3_path_style_access": {
+          "description": "Controls S3 addressing style. Defaults to 'true' (path-style: endpoint/bucket), which is required for object stores such as MinIO. Set to 'false' to use virtual-hosted-style (bucket.endpoint).",
+          "type": "string",
+          "default": "true"
+        },
         "iceberg_gcs_project_id": {
           "description": "The Google Cloud project ID for GCS storage.",
           "type": "string"
@@ -7385,6 +7772,10 @@
           "type": "string",
           "x-secret": true
         },
+        "unity_catalog_credential_vending": {
+          "description": "When set to 'enabled', short-lived storage credentials for each table are fetched from the Unity Catalog credential vending API instead of using static storage credentials. Defaults to 'disabled'.",
+          "type": "string"
+        },
         "unity_catalog_aws_region": {
           "description": "The AWS region to use for S3 storage.",
           "type": "string",
@@ -7404,6 +7795,10 @@
           "description": "The AWS endpoint to use for S3 storage.",
           "type": "string",
           "x-secret": true
+        },
+        "unity_catalog_aws_allow_http": {
+          "description": "Enables insecure HTTP connections to the AWS endpoint. Defaults to false.",
+          "type": "string"
         },
         "unity_catalog_azure_storage_account_name": {
           "description": "The storage account to use for Azure storage.",
@@ -7456,6 +7851,10 @@
           "description": "The personal access token used to authenticate against the DataBricks API.",
           "type": "string",
           "x-secret": true
+        },
+        "databricks_credential_vending": {
+          "description": "When set to 'enabled' (requires 'mode' to be 'delta_lake'), short-lived storage credentials for each table are fetched from the Unity Catalog credential vending API instead of using static storage credentials. Defaults to 'disabled'.",
+          "type": "string"
         },
         "mode": {
           "description": "The execution mode for querying against Databricks.",
@@ -8111,6 +8510,31 @@
           "description": "Customizes the transformation of OpenAI chat messages into a character stream for the model.",
           "type": "string"
         },
+        "trust_pickle": {
+          "description": "Allow loading pickle-based weight files (.pt / .pth / .ckpt / .bin). These formats execute arbitrary code on load and are disabled by default. Set to 'true' only when the model weights come from a fully trusted source.",
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "distributed_backend": {
+          "description": "Run the model tensor-parallel across multiple nodes (a Spice enterprise feature; standard builds are single-node only). Set to 'ring' to pool the model over the `nodes` list (the 'ring' backend currently supports exactly 2 nodes); omit or 'none' for single-node.",
+          "type": "string",
+          "default": "none",
+          "enum": [
+            "none",
+            "ring"
+          ]
+        },
+        "node_rank": {
+          "description": "This node's 0-indexed rank in the distributed `nodes` list. Rank 0 is the head and serves the API; other ranks are compute replicas.",
+          "type": "string"
+        },
+        "nodes": {
+          "description": "Comma-separated, rank-ordered node addresses for distributed inference (e.g. '10.0.0.1,10.0.0.2'). Identical on every node; only `node_rank` differs. The node count (world size) must be a power of two; the 'ring' backend requires exactly 2.",
+          "type": "string"
+        },
         "tools": {
           "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery without data sampling tools, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
           "type": "string"
@@ -8565,6 +8989,23 @@
         },
         "huggingface_token": {
           "description": "The Huggingface access token.",
+          "type": "string"
+        },
+        "distributed_backend": {
+          "description": "Run the model tensor-parallel across multiple nodes (a Spice enterprise feature; standard builds are single-node only). Set to 'ring' to pool the model over the `nodes` list (the 'ring' backend currently supports exactly 2 nodes); omit or 'none' for single-node.",
+          "type": "string",
+          "default": "none",
+          "enum": [
+            "none",
+            "ring"
+          ]
+        },
+        "node_rank": {
+          "description": "This node's 0-indexed rank in the distributed `nodes` list. Rank 0 is the head and serves the API; other ranks are compute replicas.",
+          "type": "string"
+        },
+        "nodes": {
+          "description": "Comma-separated, rank-ordered node addresses for distributed inference (e.g. '10.0.0.1,10.0.0.2'). Identical on every node; only `node_rank` differs. The node count (world size) must be a power of two; the 'ring' backend requires exactly 2.",
           "type": "string"
         },
         "tools": {
@@ -9877,6 +10318,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -10057,6 +10501,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -10239,6 +10686,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -10419,6 +10869,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -10601,6 +11054,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -10781,6 +11237,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -10963,6 +11422,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -11143,6 +11605,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -11325,6 +11790,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -11505,6 +11973,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -11687,6 +12158,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -11867,6 +12341,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -12049,6 +12526,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -12229,6 +12709,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -12411,6 +12894,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -12591,6 +13077,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -12773,6 +13262,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -12953,6 +13445,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -13135,6 +13630,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -13316,6 +13814,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -13496,6 +13997,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -13687,6 +14191,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -13876,6 +14383,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -14067,6 +14577,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -14256,6 +14769,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -14447,6 +14963,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -14636,6 +15155,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -15727,6 +16249,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"

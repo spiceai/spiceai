@@ -2,7 +2,7 @@ use bytes::Buf;
 
 use crate::error::{PgWireError, Result};
 
-/// Parsed PostgreSQL error/notice response fields
+/// Parsed `PostgreSQL` error/notice response fields
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ErrorFields {
     pub severity: Option<String>,
@@ -24,6 +24,7 @@ pub struct ErrorFields {
 
 impl ErrorFields {
     /// Parse error fields from payload bytes
+    #[must_use]
     pub fn parse(payload: &[u8]) -> Self {
         let mut fields = ErrorFields::default();
         let mut b = payload;
@@ -64,6 +65,7 @@ impl ErrorFields {
     }
 
     /// Format as a human-readable error string
+    #[must_use]
     pub fn to_error_string(&self) -> String {
         match (&self.message, &self.code) {
             (Some(m), Some(c)) => format!("{m} (SQLSTATE {c})"),
@@ -74,23 +76,28 @@ impl ErrorFields {
     }
 }
 
-/// Parse an ErrorResponse payload into a human-readable string.
+/// Parse an `ErrorResponse` payload into a human-readable string.
 ///
 /// For more detailed error information, use `ErrorFields::parse()` instead.
+#[must_use]
 pub fn parse_error_response(payload: &[u8]) -> String {
     ErrorFields::parse(payload).to_error_string()
 }
 
-/// Parse an AuthenticationRequest payload.
+/// Parse an `AuthenticationRequest` payload.
 ///
-/// Returns (auth_type, remaining_data).
+/// Returns (`auth_type`, `remaining_data`).
 /// Auth types:
-/// - 0 = AuthenticationOk
-/// - 3 = AuthenticationCleartextPassword
-/// - 5 = AuthenticationMD5Password (data contains 4-byte salt)
-/// - 10 = AuthenticationSASL (data contains mechanism names)
-/// - 11 = AuthenticationSASLContinue
-/// - 12 = AuthenticationSASLFinal
+/// - 0 = `AuthenticationOk`
+/// - 3 = `AuthenticationCleartextPassword`
+/// - 5 = `AuthenticationMD5Password` (data contains 4-byte salt)
+/// - 10 = `AuthenticationSASL` (data contains mechanism names)
+/// - 11 = `AuthenticationSASLContinue`
+/// - 12 = `AuthenticationSASLFinal`
+///
+/// # Errors
+/// Returns [`PgWireError::Protocol`] if the payload is shorter than the 4-byte
+/// authentication type field.
 pub fn parse_auth_request(payload: &[u8]) -> Result<(i32, &[u8])> {
     if payload.len() < 4 {
         return Err(PgWireError::Protocol("auth request too short".into()));
@@ -206,7 +213,7 @@ mod tests {
     #[test]
     fn parse_auth_request_ok() {
         let payload = [0, 0, 0, 0]; // auth type 0 = OK
-        let (code, rest) = parse_auth_request(&payload).unwrap();
+        let (code, rest) = parse_auth_request(&payload).expect("should succeed");
         assert_eq!(code, auth::OK);
         assert!(rest.is_empty());
     }
@@ -217,7 +224,7 @@ mod tests {
         payload.extend_from_slice(&5i32.to_be_bytes()); // MD5
         payload.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // salt
 
-        let (code, salt) = parse_auth_request(&payload).unwrap();
+        let (code, salt) = parse_auth_request(&payload).expect("should succeed");
         assert_eq!(code, auth::MD5_PASSWORD);
         assert_eq!(salt, &[0xDE, 0xAD, 0xBE, 0xEF]);
     }
@@ -230,7 +237,7 @@ mod tests {
         payload.extend_from_slice(b"SCRAM-SHA-256-PLUS\0");
         payload.push(0); // terminator
 
-        let (code, mechanisms) = parse_auth_request(&payload).unwrap();
+        let (code, mechanisms) = parse_auth_request(&payload).expect("should succeed");
         assert_eq!(code, auth::SASL);
         assert!(mechanisms.starts_with(b"SCRAM-SHA-256"));
     }
@@ -238,7 +245,7 @@ mod tests {
     #[test]
     fn parse_auth_request_rejects_short_payload() {
         let payload = [0, 0, 0]; // only 3 bytes
-        let err = parse_auth_request(&payload).unwrap_err();
+        let err = parse_auth_request(&payload).expect_err("should error");
         assert!(err.to_string().contains("too short"));
     }
 

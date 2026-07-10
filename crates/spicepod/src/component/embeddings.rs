@@ -122,9 +122,9 @@ impl Embeddings {
     ///    - Prefix: `huggingface:huggingface.co`
     ///    - Model Id: `transformers/gpt-2:latest`
     ///
-    /// - `file://absolute/path/to/my/model.onnx`
+    /// - `file://absolute/path/to/my/model.gguf`
     ///     - Prefix: `file:`
-    ///     - Model Id: `/absolute/path/to/my/model.onnx`
+    ///     - Model Id: `/absolute/path/to/my/model.gguf`
     #[must_use]
     pub fn get_model_id(&self) -> Option<String> {
         match self.get_prefix() {
