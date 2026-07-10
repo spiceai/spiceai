@@ -13774,7 +13774,7 @@ impl CayenneTableProvider {
                 warm_files,
                 max_bytes = vc.cold_tier_warm_max_bytes,
                 max_files = vc.cold_tier_warm_max_files,
-                "Datalake promotion not triggered; warm tier below thresholds"
+                "Datalake promotion skipped; warm tier below thresholds"
             );
             return Ok(false);
         }
