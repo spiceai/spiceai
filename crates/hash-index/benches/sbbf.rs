@@ -40,7 +40,7 @@ limitations under the License.
 //! forces all 8 word loads + compares.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use hash_index::{SplitBlockBloomFilter, hash_key};
+use hash_index::{SplitBlockBloomFilter, hash_key_i64};
 use std::cell::Cell;
 use std::hint::black_box;
 
@@ -65,7 +65,7 @@ const SIZES: [usize; 3] = [8_192, 800_000, 40_000_000];
 fn build_filter(n: usize) -> SplitBlockBloomFilter {
     let filter = SplitBlockBloomFilter::new(n);
     for k in 0..n as i64 {
-        filter.insert(hash_key(&k));
+        filter.insert(hash_key_i64(k));
     }
     filter
 }
@@ -85,7 +85,7 @@ fn bench_probe(c: &mut Criterion) {
         // All-miss: distinct keys just past the inserted range (bar the ~0.04%
         // FPR). Rotate a PROBE_BATCH window so the swept blocks span the pool.
         let miss: Vec<u64> = (n as i64..(n as i64 + pool_len as i64))
-            .map(|k| hash_key(&k))
+            .map(hash_key_i64)
             .collect();
         let miss_cursor = Cell::new(0_usize);
         group.bench_with_input(BenchmarkId::new("miss", n), &n, |b, _| {
@@ -107,7 +107,7 @@ fn bench_probe(c: &mut Criterion) {
 
         // All-hit: distinct present keys (forces all 8 word checks), same
         // rotating window across the pool.
-        let hit: Vec<u64> = (0..pool_len as i64).map(|k| hash_key(&k)).collect();
+        let hit: Vec<u64> = (0..pool_len as i64).map(hash_key_i64).collect();
         let hit_cursor = Cell::new(0_usize);
         group.bench_with_input(BenchmarkId::new("hit", n), &n, |b, _| {
             b.iter(|| {
@@ -129,24 +129,27 @@ fn bench_probe(c: &mut Criterion) {
     group.finish();
 }
 
-/// Insert throughput: build a filter of `PROBE_BATCH` keys. Baselines the
-/// writer's 8-word `fetch_or` block loop (the filter is sized to the batch so
-/// allocation does not dominate). Insert can't be soundly SIMD'd — the per-word
-/// atomics are load-bearing for lock-free probe-during-insert — so this is
-/// context, not a SIMD candidate.
+/// Insert throughput into a fresh filter — the writer's 8-word `fetch_or` block
+/// loop. Uses `iter_batched` so the filter allocation/zero-init runs in
+/// (untimed) setup and the measurement reflects steady-state inserts. Insert
+/// can't be soundly SIMD'd — the per-word atomics are load-bearing for lock-free
+/// probe-during-insert — so this is context, not a SIMD candidate.
 fn bench_insert(c: &mut Criterion) {
     let mut group = c.benchmark_group("sbbf_insert");
     group.throughput(Throughput::Elements(PROBE_BATCH as u64));
 
-    let keys: Vec<u64> = (0..PROBE_BATCH as i64).map(|k| hash_key(&k)).collect();
-    group.bench_function("build_batch", |b| {
-        b.iter(|| {
-            let filter = SplitBlockBloomFilter::new(PROBE_BATCH);
-            for &h in &keys {
-                filter.insert(h);
-            }
-            black_box(filter);
-        });
+    let keys: Vec<u64> = (0..PROBE_BATCH as i64).map(hash_key_i64).collect();
+    group.bench_function("insert_batch", |b| {
+        b.iter_batched(
+            || SplitBlockBloomFilter::new(PROBE_BATCH),
+            |filter| {
+                for &h in &keys {
+                    filter.insert(h);
+                }
+                black_box(filter);
+            },
+            criterion::BatchSize::PerIteration,
+        );
     });
     group.finish();
 }
