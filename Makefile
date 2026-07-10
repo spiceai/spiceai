@@ -61,6 +61,13 @@ ci:
 	make -C bin/spice
 	make -C bin/spiced
 
+# Local CI attestation ("developer sign-off"). Runs lint + unit tests, then
+# posts a `signoff` commit status on HEAD so the PR can enter the merge queue,
+# where the full suite runs. See scripts/signoff and docs/dev/ci_signoff.md.
+.PHONY: signoff
+signoff:
+	@./scripts/signoff
+
 .PHONY: test
 test:
 	@cargo test --all --lib

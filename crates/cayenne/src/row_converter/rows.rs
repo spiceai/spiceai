@@ -120,6 +120,17 @@ pub struct Row<'a> {
 }
 
 impl<'a> Row<'a> {
+    /// Wrap previously-encoded row bytes (as produced by
+    /// [`super::RowConverter::convert_columns`]) so they can be decoded back
+    /// into column arrays via [`super::RowConverter::convert_rows`] — e.g. the
+    /// datalake dirty-file detection decodes the deletion index's stored keys.
+    /// The bytes MUST come from the same converter configuration that encoded
+    /// them; `convert_rows` returns an error on malformed input.
+    #[must_use]
+    pub fn from_encoded(data: &'a [u8]) -> Self {
+        Self { data }
+    }
+
     /// The row's raw encoded bytes.
     #[must_use]
     pub fn data(&self) -> &'a [u8] {

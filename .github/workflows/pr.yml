@@ -54,10 +54,57 @@ env:
   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=lld
 
 jobs:
-  # `pr` is a required check for pull requests. Therefore we cannot skip the workflow via
-  # `on.pull_requests.paths-ignore`. Instead, we conditionally run the jobs (which report
-  # a success when skipped).
+  # On a pull request this is the ONLY job that runs. It validates the developer
+  # sign-off — the `signoff` commit status posted by `make signoff` — for the PR's
+  # head commit. A green Attestation (plus review) is what lets the PR into the
+  # merge queue, where the heavy jobs below and the other workflows run the full
+  # suite. This is what replaces running all checks on every PR push.
+  attestation:
+    # GitHub-hosted: this job only calls the API, and self-hosted runners don't
+    # run for fork PRs — which would leave external contributors' required
+    # Attestation check unreported and stuck.
+    name: Attestation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: read
+    steps:
+      - name: Validate developer sign-off
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const sha = context.payload.pull_request.head.sha;
+            const { data } = await github.rest.repos.getCombinedStatusForRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: sha,
+            });
+            // 'signoff' matches the hardcoded STATUS_CONTEXT in scripts/signoff.
+            const signoff = data.statuses.find((s) => s.context === 'signoff');
+            if (signoff && signoff.state === 'success') {
+              core.notice(`Signed off by ${signoff.creator?.login ?? 'unknown'}: ${signoff.description ?? ''}`);
+              return;
+            }
+            core.setFailed(
+              `No developer sign-off found for ${sha}.\n\n` +
+              `On your machine, with this commit pushed, run:\n\n` +
+              `    make signoff\n\n` +
+              `It runs lint + unit tests locally and records a sign-off on this exact\n` +
+              `commit (push a new commit and you must sign off again). The full test\n` +
+              `suite then runs in the merge queue. See docs/dev/ci_signoff.md.`
+            );
+      - name: Merge queue passthrough
+        if: ${{ github.event_name != 'pull_request' }}
+        run: echo "Sign-off was validated at queue entry; the full suite runs in this merge_group run."
+
+  # The jobs below run ONLY in the merge queue (merge_group) and on manual
+  # dispatch — never on a pull request. They stay required, so the full suite
+  # still gates every merge; it just runs once on the merged result instead of on
+  # every PR push. `check_changes` lets docs-only merges skip the build and still
+  # report success (a required check can't be skipped via paths-ignore).
   check_changes:
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-macos
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
@@ -81,6 +128,7 @@ jobs:
     name: Rust Lint
     runs-on: spiceai-macos
     needs: check_changes
+    if: ${{ github.event_name != 'pull_request' }}
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
@@ -166,6 +214,7 @@ jobs:
     name: Build and Test
     runs-on: spiceai-macos
     needs: [check_changes]
+    if: ${{ github.event_name != 'pull_request' }}
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
@@ -287,6 +336,7 @@ jobs:
     name: Build (release profile)
     runs-on: spiceai-macos
     needs: [check_changes]
+    if: ${{ github.event_name != 'pull_request' }}
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
