@@ -203,8 +203,10 @@ async fn login_spiceai(
         println!("\n{auth_url}\n");
     }
 
-    // Try to open browser automatically
-    let _ = system_open::that(&auth_url);
+    // Try to open browser automatically. Run in spawn_blocking so the
+    // process wait inside system_open does not block a Tokio worker.
+    let auth_url_for_open = auth_url.clone();
+    let _ = tokio::task::spawn_blocking(move || system_open::that(auth_url_for_open)).await;
 
     tracing::info!("Waiting for authentication...");
 

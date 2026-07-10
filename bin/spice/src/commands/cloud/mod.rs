@@ -974,7 +974,10 @@ async fn execute_login_device_flow(open_browser: bool) -> Result<()> {
     println!("\n  {auth_url}\n");
 
     if open_browser {
-        let _ = system_open::that(&auth_url);
+        // Run in spawn_blocking so the process wait inside system_open does
+        // not block a Tokio worker during the subsequent poll loop.
+        let auth_url_for_open = auth_url.clone();
+        let _ = tokio::task::spawn_blocking(move || system_open::that(auth_url_for_open)).await;
     }
 
     println!("Waiting for authentication...");

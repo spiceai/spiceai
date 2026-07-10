@@ -506,8 +506,10 @@ async fn msal_device_code_flow(
     println!("  {verification_uri}");
     println!("\nAnd enter the code: {user_code}\n");
 
-    // Try to open browser automatically
-    let _ = system_open::that(verification_uri);
+    // Try to open browser automatically. Run in spawn_blocking so the
+    // process wait inside system_open does not block a Tokio worker.
+    let verification_uri = verification_uri.to_string();
+    let _ = tokio::task::spawn_blocking(move || system_open::that(verification_uri)).await;
 
     println!("Waiting for authentication...");
 
