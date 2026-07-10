@@ -263,7 +263,7 @@ jobs:
     # When test_filter is set, only run shard 1 (no partitioning) so filtered tests are not split away.
     if: |
       needs.check_changes.outputs.relevant_changes == 'true' &&
-      (env.INTEGRATION_TEST_FILTER == '' || matrix.label == 1)
+      ((github.event.inputs.test_filter || '') == '' || matrix.label == 1)
     permissions:
       contents: write
     runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
@@ -540,7 +540,7 @@ jobs:
   test-aws-sdk:
     name: AWS SDK Integration Tests
     needs: [build, check_changes]
-    if: needs.check_changes.outputs.relevant_changes == 'true' && env.INTEGRATION_TEST_FILTER == ''
+    if: needs.check_changes.outputs.relevant_changes == 'true' && (github.event.inputs.test_filter || '') == ''
     permissions: read-all
     runs-on: spiceai-dev-runners
     steps:
@@ -600,7 +600,7 @@ jobs:
   test-aws-sdk-credential-bridge:
     name: AWS SDK Credential Bridge Integration Tests
     needs: [build, check_changes]
-    if: needs.check_changes.outputs.relevant_changes == 'true' && env.INTEGRATION_TEST_FILTER == ''
+    if: needs.check_changes.outputs.relevant_changes == 'true' && (github.event.inputs.test_filter || '') == ''
     permissions: read-all
     runs-on: spiceai-dev-runners
     steps:
@@ -664,7 +664,7 @@ jobs:
   test-snapshot-refresh:
     name: Snapshot Refresh Mode Integration Tests
     needs: [build, check_changes]
-    if: needs.check_changes.outputs.relevant_changes == 'true' && env.INTEGRATION_TEST_FILTER == ''
+    if: needs.check_changes.outputs.relevant_changes == 'true' && (github.event.inputs.test_filter || '') == ''
     permissions: read-all
     runs-on: spiceai-dev-runners
     steps:
@@ -722,7 +722,7 @@ jobs:
   test-data-components:
     name: Data Components Integration Tests
     needs: [build, check_changes]
-    if: needs.check_changes.outputs.relevant_changes == 'true' && env.INTEGRATION_TEST_FILTER == ''
+    if: needs.check_changes.outputs.relevant_changes == 'true' && (github.event.inputs.test_filter || '') == ''
     permissions: read-all
     runs-on: spiceai-dev-runners
     steps:
@@ -773,7 +773,7 @@ jobs:
   test-runtime-partition:
     name: Partition Table Integration Tests
     needs: [build, check_changes]
-    if: needs.check_changes.outputs.relevant_changes == 'true' && env.INTEGRATION_TEST_FILTER == ''
+    if: needs.check_changes.outputs.relevant_changes == 'true' && (github.event.inputs.test_filter || '') == ''
     runs-on: spiceai-dev-runners
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
