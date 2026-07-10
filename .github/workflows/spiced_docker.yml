@@ -180,7 +180,20 @@ jobs:
 
           if [ "$tag_latest_input" = "auto" ]; then
             # Query GitHub for whether this tag is currently the 'latest' release.
-            is_latest=$(gh release view "${release_tag}" --repo "${GITHUB_REPOSITORY}" --json isLatest -q .isLatest 2>/dev/null || echo "false")
+            # Use GraphQL because `gh release view --json isLatest` can return stale
+            # data when a newer release was published after the REST API cached it.
+            gh_owner="${GITHUB_REPOSITORY%%/*}"
+            gh_repo="${GITHUB_REPOSITORY##*/}"
+            is_latest=$(gh api graphql \
+              -f owner="${gh_owner}" \
+              -f repo="${gh_repo}" \
+              -f tag="${release_tag}" \
+              -f query='query($owner: String!, $repo: String!, $tag: String!) {
+                repository(owner: $owner, name: $repo) {
+                  release(tagName: $tag) { isLatest }
+                }
+              }' \
+              --jq '.data.repository.release.isLatest // false' 2>/dev/null || echo "false")
             if [ "$is_latest" = "true" ]; then
               should_tag_latest="true"
               echo "Release ${release_tag} is marked as 'latest' on GitHub, will tag as 'latest'"
@@ -217,14 +230,14 @@ jobs:
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
 
       - name: Login to Docker Hub
         # Authenticate to Docker Hub before building so base image pulls (debian, etc.)
         # use authenticated rate limits instead of anonymous (per-IP) limits.
         if: ${{ needs.setup.outputs.run_amd64 == 'true' && github.repository == 'spiceai/spiceai' }}
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -237,7 +250,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
       - &build-amd64-image
         name: Package AMD64 ${{ env.IMAGE_TAG }} image
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: Dockerfile-release
@@ -298,14 +311,14 @@ jobs:
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
       - name: Login to Docker Hub
         # Authenticate to Docker Hub before building so base image pulls (debian, etc.)
         # use authenticated rate limits instead of anonymous (per-IP) limits.
         if: ${{ needs.setup.outputs.run_arm64 == 'true' && github.repository == 'spiceai/spiceai' }}
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -318,7 +331,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
       - &build-arm64-image
         name: Package ARM64 ${{ env.IMAGE_TAG }} image
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: Dockerfile-release
@@ -360,14 +373,14 @@ jobs:
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Login to Docker Hub
         # Authenticate to Docker Hub before building so base image pulls (nvidia/cuda, etc.)
         # use authenticated rate limits instead of anonymous (per-IP) limits.
         if: ${{ needs.setup.outputs.run_cuda == 'true' && github.repository == 'spiceai/spiceai' }}
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -380,7 +393,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Package CUDA image
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: Dockerfile-cuda-release
@@ -438,14 +451,14 @@ jobs:
           ls -l /tmp
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Login to Docker Hub
         # Authenticate to Docker Hub before pulling so we use the authenticated
         # rate limits instead of anonymous (per-IP) limits when pulling
         # registry:2 below.
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -456,7 +469,7 @@ jobs:
 
       - name: Login to GitHub Package Registry
         if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -464,7 +477,7 @@ jobs:
 
       - name: Login to DockerHub
         if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -554,14 +567,14 @@ jobs:
           ls -l /tmp
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Login to Docker Hub
         # Authenticate to Docker Hub before pulling so we use the authenticated
         # rate limits instead of anonymous (per-IP) limits when pulling
         # registry:2 below.
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -572,7 +585,7 @@ jobs:
 
       - name: Login to GitHub Package Registry
         if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -580,7 +593,7 @@ jobs:
 
       - name: Login to DockerHub
         if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}

@@ -1,6 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp, round_scores)
+expression: "normalize_search_response(resp, round_scores)"
 ---
 {
   "duration_ms": "duration_ms_val",
@@ -10,7 +10,7 @@ expression: normalize_search_response(resp, round_scores)
       "dataset": "catalog_page_with_chunking_no_pk",
       "matches": {
         "cp_description": [
-          "In general basic characters welcome. Clearly lively friends con"
+          "In general basic characters welcome. Clearly lively friends conv"
         ]
       }
     }

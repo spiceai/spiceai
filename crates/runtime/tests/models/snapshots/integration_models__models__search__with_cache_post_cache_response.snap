@@ -1,6 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp, round_scores)
+expression: "normalize_search_response(resp, round_scores)"
 ---
 {
   "duration_ms": "duration_ms_val",
@@ -10,7 +10,7 @@ expression: normalize_search_response(resp, round_scores)
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
-          "In general basic characters welcome. Clearly lively friends con"
+          "In general basic characters welcome. Clearly lively friends conv"
         ]
       },
       "primary_key": {
@@ -22,7 +22,7 @@ expression: normalize_search_response(resp, round_scores)
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
-          "Close customers might struggle away different mem"
+          "Close customers might struggle away different memb"
         ]
       },
       "primary_key": {
@@ -34,7 +34,7 @@ expression: normalize_search_response(resp, round_scores)
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
-          "Earlier different differences get just to a methods; masses inclu"
+          "Earlier different differences get just to a methods; masses includ"
         ]
       },
       "primary_key": {
@@ -46,7 +46,7 @@ expression: normalize_search_response(resp, round_scores)
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
-          "Years must understand. Well fat thousands take. Good police "
+          "Years must understand. Well fat thousands take. Good police l"
         ]
       },
       "primary_key": {
@@ -58,7 +58,7 @@ expression: normalize_search_response(resp, round_scores)
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
-          "Human, successive tears highlight also as radical prod"
+          "Human, successive tears highlight also as radical produ"
         ]
       },
       "primary_key": {
@@ -70,7 +70,7 @@ expression: normalize_search_response(resp, round_scores)
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
-          "Even democratic stairs would know happy investigations. Hist"
+          "Even democratic stairs would know happy investigations. Histo"
         ]
       },
       "primary_key": {
@@ -82,7 +82,7 @@ expression: normalize_search_response(resp, round_scores)
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
-          "Practical schools might put twice interested, strong organizations. Regulatory"
+          "Practical schools might put twice interested, strong organizations. Regulatory,"
         ]
       },
       "primary_key": {
@@ -94,7 +94,7 @@ expression: normalize_search_response(resp, round_scores)
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
-          "Heavily direct problems try eventually on a nurses. Courses may make "
+          "Heavily direct problems try eventually on a nurses. Courses may make a"
         ]
       },
       "primary_key": {
@@ -106,7 +106,7 @@ expression: normalize_search_response(resp, round_scores)
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
-          "Good questions borrow only base children. Remarkably present "
+          "Good questions borrow only base children. Remarkably present e"
         ]
       },
       "primary_key": {
@@ -118,7 +118,7 @@ expression: normalize_search_response(resp, round_scores)
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
-          "Necessary, major terms give still now joint thoughts. Only considerable wome"
+          "Necessary, major terms give still now joint thoughts. Only considerable women"
         ]
       },
       "primary_key": {
@@ -130,7 +130,7 @@ expression: normalize_search_response(resp, round_scores)
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
-          "Absolute, early papers spare. Independent services need. About extreme women "
+          "Absolute, early papers spare. Independent services need. About extreme women u"
         ]
       },
       "primary_key": {
@@ -142,7 +142,7 @@ expression: normalize_search_response(resp, round_scores)
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
-          "Programmes receive just likely, key homes. Relevant"
+          "Programmes receive just likely, key homes. Relevant,"
         ]
       },
       "primary_key": {
@@ -154,7 +154,7 @@ expression: normalize_search_response(resp, round_scores)
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
-          "Respects might appear early, long metres. Cases would understan"
+          "Respects might appear early, long metres. Cases would understand"
         ]
       },
       "primary_key": {
@@ -166,7 +166,7 @@ expression: normalize_search_response(resp, round_scores)
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
-          "Times could not address disabled indians. Effectively public ports "
+          "Times could not address disabled indians. Effectively public ports c"
         ]
       },
       "primary_key": {
@@ -178,7 +178,7 @@ expression: normalize_search_response(resp, round_scores)
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
-          "Members comfort major horses. All good vehicles must perform ago wrong new conditions. P"
+          "Members comfort major horses. All good vehicles must perform ago wrong new conditions. Pl"
         ]
       },
       "primary_key": {
@@ -190,7 +190,7 @@ expression: normalize_search_response(resp, round_scores)
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
-          "Narrowly great dogs carry only by the events. Successful, able legs would no"
+          "Narrowly great dogs carry only by the events. Successful, able legs would not"
         ]
       },
       "primary_key": {
@@ -202,7 +202,7 @@ expression: normalize_search_response(resp, round_scores)
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
-          "So appropriate hopes cannot constitute with a shapes. Investors know therefo"
+          "So appropriate hopes cannot constitute with a shapes. Investors know therefor"
         ]
       },
       "primary_key": {
@@ -214,7 +214,7 @@ expression: normalize_search_response(resp, round_scores)
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
-          "Social pictures welcome almost british teams. Awful preparations leave g"
+          "Social pictures welcome almost british teams. Awful preparations leave ga"
         ]
       },
       "primary_key": {
@@ -226,7 +226,7 @@ expression: normalize_search_response(resp, round_scores)
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
-          "Legislative origins precede bold stations. Tiny sports should resume all pupils. Forces launch t"
+          "Legislative origins precede bold stations. Tiny sports should resume all pupils. Forces launch to"
         ]
       },
       "primary_key": {

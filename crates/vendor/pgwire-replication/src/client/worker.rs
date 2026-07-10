@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
@@ -10,7 +10,7 @@ use crate::error::{PgWireError, Result};
 use crate::lsn::Lsn;
 use crate::protocol::framing::{
     read_backend_message, write_copy_data, write_copy_done, write_password_message, write_query,
-    write_startup_message, MessageReader,
+    write_startup_message, FrameReader,
 };
 use crate::protocol::messages::{parse_auth_request, parse_error_response};
 use crate::protocol::replication::{
@@ -19,7 +19,7 @@ use crate::protocol::replication::{
 
 /// Shared replication progress updated by the consumer and read by the worker.
 ///
-/// Stored as an AtomicU64 so progress updates are cheap and monotonic
+/// Stored as an `AtomicU64` so progress updates are cheap and monotonic
 /// without async backpressure.
 pub struct SharedProgress {
     applied: AtomicU64,
@@ -153,14 +153,15 @@ impl WorkerState {
         &mut self,
         stream: &mut S,
     ) -> Result<()> {
-        // Wrap in a 128KB read buffer to batch multiple WAL messages into fewer
-        // recv() syscalls. BufReader delegates AsyncWrite to the inner stream,
-        // so writes (standby status replies, etc.) are unaffected.
-        let mut stream = BufReader::with_capacity(128 * 1024, stream);
-        self.startup(&mut stream).await?;
-        self.authenticate(&mut stream).await?;
-        self.start_replication(&mut stream).await?;
-        self.stream_loop(&mut stream).await
+        // No intermediate `BufReader`: the streaming loop reads through a
+        // `FrameReader`, which owns a single growable buffer it fills straight
+        // from the socket (kernel -> one buffer, frames are zero-copy slices of
+        // it). Handshake reads are exact and never over-read past a message
+        // boundary, so nothing is lost handing the raw stream to `stream_loop`.
+        self.startup(stream).await?;
+        self.authenticate(stream).await?;
+        self.start_replication(stream).await?;
+        self.stream_loop(stream).await
     }
 
     /// Send startup message with replication parameters.
@@ -172,7 +173,7 @@ impl WorkerState {
             ("client_encoding", "UTF8"),
             ("application_name", "pgwire-replication"),
         ];
-        write_startup_message(stream, 196608, &params).await
+        write_startup_message(stream, 196_608, &params).await
     }
 
     /// Start the logical replication stream.
@@ -182,10 +183,19 @@ impl WorkerState {
     ) -> Result<()> {
         // Escape single quotes in publication name
         let publication = self.cfg.publication.replace('\'', "''");
+        // pgoutput options. `binary 'true'` is only appended when requested;
+        // omitting it preserves the historical text-format wire and keeps the
+        // query identical to prior versions for text consumers.
+        let mut options = format!(
+            "proto_version '{}', publication_names '{}', messages 'true'",
+            self.cfg.proto_version, publication,
+        );
+        if matches!(self.cfg.format, crate::config::PgOutputFormat::Binary) {
+            options.push_str(", binary 'true'");
+        }
         let sql = format!(
-            "START_REPLICATION SLOT {} LOGICAL {} \
-            (proto_version '1', publication_names '{}', messages 'true')",
-            self.cfg.slot, self.cfg.start_lsn, publication,
+            "START_REPLICATION SLOT {} LOGICAL {} ({options})",
+            self.cfg.slot, self.cfg.start_lsn,
         );
         write_query(stream, &sql).await?;
 
@@ -195,8 +205,8 @@ impl WorkerState {
             match msg.tag {
                 b'W' => return Ok(()), // CopyBothResponse - ready to stream
                 b'E' => return Err(PgWireError::Server(parse_error_response(&msg.payload))),
-                b'N' | b'S' | b'K' => continue, // Notice, ParameterStatus, BackendKeyData
-                _ => continue,
+                // Notice / ParameterStatus / BackendKeyData / anything else: keep waiting.
+                _ => {}
             }
         }
     }
@@ -204,24 +214,30 @@ impl WorkerState {
     /// Main replication streaming loop.
     ///
     /// Uses a two-phase approach for throughput:
-    /// 1. **Drain phase**: while the BufReader has buffered data, read messages
-    ///    in a tight loop without `select!` or timeout overhead.
-    /// 2. **Wait phase**: when the buffer is empty, fall back to `select!` with
-    ///    timeout + stop signal to handle idle keepalives and graceful shutdown.
+    /// 1. **Drain phase**: while the [`FrameReader`] already has whole frames
+    ///    buffered, read them in a tight loop without `select!` or timeout
+    ///    overhead.
+    /// 2. **Wait phase**: when no complete frame is buffered, fall back to
+    ///    `select!` with timeout + stop signal to handle idle keepalives and
+    ///    graceful shutdown.
     ///
-    /// Reads use [`MessageReader`], which preserves partial-read state across
-    /// dropped futures so the wait-phase `select!` is cancellation-safe.
+    /// [`FrameReader`] reads straight from the socket into a single growable
+    /// buffer (no per-message zero-fill, no intermediate `BufReader` copy) and
+    /// hands out frames as zero-copy slices. It is cancellation-safe — partial
+    /// reads survive a dropped future — so the wait-phase `select!` cannot lose
+    /// bytes.
     async fn stream_loop<S: AsyncRead + AsyncWrite + Unpin>(
         &mut self,
-        stream: &mut BufReader<S>,
+        stream: &mut S,
     ) -> Result<()> {
-        let mut last_status_sent = Instant::now() - self.cfg.status_interval;
-        let mut last_applied = self.progress.load_applied();
-        // Cancellation-safe message reader, partial reads survive dropped futures.
-        let mut reader = MessageReader::new();
         // How many messages to process in the tight loop before checking
         // stop signal and sending periodic status feedback.
         const DRAIN_BATCH: usize = 256;
+
+        let mut last_status_sent = Instant::now() - self.cfg.status_interval;
+        let mut last_applied = self.progress.load_applied();
+        // Incremental, zero-copy, cancellation-safe reader.
+        let mut reader = FrameReader::new(self.cfg.max_message_size);
 
         loop {
             // Update applied LSN from client
@@ -236,13 +252,13 @@ impl WorkerState {
                 last_status_sent = Instant::now();
             }
 
-            // ── Drain phase: tight loop while BufReader has buffered data ──
-            // The BufReader has a 128KB internal buffer. When the kernel delivers
-            // a large TCP segment, many WAL messages are available without syscalls.
-            // Read them in a tight loop to avoid select!/timeout overhead per message.
+            // ── Drain phase: tight loop while whole frames are already buffered ──
+            // A single socket read often delivers many WAL messages into the
+            // FrameReader's buffer. Slice them out in a tight loop (no await on
+            // the socket, no select!/timeout overhead per message).
             let mut drained = 0usize;
-            while stream.buffer().len() >= 5 && drained < DRAIN_BATCH {
-                let msg = reader.read(stream).await?;
+            while drained < DRAIN_BATCH && reader.has_buffered_frame() {
+                let msg = reader.next(stream).await?;
                 drained += 1;
                 if msg.tag == b'E' {
                     return Err(PgWireError::Server(parse_error_response(&msg.payload)));
@@ -272,11 +288,11 @@ impl WorkerState {
                 continue;
             }
 
-            // ── Wait phase: buffer empty, need to wait for socket data ──
+            // ── Wait phase: no whole frame buffered, wait for socket data ──
             //
             // Both `stop_rx.changed()` and the timeout can drop the read future
-            // mid-message. `MessageReader::read` is cancellation-safe — partial
-            // header/payload state lives on `reader` and is preserved across the
+            // mid-message. `FrameReader::next` is cancellation-safe — a partial
+            // frame stays in the reader's buffer and is preserved across the
             // drop, so the next iteration resumes the read without losing bytes.
             let msg = tokio::select! {
                 biased;
@@ -291,17 +307,14 @@ impl WorkerState {
 
                 msg_result = tokio::time::timeout(
                     self.cfg.idle_wakeup_interval,
-                    reader.read(stream),
+                    reader.next(stream),
                 ) => {
-                    match msg_result {
-                        Ok(res) => res?,
-                        Err(_) => {
-                            let applied = self.progress.load_applied();
-                            last_applied = applied;
-                            self.send_feedback(stream, applied, false).await?;
-                            last_status_sent = Instant::now();
-                            continue;
-                        }
+                    if let Ok(res) = msg_result { res? } else {
+                        let applied = self.progress.load_applied();
+                        last_applied = applied;
+                        self.send_feedback(stream, applied, false).await?;
+                        last_status_sent = Instant::now();
+                        continue;
                     }
                 }
             };
@@ -324,10 +337,10 @@ impl WorkerState {
         }
     }
 
-    /// Handle a CopyData message. Returns true if we should stop.
+    /// Handle a `CopyData` message. Returns true if we should stop.
     async fn handle_copy_data<S: AsyncRead + AsyncWrite + Unpin>(
         &mut self,
-        stream: &mut BufReader<S>,
+        stream: &mut S,
         payload: Bytes,
         last_applied: &mut Lsn,
         last_status_sent: &mut Instant,
@@ -348,12 +361,16 @@ impl WorkerState {
                     *last_status_sent = Instant::now();
                 }
 
-                self.send_event(Ok(ReplicationEvent::KeepAlive {
-                    wal_end,
-                    reply_requested,
-                    server_time_micros,
-                }))
-                .await;
+                self.send_event(
+                    stream,
+                    Ok(ReplicationEvent::KeepAlive {
+                        wal_end,
+                        reply_requested,
+                        server_time_micros,
+                    }),
+                    last_status_sent,
+                )
+                .await?;
 
                 Ok(false)
             }
@@ -371,15 +388,20 @@ impl WorkerState {
                         _ => wal_end, // should never happen if parser only returns Begin/Commit
                     };
 
-                    self.send_event(Ok(boundary_ev)).await;
+                    self.send_event(stream, Ok(boundary_ev), last_status_sent)
+                        .await?;
 
                     // Stop condition (prefer boundary LSN semantics when available)
                     if let Some(stop_lsn) = self.cfg.stop_at_lsn {
                         if reached_lsn >= stop_lsn {
-                            self.send_event(Ok(ReplicationEvent::StoppedAt {
-                                reached: reached_lsn,
-                            }))
-                            .await;
+                            self.send_event(
+                                stream,
+                                Ok(ReplicationEvent::StoppedAt {
+                                    reached: reached_lsn,
+                                }),
+                                last_status_sent,
+                            )
+                            .await?;
                             let _ = write_copy_done(stream).await;
                             return Ok(true); // should stop.
                         }
@@ -392,46 +414,138 @@ impl WorkerState {
                 if let Some(stop_lsn) = self.cfg.stop_at_lsn {
                     if wal_end >= stop_lsn {
                         // Send final event, then stop signal
-                        self.send_event(Ok(ReplicationEvent::XLogData {
-                            wal_start,
-                            wal_end,
-                            server_time_micros,
-                            data,
-                        }))
-                        .await;
+                        self.send_event(
+                            stream,
+                            Ok(ReplicationEvent::XLogData {
+                                wal_start,
+                                wal_end,
+                                server_time_micros,
+                                data,
+                            }),
+                            last_status_sent,
+                        )
+                        .await?;
 
-                        self.send_event(Ok(ReplicationEvent::StoppedAt { reached: wal_end }))
-                            .await;
+                        self.send_event(
+                            stream,
+                            Ok(ReplicationEvent::StoppedAt { reached: wal_end }),
+                            last_status_sent,
+                        )
+                        .await?;
 
                         let _ = write_copy_done(stream).await;
                         return Ok(true);
                     }
                 }
 
-                self.send_event(Ok(ReplicationEvent::XLogData {
-                    wal_start,
-                    wal_end,
-                    server_time_micros,
-                    data,
-                }))
-                .await;
+                self.send_event(
+                    stream,
+                    Ok(ReplicationEvent::XLogData {
+                        wal_start,
+                        wal_end,
+                        server_time_micros,
+                        data,
+                    }),
+                    last_status_sent,
+                )
+                .await?;
 
                 Ok(false)
             }
         }
     }
 
-    /// Send an event to the client channel.
+    /// Send an event to the consumer channel without letting a full channel
+    /// starve server feedback.
     ///
-    /// If the channel is full or closed, we log and continue - the client
-    /// may have stopped listening but we don't want to crash the worker.
-    async fn send_event(&self, event: std::result::Result<ReplicationEvent, PgWireError>) {
-        if self.out.send(event).await.is_err() {
-            tracing::debug!("event channel closed, client may have disconnected");
+    /// A plain `out.send().await` on a full events channel parks the entire
+    /// worker until the consumer drains — and while parked, the worker sends no
+    /// standby status updates and services no keepalives. `PostgreSQL` then sees
+    /// no feedback for `> wal_sender_timeout` and terminates the walsender
+    /// (connection reset), forcing a reconnect and WAL replay. This is the
+    /// coupling this method breaks.
+    ///
+    /// Hot path: a non-blocking `try_reserve` sends immediately (no timer, no
+    /// `select!`). Only when the channel is full do we enter a loop that keeps
+    /// emitting standby status updates every [`status_interval`] while awaiting
+    /// capacity, so the server's liveness window is satisfied regardless of
+    /// consumer progress.
+    ///
+    /// While parked here the worker is not reading the socket, so a server
+    /// keepalive with `reply_requested=true` may sit unread — that is fine,
+    /// because the proactive feedback we send on `status_interval` satisfies
+    /// `wal_sender_timeout` whether or not the request byte was observed.
+    ///
+    /// Gated by [`ReplicationConfig::feedback_while_backpressured`] (default
+    /// `true`); when disabled this reverts to the original blocking `send`.
+    ///
+    /// [`status_interval`]: ReplicationConfig::status_interval
+    /// [`ReplicationConfig::feedback_while_backpressured`]: ReplicationConfig::feedback_while_backpressured
+    async fn send_event<S: AsyncRead + AsyncWrite + Unpin>(
+        &mut self,
+        stream: &mut S,
+        event: std::result::Result<ReplicationEvent, PgWireError>,
+        last_status_sent: &mut Instant,
+    ) -> Result<()> {
+        // Opt-out: original hard-backpressure semantics.
+        if !self.cfg.feedback_while_backpressured {
+            if self.out.send(event).await.is_err() {
+                tracing::debug!("event channel closed, client may have disconnected");
+            }
+            return Ok(());
+        }
+
+        // Hot path: capacity available right now — no timer/select overhead.
+        match self.out.try_reserve() {
+            Ok(permit) => {
+                permit.send(event);
+                return Ok(());
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                tracing::debug!("event channel closed, client may have disconnected");
+                return Ok(());
+            }
+            Err(mpsc::error::TrySendError::Full(())) => {}
+        }
+
+        // Backpressured: wait for capacity, but keep the server alive by
+        // re-sending standby status feedback every `status_interval`.
+        loop {
+            let feedback_deadline = *last_status_sent + self.cfg.status_interval;
+            tokio::select! {
+                biased;
+
+                // Shutdown must be able to interrupt a stalled send.
+                _ = self.stop_rx.changed() => {
+                    if *self.stop_rx.borrow() {
+                        // Caller's loop observes stop on the next iteration and
+                        // finishes; the event is dropped along with the stream.
+                        return Ok(());
+                    }
+                }
+
+                reserved = tokio::time::timeout_at(feedback_deadline, self.out.reserve()) => {
+                    match reserved {
+                        Ok(Ok(permit)) => {
+                            permit.send(event);
+                            return Ok(());
+                        }
+                        Ok(Err(_)) => {
+                            tracing::debug!("event channel closed, client may have disconnected");
+                            return Ok(());
+                        }
+                        Err(_elapsed) => {
+                            let applied = self.progress.load_applied();
+                            self.send_feedback(stream, applied, false).await?;
+                            *last_status_sent = Instant::now();
+                        }
+                    }
+                }
+            }
         }
     }
 
-    /// Handle PostgreSQL authentication exchange.
+    /// Handle `PostgreSQL` authentication exchange.
     async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
         &mut self,
         stream: &mut S,
@@ -444,8 +558,8 @@ impl WorkerState {
                     self.handle_auth_request(stream, code, rest).await?;
                 }
                 b'E' => return Err(PgWireError::Server(parse_error_response(&msg.payload))),
-                b'S' | b'K' => {}      // ParameterStatus, BackendKeyData - ignore
                 b'Z' => return Ok(()), // ReadyForQuery - auth complete
+                // ParameterStatus / BackendKeyData / anything else - ignore
                 _ => {}
             }
         }
@@ -481,7 +595,7 @@ impl WorkerState {
                 let mut salt = [0u8; 4];
                 salt.copy_from_slice(&data[..4]);
 
-                let hash = postgres_md5(&self.cfg.password, &self.cfg.user, &salt);
+                let hash = postgres_md5(&self.cfg.password, &self.cfg.user, salt);
                 let mut payload = hash.into_bytes();
                 payload.push(0);
                 write_password_message(stream, &payload).await
@@ -521,7 +635,13 @@ impl WorkerState {
             // Send SASLInitialResponse
             let mut init = Vec::new();
             init.extend_from_slice(b"SCRAM-SHA-256\0");
-            init.extend_from_slice(&(scram.client_first.len() as i32).to_be_bytes());
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_possible_wrap,
+                reason = "SASL client-first length (nonce + username) is far below i32::MAX"
+            )]
+            let client_first_len = scram.client_first.len() as i32;
+            init.extend_from_slice(&client_first_len.to_be_bytes());
             init.extend_from_slice(scram.client_first.as_bytes());
             write_password_message(stream, &init).await?;
 
@@ -576,14 +696,16 @@ fn parse_sasl_mechanisms(data: &[u8]) -> Vec<String> {
     mechanisms
 }
 
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "pgoutput LSNs, xid, and content length are unsigned values carried as \
+              signed integers on the wire; these casts are bit-preserving"
+)]
 fn parse_pgoutput_boundary(data: &Bytes) -> Result<Option<ReplicationEvent>> {
-    if data.is_empty() {
-        return Ok(None);
-    }
-
-    let tag = data[0];
-    let mut p = &data[1..];
-
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "a pgoutput flags byte is a signed i8 on the wire"
+    )]
     fn take_i8(p: &mut &[u8]) -> Result<i8> {
         if p.is_empty() {
             return Err(PgWireError::Protocol("pgoutput: truncated i8".into()));
@@ -599,7 +721,9 @@ fn parse_pgoutput_boundary(data: &Bytes) -> Result<Option<ReplicationEvent>> {
         }
         let (head, tail) = p.split_at(4);
         *p = tail;
-        Ok(i32::from_be_bytes(head.try_into().unwrap()))
+        let mut b = [0u8; 4];
+        b.copy_from_slice(head);
+        Ok(i32::from_be_bytes(b))
     }
 
     fn take_i64(p: &mut &[u8]) -> Result<i64> {
@@ -608,8 +732,17 @@ fn parse_pgoutput_boundary(data: &Bytes) -> Result<Option<ReplicationEvent>> {
         }
         let (head, tail) = p.split_at(8);
         *p = tail;
-        Ok(i64::from_be_bytes(head.try_into().unwrap()))
+        let mut b = [0u8; 8];
+        b.copy_from_slice(head);
+        Ok(i64::from_be_bytes(b))
     }
+
+    if data.is_empty() {
+        return Ok(None);
+    }
+
+    let tag = data[0];
+    let mut p = &data[1..];
 
     match tag {
         b'B' => {
@@ -693,7 +826,11 @@ async fn read_auth_data<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-/// Get current time as PostgreSQL timestamp (microseconds since 2000-01-01).
+/// Get current time as `PostgreSQL` timestamp (microseconds since 2000-01-01).
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "seconds since the UNIX epoch fit in i64 for the next ~292 billion years"
+)]
 fn current_pg_timestamp() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -701,13 +838,13 @@ fn current_pg_timestamp() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
 
-    let unix_micros = (now.as_secs() as i64) * 1_000_000 + (now.subsec_micros() as i64);
+    let unix_micros = (now.as_secs() as i64) * 1_000_000 + i64::from(now.subsec_micros());
     unix_micros - PG_EPOCH_MICROS
 }
 
-/// Compute PostgreSQL MD5 password hash.
+/// Compute `PostgreSQL` MD5 password hash.
 #[cfg(feature = "md5")]
-fn postgres_md5(password: &str, user: &str, salt: &[u8; 4]) -> String {
+fn postgres_md5(password: &str, user: &str, salt: [u8; 4]) -> String {
     fn md5_hex(data: &[u8]) -> String {
         format!("{:x}", md5::compute(data))
     }
@@ -717,7 +854,7 @@ fn postgres_md5(password: &str, user: &str, salt: &[u8; 4]) -> String {
 
     // Second hash: md5(inner_hash + salt)
     let mut outer_input = inner.into_bytes();
-    outer_input.extend_from_slice(salt);
+    outer_input.extend_from_slice(&salt);
 
     format!("md5{}", md5_hex(&outer_input))
 }
@@ -751,7 +888,7 @@ mod tests {
     fn postgres_md5_known_value() {
         // Test vector: user="md5_user", password="md5_pass", salt=[0x01, 0x02, 0x03, 0x04]
         // Can verify with: SELECT 'md5' || md5(md5('md5_passmd5_user') || E'\\x01020304');
-        let hash = postgres_md5("md5_pass", "md5_user", &[0x01, 0x02, 0x03, 0x04]);
+        let hash = postgres_md5("md5_pass", "md5_user", [0x01, 0x02, 0x03, 0x04]);
         assert!(hash.starts_with("md5"));
         assert_eq!(hash.len(), 35); // "md5" + 32 hex chars
     }
@@ -761,5 +898,89 @@ mod tests {
         // Any time after 2000-01-01 should be positive
         let ts = current_pg_timestamp();
         assert!(ts > 0);
+    }
+
+    /// Regression test for the feedback/backpressure coupling: when the consumer
+    /// stops draining the events channel, `send_event` must keep emitting standby
+    /// status updates every `status_interval` instead of parking silently. If it
+    /// didn't, Postgres would see no feedback and terminate the walsender on
+    /// `wal_sender_timeout`.
+    #[tokio::test]
+    async fn feedback_continues_while_events_channel_is_full() {
+        use tokio::io::{duplex, AsyncReadExt};
+
+        // Capacity-1 consumer channel, primed to full and never drained. `_rx`
+        // keeps it open so `send_event` blocks on backpressure (not closure).
+        let (out_tx, _rx) = mpsc::channel::<std::result::Result<ReplicationEvent, PgWireError>>(1);
+        out_tx
+            .try_send(Ok(ReplicationEvent::KeepAlive {
+                wal_end: Lsn(0),
+                reply_requested: false,
+                server_time_micros: 0,
+            }))
+            .expect("prime channel to full");
+
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        // Short real interval so the three feedback sends complete quickly.
+        let cfg = ReplicationConfig {
+            status_interval: std::time::Duration::from_millis(20),
+            feedback_while_backpressured: true,
+            ..Default::default()
+        };
+        let progress = Arc::new(SharedProgress::new(Lsn(42)));
+        let mut worker = WorkerState::new(cfg, progress, stop_rx, out_tx.clone());
+
+        // In-memory socket; the worker writes standby status updates on its side.
+        let (client_io, mut server_io) = duplex(64 * 1024);
+
+        let send = tokio::spawn(async move {
+            let mut stream = client_io;
+            let mut last_status_sent = Instant::now();
+            worker
+                .send_event(
+                    &mut stream,
+                    Ok(ReplicationEvent::KeepAlive {
+                        wal_end: Lsn(0),
+                        reply_requested: false,
+                        server_time_micros: 0,
+                    }),
+                    &mut last_status_sent,
+                )
+                .await
+        });
+
+        // Read three standby status updates, one per `status_interval`. Under the
+        // old coupling zero frames would ever arrive and `read_exact` would hang.
+        for _ in 0..3 {
+            let mut tag = [0u8; 1];
+            server_io
+                .read_exact(&mut tag)
+                .await
+                .expect("read frame tag");
+            assert_eq!(tag[0], b'd', "expected a CopyData frame");
+            let mut len = [0u8; 4];
+            server_io
+                .read_exact(&mut len)
+                .await
+                .expect("read frame len");
+            let payload_len = (u32::from_be_bytes(len) as usize) - 4;
+            let mut payload = vec![0u8; payload_len];
+            server_io
+                .read_exact(&mut payload)
+                .await
+                .expect("read frame payload");
+            assert_eq!(
+                payload[0], b'r',
+                "CopyData payload should be a standby status update"
+            );
+        }
+
+        // Feedback flowed *while* the send was still backpressured — the point of
+        // the fix.
+        assert!(
+            !send.is_finished(),
+            "send_event should still be parked on the full channel"
+        );
+        send.abort();
     }
 }

@@ -149,6 +149,36 @@ async fn get_ids(ctx: &SessionContext, table_name: &str) -> TestResult<Vec<i64>>
     Ok(ids)
 }
 
+/// Insert `n` sequential Int64-PK rows (id `0..n`, name `"n{i}"`, value `i*100`)
+/// and checkpoint them into listing-table files, so a subsequent delete
+/// exercises the file-resident `pk IN (...)` path rather than the inline
+/// memtable (an inline-resident delete takes a different, already-correct path).
+/// Asserts the full row count landed.
+async fn seed_int64_rows_to_files(
+    table: &Arc<CayenneTableProvider>,
+    ctx: &SessionContext,
+    schema: &Arc<Schema>,
+    name: &str,
+    n: i64,
+) -> TestResult<()> {
+    let batch = RecordBatch::try_new(
+        Arc::clone(schema),
+        vec![
+            Arc::new(Int64Array::from((0..n).collect::<Vec<i64>>())),
+            Arc::new(StringArray::from(
+                (0..n).map(|i| format!("n{i}")).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                (0..n).map(|i| i * 100).collect::<Vec<i64>>(),
+            )),
+        ],
+    )?;
+    insert_batch(table, batch).await?;
+    table.checkpoint_inlined_data().await?;
+    assert_eq!(get_row_count(ctx, name).await?, n);
+    Ok(())
+}
+
 // =============================================================================
 // Edge Case 1: Empty deletion set (no matching rows)
 // =============================================================================
@@ -180,11 +210,11 @@ async fn test_int64_pk_delete_no_matches_impl(fixture: TestFixture) -> TestResul
 test_with_backends!(test_int64_pk_delete_no_matches_impl);
 
 // =============================================================================
-// Regression: user-visible `DELETE ... WHERE id IN (...)` reports the EXACT
-// number of live rows removed.
+// User-visible `DELETE ... WHERE id IN (...)` reports the exact number of live
+// rows removed.
 //
 // A single-Int64-PK `DELETE WHERE id IN (...)` is extracted straight from the
-// filter and applied via deletion vectors. The CDC fast path (#11049)
+// filter and applied via deletion vectors. The CDC count-skipping path
 // intentionally skips the scan and returns 0 for that shape; a user-visible
 // DELETE surfaces "rows affected" to the SQL client, so it must instead return
 // the verified count (the fix routes user DELETEs through the scan-based count
@@ -196,26 +226,9 @@ async fn test_int64_pk_delete_in_list_reports_exact_count_impl(
     fixture: TestFixture,
 ) -> TestResult<()> {
     let (table, ctx, schema) = setup_int64_pk_table(&fixture, "in_list_count_test").await?;
-
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(Int64Array::from((0i64..10).collect::<Vec<i64>>())),
-            Arc::new(StringArray::from(
-                (0i64..10).map(|i| format!("n{i}")).collect::<Vec<_>>(),
-            )),
-            Arc::new(Int64Array::from(
-                (0i64..10).map(|i| i * 100).collect::<Vec<i64>>(),
-            )),
-        ],
-    )?;
-    insert_batch(&table, batch).await?;
-    // Force the rows out of the inline memtable into listing-table files. The
-    // count bug lives in the FILE deletion path's `pk IN (...)` fast path; an
-    // inline-resident delete is counted by a different (already-correct) path,
-    // so without this checkpoint a small table would not exercise the fix.
-    table.checkpoint_inlined_data().await?;
-    assert_eq!(get_row_count(&ctx, "in_list_count_test").await?, 10);
+    // File-resident seed: the file deletion path's `pk IN (...)` fast path is
+    // separate from the inline-resident delete count path.
+    seed_int64_rows_to_files(&table, &ctx, &schema, "in_list_count_test", 10).await?;
 
     // DELETE WHERE id IN (0,1,2,3,4) — all five exist.
     let in_list = col("id").in_list((0i64..5).map(lit).collect::<Vec<_>>(), false);
@@ -241,6 +254,48 @@ async fn test_int64_pk_delete_in_list_reports_exact_count_impl(
 }
 
 test_with_backends!(test_int64_pk_delete_in_list_reports_exact_count_impl);
+
+/// The durable CDC delete path (`CayenneTableProvider::delete_from_cdc_fast`)
+/// must stay on the count-skipping `pk IN (...)` fast path, not the scan-to-count
+/// path used by user-visible DELETEs. CDC counterpart to
+/// `test_int64_pk_delete_in_list_reports_exact_count` above (same file-resident
+/// seed): it asserts the fast-path witness (`Some(0)`, not a scanned count) and
+/// that the rows are actually removed.
+async fn test_int64_pk_cdc_fast_delete_keeps_fast_path_impl(
+    fixture: TestFixture,
+) -> TestResult<()> {
+    let (table, ctx, schema) = setup_int64_pk_table(&fixture, "cdc_fast_delete_test").await?;
+    seed_int64_rows_to_files(&table, &ctx, &schema, "cdc_fast_delete_test", 10).await?;
+
+    // The durable CDC apply loop's delete: `id IN (2,4,6)`, all live.
+    let in_list = col("id").in_list(vec![lit(2i64), lit(4i64), lit(6i64)], false);
+    let handled = table
+        .delete_from_cdc_fast(std::slice::from_ref(&in_list))
+        .await?;
+    // The count-skipping fast path returns the deliberate non-authoritative
+    // sentinel 0 (the CDC caller discards it). `Some(3)` would mean the
+    // scan-to-count path ran instead, and `None` would mean the shape was
+    // declined back to the exact-count `delete_from`.
+    assert_eq!(
+        handled,
+        Some(0),
+        "a key-based `pk IN (...)` CDC delete must stay on the count-skipping fast path \
+         (sentinel 0), not the scan-to-count path (exact count 3) or a decline to \
+         `delete_from` (`None`)"
+    );
+
+    // The deletion must be correct even though the (non-authoritative) count is
+    // discarded by the CDC caller.
+    assert_eq!(get_row_count(&ctx, "cdc_fast_delete_test").await?, 7);
+    assert_eq!(
+        get_ids(&ctx, "cdc_fast_delete_test").await?,
+        vec![0, 1, 3, 5, 7, 8, 9]
+    );
+
+    Ok(())
+}
+
+test_with_backends!(test_int64_pk_cdc_fast_delete_keeps_fast_path_impl);
 
 // =============================================================================
 // Edge Case 2: Delete all rows

@@ -21,15 +21,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, RwLock as StdRwLock};
 use std::time::Duration;
 
-use crate::component::ComponentType;
 use crate::component::dataset::Dataset;
-use crate::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use crate::dataconnector::{ConnectorComponent, DataConnectorError, DataConnectorResult};
 use crate::parameters::{ParameterSpec, Parameters};
 use data_components::rate_limit::{HttpRateLimiter, HttpRateLimiterMetrics};
 use governor::Quota;
 use object_store::ObjectStore;
 use opentelemetry::KeyValue;
+use runtime_api_types::v1::ComponentType;
+use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_rate_control::{JitterConfig, RateController, RateControllerMetrics};
 use tokio::sync::RwLock;
 use url::Url;

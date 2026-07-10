@@ -20,9 +20,118 @@ limitations under the License.
 //! provider maintains and probes these; the per-row location is recorded as a
 //! [`RowLocation`].
 
-use arrow_row::OwnedRow;
+use crate::row_converter::OwnedRow;
+use hash_index::{PrehashedBuildHasher, hash_key_128};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+/// Seeded XXH3-128 digest of a primary key's `RowConverter`-encoded bytes — the
+/// key's identity throughout the upsert conflict path.
+///
+/// The per-row conflict loop probes three maps (in-batch dedup, cross-batch
+/// `incoming_keys`, and the `existing_keys` keyset). Hashing the `OwnedRow`
+/// bytes ONCE into this digest and keying every map on it — fronted by
+/// [`PrehashedBuildHasher`], which reuses the digest's own entropy rather than
+/// re-hashing — collapses those probes onto a single hash pass, mirroring
+/// [`KeyDeletionIndex`](super::deletion_index::KeyDeletionIndex). It replaces the
+/// standard-library `SipHash` default, which showed up on apply-side flamegraphs
+/// and streamed (slowly) for composite PKs whose encoding is long.
+///
+/// Two distinct keys colliding under XXH3-128 would share one map slot; at one
+/// billion keys the birthday bound puts that below ~1e-20 — orders of magnitude
+/// under hardware error rates, and the same identity trade the key-based
+/// deletion index already makes. (A 64-bit digest would NOT be safe as identity
+/// at these cardinalities: ~0.3% collision odds at the same scale.)
+#[inline]
+pub(crate) fn pk_digest(key: &OwnedRow) -> u128 {
+    hash_key_128(key.as_ref())
+}
+
+/// A set of primary-key [`OwnedRow`]s identified by their [`pk_digest`] and
+/// fronted by [`PrehashedBuildHasher`]. Presents a `HashSet`-like API while
+/// keying on the 128-bit digest, so the per-apply accumulators
+/// (`incoming_keys` / `kept_keys` / bloom-MISS keys) share the conflict loop's
+/// single hash pass. The `OwnedRow` is retained (as the map value) because
+/// downstream consumers — the keyset insert, bloom rebuild, deletion lists, and
+/// shard routing — need the raw key bytes, never the digest.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PkDigestSet {
+    inner: HashMap<u128, OwnedRow, PrehashedBuildHasher>,
+}
+
+impl PkDigestSet {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            inner: HashMap::with_capacity_and_hasher(capacity, PrehashedBuildHasher),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Whether a key with this precomputed digest is present — lets the conflict
+    /// loop reuse the digest it already computed for the row.
+    #[inline]
+    pub(crate) fn contains_digest(&self, digest: u128) -> bool {
+        self.inner.contains_key(&digest)
+    }
+
+    /// Insert `key` under a precomputed `digest` (the loop's single hash pass).
+    /// `digest` MUST equal `pk_digest(&key)`.
+    #[inline]
+    pub(crate) fn insert_with_digest(&mut self, digest: u128, key: OwnedRow) {
+        debug_assert_eq!(
+            digest,
+            pk_digest(&key),
+            "insert_with_digest called with a digest that does not match the key"
+        );
+        self.inner.insert(digest, key);
+    }
+
+    /// Iterate the retained `OwnedRow`s (arbitrary order, like a `HashSet`).
+    #[inline]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &OwnedRow> {
+        self.inner.values()
+    }
+
+    /// Merge every key of `other` into `self`, consuming it and reusing its
+    /// stored digests — no re-hashing.
+    #[inline]
+    pub(crate) fn absorb(&mut self, other: PkDigestSet) {
+        self.inner.extend(other.inner);
+    }
+
+    /// Copy every key of `other` into `self`, reusing its stored digests.
+    pub(crate) fn extend_ref(&mut self, other: &PkDigestSet) {
+        self.inner.reserve(other.inner.len());
+        for (&digest, key) in &other.inner {
+            self.inner.insert(digest, key.clone());
+        }
+    }
+
+    /// Iterate `(digest, key)` pairs, so a consumer rebuilding another
+    /// digest-keyed structure reuses the stored digest instead of re-hashing.
+    #[inline]
+    pub(crate) fn iter_with_digest(&self) -> impl Iterator<Item = (u128, &OwnedRow)> {
+        self.inner.iter().map(|(&digest, key)| (digest, key))
+    }
+}
+
+/// Value stored per key in the digest-keyed [`CachedPkKeyset`]: the raw PK
+/// [`OwnedRow`] (retained because bloom rebuild, shard routing, and byte
+/// accounting need the bytes) alongside its current [`RowLocation`].
+#[derive(Debug, Clone)]
+struct PkKeysetEntry {
+    row: OwnedRow,
+    location: RowLocation,
+}
 
 // Approximate per-entry `HashMap` control/allocation overhead used for the
 // cache budget. The exact value is allocator-dependent, so keep this estimate
@@ -65,7 +174,11 @@ pub(crate) enum RowLocation {
 }
 
 pub(crate) struct CachedPkKeyset {
-    pub(crate) keys: HashMap<OwnedRow, RowLocation>,
+    /// PK existence map, keyed by [`pk_digest`] and fronted by
+    /// [`PrehashedBuildHasher`]. Private so every access routes through a method
+    /// that hashes the key consistently; the retained [`OwnedRow`] lives in each
+    /// entry's value.
+    keys: HashMap<u128, PkKeysetEntry, PrehashedBuildHasher>,
     pub(crate) approx_bytes: usize,
     /// Data files whose rows have already had their `(key -> file-local
     /// position)` captured by the `deletion_mode: position` read-back, so the
@@ -77,25 +190,48 @@ pub(crate) struct CachedPkKeyset {
 impl CachedPkKeyset {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
-            keys: HashMap::with_capacity(capacity),
+            keys: HashMap::with_capacity_and_hasher(capacity, PrehashedBuildHasher),
             approx_bytes: 0,
             captured_files: HashSet::new(),
         }
     }
 
+    #[inline]
     pub(crate) fn len(&self) -> usize {
         self.keys.len()
     }
 
+    /// Insert `key` -> `location`, overwriting an existing entry's location.
+    /// Hashes `key` once via [`pk_digest`]; callers with a precomputed digest
+    /// should use [`Self::insert_with_digest`] instead.
     pub(crate) fn insert(&mut self, key: OwnedRow, location: RowLocation) {
-        let entry_bytes = approx_pk_keyset_entry_bytes(&key);
-        match self.keys.entry(key) {
+        self.insert_with_digest(pk_digest(&key), key, location);
+    }
+
+    /// Insert `key` -> `location` under a precomputed `digest` (which MUST equal
+    /// `pk_digest(&key)`), overwriting an existing entry's location. Lets the
+    /// per-apply recording paths reuse the digest already stored in a
+    /// [`PkDigestSet`] instead of re-hashing.
+    pub(crate) fn insert_with_digest(
+        &mut self,
+        digest: u128,
+        key: OwnedRow,
+        location: RowLocation,
+    ) {
+        debug_assert_eq!(
+            digest,
+            pk_digest(&key),
+            "insert_with_digest called with a digest that does not match the key"
+        );
+        match self.keys.entry(digest) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
-                entry.insert(location);
+                entry.get_mut().location = location;
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
-                self.approx_bytes = self.approx_bytes.saturating_add(entry_bytes);
-                entry.insert(location);
+                self.approx_bytes = self
+                    .approx_bytes
+                    .saturating_add(approx_pk_keyset_entry_bytes(&key));
+                entry.insert(PkKeysetEntry { row: key, location });
             }
         }
     }
@@ -106,12 +242,59 @@ impl CachedPkKeyset {
     /// Used by the mem-tier fold, which must not clobber a durable-scan location
     /// with `FileUnlocated`.
     pub(crate) fn insert_if_absent(&mut self, key: OwnedRow, location: RowLocation) {
-        if let std::collections::hash_map::Entry::Vacant(entry) = self.keys.entry(key) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.keys.entry(pk_digest(&key)) {
             self.approx_bytes = self
                 .approx_bytes
-                .saturating_add(approx_pk_keyset_entry_bytes(entry.key()));
-            entry.insert(location);
+                .saturating_add(approx_pk_keyset_entry_bytes(&key));
+            entry.insert(PkKeysetEntry { row: key, location });
         }
+    }
+
+    /// Whether a key with this precomputed digest is present — lets a caller
+    /// holding the digest (e.g. from a [`PkDigestSet`]) skip re-hashing.
+    #[inline]
+    pub(crate) fn contains_digest(&self, digest: u128) -> bool {
+        self.keys.contains_key(&digest)
+    }
+
+    /// The [`RowLocation`] for a key with this precomputed digest — the hot-path
+    /// existence probe, reusing the conflict loop's single hash pass.
+    #[inline]
+    pub(crate) fn location_by_digest(&self, digest: u128) -> Option<&RowLocation> {
+        self.keys.get(&digest).map(|entry| &entry.location)
+    }
+
+    /// Mutable access to a key's [`RowLocation`] (position-capture upgrade).
+    #[inline]
+    pub(crate) fn location_mut(&mut self, key: &OwnedRow) -> Option<&mut RowLocation> {
+        self.keys
+            .get_mut(&pk_digest(key))
+            .map(|entry| &mut entry.location)
+    }
+
+    /// Iterate every retained key's [`OwnedRow`] bytes (bloom rebuild, sharding).
+    #[inline]
+    pub(crate) fn rows(&self) -> impl Iterator<Item = &OwnedRow> {
+        self.keys.values().map(|entry| &entry.row)
+    }
+
+    /// Iterate every entry's [`RowLocation`] immutably (test/inspection).
+    #[cfg(test)]
+    pub(crate) fn locations(&self) -> impl Iterator<Item = &RowLocation> {
+        self.keys.values().map(|entry| &entry.location)
+    }
+
+    /// Mutable iterator over every entry's [`RowLocation`] (the
+    /// `Inlined -> FileUnlocated` flip after an inline checkpoint).
+    pub(crate) fn locations_mut(&mut self) -> impl Iterator<Item = &mut RowLocation> {
+        self.keys.values_mut().map(|entry| &mut entry.location)
+    }
+
+    /// Consume the keyset into `(key, location)` pairs (the shard split).
+    pub(crate) fn into_entries(self) -> impl Iterator<Item = (OwnedRow, RowLocation)> {
+        self.keys
+            .into_values()
+            .map(|entry| (entry.row, entry.location))
     }
 }
 
@@ -422,8 +605,12 @@ impl ShardedPkIndex {
         let n = n.max(1);
         let mut shards: Vec<CachedPkKeyset> =
             (0..n).map(|_| CachedPkKeyset::with_capacity(0)).collect();
-        for (key, loc) in keyset.keys {
-            let s = shard_of_pk(key.row().as_ref(), n);
+        // The position-delete capture set is table-global; every shard needs the
+        // complete skip set so its read-back doesn't re-capture a covered file.
+        // Captured before `into_entries` consumes the keyset below.
+        let captured_files = keyset.captured_files.clone();
+        for (key, loc) in keyset.into_entries() {
+            let s = shard_of_pk(key.as_ref(), n);
             // Route through CachedPkKeyset::insert — the single source of truth for
             // approx_bytes (per-key approx_pk_keyset_entry_bytes) — so each shard's
             // byte tally is exact for variable-length/composite PKs, not an even
@@ -431,10 +618,8 @@ impl ShardedPkIndex {
             // unsharded keyset's bytes with no integer-division undercount.
             shards[s].insert(key, loc);
         }
-        // The position-delete capture set is table-global; every shard needs the
-        // complete skip set so its read-back doesn't re-capture a covered file.
         for shard in &mut shards {
-            shard.captured_files.clone_from(&keyset.captured_files);
+            shard.captured_files.clone_from(&captured_files);
         }
         Self::Exact(shards.into_boxed_slice())
     }
@@ -449,7 +634,7 @@ impl ShardedPkIndex {
     /// Borrowed existence view for shard `i`, handed to that shard's validation.
     pub(crate) fn existence_ref(&self, i: usize) -> PkExistenceRef<'_> {
         match self {
-            Self::Exact(keysets) => PkExistenceRef::Exact(&keysets[i].keys),
+            Self::Exact(keysets) => PkExistenceRef::Exact(&keysets[i]),
             Self::Bloom(blooms) => PkExistenceRef::Bloom(&blooms[i]),
         }
     }
@@ -487,20 +672,22 @@ impl ShardedPkIndex {
     pub(crate) fn record_keys_in_shard(
         &mut self,
         shard: usize,
-        keys: &HashSet<OwnedRow>,
+        keys: &PkDigestSet,
         location: &RowLocation,
     ) {
         match self {
             Self::Exact(keysets) => {
                 if let Some(keyset) = keysets.get_mut(shard) {
-                    for key in keys {
-                        keyset.insert(key.clone(), location.clone());
+                    // Reuse each key's stored digest — the keyset is digest-keyed,
+                    // so this avoids re-hashing every recorded key.
+                    for (digest, key) in keys.iter_with_digest() {
+                        keyset.insert_with_digest(digest, key.clone(), location.clone());
                     }
                 }
             }
             Self::Bloom(blooms) => {
                 if let Some(bloom) = blooms.get_mut(shard) {
-                    for key in keys {
+                    for key in keys.iter() {
                         bloom.insert(key.as_ref());
                     }
                 }
@@ -509,8 +696,10 @@ impl ShardedPkIndex {
     }
 }
 
-/// Borrowed view of a [`CachedPkIndex`] handed to per-batch validation.
+/// Borrowed view of a [`CachedPkIndex`] handed to per-batch validation. The
+/// `Exact` variant borrows the whole [`CachedPkKeyset`] so the conflict loop can
+/// probe it by precomputed digest ([`CachedPkKeyset::location_by_digest`]).
 pub(crate) enum PkExistenceRef<'a> {
-    Exact(&'a HashMap<OwnedRow, RowLocation>),
+    Exact(&'a CachedPkKeyset),
     Bloom(&'a PkBloom),
 }

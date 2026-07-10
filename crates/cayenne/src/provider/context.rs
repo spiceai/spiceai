@@ -26,7 +26,9 @@ use vortex_datafusion::{ProjectionPushdown, VortexFormat, VortexTableOptions, Wr
 use vortex_session::VortexSession;
 
 use super::tuning::{self, ActuatorValues, IngestStats, LiveActuators, TuningBounds};
-use crate::metadata::{DeletionMode, DeltaEncoding, PkConflictDetection, VortexConfig};
+use crate::metadata::{
+    DeletionMode, DeltaEncoding, PkConflictDetection, StorageClass, VortexConfig,
+};
 
 /// Shared context for Cayenne table operations.
 ///
@@ -111,6 +113,12 @@ pub struct CayenneContext {
     /// inter-batch arrival interval (the offered-load signal). `None` until the
     /// first write.
     last_write: parking_lot::Mutex<Option<std::time::Instant>>,
+    /// Set of data files whose integrity digest has already been verified this
+    /// process, keyed by `"<snapshot_id>/<file_path>"`. Used only when
+    /// `integrity_checksums` is enabled, to bound verification to one whole-file
+    /// read per file per process ("verify on first read"). Data files are
+    /// immutable once published, so a verified file never needs re-checking.
+    verified_data_files: parking_lot::Mutex<std::collections::HashSet<String>>,
 }
 
 /// Default byte budget for the in-memory PK keyset cache when
@@ -278,6 +286,7 @@ impl CayenneContext {
             bake_gate_last_samples: std::sync::atomic::AtomicU64::new(0),
             goal_stuck_ticks: std::sync::atomic::AtomicU64::new(0),
             last_write: parking_lot::Mutex::new(None),
+            verified_data_files: parking_lot::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -307,6 +316,36 @@ impl CayenneContext {
         let format =
             VortexFormat::new_with_options(session, Self::vortex_table_options(&self.config))
                 .with_dataset_label(self.dataset.as_str());
+        let format = match shard {
+            Some(config) => format.with_write_shard(config),
+            None => format,
+        };
+        Arc::new(format)
+    }
+
+    /// Build a write-only `VortexFormat` for the cold (datalake) tier whose
+    /// file-rolling target is `cold_target_file_size_mb` rather than the warm
+    /// `target_vortex_file_size_mb`.
+    #[must_use]
+    pub(crate) fn cold_write_format(
+        &self,
+        cold_target_file_size_mb: usize,
+        shard: Option<WriteShardConfig>,
+    ) -> Arc<VortexFormat> {
+        let mut session = VortexSession::default();
+        if let Some(full_strategy) =
+            super::delta_encoding::full_strategy_builder_for(&self.config.compression_strategy)
+        {
+            session = session.set(full_strategy);
+        }
+        let mut options = Self::vortex_table_options(&self.config);
+        options.target_file_size_mb = cold_target_file_size_mb;
+        // Write-only format: it never scans, so drop the read-path segment cache
+        // and avoid constructing a `SharedSegmentCache` (moka + metrics) per
+        // promotion.
+        options.segment_cache_size_bytes = None;
+        let format = VortexFormat::new_with_options(session, options)
+            .with_dataset_label(self.dataset.as_str());
         let format = match shard {
             Some(config) => format.with_write_shard(config),
             None => format,
@@ -536,6 +575,27 @@ impl CayenneContext {
         self.config.force_view_read_schema
     }
 
+    /// Whether end-to-end integrity checksums are enabled for the staging WAL
+    /// and Vortex data files. See
+    /// [`crate::metadata::VortexConfig::integrity_checksums`].
+    #[must_use]
+    pub(crate) fn integrity_checksums(&self) -> bool {
+        self.config.integrity_checksums
+    }
+
+    /// Whether the data file keyed by `"<snapshot_id>/<file_path>"` has already
+    /// had its integrity digest verified in this process.
+    #[must_use]
+    pub(crate) fn is_data_file_verified(&self, key: &str) -> bool {
+        self.verified_data_files.lock().contains(key)
+    }
+
+    /// Record that the data file keyed by `"<snapshot_id>/<file_path>"` passed
+    /// integrity verification, so it is not re-read on later scans.
+    pub(crate) fn mark_data_file_verified(&self, key: String) {
+        self.verified_data_files.lock().insert(key);
+    }
+
     /// Maximum number of consecutive compaction passes per trigger.
     #[must_use]
     pub(crate) fn compaction_max_levels(&self) -> usize {
@@ -574,6 +634,34 @@ impl CayenneContext {
     #[must_use]
     pub(crate) fn mem_tier_checkpoint_interval(&self) -> Option<std::time::Duration> {
         let ms = self.config.cdc_mem_tier_checkpoint_interval_ms;
+        if ms == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(ms))
+        }
+    }
+
+    /// Max age of the ACTIVE ingestion piece before a **seal** durably shadows it
+    /// and advances the source slot (`cdc_durability: memory`). Returns `None` when
+    /// sealing is disabled (`cdc_mem_tier_seal_age_ms == 0`), in which case the
+    /// slot ack reverts to the checkpoint cadence. Like the checkpoint interval
+    /// this is a fixed time-domain durability-policy bound, not a tuned actuator.
+    #[must_use]
+    pub(crate) fn mem_tier_seal_age(&self) -> Option<std::time::Duration> {
+        let ms = self.config.cdc_mem_tier_seal_age_ms;
+        if ms == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(ms))
+        }
+    }
+
+    /// Maximum age of buffered streaming-append data before the sink cuts the
+    /// segment and publishes it. Returns `None` when disabled (interval = 0):
+    /// the sink then publishes only when the input stream ends.
+    #[must_use]
+    pub(crate) fn stream_publish_interval(&self) -> Option<std::time::Duration> {
+        let ms = self.config.stream_publish_interval_ms;
         if ms == 0 {
             None
         } else {
@@ -654,6 +742,22 @@ impl CayenneContext {
     #[must_use]
     pub(crate) fn mem_pressure(&self) -> Option<f64> {
         self.ingest_stats.mem_pressure()
+    }
+
+    /// Test hook: inject a memory-pressure sample directly (production writes it
+    /// via the controller's `observe_environment`).
+    #[cfg(test)]
+    pub(crate) fn set_mem_pressure_for_test(&self, fraction: f64) {
+        self.ingest_stats.set_mem_pressure(fraction);
+    }
+
+    /// The detected storage medium backing this table's data files (from the
+    /// runtime's acceleration-storage detection at registration, or the operator's
+    /// `storage` param). A cheap field read — the compaction writer's tier gate
+    /// uses it without building a full [`Self::ingest_snapshot`].
+    #[must_use]
+    pub(crate) fn data_storage_class(&self) -> StorageClass {
+        self.config.data_storage_class
     }
 
     /// A snapshot of the current ingest accounting (rate + response), enriched with
@@ -905,6 +1009,41 @@ mod tests {
         assert_eq!(
             context.file_format().options().projection_pushdown,
             ProjectionPushdown::On
+        );
+    }
+
+    /// Regression: the cold (datalake) promotion write must roll files at
+    /// `cayenne_cold_target_file_size_mb`, not the warm `target_vortex_file_size_mb`.
+    ///
+    /// Every sorted / PK-upsert table earns a single write shard, so the warm
+    /// `write_shard_format` path returns the base format unchanged — whose
+    /// `target_file_size_mb` is the warm size. Cold promotion therefore silently
+    /// rolled files at the warm size, leaving `cayenne_cold_target_file_size_mb`
+    /// inert. `cold_write_format` must build a format carrying the cold size.
+    #[test]
+    fn cold_write_format_rolls_files_at_cold_target_size() {
+        let runtime_env = Arc::new(RuntimeEnv::default());
+        let config = VortexConfig {
+            target_vortex_file_size_mb: 256,
+            cold_target_file_size_mb: 1024,
+            ..VortexConfig::default()
+        };
+        let context = CayenneContext::new(&config, runtime_env, "test");
+
+        // Baseline: the warm/base format rolls at the warm target size.
+        assert_eq!(
+            context.file_format().options().target_file_size_mb,
+            256,
+            "base (warm) format must use target_vortex_file_size_mb"
+        );
+
+        // Datalake: the cold format rolls at the cold target size, independent of the warm size;
+        // previously this file size was silently 256 (the warm size).
+        let cold = context.cold_write_format(config.cold_target_file_size_mb, None);
+        assert_eq!(
+            cold.options().target_file_size_mb,
+            1024,
+            "cold format must use cayenne_cold_target_file_size_mb, not the warm size"
         );
     }
 

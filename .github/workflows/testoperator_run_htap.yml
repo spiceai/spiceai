@@ -61,6 +61,11 @@ on:
         required: false
         default: false
         type: boolean
+      cayenne_eager_ndv:
+        description: 'Fold NDV eagerly on ingest (sets SPICE_CAYENNE_EAGER_NDV); default (false) = lazy, compute NDV on file spill'
+        required: false
+        default: false
+        type: boolean
 
 # Serialize ALL SF100 + SF1000 CH-benCHmark runs across every variant (sqlite/turso cdc-tuned,
 # adaptive, duckdb): they share ONE concurrency group keyed only by scale factor, so
@@ -69,12 +74,15 @@ on:
 # an in-flight benchmark is never killed mid-run. Other scale factors (e.g. manual SF1/SF10 runs)
 # get a unique group (github.run_id) and stay parallel.
 #
-# NOTE: GitHub keeps at most one in-progress + one pending run per group (a newer pending run
-# cancels the older pending one), so when a cron dispatches a batch faster than runs complete,
-# the intermediate dispatches are superseded rather than queued FIFO.
+# queue: max keeps up to 100 runs pending in the group, processed first-in-first-out by the time
+# each started waiting. So a batch dispatched faster than runs complete queues FIFO instead of the
+# newer pending run superseding (cancelling) the older one, which is the default (queue: single).
+# This is what lets the dispatcher fire a whole batch at once and let GitHub serialize it, rather
+# than blocking to feed runs one at a time; see testoperator_dispatch_htap.yml.
 concurrency:
   group: ${{ (github.event.inputs.scale_factor == '100' || github.event.inputs.scale_factor == '1000') && 'chbench-htap-sf100-sf1000' || github.run_id }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
   run-htap:
@@ -92,6 +100,17 @@ jobs:
         run: |
           SPICEPOD_PATH="./test/spicepods/chbench/${{ github.event.inputs.spicepod_path }}"
           echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
+          # Derive the source database from the spicepod filename so the DB setup can
+          # never disagree with the spicepod under test. By convention the connector is
+          # the filename prefix (`{connector[variant]}-{accelerator}-...`), e.g.
+          # `mysql-cayenne[file].yaml` or `federated/mysql.yaml`. Anything not `mysql*`
+          # is Postgres (the only other CH-benCH source today).
+          case "$(basename "${SPICEPOD_PATH}")" in
+            mysql*) SOURCE_TYPE=mysql ;;
+            *)      SOURCE_TYPE=postgres ;;
+          esac
+          echo "SOURCE_TYPE=${SOURCE_TYPE}" >> $GITHUB_OUTPUT
+          echo "Derived source_type=${SOURCE_TYPE} from spicepod $(basename "${SPICEPOD_PATH}")"
 
       - name: Validate spicepod file exists
         run: |
@@ -117,14 +136,44 @@ jobs:
       - name: Display spiced commit
         run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
 
+      # Write the commit + high-level config to the job summary up front, so the
+      # run is identifiable and reproducible even if it crashes mid-run. Results
+      # are appended after the run below.
+      - name: Write run summary header
+        run: |
+          {
+            echo "## CH-BenCHmark run"
+            echo ""
+            echo "| Parameter | Value |"
+            echo "| --- | --- |"
+            echo "| spiced commit | \`${{ steps.setup-spiced.outputs.SPICED_COMMIT }}\` |"
+            echo "| testoperator commit | \`${{ github.sha }}\` |"
+            echo "| spicepod | \`${{ github.event.inputs.spicepod_path }}\` |"
+            echo "| source database | ${{ steps.set_spicepod_path.outputs.SOURCE_TYPE }} |"
+            echo "| scale factor (warehouses) | ${{ github.event.inputs.scale_factor }} |"
+            echo "| terminals | ${{ github.event.inputs.terminals || 'scale_factor × 10' }} |"
+            echo "| target OLTP rate | ${{ github.event.inputs.rate || 'unlimited' }} |"
+            echo "| duration (s) | ${{ github.event.inputs.duration }} |"
+            echo "| analytical concurrency | ${{ github.event.inputs.concurrency }} |"
+            echo "| query overrides | ${{ github.event.inputs.query_overrides || 'none' }} |"
+            echo "| runner | ${{ github.event.inputs.runner_type }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
 
       # On spiceai-dev-xlarge-runners a dedicated in-cluster PostgreSQL pod is used,
       # so skip the local docker Postgres there.
       - name: Setup CH-benCH PostgreSQL
-        if: github.event.inputs.runner_type != 'spiceai-dev-xlarge-runners'
+        if: steps.set_spicepod_path.outputs.SOURCE_TYPE != 'mysql' && github.event.inputs.runner_type != 'spiceai-dev-xlarge-runners'
         uses: ./.github/actions/setup-chbench-postgres
+
+      # MySQL source: on spiceai-dev-xlarge-runners a dedicated in-cluster MySQL
+      # pod is used (chbench-mysql.dataplatform.svc.cluster.local, like Postgres),
+      # so skip the local docker MySQL there.
+      - name: Setup CH-benCH MySQL
+        if: steps.set_spicepod_path.outputs.SOURCE_TYPE == 'mysql' && github.event.inputs.runner_type != 'spiceai-dev-xlarge-runners'
+        uses: ./.github/actions/setup-chbench-mysql
 
       # The xlarge PG pod is long-lived, so cache a pristine seed as a Postgres
       # template database and restore chbench from it (FILE_COPY, seconds) instead
@@ -133,7 +182,7 @@ jobs:
       # this the run below uses `--skip-prepare`. Ephemeral docker-PG runners have
       # nothing to cache, so they skip this and seed normally.
       - name: Restore or seed CH-benCH from template
-        if: github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners'
+        if: steps.set_spicepod_path.outputs.SOURCE_TYPE != 'mysql' && github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners'
         run: bash .github/scripts/chbench_template.sh
         env:
           SCALE_FACTOR: ${{ github.event.inputs.scale_factor }}
@@ -147,6 +196,7 @@ jobs:
 
       - name: Run CH-benCHmark - ${{ github.event.inputs.spicepod_path }}
         run: |
+          set -o pipefail
           # On the xlarge runner (64-core EPYC, 2 threads/core, SMT siblings are
           # cpu N and cpu 64+N), pin spiced and testoperator to whole physical
           # cores so they don't contend — not even via hyperthread siblings:
@@ -181,6 +231,7 @@ jobs:
           $TESTOP_PREFIX testoperator run htap \
             -s "${SPICED_BIN}" \
             -p '${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}' \
+            --source-type ${{ steps.set_spicepod_path.outputs.SOURCE_TYPE }} \
             --query-set chbench \
             --scale-factor ${{ github.event.inputs.scale_factor }} \
             ${{ github.event.inputs.terminals && format('--terminals {0}', github.event.inputs.terminals) || '' }} \
@@ -189,11 +240,17 @@ jobs:
             --concurrency ${{ github.event.inputs.concurrency }} \
             ${{ github.event.inputs.query_overrides != '' && format('--query-overrides {0}', github.event.inputs.query_overrides) || '' }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
-            ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && '--skip-prepare' || '' }} \
+            ${{ steps.set_spicepod_path.outputs.SOURCE_TYPE != 'mysql' && github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && '--skip-prepare' || '' }} \
             --disable-progress-bars \
-            --metrics
-          testop_exit=$?
+            --metrics \
+            --metrics-dump "${GITHUB_WORKSPACE}/htap-metrics.json" \
+            --summary-out "${GITHUB_WORKSPACE}/htap-summary.md" 2>&1 | tee "${GITHUB_WORKSPACE}/htap-run.log"
+          # ${PIPESTATUS[0]} is testoperator's real exit (not tee's), so a failed
+          # run fails the step even though it is piped to tee — this also avoids the
+          # false-green where a benchmark/ready-wait timeout reported success.
+          testop_exit=${PIPESTATUS[0]}
           set -e
+          echo "testoperator exit code: ${testop_exit}"
 
           # Stop the diagnostics probes (spiced exits after this step, so they
           # self-terminate anyway); propagate testoperator's real exit code.
@@ -204,12 +261,18 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           # Dedicated in-cluster PG pod on xlarge; per-run docker container (loopback) elsewhere.
           CHBENCH_PG_HOST: ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && 'chbench-postgres.dataplatform.svc.cluster.local' || '127.0.0.1' }}
+          # Dedicated in-cluster MySQL pod on xlarge; per-run docker container (loopback) elsewhere. Used only when the spicepod is a MySQL source.
+          CHBENCH_MYSQL_HOST: ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && 'chbench-mysql.dataplatform.svc.cluster.local' || '127.0.0.1' }}
           # MinIO credentials for spiced, mirroring testoperator_run_bench.yml. Consumed only by
           # configs that reference the local S3 (`${secrets:S3_ENDPOINT}` etc.) — e.g. the Cayenne
           # cold-object-store-tier chbench config; harmless/unused for every other HTAP config.
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          # Eager vs lazy Cayenne NDV (default lazy). Inherited by the spiced
+          # process testoperator spawns; spiced logs the resolved mode once. Used
+          # to A/B the lazy-NDV change in the benchmark.
+          SPICE_CAYENNE_EAGER_NDV: ${{ github.event.inputs.cayenne_eager_ndv }}
 
       # Upload the under-load diagnostics dir
       - name: Upload HTAP diagnostics
@@ -221,13 +284,57 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+      # Append the headline results (tpmC, QPH, worst replication lag, per-query
+      # latencies) to the job summary so the outcome is visible without opening the
+      # run log. testoperator writes this Markdown via --summary-out. Runs even on
+      # failure (a partial summary is still useful).
+      - name: Render results to summary
+        if: always()
+        run: |
+          if [ -f "${GITHUB_WORKSPACE}/htap-summary.md" ]; then
+            cat "${GITHUB_WORKSPACE}/htap-summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "_No results summary produced (run did not reach the reporting stage)._" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Render the CDC-backpressure waterfall from the metrics dump into the job
+      # summary so the "where is CDC falling behind" attribution is visible without
+      # downloading the artifact. Runs even if the benchmark failed (partial data
+      # is still diagnostic).
+      - name: Render backpressure waterfall to summary
+        if: always()
+        run: |
+          if [ -f "${GITHUB_WORKSPACE}/htap-metrics.json" ]; then
+            echo "## CDC backpressure waterfall" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            python3 scripts/chbench-waterfall.py "${GITHUB_WORKSPACE}/htap-metrics.json" \
+              >> "$GITHUB_STEP_SUMMARY" 2>&1 || echo "(waterfall analysis failed; see htap-metrics.json artifact)" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "_No metrics dump produced (run did not reach the reporting stage)._" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Persist the raw metrics time-series + run log so runs are diffable and the
+      # waterfall can be re-run offline against different thresholds.
+      - name: Upload metrics dump + run log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: htap-metrics-sf${{ github.event.inputs.scale_factor }}-${{ github.run_id }}
+          path: |
+            ${{ github.workspace }}/htap-metrics.json
+            ${{ github.workspace }}/htap-run.log
+            ${{ github.workspace }}/htap-summary.md
+          if-no-files-found: warn
+          retention-days: 30
+
       # The dedicated PG pod is long-lived and shared across runs, so a crashed
       # or cancelled run can leave inactive replication slots (which retain WAL
       # and eventually fill the disk) and orphaned publications. Drop any left
       # behind. testoperator already drops its tables/publication at the start of
       # the next run, but inactive slots are not covered by that.
       - name: Clean up PG replication slots
-        if: always() && github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners'
+        if: always() && steps.set_spicepod_path.outputs.SOURCE_TYPE != 'mysql' && github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners'
         env:
           CHBENCH_PG_HOST: chbench-postgres.dataplatform.svc.cluster.local
           CHBENCH_PG_PORT: '5432'
@@ -267,22 +374,25 @@ jobs:
             echo "No psql client available; skipping replication slot cleanup."
           fi
 
-      # The MinIO `benchmarks` bucket is shared across runs, so the Cayenne cold-object-store tier
-      # (cayenne_cold_tier_location: s3://benchmarks/cayenne-cold-sf1000/) would otherwise accumulate
+      # The MinIO `benchmarks` bucket is shared across runs, so the Cayenne datalake (cold) tier
+      # (cayenne_datalake_location: s3://benchmarks/cayenne-cold-*/) would otherwise accumulate
       # cold files every run: each promotion writes a new UUID-named prefix and nothing GCs them
       # (the query path reads the metastore manifest, never an S3 listing, so a fresh run never
       # references a prior run's objects — they are dead weight, not a collision). Drop the whole
-      # cold prefix after the run. Gated to the cold config; `mc` + the `spice-minio` alias come from
-      # the Install MinIO step above. Runs on failure/cancel too so a crashed run leaves no orphans.
-      - name: Clean up Cayenne cold-tier S3 objects
-        if: always() && endsWith(github.event.inputs.spicepod_path, 'cold-sf1000.yaml')
+      # cold prefix after the run. Gated to the cold configs (any `-cold` spicepod); `mc` + the
+      # `spice-minio` alias come from the Install MinIO step above. Runs on failure/cancel too so a
+      # crashed run leaves no orphans.
+      - name: Clean up Cayenne datalake-tier S3 objects
+        if: always() && contains(github.event.inputs.spicepod_path, '-cold')
         run: |
           if command -v mc >/dev/null 2>&1; then
-            echo "Removing cold-tier objects under spice-minio/benchmarks/cayenne-cold-sf1000/ (best-effort; an empty prefix is expected when no promotion ran) ..."
             # Non-fatal: mc prints its own diagnostics (empty prefix, or an auth/endpoint failure) to
             # the log, but a cleanup miss must never fail the benchmark run. No success/"already clean"
             # message here, so a real mc failure is not misreported.
-            mc rm --recursive --force spice-minio/benchmarks/cayenne-cold-sf1000/ || true
+            for prefix in cayenne-cold-sf1000 cayenne-cold-sf10; do
+              echo "Removing datalake objects under spice-minio/benchmarks/${prefix}/ (best-effort; an empty prefix is expected when no promotion ran) ..."
+              mc rm --recursive --force "spice-minio/benchmarks/${prefix}/" || true
+            done
           else
-            echo "mc client not found; skipping cold-tier S3 cleanup."
+            echo "mc client not found; skipping datalake-tier S3 cleanup."
           fi

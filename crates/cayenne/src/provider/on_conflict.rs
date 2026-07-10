@@ -22,12 +22,13 @@ limitations under the License.
 //! scan/update plumbing. The provider drives these from its insert/delete path.
 
 use super::delete::CayenneDeletionSink;
-use super::pk_index::{CachedPkIndex, PkExistenceRef, ShardedPkIndex};
+use super::pk_index::{CachedPkIndex, PkDigestSet, PkExistenceRef, ShardedPkIndex};
 use crate::metadata::InlinedData;
 
 use arrow::record_batch::RecordBatch;
-use arrow_row::{OwnedRow, RowConverter};
 use arrow_schema::SchemaRef;
+
+use crate::row_converter::RowConverter;
 use async_trait::async_trait;
 use data_components::delete::DeletionSink;
 use datafusion_catalog::Session;
@@ -351,7 +352,7 @@ pub(crate) struct BatchValidationResult {
     /// Per-file position deletes for located conflict rows: file path -> deleted
     /// file-local row positions. Empty unless `deletion_mode: position`.
     pub(crate) delete_specs: Vec<(Arc<str>, Vec<u64>)>,
-    pub(crate) kept_keys: HashSet<OwnedRow>,
+    pub(crate) kept_keys: PkDigestSet,
     /// File-backed Int64 PK values being deleted (for `Int64Pk` strategy).
     pub(crate) deleted_pk_i64: Vec<i64>,
     /// File-backed row key bytes being deleted (for `RowConverterBased` strategy).
@@ -591,13 +592,35 @@ pub(crate) enum PkDeletionSnapshot {
 /// One memoized merged (file ∪ mem-tier) deletion snapshot for the scan path.
 /// See the `merged_scan_deletions` field docs for the key's torn-state proof.
 pub(crate) struct MergedScanDeletions {
-    /// `Arc::as_ptr` identity of the FILE-side index the merge was built from.
-    pub(crate) file_index_ptr: usize,
+    /// The FILE-side deletion snapshot the merge was built from, RETAINED for
+    /// the lifetime of the memo.
+    ///
+    /// The memo key's file-side identity is the `Arc::as_ptr` of this snapshot's
+    /// index ([`Self::file_index_ptr`]). Holding the `Arc` here — not merely its
+    /// raw address — is load-bearing for correctness: a live `Arc` allocation
+    /// can never be freed and its address handed to a *different* index
+    /// generation, so a pointer match proves the live file-side index IS this
+    /// same generation, never a coincidental ABA alias. Without the retention a
+    /// deletion publish could free this index and a later publish reuse its
+    /// freed address, yielding a false memo hit that serves a stale merged view
+    /// and resurrects deleted rows (#11303).
+    pub(crate) file_index: PkDeletionSnapshot,
     /// [`crate::provider::mem_tier::MemTier::version`] of the tier merged in.
     pub(crate) tier_version: u64,
     /// Structural epoch observed when the memo was built.
     pub(crate) structural_epoch: u64,
     pub(crate) merged: PkDeletionSnapshot,
+}
+
+impl MergedScanDeletions {
+    /// `Arc::as_ptr` identity of the retained file-side index — the memo key's
+    /// file-side component. Read from [`Self::file_index`] so the compared
+    /// pointer and the pinned allocation can never diverge. Always `Some` in
+    /// practice: the memo is only stored once the source index has an identity
+    /// (`PositionBased` returns before the store).
+    pub(crate) fn file_index_ptr(&self) -> Option<usize> {
+        self.file_index.index_ptr()
+    }
 }
 
 /// PK membership of a mem-tier checkpoint's flushed corpus (the visible inline +
@@ -797,7 +820,7 @@ pub(crate) struct PreparedProtectedSnapshotUpdate {
 #[derive(Default)]
 pub(crate) struct PostValidationState {
     pub(crate) on_conflict_deletions: OnConflictDeletions,
-    pub(crate) validated_keys: HashSet<OwnedRow>,
+    pub(crate) validated_keys: PkDigestSet,
 }
 
 /// Aggregate result of one sharded in-memory CDC apply
@@ -814,7 +837,7 @@ pub(crate) struct ShardedApplyResult {
     /// Union of every shard's on-conflict deletions (keys disjoint across shards).
     pub(crate) on_conflict_deletions: OnConflictDeletions,
     /// Union of every shard's validated (kept) keys.
-    pub(crate) validated_keys: HashSet<OwnedRow>,
+    pub(crate) validated_keys: PkDigestSet,
 }
 
 pub(crate) struct OnConflictContext<'a> {
@@ -823,7 +846,7 @@ pub(crate) struct OnConflictContext<'a> {
     pub(crate) on_conflict: &'a OnConflict,
     pub(crate) upsert_options: &'a UpsertOptions,
     pub(crate) existing: PkExistenceRef<'a>,
-    pub(crate) incoming_keys: &'a HashSet<OwnedRow>,
+    pub(crate) incoming_keys: &'a PkDigestSet,
 }
 
 pub(crate) struct OnConflictValidationStream {
@@ -835,8 +858,8 @@ pub(crate) struct OnConflictValidationStream {
     pub(crate) on_conflict: OnConflict,
     pub(crate) upsert_options: UpsertOptions,
     existing_keys: Option<CachedPkIndex>,
-    pub(crate) incoming_keys: HashSet<OwnedRow>,
-    pub(crate) kept_keys: HashSet<OwnedRow>,
+    pub(crate) incoming_keys: PkDigestSet,
+    pub(crate) kept_keys: PkDigestSet,
     pub(crate) delete_specs: HashMap<Arc<str>, Vec<u64>>,
     pub(crate) deleted_pk_i64: Vec<i64>,
     pub(crate) deleted_row_keys: Vec<Box<[u8]>>,
@@ -868,8 +891,8 @@ impl OnConflictValidationStream {
             on_conflict,
             upsert_options,
             existing_keys: Some(existing_keys),
-            incoming_keys: HashSet::with_capacity(1024),
-            kept_keys: HashSet::with_capacity(1024),
+            incoming_keys: PkDigestSet::with_capacity(1024),
+            kept_keys: PkDigestSet::with_capacity(1024),
             delete_specs: HashMap::new(),
             deleted_pk_i64: Vec::new(),
             deleted_row_keys: Vec::new(),
@@ -896,7 +919,7 @@ impl OnConflictValidationStream {
             ))
         })?;
         let existing = match existing_index {
-            CachedPkIndex::Exact(keyset) => PkExistenceRef::Exact(&keyset.keys),
+            CachedPkIndex::Exact(keyset) => PkExistenceRef::Exact(keyset),
             CachedPkIndex::Bloom(bloom) => PkExistenceRef::Bloom(bloom),
         };
 
@@ -939,8 +962,8 @@ impl OnConflictValidationStream {
             .extend(deleted_inlined_row_keys);
         self.reinserted_over_tombstone += reinserted_over_tombstone;
 
-        self.incoming_keys.extend(kept_keys.iter().cloned());
-        self.kept_keys.extend(kept_keys);
+        self.incoming_keys.extend_ref(&kept_keys);
+        self.kept_keys.absorb(kept_keys);
 
         Ok(filtered_batch)
     }

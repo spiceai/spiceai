@@ -78,3 +78,6 @@ hashicorp_vault = ["dep:url"]
 # and `spiced/azure-keyvault` features.
 default = ["keyring-secret-store", "aws-secrets-manager", "hashicorp_vault"]
 keyring-secret-store = ["dep:keyring"]
+
+[lints]
+workspace = true

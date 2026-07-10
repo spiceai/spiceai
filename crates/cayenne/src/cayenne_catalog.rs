@@ -638,10 +638,11 @@ impl CayenneCatalog {
     ///
     /// In-transaction body of [`MetadataCatalog::commit_overwrite_to_cold`]: the
     /// cold-tier graduation's per-attempt work, factored out so the retry loop
-    /// mirrors [`Self::commit_overwrite`]. In one transaction it (a) clears the
-    /// prior cold generation, (b) inserts the new cold-file rows, then (c) runs
-    /// the standard overwrite clear + snapshot flip via
-    /// [`Self::commit_overwrite_in_txn`].
+    /// mirrors [`Self::commit_overwrite`]. In one transaction it (a) runs the
+    /// standard overwrite clear + snapshot flip via
+    /// [`Self::commit_overwrite_in_txn`] — which also clears the prior cold
+    /// generation's manifest rows — then (b) inserts this graduation's new
+    /// cold-file rows.
     ///
     /// Replace-all (a): v1 promotion re-materializes the WHOLE visible table
     /// (warm + any prior cold, via the cross-tier scan) into this new cold
@@ -660,11 +661,12 @@ impl CayenneCatalog {
         new_snapshot_id: &str,
         cold_files: &[ColdTierFile],
     ) -> CatalogResult<()> {
-        txn.execute(ExecuteParams {
-            sql: "DELETE FROM cayenne_cold_tier_file WHERE table_id = ?1",
-            params: vec![MetastoreValue::Text(table_id.to_string())],
-        })
-        .await?;
+        // The proven overwrite clear FIRST (it also clears the cold manifest —
+        // replace-all), then register this graduation's cold files, so cold
+        // graduation is exactly an overwrite whose new content lives on the
+        // cold store.
+        self.commit_overwrite_in_txn(txn, table_id, new_snapshot_id)
+            .await?;
         for f in cold_files {
             txn.execute(ExecuteParams {
                 sql: "INSERT OR REPLACE INTO cayenne_cold_tier_file \
@@ -682,10 +684,7 @@ impl CayenneCatalog {
             })
             .await?;
         }
-        // The proven overwrite clear, reused so cold graduation is exactly an
-        // overwrite whose new content lives on the cold store.
-        self.commit_overwrite_in_txn(txn, table_id, new_snapshot_id)
-            .await
+        Ok(())
     }
 
     /// # Errors
@@ -714,6 +713,12 @@ impl CayenneCatalog {
         // use (a TEXT literal never equals a BLOB in SQLite).
         let insert_record_table_id_literal = insert_record_table_id_blob_literal(table_id);
         let new_snapshot_id_literal = sql_text_literal(new_snapshot_id);
+        // NOTE: the cold-tier (datalake) manifest is cleared too — an overwrite
+        // replaces the WHOLE visible table, and cold files are part of it. Not
+        // clearing them double-counts every cold-resident row on the next scan
+        // (a full refresh after a promotion would return 2x rows). The
+        // cold-graduation commit reuses this clear and re-registers its new
+        // cold files AFTER it (see `commit_overwrite_to_cold_in_txn`).
         let batch_sql = format!(
             "DELETE FROM cayenne_delete_file WHERE table_id = {table_id_literal}; \
              DELETE FROM cayenne_insert_record WHERE table_id = {insert_record_table_id_literal}; \
@@ -723,6 +728,7 @@ impl CayenneCatalog {
              DELETE FROM cayenne_table_statistics WHERE table_id = {table_id_literal}; \
              DELETE FROM cayenne_snapshot_file_statistics WHERE table_id = {table_id_literal}; \
              DELETE FROM cayenne_pk_index WHERE table_id = {table_id_literal}; \
+             DELETE FROM cayenne_cold_tier_file WHERE table_id = {table_id_literal}; \
              UPDATE cayenne_table SET current_snapshot_id = {new_snapshot_id_literal} WHERE table_id = {table_id_literal};"
         );
 
@@ -733,14 +739,123 @@ impl CayenneCatalog {
             })
     }
 
+    /// Reconcile the datalake (cold tier) fields of a reopened table's stored
+    /// `VortexConfig` with the currently configured options.
+    ///
+    /// The cold fields are deliberately excluded from [`configuration_matches`]
+    /// (toggling the tier never recreates the table), and the provider runs
+    /// with the STORED config — so a spicepod change must be persisted here to
+    /// take effect on reopen. One change is rejected instead of persisted:
+    /// moving (or unsetting) the location while cold files exist, because the
+    /// cold manifest's absolute file URLs point at the old location and the
+    /// next promotion's replace-all would strand them.
+    async fn reconcile_cold_tier_config(
+        &self,
+        stored: &mut TableMetadata,
+        options: &CreateTableOptions,
+    ) -> CatalogResult<()> {
+        let normalize = |loc: &Option<String>| -> Option<String> {
+            loc.as_deref()
+                .map(|l| l.trim().trim_end_matches('/').to_string())
+                .filter(|l| !l.is_empty())
+        };
+        let stored_loc = normalize(&stored.vortex_config.cold_tier_location);
+        let configured_loc = normalize(&options.vortex_config.cold_tier_location);
+
+        if let Some(ref stored_loc) = stored_loc
+            && configured_loc.as_ref() != Some(stored_loc)
+        {
+            let cold_files = self.list_cold_tier_files(&stored.table_id).await?;
+            if !cold_files.is_empty() {
+                return Err(CatalogError::ColdTierLocationChanged {
+                    table_name: stored.table_name.clone(),
+                    stored: stored_loc.clone(),
+                    configured: configured_loc.unwrap_or_else(|| "<unset>".to_string()),
+                });
+            }
+        }
+
+        let stored_vc = &stored.vortex_config;
+        let new_vc = &options.vortex_config;
+        let cold_fields_differ = stored_vc.cold_tier_location != new_vc.cold_tier_location
+            || stored_vc.cold_clustering_columns != new_vc.cold_clustering_columns
+            || stored_vc.cold_target_file_size_mb != new_vc.cold_target_file_size_mb
+            || stored_vc.cold_tier_warm_max_bytes != new_vc.cold_tier_warm_max_bytes
+            || stored_vc.cold_tier_warm_max_files != new_vc.cold_tier_warm_max_files
+            || stored_vc.cold_tier_background_interval_ms
+                != new_vc.cold_tier_background_interval_ms;
+        if !cold_fields_differ {
+            return Ok(());
+        }
+
+        stored
+            .vortex_config
+            .cold_tier_location
+            .clone_from(&new_vc.cold_tier_location);
+        stored
+            .vortex_config
+            .cold_clustering_columns
+            .clone_from(&new_vc.cold_clustering_columns);
+        stored.vortex_config.cold_target_file_size_mb = new_vc.cold_target_file_size_mb;
+        stored.vortex_config.cold_tier_warm_max_bytes = new_vc.cold_tier_warm_max_bytes;
+        stored.vortex_config.cold_tier_warm_max_files = new_vc.cold_tier_warm_max_files;
+        stored.vortex_config.cold_tier_background_interval_ms =
+            new_vc.cold_tier_background_interval_ms;
+
+        let vortex_config_json = serde_json::to_string(&stored.vortex_config).map_err(|e| {
+            CatalogError::InvalidOperation {
+                message: format!(
+                    "Failed to serialize updated datalake configuration for table {}.",
+                    stored.table_name
+                ),
+                source: Box::new(e),
+            }
+        })?;
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "UPDATE cayenne_table SET vortex_config_json = ?1 WHERE table_id = ?2",
+                params: vec![
+                    MetastoreValue::Text(vortex_config_json),
+                    MetastoreValue::Text(stored.table_id.clone()),
+                ],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: format!(
+                    "Failed to persist updated datalake configuration for table {}.",
+                    stored.table_name
+                ),
+                source: Box::new(e),
+            })?;
+        tracing::info!(
+            table = stored.table_name.as_str(),
+            "Reconciled datalake configuration from spicepod params on table reopen"
+        );
+        Ok(())
+    }
+
     async fn validate_existing_table_configuration(
         &self,
         table_name: &str,
         options: &CreateTableOptions,
     ) -> CatalogResult<TableMetadata> {
         match self.get_table(table_name).await {
-            Ok(stored_metadata) => {
+            Ok(mut stored_metadata) => {
                 log_runtime_footer_cache_drift(table_name, &stored_metadata, options);
+
+                // Datalake (cold tier) config is runtime-toggleable, not table
+                // identity: reconcile it here instead of comparing it in
+                // `configuration_matches`. Gated on the rest of the
+                // configuration matching (schema excluded — widening evolution
+                // is handled below): when identity config differs, the caller
+                // falls back to the stored config wholesale, and persisting
+                // PART of the new config (the cold fields) would leave a mixed
+                // state. Rejects a location change while cold files exist;
+                // persists any other cold-field change.
+                if configuration_matches_ignoring_schema(&stored_metadata, options) {
+                    self.reconcile_cold_tier_config(&mut stored_metadata, options)
+                        .await?;
+                }
 
                 if configuration_matches(&stored_metadata, options) {
                     return Ok(stored_metadata);
@@ -2778,8 +2893,8 @@ impl MetadataCatalog for CayenneCatalog {
         self.metastore
             .execute_helper(ExecuteParams {
                 sql: "INSERT OR REPLACE INTO cayenne_snapshot_file \
-                      (table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence) \
-                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                      (table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence, digest) \
+                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params: vec![
                     MetastoreValue::Text(file.table_id.clone()),
                     MetastoreValue::Text(file.snapshot_id.clone()),
@@ -2788,6 +2903,9 @@ impl MetadataCatalog for CayenneCatalog {
                     MetastoreValue::Integer(file.file_size_bytes),
                     MetastoreValue::Integer(file.min_sequence),
                     MetastoreValue::Integer(file.max_sequence),
+                    file.digest
+                        .clone()
+                        .map_or(MetastoreValue::Null, MetastoreValue::Text),
                 ],
             })
             .await
@@ -2802,7 +2920,7 @@ impl MetadataCatalog for CayenneCatalog {
             .query_helper(
                 QueryParams {
                     sql: r"
-                    SELECT table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence
+                    SELECT table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence, digest
                     FROM cayenne_snapshot_file
                     WHERE table_id = ?1 AND snapshot_id = ?2
                     ",
@@ -2820,6 +2938,7 @@ impl MetadataCatalog for CayenneCatalog {
                         file_size_bytes: row.get_i64(4)?,
                         min_sequence: row.get_i64(5)?,
                         max_sequence: row.get_i64(6)?,
+                        digest: row.get_optional_string(7)?,
                     })
                 },
             )
@@ -2831,7 +2950,7 @@ impl MetadataCatalog for CayenneCatalog {
             .query_helper(
                 QueryParams {
                     sql: r"
-                    SELECT table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence
+                    SELECT table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence, digest
                     FROM cayenne_snapshot_file
                     WHERE table_id = ?1
                     ",
@@ -2846,6 +2965,7 @@ impl MetadataCatalog for CayenneCatalog {
                         file_size_bytes: row.get_i64(4)?,
                         min_sequence: row.get_i64(5)?,
                         max_sequence: row.get_i64(6)?,
+                        digest: row.get_optional_string(7)?,
                     })
                 },
             )

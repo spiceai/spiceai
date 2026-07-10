@@ -53,3 +53,6 @@ name = "cache_throughput"
 [[bench]]
 harness = false
 name = "hash_algorithms"
+
+[lints]
+workspace = true
