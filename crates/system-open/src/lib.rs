@@ -43,7 +43,8 @@ use std::process::{Command, Stdio};
 ///
 /// # Errors
 ///
-/// Returns the last I/O error if every candidate launcher fails to run.
+/// Returns the last I/O error if every candidate launcher fails to spawn or
+/// exits with a non-zero status.
 pub fn that(path: impl AsRef<OsStr>) -> io::Result<()> {
     platform::that(path.as_ref())
 }
@@ -212,14 +213,16 @@ mod tests {
 
     #[test]
     fn quote_wraps_plain_path() {
+        use std::ffi::OsString;
         let quoted = quote_for_cmd_start(OsStr::new("https://example.com/login")).expect("quote");
-        assert_eq!(quoted, "\"https://example.com/login\"");
+        assert_eq!(quoted, OsString::from("\"https://example.com/login\""));
     }
 
     #[test]
     fn quote_wraps_path_with_spaces() {
+        use std::ffi::OsString;
         let quoted = quote_for_cmd_start(OsStr::new("C:\\Program Files\\app")).expect("quote");
-        assert_eq!(quoted, "\"C:\\Program Files\\app\"");
+        assert_eq!(quoted, OsString::from("\"C:\\Program Files\\app\""));
     }
 
     #[test]
