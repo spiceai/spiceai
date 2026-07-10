@@ -52,8 +52,9 @@ fn is_privilege_denied(e: &mysql_async::Error) -> bool {
     matches!(e, mysql_async::Error::Server(se) if se.code == 1227)
 }
 
-/// Apply session-level settings that speed up bulk loading on `conn`. Restore
-/// them afterwards with [`restore_bulk_load_session`].
+/// Apply session-level settings that speed up bulk loading on `conn`. Every
+/// connection this is applied to is short-lived — opened per load and dropped
+/// when the load finishes — so the flags never need restoring.
 ///
 /// `unique_checks=0` and `foreign_key_checks=0` need no special privilege.
 /// `sql_log_bin=0` skips writing the multi-GB seed to the binary log — the Spice
@@ -80,34 +81,9 @@ async fn apply_bulk_load_session(conn: &mut mysql_async::Conn) -> Result<bool> {
     }
 }
 
-/// Restore the session flags changed by [`apply_bulk_load_session`], leaving
-/// `conn` in its default state so a later reuse is not surprised by them.
-/// `sql_log_bin` is restored only if it was successfully disabled.
-async fn restore_bulk_load_session(
-    conn: &mut mysql_async::Conn,
-    sql_log_bin_disabled: bool,
-) -> Result<()> {
-    conn.query_drop("SET unique_checks=1, foreign_key_checks=1")
-        .await
-        .map_err(|source| crate::Error::MySql {
-            action: "restore bulk-load session flags".into(),
-            source,
-        })?;
-    if sql_log_bin_disabled {
-        conn.query_drop("SET sql_log_bin=1")
-            .await
-            .map_err(|source| crate::Error::MySql {
-                action: "restore binlogging for the session".into(),
-                source,
-            })?;
-    }
-    Ok(())
-}
-
-/// Open a fresh loader connection: pinned to UTC (via [`crate::set_mysql_utc`],
-/// the same helper the CDC session uses) and configured with the bulk-load
-/// session flags. Used for the parallel seed/clone workers.
-async fn open_worker(opts: &mysql_async::Opts) -> Result<mysql_async::Conn> {
+/// Open a fresh connection from `opts`, pinned to UTC via [`crate::set_mysql_utc`]
+/// (the same helper the CDC session uses).
+async fn open_conn(opts: &mysql_async::Opts) -> Result<mysql_async::Conn> {
     let mut conn = mysql_async::Conn::new(opts.clone())
         .await
         .map_err(|source| crate::Error::MySql {
@@ -115,6 +91,13 @@ async fn open_worker(opts: &mysql_async::Opts) -> Result<mysql_async::Conn> {
             source,
         })?;
     crate::set_mysql_utc(&mut conn).await?;
+    Ok(conn)
+}
+
+/// Open a loader worker connection: like [`open_conn`] but also configured with
+/// the bulk-load session flags. Used for the parallel seed/clone workers.
+async fn open_worker(opts: &mysql_async::Opts) -> Result<mysql_async::Conn> {
+    let mut conn = open_conn(opts).await?;
     apply_bulk_load_session(&mut conn).await?;
     Ok(conn)
 }
@@ -305,25 +288,24 @@ const WAREHOUSE_TABLES: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// Load all seed data for the given number of warehouses.
+/// Load all seed data for the given number of warehouses, opening every
+/// connection from `opts` (the caller's connection is never touched).
 ///
 /// Strategy:
-/// - Shared tables (item, nation, region, supplier) are loaded once on `conn`.
+/// - A coordinator connection loads the shared tables (item, nation, region,
+///   supplier).
 /// - The first `min(warehouses, SEED_WAREHOUSES)` warehouses are loaded **in
-///   parallel**, each on its own connection opened from `opts`. Each warehouse
-///   gets a deterministic per-warehouse RNG derived from `seed`.
+///   parallel**, each on its own connection. Each warehouse gets a deterministic
+///   per-warehouse RNG derived from `seed`.
 /// - Remaining warehouses are cloned from the seed set with server-side
 ///   `INSERT ... SELECT` (rotating source across seed warehouses), across a
 ///   bounded pool of connections; the primary-key-less `history` table is cloned
 ///   on its own connection to avoid `InnoDB` deadlocks (see `ClonePhase`).
 ///
-/// `conn` loads the shared tables and coordinates; the parallel phases open
-/// their own worker connections via [`open_worker`]. Concurrent inserts on
-/// `history` retry transient `InnoDB` lock errors (see [`exec_with_lock_retry`]).
-///
-/// The bulk-load session flags applied to `conn` (see [`apply_bulk_load_session`])
-/// are restored before returning on **both** the success and error paths, so the
-/// connection is left in its default state either way.
+/// Every connection is opened here and dropped when this function returns, so the
+/// bulk-load session flags from [`apply_bulk_load_session`] never leak to the
+/// caller and nothing needs restoring. Concurrent inserts on `history` retry
+/// transient `InnoDB` lock errors (see [`exec_with_lock_retry`]).
 ///
 /// When `seed` is `Some`, a deterministic RNG is used so that the same seed
 /// always produces the same dataset — independent of loader parallelism.
@@ -332,13 +314,15 @@ const WAREHOUSE_TABLES: &[(&str, &str, &str)] = &[
 ///
 /// Returns an error if any database operation fails.
 pub async fn load_all(
-    conn: &mut mysql_async::Conn,
     opts: &mysql_async::Opts,
     warehouses: usize,
     seed: Option<u64>,
 ) -> Result<()> {
-    // Bulk-load session flags on the shared-table connection.
-    let sql_log_bin_off = apply_bulk_load_session(conn).await?;
+    // Coordinator connection for the shared tables — opened from `opts` and
+    // dropped when this function returns, so its bulk-load session flags never
+    // leak to the caller.
+    let mut coordinator = open_conn(opts).await?;
+    let sql_log_bin_off = apply_bulk_load_session(&mut coordinator).await?;
     println!(
         "  bulk-load session: unique_checks=0 foreign_key_checks=0 sql_log_bin={}",
         if sql_log_bin_off {
@@ -348,27 +332,12 @@ pub async fn load_all(
         }
     );
 
-    // Run the load, then always restore the flags — on success and on error — so
-    // a failed load never leaves the coordinator connection in a modified state.
-    let result = seed_and_clone(conn, opts, warehouses, seed).await;
-    let restored = restore_bulk_load_session(conn, sql_log_bin_off).await;
-    result.and(restored)
-}
-
-/// Load the shared tables plus the seed (phase 1) and cloned (phase 2)
-/// warehouses. Split out of [`load_all`] so the session-flag restore there wraps
-/// it on every exit path.
-async fn seed_and_clone(
-    conn: &mut mysql_async::Conn,
-    opts: &mysql_async::Opts,
-    warehouses: usize,
-    seed: Option<u64>,
-) -> Result<()> {
     let mut rng: StdRng = match seed {
         Some(s) => StdRng::seed_from_u64(s),
         None => StdRng::from_rng(&mut rand::rng()),
     };
 
+    let conn = &mut coordinator;
     load_item(conn, &mut rng).await?;
     load_nation(conn).await?;
     load_region(conn).await?;
