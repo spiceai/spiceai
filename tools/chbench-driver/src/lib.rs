@@ -83,6 +83,9 @@ pub enum Error {
     #[snafu(display("Failed to {action}: {message}"))]
     Arrow { action: String, message: String },
 
+    #[snafu(display("Background loader task failed: {message}"))]
+    TaskJoin { message: String },
+
     #[snafu(display(
         "--skip-prepare source has {found} warehouse(s) but --scale-factor expects {expected}; \
          restore a matching template or drop --skip-prepare to re-seed"
@@ -91,6 +94,40 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Await a batch of spawned loader tasks (from either the Postgres or `MySQL`
+/// seed/clone phases), propagating the first task error — or a panic as
+/// [`Error::TaskJoin`]. On failure, the tasks not yet finished are aborted so a
+/// failed load does not leave workers mutating the database detached. `what`
+/// names the phase for the panic message (e.g. "seed warehouse").
+///
+/// Tasks are polled concurrently via `select_all`, so a failure in *any* task is
+/// noticed as soon as it completes — the abort is not delayed behind an earlier
+/// still-running task.
+pub(crate) async fn join_loader_tasks(
+    handles: Vec<tokio::task::JoinHandle<Result<()>>>,
+    what: &str,
+) -> Result<()> {
+    let mut pending = handles;
+    while !pending.is_empty() {
+        let (joined, _idx, rest) = futures::future::select_all(pending).await;
+        let err = match joined {
+            Ok(Ok(())) => {
+                pending = rest;
+                continue;
+            }
+            Ok(Err(e)) => e,
+            Err(e) => Error::TaskJoin {
+                message: format!("{what} loader task panicked: {e}"),
+            },
+        };
+        for handle in rest {
+            handle.abort();
+        }
+        return Err(err);
+    }
+    Ok(())
+}
 
 /// Source-agnostic interface for CH-benCH benchmarks.
 ///
@@ -241,6 +278,10 @@ impl ChBenchDriver for PostgresChBenchDriver {
             self.config.seed,
         )
         .await?;
+        // Build secondary indexes and attach the _bench_ts triggers *after* the
+        // bulk load so neither is maintained per-row during the seed/clone.
+        schema::create_indexes(&self.client).await?;
+        schema::create_triggers(&self.client).await?;
 
         Ok(())
     }
@@ -460,7 +501,7 @@ async fn run_terminal(
 /// Pin a `MySQL` session's time zone to UTC so `NOW(3)`/`_bench_ts` writes and
 /// reads line up with how the Spice CDC path interprets timestamps (which pins
 /// the replication session to UTC).
-async fn set_mysql_utc(conn: &mut mysql_async::Conn) -> Result<()> {
+pub(crate) async fn set_mysql_utc(conn: &mut mysql_async::Conn) -> Result<()> {
     conn.query_drop("SET time_zone = '+00:00'")
         .await
         .map_err(|source| Error::MySql {
@@ -584,7 +625,13 @@ impl ChBenchDriver for MysqlChBenchDriver {
         let mut conn = self.new_conn().await?;
         schema_mysql::drop_tables(&mut conn).await?;
         schema_mysql::create_tables(&mut conn).await?;
-        loader_mysql::load_all(&mut conn, self.config.warehouses, self.config.seed).await?;
+        // load_all opens its own connections from `self.opts`; `conn` is only
+        // used for the DDL before and after.
+        loader_mysql::load_all(&self.opts, self.config.warehouses, self.config.seed).await?;
+        // Build secondary indexes and attach the _bench_ts triggers *after* the
+        // bulk load so neither is maintained per-row during the seed/clone.
+        schema_mysql::create_indexes(&mut conn).await?;
+        schema_mysql::create_triggers(&mut conn).await?;
 
         Ok(())
     }
