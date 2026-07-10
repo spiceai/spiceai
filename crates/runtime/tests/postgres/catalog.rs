@@ -44,7 +44,7 @@ const CATALOG_NAME: &str = "pg_e2e";
 
 /// Seed a range-partitioned `events` table with two leaf partitions, populate it
 /// both by inserting directly into each child and by inserting into the parent
-/// (which PostgreSQL auto-routes to the matching leaf), and add a plain table to
+/// (which `PostgreSQL` auto-routes to the matching leaf), and add a plain table to
 /// confirm non-partitioned tables still surface. Verifies at the source that the
 /// parent-routed rows physically landed in the leaves.
 async fn seed_partitioned_schema(port: usize) -> Result<(), anyhow::Error> {
