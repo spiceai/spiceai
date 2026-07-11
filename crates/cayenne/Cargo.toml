@@ -455,5 +455,9 @@ name = "pk_key_hashing"
 harness = false
 name = "hll_ndv_hashing"
 
+[[bench]]
+harness = false
+name = "pk_keyset_present_path"
+
 [lints]
 workspace = true
