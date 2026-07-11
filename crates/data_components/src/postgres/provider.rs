@@ -24,6 +24,7 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
+use datafusion::common::utils::quote_identifier;
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
 use datafusion::sql::TableReference;
@@ -217,10 +218,8 @@ impl PostgresCatalogProvider {
 
             let table_constraints = constraints_by_table.entry(table_name).or_default();
 
-            let foreign_table = format!(
-                "{}.{}.{}",
-                self.catalog_name, referenced_schema, referenced_table
-            );
+            let foreign_table =
+                foreign_key_target(&self.catalog_name, &referenced_schema, &referenced_table);
             let fk =
                 table_constraints
                     .entry(constraint_name)
@@ -474,6 +473,23 @@ impl PostgresSchemaProvider {
     }
 }
 
+/// Build the fully-qualified name of a foreign-key target table
+/// (`catalog.schema.table`) for the `foreign_keys` schema metadata.
+///
+/// Each component is quoted following `PostgreSQL` `quote_ident` semantics
+/// (quoted only when required, doubling any embedded `"`) so the joined name
+/// round-trips back to the exact `(catalog, schema, table)` triple via
+/// `TableReference::parse_str`, even when a component legally contains a `.`
+/// (a quoted identifier such as `"my.schema"`). See #11727.
+fn foreign_key_target(catalog: &str, schema: &str, table: &str) -> String {
+    format!(
+        "{}.{}.{}",
+        quote_identifier(catalog),
+        quote_identifier(schema),
+        quote_identifier(table),
+    )
+}
+
 fn is_table_included(schema_name: &str, table_name: &str, include: Option<&GlobSet>) -> bool {
     let schema_with_table = format!("{schema_name}.{table_name}");
     include.is_none_or(|globset| globset.is_match(&schema_with_table))
@@ -628,7 +644,7 @@ impl SchemaProvider for PostgresSchemaProvider {
 mod tests {
     use super::{
         CommentMap, ForeignKeyConstraint, ForeignKeyMap, TableComments,
-        build_table_providers_for_schema, is_table_included,
+        build_table_providers_for_schema, foreign_key_target, is_table_included,
     };
     use crate::{
         DESCRIPTION_METADATA_KEY, FOREIGN_KEYS_METADATA_KEY, Read, SOURCE_TYPE_METADATA_KEY,
@@ -730,6 +746,47 @@ mod tests {
             builder.add(Glob::new(pattern).expect("glob pattern should parse"));
         }
         Arc::new(builder.build().expect("glob set should build"))
+    }
+
+    /// Regression test for #11727: a foreign-key target whose schema or table
+    /// name legally contains a `.` (e.g. a schema created as `"my.schema"`)
+    /// must round-trip back to the exact `(catalog, schema, table)` triple.
+    ///
+    /// The pre-fix code joined the parts with a bare `format!("{}.{}.{}")`,
+    /// producing the ambiguous `spice.my.schema.customers`. That string has four
+    /// identifier parts, which `TableReference::parse_str` cannot resolve to a
+    /// 3-part reference — it silently degrades to a bare table name, so a
+    /// downstream NL-to-SQL consumer loses (or misresolves) the FK target.
+    #[test]
+    fn foreign_key_target_with_dotted_identifier_round_trips() {
+        let cases = [
+            ("spice", "my.schema", "customers"),
+            ("spice", "sales", "order.lines"),
+            ("odd.catalog", "sales", "customers"),
+            // A component containing a literal double-quote must also survive.
+            ("spice", "we\"ird", "customers"),
+        ];
+
+        for (catalog, schema, table) in cases {
+            let target = foreign_key_target(catalog, schema, table);
+            let parsed = TableReference::parse_str(&target);
+
+            assert_eq!(
+                parsed.catalog(),
+                Some(catalog),
+                "catalog must round-trip (target = `{target}`)"
+            );
+            assert_eq!(
+                parsed.schema(),
+                Some(schema),
+                "schema must round-trip (target = `{target}`)"
+            );
+            assert_eq!(
+                parsed.table(),
+                table,
+                "table must round-trip (target = `{target}`)"
+            );
+        }
     }
 
     #[test]
