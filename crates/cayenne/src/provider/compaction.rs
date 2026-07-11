@@ -36,6 +36,7 @@ limitations under the License.
 //! tables can't overwhelm the writer pool.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -62,11 +63,113 @@ use tokio::task::JoinHandle;
 /// `dedicated_thread_pool=disabled` — compaction falls back to [`tokio::spawn`]
 /// on the ambient runtime, preserving prior behavior.
 static COMPACTION_RUNTIME: LazyLock<RwLock<Option<Handle>>> = LazyLock::new(|| RwLock::new(None));
+static COMPACTION_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+static IN_FLIGHT_COMPACTION_PASSES: LazyLock<CompactionPassTracker> =
+    LazyLock::new(CompactionPassTracker::default);
+
+#[derive(Default)]
+struct CompactionPassTracker {
+    count: AtomicUsize,
+    notify: Notify,
+}
+
+impl CompactionPassTracker {
+    fn start(&self) -> CompactionPassGuard<'_> {
+        self.count.fetch_add(1, Ordering::AcqRel);
+        CompactionPassGuard { tracker: self }
+    }
+
+    fn finish(&self) {
+        if self.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.notify.notify_waiters();
+        }
+    }
+
+    fn in_flight(&self) -> usize {
+        self.count.load(Ordering::Acquire)
+    }
+
+    async fn drain(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.in_flight() == 0 {
+                return true;
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return self.in_flight() == 0;
+            }
+
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            // Register before the second count check so a pass that finishes
+            // after the first check cannot notify between `in_flight()` and the
+            // await setup, which would otherwise sleep until the timeout.
+            notified.as_mut().enable();
+            if self.in_flight() == 0 {
+                return true;
+            }
+
+            if tokio::time::timeout(remaining, notified).await.is_err() {
+                return self.in_flight() == 0;
+            }
+        }
+    }
+}
+
+/// RAII marker for one active Cayenne maintenance pass that may be inside a
+/// Vortex read/write pipeline on the compaction runtime.
+pub(crate) struct CompactionPassGuard<'a> {
+    tracker: &'a CompactionPassTracker,
+}
+
+impl Drop for CompactionPassGuard<'_> {
+    fn drop(&mut self) {
+        self.tracker.finish();
+    }
+}
+
+/// Mark a Vortex-producing Cayenne maintenance pass as active unless compaction
+/// shutdown has already begun.
+///
+/// The background schedulers themselves are long-lived sleep loops; tracking
+/// those tasks would make shutdown wait forever. Track only the bounded pass
+/// bodies (subset/full compaction, mem-tier checkpoint, cold promotion) so
+/// runtime shutdown can avoid dropping Vortex CPU tasks while they are still
+/// being awaited.
+pub(crate) fn try_track_compaction_pass() -> Option<CompactionPassGuard<'static>> {
+    let guard = IN_FLIGHT_COMPACTION_PASSES.start();
+    if COMPACTION_SHUTTING_DOWN.load(Ordering::Acquire) {
+        drop(guard);
+        None
+    } else {
+        Some(guard)
+    }
+}
+
+/// Prevent new Cayenne compaction-runtime maintenance passes from starting.
+/// Existing pass guards remain counted and can be drained via
+/// [`drain_compaction_tasks`].
+pub fn begin_compaction_shutdown() {
+    COMPACTION_SHUTTING_DOWN.store(true, Ordering::Release);
+}
+
+/// Allow Cayenne compaction-runtime maintenance passes to start again.
+///
+/// Runtime construction calls this so tests or embedded runtimes that create a
+/// fresh runtime after shutting down a prior one do not inherit stale global
+/// shutdown state. Normal `spiced` startup also resets via
+/// [`set_compaction_runtime_handle`].
+pub fn reset_compaction_shutdown() {
+    COMPACTION_SHUTTING_DOWN.store(false, Ordering::Release);
+}
 
 /// Inject the dedicated compaction runtime handle. Called once at process
 /// startup. Later calls replace the previous handle so tests that create a new
 /// runtime after dropping an old one do not retain stale global state.
 pub fn set_compaction_runtime_handle(handle: Handle) {
+    reset_compaction_shutdown();
     let mut guard = COMPACTION_RUNTIME.write();
     if guard.is_some() {
         tracing::debug!(
@@ -91,6 +194,22 @@ where
 {
     let handle = COMPACTION_RUNTIME.read().clone();
     spawn_on(handle.as_ref(), future)
+}
+
+/// Wait for active Vortex-producing Cayenne maintenance passes to finish.
+///
+/// Runtime shutdown uses this before the dedicated compaction Tokio runtime is
+/// dropped. That gives in-flight Vortex writes a bounded chance to drain
+/// naturally; otherwise Tokio can drop the runtime underneath pending Vortex
+/// `Task`s, which can panic in `vortex-io`.
+pub async fn drain_compaction_tasks(timeout: Duration) -> bool {
+    IN_FLIGHT_COMPACTION_PASSES.drain(timeout).await
+}
+
+/// Number of Vortex-producing Cayenne maintenance passes currently in flight.
+#[must_use]
+pub fn in_flight_compaction_tasks() -> usize {
+    IN_FLIGHT_COMPACTION_PASSES.in_flight()
 }
 
 /// Spawn `future` on `handle` if provided, otherwise on the ambient runtime via
@@ -443,6 +562,7 @@ impl BackgroundCompactor {
                     // `run_compaction_trigger` below is intentionally never
                     // interrupted, so a pass still drains to completion on drop (see
                     // `COMPACTOR_SHUTDOWN_DRAIN` and the drain-in-flight test).
+                    let acquire_start = Instant::now();
                     let _permit = tokio::select! {
                         biased;
                         () = shutdown_task.notified() => break 'wake,
@@ -452,6 +572,16 @@ impl BackgroundCompactor {
                             Err(_) => break 'wake,
                         },
                     };
+                    // Attribute the wait for a compaction slot: a high value means
+                    // peer tables saturate the fleet-wide semaphore, starving this
+                    // table's compaction (protected set / read-amp run away).
+                    telemetry::cayenne::track_compaction_acquire_wait(
+                        acquire_start.elapsed(),
+                        &[telemetry::KeyValue::new(
+                            "table",
+                            runner.compaction_target_name().to_string(),
+                        )],
+                    );
 
                     match runner.run_compaction_trigger().await {
                         Ok(true) => {
@@ -490,18 +620,17 @@ impl BackgroundCompactor {
 /// How long the detached drain thread lets an in-flight compaction finish its
 /// current Vortex write before force-aborting. Bounded so shutdown can never hang.
 ///
-/// Sized to outlast a realistic compaction pass: a pass rewrites the whole
-/// current snapshot (see `run_one_compaction_pass` / `rewrite_current_snapshot_for_compaction`),
-/// so its duration scales with table size. At large scale factors that rewrite
-/// can take well over the original 5s, so the abort fired mid-write and vortex-io
-/// panicked ("Runtime dropped task without completing it"). 30s covers a realistic
-/// large-table pass and coincides with the runtime's connection-drain window.
+/// Sized to outlast the large seq-prefix/subset passes seen during SF100
+/// CH-benCH: individual passes can legitimately run for 60-90s while the
+/// benchmark is still applying CDC. Aborting those writes mid-flight can leave
+/// Vortex layout tasks awaiting CPU jobs that Tokio has cancelled, which panics
+/// in `vortex-io` ("Runtime dropped task without completing it").
 ///
-/// This is a mitigation, not a cure: a pass that still exceeds the window aborts
-/// mid-write and panics on shutdown. The durable fix is incremental (tiered) merge
-/// of the picked candidate files instead of a full-snapshot rewrite, which keeps a
-/// pass short enough to always drain — see the picker's `CompactionCandidate`.
-const COMPACTOR_SHUTDOWN_DRAIN: Duration = Duration::from_secs(30);
+/// This is still a mitigation: a pass that exceeds the window may be aborted.
+/// The durable performance fix is to keep each pass shorter (incremental merge
+/// width / bake sizing) so shutdown and provider replacement rarely need this
+/// backstop.
+const COMPACTOR_SHUTDOWN_DRAIN: Duration = Duration::from_mins(2);
 
 fn drain_and_abort_compactor(handle: &JoinHandle<()>) {
     // Let an in-flight compaction finish its current write before the
@@ -652,6 +781,9 @@ impl BackgroundMemTierCheckpointer {
                 // One checkpoint per tick. The tick itself is a no-op on an empty
                 // or unarmed tier and takes the per-table lock only when there is
                 // something to flush, so an idle table costs one cheap wake.
+                let Some(_pass) = try_track_compaction_pass() else {
+                    break;
+                };
                 runner.run_mem_tier_checkpoint_tick().await;
             }
         });
@@ -779,6 +911,9 @@ impl BackgroundColdTierPromoter {
                     "Periodic cold-tier promotion wake",
                 );
 
+                let Some(_pass) = try_track_compaction_pass() else {
+                    break;
+                };
                 runner.run_cold_tier_promotion_tick().await;
             }
         });
@@ -1013,6 +1148,32 @@ mod tests {
         // max_files_per_pick=0 should be clamped to 2 as well.
         let cfg = CompactionPickerConfig::new(8, 0, 128 * 1024 * 1024);
         assert!(cfg.max_files_per_pick >= 2);
+    }
+
+    // ------------------------------------------------------------------
+    // Active compaction pass tracker tests
+    // ------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compaction_pass_tracker_drains_when_guard_drops() {
+        let tracker = Arc::new(CompactionPassTracker::default());
+        let guard = tracker.start();
+        assert_eq!(tracker.in_flight(), 1);
+
+        let drain_tracker = Arc::clone(&tracker);
+        let drain = tokio::spawn(async move { drain_tracker.drain(Duration::from_secs(5)).await });
+
+        // Give the drain task a chance to observe the active pass and register
+        // for notification, then finish the pass.
+        tokio::task::yield_now().await;
+        drop(guard);
+
+        let drained = tokio::time::timeout(Duration::from_secs(1), drain)
+            .await
+            .expect("drain should not wait for its full timeout")
+            .expect("drain task should not panic");
+        assert!(drained);
+        assert_eq!(tracker.in_flight(), 0);
     }
 
     // ------------------------------------------------------------------

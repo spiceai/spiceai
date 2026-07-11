@@ -17,3 +17,6 @@ regex.workspace = true
 runtime = { path = "../../runtime" }
 secrecy.workspace = true
 snafu.workspace = true
+
+[lints]
+workspace = true

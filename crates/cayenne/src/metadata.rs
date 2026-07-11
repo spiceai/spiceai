@@ -621,7 +621,9 @@ pub struct PinnedTuningActuators {
 pub enum StorageClass {
     /// Local NVMe/SSD — fast random I/O; the tuner applies no write-amortization bias.
     LocalSsd,
-    /// Network block store (e.g. EBS) — higher, variable latency: the slow tier.
+    /// Network-attached storage — EBS / Azure managed block disks, or an NFS/SMB
+    /// network filesystem. Higher, variable latency: the slow/networked tier.
+    /// (The variant name is historical — EBS was the first case.)
     Ebs,
     /// tmpfs / RAM-backed — fastest; no bias.
     Tmpfs,
@@ -1052,6 +1054,13 @@ pub struct VortexConfig {
     /// compaction interval. Set from `cayenne_cold_tier_background_interval_ms`.
     /// Defaults to 60s.
     pub cold_tier_background_interval_ms: u64,
+    /// Physical-GC cadence AND orphan grace (ms) for superseded cold objects:
+    /// the sweep runs about this often, and an orphan (on the store, not in the
+    /// manifest) is deleted only after being observed orphaned this long — mark
+    /// on one sweep, delete on the next, so an in-flight scan gets a full
+    /// interval to finish. From `cayenne_datalake_gc_interval_ms`; defaults to
+    /// 5min, lowered in tests.
+    pub cold_tier_gc_interval_ms: u64,
 }
 
 impl VortexConfig {
@@ -1385,6 +1394,7 @@ impl Default for VortexConfig {
             cold_tier_warm_max_bytes: 0,
             cold_tier_warm_max_files: 0,
             cold_tier_background_interval_ms: 60_000,
+            cold_tier_gc_interval_ms: 300_000,
         }
     }
 }
@@ -1695,6 +1705,13 @@ pub struct ColdTierFile {
     /// sum). Always populated at promotion (copied from the written footer) so
     /// listing-time pruning never falls back to a full scan.
     pub statistics_blob: Vec<u8>,
+    /// Serialized PK existence bloom (`provider::pk_index::PkBloom`) over this
+    /// file's live PK values, built at promotion for upsert-eligible tables so the keyset
+    /// rebuild can fold cold-resident keys without scanning the cold store.
+    /// `None` (non-upsert table, over the per-file cap, or a legacy row) makes
+    /// the rebuild fall back to the exact cold scan. Never consulted for
+    /// `DoNothing` (a false positive would wrongly drop a new row).
+    pub pk_bloom: Option<Vec<u8>>,
 }
 
 /// Table-level statistics stored as a serialized Vortex [`FileStatistics`] blob.

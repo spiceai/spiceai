@@ -49,3 +49,6 @@ text_search = ["dep:tantivy"]
 [dev-dependencies]
 insta = { workspace = true, features = ["json"] }
 tokio.workspace = true
+
+[lints]
+workspace = true

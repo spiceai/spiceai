@@ -82,6 +82,7 @@ use super::column_stats::ColumnStatsAccumulator;
 use super::context::CayenneContext;
 use super::mem_tier_budget;
 use super::on_conflict::{PostValidationState, PreparedShardedInsertStream};
+use super::pk_index::PkDigestSet;
 use super::staging_wal::{CayenneStagedAppend, PreparedStagedAppend, StagingWalTargetKind};
 use super::table::{CayenneCdcWrite, CayenneTableProvider, record_cayenne_write_phase};
 
@@ -93,8 +94,8 @@ use super::table::{CayenneCdcWrite, CayenneTableProvider, record_cayenne_write_p
 /// Forwarding both together keeps the two histograms paired per batch.
 fn record_cayenne_cdc_burst(table_name: &str, rows: u64, bytes: u64) {
     let dims = [telemetry::KeyValue::new("table", table_name.to_string())];
-    telemetry::track_cayenne_cdc_burst_rows(rows, &dims);
-    telemetry::track_cayenne_cdc_burst_bytes(bytes, &dims);
+    telemetry::cayenne::track_cdc_burst_rows(rows, &dims);
+    telemetry::cayenne::track_cdc_burst_bytes(bytes, &dims);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1032,7 +1033,7 @@ impl<'a> AppendMutationWriter<'a> {
             // this write goes straight to a staged Vortex write without ever
             // buffering. `try_inline_or_restream` (which records rows_cap/bytes_cap
             // and the burst shape) is skipped, so attribute the flip here.
-            telemetry::track_cayenne_inline_fallback(&[
+            telemetry::cayenne::track_inline_fallback(&[
                 telemetry::KeyValue::new("table", self.table.table_name().to_string()),
                 telemetry::KeyValue::new("reason", "blocking_config"),
             ]);
@@ -1123,12 +1124,7 @@ impl<'a> AppendMutationWriter<'a> {
         prepared_stream: SendableRecordBatchStream,
         post_validation: &Arc<ParkingMutex<Option<PostValidationState>>>,
         estimated_bytes: Option<u64>,
-    ) -> Result<(
-        u64,
-        Arc<ColumnStatsAccumulator>,
-        std::collections::HashSet<crate::row_converter::OwnedRow>,
-        usize,
-    )> {
+    ) -> Result<(u64, Arc<ColumnStatsAccumulator>, PkDigestSet, usize)> {
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
         let target_size_bytes = self.context.target_file_size_bytes();
         let write_start = Instant::now();
@@ -1191,6 +1187,20 @@ impl<'a> AppendMutationWriter<'a> {
             "apply_on_conflict_deletions",
             deletion_start,
         );
+
+        // A write that carried no rows produced no data files, so the snapshot
+        // directory was never materialized on disk (the Vortex sink only
+        // creates it when writing a file) and there is nothing to fsync,
+        // sequence, or protect. Publish any on-conflict update without a
+        // protected-snapshot entry and skip the sequence record — recording a
+        // snapshot that has no directory would fail the directory sync with
+        // NotFound and leave the catalog referencing a phantom snapshot. This
+        // is the steady state of a scheduled append refresh whose source has
+        // no new rows.
+        if rows == 0 {
+            self.table.commit_on_conflict_publish(update, None).await;
+            return Ok((rows, stats_acc, validated_keys, superseded));
+        }
 
         // `publish` is the metastore finalization total; the sub-phases attribute
         // it — `publish_seq` is sequence allocation + the durable sequence record,
@@ -1262,7 +1272,17 @@ impl<'a> AppendMutationWriter<'a> {
                 )
                 .await?
             {
-                let stats_acc = ColumnStatsAccumulator::new(&schema);
+                // Inline tier0 (metastore BLOB) write — the synchronous CDC hot
+                // loop. By default skip NDV here (lazy): these rows contribute
+                // their distinct-count for free when the inline memtable later
+                // spills to a Vortex file at checkpoint (`write_to_snapshot` folds
+                // NDV there). `SPICE_CAYENNE_EAGER_NDV` flips this back to eager
+                // (fold on ingest) for benchmarking. Min/max/null-count stats are
+                // maintained regardless.
+                let stats_acc = ColumnStatsAccumulator::new_with_ndv(
+                    &schema,
+                    super::column_stats::eager_ndv_on_ingest(),
+                );
                 for batch in buffer.batches() {
                     stats_acc.update(batch);
                 }
@@ -1321,7 +1341,7 @@ impl<'a> AppendMutationWriter<'a> {
         // not an admission-cap event, so it is deliberately left uncounted rather
         // than mislabeled as a cap.
         if let Some(reason) = buffer.overflow_reason() {
-            telemetry::track_cayenne_inline_fallback(&[
+            telemetry::cayenne::track_inline_fallback(&[
                 telemetry::KeyValue::new("table", self.table.table_name().to_string()),
                 telemetry::KeyValue::new("reason", reason),
             ]);
