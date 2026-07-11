@@ -197,6 +197,22 @@ impl CayennePartitionedInsertStrategy {
         };
 
         for wal in wals {
+            let mut missing_table_ids = wal
+                .partitions
+                .iter()
+                .filter(|entry| !by_id.contains_key(entry.table_id.as_str()))
+                .map(|entry| entry.table_id.as_str())
+                .collect::<Vec<_>>();
+            missing_table_ids.sort_unstable();
+            missing_table_ids.dedup();
+            if !missing_table_ids.is_empty() {
+                return Err(DataFusionError::Execution(format!(
+                    "Failed to recover partitioned Cayenne commit {}: providers for participant table IDs [{}] are unavailable; retaining its WAL until every participant can be reconciled",
+                    wal.commit_id,
+                    missing_table_ids.join(", ")
+                )));
+            }
+
             let mut committed = 0usize;
             let mut uncommitted = 0usize;
             for entry in &wal.partitions {
@@ -228,12 +244,16 @@ impl CayennePartitionedInsertStrategy {
             // here to make convergence explicit and to cover providers that
             // were opened before another participant finished recovery.
             for entry in &wal.partitions {
-                if let Some(provider) = by_id.get(entry.table_id.as_str()) {
-                    provider
-                        .recover_incomplete_writes()
-                        .await
-                        .map_err(DataFusionError::from)?;
-                }
+                let provider = by_id.get(entry.table_id.as_str()).ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "provider for validated partitioned Cayenne participant {} disappeared during recovery",
+                        entry.table_id
+                    ))
+                })?;
+                provider
+                    .recover_incomplete_writes()
+                    .await
+                    .map_err(DataFusionError::from)?;
             }
 
             if let Some((store, prefix)) = &object_store_location {
@@ -530,7 +550,7 @@ impl CayennePartitionedOverwriteSink {
         prepared: &[PreparedOverwrite],
     ) -> datafusion::common::Result<()> {
         let max_attempts = turso_shared::DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
-        for attempt in 1..=max_attempts {
+        'attempts: for attempt in 1..=max_attempts {
             let mut txn = self
                 .catalog
                 .begin_transaction()
@@ -773,7 +793,7 @@ impl DataSink for CayennePartitionedAppendSink {
                     })?;
                     if !cayenne.supports_deferred_partition_append() {
                         return Err(DataFusionError::NotImplemented(
-                            "Partitioned Cayenne atomic append does not yet support on_conflict upsert; use overwrite or disable primary-key conflict detection"
+                            "This Cayenne partition does not support atomic deferred append"
                                 .to_string(),
                         ));
                     }
@@ -792,7 +812,7 @@ impl DataSink for CayennePartitionedAppendSink {
                             let staged = cayenne_owned
                                 .begin_deferred_snapshot_append(stream, target_partitions)
                                 .await?;
-                            staged.prepare().await
+                            Ok(staged)
                         });
                     senders.insert(key.clone(), tx.clone());
                     handles.push(handle);
@@ -939,6 +959,11 @@ impl DataSink for CayennePartitionedAppendSink {
             }
         };
 
+        let mut prepared_on_conflicts = prepared
+            .iter_mut()
+            .map(PreparedStagedAppend::take_prepared_on_conflict)
+            .collect::<Vec<_>>();
+
         // Apply the barrier on every partition. If any fails partway, the
         // top-level WAL stays on disk so the next process restart can
         // recover the set; we surface the error and stop. We do NOT attempt
@@ -951,12 +976,32 @@ impl DataSink for CayennePartitionedAppendSink {
                 return Err(DataFusionError::from(e));
             }
         }
+        drop(fence_guards);
+        for receipt in &mut prepared {
+            if let Err(error) = receipt.prepare_deferred_manifest().await {
+                return Err(DataFusionError::from(error));
+            }
+        }
+        let mut fence_guards: Vec<tokio::sync::OwnedRwLockWriteGuard<()>> =
+            Vec::with_capacity(prepared.len());
+        for receipt in &prepared {
+            fence_guards.push(receipt.lock_listing_fence_write_owned().await);
+        }
 
         // The complete post-append contents now exist in one private snapshot
         // per partition. Flip every pointer in a single metastore transaction;
         // readers cannot observe a subset through a fresh directory listing.
-        if let Err(error) = self.commit_append_snapshots_in_one_txn(&prepared).await {
+        if let Err(error) = self
+            .commit_append_snapshots_in_one_txn(&prepared, &mut prepared_on_conflicts)
+            .await
+        {
             drop(fence_guards);
+            for (receipt, on_conflict) in prepared
+                .iter_mut()
+                .zip(prepared_on_conflicts.into_iter())
+            {
+                receipt.restore_prepared_on_conflict(on_conflict);
+            }
             let mut rollback_failed = false;
             for receipt in prepared {
                 if let Err(rollback_error) = receipt.rollback().await {
@@ -982,9 +1027,22 @@ impl DataSink for CayennePartitionedAppendSink {
         // No await is permitted between these publications. The catalog commit
         // above is the durable global decision; cancellation must not leave a
         // proper subset of the participating providers on the new snapshots.
-        for (receipt, publish_state) in prepared.iter().zip(publish_states) {
+        for ((receipt, publish_state), prepared_on_conflict) in prepared
+            .iter()
+            .zip(publish_states)
+            .zip(prepared_on_conflicts.into_iter())
+        {
             receipt.publish_deferred_snapshot_under_held_fence(publish_state);
+            if let Some(on_conflict) = prepared_on_conflict {
+                receipt.publish_on_conflict_under_held_fence(on_conflict);
+            }
+            receipt.publish_validated_file_keys();
         }
+
+        // Publication is complete for every participant. Release all listing
+        // fences before WAL deletion and other maintenance so readers are not
+        // blocked by recoverable post-commit I/O.
+        drop(fence_guards);
 
         // WAL cleanup is post-commit maintenance. Recovery consults the
         // catalog pointers and safely recognizes these as committed if cleanup
@@ -1012,8 +1070,6 @@ impl DataSink for CayennePartitionedAppendSink {
             );
         }
 
-        drop(fence_guards);
-
         // Phase 3: per-partition finish (drops the per-partition write guard,
         // returns row count).
         let mut total_rows: u64 = 0;
@@ -1038,6 +1094,7 @@ impl CayennePartitionedAppendSink {
     async fn commit_append_snapshots_in_one_txn(
         &self,
         prepared: &[PreparedStagedAppend],
+        prepared_on_conflicts: &mut [Option<cayenne::provider::PreparedOnConflictDeletionPublish>],
     ) -> datafusion::common::Result<()> {
         let max_attempts = turso_shared::DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
         let snapshots: Vec<(&str, &str)> = prepared
@@ -1045,7 +1102,7 @@ impl CayennePartitionedAppendSink {
             .map(|receipt| (receipt.table_id(), receipt.target_snapshot_id()))
             .collect();
 
-        for attempt in 1..=max_attempts {
+        'attempts: for attempt in 1..=max_attempts {
             let mut txn = self
                 .catalog
                 .begin_transaction()
@@ -1063,8 +1120,47 @@ impl CayennePartitionedAppendSink {
                 }
                 return Err(DataFusionError::External(Box::new(error)));
             }
+            for on_conflict in prepared_on_conflicts.iter_mut().flatten() {
+                if let Err(error) = self
+                    .catalog
+                    .apply_prepared_on_conflict_in_txn(&mut *txn, on_conflict)
+                    .await
+                {
+                    drop(txn);
+                    if attempt < max_attempts && cayenne::is_retryable_write_conflict(&error) {
+                        tokio::time::sleep(turso_shared::retry_backoff_delay(attempt)).await;
+                        continue 'attempts;
+                    }
+                    return Err(DataFusionError::External(Box::new(error)));
+                }
+            }
+            for receipt in prepared {
+                if let Some(manifest) = receipt.deferred_manifest()
+                    && let Err(error) = self
+                        .catalog
+                        .replace_snapshot_files_in_txn(
+                            &mut *txn,
+                            receipt.table_id(),
+                            receipt.target_snapshot_id(),
+                            manifest,
+                        )
+                        .await
+                {
+                    drop(txn);
+                    if attempt < max_attempts && cayenne::is_retryable_write_conflict(&error) {
+                        tokio::time::sleep(turso_shared::retry_backoff_delay(attempt)).await;
+                        continue 'attempts;
+                    }
+                    return Err(DataFusionError::External(Box::new(error)));
+                }
+            }
             match txn.commit().await {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    for on_conflict in prepared_on_conflicts.iter_mut().flatten() {
+                        on_conflict.mark_catalog_committed();
+                    }
+                    return Ok(());
+                }
                 Err(error)
                     if attempt < max_attempts && cayenne::is_retryable_write_conflict(&error) =>
                 {

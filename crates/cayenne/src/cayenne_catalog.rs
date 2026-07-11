@@ -364,6 +364,126 @@ impl CayenneCatalog {
         Ok(())
     }
 
+    /// Apply one deferred on-conflict payload in a caller-owned transaction.
+    /// The caller commits this together with all participating snapshot pointers.
+    pub async fn apply_prepared_on_conflict_in_txn(
+        &self,
+        txn: &mut dyn MetastoreTransaction,
+        prepared: &mut crate::provider::on_conflict::PreparedOnConflictDeletionPublish,
+    ) -> CatalogResult<()> {
+        let Some(payload) = prepared.durable_payload.as_mut() else {
+            return Ok(());
+        };
+        let table_id = payload.table_id.as_str();
+        let reinsert_sequence = prepared
+            .insert_sequence
+            .filter(|_| !payload.insert_pk_bytes.is_empty());
+        ensure_reinsert_keys_have_key_based_delete_file(
+            table_id,
+            &payload.delete_files,
+            payload.insert_pk_bytes.len(),
+        )?;
+        for file in &mut payload.delete_files {
+            if file.table_id != table_id {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: "Deferred on-conflict payload spans multiple tables".to_string(),
+                });
+            }
+            if file.deletion_type == DeletionType::KeyBased {
+                file.reinsert_sequence = reinsert_sequence;
+            }
+            if reinsert_sequence.is_some_and(|sequence| sequence <= file.sequence_number) {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "Deferred upsert reinsert sequence must exceed delete sequence {}",
+                        file.sequence_number
+                    ),
+                });
+            }
+        }
+        const MAX_PARAMS: usize = 32_000;
+        for chunk in payload.delete_files.chunks(MAX_PARAMS / 10) {
+            let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
+            txn.execute(ExecuteParams { sql: &sql, params }).await?;
+        }
+        txn.execute(ExecuteParams {
+            sql: "INSERT OR REPLACE INTO cayenne_snapshot_sequence (table_id, snapshot_id, sequence_number) VALUES (?1, ?2, ?3)",
+            params: vec![
+                MetastoreValue::Text(table_id.to_string()),
+                MetastoreValue::Text(prepared.target_snapshot_id.clone()),
+                MetastoreValue::Integer(prepared.snapshot_sequence),
+            ],
+        })
+        .await?;
+        if let Some(tombstone) = &payload.inline_tombstone {
+            txn.execute(ExecuteParams {
+                sql: "INSERT INTO cayenne_inlined_delete (inlined_id, table_id, delete_ipc, delete_count, sequence_number, published) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params: vec![
+                    MetastoreValue::Text(tombstone.inlined_id.clone()),
+                    MetastoreValue::Text(tombstone.table_id.clone()),
+                    MetastoreValue::Blob(tombstone.delete_ipc.clone()),
+                    MetastoreValue::Integer(tombstone.delete_count),
+                    MetastoreValue::Integer(tombstone.sequence_number),
+                    MetastoreValue::Integer(i64::from(tombstone.published)),
+                ],
+            })
+            .await?;
+        }
+        for inlined_id in &payload.pending_durable_flips {
+            txn.execute(ExecuteParams {
+                sql: "UPDATE cayenne_inlined_delete SET published = 1 WHERE table_id = ?1 AND inlined_id = ?2",
+                params: vec![
+                    MetastoreValue::Text(table_id.to_string()),
+                    MetastoreValue::Text(inlined_id.clone()),
+                ],
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn replace_snapshot_files_in_txn(
+        &self,
+        txn: &mut dyn MetastoreTransaction,
+        table_id: &str,
+        snapshot_id: &str,
+        files: &[SnapshotFile],
+    ) -> CatalogResult<()> {
+        txn.execute(ExecuteParams {
+            sql: "DELETE FROM cayenne_snapshot_file WHERE table_id = ?1 AND snapshot_id = ?2",
+            params: vec![
+                MetastoreValue::Text(table_id.to_string()),
+                MetastoreValue::Text(snapshot_id.to_string()),
+            ],
+        })
+        .await?;
+        for file in files {
+            if file.table_id != table_id || file.snapshot_id != snapshot_id {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "Snapshot manifest row does not match target {table_id}/{snapshot_id}: {}/{}",
+                        file.table_id, file.snapshot_id
+                    ),
+                });
+            }
+            txn.execute(ExecuteParams {
+                sql: "INSERT INTO cayenne_snapshot_file (table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence, digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params: vec![
+                    MetastoreValue::Text(file.table_id.clone()),
+                    MetastoreValue::Text(file.snapshot_id.clone()),
+                    MetastoreValue::Text(file.file_path.clone()),
+                    MetastoreValue::Integer(file.row_count),
+                    MetastoreValue::Integer(file.file_size_bytes),
+                    MetastoreValue::Integer(file.min_sequence),
+                    MetastoreValue::Integer(file.max_sequence),
+                    file.digest.clone().map_or(MetastoreValue::Null, MetastoreValue::Text),
+                ],
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
     async fn existing_delete_file_record(
         &self,
         table_id: &str,
@@ -1828,6 +1948,73 @@ impl MetadataCatalog for CayenneCatalog {
         for chunk in delete_files.chunks(MAX_PARAMS / PARAMS_PER_ROW) {
             let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
             txn.execute(ExecuteParams { sql: &sql, params }).await?;
+        }
+        txn.commit().await
+    }
+
+    async fn commit_delete_files_with_inlined_rewrite(
+        &self,
+        delete_files: Vec<DeleteFile>,
+        table_id: &str,
+        updated_data: Vec<InlinedData>,
+        deleted_inlined_ids: Vec<String>,
+    ) -> CatalogResult<()> {
+        for delete_file in &delete_files {
+            if delete_file.table_id != table_id {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "Delete-file table_id '{}' does not match combined delete table_id '{table_id}'",
+                        delete_file.table_id
+                    ),
+                });
+            }
+        }
+        for updated in &updated_data {
+            if updated.table_id != table_id || updated.inlined_id.is_empty() {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "Updated inline row must match combined delete table_id '{table_id}' and include an inlined_id"
+                    ),
+                });
+            }
+        }
+
+        const MAX_PARAMS: usize = 32_000;
+        const PARAMS_PER_DELETE_FILE: usize = 10;
+        let txn = self.begin_transaction().await?;
+        for chunk in delete_files.chunks(MAX_PARAMS / PARAMS_PER_DELETE_FILE) {
+            let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
+            txn.execute(ExecuteParams { sql: &sql, params }).await?;
+        }
+        for updated in &updated_data {
+            txn.query_row_values(QueryRowParams {
+                sql: "SELECT inlined_id FROM cayenne_inlined_data WHERE table_id = ?1 AND inlined_id = ?2",
+                params: vec![
+                    MetastoreValue::Text(table_id.to_string()),
+                    MetastoreValue::Text(updated.inlined_id.clone()),
+                ],
+            })
+            .await?;
+            txn.execute(ExecuteParams {
+                sql: "UPDATE cayenne_inlined_data SET data_ipc = ?1, record_count = ?2 WHERE table_id = ?3 AND inlined_id = ?4",
+                params: vec![
+                    MetastoreValue::Blob(updated.data_ipc.clone()),
+                    MetastoreValue::Integer(updated.record_count),
+                    MetastoreValue::Text(table_id.to_string()),
+                    MetastoreValue::Text(updated.inlined_id.clone()),
+                ],
+            })
+            .await?;
+        }
+        for inlined_id in &deleted_inlined_ids {
+            txn.execute(ExecuteParams {
+                sql: "DELETE FROM cayenne_inlined_data WHERE table_id = ?1 AND inlined_id = ?2",
+                params: vec![
+                    MetastoreValue::Text(table_id.to_string()),
+                    MetastoreValue::Text(inlined_id.clone()),
+                ],
+            })
+            .await?;
         }
         txn.commit().await
     }

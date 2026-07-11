@@ -35,6 +35,7 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::{Array, BinaryArray, Int64Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -191,6 +192,69 @@ pub struct DeletionVectorWriter<'a> {
     table: &'a TableMetadata,
 }
 
+struct PendingBatchWrites {
+    remaining: AtomicUsize,
+    completed: tokio::sync::Notify,
+}
+
+struct PendingWriteCompletion(Arc<PendingBatchWrites>);
+
+impl Drop for PendingWriteCompletion {
+    fn drop(&mut self) {
+        if self.0.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.completed.notify_waiters();
+        }
+    }
+}
+
+struct UncommittedDeleteFilesGuard {
+    paths: Vec<PathBuf>,
+    pending: Arc<PendingBatchWrites>,
+    armed: bool,
+}
+
+impl UncommittedDeleteFilesGuard {
+    fn new(paths: Vec<PathBuf>) -> Self {
+        Self {
+            pending: Arc::new(PendingBatchWrites {
+                remaining: AtomicUsize::new(paths.len()),
+                completed: tokio::sync::Notify::new(),
+            }),
+            paths,
+            armed: true,
+        }
+    }
+
+    fn completion(&self) -> PendingWriteCompletion {
+        PendingWriteCompletion(Arc::clone(&self.pending))
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UncommittedDeleteFilesGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let paths = std::mem::take(&mut self.paths);
+        let pending = Arc::clone(&self.pending);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                while pending.remaining.load(Ordering::Acquire) != 0 {
+                    let notified = pending.completed.notified();
+                    if pending.remaining.load(Ordering::Acquire) != 0 {
+                        notified.await;
+                    }
+                }
+                cleanup_uncommitted_delete_paths(&paths).await;
+            });
+        }
+    }
+}
+
 impl<'a> DeletionVectorWriter<'a> {
     /// Create a new writer bound to the provided table metadata.
     #[must_use]
@@ -270,10 +334,19 @@ impl<'a> DeletionVectorWriter<'a> {
         // independent (one per spec, UUIDv7 filenames), so their writes + file
         // fsyncs overlap on the blocking pool — on network-attached storage
         // (EBS) this turns N serialized ~1 ms fsync round-trips into ~1 round
-        // of in-flight barriers. `try_join_all` preserves spec order in the
-        // returned results.
-        let write_futures = specs.into_iter().map(|spec| {
-            let file_path = Self::deletion_file_path(&deletion_dir);
+        // of in-flight barriers. `join_all` preserves spec order in the
+        // returned results. The cleanup guard owns every generated path until
+        // this method returns a complete result. If this future is cancelled,
+        // it waits for detached blocking writers before unlinking their paths.
+        let batch_paths = (0..specs.len())
+            .map(|_| Self::deletion_file_path(&deletion_dir))
+            .collect::<Vec<_>>();
+        let mut cleanup_guard = UncommittedDeleteFilesGuard::new(batch_paths.clone());
+        let write_futures = specs
+            .into_iter()
+            .zip(batch_paths.iter().cloned())
+            .map(|(spec, file_path)| {
+            let mut completion = Some(cleanup_guard.completion());
             let table_name = self.table.table_name.clone();
             async move {
                 let (batch, schema, count, identifiers, source_data_file_path) =
@@ -324,9 +397,20 @@ impl<'a> DeletionVectorWriter<'a> {
                         }
                     };
 
+                // From this point the completion token is transferred into the
+                // detached blocking writer. Any earlier `?` drops it here and
+                // decrements the pending count, so cancellation cleanup cannot
+                // wait forever for a writer that was never spawned.
+
                 let file_size_bytes =
-                    write_deletion_file(&file_path, Arc::clone(&schema), batch, &table_name)
-                        .await?;
+                    write_deletion_file(
+                        &file_path,
+                        Arc::clone(&schema),
+                        batch,
+                        &table_name,
+                        completion.take(),
+                    )
+                    .await?;
 
                 Ok::<_, Error>((
                     file_path,
@@ -337,7 +421,25 @@ impl<'a> DeletionVectorWriter<'a> {
                 ))
             }
         });
-        let written = futures::future::try_join_all(write_futures).await?;
+        let written: Vec<(PathBuf, usize, u64, DeletionIdentifier, Option<String>)> =
+            match futures::future::join_all(write_futures)
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()
+            {
+            Ok(written) => written,
+            Err(error) => {
+                // Every write future owns a distinct UUID path. `join_all`
+                // waits for all of them, so after one fails no sibling write is
+                // still racing this cleanup. Remove every final-path artifact
+                // from the failed logical batch before returning; otherwise a
+                // later failure or task cancellation at a caller could leak
+                // unreferenced deletion vectors indefinitely.
+                cleanup_uncommitted_delete_paths(&batch_paths).await;
+                cleanup_guard.disarm();
+                return Err(error);
+            }
+        };
 
         // ONE coalesced deletions/-dir sync for the whole batch of files
         // (replaces the previous per-file parent-dir fsync): a directory fsync
@@ -377,6 +479,7 @@ impl<'a> DeletionVectorWriter<'a> {
             });
         }
 
+        cleanup_guard.disarm();
         Ok(results)
     }
 
@@ -652,11 +755,13 @@ async fn write_deletion_file(
     schema: SchemaRef,
     batch: RecordBatch,
     table_name: &str,
+    completion: Option<PendingWriteCompletion>,
 ) -> Result<u64> {
     let output_path = file_path.to_path_buf();
     let table_name = table_name.to_string();
 
     tokio::task::spawn_blocking(move || -> Result<u64> {
+        let _completion = completion;
         use arrow::ipc::writer::FileWriter;
 
         // Crash-safe write. Ensure the deletion vector file content is durable
@@ -702,6 +807,22 @@ async fn write_deletion_file(
         table: table_name,
         source,
     })?
+}
+
+/// Best-effort removal of physical deletion-vector files that were written but
+/// never committed to the catalog.
+pub(crate) async fn cleanup_uncommitted_delete_paths(paths: &[PathBuf]) {
+    for path in paths {
+        if let Err(error) = tokio::fs::remove_file(path).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "Failed to remove an uncommitted deletion-vector file"
+            );
+        }
+    }
 }
 
 fn build_delete_file(

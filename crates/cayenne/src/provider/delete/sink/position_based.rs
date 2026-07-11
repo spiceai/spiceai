@@ -122,7 +122,7 @@ impl CayenneDeletionSink {
                 .first()
                 .map(datafusion_datasource::ListingTableUrl::object_store)
                 .ok_or_else(|| Error::Internal {
-                    table: table_name.clone(),
+                    table: table_name.to_string(),
                     message: "Table has no paths".to_string(),
                 })?;
 
@@ -814,7 +814,12 @@ impl CayenneDeletionSink {
                 continue;
             }
 
-            new_deletion_count += newly_added_for_file;
+            new_deletion_count = new_deletion_count.checked_add(newly_added_for_file).ok_or_else(
+                || Error::Internal {
+                    table: table_name.clone(),
+                    message: "New position-deletion count overflowed usize".to_string(),
+                },
+            )?;
 
             // Union existing + new into one bitmap, then derive the writer-bound
             // `Vec<u64>` from its monotone iterator — saves a separate
@@ -873,10 +878,32 @@ impl CayenneDeletionSink {
             .iter()
             .map(|delete_file| delete_file.path.clone())
             .collect::<Vec<_>>();
+        struct PositionDeleteCleanup(Vec<std::path::PathBuf>);
+        impl Drop for PositionDeleteCleanup {
+            fn drop(&mut self) {
+                let paths = std::mem::take(&mut self.0);
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn(async move {
+                        crate::provider::delete::vector_io::cleanup_uncommitted_delete_paths(
+                            &paths,
+                        )
+                        .await;
+                    });
+                }
+            }
+        }
+        let mut cleanup_guard = PositionDeleteCleanup(
+            cleanup_paths
+                .iter()
+                .map(std::path::PathBuf::from)
+                .collect(),
+        );
         if let Err(error) = self.catalog.add_delete_files(delete_files).await {
             Self::cleanup_uncommitted_delete_paths(&cleanup_paths).await;
+            cleanup_guard.0.clear();
             return Err(error.into());
         }
+        cleanup_guard.0.clear();
 
         // Build a fresh snapshot. Cloning the outer HashMap now only clones
         // small (String, Arc<PositionDeletionVector>) entries — unchanged files

@@ -49,7 +49,12 @@ use super::table::{
     record_cayenne_write_phase,
 };
 
-pub(crate) struct PreparedOnConflictDeletionPublish {
+pub struct PreparedOnConflictDeletionPublish {
+    pub(crate) durable_payload: Option<PreparedOnConflictDurablePayload>,
+    cleanup_armed: bool,
+    pending_inline_tombstone_owned: bool,
+    table: CayenneTableProvider,
+    pub(crate) publish_as_protected_snapshot: bool,
     pub(crate) target_snapshot_id: String,
     pub(crate) snapshot_sequence: i64,
     pub(crate) delete_sequence: Option<i64>,
@@ -88,6 +93,64 @@ pub(crate) struct PreparedOnConflictDeletionPublish {
     /// SAME `Int64Pk` deletions in two encodings (i64 + committed byte keys), so
     /// summing their lengths double-counts, and neither captures `position_deletions`.
     pub(crate) superseded: usize,
+}
+
+pub(crate) struct PreparedOnConflictDurablePayload {
+    pub(crate) table_id: String,
+    pub(crate) delete_files: Vec<crate::metadata::DeleteFile>,
+    pub(crate) insert_pk_bytes: Vec<Vec<u8>>,
+    pub(crate) inline_tombstone: Option<crate::metadata::InlinedDelete>,
+    pub(crate) pending_durable_flips: Vec<String>,
+}
+
+impl PreparedOnConflictDeletionPublish {
+    pub fn cleanup_paths(&self) -> Vec<std::path::PathBuf> {
+        self.durable_payload
+            .as_ref()
+            .map_or_else(Vec::new, |payload| {
+                payload
+                    .delete_files
+                    .iter()
+                    .map(|file| std::path::PathBuf::from(&file.path))
+                    .collect()
+            })
+    }
+
+    pub fn mark_catalog_committed(&mut self) {
+        self.cleanup_armed = false;
+        self.pending_inline_tombstone_owned = false;
+    }
+}
+
+impl Drop for PreparedOnConflictDeletionPublish {
+    fn drop(&mut self) {
+        if !self.cleanup_armed {
+            return;
+        }
+        if self.pending_inline_tombstone_owned {
+            self.table
+                .pending_inline_tombstones
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            self.pending_inline_tombstone_owned = false;
+        }
+        if let Some(payload) = &mut self.durable_payload
+            && !payload.pending_durable_flips.is_empty()
+        {
+            let mut pending = self.table.pending_durable_tombstone_flips.lock();
+            let mut restored = std::mem::take(&mut payload.pending_durable_flips);
+            restored.append(&mut pending);
+            *pending = restored;
+        }
+        let paths = self.cleanup_paths();
+        if paths.is_empty() {
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                super::delete::vector_io::cleanup_uncommitted_delete_paths(&paths).await;
+            });
+        }
+    }
 }
 
 /// One published inline tombstone's removal effect, recorded so the inline-cache
@@ -313,11 +376,42 @@ impl DeletionSink for InlineAwareDeletionSink {
         let _write_guard = self.table.write_lock.lock().await;
         self.table.mark_maintained_aggregates_stale();
 
-        let inlined_deleted = self
+        let (inline_rewrite, inlined_deleted) = self
             .table
-            .delete_inlined_rows_matching_filters(&self.filters)
+            .prepare_inlined_rows_matching_filters(&self.filters)
             .await?;
-        let file_deleted = self.file_sink.delete_from().await?;
+        let mut prepared_file_delete = self.file_sink.prepare_delete().await?;
+        let file_deleted = prepared_file_delete
+            .as_ref()
+            .map_or(0, super::delete::sink::PreparedDeletionPublish::deleted_count);
+
+        if !inline_rewrite.is_empty() || prepared_file_delete.is_some() {
+            let delete_files = prepared_file_delete
+                .as_ref()
+                .map_or_else(Vec::new, |prepared| prepared.delete_files().to_vec());
+            if let Err(error) = self
+                .table
+                .metadata_catalog()
+                .commit_delete_files_with_inlined_rewrite(
+                    delete_files,
+                    &self.table.table_metadata.table_id,
+                    inline_rewrite.updated_data.clone(),
+                    inline_rewrite.deleted_inlined_ids.clone(),
+                )
+                .await
+            {
+                return Err(Box::new(error));
+            }
+            if let Some(prepared) = &mut prepared_file_delete {
+                prepared.mark_catalog_committed();
+            }
+            if let Some(prepared) = prepared_file_delete {
+                prepared.publish()?;
+            }
+            if !inline_rewrite.is_empty() {
+                self.table.publish_inlined_rewrite(&inline_rewrite);
+            }
+        }
 
         let deleted = inlined_deleted.checked_add(file_deleted).ok_or_else(|| {
             Box::new(datafusion_common::DataFusionError::Execution(

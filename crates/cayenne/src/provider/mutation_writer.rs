@@ -613,6 +613,7 @@ impl<'a> AppendMutationWriter<'a> {
                         .prepare_on_conflict_deletions_for_staged_snapshot(
                             on_conflict_deletions,
                             target_snapshot_id,
+                            false,
                         )
                         .await
                     {

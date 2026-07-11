@@ -91,7 +91,7 @@ pub(crate) mod mem_tier;
 pub(crate) mod mem_tier_budget;
 pub(crate) mod memory_account;
 pub(crate) mod mutation_writer;
-pub(crate) mod on_conflict;
+pub mod on_conflict;
 pub(crate) mod overwrite;
 pub mod partitioned_wal;
 pub(crate) mod pk_index;
@@ -122,6 +122,7 @@ pub use query_admission::set_query_admission_governor;
 pub use retention::TimeRetentionFilterBuilder;
 pub use scan::CayenneAccelerationExec;
 pub use staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
+pub use on_conflict::PreparedOnConflictDeletionPublish;
 pub use table::{
     CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder,
     PreparedAppendSnapshotPublish,

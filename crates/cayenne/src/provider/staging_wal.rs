@@ -58,8 +58,11 @@ limitations under the License.
 use super::PartitionedWal;
 use super::Result;
 use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
+use super::on_conflict::{PostValidationState, PreparedOnConflictDeletionPublish};
+use crate::row_converter::OwnedRow;
 use super::table::{CayenneTableProvider, PreparedAppendSnapshotPublish};
 use crate::metastore::MetastoreTransaction;
+use crate::metadata::SnapshotFile;
 use crate::provider::Error;
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::SendableRecordBatchStream;
@@ -374,6 +377,10 @@ impl CayenneStagedAppend {
             // Default: no incremental IVM feed. The write path attaches captured
             // batches via `set_ivm_feed_batches` only for IVM tables.
             ivm_feed_batches: None,
+            prepared_on_conflict: None,
+            deferred_manifest: None,
+            validated_file_keys: None,
+            append_sequence: None,
         })
     }
 
@@ -423,6 +430,10 @@ pub struct PreparedStagedAppend {
     /// [`CayenneTableProvider::feed_staged_ivm_under_fence`]: `Some` feeds the
     /// registry incrementally, `None` marks it stale (if IVM is registered).
     ivm_feed_batches: Option<Arc<Vec<RecordBatch>>>,
+    prepared_on_conflict: Option<PreparedOnConflictDeletionPublish>,
+    deferred_manifest: Option<Vec<SnapshotFile>>,
+    validated_file_keys: Option<std::collections::HashSet<OwnedRow>>,
+    append_sequence: Option<i64>,
 }
 
 impl std::fmt::Debug for PreparedStagedAppend {
@@ -436,6 +447,10 @@ impl std::fmt::Debug for PreparedStagedAppend {
             .field("row_count", &self.row_count)
             .field("has_write_guard", &self.write_guard.is_some())
             .field("has_ivm_feed", &self.ivm_feed_batches.is_some())
+            .field("has_on_conflict", &self.prepared_on_conflict.is_some())
+            .field("has_deferred_manifest", &self.deferred_manifest.is_some())
+            .field("has_validated_file_keys", &self.validated_file_keys.is_some())
+            .field("append_sequence", &self.append_sequence)
             .finish()
     }
 }
@@ -461,6 +476,154 @@ impl PreparedStagedAppend {
     /// registered, falling queries back to a base scan.
     pub(crate) fn set_ivm_feed_batches(&mut self, batches: Option<Arc<Vec<RecordBatch>>>) {
         self.ivm_feed_batches = batches;
+    }
+
+    pub(crate) fn set_prepared_on_conflict(
+        &mut self,
+        prepared: PreparedOnConflictDeletionPublish,
+    ) {
+        self.prepared_on_conflict = Some(prepared);
+    }
+
+    pub(crate) fn set_validated_file_keys(
+        &mut self,
+        keys: std::collections::HashSet<OwnedRow>,
+    ) {
+        self.validated_file_keys = Some(keys);
+    }
+
+    pub fn publish_validated_file_keys(&self) {
+        if let Some(keys) = &self.validated_file_keys {
+            self.table.record_file_pk_keys(keys);
+        }
+    }
+
+    pub fn take_prepared_on_conflict(&mut self) -> Option<PreparedOnConflictDeletionPublish> {
+        self.prepared_on_conflict.take()
+    }
+
+    pub fn restore_prepared_on_conflict(
+        &mut self,
+        prepared: Option<PreparedOnConflictDeletionPublish>,
+    ) {
+        self.prepared_on_conflict = prepared;
+    }
+
+    pub fn deferred_manifest(&self) -> Option<&[SnapshotFile]> {
+        self.deferred_manifest.as_deref()
+    }
+
+    pub async fn prepare_deferred_manifest(&mut self) -> Result<()> {
+        let source_snapshot_id = self.source_snapshot_id.as_ref().ok_or_else(|| Error::Internal {
+            table: self.table.table_name().to_string(),
+            message: "Deferred manifest preparation requires a source snapshot".to_string(),
+        })?;
+        let source_manifest = self
+            .table
+            .metadata_catalog()
+            .get_snapshot_files(self.table.table_id(), source_snapshot_id)
+            .await?;
+        let source_names = self
+            .table
+            .list_snapshot_files_with_sizes(source_snapshot_id)
+            .await?
+            .into_iter()
+            .map(|(file, _)| file)
+            .collect::<std::collections::HashSet<_>>();
+        let new_sequence = if let Some(prepared) = &self.prepared_on_conflict {
+            prepared.snapshot_sequence
+        } else if let Some(sequence) = self.append_sequence {
+            sequence
+        } else {
+            return Err(Error::Internal {
+                table: self.table.table_name().to_string(),
+                message: "Deferred append manifest has no reserved append sequence".to_string(),
+            });
+        };
+        let listed_files = self
+            .table
+            .list_snapshot_files_with_sizes(&self.target_snapshot_id)
+            .await?;
+        let target_names = listed_files
+            .iter()
+            .map(|(file, _)| file.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let listed_file_count = listed_files.len();
+        if target_names.len() != listed_files.len() {
+            return Err(Error::Internal {
+                table: self.table.table_name().to_string(),
+                message: format!(
+                    "Deferred snapshot '{}' contains duplicate data-file names",
+                    self.target_snapshot_id
+                ),
+            });
+        }
+        let mut manifest = source_manifest
+            .into_iter()
+            .filter(|file| {
+                source_names.contains(&file.file_path) && target_names.contains(&file.file_path)
+            })
+            .map(|mut file| {
+                file.snapshot_id.clone_from(&self.target_snapshot_id);
+                file
+            })
+            .collect::<Vec<_>>();
+        let manifest_names = manifest
+            .iter()
+            .map(|file| file.file_path.clone())
+            .collect::<std::collections::HashSet<_>>();
+        manifest.extend(
+            listed_files
+                .iter()
+                .filter(|(name, _)| source_names.contains(name) && !manifest_names.contains(name))
+                .map(|(file_path, file_size_bytes)| SnapshotFile {
+                    table_id: self.table.table_id().to_string(),
+                    snapshot_id: self.target_snapshot_id.clone(),
+                    file_path: file_path.clone(),
+                    row_count: 0,
+                    file_size_bytes: i64::try_from(*file_size_bytes).unwrap_or(i64::MAX),
+                    min_sequence: 0,
+                    max_sequence: new_sequence,
+                    digest: None,
+                }),
+        );
+        manifest.extend(
+            listed_files
+                .into_iter()
+                .filter(|(name, _)| !source_names.contains(name))
+                .map(|(file_path, file_size_bytes)| SnapshotFile {
+                    table_id: self.table.table_id().to_string(),
+                    snapshot_id: self.target_snapshot_id.clone(),
+                    file_path,
+                    row_count: 0,
+                    file_size_bytes: i64::try_from(file_size_bytes).unwrap_or(i64::MAX),
+                    min_sequence: new_sequence,
+                    max_sequence: new_sequence,
+                    digest: None,
+                }),
+        );
+        manifest.sort_unstable_by(|left, right| left.file_path.cmp(&right.file_path));
+        if manifest.len() != listed_file_count {
+            return Err(Error::Internal {
+                table: self.table.table_name().to_string(),
+                message: format!(
+                    "Deferred manifest for snapshot '{}' has {} rows for {} physical files",
+                    self.target_snapshot_id,
+                    manifest.len(),
+                    listed_file_count
+                ),
+            });
+        }
+        self.deferred_manifest = Some(manifest);
+        Ok(())
+    }
+
+    pub fn publish_on_conflict_under_held_fence(
+        &self,
+        prepared: PreparedOnConflictDeletionPublish,
+    ) {
+        self.table
+            .publish_prepared_on_conflict_deletions(prepared);
     }
 
     async fn lock_current_snapshot_for_apply(&self) -> Option<OwnedMutexGuard<()>> {
@@ -589,10 +752,10 @@ impl PreparedStagedAppend {
         self.table
             .move_staged_files_to_snapshot(&self.staging_snapshot_id, &self.target_snapshot_id)
             .await?;
-        self.table
-            .remove_staging_wal_for(&self.staging_snapshot_id)
-            .await?;
         if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
+            self.table
+                .remove_staging_wal_for(&self.staging_snapshot_id)
+                .await?;
             self.table
                 .publish_current_snapshot_files_changed_under_held_fence();
         }
@@ -938,7 +1101,29 @@ impl CayenneTableProvider {
         &self,
         data: SendableRecordBatchStream,
         target_partitions: usize,
-    ) -> Result<CayenneStagedAppend> {
+    ) -> Result<PreparedStagedAppend> {
+        struct DeferredSetupCleanup {
+            table: CayenneTableProvider,
+            snapshots: Vec<String>,
+            armed: bool,
+        }
+        impl Drop for DeferredSetupCleanup {
+            fn drop(&mut self) {
+                if !self.armed {
+                    return;
+                }
+                let table = self.table.clone_for_write_operations();
+                let snapshots = std::mem::take(&mut self.snapshots);
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn(async move {
+                        for snapshot in snapshots {
+                            let _ = table.clear_snapshot_dir(&snapshot).await;
+                            let _ = table.clear_staging_snapshot_dir(&snapshot).await;
+                        }
+                    });
+                }
+            }
+        }
         let write_guard = self.write_lock_arc().lock_owned().await;
         self.ensure_no_incomplete_write().await?;
 
@@ -947,28 +1132,18 @@ impl CayenneTableProvider {
         // state are separate visibility inputs and cannot be dropped from a
         // cross-partition append. Refuse before cloning or consuming input until
         // those states are included in the coordinated transaction.
-        if !self.pk_deletion_strategy().is_position_based() {
-            return Err(Error::Unsupported {
-                operation: "deferred partition append for Cayenne tables with primary-key deletion handling",
-            });
-        }
-        if self.has_pending_deletions() {
-            return Err(Error::Unsupported {
-                operation: "deferred partition append for Cayenne tables with pending deletions",
-            });
-        }
-        if self.cached_inlined_row_count() > 0 {
-            return Err(Error::Unsupported {
-                operation: "deferred partition append for Cayenne tables with inlined rows",
-            });
-        }
-
         let current_snapshot_id = self.get_current_snapshot_id();
         let target_snapshot_id = Self::new_staging_snapshot_id();
+        let mut setup_cleanup = DeferredSetupCleanup {
+            table: self.clone_for_write_operations(),
+            snapshots: vec![target_snapshot_id.clone()],
+            armed: true,
+        };
         self.clone_snapshot_files(&current_snapshot_id, &target_snapshot_id)
             .await?;
 
         let staging_snapshot_id = Self::new_staging_snapshot_id();
+        setup_cleanup.snapshots.push(staging_snapshot_id.clone());
         self.clear_staging_snapshot_dir(&staging_snapshot_id)
             .await?;
         let prepared_insert = match self.prepare_stream_for_insert(data).await {
@@ -978,14 +1153,8 @@ impl CayenneTableProvider {
                 return Err(error);
             }
         };
-        if prepared_insert.may_have_on_conflict_deletions() {
-            self.clear_snapshot_dir(&target_snapshot_id).await?;
-            return Err(Error::Internal {
-                table: self.table_name().to_string(),
-                message: "Cross-partition deferred append does not support on-conflict deletions"
-                    .to_string(),
-            });
-        }
+        let may_have_on_conflict_deletions = prepared_insert.may_have_on_conflict_deletions();
+        let post_validation = prepared_insert.post_validation();
         let row_count = match self
             .write_stream_to_staging_snapshot(
                 prepared_insert.stream,
@@ -1002,7 +1171,36 @@ impl CayenneTableProvider {
                 return Err(error);
             }
         };
-        Ok(CayenneStagedAppend::from_staged_append_to_snapshot(
+        let PostValidationState {
+            on_conflict_deletions,
+            validated_keys,
+        } = post_validation.lock().take().unwrap_or_default();
+        let prepared_on_conflict = if may_have_on_conflict_deletions || self.has_pending_deletions()
+        {
+            match self
+                .prepare_on_conflict_deletions_for_staged_snapshot(
+                    on_conflict_deletions,
+                    target_snapshot_id.clone(),
+                    true,
+                )
+                .await
+            {
+                Ok(prepared) => Some(prepared),
+                Err(error) => {
+                    let _ = self.clear_staging_snapshot_dir(&staging_snapshot_id).await;
+                    let _ = self.clear_snapshot_dir(&target_snapshot_id).await;
+                    return Err(error.into());
+                }
+            }
+        } else {
+            None
+        };
+        let append_sequence = if prepared_on_conflict.is_none() {
+            Some(self.reserve_sequences_local(1).await?)
+        } else {
+            None
+        };
+        let staged = CayenneStagedAppend::from_staged_append_to_snapshot(
             self.clone_for_write_operations(),
             Some(write_guard),
             staging_snapshot_id,
@@ -1010,7 +1208,15 @@ impl CayenneTableProvider {
             target_snapshot_id,
             StagingWalTargetKind::ProtectedSnapshot,
             row_count,
-        ))
+        );
+        let mut prepared = staged.prepare().await?;
+        if let Some(on_conflict) = prepared_on_conflict {
+            prepared.set_prepared_on_conflict(on_conflict);
+        }
+        prepared.set_validated_file_keys(validated_keys);
+        prepared.append_sequence = append_sequence;
+        setup_cleanup.armed = false;
+        Ok(prepared)
     }
 
     /// Write the staging WAL file that records the pending move operation.
