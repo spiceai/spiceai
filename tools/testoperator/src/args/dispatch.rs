@@ -430,11 +430,13 @@ pub struct StreamingCorrectnessDispatchArgs {
 
 /// HTAP workflow arguments.
 ///
-/// Mirrors the inputs of `testoperator_run_htap.yml`. Deliberately omits
-/// `skip_analytic_gate`: scheduled dispatch (`testoperator_dispatch_htap.yml`)
-/// builds its payload from this struct, so leaving the field out means the
-/// dispatched workflow run always falls back to the workflow's `false`
-/// default and the analytical-correctness gate always runs on schedule.
+/// A subset of the inputs of `testoperator_run_htap.yml` — only the ones
+/// scheduled/test-file dispatch needs to set (`spiced_commit` is handled by
+/// the `WorkflowArgs` wrapper). Deliberately also omits `skip_analytic_gate`:
+/// scheduled dispatch (`testoperator_dispatch_htap.yml`) builds its payload
+/// from this struct, so leaving the field out means the dispatched workflow
+/// run always falls back to the workflow's `false` default and the
+/// analytical-correctness gate always runs on schedule.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HtapDispatchArgs {
     pub spicepod_path: PathBuf,

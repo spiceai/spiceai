@@ -170,7 +170,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
                 args.rate
                     .map_or_else(|| "unlimited".to_string(), |r| r.to_string()),
             ),
-            KeyValue::new("skip_analytic_gate", args.skip_analytic_gate),
+            KeyValue::new("skip_analytic_gate", args.skip_analytic_gate.to_string()),
         ])
         .build();
 
