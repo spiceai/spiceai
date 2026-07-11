@@ -294,6 +294,59 @@ impl CayenneCatalog {
         self.metastore.begin_transaction().await
     }
 
+    /// Atomically update the current snapshot pointer for multiple tables and
+    /// invalidate statistics derived from the previous snapshots.
+    pub async fn set_current_snapshots_in_txn(
+        &self,
+        txn: &mut dyn MetastoreTransaction,
+        snapshots: &[(&str, &str)],
+    ) -> CatalogResult<()> {
+        for (table_id, snapshot_id) in snapshots {
+            if uuid::Uuid::parse_str(table_id).is_err()
+                || uuid::Uuid::parse_str(snapshot_id).is_err()
+            {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "Invalid table or snapshot UUID in cross-partition append: table_id={table_id}, snapshot_id={snapshot_id}"
+                    ),
+                });
+            }
+            let count_values = txn
+                .query_row_values(QueryRowParams {
+                    sql: "SELECT COUNT(*) FROM cayenne_table WHERE table_id = ?1",
+                    params: vec![MetastoreValue::Text((*table_id).to_string())],
+                })
+                .await?;
+            let count = i64::from_value(metastore_value_at(&count_values, 0)?)?;
+            if count != 1 {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "Expected exactly one Cayenne table for cross-partition append table_id={table_id}, found {count}"
+                    ),
+                });
+            }
+            txn.execute(ExecuteParams {
+                sql: "UPDATE cayenne_table SET current_snapshot_id = ?1 WHERE table_id = ?2",
+                params: vec![
+                    MetastoreValue::Text((*snapshot_id).to_string()),
+                    MetastoreValue::Text((*table_id).to_string()),
+                ],
+            })
+            .await?;
+            // Exact table statistics are snapshot state: after the pointer
+            // advances they no longer describe the visible rows. Delete them in
+            // this SAME transaction so a crash immediately after commit cannot
+            // reopen the new snapshot with the old snapshot's exact count (which
+            // DataFusion may substitute directly into COUNT(*)).
+            txn.execute(ExecuteParams {
+                sql: "DELETE FROM cayenne_table_statistics WHERE table_id = ?1",
+                params: vec![MetastoreValue::Text((*table_id).to_string())],
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
     async fn existing_delete_file_record(
         &self,
         table_id: &str,
@@ -2512,24 +2565,34 @@ impl MetadataCatalog for CayenneCatalog {
         })?;
         let partition_key = partition.composite_key();
 
-        // Check if partition already exists using the composite key
+        // Check if partition already exists using the canonical composite key.
+        // Always verify the full value tuple: legacy catalogs used slash-joined
+        // keys, which could collide for distinct tuples such as `["a/b", "c"]`
+        // and `["a", "b/c"]`.
         let existing_partition = self
             .metastore
             .query_row_helper(
                 QueryRowParams {
-                    sql: "SELECT partition_id FROM cayenne_partition WHERE table_id = ?1 AND partition_key = ?2",
+                    sql: "SELECT partition_id, partition_columns_json, partition_values_json FROM cayenne_partition WHERE table_id = ?1 AND partition_key = ?2",
                     params: vec![
                         MetastoreValue::Text(partition.table_id.clone()),
                         MetastoreValue::Text(partition_key.clone()),
                     ],
                 },
-                |row| row.get_string(0),
+                |row| Ok((row.get_string(0)?, row.get_string(1)?, row.get_string(2)?)),
             )
             .await;
 
-        if let Ok(id) = existing_partition {
-            // Partition already exists, return its ID
-            return Ok(id);
+        if let Ok((id, existing_columns_json, existing_values_json)) = existing_partition {
+            if existing_columns_json == columns_json && existing_values_json == values_json {
+                return Ok(id);
+            }
+            return Err(CatalogError::InvalidPartitionMetadata {
+                message: format!(
+                    "Partition key collision for table '{}': stored partition values differ from the requested values",
+                    partition.table_id
+                ),
+            });
         }
 
         let partition_id = uuid::Uuid::now_v7().to_string();
@@ -2570,22 +2633,29 @@ impl MetadataCatalog for CayenneCatalog {
         }
 
         // Another concurrent operation inserted first — retrieve existing partition ID
-        let existing_id: String = self
+        let (existing_id, existing_columns_json, existing_values_json): (String, String, String) = self
             .metastore
             .query_row_helper(
                 QueryRowParams {
-                    sql: "SELECT partition_id FROM cayenne_partition WHERE table_id = ?1 AND partition_key = ?2",
+                    sql: "SELECT partition_id, partition_columns_json, partition_values_json FROM cayenne_partition WHERE table_id = ?1 AND partition_key = ?2",
                     params: vec![
                         MetastoreValue::Text(partition.table_id),
                         MetastoreValue::Text(partition_key),
                     ],
                 },
-                |row| row.get_string(0),
+                |row| Ok((row.get_string(0)?, row.get_string(1)?, row.get_string(2)?)),
             )
             .await
             .map_err(|e| CatalogError::FailedToAddPartition {
                 source: Box::new(e),
             })?;
+
+        if existing_columns_json != columns_json || existing_values_json != values_json {
+            return Err(CatalogError::InvalidPartitionMetadata {
+                message: "Concurrent partition insert produced a conflicting value tuple"
+                    .to_string(),
+            });
+        }
 
         Ok(existing_id)
     }
@@ -2794,6 +2864,52 @@ impl MetadataCatalog for CayenneCatalog {
                 ],
             })
             .await
+    }
+
+    async fn replace_snapshot_files(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+        files: &[SnapshotFile],
+    ) -> CatalogResult<()> {
+        let txn = self.begin_transaction().await?;
+        txn.execute(ExecuteParams {
+            sql: "DELETE FROM cayenne_snapshot_file WHERE table_id = ?1 AND snapshot_id = ?2",
+            params: vec![
+                MetastoreValue::Text(table_id.to_string()),
+                MetastoreValue::Text(snapshot_id.to_string()),
+            ],
+        })
+        .await?;
+        for file in files {
+            if file.table_id != table_id || file.snapshot_id != snapshot_id {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "Snapshot manifest replacement row does not match target table/snapshot: expected {table_id}/{snapshot_id}, found {}/{}",
+                        file.table_id, file.snapshot_id
+                    ),
+                });
+            }
+            txn.execute(ExecuteParams {
+                sql: "INSERT INTO cayenne_snapshot_file \
+                      (table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence, digest) \
+                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params: vec![
+                    MetastoreValue::Text(file.table_id.clone()),
+                    MetastoreValue::Text(file.snapshot_id.clone()),
+                    MetastoreValue::Text(file.file_path.clone()),
+                    MetastoreValue::Integer(file.row_count),
+                    MetastoreValue::Integer(file.file_size_bytes),
+                    MetastoreValue::Integer(file.min_sequence),
+                    MetastoreValue::Integer(file.max_sequence),
+                    file.digest
+                        .clone()
+                        .map_or(MetastoreValue::Null, MetastoreValue::Text),
+                ],
+            })
+            .await?;
+        }
+        txn.commit().await
     }
 
     async fn get_snapshot_files(

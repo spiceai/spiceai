@@ -94,6 +94,18 @@ pub fn partition_by_expressions(
                 .simplify(expression)
                 .context(SimplifyingExpressionSnafu)?;
             PartitionCriteria.validate(&expression, df_schema)?;
+            ensure!(
+                !p.name.is_empty()
+                    && p.name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
+                InvalidExpressionSnafu {
+                    message: format!(
+                        "partition name '{}' must contain only ASCII letters, digits, and underscores",
+                        p.name
+                    )
+                }
+            );
             Ok(PartitionedBy {
                 name: p.name.clone(),
                 expression,

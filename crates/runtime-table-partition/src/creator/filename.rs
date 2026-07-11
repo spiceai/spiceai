@@ -31,6 +31,10 @@ use snafu::prelude::*;
 
 use crate::expression::PartitionedBy;
 
+const PARTITION_KEY_CODEC_PREFIX: &str = "v1";
+const NULL_COMPONENT: &str = "n";
+const VALUE_COMPONENT_PREFIX: &str = "v";
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unsupported scalar value type: {data_type}"))]
@@ -48,6 +52,11 @@ pub enum Error {
     Discovering {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display(
+        "Invalid partition name '{name}': names must contain only ASCII letters, digits, and underscores"
+    ))]
+    InvalidPartitionName { name: String },
 }
 
 /// Create a hive style partitioned directory.
@@ -58,6 +67,7 @@ pub fn to_hive_partition_dir(pairings: &[(PartitionedBy, ScalarValue)]) -> Resul
     let mut path = PathBuf::new();
     for (partitioned_by, key) in pairings {
         let name = &partitioned_by.name;
+        validate_partition_name(name)?;
         let key = encode_key(key)?;
         let part = format!("{name}={key}");
         path = path.join(part);
@@ -66,31 +76,45 @@ pub fn to_hive_partition_dir(pairings: &[(PartitionedBy, ScalarValue)]) -> Resul
     Ok(path)
 }
 
-/// Encodes a [`ScalarValue`] partition key into a Hive-style string representation.
+fn validate_partition_name(name: &str) -> Result<(), Error> {
+    ensure!(
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
+        InvalidPartitionNameSnafu { name }
+    );
+    Ok(())
+}
+
+/// Encodes a [`ScalarValue`] partition key into a versioned, path-safe representation.
 ///
-/// NULL values are encoded as `"none"` following Hive partitioning conventions.
+/// NULL values and non-NULL values have distinct encodings, and the scalar type is
+/// included so values such as `Int32(1)` and `Utf8("1")` cannot collide. The value
+/// payload uses uppercase hexadecimal, making every encoded key a single safe path
+/// component even when a string contains `/`, `=`, `..`, or platform separators.
 ///
 /// # Errors
 /// Returns [`Error::UnsupportedPartitionKey`] if the scalar value type is not supported
 /// for partitioning.
 pub fn encode_key(key: &ScalarValue) -> Result<String, Error> {
-    let key = match key {
-        ScalarValue::Boolean(v) => v.map(|v| format!("{v}")),
-        ScalarValue::Int8(v) => v.map(|v| format!("{v}")),
-        ScalarValue::Int16(v) => v.map(|v| format!("{v}")),
-        ScalarValue::Int32(v) => v.map(|v| format!("{v}")),
-        ScalarValue::Int64(v) => v.map(|v| format!("{v}")),
-        ScalarValue::UInt8(v) => v.map(|v| format!("{v}")),
-        ScalarValue::UInt16(v) => v.map(|v| format!("{v}")),
-        ScalarValue::UInt32(v) => v.map(|v| format!("{v}")),
-        ScalarValue::UInt64(v) => v.map(|v| format!("{v}")),
-        ScalarValue::TimestampSecond(v, _) => v.map(|v| format!("{v}")),
-        ScalarValue::TimestampMillisecond(v, _) => v.map(|v| format!("{v}")),
-        ScalarValue::TimestampMicrosecond(v, _) => v.map(|v| format!("{v}")),
-        ScalarValue::TimestampNanosecond(v, _) => v.map(|v| format!("{v}")),
-        ScalarValue::Utf8(v) | ScalarValue::LargeUtf8(v) | ScalarValue::Utf8View(v) => {
-            v.as_ref().map(std::string::ToString::to_string)
-        }
+    let (type_tag, value) = match key {
+        ScalarValue::Boolean(v) => ("bool", v.map(|v| v.to_string())),
+        ScalarValue::Int8(v) => ("i8", v.map(|v| v.to_string())),
+        ScalarValue::Int16(v) => ("i16", v.map(|v| v.to_string())),
+        ScalarValue::Int32(v) => ("i32", v.map(|v| v.to_string())),
+        ScalarValue::Int64(v) => ("i64", v.map(|v| v.to_string())),
+        ScalarValue::UInt8(v) => ("u8", v.map(|v| v.to_string())),
+        ScalarValue::UInt16(v) => ("u16", v.map(|v| v.to_string())),
+        ScalarValue::UInt32(v) => ("u32", v.map(|v| v.to_string())),
+        ScalarValue::UInt64(v) => ("u64", v.map(|v| v.to_string())),
+        ScalarValue::TimestampSecond(v, _) => ("ts_s", v.map(|v| v.to_string())),
+        ScalarValue::TimestampMillisecond(v, _) => ("ts_ms", v.map(|v| v.to_string())),
+        ScalarValue::TimestampMicrosecond(v, _) => ("ts_us", v.map(|v| v.to_string())),
+        ScalarValue::TimestampNanosecond(v, _) => ("ts_ns", v.map(|v| v.to_string())),
+        ScalarValue::Utf8(v) => ("utf8", v.clone()),
+        ScalarValue::LargeUtf8(v) => ("large_utf8", v.clone()),
+        ScalarValue::Utf8View(v) => ("utf8_view", v.clone()),
         value => {
             return Err(Error::UnsupportedPartitionKey {
                 value: value.clone(),
@@ -98,7 +122,15 @@ pub fn encode_key(key: &ScalarValue) -> Result<String, Error> {
         }
     };
 
-    Ok(key.unwrap_or("none".to_string()))
+    Ok(value.map_or_else(
+        || format!("{PARTITION_KEY_CODEC_PREFIX}.{type_tag}.{NULL_COMPONENT}"),
+        |value| {
+            format!(
+                "{PARTITION_KEY_CODEC_PREFIX}.{type_tag}.{VALUE_COMPONENT_PREFIX}{}",
+                encode_hex(value.as_bytes())
+            )
+        },
+    ))
 }
 
 /// Encodes multiple [`ScalarValue`] partition keys into a composite key string.
@@ -106,9 +138,8 @@ pub fn encode_key(key: &ScalarValue) -> Result<String, Error> {
 /// This is used for hierarchical partitions where the partition is identified
 /// by multiple values (e.g., year=2025 and month=10).
 ///
-/// The composite key is encoded by joining individual keys with "/",
-/// e.g., `"2025/10"` for the example above. This provides a unique, stable
-/// identifier for the partition that can be used as a `HashMap` key.
+/// The composite key is encoded by length-prefixing each versioned component.
+/// This keeps tuple boundaries unambiguous without introducing path separators.
 ///
 /// Note: This function produces a compact key format (e.g., "2025/10") without
 /// column names. For Hive-style partition directories with column names
@@ -117,8 +148,136 @@ pub fn encode_key(key: &ScalarValue) -> Result<String, Error> {
 /// # Errors
 /// Returns [`Error::UnsupportedPartitionKey`] if any scalar value type is not supported.
 pub fn encode_composite_key(keys: &[ScalarValue]) -> Result<String, Error> {
-    let encoded: Result<Vec<String>, Error> = keys.iter().map(encode_key).collect();
-    Ok(encoded?.join("/"))
+    let mut composite = format!("{PARTITION_KEY_CODEC_PREFIX}:");
+    for key in keys {
+        let encoded = encode_key(key)?;
+        composite.push_str(&encoded.len().to_string());
+        composite.push(':');
+        composite.push_str(&encoded);
+    }
+    Ok(composite)
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(encoded, "{byte:02X}");
+    }
+    encoded
+}
+
+fn decode_hex(encoded: &str) -> Result<String, Error> {
+    if !encoded.len().is_multiple_of(2) {
+        return Err(Error::Parsing {
+            source: "partition value has an odd-length hexadecimal payload".into(),
+        });
+    }
+
+    let bytes = encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair)?;
+            Ok(u8::from_str_radix(pair, 16)?)
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error + Send + Sync>>>()
+        .map_err(|source| Error::Parsing { source })?;
+    String::from_utf8(bytes).map_err(|source| Error::Parsing {
+        source: Box::new(source),
+    })
+}
+
+fn decode_versioned_partition_value(
+    value: &str,
+    expected_type: &DataType,
+) -> Result<Option<String>, Error> {
+    let Some(remainder) = value.strip_prefix("v1.") else {
+        return Ok(Some(value.to_string()));
+    };
+    let Some((type_tag, payload)) = remainder.split_once('.') else {
+        return legacy_string_or_error(
+            value,
+            expected_type,
+            "versioned partition value is missing its payload",
+        );
+    };
+    let expected_tag = data_type_tag(expected_type).ok_or_else(|| Error::UnsupportedType {
+        data_type: expected_type.clone(),
+    })?;
+    if type_tag != expected_tag {
+        return legacy_string_or_error(
+            value,
+            expected_type,
+            format!(
+                "partition value type tag '{type_tag}' does not match expected type '{expected_tag}'"
+            ),
+        );
+    }
+    if payload == NULL_COMPONENT {
+        return Ok(None);
+    }
+    let Some(encoded) = payload.strip_prefix(VALUE_COMPONENT_PREFIX) else {
+        return legacy_string_or_error(
+            value,
+            expected_type,
+            "versioned partition value has an invalid payload marker",
+        );
+    };
+    match decode_hex(encoded) {
+        Ok(decoded) => Ok(Some(decoded)),
+        Err(error) => {
+            if is_string_type(expected_type) {
+                Ok(Some(value.to_string()))
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+fn legacy_string_or_error(
+    value: &str,
+    expected_type: &DataType,
+    message: impl Into<String>,
+) -> Result<Option<String>, Error> {
+    if is_string_type(expected_type) {
+        Ok(Some(value.to_string()))
+    } else {
+        Err(Error::Parsing {
+            source: message.into().into(),
+        })
+    }
+}
+
+const fn is_string_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    )
+}
+
+fn data_type_tag(data_type: &DataType) -> Option<&'static str> {
+    match data_type {
+        DataType::Boolean => Some("bool"),
+        DataType::Int8 => Some("i8"),
+        DataType::Int16 => Some("i16"),
+        DataType::Int32 => Some("i32"),
+        DataType::Int64 => Some("i64"),
+        DataType::UInt8 => Some("u8"),
+        DataType::UInt16 => Some("u16"),
+        DataType::UInt32 => Some("u32"),
+        DataType::UInt64 => Some("u64"),
+        DataType::Timestamp(TimeUnit::Second, _) => Some("ts_s"),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => Some("ts_ms"),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => Some("ts_us"),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => Some("ts_ns"),
+        DataType::Utf8 => Some("utf8"),
+        DataType::LargeUtf8 => Some("large_utf8"),
+        DataType::Utf8View => Some("utf8_view"),
+        _ => None,
+    }
 }
 
 /// Discover hive style partitions in the `base_dir` recursively.
@@ -222,12 +381,12 @@ fn discover_partitions_recursive(
 }
 
 macro_rules! parse_numeric_scalar {
-    ($value_str:expr, $scalar_type:ident, $parse_type:ty) => {
-        if $value_str == "none" || $value_str == "NULL" {
-            ScalarValue::$scalar_type(None)
-        } else {
-            let parsed: $parse_type = $value_str.parse()?;
+    ($value:expr, $scalar_type:ident, $parse_type:ty) => {
+        if let Some(value_str) = $value {
+            let parsed: $parse_type = value_str.parse()?;
             ScalarValue::$scalar_type(Some(parsed))
+        } else {
+            ScalarValue::$scalar_type(None)
         }
     };
 }
@@ -259,56 +418,51 @@ pub fn parse_partition_value(
     let data_type = alias
         .get_type(schema)
         .map_err(|e| Error::Parsing { source: e.into() })?;
+    let legacy_null = value_str == "none" || value_str == "NULL";
+    let decoded = decode_versioned_partition_value(value_str, &data_type)?;
+    let decoded = if value_str.starts_with("v1.") || !legacy_null {
+        decoded
+    } else {
+        None
+    };
     let scalar_value = match data_type {
         DataType::Boolean => {
-            if value_str == "none" || value_str == "NULL" {
-                ScalarValue::Boolean(None)
-            } else {
+            if let Some(value_str) = decoded {
                 let b = value_str.parse()?;
                 ScalarValue::Boolean(Some(b))
+            } else {
+                ScalarValue::Boolean(None)
             }
         }
-        DataType::Int8 => parse_numeric_scalar!(value_str, Int8, i8),
-        DataType::Int16 => parse_numeric_scalar!(value_str, Int16, i16),
-        DataType::Int32 => parse_numeric_scalar!(value_str, Int32, i32),
-        DataType::Int64 => parse_numeric_scalar!(value_str, Int64, i64),
-        DataType::UInt8 => parse_numeric_scalar!(value_str, UInt8, u8),
-        DataType::UInt16 => parse_numeric_scalar!(value_str, UInt16, u16),
-        DataType::UInt32 => parse_numeric_scalar!(value_str, UInt32, u32),
-        DataType::UInt64 => parse_numeric_scalar!(value_str, UInt64, u64),
-        DataType::Timestamp(t, _) => match t {
-            TimeUnit::Second => ScalarValue::TimestampSecond(Some(value_str.parse()?), None),
-            TimeUnit::Millisecond => {
-                ScalarValue::TimestampMillisecond(Some(value_str.parse()?), None)
-            }
-            TimeUnit::Microsecond => {
-                ScalarValue::TimestampMicrosecond(Some(value_str.parse()?), None)
-            }
-            TimeUnit::Nanosecond => {
-                ScalarValue::TimestampNanosecond(Some(value_str.parse()?), None)
-            }
+        DataType::Int8 => parse_numeric_scalar!(decoded, Int8, i8),
+        DataType::Int16 => parse_numeric_scalar!(decoded, Int16, i16),
+        DataType::Int32 => parse_numeric_scalar!(decoded, Int32, i32),
+        DataType::Int64 => parse_numeric_scalar!(decoded, Int64, i64),
+        DataType::UInt8 => parse_numeric_scalar!(decoded, UInt8, u8),
+        DataType::UInt16 => parse_numeric_scalar!(decoded, UInt16, u16),
+        DataType::UInt32 => parse_numeric_scalar!(decoded, UInt32, u32),
+        DataType::UInt64 => parse_numeric_scalar!(decoded, UInt64, u64),
+        DataType::Timestamp(t, timezone) => match t {
+            TimeUnit::Second => ScalarValue::TimestampSecond(
+                decoded.map(|value| value.parse()).transpose()?,
+                timezone,
+            ),
+            TimeUnit::Millisecond => ScalarValue::TimestampMillisecond(
+                decoded.map(|value| value.parse()).transpose()?,
+                timezone,
+            ),
+            TimeUnit::Microsecond => ScalarValue::TimestampMicrosecond(
+                decoded.map(|value| value.parse()).transpose()?,
+                timezone,
+            ),
+            TimeUnit::Nanosecond => ScalarValue::TimestampNanosecond(
+                decoded.map(|value| value.parse()).transpose()?,
+                timezone,
+            ),
         },
-        DataType::Utf8 => {
-            if value_str == "none" || value_str == "NULL" {
-                ScalarValue::Utf8(None)
-            } else {
-                ScalarValue::Utf8(Some(value_str.to_string()))
-            }
-        }
-        DataType::LargeUtf8 => {
-            if value_str == "none" || value_str == "NULL" {
-                ScalarValue::LargeUtf8(None)
-            } else {
-                ScalarValue::LargeUtf8(Some(value_str.to_string()))
-            }
-        }
-        DataType::Utf8View => {
-            if value_str == "none" || value_str == "NULL" {
-                ScalarValue::Utf8View(None)
-            } else {
-                ScalarValue::Utf8View(Some(value_str.to_string()))
-            }
-        }
+        DataType::Utf8 => ScalarValue::Utf8(decoded),
+        DataType::LargeUtf8 => ScalarValue::LargeUtf8(decoded),
+        DataType::Utf8View => ScalarValue::Utf8View(decoded),
         data_type => return Err(Error::UnsupportedType { data_type }),
     };
 
@@ -336,6 +490,7 @@ mod tests {
     use std::{
         fs::{self, File},
         io::Write,
+        sync::Arc,
     };
 
     use arrow_schema::{Field, Schema};
@@ -374,7 +529,14 @@ mod tests {
         let path = to_hive_partition_dir(&pairings)?;
 
         let parts = path.iter().collect::<Vec<_>>();
-        for (want, got) in ["year=2025", "month=10", "day=15"].iter().zip(parts) {
+        for (want, got) in [
+            "year=v1.i32.v32303235",
+            "month=v1.i32.v3130",
+            "day=v1.i32.v3135",
+        ]
+        .iter()
+        .zip(parts)
+        {
             assert_eq!(*want, got.to_str().expect("to_str"));
         }
 
@@ -383,22 +545,21 @@ mod tests {
 
     #[test]
     fn test_encode_key_with_nulls() -> Result<(), Error> {
-        // Test NULL values are encoded as "none"
-        assert_eq!(encode_key(&ScalarValue::Int32(None))?, "none");
-        assert_eq!(encode_key(&ScalarValue::Int64(None))?, "none");
-        assert_eq!(encode_key(&ScalarValue::Utf8(None))?, "none");
-        assert_eq!(encode_key(&ScalarValue::Boolean(None))?, "none");
-        assert_eq!(encode_key(&ScalarValue::UInt32(None))?, "none");
+        assert_eq!(encode_key(&ScalarValue::Int32(None))?, "v1.i32.n");
+        assert_eq!(encode_key(&ScalarValue::Int64(None))?, "v1.i64.n");
+        assert_eq!(encode_key(&ScalarValue::Utf8(None))?, "v1.utf8.n");
+        assert_eq!(encode_key(&ScalarValue::Boolean(None))?, "v1.bool.n");
+        assert_eq!(encode_key(&ScalarValue::UInt32(None))?, "v1.u32.n");
 
         // Test non-NULL values are encoded correctly
-        assert_eq!(encode_key(&ScalarValue::Int32(Some(42)))?, "42");
-        assert_eq!(encode_key(&ScalarValue::Int64(Some(-100)))?, "-100");
+        assert_eq!(encode_key(&ScalarValue::Int32(Some(42)))?, "v1.i32.v3432");
+        assert_eq!(encode_key(&ScalarValue::Int64(Some(-100)))?, "v1.i64.v2D313030");
         assert_eq!(
             encode_key(&ScalarValue::Utf8(Some("test".to_string())))?,
-            "test"
+            "v1.utf8.v74657374"
         );
-        assert_eq!(encode_key(&ScalarValue::Boolean(Some(true)))?, "true");
-        assert_eq!(encode_key(&ScalarValue::UInt32(Some(99)))?, "99");
+        assert_eq!(encode_key(&ScalarValue::Boolean(Some(true)))?, "v1.bool.v74727565");
+        assert_eq!(encode_key(&ScalarValue::UInt32(Some(99)))?, "v1.u32.v3939");
 
         Ok(())
     }
@@ -489,10 +650,10 @@ mod tests {
             expression: col("bucket_col"),
         };
 
-        // Test roundtrip: ScalarValue::Int32(None) -> "none" -> ScalarValue::Int32(None)
+        // Test roundtrip through the versioned representation.
         let null_value = ScalarValue::Int32(None);
         let encoded = encode_key(&null_value)?;
-        assert_eq!(encoded, "none");
+        assert_eq!(encoded, "v1.i32.n");
 
         let decoded = parse_partition_value(&df_schema, &partition_by, &encoded)?;
         assert_eq!(decoded, null_value);
@@ -500,12 +661,133 @@ mod tests {
         // Test roundtrip with actual value
         let value = ScalarValue::Int32(Some(5));
         let encoded = encode_key(&value)?;
-        assert_eq!(encoded, "5");
+        assert_eq!(encoded, "v1.i32.v35");
 
         let decoded = parse_partition_value(&df_schema, &partition_by, &encoded)?;
         assert_eq!(decoded, value);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_partition_codec_is_injective_and_path_safe() -> Result<(), Box<dyn std::error::Error>> {
+        let null = encode_key(&ScalarValue::Utf8(None))?;
+        let literal_none = encode_key(&ScalarValue::Utf8(Some("none".to_string())))?;
+        let literal_null = encode_key(&ScalarValue::Utf8(Some("NULL".to_string())))?;
+        assert_ne!(null, literal_none);
+        assert_ne!(null, literal_null);
+        assert_ne!(
+            encode_key(&ScalarValue::Int32(Some(1)))?,
+            encode_key(&ScalarValue::Utf8(Some("1".to_string())))?
+        );
+
+        let slash_tuple = encode_composite_key(&[
+            ScalarValue::Utf8(Some("a/b".to_string())),
+            ScalarValue::Utf8(Some("c".to_string())),
+        ])?;
+        let split_tuple = encode_composite_key(&[
+            ScalarValue::Utf8(Some("a".to_string())),
+            ScalarValue::Utf8(Some("b/c".to_string())),
+        ])?;
+        assert_ne!(slash_tuple, split_tuple);
+
+        let path = to_hive_partition_dir(&[(
+            PartitionedBy {
+                name: "value".to_string(),
+                expression: col("value"),
+            },
+            ScalarValue::Utf8(Some("../a/b=c\\d".to_string())),
+        )])?;
+        assert_eq!(path.components().count(), 1);
+        assert!(!path.to_string_lossy().contains(".."));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_versioned_string_roundtrip_preserves_legacy_null_sentinels_as_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let schema = Schema::new(vec![Field::new("str_col", DataType::Utf8, true)]);
+        let df_schema = DFSchema::try_from(schema)?;
+        let partition_by = PartitionedBy {
+            name: "str_col".to_string(),
+            expression: col("str_col"),
+        };
+
+        for value in ["none", "NULL", "a/b", "", "東京"] {
+            let scalar = ScalarValue::Utf8(Some(value.to_string()));
+            let encoded = encode_key(&scalar)?;
+            assert_eq!(
+                parse_partition_value(&df_schema, &partition_by, &encoded)?,
+                scalar
+            );
+        }
+
+        // Existing deployments remain readable with the legacy sentinel format.
+        assert_eq!(
+            parse_partition_value(&df_schema, &partition_by, "none")?,
+            ScalarValue::Utf8(None)
+        );
+        assert_eq!(
+            parse_partition_value(&df_schema, &partition_by, "legacy")?,
+            ScalarValue::Utf8(Some("legacy".to_string()))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_legacy_string_starting_with_codec_prefix() -> Result<(), Box<dyn std::error::Error>> {
+        let schema = Schema::new(vec![Field::new("str_col", DataType::Utf8, true)]);
+        let df_schema = DFSchema::try_from(schema)?;
+        let partition_by = PartitionedBy {
+            name: "str_col".to_string(),
+            expression: col("str_col"),
+        };
+
+        for legacy in ["v1.foo", "v1.i32.n", "v1.utf8.vNOT_HEX"] {
+            assert_eq!(
+                parse_partition_value(&df_schema, &partition_by, legacy)?,
+                ScalarValue::Utf8(Some(legacy.to_string()))
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_timestamp_roundtrip_preserves_timezone() -> Result<(), Box<dyn std::error::Error>> {
+        let timezone: Arc<str> = Arc::from("America/Los_Angeles");
+        let schema = Schema::new(vec![Field::new(
+            "event_time",
+            DataType::Timestamp(TimeUnit::Millisecond, Some(Arc::clone(&timezone))),
+            false,
+        )]);
+        let df_schema = DFSchema::try_from(schema)?;
+        let partition_by = PartitionedBy {
+            name: "event_time".to_string(),
+            expression: col("event_time"),
+        };
+        let value = ScalarValue::TimestampMillisecond(Some(1_234), Some(timezone));
+        let encoded = encode_key(&value)?;
+
+        assert_eq!(
+            parse_partition_value(&df_schema, &partition_by, &encoded)?,
+            value
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_hive_partition_rejects_unsafe_name() {
+        let result = to_hive_partition_dir(&[(
+            PartitionedBy {
+                name: "../escape".to_string(),
+                expression: col("value"),
+            },
+            ScalarValue::Utf8(Some("safe".to_string())),
+        )]);
+
+        assert!(matches!(result, Err(Error::InvalidPartitionName { .. })));
     }
 
     #[test]

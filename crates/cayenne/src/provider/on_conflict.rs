@@ -372,6 +372,65 @@ pub(crate) struct PreparedInsertStream {
     may_have_on_conflict_deletions: bool,
 }
 
+/// Stream wrapper that enforces the non-null primary-key invariant without
+/// performing conflict detection. `pk_conflict_detection: none` disables only
+/// the existence lookup; it must not make invalid rows writable.
+pub(crate) struct PrimaryKeyValidationStream {
+    inner: SendableRecordBatchStream,
+    schema: SchemaRef,
+    pk_indices: Vec<usize>,
+    table_name: String,
+}
+
+impl PrimaryKeyValidationStream {
+    pub(crate) fn new(
+        inner: SendableRecordBatchStream,
+        pk_indices: Vec<usize>,
+        table_name: String,
+    ) -> Self {
+        let schema = inner.schema();
+        Self {
+            inner,
+            schema,
+            pk_indices,
+            table_name,
+        }
+    }
+}
+
+impl futures::Stream for PrimaryKeyValidationStream {
+    type Item = datafusion_common::Result<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(batch))) => {
+                if this
+                    .pk_indices
+                    .iter()
+                    .any(|&index| batch.column(index).null_count() > 0)
+                {
+                    Poll::Ready(Some(Err(datafusion_common::DataFusionError::Execution(
+                        format!(
+                            "Data validation failed for table '{}': Primary key values must be non-null",
+                            this.table_name
+                        ),
+                    ))))
+                } else {
+                    Poll::Ready(Some(Ok(batch)))
+                }
+            }
+            other => other,
+        }
+    }
+}
+
+impl RecordBatchStream for PrimaryKeyValidationStream {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
+
 impl PreparedInsertStream {
     pub(crate) fn immediate(stream: SendableRecordBatchStream) -> Self {
         Self {

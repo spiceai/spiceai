@@ -30,9 +30,8 @@ limitations under the License.
 //!   participating partition's `listing_fence.write()` is held for one
 //!   shared barrier window while files move into the current snapshot dir
 //!   and the in-memory `ListingTable` Arcs swap, anchored by a top-level
-//!   [`cayenne::PartitionedWal`] for crash recovery (local-FS only —
-//!   S3-backed tables skip the top-level WAL and rely on the per-partition
-//!   staging WAL for crash safety).
+//!   [`cayenne::PartitionedWal`] for crash recovery on local and object-store
+//!   tables.
 //!
 //! ## Overwrite coordination flow
 //!
@@ -64,10 +63,8 @@ limitations under the License.
 //!    order across concurrent coordinators.
 //! 2. Acquire every partition's `listing_fence.write()` (held until the
 //!    barrier closes).
-//! 3. On local FS, write a top-level [`cayenne::PartitionedWal`] anchor at
+//! 3. Write a top-level [`cayenne::PartitionedWal`] anchor at
 //!    `<table_root>/_partitioned_wal/<commit_id>.json` before any file move.
-//!    On S3, skip the WAL — the per-partition staging WAL still anchors
-//!    single-partition recovery.
 //! 4. For each receipt, call `apply_under_held_barrier`: move staged files
 //!    into the snapshot directory, remove the per-partition WAL, swap the
 //!    in-memory `ListingTable`.
@@ -159,6 +156,107 @@ impl CayennePartitionedInsertStrategy {
             table_root,
         }
     }
+
+    /// Reconcile stale cross-partition WAL anchors after all partition
+    /// providers have completed their per-partition staged-WAL recovery.
+    ///
+    /// The catalog pointer transaction is the only commit decision. For each
+    /// set, every pointer must either equal its recorded target (committed) or
+    /// differ (not committed). A mixed set is impossible under an atomic
+    /// catalog transaction and is rejected rather than guessed at.
+    pub async fn recover_partitioned_wals(
+        &self,
+        providers: &[Arc<dyn datafusion::catalog::TableProvider>],
+    ) -> Result<(), DataFusionError> {
+        let _coordinator_guard = self.coordinator_lock.lock().await;
+        let by_id: HashMap<&str, &CayenneTableProvider> = providers
+            .iter()
+            .filter_map(|provider| downcast_to_cayenne(provider))
+            .map(|provider| (provider.table_id(), provider))
+            .collect();
+
+        let object_store_location = by_id
+            .values()
+            .next()
+            .map(|provider| provider.partitioned_wal_object_store())
+            .transpose()
+            .map_err(DataFusionError::from)?
+            .flatten();
+        let local_wals;
+        let object_wals;
+        let wals: Vec<PartitionedWal> = if let Some((store, prefix)) = &object_store_location {
+            object_wals = PartitionedWal::read_all_in_object_store(store.as_ref(), prefix)
+                .await
+                .map_err(DataFusionError::from)?;
+            object_wals
+        } else {
+            local_wals = PartitionedWal::read_all_in(&self.table_root)
+                .await
+                .map_err(DataFusionError::from)?;
+            local_wals.into_iter().map(|(wal, _)| wal).collect()
+        };
+
+        for wal in wals {
+            let mut committed = 0usize;
+            let mut uncommitted = 0usize;
+            for entry in &wal.partitions {
+                let target_snapshot_id = entry.target_snapshot_id.as_deref().ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "Failed to automatically recover legacy partitioned Cayenne commit {}: partition {} has no target snapshot; retaining its WAL for manual recovery",
+                        wal.commit_id, entry.table_id
+                    ))
+                })?;
+                let provider = by_id.get(entry.table_id.as_str()).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "Failed to recover partitioned Cayenne commit {}: partition table {} is not open",
+                        wal.commit_id, entry.table_id
+                    ))
+                })?;
+                if provider.current_snapshot_id() == target_snapshot_id {
+                    committed += 1;
+                } else {
+                    uncommitted += 1;
+                }
+            }
+            if committed > 0 && uncommitted > 0 {
+                return Err(DataFusionError::Execution(format!(
+                    "Failed to recover partitioned Cayenne commit {}: catalog contains mixed snapshot pointers ({committed} committed, {uncommitted} uncommitted); refusing potentially incorrect recovery",
+                    wal.commit_id
+                )));
+            }
+
+            // Opening a provider already invokes this recovery. Re-run it
+            // here to make convergence explicit and to cover providers that
+            // were opened before another participant finished recovery.
+            for entry in &wal.partitions {
+                let provider = by_id.get(entry.table_id.as_str()).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "Failed to recover partitioned Cayenne commit {}: partition table {} disappeared",
+                        wal.commit_id, entry.table_id
+                    ))
+                })?;
+                provider
+                    .recover_incomplete_writes()
+                    .await
+                    .map_err(DataFusionError::from)?;
+            }
+
+            if let Some((store, prefix)) = &object_store_location {
+                PartitionedWal::remove_from_object_store(
+                    store.as_ref(),
+                    prefix,
+                    &wal.commit_id,
+                )
+                .await
+                .map_err(DataFusionError::from)?;
+            } else {
+                PartitionedWal::remove(&self.table_root, &wal.commit_id)
+                    .await
+                    .map_err(DataFusionError::from)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -191,6 +289,7 @@ impl InsertStrategy for CayennePartitionedInsertStrategy {
                     Arc::clone(&context.schema),
                 )?;
                 let sink = Arc::new(CayennePartitionedAppendSink {
+                    catalog: Arc::clone(&self.catalog),
                     coordinator_lock: Arc::clone(&self.coordinator_lock),
                     creator: Arc::clone(&context.creator),
                     partitions: Arc::clone(&context.partitions),
@@ -590,24 +689,12 @@ fn downcast_to_cayenne(
 // happen, so any reader going through `CayenneTableProvider::scan()`
 // resolves either before or after the whole barrier, never in the middle.
 //
-// Crash safety: on local-filesystem tables, the top-level `PartitionedWal`
+// Crash safety: the top-level `PartitionedWal`
 // written at `<table_root>/_partitioned_wal/<commit_id>.json` records every
-// partition participating in this barrier. If the writer crashes mid-barrier,
-// the WAL survives and the per-partition staging WALs that exist correspond
-// to partitions in the top-level WAL. Operator/recovery uses this to decide
-// whether to replay or roll back the set. Auto-recovery is a follow-up; the
-// MVP keeps the WAL as a diagnostic anchor + a clean removal on success.
-//
-// S3-backed tables: `PartitionedWal::write_to` uses `tokio::fs` and would
-// fail on an `s3://...` `table_root`. Until the WAL grows an object-store IO
-// path, the append coordinator skips the top-level WAL for S3 tables and
-// relies on each partition's staging WAL for single-partition recovery. The
-// cross-partition barrier (fence + ordered fence acquisition) still holds —
-// what is lost is the *set anchor* needed to atomically replay or roll back
-// a crash that interrupted the apply loop across partitions. For the MVP
-// that gap is acceptable: the per-partition `ensure_no_incomplete_write`
-// check still blocks any partition whose staging WAL survives, so no
-// half-applied state becomes silently visible to readers.
+// partition participating in this barrier. If the writer crashes, provider
+// startup converges each participant from the catalog pointer and then this
+// coordinator validates and removes the stale set anchor. Local filesystems
+// use an atomic file; S3-compatible stores use object-store put/delete.
 // ============================================================================
 
 /// `DataSink` that fans the input stream out by partition key, stages every
@@ -617,6 +704,7 @@ fn downcast_to_cayenne(
 /// Streaming + backpressure work the same way as the overwrite sink (see
 /// [`CayennePartitionedOverwriteSink`]); only the commit-side differs.
 struct CayennePartitionedAppendSink {
+    catalog: Arc<CayenneCatalog>,
     coordinator_lock: Arc<tokio::sync::Mutex<()>>,
     creator: Arc<dyn runtime_table_partition::creator::PartitionCreator>,
     partitions: Arc<tokio::sync::RwLock<HashMap<CompositePartitionKey, Partition>>>,
@@ -692,6 +780,12 @@ impl DataSink for CayennePartitionedAppendSink {
                                 .to_string(),
                         )
                     })?;
+                    if !cayenne.supports_deferred_partition_append() {
+                        return Err(DataFusionError::NotImplemented(
+                            "Partitioned Cayenne atomic append does not yet support on_conflict upsert; use overwrite or disable primary-key conflict detection"
+                                .to_string(),
+                        ));
+                    }
                     let cayenne_owned = cayenne.clone_for_write_operations();
                     let (tx, rx) = mpsc::channel::<datafusion::common::Result<RecordBatch>>(
                         PARTITION_WRITER_CHANNEL_DEPTH,
@@ -705,7 +799,7 @@ impl DataSink for CayennePartitionedAppendSink {
                                     ReceiverStream::new(rx),
                                 ));
                             let staged = cayenne_owned
-                                .begin_staged_append(stream, target_partitions)
+                                .begin_deferred_snapshot_append(stream, target_partitions)
                                 .await?;
                             staged.prepare().await
                         });
@@ -791,34 +885,36 @@ impl DataSink for CayennePartitionedAppendSink {
         }
 
         let commit_id = uuid::Uuid::now_v7().to_string();
-        // The top-level partitioned WAL uses `tokio::fs` and only works for
-        // local-filesystem table roots. For S3-backed tables we skip it and
-        // rely on each partition's staging WAL for crash recovery (see the
-        // S3 note in the module-level crash-safety comment). When the WAL
-        // grows object-store IO, drop this branch.
         let table_root_str = self.table_root.to_string_lossy();
-        let write_top_level_wal = !table_root_str.starts_with("s3://");
-        if write_top_level_wal {
-            let wal_entries: Vec<PartitionedWalEntry> = prepared
-                .iter()
-                .map(|p| PartitionedWalEntry {
-                    table_id: p.table_id().to_string(),
-                    staging_wal_path: Some(p.staging_wal_path().to_string_lossy().to_string()),
-                })
-                .collect();
-            let top_level_wal =
-                PartitionedWal::new(commit_id.clone(), table_root_str.to_string(), wal_entries);
-            if let Err(e) = top_level_wal.write_to(&self.table_root).await {
-                // Failed to even record the intent. Roll back every prepared
-                // append. Fences will be released when fence_guards drops.
-                drop(fence_guards);
-                for prep in prepared {
-                    if let Err(rb) = prep.rollback().await {
-                        tracing::warn!("rollback after top-level WAL write failure: {rb}");
-                    }
+        let wal_entries: Vec<PartitionedWalEntry> = prepared
+            .iter()
+            .map(|p| PartitionedWalEntry {
+                table_id: p.table_id().to_string(),
+                target_snapshot_id: Some(p.target_snapshot_id().to_string()),
+                staging_wal_path: Some(p.staging_wal_path().to_string_lossy().to_string()),
+            })
+            .collect();
+        let top_level_wal =
+            PartitionedWal::new(commit_id.clone(), table_root_str.to_string(), wal_entries);
+        let object_store_wal = prepared[0]
+            .partitioned_wal_object_store()
+            .map_err(DataFusionError::from)?;
+        let wal_write_result = if let Some((store, prefix)) = &object_store_wal {
+            top_level_wal
+                .write_to_object_store(store.as_ref(), prefix)
+                .await
+                .map(|_| ())
+        } else {
+            top_level_wal.write_to(&self.table_root).await.map(|_| ())
+        };
+        if let Err(e) = wal_write_result {
+            drop(fence_guards);
+            for prep in prepared {
+                if let Err(rb) = prep.rollback().await {
+                    tracing::warn!("rollback after top-level WAL write failure: {rb}");
                 }
-                return Err(DataFusionError::from(e));
             }
+            return Err(DataFusionError::from(e));
         }
 
         // Apply the barrier on every partition. If any fails partway, the
@@ -834,19 +930,90 @@ impl DataSink for CayennePartitionedAppendSink {
             }
         }
 
-        // Success path: remove top-level WAL, then release the fences. The
-        // top-level WAL absence is what recovery uses to skip clean commits.
-        // Mirrors the S3 skip on the write side — nothing to clean up if we
-        // never wrote it.
-        if write_top_level_wal
-            && let Err(e) = PartitionedWal::remove(&self.table_root, &commit_id).await
+        let publish_states = match prepared
+            .iter()
+            .map(PreparedStagedAppend::prepare_deferred_snapshot_publish)
+            .collect::<cayenne::provider::Result<Vec<_>>>()
         {
-            // Visibility has already flipped on every partition; surface the
-            // cleanup failure as a warning rather than rolling back. The
-            // next coordinator's recovery sweep will treat the dangling WAL
-            // as a no-op if every partition's per-partition WAL is absent.
+            Ok(states) => states,
+            Err(error) => {
+                if let Err(cleanup_error) = if let Some((store, prefix)) = &object_store_wal {
+                    PartitionedWal::remove_from_object_store(store.as_ref(), prefix, &commit_id)
+                        .await
+                } else {
+                    PartitionedWal::remove(&self.table_root, &commit_id).await
+                } {
+                    tracing::warn!("Failed to remove top-level WAL after append preparation failure: {cleanup_error}");
+                }
+                drop(fence_guards);
+                for receipt in prepared {
+                    if let Err(rollback_error) = receipt.rollback().await {
+                        tracing::warn!("Failed to roll back deferred append: {rollback_error}");
+                    }
+                }
+                return Err(DataFusionError::from(error));
+            }
+        };
+
+        // The complete post-append contents now exist in one private snapshot
+        // per partition. Flip every pointer in a single metastore transaction;
+        // readers cannot observe a subset through a fresh directory listing.
+        if let Err(error) = self.commit_append_snapshots_in_one_txn(&prepared).await {
+            drop(fence_guards);
+            let mut rollback_failed = false;
+            for receipt in prepared {
+                if let Err(rollback_error) = receipt.rollback().await {
+                    rollback_failed = true;
+                    tracing::warn!("Failed to roll back deferred append: {rollback_error}");
+                }
+            }
+            if !rollback_failed
+                && let Err(cleanup_error) = if let Some((store, prefix)) = &object_store_wal {
+                    PartitionedWal::remove_from_object_store(
+                        store.as_ref(),
+                        prefix,
+                        &commit_id,
+                    )
+                    .await
+                } else {
+                    PartitionedWal::remove(&self.table_root, &commit_id).await
+                }
+            {
+                tracing::warn!("Failed to remove top-level WAL after append rollback: {cleanup_error}");
+            }
+            return Err(error);
+        }
+
+        // No await is permitted between these publications. The catalog commit
+        // above is the durable global decision; cancellation must not leave a
+        // proper subset of the participating providers on the new snapshots.
+        for (receipt, publish_state) in prepared.iter().zip(publish_states) {
+            receipt.publish_deferred_snapshot_under_held_fence(publish_state);
+        }
+
+        // WAL cleanup is post-commit maintenance. Recovery consults the
+        // catalog pointers and safely recognizes these as committed if cleanup
+        // is interrupted.
+        for receipt in &prepared {
+            if let Err(error) = receipt.remove_deferred_snapshot_wal().await {
+                tracing::warn!(
+                    table_id = receipt.table_id(),
+                    %error,
+                    "Failed to remove committed partition staging WAL"
+                );
+            }
+        }
+
+        let wal_remove_result = if let Some((store, prefix)) = &object_store_wal {
+            PartitionedWal::remove_from_object_store(store.as_ref(), prefix, &commit_id).await
+        } else {
+            PartitionedWal::remove(&self.table_root, &commit_id).await
+        };
+        if let Err(error) = wal_remove_result {
             tracing::warn!(
-                "Failed to remove top-level partitioned WAL after successful barrier: {e}"
+                commit_id,
+                %error,
+                "Failed to remove committed cross-partition WAL; append remains committed"
             );
         }
 
@@ -856,6 +1023,7 @@ impl DataSink for CayennePartitionedAppendSink {
         // returns row count).
         let mut total_rows: u64 = 0;
         for prep in prepared {
+            prep.finish_deferred_snapshot_maintenance().await;
             match prep.finish().await {
                 Ok(rows) => total_rows = total_rows.saturating_add(rows),
                 Err(e) => {
@@ -866,11 +1034,57 @@ impl DataSink for CayennePartitionedAppendSink {
                 }
             }
         }
+
         Ok(total_rows)
     }
 }
 
 impl CayennePartitionedAppendSink {
+    async fn commit_append_snapshots_in_one_txn(
+        &self,
+        prepared: &[PreparedStagedAppend],
+    ) -> datafusion::common::Result<()> {
+        let max_attempts = turso_shared::DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
+        let snapshots: Vec<(&str, &str)> = prepared
+            .iter()
+            .map(|receipt| (receipt.table_id(), receipt.target_snapshot_id()))
+            .collect();
+
+        for attempt in 1..=max_attempts {
+            let mut txn = self
+                .catalog
+                .begin_transaction()
+                .await
+                .map_err(|error| DataFusionError::External(Box::new(error)))?;
+            if let Err(error) = self
+                .catalog
+                .set_current_snapshots_in_txn(&mut *txn, &snapshots)
+                .await
+            {
+                drop(txn);
+                if attempt < max_attempts && cayenne::is_retryable_write_conflict(&error) {
+                    tokio::time::sleep(turso_shared::retry_backoff_delay(attempt)).await;
+                    continue;
+                }
+                return Err(DataFusionError::External(Box::new(error)));
+            }
+            match txn.commit().await {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if attempt < max_attempts
+                        && cayenne::is_retryable_write_conflict(&error) =>
+                {
+                    tokio::time::sleep(turso_shared::retry_backoff_delay(attempt)).await;
+                }
+                Err(error) => return Err(DataFusionError::External(Box::new(error))),
+            }
+        }
+
+        Err(DataFusionError::Execution(format!(
+            "cross-partition append commit exhausted {max_attempts} attempts without success"
+        )))
+    }
+
     /// Identical to [`CayennePartitionedOverwriteSink::get_or_create_partition_provider`].
     /// Duplicated here rather than abstracted so each sink remains
     /// independently readable; if a third coordinator joins, lift into a

@@ -57,7 +57,7 @@ use super::vector_io::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVect
 use crate::catalog::MetadataCatalog;
 use crate::metadata::TableMetadata;
 use arc_swap::ArcSwap;
-use arrow::array::ArrayRef;
+use arrow::array::{Array, ArrayRef};
 use arrow_schema::SchemaRef;
 
 use crate::row_converter::RowConverter;
@@ -68,7 +68,7 @@ use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
-use datafusion::physical_plan::{collect, execute_stream};
+use datafusion::physical_plan::execute_stream;
 use datafusion_catalog::TableProvider;
 use datafusion_common::DFSchema;
 use datafusion_common::tree_node::TreeNode;
@@ -76,6 +76,7 @@ use datafusion_expr::Expr;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use futures::StreamExt;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 
@@ -97,6 +98,7 @@ const PK_DELETE_FLUSH_BATCH_SIZE: usize = 50_000;
 /// - Position-based deletion (for tables without primary key)
 /// - Int64 PK deletion (for tables with single-column Int64 primary key)
 /// - Key-based deletion (for tables with composite/non-integer primary key)
+#[derive(Clone)]
 pub struct CayenneDeletionSink {
     table_metadata: TableMetadata,
     catalog: Arc<dyn MetadataCatalog>,
@@ -203,22 +205,58 @@ impl CayenneDeletionSink {
         // For PK-based deletions, we can still batch across all files
         match &self.pk_deletion_strategy {
             PkDeletionStrategyWithCache::Int64Pk { .. } => {
-                // Int64 PK deletion - collect all batches and extract PK values
-                let mut all_batches = Vec::new();
+                let mut pending_pk_values = HashSet::with_capacity(PK_DELETE_FLUSH_BATCH_SIZE);
+                let mut delete_sequence = None;
+                let mut deleted_rows = 0_u64;
                 for table in tables {
-                    let scan_plan = table.scan(&ctx.state(), None, &[], None).await?;
-                    let batches = collect(scan_plan, ctx.task_ctx()).await?;
-                    all_batches.extend(batches);
+                    let scan_plan = table
+                        .scan(
+                            &ctx.state(),
+                            Some(&self.pk_column_indices),
+                            &[],
+                            None,
+                        )
+                        .await?;
+                    let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
+                    while let Some(batch) = stream.next().await {
+                        let batch = batch?;
+                        let projected_sink = Self {
+                            pk_column_indices: vec![0],
+                            ..self.clone()
+                        };
+                        pending_pk_values.extend(projected_sink.extract_int64_pk_values(&batch)?);
+                        if pending_pk_values.len() >= PK_DELETE_FLUSH_BATCH_SIZE {
+                            let chunk = pending_pk_values.drain().collect();
+                            let count = self
+                                .persist_int64_pk_chunk_with_shared_sequence(
+                                    chunk,
+                                    &mut delete_sequence,
+                                )
+                                .await?;
+                            deleted_rows = deleted_rows.checked_add(count).ok_or_else(|| {
+                                Error::Internal {
+                                    table: table_name.clone(),
+                                    message: "Deleted row count overflowed u64".to_string(),
+                                }
+                            })?;
+                        }
+                    }
                 }
-
-                if all_batches.is_empty() {
-                    return Ok(0);
+                if !pending_pk_values.is_empty() {
+                    let count = self
+                        .persist_int64_pk_chunk_with_shared_sequence(
+                            pending_pk_values.into_iter().collect(),
+                            &mut delete_sequence,
+                        )
+                        .await?;
+                    deleted_rows = deleted_rows.checked_add(count).ok_or_else(|| {
+                        Error::Internal {
+                            table: table_name.clone(),
+                            message: "Deleted row count overflowed u64".to_string(),
+                        }
+                    })?;
                 }
-
-                let concatenated_batch =
-                    arrow::compute::concat_batches(&self.schema, &all_batches)?;
-                let pk_values = self.extract_int64_pk_values(&concatenated_batch)?;
-                self.persist_int64_pk_deletions(pk_values).await
+                Ok(deleted_rows)
             }
             PkDeletionStrategyWithCache::RowConverterBased { .. } => {
                 // RowConverter-based deletion for composite/non-integer PKs
@@ -230,21 +268,70 @@ impl CayenneDeletionSink {
                     });
                 };
 
-                let mut all_batches = Vec::new();
+                let mut pending_row_keys = HashSet::with_capacity(PK_DELETE_FLUSH_BATCH_SIZE);
+                let mut delete_sequence = None;
+                let mut deleted_rows = 0_u64;
                 for table in tables {
-                    let scan_plan = table.scan(&ctx.state(), None, &[], None).await?;
-                    let batches = collect(scan_plan, ctx.task_ctx()).await?;
-                    all_batches.extend(batches);
+                    let scan_plan = table
+                        .scan(
+                            &ctx.state(),
+                            Some(&self.pk_column_indices),
+                            &[],
+                            None,
+                        )
+                        .await?;
+                    let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
+                    let projected_indices: Vec<usize> =
+                        (0..self.pk_column_indices.len()).collect();
+                    while let Some(batch) = stream.next().await {
+                        let batch = batch?;
+                        let pk_columns: Vec<ArrayRef> = projected_indices
+                            .iter()
+                            .map(|&index| Arc::clone(batch.column(index)))
+                            .collect();
+                        if pk_columns.iter().any(|column| column.null_count() > 0) {
+                            return Err(Error::DataValidation {
+                                table: table_name.clone(),
+                                message: "Primary key values must be non-null".to_string(),
+                            });
+                        }
+                        let rows = row_converter.convert_columns(&pk_columns)?;
+                        pending_row_keys.extend(
+                            rows.iter()
+                                .map(|row| row.as_ref().to_vec().into_boxed_slice()),
+                        );
+                        if pending_row_keys.len() >= PK_DELETE_FLUSH_BATCH_SIZE {
+                            let chunk = pending_row_keys.drain().collect();
+                            let count = self
+                                .persist_key_based_chunk_with_shared_sequence(
+                                    chunk,
+                                    &mut delete_sequence,
+                                )
+                                .await?;
+                            deleted_rows = deleted_rows.checked_add(count).ok_or_else(|| {
+                                Error::Internal {
+                                    table: table_name.clone(),
+                                    message: "Deleted row count overflowed u64".to_string(),
+                                }
+                            })?;
+                        }
+                    }
                 }
-
-                if all_batches.is_empty() {
-                    return Ok(0);
+                if !pending_row_keys.is_empty() {
+                    let count = self
+                        .persist_key_based_chunk_with_shared_sequence(
+                            pending_row_keys.into_iter().collect(),
+                            &mut delete_sequence,
+                        )
+                        .await?;
+                    deleted_rows = deleted_rows.checked_add(count).ok_or_else(|| {
+                        Error::Internal {
+                            table: table_name.clone(),
+                            message: "Deleted row count overflowed u64".to_string(),
+                        }
+                    })?;
                 }
-
-                let concatenated_batch =
-                    arrow::compute::concat_batches(&self.schema, &all_batches)?;
-                let row_keys = self.extract_row_keys(&concatenated_batch, row_converter)?;
-                self.persist_key_based_deletions(row_keys).await
+                Ok(deleted_rows)
             }
             PkDeletionStrategyWithCache::PositionBased { .. } => {
                 // Position-based deletion for "delete all" (delete w/o filters)
@@ -288,6 +375,13 @@ impl CayenneDeletionSink {
                     pk_column.data_type()
                 ),
             })?;
+
+        if pk_array.null_count() > 0 {
+            return Err(Error::DataValidation {
+                table: table_name.clone(),
+                message: "Primary key values must be non-null".to_string(),
+            });
+        }
 
         let pk_values: Vec<i64> = pk_array.values().iter().copied().collect();
         Ok(pk_values)
@@ -743,11 +837,6 @@ impl CayenneDeletionSink {
         // This gives an accurate count of newly deleted rows for the return value.
         // ArcSwap load is wait-free; the snapshot is immutable for the lifetime of `current`.
         let current = deletion_snapshot.load_full();
-        let new_deletion_count = row_keys
-            .iter()
-            .filter(|key| current.tombstones.get(key.as_ref()).is_none())
-            .count();
-
         // Create a temporary metadata with the delete sequence number
         let mut temp_metadata = self.table_metadata.clone();
         temp_metadata.current_sequence_number = delete_sequence;
@@ -773,6 +862,10 @@ impl CayenneDeletionSink {
                 });
             }
         };
+        let new_deletion_count = written_row_keys
+            .iter()
+            .filter(|key| current.tombstones.get(key.as_ref()).is_none())
+            .count();
 
         // Build a fresh snapshot with the new deletions and publish via ArcSwap.
         deletion_snapshot.rcu(|current| {
@@ -860,11 +953,6 @@ impl CayenneDeletionSink {
         // Count how many PKs are NEW deletions (not already in the cache).
         // ArcSwap load is wait-free; the snapshot is immutable for the lifetime of `current`.
         let current = deletion_snapshot.load_full();
-        let new_deletion_count = pk_values
-            .iter()
-            .filter(|pk| current.tombstones.get(**pk).is_none())
-            .count();
-
         // For Int64 PK deletions, we store them as key-based deletions
         // where each key is the 8-byte big-endian representation of the i64 value.
         // This allows efficient storage and lookup.
@@ -886,13 +974,36 @@ impl CayenneDeletionSink {
             return Ok(0);
         };
 
+        let written_pk_values: Vec<i64> = match &result.identifiers {
+            DeletionIdentifier::KeyBased(keys) => keys
+                .iter()
+                .map(|key| {
+                    let bytes: [u8; 8] = key.as_ref().try_into().map_err(|_| Error::Internal {
+                        table: table_name.clone(),
+                        message: "Int64 deletion key did not contain exactly 8 bytes".to_string(),
+                    })?;
+                    Ok(i64::from_be_bytes(bytes))
+                })
+                .collect::<super::super::Result<Vec<_>>>()?,
+            DeletionIdentifier::PositionBased { .. } => {
+                return Err(Error::Internal {
+                    table: table_name.clone(),
+                    message: "Unexpected position-based deletion in Int64 sink".to_string(),
+                });
+            }
+        };
+        let new_deletion_count = written_pk_values
+            .iter()
+            .filter(|pk| current.tombstones.get(**pk).is_none())
+            .count();
+
         self.catalog.add_delete_file(result.delete_file).await?;
 
         // Build a fresh snapshot with the new deletions and publish via ArcSwap.
         deletion_snapshot.rcu(|current| {
             let updated = current
                 .tombstones
-                .extend_max_deletes(pk_values.iter().map(|&pk| (pk, delete_sequence)));
+                .extend_max_deletes(written_pk_values.iter().map(|&pk| (pk, delete_sequence)));
             Arc::new(Int64PkDeletionSnapshot::from_index(updated))
         });
         self.refresh_deletion_memory_accounting();

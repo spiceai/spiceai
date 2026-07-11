@@ -1549,6 +1549,14 @@ pub struct CayenneTableProvider {
         Arc<std::sync::OnceLock<super::compaction::BackgroundColdTierPromoter>>,
 }
 
+/// Prebuilt in-memory state for publishing a cloned append snapshot. Building
+/// the `ListingTable` is the only fallible step and happens before the catalog
+/// commit; applying this value under the caller-held listing fence is infallible.
+pub struct PreparedAppendSnapshotPublish {
+    snapshot_id: String,
+    listing_table: Arc<ListingTable>,
+}
+
 /// Builder for constructing a `CayenneTableProvider` with optional configuration.
 ///
 /// Use this builder to configure optional parameters before opening an existing table
@@ -2453,6 +2461,75 @@ impl CayenneTableProvider {
         // attestation; the overwrite rebinds to a non-sorted snapshot, so it stays cleared.
         self.listing_table.store(new_listing_table);
         Ok(())
+    }
+
+    pub(crate) fn prepare_append_snapshot_publish(
+        &self,
+        new_snapshot_id: &str,
+    ) -> Result<PreparedAppendSnapshotPublish> {
+        let snapshot_dir_url = Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            &self.table_metadata.table_id,
+            new_snapshot_id,
+        );
+        let new_listing_table = Self::create_listing_table(
+            &snapshot_dir_url,
+            self.table_schema(),
+            self.context.file_format(),
+            &self.pk_deletion_strategy,
+        )?;
+        Ok(PreparedAppendSnapshotPublish {
+            snapshot_id: new_snapshot_id.to_string(),
+            listing_table: new_listing_table,
+        })
+    }
+
+    /// Apply a prepared append snapshot while the caller holds this table's
+    /// `listing_fence` write guard.
+    pub(crate) fn publish_append_snapshot_under_held_fence(
+        &self,
+        prepared: PreparedAppendSnapshotPublish,
+    ) {
+        self.update_current_snapshot_id(&prepared.snapshot_id);
+        self.listing_table.store(prepared.listing_table);
+        self.current_dir_generation.fetch_add(1, Ordering::Relaxed);
+        self.current_sorted_snapshot.store(Arc::new(None));
+        // The cloned snapshot contains the prior rows plus the staged delta,
+        // so persisted exact row/column statistics for the source snapshot are
+        // stale. Invalidate the in-memory optimizer view synchronously with the
+        // snapshot pointer; background maintenance can rebuild it later.
+        self.clear_cached_table_statistics_unlocked();
+        self.scan_file_statistics.clear();
+        self.mark_maintained_aggregates_stale();
+    }
+
+    pub(crate) async fn finish_deferred_append_snapshot(&self, snapshot_id: &str) {
+        // This private snapshot contains cloned historical files plus fresh
+        // append files. Their individual write sequences are not recoverable
+        // from a directory listing, so use the conservative current high-water:
+        // min=0 keeps every untagged file bake-eligible and max records a safe
+        // upper bound. Claiming [0,0] would incorrectly state that files written
+        // after sequence 0 contain no newer rows.
+        let current_sequence = self.sequence_high_water().await;
+        if let Err(error) = self
+            .upsert_snapshot_manifest_from_listing(
+                snapshot_id,
+                ManifestSequenceTag::PreserveOrUniform {
+                    min: 0,
+                    max: current_sequence,
+                },
+            )
+            .await
+        {
+            tracing::warn!(
+                table = self.table_name(),
+                snapshot_id,
+                %error,
+                "Failed to populate deferred append snapshot manifest"
+            );
+        }
+        self.trigger_old_snapshot_cleanup(snapshot_id).await;
+        self.mark_maintained_aggregates_stale();
     }
 
     /// Trigger cleanup of old snapshot directories in the background.
@@ -3864,6 +3941,121 @@ impl CayenneTableProvider {
         }
 
         Ok(())
+    }
+
+    pub(crate) async fn clone_snapshot_files(
+        &self,
+        source_snapshot_id: &str,
+        target_snapshot_id: &str,
+    ) -> Result<()> {
+        if self.table_metadata.path.starts_with("s3://") {
+            let config = self.require_object_store()?;
+            let source_prefix = self
+                .snapshot_object_store_prefix(source_snapshot_id)?
+                .ok_or_else(|| Error::Internal {
+                    table: self.table_name().to_string(),
+                    message: "Missing source snapshot object-store prefix".to_string(),
+                })?;
+            let target_prefix = self
+                .snapshot_object_store_prefix(target_snapshot_id)?
+                .ok_or_else(|| Error::Internal {
+                    table: self.table_name().to_string(),
+                    message: "Missing target snapshot object-store prefix".to_string(),
+                })?;
+            let mut objects = config.store.list(Some(&source_prefix));
+            while let Some(meta) = objects.try_next().await.map_err(|source| {
+                Error::ObjectStore {
+                    operation: "list source snapshot for clone",
+                    table: self.table_name().to_string(),
+                    source,
+                }
+            })? {
+                let relative = meta
+                    .location
+                    .as_ref()
+                    .strip_prefix(source_prefix.as_ref())
+                    .ok_or_else(|| Error::Internal {
+                        table: self.table_name().to_string(),
+                        message: "Source snapshot object escaped its prefix".to_string(),
+                    })?;
+                let target = ObjectStorePath::from(format!("{}{relative}", target_prefix.as_ref()));
+                config.store.copy(&meta.location, &target).await.map_err(|source| {
+                    Error::ObjectStore {
+                        operation: "clone snapshot object",
+                        table: self.table_name().to_string(),
+                        source,
+                    }
+                })?;
+            }
+            return Ok(());
+        }
+
+        let source_dir = self.snapshot_dir_path_for(source_snapshot_id);
+        let target_dir = self.snapshot_dir_path_for(target_snapshot_id);
+        Self::ensure_snapshot_dir_exists(&target_dir).await?;
+        let mut entries = match tokio::fs::read_dir(&source_dir).await {
+            Ok(entries) => entries,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => return Err(Error::IoError { source }),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            if !entry.file_type().await?.is_file() {
+                continue;
+            }
+            let destination = target_dir.join(entry.file_name());
+            // Vortex snapshot files are immutable after publication. A hard
+            // link therefore gives the private target snapshot an independent
+            // directory entry without copying the source bytes. Fall back to a
+            // regular copy when the storage layout crosses filesystems or the
+            // filesystem does not support links.
+            if let Err(link_error) = tokio::fs::hard_link(entry.path(), &destination).await {
+                tracing::debug!(
+                    table = self.table_name(),
+                    source = %entry.path().display(),
+                    target = %destination.display(),
+                    %link_error,
+                    "Hard-link snapshot clone unavailable; copying immutable file"
+                );
+                tokio::fs::copy(entry.path(), destination).await?;
+            }
+        }
+        Self::sync_snapshot_dir(&target_dir)
+            .await
+            .map_err(|source| Error::Catalog { source })
+    }
+
+    pub(crate) async fn clear_snapshot_dir(&self, snapshot_id: &str) -> Result<()> {
+        if self.table_metadata.path.starts_with("s3://") {
+            if let Some(prefix) = self.snapshot_object_store_prefix(snapshot_id)? {
+                self.delete_prefix_with_object_store(&prefix).await?;
+            }
+            return Ok(());
+        }
+        match tokio::fs::remove_dir_all(self.snapshot_dir_path_for(snapshot_id)).await {
+            Ok(()) => Ok(()),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(Error::IoError { source }),
+        }
+    }
+
+    pub(crate) async fn write_stream_to_staging_snapshot(
+        &self,
+        stream: SendableRecordBatchStream,
+        staging_snapshot_id: &str,
+        target_partitions: usize,
+    ) -> Result<u64> {
+        self.staging_may_have_files().store(true, Ordering::Release);
+        let (row_count, _writer_ops, _stats_acc) = self
+            .write_to_snapshot(
+                stream,
+                self.target_file_size_bytes(),
+                staging_snapshot_id,
+                target_partitions,
+                None,
+                super::delta_encoding::WriteClass::Delta,
+            )
+            .await?;
+        Ok(row_count)
     }
 
     /// Sync a directory to ensure all files are durably written to disk.
@@ -5672,6 +5864,14 @@ impl CayenneTableProvider {
         matches!(self.table_metadata.on_conflict, Some(OnConflict::Upsert(_)))
     }
 
+    /// Deferred cross-partition appends currently support append-only conflict
+    /// handling. Upsert requires a coordinated deletion/tombstone transaction.
+    #[must_use]
+    pub fn supports_deferred_partition_append(&self) -> bool {
+        !matches!(self.table_metadata.on_conflict, Some(OnConflict::Upsert(_)))
+            || self.context.pk_conflict_detection() == PkConflictDetection::None
+    }
+
     /// Build a bloom existence filter over `keyset`'s keys, sized to `max_bytes`.
     fn bloom_from_keyset(keyset: &CachedPkKeyset, max_bytes: usize) -> PkBloom {
         let mut bloom = PkBloom::with_byte_budget(max_bytes);
@@ -6834,7 +7034,12 @@ impl CayenneTableProvider {
                 table = %self.table_metadata.table_name,
                 "Skipping Cayenne primary-key conflict detection for append"
             );
-            return Ok(PreparedInsertStream::immediate(stream));
+            let validation_stream = super::on_conflict::PrimaryKeyValidationStream::new(
+                stream,
+                pk_indices,
+                self.table_metadata.table_name.clone(),
+            );
+            return Ok(PreparedInsertStream::immediate(Box::pin(validation_stream)));
         }
 
         let converter = self.build_pk_converter(&pk_indices)?;
@@ -7501,7 +7706,17 @@ impl CayenneTableProvider {
                 continue;
             }
             let Some(index) = sharded_index else {
-                // No validation (pk_conflict_detection: none / no PK): keep all.
+                // Conflict detection is disabled, but the PK validity contract
+                // remains mandatory.
+                if pk_indices
+                    .iter()
+                    .any(|&index| batch.column(index).null_count() > 0)
+                {
+                    return Err(Error::DataValidation {
+                        table: self.table_metadata.table_name.clone(),
+                        message: "Primary key values must be non-null".to_string(),
+                    });
+                }
                 filtered_batches.push(batch);
                 continue;
             };
@@ -11634,6 +11849,7 @@ impl CayenneTableProvider {
         // bounding the whole-file read-back to a file's first appearance.
         let compute_digests = self.context.integrity_checksums();
 
+        let mut replacement = Vec::with_capacity(files.len());
         for (file_name, size) in &files {
             // Reuse the per-file footer row count when the scan path already
             // persisted it for this exact (snapshot, file); the manifest entry is
@@ -11691,19 +11907,21 @@ impl CayenneTableProvider {
                 None
             };
 
-            self.catalog
-                .upsert_snapshot_file(&SnapshotFile {
-                    table_id: table_id.clone(),
-                    snapshot_id: snapshot_id.to_string(),
-                    file_path: file_name.clone(),
-                    row_count,
-                    file_size_bytes: i64::try_from(*size).unwrap_or(i64::MAX),
-                    min_sequence,
-                    max_sequence,
-                    digest,
-                })
-                .await?;
+            replacement.push(SnapshotFile {
+                table_id: table_id.clone(),
+                snapshot_id: snapshot_id.to_string(),
+                file_path: file_name.clone(),
+                row_count,
+                file_size_bytes: i64::try_from(*size).unwrap_or(i64::MAX),
+                min_sequence,
+                max_sequence,
+                digest,
+            });
         }
+
+        self.catalog
+            .replace_snapshot_files(&table_id, snapshot_id, &replacement)
+            .await?;
 
         Ok(files)
     }
@@ -14970,6 +15188,12 @@ impl CayenneTableProvider {
     pub(super) fn get_current_snapshot_id(&self) -> String {
         let guard = self.current_snapshot_id.read();
         guard.clone()
+    }
+
+    /// Return the snapshot currently published by this provider.
+    #[must_use]
+    pub fn current_snapshot_id(&self) -> String {
+        self.get_current_snapshot_id()
     }
 
     /// Update the current snapshot ID after a compaction operation.
@@ -20856,15 +21080,14 @@ impl CayenneTableProvider {
         // past this listing, so the plan being built here (and its execution,
         // however long it runs) can open the files it resolves.
         self.note_snapshot_listed(request.snapshot_id);
-        // Per-file stats drive the LIMIT-based file-set truncation in
-        // `collect_scan_files_with_limit`, which sums RAW (pre-deletion) footer
-        // row counts. With ANY pending deletion those counts overcount live
-        // rows, so truncating by them can drop files the LIMIT still needs and
-        // under-deliver — returning fewer rows than exist (key-based deletion
-        // could even return 0). Disable stats-driven truncation whenever a
-        // deletion is pending, not just for position-based (the only case
-        // guarded before this fix).
-        let collect_stats = request.options.collect_stat && !self.has_pending_deletions();
+        // Footer min/max remains safe for file pruning under deletions: deleting
+        // rows can only shrink a file's value domain, so a predicate proven
+        // disjoint from the original domain is still disjoint afterward. Raw
+        // footer row counts are not live-row counts, however, so pending
+        // deletions separately disable LIMIT early-stop and exact aggregates.
+        let collect_stats = request.options.collect_stat;
+        let has_pending_deletions = self.has_pending_deletions();
+        let use_stats_for_limit = collect_stats && !has_pending_deletions;
         let store = request
             .state
             .runtime_env()
@@ -20962,8 +21185,12 @@ impl CayenneTableProvider {
                 }
             });
 
-        let (file_group, inexact_stats) =
-            Self::collect_scan_files_with_limit(files, request.limit, collect_stats).await?;
+        let (file_group, truncated_file_set) = Self::collect_scan_files_with_limit(
+            files,
+            request.limit,
+            use_stats_for_limit,
+        )
+        .await?;
 
         let threshold = request
             .state
@@ -20997,7 +21224,7 @@ impl CayenneTableProvider {
             file_groups,
             Arc::clone(&request.scan_schema),
             collect_stats,
-            inexact_stats,
+            truncated_file_set || has_pending_deletions,
         )?;
 
         Ok(SnapshotFilesForScan {
@@ -21679,32 +21906,57 @@ fn rewrite_consecutive_inlist_to_range_if_needed(expr: &Expr) -> Option<Expr> {
         return None;
     }
     let original_len = in_list.list.len();
-    let mut values: Vec<i64> = Vec::with_capacity(original_len);
+    let mut values: Vec<(i128, ScalarValue)> = Vec::with_capacity(original_len);
     for item in &in_list.list {
-        let v = extract_integer_literal(item)?;
-        values.push(v);
+        let Expr::Literal(value, _) = item else {
+            // Cast/TryCast nodes carry semantics (including overflow behavior)
+            // that cannot be discarded by replacing them with bare literals.
+            return None;
+        };
+        let ordinal = signed_integer_ordinal(value)?;
+        if values
+            .first()
+            .is_some_and(|(_, first)| std::mem::discriminant(first) != std::mem::discriminant(value))
+        {
+            return None;
+        }
+        values.push((ordinal, value.clone()));
     }
-    values.sort_unstable();
-    values.dedup();
+    values.sort_unstable_by_key(|(ordinal, _)| *ordinal);
+    values.dedup_by_key(|(ordinal, _)| *ordinal);
     if values.len() != original_len {
         return None;
     }
     // Safe: sorted+deduped+len>=2 guarantees both ends exist.
-    let min = values[0];
-    let max = values[values.len() - 1];
+    let min = values[0].0;
+    let max = values[values.len() - 1].0;
     let span = max.checked_sub(min).and_then(|d| d.checked_add(1))?;
     if usize::try_from(span).ok() != Some(values.len()) {
         return None;
     }
     let col_expr = (*in_list.expr).clone();
-    let lit_min = Expr::Literal(ScalarValue::Int64(Some(min)), None);
-    let lit_max = Expr::Literal(ScalarValue::Int64(Some(max)), None);
+    let lit_min = Expr::Literal(values[0].1.clone(), None);
+    let lit_max = Expr::Literal(values[values.len() - 1].1.clone(), None);
     Some(Expr::Between(datafusion_expr::expr::Between::new(
         Box::new(col_expr),
         false,
         Box::new(lit_min),
         Box::new(lit_max),
     )))
+}
+
+fn signed_integer_ordinal(value: &ScalarValue) -> Option<i128> {
+    match value {
+        ScalarValue::Int8(Some(value)) => Some(i128::from(*value)),
+        ScalarValue::Int16(Some(value)) => Some(i128::from(*value)),
+        ScalarValue::Int32(Some(value)) => Some(i128::from(*value)),
+        ScalarValue::Int64(Some(value)) => Some(i128::from(*value)),
+        ScalarValue::UInt8(Some(value)) => Some(i128::from(*value)),
+        ScalarValue::UInt16(Some(value)) => Some(i128::from(*value)),
+        ScalarValue::UInt32(Some(value)) => Some(i128::from(*value)),
+        ScalarValue::UInt64(Some(value)) => Some(i128::from(*value)),
+        _ => None,
+    }
 }
 
 fn rewritten_scan_filters(
@@ -36292,7 +36544,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_inlist_with_mixed_int_widths() {
+    fn rewrites_inlist_preserving_int32_literals() {
         let in_list = Expr::InList(datafusion_expr::expr::InList::new(
             Box::new(col("id")),
             vec![
@@ -36304,7 +36556,43 @@ mod tests {
             false,
         ));
         let rewritten = rewrite_consecutive_inlist_to_range(in_list);
-        assert_eq!(rewritten, between_int("id", 5, 8));
+        assert_eq!(
+            rewritten,
+            Expr::Between(datafusion_expr::expr::Between::new(
+                Box::new(col("id")),
+                false,
+                Box::new(Expr::Literal(ScalarValue::Int32(Some(5)), None)),
+                Box::new(Expr::Literal(ScalarValue::Int32(Some(8)), None)),
+            ))
+        );
+    }
+
+    #[test]
+    fn leaves_casted_or_mixed_width_inlist_unchanged() {
+        let casted = Expr::InList(datafusion_expr::expr::InList::new(
+            Box::new(col("id")),
+            (5..=8)
+                .map(|value| {
+                    Expr::Literal(ScalarValue::Int32(Some(value)), None)
+                        .cast_to(&DataType::Int64, &DFSchema::empty())
+                        .expect("literal cast")
+                })
+                .collect(),
+            false,
+        ));
+        assert_eq!(rewrite_consecutive_inlist_to_range(casted.clone()), casted);
+
+        let mixed = Expr::InList(datafusion_expr::expr::InList::new(
+            Box::new(col("id")),
+            vec![
+                Expr::Literal(ScalarValue::Int32(Some(5)), None),
+                Expr::Literal(ScalarValue::Int64(Some(6)), None),
+                Expr::Literal(ScalarValue::Int32(Some(7)), None),
+                Expr::Literal(ScalarValue::Int32(Some(8)), None),
+            ],
+            false,
+        ));
+        assert_eq!(rewrite_consecutive_inlist_to_range(mixed.clone()), mixed);
     }
 
     // ========================================================================

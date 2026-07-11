@@ -659,6 +659,16 @@ pub trait MetadataCatalog: Send + Sync {
     /// (`cayenne_snapshot_file`) — the complete file set for a snapshot.
     async fn upsert_snapshot_file(&self, file: &SnapshotFile) -> CatalogResult<()>;
 
+    /// Atomically replace the complete manifest for one snapshot. Readers see
+    /// either the old complete set or the new complete set, never a partial
+    /// prefix if an insert fails.
+    async fn replace_snapshot_files(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+        files: &[SnapshotFile],
+    ) -> CatalogResult<()>;
+
     /// Get the complete manifest file set for a snapshot. In the manifest
     /// snapshot model this is the scan's authoritative file source (rather than
     /// directory listing).

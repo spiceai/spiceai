@@ -232,6 +232,88 @@ where
     Ok(total_bytes)
 }
 
+/// Archive directories directly into a filesystem file without materializing
+/// the tar payload in memory.
+///
+/// # Errors
+/// Returns an error when the destination file or any archive input cannot be
+/// read or written.
+pub async fn archive_directories_to_file_with_plan(
+    dirs: &[(PathBuf, String)],
+    destination: &Path,
+    skip_relative_paths: &[PathBuf],
+    extras: &[(String, Vec<u8>)],
+) -> Result<u64> {
+    let dirs = dirs.to_vec();
+    let destination = destination.to_path_buf();
+    let skip: HashSet<PathBuf> = skip_relative_paths.iter().cloned().collect();
+    let extras = extras.to_vec();
+
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::create(&destination).map_err(|source| {
+            ArchiveError::CreateArchive {
+                path: destination.clone(),
+                source,
+            }
+        })?;
+        let mut archive = tar::Builder::new(file);
+
+        for (dir_path, archive_prefix) in &dirs {
+            let metadata = match std::fs::symlink_metadata(dir_path) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::warn!("Directory {} does not exist, skipping", dir_path.display());
+                    continue;
+                }
+                Err(source) => {
+                    return Err(ArchiveError::CreateArchive {
+                        path: dir_path.clone(),
+                        source,
+                    });
+                }
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                tracing::warn!("Directory {} is not archivable, skipping", dir_path.display());
+                continue;
+            }
+            add_directory_to_archive_filtered(&mut archive, dir_path, archive_prefix, &skip)
+                .map_err(|source| ArchiveError::CreateArchive {
+                    path: dir_path.clone(),
+                    source,
+                })?;
+        }
+
+        for (archive_path, bytes) in &extras {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_mtime(0);
+            archive
+                .append_data(&mut header, archive_path.as_str(), bytes.as_slice())
+                .map_err(|source| ArchiveError::WriteArchive { source })?;
+        }
+        archive
+            .finish()
+            .map_err(|source| ArchiveError::WriteArchive { source })?;
+        let mut file = archive
+            .into_inner()
+            .map_err(|source| ArchiveError::WriteArchive { source })?;
+        std::io::Write::flush(&mut file)
+            .map_err(|source| ArchiveError::WriteArchive { source })?;
+        file.metadata()
+            .map(|metadata| metadata.len())
+            .map_err(|source| ArchiveError::CreateArchive {
+                path: destination,
+                source,
+            })
+    })
+    .await
+    .map_err(|source| ArchiveError::WriteArchive {
+        source: std::io::Error::other(source),
+    })?
+}
+
 /// Options for controlling archive extraction behavior.
 #[derive(Debug, Clone, Default)]
 pub struct ExtractOptions {
@@ -379,6 +461,44 @@ where
     .map_err(|e| ArchiveError::ExtractArchive {
         path: target_dir_for_error,
         source: std::io::Error::other(e),
+    })??;
+
+    Ok(())
+}
+
+/// Extract an archive directly from a filesystem file without first reading the
+/// entire archive into memory.
+///
+/// # Errors
+/// Returns an error if the archive cannot be opened, validated, or extracted.
+pub async fn extract_archive_file_with_options(
+    archive_path: &Path,
+    target_dir: &Path,
+    options: ExtractOptions,
+) -> Result<()> {
+    let dir_lock = acquire_directory_lock(target_dir).await;
+    let _lock_guard = dir_lock.lock().await;
+    let archive_path = archive_path.to_path_buf();
+    let target_dir = target_dir.to_path_buf();
+    let target_dir_for_error = target_dir.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(&archive_path).map_err(|source| {
+            ArchiveError::ReadArchive { source }
+        })?;
+        let mut archive = tar::Archive::new(file);
+        std::fs::create_dir_all(&target_dir).map_err(|source| {
+            ArchiveError::ExtractArchive {
+                path: target_dir.clone(),
+                source,
+            }
+        })?;
+        extract_with_skip_existing_and_verify(&mut archive, &target_dir, &options)
+    })
+    .await
+    .map_err(|source| ArchiveError::ExtractArchive {
+        path: target_dir_for_error,
+        source: std::io::Error::other(source),
     })??;
 
     Ok(())
@@ -617,7 +737,8 @@ fn create_new_temp_file(temp_path: &Path, target_dir: &Path) -> Result<std::fs::
 fn set_archive_permissions(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    let permissions = std::fs::Permissions::from_mode(mode & 0o7777);
+    // Never restore setuid/setgid/sticky bits from an external archive.
+    let permissions = std::fs::Permissions::from_mode(mode & 0o777);
     std::fs::set_permissions(path, permissions).map_err(|source| ArchiveError::ExtractArchive {
         path: path.to_path_buf(),
         source,
@@ -816,6 +937,20 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
                     source,
                 }
             })?;
+
+            #[cfg(unix)]
+            if let Some(parent) = dest_path.parent() {
+                let parent_dir = fs::File::open(parent).map_err(|source| {
+                    ArchiveError::ExtractArchive {
+                        path: parent.to_path_buf(),
+                        source,
+                    }
+                })?;
+                parent_dir.sync_all().map_err(|source| ArchiveError::ExtractArchive {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            }
 
             #[cfg(unix)]
             if let Some(mode) = entry_mode {

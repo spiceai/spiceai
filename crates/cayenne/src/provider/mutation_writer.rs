@@ -263,6 +263,7 @@ enum MemShardedOutcome {
 
 struct PreparedStagedAppendTarget {
     staging_snapshot_id: String,
+    source_snapshot_id: String,
     target_snapshot_id: String,
     target_kind: StagingWalTargetKind,
     estimated_bytes: Option<u64>,
@@ -578,6 +579,7 @@ impl<'a> AppendMutationWriter<'a> {
                         write_guard_for_prepare,
                         PreparedStagedAppendTarget {
                             staging_snapshot_id,
+                            source_snapshot_id: self.table.get_current_snapshot_id(),
                             target_snapshot_id: target_snapshot_id.clone(),
                             target_kind,
                             estimated_bytes,
@@ -1496,6 +1498,7 @@ impl<'a> AppendMutationWriter<'a> {
             self.table.clone_for_write_operations(),
             write_guard,
             target.staging_snapshot_id.clone(),
+            target.source_snapshot_id,
             target.target_snapshot_id,
             target.target_kind,
             rows,

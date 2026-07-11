@@ -122,7 +122,10 @@ pub use query_admission::set_query_admission_governor;
 pub use retention::TimeRetentionFilterBuilder;
 pub use scan::CayenneAccelerationExec;
 pub use staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
-pub use table::{CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder};
+pub use table::{
+    CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder,
+    PreparedAppendSnapshotPublish,
+};
 pub use tuning::{
     QueryObservations, deregister_query_observations, global_qph, record_global_query,
     record_query_latency, register_query_observations, set_cpu_burstable, set_global_memory_budget,
