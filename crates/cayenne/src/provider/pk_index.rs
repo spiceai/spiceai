@@ -173,6 +173,17 @@ pub(crate) enum RowLocation {
     FilePositioned { file_path: Arc<str>, position: u64 },
 }
 
+/// Outcome of [`CachedPkKeyset::try_insert_with_digest`].
+pub(crate) enum PkKeysetInsertOutcome {
+    /// The key was already present; its location was updated in place.
+    Updated,
+    /// The key was new and inserted within `max_bytes`.
+    Inserted,
+    /// The key was new but inserting it would exceed `max_bytes`; the keyset is
+    /// unchanged and the caller should fall back to a bloom filter.
+    OverBudget,
+}
+
 pub(crate) struct CachedPkKeyset {
     /// PK existence map, keyed by [`pk_digest`] and fronted by
     /// [`PrehashedBuildHasher`]. Private so every access routes through a method
@@ -236,6 +247,44 @@ impl CachedPkKeyset {
         }
     }
 
+    /// Update `key`'s location if it is already present, else insert it if doing
+    /// so keeps `approx_bytes` within `max_bytes` — one hash lookup via `entry`
+    /// (vs. a separate `contains_digest` probe followed by `insert_with_digest`'s
+    /// own lookup), and clones `key` only on the insert branch. The hot path on
+    /// re-touched PKs (e.g. CDC updates) is "present", where this does neither a
+    /// second hash nor an allocation.
+    pub(crate) fn try_insert_with_digest(
+        &mut self,
+        digest: u128,
+        key: &OwnedRow,
+        location: RowLocation,
+        max_bytes: usize,
+    ) -> PkKeysetInsertOutcome {
+        debug_assert_eq!(
+            digest,
+            pk_digest(key),
+            "try_insert_with_digest called with a digest that does not match the key"
+        );
+        match self.keys.entry(digest) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().location = location;
+                PkKeysetInsertOutcome::Updated
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let entry_bytes = approx_pk_keyset_entry_bytes(key);
+                if self.approx_bytes.saturating_add(entry_bytes) > max_bytes {
+                    return PkKeysetInsertOutcome::OverBudget;
+                }
+                self.approx_bytes = self.approx_bytes.saturating_add(entry_bytes);
+                entry.insert(PkKeysetEntry {
+                    row: key.clone(),
+                    location,
+                });
+                PkKeysetInsertOutcome::Inserted
+            }
+        }
+    }
+
     /// Insert `key` -> `location` only when the key is ABSENT, preserving an
     /// existing entry's `RowLocation` (unlike [`Self::insert`], which overwrites).
     /// One hash lookup via `entry`, updating `approx_bytes` only for the new key.
@@ -248,13 +297,6 @@ impl CachedPkKeyset {
                 .saturating_add(approx_pk_keyset_entry_bytes(&key));
             entry.insert(PkKeysetEntry { row: key, location });
         }
-    }
-
-    /// Whether a key with this precomputed digest is present — lets a caller
-    /// holding the digest (e.g. from a [`PkDigestSet`]) skip re-hashing.
-    #[inline]
-    pub(crate) fn contains_digest(&self, digest: u128) -> bool {
-        self.keys.contains_key(&digest)
     }
 
     /// The [`RowLocation`] for a key with this precomputed digest — the hot-path
@@ -733,10 +775,14 @@ impl ShardedPkIndex {
         match self {
             Self::Exact(keysets) => {
                 if let Some(keyset) = keysets.get_mut(shard) {
-                    // Reuse each key's stored digest — the keyset is digest-keyed,
-                    // so this avoids re-hashing every recorded key.
+                    // Reuse each key's stored digest and fold the presence
+                    // check into the insert itself (`max_bytes: usize::MAX`
+                    // so `OverBudget` never fires — this path recomputes the
+                    // byte tally once after all shards, per the doc above) —
+                    // one hash lookup per key, and no clone on the (common,
+                    // re-touched-PK) present branch.
                     for (digest, key) in keys.iter_with_digest() {
-                        keyset.insert_with_digest(digest, key.clone(), location.clone());
+                        keyset.try_insert_with_digest(digest, key, location.clone(), usize::MAX);
                     }
                 }
             }

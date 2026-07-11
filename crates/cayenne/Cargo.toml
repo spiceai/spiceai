@@ -450,5 +450,9 @@ name = "compaction_io_hygiene"
 harness = false
 name = "pk_key_hashing"
 
+[[bench]]
+harness = false
+name = "pk_keyset_present_path"
+
 [lints]
 workspace = true
