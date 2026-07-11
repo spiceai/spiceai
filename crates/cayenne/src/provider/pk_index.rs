@@ -174,6 +174,7 @@ pub(crate) enum RowLocation {
 }
 
 /// Outcome of [`CachedPkKeyset::try_insert_with_digest`].
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PkKeysetInsertOutcome {
     /// The key was already present; its location was updated in place.
     Updated,
@@ -782,7 +783,12 @@ impl ShardedPkIndex {
                     // one hash lookup per key, and no clone on the (common,
                     // re-touched-PK) present branch.
                     for (digest, key) in keys.iter_with_digest() {
-                        let _ = keyset.try_insert_with_digest(digest, key, location.clone(), usize::MAX);
+                        let _ = keyset.try_insert_with_digest(
+                            digest,
+                            key,
+                            location.clone(),
+                            usize::MAX,
+                        );
                     }
                 }
             }
@@ -807,10 +813,18 @@ pub(crate) enum PkExistenceRef<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{COLD_PK_BLOOM_PER_FILE_MAX_BYTES, ColdPkExistence, PkBloom};
+    use super::{
+        COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkKeyset, ColdPkExistence, PkBloom,
+        PkKeysetInsertOutcome, RowLocation, approx_pk_keyset_entry_bytes, pk_digest,
+    };
+    use crate::row_converter::Row;
 
     fn key(n: u64) -> [u8; 8] {
         n.to_be_bytes()
+    }
+
+    fn owned_key(bytes: &[u8]) -> super::OwnedRow {
+        Row::from_encoded(bytes).owned()
     }
 
     #[test]
@@ -888,5 +902,90 @@ mod tests {
         let existence = ColdPkExistence::new(Vec::new());
         assert!(!existence.maybe_contains(&key(1)));
         assert_eq!(existence.approx_bytes(), 0);
+    }
+
+    #[test]
+    fn try_insert_with_digest_on_new_key_inserts_and_grows_budget() {
+        let mut keyset = CachedPkKeyset::with_capacity(4);
+        let row = owned_key(b"pk-a");
+        let digest = pk_digest(&row);
+        let entry_bytes = approx_pk_keyset_entry_bytes(&row);
+
+        let outcome = keyset.try_insert_with_digest(digest, &row, RowLocation::Inlined, usize::MAX);
+
+        assert_eq!(outcome, PkKeysetInsertOutcome::Inserted);
+        assert_eq!(keyset.len(), 1);
+        assert_eq!(
+            keyset.approx_bytes, entry_bytes,
+            "a new key must grow approx_bytes by exactly its own entry cost"
+        );
+        assert!(
+            matches!(
+                keyset.location_by_digest(digest),
+                Some(RowLocation::Inlined)
+            ),
+            "the inserted key must be retrievable at its stored location"
+        );
+    }
+
+    #[test]
+    fn try_insert_with_digest_on_present_key_updates_location_without_growing_budget() {
+        let mut keyset = CachedPkKeyset::with_capacity(4);
+        let row = owned_key(b"pk-b");
+        let digest = pk_digest(&row);
+
+        let first = keyset.try_insert_with_digest(digest, &row, RowLocation::Inlined, usize::MAX);
+        assert_eq!(first, PkKeysetInsertOutcome::Inserted);
+        let bytes_after_insert = keyset.approx_bytes;
+
+        // Re-touch the SAME key (the CDC-update hot path this fix targets) with a
+        // different location.
+        let second =
+            keyset.try_insert_with_digest(digest, &row, RowLocation::FileUnlocated, usize::MAX);
+
+        assert_eq!(second, PkKeysetInsertOutcome::Updated);
+        assert_eq!(
+            keyset.len(),
+            1,
+            "the present-path update must not duplicate the entry"
+        );
+        assert_eq!(
+            keyset.approx_bytes, bytes_after_insert,
+            "updating an already-present key's location must not grow approx_bytes"
+        );
+        assert!(
+            matches!(
+                keyset.location_by_digest(digest),
+                Some(RowLocation::FileUnlocated)
+            ),
+            "the update must overwrite the stored location"
+        );
+    }
+
+    #[test]
+    fn try_insert_with_digest_over_budget_leaves_keyset_unchanged() {
+        let mut keyset = CachedPkKeyset::with_capacity(4);
+        let row = owned_key(b"pk-c");
+        let digest = pk_digest(&row);
+        // One byte short of what this key needs, so the vacant branch must
+        // refuse the insert rather than exceed the budget.
+        let max_bytes = approx_pk_keyset_entry_bytes(&row) - 1;
+
+        let outcome = keyset.try_insert_with_digest(digest, &row, RowLocation::Inlined, max_bytes);
+
+        assert_eq!(outcome, PkKeysetInsertOutcome::OverBudget);
+        assert_eq!(
+            keyset.len(),
+            0,
+            "an over-budget key must not be inserted into the keyset"
+        );
+        assert_eq!(
+            keyset.approx_bytes, 0,
+            "a refused insert must not have mutated approx_bytes"
+        );
+        assert!(
+            keyset.location_by_digest(digest).is_none(),
+            "an over-budget key must not be retrievable afterward"
+        );
     }
 }
