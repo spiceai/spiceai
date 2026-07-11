@@ -419,14 +419,11 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("preserve_insertion_order"),
     ParameterSpec::component("index_scan_percentage"),
     ParameterSpec::component("index_scan_max_count"),
-    ParameterSpec::runtime("partition_mode"),
-    ParameterSpec::component("partitioned_write_flush_threshold_rows"),
     ParameterSpec::runtime("connection_pool_size").description(
         "The maximum number of client connections created in the duckdb connection pool.",
     ),
     ParameterSpec::runtime("on_refresh_recompute_statistics"),
     ParameterSpec::runtime("on_refresh_sort_columns"),
-    ParameterSpec::runtime("partitioned_write_buffer"),
     ParameterSpec::runtime("optimizer_duckdb_aggregate_pushdown"),
 ];
 
@@ -550,9 +547,18 @@ impl DataAccelerator for DuckDBAccelerator {
         &self,
         mut cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
-        _partition_by: Vec<PartitionedBy>,
+        partition_by: Vec<PartitionedBy>,
         _runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        ensure!(
+            partition_by.is_empty(),
+            super::InvalidConfigurationSnafu {
+                msg: "DuckDB data accelerator does not support the `partition_by` parameter but it was provided. \
+                      Use engine 'cayenne' or 'arrow' for partitioned acceleration, or remove `partition_by`."
+                    .to_string()
+            }
+        );
+
         normalize_schema_for_duckdb(&mut cmd)
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
@@ -1752,6 +1758,29 @@ mod tests {
             !external_table
                 .options
                 .contains_key("recompute_statistics_on_write")
+        );
+    }
+
+    #[tokio::test]
+    async fn duckdb_rejects_partition_by() {
+        use runtime_table_partition::expression::PartitionedBy;
+
+        let external_table = external_table_with_options(HashMap::new());
+        let accelerator = DuckDBAccelerator::new();
+        let partition_by = vec![PartitionedBy {
+            name: "value".to_string(),
+            expression: col("value"),
+        }];
+
+        let err = accelerator
+            .create_external_table(external_table, None, partition_by, None)
+            .await
+            .expect_err("partition_by should be rejected for DuckDB");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("partition_by"),
+            "expected error to mention partition_by, got: {message}"
         );
     }
 

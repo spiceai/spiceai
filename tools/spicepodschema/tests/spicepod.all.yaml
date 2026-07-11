@@ -443,7 +443,6 @@ datasets:
       params:
         duckdb_file: ./data/postgres.duckdb
         file_watcher: 'true'
-        partition_mode: auto
         connection_pool_size: '5'
         on_refresh_recompute_statistics: 'true'
         partitioned_write_buffer: '1000'

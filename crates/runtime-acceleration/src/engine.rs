@@ -19,8 +19,6 @@ pub enum Engine {
     Arrow,
     PartitionedArrow,
     DuckDB,
-    PartitionedDuckDB,
-    TableModePartitionedDuckDB,
     Sqlite,
     Turso,
     PostgreSQL,
@@ -33,7 +31,6 @@ impl Engine {
     pub fn to_unpartitioned(&self) -> Engine {
         match self {
             Engine::PartitionedArrow => Engine::Arrow,
-            Engine::PartitionedDuckDB | Engine::TableModePartitionedDuckDB => Engine::DuckDB,
             other => *other,
         }
     }
@@ -43,9 +40,7 @@ impl Display for Engine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Engine::Arrow | Engine::PartitionedArrow => write!(f, "arrow"),
-            Engine::DuckDB | Engine::PartitionedDuckDB | Engine::TableModePartitionedDuckDB => {
-                write!(f, "duckdb")
-            }
+            Engine::DuckDB => write!(f, "duckdb"),
             Engine::Sqlite => write!(f, "sqlite"),
             Engine::Turso => write!(f, "turso"),
             Engine::PostgreSQL => write!(f, "postgres"),
