@@ -36,7 +36,7 @@ implemented in `execute_login_with_chooser`.
   share flags. Subscription only takes `--device`; PAT only takes `--token`;
   API only takes `--client-id` / `--client-secret`.
 - Subscription is the **default** human flow. `--device` is the
-  headless/manual fallback for SSH or environments where `open::that`
+  headless/manual fallback for SSH or environments where `system_open::that`
   cannot launch a browser. Both modes use the same browser-mediated OAuth
   flow against `/auth/token`; they differ only in whether the CLI
   auto-opens the URL.
@@ -91,7 +91,7 @@ with `open_browser = !args.device`:
 2. Builds the auth URL via `CloudClient::get_auth_url(auth_code)`, which
    resolves to `{oauth_base_url}/auth/token?code=<CODE>`.
 3. If `--device` is **not** set: auto-opens the URL in the system browser
-   via `open::that`. If `--device` **is** set: only prints the URL and code,
+   via `system_open::that`. If `--device` **is** set: only prints the URL and code,
    leaving it to the user to open them on another device.
 4. Polls `POST {oauth_base_url}/auth/token/exchange` with body
    `{ "code": "<CODE>" }` once per second for up to 5 minutes. The server
@@ -106,7 +106,7 @@ User-facing characteristics:
   the user can paste it into a different browser (e.g. when SSH-ing with X
   forwarding off, or on a different machine).
 - `--device` mode is for SSH sessions, remote shells with no display,
-  supervised CI runners, and cases where `open::that` cannot find a usable
+  supervised CI runners, and cases where `system_open::that` cannot find a usable
   browser.
 - Times out after 5 minutes with a clear error.
 - Cannot be automated with env vars — a human must complete the OAuth flow
