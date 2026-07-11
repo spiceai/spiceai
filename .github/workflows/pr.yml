@@ -56,44 +56,139 @@ env:
 jobs:
   # On a pull request this is the ONLY job that runs. It validates the developer
   # sign-off — the `signoff` commit status posted by `make signoff` — for the PR's
-  # head commit. A green Attestation (plus review) is what lets the PR into the
-  # merge queue, where the heavy jobs below and the other workflows run the full
-  # suite. This is what replaces running all checks on every PR push.
+  # head commit. It can also inherit the first parent's sign-off when HEAD is an
+  # unmodified, conflict-free merge of the current base commit. A green
+  # Attestation (plus review) is what lets the PR into the merge queue, where the
+  # heavy jobs below and the other workflows run the full suite. This is what
+  # replaces running all checks on every PR push.
   attestation:
-    # GitHub-hosted: this job only calls the API, and self-hosted runners don't
-    # run for fork PRs — which would leave external contributors' required
-    # Attestation check unreported and stuck.
+    # GitHub-hosted: self-hosted runners don't run for fork PRs, which would
+    # leave external contributors' required Attestation check unreported and
+    # stuck.
     name: Attestation
     runs-on: ubuntu-latest
     permissions:
       contents: read
       statuses: read
     steps:
-      - name: Validate developer sign-off
+      - name: Inspect developer sign-off
+        id: signoff
         if: ${{ github.event_name == 'pull_request' }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
-            const sha = context.payload.pull_request.head.sha;
-            const { data } = await github.rest.repos.getCombinedStatusForRef({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              ref: sha,
-            });
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const headSha = context.payload.pull_request.head.sha;
+            const baseSha = context.payload.pull_request.base.sha;
+
             // 'signoff' matches the hardcoded STATUS_CONTEXT in scripts/signoff.
-            const signoff = data.statuses.find((s) => s.context === 'signoff');
-            if (signoff && signoff.state === 'success') {
-              core.notice(`Signed off by ${signoff.creator?.login ?? 'unknown'}: ${signoff.description ?? ''}`);
+            async function successfulSignoff(sha) {
+              const { data } = await github.rest.repos.getCombinedStatusForRef({
+                owner,
+                repo,
+                ref: sha,
+              });
+              const signoff = data.statuses.find((status) => status.context === 'signoff');
+              return signoff?.state === 'success' ? signoff : undefined;
+            }
+
+            const headSignoff = await successfulSignoff(headSha);
+            if (headSignoff) {
+              core.notice(
+                `Signed off by ${headSignoff.creator?.login ?? 'unknown'}: ` +
+                `${headSignoff.description ?? ''}`
+              );
               return;
             }
-            core.setFailed(
-              `No developer sign-off found for ${sha}.\n\n` +
-              `On your machine, with this commit pushed, run:\n\n` +
-              `    make signoff\n\n` +
-              `It runs lint + unit tests locally and records a sign-off on this exact\n` +
-              `commit (push a new commit and you must sign off again). The full test\n` +
-              `suite then runs in the merge queue. See docs/dev/ci_signoff.md.`
+
+            const { data: headCommit } = await github.rest.repos.getCommit({
+              owner,
+              repo,
+              ref: headSha,
+            });
+            const [previousHead, mergedBase, ...extraParents] = headCommit.parents;
+            if (
+              !previousHead ||
+              !mergedBase ||
+              extraParents.length > 0 ||
+              mergedBase.sha !== baseSha
+            ) {
+              core.setFailed(
+                `No developer sign-off found for ${headSha}. HEAD is not a two-parent merge ` +
+                `of the current base commit (${baseSha}), so it cannot inherit an earlier sign-off.\n\n` +
+                `On your machine, with this commit pushed, run:\n\n` +
+                `    make signoff\n\n` +
+                `See docs/dev/ci_signoff.md.`
+              );
+              return;
+            }
+
+            const previousSignoff = await successfulSignoff(previousHead.sha);
+            if (!previousSignoff) {
+              core.setFailed(
+                `No developer sign-off found for ${headSha} or its pre-merge parent ` +
+                `${previousHead.sha}. Run make signoff on the pushed HEAD. ` +
+                `See docs/dev/ci_signoff.md.`
+              );
+              return;
+            }
+
+            core.setOutput('inheritance-candidate', 'true');
+            core.setOutput('previous-sha', previousHead.sha);
+            core.setOutput('base-sha', mergedBase.sha);
+            core.setOutput('head-tree', headCommit.commit.tree.sha);
+            core.notice(
+              `Found sign-off on pre-merge parent ${previousHead.sha}; ` +
+              `verifying that HEAD is the unmodified automatic merge result.`
             );
+
+      # Only an otherwise-valid inheritance candidate needs repository history
+      # and blobs to reproduce the merge without relying on a lazy network fetch.
+      - name: Check out pull request history
+        if: ${{ github.event_name == 'pull_request' && steps.signoff.outputs.inheritance-candidate == 'true' }}
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate inherited developer sign-off
+        if: ${{ github.event_name == 'pull_request' && steps.signoff.outputs.inheritance-candidate == 'true' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PREVIOUS_SHA: ${{ steps.signoff.outputs.previous-sha }}
+          BASE_SHA: ${{ steps.signoff.outputs.base-sha }}
+          HEAD_TREE: ${{ steps.signoff.outputs.head-tree }}
+        with:
+          script: |
+            const previousSha = process.env.PREVIOUS_SHA;
+            const baseSha = process.env.BASE_SHA;
+            const expectedTree = process.env.HEAD_TREE;
+            const merge = await exec.getExecOutput(
+              'git',
+              ['merge-tree', '--write-tree', '--no-messages', previousSha, baseSha],
+              { ignoreReturnCode: true, silent: true }
+            );
+            const reproducedTree = merge.stdout.trim();
+            if (merge.exitCode !== 0) {
+              core.setFailed(
+                `The merge of ${baseSha} into ${previousSha} is not conflict-free, so HEAD ` +
+                `cannot inherit the earlier sign-off. Resolve the merge, then run make signoff ` +
+                `on the pushed HEAD.`
+              );
+              return;
+            }
+            if (!/^[0-9a-f]{40,64}$/.test(reproducedTree) || reproducedTree !== expectedTree) {
+              core.setFailed(
+                `HEAD contains changes beyond Git's automatic merge of ${baseSha} into ` +
+                `${previousSha}, so it cannot inherit the earlier sign-off. Run make signoff ` +
+                `on the pushed HEAD.`
+              );
+              return;
+            }
+
+            core.notice(`Inherited developer sign-off from ${previousSha}.`);
       - name: Merge queue passthrough
         if: ${{ github.event_name != 'pull_request' }}
         run: echo "Sign-off was validated at queue entry; the full suite runs in this merge_group run."
