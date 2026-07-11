@@ -276,7 +276,10 @@ refresh_attestation_check() {
     return 0
   fi
 
-  if gh run rerun "$run_id" --repo "$repo" --failed >/dev/null 2>&1; then
+  # Not `--failed`: that only reruns jobs with conclusion=failure and no-ops
+  # on cancelled/skipped runs. Rerunning the whole run is fine here — on a
+  # `pull_request` event, pr.yml executes nothing but the Attestation job.
+  if gh run rerun "$run_id" --repo "$repo" >/dev/null 2>&1; then
     echo "  Re-ran the 'Attestation' check (run ${run_id}) — it will turn green shortly."
   else
     info "  Could not auto-refresh the 'Attestation' check — ${fallback}"
