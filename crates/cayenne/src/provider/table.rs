@@ -17287,6 +17287,7 @@ impl CayenneTableProvider {
         let statistics = Arc::new(super::file_pruning::statistics_from_record_batches(
             &self.table_metadata.schema,
             &entry_batches,
+            None,
         ));
         let mut filtered_batches = Vec::with_capacity(entry_batches.len());
         for batch in entry_batches {
@@ -18479,6 +18480,20 @@ impl CayenneTableProvider {
         .await
     }
 
+    /// The schema-column indices per-append mem-tier segment stats should cover,
+    /// or `None` for every column. Returns `Some(pk_column_indices)` only when the
+    /// `SPICE_CAYENNE_APPLY_STATS_PK_ONLY` benchmark knob is set and the table has
+    /// primary-key columns (a keyless table falls back to all-column stats — its
+    /// pruning-relevant set is unknown). See
+    /// [`file_pruning::apply_stats_pk_only`](super::file_pruning::apply_stats_pk_only).
+    fn apply_stats_columns(&self) -> Option<&[usize]> {
+        if super::file_pruning::apply_stats_pk_only() && !self.pk_column_indices.is_empty() {
+            Some(&self.pk_column_indices)
+        } else {
+            None
+        }
+    }
+
     /// Append a CDC batch to ONE PK-shard's sub-tier. Takes `locks[shard_id]`,
     /// reserves the (delete, data) sequence under it (the §2.3d {reserve ⇔
     /// snapshot-membership} coupling — the reservation MUST be under the shard lock,
@@ -18639,6 +18654,7 @@ impl CayenneTableProvider {
                 incoming_rows,
                 superseded,
                 source_position,
+                self.apply_stats_columns(),
             );
             let epoch = next.epoch;
             let next_version = next.version;

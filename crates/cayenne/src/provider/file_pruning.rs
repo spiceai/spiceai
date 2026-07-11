@@ -163,15 +163,66 @@ pub(crate) fn should_prune_statistics(
     }
 }
 
-/// Compute exact min, max, and null-count statistics for one or more in-memory batches.
+/// Benchmark toggle (`SPICE_CAYENNE_APPLY_STATS_PK_ONLY`): when set, per-append
+/// mem-tier segment statistics ([`statistics_from_record_batches`]) compute
+/// min/max only for the pruning-relevant (primary-key) columns instead of every
+/// column. Segment pruning is a conservative optimization — an `Absent` min/max
+/// only means the segment can't be pruned by a predicate on that column (never a
+/// wrong result), and min/max on unclustered payload columns rarely prunes
+/// anyway (overlapping ranges) — so this is safe, trading a small loss of
+/// non-PK-column mem-tier pruning for O(columns→PK-columns) cheaper appends. The
+/// win scales with table width and burst size; it is an SF-scale A/B knob (the
+/// per-append stat cost is only a large fraction of the apply at very large
+/// coalesced bursts). Default off; resolved mode logged once.
+pub(crate) fn apply_stats_pk_only() -> bool {
+    static PK_ONLY: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = std::env::var("SPICE_CAYENNE_APPLY_STATS_PK_ONLY").is_ok_and(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        });
+        tracing::info!(
+            target: "cayenne",
+            "Per-append mem-tier stats columns: {} (SPICE_CAYENNE_APPLY_STATS_PK_ONLY)",
+            if on { "pk-only" } else { "all-columns" },
+        );
+        on
+    });
+    *PK_ONLY
+}
+
+/// Compute exact min, max, and null-count statistics for one or more in-memory
+/// batches.
+///
+/// `only_columns`, when `Some`, restricts the min/max/null computation to those
+/// schema column indices; every other column gets an all-`Absent`
+/// [`datafusion_common::ColumnStatistics`] (which segment pruning treats
+/// conservatively — it simply can't prune on that column). `None` computes every
+/// column (the default). See [`apply_stats_pk_only`].
 #[must_use]
 pub(crate) fn statistics_from_record_batches(
     schema: &SchemaRef,
     batches: &[RecordBatch],
+    only_columns: Option<&[usize]>,
 ) -> Statistics {
     let num_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    let absent = || datafusion_common::ColumnStatistics {
+        null_count: datafusion_common::stats::Precision::Absent,
+        min_value: datafusion_common::stats::Precision::Absent,
+        max_value: datafusion_common::stats::Precision::Absent,
+        sum_value: datafusion_common::stats::Precision::Absent,
+        distinct_count: datafusion_common::stats::Precision::Absent,
+        byte_size: datafusion_common::stats::Precision::Absent,
+    };
     let column_statistics = (0..schema.fields().len())
         .map(|col_idx| {
+            // Skip non-selected columns entirely when a restriction is active:
+            // an all-Absent ColumnStatistics is pruning-neutral (conservative).
+            if only_columns.is_some_and(|cols| !cols.contains(&col_idx)) {
+                return absent();
+            }
+
             let mut min_value = datafusion_common::stats::Precision::Absent;
             let mut max_value = datafusion_common::stats::Precision::Absent;
             let mut null_count = 0usize;
@@ -274,6 +325,7 @@ mod tests {
                 batch(&[1, 2], &[Some(10), Some(20)]),
                 batch(&[5], &[Some(5)]),
             ],
+            None,
         );
 
         assert_eq!(
@@ -291,10 +343,34 @@ mod tests {
     }
 
     #[test]
+    fn only_columns_restricts_stats_to_selected() {
+        let schema = test_schema(); // columns: [id, value]
+        let batches = [batch(&[1, 2, 5], &[Some(10), Some(20), Some(5)])];
+        // Restrict to column 0 (id): column 1 (value) must be all-Absent, so a
+        // predicate on `value` can no longer prune (conservative), while `id`
+        // stats are unchanged.
+        let stats = statistics_from_record_batches(&schema, &batches, Some(&[0]));
+        assert_eq!(
+            stats.column_statistics[0].min_value,
+            datafusion_common::stats::Precision::Exact(ScalarValue::Int64(Some(1)))
+        );
+        assert_eq!(
+            stats.column_statistics[1].min_value,
+            datafusion_common::stats::Precision::Absent
+        );
+        assert_eq!(
+            stats.column_statistics[1].null_count,
+            datafusion_common::stats::Precision::Absent
+        );
+        // num_rows stays exact regardless of the column restriction.
+        assert_eq!(stats.num_rows, datafusion_common::stats::Precision::Exact(3));
+    }
+
+    #[test]
     fn prunes_segment_disjoint_from_predicate() {
         let schema = test_schema();
         let stats =
-            statistics_from_record_batches(&schema, &[batch(&[1, 2, 3], &[None, None, None])]);
+            statistics_from_record_batches(&schema, &[batch(&[1, 2, 3], &[None, None, None])], None);
         let predicate = build_listing_pruning_predicate(&schema, &[col("id").eq(lit(99))])
             .expect("predicate")
             .expect("some");
@@ -332,7 +408,7 @@ mod tests {
     fn keeps_segment_overlapping_predicate() {
         let schema = test_schema();
         let stats =
-            statistics_from_record_batches(&schema, &[batch(&[1, 2, 3], &[None, None, None])]);
+            statistics_from_record_batches(&schema, &[batch(&[1, 2, 3], &[None, None, None])], None);
         let predicate = build_listing_pruning_predicate(&schema, &[col("id").eq(lit(2))])
             .expect("predicate")
             .expect("some");

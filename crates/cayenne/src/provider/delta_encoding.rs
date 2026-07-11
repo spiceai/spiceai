@@ -139,6 +139,39 @@ pub(crate) const AUTO_LIGHT_LEVEL: u8 = 2;
 /// definition (compaction exists to fold it).
 pub(crate) const AUTO_LIGHT_DENOMINATOR: u64 = 4;
 
+/// Benchmark toggle (`SPICE_CAYENNE_DELTA_LIGHT_ALWAYS`): when set, an `auto`
+/// [`WriteClass::Delta`] write encodes LIGHT ([`AUTO_LIGHT_LEVEL`]) regardless
+/// of its estimated size — extending the small/unknown-delta light path to
+/// large mem-tier checkpoints too, on the rationale that every Delta write is
+/// transient and re-encoded by compaction anyway (`Maintenance`). This trades
+/// checkpoint encode CPU (skips the per-file BtrBlocks strategy search + FSST
+/// double-train — ~1.7× faster encode in the `delta_encoding_sweep` bench) for
+/// larger transient files (~2.4× on a string-bearing corpus) until compaction
+/// folds them, so it is an SF-scale A/B knob, not a default. `Maintenance`
+/// writes and explicit `Level(_)` configs are unaffected. Default off; the
+/// resolved mode is logged once so a run's logs record which was active.
+pub(crate) fn delta_light_always() -> bool {
+    static LIGHT_ALWAYS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = std::env::var("SPICE_CAYENNE_DELTA_LIGHT_ALWAYS").is_ok_and(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        });
+        tracing::info!(
+            target: "cayenne",
+            "Delta encoding size gate: {} (SPICE_CAYENNE_DELTA_LIGHT_ALWAYS)",
+            if on {
+                "light-always (large auto deltas encode LIGHT)"
+            } else {
+                "default (large auto deltas encode FULL)"
+            },
+        );
+        on
+    });
+    *LIGHT_ALWAYS
+}
+
 /// Resolve the effective encoding level for one snapshot write.
 ///
 /// `estimated_bytes` is the caller's pre-encode size estimate (`None` when
@@ -168,7 +201,16 @@ pub(crate) fn effective_level(
                 // BtrBlocks cascade (incl. the FSST symbol-table double-train)
                 // on the CDC hot path. Only a known-large delta takes FULL.
                 None => AUTO_LIGHT_LEVEL,
-                Some(_) => FULL_LEVEL,
+                // A known-large delta normally takes FULL, but the light-always
+                // benchmark knob keeps even large checkpoints on the light path
+                // (compaction re-encodes them at FULL).
+                Some(_) => {
+                    if delta_light_always() {
+                        AUTO_LIGHT_LEVEL
+                    } else {
+                        FULL_LEVEL
+                    }
+                }
             }
         }
     }

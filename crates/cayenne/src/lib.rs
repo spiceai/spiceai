@@ -91,7 +91,7 @@ pub mod __bench_stats {
     /// `MemTier::append_segment_with_source_position`.
     #[must_use]
     pub fn statistics_from_record_batches(schema: &SchemaRef, batches: &[RecordBatch]) -> Statistics {
-        crate::provider::file_pruning::statistics_from_record_batches(schema, batches)
+        crate::provider::file_pruning::statistics_from_record_batches(schema, batches, None)
     }
 
     /// Per-column min/max/null-count primitive used by both stats paths.

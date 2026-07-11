@@ -435,6 +435,7 @@ impl MemTier {
             incoming_rows,
             superseded,
             None,
+            None,
         )
     }
 
@@ -454,6 +455,7 @@ impl MemTier {
         incoming_rows: u64,
         superseded: u64,
         source_position: Option<u64>,
+        stats_only_columns: Option<&[usize]>,
     ) -> Self {
         let statistics = batches.first().map_or_else(
             || Arc::new(Statistics::new_unknown(&Schema::empty())),
@@ -462,6 +464,7 @@ impl MemTier {
                     crate::provider::file_pruning::statistics_from_record_batches(
                         first.schema_ref(),
                         batches.as_ref(),
+                        stats_only_columns,
                     ),
                 )
             },
