@@ -9036,6 +9036,7 @@ impl CayenneTableProvider {
         row_keys: Vec<Box<[u8]>>,
         insert_pk_bytes: Vec<Vec<u8>>,
         insert_sequence: i64,
+        snapshot_sequence: Option<SnapshotSequenceCommit>,
     ) -> CatalogResult<Option<Vec<DeletionVectorWriteResult>>> {
         let Some(results) = self
             .write_key_deletion_vectors(delete_sequence, row_keys)
@@ -9050,13 +9051,18 @@ impl CayenneTableProvider {
 
         let delete_files: Vec<crate::metadata::DeleteFile> =
             results.iter().map(|r| r.delete_file.clone()).collect();
+        // When `snapshot_sequence` is `Some`, the new snapshot's sequence row is
+        // written INSIDE this same delete-file transaction (E2), so the sync
+        // publish path needs no separate `set_snapshot_sequence` autocommit —
+        // one fewer WAL writer-lock acquisition per deletion-carrying publish,
+        // and the delete files + sequence become durable atomically.
         self.catalog
             .commit_on_conflict_deletions(
                 delete_files,
                 &self.table_metadata.table_id,
                 insert_pk_bytes,
                 insert_sequence,
-                None,
+                snapshot_sequence,
             )
             .await
             .map_err(|err| CatalogError::InvalidOperationNoSource {
@@ -9939,9 +9945,24 @@ impl CayenneTableProvider {
     ///
     /// Following Iceberg's sequence-based ordering model where deletes are tracked by
     /// PK value + sequence number for proper ordering of concurrent operations.
+    /// `fold_snapshot_id` + `folded_snapshot_sequence` (E2): when the caller will
+    /// publish a new protected snapshot, it passes `Some(snapshot_id)` and an
+    /// `&mut None`. If this resolution runs the durable delete-file transaction
+    /// (i.e. there ARE file-key deletions), that snapshot's sequence row is
+    /// written INSIDE that transaction and `*folded_snapshot_sequence` is set to
+    /// the reserved sequence — so the caller skips the separate
+    /// `record_written_snapshot_sequence` autocommit (one fewer WAL writer-lock
+    /// acquisition). The sequence is reserved as the HIGHEST of this apply's block
+    /// so the `delete_sequence < snapshot_sequence` merge-on-read invariant holds.
+    /// When there is no delete-file transaction to fold into (inline-only /
+    /// position-only / no deletions), the out-param stays `None` and the caller
+    /// records the sequence itself. Callers that publish no snapshot pass `None`
+    /// and an ignored out-param.
     pub(crate) async fn apply_on_conflict_deletions(
         &self,
         on_conflict_deletions: OnConflictDeletions,
+        fold_snapshot_id: Option<&str>,
+        folded_snapshot_sequence: &mut Option<i64>,
     ) -> CatalogResult<OnConflictUpdate> {
         let OnConflictDeletions {
             delete_specs,
@@ -9981,7 +10002,18 @@ impl CayenneTableProvider {
         // tombstone hides it, and (b) < the replacement snapshot's sequence so
         // the new file row stays visible. Reserving here, before the caller's
         // `increment_sequence_number`, satisfies both.
-        let reserve_count = if has_file_key_deletions { 2 } else { 1 };
+        // E2: when the caller will publish a new snapshot AND this resolution has
+        // file-key deletions (so the durable delete-file txn runs), reserve ONE
+        // MORE sequence for that snapshot, allocated as the HIGHEST of the block
+        // (`base + 2`) so `delete_sequence(base) < insert_sequence(base+1) <
+        // snapshot_sequence(base+2)`. The snapshot row is then written inside the
+        // delete-file txn instead of a separate autocommit.
+        let fold_snapshot = has_file_key_deletions && fold_snapshot_id.is_some();
+        let reserve_count = match (has_file_key_deletions, fold_snapshot) {
+            (true, true) => 3,
+            (true, false) => 2,
+            (false, _) => 1,
+        };
         // Lever B2: same in-memory allocator as the staged path, so the sync
         // last-resort path and the staged path share one monotone source.
         let base = self
@@ -10102,12 +10134,34 @@ impl CayenneTableProvider {
         let insert_pk_bytes: Vec<Vec<u8>> =
             row_keys.iter().map(|key| key.as_ref().to_vec()).collect();
 
+        // E2: fold the new snapshot's sequence into the delete-file transaction
+        // when folding is active. `snapshot_sequence = base + 2` is the highest
+        // reserved sequence (> delete_sequence, > insert_sequence), preserving the
+        // merge-on-read ordering invariant. Only set the caller's out-param AFTER
+        // the transaction commits below, so a `None` result (nothing written)
+        // leaves the caller to record the sequence itself.
+        let snapshot_commit = if fold_snapshot {
+            let seq = insert_sequence.checked_add(1).ok_or_else(|| {
+                CatalogError::InvalidOperationNoSource {
+                    message: "sequence-number counter overflowed reserving an on-conflict snapshot sequence".to_string(),
+                }
+            })?;
+            fold_snapshot_id.map(|id| SnapshotSequenceCommit {
+                snapshot_id: id.to_string(),
+                sequence_number: seq,
+            })
+        } else {
+            None
+        };
+        let folded_seq_value = snapshot_commit.as_ref().map(|c| c.sequence_number);
+
         let Some(results) = self
             .write_and_commit_deletion_vectors(
                 delete_sequence,
                 row_keys,
                 insert_pk_bytes,
                 insert_sequence,
+                snapshot_commit,
             )
             .await?
         else {
@@ -10120,6 +10174,10 @@ impl CayenneTableProvider {
                 OnConflictUpdate::none().with_inlined_tombstone_written(inlined_tombstone_written)
             );
         };
+        // The delete-file transaction committed durably; if it carried the
+        // snapshot sequence, report it so the caller skips the redundant
+        // `record_written_snapshot_sequence` autocommit (E2).
+        *folded_snapshot_sequence = folded_seq_value;
         record_cayenne_write_phase(
             &self.table_metadata.table_name,
             "on_conflict_key_delete",
@@ -10505,7 +10563,7 @@ impl CayenneTableProvider {
 
         // Commit delete files only — no insert records (inline data bypasses
         // the deletion filter, so no protected insert sequence is needed).
-        self.write_and_commit_deletion_vectors(delete_sequence, row_keys, vec![], 0)
+        self.write_and_commit_deletion_vectors(delete_sequence, row_keys, vec![], 0, None)
             .await?;
 
         Ok(())

@@ -449,6 +449,10 @@ name = "stats_single_pass"
 
 [[bench]]
 harness = false
+name = "metastore_seq_coalesce"
+
+[[bench]]
+harness = false
 name = "compaction_io_hygiene"
 
 [[bench]]

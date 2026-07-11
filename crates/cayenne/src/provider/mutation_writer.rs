@@ -1080,9 +1080,12 @@ impl<'a> AppendMutationWriter<'a> {
             } = take_post_validation(&post_validation);
 
             let superseded = on_conflict_deletions.total_superseded();
+            // This path publishes no protected snapshot, so there is no snapshot
+            // sequence to fold — pass `None` and ignore the out-param.
+            let mut _folded_seq: Option<i64> = None;
             let update = self
                 .table
-                .apply_on_conflict_deletions(on_conflict_deletions)
+                .apply_on_conflict_deletions(on_conflict_deletions, None, &mut _folded_seq)
                 .await?;
             // Publish any deletion-cache update under the consistency lock. This path writes no protected snapshot
             self.table.commit_on_conflict_publish(update, None).await;
@@ -1175,9 +1178,16 @@ impl<'a> AppendMutationWriter<'a> {
         record_cayenne_write_phase(self.table.table_name(), "publish_lock_wait", lock_start);
 
         let deletion_start = Instant::now();
+        // E2: let the deletion apply fold this publish's snapshot sequence into
+        // its delete-file transaction when there are file-key deletions.
+        let mut folded_snapshot_sequence: Option<i64> = None;
         let update = self
             .table
-            .apply_on_conflict_deletions(on_conflict_deletions)
+            .apply_on_conflict_deletions(
+                on_conflict_deletions,
+                Some(&new_snapshot_id),
+                &mut folded_snapshot_sequence,
+            )
             .await?;
         record_cayenne_write_phase(
             self.table.table_name(),
@@ -1204,15 +1214,26 @@ impl<'a> AppendMutationWriter<'a> {
         // `publish_cas` is the atomic deletion-cache + protected-snapshot publish.
         let publish_start = Instant::now();
         let seq_start = Instant::now();
-        // Lever B2: in-memory allocator (shared with the staged path on this
-        // same provider), so the sync-publish snapshot sequence stays on the one
-        // monotone source instead of acquiring the metastore writer here.
-        let new_sequence = self.table.reserve_sequences_local(1).await?;
-
-        // Durably record the new snapshot's sequence before making it visible.
-        self.table
-            .record_written_snapshot_sequence(&new_snapshot_id, new_sequence)
-            .await?;
+        // E2: if the deletion apply folded the snapshot sequence into its
+        // delete-file transaction, reuse it — the durable record already happened
+        // in that transaction, so no separate metastore writer-lock acquisition
+        // here. Only a publish with no delete-file transaction (pure inserts /
+        // inline-only) still reserves and records the sequence via a standalone
+        // write. Either way the sequence is durable before the snapshot is made
+        // visible by `commit_on_conflict_publish` below.
+        let new_sequence = if let Some(seq) = folded_snapshot_sequence {
+            seq
+        } else {
+            // Lever B2: in-memory allocator (shared with the staged path on this
+            // same provider), so the sync-publish snapshot sequence stays on the
+            // one monotone source instead of acquiring the metastore writer here.
+            let seq = self.table.reserve_sequences_local(1).await?;
+            // Durably record the new snapshot's sequence before making it visible.
+            self.table
+                .record_written_snapshot_sequence(&new_snapshot_id, seq)
+                .await?;
+            seq
+        };
         record_cayenne_write_phase(self.table.table_name(), "publish_seq", seq_start);
         // Atomically publish the deletion-cache update and the protected snapshot
         // so concurrent scans never observe the new protected snapshot with a stale deletion view (the duplicate-PK window).
