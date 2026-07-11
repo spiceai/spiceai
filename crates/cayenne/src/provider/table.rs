@@ -57,8 +57,8 @@ use super::on_conflict::{
 };
 use super::pk_index::{
     COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkIndex, CachedPkKeyset, ColdPkExistence,
-    PK_INDEX_PERSIST_MAX_BYTES, PkBloom, PkDigestSet, PkExistenceRef, RowLocation, ShardedPkIndex,
-    approx_captured_file_bytes, approx_pk_keyset_entry_bytes, deserialize_pk_bloom_sidecar,
+    PK_INDEX_PERSIST_MAX_BYTES, PkBloom, PkDigestSet, PkExistenceRef, PkKeysetInsertOutcome,
+    RowLocation, ShardedPkIndex, approx_captured_file_bytes, deserialize_pk_bloom_sidecar,
     pk_digest, serialize_pk_bloom_sidecar, shard_of_pk,
 };
 use super::streaming::StreamingExec;
@@ -6120,19 +6120,18 @@ impl CayenneTableProvider {
                 // Existence-only insert. Under `deletion_mode: position`, real
                 // `(file, position)` for File rows is captured separately by the
                 // row_idx() read-back, which upgrades these to `FilePositioned`.
-                // Reuse each key's stored digest (the keyset is digest-keyed) so
-                // the contains-gate and insert don't each re-hash the key.
+                // Reuse each key's stored digest (the keyset is digest-keyed) and
+                // fold the presence check and the insert into a single hash
+                // lookup — the common case on re-touched PKs (e.g. CDC updates)
+                // is "present", where this clones neither the key nor re-hashes.
                 for (digest, key) in keys.iter_with_digest() {
-                    if !keyset.contains_digest(digest)
-                        && keyset
-                            .approx_bytes
-                            .saturating_add(approx_pk_keyset_entry_bytes(key))
-                            > max_bytes
-                    {
-                        convert_to_bloom = true;
-                        break;
+                    match keyset.try_insert_with_digest(digest, key, location.clone(), max_bytes) {
+                        PkKeysetInsertOutcome::OverBudget => {
+                            convert_to_bloom = true;
+                            break;
+                        }
+                        PkKeysetInsertOutcome::Updated | PkKeysetInsertOutcome::Inserted => {}
                     }
-                    keyset.insert_with_digest(digest, key.clone(), location.clone());
                 }
             }
         }
