@@ -77,6 +77,46 @@ export CHBENCH_PG_PASS="${CHBENCH_PG_PASS:-$PG_PASS}"
 export CHBENCH_PG_DB="${CHBENCH_PG_DB:-$PG_DB}"
 
 mkdir -p "$OUTDIR"
+
+# --- Reset stale CDC replication slots BEFORE this run's spiced starts. ---
+# A logical `spice_%` slot left behind by a previous (or crashed) run streams WAL
+# from its old LSN, which does NOT match the fresh initial-snapshot LSN the next
+# spiced takes: the result is inherited WAL backlog AND a snapshot/stream
+# inconsistency that surfaces as spurious "table mismatch / replication did not
+# converge" — a FALSE correctness signal, not a real bug. `testoperator` prepare
+# drops these slots (chbench-driver `drop_replication_artifacts`), but
+# `--skip-prepare` skips that, so repeated local runs contaminate each other.
+# (CI is unaffected: its `.github/scripts/chbench_template.sh` drops all slots
+# before every run.)
+#
+# Robustness mirrors that CI cleanup (spiceai/spiceai#11811): a slot pins its
+# database and an *active* slot won't drop until its walsender is terminated, so
+# terminate holders then drop, retrying until none remain. Scoped to `spice_%`
+# slots on THIS run's database so unrelated slots on a shared server are never
+# disturbed; publications and seeded data are left intact (spiced recreates a
+# fresh slot on its initial snapshot). Best-effort; warns loudly if any persist.
+pg_admin() {  # run one SQL, stdout the result; native psql or docker exec
+  if [ -n "$PG_CONTAINER" ]; then
+    docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -t -A -c "$1" 2>/dev/null
+  elif command -v psql >/dev/null 2>&1; then
+    PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -t -A -c "$1" 2>/dev/null
+  fi
+}
+SLOT_FILTER="slot_name LIKE 'spice_%' AND database = '${PG_DB}'"
+for _ in 1 2 3 4 5; do
+  n=$(pg_admin "SELECT count(*) FROM pg_replication_slots WHERE $SLOT_FILTER" | tr -d ' ')
+  [ "${n:-0}" = 0 ] && break
+  pg_admin "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE $SLOT_FILTER AND active_pid IS NOT NULL" >/dev/null
+  pg_admin "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE $SLOT_FILTER AND NOT active" >/dev/null
+  sleep 1
+done
+stuck=$(pg_admin "SELECT string_agg(slot_name || '(active_pid=' || coalesce(active_pid::text,'none') || ')', ', ') FROM pg_replication_slots WHERE $SLOT_FILTER" | tr -d ' ')
+if [ -n "$stuck" ]; then
+  echo "WARNING: stale spice_% replication slots still present after cleanup: $stuck"
+else
+  echo "Reset stale spice_% replication slots before run: clean"
+fi
+
 LOG="$OUTDIR/htap.log"
 CPU="$OUTDIR/cpu.csv"
 QLAT="$OUTDIR/qlat.csv"
