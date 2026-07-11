@@ -775,8 +775,6 @@ impl CayenneDeletionSink {
         // Build write specs and precompute cache updates while counting TRUE new deletions
         // (set difference between incoming row_ids and existing cache per file).
         let mut new_deletion_count: usize = 0;
-        let mut overflow_count: u64 = 0;
-        let mut first_overflow_id: Option<u64> = None;
         let mut specs: Vec<DeletionVectorWriteSpec> = Vec::new();
         let mut cache_updates: HashMap<String, Arc<PositionDeletionVector>> = HashMap::new();
 
@@ -789,14 +787,15 @@ impl CayenneDeletionSink {
             // Deduplicate incoming row IDs first to avoid over-counting and redundant writes.
             let mut unique_new_row_ids: Vec<u32> = Vec::with_capacity(incoming_row_ids.len());
             for &id in incoming_row_ids {
-                if let Ok(id32) = u32::try_from(id) {
-                    unique_new_row_ids.push(id32);
-                } else {
-                    if first_overflow_id.is_none() {
-                        first_overflow_id = Some(id);
-                    }
-                    overflow_count += 1;
-                }
+                let id32 = u32::try_from(id).map_err(|_| Error::DataValidation {
+                    table: table_name.clone(),
+                    message: format!(
+                        "Position deletion row ID {id} for data file '{file_path}' exceeds the supported maximum {}. Compact the table into files with at most {} rows before using position-based deletion.",
+                        u32::MAX,
+                        u32::MAX
+                    ),
+                })?;
+                unique_new_row_ids.push(id32);
             }
             unique_new_row_ids.sort_unstable();
             unique_new_row_ids.dedup();
@@ -843,14 +842,6 @@ impl CayenneDeletionSink {
             cache_updates.insert(
                 file_path.clone(),
                 Arc::new(PositionDeletionVector::new(updated_bitmap)),
-            );
-        }
-
-        if overflow_count > 0 {
-            tracing::warn!(
-                "Skipped {} row ID(s) that exceed u32::MAX (first: {}) - table should be compacted",
-                overflow_count,
-                first_overflow_id.unwrap_or(0)
             );
         }
 

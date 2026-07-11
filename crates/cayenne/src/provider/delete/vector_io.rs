@@ -547,10 +547,6 @@ pub fn detect_deletion_type_and_read(
         file_count
     );
 
-    // Track overflow occurrences to log once at the end
-    let mut overflow_count: u64 = 0;
-    let mut first_overflow_id: Option<u64> = None;
-
     for delete_file in delete_files {
         let path = std::path::Path::new(&delete_file.path);
         tracing::debug!("detect_deletion_type_and_read: reading file {:?}", path);
@@ -663,25 +659,18 @@ pub fn detect_deletion_type_and_read(
                 let bitmap = per_file_row_ids.entry(source_file).or_default();
                 let values = row_id_array.values();
                 for &row_id in values {
-                    if let Ok(row_id_u32) = u32::try_from(row_id) {
-                        bitmap.insert(row_id_u32);
-                    } else {
-                        if first_overflow_id.is_none() {
-                            first_overflow_id = Some(row_id);
-                        }
-                        overflow_count += 1;
-                    }
+                    let row_id_u32 = u32::try_from(row_id).map_err(|_| {
+                        datafusion_common::DataFusionError::Execution(format!(
+                            "Position deletion vector {} contains row ID {row_id}, which exceeds the supported maximum {}. Compact the table into files with at most {} rows before using position-based deletion.",
+                            path.display(),
+                            u32::MAX,
+                            u32::MAX
+                        ))
+                    })?;
+                    bitmap.insert(row_id_u32);
                 }
             }
         }
-    }
-
-    if overflow_count > 0 {
-        tracing::warn!(
-            "Skipped {} row ID(s) that exceed u32::MAX (first: {}) - table should be compacted",
-            overflow_count,
-            first_overflow_id.unwrap_or(0)
-        );
     }
 
     let mut deleted_row_keys: HashMap<Box<[u8]>, i64> = HashMap::with_capacity(key_row_state.len());
@@ -978,5 +967,31 @@ mod tests {
             .expect("write deletion vector");
 
         assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rejects_position_ids_above_bitmap_range() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let table_metadata = build_table_metadata(&temp_dir);
+        let writer = DeletionVectorWriter::new(&table_metadata);
+        let results = writer
+            .write(vec![DeletionVectorWriteSpec::new_position_based(
+                "large.vortex".to_string(),
+                vec![u64::from(u32::MAX) + 1],
+            )])
+            .await
+            .expect("write oversized position deletion vector");
+
+        let delete_files = results
+            .into_iter()
+            .map(|result| result.delete_file)
+            .collect();
+        let error = detect_deletion_type_and_read(delete_files)
+            .expect_err("oversized position must not be silently skipped");
+
+        assert!(
+            error.to_string().contains("exceeds the supported maximum"),
+            "unexpected error: {error}"
+        );
     }
 }

@@ -16663,6 +16663,44 @@ impl CayenneTableProvider {
         self.publish_current_snapshot_files_changed_under_held_fence();
     }
 
+    /// Publish a deferred snapshot recovered after its durable catalog commit
+    /// completed without the coordinator's in-memory publication phase.
+    ///
+    /// Recovery first moves any remaining staged files, then calls this method
+    /// to reload every durable visibility input written by the shared
+    /// transaction (delete vectors and protected-snapshot thresholds) before
+    /// swapping the snapshot/listing state under one listing fence.
+    pub(crate) async fn publish_recovered_deferred_snapshot(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<()> {
+        let fresh_strategy = Self::load_deletion_vectors_all(
+            &self.table_metadata.table_id,
+            snapshot_id,
+            Arc::clone(&self.catalog),
+            self.pk_deletion_strategy.strategy(),
+        )
+        .await
+        .map_err(|source| Error::Catalog { source })?;
+        let fresh_protected_snapshots = Self::load_protected_snapshots(
+            Arc::clone(&self.catalog),
+            &self.table_metadata.table_id,
+            &fresh_strategy,
+        )
+        .await
+        .map_err(|source| Error::Catalog { source })?;
+        let prepared = self.prepare_append_snapshot_publish(snapshot_id)?;
+
+        let _fence = self.listing_fence.write().await;
+        self.pk_deletion_strategy
+            .refresh_from(&fresh_strategy, &self.table_metadata.table_name)?;
+        self.protected_snapshots
+            .store(Arc::new(fresh_protected_snapshots));
+        self.clear_cached_pk_keyset();
+        self.publish_append_snapshot_under_held_fence(prepared);
+        Ok(())
+    }
+
     /// Acquire `listing_fence` for write and return an owned guard.
     ///
     /// Used by the cross-partition append coordinator (#10125 step 6) so it

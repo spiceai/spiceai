@@ -1641,9 +1641,23 @@ impl CayenneTableProvider {
                 }
             }
 
-            let current_snapshot = self.get_current_snapshot_id();
+            // The provider-local pointer can be stale if cancellation happens
+            // while the metastore COMMIT is in flight: both SQLite and Turso
+            // may complete that COMMIT after the coordinator future is dropped,
+            // before its synchronous publication block runs. Classify protected
+            // targets from the durable catalog pointer so recovery never deletes
+            // a snapshot that the catalog has committed.
+            let provider_snapshot = self.get_current_snapshot_id();
+            let durable_snapshot = if wal.target_kind == StagingWalTargetKind::ProtectedSnapshot {
+                self.metadata_catalog()
+                    .get_table(self.table_name())
+                    .await?
+                    .current_snapshot_id
+            } else {
+                provider_snapshot.clone()
+            };
             if wal.target_kind == StagingWalTargetKind::CurrentSnapshot
-                && current_snapshot != wal.target_snapshot
+                && provider_snapshot != wal.target_snapshot
             {
                 return Err(Error::IncompleteWrite {
                     table: table_name,
@@ -1652,17 +1666,17 @@ impl CayenneTableProvider {
                         wal.staged_files.len(),
                         wal.target_snapshot,
                         wal.created_at,
-                        current_snapshot,
+                        provider_snapshot,
                     ),
                 });
             }
             if wal.target_kind == StagingWalTargetKind::ProtectedSnapshot
-                && current_snapshot != wal.target_snapshot
+                && durable_snapshot != wal.target_snapshot
             {
                 tracing::warn!(
                     table = table_name.as_str(),
                     target_snapshot = wal.target_snapshot.as_str(),
-                    current_snapshot = current_snapshot.as_str(),
+                    current_snapshot = durable_snapshot.as_str(),
                     "Rolling back an uncommitted deferred snapshot append"
                 );
                 self.clear_staging_snapshot_dir(&staging_snapshot_id)
@@ -1865,7 +1879,10 @@ impl CayenneTableProvider {
                     // in-memory pointer/listing just as for a current-snapshot
                     // append; otherwise a long-lived provider would keep serving
                     // its pre-crash snapshot until reopened.
-                    if self.get_current_snapshot_id() == wal.target_snapshot {
+                    if durable_snapshot == wal.target_snapshot {
+                        if provider_snapshot != wal.target_snapshot {
+                            self.update_current_snapshot_id(&wal.target_snapshot);
+                        }
                         recovered_visible_any = true;
                     }
                 }
