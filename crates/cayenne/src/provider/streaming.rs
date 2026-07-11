@@ -149,23 +149,14 @@ impl ExecutionPlan for StreamingExec {
     }
 }
 
-/// Shared, resumable source that splits one stream into sequential row-bounded
-/// chunks. Generic — no cold-tier/bloom knowledge; callers supply the row cap
-/// and the reason (see `write_stream_to_cold`, which uses it to keep each cold
-/// file under the per-file PK-bloom budget).
+/// Splits one stream into sequential row-bounded chunks over a shared source.
+/// Generic (no cold-tier/bloom knowledge); the caller supplies the row cap.
+/// Splitting a globally-sorted stream at row boundaries preserves global order.
 ///
-/// Successive [`RowChunkStream`]s pull from this one source; each stops after
-/// its row budget, leaving the source positioned for the next chunk. Splitting a
-/// globally-sorted stream at row boundaries preserves global order across chunks
-/// (and yields disjoint per-chunk min/max ranges).
-///
-/// CONTRACT: **consume chunks sequentially** — poll one [`RowChunkStream`] to
-/// completion before minting the next. Concurrent chunks would race the shared
-/// inner stream. The inner stream lives behind a `parking_lot::Mutex` polled
-/// **synchronously** inside `poll_next` and released before returning — it is
-/// never held across an `.await` (poll returns immediately), matching this
-/// module's `StreamingExec` convention. A `None` inner marks the source
-/// exhausted.
+/// CONTRACT: consume chunks sequentially — poll one [`RowChunkStream`] to
+/// completion before minting the next; concurrent chunks would race the shared
+/// inner stream. That stream is polled synchronously under a `parking_lot::Mutex`
+/// (never held across `.await`).
 pub(crate) struct RowChunkedSource {
     schema: SchemaRef,
     inner: Mutex<Option<DFStream>>,
@@ -179,17 +170,14 @@ impl RowChunkedSource {
         })
     }
 
-    /// `true` once the underlying stream has yielded end-of-stream (so a caller's
-    /// chunk loop knows to stop minting further chunks).
+    /// `true` once the underlying stream has ended (caller stops minting chunks).
     pub(crate) fn is_exhausted(&self) -> bool {
         self.inner.lock().is_none()
     }
 
-    /// The next chunk: a stream that forwards batches from the shared source
-    /// until it has emitted at least `row_cap` rows, then ends without consuming
-    /// further. The boundary is at batch granularity, so the final batch may
-    /// overshoot `row_cap` by up to one batch — set `row_cap` with headroom below
-    /// any hard limit to absorb that.
+    /// A chunk that forwards batches until it has emitted `>= row_cap` rows, then
+    /// ends. Boundary is batch-granular, so the last batch may overshoot by up to
+    /// one batch — give `row_cap` headroom below any hard limit.
     pub(crate) fn next_chunk(self: &Arc<Self>, row_cap: usize) -> RowChunkStream {
         RowChunkStream {
             source: Arc::clone(self),
@@ -212,8 +200,7 @@ impl Stream for RowChunkStream {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         if this.emitted >= this.row_cap {
-            // Chunk budget reached; end WITHOUT pulling further so the next
-            // chunk resumes from the source's current position.
+            // Budget reached — end without pulling, so the next chunk resumes here.
             return Poll::Ready(None);
         }
         let mut guard = this.source.inner.lock();
@@ -278,9 +265,8 @@ mod tests {
         out
     }
 
-    /// A source larger than the row cap splits into multiple chunks; every row is
-    /// preserved exactly once and in order (contiguous slices of the input), and
-    /// no chunk exceeds the cap by more than one batch (batch-granularity cut).
+    /// Splits past the cap; rows preserved exactly once and in order, no chunk
+    /// over cap + one batch.
     #[tokio::test]
     async fn chunk_source_splits_at_row_cap_preserving_order_and_rows() {
         let schema = id_schema();
@@ -315,8 +301,7 @@ mod tests {
         assert!(source.is_exhausted());
     }
 
-    /// A source at or below the cap stays a single chunk (today's layout for the
-    /// common case) and drains fully.
+    /// At or below the cap: a single chunk that drains fully.
     #[tokio::test]
     async fn chunk_source_single_chunk_when_under_cap() {
         let schema = id_schema();

@@ -13316,14 +13316,10 @@ impl CayenneTableProvider {
         )))
     }
 
-    /// Per-cold-file row cap that keeps a file's right-sized PK bloom
-    /// (~10 bits/key, matching [`Self::build_cold_file_pk_bloom`]) within
-    /// [`COLD_PK_BLOOM_PER_FILE_MAX_BYTES`]. A file over the cap would carry no
-    /// bloom, degrading the CDC-apply keyset rebuild to a full cold scan.
-    ///
-    /// Includes 10% headroom below the exact bloom key budget so the
-    /// batch-granularity chunk boundary (which may overshoot by up to one batch)
-    /// still lands under the hard cap.
+    /// Per-file row cap so a file's PK bloom (~10 bits/key) stays within
+    /// [`COLD_PK_BLOOM_PER_FILE_MAX_BYTES`] — over the cap the file gets no bloom
+    /// and the keyset rebuild falls back to a full cold scan. 10% headroom absorbs
+    /// the batch-granularity chunk overshoot.
     fn cold_file_row_cap() -> usize {
         // 10 bits/key => bytes = keys * 10 / 8, so keys = bytes * 8 / 10.
         let max_bloom_keys = COLD_PK_BLOOM_PER_FILE_MAX_BYTES.saturating_mul(8) / 10;
@@ -13360,11 +13356,9 @@ impl CayenneTableProvider {
     ///
     /// Single ordered run (`target_partitions = 1`) so the Z-order survives across
     /// cold files — each file is a contiguous slice of the sorted order, giving
-    /// tight, non-overlapping zone maps. Bloom-eligible tables additionally split
-    /// the sorted stream into contiguous row-bounded chunks (sequential writes
-    /// into the same flat promotion directory) so every file stays under
-    /// [`Self::cold_file_row_cap`] and keeps a PK bloom; the split preserves
-    /// global order across files.
+    /// tight, non-overlapping zone maps. Bloom-eligible tables split the stream
+    /// into row-bounded chunks (sequential writes to the same dir) so every file
+    /// stays under [`Self::cold_file_row_cap`] and keeps a PK bloom.
     async fn write_stream_to_cold(
         &self,
         cold_location: &str,
@@ -13410,30 +13404,20 @@ impl CayenneTableProvider {
         let session_state = Arc::new(ctx.state());
         let schema = self.table_schema();
 
-        // Bloom-eligible (upsert) tables bound each output file's row count so its
-        // right-sized PK bloom stays within `COLD_PK_BLOOM_PER_FILE_MAX_BYTES`.
-        // Otherwise a file over the cap carries no bloom and the CDC-apply keyset
-        // rebuild degrades to a full cold scan. Only narrow-row tables (many keys
-        // per byte target) reach the cap; wide tables write a single chunk, and
-        // non-bloom tables keep the plain single write.
+        // Bloom-eligible (upsert) tables split output so each file stays under the
+        // PK-bloom row cap (else no bloom → full cold scan on keyset rebuild). Only
+        // narrow-row tables reach the cap; others write a single chunk.
         let bloom_eligible = self.upsert_bloom_eligible() && !self.pk_column_indices.is_empty();
         if bloom_eligible {
-            // All chunks write into the SAME promotion directory: the Vortex sink
-            // mints a fresh `write_id` UUID per write and names files
-            // `{write_id}_{index}.vortex`, so sequential chunk writes never collide
-            // and the physical layout stays flat (identical to the single-write
-            // path). The post-write listing below discovers every chunk's files.
-            // `RowChunkedSource` is a generic row-bounded stream splitter; the
-            // cold-tier reason (keep each file's PK bloom under the cap) lives here,
-            // in `cold_file_row_cap`.
+            // All chunks write to the SAME dir: the Vortex sink names files with a
+            // fresh per-write `write_id` UUID, so sequential writes never collide
+            // (flat layout, identical to the single-write path).
             let row_cap = Self::cold_file_row_cap();
             let source = super::streaming::RowChunkedSource::new(Arc::clone(&schema), stream);
             let mut chunk_idx: usize = 0;
             while !source.is_exhausted() {
                 if chunk_idx == 1 {
-                    // Fired once per promotion that splits: the visible set exceeds
-                    // one file's bloom budget, so it graduates into multiple
-                    // row-bounded files (each still bloom-backed).
+                    // Once per splitting promotion (on entering the 2nd chunk).
                     tracing::warn!(
                         target: "cayenne::compaction",
                         table = self.table_metadata.table_name.as_str(),
