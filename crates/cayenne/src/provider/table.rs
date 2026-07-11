@@ -13361,9 +13361,10 @@ impl CayenneTableProvider {
     /// Single ordered run (`target_partitions = 1`) so the Z-order survives across
     /// cold files — each file is a contiguous slice of the sorted order, giving
     /// tight, non-overlapping zone maps. Bloom-eligible tables additionally split
-    /// the sorted stream into contiguous row-bounded chunks (one subdirectory
-    /// each) so every file stays under [`Self::cold_file_row_cap`] and keeps a PK
-    /// bloom; the split preserves global order across files.
+    /// the sorted stream into contiguous row-bounded chunks (sequential writes
+    /// into the same flat promotion directory) so every file stays under
+    /// [`Self::cold_file_row_cap`] and keeps a PK bloom; the split preserves
+    /// global order across files.
     async fn write_stream_to_cold(
         &self,
         cold_location: &str,
@@ -13408,7 +13409,6 @@ impl CayenneTableProvider {
         }
         let session_state = Arc::new(ctx.state());
         let schema = self.table_schema();
-        let is_local = !cold_base.starts_with("s3://");
 
         // Bloom-eligible (upsert) tables bound each output file's row count so its
         // right-sized PK bloom stays within `COLD_PK_BLOOM_PER_FILE_MAX_BYTES`.
@@ -13418,6 +13418,11 @@ impl CayenneTableProvider {
         // non-bloom tables keep the plain single write.
         let bloom_eligible = self.upsert_bloom_eligible() && !self.pk_column_indices.is_empty();
         if bloom_eligible {
+            // All chunks write into the SAME promotion directory: the Vortex sink
+            // mints a fresh `write_id` UUID per write and names files
+            // `{write_id}_{index}.vortex`, so sequential chunk writes never collide
+            // and the physical layout stays flat (identical to the single-write
+            // path). The post-write listing below discovers every chunk's files.
             let row_cap = Self::cold_file_row_cap();
             let source = super::streaming::ColdChunkSource::new(Arc::clone(&schema), stream);
             let mut chunk_idx: usize = 0;
@@ -13434,18 +13439,11 @@ impl CayenneTableProvider {
                         "Cold-tier promotion is splitting output into multiple row-bounded files to keep each file's PK bloom within the per-file cap"
                     );
                 }
-                let chunk_dir_url = format!("{cold_dir_url}{chunk_idx:05}/");
-                if is_local {
-                    let local = chunk_dir_url
-                        .strip_prefix("file://")
-                        .unwrap_or(chunk_dir_url.as_str());
-                    Self::ensure_snapshot_dir_exists(std::path::Path::new(local)).await?;
-                }
                 let chunk_stream: SendableRecordBatchStream = Box::pin(source.next_chunk(row_cap));
                 self.insert_stream_into_cold_dir(
                     session_state.as_ref(),
                     &write_format,
-                    &chunk_dir_url,
+                    &cold_dir_url,
                     chunk_stream,
                 )
                 .await?;
