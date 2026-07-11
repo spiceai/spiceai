@@ -2267,6 +2267,24 @@ impl CayenneTableProvider {
         &self.table_metadata.table_id
     }
 
+    pub(crate) fn restore_aborted_inline_tombstone_bookkeeping(
+        &self,
+        pending_inline_tombstone_owned: &mut bool,
+        pending_durable_flips: &mut Vec<String>,
+    ) {
+        if *pending_inline_tombstone_owned {
+            self.pending_inline_tombstones
+                .fetch_sub(1, Ordering::AcqRel);
+            *pending_inline_tombstone_owned = false;
+        }
+        if !pending_durable_flips.is_empty() {
+            let mut pending = self.pending_durable_tombstone_flips.lock();
+            let mut restored = std::mem::take(pending_durable_flips);
+            restored.append(&mut pending);
+            *pending = restored;
+        }
+    }
+
     /// Returns a reference to the write lock for serializing insert operations.
     #[must_use]
     pub(crate) fn write_lock(&self) -> &tokio::sync::Mutex<()> {
@@ -9763,9 +9781,9 @@ impl CayenneTableProvider {
         let durable_payload = if defer_catalog_commit {
             Some(PreparedOnConflictDurablePayload {
                 table_id: self.table_metadata.table_id.clone(),
-                delete_files,
-                insert_pk_bytes,
-                inline_tombstone,
+                delete_files: std::mem::take(&mut delete_files),
+                insert_pk_bytes: insert_pk_bytes.clone(),
+                inline_tombstone: inline_tombstone.take(),
                 pending_durable_flips: drained_flips.clone(),
             })
         } else {

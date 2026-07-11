@@ -904,7 +904,7 @@ impl CayenneDeletionSink {
                 .collect(),
         );
         if let Err(error) = self.catalog.add_delete_files(delete_files).await {
-            Self::cleanup_uncommitted_delete_paths(&cleanup_paths).await;
+            super::super::cleanup_uncommitted_delete_paths(&cleanup_guard.0).await;
             cleanup_guard.0.clear();
             return Err(error.into());
         }

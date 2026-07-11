@@ -49,11 +49,12 @@ use super::table::{
     record_cayenne_write_phase,
 };
 
+/// Prepared deletion metadata and process-local visibility state for a staged upsert.
 pub struct PreparedOnConflictDeletionPublish {
     pub(crate) durable_payload: Option<PreparedOnConflictDurablePayload>,
-    cleanup_armed: bool,
-    pending_inline_tombstone_owned: bool,
-    table: CayenneTableProvider,
+    pub(crate) cleanup_armed: bool,
+    pub(crate) pending_inline_tombstone_owned: bool,
+    pub(crate) table: CayenneTableProvider,
     pub(crate) publish_as_protected_snapshot: bool,
     pub(crate) target_snapshot_id: String,
     pub(crate) snapshot_sequence: i64,
@@ -104,6 +105,7 @@ pub(crate) struct PreparedOnConflictDurablePayload {
 }
 
 impl PreparedOnConflictDeletionPublish {
+    /// Return the exact deletion-vector paths owned by abort cleanup.
     pub fn cleanup_paths(&self) -> Vec<std::path::PathBuf> {
         self.durable_payload
             .as_ref()
@@ -116,6 +118,7 @@ impl PreparedOnConflictDeletionPublish {
             })
     }
 
+    /// Mark the durable metadata committed and disarm destructive abort cleanup.
     pub fn mark_catalog_committed(&mut self) {
         self.cleanup_armed = false;
         self.pending_inline_tombstone_owned = false;
@@ -128,19 +131,17 @@ impl PreparedOnConflictDeletionPublish {
     /// deleting staged vectors would be unsafe, but counters and deferred flips
     /// owned by this process must still be restored before the value is dropped.
     pub fn retain_files_for_wal_recovery(&mut self) {
-        if self.pending_inline_tombstone_owned {
-            self.table
-                .pending_inline_tombstones
-                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-            self.pending_inline_tombstone_owned = false;
-        }
-        if let Some(payload) = &mut self.durable_payload
-            && !payload.pending_durable_flips.is_empty()
-        {
-            let mut pending = self.table.pending_durable_tombstone_flips.lock();
-            let mut restored = std::mem::take(&mut payload.pending_durable_flips);
-            restored.append(&mut pending);
-            *pending = restored;
+        if let Some(payload) = self.durable_payload.as_mut() {
+            self.table.restore_aborted_inline_tombstone_bookkeeping(
+                &mut self.pending_inline_tombstone_owned,
+                &mut payload.pending_durable_flips,
+            );
+        } else {
+            let mut no_pending_flips = Vec::new();
+            self.table.restore_aborted_inline_tombstone_bookkeeping(
+                &mut self.pending_inline_tombstone_owned,
+                &mut no_pending_flips,
+            );
         }
         self.cleanup_armed = false;
     }
@@ -173,19 +174,17 @@ impl Drop for PreparedOnConflictDeletionPublish {
         if !self.cleanup_armed {
             return;
         }
-        if self.pending_inline_tombstone_owned {
-            self.table
-                .pending_inline_tombstones
-                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-            self.pending_inline_tombstone_owned = false;
-        }
-        if let Some(payload) = &mut self.durable_payload
-            && !payload.pending_durable_flips.is_empty()
-        {
-            let mut pending = self.table.pending_durable_tombstone_flips.lock();
-            let mut restored = std::mem::take(&mut payload.pending_durable_flips);
-            restored.append(&mut pending);
-            *pending = restored;
+        if let Some(payload) = self.durable_payload.as_mut() {
+            self.table.restore_aborted_inline_tombstone_bookkeeping(
+                &mut self.pending_inline_tombstone_owned,
+                &mut payload.pending_durable_flips,
+            );
+        } else {
+            let mut no_pending_flips = Vec::new();
+            self.table.restore_aborted_inline_tombstone_bookkeeping(
+                &mut self.pending_inline_tombstone_owned,
+                &mut no_pending_flips,
+            );
         }
         let paths = self.cleanup_paths();
         if paths.is_empty() {
@@ -193,7 +192,7 @@ impl Drop for PreparedOnConflictDeletionPublish {
         }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                super::delete::vector_io::cleanup_uncommitted_delete_paths(&paths).await;
+                super::delete::cleanup_uncommitted_delete_paths(&paths).await;
             });
         } else {
             std::thread::spawn(move || {
@@ -442,7 +441,7 @@ impl DeletionSink for InlineAwareDeletionSink {
         let mut prepared_file_delete = self.file_sink.prepare_delete().await?;
         let file_deleted = prepared_file_delete
             .as_ref()
-            .map_or(0, super::delete::sink::PreparedDeletionPublish::deleted_count);
+            .map_or(0, super::delete::PreparedDeletionPublish::deleted_count);
 
         if !inline_rewrite.is_empty() || prepared_file_delete.is_some() {
             let delete_files = prepared_file_delete
@@ -453,7 +452,7 @@ impl DeletionSink for InlineAwareDeletionSink {
                 .metadata_catalog()
                 .commit_delete_files_with_inlined_rewrite(
                     delete_files,
-                    &self.table.table_metadata.table_id,
+                    self.table.table_id(),
                     inline_rewrite.updated_data.clone(),
                     inline_rewrite.deleted_inlined_ids.clone(),
                 )

@@ -491,16 +491,19 @@ impl PreparedStagedAppend {
         self.validated_file_keys = Some(keys);
     }
 
+    /// Publish primary-key digests validated while the staged snapshot was private.
     pub fn publish_validated_file_keys(&self) {
         if let Some(keys) = &self.validated_file_keys {
             self.table.record_file_pk_keys(keys);
         }
     }
 
+    /// Remove and return deferred on-conflict publication state from this receipt.
     pub fn take_prepared_on_conflict(&mut self) -> Option<PreparedOnConflictDeletionPublish> {
         self.prepared_on_conflict.take()
     }
 
+    /// Restore deferred on-conflict state after durable-outcome reconciliation.
     pub fn restore_prepared_on_conflict(
         &mut self,
         prepared: Option<PreparedOnConflictDeletionPublish>,
@@ -550,10 +553,12 @@ impl PreparedStagedAppend {
         self.table.ensure_no_incomplete_write().await
     }
 
+    /// Return the exact manifest prepared for this deferred snapshot.
     pub fn deferred_manifest(&self) -> Option<&[SnapshotFile]> {
         self.deferred_manifest.as_deref()
     }
 
+    /// Build and validate the target snapshot's exact durable manifest.
     pub async fn prepare_deferred_manifest(&mut self) -> Result<()> {
         let source_snapshot_id = self.source_snapshot_id.as_ref().ok_or_else(|| Error::Internal {
             table: self.table.table_name().to_string(),
@@ -659,6 +664,7 @@ impl PreparedStagedAppend {
         Ok(())
     }
 
+    /// Publish prepared on-conflict state while the caller holds the listing fence.
     pub fn publish_on_conflict_under_held_fence(
         &self,
         prepared: PreparedOnConflictDeletionPublish,

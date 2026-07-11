@@ -462,6 +462,7 @@ impl CayenneCatalog {
         Ok(())
     }
 
+    /// Replace one snapshot's exact manifest inside the caller-owned transaction.
     pub async fn replace_snapshot_files_in_txn(
         &self,
         txn: &mut dyn MetastoreTransaction,
