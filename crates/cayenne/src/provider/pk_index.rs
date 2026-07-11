@@ -782,7 +782,7 @@ impl ShardedPkIndex {
                     // one hash lookup per key, and no clone on the (common,
                     // re-touched-PK) present branch.
                     for (digest, key) in keys.iter_with_digest() {
-                        keyset.try_insert_with_digest(digest, key, location.clone(), usize::MAX);
+                        let _ = keyset.try_insert_with_digest(digest, key, location.clone(), usize::MAX);
                     }
                 }
             }
