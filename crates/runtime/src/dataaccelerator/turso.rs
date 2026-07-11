@@ -905,7 +905,7 @@ mod tests {
 
     fn cleanup_turso_test_files(path: &str) {
         let db_path = std::path::Path::new(path);
-        std::fs::remove_file(db_path).ok();
+        let _ = std::fs::remove_file(db_path);
 
         // Remove every sidecar turso/libsql may leave next to the database: the
         // WAL/SHM/journal files (`<name>-wal`, ...) and the MVCC logical log
@@ -930,7 +930,7 @@ mod tests {
                 continue;
             };
             if rest.is_empty() || rest.starts_with('.') || rest.starts_with('-') {
-                std::fs::remove_file(entry.path()).ok();
+                let _ = std::fs::remove_file(entry.path());
             }
         }
     }
