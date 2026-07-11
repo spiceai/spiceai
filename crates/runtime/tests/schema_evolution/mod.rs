@@ -266,9 +266,13 @@ async fn wait_for_checkpoint(
     dataset: &RuntimeDataset,
     timeout_secs: u64,
 ) -> Result<(), anyhow::Error> {
-    let checkpoint = DatasetCheckpoint::try_new(dataset, OpenOption::OpenExisting)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to create checkpoint: {e}"))?;
+    let checkpoint = DatasetCheckpoint::try_new(
+        dataset,
+        dataset.runtime.accelerator_engine_registry(),
+        OpenOption::OpenExisting,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to create checkpoint: {e}"))?;
 
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(timeout_secs);

@@ -27,3 +27,6 @@ tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 winver = "1.0.0"
+
+[lints]
+workspace = true

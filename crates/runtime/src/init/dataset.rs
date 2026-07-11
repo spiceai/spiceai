@@ -53,7 +53,6 @@ use crate::{
 };
 use app::App;
 use datafusion::sql::TableReference;
-#[cfg(any(feature = "duckdb", feature = "sqlite"))]
 use futures::StreamExt;
 use futures::future::join_all;
 use opentelemetry::KeyValue;
@@ -100,7 +99,9 @@ impl Runtime {
             .filter(|ds| init_results.get(&ds.name).is_some_and(Result::is_ok))
             .map(|ds| ds.clone_arc())
             .collect();
-        if let Err(err) = validate_snapshot_paths(initialized_sources).await {
+        if let Err(err) =
+            validate_snapshot_paths(initialized_sources, &self.accelerator_engine_registry).await
+        {
             tracing::error!("{err}");
             return;
         }
@@ -1580,11 +1581,12 @@ impl Runtime {
                     }
                 };
 
-                match accelerator.init(ds.as_ref()).await.context(
-                    AcceleratorInitializationFailedSnafu {
+                match accelerator
+                    .init(ds.as_ref(), Arc::clone(&accelerator_engine_registry))
+                    .await
+                    .context(AcceleratorInitializationFailedSnafu {
                         name: acceleration_settings.engine.to_string(),
-                    },
-                ) {
+                    }) {
                     Ok(bootstrap_status) => {
                         if bootstrap_status.is_bootstrapped() {
                             update_cached_dataset_timestamps(ds.as_ref()).await;
@@ -1612,8 +1614,6 @@ impl Runtime {
         init_results
     }
 
-    /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
-    #[cfg(any(feature = "duckdb", feature = "sqlite"))]
     pub(crate) async fn get_initialized_datasets(
         self: Arc<Self>,
         app: &Arc<App>,

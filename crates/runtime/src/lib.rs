@@ -69,7 +69,6 @@ use llms::rerank::RerankerModelStore;
 use model::{EmbeddingModelStore, LLMChatCompletionsModelStore};
 
 use crate::tools::{Tooling, factory::default_available_catalogs};
-use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use snafu::prelude::*;
 use status::ComponentStatus;
@@ -540,9 +539,6 @@ pub struct Runtime {
     /// diff phase can still read the app `RwLock` without deadlocking.
     apply_app_lock: Arc<tokio::sync::Mutex<()>>,
     df: Arc<DataFusion>,
-    // `Arc<Model>` (not `Model`) so a handle can be cloned out of the lock and
-    // moved into `spawn_blocking` to run synchronous inference off the runtime.
-    models: Arc<RwLock<HashMap<String, Arc<Model>>>>,
     llm_runtime_stores: Arc<model::LlmRuntimeStores>,
     http_rate_control_registry: Arc<dataconnector::http_rate_control::HttpRateControlRegistry>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
@@ -1958,5 +1954,13 @@ pub(crate) fn make_spice_data_sub_directory(directory: &[String]) -> Result<Path
 impl From<http::Error> for Error {
     fn from(err: http::Error) -> Self {
         Error::UnableToStartHttpServer { source: err }
+    }
+}
+
+impl From<runtime_acceleration::AccelerationParseError> for Error {
+    fn from(err: runtime_acceleration::AccelerationParseError) -> Self {
+        Error::InvalidAccelerationConfiguration {
+            source: Box::new(err),
+        }
     }
 }

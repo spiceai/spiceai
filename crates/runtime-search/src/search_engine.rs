@@ -40,7 +40,6 @@ use datafusion::error::DataFusionError;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use datafusion_expr::Expr;
-use datafusion_expr::sqlparser::ast;
 use futures::StreamExt;
 use itertools::Itertools;
 #[cfg(feature = "models")]
@@ -372,7 +371,7 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
     ) -> Result<(VectorSearchResult, CacheStatus)> {
         Ok(if let Some(cache_provider) = cache_provider {
             tracing::trace!("Search cache is enabled");
-            let search_key = SearchKey::from(req.clone());
+            let search_key = SearchKey::from(req);
             let cache_control = request_context.cache_control();
 
             let scoped_user_cache_key =
@@ -484,9 +483,14 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
             let table_primary_keys = get_primary_keys_with_overrides(&self.df, &tables, &self.explicit_primary_keys)
                 .await?;
 
+            // Stringify the WHERE filter once; per-table work only rebinds it to each schema.
+            // `&str` / `&[String]` are `Copy`, so each parallel task can capture them without cloning.
+            let where_filter_sql = where_cond.as_ref().map(ToString::to_string);
+            let where_filter_sql = where_filter_sql.as_deref();
+            let keywords = keywords.as_slice();
+
             // Search for each table is independent, but done in parallel.
             let response: HashMap<TableReference, AggregationResult> = futures::future::try_join_all(tables.into_iter().map(|tbl| {
-                let keywords = keywords.clone();
                 let primary_keys = table_primary_keys.get(&tbl).map_or(&[] as &[String], |v| v.as_slice());
 
                 async move {
@@ -526,7 +530,7 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
                     let agg_result = pipe.run(
                         query.clone(),
                         &tbl,
-                        get_filter_for_table(&self.df, &tbl, where_cond.as_ref()).await?,
+                        get_filter_for_table(&self.df, &tbl, where_filter_sql).await?,
                         table_cols,
                         primary_keys.iter().map(|pk| Column::from_name(pk.clone()) ).collect::<Vec<Column>>(),
                         keywords,
@@ -564,9 +568,9 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
 async fn get_filter_for_table(
     df: &Arc<dyn QueryEngine>,
     tbl: &TableReference,
-    filter_opt: Option<&ast::Expr>,
+    filter_sql: Option<&str>,
 ) -> Result<Option<Expr>, Error> {
-    let Some(filter) = filter_opt else {
+    let Some(filter_sql) = filter_sql else {
         return Ok(None);
     };
 
@@ -579,13 +583,12 @@ async fn get_filter_for_table(
     match df
         .session_context()
         .state()
-        .create_logical_expr(&filter.to_string(), &schema)
+        .create_logical_expr(filter_sql, &schema)
     {
         Ok(f) => Ok(Some(f)),
         Err(e) if is_field_not_found_on_unrelated_table(tbl, &e) => {
             tracing::debug!(
-                "Ignoring SQL filter ('{}') on table {tbl:?} for search request as its columns do not reference this table",
-                filter
+                "Ignoring SQL filter ('{filter_sql}') on table {tbl:?} for search request as its columns do not reference this table"
             );
             Ok(None)
         }

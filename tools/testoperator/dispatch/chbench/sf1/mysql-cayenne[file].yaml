@@ -3,6 +3,6 @@ tests:
     spicepod_path: accelerated/mysql-cayenne[file].yaml
     runner_type: spiceai-dev-large-runners
     scale_factor: 1
-    duration: 600
+    duration: 900
     ready_wait: 60
-    rate: 5000
+    rate: 9250
