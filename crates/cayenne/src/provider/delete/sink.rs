@@ -53,8 +53,8 @@ use super::super::deletion_strategy::{
 };
 use super::super::memory_account::CayenneMemoryAccount;
 use super::super::utils::convert_to_u64_box;
-use super::vector_io::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
 use super::vector_io::DeletionVectorWriteResult;
+use super::vector_io::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
 use crate::catalog::MetadataCatalog;
 use crate::metadata::{DeleteFile, TableMetadata};
 use arc_swap::ArcSwap;
@@ -134,8 +134,7 @@ impl StagedPkDelete {
             }),
             PkDeletionStrategyWithCache::PositionBased { .. } => Err(Error::Internal {
                 table: table_name.to_string(),
-                message: "Primary-key delete staging used with position-based strategy"
-                    .to_string(),
+                message: "Primary-key delete staging used with position-based strategy".to_string(),
             }),
         }
     }
@@ -160,13 +159,13 @@ impl StagedPkDelete {
                     match result.identifiers {
                         DeletionIdentifier::KeyBased(keys) => {
                             for key in keys {
-                                let bytes: [u8; 8] = key.as_ref().try_into().map_err(|_| {
-                                    Error::Internal {
+                                let bytes: [u8; 8] =
+                                    key.as_ref().try_into().map_err(|_| Error::Internal {
                                         table: table_name.to_string(),
-                                        message: "Int64 deletion key did not contain exactly 8 bytes"
-                                            .to_string(),
-                                    }
-                                })?;
+                                        message:
+                                            "Int64 deletion key did not contain exactly 8 bytes"
+                                                .to_string(),
+                                    })?;
                                 new_pks.insert(i64::from_be_bytes(bytes));
                             }
                         }
@@ -330,7 +329,10 @@ impl CayenneDeletionSink {
             .set_deletion_bytes(self.pk_deletion_strategy.approx_resident_bytes());
     }
 
-    fn assigned_delete_sequence(sequence: Option<i64>, table_name: &str) -> super::super::Result<i64> {
+    fn assigned_delete_sequence(
+        sequence: Option<i64>,
+        table_name: &str,
+    ) -> super::super::Result<i64> {
         sequence.ok_or_else(|| Error::Internal {
             table: table_name.to_string(),
             message: "Deletion-vector write completed without assigning a delete sequence"
@@ -353,12 +355,7 @@ impl CayenneDeletionSink {
                 let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
                 for table in tables {
                     let scan_plan = table
-                        .scan(
-                            &ctx.state(),
-                            Some(&self.pk_column_indices),
-                            &[],
-                            None,
-                        )
+                        .scan(&ctx.state(), Some(&self.pk_column_indices), &[], None)
                         .await?;
                     let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
                     while let Some(batch) = stream.next().await {
@@ -394,10 +391,7 @@ impl CayenneDeletionSink {
                         .map(|pk| pk.to_be_bytes().to_vec().into_boxed_slice())
                         .collect();
                     let results = self
-                        .write_key_based_chunk_with_shared_sequence(
-                            row_keys,
-                            &mut delete_sequence,
-                        )
+                        .write_key_based_chunk_with_shared_sequence(row_keys, &mut delete_sequence)
                         .await?;
                     staged.absorb(
                         results,
@@ -425,16 +419,10 @@ impl CayenneDeletionSink {
                 let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
                 for table in tables {
                     let scan_plan = table
-                        .scan(
-                            &ctx.state(),
-                            Some(&self.pk_column_indices),
-                            &[],
-                            None,
-                        )
+                        .scan(&ctx.state(), Some(&self.pk_column_indices), &[], None)
                         .await?;
                     let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
-                    let projected_indices: Vec<usize> =
-                        (0..self.pk_column_indices.len()).collect();
+                    let projected_indices: Vec<usize> = (0..self.pk_column_indices.len()).collect();
                     while let Some(batch) = stream.next().await {
                         let batch = batch?;
                         let pk_columns: Vec<ArrayRef> = projected_indices
@@ -665,10 +653,7 @@ impl CayenneDeletionSink {
                         .map(|pk| pk.to_be_bytes().to_vec().into_boxed_slice())
                         .collect();
                     let results = self
-                        .write_key_based_chunk_with_shared_sequence(
-                            row_keys,
-                            &mut delete_sequence,
-                        )
+                        .write_key_based_chunk_with_shared_sequence(row_keys, &mut delete_sequence)
                         .await?;
                     staged.absorb(
                         results,

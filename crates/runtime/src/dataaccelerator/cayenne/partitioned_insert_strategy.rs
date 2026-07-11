@@ -237,13 +237,9 @@ impl CayennePartitionedInsertStrategy {
             }
 
             if let Some((store, prefix)) = &object_store_location {
-                PartitionedWal::remove_from_object_store(
-                    store.as_ref(),
-                    prefix,
-                    &wal.commit_id,
-                )
-                .await
-                .map_err(DataFusionError::from)?;
+                PartitionedWal::remove_from_object_store(store.as_ref(), prefix, &wal.commit_id)
+                    .await
+                    .map_err(DataFusionError::from)?;
             } else {
                 PartitionedWal::remove(&self.table_root, &wal.commit_id)
                     .await
@@ -929,7 +925,9 @@ impl DataSink for CayennePartitionedAppendSink {
                 } else {
                     PartitionedWal::remove(&self.table_root, &commit_id).await
                 } {
-                    tracing::warn!("Failed to remove top-level WAL after append preparation failure: {cleanup_error}");
+                    tracing::warn!(
+                        "Failed to remove top-level WAL after append preparation failure: {cleanup_error}"
+                    );
                 }
                 drop(fence_guards);
                 for receipt in prepared {
@@ -968,17 +966,15 @@ impl DataSink for CayennePartitionedAppendSink {
             }
             if !rollback_failed
                 && let Err(cleanup_error) = if let Some((store, prefix)) = &object_store_wal {
-                    PartitionedWal::remove_from_object_store(
-                        store.as_ref(),
-                        prefix,
-                        &commit_id,
-                    )
-                    .await
+                    PartitionedWal::remove_from_object_store(store.as_ref(), prefix, &commit_id)
+                        .await
                 } else {
                     PartitionedWal::remove(&self.table_root, &commit_id).await
                 }
             {
-                tracing::warn!("Failed to remove top-level WAL after append rollback: {cleanup_error}");
+                tracing::warn!(
+                    "Failed to remove top-level WAL after append rollback: {cleanup_error}"
+                );
             }
             return Err(error);
         }
@@ -1070,8 +1066,7 @@ impl CayennePartitionedAppendSink {
             match txn.commit().await {
                 Ok(()) => return Ok(()),
                 Err(error)
-                    if attempt < max_attempts
-                        && cayenne::is_retryable_write_conflict(&error) =>
+                    if attempt < max_attempts && cayenne::is_retryable_write_conflict(&error) =>
                 {
                     tokio::time::sleep(turso_shared::retry_backoff_delay(attempt)).await;
                 }
