@@ -235,6 +235,52 @@ run_checks() {
   make build-cli nextest
 }
 
+# After a successful sign-off, the PR's `Attestation` job (pr.yml) only
+# re-evaluates the `signoff` commit status when its workflow run executes. If
+# that run already completed — e.g. sign-off happened after the PR's checks
+# ran — `Attestation` is stuck showing a stale failure until something
+# re-triggers it. Re-run that job instead of making the developer open or
+# refresh the PR by hand. `gh` is already required by require_tools() before
+# cmd_signoff can reach this point, but the check stays here so this function
+# remains correct if it's ever called on its own.
+refresh_attestation_check() {
+  local sha="$1" repo="$2"
+  local fallback="Open/refresh the PR and it will pick up the sign-off."
+  local run run_id run_status run_conclusion
+
+  if ! command -v gh >/dev/null 2>&1; then
+    info "  Install the GitHub CLI (https://cli.github.com) so signoff can auto-refresh the 'Attestation' check."
+    info "  ${fallback}"
+    return 0
+  fi
+
+  run=$(gh run list --repo "$repo" --commit "$sha" --workflow pr.yml --event pull_request \
+    --json databaseId,status,conclusion --jq 'first(.[]) | "\(.databaseId) \(.status) \(.conclusion)"' 2>/dev/null) \
+    || { debug "could not list 'pr' workflow runs for ${sha} on ${repo}"; info "  ${fallback}"; return 0; }
+
+  if [[ -z "$run" ]]; then
+    debug "no 'pr' workflow run found yet for ${sha} — nothing to refresh"
+    info "  ${fallback}"
+    return 0
+  fi
+
+  read -r run_id run_status run_conclusion <<<"$run"
+  if [[ "$run_status" != "completed" ]]; then
+    debug "run ${run_id} is still ${run_status} — it will evaluate the sign-off once it finishes"
+    return 0
+  fi
+  if [[ "$run_conclusion" == "success" ]]; then
+    debug "run ${run_id} already succeeded — nothing to refresh"
+    return 0
+  fi
+
+  if gh run rerun "$run_id" --repo "$repo" --failed >/dev/null 2>&1; then
+    echo "  Re-ran the 'Attestation' check (run ${run_id}) — it will turn green shortly."
+  else
+    info "  Could not auto-refresh the 'Attestation' check — ${fallback}"
+  fi
+}
+
 cmd_signoff() {
   local force=false verify=true
   while [[ $# -gt 0 ]]; do
@@ -273,7 +319,7 @@ cmd_signoff() {
     || fail "failed to post the sign-off status (do you have write access to ${repo}?)"
 
   echo "${OK} Signed off on ${sha:0:12} — ${description}"
-  echo "  Push is already up to date; open/refresh the PR and it will enter the merge queue."
+  refresh_attestation_check "$sha" "$repo"
 }
 
 cmd_status() {
