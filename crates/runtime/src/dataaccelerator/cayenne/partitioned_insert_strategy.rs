@@ -206,13 +206,12 @@ impl CayennePartitionedInsertStrategy {
                         wal.commit_id, entry.table_id
                     ))
                 })?;
-                let provider = by_id.get(entry.table_id.as_str()).ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "Failed to recover partitioned Cayenne commit {}: partition table {} is not open",
-                        wal.commit_id, entry.table_id
-                    ))
-                })?;
-                if provider.current_snapshot_id() == target_snapshot_id {
+                let current_snapshot_id = self
+                    .catalog
+                    .current_snapshot_id_for_table(&entry.table_id)
+                    .await
+                    .map_err(DataFusionError::from)?;
+                if current_snapshot_id == target_snapshot_id {
                     committed += 1;
                 } else {
                     uncommitted += 1;
@@ -229,16 +228,12 @@ impl CayennePartitionedInsertStrategy {
             // here to make convergence explicit and to cover providers that
             // were opened before another participant finished recovery.
             for entry in &wal.partitions {
-                let provider = by_id.get(entry.table_id.as_str()).ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "Failed to recover partitioned Cayenne commit {}: partition table {} disappeared",
-                        wal.commit_id, entry.table_id
-                    ))
-                })?;
-                provider
-                    .recover_incomplete_writes()
-                    .await
-                    .map_err(DataFusionError::from)?;
+                if let Some(provider) = by_id.get(entry.table_id.as_str()) {
+                    provider
+                        .recover_incomplete_writes()
+                        .await
+                        .map_err(DataFusionError::from)?;
+                }
             }
 
             if let Some((store, prefix)) = &object_store_location {

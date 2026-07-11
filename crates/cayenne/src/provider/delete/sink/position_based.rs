@@ -854,17 +854,28 @@ impl CayenneDeletionSink {
         }
 
         let results = writer.write(specs).await?;
-
-        for result in results {
-            self.catalog.add_delete_file(result.delete_file).await?;
-
-            // Validate we received position-based identifiers as expected
+        for result in &results {
             if matches!(&result.identifiers, DeletionIdentifier::KeyBased(_)) {
+                for written in &results {
+                    Self::cleanup_uncommitted_delete_file(&written.delete_file.path).await;
+                }
                 return Err(Error::Internal {
                     table: table_name.clone(),
                     message: "Unexpected key-based deletion in position-based sink".to_string(),
                 });
             }
+        }
+        let delete_files = results
+            .into_iter()
+            .map(|result| result.delete_file)
+            .collect::<Vec<_>>();
+        let cleanup_paths = delete_files
+            .iter()
+            .map(|delete_file| delete_file.path.clone())
+            .collect::<Vec<_>>();
+        if let Err(error) = self.catalog.add_delete_files(delete_files).await {
+            Self::cleanup_uncommitted_delete_paths(&cleanup_paths).await;
+            return Err(error.into());
         }
 
         // Build a fresh snapshot. Cloning the outer HashMap now only clones

@@ -3962,31 +3962,46 @@ impl CayenneTableProvider {
                     table: self.table_name().to_string(),
                     message: "Missing target snapshot object-store prefix".to_string(),
                 })?;
-            let mut objects = config.store.list(Some(&source_prefix));
-            while let Some(meta) = objects.try_next().await.map_err(|source| {
-                Error::ObjectStore {
-                    operation: "list source snapshot for clone",
-                    table: self.table_name().to_string(),
-                    source,
-                }
-            })? {
-                let relative = meta
-                    .location
-                    .as_ref()
-                    .strip_prefix(source_prefix.as_ref())
-                    .ok_or_else(|| Error::Internal {
-                        table: self.table_name().to_string(),
-                        message: "Source snapshot object escaped its prefix".to_string(),
-                    })?;
-                let target = ObjectStorePath::from(format!("{}{relative}", target_prefix.as_ref()));
-                config.store.copy(&meta.location, &target).await.map_err(|source| {
-                    Error::ObjectStore {
-                        operation: "clone snapshot object",
-                        table: self.table_name().to_string(),
+            let store = Arc::clone(&config.store);
+            let table_name = self.table_name().to_string();
+            config
+                .store
+                .list(Some(&source_prefix))
+                .map_err({
+                    let table_name = table_name.clone();
+                    move |source| Error::ObjectStore {
+                        operation: "list source snapshot for clone",
+                        table: table_name.clone(),
                         source,
                     }
-                })?;
-            }
+                })
+                .and_then(|meta| {
+                    let store = Arc::clone(&store);
+                    let table_name = table_name.clone();
+                    let source_prefix = source_prefix.clone();
+                    let target_prefix = target_prefix.clone();
+                    async move {
+                        let relative = meta
+                            .location
+                            .as_ref()
+                            .strip_prefix(source_prefix.as_ref())
+                            .ok_or_else(|| Error::Internal {
+                                table: table_name.clone(),
+                                message: "Source snapshot object escaped its prefix".to_string(),
+                            })?;
+                        let target =
+                            ObjectStorePath::from(format!("{}{relative}", target_prefix.as_ref()));
+                        store.copy(&meta.location, &target).await.map_err(|source| {
+                            Error::ObjectStore {
+                                operation: "clone snapshot object",
+                                table: table_name,
+                                source,
+                            }
+                        })
+                    }
+                })
+                .try_for_each_concurrent(OBJECT_STORE_MOVE_CONCURRENCY, |_| async { Ok(()) })
+                .await?;
             return Ok(());
         }
 

@@ -179,8 +179,6 @@ pub struct DeletionVectorWriteResult {
     pub delete_file: DeleteFile,
     /// The deletion identifiers that were written (position-based or key-based).
     pub identifiers: DeletionIdentifier,
-    /// Filesystem path where the deletion-vector file was written.
-    pub path: PathBuf,
 }
 
 // ============================================================================
@@ -376,7 +374,6 @@ impl<'a> DeletionVectorWriter<'a> {
             results.push(DeletionVectorWriteResult {
                 delete_file,
                 identifiers,
-                path: file_path,
             });
         }
 
@@ -824,7 +821,7 @@ mod tests {
         );
         assert_eq!(result.delete_file.format, DELETION_FILE_FORMAT);
 
-        let file = std::fs::File::open(&result.path).expect("open deletion file");
+        let file = std::fs::File::open(&result.delete_file.path).expect("open deletion file");
         let reader = FileReader::try_new(file, None).expect("create reader");
         let batches: Vec<_> = reader
             .into_iter()

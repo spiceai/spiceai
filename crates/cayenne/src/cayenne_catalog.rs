@@ -294,6 +294,23 @@ impl CayenneCatalog {
         self.metastore.begin_transaction().await
     }
 
+    /// Return the durable current-snapshot pointer for a table ID.
+    ///
+    /// Cross-partition recovery uses this catalog-only lookup before all
+    /// partition providers are necessarily open. The pointer is the global
+    /// commit decision; provider-local state must not be used to infer it.
+    pub async fn current_snapshot_id_for_table(&self, table_id: &str) -> CatalogResult<String> {
+        self.metastore
+            .query_row_helper(
+                QueryRowParams {
+                    sql: "SELECT current_snapshot_id FROM cayenne_table WHERE table_id = ?1",
+                    params: vec![MetastoreValue::Text(table_id.to_string())],
+                },
+                |row| row.get_string(0),
+            )
+            .await
+    }
+
     /// Atomically update the current snapshot pointer for multiple tables and
     /// invalidate statistics derived from the previous snapshots.
     pub async fn set_current_snapshots_in_txn(
@@ -1787,6 +1804,32 @@ impl MetadataCatalog for CayenneCatalog {
                 source: Box::new(e),
             }),
         }
+    }
+
+    async fn add_delete_files(&self, delete_files: Vec<DeleteFile>) -> CatalogResult<()> {
+        if delete_files.is_empty() {
+            return Ok(());
+        }
+        let table_id = delete_files[0].table_id.as_str();
+        for delete_file in &delete_files {
+            if delete_file.table_id != table_id {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "Delete-file table_id '{}' does not match atomic delete table_id '{table_id}'",
+                        delete_file.table_id
+                    ),
+                });
+            }
+        }
+
+        const MAX_PARAMS: usize = 32_000;
+        const PARAMS_PER_ROW: usize = 10;
+        let txn = self.begin_transaction().await?;
+        for chunk in delete_files.chunks(MAX_PARAMS / PARAMS_PER_ROW) {
+            let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
+            txn.execute(ExecuteParams { sql: &sql, params }).await?;
+        }
+        txn.commit().await
     }
 
     async fn get_table_delete_files(&self, table_id: &str) -> CatalogResult<Vec<DeleteFile>> {

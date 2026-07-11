@@ -292,6 +292,10 @@ pub trait MetadataCatalog: Send + Sync {
     /// virtual file (`ListingTable`).
     async fn add_delete_file(&self, delete_file: DeleteFile) -> CatalogResult<String>;
 
+    /// Atomically add every deletion-vector file produced by one logical delete.
+    /// If any row fails validation or insertion, none become visible.
+    async fn add_delete_files(&self, delete_files: Vec<DeleteFile>) -> CatalogResult<()>;
+
     /// Get all active delete files for a table (across all virtual files).
     async fn get_table_delete_files(&self, table_id: &str) -> CatalogResult<Vec<DeleteFile>>;
 
