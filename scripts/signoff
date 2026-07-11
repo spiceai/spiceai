@@ -258,15 +258,17 @@ refresh_attestation_check() {
     --json databaseId,status,conclusion --jq 'first(.[]) | "\(.databaseId) \(.status) \(.conclusion)"' 2>/dev/null) \
     || { debug "could not list 'pr' workflow runs for ${sha} on ${repo}"; info "  ${fallback}"; return 0; }
 
-  if [[ -z "$run" ]]; then
+  read -r run_id run_status run_conclusion <<<"$run"
+  # A missing run renders as an empty string, but an empty `--jq` match can
+  # also render as the literal word "null" for each field — check run_id
+  # looks like a real numeric database id rather than trusting non-emptiness.
+  if [[ ! "$run_id" =~ ^[0-9]+$ ]]; then
     debug "no 'pr' workflow run found yet for ${sha} — nothing to refresh"
     info "  ${fallback}"
     return 0
   fi
-
-  read -r run_id run_status run_conclusion <<<"$run"
   if [[ "$run_status" != "completed" ]]; then
-    debug "run ${run_id} is still ${run_status} — it will evaluate the sign-off once it finishes"
+    info "  The 'Attestation' check (run ${run_id}) is still ${run_status} — it will evaluate the sign-off once it finishes."
     return 0
   fi
   if [[ "$run_conclusion" == "success" ]]; then
