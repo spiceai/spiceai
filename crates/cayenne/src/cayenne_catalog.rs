@@ -417,7 +417,12 @@ impl CayenneCatalog {
         .await?;
         if let Some(tombstone) = &payload.inline_tombstone {
             txn.execute(ExecuteParams {
-                sql: "INSERT INTO cayenne_inlined_delete (inlined_id, table_id, delete_ipc, delete_count, sequence_number, published) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                // An exact replay is a no-op, including an ambiguous-commit
+                // retry after the first transaction actually committed. A
+                // mismatched payload deliberately assigns NULL to the NOT NULL
+                // `table_id` column so the transaction fails instead of
+                // accepting conflicting metadata for the same tombstone ID.
+                sql: "INSERT INTO cayenne_inlined_delete (inlined_id, table_id, delete_ipc, delete_count, sequence_number, published) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(inlined_id) DO UPDATE SET table_id = CASE WHEN cayenne_inlined_delete.table_id = excluded.table_id AND cayenne_inlined_delete.delete_ipc = excluded.delete_ipc AND cayenne_inlined_delete.delete_count = excluded.delete_count AND cayenne_inlined_delete.sequence_number = excluded.sequence_number AND cayenne_inlined_delete.published = excluded.published THEN cayenne_inlined_delete.table_id ELSE NULL END",
                 params: vec![
                     MetastoreValue::Text(tombstone.inlined_id.clone()),
                     MetastoreValue::Text(tombstone.table_id.clone()),
@@ -449,6 +454,17 @@ impl CayenneCatalog {
         snapshot_id: &str,
         files: &[SnapshotFile],
     ) -> CatalogResult<()> {
+        if let Some(file) = files
+            .iter()
+            .find(|file| file.table_id != table_id || file.snapshot_id != snapshot_id)
+        {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: format!(
+                    "Snapshot manifest row does not match target {table_id}/{snapshot_id}: {}/{}",
+                    file.table_id, file.snapshot_id
+                ),
+            });
+        }
         txn.execute(ExecuteParams {
             sql: "DELETE FROM cayenne_snapshot_file WHERE table_id = ?1 AND snapshot_id = ?2",
             params: vec![
@@ -458,14 +474,6 @@ impl CayenneCatalog {
         })
         .await?;
         for file in files {
-            if file.table_id != table_id || file.snapshot_id != snapshot_id {
-                return Err(CatalogError::InvalidOperationNoSource {
-                    message: format!(
-                        "Snapshot manifest row does not match target {table_id}/{snapshot_id}: {}/{}",
-                        file.table_id, file.snapshot_id
-                    ),
-                });
-            }
             txn.execute(ExecuteParams {
                 sql: "INSERT INTO cayenne_snapshot_file (table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence, digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params: vec![
@@ -7227,6 +7235,79 @@ mod tests {
             .expect("Failed to add delete file");
 
         table_id
+    }
+
+    #[tokio::test]
+    async fn test_replace_snapshot_files_rejects_invalid_row_without_mutation() {
+        let test_db = format!(
+            "sqlite://./.test_manifest_replacement_rollback_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("create catalog");
+        catalog.init().await.expect("initialize catalog");
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "manifest_replacement_rollback".to_string(),
+                schema: Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                    "id",
+                    arrow_schema::DataType::Int64,
+                    false,
+                )])),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: "/tmp/cayenne_manifest_rollback".to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("create table");
+        let snapshot_id = catalog
+            .get_table("manifest_replacement_rollback")
+            .await
+            .expect("get table")
+            .current_snapshot_id;
+        let old = SnapshotFile {
+            table_id: table_id.clone(),
+            snapshot_id: snapshot_id.clone(),
+            file_path: "old.vortex".to_string(),
+            row_count: 10,
+            file_size_bytes: 100,
+            min_sequence: 1,
+            max_sequence: 1,
+            digest: None,
+        };
+        catalog
+            .replace_snapshot_files(&table_id, &snapshot_id, std::slice::from_ref(&old))
+            .await
+            .expect("seed old manifest");
+
+        let replacement = vec![
+            SnapshotFile {
+                file_path: "new.vortex".to_string(),
+                ..old.clone()
+            },
+            SnapshotFile {
+                table_id: uuid::Uuid::now_v7().to_string(),
+                file_path: "wrong-table.vortex".to_string(),
+                ..old.clone()
+            },
+        ];
+        catalog
+            .replace_snapshot_files(&table_id, &snapshot_id, &replacement)
+            .await
+            .expect_err("mismatched manifest row must be rejected");
+
+        let manifest = catalog
+            .get_snapshot_files(&table_id, &snapshot_id)
+            .await
+            .expect("read preserved manifest");
+        assert_eq!(manifest.len(), 1);
+        assert_eq!(manifest[0].file_path, old.file_path);
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
     }
 
     #[tokio::test]

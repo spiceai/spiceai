@@ -9356,7 +9356,6 @@ impl CayenneTableProvider {
         &self,
         mut prepared: PreparedOnConflictDeletionPublish,
     ) {
-        let catalog_committed_inline_tombstone = prepared.durable_payload.is_some();
         if let Some(payload) = prepared.durable_payload.as_ref()
             && !payload.pending_durable_flips.is_empty()
         {
@@ -9442,14 +9441,17 @@ impl CayenneTableProvider {
         //     tombstone row and its in-memory entries, see
         //     `clear_inlined_metadata_after_checkpoint`).
         if let Some(inlined_id) = prepared.inlined_delete_id.clone() {
-            if catalog_committed_inline_tombstone {
-                self.inlined_locally_published.lock().remove(&inlined_id);
-            } else {
-                self.inlined_locally_published
-                    .lock()
-                    .insert(inlined_id.clone());
-                self.pending_durable_tombstone_flips.lock().push(inlined_id);
-            }
+            // The shared catalog transaction inserted THIS tombstone as
+            // `published = 0`; committing its row does not activate it. Publish
+            // it locally now, atomically with the replacement snapshot, and
+            // queue the durable flip exactly like the single-partition path.
+            // `payload.pending_durable_flips` above names older tombstones whose
+            // flips were committed by this transaction and is intentionally a
+            // different set.
+            self.inlined_locally_published
+                .lock()
+                .insert(inlined_id.clone());
+            self.pending_durable_tombstone_flips.lock().push(inlined_id);
             if let Some((delete_sequence, int64_pk, row_keys)) = tombstone_removal {
                 self.pending_tombstone_deltas
                     .lock()
