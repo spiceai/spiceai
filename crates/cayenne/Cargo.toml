@@ -112,7 +112,8 @@ datafusion-functions = { workspace = true }
 insta = { workspace = true, features = ["json"] }
 paste.workspace = true
 rstest = "0.26.1"
-# Only for the `pk_key_hashing` bench, to evaluate FxHash for native integer PK keys.
+# For the `pk_key_hashing` bench (FxHash for native integer PK keys) and the
+# `hll_ndv_hashing` bench (FxHash vs XXH3 for NDV sketch value hashing).
 rustc-hash = "2.1.2"
 tempfile = { workspace = true }
 test-framework = { path = "../test-framework" }
@@ -449,6 +450,10 @@ name = "compaction_io_hygiene"
 [[bench]]
 harness = false
 name = "pk_key_hashing"
+
+[[bench]]
+harness = false
+name = "hll_ndv_hashing"
 
 [[bench]]
 harness = false
