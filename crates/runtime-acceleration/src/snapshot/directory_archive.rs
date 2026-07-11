@@ -1234,6 +1234,83 @@ mod tests {
         Ok(())
     }
 
+    /// Regression: setuid/setgid/sticky bits from an archived entry must NOT be
+    /// restored on extract (a malicious snapshot must not drop a setuid binary);
+    /// the ordinary permission bits are preserved.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_extract_strips_setuid_setgid_sticky_bits() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let test_dir = TempDir::new().expect("Failed to create temp dir");
+        // 0o7755 = setuid + setgid + sticky + rwxr-xr-x.
+        let archive_buffer = archive_with_file_mode("data/suid.sh", b"#!/bin/sh\n", 0o7755);
+
+        extract_archive(Cursor::new(archive_buffer), test_dir.path()).await?;
+
+        let full_mode = std::fs::metadata(test_dir.path().join("data/suid.sh"))
+            .expect("extracted file metadata should be readable")
+            .permissions()
+            .mode();
+        assert_eq!(
+            full_mode & 0o7000,
+            0,
+            "setuid/setgid/sticky bits must be stripped on extract"
+        );
+        assert_eq!(
+            full_mode & 0o777,
+            0o755,
+            "ordinary permission bits must be preserved"
+        );
+
+        Ok(())
+    }
+
+    /// Regression: the streaming (never-fully-in-memory) archive/extract APIs
+    /// used for large snapshots must round-trip directory contents and `extras`.
+    #[tokio::test]
+    async fn test_archive_to_file_and_extract_from_file_round_trip() -> Result<()> {
+        let test_dir = TempDir::new().expect("Failed to create temp dir");
+        let data_dir = test_dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("Failed to create data dir");
+        std::fs::write(data_dir.join("file1.vortex"), b"stream data 1").expect("write file1");
+        std::fs::write(data_dir.join("file2.vortex"), b"stream data 2").expect("write file2");
+
+        let archive_path = test_dir.path().join("snapshot.tar");
+        let dirs = vec![(data_dir.clone(), "data/".to_string())];
+        let extras = vec![("meta.json".to_string(), b"{\"v\":1}".to_vec())];
+        let bytes_written =
+            archive_directories_to_file_with_plan(&dirs, &archive_path, &[], &extras).await?;
+        assert!(bytes_written > 0);
+        assert!(archive_path.exists());
+
+        let extract_dir = TempDir::new().expect("Failed to create extract dir");
+        extract_archive_file_with_options(
+            &archive_path,
+            extract_dir.path(),
+            ExtractOptions::default(),
+        )
+        .await?;
+
+        assert_eq!(
+            std::fs::read_to_string(extract_dir.path().join("data/file1.vortex"))
+                .expect("read extracted file1"),
+            "stream data 1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(extract_dir.path().join("data/file2.vortex"))
+                .expect("read extracted file2"),
+            "stream data 2"
+        );
+        assert_eq!(
+            std::fs::read_to_string(extract_dir.path().join("meta.json"))
+                .expect("read extracted extra"),
+            "{\"v\":1}"
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_archive_and_extract() -> Result<()> {
         // Create test directories
