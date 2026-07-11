@@ -1793,16 +1793,62 @@ impl CayenneTableProvider {
             if wal.target_kind == StagingWalTargetKind::ProtectedSnapshot
                 && durable_snapshot != wal.target_snapshot
             {
-                tracing::warn!(
+                // The target is NOT the durable current-snapshot pointer. Whether
+                // it is committed is decided by its durable snapshot sequence
+                // (`cayenne_snapshot_sequence`), NOT the pointer, because the two
+                // protected-snapshot producers commit differently:
+                //
+                //   * A single-table CDC upsert writes its protected target's
+                //     sequence SYNCHRONOUSLY in Stage A — before `write_cdc_append_stream`
+                //     returns and the CDC source offset advances — and its
+                //     writer-free Stage-B publish (`CayenneCdcWrite::finish`) never
+                //     moves the current pointer: the target is a merge-on-read
+                //     OVERLAY layered on the unchanged current snapshot. Such an
+                //     append is COMMITTED. It must be rolled FORWARD, both when a
+                //     crash lands between Stage A and Stage B (recovered at reopen)
+                //     and when the NEXT write's recovery pass finds a finalized
+                //     batch's still-present WAL (Stage B does not remove a
+                //     protected-snapshot WAL). Rolling it back deletes durably
+                //     committed rows — including rows the upsert did NOT supersede.
+                //   * A cross-partition deferred append DEFERS its sequence write
+                //     into the coordinator transaction that also flips every
+                //     partition's pointer, so a crash before that COMMIT leaves no
+                //     durable sequence and the pointer unmoved — genuinely
+                //     uncommitted, and correctly rolled back.
+                //
+                // Durable sequence present => roll FORWARD by falling through to the
+                // move + WAL-removal below. The pointer is deliberately NOT advanced:
+                // `recovered_protected_snapshots` (which drives
+                // `publish_recovered_deferred_snapshot`, and with it `current = target`)
+                // stays gated on `durable_snapshot == target`, reserved for the
+                // pointer-committed cross-partition case. A CDC-upsert overlay's
+                // in-memory visibility is (re)established by the owning `finish()` or,
+                // after a crash, by table-open reloading `protected_snapshots` and
+                // activating orphan inline tombstones — recovery here only makes the
+                // staged files durable in the target dir and clears the WAL.
+                let durably_committed = self
+                    .metadata_catalog()
+                    .get_snapshot_sequence(self.table_id(), &wal.target_snapshot)
+                    .await?
+                    .is_some();
+                if !durably_committed {
+                    tracing::warn!(
+                        table = table_name.as_str(),
+                        target_snapshot = wal.target_snapshot.as_str(),
+                        current_snapshot = durable_snapshot.as_str(),
+                        "Rolling back an uncommitted deferred snapshot append"
+                    );
+                    self.clear_staging_snapshot_dir(&staging_snapshot_id)
+                        .await?;
+                    self.clear_snapshot_dir(&wal.target_snapshot).await?;
+                    continue;
+                }
+                tracing::debug!(
                     table = table_name.as_str(),
                     target_snapshot = wal.target_snapshot.as_str(),
                     current_snapshot = durable_snapshot.as_str(),
-                    "Rolling back an uncommitted deferred snapshot append"
+                    "Recovering a durably-committed protected-snapshot append forward (merge-on-read overlay; current pointer unchanged)"
                 );
-                self.clear_staging_snapshot_dir(&staging_snapshot_id)
-                    .await?;
-                self.clear_snapshot_dir(&wal.target_snapshot).await?;
-                continue;
             }
 
             // Audit: every file the WAL claims must be reachable — either
