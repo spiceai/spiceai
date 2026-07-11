@@ -17,17 +17,9 @@ to a file.
 
 Concretely, the only behavioral change from eager folding is at the inline path
 (`AppendMutationWriter`): its `ColumnStatsAccumulator` is built with
-`new_with_ndv(schema, eager_ndv_on_ingest())`, which is `false` (lazy) by
-default. Min/max/null-count stats are still maintained there; only the per-batch
-NDV hashing is removed from the hot loop.
-
-### Escape hatch: `SPICE_CAYENNE_EAGER_NDV`
-
-`eager_ndv_on_ingest()` reads the `SPICE_CAYENNE_EAGER_NDV` environment variable
-once (truthy = eager); unset/default is lazy. Setting it restores eager inline
-folding — a benchmark/A-B and operational escape hatch, exposed by the HTAP CI
-workflow as the `cayenne_eager_ndv` dispatch input, and expected to be removed
-once lazy is the only path. The resolved mode is logged once.
+`new_with_ndv(schema, false)` — lazy is the only path. Min/max/null-count
+stats are still maintained there; only the per-batch NDV hashing is removed
+from the hot loop.
 
 The table keeps a **single global aggregate sketch**
 (`cayenne_table_statistics.ndv_sketches`), maintained exactly as before — no
@@ -57,6 +49,45 @@ slice** into the per-column accumulator in one autovectorized `max` pass
 `Vec` + `BTreeMap` and doing a second pass — ~16–20× faster at realistic sizes,
 verified register-for-register identical to the prior path. This is the
 write-time aggregate-merge path, so it speeds up NDV persistence on every commit.
+
+## Per-value hashing cost
+
+`ColumnStatsAccumulator::add_column_to_hll` folds every non-null value of every
+NDV-tracked column through `HyperLogLog::add_i128`/`add_bytes`, each hashing one
+value via `hash_index::hash_key_bytes_oneshot` (one-shot XXH3-64) rather than
+constructing a fresh streaming `XxHash3_64` hasher per value. Byte-identical to
+the prior streaming call (pinned by
+`hash_key_bytes_oneshot_matches_streaming` in `hash-index`), so persisted
+sketches are unaffected — this only removes per-value hasher setup cost.
+
+`benches/hll_ndv_hashing.rs` measured (Apple Silicon, `bench` profile,
+1K/100K values per fold, `cargo bench -p cayenne --bench hll_ndv_hashing`):
+
+| shape       | streaming XXH3 | one-shot XXH3 | FxHash      |
+|-------------|---------------:|--------------:|------------:|
+| i128 (1K)   |     30.1 ns/val |    1.21 ns/val |  0.341 ns/val |
+| i128 (100K) |     30.6 ns/val |    1.21 ns/val |  0.351 ns/val |
+| utf8 (1K)   |     26.8 ns/val |    1.23 ns/val |  0.554 ns/val |
+| utf8 (100K) |     26.8 ns/val |    1.33 ns/val |  0.630 ns/val |
+
+One-shot XXH3 is **~21–25× faster** than streaming XXH3. `FxHash` is a further
+**~2.1–3.5× faster than one-shot XXH3** (~45–90× faster than the original
+streaming baseline) but is **not adopted**: it produces different hash values,
+which would desync newly folded sketches from already-persisted ones. The
+serialized blob already carries a `SKETCH_FORMAT_VERSION` byte, checked by
+`parse_columns` — a mismatched version is already treated as "absent" (dropped
+on merge, not read), so switching hash functions is *mechanically* a version
+bump away. But `persist_table_stats_locked` merges each write's fresh sketch
+with the *existing persisted* blob (`merge_serialized`), so a version-mismatched
+existing blob would be silently dropped rather than merged — the persisted NDV
+would reset to just the current write's rows until the next full compaction
+rebuilds it from a live-row rescan (`ColumnStatsAccumulator::new` per
+compaction), the same self-healing property already relied on for deletes.
+Unlike deletes (which only ever over-count — the safe direction), a version-cut
+reset would transiently *under*-count, so adopting a different hash function
+would need an explicit rebuild trigger rather than relying on the natural
+compaction cadence. Not pursued here since one-shot XXH3 already removes the
+dominant cost (hasher construction) while staying value-preserving.
 
 ## Follow-up (separate PR): per-file sketches for deletion tolerance
 
