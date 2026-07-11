@@ -354,8 +354,8 @@ async fn plan_capture_explain_mode_still_replans() -> Result<(), anyhow::Error> 
             let plan_input = format!("EXPLAIN {sql}");
             let plan_input_sql = sql_escape(&plan_input);
             let _ = run_sql(&rt, sql).await?;
-            // Flush writes the sql_query and awaits the Explain re-plan, which
-            // writes the plan row directly (no nested OTel span).
+            // Flush writes the sql_query and spawns the Explain re-plan, which
+            // writes the plan row via TaskSpan::write on the exporter worker.
             let _ = provider.force_flush();
 
             wait_for_count(

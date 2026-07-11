@@ -225,9 +225,7 @@ impl TaskHistoryExporter {
         trace_id.len() == 32 && trace_id.chars().all(|c| c.is_ascii_hexdigit())
     }
 
-    /// Asynchronously captures query plans for spans that meet the threshold.
-    /// This runs on a separate tokio task to avoid blocking the original query.
-    /// The spans passed to this method have already been filtered by the caller.
+    /// Captures query plans for spans that meet the threshold.
     ///
     /// Only used for `TaskHistoryCapturedPlan::Explain` (plan-only, no body
     /// execution). `ExplainAnalyze` is captured at query completion from the
@@ -238,6 +236,9 @@ impl TaskHistoryExporter {
     /// test harness runs export on a dedicated worker thread that does not
     /// see the test's thread-local subscriber, so a tracing-emitted `plan`
     /// span would never reach this exporter.
+    ///
+    /// Called from a `tokio::spawn` after the parent batch is written so
+    /// `EXPLAIN` does not block span export throughput.
     async fn capture_plans_async(
         df: Arc<dyn QueryEngine>,
         spans: Vec<TaskSpan>,
@@ -295,16 +296,19 @@ impl TaskHistoryExporter {
                         .duration_since(start_time)
                         .map_or(0.0, |d| d.as_secs_f64() * 1000.0);
 
-                    let mut labels = HashMap::new();
+                    // Inherit parent correlation (labels, distributed parent,
+                    // client trace override) so Explain re-plan rows stay on
+                    // the same trace / job filters as the sql_query.
+                    let mut labels = span.labels.clone();
                     labels.insert(Arc::from(PLAN_CAPTURE_LABEL), Arc::from("true"));
                     labels.insert(Arc::from("runtime_query"), Arc::from("true"));
 
                     let plan_task = TaskSpan {
                         trace_id: Arc::clone(&span.trace_id),
-                        trace_id_override: None,
+                        trace_id_override: span.trace_id_override.clone(),
                         span_id: Arc::from(format!("{:016x}", rand::random::<u64>())),
                         parent_span_id: Some(Arc::clone(&span.span_id)),
-                        distributed_parent_id: None,
+                        distributed_parent_id: span.distributed_parent_id.clone(),
                         task: Arc::from("plan"),
                         input: Arc::from(explain_query),
                         captured_output: Some(Arc::from(output)),
@@ -528,21 +532,22 @@ impl SpanExporter for TaskHistoryExporter {
                 .await
                 .map_err(|e| OTelSdkError::InternalFailure(e.to_string()))?;
 
-            // Await Explain re-plan and write the plan row directly (see
-            // `capture_plans_async`). Do not `tokio::spawn`: under
-            // `TokioCurrentThread` the worker may not drive the spawn before
-            // the next assertion, and a tracing-emitted child span would be
-            // invisible on the worker thread anyway.
+            // Spawn Explain re-plan so export stays non-blocking. Plan rows are
+            // written via `TaskSpan::write` (not tracing), so the worker thread
+            // does not need the test's thread-local subscriber.
             if !spans_for_plan.is_empty() {
+                let df_clone = Arc::clone(&df);
                 let num_spans = spans_for_plan.len();
-                Self::capture_plans_async(
-                    Arc::clone(&df),
-                    spans_for_plan,
-                    captured_plan,
-                    min_plan_duration_ms,
-                )
-                .await;
-                tracing::trace!("Plan capture completed successfully for {num_spans} queries");
+                tokio::spawn(async move {
+                    Self::capture_plans_async(
+                        df_clone,
+                        spans_for_plan,
+                        captured_plan,
+                        min_plan_duration_ms,
+                    )
+                    .await;
+                    tracing::trace!("Plan capture completed successfully for {num_spans} queries");
+                });
             }
 
             Ok(())
