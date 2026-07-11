@@ -169,6 +169,16 @@ impl PreparedDeletionPublish {
         self.deleted_count
     }
 
+    /// Replace the computed count with the non-authoritative sentinel `0`. Used
+    /// by the CDC `pk IN (...)` fast path: its extracted keys are an upper bound
+    /// (not verified live rows), so returning a real count would require the
+    /// table scan that path deliberately skips. The CDC caller discards the count.
+    #[must_use]
+    pub(crate) fn with_sentinel_count(mut self) -> Self {
+        self.deleted_count = 0;
+        self
+    }
+
     fn cleanup_paths(&self) -> Vec<std::path::PathBuf> {
         self.delete_files
             .iter()
@@ -748,7 +758,9 @@ impl CayenneDeletionSink {
                         Self::assigned_delete_sequence(delete_sequence, table_name)?,
                         table_name,
                     )?;
-                    return self.prepare_staged_pk_deletions(staged).map(Some);
+                    return self
+                        .prepare_staged_pk_deletions(staged)
+                        .map(|prepared| Some(prepared.with_sentinel_count()));
                 }
                 Some(ExtractedPkDeletes::RowKeys(row_keys)) => {
                     tracing::debug!(
@@ -769,7 +781,9 @@ impl CayenneDeletionSink {
                         Self::assigned_delete_sequence(delete_sequence, table_name)?,
                         table_name,
                     )?;
-                    return self.prepare_staged_pk_deletions(staged).map(Some);
+                    return self
+                        .prepare_staged_pk_deletions(staged)
+                        .map(|prepared| Some(prepared.with_sentinel_count()));
                 }
                 None => {}
             }
