@@ -799,18 +799,15 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
                         let mut cfg = make_named_scheduler_config(
                             "test_distributed_acceleration_join_two_partitioned_tables",
                         );
-                        // Limit each executor to 4 partitions (2 per table) so
-                        // that partitions are forced to split across the 2 executors,
-                        // producing a UnionExec in the query plan.
-                        // Note: this is a global limit across all tables, so with
-                        // 2 tables × 4 buckets we need at least 4 per executor.
+                        // Cap global partitions per executor and pace assignment so
+                        // both tables tend to span the 2 executors (UnionExec in
+                        // EXPLAIN). This is a soft nudge — locality scoring can
+                        // still produce uneven per-table splits (e.g. 3+1).
                         cfg.partition_assignment_interval = "1s".to_string();
                         cfg.max_partitions_per_executor = 4;
-                        // This is to avoid:
-                        //  - 4 partitions of tableA -> executor1, then
-                        //  - 4 partitions of tableB -> executor2
-                        //
-                        // We want executor1: 2 partitions of tableA, 2 partitions of tableB. (similar for executor2).
+                        // Avoid assigning an entire table to one executor in a
+                        // single cycle (e.g. 4 of tableA → exec1, then 4 of
+                        // tableB → exec2).
                         cfg.max_partition_assignments_per_interval = 2;
                         cfg
                     }),
@@ -837,6 +834,14 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
                 .partition_store()
                 .expect("scheduler should have partition store");
 
+            // Wait until each table's partitions span ≥2 executors so EXPLAIN
+            // produces a Union of FlightSqlExec (see join_plan snapshot).
+            //
+            // Do not assert an exact 2+2 split: locality scoring prefers stacking
+            // same-table partitions on one executor (+50 vs ≤40 load penalty), so
+            // `max_partitions_per_executor=4` + `max_partition_assignments_per_interval=2`
+            // only *encourage* a multi-executor layout — they do not guarantee
+            // even per-table counts. A 3+1 (or similar) split still yields Union.
             for table_name in ["test_data", "categories"] {
                 let table_ref = datafusion::sql::TableReference::parse_str(table_name);
                 let distributed = crate::utils::wait_until_true(Duration::from_mins(1), || async {
@@ -855,29 +860,40 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
                             {
                                 return false;
                             }
-                            // Match the scheduler config above:
-                            // `max_partitions_per_executor = 4` (global) and
-                            // `max_partition_assignments_per_interval = 2` force
-                            // each table's 4 buckets to land 2+2 across the two
-                            // executors (Union of FlightSqlExec in EXPLAIN).
-                            // Assignment-only is not enough — early allocate can
-                            // park every partition of a table on the first
-                            // executor that finishes bind.
-                            let mut per_executor: std::collections::HashMap<&str, usize> =
-                                std::collections::HashMap::new();
-                            for partition in &m.partitions {
-                                for executor in &partition.assigned_executors {
-                                    *per_executor.entry(executor.as_str()).or_default() += 1;
-                                }
-                            }
-                            per_executor.len() == 2 && per_executor.values().all(|&n| n == 2)
+                            let executors: std::collections::HashSet<&str> = m
+                                .partitions
+                                .iter()
+                                .flat_map(|p| p.assigned_executors.iter().map(String::as_str))
+                                .collect();
+                            executors.len() >= 2
                         })
                 })
                 .await;
+
+                let distribution = {
+                    partition_store.refresh().await.ok();
+                    partition_store
+                        .get_table_metadata(&table_ref)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|m| {
+                            let mut per_executor: std::collections::BTreeMap<String, usize> =
+                                std::collections::BTreeMap::new();
+                            for partition in &m.partitions {
+                                for executor in &partition.assigned_executors {
+                                    *per_executor.entry(executor.clone()).or_default() += 1;
+                                }
+                            }
+                            format!("{per_executor:?}")
+                        })
+                        .unwrap_or_else(|| "<no metadata>".to_string())
+                };
                 assert!(
                     distributed,
-                    "All 4 partitions for {table_name} should be split 2+2 across 2 executors \
-                     (max_partitions_per_executor=4, max_partition_assignments_per_interval=2)"
+                    "All 4 partitions for {table_name} should be assigned across ≥2 executors \
+                     (max_partitions_per_executor=4, max_partition_assignments_per_interval=2); \
+                     got distribution {distribution}"
                 );
             }
 
