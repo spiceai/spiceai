@@ -77,16 +77,38 @@ const DELETION_FILE_EXTENSION: &str = "arrow";
 const DELETION_FILE_FORMAT: &str = "arrow_ipc";
 
 #[cfg(test)]
-static TEST_BLOCK_WRITERS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+#[derive(Debug, Default)]
+struct TestWriterHook {
+    block_writers: std::sync::atomic::AtomicBool,
+    fail_writer_number: AtomicUsize,
+    writers_started: AtomicUsize,
+    writers_completed: AtomicUsize,
+}
+
 #[cfg(test)]
-static TEST_FAIL_WRITER_NUMBER: AtomicUsize = AtomicUsize::new(0);
+struct TestWriterHookGuard(Arc<TestWriterHook>);
+
 #[cfg(test)]
-static TEST_WRITERS_STARTED: AtomicUsize = AtomicUsize::new(0);
+impl TestWriterHookGuard {
+    fn new(fail_writer_number: usize, block_writers: bool) -> Self {
+        let hook = Arc::new(TestWriterHook::default());
+        hook.fail_writer_number
+            .store(fail_writer_number, Ordering::Release);
+        hook.block_writers.store(block_writers, Ordering::Release);
+        Self(hook)
+    }
+
+    fn hook(&self) -> Arc<TestWriterHook> {
+        Arc::clone(&self.0)
+    }
+}
+
 #[cfg(test)]
-static TEST_WRITERS_COMPLETED: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
-static TEST_WRITER_HOOK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+impl Drop for TestWriterHookGuard {
+    fn drop(&mut self) {
+        self.0.block_writers.store(false, Ordering::Release);
+    }
+}
 
 /// Identifies rows for deletion using either position-based IDs or primary key-based keys.
 ///
@@ -203,6 +225,8 @@ pub struct DeletionVectorWriteResult {
 #[derive(Debug)]
 pub struct DeletionVectorWriter<'a> {
     table: &'a TableMetadata,
+    #[cfg(test)]
+    test_hook: Option<Arc<TestWriterHook>>,
 }
 
 struct PendingBatchWrites {
@@ -288,7 +312,19 @@ impl<'a> DeletionVectorWriter<'a> {
     /// Create a new writer bound to the provided table metadata.
     #[must_use]
     pub fn new(table: &'a TableMetadata) -> Self {
-        Self { table }
+        Self {
+            table,
+            #[cfg(test)]
+            test_hook: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_test_hook(table: &'a TableMetadata, test_hook: Arc<TestWriterHook>) -> Self {
+        Self {
+            table,
+            test_hook: Some(test_hook),
+        }
     }
 
     /// Write deletion-vector files for the supplied specifications.
@@ -377,6 +413,8 @@ impl<'a> DeletionVectorWriter<'a> {
             .map(|(spec, file_path)| {
             let mut completion = Some(cleanup_guard.completion());
             let table_name = self.table.table_name.clone();
+            #[cfg(test)]
+            let test_hook = self.test_hook.as_ref().map(Arc::clone);
             async move {
                 let (batch, schema, count, identifiers, source_data_file_path) =
                     match spec.identifiers {
@@ -431,15 +469,25 @@ impl<'a> DeletionVectorWriter<'a> {
                 // decrements the pending count, so cancellation cleanup cannot
                 // wait forever for a writer that was never spawned.
 
-                let file_size_bytes =
-                    write_deletion_file(
-                        &file_path,
-                        Arc::clone(&schema),
-                        batch,
-                        &table_name,
-                        completion.take(),
-                    )
-                    .await?;
+                #[cfg(test)]
+                let file_size_bytes = write_deletion_file(
+                    &file_path,
+                    Arc::clone(&schema),
+                    batch,
+                    &table_name,
+                    completion.take(),
+                    test_hook,
+                )
+                .await?;
+                #[cfg(not(test))]
+                let file_size_bytes = write_deletion_file(
+                    &file_path,
+                    Arc::clone(&schema),
+                    batch,
+                    &table_name,
+                    completion.take(),
+                )
+                .await?;
 
                 Ok::<_, Error>((
                     file_path,
@@ -774,6 +822,7 @@ async fn write_deletion_file(
     batch: RecordBatch,
     table_name: &str,
     completion: Option<PendingWriteCompletion>,
+    #[cfg(test)] test_hook: Option<Arc<TestWriterHook>>,
 ) -> Result<u64> {
     let output_path = file_path.to_path_buf();
     let table_name = table_name.to_string();
@@ -781,13 +830,13 @@ async fn write_deletion_file(
     tokio::task::spawn_blocking(move || -> Result<u64> {
         let _completion = completion;
         #[cfg(test)]
-        {
-            TEST_WRITERS_STARTED.fetch_add(1, Ordering::AcqRel);
-            while TEST_BLOCK_WRITERS.load(Ordering::Acquire) {
+        if let Some(test_hook) = test_hook {
+            test_hook.writers_started.fetch_add(1, Ordering::AcqRel);
+            while test_hook.block_writers.load(Ordering::Acquire) {
                 std::thread::yield_now();
             }
-            if TEST_FAIL_WRITER_NUMBER.load(Ordering::Acquire)
-                == TEST_WRITERS_COMPLETED.fetch_add(1, Ordering::AcqRel) + 1
+            if test_hook.fail_writer_number.load(Ordering::Acquire)
+                == test_hook.writers_completed.fetch_add(1, Ordering::AcqRel) + 1
             {
                 return Err(Error::IoError {
                     source: std::io::Error::other("injected deletion-vector writer failure"),
@@ -1039,13 +1088,10 @@ mod tests {
 
     #[tokio::test]
     async fn later_writer_failure_cleans_every_batch_path() {
-        let _hook_guard = TEST_WRITER_HOOK_LOCK.lock().await;
         let temp_dir = TempDir::new().expect("temp dir");
         let table_metadata = build_table_metadata(&temp_dir);
-        TEST_WRITERS_STARTED.store(0, Ordering::Release);
-        TEST_WRITERS_COMPLETED.store(0, Ordering::Release);
-        TEST_FAIL_WRITER_NUMBER.store(2, Ordering::Release);
-        let writer = DeletionVectorWriter::new(&table_metadata);
+        let test_hook = TestWriterHookGuard::new(2, false);
+        let writer = DeletionVectorWriter::new_with_test_hook(&table_metadata, test_hook.hook());
         writer
             .write(vec![
                 DeletionVectorWriteSpec::new_position_based("first.vortex".to_string(), vec![1]),
@@ -1054,7 +1100,6 @@ mod tests {
             ])
             .await
             .expect_err("injected later writer must fail the logical batch");
-        TEST_FAIL_WRITER_NUMBER.store(0, Ordering::Release);
 
         let deletion_dir = Path::new(&table_metadata.path)
             .join(&table_metadata.current_snapshot_id)
@@ -1068,16 +1113,13 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_waits_for_detached_writers_then_cleans_paths() {
-        let _hook_guard = TEST_WRITER_HOOK_LOCK.lock().await;
         let temp_dir = TempDir::new().expect("temp dir");
         let table_metadata = build_table_metadata(&temp_dir);
-        TEST_WRITERS_STARTED.store(0, Ordering::Release);
-        TEST_WRITERS_COMPLETED.store(0, Ordering::Release);
-        TEST_FAIL_WRITER_NUMBER.store(0, Ordering::Release);
-        TEST_BLOCK_WRITERS.store(true, Ordering::Release);
+        let test_hook = TestWriterHookGuard::new(0, true);
         let metadata = table_metadata.clone();
+        let task_hook = test_hook.hook();
         let task = tokio::spawn(async move {
-            DeletionVectorWriter::new(&metadata)
+            DeletionVectorWriter::new_with_test_hook(&metadata, task_hook)
                 .write(vec![
                     DeletionVectorWriteSpec::new_position_based(
                         "first.vortex".to_string(),
@@ -1091,14 +1133,14 @@ mod tests {
                 .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while TEST_WRITERS_STARTED.load(Ordering::Acquire) < 2 {
+            while test_hook.0.writers_started.load(Ordering::Acquire) < 2 {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .expect("writers should reach the deterministic gate");
         task.abort();
-        TEST_BLOCK_WRITERS.store(false, Ordering::Release);
+        test_hook.0.block_writers.store(false, Ordering::Release);
         let _ = task.await;
 
         let deletion_dir = Path::new(&table_metadata.path)

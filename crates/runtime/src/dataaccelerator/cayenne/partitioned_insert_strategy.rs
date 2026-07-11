@@ -724,6 +724,7 @@ struct CayennePartitionedAppendSink {
     table_root: PathBuf,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum AppendCommitState {
     AllCommitted,
     AllUncommitted,
@@ -731,6 +732,100 @@ enum AppendCommitState {
         committed: usize,
         uncommitted: usize,
     },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AppendCommitFailureDisposition<E> {
+    RecoverCommitted,
+    Rollback,
+    RetainMixed {
+        committed: usize,
+        uncommitted: usize,
+    },
+    RetainUnknown(E),
+}
+
+fn append_commit_failure_disposition<E>(
+    classification: Result<AppendCommitState, E>,
+) -> AppendCommitFailureDisposition<E> {
+    match classification {
+        Ok(AppendCommitState::AllCommitted) => {
+            AppendCommitFailureDisposition::RecoverCommitted
+        }
+        Ok(AppendCommitState::AllUncommitted) => AppendCommitFailureDisposition::Rollback,
+        Ok(AppendCommitState::Mixed {
+            committed,
+            uncommitted,
+        }) => AppendCommitFailureDisposition::RetainMixed {
+            committed,
+            uncommitted,
+        },
+        Err(error) => AppendCommitFailureDisposition::RetainUnknown(error),
+    }
+}
+
+trait AmbiguousCommitReceipt {
+    type OnConflict;
+
+    fn restore_on_conflict(&mut self, prepared: Option<Self::OnConflict>);
+    fn retain_for_wal_recovery(&mut self);
+}
+
+impl AmbiguousCommitReceipt for PreparedStagedAppend {
+    type OnConflict = cayenne::provider::PreparedOnConflictDeletionPublish;
+
+    fn restore_on_conflict(&mut self, prepared: Option<Self::OnConflict>) {
+        self.restore_prepared_on_conflict(prepared);
+    }
+
+    fn retain_for_wal_recovery(&mut self) {
+        self.retain_files_for_wal_recovery();
+    }
+}
+
+fn retain_ambiguous_commit_receipts<R: AmbiguousCommitReceipt>(
+    receipts: &mut [R],
+    prepared_on_conflicts: Vec<Option<R::OnConflict>>,
+) {
+    for (receipt, on_conflict) in receipts.iter_mut().zip(prepared_on_conflicts) {
+        receipt.restore_on_conflict(on_conflict);
+        receipt.retain_for_wal_recovery();
+    }
+}
+
+fn classify_pointer_matches(pointer_matches: impl IntoIterator<Item = bool>) -> AppendCommitState {
+    let mut committed = 0usize;
+    let mut uncommitted = 0usize;
+    for matches_target in pointer_matches {
+        if matches_target {
+            committed += 1;
+        } else {
+            uncommitted += 1;
+        }
+    }
+    if uncommitted == 0 {
+        AppendCommitState::AllCommitted
+    } else if committed == 0 {
+        AppendCommitState::AllUncommitted
+    } else {
+        AppendCommitState::Mixed {
+            committed,
+            uncommitted,
+        }
+    }
+}
+
+fn same_partitioned_wal_backend(
+    first: &Option<cayenne::provider::PartitionedWalObjectStore>,
+    participant: &Option<cayenne::provider::PartitionedWalObjectStore>,
+) -> bool {
+    match (first, participant) {
+        (None, None) => true,
+        (Some((_, first_prefix, first_backend)), Some((_, prefix, backend))) => {
+            first_prefix == prefix && first_backend == backend
+        }
+        _ => false,
+    }
 }
 
 impl std::fmt::Debug for CayennePartitionedAppendSink {
@@ -923,14 +1018,7 @@ impl DataSink for CayennePartitionedAppendSink {
             let participant_wal = participant
                 .partitioned_wal_object_store()
                 .map_err(DataFusionError::from)?;
-            let same_backend = match (&object_store_wal, &participant_wal) {
-                (None, None) => true,
-                (
-                    Some((_, first_prefix, first_backend)),
-                    Some((_, prefix, backend)),
-                ) => first_prefix == prefix && first_backend == backend,
-                _ => false,
-            };
+            let same_backend = same_partitioned_wal_backend(&object_store_wal, &participant_wal);
             if !same_backend {
                 drop(fence_guards);
                 for receipt in prepared {
@@ -1051,8 +1139,8 @@ impl DataSink for CayennePartitionedAppendSink {
                 &prepared,
             )
             .await;
-            match commit_state {
-                Ok(AppendCommitState::AllCommitted) => {
+            match append_commit_failure_disposition(commit_state) {
+                AppendCommitFailureDisposition::RecoverCommitted => {
                     // `COMMIT` can complete but report an ambiguous transport
                     // failure. Durable pointers are the decision: restore each
                     // payload, prove its generated DV paths are in committed
@@ -1060,7 +1148,7 @@ impl DataSink for CayennePartitionedAppendSink {
                     // publish the complete durable state.
                     for (receipt, on_conflict) in prepared
                         .iter_mut()
-                        .zip(prepared_on_conflicts.into_iter())
+                        .zip(prepared_on_conflicts)
                     {
                         receipt.restore_prepared_on_conflict(on_conflict);
                         receipt
@@ -1077,29 +1165,25 @@ impl DataSink for CayennePartitionedAppendSink {
                     }
                     return Err(error);
                 }
-                Ok(AppendCommitState::AllUncommitted) => {}
-                Ok(AppendCommitState::Mixed {
+                AppendCommitFailureDisposition::Rollback => {}
+                AppendCommitFailureDisposition::RetainMixed {
                     committed,
                     uncommitted,
-                }) => {
-                    for (receipt, on_conflict) in
-                        prepared.iter_mut().zip(prepared_on_conflicts)
-                    {
-                        receipt.restore_prepared_on_conflict(on_conflict);
-                        receipt.retain_files_for_wal_recovery();
-                    }
+                } => {
+                    retain_ambiguous_commit_receipts(
+                        &mut prepared,
+                        prepared_on_conflicts,
+                    );
                     drop(fence_guards);
                     return Err(DataFusionError::Execution(format!(
                         "Cross-partition Cayenne commit returned an error and durable catalog pointers are mixed ({committed} committed, {uncommitted} uncommitted); refusing rollback and retaining every WAL for manual recovery"
                     )));
                 }
-                Err(classification_error) => {
-                    for (receipt, on_conflict) in
-                        prepared.iter_mut().zip(prepared_on_conflicts)
-                    {
-                        receipt.restore_prepared_on_conflict(on_conflict);
-                        receipt.retain_files_for_wal_recovery();
-                    }
+                AppendCommitFailureDisposition::RetainUnknown(classification_error) => {
+                    retain_ambiguous_commit_receipts(
+                        &mut prepared,
+                        prepared_on_conflicts,
+                    );
                     drop(fence_guards);
                     return Err(DataFusionError::Execution(format!(
                         "Cross-partition Cayenne commit returned an error and its durable outcome could not be classified ({classification_error}); refusing rollback and retaining every WAL for recovery. Original commit error: {error}"
@@ -1109,7 +1193,7 @@ impl DataSink for CayennePartitionedAppendSink {
             drop(fence_guards);
             for (receipt, on_conflict) in prepared
                 .iter_mut()
-                .zip(prepared_on_conflicts.into_iter())
+                .zip(prepared_on_conflicts)
             {
                 receipt.restore_prepared_on_conflict(on_conflict);
             }
@@ -1141,7 +1225,7 @@ impl DataSink for CayennePartitionedAppendSink {
         for ((receipt, publish_state), prepared_on_conflict) in prepared
             .iter()
             .zip(publish_states)
-            .zip(prepared_on_conflicts.into_iter())
+            .zip(prepared_on_conflicts)
         {
             receipt.publish_deferred_snapshot_under_held_fence(publish_state);
             if let Some(on_conflict) = prepared_on_conflict {
@@ -1214,29 +1298,15 @@ impl CayennePartitionedAppendSink {
         catalog: &CayenneCatalog,
         prepared: &[PreparedStagedAppend],
     ) -> datafusion::common::Result<AppendCommitState> {
-        let mut committed = 0usize;
-        let mut uncommitted = 0usize;
+        let mut pointer_matches = Vec::with_capacity(prepared.len());
         for receipt in prepared {
             let current = catalog
                 .current_snapshot_id_for_table(receipt.table_id())
                 .await
                 .map_err(|error| DataFusionError::External(Box::new(error)))?;
-            if current == receipt.target_snapshot_id() {
-                committed += 1;
-            } else {
-                uncommitted += 1;
-            }
+            pointer_matches.push(current == receipt.target_snapshot_id());
         }
-        if committed == prepared.len() {
-            Ok(AppendCommitState::AllCommitted)
-        } else if uncommitted == prepared.len() {
-            Ok(AppendCommitState::AllUncommitted)
-        } else {
-            Ok(AppendCommitState::Mixed {
-                committed,
-                uncommitted,
-            })
-        }
+        Ok(classify_pointer_matches(pointer_matches))
     }
 
     async fn commit_append_snapshots_in_one_txn(
@@ -1362,5 +1432,132 @@ impl CayennePartitionedAppendSink {
         let provider = Arc::clone(&partition.table_provider);
         partitions_lock.insert(partition_key, partition);
         Ok(provider)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object_store::memory::InMemory;
+    use object_store::path::Path as ObjectStorePath;
+
+    fn memory_store() -> Arc<dyn object_store::ObjectStore> {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        store
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeAmbiguousReceipt {
+        restored: Option<u8>,
+        retained: bool,
+    }
+
+    impl AmbiguousCommitReceipt for FakeAmbiguousReceipt {
+        type OnConflict = u8;
+
+        fn restore_on_conflict(&mut self, prepared: Option<Self::OnConflict>) {
+            self.restored = prepared;
+        }
+
+        fn retain_for_wal_recovery(&mut self) {
+            self.retained = true;
+        }
+    }
+
+    fn object_store_wal(
+        store: Arc<dyn object_store::ObjectStore>,
+        prefix: &str,
+        backend: &str,
+    ) -> cayenne::provider::PartitionedWalObjectStore {
+        (
+            store,
+            ObjectStorePath::from(prefix),
+            backend.to_string(),
+        )
+    }
+
+    #[test]
+    fn classifies_every_durable_pointer_outcome() {
+        assert_eq!(
+            classify_pointer_matches([true, true]),
+            AppendCommitState::AllCommitted
+        );
+        assert_eq!(
+            classify_pointer_matches([false, false]),
+            AppendCommitState::AllUncommitted
+        );
+        assert_eq!(
+            classify_pointer_matches([true, false, true]),
+            AppendCommitState::Mixed {
+                committed: 2,
+                uncommitted: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn maps_mixed_and_unknown_outcomes_to_non_destructive_retention() {
+        assert_eq!(
+            append_commit_failure_disposition::<&str>(Ok(AppendCommitState::Mixed {
+                committed: 1,
+                uncommitted: 2,
+            })),
+            AppendCommitFailureDisposition::RetainMixed {
+                committed: 1,
+                uncommitted: 2,
+            }
+        );
+        assert_eq!(
+            append_commit_failure_disposition::<&str>(Err("catalog unavailable")),
+            AppendCommitFailureDisposition::RetainUnknown("catalog unavailable")
+        );
+    }
+
+    #[test]
+    fn ambiguous_outcomes_restore_payloads_before_retaining_files() {
+        let mut receipts = vec![
+            FakeAmbiguousReceipt::default(),
+            FakeAmbiguousReceipt::default(),
+        ];
+        retain_ambiguous_commit_receipts(&mut receipts, vec![Some(7), None]);
+
+        assert_eq!(receipts[0].restored, Some(7));
+        assert!(receipts[0].retained);
+        assert_eq!(receipts[1].restored, None);
+        assert!(receipts[1].retained);
+    }
+
+    #[test]
+    fn accepts_distinct_handles_for_the_same_wal_backend() {
+        let first = memory_store();
+        let second = memory_store();
+        assert!(!Arc::ptr_eq(&first, &second));
+
+        assert!(same_partitioned_wal_backend(
+            &Some(object_store_wal(first, "shared/table", "s3://bucket")),
+            &Some(object_store_wal(second, "shared/table", "s3://bucket")),
+        ));
+    }
+
+    #[test]
+    fn rejects_same_prefix_on_heterogeneous_wal_backends() {
+        let first = memory_store();
+        let second = memory_store();
+
+        assert!(!same_partitioned_wal_backend(
+            &Some(object_store_wal(first, "shared/table", "s3://bucket-a")),
+            &Some(object_store_wal(second, "shared/table", "s3://bucket-b")),
+        ));
+    }
+
+    #[test]
+    fn rejects_different_prefixes_on_the_same_wal_backend() {
+        let first = memory_store();
+        let second = memory_store();
+
+        assert!(!same_partitioned_wal_backend(
+            &Some(object_store_wal(first, "table-a", "s3://bucket")),
+            &Some(object_store_wal(second, "table-b", "s3://bucket")),
+        ));
     }
 }

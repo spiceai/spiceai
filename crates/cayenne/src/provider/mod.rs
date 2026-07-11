@@ -126,7 +126,7 @@ pub use partitioned_wal::{PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEnt
 pub use query_admission::set_query_admission_governor;
 pub use retention::TimeRetentionFilterBuilder;
 pub use scan::CayenneAccelerationExec;
-pub use staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
+pub use staging_wal::{CayenneStagedAppend, PartitionedWalObjectStore, PreparedStagedAppend};
 pub use on_conflict::PreparedOnConflictDeletionPublish;
 pub use table::{
     CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder,
