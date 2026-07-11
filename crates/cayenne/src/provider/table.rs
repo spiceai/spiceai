@@ -13435,7 +13435,7 @@ impl CayenneTableProvider {
                     // one file's bloom budget, so it graduates into multiple
                     // row-bounded files (each still bloom-backed).
                     tracing::warn!(
-                        target: "cayenne::provider::table",
+                        target: "cayenne::compaction",
                         table = self.table_metadata.table_name.as_str(),
                         cold_file_row_cap = row_cap,
                         bloom_cap_bytes = COLD_PK_BLOOM_PER_FILE_MAX_BYTES,
