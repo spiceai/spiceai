@@ -374,10 +374,25 @@ impl CayenneCatalog {
         let Some(payload) = prepared.durable_payload.as_mut() else {
             return Ok(());
         };
+        Self::apply_prepared_on_conflict_payload_in_txn(
+            txn,
+            payload,
+            &prepared.target_snapshot_id,
+            prepared.snapshot_sequence,
+            prepared.insert_sequence,
+        )
+        .await
+    }
+
+    async fn apply_prepared_on_conflict_payload_in_txn(
+        txn: &mut dyn MetastoreTransaction,
+        payload: &mut crate::provider::on_conflict::PreparedOnConflictDurablePayload,
+        target_snapshot_id: &str,
+        snapshot_sequence: i64,
+        insert_sequence: Option<i64>,
+    ) -> CatalogResult<()> {
         let table_id = payload.table_id.as_str();
-        let reinsert_sequence = prepared
-            .insert_sequence
-            .filter(|_| !payload.insert_pk_bytes.is_empty());
+        let reinsert_sequence = insert_sequence.filter(|_| !payload.insert_pk_bytes.is_empty());
         ensure_reinsert_keys_have_key_based_delete_file(
             table_id,
             &payload.delete_files,
@@ -410,8 +425,8 @@ impl CayenneCatalog {
             sql: "INSERT OR REPLACE INTO cayenne_snapshot_sequence (table_id, snapshot_id, sequence_number) VALUES (?1, ?2, ?3)",
             params: vec![
                 MetastoreValue::Text(table_id.to_string()),
-                MetastoreValue::Text(prepared.target_snapshot_id.clone()),
-                MetastoreValue::Integer(prepared.snapshot_sequence),
+                MetastoreValue::Text(target_snapshot_id.to_string()),
+                MetastoreValue::Integer(snapshot_sequence),
             ],
         })
         .await?;
@@ -6103,6 +6118,194 @@ mod tests {
             1,
             "after the flip the tombstone becomes visible on the published path"
         );
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_apply_prepared_on_conflict_inline_tombstone_replay() {
+        let test_db = format!(
+            "sqlite://./.test_prepared_inline_replay_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "test_prepared_inline_replay".to_string(),
+                schema: Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                    "id",
+                    arrow_schema::DataType::Int64,
+                    false,
+                )])),
+                primary_key: vec!["id".to_string()],
+                on_conflict: None,
+                base_path: "/tmp/cayenne_test".to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("Failed to create table");
+        let target_snapshot_id = uuid::Uuid::now_v7().to_string();
+        let tombstone_id = uuid::Uuid::now_v7().to_string();
+        let mut payload = crate::provider::on_conflict::PreparedOnConflictDurablePayload {
+            table_id: table_id.clone(),
+            delete_files: Vec::new(),
+            insert_pk_bytes: Vec::new(),
+            inline_tombstone: Some(InlinedDelete {
+                inlined_id: tombstone_id.clone(),
+                table_id: table_id.clone(),
+                delete_ipc: vec![1, 2, 3],
+                delete_count: 1,
+                sequence_number: 4,
+                created_at: String::new(),
+                published: false,
+            }),
+            pending_durable_flips: Vec::new(),
+        };
+
+        for _ in 0..2 {
+            let mut txn = catalog
+                .begin_transaction()
+                .await
+                .expect("begin replay transaction");
+            CayenneCatalog::apply_prepared_on_conflict_payload_in_txn(
+                &mut *txn,
+                &mut payload,
+                &target_snapshot_id,
+                5,
+                None,
+            )
+            .await
+            .expect("exact replay should be idempotent");
+            txn.commit().await.expect("commit replay transaction");
+        }
+        let stored = catalog
+            .get_inlined_deletes(&table_id)
+            .await
+            .expect("get replayed tombstone");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].inlined_id, tombstone_id);
+        assert_eq!(stored[0].delete_ipc, vec![1, 2, 3]);
+
+        payload
+            .inline_tombstone
+            .as_mut()
+            .expect("tombstone payload")
+            .delete_ipc = vec![9, 9, 9];
+        let mut txn = catalog
+            .begin_transaction()
+            .await
+            .expect("begin conflicting replay transaction");
+        CayenneCatalog::apply_prepared_on_conflict_payload_in_txn(
+            &mut *txn,
+            &mut payload,
+            &target_snapshot_id,
+            5,
+            None,
+        )
+        .await
+        .expect_err("conflicting replay must fail");
+        txn.rollback()
+            .await
+            .expect("rollback conflicting replay transaction");
+        let stored = catalog
+            .get_inlined_deletes(&table_id)
+            .await
+            .expect("get tombstone after conflicting replay");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].delete_ipc, vec![1, 2, 3]);
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_combined_delete_and_inline_rewrite_rolls_back_on_missing_inline_row() {
+        let test_db = format!(
+            "sqlite://./.test_combined_delete_rewrite_rollback_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "test_combined_delete_rewrite_rollback".to_string(),
+                schema: Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                    "id",
+                    arrow_schema::DataType::Int64,
+                    false,
+                )])),
+                primary_key: vec!["id".to_string()],
+                on_conflict: None,
+                base_path: "/tmp/cayenne_test".to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("Failed to create table");
+        let existing_inline_id = catalog
+            .add_inlined_data(InlinedData {
+                inlined_id: String::new(),
+                table_id: table_id.clone(),
+                partition_key: None,
+                data_ipc: vec![1, 2, 3],
+                record_count: 1,
+                sequence_number: 1,
+                created_at: String::new(),
+            })
+            .await
+            .expect("seed inline row");
+        let delete_file = DeleteFile {
+            delete_file_id: String::new(),
+            table_id: table_id.clone(),
+            source_data_file_path: None,
+            path: "/tmp/combined_delete_rewrite_rollback.arrow".to_string(),
+            path_is_relative: false,
+            format: "arrow".to_string(),
+            delete_count: 1,
+            file_size_bytes: 64,
+            deletion_type: DeletionType::KeyBased,
+            sequence_number: 2,
+            reinsert_sequence: None,
+        };
+        catalog
+            .commit_delete_files_with_inlined_rewrite(
+                vec![delete_file],
+                &table_id,
+                vec![InlinedData {
+                    inlined_id: uuid::Uuid::now_v7().to_string(),
+                    table_id: table_id.clone(),
+                    partition_key: None,
+                    data_ipc: vec![9, 9, 9],
+                    record_count: 1,
+                    sequence_number: 1,
+                    created_at: String::new(),
+                }],
+                Vec::new(),
+            )
+            .await
+            .expect_err("missing inline rewrite target must abort the transaction");
+        assert!(
+            catalog
+                .get_table_delete_files(&table_id)
+                .await
+                .expect("get delete files after rollback")
+                .is_empty(),
+            "delete-file metadata must roll back with the failed inline rewrite"
+        );
+        let stored_inline = catalog
+            .get_inlined_data(&table_id)
+            .await
+            .expect("get inline rows after rollback");
+        assert_eq!(stored_inline.len(), 1);
+        assert_eq!(stored_inline[0].inlined_id, existing_inline_id);
+        assert_eq!(stored_inline[0].data_ipc, vec![1, 2, 3]);
 
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);

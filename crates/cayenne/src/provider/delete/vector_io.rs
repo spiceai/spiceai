@@ -75,6 +75,16 @@ const DELETION_FILE_EXTENSION: &str = "arrow";
 /// File format recorded in the catalog for deletion vectors.
 const DELETION_FILE_FORMAT: &str = "arrow_ipc";
 
+#[cfg(test)]
+static TEST_BLOCK_WRITERS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static TEST_FAIL_WRITER_NUMBER: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_WRITERS_STARTED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_WRITERS_COMPLETED: AtomicUsize = AtomicUsize::new(0);
+
 /// Identifies rows for deletion using either position-based IDs or primary key-based keys.
 ///
 /// # Deletion Strategies
@@ -250,6 +260,22 @@ impl Drop for UncommittedDeleteFilesGuard {
                     }
                 }
                 cleanup_uncommitted_delete_paths(&paths).await;
+            });
+        } else {
+            std::thread::spawn(move || {
+                while pending.remaining.load(Ordering::Acquire) != 0 {
+                    std::thread::yield_now();
+                }
+                for path in paths {
+                    match std::fs::remove_file(path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "Failed to clean uncommitted deletion-vector file"
+                        ),
+                    }
+                }
             });
         }
     }
@@ -751,6 +777,20 @@ async fn write_deletion_file(
 
     tokio::task::spawn_blocking(move || -> Result<u64> {
         let _completion = completion;
+        #[cfg(test)]
+        {
+            TEST_WRITERS_STARTED.fetch_add(1, Ordering::AcqRel);
+            while TEST_BLOCK_WRITERS.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            if TEST_FAIL_WRITER_NUMBER.load(Ordering::Acquire)
+                == TEST_WRITERS_COMPLETED.fetch_add(1, Ordering::AcqRel) + 1
+            {
+                return Err(Error::IoError {
+                    source: std::io::Error::other("injected deletion-vector writer failure"),
+                });
+            }
+        }
         use arrow::ipc::writer::FileWriter;
 
         // Crash-safe write. Ensure the deletion vector file content is durable
@@ -886,6 +926,7 @@ mod tests {
     use arrow::ipc::reader::FileReader;
     use tempfile::TempDir;
 
+
     fn build_table_metadata(temp_dir: &TempDir) -> TableMetadata {
         TableMetadata {
             table_id: "test-table-id".to_string(),
@@ -993,5 +1034,85 @@ mod tests {
             error.to_string().contains("exceeds the supported maximum"),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn later_writer_failure_cleans_every_batch_path() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let table_metadata = build_table_metadata(&temp_dir);
+        TEST_WRITERS_STARTED.store(0, Ordering::Release);
+        TEST_WRITERS_COMPLETED.store(0, Ordering::Release);
+        TEST_FAIL_WRITER_NUMBER.store(2, Ordering::Release);
+        let writer = DeletionVectorWriter::new(&table_metadata);
+        writer
+            .write(vec![
+                DeletionVectorWriteSpec::new_position_based("first.vortex".to_string(), vec![1]),
+                DeletionVectorWriteSpec::new_position_based("second.vortex".to_string(), vec![2]),
+                DeletionVectorWriteSpec::new_position_based("third.vortex".to_string(), vec![3]),
+            ])
+            .await
+            .expect_err("injected later writer must fail the logical batch");
+        TEST_FAIL_WRITER_NUMBER.store(0, Ordering::Release);
+
+        let deletion_dir = Path::new(&table_metadata.path)
+            .join(&table_metadata.current_snapshot_id)
+            .join(DELETION_DIR_NAME);
+        let entries = std::fs::read_dir(&deletion_dir)
+            .expect("read deletion directory after failure")
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("collect deletion directory entries");
+        assert!(entries.is_empty(), "failed batch leaked deletion vectors");
+    }
+
+    #[tokio::test]
+    async fn cancellation_waits_for_detached_writers_then_cleans_paths() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let table_metadata = build_table_metadata(&temp_dir);
+        TEST_WRITERS_STARTED.store(0, Ordering::Release);
+        TEST_WRITERS_COMPLETED.store(0, Ordering::Release);
+        TEST_FAIL_WRITER_NUMBER.store(0, Ordering::Release);
+        TEST_BLOCK_WRITERS.store(true, Ordering::Release);
+        let metadata = table_metadata.clone();
+        let task = tokio::spawn(async move {
+            DeletionVectorWriter::new(&metadata)
+                .write(vec![
+                    DeletionVectorWriteSpec::new_position_based(
+                        "first.vortex".to_string(),
+                        vec![1],
+                    ),
+                    DeletionVectorWriteSpec::new_position_based(
+                        "second.vortex".to_string(),
+                        vec![2],
+                    ),
+                ])
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while TEST_WRITERS_STARTED.load(Ordering::Acquire) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writers should reach the deterministic gate");
+        task.abort();
+        TEST_BLOCK_WRITERS.store(false, Ordering::Release);
+        let _ = task.await;
+
+        let deletion_dir = Path::new(&table_metadata.path)
+            .join(&table_metadata.current_snapshot_id)
+            .join(DELETION_DIR_NAME);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let empty = std::fs::read_dir(&deletion_dir)
+                    .map(|entries| entries.count() == 0)
+                    .unwrap_or(true);
+                if empty {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancellation cleanup should remove every generated path");
     }
 }

@@ -120,6 +120,28 @@ impl PreparedOnConflictDeletionPublish {
         self.cleanup_armed = false;
         self.pending_inline_tombstone_owned = false;
     }
+
+    /// Disarm abort cleanup when recovery proves that an ambiguously completed
+    /// shared transaction committed this payload. Exact path matching is used:
+    /// an unrelated later catalog row must never retain this batch's files.
+    pub(crate) fn mark_catalog_committed_if_paths_match(
+        &mut self,
+        committed_paths: &std::collections::HashSet<String>,
+    ) -> bool {
+        let Some(payload) = self.durable_payload.as_ref() else {
+            return true;
+        };
+        if payload
+            .delete_files
+            .iter()
+            .all(|file| committed_paths.contains(&file.path))
+        {
+            self.mark_catalog_committed();
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl Drop for PreparedOnConflictDeletionPublish {
@@ -148,6 +170,19 @@ impl Drop for PreparedOnConflictDeletionPublish {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 super::delete::vector_io::cleanup_uncommitted_delete_paths(&paths).await;
+            });
+        } else {
+            std::thread::spawn(move || {
+                for path in paths {
+                    match std::fs::remove_file(path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "Failed to clean uncommitted deletion-vector file"
+                        ),
+                    }
+                }
             });
         }
     }

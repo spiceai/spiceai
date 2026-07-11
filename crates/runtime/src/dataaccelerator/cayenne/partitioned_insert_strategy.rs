@@ -724,6 +724,15 @@ struct CayennePartitionedAppendSink {
     table_root: PathBuf,
 }
 
+enum AppendCommitState {
+    AllCommitted,
+    AllUncommitted,
+    Mixed {
+        committed: usize,
+        uncommitted: usize,
+    },
+}
+
 impl std::fmt::Debug for CayennePartitionedAppendSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CayennePartitionedAppendSink")
@@ -910,6 +919,31 @@ impl DataSink for CayennePartitionedAppendSink {
         let object_store_wal = prepared[0]
             .partitioned_wal_object_store()
             .map_err(DataFusionError::from)?;
+        for participant in prepared.iter().skip(1) {
+            let participant_wal = participant
+                .partitioned_wal_object_store()
+                .map_err(DataFusionError::from)?;
+            let same_backend = match (&object_store_wal, &participant_wal) {
+                (None, None) => true,
+                (Some((_, first_prefix)), Some((_, prefix))) => first_prefix == prefix,
+                _ => false,
+            };
+            if !same_backend {
+                drop(fence_guards);
+                for receipt in prepared {
+                    if let Err(error) = receipt.rollback().await {
+                        tracing::warn!(
+                            %error,
+                            "Failed to roll back deferred append after heterogeneous WAL backend validation"
+                        );
+                    }
+                }
+                return Err(DataFusionError::Execution(
+                    "Cannot atomically append across Cayenne partitions configured with different WAL storage backends or prefixes"
+                        .to_string(),
+                ));
+            }
+        }
         let wal_write_result = if let Some((store, prefix)) = &object_store_wal {
             top_level_wal
                 .write_to_object_store(store.as_ref(), prefix)
@@ -988,13 +1022,79 @@ impl DataSink for CayennePartitionedAppendSink {
             fence_guards.push(receipt.lock_listing_fence_write_owned().await);
         }
 
+        // Own the durable commit, every participant publication, and cleanup in
+        // one detached-safe task. Dropping the request future while COMMIT is in
+        // flight only drops this JoinHandle; the task retains the receipts,
+        // deletion-file guards, and listing fences and runs through publication
+        // before releasing them. This closes the ambiguous-COMMIT cancellation
+        // window where a database connection could commit after its caller was
+        // dropped while abort guards unlinked newly-live deletion vectors.
+        let catalog = Arc::clone(&self.catalog);
+        let table_root = self.table_root.clone();
+        let completion = tokio::spawn(async move {
         // The complete post-append contents now exist in one private snapshot
         // per partition. Flip every pointer in a single metastore transaction;
         // readers cannot observe a subset through a fresh directory listing.
-        if let Err(error) = self
-            .commit_append_snapshots_in_one_txn(&prepared, &mut prepared_on_conflicts)
+        if let Err(error) = Self::commit_append_snapshots_in_one_txn(
+            catalog.as_ref(),
+            &prepared,
+            &mut prepared_on_conflicts,
+        )
             .await
         {
+            let commit_state = Self::classify_append_snapshot_pointers(
+                catalog.as_ref(),
+                &prepared,
+            )
+            .await;
+            if matches!(commit_state, Ok(AppendCommitState::AllCommitted)) {
+                // `COMMIT` can complete but report an ambiguous transport
+                // failure. Durable pointers are the decision: restore each
+                // payload, prove its generated DV paths are in committed
+                // metadata, then let the per-partition WAL recovery reload and
+                // publish the complete durable state. Never roll back a target
+                // the catalog now names current.
+                for (receipt, on_conflict) in prepared
+                    .iter_mut()
+                    .zip(prepared_on_conflicts.into_iter())
+                {
+                    receipt.restore_prepared_on_conflict(on_conflict);
+                    receipt
+                        .reconcile_committed_on_conflict_cleanup()
+                        .await
+                        .map_err(DataFusionError::from)?;
+                }
+                drop(fence_guards);
+                for receipt in &prepared {
+                    receipt
+                        .recover_committed_snapshot()
+                        .await
+                        .map_err(DataFusionError::from)?;
+                }
+                return Err(error);
+            }
+            match commit_state {
+                Ok(AppendCommitState::AllUncommitted) => {}
+                Ok(AppendCommitState::Mixed {
+                    committed,
+                    uncommitted,
+                }) => {
+                    drop(fence_guards);
+                    return Err(DataFusionError::Execution(format!(
+                        "Cross-partition Cayenne commit returned an error and durable catalog pointers are mixed ({committed} committed, {uncommitted} uncommitted); refusing rollback and retaining every WAL for manual recovery"
+                    )));
+                }
+                Err(classification_error) => {
+                    drop(fence_guards);
+                    return Err(DataFusionError::Execution(format!(
+                        "Cross-partition Cayenne commit returned an error and its durable outcome could not be classified ({classification_error}); refusing rollback and retaining every WAL for recovery. Original commit error: {error}"
+                    )));
+                }
+                Ok(AppendCommitState::AllCommitted) => {
+                    drop(fence_guards);
+                    return Err(error);
+                }
+            }
             drop(fence_guards);
             for (receipt, on_conflict) in prepared
                 .iter_mut()
@@ -1014,7 +1114,7 @@ impl DataSink for CayennePartitionedAppendSink {
                     PartitionedWal::remove_from_object_store(store.as_ref(), prefix, &commit_id)
                         .await
                 } else {
-                    PartitionedWal::remove(&self.table_root, &commit_id).await
+                    PartitionedWal::remove(&table_root, &commit_id).await
                 }
             {
                 tracing::warn!(
@@ -1060,7 +1160,7 @@ impl DataSink for CayennePartitionedAppendSink {
         let wal_remove_result = if let Some((store, prefix)) = &object_store_wal {
             PartitionedWal::remove_from_object_store(store.as_ref(), prefix, &commit_id).await
         } else {
-            PartitionedWal::remove(&self.table_root, &commit_id).await
+            PartitionedWal::remove(&table_root, &commit_id).await
         };
         if let Err(error) = wal_remove_result {
             tracing::warn!(
@@ -1087,12 +1187,49 @@ impl DataSink for CayennePartitionedAppendSink {
         }
 
         Ok(total_rows)
+        });
+
+        match completion.await {
+            Ok(result) => result,
+            Err(error) => Err(DataFusionError::Execution(format!(
+                "Cayenne cross-partition commit task failed: {error}"
+            ))),
+        }
     }
 }
 
 impl CayennePartitionedAppendSink {
+    async fn classify_append_snapshot_pointers(
+        catalog: &CayenneCatalog,
+        prepared: &[PreparedStagedAppend],
+    ) -> datafusion::common::Result<AppendCommitState> {
+        let mut committed = 0usize;
+        let mut uncommitted = 0usize;
+        for receipt in prepared {
+            let current = catalog
+                .current_snapshot_id_for_table(receipt.table_id())
+                .await
+                .map_err(|error| DataFusionError::External(Box::new(error)))?;
+            if current == receipt.target_snapshot_id() {
+                committed += 1;
+            } else {
+                uncommitted += 1;
+            }
+        }
+        if committed == prepared.len() {
+            Ok(AppendCommitState::AllCommitted)
+        } else if uncommitted == prepared.len() {
+            Ok(AppendCommitState::AllUncommitted)
+        } else {
+            Ok(AppendCommitState::Mixed {
+                committed,
+                uncommitted,
+            })
+        }
+    }
+
     async fn commit_append_snapshots_in_one_txn(
-        &self,
+        catalog: &CayenneCatalog,
         prepared: &[PreparedStagedAppend],
         prepared_on_conflicts: &mut [Option<cayenne::provider::PreparedOnConflictDeletionPublish>],
     ) -> datafusion::common::Result<()> {
@@ -1103,13 +1240,11 @@ impl CayennePartitionedAppendSink {
             .collect();
 
         'attempts: for attempt in 1..=max_attempts {
-            let mut txn = self
-                .catalog
+            let mut txn = catalog
                 .begin_transaction()
                 .await
                 .map_err(|error| DataFusionError::External(Box::new(error)))?;
-            if let Err(error) = self
-                .catalog
+            if let Err(error) = catalog
                 .set_current_snapshots_in_txn(&mut *txn, &snapshots)
                 .await
             {
@@ -1121,8 +1256,7 @@ impl CayennePartitionedAppendSink {
                 return Err(DataFusionError::External(Box::new(error)));
             }
             for on_conflict in prepared_on_conflicts.iter_mut().flatten() {
-                if let Err(error) = self
-                    .catalog
+                if let Err(error) = catalog
                     .apply_prepared_on_conflict_in_txn(&mut *txn, on_conflict)
                     .await
                 {
@@ -1136,8 +1270,7 @@ impl CayennePartitionedAppendSink {
             }
             for receipt in prepared {
                 if let Some(manifest) = receipt.deferred_manifest()
-                    && let Err(error) = self
-                        .catalog
+                    && let Err(error) = catalog
                         .replace_snapshot_files_in_txn(
                             &mut *txn,
                             receipt.table_id(),

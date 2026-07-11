@@ -4209,6 +4209,34 @@ impl CayenneTableProvider {
                             );
                         }
                     });
+                } else {
+                    std::thread::spawn(move || {
+                        let runtime = match tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                        {
+                            Ok(runtime) => runtime,
+                            Err(error) => {
+                                tracing::warn!(
+                                    table = table.table_name(),
+                                    snapshot_id,
+                                    %error,
+                                    "Failed to start cleanup runtime for an incomplete cloned snapshot"
+                                );
+                                return;
+                            }
+                        };
+                        if let Err(error) =
+                            runtime.block_on(table.clear_snapshot_dir(&snapshot_id))
+                        {
+                            tracing::warn!(
+                                table = table.table_name(),
+                                snapshot_id,
+                                %error,
+                                "Failed to clean an incomplete cloned snapshot"
+                            );
+                        }
+                    });
                 }
             }
         }
@@ -16689,14 +16717,35 @@ impl CayenneTableProvider {
         )
         .await
         .map_err(|source| Error::Catalog { source })?;
+        let recovered_inline_tombstones = if fresh_strategy.is_position_based() {
+            0
+        } else {
+            self.catalog
+                .publish_orphan_inlined_deletes(&self.table_metadata.table_id)
+                .await
+                .map_err(|source| Error::Catalog { source })?
+        };
         let prepared = self.prepare_append_snapshot_publish(snapshot_id)?;
 
         let _fence = self.listing_fence.write().await;
         self.pk_deletion_strategy
             .refresh_from(&fresh_strategy, &self.table_metadata.table_name)?;
+        self.refresh_deletion_memory_accounting();
         self.protected_snapshots
             .store(Arc::new(fresh_protected_snapshots));
         self.clear_cached_pk_keyset();
+        if recovered_inline_tombstones > 0 {
+            // The shared catalog transaction committed the replacement and its
+            // inert tombstone, but cancellation prevented the normal local
+            // activation bookkeeping. The durable sweep above made every such
+            // tombstone authoritative, so discard stale process-local queues
+            // and force the next inline read to rebuild from that state.
+            self.inlined_locally_published.lock().clear();
+            self.pending_durable_tombstone_flips.lock().clear();
+            self.pending_tombstone_deltas.lock().drain_through(u64::MAX);
+            self.pending_inline_tombstones.store(0, Ordering::Release);
+            self.bump_inlined_structural_epoch();
+        }
         self.publish_append_snapshot_under_held_fence(prepared);
         Ok(())
     }

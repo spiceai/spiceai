@@ -1079,7 +1079,7 @@ pub struct TursoTransaction {
 impl Drop for TursoTransaction {
     fn drop(&mut self) {
         if let Some(guard) = self.conn.take() {
-            tokio::spawn(async move {
+            let rollback = async move {
                 tracing::debug!(
                     "TursoTransaction dropped without explicit commit or rollback; \
                      attempting auto-rollback"
@@ -1088,7 +1088,19 @@ impl Drop for TursoTransaction {
                     tracing::error!("Failed to auto-rollback TursoTransaction on drop: {err}");
                 }
                 // `guard` is dropped here, releasing the pool slot.
-            });
+            };
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(rollback);
+            } else {
+                std::thread::spawn(move || {
+                    if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        runtime.block_on(rollback);
+                    }
+                });
+            }
         }
     }
 }

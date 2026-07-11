@@ -707,4 +707,76 @@ mod tests {
             .await
             .expect("final key exists after WAL commit");
     }
+
+    #[tokio::test]
+    async fn object_store_read_filters_temporary_and_malformed_wals() {
+        use object_store::PutPayload;
+        use object_store::memory::InMemory;
+        use object_store::path::Path as ObjectStorePath;
+
+        let store = InMemory::new();
+        let base = ObjectStorePath::from("table_root");
+        let wal = sample_wal();
+        wal.write_to_object_store(&store, &base)
+            .await
+            .expect("write valid WAL");
+        let wal_dir = base.clone().join(PARTITIONED_WAL_DIR);
+        store
+            .put(
+                &wal_dir.clone().join("ignored.json.tmp"),
+                PutPayload::from_static(b"{}"),
+            )
+            .await
+            .expect("write temporary object");
+        store
+            .put(
+                &wal_dir.join("malformed.json"),
+                PutPayload::from_static(b"not-json"),
+            )
+            .await
+            .expect("write malformed object");
+
+        let recovered = PartitionedWal::read_all_in_object_store(&store, &base)
+            .await
+            .expect("read object-store WALs");
+        assert_eq!(recovered, vec![wal]);
+    }
+
+    #[tokio::test]
+    async fn object_store_remove_is_idempotent_and_cleans_tmp() {
+        use object_store::PutPayload;
+        use object_store::memory::InMemory;
+        use object_store::path::Path as ObjectStorePath;
+
+        let store = InMemory::new();
+        let base = ObjectStorePath::from("table_root");
+        let wal = sample_wal();
+        let final_key = wal
+            .write_to_object_store(&store, &base)
+            .await
+            .expect("write WAL");
+        let tmp_key = base
+            .clone()
+            .join(PARTITIONED_WAL_DIR)
+            .join(format!("{}.json.tmp", wal.commit_id));
+        store
+            .put(&tmp_key, PutPayload::from_static(b"partial"))
+            .await
+            .expect("restore interrupted temporary object");
+
+        PartitionedWal::remove_from_object_store(&store, &base, &wal.commit_id)
+            .await
+            .expect("remove final and temporary WALs");
+        PartitionedWal::remove_from_object_store(&store, &base, &wal.commit_id)
+            .await
+            .expect("idempotent second removal");
+        assert!(matches!(
+            store.get(&final_key).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+        assert!(matches!(
+            store.get(&tmp_key).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+    }
 }

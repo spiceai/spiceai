@@ -880,6 +880,20 @@ impl CayenneDeletionSink {
                         )
                         .await;
                     });
+                } else {
+                    std::thread::spawn(move || {
+                        for path in paths {
+                            match std::fs::remove_file(path) {
+                                Ok(()) => {}
+                                Err(error)
+                                    if error.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(error) => tracing::warn!(
+                                    %error,
+                                    "Failed to clean uncommitted deletion-vector file"
+                                ),
+                            }
+                        }
+                    });
                 }
             }
         }

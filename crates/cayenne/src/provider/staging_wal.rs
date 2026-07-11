@@ -59,14 +59,13 @@ use super::PartitionedWal;
 use super::Result;
 use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
 use super::on_conflict::{PostValidationState, PreparedOnConflictDeletionPublish};
-use crate::row_converter::OwnedRow;
 use super::table::{CayenneTableProvider, PreparedAppendSnapshotPublish};
 use crate::metastore::MetastoreTransaction;
 use crate::metadata::SnapshotFile;
 use crate::provider::Error;
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::SendableRecordBatchStream;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectStorePath;
 use std::sync::Arc;
@@ -432,7 +431,7 @@ pub struct PreparedStagedAppend {
     ivm_feed_batches: Option<Arc<Vec<RecordBatch>>>,
     prepared_on_conflict: Option<PreparedOnConflictDeletionPublish>,
     deferred_manifest: Option<Vec<SnapshotFile>>,
-    validated_file_keys: Option<std::collections::HashSet<OwnedRow>>,
+    validated_file_keys: Option<super::pk_index::PkDigestSet>,
     append_sequence: Option<i64>,
 }
 
@@ -487,7 +486,7 @@ impl PreparedStagedAppend {
 
     pub(crate) fn set_validated_file_keys(
         &mut self,
-        keys: std::collections::HashSet<OwnedRow>,
+        keys: super::pk_index::PkDigestSet,
     ) {
         self.validated_file_keys = Some(keys);
     }
@@ -507,6 +506,40 @@ impl PreparedStagedAppend {
         prepared: Option<PreparedOnConflictDeletionPublish>,
     ) {
         self.prepared_on_conflict = prepared;
+    }
+
+    /// Resolve abort-cleanup ownership after a cancelled shared commit.
+    /// Recovery calls this only after the durable snapshot pointer proves the
+    /// transaction committed, then verifies every generated delete-file path is
+    /// present in the committed catalog payload before disarming cleanup.
+    pub async fn reconcile_committed_on_conflict_cleanup(&mut self) -> Result<()> {
+        let Some(prepared) = self.prepared_on_conflict.as_mut() else {
+            return Ok(());
+        };
+        let committed_paths = self
+            .table
+            .metadata_catalog()
+            .get_table_delete_files(self.table.table_id())
+            .await?
+            .into_iter()
+            .map(|file| file.path)
+            .collect::<std::collections::HashSet<_>>();
+        if !prepared.mark_catalog_committed_if_paths_match(&committed_paths) {
+            return Err(Error::IncompleteWrite {
+                table: self.table.table_name().to_string(),
+                message: format!(
+                    "Catalog committed deferred snapshot '{}', but its prepared deletion-vector files do not exactly match the committed metadata; retaining cleanup ownership and requiring manual recovery",
+                    self.target_snapshot_id
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Reconcile this receipt's table from its durable staging WAL and catalog
+    /// pointer while the receipt still owns its write guard.
+    pub async fn recover_committed_snapshot(&self) -> Result<()> {
+        self.table.ensure_no_incomplete_write().await
     }
 
     pub fn deferred_manifest(&self) -> Option<&[SnapshotFile]> {
@@ -1121,6 +1154,29 @@ impl CayenneTableProvider {
                             let _ = table.clear_staging_snapshot_dir(&snapshot).await;
                         }
                     });
+                } else {
+                    std::thread::spawn(move || {
+                        let runtime = match tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                        {
+                            Ok(runtime) => runtime,
+                            Err(error) => {
+                                tracing::warn!(
+                                    table = table.table_name(),
+                                    %error,
+                                    "Failed to start cleanup runtime for deferred snapshot setup"
+                                );
+                                return;
+                            }
+                        };
+                        runtime.block_on(async move {
+                            for snapshot in snapshots {
+                                let _ = table.clear_snapshot_dir(&snapshot).await;
+                                let _ = table.clear_staging_snapshot_dir(&snapshot).await;
+                            }
+                        });
+                    });
                 }
             }
         }
@@ -1580,7 +1636,8 @@ impl CayenneTableProvider {
         located_wals
             .sort_by(|left, right| left.staging_snapshot_id.cmp(&right.staging_snapshot_id));
 
-        let mut recovered_visible_any = false;
+        let mut recovered_current_snapshot_any = false;
+        let mut recovered_protected_snapshots = Vec::new();
         for located_wal in located_wals {
             if self.staging_append_is_inflight(&located_wal.staging_snapshot_id) {
                 continue;
@@ -1768,43 +1825,75 @@ impl CayenneTableProvider {
                     });
                 };
 
-                let target_prefix = self
+                let Some(target_prefix) = self
                     .snapshot_object_store_prefix(&wal.target_snapshot)
-                    .ok()
-                    .flatten();
+                    .map_err(|error| Error::IncompleteWrite {
+                        table: table_name.clone(),
+                        message: format!(
+                            "A previous write was interrupted while moving {} file(s) to '{}'. Failed to determine the target S3 prefix for the pre-recovery audit ({error}); refusing automated recovery because file reachability is unknown. Manual resolution is required. The WAL file is located at '{wal_location}'.{extra}",
+                            wal.staged_files.len(),
+                            wal.target_snapshot
+                        ),
+                    })?
+                else {
+                    return Err(Error::IncompleteWrite {
+                        table: table_name.clone(),
+                        message: format!(
+                            "A previous write was interrupted while moving {} file(s) to '{}'. Could not determine the target S3 prefix for the pre-recovery audit; refusing automated recovery because file reachability is unknown. Manual resolution is required. The WAL file is located at '{wal_location}'.{extra}",
+                            wal.staged_files.len(),
+                            wal.target_snapshot
+                        ),
+                    });
+                };
 
                 let mut reachable: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
+                let expected = wal
+                    .staged_files
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<std::collections::HashSet<_>>();
 
-                if let Ok(objects) = config
-                    .store
-                    .list(Some(&staging_prefix))
-                    .try_collect::<Vec<_>>()
-                    .await
-                {
-                    for meta in objects {
-                        if let Some(rel) =
-                            meta.location.as_ref().strip_prefix(staging_prefix.as_ref())
-                            && rel != STAGING_WAL_FILENAME
-                            && rel != STAGING_WAL_TMP_FILENAME
-                        {
-                            reachable.insert(rel.to_string());
+                let mut staging_objects = config.store.list(Some(&staging_prefix));
+                while let Some(meta) = staging_objects.next().await {
+                    let meta = meta.map_err(|error| Error::IncompleteWrite {
+                        table: table_name.clone(),
+                        message: format!(
+                            "A previous write was interrupted while moving {} file(s) to '{}'. Failed to list the S3 staging prefix during the pre-recovery audit ({error}); refusing automated recovery because file reachability is unknown. Manual resolution is required. The WAL file is located at '{wal_location}'.{extra}",
+                            wal.staged_files.len(),
+                            wal.target_snapshot
+                        ),
+                    })?;
+                    if let Some(rel) =
+                        meta.location.as_ref().strip_prefix(staging_prefix.as_ref())
+                        && expected.contains(rel)
+                    {
+                        reachable.insert(rel.to_string());
+                        if reachable.len() == expected.len() {
+                            break;
                         }
                     }
                 }
 
-                if let Some(target_prefix) = &target_prefix
-                    && let Ok(objects) = config
-                        .store
-                        .list(Some(target_prefix))
-                        .try_collect::<Vec<_>>()
-                        .await
-                {
-                    for meta in objects {
+                if reachable.len() != expected.len() {
+                    let mut target_objects = config.store.list(Some(&target_prefix));
+                    while let Some(meta) = target_objects.next().await {
+                        let meta = meta.map_err(|error| Error::IncompleteWrite {
+                            table: table_name.clone(),
+                            message: format!(
+                                "A previous write was interrupted while moving {} file(s) to '{}'. Failed to list the target S3 prefix during the pre-recovery audit ({error}); refusing automated recovery because file reachability is unknown. Manual resolution is required. The WAL file is located at '{wal_location}'.{extra}",
+                                wal.staged_files.len(),
+                                wal.target_snapshot
+                            ),
+                        })?;
                         if let Some(rel) =
                             meta.location.as_ref().strip_prefix(target_prefix.as_ref())
+                            && expected.contains(rel)
                         {
                             reachable.insert(rel.to_string());
+                            if reachable.len() == expected.len() {
+                                break;
+                            }
                         }
                     }
                 }
@@ -1880,10 +1969,14 @@ impl CayenneTableProvider {
                     // append; otherwise a long-lived provider would keep serving
                     // its pre-crash snapshot until reopened.
                     if durable_snapshot == wal.target_snapshot {
-                        if provider_snapshot != wal.target_snapshot {
-                            self.update_current_snapshot_id(&wal.target_snapshot);
+                        match wal.target_kind {
+                            StagingWalTargetKind::CurrentSnapshot => {
+                                recovered_current_snapshot_any = true;
+                            }
+                            StagingWalTargetKind::ProtectedSnapshot => {
+                                recovered_protected_snapshots.push(wal.target_snapshot.clone());
+                            }
                         }
-                        recovered_visible_any = true;
                     }
                 }
                 Err(e) => {
@@ -1906,7 +1999,16 @@ impl CayenneTableProvider {
             }
         }
 
-        if recovered_visible_any {
+        // A protected target became the durable current snapshot in the shared
+        // cross-partition transaction. Rehydrate every catalog-backed
+        // visibility input before publishing the pointer/listing under its
+        // listing fence; a pointer-only refresh would leave stale deletions and
+        // protected-snapshot thresholds after cancellation at COMMIT.
+        for snapshot_id in recovered_protected_snapshots {
+            self.publish_recovered_deferred_snapshot(&snapshot_id)
+                .await?;
+        }
+        if recovered_current_snapshot_any {
             self.publish_current_snapshot_files_changed().await;
         }
 

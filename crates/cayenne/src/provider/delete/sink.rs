@@ -134,6 +134,8 @@ impl Drop for StagedPkDelete {
             runtime.spawn(async move {
                 cleanup_uncommitted_delete_paths(&paths).await;
             });
+        } else {
+            cleanup_uncommitted_delete_paths_blocking(paths);
         }
     }
 }
@@ -234,8 +236,25 @@ impl Drop for PreparedDeletionPublish {
             runtime.spawn(async move {
                 cleanup_uncommitted_delete_paths(&paths).await;
             });
+        } else {
+            cleanup_uncommitted_delete_paths_blocking(paths);
         }
     }
+}
+
+fn cleanup_uncommitted_delete_paths_blocking(paths: Vec<std::path::PathBuf>) {
+    std::thread::spawn(move || {
+        for path in paths {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    %error,
+                    "Failed to clean uncommitted deletion-vector file"
+                ),
+            }
+        }
+    });
 }
 
 impl StagedPkDelete {

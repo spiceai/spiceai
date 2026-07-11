@@ -1522,14 +1522,26 @@ impl Drop for SqliteTransaction {
             // tokio_rusqlite::Connection::call sends a closure to the bg
             // thread; it will execute even after this Drop returns.
             // We spawn a task to await the future properly.
-            tokio::spawn(async move {
+            let rollback = async move {
                 let _ = conn
                     .call(|conn| {
                         let _ = conn.execute_batch("ROLLBACK");
                         Ok::<_, rusqlite::Error>(())
                     })
                     .await;
-            });
+            };
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(rollback);
+            } else {
+                std::thread::spawn(move || {
+                    if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        runtime.block_on(rollback);
+                    }
+                });
+            }
         }
     }
 }
