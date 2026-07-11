@@ -436,13 +436,34 @@ impl PostgresSchemaProvider {
             .await
             .context(ConnectionFailedSnafu)?;
 
+        // A declaratively-partitioned parent (relkind 'p') and every one of its
+        // leaf partitions (relkind 'r') all appear in `information_schema.tables`
+        // as `BASE TABLE`. Registering both the parent and its children would
+        // double-count the data (the parent is a union over its children) and
+        // clutter the catalog for tables with many partitions (#11726). It would
+        // also diverge from how the CDC path treats these tables: Spice publishes
+        // partitioned-table changes under the parent relation
+        // (`publish_via_partition_root = true`, see `postgres_replication::slot`),
+        // so the parent is the coherent unit either way. We therefore exclude any
+        // relation that is a child in `pg_inherits` (covering both declarative
+        // partitions and legacy table inheritance) and keep only the parent. The
+        // `pg_inherits` catalog exists on every supported PostgreSQL version and
+        // on Redshift (where it is empty), so this degrades to the prior
+        // behaviour on engines without partitioning.
         let rows = conn
             .conn
             .query(
-                "SELECT table_name FROM information_schema.tables \
-                 WHERE table_schema = $1 \
-                 AND table_type IN ('BASE TABLE', 'VIEW') \
-                 ORDER BY table_name",
+                "SELECT t.table_name FROM information_schema.tables t \
+                 WHERE t.table_schema = $1 \
+                 AND t.table_type IN ('BASE TABLE', 'VIEW') \
+                 AND NOT EXISTS ( \
+                     SELECT 1 FROM pg_catalog.pg_inherits inh \
+                     JOIN pg_catalog.pg_class child ON child.oid = inh.inhrelid \
+                     JOIN pg_catalog.pg_namespace ns ON ns.oid = child.relnamespace \
+                     WHERE ns.nspname = t.table_schema \
+                     AND child.relname = t.table_name \
+                 ) \
+                 ORDER BY t.table_name",
                 &[&self.schema_name],
             )
             .await
