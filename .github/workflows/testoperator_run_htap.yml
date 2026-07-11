@@ -386,12 +386,13 @@ jobs:
         if: always() && contains(github.event.inputs.spicepod_path, '-cold')
         run: |
           if command -v mc >/dev/null 2>&1; then
-            # Non-fatal: mc prints its own diagnostics (empty prefix, or an auth/endpoint failure) to
-            # the log, but a cleanup miss must never fail the benchmark run. No success/"already clean"
-            # message here, so a real mc failure is not misreported.
+            # Non-fatal: a cleanup miss must never fail the benchmark run, so every mc call is guarded
+            # with `|| true`. We print a one-line size/count summary per prefix (mc du) before deleting.
             for prefix in cayenne-cold-sf1000 cayenne-cold-sf10; do
-              echo "Removing datalake objects under spice-minio/benchmarks/${prefix}/ (best-effort; an empty prefix is expected when no promotion ran) ..."
-              mc rm --recursive --force "spice-minio/benchmarks/${prefix}/" || true
+              target="spice-minio/benchmarks/${prefix}/"
+              summary=$(mc du "${target}" 2>/dev/null || true)
+              echo "Cleaning ${target} — ${summary:-empty (no promotion ran)}"
+              mc rm --recursive --force "${target}" >/dev/null 2>&1 || true
             done
           else
             echo "mc client not found; skipping datalake-tier S3 cleanup."
