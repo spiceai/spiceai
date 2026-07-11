@@ -14,19 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::parameters::ParameterSpec;
+use runtime_parameters::TypedParams;
+use secrecy::SecretString;
 
-const HF_PARAM_LEN: usize = 3;
+use super::Pooling;
 
-pub const PARAMETERS: &[ParameterSpec] = &HF_PARAMETERS;
-
-pub(crate) const HF_PARAMETERS: [ParameterSpec; HF_PARAM_LEN] = [
-    ParameterSpec::component("hf_token")
-        .secret()
-        .description("The Hugging Face access token."),
-    ParameterSpec::runtime("pooling")
-        .description("The pooling strategy for the embedding model.")
-        .one_of(&["cls", "mean", "splade"]),
-    ParameterSpec::runtime("max_seq_length")
-        .description("The maximum sequence length for the embedding model."),
-];
+/// Parameters for `from: huggingface` embedding models.
+#[derive(TypedParams)]
+#[params(prefix = "huggingface")]
+pub struct HuggingFaceEmbeddingParams {
+    /// The Hugging Face access token.
+    #[param(secret)]
+    pub hf_token: Option<SecretString>,
+    /// The pooling strategy for the embedding model.
+    #[param(runtime)]
+    pub pooling: Option<Pooling>,
+    /// The maximum sequence length for the embedding model.
+    #[param(runtime)]
+    pub max_seq_length: Option<usize>,
+}

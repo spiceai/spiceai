@@ -14,23 +14,24 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::parameters::ParameterSpec;
+use runtime_parameters::TypedParams;
+use secrecy::SecretString;
 
-const AZURE_PARAM_LEN: usize = 5;
-
-pub const PARAMETERS: &[ParameterSpec] = &AZURE_PARAMETERS;
-
-pub(crate) const AZURE_PARAMETERS: [ParameterSpec; AZURE_PARAM_LEN] = [
-    ParameterSpec::runtime("endpoint").description(
-        "The Azure OpenAI resource endpoint, e.g., https://resource-name.openai.azure.com.",
-    ),
-    ParameterSpec::component("api_version")
-        .description("The API version used for the Azure OpenAI service."),
-    ParameterSpec::component("deployment_name").description("The name of the model deployment."),
-    ParameterSpec::component("api_key")
-        .secret()
-        .description("The Azure OpenAI API key."),
-    ParameterSpec::component("entra_token")
-        .secret()
-        .description("The Azure Entra token for authentication."),
-];
+/// Parameters for `from: azure` embedding models.
+#[derive(TypedParams)]
+#[params(prefix = "azure")]
+pub struct AzureEmbeddingParams {
+    /// The Azure OpenAI resource endpoint, e.g., <https://resource-name.openai.azure.com>.
+    #[param(runtime)]
+    pub endpoint: Option<String>,
+    /// The API version used for the Azure OpenAI service.
+    pub api_version: Option<String>,
+    /// The name of the model deployment.
+    pub deployment_name: Option<String>,
+    /// The Azure OpenAI API key.
+    #[param(secret)]
+    pub api_key: Option<SecretString>,
+    /// The Azure Entra token for authentication.
+    #[param(secret)]
+    pub entra_token: Option<SecretString>,
+}

@@ -189,6 +189,13 @@ impl Secrets {
         Self { stores }
     }
 
+    /// Registers a single secret store under the given name, appended at the
+    /// end of the precedence order. Primarily useful for wiring fake stores in
+    /// tests without touching process environment variables.
+    pub fn register_store(&mut self, name: impl Into<String>, store: Arc<dyn SecretStore>) {
+        self.stores.insert(name.into(), store);
+    }
+
     /// Initializes the runtime secrets based on the provided secret store configuration.
     ///
     /// If no secret stores are provided — or none of the configured stores

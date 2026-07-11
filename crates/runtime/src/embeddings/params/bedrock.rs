@@ -14,22 +14,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::parameters::ParameterSpec;
+use llms::bedrock::embed::{cohere::CohereEmbeddingInputType, nova::NovaEmbeddingPurpose};
+use runtime_parameters::TypedParams;
 
-const BEDROCK_PARAM_LEN: usize = 5;
-
-pub const PARAMETERS: &[ParameterSpec] = &BEDROCK_PARAMETERS;
-
-pub(crate) const BEDROCK_PARAMETERS: [ParameterSpec; BEDROCK_PARAM_LEN] = [
-    ParameterSpec::component("dimensions")
-        .description("The number of dimensions for the embedding output."),
-    ParameterSpec::component("normalize")
-        .description("Whether to normalize the embedding output.")
-        .one_of(&["true", "false"]),
-    ParameterSpec::component("truncate_mode")
-        .description("Truncation mode for input text that exceeds the model's token limit."),
-    ParameterSpec::component("input_type")
-        .description("The input type for Cohere embedding models."),
-    ParameterSpec::component("embedding_purpose")
-        .description("The embedding purpose for Nova multimodal embedding models."),
-];
+/// Parameters for `from: bedrock` embedding models.
+///
+/// `truncate_mode` stays a string here because it targets a different enum per
+/// model family (`CohereEmbeddingTruncate` vs `NovaTruncationMode`); it is
+/// parsed once the model id is known.
+#[derive(TypedParams)]
+#[params(prefix = "bedrock")]
+pub struct BedrockEmbeddingParams {
+    /// The number of dimensions for the embedding output.
+    pub dimensions: Option<u32>,
+    /// Whether to normalize the embedding output.
+    pub normalize: Option<bool>,
+    /// Truncation mode for input text that exceeds the model's token limit.
+    pub truncate_mode: Option<String>,
+    /// The input type for Cohere embedding models.
+    pub input_type: Option<CohereEmbeddingInputType>,
+    /// The embedding purpose for Nova multimodal embedding models.
+    pub embedding_purpose: Option<NovaEmbeddingPurpose>,
+}

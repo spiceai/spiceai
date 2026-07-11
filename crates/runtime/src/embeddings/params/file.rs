@@ -14,16 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::parameters::ParameterSpec;
+use runtime_parameters::TypedParams;
 
-const FILE_PARAM_LEN: usize = 2;
+use super::Pooling;
 
-pub const PARAMETERS: &[ParameterSpec] = &FILE_PARAMETERS;
-
-pub(crate) const FILE_PARAMETERS: [ParameterSpec; FILE_PARAM_LEN] = [
-    ParameterSpec::runtime("pooling")
-        .description("The pooling strategy for the embedding model.")
-        .one_of(&["cls", "mean", "splade"]),
-    ParameterSpec::runtime("max_seq_length")
-        .description("The maximum sequence length for the embedding model."),
-];
+/// Parameters for `from: file` embedding models.
+#[derive(TypedParams)]
+#[params(prefix = "file")]
+pub struct FileEmbeddingParams {
+    /// The pooling strategy for the embedding model.
+    #[param(runtime)]
+    pub pooling: Option<Pooling>,
+    /// The maximum sequence length for the embedding model.
+    #[param(runtime)]
+    pub max_seq_length: Option<usize>,
+}

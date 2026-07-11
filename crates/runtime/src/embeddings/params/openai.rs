@@ -14,23 +14,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::parameters::ParameterSpec;
+use llms::openai::UsageTier;
+use runtime_parameters::TypedParams;
+use secrecy::SecretString;
 
-const OPENAI_PARAM_LEN: usize = 5;
-
-pub const PARAMETERS: &[ParameterSpec] = &OPENAI_PARAMETERS;
-
-pub(crate) const OPENAI_PARAMETERS: [ParameterSpec; OPENAI_PARAM_LEN] = [
-    ParameterSpec::runtime("endpoint")
-        .description("The OpenAI API base endpoint.")
-        .default("https://api.openai.com/v1"),
-    ParameterSpec::component("api_key")
-        .secret()
-        .description("The OpenAI API key."),
-    ParameterSpec::component("org_id").description("The OpenAI organization ID."),
-    ParameterSpec::component("project_id").description("The OpenAI project ID."),
-    ParameterSpec::component("usage_tier")
-        .description("The current usage tier for the OpenAI account: 'free', 'tier1'-'tier5'.")
-        .one_of(&["free", "tier1", "tier2", "tier3", "tier4", "tier5"])
-        .default("tier1"),
-];
+/// Parameters for `from: openai` embedding models.
+#[derive(TypedParams)]
+#[params(prefix = "openai")]
+pub struct OpenAiEmbeddingParams {
+    /// The OpenAI API base endpoint.
+    #[param(runtime, default = "https://api.openai.com/v1")]
+    pub endpoint: String,
+    /// The OpenAI API key.
+    #[param(secret)]
+    pub api_key: Option<SecretString>,
+    /// The OpenAI organization ID.
+    pub org_id: Option<String>,
+    /// The OpenAI project ID.
+    pub project_id: Option<String>,
+    /// The current usage tier for the OpenAI account: 'free', 'tier1'-'tier5'.
+    #[param(default = "tier1")]
+    pub usage_tier: UsageTier,
+}
