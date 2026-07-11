@@ -60,12 +60,15 @@ review — lets a maintainer add the PR to the merge queue.
 
 The sign-off is normally bound to the **exact commit** you pushed. If you push a
 code change, the old sign-off no longer applies and you must run `make signoff`
-again. The only exception is merging the PR's current base branch: when `HEAD`
-is exactly Git's conflict-free automatic merge result, **Attestation** accepts
-the sign-off on the first parent. A conflict resolution, amended merge, octopus
-merge, or merge of an outdated base commit still requires a new sign-off.
-`scripts/signoff status` reports only a commit's own status; the inheritance check
-runs in the PR's **Attestation** workflow.
+again. The only exception is merging the PR's base branch. **Attestation** walks
+up to 100 successive merge commits on the first-parent chain to find a sign-off.
+`HEAD` must merge the current base commit, each older merged base must appear in
+order on the current base branch's first-parent history, and every merge tree
+must exactly match Git's conflict-free automatic result. A conflict resolution,
+amended merge, octopus merge, or merge from another branch still requires a new
+sign-off.
+`scripts/signoff status` reports only a commit's own status; the inheritance
+check runs in the PR's **Attestation** workflow.
 
 Options:
 
@@ -102,10 +105,10 @@ path, so existing Git behavior is unchanged.
 ### "No developer sign-off found for &lt;sha&gt;"
 
 The Attestation check couldn't find an applicable green `signoff` status. It
-checks the PR's head commit first, then its first parent only when `HEAD` is an
-unmodified, conflict-free merge of the PR's current base commit. Make sure the
-commit under review is pushed, then run `make signoff` again. Any new code or
-manual merge resolution needs a fresh sign-off.
+checks the PR's head commit first, then walks backward through clean, unmodified
+base merges on the first-parent chain. Make sure the commit under review is
+pushed, then run `make signoff` again. Any new code or manual merge resolution
+needs a fresh sign-off.
 
 ### External contributors (forks)
 

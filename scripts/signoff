@@ -417,8 +417,8 @@ Maintainers:
 
 The sign-off is a '${STATUS_CONTEXT}' commit status bound to the exact commit you
 pushed. Sign off again after any code change or manual conflict resolution. The
-Attestation check can carry a sign-off across one unmodified, conflict-free merge
-of the PR's current base commit. The full test suite runs in the merge queue.
+Attestation check can carry a sign-off across a first-parent chain of unmodified,
+conflict-free base merges. The full test suite runs in the merge queue.
 EOF
 }
 

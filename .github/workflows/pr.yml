@@ -56,9 +56,9 @@ env:
 jobs:
   # On a pull request this is the ONLY job that runs. It validates the developer
   # sign-off — the `signoff` commit status posted by `make signoff` — for the PR's
-  # head commit. It can also inherit the first parent's sign-off when HEAD is an
-  # unmodified, conflict-free merge of the current base commit. A green
-  # Attestation (plus review) is what lets the PR into the merge queue, where the
+  # head commit. It can also walk through clean, unmodified base-merge commits
+  # on the first-parent chain to find an earlier sign-off. A green Attestation
+  # (plus review) is what lets the PR into the merge queue, where the
   # heavy jobs below and the other workflows run the full suite. This is what
   # replaces running all checks on every PR push.
   attestation:
@@ -81,6 +81,7 @@ jobs:
             const repo = context.repo.repo;
             const headSha = context.payload.pull_request.head.sha;
             const baseSha = context.payload.pull_request.base.sha;
+            const maxInheritedMerges = 100;
 
             // 'signoff' matches the hardcoded STATUS_CONTEXT in scripts/signoff.
             async function successfulSignoff(sha) {
@@ -93,55 +94,70 @@ jobs:
               return signoff?.state === 'success' ? signoff : undefined;
             }
 
-            const headSignoff = await successfulSignoff(headSha);
-            if (headSignoff) {
-              core.notice(
-                `Signed off by ${headSignoff.creator?.login ?? 'unknown'}: ` +
-                `${headSignoff.description ?? ''}`
-              );
-              return;
-            }
+            const merges = [];
+            let currentSha = headSha;
+            for (let depth = 0; depth <= maxInheritedMerges; depth += 1) {
+              const signoff = await successfulSignoff(currentSha);
+              if (signoff) {
+                if (merges.length === 0) {
+                  core.notice(
+                    `Signed off by ${signoff.creator?.login ?? 'unknown'}: ` +
+                    `${signoff.description ?? ''}`
+                  );
+                  return;
+                }
 
-            const { data: headCommit } = await github.rest.repos.getCommit({
-              owner,
-              repo,
-              ref: headSha,
-            });
-            const [previousHead, mergedBase, ...extraParents] = headCommit.parents;
-            if (
-              !previousHead ||
-              !mergedBase ||
-              extraParents.length > 0 ||
-              mergedBase.sha !== baseSha
-            ) {
-              core.setFailed(
-                `No developer sign-off found for ${headSha}. HEAD is not a two-parent merge ` +
-                `of the current base commit (${baseSha}), so it cannot inherit an earlier sign-off.\n\n` +
-                `On your machine, with this commit pushed, run:\n\n` +
-                `    make signoff\n\n` +
-                `See docs/dev/ci_signoff.md.`
-              );
-              return;
-            }
+                core.setOutput('inheritance-candidate', 'true');
+                core.setOutput('merge-chain', JSON.stringify(merges));
+                core.setOutput('signed-sha', currentSha);
+                core.setOutput('current-base-sha', baseSha);
+                core.notice(
+                  `Found sign-off on ${currentSha} behind ${merges.length} base merge(s); ` +
+                  `verifying each automatic merge result.`
+                );
+                return;
+              }
 
-            const previousSignoff = await successfulSignoff(previousHead.sha);
-            if (!previousSignoff) {
-              core.setFailed(
-                `No developer sign-off found for ${headSha} or its pre-merge parent ` +
-                `${previousHead.sha}. Run make signoff on the pushed HEAD. ` +
-                `See docs/dev/ci_signoff.md.`
-              );
-              return;
-            }
+              if (depth === maxInheritedMerges) {
+                core.setFailed(
+                  `No developer sign-off found within ${maxInheritedMerges} base merges of ` +
+                  `${headSha}. Run make signoff on the pushed HEAD.`
+                );
+                return;
+              }
 
-            core.setOutput('inheritance-candidate', 'true');
-            core.setOutput('previous-sha', previousHead.sha);
-            core.setOutput('base-sha', mergedBase.sha);
-            core.setOutput('head-tree', headCommit.commit.tree.sha);
-            core.notice(
-              `Found sign-off on pre-merge parent ${previousHead.sha}; ` +
-              `verifying that HEAD is the unmodified automatic merge result.`
-            );
+              const { data: commit } = await github.rest.repos.getCommit({
+                owner,
+                repo,
+                ref: currentSha,
+              });
+              const [previousHead, mergedBase, ...extraParents] = commit.parents;
+              if (!previousHead || !mergedBase || extraParents.length > 0) {
+                core.setFailed(
+                  `No developer sign-off found for ${headSha}. The first-parent chain reaches ` +
+                  `unsigned commit ${currentSha}, which is not a two-parent merge and cannot ` +
+                  `inherit an earlier sign-off.\n\nRun make signoff on the pushed HEAD. ` +
+                  `See docs/dev/ci_signoff.md.`
+                );
+                return;
+              }
+              if (merges.length === 0 && mergedBase.sha !== baseSha) {
+                core.setFailed(
+                  `No developer sign-off found for ${headSha}. HEAD does not merge the current ` +
+                  `base commit (${baseSha}), so it cannot inherit an earlier sign-off.\n\n` +
+                  `Run make signoff on the pushed HEAD. See docs/dev/ci_signoff.md.`
+                );
+                return;
+              }
+
+              merges.push({
+                head: currentSha,
+                previous: previousHead.sha,
+                base: mergedBase.sha,
+                tree: commit.commit.tree.sha,
+              });
+              currentSha = previousHead.sha;
+            }
 
       # Only an otherwise-valid inheritance candidate needs repository history
       # and blobs to reproduce the merge without relying on a lazy network fetch.
@@ -157,38 +173,74 @@ jobs:
         if: ${{ github.event_name == 'pull_request' && steps.signoff.outputs.inheritance-candidate == 'true' }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
-          PREVIOUS_SHA: ${{ steps.signoff.outputs.previous-sha }}
-          BASE_SHA: ${{ steps.signoff.outputs.base-sha }}
-          HEAD_TREE: ${{ steps.signoff.outputs.head-tree }}
+          MERGE_CHAIN: ${{ steps.signoff.outputs.merge-chain }}
+          SIGNED_SHA: ${{ steps.signoff.outputs.signed-sha }}
+          CURRENT_BASE_SHA: ${{ steps.signoff.outputs.current-base-sha }}
         with:
           script: |
-            const previousSha = process.env.PREVIOUS_SHA;
-            const baseSha = process.env.BASE_SHA;
-            const expectedTree = process.env.HEAD_TREE;
-            const merge = await exec.getExecOutput(
+            const merges = JSON.parse(process.env.MERGE_CHAIN);
+            const signedSha = process.env.SIGNED_SHA;
+            const currentBaseSha = process.env.CURRENT_BASE_SHA;
+            const baseHistory = await exec.getExecOutput(
               'git',
-              ['merge-tree', '--write-tree', '--no-messages', previousSha, baseSha],
-              { ignoreReturnCode: true, silent: true }
+              ['rev-list', '--first-parent', currentBaseSha],
+              { silent: true }
             );
-            const reproducedTree = merge.stdout.trim();
-            if (merge.exitCode !== 0) {
-              core.setFailed(
-                `The merge of ${baseSha} into ${previousSha} is not conflict-free, so HEAD ` +
-                `cannot inherit the earlier sign-off. Resolve the merge, then run make signoff ` +
-                `on the pushed HEAD.`
+            const basePositions = new Map(
+              baseHistory.stdout.trim().split('\n').map((sha, index) => [sha, index])
+            );
+            let newerBasePosition = -1;
+
+            for (const mergeCommit of merges) {
+              const basePosition = basePositions.get(mergeCommit.base);
+              if (basePosition === undefined || basePosition < newerBasePosition) {
+                core.setFailed(
+                  `Merge ${mergeCommit.head} uses base commit ${mergeCommit.base} out of order ` +
+                  `or outside the current base branch's first-parent history. Run make signoff ` +
+                  `on the pushed HEAD.`
+                );
+                return;
+              }
+
+              const merge = await exec.getExecOutput(
+                'git',
+                [
+                  'merge-tree',
+                  '--write-tree',
+                  '--no-messages',
+                  mergeCommit.previous,
+                  mergeCommit.base,
+                ],
+                { ignoreReturnCode: true, silent: true }
               );
-              return;
-            }
-            if (!/^[0-9a-f]{40,64}$/.test(reproducedTree) || reproducedTree !== expectedTree) {
-              core.setFailed(
-                `HEAD contains changes beyond Git's automatic merge of ${baseSha} into ` +
-                `${previousSha}, so it cannot inherit the earlier sign-off. Run make signoff ` +
-                `on the pushed HEAD.`
-              );
-              return;
+              const reproducedTree = merge.stdout.trim();
+              if (merge.exitCode !== 0) {
+                core.setFailed(
+                  `Merge ${mergeCommit.head} of ${mergeCommit.base} into ` +
+                  `${mergeCommit.previous} is not conflict-free. Resolve the merge, then run ` +
+                  `make signoff on the pushed HEAD.`
+                );
+                return;
+              }
+              if (
+                !/^[0-9a-f]{40,64}$/.test(reproducedTree) ||
+                reproducedTree !== mergeCommit.tree
+              ) {
+                core.setFailed(
+                  `Merge ${mergeCommit.head} contains changes beyond Git's automatic merge of ` +
+                  `${mergeCommit.base} into ${mergeCommit.previous}. Run make signoff on the ` +
+                  `pushed HEAD.`
+                );
+                return;
+              }
+
+              newerBasePosition = basePosition;
             }
 
-            core.notice(`Inherited developer sign-off from ${previousSha}.`);
+            core.notice(
+              `Inherited developer sign-off from ${signedSha} across ${merges.length} ` +
+              `clean base merge(s).`
+            );
       - name: Merge queue passthrough
         if: ${{ github.event_name != 'pull_request' }}
         run: echo "Sign-off was validated at queue entry; the full suite runs in this merge_group run."
