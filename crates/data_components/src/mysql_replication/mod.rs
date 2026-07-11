@@ -31,11 +31,13 @@ limitations under the License.
 
 pub mod binlog;
 pub mod bootstrap;
+pub mod changes;
 pub mod config;
 pub mod metrics;
 pub mod resilience;
 pub mod rows;
 pub mod setup;
+pub mod shared;
 
 use std::sync::Arc;
 
@@ -123,6 +125,35 @@ pub enum Error {
 
     #[snafu(display("{message}"))]
     StalePosition { message: String },
+
+    #[snafu(display(
+        "Table {database}.{table} is already subscribed on shared MySQL binlog group `{group}` by \
+         another dataset. Each source table can back at most one dataset per shared group — \
+         give this dataset its own group (`mysql_replication_group`) or remove the duplicate."
+    ))]
+    SharedTableAlreadySubscribed {
+        database: String,
+        table: String,
+        group: String,
+    },
+
+    #[snafu(display(
+        "Dataset `{dataset}` joins shared MySQL binlog group `{group}` but its `{param}` differs \
+         from the group's first member. All datasets in a shared group must use identical \
+         connection parameters (they share one binlog dump connection). See: \
+         https://spiceai.org/docs/components/data-connectors/mysql"
+    ))]
+    SharedConnectionParamsMismatch {
+        dataset: String,
+        group: String,
+        param: &'static str,
+    },
+
+    #[snafu(display(
+        "Shared MySQL binlog group `{group}` is unavailable (its dump connection is shutting \
+         down). Retry — a fresh shared connection will be established."
+    ))]
+    SharedSourceUnavailable { group: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -414,6 +445,12 @@ pub struct ReplicationStreamInput {
 /// snapshot/WAL boundary.
 #[must_use]
 pub fn start_replication_stream(input: ReplicationStreamInput) -> ChangesStream {
+    // Datasets that opted into a shared binlog group (`mysql_replication_group`)
+    // are multiplexed onto one dump connection per (connection, group) — see
+    // [`shared`]. Everything else keeps its dedicated per-dataset dump.
+    if input.params.shared {
+        return shared::subscribe(input);
+    }
     Box::pin(
         stream::once(async move { start_inner(input).await }).flat_map(|result| match result {
             Ok(stream) => stream,

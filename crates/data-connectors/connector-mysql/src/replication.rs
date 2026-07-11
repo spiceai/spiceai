@@ -435,6 +435,16 @@ pub(crate) const REPLICATION_METRICS: &[MetricSpec] = &[
         "Number of failed binlog-position checkpoint writes (retried on the next interval).",
     )
     .auto_register(),
+    MetricSpec::new(
+        "replication_member_attached",
+        MetricType::ObservableGaugeU64,
+    )
+    .description(
+        "1 while this dataset is an attached member of its shared binlog group (or on the \
+         per-dataset path), 0 once detached. A detached member holds the group's shared resume \
+         position back, so this is the unambiguous signal for which dataset stalled the group.",
+    )
+    .auto_register(),
 ];
 
 /// Observation callback for one of the [`REPLICATION_METRICS`], or `None`
@@ -538,6 +548,9 @@ pub(crate) fn observe_replication_metric(
                 instrument.observe(m.checkpoint_persist_errors_total(), &attributes);
             }))
         }
+        "replication_member_attached" => ObserveMetricCallback::U64(Box::new(move |instrument| {
+            instrument.observe(m.member_attached(), &attributes);
+        })),
         _ => return None,
     };
     Some(callback)
@@ -548,12 +561,23 @@ fn replication_params_from_connector_params(
     dataset_name: &str,
 ) -> Result<ReplicationParams, String> {
     let opts = build_mysql_opts(params)?;
+    // Opt into a shared binlog dump when `mysql_replication_group` is set. All
+    // datasets on the same connection naming the same group share one dump and
+    // one `server_id`, so the id is derived from the GROUP name (not the dataset
+    // name) — every member computes the same id. An explicit
+    // `mysql_replication_server_id` still wins.
+    let group = optional_string(params, "replication_group")
+        .map(|g| g.trim().to_string())
+        .filter(|g| !g.is_empty());
     let server_id = match optional_string(params, "replication_server_id") {
         Some(raw) => raw.trim().parse::<u32>().map_err(|e| {
             let user_param = params.user_param("replication_server_id");
             format!("parameter `{user_param}` must be a u32 server id, got {raw:?}: {e}")
         })?,
-        None => derive_server_id(dataset_name, process_nonce()),
+        None => match &group {
+            Some(group) => derive_server_id(group, process_nonce()),
+            None => derive_server_id(dataset_name, process_nonce()),
+        },
     };
     let snapshot_mode = parse_snapshot_mode(params)?;
     let checkpoint_interval = optional_duration(
@@ -582,6 +606,8 @@ fn replication_params_from_connector_params(
         checkpoint_interval,
         invalid_position_behavior,
         ready_lag,
+        shared: group.is_some(),
+        group,
     })
 }
 
@@ -920,6 +946,39 @@ mod tests {
         assert_eq!(repl.opts.ip_or_hostname(), "localhost");
         assert_eq!(repl.opts.db_name(), Some("mydb"));
         assert!(repl.opts.ssl_opts().is_none());
+    }
+
+    #[test]
+    fn replication_group_enables_sharing_with_a_stable_shared_server_id() {
+        // Two different datasets in the SAME group must derive the SAME server_id
+        // (one shared dump connection); `shared` is set and `group` recorded.
+        let params = |ds: &str| {
+            let p = params_with(&[
+                ("host", "localhost"),
+                ("sslmode", "disabled"),
+                ("replication_group", "app"),
+            ]);
+            replication_params_from_connector_params(&p, ds).expect("valid params parse")
+        };
+        let orders = params("orders");
+        let customers = params("customers");
+        assert!(orders.shared, "group set -> shared");
+        assert_eq!(orders.group.as_deref(), Some("app"));
+        assert_eq!(
+            orders.server_id, customers.server_id,
+            "members of the same group must share one server_id"
+        );
+
+        // No group -> per-dataset, distinct ids, not shared.
+        let p = params_with(&[("host", "localhost"), ("sslmode", "disabled")]);
+        let plain =
+            replication_params_from_connector_params(&p, "orders").expect("valid params parse");
+        assert!(!plain.shared);
+        assert!(plain.group.is_none());
+        assert_ne!(
+            plain.server_id, orders.server_id,
+            "a grouped dataset derives its id from the group, not the dataset name"
+        );
     }
 
     #[test]

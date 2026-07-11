@@ -746,9 +746,9 @@ fn binlog_change_stream(
 
 /// Binlog events start at offset 4 (after the magic header); positions below
 /// that (fake rotates and heartbeats report 0) are not resumable.
-const MIN_VALID_EVENT_POS: u64 = 4;
+pub(super) const MIN_VALID_EVENT_POS: u64 = 4;
 
-async fn open_binlog_stream(
+pub(super) async fn open_binlog_stream(
     params: &ReplicationParams,
     resume: &BinlogPosition,
     dataset_name: &str,
@@ -787,12 +787,12 @@ async fn open_binlog_stream(
     .await
 }
 
-fn table_map_matches(tme: &TableMapEvent<'_>, database: &str, table: &str) -> bool {
+pub(super) fn table_map_matches(tme: &TableMapEvent<'_>, database: &str, table: &str) -> bool {
     tme.database_name() == database && tme.table_name() == table
 }
 
 /// Decode a rows event for the subscribed table into the transaction buffer.
-fn buffer_rows_event(
+pub(super) fn buffer_rows_event(
     rows_data: &RowsEventData<'_>,
     tme: &TableMapEvent<'_>,
     layout: &TableLayout,
@@ -944,7 +944,7 @@ fn commit_transaction(
 /// source-attested clock (`source_now_ms`), flagged Ready when that clock is
 /// within `ready_lag` of now. Emitted only when the stream has caught up to the
 /// source head, so it never marks a still-behind dataset Ready.
-fn readiness_heartbeat(
+pub(super) fn readiness_heartbeat(
     schema: &SchemaRef,
     source_now_ms: i64,
     ready_lag: Duration,
@@ -974,7 +974,7 @@ fn readiness_heartbeat(
     })
 }
 
-fn record_watermark(metrics: &MetricsCollector, event_timestamp: u32) {
+pub(super) fn record_watermark(metrics: &MetricsCollector, event_timestamp: u32) {
     if event_timestamp > 0 {
         metrics.record_commit_watermark(
             SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(event_timestamp)),
@@ -982,7 +982,7 @@ fn record_watermark(metrics: &MetricsCollector, event_timestamp: u32) {
     }
 }
 
-fn commit_ts_ms(event_timestamp: u32) -> Option<i64> {
+pub(super) fn commit_ts_ms(event_timestamp: u32) -> Option<i64> {
     (event_timestamp > 0).then(|| i64::from(event_timestamp) * 1000)
 }
 
@@ -1304,7 +1304,7 @@ impl Checkpointer {
 /// Source row-image indexes of the declared primary keys, for PK-change
 /// detection on UPDATE. `column_map` is dataset-field-indexed, so PK names
 /// map through the dataset schema.
-fn compute_pk_source_indexes(
+pub(super) fn compute_pk_source_indexes(
     schema: &SchemaRef,
     primary_keys: &[String],
     column_map: &[usize],
@@ -1323,10 +1323,10 @@ fn compute_pk_source_indexes(
 
 /// The re-validated positional mappings adopted after a source DDL.
 #[derive(Clone)]
-struct AdoptedLayout {
-    layout: TableLayout,
-    column_map: Vec<usize>,
-    pk_source_indexes: Vec<usize>,
+pub(super) struct AdoptedLayout {
+    pub(super) layout: TableLayout,
+    pub(super) column_map: Vec<usize>,
+    pub(super) pk_source_indexes: Vec<usize>,
 }
 
 /// Re-fetch the source table's layout and reconcile it against the dataset
@@ -1335,7 +1335,7 @@ struct AdoptedLayout {
 /// dataset doesn't declare (including ones a DDL just added) are not
 /// replicated; newly-appeared ones are warned about, mirroring the Postgres
 /// connector's block-mode behavior for compatible relation changes.
-async fn adopt_current_layout(
+pub(super) async fn adopt_current_layout(
     params: &ReplicationParams,
     database: &str,
     table: &str,
@@ -1446,7 +1446,7 @@ async fn poll_source_head(
     }
 }
 
-fn purged_position_error(resume: &BinlogPosition, dataset_name: &str) -> StreamError {
+pub(super) fn purged_position_error(resume: &BinlogPosition, dataset_name: &str) -> StreamError {
     StreamError::External(format!(
         "mysql binlog for {dataset_name}: the source no longer has binlog position {resume} \
          (binary logs were purged). Restart the dataset with \
@@ -1457,7 +1457,7 @@ fn purged_position_error(resume: &BinlogPosition, dataset_name: &str) -> StreamE
 
 /// See `postgres_replication::client` for the WARN→DEBUG demotion rationale:
 /// the first failure of an outage is loud, the rest keep log volume sublinear.
-fn log_transient_reconnect(attempt: u32, dataset: &str, error: &str, retry_in_ms: u128) {
+pub(super) fn log_transient_reconnect(attempt: u32, dataset: &str, error: &str, retry_in_ms: u128) {
     if attempt <= 1 {
         tracing::warn!(
             dataset = %dataset,
@@ -1477,7 +1477,7 @@ fn log_transient_reconnect(attempt: u32, dataset: &str, error: &str, retry_in_ms
     }
 }
 
-enum QueryKind {
+pub(super) enum QueryKind {
     Begin,
     Commit,
     /// `XA START|END|PREPARE|COMMIT|ROLLBACK ...` — two-phase transactions
@@ -1486,7 +1486,7 @@ enum QueryKind {
     Statement,
 }
 
-fn classify_query(statement: &str) -> QueryKind {
+pub(super) fn classify_query(statement: &str) -> QueryKind {
     let trimmed = statement.trim();
     if trimmed.eq_ignore_ascii_case("BEGIN") {
         QueryKind::Begin
@@ -1503,7 +1503,7 @@ fn classify_query(statement: &str) -> QueryKind {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum StatementKind {
+pub(super) enum StatementKind {
     Truncate,
     SchemaChange(&'static str),
 }
@@ -1521,7 +1521,7 @@ enum StatementKind {
 /// for unqualified table references. Identifier comparison is
 /// case-insensitive (matching `MySQL`'s common `lower_case_table_names`
 /// deployments; a false positive requires two tables differing only in case).
-fn classify_statement(
+pub(super) fn classify_statement(
     statement: &str,
     default_db: &str,
     database: &str,

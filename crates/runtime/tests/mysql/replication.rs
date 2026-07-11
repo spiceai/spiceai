@@ -99,6 +99,8 @@ fn params_for(port: u16, server_id: u32) -> ReplicationParams {
         checkpoint_interval: Duration::from_secs(1),
         invalid_position_behavior: InvalidCheckpointBehavior::Error,
         ready_lag: Duration::from_secs(2),
+        shared: false,
+        group: None,
     }
 }
 
