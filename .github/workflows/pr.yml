@@ -107,10 +107,10 @@ jobs:
                   return;
                 }
 
-                core.setOutput('inheritance-candidate', 'true');
-                core.setOutput('merge-chain', JSON.stringify(merges));
-                core.setOutput('signed-sha', currentSha);
-                core.setOutput('current-base-sha', baseSha);
+                core.setOutput('inheritance_candidate', 'true');
+                core.setOutput('merge_chain', JSON.stringify(merges));
+                core.setOutput('signed_sha', currentSha);
+                core.setOutput('current_base_sha', baseSha);
                 core.notice(
                   `Found sign-off on ${currentSha} behind ${merges.length} base merge(s); ` +
                   `verifying each automatic merge result.`
@@ -162,7 +162,7 @@ jobs:
       # Only an otherwise-valid inheritance candidate needs repository history
       # and blobs to reproduce the merge without relying on a lazy network fetch.
       - name: Check out pull request history
-        if: ${{ github.event_name == 'pull_request' && steps.signoff.outputs.inheritance-candidate == 'true' }}
+        if: ${{ github.event_name == 'pull_request' && steps.signoff.outputs.inheritance_candidate == 'true' }}
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
@@ -170,12 +170,12 @@ jobs:
           persist-credentials: false
 
       - name: Validate inherited developer sign-off
-        if: ${{ github.event_name == 'pull_request' && steps.signoff.outputs.inheritance-candidate == 'true' }}
+        if: ${{ github.event_name == 'pull_request' && steps.signoff.outputs.inheritance_candidate == 'true' }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
-          MERGE_CHAIN: ${{ steps.signoff.outputs.merge-chain }}
-          SIGNED_SHA: ${{ steps.signoff.outputs.signed-sha }}
-          CURRENT_BASE_SHA: ${{ steps.signoff.outputs.current-base-sha }}
+          MERGE_CHAIN: ${{ steps.signoff.outputs.merge_chain }}
+          SIGNED_SHA: ${{ steps.signoff.outputs.signed_sha }}
+          CURRENT_BASE_SHA: ${{ steps.signoff.outputs.current_base_sha }}
         with:
           script: |
             const merges = JSON.parse(process.env.MERGE_CHAIN);
