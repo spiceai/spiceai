@@ -58,15 +58,24 @@ On success it posts a `signoff` commit status on your current `HEAD`. Open or
 refresh the PR and the **Attestation** check turns green, which — together with a
 review — lets a maintainer add the PR to the merge queue.
 
-The sign-off is bound to the **exact commit** you pushed. If you push a new
-commit, the old sign-off no longer applies and you must run `make signoff` again.
+The sign-off is normally bound to the **exact commit** you pushed. If you push a
+code change, the old sign-off no longer applies and you must run `make signoff`
+again. The only exception is merging the PR's base branch. **Attestation** walks
+up to 100 successive merge commits on the first-parent chain to find a sign-off.
+`HEAD` must merge the current base commit, each older merged base must appear in
+order on the current base branch's first-parent history, and every merge tree
+must exactly match Git's conflict-free automatic result. A conflict resolution,
+amended merge, octopus merge, or merge from another branch still requires a new
+sign-off.
+`scripts/signoff status` reports only a commit's own status; the inheritance
+check runs in the PR's **Attestation** workflow.
 
 Options:
 
 ```bash
 scripts/signoff -f            # sign off even with an uncommitted/unpushed tree
 scripts/signoff --no-verify   # attest without running the checks (honor system)
-scripts/signoff status        # is HEAD signed off?
+scripts/signoff status        # does HEAD have its own sign-off?
 scripts/signoff --help        # full usage
 ```
 
@@ -95,9 +104,11 @@ path, so existing Git behavior is unchanged.
 
 ### "No developer sign-off found for &lt;sha&gt;"
 
-The Attestation check couldn't find a green `signoff` status for the PR's head
-commit. Make sure the commit under review is pushed, then run `make signoff`
-again. A new push always needs a fresh sign-off.
+The Attestation check couldn't find an applicable green `signoff` status. It
+checks the PR's head commit first, then walks backward through clean, unmodified
+base merges on the first-parent chain. Make sure the commit under review is
+pushed, then run `make signoff` again. Any new code or manual merge resolution
+needs a fresh sign-off.
 
 ### External contributors (forks)
 
