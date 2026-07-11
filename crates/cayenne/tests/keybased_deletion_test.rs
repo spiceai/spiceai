@@ -188,6 +188,86 @@ async fn get_codes(ctx: &SessionContext, table_name: &str) -> TestResult<Vec<Str
     Ok(codes)
 }
 
+/// Issue an unfiltered `DELETE` (delete-all) and return the reported count.
+async fn delete_all(table: &Arc<CayenneTableProvider>) -> TestResult<u64> {
+    let ctx = SessionContext::new();
+    let plan = table.delete_from(&ctx.state(), vec![]).await?;
+    let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
+    Ok(results
+        .first()
+        .and_then(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+        })
+        .and_then(|a| a.values().first())
+        .copied()
+        .unwrap_or(0))
+}
+
+// =============================================================================
+// Regression: RowConverter delete-all (unfiltered DELETE over file rows)
+// =============================================================================
+
+/// An unfiltered `DELETE` over file-resident string-PK (RowConverter) rows must
+/// remove every row and report the exact count. Guards the RowConverter
+/// delete-all scan path (deleting nothing here is a silent correctness bug).
+async fn test_string_pk_delete_all_empty_filter_impl(fixture: TestFixture) -> TestResult<()> {
+    let (table, ctx, schema) = setup_string_pk_table(&fixture, "string_delete_all").await?;
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["A", "B", "C", "D", "E"])),
+            Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
+            Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4, 5])),
+        ],
+    )?;
+    insert_batch(&table, batch).await?;
+    table.checkpoint_inlined_data().await?;
+    assert_eq!(get_row_count(&ctx, "string_delete_all").await?, 5);
+
+    let deleted = delete_all(&table).await?;
+    assert_eq!(
+        deleted, 5,
+        "RowConverter delete-all must remove every file-resident row"
+    );
+    assert_eq!(get_row_count(&ctx, "string_delete_all").await?, 0);
+    assert!(
+        get_codes(&ctx, "string_delete_all").await?.is_empty(),
+        "no rows may remain after delete-all"
+    );
+    Ok(())
+}
+test_with_backends!(test_string_pk_delete_all_empty_filter_impl);
+
+/// Composite-PK `(region, id)` delete-all over file-resident rows must remove
+/// every row. Guards the composite RowConverter delete-all path.
+async fn test_composite_pk_delete_all_empty_filter_impl(fixture: TestFixture) -> TestResult<()> {
+    let (table, ctx, schema) =
+        setup_composite_pk_table(&fixture, "composite_delete_all").await?;
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["us", "us", "eu", "eu"])),
+            Arc::new(Int64Array::from(vec![1_i64, 2, 1, 2])),
+            Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
+            Arc::new(Int64Array::from(vec![10_i64, 20, 30, 40])),
+        ],
+    )?;
+    insert_batch(&table, batch).await?;
+    table.checkpoint_inlined_data().await?;
+    assert_eq!(get_row_count(&ctx, "composite_delete_all").await?, 4);
+
+    let deleted = delete_all(&table).await?;
+    assert_eq!(
+        deleted, 4,
+        "composite-PK delete-all must remove every file-resident row"
+    );
+    assert_eq!(get_row_count(&ctx, "composite_delete_all").await?, 0);
+    Ok(())
+}
+test_with_backends!(test_composite_pk_delete_all_empty_filter_impl);
+
 // =============================================================================
 // STRING PK TESTS
 // =============================================================================
