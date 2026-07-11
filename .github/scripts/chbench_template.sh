@@ -42,7 +42,31 @@ drop_template() {  # un-freeze (IS_TEMPLATE blocks DROP) then drop
   psql_pg "DROP DATABASE IF EXISTS $1 WITH (FORCE)" >/dev/null 2>&1 || true
 }
 
-psql_pg "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots" >/dev/null 2>&1 || true
+# A crashed/cancelled prior run can leave a logical replication slot on chbench.
+# A slot pins its database, so DROP DATABASE fails even WITH (FORCE) until the
+# slot is gone; and an *active* slot won't drop until its walsender is killed.
+# Terminate holders, then drop, retrying until none remain.
+drop_all_replication_slots() {
+  for _ in 1 2 3 4 5; do
+    n=$(psql_pg "SELECT count(*) FROM pg_replication_slots" 2>/dev/null || echo 0)
+    [ "${n:-0}" = 0 ] && return 0
+    psql_pg "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE active_pid IS NOT NULL" >/dev/null 2>&1 || true
+    psql_pg "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE NOT active" >/dev/null 2>&1 || true
+    sleep 1
+  done
+  stuck=$(psql_pg "SELECT string_agg(slot_name || '(active_pid=' || coalesce(active_pid::text,'none') || ')', ', ') FROM pg_replication_slots" 2>/dev/null || true)
+  [ -n "$stuck" ] && echo "WARNING: replication slots still present after cleanup: $stuck"
+}
+
+# Terminate lingering backends then drop; fail loud (no error suppression) so a
+# genuine failure surfaces here instead of masking into a later CREATE
+# 'database already exists'.
+drop_working_db() {  # $1 = dbname
+  psql_pg "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$1' AND pid <> pg_backend_pid()" >/dev/null 2>&1 || true
+  psql_pg "DROP DATABASE IF EXISTS $1 WITH (FORCE)"
+}
+
+drop_all_replication_slots
 
 exists=$(psql_pg "SELECT 1 FROM pg_database WHERE datname='$TMPL'" 2>/dev/null)
 hit=0
@@ -73,7 +97,7 @@ else
 fi
 
 # Restore the working chbench from the template (fast physical copy).
-psql_pg "DROP DATABASE IF EXISTS chbench WITH (FORCE)" >/dev/null 2>&1 || true
+drop_working_db chbench
 psql_pg "CREATE DATABASE chbench TEMPLATE $TMPL OWNER $PGU STRATEGY=FILE_COPY" >/dev/null
 psql_pg "ALTER DATABASE chbench WITH ALLOW_CONNECTIONS true" >/dev/null 2>&1 || true
 echo "chbench restored from $TMPL — run with --skip-prepare"
