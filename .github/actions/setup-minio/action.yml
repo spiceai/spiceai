@@ -24,7 +24,8 @@ runs:
           exit 0
         fi
 
-        mc_url="https://dl.min.io/client/mc/release/linux-amd64/mc"
+        # Mirror of mc; dl.min.io currently serves an expired TLS cert.
+        mc_url="https://public-data.spiceai.org/mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z"
         tmp_mc="$(mktemp)"
         if command -v curl >/dev/null 2>&1; then
           curl --fail --silent --show-error --location --output "$tmp_mc" "$mc_url"

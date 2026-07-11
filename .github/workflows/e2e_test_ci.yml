@@ -28,24 +28,16 @@ on:
   pull_request:
     branches:
       - trunk
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'README.md'
-      - 'Makefile'
-      - 'CONTRIBUTING.md'
-      - 'SECURITY.md'
-      - 'LICENSE'
-      - '.github/**'
-      - 'version.txt'
-      - '.schema/**'
-      - '.vscode/**'
-      - 'deploy/**'
-      - 'install/**'
-      - 'media/**'
-      - 'monitoring/**'
-      - 'acknowledgements.md'
-      - 'Dockerfile*'
+      - release-*
+      - release/*
+      - feature-*
+
+  merge_group:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
 
   workflow_dispatch:
 
@@ -63,8 +55,26 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
+  # Skip the expensive E2E matrix on merge groups that don't touch code (docs,
+  # etc.). `build` — which every test job depends on — is gated on this, so the
+  # whole matrix cascades to "skipped" while the E2E Test CI gate still reports.
+  check_changes:
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: spiceai-dev-runners
+    outputs:
+      relevant_changes: ${{ steps.check.outputs.relevant_changes == 'true' || github.event_name == 'workflow_dispatch' }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Check for code changes
+        id: check
+        uses: ./.github/actions/check-code-changes
+
   setup-matrix:
     name: Setup strategy matrix
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-dev-runners
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
@@ -97,7 +107,8 @@ jobs:
   build:
     name: Build ${{ matrix.target.name }} binaries
     runs-on: ${{ matrix.target.builder }}
-    needs: setup-matrix
+    needs: [setup-matrix, check_changes]
+    if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
 
     strategy:
       matrix:
@@ -158,6 +169,7 @@ jobs:
 
   setup-model-matrix:
     name: Setup model strategy matrix
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
@@ -2209,3 +2221,44 @@ jobs:
             echo "Failures detected in spice.log"
             exit 1
           fi
+
+  # Stable, matrix-proof summary check. On pull requests, the upstream jobs are
+  # skipped and this lightweight gate reports the required context. In the merge
+  # queue it succeeds only if every E2E job above succeeded (or was skipped), so
+  # the whole matrix is gated by one ruleset entry rather than dozens of shifting
+  # matrix names.
+  e2e-gate:
+    name: E2E Test CI
+    runs-on: ubuntu-latest
+    if: ${{ !cancelled() }}
+    needs:
+      - check_changes
+      - setup-matrix
+      - build
+      - setup-model-matrix
+      - test_openai_model
+      - test_hf_model
+      - test_quickstart_dremio
+      - test_quickstart_spiceai
+      - test_quickstart_s3
+      - test_quickstart_data_postgres
+      - test_quickstart_data_mysql
+      - test_quickstart_clickhouse
+      - test_quickstart_duckdb
+      - test_local_acceleration
+      - test_results_caching
+      - gh_connector_quickstart
+      - mssql_connector_quickstart
+      - databricks_delta_catalog_connector_quickstart
+      - graceful_shutdown_test_append
+      - graceful_shutdown_test_full
+    steps:
+      - name: Verify all E2E jobs succeeded
+        run: |
+          failure="${{ contains(needs.*.result, 'failure') }}"
+          cancelled="${{ contains(needs.*.result, 'cancelled') }}"
+          if [ "$failure" = "true" ] || [ "$cancelled" = "true" ]; then
+            echo "::error::One or more E2E Test CI jobs did not succeed"
+            exit 1
+          fi
+          echo "All E2E Test CI jobs succeeded"

@@ -80,7 +80,7 @@ dialoguer = "0.12"
 rand = "0.10"
 
 # Open URLs in browser
-open = "5"
+system-open = { path = "../../crates/system-open" }
 
 # Platform keyring for credential storage
 keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "linux-native"] }
