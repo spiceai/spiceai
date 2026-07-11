@@ -122,8 +122,7 @@ async fn seed_partitioned_schema(port: usize) -> Result<(), anyhow::Error> {
 
 /// Build a `PostgreSQL` catalog against the seeded database.
 fn pg_catalog(port: usize) -> Catalog {
-    let mut catalog = Catalog::new("pg:postgres".to_string(), CATALOG_NAME.to_string());
-    catalog.params = Some(Params::from_string_map(
+    let mut catalog = Catalog::new("pg".to_string(), CATALOG_NAME.to_string());
         get_pg_params(port)
             .into_iter()
             .map(|(k, v)| (k, v.expose_secret().to_string()))
