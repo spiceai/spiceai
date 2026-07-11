@@ -13316,13 +13316,54 @@ impl CayenneTableProvider {
         )))
     }
 
+    /// Per-cold-file row cap that keeps a file's right-sized PK bloom
+    /// (~10 bits/key, matching [`Self::build_cold_file_pk_bloom`]) within
+    /// [`COLD_PK_BLOOM_PER_FILE_MAX_BYTES`]. A file over the cap would carry no
+    /// bloom, degrading the CDC-apply keyset rebuild to a full cold scan.
+    ///
+    /// Includes 10% headroom below the exact bloom key budget so the
+    /// batch-granularity chunk boundary (which may overshoot by up to one batch)
+    /// still lands under the hard cap.
+    fn cold_file_row_cap() -> usize {
+        // 10 bits/key => bytes = keys * 10 / 8, so keys = bytes * 8 / 10.
+        let max_bloom_keys = COLD_PK_BLOOM_PER_FILE_MAX_BYTES.saturating_mul(8) / 10;
+        (max_bloom_keys / 10).saturating_mul(9).max(1)
+    }
+
+    /// Write one stream to a single cold-tier directory as Vortex files (the unit
+    /// reused per row-bounded chunk in [`Self::write_stream_to_cold`]).
+    async fn insert_stream_into_cold_dir(
+        &self,
+        session_state: &datafusion::execution::SessionState,
+        write_format: &Arc<VortexFormat>,
+        dir_url: &str,
+        stream: SendableRecordBatchStream,
+    ) -> Result<()> {
+        let listing = Self::create_listing_table(
+            dir_url,
+            self.table_schema(),
+            write_format,
+            &self.pk_deletion_strategy,
+        )?;
+        let input: Arc<dyn ExecutionPlan> =
+            Arc::new(StreamingExec::new(self.table_schema(), stream));
+        let plan = listing
+            .insert_into(session_state, input, InsertOp::Append)
+            .await?;
+        collect(plan, session_state.task_ctx()).await?;
+        Ok(())
+    }
+
     /// Write a (Z-ordered, deletes-applied) stream to the cold object store as
     /// read-optimized Vortex files, returning one [`ColdTierFile`] per written
     /// file with accurate per-file footer statistics (for listing-time pruning).
     ///
     /// Single ordered run (`target_partitions = 1`) so the Z-order survives across
     /// cold files — each file is a contiguous slice of the sorted order, giving
-    /// tight, non-overlapping zone maps.
+    /// tight, non-overlapping zone maps. Bloom-eligible tables additionally split
+    /// the sorted stream into contiguous row-bounded chunks (one subdirectory
+    /// each) so every file stays under [`Self::cold_file_row_cap`] and keeps a PK
+    /// bloom; the split preserves global order across files.
     async fn write_stream_to_cold(
         &self,
         cold_location: &str,
@@ -13355,12 +13396,6 @@ impl CayenneTableProvider {
         let write_format = self
             .context
             .cold_write_format(cold_target_file_size_mb, shard);
-        let cold_listing_table = Self::create_listing_table(
-            &cold_dir_url,
-            self.table_schema(),
-            &write_format,
-            &self.pk_deletion_strategy,
-        )?;
 
         // Session context with the COLD object store registered when configured
         // (S3 cold; may be a different bucket/endpoint than the warm store). A
@@ -13372,16 +13407,59 @@ impl CayenneTableProvider {
             Self::register_object_store_if_needed(&cold_renv, cold_config);
         }
         let session_state = Arc::new(ctx.state());
-
         let schema = self.table_schema();
-        let writer_input: Arc<dyn ExecutionPlan> = Arc::new(StreamingExec::new(
-            Arc::clone(&schema),
-            Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), stream)),
-        ));
-        let insert_plan = cold_listing_table
-            .insert_into(session_state.as_ref(), writer_input, InsertOp::Append)
+        let is_local = !cold_base.starts_with("s3://");
+
+        // Bloom-eligible (upsert) tables bound each output file's row count so its
+        // right-sized PK bloom stays within `COLD_PK_BLOOM_PER_FILE_MAX_BYTES`.
+        // Otherwise a file over the cap carries no bloom and the CDC-apply keyset
+        // rebuild degrades to a full cold scan. Only narrow-row tables (many keys
+        // per byte target) reach the cap; wide tables write a single chunk, and
+        // non-bloom tables keep the plain single write.
+        let bloom_eligible = self.upsert_bloom_eligible() && !self.pk_column_indices.is_empty();
+        if bloom_eligible {
+            let row_cap = Self::cold_file_row_cap();
+            let source = super::streaming::ColdChunkSource::new(Arc::clone(&schema), stream);
+            let mut chunk_idx: usize = 0;
+            while !source.is_exhausted() {
+                if chunk_idx == 1 {
+                    // Fired once per promotion that splits: the visible set exceeds
+                    // one file's bloom budget, so it graduates into multiple
+                    // row-bounded files (each still bloom-backed).
+                    tracing::warn!(
+                        target: "cayenne::provider::table",
+                        table = self.table_metadata.table_name.as_str(),
+                        cold_file_row_cap = row_cap,
+                        bloom_cap_bytes = COLD_PK_BLOOM_PER_FILE_MAX_BYTES,
+                        "Cold-tier promotion is splitting output into multiple row-bounded files to keep each file's PK bloom within the per-file cap"
+                    );
+                }
+                let chunk_dir_url = format!("{cold_dir_url}{chunk_idx:05}/");
+                if is_local {
+                    let local = chunk_dir_url
+                        .strip_prefix("file://")
+                        .unwrap_or(chunk_dir_url.as_str());
+                    Self::ensure_snapshot_dir_exists(std::path::Path::new(local)).await?;
+                }
+                let chunk_stream: SendableRecordBatchStream = Box::pin(source.next_chunk(row_cap));
+                self.insert_stream_into_cold_dir(
+                    session_state.as_ref(),
+                    &write_format,
+                    &chunk_dir_url,
+                    chunk_stream,
+                )
+                .await?;
+                chunk_idx = chunk_idx.saturating_add(1);
+            }
+        } else {
+            self.insert_stream_into_cold_dir(
+                session_state.as_ref(),
+                &write_format,
+                &cold_dir_url,
+                stream,
+            )
             .await?;
-        collect(insert_plan, session_state.task_ctx()).await?;
+        }
 
         // List the written cold files and read each footer for accurate per-file
         // stats + row counts (so listing-time pruning is exact).
@@ -24659,6 +24737,30 @@ mod tests {
 
     fn url(s: &str) -> String {
         s.to_string()
+    }
+
+    /// The per-file row cap must keep a full file's right-sized PK bloom
+    /// (~10 bits/key) strictly within `COLD_PK_BLOOM_PER_FILE_MAX_BYTES`, with
+    /// headroom for batch-granularity overshoot. This is the invariant the cold
+    /// promotion split relies on to keep every file bloom-backed.
+    #[test]
+    fn cold_file_row_cap_stays_within_bloom_budget() {
+        let row_cap = CayenneTableProvider::cold_file_row_cap();
+        assert!(row_cap > 0);
+        // Bloom bytes for a full file at ~10 bits/key (matches
+        // `build_cold_file_pk_bloom`'s `expected_keys * 10 / 8`).
+        let bloom_bytes = row_cap.saturating_mul(10) / 8;
+        assert!(
+            bloom_bytes <= COLD_PK_BLOOM_PER_FILE_MAX_BYTES,
+            "a full file's bloom ({bloom_bytes}B) must fit the cap ({COLD_PK_BLOOM_PER_FILE_MAX_BYTES}B)"
+        );
+        // Headroom: strictly below the exact key budget so a boundary batch can
+        // overshoot without tipping the file over the cap.
+        let exact_key_budget = COLD_PK_BLOOM_PER_FILE_MAX_BYTES.saturating_mul(8) / 10;
+        assert!(
+            row_cap < exact_key_budget,
+            "row cap ({row_cap}) must leave headroom below the exact key budget ({exact_key_budget})"
+        );
     }
 
     /// Mark-and-sweep core: an orphan (on store, not in manifest) is marked on

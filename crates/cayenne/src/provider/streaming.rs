@@ -19,17 +19,22 @@ limitations under the License.
 //! This module provides `StreamingExec`, an execution plan that forwards
 //! record batches from a stream without buffering.
 
+use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::execution::SendableRecordBatchStream as DFStream;
 use datafusion_physical_plan::DisplayAs;
 use datafusion_physical_plan::DisplayFormatType;
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::PlanProperties;
+use datafusion_physical_plan::RecordBatchStream;
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType, Partitioning};
+use futures::Stream;
 use futures::StreamExt;
 use futures::stream::unfold;
 use parking_lot::Mutex;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 /// A streaming execution plan that forwards batches without buffering.
 ///
@@ -141,5 +146,199 @@ impl ExecutionPlan for StreamingExec {
 
         let adapter = RecordBatchStreamAdapter::new(schema, Box::pin(forward));
         Ok(Box::pin(adapter))
+    }
+}
+
+/// Shared, resumable source for row-bounded cold-tier chunk writes.
+///
+/// Cold promotion Z-order sorts the whole visible table into one stream, then
+/// writes it in contiguous, row-bounded chunks so no output file's PK bloom can
+/// exceed `COLD_PK_BLOOM_PER_FILE_MAX_BYTES` (otherwise the file carries no bloom
+/// and the keyset rebuild degrades to a full cold scan). Sequential
+/// [`ColdChunkStream`]s pull from this one source; each stops after its row
+/// budget, leaving the source positioned for the next chunk. Splitting a
+/// globally-sorted stream at row boundaries preserves global order across files
+/// (and yields disjoint per-file min/max ranges, which helps listing-time
+/// pruning).
+///
+/// The inner stream lives behind a `parking_lot::Mutex` that is polled
+/// **synchronously** inside `poll_next` and released before returning — it is
+/// never held across an `.await` (poll returns immediately), matching this
+/// module's `StreamingExec` convention. A `None` inner marks the source
+/// exhausted.
+pub(crate) struct ColdChunkSource {
+    schema: SchemaRef,
+    inner: Mutex<Option<DFStream>>,
+}
+
+impl ColdChunkSource {
+    pub(crate) fn new(schema: SchemaRef, stream: DFStream) -> Arc<Self> {
+        Arc::new(Self {
+            schema,
+            inner: Mutex::new(Some(stream)),
+        })
+    }
+
+    /// `true` once the underlying stream has yielded end-of-stream (so the
+    /// promotion write loop stops minting further chunks).
+    pub(crate) fn is_exhausted(&self) -> bool {
+        self.inner.lock().is_none()
+    }
+
+    /// The next chunk: a stream that forwards batches from the shared source
+    /// until it has emitted at least `row_cap` rows, then ends without consuming
+    /// further. The boundary is at batch granularity, so the final batch may
+    /// overshoot `row_cap` by up to one batch — callers set `row_cap` with
+    /// headroom below the hard bloom cap to absorb that.
+    pub(crate) fn next_chunk(self: &Arc<Self>, row_cap: usize) -> ColdChunkStream {
+        ColdChunkStream {
+            source: Arc::clone(self),
+            emitted: 0,
+            row_cap,
+        }
+    }
+}
+
+/// One row-bounded chunk over a shared [`ColdChunkSource`]; see its docs.
+pub(crate) struct ColdChunkStream {
+    source: Arc<ColdChunkSource>,
+    emitted: usize,
+    row_cap: usize,
+}
+
+impl Stream for ColdChunkStream {
+    type Item = datafusion_common::Result<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.emitted >= this.row_cap {
+            // Chunk budget reached; end WITHOUT pulling further so the next
+            // chunk resumes from the source's current position.
+            return Poll::Ready(None);
+        }
+        let mut guard = this.source.inner.lock();
+        let Some(inner) = guard.as_mut() else {
+            return Poll::Ready(None);
+        };
+        match inner.poll_next_unpin(cx) {
+            Poll::Ready(Some(Ok(batch))) => {
+                this.emitted = this.emitted.saturating_add(batch.num_rows());
+                Poll::Ready(Some(Ok(batch)))
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(None) => {
+                *guard = None;
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl RecordBatchStream for ColdChunkStream {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.source.schema)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Array, Int64Array};
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use futures::stream;
+
+    fn id_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
+    }
+
+    fn id_batch(schema: &SchemaRef, start: i64, n: i64) -> RecordBatch {
+        let arr = Int64Array::from_iter_values(start..start + n);
+        RecordBatch::try_new(Arc::clone(schema), vec![Arc::new(arr)])
+            .expect("build test record batch")
+    }
+
+    fn source_stream(schema: &SchemaRef, batches: Vec<RecordBatch>) -> DFStream {
+        let s = stream::iter(batches.into_iter().map(Ok));
+        Box::pin(RecordBatchStreamAdapter::new(Arc::clone(schema), s))
+    }
+
+    async fn drain_ids(mut chunk: ColdChunkStream) -> Vec<i64> {
+        let mut out = Vec::new();
+        while let Some(item) = chunk.next().await {
+            let batch = item.expect("chunk batch is Ok");
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id column is Int64");
+            out.extend(col.values().iter().copied());
+        }
+        out
+    }
+
+    /// A source larger than the row cap splits into multiple chunks; every row is
+    /// preserved exactly once and in order (contiguous slices of the input), and
+    /// no chunk exceeds the cap by more than one batch (batch-granularity cut).
+    #[tokio::test]
+    async fn chunk_source_splits_at_row_cap_preserving_order_and_rows() {
+        let schema = id_schema();
+        // 5 batches x 100 rows = ids 0..500.
+        let batches: Vec<_> = (0..5).map(|i| id_batch(&schema, i * 100, 100)).collect();
+        let source = ColdChunkSource::new(Arc::clone(&schema), source_stream(&schema, batches));
+
+        let row_cap = 250usize;
+        let batch_rows = 100usize;
+        let mut all = Vec::new();
+        let mut chunks = 0usize;
+        while !source.is_exhausted() {
+            let got = drain_ids(source.next_chunk(row_cap)).await;
+            if got.is_empty() {
+                // Exact-boundary empty tail: harmless, produces no files.
+                break;
+            }
+            assert!(
+                got.len() <= row_cap + batch_rows,
+                "chunk exceeded cap + one batch: {}",
+                got.len()
+            );
+            all.extend(got);
+            chunks += 1;
+        }
+        assert!(chunks >= 2, "expected a split, got {chunks} chunk(s)");
+        assert_eq!(
+            all,
+            (0..500).collect::<Vec<_>>(),
+            "rows must be preserved exactly once, in order"
+        );
+        assert!(source.is_exhausted());
+    }
+
+    /// A source at or below the cap stays a single chunk (today's layout for the
+    /// common case) and drains fully.
+    #[tokio::test]
+    async fn chunk_source_single_chunk_when_under_cap() {
+        let schema = id_schema();
+        let batches = vec![id_batch(&schema, 0, 100), id_batch(&schema, 100, 100)];
+        let source = ColdChunkSource::new(Arc::clone(&schema), source_stream(&schema, batches));
+
+        assert!(!source.is_exhausted());
+        let first = drain_ids(source.next_chunk(10_000)).await;
+        assert_eq!(first, (0..200).collect::<Vec<_>>());
+        assert!(
+            source.is_exhausted(),
+            "source must be exhausted after a single under-cap chunk"
+        );
+    }
+
+    /// An empty source yields an immediately-empty chunk and marks exhausted.
+    #[tokio::test]
+    async fn chunk_source_empty_source() {
+        let schema = id_schema();
+        let source = ColdChunkSource::new(Arc::clone(&schema), source_stream(&schema, vec![]));
+        let got = drain_ids(source.next_chunk(100)).await;
+        assert!(got.is_empty());
+        assert!(source.is_exhausted());
     }
 }
