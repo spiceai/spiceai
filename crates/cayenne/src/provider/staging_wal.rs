@@ -60,8 +60,8 @@ use super::Result;
 use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
 use super::on_conflict::{PostValidationState, PreparedOnConflictDeletionPublish};
 use super::table::{CayenneTableProvider, PreparedAppendSnapshotPublish};
-use crate::metastore::MetastoreTransaction;
 use crate::metadata::SnapshotFile;
+use crate::metastore::MetastoreTransaction;
 use crate::provider::Error;
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::SendableRecordBatchStream;
@@ -436,11 +436,7 @@ pub struct PreparedStagedAppend {
 }
 
 /// Object-store handle, table-level WAL prefix, and canonical backend identity.
-pub type PartitionedWalObjectStore = (
-    Arc<dyn object_store::ObjectStore>,
-    ObjectStorePath,
-    String,
-);
+pub type PartitionedWalObjectStore = (Arc<dyn object_store::ObjectStore>, ObjectStorePath, String);
 
 impl std::fmt::Debug for PreparedStagedAppend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -455,7 +451,10 @@ impl std::fmt::Debug for PreparedStagedAppend {
             .field("has_ivm_feed", &self.ivm_feed_batches.is_some())
             .field("has_on_conflict", &self.prepared_on_conflict.is_some())
             .field("has_deferred_manifest", &self.deferred_manifest.is_some())
-            .field("has_validated_file_keys", &self.validated_file_keys.is_some())
+            .field(
+                "has_validated_file_keys",
+                &self.validated_file_keys.is_some(),
+            )
             .field("append_sequence", &self.append_sequence)
             .finish()
     }
@@ -484,17 +483,11 @@ impl PreparedStagedAppend {
         self.ivm_feed_batches = batches;
     }
 
-    pub(crate) fn set_prepared_on_conflict(
-        &mut self,
-        prepared: PreparedOnConflictDeletionPublish,
-    ) {
+    pub(crate) fn set_prepared_on_conflict(&mut self, prepared: PreparedOnConflictDeletionPublish) {
         self.prepared_on_conflict = Some(prepared);
     }
 
-    pub(crate) fn set_validated_file_keys(
-        &mut self,
-        keys: super::pk_index::PkDigestSet,
-    ) {
+    pub(crate) fn set_validated_file_keys(&mut self, keys: super::pk_index::PkDigestSet) {
         self.validated_file_keys = Some(keys);
     }
 
@@ -582,10 +575,13 @@ impl PreparedStagedAppend {
     /// Returns an error if source or target files cannot be listed, metadata
     /// cannot be loaded, or the target manifest is inconsistent.
     pub async fn prepare_deferred_manifest(&mut self) -> Result<()> {
-        let source_snapshot_id = self.source_snapshot_id.as_ref().ok_or_else(|| Error::Internal {
-            table: self.table.table_name().to_string(),
-            message: "Deferred manifest preparation requires a source snapshot".to_string(),
-        })?;
+        let source_snapshot_id =
+            self.source_snapshot_id
+                .as_ref()
+                .ok_or_else(|| Error::Internal {
+                    table: self.table.table_name().to_string(),
+                    message: "Deferred manifest preparation requires a source snapshot".to_string(),
+                })?;
         let source_manifest = self
             .table
             .metadata_catalog()
@@ -691,8 +687,7 @@ impl PreparedStagedAppend {
         &self,
         prepared: PreparedOnConflictDeletionPublish,
     ) {
-        self.table
-            .publish_prepared_on_conflict_deletions(prepared);
+        self.table.publish_prepared_on_conflict_deletions(prepared);
     }
 
     async fn lock_current_snapshot_for_apply(&self) -> Option<OwnedMutexGuard<()>> {
@@ -922,9 +917,7 @@ impl PreparedStagedAppend {
     ///
     /// Returns an error if object-store configuration or the canonical table
     /// prefix cannot be resolved.
-    pub fn partitioned_wal_object_store(
-        &self,
-    ) -> Result<Option<PartitionedWalObjectStore>> {
+    pub fn partitioned_wal_object_store(&self) -> Result<Option<PartitionedWalObjectStore>> {
         self.table.partitioned_wal_object_store()
     }
 
@@ -1065,9 +1058,7 @@ impl CayenneTableProvider {
     ///
     /// Returns an error if object-store configuration or the canonical table
     /// prefix cannot be resolved.
-    pub fn partitioned_wal_object_store(
-        &self,
-    ) -> Result<Option<PartitionedWalObjectStore>> {
+    pub fn partitioned_wal_object_store(&self) -> Result<Option<PartitionedWalObjectStore>> {
         if !self.table_path().starts_with("s3://") {
             return Ok(None);
         }
@@ -1740,9 +1731,13 @@ impl CayenneTableProvider {
             // commit, carry the commit id through every operator-facing recovery
             // error so related partition failures can be correlated.
             let mut extra = String::new();
-            let partitioned_table_root = std::path::Path::new(self.table_path())
-                .ancestors()
-                .find(|path| path.join(super::partitioned_wal::PARTITIONED_WAL_DIR).exists());
+            let partitioned_table_root =
+                std::path::Path::new(self.table_path())
+                    .ancestors()
+                    .find(|path| {
+                        path.join(super::partitioned_wal::PARTITIONED_WAL_DIR)
+                            .exists()
+                    });
             if let Some(partitioned_table_root) = partitioned_table_root
                 && let Ok(all_wals) = PartitionedWal::read_all_in(partitioned_table_root).await
             {
@@ -1973,8 +1968,7 @@ impl CayenneTableProvider {
                             wal.target_snapshot
                         ),
                     })?;
-                    if let Some(rel) =
-                        meta.location.as_ref().strip_prefix(staging_prefix.as_ref())
+                    if let Some(rel) = meta.location.as_ref().strip_prefix(staging_prefix.as_ref())
                         && expected.contains(rel)
                     {
                         reachable.insert(rel.to_string());

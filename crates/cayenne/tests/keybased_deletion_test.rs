@@ -209,8 +209,8 @@ async fn delete_all(table: &Arc<CayenneTableProvider>) -> TestResult<u64> {
 // Regression: RowConverter delete-all (unfiltered DELETE over file rows)
 // =============================================================================
 
-/// An unfiltered `DELETE` over file-resident string-PK (RowConverter) rows must
-/// remove every row and report the exact count. Guards the RowConverter
+/// An unfiltered `DELETE` over file-resident string-PK (`RowConverter`) rows must
+/// remove every row and report the exact count. Guards the `RowConverter`
 /// delete-all scan path (deleting nothing here is a silent correctness bug).
 async fn test_string_pk_delete_all_empty_filter_impl(fixture: TestFixture) -> TestResult<()> {
     let (table, ctx, schema) = setup_string_pk_table(&fixture, "string_delete_all").await?;
@@ -241,10 +241,9 @@ async fn test_string_pk_delete_all_empty_filter_impl(fixture: TestFixture) -> Te
 test_with_backends!(test_string_pk_delete_all_empty_filter_impl);
 
 /// Composite-PK `(region, id)` delete-all over file-resident rows must remove
-/// every row. Guards the composite RowConverter delete-all path.
+/// every row. Guards the composite `RowConverter` delete-all path.
 async fn test_composite_pk_delete_all_empty_filter_impl(fixture: TestFixture) -> TestResult<()> {
-    let (table, ctx, schema) =
-        setup_composite_pk_table(&fixture, "composite_delete_all").await?;
+    let (table, ctx, schema) = setup_composite_pk_table(&fixture, "composite_delete_all").await?;
     let batch = RecordBatch::try_new(
         schema,
         vec![

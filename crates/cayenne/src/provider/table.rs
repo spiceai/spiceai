@@ -52,9 +52,8 @@ use super::on_conflict::{
     OnConflictDeletionUpdate, OnConflictDeletions, OnConflictUpdate, OnConflictValidationStream,
     PendingTombstoneDeltas, PkDeletionSnapshot, PkKeysetInvalidatingDeletionSink,
     PreparedInsertStream, PreparedOnConflictDeletionPublish, PreparedOnConflictDurablePayload,
-    PreparedProtectedSnapshotUpdate,
-    PreparedShardedInsertStream, ProtectedSnapshotScan, RowKeyDeletionDelta, ShardedApplyResult,
-    pk_deletion_snapshot_for_strategy,
+    PreparedProtectedSnapshotUpdate, PreparedShardedInsertStream, ProtectedSnapshotScan,
+    RowKeyDeletionDelta, ShardedApplyResult, pk_deletion_snapshot_for_strategy,
 };
 use super::pk_index::{
     COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkIndex, CachedPkKeyset, ColdPkExistence,
@@ -4244,8 +4243,7 @@ impl CayenneTableProvider {
                                 return;
                             }
                         };
-                        if let Err(error) =
-                            runtime.block_on(table.clear_snapshot_dir(&snapshot_id))
+                        if let Err(error) = runtime.block_on(table.clear_snapshot_dir(&snapshot_id))
                         {
                             tracing::warn!(
                                 table = table.table_name(),
@@ -10120,7 +10118,6 @@ impl CayenneTableProvider {
             snapshot_sequence,
             "Published staged on-conflict snapshot"
         );
-
     }
 
     fn publish_staged_position_deletion_cache(
@@ -19349,8 +19346,8 @@ impl CayenneTableProvider {
                 snapshot,
                 durable_epoch,
                 seq,
-                )
-            };
+            )
+        };
         // The all-shards-atomic capture window: the per-shard snapshot load +
         // sequence reservation under the publish locks (and `write_lock` at N>1).
         // The encode/commit below run OUTSIDE this window, so this metric isolates
@@ -22381,12 +22378,8 @@ impl CayenneTableProvider {
                 }
             });
 
-        let (file_group, truncated_file_set) = Self::collect_scan_files_with_limit(
-            files,
-            request.limit,
-            use_stats_for_limit,
-        )
-        .await?;
+        let (file_group, truncated_file_set) =
+            Self::collect_scan_files_with_limit(files, request.limit, use_stats_for_limit).await?;
 
         let threshold = request
             .state
@@ -23110,10 +23103,9 @@ fn rewrite_consecutive_inlist_to_range_if_needed(expr: &Expr) -> Option<Expr> {
             return None;
         };
         let ordinal = signed_integer_ordinal(value)?;
-        if values
-            .first()
-            .is_some_and(|(_, first)| std::mem::discriminant(first) != std::mem::discriminant(value))
-        {
+        if values.first().is_some_and(|(_, first)| {
+            std::mem::discriminant(first) != std::mem::discriminant(value)
+        }) {
             return None;
         }
         values.push((ordinal, value.clone()));

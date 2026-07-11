@@ -553,12 +553,18 @@ mod tests {
 
         // Test non-NULL values are encoded correctly
         assert_eq!(encode_key(&ScalarValue::Int32(Some(42)))?, "v1.i32.v3432");
-        assert_eq!(encode_key(&ScalarValue::Int64(Some(-100)))?, "v1.i64.v2D313030");
+        assert_eq!(
+            encode_key(&ScalarValue::Int64(Some(-100)))?,
+            "v1.i64.v2D313030"
+        );
         assert_eq!(
             encode_key(&ScalarValue::Utf8(Some("test".to_string())))?,
             "v1.utf8.v74657374"
         );
-        assert_eq!(encode_key(&ScalarValue::Boolean(Some(true)))?, "v1.bool.v74727565");
+        assert_eq!(
+            encode_key(&ScalarValue::Boolean(Some(true)))?,
+            "v1.bool.v74727565"
+        );
         assert_eq!(encode_key(&ScalarValue::UInt32(Some(99)))?, "v1.u32.v3939");
 
         Ok(())

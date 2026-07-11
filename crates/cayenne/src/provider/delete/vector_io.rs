@@ -34,8 +34,8 @@ limitations under the License.
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 
 use arrow::array::{Array, BinaryArray, Int64Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -407,116 +407,118 @@ impl<'a> DeletionVectorWriter<'a> {
             .map(|_| Self::deletion_file_path(&deletion_dir))
             .collect::<Vec<_>>();
         let mut cleanup_guard = UncommittedDeleteFilesGuard::new(batch_paths.clone());
-        let write_futures = specs
-            .into_iter()
-            .zip(batch_paths.iter().cloned())
-            .map(|(spec, file_path)| {
-            let mut completion = Some(cleanup_guard.completion());
-            let table_name = self.table.table_name.clone();
-            #[cfg(test)]
-            let test_hook = self.test_hook.as_ref().map(Arc::clone);
-            async move {
-                let (batch, schema, count, identifiers, source_data_file_path) =
-                    match spec.identifiers {
-                        DeletionIdentifier::PositionBased {
-                            file_path: source_file,
-                            mut row_ids,
-                            pre_sorted,
-                        } => {
-                            if pre_sorted {
-                                debug_assert!(
-                                    row_ids.windows(2).all(|w| w[0] < w[1]),
-                                    "pre_sorted=true but row_ids is not strictly increasing",
-                                );
-                            } else {
-                                row_ids.sort_unstable();
-                                row_ids.dedup();
+        let write_futures =
+            specs
+                .into_iter()
+                .zip(batch_paths.iter().cloned())
+                .map(|(spec, file_path)| {
+                    let mut completion = Some(cleanup_guard.completion());
+                    let table_name = self.table.table_name.clone();
+                    #[cfg(test)]
+                    let test_hook = self.test_hook.as_ref().map(Arc::clone);
+                    async move {
+                        let (batch, schema, count, identifiers, source_data_file_path) = match spec
+                            .identifiers
+                        {
+                            DeletionIdentifier::PositionBased {
+                                file_path: source_file,
+                                mut row_ids,
+                                pre_sorted,
+                            } => {
+                                if pre_sorted {
+                                    debug_assert!(
+                                        row_ids.windows(2).all(|w| w[0] < w[1]),
+                                        "pre_sorted=true but row_ids is not strictly increasing",
+                                    );
+                                } else {
+                                    row_ids.sort_unstable();
+                                    row_ids.dedup();
+                                }
+                                let count = row_ids.len();
+                                let schema = position_based_deletion_schema();
+                                let batch = build_position_based_batch(&schema, &row_ids)?;
+                                (
+                                    batch,
+                                    schema,
+                                    count,
+                                    DeletionIdentifier::PositionBased {
+                                        file_path: source_file.clone(),
+                                        row_ids,
+                                        pre_sorted,
+                                    },
+                                    Some(source_file),
+                                )
                             }
-                            let count = row_ids.len();
-                            let schema = position_based_deletion_schema();
-                            let batch = build_position_based_batch(&schema, &row_ids)?;
-                            (
-                                batch,
-                                schema,
-                                count,
-                                DeletionIdentifier::PositionBased {
-                                    file_path: source_file.clone(),
-                                    row_ids,
-                                    pre_sorted,
-                                },
-                                Some(source_file),
-                            )
-                        }
-                        DeletionIdentifier::KeyBased(mut row_keys) => {
-                            // Sort and deduplicate keys
-                            row_keys.sort();
-                            row_keys.dedup();
-                            let count = row_keys.len();
-                            let schema = key_based_deletion_schema();
-                            let batch = build_key_based_batch(&schema, &row_keys)?;
-                            (
-                                batch,
-                                schema,
-                                count,
-                                DeletionIdentifier::KeyBased(row_keys),
-                                None,
-                            )
-                        }
-                    };
+                            DeletionIdentifier::KeyBased(mut row_keys) => {
+                                // Sort and deduplicate keys
+                                row_keys.sort();
+                                row_keys.dedup();
+                                let count = row_keys.len();
+                                let schema = key_based_deletion_schema();
+                                let batch = build_key_based_batch(&schema, &row_keys)?;
+                                (
+                                    batch,
+                                    schema,
+                                    count,
+                                    DeletionIdentifier::KeyBased(row_keys),
+                                    None,
+                                )
+                            }
+                        };
 
-                // From this point the completion token is transferred into the
-                // detached blocking writer. Any earlier `?` drops it here and
-                // decrements the pending count, so cancellation cleanup cannot
-                // wait forever for a writer that was never spawned.
+                        // From this point the completion token is transferred into the
+                        // detached blocking writer. Any earlier `?` drops it here and
+                        // decrements the pending count, so cancellation cleanup cannot
+                        // wait forever for a writer that was never spawned.
 
-                #[cfg(test)]
-                let file_size_bytes = write_deletion_file(
-                    &file_path,
-                    Arc::clone(&schema),
-                    batch,
-                    &table_name,
-                    completion.take(),
-                    test_hook,
-                )
-                .await?;
-                #[cfg(not(test))]
-                let file_size_bytes = write_deletion_file(
-                    &file_path,
-                    Arc::clone(&schema),
-                    batch,
-                    &table_name,
-                    completion.take(),
-                )
-                .await?;
+                        #[cfg(test)]
+                        let file_size_bytes = write_deletion_file(
+                            &file_path,
+                            Arc::clone(&schema),
+                            batch,
+                            &table_name,
+                            completion.take(),
+                            test_hook,
+                        )
+                        .await?;
+                        #[cfg(not(test))]
+                        let file_size_bytes = write_deletion_file(
+                            &file_path,
+                            Arc::clone(&schema),
+                            batch,
+                            &table_name,
+                            completion.take(),
+                        )
+                        .await?;
 
-                Ok::<_, Error>((
-                    file_path,
-                    count,
-                    file_size_bytes,
-                    identifiers,
-                    source_data_file_path,
-                ))
-            }
-        });
+                        Ok::<_, Error>((
+                            file_path,
+                            count,
+                            file_size_bytes,
+                            identifiers,
+                            source_data_file_path,
+                        ))
+                    }
+                });
         let written: Vec<(PathBuf, usize, u64, DeletionIdentifier, Option<String>)> =
             match futures::future::join_all(write_futures)
                 .await
                 .into_iter()
                 .collect::<Result<Vec<_>>>()
             {
-            Ok(written) => written,
-            Err(error) => {
-                // Every write future owns a distinct UUID path. `join_all`
-                // waits for all of them, so after one fails no sibling write is
-                // still racing this cleanup. Remove every final-path artifact
-                // from the failed logical batch before returning; otherwise a
-                // later failure or task cancellation at a caller could leak
-                // unreferenced deletion vectors indefinitely.
-                cleanup_uncommitted_delete_paths(&batch_paths).await;
-                cleanup_guard.disarm();
-                return Err(error);
-            }
-        };
+                Ok(written) => written,
+                Err(error) => {
+                    // Every write future owns a distinct UUID path. `join_all`
+                    // waits for all of them, so after one fails no sibling write is
+                    // still racing this cleanup. Remove every final-path artifact
+                    // from the failed logical batch before returning; otherwise a
+                    // later failure or task cancellation at a caller could leak
+                    // unreferenced deletion vectors indefinitely.
+                    cleanup_uncommitted_delete_paths(&batch_paths).await;
+                    cleanup_guard.disarm();
+                    return Err(error);
+                }
+            };
 
         // ONE coalesced deletions/-dir sync for the whole batch of files
         // (replaces the previous per-file parent-dir fsync): a directory fsync
@@ -976,7 +978,6 @@ mod tests {
     use arrow::ipc::reader::FileReader;
     use tempfile::TempDir;
 
-
     fn build_table_metadata(temp_dir: &TempDir) -> TableMetadata {
         TableMetadata {
             table_id: "test-table-id".to_string(),
@@ -1148,9 +1149,8 @@ mod tests {
             .join(DELETION_DIR_NAME);
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                let empty = std::fs::read_dir(&deletion_dir)
-                    .map(|entries| entries.count() == 0)
-                    .unwrap_or(true);
+                let empty =
+                    std::fs::read_dir(&deletion_dir).map_or(true, |entries| entries.count() == 0);
                 if empty {
                     break;
                 }

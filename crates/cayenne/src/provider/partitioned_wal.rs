@@ -675,9 +675,19 @@ mod tests {
         let mut wal = sample_wal();
         wal.commit_id = "../../escape".to_string();
 
-        assert!(wal.write_to(tmp.path()).await.is_err());
-        assert!(PartitionedWal::remove(tmp.path(), "../../escape").await.is_err());
-        assert!(!tmp.path().parent().expect("parent").join("escape.json").exists());
+        wal.write_to(tmp.path())
+            .await
+            .expect_err("write_to must reject a path-traversal commit_id");
+        PartitionedWal::remove(tmp.path(), "../../escape")
+            .await
+            .expect_err("remove must reject a path-traversal commit_id");
+        assert!(
+            !tmp.path()
+                .parent()
+                .expect("parent")
+                .join("escape.json")
+                .exists()
+        );
     }
 
     #[tokio::test]

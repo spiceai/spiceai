@@ -2922,22 +2922,18 @@ impl DataAccelerator for CayenneAccelerator {
                     PathBuf::from(&dir_path),
                 ),
             );
-            let partition_provider = PartitionTableProvider::new(
-                creator,
-                partition_by,
-                Arc::clone(&arrow_schema),
-            )
-            .await
-            .boxed()
-            .context(AccelerationCreationFailedSnafu)?;
+            let partition_provider =
+                PartitionTableProvider::new(creator, partition_by, Arc::clone(&arrow_schema))
+                    .await
+                    .boxed()
+                    .context(AccelerationCreationFailedSnafu)?;
             insert_strategy
                 .recover_partitioned_wals(&partition_provider.partition_table_providers().await)
                 .await
                 .boxed()
                 .context(AccelerationCreationFailedSnafu)?;
-            let partition_provider = Arc::new(
-                partition_provider.with_insert_strategy(insert_strategy),
-            );
+            let partition_provider =
+                Arc::new(partition_provider.with_insert_strategy(insert_strategy));
 
             // Wrap with upsert deduplication if needed based on on_conflict settings
             let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
@@ -3284,7 +3280,11 @@ impl CayennePartitionCreator {
 
     /// Generate a unique table name for this partition based on composite key.
     fn partition_table_name(&self, partition_key: &str) -> String {
-        format!("{}_p{}", self.table_name, encode_identifier_hex(partition_key))
+        format!(
+            "{}_p{}",
+            self.table_name,
+            encode_identifier_hex(partition_key)
+        )
     }
 
     fn legacy_partition_table_name(&self, partition_values: &[String]) -> String {

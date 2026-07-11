@@ -1359,12 +1359,8 @@ impl SnapshotManager {
             uuid::Uuid::now_v7()
         ));
 
-        let total_archived = archive_directories_to_file_with_plan(
-            dirs,
-            &temp_archive_path,
-            &skip_paths,
-            &extras,
-        )
+        let total_archived =
+            archive_directories_to_file_with_plan(dirs, &temp_archive_path, &skip_paths, &extras)
                 .await
                 .map_err(|source| SnapshotUploadError::ArchiveCreate {
                     path: temp_archive_path.clone(),

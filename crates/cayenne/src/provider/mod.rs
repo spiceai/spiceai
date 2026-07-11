@@ -121,13 +121,13 @@ pub use mem_tier_budget::{
     global_mem_tier_total, global_mem_tier_used, set_global_mem_tier_bytes,
     update_global_mem_tier_total,
 };
+pub use on_conflict::PreparedOnConflictDeletionPublish;
 pub use overwrite::PreparedOverwrite;
 pub use partitioned_wal::{PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry};
 pub use query_admission::set_query_admission_governor;
 pub use retention::TimeRetentionFilterBuilder;
 pub use scan::CayenneAccelerationExec;
 pub use staging_wal::{CayenneStagedAppend, PartitionedWalObjectStore, PreparedStagedAppend};
-pub use on_conflict::PreparedOnConflictDeletionPublish;
 pub use table::{
     CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder,
     PreparedAppendSnapshotPublish,

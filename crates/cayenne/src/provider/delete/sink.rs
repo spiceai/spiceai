@@ -196,10 +196,14 @@ impl PreparedDeletionPublish {
         );
         match publish {
             PreparedDeletionCache::Int64 { pks, sequence } => {
-                let snapshot = self.strategy.int64_pk_snapshot().ok_or_else(|| Error::Internal {
-                    table: "unknown".to_string(),
-                    message: "Atomic Int64 deletion used with incompatible strategy".to_string(),
-                })?;
+                let snapshot =
+                    self.strategy
+                        .int64_pk_snapshot()
+                        .ok_or_else(|| Error::Internal {
+                            table: "unknown".to_string(),
+                            message: "Atomic Int64 deletion used with incompatible strategy"
+                                .to_string(),
+                        })?;
                 if let Some(sequence) = sequence {
                     snapshot.rcu(|current| {
                         Arc::new(Int64PkDeletionSnapshot::from_index(
@@ -211,10 +215,14 @@ impl PreparedDeletionPublish {
                 }
             }
             PreparedDeletionCache::RowKeys { keys, sequence } => {
-                let snapshot = self.strategy.row_keys_snapshot().ok_or_else(|| Error::Internal {
-                    table: "unknown".to_string(),
-                    message: "Atomic key deletion used with incompatible strategy".to_string(),
-                })?;
+                let snapshot =
+                    self.strategy
+                        .row_keys_snapshot()
+                        .ok_or_else(|| Error::Internal {
+                            table: "unknown".to_string(),
+                            message: "Atomic key deletion used with incompatible strategy"
+                                .to_string(),
+                        })?;
                 if let Some(sequence) = sequence {
                     snapshot.rcu(|current| {
                         Arc::new(RowConverterDeletionSnapshot::from_index(
@@ -573,8 +581,7 @@ impl CayenneDeletionSink {
                         .scan(&ctx.state(), Some(&self.pk_column_indices), &[], None)
                         .await?;
                     let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
-                    let projected_indices: Vec<usize> =
-                        (0..self.pk_column_indices.len()).collect();
+                    let projected_indices: Vec<usize> = (0..self.pk_column_indices.len()).collect();
                     while let Some(batch) = stream.next().await {
                         let batch = batch?;
                         let pk_columns: Vec<ArrayRef> = projected_indices
@@ -1118,23 +1125,25 @@ impl CayenneDeletionSink {
                 delete_sequence,
                 delete_files,
                 ..
-            } => {
-                (std::mem::take(delete_files), PreparedDeletionCache::Int64 {
+            } => (
+                std::mem::take(delete_files),
+                PreparedDeletionCache::Int64 {
                     pks: std::mem::take(new_pks),
                     sequence: *delete_sequence,
-                })
-            }
+                },
+            ),
             StagedPkDelete::RowKeys {
                 new_keys,
                 delete_sequence,
                 delete_files,
                 ..
-            } => {
-                (std::mem::take(delete_files), PreparedDeletionCache::RowKeys {
+            } => (
+                std::mem::take(delete_files),
+                PreparedDeletionCache::RowKeys {
                     keys: std::mem::take(new_keys),
                     sequence: *delete_sequence,
-                })
-            }
+                },
+            ),
         };
         Ok(PreparedDeletionPublish {
             strategy: self.pk_deletion_strategy.clone(),

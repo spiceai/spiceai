@@ -372,12 +372,11 @@ pub async fn archive_directories_to_file_with_plan(
     let extras = extras.to_vec();
 
     tokio::task::spawn_blocking(move || {
-        let file = std::fs::File::create(&destination).map_err(|source| {
-            ArchiveError::CreateArchive {
+        let file =
+            std::fs::File::create(&destination).map_err(|source| ArchiveError::CreateArchive {
                 path: destination.clone(),
                 source,
-            }
-        })?;
+            })?;
         let mut archive = tar::Builder::new(file);
 
         for (dir_path, archive_prefix) in &dirs {
@@ -395,7 +394,10 @@ pub async fn archive_directories_to_file_with_plan(
                 }
             };
             if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                tracing::warn!("Directory {} is not archivable, skipping", dir_path.display());
+                tracing::warn!(
+                    "Directory {} is not archivable, skipping",
+                    dir_path.display()
+                );
                 continue;
             }
             add_directory_to_archive_filtered(&mut archive, dir_path, archive_prefix, &skip)
@@ -421,8 +423,7 @@ pub async fn archive_directories_to_file_with_plan(
         let mut file = archive
             .into_inner()
             .map_err(|source| ArchiveError::WriteArchive { source })?;
-        std::io::Write::flush(&mut file)
-            .map_err(|source| ArchiveError::WriteArchive { source })?;
+        std::io::Write::flush(&mut file).map_err(|source| ArchiveError::WriteArchive { source })?;
         file.metadata()
             .map(|metadata| metadata.len())
             .map_err(|source| ArchiveError::CreateArchive {
@@ -607,15 +608,12 @@ pub async fn extract_archive_file_with_options(
     let target_dir_for_error = target_dir.clone();
 
     tokio::task::spawn_blocking(move || {
-        let file = std::fs::File::open(&archive_path).map_err(|source| {
-            ArchiveError::ReadArchive { source }
-        })?;
+        let file = std::fs::File::open(&archive_path)
+            .map_err(|source| ArchiveError::ReadArchive { source })?;
         let mut archive = tar::Archive::new(file);
-        std::fs::create_dir_all(&target_dir).map_err(|source| {
-            ArchiveError::ExtractArchive {
-                path: target_dir.clone(),
-                source,
-            }
+        std::fs::create_dir_all(&target_dir).map_err(|source| ArchiveError::ExtractArchive {
+            path: target_dir.clone(),
+            source,
         })?;
         extract_with_skip_existing_and_verify(
             &mut archive,
@@ -1072,16 +1070,17 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
 
             #[cfg(unix)]
             if let Some(parent) = dest_path.parent() {
-                let parent_dir = fs::File::open(parent).map_err(|source| {
-                    ArchiveError::ExtractArchive {
+                let parent_dir =
+                    fs::File::open(parent).map_err(|source| ArchiveError::ExtractArchive {
                         path: parent.to_path_buf(),
                         source,
-                    }
-                })?;
-                parent_dir.sync_all().map_err(|source| ArchiveError::ExtractArchive {
-                    path: parent.to_path_buf(),
-                    source,
-                })?;
+                    })?;
+                parent_dir
+                    .sync_all()
+                    .map_err(|source| ArchiveError::ExtractArchive {
+                        path: parent.to_path_buf(),
+                        source,
+                    })?;
             }
 
             #[cfg(unix)]
@@ -1515,11 +1514,8 @@ mod tests {
         assert_eq!(specific_path, specific_dir.join("file.vortex"));
 
         // Segment-aware matching must not route `database/...` through `data`.
-        let (default_path, _) = remap_entry_path(
-            Path::new("database/file.vortex"),
-            &default_dir,
-            &normalized,
-        )?;
+        let (default_path, _) =
+            remap_entry_path(Path::new("database/file.vortex"), &default_dir, &normalized)?;
         assert_eq!(default_path, default_dir.join("database/file.vortex"));
         Ok(())
     }
@@ -1533,7 +1529,12 @@ mod tests {
         let second_key = canonical_lock_path(&second).await?;
 
         let first_guards = acquire_extraction_locks(&first, &[]).await?;
-        assert!(DIRECTORY_EXTRACTION_LOCKS.lock().await.contains_key(&first_key));
+        assert!(
+            DIRECTORY_EXTRACTION_LOCKS
+                .lock()
+                .await
+                .contains_key(&first_key)
+        );
         drop(first_guards);
 
         let second_guards = acquire_extraction_locks(&second, &[]).await?;

@@ -840,12 +840,12 @@ impl CayenneDeletionSink {
                 continue;
             }
 
-            new_deletion_count = new_deletion_count.checked_add(newly_added_for_file).ok_or_else(
-                || Error::Internal {
+            new_deletion_count = new_deletion_count
+                .checked_add(newly_added_for_file)
+                .ok_or_else(|| Error::Internal {
                     table: table_name.clone(),
                     message: "New position-deletion count overflowed usize".to_string(),
-                },
-            )?;
+                })?;
 
             // Union existing + new into one bitmap, then derive the writer-bound
             // `Vec<u64>` from its monotone iterator — saves a separate
@@ -896,12 +896,8 @@ impl CayenneDeletionSink {
             .iter()
             .map(|delete_file| delete_file.path.clone())
             .collect::<Vec<_>>();
-        let mut cleanup_guard = PositionDeleteCleanup(
-            cleanup_paths
-                .iter()
-                .map(PathBuf::from)
-                .collect(),
-        );
+        let mut cleanup_guard =
+            PositionDeleteCleanup(cleanup_paths.iter().map(PathBuf::from).collect());
         if let Err(error) = self.catalog.add_delete_files(delete_files).await {
             super::super::cleanup_uncommitted_delete_paths(&cleanup_guard.0).await;
             cleanup_guard.0.clear();

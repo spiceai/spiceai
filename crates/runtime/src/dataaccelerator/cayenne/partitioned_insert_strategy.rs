@@ -749,9 +749,7 @@ fn append_commit_failure_disposition<E>(
     classification: Result<AppendCommitState, E>,
 ) -> AppendCommitFailureDisposition<E> {
     match classification {
-        Ok(AppendCommitState::AllCommitted) => {
-            AppendCommitFailureDisposition::RecoverCommitted
-        }
+        Ok(AppendCommitState::AllCommitted) => AppendCommitFailureDisposition::RecoverCommitted,
         Ok(AppendCommitState::AllUncommitted) => AppendCommitFailureDisposition::Rollback,
         Ok(AppendCommitState::Mixed {
             committed,
@@ -1123,165 +1121,152 @@ impl DataSink for CayennePartitionedAppendSink {
         let catalog = Arc::clone(&self.catalog);
         let table_root = self.table_root.clone();
         let completion = tokio::spawn(async move {
-        let _coordinator_guard = _coordinator_guard;
-        // The complete post-append contents now exist in one private snapshot
-        // per partition. Flip every pointer in a single metastore transaction;
-        // readers cannot observe a subset through a fresh directory listing.
-        if let Err(error) = Self::commit_append_snapshots_in_one_txn(
-            catalog.as_ref(),
-            &prepared,
-            &mut prepared_on_conflicts,
-        )
-            .await
-        {
-            let commit_state = Self::classify_append_snapshot_pointers(
+            let _coordinator_guard = _coordinator_guard;
+            // The complete post-append contents now exist in one private snapshot
+            // per partition. Flip every pointer in a single metastore transaction;
+            // readers cannot observe a subset through a fresh directory listing.
+            if let Err(error) = Self::commit_append_snapshots_in_one_txn(
                 catalog.as_ref(),
                 &prepared,
+                &mut prepared_on_conflicts,
             )
-            .await;
-            match append_commit_failure_disposition(commit_state) {
-                AppendCommitFailureDisposition::RecoverCommitted => {
-                    // `COMMIT` can complete but report an ambiguous transport
-                    // failure. Durable pointers are the decision: restore each
-                    // payload, prove its generated DV paths are in committed
-                    // metadata, then let per-partition WAL recovery reload and
-                    // publish the complete durable state.
-                    for (receipt, on_conflict) in prepared
-                        .iter_mut()
-                        .zip(prepared_on_conflicts)
+            .await
+            {
+                let commit_state =
+                    Self::classify_append_snapshot_pointers(catalog.as_ref(), &prepared).await;
+                match append_commit_failure_disposition(commit_state) {
+                    AppendCommitFailureDisposition::RecoverCommitted => {
+                        // `COMMIT` can complete but report an ambiguous transport
+                        // failure. Durable pointers are the decision: restore each
+                        // payload, prove its generated DV paths are in committed
+                        // metadata, then let per-partition WAL recovery reload and
+                        // publish the complete durable state.
+                        for (receipt, on_conflict) in prepared.iter_mut().zip(prepared_on_conflicts)
+                        {
+                            receipt.restore_prepared_on_conflict(on_conflict);
+                            receipt
+                                .reconcile_committed_on_conflict_cleanup()
+                                .await
+                                .map_err(DataFusionError::from)?;
+                        }
+                        drop(fence_guards);
+                        for receipt in &prepared {
+                            receipt
+                                .recover_committed_snapshot()
+                                .await
+                                .map_err(DataFusionError::from)?;
+                        }
+                        return Err(error);
+                    }
+                    AppendCommitFailureDisposition::Rollback => {}
+                    AppendCommitFailureDisposition::RetainMixed {
+                        committed,
+                        uncommitted,
+                    } => {
+                        retain_ambiguous_commit_receipts(&mut prepared, prepared_on_conflicts);
+                        drop(fence_guards);
+                        return Err(DataFusionError::Execution(format!(
+                            "Cross-partition Cayenne commit returned an error and durable catalog pointers are mixed ({committed} committed, {uncommitted} uncommitted); refusing rollback and retaining every WAL for manual recovery"
+                        )));
+                    }
+                    AppendCommitFailureDisposition::RetainUnknown(classification_error) => {
+                        retain_ambiguous_commit_receipts(&mut prepared, prepared_on_conflicts);
+                        drop(fence_guards);
+                        return Err(DataFusionError::Execution(format!(
+                            "Cross-partition Cayenne commit returned an error and its durable outcome could not be classified ({classification_error}); refusing rollback and retaining every WAL for recovery. Original commit error: {error}"
+                        )));
+                    }
+                }
+                drop(fence_guards);
+                for (receipt, on_conflict) in prepared.iter_mut().zip(prepared_on_conflicts) {
+                    receipt.restore_prepared_on_conflict(on_conflict);
+                }
+                let mut rollback_failed = false;
+                for receipt in prepared {
+                    if let Err(rollback_error) = receipt.rollback().await {
+                        rollback_failed = true;
+                        tracing::warn!("Failed to roll back deferred append: {rollback_error}");
+                    }
+                }
+                if !rollback_failed
+                    && let Err(cleanup_error) = if let Some((store, prefix, _)) = &object_store_wal
                     {
-                        receipt.restore_prepared_on_conflict(on_conflict);
-                        receipt
-                            .reconcile_committed_on_conflict_cleanup()
+                        PartitionedWal::remove_from_object_store(store.as_ref(), prefix, &commit_id)
                             .await
-                            .map_err(DataFusionError::from)?;
+                    } else {
+                        PartitionedWal::remove(&table_root, &commit_id).await
                     }
-                    drop(fence_guards);
-                    for receipt in &prepared {
-                        receipt
-                            .recover_committed_snapshot()
-                            .await
-                            .map_err(DataFusionError::from)?;
-                    }
-                    return Err(error);
-                }
-                AppendCommitFailureDisposition::Rollback => {}
-                AppendCommitFailureDisposition::RetainMixed {
-                    committed,
-                    uncommitted,
-                } => {
-                    retain_ambiguous_commit_receipts(
-                        &mut prepared,
-                        prepared_on_conflicts,
+                {
+                    tracing::warn!(
+                        "Failed to remove top-level WAL after append rollback: {cleanup_error}"
                     );
-                    drop(fence_guards);
-                    return Err(DataFusionError::Execution(format!(
-                        "Cross-partition Cayenne commit returned an error and durable catalog pointers are mixed ({committed} committed, {uncommitted} uncommitted); refusing rollback and retaining every WAL for manual recovery"
-                    )));
                 }
-                AppendCommitFailureDisposition::RetainUnknown(classification_error) => {
-                    retain_ambiguous_commit_receipts(
-                        &mut prepared,
-                        prepared_on_conflicts,
-                    );
-                    drop(fence_guards);
-                    return Err(DataFusionError::Execution(format!(
-                        "Cross-partition Cayenne commit returned an error and its durable outcome could not be classified ({classification_error}); refusing rollback and retaining every WAL for recovery. Original commit error: {error}"
-                    )));
-                }
+                return Err(error);
             }
-            drop(fence_guards);
-            for (receipt, on_conflict) in prepared
-                .iter_mut()
+
+            // No await is permitted between these publications. The catalog commit
+            // above is the durable global decision; cancellation must not leave a
+            // proper subset of the participating providers on the new snapshots.
+            for ((receipt, publish_state), prepared_on_conflict) in prepared
+                .iter()
+                .zip(publish_states)
                 .zip(prepared_on_conflicts)
             {
-                receipt.restore_prepared_on_conflict(on_conflict);
-            }
-            let mut rollback_failed = false;
-            for receipt in prepared {
-                if let Err(rollback_error) = receipt.rollback().await {
-                    rollback_failed = true;
-                    tracing::warn!("Failed to roll back deferred append: {rollback_error}");
+                receipt.publish_deferred_snapshot_under_held_fence(publish_state);
+                if let Some(on_conflict) = prepared_on_conflict {
+                    receipt.publish_on_conflict_under_held_fence(on_conflict);
                 }
+                receipt.publish_validated_file_keys();
             }
-            if !rollback_failed
-                && let Err(cleanup_error) = if let Some((store, prefix, _)) = &object_store_wal {
-                    PartitionedWal::remove_from_object_store(store.as_ref(), prefix, &commit_id)
-                        .await
-                } else {
-                    PartitionedWal::remove(&table_root, &commit_id).await
-                }
-            {
-                tracing::warn!(
-                    "Failed to remove top-level WAL after append rollback: {cleanup_error}"
-                );
-            }
-            return Err(error);
-        }
 
-        // No await is permitted between these publications. The catalog commit
-        // above is the durable global decision; cancellation must not leave a
-        // proper subset of the participating providers on the new snapshots.
-        for ((receipt, publish_state), prepared_on_conflict) in prepared
-            .iter()
-            .zip(publish_states)
-            .zip(prepared_on_conflicts)
-        {
-            receipt.publish_deferred_snapshot_under_held_fence(publish_state);
-            if let Some(on_conflict) = prepared_on_conflict {
-                receipt.publish_on_conflict_under_held_fence(on_conflict);
-            }
-            receipt.publish_validated_file_keys();
-        }
+            // Publication is complete for every participant. Release all listing
+            // fences before WAL deletion and other maintenance so readers are not
+            // blocked by recoverable post-commit I/O.
+            drop(fence_guards);
 
-        // Publication is complete for every participant. Release all listing
-        // fences before WAL deletion and other maintenance so readers are not
-        // blocked by recoverable post-commit I/O.
-        drop(fence_guards);
-
-        // WAL cleanup is post-commit maintenance. Recovery consults the
-        // catalog pointers and safely recognizes these as committed if cleanup
-        // is interrupted.
-        for receipt in &prepared {
-            if let Err(error) = receipt.remove_deferred_snapshot_wal().await {
-                tracing::warn!(
-                    table_id = receipt.table_id(),
-                    %error,
-                    "Failed to remove committed partition staging WAL"
-                );
-            }
-        }
-
-        let wal_remove_result = if let Some((store, prefix, _)) = &object_store_wal {
-            PartitionedWal::remove_from_object_store(store.as_ref(), prefix, &commit_id).await
-        } else {
-            PartitionedWal::remove(&table_root, &commit_id).await
-        };
-        if let Err(error) = wal_remove_result {
-            tracing::warn!(
-                commit_id,
-                %error,
-                "Failed to remove committed cross-partition WAL; append remains committed"
-            );
-        }
-
-        // Phase 3: per-partition finish (drops the per-partition write guard,
-        // returns row count).
-        let mut total_rows: u64 = 0;
-        for prep in prepared {
-            prep.finish_deferred_snapshot_maintenance().await;
-            match prep.finish().await {
-                Ok(rows) => total_rows = total_rows.saturating_add(rows),
-                Err(e) => {
+            // WAL cleanup is post-commit maintenance. Recovery consults the
+            // catalog pointers and safely recognizes these as committed if cleanup
+            // is interrupted.
+            for receipt in &prepared {
+                if let Err(error) = receipt.remove_deferred_snapshot_wal().await {
                     tracing::warn!(
-                        "finish() for prepared append failed after barrier: {e}; \
-                         in-memory state will reconcile on next scan"
+                        table_id = receipt.table_id(),
+                        %error,
+                        "Failed to remove committed partition staging WAL"
                     );
                 }
             }
-        }
 
-        Ok(total_rows)
+            let wal_remove_result = if let Some((store, prefix, _)) = &object_store_wal {
+                PartitionedWal::remove_from_object_store(store.as_ref(), prefix, &commit_id).await
+            } else {
+                PartitionedWal::remove(&table_root, &commit_id).await
+            };
+            if let Err(error) = wal_remove_result {
+                tracing::warn!(
+                    commit_id,
+                    %error,
+                    "Failed to remove committed cross-partition WAL; append remains committed"
+                );
+            }
+
+            // Phase 3: per-partition finish (drops the per-partition write guard,
+            // returns row count).
+            let mut total_rows: u64 = 0;
+            for prep in prepared {
+                prep.finish_deferred_snapshot_maintenance().await;
+                match prep.finish().await {
+                    Ok(rows) => total_rows = total_rows.saturating_add(rows),
+                    Err(e) => {
+                        tracing::warn!(
+                            "finish() for prepared append failed after barrier: {e}; \
+                         in-memory state will reconcile on next scan"
+                        );
+                    }
+                }
+            }
+
+            Ok(total_rows)
         });
 
         match completion.await {
@@ -1312,7 +1297,9 @@ impl CayennePartitionedAppendSink {
     async fn commit_append_snapshots_in_one_txn(
         catalog: &CayenneCatalog,
         prepared: &[PreparedStagedAppend],
-        prepared_on_conflicts: &mut [Option<cayenne::provider::PreparedOnConflictDeletionPublish>],
+        prepared_on_conflicts: &mut [Option<
+            cayenne::provider::PreparedOnConflictDeletionPublish,
+        >],
     ) -> datafusion::common::Result<()> {
         let max_attempts = turso_shared::DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
         let snapshots: Vec<(&str, &str)> = prepared
@@ -1469,11 +1456,7 @@ mod tests {
         prefix: &str,
         backend: &str,
     ) -> cayenne::provider::PartitionedWalObjectStore {
-        (
-            store,
-            ObjectStorePath::from(prefix),
-            backend.to_string(),
-        )
+        (store, ObjectStorePath::from(prefix), backend.to_string())
     }
 
     #[test]

@@ -145,11 +145,15 @@ impl CayennePartitionCreator {
     }
 
     fn partition_table_name(&self, partition_key: &str) -> String {
-        format!("{}_p{}", self.table_name, encode_identifier_hex(partition_key))
+        format!(
+            "{}_p{}",
+            self.table_name,
+            encode_identifier_hex(partition_key)
+        )
     }
 
     fn legacy_partition_table_name(&self, partition_values: &[String]) -> String {
-        format!("{}_{}", self.table_name, partition_values.join("_") )
+        format!("{}_{}", self.table_name, partition_values.join("_"))
     }
 
     fn partition_dir(&self, partition_values: &[ScalarValue]) -> Result<PathBuf, creator::Error> {
