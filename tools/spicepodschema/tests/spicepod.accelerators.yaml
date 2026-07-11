@@ -34,7 +34,7 @@ datasets:
   # ===========================================================================
   # DuckDB Accelerator
   # Runtime params: file_watcher, connection_pool_size,
-  #                 on_refresh_recompute_statistics, partitioned_write_buffer,
+  #                 on_refresh_recompute_statistics,
   #                 optimizer_duckdb_aggregate_pushdown
   # ===========================================================================
   - name: accel_duckdb
