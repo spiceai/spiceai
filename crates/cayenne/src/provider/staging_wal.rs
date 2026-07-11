@@ -435,6 +435,13 @@ pub struct PreparedStagedAppend {
     append_sequence: Option<i64>,
 }
 
+/// Object-store handle, table-level WAL prefix, and canonical backend identity.
+pub type PartitionedWalObjectStore = (
+    Arc<dyn object_store::ObjectStore>,
+    ObjectStorePath,
+    String,
+);
+
 impl std::fmt::Debug for PreparedStagedAppend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreparedStagedAppend")
@@ -523,6 +530,11 @@ impl PreparedStagedAppend {
     /// Recovery calls this only after the durable snapshot pointer proves the
     /// transaction committed, then verifies every generated delete-file path is
     /// present in the committed catalog payload before disarming cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if committed deletion metadata cannot be loaded or does
+    /// not exactly contain every prepared deletion-vector path.
     pub async fn reconcile_committed_on_conflict_cleanup(&mut self) -> Result<()> {
         let Some(prepared) = self.prepared_on_conflict.as_mut() else {
             return Ok(());
@@ -549,16 +561,26 @@ impl PreparedStagedAppend {
 
     /// Reconcile this receipt's table from its durable staging WAL and catalog
     /// pointer while the receipt still owns its write guard.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if staged-write recovery cannot converge safely.
     pub async fn recover_committed_snapshot(&self) -> Result<()> {
         self.table.ensure_no_incomplete_write().await
     }
 
     /// Return the exact manifest prepared for this deferred snapshot.
+    #[must_use]
     pub fn deferred_manifest(&self) -> Option<&[SnapshotFile]> {
         self.deferred_manifest.as_deref()
     }
 
     /// Build and validate the target snapshot's exact durable manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if source or target files cannot be listed, metadata
+    /// cannot be loaded, or the target manifest is inconsistent.
     pub async fn prepare_deferred_manifest(&mut self) -> Result<()> {
         let source_snapshot_id = self.source_snapshot_id.as_ref().ok_or_else(|| Error::Internal {
             table: self.table.table_name().to_string(),
@@ -831,6 +853,11 @@ impl PreparedStagedAppend {
 
     /// Build the fallible listing-table state needed to publish this deferred
     /// append. Call before the cross-partition catalog transaction commits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the receipt is not a protected-snapshot append or
+    /// listing-table publication state cannot be prepared.
     pub fn prepare_deferred_snapshot_publish(&self) -> Result<PreparedAppendSnapshotPublish> {
         if self.target_kind != StagingWalTargetKind::ProtectedSnapshot {
             return Err(Error::Internal {
@@ -858,6 +885,10 @@ impl PreparedStagedAppend {
     /// Remove this partition's staging WAL after its committed snapshot has
     /// been published. Failure is recoverable maintenance and must not turn a
     /// durably committed append into a client-visible failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the local or object-store WAL cannot be removed.
     pub async fn remove_deferred_snapshot_wal(&self) -> Result<()> {
         self.table
             .remove_staging_wal_for(&self.staging_snapshot_id)
@@ -886,9 +917,14 @@ impl PreparedStagedAppend {
 
     /// Return the object store and table-level prefix used for a top-level
     /// cross-partition WAL. Local tables return `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if object-store configuration or the canonical table
+    /// prefix cannot be resolved.
     pub fn partitioned_wal_object_store(
         &self,
-    ) -> Result<Option<(Arc<dyn object_store::ObjectStore>, ObjectStorePath, String)>> {
+    ) -> Result<Option<PartitionedWalObjectStore>> {
         self.table.partitioned_wal_object_store()
     }
 
@@ -1024,9 +1060,14 @@ enum StagingWalOutcome {
 impl CayenneTableProvider {
     /// Return the object store and table-level prefix used for top-level
     /// cross-partition WALs. Local tables return `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if object-store configuration or the canonical table
+    /// prefix cannot be resolved.
     pub fn partitioned_wal_object_store(
         &self,
-    ) -> Result<Option<(Arc<dyn object_store::ObjectStore>, ObjectStorePath, String)>> {
+    ) -> Result<Option<PartitionedWalObjectStore>> {
         if !self.table_path().starts_with("s3://") {
             return Ok(None);
         }
@@ -1045,8 +1086,7 @@ impl CayenneTableProvider {
             .ok_or_else(|| Error::Internal {
                 table: self.table_name().to_string(),
                 message: format!(
-                    "Snapshot prefix '{}' does not end with expected suffix '{suffix}'",
-                    partition_prefix
+                    "Snapshot prefix '{partition_prefix}' does not end with expected suffix '{suffix}'"
                 ),
             })?;
         Ok(Some((
@@ -1148,6 +1188,11 @@ impl CayenneTableProvider {
     /// Begin a staged append into a fresh snapshot cloned from the current
     /// snapshot. The new snapshot remains invisible until its catalog pointer is
     /// committed and [`PreparedStagedAppend::publish_deferred_snapshot`] runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source snapshot cannot be cloned, the append
+    /// cannot be staged, or its exact target manifest cannot be prepared.
     pub async fn begin_deferred_snapshot_append(
         &self,
         data: SendableRecordBatchStream,
@@ -2050,6 +2095,11 @@ impl CayenneTableProvider {
     /// Reconcile leftover staged appends after a cross-partition coordinator
     /// crash. The catalog pointer is the durable commit decision: protected
     /// targets equal to the pointer are completed; all others are rolled back.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a WAL cannot be read, its durable outcome cannot be
+    /// classified safely, or committed publication/rollback cannot complete.
     pub async fn recover_incomplete_writes(&self) -> Result<()> {
         let _write_guard = self.write_lock_arc().lock_owned().await;
         self.ensure_no_incomplete_write().await

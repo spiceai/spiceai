@@ -1534,12 +1534,7 @@ impl Drop for SqliteTransaction {
                 runtime.spawn(rollback);
             } else {
                 std::thread::spawn(move || {
-                    if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                    {
-                        runtime.block_on(rollback);
-                    }
+                    futures::executor::block_on(rollback);
                 });
             }
         }

@@ -550,7 +550,7 @@ impl CayennePartitionedOverwriteSink {
         prepared: &[PreparedOverwrite],
     ) -> datafusion::common::Result<()> {
         let max_attempts = turso_shared::DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
-        'attempts: for attempt in 1..=max_attempts {
+        for attempt in 1..=max_attempts {
             let mut txn = self
                 .catalog
                 .begin_transaction()

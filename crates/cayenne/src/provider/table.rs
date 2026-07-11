@@ -1168,8 +1168,8 @@ pub struct CayenneTableProvider {
     mem_tier_pending_superseded: Arc<AtomicI64>,
     /// Inline-memtable cache generation counter.
     ///
-    /// Incremented (with `Release` ordering) by every
-    /// `commit_inlined_data_mutation` and
+    /// Incremented (with `Release` ordering) by every inline mutation
+    /// publication and
     /// `clear_inlined_metadata_after_checkpoint`. [`Self::inlined_cache`] is
     /// valid only when its stored generation matches this counter.
     inlined_generation: Arc<AtomicU64>,
@@ -4315,7 +4315,7 @@ impl CayenneTableProvider {
                         })
                     }
                 })
-                .try_for_each_concurrent(OBJECT_STORE_MOVE_CONCURRENCY, |_| async { Ok(()) })
+                .try_for_each_concurrent(OBJECT_STORE_MOVE_CONCURRENCY, |()| async { Ok(()) })
                 .await?;
             cleanup.armed = false;
             return Ok(());
@@ -9100,23 +9100,6 @@ impl CayenneTableProvider {
         Ok(())
     }
 
-    async fn commit_inlined_data_mutation(
-        &self,
-        rewrite: InlinedDataRewrite,
-        data: Vec<InlinedData>,
-        appended_rows: usize,
-        assigned_sequence: Option<i64>,
-    ) -> CatalogResult<()> {
-        let Some(commit) = self
-            .commit_inlined_data_durable(rewrite, data, assigned_sequence)
-            .await?
-        else {
-            return Ok(());
-        };
-        self.publish_inlined_mutation(appended_rows, commit.removed_rows, commit.published_seq);
-        Ok(())
-    }
-
     /// Durably commit an inlined-data mutation to the catalog WITHOUT publishing
     /// the in-memory visibility change. Returns `Some(InlinedDurableCommit)`
     /// when a commit occurred, or `None` when there was nothing to commit.
@@ -9773,10 +9756,9 @@ impl CayenneTableProvider {
         let mut inline_tombstone = inline_tombstone;
         if defer_catalog_commit
             && let Some(tombstone) = &mut inline_tombstone
+            && tombstone.inlined_id.is_empty()
         {
-            if tombstone.inlined_id.is_empty() {
-                tombstone.inlined_id = uuid::Uuid::now_v7().to_string();
-            }
+            tombstone.inlined_id = uuid::Uuid::now_v7().to_string();
         }
         let durable_payload = if defer_catalog_commit {
             Some(PreparedOnConflictDurablePayload {
@@ -16278,7 +16260,7 @@ impl CayenneTableProvider {
     /// `cayenne_inlined_data` / `cayenne_inlined_delete` rows for the
     /// table outside the inline-mutation path — e.g. `commit_overwrite`,
     /// which clears those tables atomically with the snapshot pointer
-    /// flip but does not flow through `commit_inlined_data_mutation`.
+    /// flip but does not flow through inline mutation publication.
     /// Without this bump, scans keep serving the pre-overwrite cache and
     /// row counts read high (old inline rows + new snapshot rows).
     ///
@@ -17158,7 +17140,7 @@ impl CayenneTableProvider {
 
     /// Returns the current inline-memtable cache generation counter.
     ///
-    /// Monotonically increasing: bumped after every `commit_inlined_data_mutation`
+    /// Monotonically increasing: bumped after every inline mutation publication
     /// (write path) and `clear_inlined_metadata_after_checkpoint` (flush path).
     /// Exposed for testing cache-invalidation invariants.
     #[must_use]
@@ -20848,8 +20830,8 @@ impl CayenneTableProvider {
         // Why the threshold is `inline_flush_max_bytes / inline_max_bytes`
         // (runtime values derived from `DEFAULT_INLINE_FLUSH_MAX_BYTES`,
         // `DEFAULT_INLINE_FLUSH_MAX_SEGMENTS`, `DEFAULT_INLINE_FLUSH_MAX_ROWS`,
-        // and `DEFAULT_INLINE_MAX_BYTES`): every `commit_inlined_data_mutation`
-        // call from the inline-write path adds at most 1 inline entry, with
+        // and `DEFAULT_INLINE_MAX_BYTES`): every inline-write commit adds at
+        // most 1 inline entry, with
         // at most `inline_max_bytes` of IPC payload and at most
         // `inline_max_rows` rows.
         // Cached `inlined_row_count` ≥ number of commits (each commit
@@ -20933,27 +20915,6 @@ impl CayenneTableProvider {
         }
 
         Ok(())
-    }
-
-    pub(crate) async fn delete_inlined_rows_matching_filters(
-        &self,
-        filters: &[Expr],
-    ) -> datafusion_common::Result<u64> {
-        let (rewrite, deleted_rows) = self
-            .prepare_inlined_rows_matching_filters(filters)
-            .await?;
-        if rewrite.is_empty() {
-            return Ok(0);
-        }
-        self.commit_inlined_data_mutation(rewrite, vec![], 0, None)
-            .await
-            .map_err(|err| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to rewrite inlined data for table {}: {err}",
-                    self.table_metadata.table_name
-                ))
-            })?;
-        Ok(deleted_rows)
     }
 
     pub(crate) async fn prepare_inlined_rows_matching_filters(
@@ -25048,6 +25009,7 @@ mod tests {
     use crate::CayenneCatalog;
     use crate::metadata::VortexConfig;
     use crate::provider::compaction::{CompactionRunner, MemTierCheckpointRunner};
+    use datafusion_expr::ExprSchemable;
     use std::time::UNIX_EPOCH;
 
     use super::*;

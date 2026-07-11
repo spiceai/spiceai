@@ -299,6 +299,10 @@ impl CayenneCatalog {
     /// Cross-partition recovery uses this catalog-only lookup before all
     /// partition providers are necessarily open. The pointer is the global
     /// commit decision; provider-local state must not be used to infer it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table does not exist or the metastore query fails.
     pub async fn current_snapshot_id_for_table(&self, table_id: &str) -> CatalogResult<String> {
         self.metastore
             .query_row_helper(
@@ -313,6 +317,10 @@ impl CayenneCatalog {
 
     /// Atomically update the current snapshot pointer for multiple tables and
     /// invalidate statistics derived from the previous snapshots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid identifiers, missing tables, or metastore failures.
     pub async fn set_current_snapshots_in_txn(
         &self,
         txn: &mut dyn MetastoreTransaction,
@@ -366,6 +374,10 @@ impl CayenneCatalog {
 
     /// Apply one deferred on-conflict payload in a caller-owned transaction.
     /// The caller commits this together with all participating snapshot pointers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if payload validation or any transactional mutation fails.
     pub async fn apply_prepared_on_conflict_in_txn(
         &self,
         txn: &mut dyn MetastoreTransaction,
@@ -391,6 +403,8 @@ impl CayenneCatalog {
         snapshot_sequence: i64,
         insert_sequence: Option<i64>,
     ) -> CatalogResult<()> {
+        const MAX_PARAMS: usize = 32_000;
+
         let table_id = payload.table_id.as_str();
         let reinsert_sequence = insert_sequence.filter(|_| !payload.insert_pk_bytes.is_empty());
         ensure_reinsert_keys_have_key_based_delete_file(
@@ -416,7 +430,6 @@ impl CayenneCatalog {
                 });
             }
         }
-        const MAX_PARAMS: usize = 32_000;
         for chunk in payload.delete_files.chunks(MAX_PARAMS / 10) {
             let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
             txn.execute(ExecuteParams { sql: &sql, params }).await?;
@@ -463,6 +476,11 @@ impl CayenneCatalog {
     }
 
     /// Replace one snapshot's exact manifest inside the caller-owned transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a manifest row targets another table/snapshot or a
+    /// metastore mutation fails.
     pub async fn replace_snapshot_files_in_txn(
         &self,
         txn: &mut dyn MetastoreTransaction,
@@ -2069,6 +2087,9 @@ impl MetadataCatalog for CayenneCatalog {
     }
 
     async fn add_delete_files(&self, delete_files: Vec<DeleteFile>) -> CatalogResult<()> {
+        const MAX_PARAMS: usize = 32_000;
+        const PARAMS_PER_ROW: usize = 10;
+
         if delete_files.is_empty() {
             return Ok(());
         }
@@ -2083,9 +2104,6 @@ impl MetadataCatalog for CayenneCatalog {
                 });
             }
         }
-
-        const MAX_PARAMS: usize = 32_000;
-        const PARAMS_PER_ROW: usize = 10;
         let txn = self.begin_transaction().await?;
         for chunk in delete_files.chunks(MAX_PARAMS / PARAMS_PER_ROW) {
             let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
@@ -2101,6 +2119,9 @@ impl MetadataCatalog for CayenneCatalog {
         updated_data: Vec<InlinedData>,
         deleted_inlined_ids: Vec<String>,
     ) -> CatalogResult<()> {
+        const MAX_PARAMS: usize = 32_000;
+        const PARAMS_PER_DELETE_FILE: usize = 10;
+
         for delete_file in &delete_files {
             if delete_file.table_id != table_id {
                 return Err(CatalogError::InvalidOperationNoSource {
@@ -2120,9 +2141,6 @@ impl MetadataCatalog for CayenneCatalog {
                 });
             }
         }
-
-        const MAX_PARAMS: usize = 32_000;
-        const PARAMS_PER_DELETE_FILE: usize = 10;
         let txn = self.begin_transaction().await?;
         for chunk in delete_files.chunks(MAX_PARAMS / PARAMS_PER_DELETE_FILE) {
             let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);

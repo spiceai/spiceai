@@ -45,6 +45,7 @@ use futures::StreamExt;
 use object_store::ObjectStore;
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 use vortex::VortexSessionDefault;
 use vortex::array::arrow::IntoArrowArray;
@@ -53,6 +54,32 @@ use vortex::layout::layouts::row_idx::row_idx;
 use vortex_datafusion::DefaultExpressionConvertor;
 use vortex_datafusion::ExpressionConvertor;
 use vortex_session::VortexSession;
+
+struct PositionDeleteCleanup(Vec<PathBuf>);
+
+impl Drop for PositionDeleteCleanup {
+    fn drop(&mut self) {
+        let paths = std::mem::take(&mut self.0);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                crate::provider::delete::cleanup_uncommitted_delete_paths(&paths).await;
+            });
+        } else {
+            std::thread::spawn(move || {
+                for path in paths {
+                    match std::fs::remove_file(path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "Failed to clean uncommitted deletion-vector file"
+                        ),
+                    }
+                }
+            });
+        }
+    }
+}
 
 static MAX_CONCURRENT_FILE_SCANS: LazyLock<usize> = LazyLock::new(get_available_parallelism);
 
@@ -122,7 +149,7 @@ impl CayenneDeletionSink {
                 .first()
                 .map(datafusion_datasource::ListingTableUrl::object_store)
                 .ok_or_else(|| Error::Internal {
-                    table: table_name.to_string(),
+                    table: table_name.clone(),
                     message: "Table has no paths".to_string(),
                 })?;
 
@@ -869,38 +896,10 @@ impl CayenneDeletionSink {
             .iter()
             .map(|delete_file| delete_file.path.clone())
             .collect::<Vec<_>>();
-        struct PositionDeleteCleanup(Vec<std::path::PathBuf>);
-        impl Drop for PositionDeleteCleanup {
-            fn drop(&mut self) {
-                let paths = std::mem::take(&mut self.0);
-                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                    runtime.spawn(async move {
-                        crate::provider::delete::vector_io::cleanup_uncommitted_delete_paths(
-                            &paths,
-                        )
-                        .await;
-                    });
-                } else {
-                    std::thread::spawn(move || {
-                        for path in paths {
-                            match std::fs::remove_file(path) {
-                                Ok(()) => {}
-                                Err(error)
-                                    if error.kind() == std::io::ErrorKind::NotFound => {}
-                                Err(error) => tracing::warn!(
-                                    %error,
-                                    "Failed to clean uncommitted deletion-vector file"
-                                ),
-                            }
-                        }
-                    });
-                }
-            }
-        }
         let mut cleanup_guard = PositionDeleteCleanup(
             cleanup_paths
                 .iter()
-                .map(std::path::PathBuf::from)
+                .map(PathBuf::from)
                 .collect(),
         );
         if let Err(error) = self.catalog.add_delete_files(delete_files).await {

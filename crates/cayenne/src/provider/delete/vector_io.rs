@@ -41,6 +41,7 @@ use arrow::array::{Array, BinaryArray, Int64Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow_ipc::reader::FileReader;
+use arrow_ipc::writer::FileWriter;
 use arrow_schema::SchemaRef;
 use chrono::Utc;
 use roaring::RoaringBitmap;
@@ -793,8 +794,6 @@ async fn write_deletion_file(
                 });
             }
         }
-        use arrow::ipc::writer::FileWriter;
-
         // Crash-safe write. Ensure the deletion vector file content is durable
         // before we record a pointer to it in the catalog. A crash without
         // this sync could leave a zero-length or partial .arrow file while the

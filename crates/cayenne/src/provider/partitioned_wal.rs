@@ -157,6 +157,10 @@ impl PartitionedWal {
     }
 
     /// Return the on-disk path for this WAL under the given table root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the commit ID is not a canonical UUID.
     pub fn path_under(&self, table_root: &Path) -> Result<PathBuf> {
         wal_path(table_root, &self.commit_id)
     }
@@ -373,6 +377,10 @@ impl PartitionedWal {
 
     /// Remove an object-store partitioned WAL and any leftover temporary key.
     /// Missing keys are treated as success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid commit ID or object-store deletion failure.
     pub async fn remove_from_object_store(
         store: &dyn ObjectStore,
         base_prefix: &ObjectStorePath,
@@ -448,6 +456,10 @@ impl PartitionedWal {
 
     /// Read every committed top-level WAL object beneath `base_prefix`.
     /// Temporary objects and malformed records are ignored with warnings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if listing or reading a listed WAL object fails.
     pub async fn read_all_in_object_store(
         store: &dyn ObjectStore,
         base_prefix: &ObjectStorePath,
@@ -467,7 +479,10 @@ impl PartitionedWal {
         let mut out = Vec::new();
         for object in objects {
             let path = object.location.as_ref();
-            if !path.ends_with(".json") {
+            if !std::path::Path::new(path)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+            {
                 continue;
             }
             let bytes = match store.get(&object.location).await {

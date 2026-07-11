@@ -510,9 +510,8 @@ impl CayenneDeletionSink {
                         };
                         pending_pk_values.extend(projected_sink.extract_int64_pk_values(&batch)?);
                         if pending_pk_values.len() >= PK_DELETE_FLUSH_BATCH_SIZE {
-                            let values: Vec<i64> = pending_pk_values.drain().collect();
-                            let row_keys = values
-                                .into_iter()
+                            let row_keys = pending_pk_values
+                                .drain()
                                 .map(|pk| pk.to_be_bytes().to_vec().into_boxed_slice())
                                 .collect();
                             let results = self
@@ -1088,24 +1087,6 @@ impl CayenneDeletionSink {
             .await
     }
 
-    async fn commit_staged_pk_deletions(
-        &self,
-        staged: StagedPkDelete,
-    ) -> super::super::Result<u64> {
-        let mut prepared = self.prepare_staged_pk_deletions(staged)?;
-        if let Err(error) = self
-            .catalog
-            .add_delete_files(prepared.delete_files().to_vec())
-            .await
-        {
-            return Err(error.into());
-        }
-        let deleted_count = prepared.deleted_count();
-        prepared.mark_catalog_committed();
-        prepared.publish()?;
-        Ok(deleted_count)
-    }
-
     fn prepare_staged_pk_deletions(
         &self,
         mut staged: StagedPkDelete,
@@ -1153,97 +1134,6 @@ impl CayenneDeletionSink {
 
     async fn cleanup_uncommitted_delete_file(path: &str) {
         cleanup_uncommitted_delete_paths(&[std::path::PathBuf::from(path)]).await;
-    }
-
-    async fn persist_key_based_deletions(
-        &self,
-        row_keys: Vec<Box<[u8]>>,
-    ) -> super::super::Result<u64> {
-        let filtered_row_keys = Self::filter_existing_key_deletions(row_keys);
-
-        if filtered_row_keys.is_empty() {
-            return Ok(0);
-        }
-
-        let table_name = &self.table_metadata.table_name;
-        let mut delete_sequence: Option<i64> = None;
-        let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
-        let mut row_keys_iter = filtered_row_keys.into_iter();
-
-        loop {
-            let chunk_keys: Vec<Box<[u8]>> = row_keys_iter
-                .by_ref()
-                .take(PK_DELETE_FLUSH_BATCH_SIZE)
-                .collect();
-            if chunk_keys.is_empty() {
-                return self.commit_staged_pk_deletions(staged).await;
-            }
-
-            let results = self
-                .write_key_based_chunk_with_shared_sequence(chunk_keys, &mut delete_sequence)
-                .await?;
-            staged.absorb(
-                results,
-                Self::assigned_delete_sequence(delete_sequence, table_name)?,
-                table_name,
-            )?;
-        }
-    }
-
-    async fn persist_int64_pk_deletions(&self, pk_values: Vec<i64>) -> super::super::Result<u64> {
-        let filtered_pk_values = Self::filter_existing_int64_pk_deletions(pk_values);
-
-        if filtered_pk_values.is_empty() {
-            return Ok(0);
-        }
-
-        let table_name = &self.table_metadata.table_name;
-        let mut delete_sequence: Option<i64> = None;
-        let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
-        let mut pk_values_iter = filtered_pk_values.into_iter();
-
-        loop {
-            let chunk_values: Vec<i64> = pk_values_iter
-                .by_ref()
-                .take(PK_DELETE_FLUSH_BATCH_SIZE)
-                .collect();
-            if chunk_values.is_empty() {
-                return self.commit_staged_pk_deletions(staged).await;
-            }
-
-            let row_keys = chunk_values
-                .into_iter()
-                .map(|pk| pk.to_be_bytes().to_vec().into_boxed_slice())
-                .collect();
-            let results = self
-                .write_key_based_chunk_with_shared_sequence(row_keys, &mut delete_sequence)
-                .await?;
-            staged.absorb(
-                results,
-                Self::assigned_delete_sequence(delete_sequence, table_name)?,
-                table_name,
-            )?;
-        }
-    }
-
-    fn filter_existing_int64_pk_deletions(pk_values: Vec<i64>) -> Vec<i64> {
-        // For sequence-based ordering, we MUST write new deletion files even for
-        // PKs that were already deleted, because the new deletion has a higher
-        // sequence number. This ensures proper ordering: data written after the
-        // first delete but before the second delete will be properly filtered.
-        //
-        // We only deduplicate within the current batch (in DeletionVectorWriter).
-        pk_values
-    }
-
-    fn filter_existing_key_deletions(row_keys: Vec<Box<[u8]>>) -> Vec<Box<[u8]>> {
-        // For sequence-based ordering, we MUST write new deletion files even for
-        // PKs that were already deleted, because the new deletion has a higher
-        // sequence number. This ensures proper ordering: data written after the
-        // first delete but before the second delete will be properly filtered.
-        //
-        // We only deduplicate within the current batch (in DeletionVectorWriter).
-        row_keys
     }
 }
 
