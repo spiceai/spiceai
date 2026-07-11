@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Before/after regression bench for BEN-18 —
 //! `CayenneTableProvider::record_pk_keys_with_location`'s keyset upsert on the
-//! "already present" path (CH update traffic re-touching existing PKs, e.g.
+//! "already present" path (CDC update traffic re-touching existing PKs, e.g.
 //! `payment`/`delivery`).
 //!
 //! `record_pk_keys_with_location`'s inner loop (`crates/cayenne/src/provider/table.rs`)
