@@ -45,17 +45,20 @@ drop_template() {  # un-freeze (IS_TEMPLATE blocks DROP) then drop
 # A crashed/cancelled prior run can leave a logical replication slot on chbench.
 # A slot pins its database, so DROP DATABASE fails even WITH (FORCE) until the
 # slot is gone; and an *active* slot won't drop until its walsender is killed.
-# Terminate holders, then drop, retrying until none remain.
-drop_all_replication_slots() {
+# Terminate holders, then drop, retrying until none remain. Scoped to Spice's
+# own chbench slots (matching the cleanup step's 'spice_%' convention) so we
+# never disturb unrelated slots on this shared, long-lived CI pod.
+SLOT_FILTER="slot_name LIKE 'spice_%' AND database = 'chbench'"
+drop_chbench_replication_slots() {
   for _ in 1 2 3 4 5; do
-    n=$(psql_pg "SELECT count(*) FROM pg_replication_slots" 2>/dev/null || echo 0)
+    n=$(psql_pg "SELECT count(*) FROM pg_replication_slots WHERE $SLOT_FILTER" 2>/dev/null || echo 0)
     [ "${n:-0}" = 0 ] && return 0
-    psql_pg "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE active_pid IS NOT NULL" >/dev/null 2>&1 || true
-    psql_pg "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE NOT active" >/dev/null 2>&1 || true
+    psql_pg "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE $SLOT_FILTER AND active_pid IS NOT NULL" >/dev/null 2>&1 || true
+    psql_pg "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE $SLOT_FILTER AND NOT active" >/dev/null 2>&1 || true
     sleep 1
   done
-  stuck=$(psql_pg "SELECT string_agg(slot_name || '(active_pid=' || coalesce(active_pid::text,'none') || ')', ', ') FROM pg_replication_slots" 2>/dev/null || true)
-  [ -n "$stuck" ] && echo "WARNING: replication slots still present after cleanup: $stuck"
+  stuck=$(psql_pg "SELECT string_agg(slot_name || '(active_pid=' || coalesce(active_pid::text,'none') || ')', ', ') FROM pg_replication_slots WHERE $SLOT_FILTER" 2>/dev/null || true)
+  [ -n "$stuck" ] && echo "WARNING: chbench replication slots still present after cleanup: $stuck"
 }
 
 # Terminate lingering backends then drop; fail loud (no error suppression) so a
@@ -66,7 +69,7 @@ drop_working_db() {  # $1 = dbname
   psql_pg "DROP DATABASE IF EXISTS $1 WITH (FORCE)"
 }
 
-drop_all_replication_slots
+drop_chbench_replication_slots
 
 exists=$(psql_pg "SELECT 1 FROM pg_database WHERE datname='$TMPL'" 2>/dev/null)
 hit=0
