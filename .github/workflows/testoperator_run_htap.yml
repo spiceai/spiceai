@@ -259,6 +259,10 @@ jobs:
         env:
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          # Everything at INFO, plus DEBUG for Cayenne compaction/promotion (datalake tiering:
+          # "Promoting warm tier...", "Datalake-tier promotion committed", GC) and the mem-tier
+          # budget, so cold-tier promotion throughput / backpressure is diagnosable in the run log.
+          SPICED_LOG: "info,cayenne::compaction=debug"
           # Dedicated in-cluster PG pod on xlarge; per-run docker container (loopback) elsewhere.
           CHBENCH_PG_HOST: ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && 'chbench-postgres.dataplatform.svc.cluster.local' || '127.0.0.1' }}
           # Dedicated in-cluster MySQL pod on xlarge; per-run docker container (loopback) elsewhere. Used only when the spicepod is a MySQL source.
