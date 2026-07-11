@@ -517,9 +517,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
             // Otherwise the underlying data is known to diverge, so comparing analytical
             // query results adds no signal.
             let skip_reason = match (args.skip_analytic_gate, row_count_message.is_some()) {
-                (true, true) => {
-                    Some("--skip-analytic-gate set (row-count gate also did not pass)")
-                }
+                (true, true) => Some("--skip-analytic-gate set (row-count gate also did not pass)"),
                 (true, false) => Some("--skip-analytic-gate set"),
                 (false, true) => Some("row-count gate did not pass"),
                 (false, false) => None,
