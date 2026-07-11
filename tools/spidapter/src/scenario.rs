@@ -60,6 +60,10 @@ pub(crate) struct ScpConfig {
     pub scheduler_state_location: Option<String>,
     /// Organization tag to apply to the created app.
     pub organization_tag: Option<String>,
+    /// Dedicated-cluster / nodegroup name (`GET /v1/clusters`). When set, cloud
+    /// injects scheduling tags from the nodegroup; do not also set
+    /// `organization_tag` for the same create.
+    pub cluster_name: Option<String>,
     /// Query memory limit (e.g. `150Gi`).
     pub query_memory_limit: Option<String>,
     /// Pod resource allocations.

@@ -49,6 +49,10 @@ url = { workspace = true }
 
 [[bench]]
 harness = false
+name = "filter_pushdown_cast_case"
+
+[[bench]]
+harness = false
 name = "schema_field_lookup"
 
 [[bench]]

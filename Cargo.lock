@@ -3536,6 +3536,7 @@ dependencies = [
  "runtime-datafusion",
  "runtime-table-partition",
  "rusqlite",
+ "rustc-hash 2.1.2",
  "serde",
  "serde_json",
  "snafu",
@@ -5749,6 +5750,7 @@ dependencies = [
  "object_store 0.13.2",
  "opendal 0.55.0",
  "oracle",
+ "parking_lot",
  "parquet",
  "percent-encoding",
  "pgwire-replication",
@@ -5761,6 +5763,7 @@ dependencies = [
  "runtime-rate-control",
  "runtime-request-context",
  "rusqlite",
+ "rustc-hash 2.1.2",
  "s3_vectors",
  "s3_vectors_metadata_filter",
  "scylla",
@@ -10279,15 +10282,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "is-docker"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "928bae27f42bc99b60d9ac7334e3a21d10ad8f1835a4e12ec3ec0464765ed1b3"
-dependencies = [
- "once_cell",
-]
-
-[[package]]
 name = "is-terminal"
 version = "0.4.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10296,16 +10290,6 @@ dependencies = [
  "hermit-abi",
  "libc",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "is-wsl"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "173609498df190136aa7dea1a91db051746d339e18476eed5ca40521f02d7aa5"
-dependencies = [
- "is-docker",
- "once_cell",
 ]
 
 [[package]]
@@ -13142,17 +13126,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
-name = "open"
-version = "5.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2fbaa89d2ddc8473c78a3adf69eea8cffa28c483b8e02a971ef31527cd0fc92c"
-dependencies = [
- "is-wsl",
- "libc",
- "pathdiff",
-]
-
-[[package]]
 name = "openai-harmony"
 version = "0.0.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13841,12 +13814,6 @@ name = "path-slash"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e91099d4268b0e11973f036e885d652fb0b21fedcf69738c627f94db6a44f42"
-
-[[package]]
-name = "pathdiff"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 
 [[package]]
 name = "pbjson"
@@ -15812,7 +15779,7 @@ dependencies = [
  "once_cell",
  "percent-encoding",
  "pin-project-lite",
- "rustls-pemfile 1.0.4",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -16380,7 +16347,6 @@ dependencies = [
  "runtime-tools",
  "rusqlite",
  "rustls",
- "rustls-pemfile 2.2.0",
  "s3_vectors",
  "scheduler",
  "schemars 1.2.1",
@@ -17165,15 +17131,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c74cae0a4cf6ccbbf5f359f08efdf8ee7e1dc532573bf0db71968cb56b1448c"
 dependencies = [
  "base64 0.21.7",
-]
-
-[[package]]
-name = "rustls-pemfile"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
-dependencies = [
- "rustls-pki-types",
 ]
 
 [[package]]
@@ -18494,7 +18451,6 @@ dependencies = [
  "insta",
  "keyring",
  "nix 0.29.0",
- "open",
  "opentelemetry",
  "pem",
  "predicates",
@@ -18513,6 +18469,7 @@ dependencies = [
  "spice-cloud-client",
  "spiceai",
  "spicepod",
+ "system-open",
  "tar",
  "tempfile",
  "test-framework",
@@ -18573,7 +18530,7 @@ dependencies = [
  "reqwest 0.12.24",
  "rustls",
  "rustls-native-certs",
- "rustls-pemfile 1.0.4",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "snafu",
@@ -19398,6 +19355,10 @@ dependencies = [
  "core-foundation-sys",
  "libc",
 ]
+
+[[package]]
+name = "system-open"
+version = "2.1.0-unstable"
 
 [[package]]
 name = "tagptr"

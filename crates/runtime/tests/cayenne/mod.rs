@@ -1960,3 +1960,306 @@ async fn test_cayenne_dml_comprehensive() -> Result<(), String> {
         }))
         .await
 }
+
+// ---------------------------------------------------------------------------
+// Datalake (cold) tier — end-to-end integration test.
+// ---------------------------------------------------------------------------
+
+/// S3 bucket for the datalake e2e test — shared with the snapshot-refresh
+/// integration tests. Per-run unique prefixes keep concurrent runs disjoint,
+/// and the tiny `nation` dataset keeps transfer to a few KB per run.
+const DATALAKE_TEST_BUCKET: &str = "spiceai-snapshot-integration-tests";
+const DATALAKE_TEST_REGION: &str = "us-west-2";
+
+/// Build the `nation` dataset (25 rows, public demo bucket) accelerated by
+/// Cayenne with the datalake tier enabled at `datalake_location`.
+fn make_datalake_nation_dataset(
+    cayenne_data_dir: &std::path::Path,
+    cayenne_metadata_dir: &std::path::Path,
+    datalake_location: &str,
+    s3_creds: (&str, &str),
+    warm_max_bytes: &str,
+    refresh_mode: RefreshMode,
+) -> Dataset {
+    let mut dataset = Dataset::new(
+        "s3://spiceai-demo-datasets/tpch/nation/".to_string(),
+        "nation".to_string(),
+    );
+    dataset.params = Some(Params::from_string_map(
+        vec![
+            ("file_format".to_string(), "parquet".to_string()),
+            ("s3_auth".to_string(), "public".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+    ));
+
+    let mut params = HashMap::from([
+        (
+            "cayenne_file_path".to_string(),
+            cayenne_data_dir.to_string_lossy().to_string(),
+        ),
+        (
+            "cayenne_metadata_dir".to_string(),
+            cayenne_metadata_dir.to_string_lossy().to_string(),
+        ),
+        (
+            "cayenne_datalake_location".to_string(),
+            datalake_location.to_string(),
+        ),
+        (
+            "cayenne_cold_tier_warm_max_bytes".to_string(),
+            warm_max_bytes.to_string(),
+        ),
+        (
+            "cayenne_cold_tier_background_interval_ms".to_string(),
+            "500".to_string(),
+        ),
+    ]);
+    let (key, secret) = s3_creds;
+    params.insert("cayenne_datalake_s3_auth".to_string(), "key".to_string());
+    params.insert("cayenne_datalake_s3_key".to_string(), key.to_string());
+    params.insert("cayenne_datalake_s3_secret".to_string(), secret.to_string());
+    params.insert(
+        "cayenne_datalake_s3_region".to_string(),
+        DATALAKE_TEST_REGION.to_string(),
+    );
+
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        engine: Some("cayenne".to_string()),
+        mode: Mode::File,
+        refresh_mode: Some(refresh_mode),
+        primary_key: Some("n_nationkey".to_string()),
+        on_conflict: HashMap::from([("n_nationkey".to_string(), OnConflictBehavior::Upsert)]),
+        params: Some(Params::from_string_map(params)),
+        refresh_sql: None,
+        ..Acceleration::default()
+    });
+    dataset
+}
+
+/// Run `sql` and return the single `i64` value of the first column of the
+/// first row (for `SELECT COUNT(*) …`-style assertions).
+async fn query_single_i64(rt: &Runtime, sql: &str) -> Result<i64, String> {
+    let result = rt
+        .datafusion()
+        .query_builder(sql)
+        .build()
+        .run()
+        .await
+        .map_err(|e| format!("query '{sql}' failed to plan: {e}"))?;
+    let batches = result
+        .data
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .map_err(|e| format!("query '{sql}' failed to execute: {e}"))?;
+    let batch = batches
+        .iter()
+        .find(|b| b.num_rows() > 0)
+        .ok_or_else(|| format!("query '{sql}' returned no rows"))?;
+    let col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| format!("query '{sql}' first column is not Int64"))?;
+    Ok(col.value(0))
+}
+
+/// Full datalake-tier cycle against real S3:
+/// registration probe → warm load (append mode; the datalake tier supports
+/// `refresh_mode` 'changes' and 'append' only) → background promotion to the
+/// datalake → cross-tier query correctness → restart with a tuned param
+/// (reconciled, re-appended rows upsert-dedupe against the promoted data).
+///
+/// Runs against real S3 (bucket [`DATALAKE_TEST_BUCKET`]) with a few KB of
+/// transfer per run. Credentials: `AWS_SNAPSHOT_KEY`/`AWS_SNAPSHOT_SECRET`
+/// (already provisioned in the integration-test CI environment; the same pair
+/// the snapshot-refresh tests use). FAILS when the credentials are missing —
+/// a silent skip would read as coverage that doesn't exist.
+#[tokio::test]
+async fn test_cayenne_datalake_tier_e2e() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    let (Ok(key), Ok(secret)) = (
+        std::env::var("AWS_SNAPSHOT_KEY"),
+        std::env::var("AWS_SNAPSHOT_SECRET"),
+    ) else {
+        return Err(
+            "AWS_SNAPSHOT_KEY/AWS_SNAPSHOT_SECRET must be set (read/write on the integration-test bucket)"
+                .to_string(),
+        );
+    };
+    if key.is_empty() || secret.is_empty() {
+        return Err(
+            "AWS_SNAPSHOT_KEY/AWS_SNAPSHOT_SECRET must be non-empty (read/write on the integration-test bucket)"
+                .to_string(),
+        );
+    }
+
+    test_request_context()
+        .scope(async {
+            let temp_dir = tempfile::tempdir()
+                .map_err(|e| format!("failed to create Cayenne temp directory: {e}"))?;
+            let data_dir = temp_dir.path().join("data");
+            let metadata_dir = temp_dir.path().join("metadata");
+
+            let run_suffix: u64 = rand::rng().random();
+            let prefix = format!("cayenne-datalake-e2e/{run_suffix:016x}");
+            let location = format!("s3://{DATALAKE_TEST_BUCKET}/{prefix}/");
+
+            // Direct S3 client for listing/cleanup (validation only — all
+            // acceleration operations go through the Runtime).
+            let store: Arc<dyn ObjectStore> = Arc::new(
+                AmazonS3Builder::new()
+                    .with_bucket_name(DATALAKE_TEST_BUCKET)
+                    .with_region(DATALAKE_TEST_REGION)
+                    .with_access_key_id(&key)
+                    .with_secret_access_key(&secret)
+                    .build()
+                    .map_err(|e| format!("failed to build S3 client: {e}"))?,
+            );
+
+            // Precondition: the run's prefix must be empty, so the later
+            // "found .vortex objects" signal can only come from THIS run's
+            // promotion — never from leftovers of a prior run.
+            let preexisting = list_objects_under_prefix(&store, &format!("{prefix}/")).await?;
+            if !preexisting.is_empty() {
+                return Err(format!(
+                    "datalake test prefix s3://{DATALAKE_TEST_BUCKET}/{prefix}/ is not empty at test start ({} objects, e.g. {:?}); promotion detection would be unsound",
+                    preexisting.len(),
+                    preexisting.keys().next()
+                ));
+            }
+
+            let result = datalake_e2e_inner(
+                &data_dir,
+                &metadata_dir,
+                &location,
+                (&key, &secret),
+                &store,
+                &prefix,
+            )
+            .await;
+
+            // Best-effort cleanup of this run's unique prefix.
+            let list_prefix = ObjectPath::from(format!("{prefix}/"));
+            let mut stream = store.list(Some(&list_prefix));
+            while let Some(Ok(meta)) = stream.next().await {
+                let _ = store.delete(&meta.location).await;
+            }
+
+            result
+        })
+        .await
+}
+
+async fn datalake_e2e_inner(
+    data_dir: &std::path::Path,
+    metadata_dir: &std::path::Path,
+    location: &str,
+    s3_creds: (&str, &str),
+    store: &Arc<dyn ObjectStore>,
+    prefix: &str,
+) -> Result<(), String> {
+    // ---- Phase 1: load, promote, and query across tiers. -------------------
+    {
+        let app = AppBuilder::new("test_cayenne_datalake_e2e")
+            .with_dataset(make_datalake_nation_dataset(
+                data_dir,
+                metadata_dir,
+                location,
+                s3_creds,
+                "1", // tiny trigger: promote as soon as any warm data exists
+                RefreshMode::Append,
+            ))
+            .build();
+        configure_test_datafusion();
+        let rt = Runtime::builder().with_app(app).build().await;
+        let cloned_rt = Arc::new(rt.clone());
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_mins(4)) => {
+                return Err("Timed out waiting for dataset to load".to_string());
+            }
+            () = cloned_rt.load_components() => {}
+        }
+        runtime_ready_check_with_timeout(&rt, Duration::from_mins(5)).await;
+
+        let count = query_single_i64(&rt, "SELECT COUNT(*) FROM nation").await?;
+        if count != 25 {
+            return Err(format!(
+                "expected 25 nation rows before promotion, got {count}"
+            ));
+        }
+
+        // Wait for the background promoter (500ms cadence, trigger = 1 byte)
+        // to graduate the warm tier: cold .vortex objects appear under the
+        // location prefix.
+        let promoted = wait_until_true(Duration::from_mins(3), || async {
+            let list_prefix = ObjectPath::from(format!("{prefix}/"));
+            let mut stream = store.list(Some(&list_prefix));
+            while let Some(Ok(meta)) = stream.next().await {
+                if meta.location.as_ref().ends_with(".vortex") && meta.size > 0 {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        if !promoted {
+            return Err(
+                "timed out waiting for warm→datalake promotion (no .vortex objects on the store)"
+                    .to_string(),
+            );
+        }
+
+        // Cross-tier correctness after promotion: full count and a point
+        // lookup both served with the warm tier cleared.
+        let count = query_single_i64(&rt, "SELECT COUNT(*) FROM nation").await?;
+        if count != 25 {
+            return Err(format!(
+                "expected 25 nation rows after promotion, got {count}"
+            ));
+        }
+        let point =
+            query_single_i64(&rt, "SELECT COUNT(*) FROM nation WHERE n_nationkey = 7").await?;
+        if point != 1 {
+            return Err(format!(
+                "expected 1 row for n_nationkey=7 after promotion, got {point}"
+            ));
+        }
+    }
+
+    // ---- Phase 2: reopen with a tuned trigger param — reconciled, and the
+    // promoted data is still readable from the datalake tier. ----------------
+    {
+        let app = AppBuilder::new("test_cayenne_datalake_e2e")
+            .with_dataset(make_datalake_nation_dataset(
+                data_dir,
+                metadata_dir,
+                location,
+                s3_creds,
+                "999999999999", // changed trigger: reconcile persists it silently
+                RefreshMode::Append,
+            ))
+            .build();
+        let rt = Runtime::builder().with_app(app).build().await;
+        let cloned_rt = Arc::new(rt.clone());
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_mins(4)) => {
+                return Err("Timed out waiting for dataset to reload".to_string());
+            }
+            () = cloned_rt.load_components() => {}
+        }
+        runtime_ready_check_with_timeout(&rt, Duration::from_mins(5)).await;
+
+        let count = query_single_i64(&rt, "SELECT COUNT(*) FROM nation").await?;
+        if count != 25 {
+            return Err(format!(
+                "expected 25 nation rows after restart, got {count}"
+            ));
+        }
+    }
+    Ok(())
+}

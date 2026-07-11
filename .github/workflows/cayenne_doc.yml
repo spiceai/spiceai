@@ -1,0 +1,91 @@
+name: Build Cayenne doc PDF
+
+# Renders the Cayenne technical reference (docs/cayenne/cayenne.md) to
+# Cayenne.pdf via docs/cayenne/build_pdf.py.
+#
+# - On pull requests touching docs/cayenne/**, this verifies the document still
+#   builds (mermaid blocks resolve via kroki.io, WeasyPrint succeeds) and
+#   uploads the rendered PDF as a run artifact for review.
+# - On push to trunk that touches docs/cayenne/** (or this workflow file), and on
+#   manual dispatch, it builds and uploads Cayenne.pdf as a downloadable, linkable
+#   artifact of the current trunk.
+
+on:
+  push:
+    branches: [trunk]
+    paths:
+      - 'docs/cayenne/**'
+      - '.github/workflows/cayenne_doc.yml'
+  pull_request:
+    branches: [trunk]
+    paths:
+      - 'docs/cayenne/**'
+      - '.github/workflows/cayenne_doc.yml'
+  workflow_dispatch:
+
+# Cancel superseded runs for the same ref (a newer push/PR update wins).
+concurrency:
+  group: cayenne-doc-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build_pdf:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      # WeasyPrint renders via Pango/HarfBuzz; DejaVu supplies the monospace
+      # font the stylesheet requests. Without these the PDF step fails to load
+      # libpango at runtime.
+      - name: Install WeasyPrint native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libpango-1.0-0 \
+            libpangoft2-1.0-0 \
+            libharfbuzz0b \
+            libffi8 \
+            fonts-dejavu-core
+
+      - name: Install Python dependencies
+        # Pin the direct dependencies so an upstream major release can't break
+        # the doc build on an otherwise-unrelated push. Bump deliberately when
+        # updating the doc.
+        run: python3 -m pip install 'markdown==3.9' 'weasyprint==66.0'
+
+      # Guard against a stale or uncommitted figure: regenerating waterfall.svg
+      # from gen_waterfall.py must leave the working tree clean. --porcelain
+      # catches a modified, untracked, or missing SVG — any of which means the
+      # generator was edited without committing the regenerated figure, so both
+      # the GitHub view and the PDF would show a stale image.
+      - name: Verify waterfall.svg is up to date
+        working-directory: docs/cayenne
+        run: |
+          python3 gen_waterfall.py
+          if [ -n "$(git status --porcelain -- waterfall.svg)" ]; then
+            echo "waterfall.svg is out of date — run 'python3 gen_waterfall.py' and commit the result." >&2
+            git --no-pager diff -- waterfall.svg
+            exit 1
+          fi
+
+      - name: Build Cayenne PDF
+        working-directory: docs/cayenne
+        run: python3 build_pdf.py
+
+      - name: Upload Cayenne PDF artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: Cayenne.pdf
+          path: docs/cayenne/Cayenne.pdf
+          if-no-files-found: error
