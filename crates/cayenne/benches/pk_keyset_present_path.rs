@@ -29,8 +29,8 @@ limitations under the License.
 //!
 //! `pk_index` is `pub(crate)`, so a bench (a separate crate) can't reach
 //! `CachedPkKeyset` directly — this reproduces its digest-keyed
-//! `HashMap<u128, _, PrehashedBuildHasher>` shape and both call patterns
-//! locally, byte-for-byte matching the production methods, so only the code
+//! `HashMap<u128, _, PrehashedBuildHasher>` shape and mirrors the executed
+//! hot-path branches of both call patterns locally, so only the code
 //! shape being compared varies:
 //!
 //! - `before_contains_then_insert`: the pre-fix shape.
