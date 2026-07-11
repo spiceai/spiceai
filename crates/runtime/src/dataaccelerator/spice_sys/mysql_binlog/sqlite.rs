@@ -20,6 +20,16 @@ use datafusion_table_providers::sql::db_connection_pool::{
 
 use super::{Error, MYSQL_BINLOG_TABLE_NAME, MySqlBinlogCheckpoint, MySqlBinlogSys, Result};
 
+/// Idempotent migration adding `gtid_executed` to a pre-existing sidecar table.
+/// `SQLite`'s `ALTER TABLE ADD COLUMN` has no `IF NOT EXISTS`, so a duplicate
+/// column (already migrated) or missing table errors — both are ignored.
+fn migrate_gtid_column(conn: &rusqlite::Connection) {
+    let _ = conn.execute(
+        &format!("ALTER TABLE {MYSQL_BINLOG_TABLE_NAME} ADD COLUMN gtid_executed TEXT"),
+        [],
+    );
+}
+
 impl MySqlBinlogSys {
     pub(super) async fn upsert_sqlite(
         &self,
@@ -30,6 +40,7 @@ impl MySqlBinlogSys {
         let binlog_file = checkpoint.binlog_file.clone();
         let binlog_pos = Self::position_to_i64(checkpoint.binlog_pos);
         let schema_json = checkpoint.schema_json.clone();
+        let gtid_executed = checkpoint.gtid_executed.clone();
 
         let conn_sync = pool.connect_sync();
         let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
@@ -47,26 +58,36 @@ impl MySqlBinlogSys {
                             binlog_file TEXT NOT NULL,
                             binlog_pos BIGINT NOT NULL,
                             schema_json TEXT,
+                            gtid_executed TEXT,
                             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                         )"
                     );
                     conn.execute(&create_table, [])?;
+                    // Migrate tables created before `gtid_executed` existed.
+                    migrate_gtid_column(conn);
 
                     let upsert = format!(
                         "INSERT INTO {MYSQL_BINLOG_TABLE_NAME}
-                         (dataset_name, binlog_file, binlog_pos, schema_json, updated_at)
-                         VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP)
+                         (dataset_name, binlog_file, binlog_pos, schema_json, gtid_executed, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP)
                          ON CONFLICT (dataset_name) DO UPDATE SET
                             binlog_file = ?2,
                             binlog_pos = ?3,
                             schema_json = ?4,
+                            gtid_executed = ?5,
                             updated_at = CURRENT_TIMESTAMP"
                     );
 
                     conn.execute(
                         &upsert,
-                        rusqlite::params![dataset_name, binlog_file, binlog_pos, schema_json],
+                        rusqlite::params![
+                            dataset_name,
+                            binlog_file,
+                            binlog_pos,
+                            schema_json,
+                            gtid_executed
+                        ],
                     )?;
 
                     Ok::<(), rusqlite::Error>(())
@@ -87,8 +108,11 @@ impl MySqlBinlogSys {
 
         conn.conn
             .call(move |conn: &mut rusqlite::Connection| -> Result<MySqlBinlogCheckpoint, rusqlite::Error> {
+                // Ensure `gtid_executed` exists so the SELECT doesn't fail on a
+                // table created before the column was added (ignored otherwise).
+                migrate_gtid_column(conn);
                 let query = format!(
-                    "SELECT binlog_file, binlog_pos, schema_json, strftime('%s', updated_at) FROM {MYSQL_BINLOG_TABLE_NAME} WHERE dataset_name = ?"
+                    "SELECT binlog_file, binlog_pos, schema_json, gtid_executed, strftime('%s', updated_at) FROM {MYSQL_BINLOG_TABLE_NAME} WHERE dataset_name = ?"
                 );
                 let mut stmt = conn.prepare(&query)?;
                 let mut rows = stmt.query([dataset_name])?;
@@ -97,7 +121,8 @@ impl MySqlBinlogSys {
                     let binlog_file: String = row.get(0)?;
                     let binlog_pos: i64 = row.get(1)?;
                     let schema_json: Option<String> = row.get(2).ok();
-                    let updated_at_epoch: Option<i64> = row.get(3).ok();
+                    let gtid_executed: Option<String> = row.get(3).ok();
+                    let updated_at_epoch: Option<i64> = row.get(4).ok();
                     let updated_at = updated_at_epoch.and_then(|epoch| {
                         u64::try_from(epoch).ok().and_then(|e| {
                             std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(e))
@@ -108,6 +133,7 @@ impl MySqlBinlogSys {
                         binlog_file,
                         binlog_pos: MySqlBinlogSys::position_from_i64(binlog_pos),
                         schema_json,
+                        gtid_executed,
                         updated_at,
                     })
                 } else {
@@ -193,6 +219,7 @@ mod tests {
             binlog_file: "binlog.000042".to_string(),
             binlog_pos: 1_234_567,
             schema_json: Some(r#"{"fields":[]}"#.to_string()),
+            gtid_executed: Some("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5".to_string()),
             updated_at: None,
         }
     }
@@ -211,6 +238,7 @@ mod tests {
         assert_eq!(retrieved.binlog_file, checkpoint.binlog_file);
         assert_eq!(retrieved.binlog_pos, checkpoint.binlog_pos);
         assert_eq!(retrieved.schema_json, checkpoint.schema_json);
+        assert_eq!(retrieved.gtid_executed, checkpoint.gtid_executed);
     }
 
     #[tokio::test]
@@ -273,6 +301,7 @@ mod tests {
             binlog_file: "binlog.000001".to_string(),
             binlog_pos: 4,
             schema_json: None,
+            gtid_executed: None,
             updated_at: None,
         };
         sys.upsert(&checkpoint).await.expect("to upsert checkpoint");
@@ -280,5 +309,6 @@ mod tests {
         let retrieved = sys.get().await.expect("to retrieve checkpoint");
         assert_eq!(retrieved.binlog_file, checkpoint.binlog_file);
         assert!(retrieved.schema_json.is_none());
+        assert!(retrieved.gtid_executed.is_none());
     }
 }

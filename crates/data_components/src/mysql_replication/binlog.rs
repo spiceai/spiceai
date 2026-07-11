@@ -48,6 +48,7 @@ use mysql_async::binlog::row::BinlogRow;
 use mysql_async::{BinlogStream, BinlogStreamRequest, Conn, Value};
 
 use super::config::{BinlogPosition, ReplicationParams};
+use super::gtid::GtidSet;
 use super::metrics::MetricsCollector;
 use super::rows::{TransactionBuffer, build_change_batch, normalize_binlog_value, truncate_change};
 use super::setup::TableLayout;
@@ -55,6 +56,7 @@ use super::{CheckpointMeta, Error, PersistedPosition, PositionStore, Result};
 use crate::cdc::{
     ChangeEnvelope, ChangesStream, CommitChange, CommitError, StreamError, build_heartbeat_envelope,
 };
+use uuid::Uuid;
 
 pub(super) struct BinlogStreamInput {
     pub params: ReplicationParams,
@@ -75,17 +77,39 @@ pub(super) struct BinlogStreamInput {
     /// for drift detection on resume.
     pub schema_json: Option<String>,
     pub metrics: Arc<MetricsCollector>,
+    /// Whether to open the dump with GTID auto-positioning and persist the
+    /// executed GTID set alongside the file position (failover-safe resume).
+    pub use_gtid: bool,
+    /// The executed GTID set to seed from — the source head's set on cold
+    /// start, or the persisted set on resume. Extended as transactions commit.
+    /// Empty when `use_gtid` is false.
+    pub gtid_seed: GtidSet,
 }
 
-/// Highest transaction-end position whose envelope committer has run.
-/// Shared between the stream (reader) and every emitted envelope's
-/// committer (writers).
-#[derive(Default)]
+/// Highest transaction-end position whose envelope committer has run, plus the
+/// executed GTID set for GTID auto-positioning. Shared between the stream
+/// (reader) and every emitted envelope's committer (writers).
+///
+/// The GTID set unions each committed transaction's GTID. Under the in-order
+/// commit contract the position logic already relies on
+/// ([`may_safely_advance`]), when the resume position advances every committed
+/// transaction up to it is in the set — so a free union stays exactly in step
+/// with the durable cursor, never ahead of applied data.
 struct AckState {
     committed: Mutex<Option<BinlogPosition>>,
+    gtid: Mutex<GtidSet>,
 }
 
 impl AckState {
+    /// Seed the executed set (source head or persisted resume set). Empty when
+    /// not using GTID positioning.
+    fn new(gtid_seed: GtidSet) -> Self {
+        Self {
+            committed: Mutex::new(None),
+            gtid: Mutex::new(gtid_seed),
+        }
+    }
+
     fn advance(&self, to: &BinlogPosition) {
         let mut committed = self
             .committed
@@ -103,6 +127,22 @@ impl AckState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
+
+    /// Fold a committed transaction's GTID into the executed set.
+    fn add_gtid(&self, uuid: Uuid, gno: u64) {
+        self.gtid
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .add(uuid, gno);
+    }
+
+    /// Snapshot the executed set for persistence / reconnect auto-positioning.
+    fn gtid_snapshot(&self) -> GtidSet {
+        self.gtid
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 /// `CommitChange` impl that advances the shared ack position. Persistence to
@@ -116,12 +156,19 @@ struct PositionCommitter {
     /// Source-commit timestamp (ms since the Unix epoch) of the transaction
     /// this commit acks; `None` when the source event carried no timestamp.
     source_commit_ts_ms: Option<i64>,
+    /// This transaction's GTID (`source uuid`, sequence), when the source is
+    /// GTID-enabled. Folded into the executed set on commit so the persisted
+    /// cursor advances exactly with durably-applied transactions.
+    gtid: Option<(Uuid, u64)>,
 }
 
 #[async_trait]
 impl CommitChange for PositionCommitter {
     async fn commit(&self) -> std::result::Result<(), CommitError> {
         self.ack.advance(&self.position);
+        if let Some((uuid, gno)) = self.gtid {
+            self.ack.add_gtid(uuid, gno);
+        }
         crate::cdc::log_committer_progress(
             "mysql",
             &self.dataset,
@@ -191,6 +238,8 @@ fn binlog_change_stream(
         position_store,
         schema_json,
         metrics,
+        use_gtid,
+        gtid_seed,
     } = input;
 
     let pk_source_indexes = compute_pk_source_indexes(&schema, &primary_keys, &column_map);
@@ -203,7 +252,7 @@ fn binlog_change_stream(
         let mut column_map = column_map;
         let mut pk_source_indexes = pk_source_indexes;
         let shutdown_epoch = crate::cdc::shutdown_epoch();
-        let ack = Arc::new(AckState::default());
+        let ack = Arc::new(AckState::new(gtid_seed));
         // Monotonic resume/ack position: what we reconnect from and persist.
         let mut resume = start.clone();
         let mut checkpointer = Checkpointer {
@@ -213,7 +262,11 @@ fn binlog_change_stream(
             dataset_name: dataset_name.clone(),
             metrics: Arc::clone(&metrics),
             last_persisted: start,
+            use_gtid,
         };
+        // The GTID of the transaction group currently buffering, captured from
+        // its GtidEvent and handed to the committer at commit time.
+        let mut current_txn_gtid: Option<(Uuid, u64)> = None;
         let mut last_persist_at = Instant::now();
         let mut last_emitted: Option<BinlogPosition> = None;
         // Lazily-opened side connection for the periodic source-head poll
@@ -241,7 +294,15 @@ fn binlog_change_stream(
                 advance_max(&mut resume, committed);
             }
 
-            let mut stream = match open_binlog_stream(&params, &resume, &dataset_name).await {
+            let mut stream = match open_binlog_stream(
+                &params,
+                &resume,
+                &dataset_name,
+                use_gtid,
+                &ack.gtid_snapshot(),
+            )
+            .await
+            {
                 Ok(stream) => {
                     backoff.reset();
                     if reconnect_attempts > 0 {
@@ -572,6 +633,9 @@ fn binlog_change_stream(
                                                 position: commit_pos.clone(),
                                                 dataset: dataset_name.clone(),
                                                 source_commit_ts_ms: commit_ts_ms(event_timestamp),
+                                                // TRUNCATE is auto-committed inside its own
+                                                // GTID group — fold that GTID into the set.
+                                                gtid: current_txn_gtid.take(),
                                             }),
                                             batch,
                                             crate::cdc::source_commit_within_ready_lag(
@@ -668,9 +732,27 @@ fn binlog_change_stream(
                     // A GTID event opens a transaction *group* ahead of its
                     // BEGIN/statement — start buffering here so the
                     // safe-advance can't checkpoint between the GTID and its
-                    // transaction.
-                    Some(EventData::GtidEvent(_) | EventData::AnonymousGtidEvent(_)) => {
+                    // transaction. Capture the GTID so the commit folds it into
+                    // the executed set for failover-safe resume.
+                    Some(EventData::GtidEvent(gtid_event)) => {
                         txn = Some(TransactionBuffer::new());
+                        current_txn_gtid =
+                            Some((Uuid::from_bytes(gtid_event.sid()), gtid_event.gno()));
+                    }
+                    Some(EventData::AnonymousGtidEvent(_)) => {
+                        // An anonymous transaction carries no GTID. Under
+                        // `gtid: enabled` this must not happen (gtid_mode not
+                        // fully ON) — fail loudly rather than silently persist a
+                        // GTID set that can't describe this transaction.
+                        if use_gtid {
+                            metrics.inc_decode_error();
+                            Err(super::err_to_stream(Error::AnonymousTransactionUnderGtid {
+                                dataset: dataset_name.clone(),
+                            }))?;
+                            unreachable!();
+                        }
+                        txn = Some(TransactionBuffer::new());
+                        current_txn_gtid = None;
                     }
                     // Heartbeats (and any other event) fall through to the
                     // safe-advance below, mirroring the Postgres KeepAlive
@@ -683,9 +765,10 @@ fn binlog_change_stream(
                 // transaction, or fold an empty/foreign one into the
                 // safe-advance.
                 if let Some(commit_pos) = pending_commit {
+                    let txn_gtid = current_txn_gtid.take();
                     if let Some(envelope) = commit_transaction(
                         &mut txn, &commit_pos, event_timestamp, &schema, &primary_keys,
-                        &column_map, &ack, &metrics, &dataset_name, ready_lag,
+                        &column_map, &ack, &metrics, &dataset_name, ready_lag, txn_gtid,
                     )? {
                         last_emitted = Some(commit_pos);
                         yield envelope;
@@ -752,6 +835,8 @@ async fn open_binlog_stream(
     params: &ReplicationParams,
     resume: &BinlogPosition,
     dataset_name: &str,
+    use_gtid: bool,
+    gtid: &GtidSet,
 ) -> std::result::Result<BinlogStream, mysql_async::Error> {
     let mut conn = Conn::new(params.opts.clone()).await?;
 
@@ -778,13 +863,26 @@ async fn open_binlog_stream(
         }
     }
 
-    let pos_u32 = u32::try_from(resume.pos).unwrap_or(u32::MAX);
-    conn.get_binlog_stream(
-        BinlogStreamRequest::new(params.server_id)
-            .with_filename(resume.file.as_bytes())
-            .with_pos(u64::from(pos_u32)),
-    )
-    .await
+    if use_gtid {
+        // GTID auto-positioning: the server computes the start point from the
+        // executed set (everything NOT in it is sent), so no filename/offset is
+        // needed. This is what survives a failover — the set is
+        // server-independent.
+        conn.get_binlog_stream(
+            BinlogStreamRequest::new(params.server_id)
+                .with_gtid()
+                .with_gtid_set(gtid.to_sids()),
+        )
+        .await
+    } else {
+        let pos_u32 = u32::try_from(resume.pos).unwrap_or(u32::MAX);
+        conn.get_binlog_stream(
+            BinlogStreamRequest::new(params.server_id)
+                .with_filename(resume.file.as_bytes())
+                .with_pos(u64::from(pos_u32)),
+        )
+        .await
+    }
 }
 
 fn table_map_matches(tme: &TableMapEvent<'_>, database: &str, table: &str) -> bool {
@@ -909,6 +1007,7 @@ fn commit_transaction(
     metrics: &MetricsCollector,
     dataset_name: &str,
     ready_lag: Duration,
+    txn_gtid: Option<(Uuid, u64)>,
 ) -> std::result::Result<Option<ChangeEnvelope>, StreamError> {
     metrics.inc_transaction();
     record_watermark(metrics, event_timestamp);
@@ -934,6 +1033,7 @@ fn commit_transaction(
             position: commit_pos.clone(),
             dataset: dataset_name.to_string(),
             source_commit_ts_ms: commit_ts_ms(event_timestamp),
+            gtid: txn_gtid,
         }),
         batch,
         crate::cdc::source_commit_within_ready_lag(commit_ts_ms(event_timestamp), ready_lag),
@@ -1064,6 +1164,9 @@ struct Checkpointer {
     dataset_name: String,
     metrics: Arc<MetricsCollector>,
     last_persisted: BinlogPosition,
+    /// Persist the executed GTID set alongside the file position (failover-safe
+    /// resume). When false, `gtid_set` stays `None` and resume is file+offset.
+    use_gtid: bool,
 }
 
 impl Checkpointer {
@@ -1278,6 +1381,10 @@ impl Checkpointer {
         let persisted = PersistedPosition {
             position: resume.clone(),
             schema_json: self.schema_json.clone(),
+            // Snapshot the executed set at the same instant as the position:
+            // under the in-order commit contract everything up to `resume` is
+            // in the set, and nothing past it (see `AckState`).
+            gtid_set: self.use_gtid.then(|| ack.gtid_snapshot().to_string()),
         };
         match self.store.save(&persisted).await {
             Ok(()) => {
@@ -1751,7 +1858,7 @@ mod tests {
 
     #[test]
     fn ack_state_is_monotonic() {
-        let ack = AckState::default();
+        let ack = AckState::new(GtidSet::new());
         ack.advance(&BinlogPosition::new("binlog.000002", 100));
         // A late-running committer for an earlier position must not regress.
         ack.advance(&BinlogPosition::new("binlog.000001", 900));
@@ -1795,6 +1902,7 @@ mod tests {
             dataset_name: "orders".to_string(),
             metrics: MetricsCollector::new(),
             last_persisted: BinlogPosition::new("binlog.000001", 100),
+            use_gtid: false,
         };
 
         let pre_adopt = AdoptedLayout {
@@ -1873,6 +1981,7 @@ mod tests {
             dataset_name: "orders".to_string(),
             metrics: MetricsCollector::new(),
             last_persisted: BinlogPosition::new("binlog.000001", 100),
+            use_gtid: false,
         };
         checkpointer.note_adopted_layout(
             &AdoptedLayout {
@@ -1933,6 +2042,7 @@ mod tests {
             dataset_name: "orders".to_string(),
             metrics: MetricsCollector::new(),
             last_persisted: BinlogPosition::new("binlog.000001", 100),
+            use_gtid: false,
         };
 
         let ba = BinlogPosition::new("binlog.000001", 500);
@@ -2047,6 +2157,7 @@ mod tests {
             dataset_name: "orders".to_string(),
             metrics: MetricsCollector::new(),
             last_persisted: BinlogPosition::new("binlog.000001", 100),
+            use_gtid: false,
         };
 
         let ba = BinlogPosition::new("binlog.000001", 500);
@@ -2157,6 +2268,7 @@ mod tests {
             dataset_name: "orders".to_string(),
             metrics: MetricsCollector::new(),
             last_persisted: BinlogPosition::new("binlog.000001", 100),
+            use_gtid: false,
         };
 
         // First change recorded only via TableMap@T1; second via ALTER@A2.

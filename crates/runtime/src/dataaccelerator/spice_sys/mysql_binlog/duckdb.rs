@@ -20,6 +20,12 @@ use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConne
 
 use super::{Error, MYSQL_BINLOG_TABLE_NAME, MySqlBinlogCheckpoint, MySqlBinlogSys, Result};
 
+/// Idempotent migration adding `gtid_executed` to a pre-existing sidecar table.
+/// `DuckDB` supports `IF NOT EXISTS`, so this is a clean no-op when present.
+fn migrate_gtid_column() -> String {
+    format!("ALTER TABLE {MYSQL_BINLOG_TABLE_NAME} ADD COLUMN IF NOT EXISTS gtid_executed TEXT")
+}
+
 impl MySqlBinlogSys {
     pub(super) fn upsert_duckdb(
         &self,
@@ -37,6 +43,7 @@ impl MySqlBinlogSys {
                 binlog_file TEXT NOT NULL,
                 binlog_pos BIGINT NOT NULL,
                 schema_json TEXT,
+                gtid_executed TEXT,
                 created_at TIMESTAMP,
                 updated_at TIMESTAMP
             )"
@@ -44,15 +51,20 @@ impl MySqlBinlogSys {
         duckdb_conn
             .execute(&create_table, [])
             .map_err(Error::external)?;
+        // Migrate tables created before `gtid_executed` existed. Idempotent.
+        duckdb_conn
+            .execute(&migrate_gtid_column(), [])
+            .map_err(Error::external)?;
 
         let upsert = format!(
             "INSERT INTO {MYSQL_BINLOG_TABLE_NAME}
-                (dataset_name, binlog_file, binlog_pos, schema_json, created_at, updated_at)
-             VALUES (?, ?, ?, ?, now(), now())
+                (dataset_name, binlog_file, binlog_pos, schema_json, gtid_executed, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, now(), now())
              ON CONFLICT (dataset_name) DO UPDATE SET
                 binlog_file = excluded.binlog_file,
                 binlog_pos = excluded.binlog_pos,
                 schema_json = excluded.schema_json,
+                gtid_executed = excluded.gtid_executed,
                 updated_at = now()"
         );
 
@@ -64,6 +76,7 @@ impl MySqlBinlogSys {
                     checkpoint.binlog_file,
                     Self::position_to_i64(checkpoint.binlog_pos),
                     checkpoint.schema_json,
+                    checkpoint.gtid_executed,
                 ],
             )
             .map_err(Error::external)?;
@@ -82,8 +95,13 @@ impl MySqlBinlogSys {
             .ok()?
             .get_underlying_conn_mut();
 
+        // Ensure `gtid_executed` exists so the SELECT below doesn't fail on a
+        // table created before the column was added. Idempotent; ignored when
+        // the table doesn't exist yet (the SELECT then returns no rows).
+        let _ = duckdb_conn.execute(&migrate_gtid_column(), []);
+
         let query = format!(
-            "SELECT binlog_file, binlog_pos, schema_json, CAST(epoch(updated_at) AS DOUBLE) FROM {MYSQL_BINLOG_TABLE_NAME} WHERE dataset_name = ?"
+            "SELECT binlog_file, binlog_pos, schema_json, gtid_executed, CAST(epoch(updated_at) AS DOUBLE) FROM {MYSQL_BINLOG_TABLE_NAME} WHERE dataset_name = ?"
         );
         let mut stmt = duckdb_conn.prepare(&query).ok()?;
         let mut rows = stmt.query([&self.dataset_name]).ok()?;
@@ -92,7 +110,8 @@ impl MySqlBinlogSys {
             let binlog_file: String = row.get(0).ok()?;
             let binlog_pos: i64 = row.get(1).ok()?;
             let schema_json: Option<String> = row.get(2).ok();
-            let updated_at_epoch: Option<f64> = row.get(3).ok();
+            let gtid_executed: Option<String> = row.get(3).ok();
+            let updated_at_epoch: Option<f64> = row.get(4).ok();
             let updated_at = updated_at_epoch
                 .and_then(|epoch| UNIX_EPOCH.checked_add(Duration::from_secs_f64(epoch)));
 
@@ -100,6 +119,7 @@ impl MySqlBinlogSys {
                 binlog_file,
                 binlog_pos: Self::position_from_i64(binlog_pos),
                 schema_json,
+                gtid_executed,
                 updated_at,
             })
         } else {
@@ -170,6 +190,7 @@ mod tests {
             binlog_file: "binlog.000042".to_string(),
             binlog_pos: 1_234_567,
             schema_json: Some(r#"{"fields":[]}"#.to_string()),
+            gtid_executed: Some("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5".to_string()),
             updated_at: None,
         }
     }
@@ -188,6 +209,7 @@ mod tests {
         assert_eq!(retrieved.binlog_file, checkpoint.binlog_file);
         assert_eq!(retrieved.binlog_pos, checkpoint.binlog_pos);
         assert_eq!(retrieved.schema_json, checkpoint.schema_json);
+        assert_eq!(retrieved.gtid_executed, checkpoint.gtid_executed);
     }
 
     #[tokio::test]

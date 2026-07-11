@@ -30,6 +30,7 @@ use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, Row};
 
 use super::config::{BinlogPosition, ReplicationParams};
+use super::gtid::GtidSet;
 use super::{
     BinaryLoggingDisabledSnafu, ColumnMissingSnafu, ConnectSnafu, Error, Result, SetupQuerySnafu,
     SourceTableNotFoundSnafu, UnsupportedBinlogFormatSnafu, UnsupportedBinlogRowImageSnafu,
@@ -286,6 +287,73 @@ pub async fn fetch_head_position(conn: &mut Conn) -> Result<BinlogPosition> {
     let pos: Option<u64> = row.get("Position");
     match (file, pos) {
         (Some(file), Some(pos)) => Ok(BinlogPosition::new(file, pos)),
+        _ => Err(Error::Decode {
+            message: "binary log status row did not include File/Position".to_string(),
+        }),
+    }
+}
+
+/// Whether the source has GTIDs fully enabled (`@@GLOBAL.gtid_mode = ON`).
+///
+/// Returns `false` for `OFF`, the transitional `ON_PERMISSIVE`/`OFF_PERMISSIVE`
+/// states (a mixed topology can still emit anonymous transactions, which GTID
+/// auto-positioning cannot resume from), and for servers that don't know the
+/// variable at all — `MariaDB` and pre-GTID `MySQL` report it as unknown (server
+/// error `1193`, `ER_UNKNOWN_SYSTEM_VARIABLE`), which means "no `MySQL`-format
+/// GTIDs here", not a fatal error.
+pub async fn detect_gtid_on(conn: &mut Conn) -> Result<bool> {
+    match conn
+        .query_first::<Option<String>, _>("SELECT @@GLOBAL.gtid_mode")
+        .await
+    {
+        Ok(row) => Ok(row
+            .flatten()
+            .is_some_and(|mode| mode.trim().eq_ignore_ascii_case("ON"))),
+        // 1193: ER_UNKNOWN_SYSTEM_VARIABLE (MariaDB / pre-GTID MySQL).
+        Err(mysql_async::Error::Server(ref e)) if e.code == 1193 => Ok(false),
+        Err(e) => Err(e).context(SetupQuerySnafu {
+            context: "SELECT @@GLOBAL.gtid_mode",
+        }),
+    }
+}
+
+/// The current binlog head together with the source's executed GTID set,
+/// captured atomically from a single `SHOW BINARY LOG STATUS` row (the
+/// `Executed_Gtid_Set` column). This pairing is the cold-start seed for
+/// GTID auto-positioning: file+offset drive the initial snapshot boundary while
+/// the GTID set becomes the durable, failover-safe resume identity.
+///
+/// The returned set is empty when the server reports no executed GTIDs (a
+/// freshly-reset GTID-enabled server), which is a valid starting point.
+pub async fn fetch_head_and_gtid(conn: &mut Conn) -> Result<(BinlogPosition, GtidSet)> {
+    let row = match conn.query_first::<Row, _>("SHOW BINARY LOG STATUS").await {
+        Ok(row) => row,
+        Err(e) if is_unknown_statement(&e) => conn
+            .query_first::<Row, _>("SHOW MASTER STATUS")
+            .await
+            .context(SetupQuerySnafu {
+                context: "SHOW MASTER STATUS",
+            })?,
+        Err(e) => {
+            return Err(e).context(SetupQuerySnafu {
+                context: "SHOW BINARY LOG STATUS",
+            });
+        }
+    };
+
+    let Some(row) = row else {
+        return BinaryLoggingDisabledSnafu.fail();
+    };
+
+    let file: Option<String> = row.get("File");
+    let pos: Option<u64> = row.get("Position");
+    let executed: Option<String> = row.get("Executed_Gtid_Set");
+    let gtid = match executed {
+        Some(raw) => GtidSet::parse(&raw).map_err(|message| Error::GtidParse { message })?,
+        None => GtidSet::new(),
+    };
+    match (file, pos) {
+        (Some(file), Some(pos)) => Ok((BinlogPosition::new(file, pos), gtid)),
         _ => Err(Error::Decode {
             message: "binary log status row did not include File/Position".to_string(),
         }),

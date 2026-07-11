@@ -27,12 +27,18 @@ limitations under the License.
 //! bare Arrow schema JSON object; the replication layer treats those as
 //! unknown layout and refuses unsafe resume.
 //!
+//! `gtid_executed` holds the source's executed GTID set for failover-safe
+//! resume (`COM_BINLOG_DUMP_GTID`); it is `NULL` for file+offset positioning.
+//! It was added after the initial schema, so the column is created lazily via
+//! `ALTER TABLE ... ADD COLUMN` on tables that predate it.
+//!
 //! ```sql
 //! CREATE TABLE spice_sys_mysql_binlog (
 //!     dataset_name TEXT PRIMARY KEY,
 //!     binlog_file TEXT NOT NULL,
 //!     binlog_pos BIGINT NOT NULL,
 //!     schema_json TEXT,
+//!     gtid_executed TEXT,
 //!     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 //!     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 //! );
@@ -70,6 +76,9 @@ pub struct MySqlBinlogCheckpoint {
     /// Optional serialized Arrow schema snapshot for detecting drift between
     /// runs.
     pub schema_json: Option<String>,
+    /// Optional executed GTID set (`uuid:range` text) for failover-safe resume
+    /// via `COM_BINLOG_DUMP_GTID`. `None` for file+offset positioning.
+    pub gtid_executed: Option<String>,
     /// When the row was last updated. Populated by the database layer on read.
     pub updated_at: Option<std::time::SystemTime>,
 }
