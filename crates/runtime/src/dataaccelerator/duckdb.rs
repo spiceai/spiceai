@@ -553,9 +553,7 @@ impl DataAccelerator for DuckDBAccelerator {
         ensure!(
             partition_by.is_empty(),
             super::InvalidConfigurationSnafu {
-                msg: "DuckDB data accelerator does not support the `partition_by` parameter but it was provided. \
-                      Use engine 'cayenne' or 'arrow' for partitioned acceleration, or remove `partition_by`."
-                    .to_string()
+                msg: "DuckDB data accelerator does not support the `partition_by` parameter but it was provided. Use engine 'cayenne' or 'arrow' for partitioned acceleration, or remove `partition_by`. See: https://spiceai.org/docs/components/data-accelerators".to_string()
             }
         );
 

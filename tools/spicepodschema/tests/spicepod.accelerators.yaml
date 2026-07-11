@@ -55,7 +55,6 @@ datasets:
         file_watcher: "true"
         connection_pool_size: "5"
         on_refresh_recompute_statistics: "true"
-        partitioned_write_buffer: "1000"
         optimizer_duckdb_aggregate_pushdown: "true"
 
   # DuckDB in memory mode
