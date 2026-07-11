@@ -210,7 +210,7 @@ impl CayennePartitionedInsertStrategy {
                     .catalog
                     .current_snapshot_id_for_table(&entry.table_id)
                     .await
-                    .map_err(DataFusionError::from)?;
+                    .map_err(|error| DataFusionError::External(Box::new(error)))?;
                 if current_snapshot_id == target_snapshot_id {
                     committed += 1;
                 } else {
@@ -912,19 +912,10 @@ impl DataSink for CayennePartitionedAppendSink {
             return Err(DataFusionError::from(e));
         }
 
-        // Apply the barrier on every partition. If any fails partway, the
-        // top-level WAL stays on disk so the next process restart can
-        // recover the set; we surface the error and stop. We do NOT attempt
-        // automated mid-barrier rollback because already-applied partitions
-        // have moved their files and removed their per-partition WALs —
-        // reverting that without coordination is unsafe.
-        for p in &prepared {
-            if let Err(e) = p.apply_under_held_barrier().await {
-                drop(fence_guards);
-                return Err(DataFusionError::from(e));
-            }
-        }
-
+        // Build every fallible in-memory publication object before moving a
+        // staged file. Once the barrier move starts, rollback is no longer a
+        // generally safe option; after the catalog commit publication itself
+        // must be infallible and await-free.
         let publish_states = match prepared
             .iter()
             .map(PreparedStagedAppend::prepare_deferred_snapshot_publish)
@@ -949,6 +940,19 @@ impl DataSink for CayennePartitionedAppendSink {
                 return Err(DataFusionError::from(error));
             }
         };
+
+        // Apply the barrier on every partition. If any fails partway, the
+        // top-level WAL stays on disk so the next process restart can
+        // recover the set; we surface the error and stop. We do NOT attempt
+        // automated mid-barrier rollback because already-applied partitions
+        // have moved their files and removed their per-partition WALs —
+        // reverting that without coordination is unsafe.
+        for p in &prepared {
+            if let Err(e) = p.apply_under_held_barrier().await {
+                drop(fence_guards);
+                return Err(DataFusionError::from(e));
+            }
+        }
 
         // The complete post-append contents now exist in one private snapshot
         // per partition. Flip every pointer in a single metastore transaction;

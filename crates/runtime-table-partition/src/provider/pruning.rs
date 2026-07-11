@@ -671,7 +671,10 @@ fn evaluate_modulo_inequality(
     _filter_value: &ScalarValue,
     op: Operator,
 ) -> Result<bool, DataFusionError> {
-    if !matches!(op, Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq) {
+    if !matches!(
+        op,
+        Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq
+    ) {
         return Err(DataFusionError::Plan("Unsupported operator".to_string()));
     }
     // A non-zero integer modulo class is unbounded in both directions. Every
@@ -1667,32 +1670,22 @@ mod tests {
         )]);
 
         let month_partition = date_trunc(lit("month"), col("date"));
-        let march_31 = ScalarValue::TimestampNanosecond(
-            Some(timestamp_nanos("2025-03-31 12:00:00")),
-            None,
-        );
+        let march_31 =
+            ScalarValue::TimestampNanosecond(Some(timestamp_nanos("2025-03-31 12:00:00")), None);
         assert!(!prune_partition(
             &[col("date").gt(lit(march_31))],
             &month_partition,
-            &ScalarValue::TimestampNanosecond(
-                Some(timestamp_nanos("2025-03-01 00:00:00")),
-                None,
-            ),
+            &ScalarValue::TimestampNanosecond(Some(timestamp_nanos("2025-03-01 00:00:00")), None,),
             &schema,
         )?);
 
         let year_partition = date_trunc(lit("year"), col("date"));
-        let leap_day = ScalarValue::TimestampNanosecond(
-            Some(timestamp_nanos("2024-02-29 12:00:00")),
-            None,
-        );
+        let leap_day =
+            ScalarValue::TimestampNanosecond(Some(timestamp_nanos("2024-02-29 12:00:00")), None);
         assert!(!prune_partition(
             &[col("date").gt(lit(leap_day))],
             &year_partition,
-            &ScalarValue::TimestampNanosecond(
-                Some(timestamp_nanos("2024-01-01 00:00:00")),
-                None,
-            ),
+            &ScalarValue::TimestampNanosecond(Some(timestamp_nanos("2024-01-01 00:00:00")), None,),
             &schema,
         )?);
 

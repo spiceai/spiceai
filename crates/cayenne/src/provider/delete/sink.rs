@@ -51,7 +51,6 @@ use super::super::Error;
 use super::super::deletion_strategy::{
     Int64PkDeletionSnapshot, PkDeletionStrategyWithCache, RowConverterDeletionSnapshot,
 };
-use super::super::deletion_index::{DeletionIndex, KeyDeletionIndex};
 use super::super::memory_account::CayenneMemoryAccount;
 use super::super::utils::convert_to_u64_box;
 use super::vector_io::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
@@ -96,13 +95,21 @@ const PK_DELETE_FLUSH_BATCH_SIZE: usize = 50_000;
 enum StagedPkDelete {
     Int64 {
         delete_files: Vec<DeleteFile>,
-        tombstones: DeletionIndex,
-        new_count: usize,
+        /// Tombstone snapshot captured when the delete began. Used only to count
+        /// how many keys are newly deleted (not already tombstoned) — it is never
+        /// re-published, so a concurrent update is never observed here.
+        initial: Arc<Int64PkDeletionSnapshot>,
+        /// This delete's primary keys, de-duplicated across chunks. Published by
+        /// merging (compare-and-swap) onto the live snapshot at commit.
+        new_pks: HashSet<i64>,
+        /// The single delete sequence shared by every chunk of this delete.
+        delete_sequence: Option<i64>,
     },
     RowKeys {
         delete_files: Vec<DeleteFile>,
-        tombstones: KeyDeletionIndex,
-        new_count: usize,
+        initial: Arc<RowConverterDeletionSnapshot>,
+        new_keys: HashSet<Box<[u8]>>,
+        delete_sequence: Option<i64>,
     },
 }
 
@@ -113,15 +120,17 @@ impl StagedPkDelete {
                 deletion_snapshot, ..
             } => Ok(Self::Int64 {
                 delete_files: Vec::new(),
-                tombstones: (*deletion_snapshot.load_full().tombstones).clone(),
-                new_count: 0,
+                initial: deletion_snapshot.load_full(),
+                new_pks: HashSet::new(),
+                delete_sequence: None,
             }),
             PkDeletionStrategyWithCache::RowConverterBased {
                 deletion_snapshot, ..
             } => Ok(Self::RowKeys {
                 delete_files: Vec::new(),
-                tombstones: (*deletion_snapshot.load_full().tombstones).clone(),
-                new_count: 0,
+                initial: deletion_snapshot.load_full(),
+                new_keys: HashSet::new(),
+                delete_sequence: None,
             }),
             PkDeletionStrategyWithCache::PositionBased { .. } => Err(Error::Internal {
                 table: table_name.to_string(),
@@ -140,15 +149,16 @@ impl StagedPkDelete {
         match self {
             Self::Int64 {
                 delete_files,
-                tombstones,
-                new_count,
+                new_pks,
+                delete_sequence: staged_sequence,
+                ..
             } => {
-                let mut values = Vec::new();
+                // Every chunk shares the one reserved delete sequence.
+                *staged_sequence = Some(delete_sequence);
                 for result in results {
                     delete_files.push(result.delete_file);
                     match result.identifiers {
                         DeletionIdentifier::KeyBased(keys) => {
-                            values.reserve(keys.len());
                             for key in keys {
                                 let bytes: [u8; 8] = key.as_ref().try_into().map_err(|_| {
                                     Error::Internal {
@@ -157,7 +167,7 @@ impl StagedPkDelete {
                                             .to_string(),
                                     }
                                 })?;
-                                values.push(i64::from_be_bytes(bytes));
+                                new_pks.insert(i64::from_be_bytes(bytes));
                             }
                         }
                         DeletionIdentifier::PositionBased { .. } => {
@@ -169,27 +179,18 @@ impl StagedPkDelete {
                         }
                     }
                 }
-                let added_count = values
-                    .iter()
-                    .filter(|pk| tombstones.get(**pk).is_none())
-                    .count();
-                *new_count = new_count.checked_add(added_count).ok_or_else(|| Error::Internal {
-                    table: table_name.to_string(),
-                    message: "Deleted row count overflowed usize".to_string(),
-                })?;
-                *tombstones = tombstones
-                    .extend_max_deletes(values.into_iter().map(|pk| (pk, delete_sequence)));
             }
             Self::RowKeys {
                 delete_files,
-                tombstones,
-                new_count,
+                new_keys,
+                delete_sequence: staged_sequence,
+                ..
             } => {
-                let mut keys = Vec::new();
+                *staged_sequence = Some(delete_sequence);
                 for result in results {
                     delete_files.push(result.delete_file);
                     match result.identifiers {
-                        DeletionIdentifier::KeyBased(result_keys) => keys.extend(result_keys),
+                        DeletionIdentifier::KeyBased(result_keys) => new_keys.extend(result_keys),
                         DeletionIdentifier::PositionBased { .. } => {
                             return Err(Error::Internal {
                                 table: table_name.to_string(),
@@ -199,25 +200,28 @@ impl StagedPkDelete {
                         }
                     }
                 }
-                let added_count = keys
-                    .iter()
-                    .filter(|key| tombstones.get(key.as_ref()).is_none())
-                    .count();
-                *new_count = new_count.checked_add(added_count).ok_or_else(|| Error::Internal {
-                    table: table_name.to_string(),
-                    message: "Deleted row count overflowed usize".to_string(),
-                })?;
-                *tombstones = tombstones.extend_max_deletes(
-                    keys.into_iter().map(|key| (key, delete_sequence)),
-                );
             }
         }
         Ok(())
     }
 
+    /// Number of keys this delete newly tombstones — keys not already deleted
+    /// when the delete began. Re-deletions of already-tombstoned keys are not
+    /// counted, preserving the pre-refactor "rows affected" semantics.
     fn new_count(&self) -> usize {
         match self {
-            Self::Int64 { new_count, .. } | Self::RowKeys { new_count, .. } => *new_count,
+            Self::Int64 {
+                initial, new_pks, ..
+            } => new_pks
+                .iter()
+                .filter(|pk| initial.tombstones.get(**pk).is_none())
+                .count(),
+            Self::RowKeys {
+                initial, new_keys, ..
+            } => new_keys
+                .iter()
+                .filter(|key| initial.tombstones.get(key.as_ref()).is_none())
+                .count(),
         }
     }
 }
@@ -916,7 +920,8 @@ impl CayenneDeletionSink {
         match staged {
             StagedPkDelete::Int64 {
                 delete_files,
-                tombstones,
+                new_pks,
+                delete_sequence,
                 ..
             } => {
                 let cleanup_paths = delete_files
@@ -927,18 +932,31 @@ impl CayenneDeletionSink {
                     Self::cleanup_uncommitted_delete_paths(&cleanup_paths).await;
                     return Err(error.into());
                 }
-                self.pk_deletion_strategy
-                    .int64_pk_snapshot()
-                    .ok_or_else(|| Error::Internal {
-                        table: table_name.clone(),
-                        message: "Atomic Int64 deletion used with incompatible strategy"
-                            .to_string(),
-                    })?
-                    .store(Arc::new(Int64PkDeletionSnapshot::from_index(tombstones)));
+                // Publish by merging this delete's keys onto the LIVE snapshot via
+                // compare-and-swap, so a concurrent tombstone update is never
+                // clobbered. `delete_sequence` is `None` only when no chunk wrote,
+                // in which case there is nothing to publish.
+                if let Some(sequence) = delete_sequence {
+                    self.pk_deletion_strategy
+                        .int64_pk_snapshot()
+                        .ok_or_else(|| Error::Internal {
+                            table: table_name.clone(),
+                            message: "Atomic Int64 deletion used with incompatible strategy"
+                                .to_string(),
+                        })?
+                        .rcu(|current| {
+                            Arc::new(Int64PkDeletionSnapshot::from_index(
+                                current
+                                    .tombstones
+                                    .extend_max_deletes(new_pks.iter().map(|&pk| (pk, sequence))),
+                            ))
+                        });
+                }
             }
             StagedPkDelete::RowKeys {
                 delete_files,
-                tombstones,
+                new_keys,
+                delete_sequence,
                 ..
             } => {
                 let cleanup_paths = delete_files
@@ -949,13 +967,22 @@ impl CayenneDeletionSink {
                     Self::cleanup_uncommitted_delete_paths(&cleanup_paths).await;
                     return Err(error.into());
                 }
-                self.pk_deletion_strategy
-                    .row_keys_snapshot()
-                    .ok_or_else(|| Error::Internal {
-                        table: table_name.clone(),
-                        message: "Atomic key deletion used with incompatible strategy".to_string(),
-                    })?
-                    .store(Arc::new(RowConverterDeletionSnapshot::from_index(tombstones)));
+                if let Some(sequence) = delete_sequence {
+                    self.pk_deletion_strategy
+                        .row_keys_snapshot()
+                        .ok_or_else(|| Error::Internal {
+                            table: table_name.clone(),
+                            message: "Atomic key deletion used with incompatible strategy"
+                                .to_string(),
+                        })?
+                        .rcu(|current| {
+                            Arc::new(RowConverterDeletionSnapshot::from_index(
+                                current
+                                    .tombstones
+                                    .extend_max_deletes(new_keys.iter().map(|key| (key, sequence))),
+                            ))
+                        });
+                }
             }
         }
         self.refresh_deletion_memory_accounting();
