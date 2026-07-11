@@ -149,29 +149,29 @@ impl ExecutionPlan for StreamingExec {
     }
 }
 
-/// Shared, resumable source for row-bounded cold-tier chunk writes.
+/// Shared, resumable source that splits one stream into sequential row-bounded
+/// chunks. Generic — no cold-tier/bloom knowledge; callers supply the row cap
+/// and the reason (see `write_stream_to_cold`, which uses it to keep each cold
+/// file under the per-file PK-bloom budget).
 ///
-/// Cold promotion Z-order sorts the whole visible table into one stream, then
-/// writes it in contiguous, row-bounded chunks so no output file's PK bloom can
-/// exceed `COLD_PK_BLOOM_PER_FILE_MAX_BYTES` (otherwise the file carries no bloom
-/// and the keyset rebuild degrades to a full cold scan). Sequential
-/// [`ColdChunkStream`]s pull from this one source; each stops after its row
-/// budget, leaving the source positioned for the next chunk. Splitting a
-/// globally-sorted stream at row boundaries preserves global order across files
-/// (and yields disjoint per-file min/max ranges, which helps listing-time
-/// pruning).
+/// Successive [`RowChunkStream`]s pull from this one source; each stops after
+/// its row budget, leaving the source positioned for the next chunk. Splitting a
+/// globally-sorted stream at row boundaries preserves global order across chunks
+/// (and yields disjoint per-chunk min/max ranges).
 ///
-/// The inner stream lives behind a `parking_lot::Mutex` that is polled
+/// CONTRACT: **consume chunks sequentially** — poll one [`RowChunkStream`] to
+/// completion before minting the next. Concurrent chunks would race the shared
+/// inner stream. The inner stream lives behind a `parking_lot::Mutex` polled
 /// **synchronously** inside `poll_next` and released before returning — it is
 /// never held across an `.await` (poll returns immediately), matching this
 /// module's `StreamingExec` convention. A `None` inner marks the source
 /// exhausted.
-pub(crate) struct ColdChunkSource {
+pub(crate) struct RowChunkedSource {
     schema: SchemaRef,
     inner: Mutex<Option<DFStream>>,
 }
 
-impl ColdChunkSource {
+impl RowChunkedSource {
     pub(crate) fn new(schema: SchemaRef, stream: DFStream) -> Arc<Self> {
         Arc::new(Self {
             schema,
@@ -179,8 +179,8 @@ impl ColdChunkSource {
         })
     }
 
-    /// `true` once the underlying stream has yielded end-of-stream (so the
-    /// promotion write loop stops minting further chunks).
+    /// `true` once the underlying stream has yielded end-of-stream (so a caller's
+    /// chunk loop knows to stop minting further chunks).
     pub(crate) fn is_exhausted(&self) -> bool {
         self.inner.lock().is_none()
     }
@@ -188,10 +188,10 @@ impl ColdChunkSource {
     /// The next chunk: a stream that forwards batches from the shared source
     /// until it has emitted at least `row_cap` rows, then ends without consuming
     /// further. The boundary is at batch granularity, so the final batch may
-    /// overshoot `row_cap` by up to one batch — callers set `row_cap` with
-    /// headroom below the hard bloom cap to absorb that.
-    pub(crate) fn next_chunk(self: &Arc<Self>, row_cap: usize) -> ColdChunkStream {
-        ColdChunkStream {
+    /// overshoot `row_cap` by up to one batch — set `row_cap` with headroom below
+    /// any hard limit to absorb that.
+    pub(crate) fn next_chunk(self: &Arc<Self>, row_cap: usize) -> RowChunkStream {
+        RowChunkStream {
             source: Arc::clone(self),
             emitted: 0,
             row_cap,
@@ -199,14 +199,14 @@ impl ColdChunkSource {
     }
 }
 
-/// One row-bounded chunk over a shared [`ColdChunkSource`]; see its docs.
-pub(crate) struct ColdChunkStream {
-    source: Arc<ColdChunkSource>,
+/// One row-bounded chunk over a shared [`RowChunkedSource`]; see its docs.
+pub(crate) struct RowChunkStream {
+    source: Arc<RowChunkedSource>,
     emitted: usize,
     row_cap: usize,
 }
 
-impl Stream for ColdChunkStream {
+impl Stream for RowChunkStream {
     type Item = datafusion_common::Result<RecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -235,7 +235,7 @@ impl Stream for ColdChunkStream {
     }
 }
 
-impl RecordBatchStream for ColdChunkStream {
+impl RecordBatchStream for RowChunkStream {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.source.schema)
     }
@@ -264,7 +264,7 @@ mod tests {
         Box::pin(RecordBatchStreamAdapter::new(Arc::clone(schema), s))
     }
 
-    async fn drain_ids(mut chunk: ColdChunkStream) -> Vec<i64> {
+    async fn drain_ids(mut chunk: RowChunkStream) -> Vec<i64> {
         let mut out = Vec::new();
         while let Some(item) = chunk.next().await {
             let batch = item.expect("chunk batch is Ok");
@@ -286,7 +286,7 @@ mod tests {
         let schema = id_schema();
         // 5 batches x 100 rows = ids 0..500.
         let batches: Vec<_> = (0..5).map(|i| id_batch(&schema, i * 100, 100)).collect();
-        let source = ColdChunkSource::new(Arc::clone(&schema), source_stream(&schema, batches));
+        let source = RowChunkedSource::new(Arc::clone(&schema), source_stream(&schema, batches));
 
         let row_cap = 250usize;
         let batch_rows = 100usize;
@@ -321,7 +321,7 @@ mod tests {
     async fn chunk_source_single_chunk_when_under_cap() {
         let schema = id_schema();
         let batches = vec![id_batch(&schema, 0, 100), id_batch(&schema, 100, 100)];
-        let source = ColdChunkSource::new(Arc::clone(&schema), source_stream(&schema, batches));
+        let source = RowChunkedSource::new(Arc::clone(&schema), source_stream(&schema, batches));
 
         assert!(!source.is_exhausted());
         let first = drain_ids(source.next_chunk(10_000)).await;
@@ -336,7 +336,7 @@ mod tests {
     #[tokio::test]
     async fn chunk_source_empty_source() {
         let schema = id_schema();
-        let source = ColdChunkSource::new(Arc::clone(&schema), source_stream(&schema, vec![]));
+        let source = RowChunkedSource::new(Arc::clone(&schema), source_stream(&schema, vec![]));
         let got = drain_ids(source.next_chunk(100)).await;
         assert!(got.is_empty());
         assert!(source.is_exhausted());

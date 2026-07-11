@@ -13423,8 +13423,11 @@ impl CayenneTableProvider {
             // `{write_id}_{index}.vortex`, so sequential chunk writes never collide
             // and the physical layout stays flat (identical to the single-write
             // path). The post-write listing below discovers every chunk's files.
+            // `RowChunkedSource` is a generic row-bounded stream splitter; the
+            // cold-tier reason (keep each file's PK bloom under the cap) lives here,
+            // in `cold_file_row_cap`.
             let row_cap = Self::cold_file_row_cap();
-            let source = super::streaming::ColdChunkSource::new(Arc::clone(&schema), stream);
+            let source = super::streaming::RowChunkedSource::new(Arc::clone(&schema), stream);
             let mut chunk_idx: usize = 0;
             while !source.is_exhausted() {
                 if chunk_idx == 1 {
