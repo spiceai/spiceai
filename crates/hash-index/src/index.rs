@@ -141,8 +141,9 @@ pub fn hash_key_i64(key: i64) -> u64 {
 }
 
 /// One-shot XXH3-64 of a single byte slice. Produces the same value as
-/// [`hash_key_bytes`]`(&[bytes])` — both hash the same bytes with the crate
-/// seed — but skips the streaming hasher construction, which dominates
+/// calling [`hash_key_bytes`] with a single-element slice (`&[bytes]`) — both
+/// hash the same bytes with the crate seed — but skips the streaming hasher
+/// construction, which dominates
 /// per-call cost for small inputs hashed one value at a time (e.g. per-row NDV
 /// sketch folding). Only valid for a single part; callers hashing composite
 /// keys from multiple parts must use [`hash_key_bytes`] so every part is
