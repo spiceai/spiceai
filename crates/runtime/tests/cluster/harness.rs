@@ -497,6 +497,8 @@ async fn start_executor(
     // the scheduler via `executor_bind_app`.
     tokio::select! {
         () = tokio::time::sleep(Duration::from_mins(2)) => {
+            executor_handle.abort();
+            let _ = executor_handle.await;
             return Err(anyhow::Error::msg(format!(
                 "Timed out waiting for {label} to become ready (object stores bound / task slots open)"
             )));

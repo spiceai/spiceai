@@ -243,6 +243,8 @@ async fn build_executor(
     // `executor_bind_app` + object-store bind; a concurrent load races that path.
     tokio::select! {
         () = sleep(Duration::from_mins(2)) => {
+            handle.abort();
+            let _ = handle.await;
             return Err(anyhow::Error::msg(
                 "timed out waiting for executor to become ready (object stores bound / task slots open)",
             ));

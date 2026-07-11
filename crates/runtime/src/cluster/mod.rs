@@ -2331,7 +2331,8 @@ impl runtime_secrets::ClusterSecretExpander for ClusterSecretExpanderImpl {
 
 /// - Binds the pre-fetched `App` to the runtime
 /// - Initializes and binds `SchedulerRPCSecretStore`
-/// - Ensures `runtime.task_history` exists (normally created by `load_components`)
+/// - Ensures `runtime.task_history` exists when task history is enabled
+///   (normally created by `load_components`); fails closed if init fails
 /// - Loads catalogs, embeddings, models, and tools
 async fn executor_bind_app(
     rt: &Arc<Runtime>,
@@ -2364,20 +2365,26 @@ async fn executor_bind_app(
     //
     // Concurrent with `load_components` is fine: if we lose the race,
     // `init_task_history` fails with "table already exists" and we re-check.
-    let task_history_ref = ::datafusion::sql::TableReference::partial(
-        crate::datafusion::SPICE_RUNTIME_SCHEMA,
-        crate::task_history::DEFAULT_TASK_HISTORY_TABLE,
-    );
-    if rt.df.get_table(&task_history_ref).await.is_none() {
-        match Arc::clone(rt).init_task_history().await {
-            Ok(()) => {}
-            Err(err) if rt.df.get_table(&task_history_ref).await.is_some() => {
-                tracing::debug!(
-                    "task_history already initialized by concurrent load_components: {err}"
-                );
-            }
-            Err(err) => {
-                tracing::warn!("Creating internal task history table: {err}");
+    // Fail closed if init fails and the table is still absent — otherwise the
+    // executor can report Ready while scheduler federated queries break.
+    if rt.df.task_history_enabled {
+        let task_history_ref = ::datafusion::sql::TableReference::partial(
+            crate::datafusion::SPICE_RUNTIME_SCHEMA,
+            crate::task_history::DEFAULT_TASK_HISTORY_TABLE,
+        );
+        if rt.df.get_table(&task_history_ref).await.is_none() {
+            match Arc::clone(rt).init_task_history().await {
+                Ok(()) => {}
+                Err(err) if rt.df.get_table(&task_history_ref).await.is_some() => {
+                    tracing::debug!(
+                        "task_history already initialized by concurrent load_components: {err}"
+                    );
+                }
+                Err(err) => {
+                    return Err(FailedToStartClusterExecutor {
+                        source: Box::new(err),
+                    });
+                }
             }
         }
     }

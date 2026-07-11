@@ -806,31 +806,36 @@ impl ObjectStoreRegistry for SpiceObjectStoreRegistry {
     }
 
     fn get_store(&self, url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
-        let key = Self::url_key(url);
         let fragment = url.fragment().unwrap_or("");
 
         if fragment.is_empty() {
             // Bare URL: return cached entry if present; never evict a configured store.
+            // Defer `url_key` until a miss so the common cache-hit path allocates nothing.
             if let Ok(store) = self.inner.get_store(url) {
                 return Ok(store);
             }
+            let key = Self::url_key(url);
             let store = self.get_feature_store(url)?;
             return Ok(self.register_built_store(url, key, StoreConfig::Bare, store));
         }
 
+        let key = Self::url_key(url);
+        let wanted = StoreConfig::from_fragment(fragment);
+
         // Fragment-bearing URL: reuse only when fingerprint matches or the
         // entry was deliberately registered externally. Re-check the
         // fingerprint after `inner.get_store` so a concurrent rebuild cannot
-        // hand us a store for a different config.
-        if self.should_reuse_cached(&key, fragment)
+        // hand us a store for a different config. Hash the fragment once and
+        // reuse `wanted` for both checks + registration.
+        if self.should_reuse_cached(&key, &wanted)
             && let Ok(store) = self.inner.get_store(url)
-            && self.should_reuse_cached(&key, fragment)
+            && self.should_reuse_cached(&key, &wanted)
         {
             return Ok(store);
         }
 
         let store = self.get_feature_store(url)?;
-        Ok(self.register_built_store(url, key, StoreConfig::from_fragment(fragment), store))
+        Ok(self.register_built_store(url, key, wanted, store))
     }
 
     fn deregister_store(&self, url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
@@ -847,11 +852,10 @@ impl ObjectStoreRegistry for SpiceObjectStoreRegistry {
 }
 
 impl SpiceObjectStoreRegistry {
-    fn should_reuse_cached(&self, key: &str, fragment: &str) -> bool {
-        let wanted = StoreConfig::from_fragment(fragment);
+    fn should_reuse_cached(&self, key: &str, wanted: &StoreConfig) -> bool {
         self.configs
             .get(key)
-            .is_some_and(|config| match (config.value(), &wanted) {
+            .is_some_and(|config| match (config.value(), wanted) {
                 (StoreConfig::External, _) | (StoreConfig::Bare, StoreConfig::Bare) => true,
                 (StoreConfig::Fragment(cached), StoreConfig::Fragment(wanted_hash)) => {
                     cached == wanted_hash
