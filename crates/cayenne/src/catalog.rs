@@ -904,6 +904,13 @@ pub trait MetadataCatalog: Send + Sync {
     /// writers at open time, so this never races a live stage.
     async fn publish_orphan_inlined_deletes(&self, table_id: &str) -> CatalogResult<u64>;
 
+    /// Return exact IDs of currently-unpublished inline tombstones without
+    /// changing their durable activation state.
+    async fn get_unpublished_inlined_delete_ids(
+        &self,
+        table_id: &str,
+    ) -> CatalogResult<Vec<String>>;
+
     /// Atomically rewrite existing inline data rows, remove emptied inline data rows,
     /// and append new inline data rows.
     ///

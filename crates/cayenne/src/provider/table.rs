@@ -16717,11 +16717,11 @@ impl CayenneTableProvider {
         )
         .await
         .map_err(|source| Error::Catalog { source })?;
-        let recovered_inline_tombstones = if fresh_strategy.is_position_based() {
-            0
+        let recovered_inline_tombstone_ids = if fresh_strategy.is_position_based() {
+            Vec::new()
         } else {
             self.catalog
-                .publish_orphan_inlined_deletes(&self.table_metadata.table_id)
+                .get_unpublished_inlined_delete_ids(&self.table_metadata.table_id)
                 .await
                 .map_err(|source| Error::Catalog { source })?
         };
@@ -16734,14 +16734,18 @@ impl CayenneTableProvider {
         self.protected_snapshots
             .store(Arc::new(fresh_protected_snapshots));
         self.clear_cached_pk_keyset();
-        if recovered_inline_tombstones > 0 {
+        if !recovered_inline_tombstone_ids.is_empty() {
             // The shared catalog transaction committed the replacement and its
             // inert tombstone, but cancellation prevented the normal local
-            // activation bookkeeping. The durable sweep above made every such
-            // tombstone authoritative, so discard stale process-local queues
-            // and force the next inline read to rebuild from that state.
-            self.inlined_locally_published.lock().clear();
-            self.pending_durable_tombstone_flips.lock().clear();
+            // activation bookkeeping. Activate the exact tombstones locally
+            // under the same fence as replacement-snapshot publication; their
+            // durable flips are deferred so no await can split visibility.
+            self.inlined_locally_published
+                .lock()
+                .extend(recovered_inline_tombstone_ids.iter().cloned());
+            self.pending_durable_tombstone_flips
+                .lock()
+                .extend(recovered_inline_tombstone_ids);
             self.pending_tombstone_deltas.lock().drain_through(u64::MAX);
             self.pending_inline_tombstones.store(0, Ordering::Release);
             self.bump_inlined_structural_epoch();

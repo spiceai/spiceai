@@ -121,6 +121,30 @@ impl PreparedOnConflictDeletionPublish {
         self.pending_inline_tombstone_owned = false;
     }
 
+    /// Relinquish process-local bookkeeping without deleting physical files.
+    ///
+    /// Used when a shared transaction's durable outcome is mixed or cannot be
+    /// read. The top-level WAL remains authoritative for restart recovery, so
+    /// deleting staged vectors would be unsafe, but counters and deferred flips
+    /// owned by this process must still be restored before the value is dropped.
+    pub fn retain_files_for_wal_recovery(&mut self) {
+        if self.pending_inline_tombstone_owned {
+            self.table
+                .pending_inline_tombstones
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            self.pending_inline_tombstone_owned = false;
+        }
+        if let Some(payload) = &mut self.durable_payload
+            && !payload.pending_durable_flips.is_empty()
+        {
+            let mut pending = self.table.pending_durable_tombstone_flips.lock();
+            let mut restored = std::mem::take(&mut payload.pending_durable_flips);
+            restored.append(&mut pending);
+            *pending = restored;
+        }
+        self.cleanup_armed = false;
+    }
+
     /// Disarm abort cleanup when recovery proves that an ambiguously completed
     /// shared transaction committed this payload. Exact path matching is used:
     /// an unrelated later catalog row must never retain this batch's files.

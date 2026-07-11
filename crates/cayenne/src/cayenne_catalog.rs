@@ -3781,6 +3781,23 @@ impl MetadataCatalog for CayenneCatalog {
         Ok(u64::try_from(pending).unwrap_or(0))
     }
 
+    async fn get_unpublished_inlined_delete_ids(
+        &self,
+        table_id: &str,
+    ) -> CatalogResult<Vec<String>> {
+        self.metastore
+            .query_helper(
+                QueryParams {
+                    sql: "SELECT inlined_id FROM cayenne_inlined_delete \
+                          WHERE table_id = ?1 AND published = 0 \
+                          ORDER BY inlined_id",
+                    params: vec![MetastoreValue::Text(table_id.to_string())],
+                },
+                |row| row.get_string(0),
+            )
+            .await
+    }
+
     async fn commit_inlined_mutation(
         &self,
         table_id: &str,

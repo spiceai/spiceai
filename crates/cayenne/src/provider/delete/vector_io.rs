@@ -84,6 +84,8 @@ static TEST_FAIL_WRITER_NUMBER: AtomicUsize = AtomicUsize::new(0);
 static TEST_WRITERS_STARTED: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static TEST_WRITERS_COMPLETED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_WRITER_HOOK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Identifies rows for deletion using either position-based IDs or primary key-based keys.
 ///
@@ -1038,6 +1040,7 @@ mod tests {
 
     #[tokio::test]
     async fn later_writer_failure_cleans_every_batch_path() {
+        let _hook_guard = TEST_WRITER_HOOK_LOCK.lock().await;
         let temp_dir = TempDir::new().expect("temp dir");
         let table_metadata = build_table_metadata(&temp_dir);
         TEST_WRITERS_STARTED.store(0, Ordering::Release);
@@ -1066,6 +1069,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_waits_for_detached_writers_then_cleans_paths() {
+        let _hook_guard = TEST_WRITER_HOOK_LOCK.lock().await;
         let temp_dir = TempDir::new().expect("temp dir");
         let table_metadata = build_table_metadata(&temp_dir);
         TEST_WRITERS_STARTED.store(0, Ordering::Release);

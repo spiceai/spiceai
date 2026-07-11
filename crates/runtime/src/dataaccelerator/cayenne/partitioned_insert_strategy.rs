@@ -168,7 +168,7 @@ impl CayennePartitionedInsertStrategy {
         &self,
         providers: &[Arc<dyn datafusion::catalog::TableProvider>],
     ) -> Result<(), DataFusionError> {
-        let _coordinator_guard = self.coordinator_lock.lock().await;
+        let _coordinator_guard = Arc::clone(&self.coordinator_lock).lock_owned().await;
         let by_id: HashMap<&str, &CayenneTableProvider> = providers
             .iter()
             .filter_map(|provider| downcast_to_cayenne(provider))
@@ -184,7 +184,7 @@ impl CayennePartitionedInsertStrategy {
             .flatten();
         let local_wals;
         let object_wals;
-        let wals: Vec<PartitionedWal> = if let Some((store, prefix)) = &object_store_location {
+        let wals: Vec<PartitionedWal> = if let Some((store, prefix, _)) = &object_store_location {
             object_wals = PartitionedWal::read_all_in_object_store(store.as_ref(), prefix)
                 .await
                 .map_err(DataFusionError::from)?;
@@ -256,7 +256,7 @@ impl CayennePartitionedInsertStrategy {
                     .map_err(DataFusionError::from)?;
             }
 
-            if let Some((store, prefix)) = &object_store_location {
+            if let Some((store, prefix, _)) = &object_store_location {
                 PartitionedWal::remove_from_object_store(store.as_ref(), prefix, &wal.commit_id)
                     .await
                     .map_err(DataFusionError::from)?;
@@ -763,7 +763,7 @@ impl DataSink for CayennePartitionedAppendSink {
         mut data: SendableRecordBatchStream,
         context: &Arc<TaskContext>,
     ) -> datafusion::common::Result<u64> {
-        let _coordinator_guard = self.coordinator_lock.lock().await;
+        let _coordinator_guard = Arc::clone(&self.coordinator_lock).lock_owned().await;
 
         let target_partitions = context.session_config().target_partitions();
 
@@ -925,7 +925,10 @@ impl DataSink for CayennePartitionedAppendSink {
                 .map_err(DataFusionError::from)?;
             let same_backend = match (&object_store_wal, &participant_wal) {
                 (None, None) => true,
-                (Some((_, first_prefix)), Some((_, prefix))) => first_prefix == prefix,
+                (
+                    Some((_, first_prefix, first_backend)),
+                    Some((_, prefix, backend)),
+                ) => first_prefix == prefix && first_backend == backend,
                 _ => false,
             };
             if !same_backend {
@@ -944,7 +947,7 @@ impl DataSink for CayennePartitionedAppendSink {
                 ));
             }
         }
-        let wal_write_result = if let Some((store, prefix)) = &object_store_wal {
+        let wal_write_result = if let Some((store, prefix, _)) = &object_store_wal {
             top_level_wal
                 .write_to_object_store(store.as_ref(), prefix)
                 .await
@@ -973,7 +976,7 @@ impl DataSink for CayennePartitionedAppendSink {
         {
             Ok(states) => states,
             Err(error) => {
-                if let Err(cleanup_error) = if let Some((store, prefix)) = &object_store_wal {
+                if let Err(cleanup_error) = if let Some((store, prefix, _)) = &object_store_wal {
                     PartitionedWal::remove_from_object_store(store.as_ref(), prefix, &commit_id)
                         .await
                 } else {
@@ -1032,6 +1035,7 @@ impl DataSink for CayennePartitionedAppendSink {
         let catalog = Arc::clone(&self.catalog);
         let table_root = self.table_root.clone();
         let completion = tokio::spawn(async move {
+        let _coordinator_guard = _coordinator_guard;
         // The complete post-append contents now exist in one private snapshot
         // per partition. Flip every pointer in a single metastore transaction;
         // readers cannot observe a subset through a fresh directory listing.
@@ -1047,52 +1051,59 @@ impl DataSink for CayennePartitionedAppendSink {
                 &prepared,
             )
             .await;
-            if matches!(commit_state, Ok(AppendCommitState::AllCommitted)) {
-                // `COMMIT` can complete but report an ambiguous transport
-                // failure. Durable pointers are the decision: restore each
-                // payload, prove its generated DV paths are in committed
-                // metadata, then let the per-partition WAL recovery reload and
-                // publish the complete durable state. Never roll back a target
-                // the catalog now names current.
-                for (receipt, on_conflict) in prepared
-                    .iter_mut()
-                    .zip(prepared_on_conflicts.into_iter())
-                {
-                    receipt.restore_prepared_on_conflict(on_conflict);
-                    receipt
-                        .reconcile_committed_on_conflict_cleanup()
-                        .await
-                        .map_err(DataFusionError::from)?;
-                }
-                drop(fence_guards);
-                for receipt in &prepared {
-                    receipt
-                        .recover_committed_snapshot()
-                        .await
-                        .map_err(DataFusionError::from)?;
-                }
-                return Err(error);
-            }
             match commit_state {
+                Ok(AppendCommitState::AllCommitted) => {
+                    // `COMMIT` can complete but report an ambiguous transport
+                    // failure. Durable pointers are the decision: restore each
+                    // payload, prove its generated DV paths are in committed
+                    // metadata, then let per-partition WAL recovery reload and
+                    // publish the complete durable state.
+                    for (receipt, on_conflict) in prepared
+                        .iter_mut()
+                        .zip(prepared_on_conflicts.into_iter())
+                    {
+                        receipt.restore_prepared_on_conflict(on_conflict);
+                        receipt
+                            .reconcile_committed_on_conflict_cleanup()
+                            .await
+                            .map_err(DataFusionError::from)?;
+                    }
+                    drop(fence_guards);
+                    for receipt in &prepared {
+                        receipt
+                            .recover_committed_snapshot()
+                            .await
+                            .map_err(DataFusionError::from)?;
+                    }
+                    return Err(error);
+                }
                 Ok(AppendCommitState::AllUncommitted) => {}
                 Ok(AppendCommitState::Mixed {
                     committed,
                     uncommitted,
                 }) => {
+                    for (receipt, on_conflict) in
+                        prepared.iter_mut().zip(prepared_on_conflicts)
+                    {
+                        receipt.restore_prepared_on_conflict(on_conflict);
+                        receipt.retain_files_for_wal_recovery();
+                    }
                     drop(fence_guards);
                     return Err(DataFusionError::Execution(format!(
                         "Cross-partition Cayenne commit returned an error and durable catalog pointers are mixed ({committed} committed, {uncommitted} uncommitted); refusing rollback and retaining every WAL for manual recovery"
                     )));
                 }
                 Err(classification_error) => {
+                    for (receipt, on_conflict) in
+                        prepared.iter_mut().zip(prepared_on_conflicts)
+                    {
+                        receipt.restore_prepared_on_conflict(on_conflict);
+                        receipt.retain_files_for_wal_recovery();
+                    }
                     drop(fence_guards);
                     return Err(DataFusionError::Execution(format!(
                         "Cross-partition Cayenne commit returned an error and its durable outcome could not be classified ({classification_error}); refusing rollback and retaining every WAL for recovery. Original commit error: {error}"
                     )));
-                }
-                Ok(AppendCommitState::AllCommitted) => {
-                    drop(fence_guards);
-                    return Err(error);
                 }
             }
             drop(fence_guards);
@@ -1110,7 +1121,7 @@ impl DataSink for CayennePartitionedAppendSink {
                 }
             }
             if !rollback_failed
-                && let Err(cleanup_error) = if let Some((store, prefix)) = &object_store_wal {
+                && let Err(cleanup_error) = if let Some((store, prefix, _)) = &object_store_wal {
                     PartitionedWal::remove_from_object_store(store.as_ref(), prefix, &commit_id)
                         .await
                 } else {
@@ -1157,7 +1168,7 @@ impl DataSink for CayennePartitionedAppendSink {
             }
         }
 
-        let wal_remove_result = if let Some((store, prefix)) = &object_store_wal {
+        let wal_remove_result = if let Some((store, prefix, _)) = &object_store_wal {
             PartitionedWal::remove_from_object_store(store.as_ref(), prefix, &commit_id).await
         } else {
             PartitionedWal::remove(&table_root, &commit_id).await

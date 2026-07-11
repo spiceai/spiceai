@@ -508,6 +508,14 @@ impl PreparedStagedAppend {
         self.prepared_on_conflict = prepared;
     }
 
+    /// Preserve physical deletion files for top-level WAL recovery while
+    /// relinquishing process-local cleanup bookkeeping.
+    pub fn retain_files_for_wal_recovery(&mut self) {
+        if let Some(prepared) = self.prepared_on_conflict.as_mut() {
+            prepared.retain_files_for_wal_recovery();
+        }
+    }
+
     /// Resolve abort-cleanup ownership after a cancelled shared commit.
     /// Recovery calls this only after the durable snapshot pointer proves the
     /// transaction committed, then verifies every generated delete-file path is
@@ -874,7 +882,7 @@ impl PreparedStagedAppend {
     /// cross-partition WAL. Local tables return `Ok(None)`.
     pub fn partitioned_wal_object_store(
         &self,
-    ) -> Result<Option<(Arc<dyn object_store::ObjectStore>, ObjectStorePath)>> {
+    ) -> Result<Option<(Arc<dyn object_store::ObjectStore>, ObjectStorePath, String)>> {
         self.table.partitioned_wal_object_store()
     }
 
@@ -1012,7 +1020,7 @@ impl CayenneTableProvider {
     /// cross-partition WALs. Local tables return `Ok(None)`.
     pub fn partitioned_wal_object_store(
         &self,
-    ) -> Result<Option<(Arc<dyn object_store::ObjectStore>, ObjectStorePath)>> {
+    ) -> Result<Option<(Arc<dyn object_store::ObjectStore>, ObjectStorePath, String)>> {
         if !self.table_path().starts_with("s3://") {
             return Ok(None);
         }
@@ -1035,7 +1043,11 @@ impl CayenneTableProvider {
                     partition_prefix
                 ),
             })?;
-        Ok(Some((Arc::clone(&config.store), ObjectStorePath::from(prefix))))
+        Ok(Some((
+            Arc::clone(&config.store),
+            ObjectStorePath::from(prefix),
+            config.url.to_string(),
+        )))
     }
 
     /// Stage an append into Cayenne without making the new rows visible.
