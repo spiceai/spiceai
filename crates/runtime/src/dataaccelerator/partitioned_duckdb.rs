@@ -418,10 +418,15 @@ impl PartitionCreator for DuckDBPartitionCreator {
             }
 
             let mut cmd = self.cmd.clone();
-            self.add_open(&mut cmd, &partition_values)
-                .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
-
+            // Bind to the DISCOVERED partition file, NOT a path recomputed from
+            // the partition values with the current key encoder. Recomputing
+            // (via `add_open`) would rebind an existing partition — written under
+            // a prior key encoding — to a different, freshly-created empty file,
+            // silently hiding its data (a partition-key encoding change would
+            // make every pre-existing partition read empty). `path` is this
+            // partition's actual data file (see `discover_hive_partitions`).
             let duckdb_path = path.display().to_string();
+            cmd.options.insert("open".to_string(), duckdb_path.clone());
             get_pool(
                 &self.duckdb_factory,
                 &duckdb_path,
