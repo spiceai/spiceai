@@ -66,6 +66,11 @@ on:
         required: false
         default: false
         type: boolean
+      skip_analytic_gate:
+        description: 'Skip the analytical-query correctness gate (re-runs every CH-benCH query against source + Spice and diffs results) to save time on experiments; the row-count gate still runs. Scheduled runs always leave this false.'
+        required: false
+        default: false
+        type: boolean
 
 # Serialize ALL SF100 + SF1000 CH-benCHmark runs across every variant (sqlite/turso cdc-tuned,
 # adaptive, duckdb): they share ONE concurrency group keyed only by scale factor, so
@@ -157,6 +162,7 @@ jobs:
             echo "| analytical concurrency | ${{ github.event.inputs.concurrency }} |"
             echo "| query overrides | ${{ github.event.inputs.query_overrides || 'none' }} |"
             echo "| runner | ${{ github.event.inputs.runner_type }} |"
+            echo "| analytic gate | ${{ github.event.inputs.skip_analytic_gate == 'true' && 'skipped' || 'enabled' }} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build Testoperator
@@ -241,6 +247,7 @@ jobs:
             ${{ github.event.inputs.query_overrides != '' && format('--query-overrides {0}', github.event.inputs.query_overrides) || '' }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             ${{ steps.set_spicepod_path.outputs.SOURCE_TYPE != 'mysql' && github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && '--skip-prepare' || '' }} \
+            ${{ github.event.inputs.skip_analytic_gate == 'true' && '--skip-analytic-gate' || '' }} \
             --disable-progress-bars \
             --metrics \
             --metrics-dump "${GITHUB_WORKSPACE}/htap-metrics.json" \

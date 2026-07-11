@@ -148,6 +148,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
             .map_or_else(|| "unlimited".to_string(), |r| r.to_string()),
         "spicepod_path": test_args.common.spicepod_path.display().to_string(),
         "clock_skew_ms_estimate": clock_skew_ms_estimate,
+        "skip_analytic_gate": args.skip_analytic_gate,
     });
 
     let benchmark_resource = Resource::builder_empty()
@@ -512,7 +513,9 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
 
             // Analytical-correctness gate runs only when the row-count gate fully passed (replication converged + every table matches).
             // Otherwise the underlying data is known to diverge, so comparing analytical query results adds no signal.
-            if row_count_message.is_none() {
+            if args.skip_analytic_gate {
+                println!("\nSkipping analytical-query gate — --skip-analytic-gate set");
+            } else if row_count_message.is_none() {
                 let query_overrides = test_args
                     .query_overrides
                     .clone()
