@@ -66,6 +66,11 @@ on:
         required: false
         default: false
         type: boolean
+      spiced_env:
+        description: 'Extra environment variables for the spiced process under test, one KEY=VALUE per line. Applied only to the benchmark run, never to template seeding, so it never invalidates the cached CH-benCH template.'
+        required: false
+        default: ''
+        type: string
 
 # Serialize ALL SF100 + SF1000 CH-benCHmark runs across every variant (sqlite/turso cdc-tuned,
 # adaptive, duckdb): they share ONE concurrency group keyed only by scale factor, so
@@ -158,6 +163,7 @@ jobs:
             echo "| query overrides | ${{ github.event.inputs.query_overrides || 'none' }} |"
             echo "| runner | ${{ github.event.inputs.runner_type }} |"
             echo "| analytic gate | ${{ github.event.inputs.skip_analytic_gate == 'true' && 'skipped' || 'enabled' }} |"
+            echo "| extra spiced env | ${{ github.event.inputs.spiced_env != '' && github.event.inputs.spiced_env || 'none' }} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build Testoperator
@@ -194,6 +200,22 @@ jobs:
           CHBENCH_PG_PORT: '5432'
           CHBENCH_PG_USER: bench
           CHBENCH_PG_PASS: bench
+
+      # Deliberately placed after template restore/seed above: these vars must never be
+      # visible to the `--prepare-only` seed run, or an experiment could silently change
+      # what gets frozen into the cached template. $GITHUB_ENV persists for all later
+      # steps in this job, so only the "Run CH-benCHmark" step below sees them.
+      - name: Export extra spiced env vars
+        if: github.event.inputs.spiced_env != ''
+        run: |
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            if [[ "$line" != *"="* ]]; then
+              echo "::error::Invalid spiced_env entry (expected KEY=VALUE): $line"
+              exit 1
+            fi
+            echo "$line" >> "$GITHUB_ENV"
+          done <<< "${{ github.event.inputs.spiced_env }}"
 
       - name: Run CH-benCHmark - ${{ github.event.inputs.spicepod_path }}
         run: |
