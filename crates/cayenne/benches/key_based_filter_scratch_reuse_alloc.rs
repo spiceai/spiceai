@@ -24,12 +24,11 @@ limitations under the License.
 //! were allocated fresh on every single `poll_next` call instead of being
 //! reused across the stream's lifetime:
 //!
-//!   1. The `pk_columns`/`deleted` `Vec`s (`filter_exec.rs:615-616,653`);
-//!      `deleted` in particular started at zero capacity, so a batch with
-//!      many deletions re-grew it geometrically from scratch every poll.
-//!   2. `KeyDeletionIndex::get_batch`'s internal chunk-sweep buffers
-//!      (`deletion_index.rs:1425-1426`) — two `BATCH_SWEEP_CHUNK`-sized
-//!      (~40 KB total) `Vec`s per call.
+//!   1. `KeyBasedDeletionFilterStream::poll_next`'s `pk_columns`/`deleted`
+//!      `Vec`s; `deleted` in particular started at zero capacity, so a batch
+//!      with many deletions re-grew it geometrically from scratch every poll.
+//!   2. `KeyDeletionIndex::get_batch`'s internal chunk-sweep buffers — two
+//!      `BATCH_SWEEP_CHUNK`-sized (~40 KB total) `Vec`s per call.
 //!
 //! Two lanes, each processing the *same* fixed batch repeatedly (criterion's
 //! own iteration repetition stands in for "many `poll_next` calls over a
