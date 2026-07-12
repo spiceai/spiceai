@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Before/after bench for BEN-14: per-batch scratch-allocation reuse in
+//! Before/after bench for per-batch scratch-allocation reuse in
 //! `KeyBasedDeletionFilterStream` (`crates/cayenne/src/provider/delete/filter_exec.rs`).
 //!
 //! CPU profiling of a local CH-benCHmark HTAP run (sf10, directional) showed
@@ -235,7 +235,7 @@ fn probe_fresh_alloc(
 }
 
 /// Per-stream scratch, reused across every simulated `poll_next` call —
-/// mirrors the `KeyBasedDeletionFilterStream` fields added for BEN-14.
+/// mirrors the `KeyBasedDeletionFilterStream` fields added by this change.
 struct ScratchReuseState {
     pk_columns: Vec<ArrayRef>,
     deleted: Vec<usize>,
