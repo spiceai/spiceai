@@ -250,7 +250,9 @@ jobs:
           reserved_names="SPICED_COMMIT SPICED_BIN SPICED_ENV_INPUT"
           while IFS= read -r line; do
             line="${line%$'\r'}"
-            [ -z "$line" ] && continue
+            # Skip blank/whitespace-only lines (consistent with the summary-header
+            # step's `awk 'NF'`), so copy/paste padding doesn't fail the run.
+            [[ "$line" =~ ^[[:space:]]*$ ]] && continue
             key="${line%%=*}"
             reserved=0
             for r in $reserved_names; do
