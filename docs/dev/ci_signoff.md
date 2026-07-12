@@ -54,9 +54,13 @@ and up to date:
 make signoff          # runs `make lint-rust` + `make build-cli nextest`, then attests
 ```
 
-On success it posts a `signoff` commit status on your current `HEAD`. Open or
-refresh the PR and the **Attestation** check turns green, which — together with a
-review — lets a maintainer add the PR to the merge queue.
+On success it posts a `signoff` commit status on your current `HEAD`. If the
+**Attestation** check already ran and failed before the sign-off existed, the
+script re-runs that job via the `gh` CLI so it turns green without you having
+to open or refresh the PR. (If no run is found yet — e.g. before the PR's
+first CI run — or the rerun call fails, it falls back to prompting you to
+open/refresh the PR yourself.) That, together with a review, lets a
+maintainer add the PR to the merge queue.
 
 The sign-off is normally bound to the **exact commit** you pushed. If you push a
 code change, the old sign-off no longer applies and you must run `make signoff`
