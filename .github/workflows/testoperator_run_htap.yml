@@ -67,7 +67,7 @@ on:
         default: false
         type: boolean
       spiced_env:
-        description: 'Extra environment variables for the spiced process under test, one SPICE_KEY=VALUE or SPICED_KEY=VALUE per line (e.g. SPICE_CAYENNE_EAGER_NDV). A handful of reserved SPICE*/SPICED* names owned by this workflow (SPICED_COMMIT, SPICED_BIN, SPICED_ENV_INPUT) are rejected. Applied only to the benchmark run, never to template seeding, so it never invalidates the cached CH-benCH template. Do not put secrets here: values are echoed into the job summary and run logs.'
+        description: 'Extra environment variables for the spiced process under test, one SPICE_KEY=VALUE or SPICED_KEY=VALUE per line (e.g. SPICE_CAYENNE_EAGER_NDV=true). A handful of reserved SPICE*/SPICED* names owned by this workflow (SPICED_COMMIT, SPICED_BIN, SPICED_ENV_INPUT) are rejected. Applied only to the benchmark run, never to template seeding, so it never invalidates the cached CH-benCH template. Do not put secrets here: values are echoed into the job summary.'
         required: false
         default: ''
         type: string
@@ -265,7 +265,7 @@ jobs:
               escaped="${line//%/%25}"
               escaped="${escaped//$'\r'/%0D}"
               escaped="${escaped//$'\n'/%0A}"
-              echo "::error::Invalid spiced_env entry (expected SPICE_KEY=VALUE or SPICED_KEY=VALUE, not a reserved name): ${escaped}"
+              echo "::error::Invalid spiced_env entry (must be SPICE_KEY=VALUE or SPICED_KEY=VALUE, and KEY must not be a reserved name): ${escaped}"
               exit 1
             fi
             printf '%s\n' "$line" >> "$GITHUB_ENV"
