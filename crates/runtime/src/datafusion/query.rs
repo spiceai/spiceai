@@ -972,11 +972,20 @@ impl Query {
                 let timer_state = state.clone();
                 let timer_token = query_cancel_token.clone();
                 let handle = tokio::spawn(async move {
-                    tokio::time::sleep(timeout).await;
-                    // Mark before cancelling so observers of the fired token
-                    // always classify the cancellation as a timeout.
-                    timer_state.mark_fired();
-                    timer_token.cancel();
+                    tokio::select! {
+                        // The token fired first (explicit cancel, client
+                        // disconnect): stand down so a cancellation observed
+                        // lazily — after the timeout would have elapsed —
+                        // keeps its `QueryCancelled` classification.
+                        () = timer_token.cancelled() => {}
+                        () = tokio::time::sleep(timeout) => {
+                            // Mark before cancelling so observers of the fired
+                            // token always classify the cancellation as a
+                            // timeout.
+                            timer_state.mark_fired();
+                            timer_token.cancel();
+                        }
+                    }
                 });
                 (state, Some(QueryTimeoutTimerGuard { handle }))
             }
@@ -3126,6 +3135,59 @@ mod tests {
         assert!(
             !is_cancellation_error(&err),
             "timeout must not be classified as a plain cancellation"
+        );
+    }
+
+    /// [query timeout] A query cancelled BEFORE the timeout elapses must keep
+    /// its `QueryCancelled` classification even when the cancellation is only
+    /// observed after the timeout would have fired: the timer stands down when
+    /// the token fires first. The sleep lets the (stood-down) timer window
+    /// pass, so it is the subject under test, not a readiness wait.
+    #[tokio::test]
+    async fn query_cancelled_before_timeout_stays_cancelled() {
+        use std::time::Duration;
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .query_timeout(Some(Duration::from_millis(100)))
+            .build(),
+        );
+
+        let cancel_token = CancellationToken::new();
+        let df_q = Arc::clone(&df);
+        let token_q = cancel_token.clone();
+        let mut result = Arc::new(RequestContext::builder(Protocol::Http).build())
+            .scope(async move {
+                QueryBuilder::new("SELECT 42 AS value", df_q)
+                    .cancellation_token(token_q)
+                    .build()
+                    .run()
+                    .await
+            })
+            .await
+            .expect("query should start successfully");
+
+        // Cancel first, then let the 100ms timeout window pass before the
+        // stream observes anything.
+        cancel_token.cancel();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let err = result
+            .data
+            .next()
+            .await
+            .expect("stream should yield the cancellation error, not end")
+            .expect_err("stream item should be the cancellation error");
+        assert!(
+            is_cancellation_error(&err),
+            "expected a cancellation error, got: {err}"
+        );
+        assert!(
+            !is_timeout_error(&err),
+            "a pre-timeout cancel must not be reclassified as a timeout"
         );
     }
 
