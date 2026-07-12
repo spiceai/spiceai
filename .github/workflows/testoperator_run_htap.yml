@@ -67,7 +67,7 @@ on:
         default: false
         type: boolean
       spiced_env:
-        description: 'Extra environment variables for the spiced process under test, one KEY=VALUE per line. Applied only to the benchmark run, never to template seeding, so it never invalidates the cached CH-benCH template. Do not put secrets here: values are echoed into the job summary and run logs.'
+        description: 'Extra environment variables for the spiced process under test, one SPICE*=VALUE per line (name must start with SPICE, e.g. SPICE_CAYENNE_EAGER_NDV). Applied only to the benchmark run, never to template seeding, so it never invalidates the cached CH-benCH template. Do not put secrets here: values are echoed into the job summary and run logs.'
         required: false
         default: ''
         type: string
@@ -230,12 +230,17 @@ jobs:
           # is parsed, not just as inert data.
           SPICED_ENV_INPUT: ${{ github.event.inputs.spiced_env }}
         run: |
+          # Allowlist names starting with SPICE (covers both the SPICE_* and SPICED_*
+          # conventions used across the codebase, e.g. SPICE_CAYENNE_EAGER_NDV,
+          # SPICED_METRICS_ADDR) so a dispatcher can never overwrite reserved
+          # runner/Actions variables (GITHUB_*, RUNNER_*, ACTIONS_*, PATH, HOME, ...)
+          # or otherwise alter the runner environment outside spiced's own config.
           while IFS= read -r line; do
             line="${line%$'\r'}"
             [ -z "$line" ] && continue
             key="${line%%=*}"
-            if [[ "$line" != *"="* ]] || [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-              echo "::error::Invalid spiced_env entry (expected KEY=VALUE with a valid variable name): $line"
+            if [[ "$line" != *"="* ]] || [[ ! "$key" =~ ^SPICE[A-Za-z0-9_]*$ ]]; then
+              echo "::error::Invalid spiced_env entry (expected SPICE*=VALUE with a variable name starting with SPICE): $line"
               exit 1
             fi
             printf '%s\n' "$line" >> "$GITHUB_ENV"
