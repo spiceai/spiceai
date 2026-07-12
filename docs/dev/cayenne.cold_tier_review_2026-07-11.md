@@ -26,8 +26,6 @@ Priority items P1–P4 (see "Suggested priority order") are implemented on
   a PK-less table — relaxed from an error 2026-07-11 so a fleet-wide
   datalake location doesn't block PK-less datasets — and on unknown
   clustering columns.
-  `VortexConfig::config_warnings` now flags `promotion_interval >
-  gc_interval` (GC cadence coarsened by the promotion tick).
 - **P4** — `run_cold_tier_gc_tick` is `pub`; `test_cold_tier_gc_end_to_end`
   verifies mark-then-sweep grace on a planted orphan, survival of
   manifest-referenced and non-`.vortex` objects, and physical reclamation of

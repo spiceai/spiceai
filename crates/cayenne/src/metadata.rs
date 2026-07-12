@@ -1382,20 +1382,6 @@ impl VortexConfig {
             ));
         }
 
-        // Datalake GC fires from inside the promotion loop (with a due gate),
-        // so its effective cadence is bounded below by the promotion tick — a
-        // coarser promotion interval silently coarsens both the sweep AND the
-        // orphan-grace observation, contrary to what the GC interval implies.
-        if self.cold_tier_enabled()
-            && self.cold_tier_gc_interval_ms > 0
-            && self.cold_tier_background_interval_ms > self.cold_tier_gc_interval_ms
-        {
-            warnings.push(format!(
-                "cayenne_datalake_promotion_interval_ms ({}) exceeds cayenne_datalake_gc_interval_ms ({}); datalake GC runs from the promotion tick, so sweeps fire only about every promotion interval. Set the promotion interval at or below the GC interval.",
-                self.cold_tier_background_interval_ms, self.cold_tier_gc_interval_ms
-            ));
-        }
-
         warnings
     }
 }
@@ -1651,30 +1637,6 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("a single protected snapshot cannot be merged"))
         );
-    }
-
-    #[test]
-    fn config_warnings_flags_promotion_interval_coarser_than_gc() {
-        let config = VortexConfig {
-            cold_tier_location: Some("s3://bucket/prefix".to_string()),
-            cold_tier_background_interval_ms: 600_000,
-            cold_tier_gc_interval_ms: 300_000,
-            ..VortexConfig::default()
-        };
-        assert!(
-            config
-                .config_warnings(16)
-                .iter()
-                .any(|w| w.contains("datalake GC runs from the promotion tick"))
-        );
-        // Same intervals with the tier disabled must stay silent.
-        let disabled = VortexConfig {
-            cold_tier_location: None,
-            cold_tier_background_interval_ms: 600_000,
-            cold_tier_gc_interval_ms: 300_000,
-            ..VortexConfig::default()
-        };
-        assert!(disabled.config_warnings(16).is_empty());
     }
 
     #[test]
