@@ -803,24 +803,23 @@ impl QueryHandle {
                     // ExplainAnalyze is configured and thresholds pass.
                     // `plan_is_explain` was decided from the LogicalPlan at
                     // submit time — no SQL re-scan on the finalize path.
+                    let elapsed_ms = query_start.elapsed().as_secs_f64() * 1000.0;
                     if !plan_is_explain
                         && let Some(cfg) = df.plan_capture_config()
                         && cfg.analyze_enabled()
-                    {
-                        let elapsed_ms = query_start.elapsed().as_secs_f64() * 1000.0;
-                        if crate::datafusion::query::plan_capture::plan_capture_eligible(
+                        && crate::datafusion::query::plan_capture::plan_capture_eligible(
                             elapsed_ms, cfg,
-                        ) {
-                            let output = crate::datafusion::query::plan_capture::render_distributed_plan_with_metrics(
-                                graph.as_ref(),
+                        )
+                    {
+                        let output = crate::datafusion::query::plan_capture::render_distributed_plan_with_metrics(
+                            graph.as_ref(),
+                        );
+                        span_for_record.in_scope(|| {
+                            crate::datafusion::query::plan_capture::emit_plan_span(
+                                sql.as_ref(),
+                                &output,
                             );
-                            span_for_record.in_scope(|| {
-                                crate::datafusion::query::plan_capture::emit_plan_span(
-                                    sql.as_ref(),
-                                    &output,
-                                );
-                            });
-                        }
+                        });
                     }
                 }
                 match final_error {
