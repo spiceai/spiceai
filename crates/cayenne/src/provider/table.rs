@@ -14629,7 +14629,7 @@ impl CayenneTableProvider {
         // can combine a pre-compaction deletion snapshot with the post-compaction
         // protected set.
         {
-            let _fence = self.listing_fence.write().await;
+            let fence = self.listing_fence.write().await;
             // OVERWRITE GUARD (resurrection-critical): an overwrite/promotion
             // that committed after our CAS wiped BOTH the catalog rows (its
             // delete-by-table_id removed the merged row we just inserted) and
@@ -14640,7 +14640,7 @@ impl CayenneTableProvider {
             // `current_snapshot_id` under this same fence, so comparing it to
             // the Phase-1 capture detects every such interleaving.
             if self.get_current_snapshot_id() != snapshot_at_capture {
-                drop(_fence);
+                drop(fence);
                 tracing::info!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
@@ -15186,14 +15186,14 @@ impl CayenneTableProvider {
         // never observes a torn state (swapped-but-not-pruned, or vice versa). Only
         // in-memory work runs here — no I/O — so the fence is held briefly.
         {
-            let _fence = self.listing_fence.write().await;
+            let fence = self.listing_fence.write().await;
             // OVERWRITE GUARD (resurrection-critical) — see the subset-merge
             // publish: a mid-pass overwrite/promotion wiped the protected map
             // and the catalog rows (including our just-swapped output);
             // re-inserting the merged id here would resurrect the whole
             // pre-overwrite row set, and pruning would gut the fresh index.
             if self.get_current_snapshot_id() != snapshot_at_capture {
-                drop(_fence);
+                drop(fence);
                 tracing::info!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
