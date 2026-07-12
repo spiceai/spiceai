@@ -57,8 +57,8 @@ use super::on_conflict::{
 };
 use super::pk_index::{
     COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkIndex, CachedPkKeyset, ColdPkExistence,
-    PK_INDEX_PERSIST_MAX_BYTES, PkBloom, PkDigestSet, PkExistenceRef, RowLocation, ShardedPkIndex,
-    approx_captured_file_bytes, approx_pk_keyset_entry_bytes, deserialize_pk_bloom_sidecar,
+    PK_INDEX_PERSIST_MAX_BYTES, PkBloom, PkDigestSet, PkExistenceRef, PkKeysetInsertOutcome,
+    RowLocation, ShardedPkIndex, approx_captured_file_bytes, deserialize_pk_bloom_sidecar,
     pk_digest, serialize_pk_bloom_sidecar, shard_of_pk,
 };
 use super::streaming::StreamingExec;
@@ -1741,7 +1741,7 @@ impl CayenneTableProviderBuilder {
 
     /// Set the object store for the cold tier (storage-cascade bottom tier).
     ///
-    /// When set (together with `cayenne_cold_tier_location`), the promotion
+    /// When set (together with `cayenne_datalake_location`), the promotion
     /// stage writes read-optimized Vortex files here and the cross-tier scan
     /// reads them. May target a different bucket/endpoint than the warm store.
     #[must_use]
@@ -2622,7 +2622,10 @@ impl CayenneTableProvider {
         );
 
         let cold_base = cold_location.trim_end_matches('/');
-        let cold_prefix_url = format!("{cold_base}/{}/cold/", self.table_metadata.table_id);
+        let cold_prefix_url = format!(
+            "{cold_base}/{}/data/",
+            self.table_metadata.datalake_dir_segment()
+        );
         let cold_url = match ListingTableUrl::parse(&cold_prefix_url) {
             Ok(url) => url,
             Err(error) => {
@@ -2699,10 +2702,26 @@ impl CayenneTableProvider {
 
         // Mark newly-seen orphans, and select those that have aged past the
         // grace for deletion (pure, testable — see `plan_cold_gc_deletions`).
-        let to_delete = {
+        let (to_delete, orphans_tracked) = {
             let mut first_seen = self.cold_gc_orphaned_first_seen.lock();
-            Self::plan_cold_gc_deletions(&on_store, &live, &mut first_seen, Instant::now(), grace)
+            let planned = Self::plan_cold_gc_deletions(
+                &on_store,
+                &live,
+                &mut first_seen,
+                Instant::now(),
+                grace,
+            );
+            (planned, first_seen.len())
         };
+        tracing::debug!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            objects_on_store = on_store.len(),
+            live_manifest_files = live.len(),
+            orphans_tracked,
+            deletable = to_delete.len(),
+            "Cold-tier GC pass"
+        );
 
         let mut deleted = 0u64;
         let mut skipped_errors = 0u64;
@@ -6392,19 +6411,18 @@ impl CayenneTableProvider {
                 // Existence-only insert. Under `deletion_mode: position`, real
                 // `(file, position)` for File rows is captured separately by the
                 // row_idx() read-back, which upgrades these to `FilePositioned`.
-                // Reuse each key's stored digest (the keyset is digest-keyed) so
-                // the contains-gate and insert don't each re-hash the key.
+                // Reuse each key's stored digest (the keyset is digest-keyed) and
+                // fold the presence check and the insert into a single hash
+                // lookup — the common case on re-touched PKs (e.g. CDC updates)
+                // is "present", where this clones neither the key nor re-hashes.
                 for (digest, key) in keys.iter_with_digest() {
-                    if !keyset.contains_digest(digest)
-                        && keyset
-                            .approx_bytes
-                            .saturating_add(approx_pk_keyset_entry_bytes(key))
-                            > max_bytes
-                    {
-                        convert_to_bloom = true;
-                        break;
+                    match keyset.try_insert_with_digest(digest, key, location.clone(), max_bytes) {
+                        PkKeysetInsertOutcome::OverBudget => {
+                            convert_to_bloom = true;
+                            break;
+                        }
+                        PkKeysetInsertOutcome::Updated | PkKeysetInsertOutcome::Inserted => {}
                     }
-                    keyset.insert_with_digest(digest, key.clone(), location.clone());
                 }
             }
         }
@@ -6994,6 +7012,8 @@ impl CayenneTableProvider {
                 )
                 .await?
         {
+            let scan_start = Instant::now();
+            let keys_before = keyset.len();
             let cold_stream = datafusion_physical_plan::execute_stream(cold_plan, ctx.task_ctx())?;
             Self::process_stream_into_keyset(
                 cold_stream,
@@ -7009,6 +7029,13 @@ impl CayenneTableProvider {
                 &mut row_id_base,
             )
             .await?;
+            tracing::info!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                cold_keys_folded = keyset.len().saturating_sub(keys_before),
+                duration_ms = u64::try_from(scan_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "Keyset rebuild folded the datalake tier via exact object-store scan"
+            );
         }
 
         if self.cached_inlined_row_count() > 0 {
@@ -13556,7 +13583,7 @@ impl CayenneTableProvider {
     }
 
     /// Resolve the cold-tier clustering columns to schema indices:
-    /// `cayenne_cold_clustering_columns` → else `cayenne_sort_columns` → else the
+    /// `cayenne_datalake_clustering_columns` → else `cayenne_sort_columns` → else the
     /// primary key. Returns the indices that exist in the schema (empty = no
     /// clustering, promotion writes unsorted).
     fn resolve_cold_clustering_indices(&self) -> Vec<usize> {
@@ -13629,8 +13656,8 @@ impl CayenneTableProvider {
         let promotion_id = uuid::Uuid::now_v7().to_string();
         let cold_base = cold_location.trim_end_matches('/');
         let cold_dir_url = format!(
-            "{cold_base}/{}/cold/{promotion_id}/",
-            self.table_metadata.table_id
+            "{cold_base}/{}/data/{promotion_id}/",
+            self.table_metadata.datalake_dir_segment()
         );
 
         // A local `file://` cold tier needs its target directory created before
@@ -13855,7 +13882,7 @@ impl CayenneTableProvider {
     /// carry-forward — promotion cost is proportional to the CHANGED data,
     /// not total table size).
     ///
-    /// When the warm tier has grown past `cayenne_cold_tier_warm_max_bytes` /
+    /// When the warm tier has grown past `cayenne_datalake_warm_max_bytes` /
     /// `_files`: flush the in-RAM/inline tiers, classify the existing cold
     /// manifest into dirty/clean against the durable tombstones
     /// ([`Self::partition_cold_manifest_for_promotion`]), read the canonical
@@ -13950,6 +13977,9 @@ impl CayenneTableProvider {
             return Ok(ColdFilePartition {
                 dirty: Vec::new(),
                 clean: Vec::new(),
+                tombstones: 0,
+                cleared_by_min_max: 0,
+                cleared_by_bloom: 0,
             });
         }
 
@@ -13963,6 +13993,9 @@ impl CayenneTableProvider {
             return Ok(ColdFilePartition {
                 dirty: Vec::new(),
                 clean: cold_files,
+                tombstones: 0,
+                cleared_by_min_max: 0,
+                cleared_by_bloom: 0,
             });
         }
         let (_, deleted_row_keys, _, _) = tokio::task::spawn_blocking(move || {
@@ -13978,6 +14011,9 @@ impl CayenneTableProvider {
             return Ok(ColdFilePartition {
                 dirty: Vec::new(),
                 clean: cold_files,
+                tombstones: 0,
+                cleared_by_min_max: 0,
+                cleared_by_bloom: 0,
             });
         }
 
@@ -14057,9 +14093,19 @@ impl CayenneTableProvider {
         let over_files =
             vc.cold_tier_warm_max_files > 0 && warm_files >= vc.cold_tier_warm_max_files;
         if !(over_bytes || over_files) {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                warm_bytes,
+                warm_files,
+                max_bytes = vc.cold_tier_warm_max_bytes,
+                max_files = vc.cold_tier_warm_max_files,
+                "Datalake promotion skipped; warm tier below thresholds"
+            );
             return Ok(false);
         }
 
+        let promotion_start = Instant::now();
         tracing::info!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
@@ -14105,6 +14151,16 @@ impl CayenneTableProvider {
                 return Ok(false);
             }
         };
+        tracing::debug!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            tombstones = partition.tombstones,
+            dirty_files = partition.dirty.len(),
+            carried_files = partition.clean.len(),
+            cleared_by_min_max = partition.cleared_by_min_max,
+            cleared_by_bloom = partition.cleared_by_bloom,
+            "Classified datalake manifest for carry-forward"
+        );
         // Deliberately no dirty-fraction guardrail: clean files are always
         // carried, so carried files' PK ranges may increasingly overlap new
         // files' across promotions. Watch `datalake_rewrite_selectivity`; if it
@@ -14230,7 +14286,8 @@ impl CayenneTableProvider {
             written_files,
             written_bytes,
             total_rows,
-            "Datalake-tier promotion committed (carry-forward)"
+            duration_ms = u64::try_from(promotion_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "Datalake-tier promotion committed"
         );
         Ok(true)
     }
@@ -25016,10 +25073,10 @@ mod tests {
     #[test]
     fn cold_gc_marks_then_sweeps_after_grace() {
         let grace = std::time::Duration::from_mins(5);
-        let live: HashSet<String> = [url("s3://b/t/cold/p2/live.vortex")].into_iter().collect();
+        let live: HashSet<String> = [url("s3://b/t/data/p2/live.vortex")].into_iter().collect();
         let on_store = vec![
-            url("s3://b/t/cold/p2/live.vortex"),
-            url("s3://b/t/cold/p1/orphan.vortex"),
+            url("s3://b/t/data/p2/live.vortex"),
+            url("s3://b/t/data/p1/orphan.vortex"),
         ];
         let mut first_seen = HashMap::new();
         let t0 = Instant::now();
@@ -25033,9 +25090,9 @@ mod tests {
             grace,
         );
         assert!(del.is_empty(), "first sight deletes nothing");
-        assert!(first_seen.contains_key(&url("s3://b/t/cold/p1/orphan.vortex")));
+        assert!(first_seen.contains_key(&url("s3://b/t/data/p1/orphan.vortex")));
         assert!(
-            !first_seen.contains_key(&url("s3://b/t/cold/p2/live.vortex")),
+            !first_seen.contains_key(&url("s3://b/t/data/p2/live.vortex")),
             "referenced file is not aged"
         );
 
@@ -25057,7 +25114,7 @@ mod tests {
             t0 + grace,
             grace,
         );
-        assert_eq!(del, vec![url("s3://b/t/cold/p1/orphan.vortex")]);
+        assert_eq!(del, vec![url("s3://b/t/data/p1/orphan.vortex")]);
     }
 
     /// Restart safety: a fresh (empty) `first_seen` — the post-restart state —

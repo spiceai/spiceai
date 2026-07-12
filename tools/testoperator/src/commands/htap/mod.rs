@@ -148,6 +148,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
             .map_or_else(|| "unlimited".to_string(), |r| r.to_string()),
         "spicepod_path": test_args.common.spicepod_path.display().to_string(),
         "clock_skew_ms_estimate": clock_skew_ms_estimate,
+        "skip_analytic_gate": args.skip_analytic_gate,
     });
 
     let benchmark_resource = Resource::builder_empty()
@@ -169,6 +170,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
                 args.rate
                     .map_or_else(|| "unlimited".to_string(), |r| r.to_string()),
             ),
+            KeyValue::new("skip_analytic_gate", args.skip_analytic_gate.to_string()),
         ])
         .build();
 
@@ -510,9 +512,20 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
                 error_messages.push(message);
             }
 
-            // Analytical-correctness gate runs only when the row-count gate fully passed (replication converged + every table matches).
-            // Otherwise the underlying data is known to diverge, so comparing analytical query results adds no signal.
-            if row_count_message.is_none() {
+            // Analytical-correctness gate runs only when not explicitly skipped AND the
+            // row-count gate fully passed (replication converged + every table matches).
+            // Otherwise the underlying data is known to diverge, so comparing analytical
+            // query results adds no signal.
+            let skip_reason = match (args.skip_analytic_gate, row_count_message.is_some()) {
+                (true, true) => Some("--skip-analytic-gate set (row-count gate also did not pass)"),
+                (true, false) => Some("--skip-analytic-gate set"),
+                (false, true) => Some("row-count gate did not pass"),
+                (false, false) => None,
+            };
+
+            if let Some(reason) = skip_reason {
+                println!("\nSkipping analytical-query gate — {reason}");
+            } else {
                 let query_overrides = test_args
                     .query_overrides
                     .clone()
@@ -535,8 +548,6 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
                         error_messages.push(format!("HTAP analytical-query error: {e}"));
                     }
                 }
-            } else {
-                println!("\nSkipping analytical-query gate — row-count gate did not pass");
             }
         }
         Err(e) => {
