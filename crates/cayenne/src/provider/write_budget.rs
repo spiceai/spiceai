@@ -380,6 +380,77 @@ async fn acquire_from(
     })
 }
 
+/// Try to acquire up to `shards` encode permits from the global budget WITHOUT
+/// blocking.
+///
+/// Returns the held permits if the budget can satisfy the (clamped) request
+/// right now, or `None` if it cannot — in which case the caller proceeds
+/// ungated (narrower), never queueing. `None` is also returned when no budget is
+/// installed, exactly like [`acquire_encode_permits`], so callers treat both
+/// identically.
+///
+/// This exists for CO-DEPENDENT write groups. [`acquire_encode_permits`]'s
+/// deadlock-freedom argument (see the module docs) assumes writes are
+/// independent — each acquires, encodes, and releases without waiting on another
+/// write. The partitioned-refresh coordinator breaks that assumption: it fans a
+/// single, backpressured input stream out to N per-partition writers and awaits
+/// them together, so no partition write completes (and releases its permits)
+/// until the coordinator has drained the whole input — which it cannot do while
+/// blocked feeding a partition that is itself blocked acquiring permits. A
+/// blocking acquire among that group therefore forms a hold-and-wait cycle once
+/// their aggregate demand exceeds the (maintenance-gated) budget. A non-blocking
+/// acquire cannot: a member that can't get a permit proceeds immediately rather
+/// than waiting while the group holds the rest. See issue #11818.
+pub(crate) fn try_acquire_encode_permits(
+    shards: usize,
+    class: WriteClass,
+) -> Option<EncodePermits> {
+    let budget = GLOBAL_ENCODE_BUDGET.read().clone()?;
+    try_acquire_from(&budget, shards, class)
+}
+
+/// Non-blocking counterpart of [`acquire_from`]: acquire `min(shards, class cap)`
+/// permits from `budget` if they are available RIGHT NOW, else `None`. Extracted
+/// so the try/clamp behavior is unit-testable against a local budget without
+/// mutating process-global state. Mirrors [`acquire_from`]'s clamp and uniform
+/// gate-then-main acquisition order; only the wait is dropped (`try_acquire_*`
+/// instead of `acquire_*.await`). If the gate is taken but the main semaphore is
+/// not, the gate permit is dropped here (released) and `None` is returned, so a
+/// failed try never leaks a partial reservation.
+fn try_acquire_from(
+    budget: &EncodeBudget,
+    shards: usize,
+    class: WriteClass,
+) -> Option<EncodePermits> {
+    drain_owed(&budget.semaphore, &budget.pending_forget);
+    drain_owed(&budget.maintenance_gate, &budget.pending_gate_forget);
+    let total = budget.total.load(Ordering::Acquire);
+    let gate = match class {
+        WriteClass::Delta => None,
+        WriteClass::Maintenance => {
+            let gate_cap = maintenance_gate_cap(total);
+            let permits = u32::try_from(shards.clamp(1, gate_cap)).unwrap_or(u32::MAX);
+            Some(
+                Arc::clone(&budget.maintenance_gate)
+                    .try_acquire_many_owned(permits)
+                    .ok()?,
+            )
+        }
+    };
+    let main_count = gate
+        .as_ref()
+        .map_or_else(|| shards.clamp(1, total), |g| g.num_permits().max(1));
+    let main_count = u32::try_from(main_count).unwrap_or(u32::MAX);
+    // On failure `gate` (if any) drops here, releasing the gate permit.
+    let main = Arc::clone(&budget.semaphore)
+        .try_acquire_many_owned(main_count)
+        .ok()?;
+    Some(EncodePermits {
+        _main: main,
+        _gate: gate,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -610,5 +681,92 @@ mod tests {
     #[tokio::test]
     async fn acquire_encode_permits_is_noop_when_unset() {
         assert!(acquire_encode_permits(8, WriteClass::Delta).await.is_none());
+    }
+
+    /// Issue #11818: the non-blocking `try_acquire_from` must NOT block when the
+    /// budget is exhausted — it returns `None` (proceed ungated) where the
+    /// blocking `acquire_from` would queue forever. This is the primitive that
+    /// breaks the co-dependent partitioned-write hold-and-wait deadlock.
+    #[tokio::test]
+    async fn try_acquire_returns_none_when_budget_exhausted() {
+        let b = budget(2);
+        // Hold the whole budget, modelling sibling partition writers in flight.
+        let _held = acquire_from(&b, 2, WriteClass::Delta)
+            .await
+            .expect("initial acquire of the full budget succeeds");
+        assert_eq!(b.semaphore.available_permits(), 0, "budget fully held");
+
+        // The blocking path would queue forever here…
+        let blocking = acquire_from(&b, 1, WriteClass::Delta);
+        tokio::pin!(blocking);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut blocking)
+                .await
+                .is_err(),
+            "acquire_from must block while the budget is fully held"
+        );
+
+        // …but the non-blocking try returns immediately with None, so a
+        // co-dependent write proceeds ungated instead of deadlocking.
+        assert!(
+            try_acquire_from(&b, 1, WriteClass::Delta).is_none(),
+            "try_acquire_from must return None (never block) on an exhausted budget"
+        );
+    }
+
+    /// A maintenance try must not block on an exhausted maintenance gate, and it
+    /// must not leak a gate permit when the main semaphore is what's exhausted.
+    #[tokio::test]
+    async fn try_acquire_maintenance_gate_no_partial_leak() {
+        let total = 12;
+        let gate = maintenance_gate_cap(total);
+        let b = budget(total);
+
+        // Exhaust the maintenance gate: a further maintenance try returns None
+        // immediately (blocking `acquire_from` would queue on the gate).
+        let gate_hog = acquire_from(&b, gate, WriteClass::Maintenance)
+            .await
+            .expect("acquire the whole maintenance gate");
+        assert!(
+            try_acquire_from(&b, 1, WriteClass::Maintenance).is_none(),
+            "maintenance try must return None on an exhausted gate"
+        );
+
+        // Now model "gate free, main exhausted": drop the gate hog, then take
+        // the entire MAIN semaphore via Delta (which ignores the gate). A
+        // maintenance try then fails on the main acquire and must release the
+        // gate permit it briefly took — the gate's availability is unchanged.
+        drop(gate_hog);
+        let _main_hog = acquire_from(&b, total, WriteClass::Delta)
+            .await
+            .expect("Delta can take the whole main semaphore");
+        assert_eq!(b.semaphore.available_permits(), 0, "main fully held");
+        let gate_available_before = b.maintenance_gate.available_permits();
+        assert!(
+            try_acquire_from(&b, 1, WriteClass::Maintenance).is_none(),
+            "maintenance try must fail when the main semaphore is exhausted"
+        );
+        assert_eq!(
+            b.maintenance_gate.available_permits(),
+            gate_available_before,
+            "a failed maintenance try must not leak (retain) a gate permit"
+        );
+    }
+
+    /// When the budget has headroom, the non-blocking try succeeds and holds
+    /// exactly the (clamped) requested permits — identical to the blocking path
+    /// in the uncontended case.
+    #[tokio::test]
+    async fn try_acquire_takes_permits_when_available() {
+        let b = budget(8);
+        let permits =
+            try_acquire_from(&b, 3, WriteClass::Delta).expect("try succeeds with headroom");
+        assert_eq!(b.semaphore.available_permits(), 5, "took exactly 3 of 8");
+        drop(permits);
+        assert_eq!(
+            b.semaphore.available_permits(),
+            8,
+            "permits released on drop"
+        );
     }
 }

@@ -305,7 +305,16 @@ impl DataSink for CayennePartitionedOverwriteSink {
                                 .to_string(),
                         )
                     })?;
-                    let cayenne_owned = cayenne.clone_for_write_operations();
+                    // Mark this per-partition writer as co-dependent: the
+                    // coordinator fans one backpressured input stream out to
+                    // every partition and awaits them together, so each write
+                    // must encode single-shard and never block on the shared
+                    // encode budget — otherwise the group hold-and-wait
+                    // deadlocks and the dataset never becomes ready (issue
+                    // #11818). Cross-partition concurrency is the parallelism.
+                    let cayenne_owned = cayenne
+                        .clone_for_write_operations()
+                        .with_co_dependent_write();
                     let (tx, rx) = mpsc::channel::<datafusion::common::Result<RecordBatch>>(
                         PARTITION_WRITER_CHANNEL_DEPTH,
                     );
@@ -692,7 +701,13 @@ impl DataSink for CayennePartitionedAppendSink {
                                 .to_string(),
                         )
                     })?;
-                    let cayenne_owned = cayenne.clone_for_write_operations();
+                    // Co-dependent per-partition writer — see the overwrite sink
+                    // above and issue #11818. Single-shard, non-blocking encode
+                    // admission so the awaited-together partition group can't
+                    // hold-and-wait deadlock on the shared encode budget.
+                    let cayenne_owned = cayenne
+                        .clone_for_write_operations()
+                        .with_co_dependent_write();
                     let (tx, rx) = mpsc::channel::<datafusion::common::Result<RecordBatch>>(
                         PARTITION_WRITER_CHANNEL_DEPTH,
                     );

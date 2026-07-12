@@ -1594,6 +1594,23 @@ pub struct CayenneTableProvider {
     /// append-mode refresh's primary-key dedup path — can see it. `None` when
     /// the table has no primary key.
     pk_constraints: Option<Constraints>,
+    /// True when this writer clone is one member of a co-dependent
+    /// partitioned-write group — a set of per-partition writers that the
+    /// partitioned-refresh coordinator
+    /// (`CayennePartitionedOverwriteSink`/`CayennePartitionedAppendSink`) fans
+    /// a single, backpressured input stream out to, and then awaits together
+    /// before any partition commits. The cross-partition fan-out already
+    /// parallelizes the encode, so such a write must NOT additionally shard
+    /// its own encode (that multiplies the group's global encode-permit demand
+    /// by the partition count) and must NOT block on the shared encode budget
+    /// (a blocking acquire among the group forms a hold-and-wait deadlock once
+    /// the aggregate demand exceeds the maintenance gate — the write-budget's
+    /// per-write independence assumption does not hold here). Set via
+    /// [`Self::with_co_dependent_write`]; consulted by
+    /// [`Self::snapshot_shard_count`] (force single-shard) and
+    /// [`Self::write_to_snapshot`] (non-blocking permit acquire). See issue
+    /// #11818. Defaults to `false` for every non-partitioned write.
+    co_dependent_write: bool,
 }
 
 /// Builder for constructing a `CayenneTableProvider` with optional configuration.
@@ -2329,6 +2346,18 @@ impl CayenneTableProvider {
     #[must_use]
     pub fn clone_for_write_operations(&self) -> Self {
         self.clone_for_write()
+    }
+
+    /// Mark this writer clone as one member of a co-dependent partitioned-write
+    /// group (see [`Self::co_dependent_write`]). Used by the partitioned-refresh
+    /// coordinator on each per-partition writer clone so the group encodes
+    /// single-shard and never blocks on the global encode budget — closing the
+    /// hold-and-wait deadlock in issue #11818. A no-op flag flip on any other
+    /// (non-partitioned) write.
+    #[must_use]
+    pub fn with_co_dependent_write(mut self) -> Self {
+        self.co_dependent_write = true;
+        self
     }
 
     /// Append a CDC upsert stream using Cayenne's native writer path.
@@ -4748,6 +4777,9 @@ impl CayenneTableProvider {
             cold_gc_orphaned_first_seen: Arc::new(ParkingMutex::new(HashMap::new())),
             cold_gc_last_run: Arc::new(ParkingMutex::new(None)),
             pk_constraints,
+            // A freshly-opened table is never a co-dependent partition sub-write;
+            // the partitioned coordinator opts specific writer clones in.
+            co_dependent_write: false,
         };
 
         provider.refresh_deletion_memory_accounting();
@@ -5036,8 +5068,19 @@ impl CayenneTableProvider {
         // `cayenne_encode_acquire_wait_ms{class}` histogram inside `acquire_from`
         // carries the same signal without the table label; this one keys by table.
         let encode_permit_wait_start = Instant::now();
-        let _encode_permits =
-            super::write_budget::acquire_encode_permits(encode_shards, write_class).await;
+        let _encode_permits = if self.co_dependent_write {
+            // Co-dependent partitioned writes must never BLOCK on the encode
+            // budget: the coordinator fans one backpressured input stream out to
+            // N per-partition writers and awaits them together, so a member that
+            // queues on the budget stalls the whole group — a hold-and-wait
+            // deadlock once the group's demand exceeds the maintenance gate
+            // (issue #11818). Take a permit only if one is immediately available;
+            // otherwise proceed ungated (single-shard, so at most one extra
+            // encode). Non-blocking, so it can never join the cycle.
+            super::write_budget::try_acquire_encode_permits(encode_shards, write_class)
+        } else {
+            super::write_budget::acquire_encode_permits(encode_shards, write_class).await
+        };
         record_cayenne_write_phase(
             self.table_name(),
             "encode_permit_wait",
@@ -5434,6 +5477,16 @@ impl CayenneTableProvider {
         target_size_bytes: usize,
         estimated_bytes: Option<u64>,
     ) -> usize {
+        // Co-dependent partitioned writes encode single-shard: the partitioned
+        // coordinator already runs one writer per partition concurrently, so
+        // that cross-partition fan-out IS the encode parallelism. Sharding each
+        // partition's write on top would multiply the co-dependent group's
+        // global encode-permit demand by the partition count, exhausting the
+        // shared maintenance gate and deadlocking readiness (issue #11818).
+        // One shard caps each partition's demand at a single permit.
+        if self.co_dependent_write {
+            return 1;
+        }
         if self.context.has_sort_columns() {
             return 1;
         }
@@ -5691,6 +5744,10 @@ impl CayenneTableProvider {
             cold_gc_orphaned_first_seen: Arc::clone(&self.cold_gc_orphaned_first_seen),
             cold_gc_last_run: Arc::clone(&self.cold_gc_last_run),
             pk_constraints: self.pk_constraints.clone(),
+            // Preserved across clones so the partitioned coordinator's internal
+            // re-clone (e.g. `begin_overwrite`'s `PreparedOverwrite.table`) stays
+            // co-dependent.
+            co_dependent_write: self.co_dependent_write,
         }
     }
 
@@ -24965,6 +25022,85 @@ mod tests {
                 "scan must emit StringViewArray under force_view_read_schema"
             );
         }
+    }
+
+    /// Regression for issue #11818: a co-dependent partitioned-write clone
+    /// (`with_co_dependent_write`) must force SINGLE-SHARD encoding even for a
+    /// write large enough to normally earn the full write-concurrency fan-out.
+    /// The partitioned coordinator already runs one writer per partition
+    /// concurrently, so intra-partition sharding on top multiplies the group's
+    /// global encode-permit demand by the partition count and deadlocks
+    /// readiness. This pins the decision at its single source
+    /// (`snapshot_shard_count` → `write_shard_config`).
+    #[tokio::test]
+    async fn co_dependent_write_forces_single_shard() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog init");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        // Pin write_concurrency > 1 so the "normally shards" precondition holds
+        // deterministically regardless of the host core count.
+        let vortex_config = VortexConfig {
+            write_concurrency: Some(4),
+            ..VortexConfig::default()
+        };
+        let context = CayenneContext::new(&vortex_config, ctx.runtime_env(), "codep_shard");
+        let options = CreateTableOptions {
+            table_name: "codep_shard".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config,
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .with_context(context)
+            .create(options)
+            .await
+            .expect("table created");
+
+        let target = provider.target_file_size_bytes();
+        // An estimate far larger than one target file — normally earns the full
+        // write-concurrency shard fan-out.
+        let big = Some((target as u64).saturating_mul(1024).max(1024 * 1024 * 1024));
+
+        let normal = provider.snapshot_shard_count(8, target, big);
+        assert!(
+            normal > 1,
+            "precondition: a large non-partitioned write must normally shard \
+             (got {normal}); write_concurrency pin failed"
+        );
+        assert!(
+            provider.write_shard_config(8, target, big).is_some(),
+            "precondition: a large non-partitioned write must earn a shard config"
+        );
+
+        let co_dep = provider
+            .clone_for_write_operations()
+            .with_co_dependent_write();
+        assert_eq!(
+            co_dep.snapshot_shard_count(8, target, big),
+            1,
+            "co-dependent partitioned write must encode single-shard (issue #11818)"
+        );
+        assert!(
+            co_dep.write_shard_config(8, target, big).is_none(),
+            "single-shard co-dependent write must produce no shard config \
+             (single serial writer)"
+        );
     }
 
     /// Regression guard for the current-snapshot compactor's read-schema/write-schema
