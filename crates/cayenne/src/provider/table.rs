@@ -13462,6 +13462,7 @@ impl CayenneTableProvider {
                     chunk_idx,
                     "Datalake promotion: cold chunk upload starting"
                 );
+                let chunk_start = Instant::now();
                 self.insert_stream_into_cold_dir(
                     session_state.as_ref(),
                     &write_format,
@@ -13473,6 +13474,7 @@ impl CayenneTableProvider {
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
                     chunk_idx,
+                    duration_ms = chunk_start.elapsed().as_millis(),
                     "Datalake promotion: cold chunk upload complete"
                 );
                 chunk_idx = chunk_idx.saturating_add(1);
@@ -14034,7 +14036,12 @@ impl CayenneTableProvider {
         // the promoted rows twice. Hold ONE `listing_fence` write across both so
         // they flip atomically w.r.t. scans — the deliberate exception to
         // "no `.await` under the fence": for cold, the metastore commit IS a
-        // visibility flip, and it is a short single transaction.
+        // visibility flip. The hold is BOUNDED: the commit's write-conflict
+        // retry loop is capped at DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS (4)
+        // short transactions with ~10ms-base Fibonacci backoff (worst case
+        // tens of ms of sleep), and conflicts are rare here — promotion
+        // already serializes with this table's writers via `write_lock`.
+        // Briefly blocked scans beat the double-count.
         let new_listing_table = self.build_overwrite_listing_table(&new_snapshot_id)?;
         tracing::debug!(
             target: "cayenne::compaction",
