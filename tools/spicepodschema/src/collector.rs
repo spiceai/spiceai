@@ -66,8 +66,6 @@ use runtime::dataaccelerator::cayenne as _;
 #[expect(unused_imports)]
 use runtime::dataaccelerator::duckdb as _;
 #[expect(unused_imports)]
-use runtime::dataaccelerator::partitioned_duckdb as _;
-#[expect(unused_imports)]
 use runtime::dataaccelerator::postgres as _;
 #[expect(unused_imports)]
 use runtime::dataaccelerator::sqlite as _;
@@ -140,8 +138,8 @@ pub fn collect_data_connectors() -> Vec<ConnectorSchema> {
 /// This function iterates over the distributed slice of data accelerator registrations
 /// and extracts the engine name, prefix, and parameters from each accelerator.
 ///
-/// Multiple registrations can share the same engine name (e.g. `duckdb` and
-/// `partitioned_duckdb` both register under `duckdb`), so results are sorted by
+/// Multiple registrations can share the same engine name (e.g. `arrow` and
+/// `partitioned_arrow` both register under `arrow`), so results are sorted by
 /// `(name, prefix)` and de-duplicated by `name`. Sorting by `prefix` as a
 /// secondary key makes the surviving entry deterministic across builds, since
 /// distributed-slice iteration order is not guaranteed.

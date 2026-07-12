@@ -47,8 +47,6 @@ pub mod cayenne;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 pub mod partitioned_arrow;
-#[cfg(feature = "duckdb")]
-pub mod partitioned_duckdb;
 #[cfg(feature = "postgres-accel")]
 pub mod postgres;
 #[cfg(feature = "sqlite")]
