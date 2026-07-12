@@ -791,6 +791,9 @@ test_with_backends!(test_cold_tier_gc_end_to_end_impl);
 /// files and non-`.vortex` objects are never touched; a superseded generation
 /// (dirty rewrite) is physically reclaimed the same way.
 async fn test_cold_tier_gc_end_to_end_impl(fixture: common::TestFixture) -> TestResult<()> {
+    // Short GC interval: it doubles as the orphan grace, which is exactly the
+    // time-domain behavior under test.
+    const GRACE_MS: u64 = 150;
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("value", DataType::Int64, false),
@@ -798,9 +801,6 @@ async fn test_cold_tier_gc_end_to_end_impl(fixture: common::TestFixture) -> Test
     let cold_dir = fixture.temp_dir.path().join("cold");
     std::fs::create_dir_all(&cold_dir)?;
 
-    // Short GC interval: it doubles as the orphan grace, which is exactly the
-    // time-domain behavior under test.
-    const GRACE_MS: u64 = 150;
     let options = cold_table_options(&fixture, "gc_t", &schema, &cold_dir, GRACE_MS);
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
@@ -822,7 +822,11 @@ async fn test_cold_tier_gc_end_to_end_impl(fixture: common::TestFixture) -> Test
         .collect();
     assert!(!gen1_paths.is_empty(), "generation 1 registered");
     for path in &gen1_paths {
-        assert!(path.is_file(), "manifest file exists on disk: {path:?}");
+        assert!(
+            path.is_file(),
+            "manifest file exists on disk: {}",
+            path.display()
+        );
     }
 
     // Plant an orphan .vortex object (as a crash between write and commit
@@ -859,7 +863,8 @@ async fn test_cold_tier_gc_end_to_end_impl(fixture: common::TestFixture) -> Test
     for path in &gen1_paths {
         assert!(
             path.is_file(),
-            "manifest-referenced file survives GC: {path:?}"
+            "manifest-referenced file survives GC: {}",
+            path.display()
         );
     }
 
@@ -894,13 +899,15 @@ async fn test_cold_tier_gc_end_to_end_impl(fixture: common::TestFixture) -> Test
     for path in &superseded {
         assert!(
             !path.exists(),
-            "superseded generation-1 file reclaimed by GC: {path:?}"
+            "superseded generation-1 file reclaimed by GC: {}",
+            path.display()
         );
     }
     for path in &live_paths {
         assert!(
             path.is_file(),
-            "current-generation file survives GC: {path:?}"
+            "current-generation file survives GC: {}",
+            path.display()
         );
     }
     // Query correctness is unaffected throughout.
@@ -1269,6 +1276,7 @@ test_with_backends!(test_cold_tier_cdc_upserts_concurrent_with_promotion_impl);
 async fn test_cold_tier_cdc_upserts_concurrent_with_promotion_impl(
     fixture: common::TestFixture,
 ) -> TestResult<()> {
+    const KEYS: i64 = 2000;
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("value", DataType::Int64, false),
@@ -1297,7 +1305,6 @@ async fn test_cold_tier_cdc_upserts_concurrent_with_promotion_impl(
     table.install_slot_advancer(Arc::new(NoopSlotAdvancer));
     ctx.register_table("cdc_race_t", Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
-    const KEYS: i64 = 2000;
     let initial: Vec<(i64, i64)> = (0..KEYS).map(|i| (i, i * 2)).collect();
     cdc_upsert(&table, &schema, &initial).await?;
     flush_warm(&table).await;
