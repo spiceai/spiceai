@@ -13451,6 +13451,12 @@ impl CayenneTableProvider {
                     );
                 }
                 let chunk_stream: SendableRecordBatchStream = Box::pin(source.next_chunk(row_cap));
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    chunk_idx,
+                    "Datalake promotion: cold chunk upload starting"
+                );
                 self.insert_stream_into_cold_dir(
                     session_state.as_ref(),
                     &write_format,
@@ -13458,9 +13464,20 @@ impl CayenneTableProvider {
                     chunk_stream,
                 )
                 .await?;
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    chunk_idx,
+                    "Datalake promotion: cold chunk upload complete"
+                );
                 chunk_idx = chunk_idx.saturating_add(1);
             }
         } else {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                "Datalake promotion: cold upload starting (single stream)"
+            );
             self.insert_stream_into_cold_dir(
                 session_state.as_ref(),
                 &write_format,
@@ -13945,6 +13962,11 @@ impl CayenneTableProvider {
             )),
         );
         let (stream, _generation_before) = self.visible_file_stream_for_rewrite(&ctx).await?;
+        tracing::debug!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            "Datalake promotion: visible cross-tier stream planned"
+        );
 
         // Z-order cluster for a read-optimized cold layout.
         let clustering = self.resolve_cold_clustering_indices();
@@ -13960,6 +13982,13 @@ impl CayenneTableProvider {
                 max_sequence,
             )
             .await?;
+        tracing::debug!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            files = cold_files.len(),
+            total_rows,
+            "Datalake promotion: cold store write complete"
+        );
         if cold_files.is_empty() && dirty_cold.is_empty() {
             // Nothing rewritten and nothing to drop. Gate on files-written, not
             // `total_rows`: a written file whose footer row count couldn't be
@@ -14002,6 +14031,11 @@ impl CayenneTableProvider {
         // "no `.await` under the fence": for cold, the metastore commit IS a
         // visibility flip, and it is a short single transaction.
         let new_listing_table = self.build_overwrite_listing_table(&new_snapshot_id)?;
+        tracing::debug!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            "Datalake promotion: committing cold manifest + snapshot flip under fence"
+        );
         {
             let _fence = self.listing_fence.write().await;
             self.catalog
