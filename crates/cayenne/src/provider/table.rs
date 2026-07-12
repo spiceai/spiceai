@@ -56,9 +56,10 @@ use super::on_conflict::{
     pk_deletion_snapshot_for_strategy,
 };
 use super::pk_index::{
-    CachedPkIndex, CachedPkKeyset, PK_INDEX_PERSIST_MAX_BYTES, PkBloom, PkExistenceRef,
-    RowLocation, ShardedPkIndex, approx_captured_file_bytes, approx_pk_keyset_entry_bytes,
-    deserialize_pk_bloom_sidecar, serialize_pk_bloom_sidecar, shard_of_pk,
+    COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkIndex, CachedPkKeyset, ColdPkExistence,
+    PK_INDEX_PERSIST_MAX_BYTES, PkBloom, PkDigestSet, PkExistenceRef, PkKeysetInsertOutcome,
+    RowLocation, ShardedPkIndex, approx_captured_file_bytes, deserialize_pk_bloom_sidecar,
+    pk_digest, serialize_pk_bloom_sidecar, shard_of_pk,
 };
 use super::streaming::StreamingExec;
 use crate::bounded_fifo::BoundedFifoSet;
@@ -77,6 +78,7 @@ use crate::resource_starvation::ResourceStarvationTracker;
 use arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray, Int64Array};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, SchemaBuilder, SchemaRef};
+use hash_index::PrehashedBuildHasher;
 
 use crate::row_converter::{OwnedRow, RowConverter, SortField};
 use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
@@ -96,8 +98,8 @@ use datafusion_catalog::{Session, TableProvider};
 use datafusion_common::stats::Precision as DFPrecision;
 use datafusion_common::tree_node::TreeNode;
 use datafusion_common::{
-    ColumnStatistics, Constraints, DFSchema, DataFusionError, Result as DataFusionResult,
-    ScalarValue, Statistics, project_schema,
+    ColumnStatistics, Constraint, Constraints, DFSchema, DataFusionError,
+    Result as DataFusionResult, ScalarValue, Statistics, project_schema,
 };
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_groups::FileGroup;
@@ -212,7 +214,7 @@ pub struct CayenneCdcWrite {
     prepared_append: Option<PreparedStagedAppend>,
     prepared_on_conflict: Option<PreparedOnConflictDeletionPublish>,
     stats: Option<Arc<ColumnStatsAccumulator>>,
-    validated_file_keys: HashSet<OwnedRow>,
+    validated_file_keys: PkDigestSet,
     /// Set when this write appended to the in-memory CDC tier
     /// (`cdc_durability: memory`): the mem-tier epoch the batch landed in. The
     /// runtime reads this (via [`Self::in_memory_epoch`]) to DEFER the source
@@ -232,7 +234,7 @@ impl CayenneCdcWrite {
             prepared_append: None,
             prepared_on_conflict: None,
             stats: None,
-            validated_file_keys: HashSet::new(),
+            validated_file_keys: PkDigestSet::default(),
             in_memory_epoch: None,
         }
     }
@@ -250,7 +252,7 @@ impl CayenneCdcWrite {
             prepared_append: None,
             prepared_on_conflict: None,
             stats: None,
-            validated_file_keys: HashSet::new(),
+            validated_file_keys: PkDigestSet::default(),
             in_memory_epoch: Some(epoch),
         }
     }
@@ -260,7 +262,7 @@ impl CayenneCdcWrite {
         rows: u64,
         prepared_append: PreparedStagedAppend,
         stats: Arc<ColumnStatsAccumulator>,
-        validated_file_keys: HashSet<OwnedRow>,
+        validated_file_keys: PkDigestSet,
     ) -> Self {
         Self {
             table,
@@ -279,7 +281,7 @@ impl CayenneCdcWrite {
         prepared_append: PreparedStagedAppend,
         prepared_on_conflict: PreparedOnConflictDeletionPublish,
         stats: Arc<ColumnStatsAccumulator>,
-        validated_file_keys: HashSet<OwnedRow>,
+        validated_file_keys: PkDigestSet,
     ) -> Self {
         Self {
             table,
@@ -917,7 +919,10 @@ pub(crate) async fn reserve_sequences_in(
 /// Keyed the SAME way as [`MergedScanDeletions`] — (file-index `Arc` ptr, the
 /// per-shard content `version` hash, structural epoch) — so any concurrent
 /// append/clear/publish forces a rebuild and a stale pairing can never be
-/// served. Where `merged_scan_deletions` memoizes the merged tombstone
+/// served. Like `MergedScanDeletions`, the file-index `Arc` is RETAINED here
+/// (`file_index`) so its address cannot be freed and reused by a later index
+/// generation, keeping the ptr comparison ABA-safe (#11303). Where
+/// `merged_scan_deletions` memoizes the merged tombstone
 /// *snapshot*, this memoizes the merge-on-read *output*: the visible batches
 /// after `filter_inlined_batch_for_deletions` has already run.
 ///
@@ -930,10 +935,13 @@ pub(crate) async fn reserve_sequences_in(
 /// reference, and lets repeated same-version queries skip merge-on-read
 /// entirely.
 struct MemTierVisibleMemo {
-    /// `PkDeletionSnapshot::index_ptr()` of the file-side index the visibility
-    /// was filtered against (`None` for position-based, which does not filter
-    /// here).
-    file_index_ptr: Option<usize>,
+    /// The file-side deletion snapshot the visibility was filtered against,
+    /// RETAINED for the lifetime of the memo (`None` for position-based, which
+    /// does not filter here). Retaining the `Arc` — not merely its address —
+    /// pins the index generation so its address cannot be freed and reused by a
+    /// later generation, making the [`Self::file_index_ptr`] identity ABA-safe;
+    /// see [`MergedScanDeletions::file_index`] and #11303.
+    file_index: Option<PkDeletionSnapshot>,
     /// [`crate::provider::mem_tier::ShardedMemTier::version_hash_of`] of the
     /// shards the batches were built from.
     tier_version: u64,
@@ -942,6 +950,18 @@ struct MemTierVisibleMemo {
     /// Per-segment deletion-filtered visible batches, unpruned. `Arc<[_]>` so a
     /// memo hit is an `Arc`-pointer clone, never an O(segments) copy.
     segments: Arc<[VisibleMemTierSegment]>,
+}
+
+impl MemTierVisibleMemo {
+    /// `Arc::as_ptr` identity of the retained file-side index — the memo key's
+    /// file-side component (`None` for position-based). Read from
+    /// [`Self::file_index`] so the compared pointer and the pinned allocation
+    /// can never diverge.
+    fn file_index_ptr(&self) -> Option<usize> {
+        self.file_index
+            .as_ref()
+            .and_then(PkDeletionSnapshot::index_ptr)
+    }
 }
 
 /// One retained mem-tier segment's deletion-filtered visible batches plus the
@@ -1102,6 +1122,14 @@ pub struct CayenneTableProvider {
     /// `build_sharded_pk_index` / the sharded validate path; routed by
     /// `shard_of_pk` so a key co-locates with its tier segments + tombstones.
     sharded_pk_keyset_cache: Arc<ParkingMutex<Option<ShardedPkIndex>>>,
+    /// Table-global cold-tier (datalake) PK existence view: one bloom per live
+    /// cold file, from the manifest's per-file `pk_bloom` blobs. Lets the
+    /// CDC-upsert keyset rebuild fold cold-resident keys WITHOUT the O(cold-rows)
+    /// object-store scan. Rebuilt on keyset cache miss by
+    /// [`Self::resolve_cold_keyset_source`], cleared by
+    /// [`Self::clear_cached_pk_keyset`] (promotion calls it on commit). `None` =
+    /// no bloom-backed cold contribution (see [`ColdKeysetSource`]).
+    cold_pk_existence: Arc<ParkingMutex<Option<Arc<ColdPkExistence>>>>,
     /// Accounts the keyset + deletion indexes against the query memory
     /// pool. `Arc`-shared with provider clones so they update one reservation.
     table_memory: Arc<CayenneMemoryAccount>,
@@ -1161,7 +1189,10 @@ pub struct CayenneTableProvider {
     /// Memo for the per-scan merged (file ∪ mem-tier) deletion snapshot. Keyed
     /// by (file-index `Arc` ptr, tier content `version`, structural epoch) — a
     /// hit requires all three, so any concurrent append/clear/publish forces a
-    /// rebuild and a stale pairing can never be served. Kills the per-scan
+    /// rebuild and a stale pairing can never be served. The file-index `Arc` is
+    /// RETAINED in the memo (`MergedScanDeletions::file_index`) so its address
+    /// cannot be freed and reused by a later index generation, keeping the ptr
+    /// comparison ABA-safe (#11303). Kills the per-scan
     /// O(tier-tombstones) `with_mem_tier_tombstones` extend that correlated
     /// plans (q20: 322ms -> 74s) paid per outer-group rescan.
     merged_scan_deletions: Arc<arc_swap::ArcSwapOption<MergedScanDeletions>>,
@@ -1547,6 +1578,22 @@ pub struct CayenneTableProvider {
     /// decoupled from the compaction tick.
     background_cold_tier_promoter:
         Arc<std::sync::OnceLock<super::compaction::BackgroundColdTierPromoter>>,
+    /// Datalake (cold) GC mark-and-sweep state: absolute `file_url -> first
+    /// instant we observed it orphaned` (on the store but not in the manifest).
+    /// An orphan is deleted only once observed for `cold_tier_gc_interval_ms`, so
+    /// an in-flight scan has a full interval to finish. In-memory (reset on
+    /// restart → one extra grace cycle, never a premature delete). See
+    /// [`Self::run_cold_tier_gc_tick`] / [`Self::plan_cold_gc_deletions`].
+    cold_gc_orphaned_first_seen: Arc<ParkingMutex<HashMap<String, Instant>>>,
+    /// Last instant the cold GC sweep ran, so the background tick fires it about
+    /// every `cold_tier_gc_interval_ms` regardless of the (finer) promotion tick
+    /// cadence. `None` until the first sweep.
+    cold_gc_last_run: Arc<ParkingMutex<Option<Instant>>>,
+    /// `DataFusion` table constraints advertising the primary key (unverified),
+    /// so runtime features gated on `TableProvider::constraints()` — e.g.
+    /// append-mode refresh's primary-key dedup path — can see it. `None` when
+    /// the table has no primary key.
+    pk_constraints: Option<Constraints>,
 }
 
 /// Builder for constructing a `CayenneTableProvider` with optional configuration.
@@ -1610,6 +1657,23 @@ enum MaintainedAggregateApply {
     },
 }
 
+/// How a PK keyset rebuild should treat the datalake (cold) tier, decided by
+/// [`CayenneTableProvider::resolve_cold_keyset_source`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColdKeysetSource {
+    /// No bloom-backed cold contribution — cold disabled, or a non-upsert
+    /// (`DoNothing`) table. The rebuild folds cold via the exact scan (a no-op
+    /// when cold is disabled).
+    None,
+    /// Cold-resident keys are served by the table-global [`ColdPkExistence`]
+    /// bloom; the rebuild SKIPS the cold scan.
+    Bloom,
+    /// A live cold file lacks a usable bloom, so the bloom union would be
+    /// incomplete; the rebuild folds cold via the exact scan for the whole
+    /// table.
+    Scan,
+}
+
 struct CayenneTableProviderOpenOptions {
     retention_filters: Vec<Expr>,
     time_retention_filter_builder: Option<super::retention::TimeRetentionFilterBuilder>,
@@ -1669,7 +1733,7 @@ impl CayenneTableProviderBuilder {
 
     /// Set the object store for the cold tier (storage-cascade bottom tier).
     ///
-    /// When set (together with `cayenne_cold_tier_location`), the promotion
+    /// When set (together with `cayenne_datalake_location`), the promotion
     /// stage writes read-optimized Vortex files here and the cross-tier scan
     /// reads them. May target a different bucket/endpoint than the warm store.
     #[must_use]
@@ -2453,6 +2517,219 @@ impl CayenneTableProvider {
         // attestation; the overwrite rebinds to a non-sorted snapshot, so it stays cleared.
         self.listing_table.store(new_listing_table);
         Ok(())
+    }
+
+    /// One physical-GC mark-and-sweep pass over the datalake (cold) tier:
+    /// deletes `.vortex` objects orphaned by overwrites and dirty rewrites.
+    ///
+    /// The manifest is the GC root; the orphan set is re-derived every pass as
+    /// `(objects under the cold prefix) − (manifest URLs)`, so GC is
+    /// self-healing across restarts — no in-memory task has to survive one.
+    ///
+    /// Scan safety ([`Self::plan_cold_gc_deletions`]): an orphan is deleted only
+    /// after being observed orphaned for `cold_tier_gc_interval_ms`, giving any
+    /// scan planned before the orphaning promotion a full interval to finish.
+    /// A query running longer than that interval can still hit a `NotFound` scan
+    /// ERROR (never silently wrong results) — known narrow limitation; the
+    /// robust fix is pinning cold URLs in the scan ref-count (deferred).
+    ///
+    /// Best-effort: missing `DeleteObject` grant or transient errors are logged
+    /// and retried next pass. Runs on the background tick, off the hot paths.
+    async fn run_cold_tier_gc_tick(&self) {
+        if !self.table_metadata.vortex_config.cold_tier_enabled() {
+            return;
+        }
+        let Some(cold_location) = self.table_metadata.vortex_config.cold_tier_location.clone()
+        else {
+            return;
+        };
+        let grace = std::time::Duration::from_millis(
+            self.table_metadata.vortex_config.cold_tier_gc_interval_ms,
+        );
+
+        let cold_base = cold_location.trim_end_matches('/');
+        let cold_prefix_url = format!(
+            "{cold_base}/{}/data/",
+            self.table_metadata.datalake_dir_segment()
+        );
+        let cold_url = match ListingTableUrl::parse(&cold_prefix_url) {
+            Ok(url) => url,
+            Err(error) => {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    "Cold-tier GC skipped: could not parse the cold prefix URL"
+                );
+                return;
+            }
+        };
+        let ctx = self.create_compaction_session_context();
+        if let Some(cold_config) = self.cold_object_store_config.as_ref() {
+            let cold_renv = ctx.runtime_env();
+            Self::register_object_store_if_needed(&cold_renv, cold_config);
+        }
+        let store = match ctx.runtime_env().object_store(&cold_url) {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    "Cold-tier GC skipped: could not resolve the cold object store"
+                );
+                return;
+            }
+        };
+        let prefix = cold_url.prefix().clone();
+        let object_store_url_str = cold_url.object_store().as_str().to_string();
+
+        // GC ROOT: the current manifest's referenced URLs.
+        let live: HashSet<String> = match self
+            .catalog
+            .list_cold_tier_files(&self.table_metadata.table_id)
+            .await
+        {
+            Ok(files) => files.into_iter().map(|f| f.file_url).collect(),
+            Err(error) => {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    "Cold-tier GC skipped: could not list the cold manifest (GC root)"
+                );
+                return;
+            }
+        };
+
+        // Every `.vortex` object actually present under the cold prefix.
+        let mut on_store: Vec<String> = Vec::new();
+        let mut listing = store.list(Some(&prefix));
+        while let Some(meta) = listing.next().await {
+            let meta = match meta {
+                Ok(meta) => meta,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "cayenne::compaction",
+                        table = self.table_metadata.table_name.as_str(),
+                        %error,
+                        "Cold-tier GC: listing the cold prefix failed; skipping this pass"
+                    );
+                    return;
+                }
+            };
+            let location = meta.location.to_string();
+            if location.ends_with(".vortex") {
+                // Reconstruct the absolute URL exactly as `write_stream_to_cold`
+                // stored it in the manifest so the membership test matches.
+                on_store.push(format!("{object_store_url_str}{location}"));
+            }
+        }
+
+        // Mark newly-seen orphans, and select those that have aged past the
+        // grace for deletion (pure, testable — see `plan_cold_gc_deletions`).
+        let (to_delete, orphans_tracked) = {
+            let mut first_seen = self.cold_gc_orphaned_first_seen.lock();
+            let planned = Self::plan_cold_gc_deletions(
+                &on_store,
+                &live,
+                &mut first_seen,
+                Instant::now(),
+                grace,
+            );
+            (planned, first_seen.len())
+        };
+        tracing::debug!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            objects_on_store = on_store.len(),
+            live_manifest_files = live.len(),
+            orphans_tracked,
+            deletable = to_delete.len(),
+            "Cold-tier GC pass"
+        );
+
+        let mut deleted = 0u64;
+        let mut skipped_errors = 0u64;
+        for full_url in to_delete {
+            // Map the absolute URL back to the store-relative path for deletion.
+            let Some(rel) = full_url.strip_prefix(object_store_url_str.as_str()) else {
+                continue;
+            };
+            let path = ObjectStorePath::from(rel);
+            match store.delete(&path).await {
+                // `NotFound` is the goal state (already gone — raced with
+                // another sweep or manual cleanup), not a retryable failure.
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {
+                    deleted += 1;
+                    self.cold_gc_orphaned_first_seen.lock().remove(&full_url);
+                }
+                Err(error) => {
+                    skipped_errors += 1;
+                    tracing::warn!(
+                        target: "cayenne::compaction",
+                        table = self.table_metadata.table_name.as_str(),
+                        object = full_url.as_str(),
+                        %error,
+                        "Cold-tier GC: failed to delete a superseded object (retried next pass); a missing DeleteObject grant is the common cause"
+                    );
+                }
+            }
+        }
+        if deleted > 0 || skipped_errors > 0 {
+            tracing::info!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                deleted,
+                skipped_errors,
+                "Cold-tier GC swept superseded datalake objects"
+            );
+        }
+    }
+
+    /// Pure mark-and-sweep decision for [`Self::run_cold_tier_gc_tick`] (no I/O,
+    /// `now` injected — unit-tested directly).
+    ///
+    /// `on_store` is every cold `.vortex` object URL; `live` is the manifest's
+    /// referenced URLs. A URL absent from `live` is orphaned. `first_seen` records
+    /// when each orphan was first observed; an orphan is returned for deletion
+    /// only once `now − first_seen ≥ grace`. Newly-seen orphans are marked
+    /// (`first_seen = now`) and kept; entries that are no longer orphaned (back in
+    /// the manifest, or gone from the store) are pruned so the map stays bounded.
+    ///
+    /// Restart-safe: `first_seen` is in-memory, so after a restart an orphan is
+    /// simply re-marked and waits one more grace interval — later deletion, never
+    /// premature, never a leak.
+    fn plan_cold_gc_deletions(
+        on_store: &[String],
+        live: &HashSet<String>,
+        first_seen: &mut HashMap<String, Instant>,
+        now: Instant,
+        grace: std::time::Duration,
+    ) -> Vec<String> {
+        let on_store_set: HashSet<&str> = on_store.iter().map(String::as_str).collect();
+        // Drop stale bookkeeping: a URL that is no longer an orphan (re-listed in
+        // the manifest, or physically gone) must not keep an aging timer.
+        first_seen.retain(|url, _| on_store_set.contains(url.as_str()) && !live.contains(url));
+
+        let mut to_delete = Vec::new();
+        for url in on_store {
+            if live.contains(url) {
+                continue; // referenced by the manifest — never deleted
+            }
+            match first_seen.get(url) {
+                Some(seen) => {
+                    if now.duration_since(*seen) >= grace {
+                        to_delete.push(url.clone());
+                    }
+                }
+                None => {
+                    // First time we've seen this orphan — mark it and let it age.
+                    first_seen.insert(url.clone(), now);
+                }
+            }
+        }
+        to_delete
     }
 
     /// Trigger cleanup of old snapshot directories in the background.
@@ -4337,6 +4614,20 @@ impl CayenneTableProvider {
         // also clamps, but pin it here so the field decl and lock-slice sizing agree.
         let mem_tier_shards = table_metadata.vortex_config.cdc_mem_tier_shards.max(1);
 
+        // Advertise the primary key as an (unverified) DataFusion constraint so
+        // `TableProvider::constraints()` reflects it — runtime features gate on
+        // it (e.g. append-mode refresh requires a time column or a primary key).
+        let pk_constraints = if table_metadata.primary_key.is_empty() {
+            None
+        } else {
+            table_metadata
+                .primary_key
+                .iter()
+                .map(|col| table_metadata.schema.index_of(col).ok())
+                .collect::<Option<Vec<usize>>>()
+                .map(|indices| Constraints::new_unverified(vec![Constraint::PrimaryKey(indices)]))
+        };
+
         let provider = Self {
             current_snapshot_id: Arc::new(RwLock::new(table_metadata.current_snapshot_id.clone())),
             table_schema: Arc::new(ArcSwap::new(Arc::<arrow_schema::Schema>::clone(
@@ -4376,6 +4667,7 @@ impl CayenneTableProvider {
             )),
             pk_keyset_cache: Arc::new(ParkingMutex::new(None)),
             sharded_pk_keyset_cache: Arc::new(ParkingMutex::new(None)),
+            cold_pk_existence: Arc::new(ParkingMutex::new(None)),
             table_memory,
             inline_checkpoint_scheduled: Arc::new(AtomicBool::new(false)),
             inlined_row_count: Arc::new(AtomicI64::new(inlined_row_count)),
@@ -4453,6 +4745,9 @@ impl CayenneTableProvider {
             background_compactor: Arc::new(std::sync::OnceLock::new()),
             background_mem_tier_checkpointer: Arc::new(std::sync::OnceLock::new()),
             background_cold_tier_promoter: Arc::new(std::sync::OnceLock::new()),
+            cold_gc_orphaned_first_seen: Arc::new(ParkingMutex::new(HashMap::new())),
+            cold_gc_last_run: Arc::new(ParkingMutex::new(None)),
+            pk_constraints,
         };
 
         provider.refresh_deletion_memory_accounting();
@@ -5349,6 +5644,7 @@ impl CayenneTableProvider {
             ),
             pk_keyset_cache: Arc::clone(&self.pk_keyset_cache),
             sharded_pk_keyset_cache: Arc::clone(&self.sharded_pk_keyset_cache),
+            cold_pk_existence: Arc::clone(&self.cold_pk_existence),
             table_memory: Arc::clone(&self.table_memory),
             inline_checkpoint_scheduled: Arc::clone(&self.inline_checkpoint_scheduled),
             inlined_row_count: Arc::clone(&self.inlined_row_count),
@@ -5411,6 +5707,9 @@ impl CayenneTableProvider {
             // original `Arc`) survives writer clones and its drop signal is shared.
             background_mem_tier_checkpointer: Arc::clone(&self.background_mem_tier_checkpointer),
             background_cold_tier_promoter: Arc::clone(&self.background_cold_tier_promoter),
+            cold_gc_orphaned_first_seen: Arc::clone(&self.cold_gc_orphaned_first_seen),
+            cold_gc_last_run: Arc::clone(&self.cold_gc_last_run),
+            pk_constraints: self.pk_constraints.clone(),
         }
     }
 
@@ -5737,7 +6036,7 @@ impl CayenneTableProvider {
     /// Build a bloom existence filter over `keyset`'s keys, sized to `max_bytes`.
     fn bloom_from_keyset(keyset: &CachedPkKeyset, max_bytes: usize) -> PkBloom {
         let mut bloom = PkBloom::with_byte_budget(max_bytes);
-        for key in keyset.keys.keys() {
+        for key in keyset.rows() {
             bloom.insert(key.as_ref());
         }
         bloom
@@ -5788,7 +6087,20 @@ impl CayenneTableProvider {
         // recovery) equally invalidates the sharded view. At N=1 the sharded cache
         // is never populated, so this is a no-op there.
         *self.sharded_pk_keyset_cache.lock() = None;
+        // The cold-tier PK existence view is tied to the same keyset generation
+        // (a promotion that changes the cold manifest calls this on commit), so
+        // drop it too; the next apply's cache miss rebuilds it from the current
+        // manifest via `resolve_cold_keyset_source`.
+        self.store_cold_pk_existence(None);
         self.table_memory.set_keyset_bytes(0);
+    }
+
+    /// Single funnel for (re)setting `cold_pk_existence`: keeps the view's
+    /// resident bytes registered with the memory pool alongside the keyset.
+    fn store_cold_pk_existence(&self, view: Option<Arc<ColdPkExistence>>) {
+        let bytes = view.as_ref().map_or(0, |v| v.approx_bytes());
+        *self.cold_pk_existence.lock() = view;
+        self.table_memory.set_cold_existence_bytes(bytes);
     }
 
     /// Rewrite every cached keyset entry from `RowLocation::Inlined` to
@@ -5800,7 +6112,7 @@ impl CayenneTableProvider {
     fn flip_inlined_keyset_entries_to_file_unlocated(&self) {
         let mut guard = self.pk_keyset_cache.lock();
         if let Some(CachedPkIndex::Exact(keyset)) = guard.as_mut() {
-            for location in keyset.keys.values_mut() {
+            for location in keyset.locations_mut() {
                 if matches!(location, RowLocation::Inlined) {
                     *location = RowLocation::FileUnlocated;
                 }
@@ -5813,7 +6125,7 @@ impl CayenneTableProvider {
         let mut sharded = self.sharded_pk_keyset_cache.lock();
         if let Some(ShardedPkIndex::Exact(keysets)) = sharded.as_mut() {
             for keyset in keysets.iter_mut() {
-                for location in keyset.keys.values_mut() {
+                for location in keyset.locations_mut() {
                     if matches!(location, RowLocation::Inlined) {
                         *location = RowLocation::FileUnlocated;
                     }
@@ -5822,7 +6134,7 @@ impl CayenneTableProvider {
         }
     }
 
-    fn record_pk_keys_with_location(&self, keys: &HashSet<OwnedRow>, location: &RowLocation) {
+    fn record_pk_keys_with_location(&self, keys: &PkDigestSet, location: &RowLocation) {
         if keys.is_empty() {
             return;
         }
@@ -5838,7 +6150,7 @@ impl CayenneTableProvider {
         let mut convert_to_bloom = false;
         match &mut index {
             CachedPkIndex::Bloom(bloom) => {
-                for key in keys {
+                for key in keys.iter() {
                     bloom.insert(key.as_ref());
                 }
             }
@@ -5846,17 +6158,18 @@ impl CayenneTableProvider {
                 // Existence-only insert. Under `deletion_mode: position`, real
                 // `(file, position)` for File rows is captured separately by the
                 // row_idx() read-back, which upgrades these to `FilePositioned`.
-                for key in keys {
-                    if !keyset.keys.contains_key(key)
-                        && keyset
-                            .approx_bytes
-                            .saturating_add(approx_pk_keyset_entry_bytes(key))
-                            > max_bytes
-                    {
-                        convert_to_bloom = true;
-                        break;
+                // Reuse each key's stored digest (the keyset is digest-keyed) and
+                // fold the presence check and the insert into a single hash
+                // lookup — the common case on re-touched PKs (e.g. CDC updates)
+                // is "present", where this clones neither the key nor re-hashes.
+                for (digest, key) in keys.iter_with_digest() {
+                    match keyset.try_insert_with_digest(digest, key, location.clone(), max_bytes) {
+                        PkKeysetInsertOutcome::OverBudget => {
+                            convert_to_bloom = true;
+                            break;
+                        }
+                        PkKeysetInsertOutcome::Updated | PkKeysetInsertOutcome::Inserted => {}
                     }
-                    keyset.insert(key.clone(), location.clone());
                 }
             }
         }
@@ -5867,7 +6180,7 @@ impl CayenneTableProvider {
                     CachedPkIndex::Exact(keyset) => Self::bloom_from_keyset(keyset, max_bytes),
                     CachedPkIndex::Bloom(_) => PkBloom::with_byte_budget(max_bytes),
                 };
-                for key in keys {
+                for key in keys.iter() {
                     bloom.insert(key.as_ref());
                 }
                 tracing::debug!(
@@ -5895,7 +6208,7 @@ impl CayenneTableProvider {
         self.table_memory.set_keyset_bytes(bytes);
     }
 
-    pub(crate) fn record_inlined_pk_keys(&self, keys: &HashSet<OwnedRow>) {
+    pub(crate) fn record_inlined_pk_keys(&self, keys: &PkDigestSet) {
         self.record_pk_keys_with_location(keys, &RowLocation::Inlined);
     }
 
@@ -5912,7 +6225,7 @@ impl CayenneTableProvider {
         self.table_memory.set_keyset_bytes(bytes);
     }
 
-    pub(crate) fn record_file_pk_keys(&self, keys: &HashSet<OwnedRow>) {
+    pub(crate) fn record_file_pk_keys(&self, keys: &PkDigestSet) {
         self.record_pk_keys_with_location(keys, &RowLocation::FileUnlocated);
     }
 
@@ -6099,7 +6412,7 @@ impl CayenneTableProvider {
                 let mut guard = self.pk_keyset_cache.lock();
                 if let Some(CachedPkIndex::Exact(keyset)) = guard.as_mut() {
                     for (key, position) in entries {
-                        if let Some(location) = keyset.keys.get_mut(&key) {
+                        if let Some(location) = keyset.location_mut(&key) {
                             *location = RowLocation::FilePositioned {
                                 file_path: Arc::clone(&file_path),
                                 position,
@@ -6218,10 +6531,87 @@ impl CayenneTableProvider {
     ///
     /// Rows marked as deleted are excluded unless they were re-inserted with a higher
     /// sequence number (upsert semantics).
+    /// (Re)build the table-global cold-tier PK existence view from the current
+    /// `cayenne_cold_tier_file` manifest and store it in `cold_pk_existence`,
+    /// returning how the keyset rebuild should treat the cold tier.
+    ///
+    /// Called on every keyset cache MISS (the same point `load_existing_keyset`
+    /// would run its cold scan), so the two stay coupled: NO object-store I/O —
+    /// the per-file blooms come straight from the manifest rows.
+    ///
+    /// See [`ColdKeysetSource`] for the three outcomes; `cold_pk_existence` is
+    /// populated only for [`ColdKeysetSource::Bloom`] and cleared otherwise.
+    async fn resolve_cold_keyset_source(&self) -> Result<ColdKeysetSource> {
+        if !self.table_metadata.vortex_config.cold_tier_enabled() || !self.upsert_bloom_eligible() {
+            self.store_cold_pk_existence(None);
+            return Ok(ColdKeysetSource::None);
+        }
+
+        let cold_files = self
+            .catalog
+            .list_cold_tier_files(&self.table_metadata.table_id)
+            .await?;
+        // Liveness is size-based, NOT row_count-based: promotion commits files
+        // with `row_count = 0` when footer stats inference fails. Such files
+        // carry no bloom, so keeping them live routes to the exact-scan fallback
+        // instead of silently dropping their keys.
+        let live: Vec<_> = cold_files
+            .into_iter()
+            .filter(|f| f.file_size_bytes > 0)
+            .collect();
+        if live.is_empty() {
+            // No cold-resident keys: an EMPTY existence view (never probes true)
+            // is complete and correct, so skip the scan. Stored (not cleared) to
+            // keep the invariant "`Bloom` ⇒ view present".
+            self.store_cold_pk_existence(Some(Arc::new(ColdPkExistence::new(Vec::new()))));
+            return Ok(ColdKeysetSource::Bloom);
+        }
+
+        let mut blooms = Vec::with_capacity(live.len());
+        for f in &live {
+            if let Some(bloom) = f.pk_bloom.as_deref().and_then(PkBloom::from_bytes) {
+                blooms.push(bloom);
+            } else {
+                // A live cold file without a usable bloom (legacy row, over
+                // the per-file cap, or corrupt) means the union would omit
+                // that file's keys. Missing a cold key would let an upsert
+                // false-negative and double-count, so fall back to the exact
+                // cold scan for the whole table.
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    file = f.file_url.as_str(),
+                    "Cold-tier file has no PK bloom; keyset rebuild falls back to the exact cold scan"
+                );
+                self.store_cold_pk_existence(None);
+                return Ok(ColdKeysetSource::Scan);
+            }
+        }
+
+        let existence = Arc::new(ColdPkExistence::new(blooms));
+        tracing::debug!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            cold_files = live.len(),
+            approx_bytes = existence.approx_bytes(),
+            "Built cold-tier PK existence view from manifest blooms; keyset rebuild skips the cold scan"
+        );
+        self.store_cold_pk_existence(Some(existence));
+        Ok(ColdKeysetSource::Bloom)
+    }
+
+    /// Rebuild the exact PK keyset from durable state.
+    ///
+    /// `fold_cold`: `true` scans the cold store to fold cold-resident keys into
+    /// the keyset (the exact path — `DoNothing`, or a cold file lacks a bloom);
+    /// `false` skips that O(cold-rows) scan because the cold contribution is
+    /// served by the [`ColdPkExistence`] bloom (`resolve_cold_keyset_source`).
+    /// Immaterial when the cold tier is disabled (the pass is a no-op).
     async fn load_existing_keyset(
         &self,
         pk_indices: &[usize],
         converter: &RowConverter,
+        fold_cold: bool,
     ) -> Result<CachedPkKeyset> {
         // Capture the snapshot LIST — un-checkpointed mem-tier shards, the
         // protected set, and the current snapshot id — COHERENTLY under the
@@ -6342,6 +6732,57 @@ impl CayenneTableProvider {
                 &mut row_id_base,
             )
             .await?;
+        }
+
+        // Fold in the datalake (cold) tier: promoted rows are still live PK
+        // holders, so an upsert of a cold-resident key must supersede-tombstone
+        // it. Without this pass a post-promotion rebuild (warm just cleared by
+        // the graduation) produces an EMPTY keyset, upserts false-negative, and
+        // every re-ingested key double-counts against its cold copy (caught by
+        // the datalake e2e's restart + re-append phase). The FULL deletion
+        // filter (None threshold) mirrors the main-tier handling: a tombstoned
+        // cold key is dead here, and its re-inserted copy is picked up by the
+        // warm/mem-tier passes above.
+        //
+        // Skipped when `fold_cold` is false: the cold contribution is then
+        // served by the `ColdPkExistence` bloom, avoiding this O(cold-rows)
+        // object-store scan entirely.
+        if fold_cold
+            && let Some(cold_plan) = self
+                .build_cold_tier_scan_plan(
+                    &ctx.state(),
+                    Some(&pk_projection),
+                    &[],
+                    None,
+                    &ctx.copied_config(),
+                    None,
+                )
+                .await?
+        {
+            let scan_start = Instant::now();
+            let keys_before = keyset.len();
+            let cold_stream = datafusion_physical_plan::execute_stream(cold_plan, ctx.task_ctx())?;
+            Self::process_stream_into_keyset(
+                cold_stream,
+                &self.pk_deletion_strategy,
+                pk_indices,
+                converter,
+                &projected_pk_indices,
+                deleted_pk_i64.as_deref(),
+                deleted_row_keys.as_deref(),
+                None, // all deletions apply to cold-resident keys
+                &self.table_metadata.table_name,
+                &mut keyset,
+                &mut row_id_base,
+            )
+            .await?;
+            tracing::info!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                cold_keys_folded = keyset.len().saturating_sub(keys_before),
+                duration_ms = u64::try_from(scan_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "Keyset rebuild folded the datalake tier via exact object-store scan"
+            );
         }
 
         if self.cached_inlined_row_count() > 0 {
@@ -6914,17 +7355,32 @@ impl CayenneTableProvider {
             // per-phase telemetry. Time it explicitly (emitted only on a cache
             // miss / cold rebuild) so retests attribute the cost correctly.
             let keyset_rebuild_start = Instant::now();
+            // Resolve the datalake (cold) tier contribution first (rebuilds the
+            // cold PK existence bloom from the manifest, no object-store I/O).
+            // `Bloom` skips the cold scan; `Scan` forces a full rebuild (the
+            // warm-only checkpoint can't cover the incomplete-bloom case).
+            let cold_source = self.resolve_cold_keyset_source().await?;
+            let fold_cold = !matches!(cold_source, ColdKeysetSource::Bloom);
+            let allow_checkpoint = !matches!(cold_source, ColdKeysetSource::Scan);
             // Fast path: reconstruct the index from the persisted bloom checkpoint
             // (+ bounded post-checkpoint delta) and skip the full-table keyset
             // scan. Falls back to the full scan on any miss/mismatch/corruption.
-            let existing_keys = match self
-                .try_load_persisted_pk_index(&pk_indices, &converter)
-                .await
-            {
-                Ok(Some(index)) => index,
-                _ => {
-                    CachedPkIndex::Exact(self.load_existing_keyset(&pk_indices, &converter).await?)
+            let existing_keys = if allow_checkpoint {
+                match self
+                    .try_load_persisted_pk_index(&pk_indices, &converter)
+                    .await
+                {
+                    Ok(Some(index)) => index,
+                    _ => CachedPkIndex::Exact(
+                        self.load_existing_keyset(&pk_indices, &converter, fold_cold)
+                            .await?,
+                    ),
                 }
+            } else {
+                CachedPkIndex::Exact(
+                    self.load_existing_keyset(&pk_indices, &converter, fold_cold)
+                        .await?,
+                )
             };
             record_cayenne_write_phase(
                 self.table_metadata.table_name.as_str(),
@@ -7073,18 +7529,35 @@ impl CayenneTableProvider {
             );
         }
 
+        // Resolve the datalake (cold) tier contribution first (rebuilds the cold
+        // PK existence bloom from the manifest, no object-store I/O), coupled
+        // with the sharded rebuild the same way the serial path couples it.
+        let cold_source = self.resolve_cold_keyset_source().await?;
+        let fold_cold = !matches!(cold_source, ColdKeysetSource::Bloom);
+        let allow_checkpoint = !matches!(cold_source, ColdKeysetSource::Scan);
+
         // Cold rebuild. Try the persisted single bloom only at n==1 (it can't be
         // split); at n>1 build N sharded blooms (or the exact keyset) directly. All
         // paths route through `load_existing_keyset`, which folds the un-checkpointed
         // mem-tier keys into the keyset (so a cold rebuild forced by
         // `clear_cached_pk_keyset` cannot drop a RAM-only key — see there).
         if n == 1 {
-            let index = match self
-                .try_load_persisted_pk_index(pk_indices, converter)
-                .await
-            {
-                Ok(Some(index)) => index,
-                _ => CachedPkIndex::Exact(self.load_existing_keyset(pk_indices, converter).await?),
+            let index = if allow_checkpoint {
+                match self
+                    .try_load_persisted_pk_index(pk_indices, converter)
+                    .await
+                {
+                    Ok(Some(index)) => index,
+                    _ => CachedPkIndex::Exact(
+                        self.load_existing_keyset(pk_indices, converter, fold_cold)
+                            .await?,
+                    ),
+                }
+            } else {
+                CachedPkIndex::Exact(
+                    self.load_existing_keyset(pk_indices, converter, fold_cold)
+                        .await?,
+                )
             };
             return match index {
                 CachedPkIndex::Exact(keyset) => Ok(ShardedPkIndex::from_exact(keyset, 1)),
@@ -7102,13 +7575,15 @@ impl CayenneTableProvider {
             // budget; if it does, route it (exact). If it does NOT, fall back to N
             // sharded blooms over the same scan. This mirrors
             // `store_cached_pk_index`'s exact->bloom threshold, split N ways.
-            let keyset = self.load_existing_keyset(pk_indices, converter).await?;
+            let keyset = self
+                .load_existing_keyset(pk_indices, converter, fold_cold)
+                .await?;
             let max_bytes = self.context.pk_keyset_cache_max_bytes();
             if keyset.approx_bytes > max_bytes {
                 let mut blooms: Vec<PkBloom> = (0..n)
                     .map(|_| PkBloom::with_byte_budget(max_bytes / n.max(1)))
                     .collect();
-                for key in keyset.keys.keys() {
+                for key in keyset.rows() {
                     let s = shard_of_pk(key.as_ref(), n);
                     blooms[s].insert(key.as_ref());
                 }
@@ -7117,7 +7592,9 @@ impl CayenneTableProvider {
             return Ok(ShardedPkIndex::from_exact(keyset, n));
         }
 
-        let keyset = self.load_existing_keyset(pk_indices, converter).await?;
+        let keyset = self
+            .load_existing_keyset(pk_indices, converter, fold_cold)
+            .await?;
         Ok(ShardedPkIndex::from_exact(keyset, n))
     }
 
@@ -7146,7 +7623,7 @@ impl CayenneTableProvider {
 
         let deduplicate_batch = !ctx.upsert_options.is_default();
         let mut keep_mask = Vec::with_capacity(batch.num_rows());
-        let mut kept_keys: HashSet<OwnedRow> = HashSet::with_capacity(batch.num_rows());
+        let mut kept_keys: PkDigestSet = PkDigestSet::with_capacity(batch.num_rows());
         let mut delete_specs: HashMap<Arc<str>, Vec<u64>> = HashMap::new();
         let mut deleted_pk_i64: Vec<i64> = Vec::new();
         let mut deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
@@ -7222,6 +7699,44 @@ impl CayenneTableProvider {
                 }
             };
 
+        // Datalake (cold) PK existence, snapshotted once for this batch: a
+        // warm/mem MISS that HITS here must record a key-based supersede, exactly
+        // like a warm `Bloom` HIT (no false negatives, so a MISS is
+        // definitely-absent-from-cold). `None` when the rebuild fell back to the
+        // exact cold scan (`ctx.existing` already covers cold keys) or for
+        // non-upsert / cold-disabled tables (`resolve_cold_keyset_source`).
+        let cold_existence = self.cold_pk_existence.lock().clone();
+
+        // Emit a key-based supersede delete (to BOTH the file and inline lists,
+        // so the prior version is masked wherever it lives) for a conflicting
+        // row with no known file position — the shared shape of the warm `Bloom`
+        // HIT and the cold-existence HIT. Takes the delete lists as parameters
+        // (not captures) so it never conflicts with the loop's own mutation,
+        // mirroring `probe_reinsert_over_tombstone`.
+        let push_key_supersede =
+            |row_idx: usize,
+             key: &OwnedRow,
+             deleted_pk_i64: &mut Vec<i64>,
+             deleted_inlined_pk_i64: &mut Vec<i64>,
+             deleted_row_keys: &mut Vec<Box<[u8]>>,
+             deleted_inlined_row_keys: &mut Vec<Box<[u8]>>| {
+                match &self.pk_deletion_strategy {
+                    PkDeletionStrategyWithCache::Int64Pk { .. } => {
+                        if let Some(arr) = int64_pk_array {
+                            let value = arr.value(row_idx);
+                            deleted_pk_i64.push(value);
+                            deleted_inlined_pk_i64.push(value);
+                        }
+                    }
+                    PkDeletionStrategyWithCache::RowConverterBased { .. } => {
+                        let row_key = key.as_ref().to_vec().into_boxed_slice();
+                        deleted_row_keys.push(row_key.clone());
+                        deleted_inlined_row_keys.push(row_key);
+                    }
+                    PkDeletionStrategyWithCache::PositionBased { .. } => {}
+                }
+            };
+
         // Hoist the PK-null check out of the per-row loop: an Arrow column with no
         // null buffer reports `null_count() == 0` in O(1), so when no PK column is
         // nullable we skip the per-row `is_null` scan across all PK columns
@@ -7243,14 +7758,20 @@ impl CayenneTableProvider {
         // computed up front) so the pre-pass can borrow them and the loop consume them.
         let row_pk_keys: Vec<OwnedRow> =
             (0..batch.num_rows()).map(|i| rows.row(i).owned()).collect();
+        // Hash each row's key bytes ONCE into a seeded XXH3-128 digest; this digest
+        // is the key's identity for all three probes below (dedup pre-pass,
+        // cross-batch `incoming_keys`, and the `existing_keys` keyset), so the
+        // per-row hashing cost is paid a single time and the maps reuse it via
+        // `PrehashedBuildHasher`.
+        let row_digests: Vec<u128> = row_pk_keys.iter().map(pk_digest).collect();
         let is_survivor: Vec<bool> = if deduplicate_batch {
-            let mut survivor: HashMap<&[u8], usize> = HashMap::with_capacity(row_pk_keys.len());
-            for (idx, key) in row_pk_keys.iter().enumerate() {
-                let bytes: &[u8] = key.as_ref();
+            let mut survivor: HashMap<u128, usize, PrehashedBuildHasher> =
+                HashMap::with_capacity_and_hasher(row_pk_keys.len(), PrehashedBuildHasher);
+            for (idx, &digest) in row_digests.iter().enumerate() {
                 if ctx.upsert_options.last_write_wins {
-                    survivor.insert(bytes, idx); // a later duplicate supersedes
+                    survivor.insert(digest, idx); // a later duplicate supersedes
                 } else {
-                    survivor.entry(bytes).or_insert(idx); // keep the first
+                    survivor.entry(digest).or_insert(idx); // keep the first
                 }
             }
             let mut mask = vec![false; row_pk_keys.len()];
@@ -7270,6 +7791,9 @@ impl CayenneTableProvider {
                 });
             }
 
+            // This row's precomputed key identity, reused across all three probes.
+            let digest = row_digests[row_idx];
+
             // Drop in-batch duplicate non-survivors before any conflict/delete work,
             // so exactly one row per PK records a delete and is kept.
             if deduplicate_batch && !is_survivor[row_idx] {
@@ -7277,7 +7801,7 @@ impl CayenneTableProvider {
                 continue;
             }
 
-            if ctx.incoming_keys.contains(&key) {
+            if ctx.incoming_keys.contains_digest(digest) {
                 return Err(Error::DataValidation {
                     table: self.table_metadata.table_name.clone(),
                     message: "Incoming data contains duplicate primary key across batches"
@@ -7287,7 +7811,7 @@ impl CayenneTableProvider {
 
             let keep_row = match ctx.existing {
                 PkExistenceRef::Exact(existing_keys) => {
-                    if let Some(existing) = existing_keys.get(&key) {
+                    if let Some(existing) = existing_keys.location_by_digest(digest) {
                         match ctx.on_conflict {
                             OnConflict::DoNothingAll | OnConflict::DoNothing(_) => false,
                             OnConflict::Upsert(_) => {
@@ -7344,6 +7868,24 @@ impl CayenneTableProvider {
                                 true
                             }
                         }
+                    } else if cold_existence
+                        .as_ref()
+                        .is_some_and(|c| c.maybe_contains(key.as_ref()))
+                    {
+                        // Not in the warm/mem keyset, but a datalake (cold) file
+                        // MAY hold this key — record a key-based supersede so the
+                        // cold copy is masked (the exact analog of a warm `Bloom`
+                        // HIT). A bloom false positive masks nothing and is a
+                        // harmless no-op under upsert.
+                        push_key_supersede(
+                            row_idx,
+                            &key,
+                            &mut deleted_pk_i64,
+                            &mut deleted_inlined_pk_i64,
+                            &mut deleted_row_keys,
+                            &mut deleted_inlined_row_keys,
+                        );
+                        true
                     } else {
                         // Key has no live existence-index entry. If it still
                         // carries a pending DELETE tombstone this is a reinsert
@@ -7390,6 +7932,21 @@ impl CayenneTableProvider {
                             }
                             PkDeletionStrategyWithCache::PositionBased { .. } => {}
                         }
+                    } else if cold_existence
+                        .as_ref()
+                        .is_some_and(|c| c.maybe_contains(key.as_ref()))
+                    {
+                        // Warm bloom MISS but a datalake (cold) file MAY hold this
+                        // key — record a key-based supersede for the cold copy
+                        // (same shape as the warm bloom HIT above).
+                        push_key_supersede(
+                            row_idx,
+                            &key,
+                            &mut deleted_pk_i64,
+                            &mut deleted_inlined_pk_i64,
+                            &mut deleted_row_keys,
+                            &mut deleted_inlined_row_keys,
+                        );
                     } else {
                         // Bloom MISS ⇒ key is definitely not live (blooms have no
                         // false negatives). But an over-budget table can still hold
@@ -7414,7 +7971,7 @@ impl CayenneTableProvider {
             };
 
             if keep_row {
-                kept_keys.insert(key);
+                kept_keys.insert_with_digest(digest, key);
             }
             keep_mask.push(keep_row);
         }
@@ -7461,10 +8018,11 @@ impl CayenneTableProvider {
     fn bloom_split_shard_batch(
         batch: &RecordBatch,
         bloom: &PkBloom,
+        cold_existence: Option<&ColdPkExistence>,
         pk_indices: &[usize],
         converter: &RowConverter,
-        incoming_keys: &HashSet<OwnedRow>,
-    ) -> Result<(Option<RecordBatch>, Option<RecordBatch>, HashSet<OwnedRow>)> {
+        incoming_keys: &PkDigestSet,
+    ) -> Result<(Option<RecordBatch>, Option<RecordBatch>, PkDigestSet)> {
         let pk_columns: Vec<_> = pk_indices
             .iter()
             .map(|&idx| Arc::clone(batch.column(idx)))
@@ -7477,16 +8035,27 @@ impl CayenneTableProvider {
         let any_pk_nullable = pk_columns.iter().any(|col| col.null_count() > 0);
 
         let mut miss_mask = Vec::with_capacity(batch.num_rows());
-        let mut miss_keys: HashSet<OwnedRow> = HashSet::new();
+        // Sized to the row count: in the common split case most rows are MISSes,
+        // so this keeps the set at one allocation on the CDC apply hot path.
+        let mut miss_keys: PkDigestSet = PkDigestSet::with_capacity(batch.num_rows());
         for row_idx in 0..batch.num_rows() {
             let null_pk = any_pk_nullable && pk_columns.iter().any(|col| col.is_null(row_idx));
             let key = rows.row(row_idx).owned();
+            // A datalake (cold) file MAY hold the key — route it to the HIT path
+            // so `apply_on_conflict_to_batch` records the cold supersede. Without
+            // this a cold-resident key would fast-path as brand-new and its cold
+            // copy would survive, double-counting (blooms have no false
+            // negatives, so a cold MISS here is safely fast-pathed).
+            let cold_hit = cold_existence.is_some_and(|c| c.maybe_contains(key.as_ref()));
+            // One hash per row, reused for both existence-set probes below.
+            let digest = pk_digest(&key);
             let is_miss = !null_pk
+                && !cold_hit
                 && !bloom.maybe_contains(key.as_ref())
-                && !incoming_keys.contains(&key)
-                && !miss_keys.contains(&key);
+                && !incoming_keys.contains_digest(digest)
+                && !miss_keys.contains_digest(digest);
             if is_miss {
-                miss_keys.insert(key);
+                miss_keys.insert_with_digest(digest, key);
             }
             miss_mask.push(is_miss);
         }
@@ -7495,7 +8064,7 @@ impl CayenneTableProvider {
         if miss_count == 0 {
             // No fast-path rows: the whole sub-batch is a HIT (preserves the
             // pre-Phase-6 behavior of routing everything through validation).
-            return Ok((None, Some(batch.clone()), HashSet::new()));
+            return Ok((None, Some(batch.clone()), PkDigestSet::default()));
         }
         if miss_count == batch.num_rows() {
             // Entirely new keys: no validation needed for this sub-batch at all.
@@ -7546,16 +8115,20 @@ impl CayenneTableProvider {
         pk_indices: &[usize],
         converter: &RowConverter,
         on_conflict: &OnConflict,
-    ) -> Result<(Vec<RecordBatch>, OnConflictDeletions, HashSet<OwnedRow>)> {
+    ) -> Result<(Vec<RecordBatch>, OnConflictDeletions, PkDigestSet)> {
         let upsert_options = on_conflict.get_upsert_options();
-        let mut incoming_keys: HashSet<OwnedRow> = HashSet::new();
+        // Datalake (cold) tier existence, snapshotted once for this shard's pass.
+        // Table-global (not sharded): every shard consults the same view for its
+        // own keys so a cold-resident key never fast-paths as brand-new.
+        let cold_existence = self.cold_pk_existence.lock().clone();
+        let mut incoming_keys: PkDigestSet = PkDigestSet::default();
         let mut delete_specs: HashMap<Arc<str>, Vec<u64>> = HashMap::new();
         let mut deleted_pk_i64: Vec<i64> = Vec::new();
         let mut deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
         let mut deleted_inlined_pk_i64: Vec<i64> = Vec::new();
         let mut deleted_inlined_row_keys: Vec<Box<[u8]>> = Vec::new();
         let mut reinserted_over_tombstone: usize = 0;
-        let mut kept_keys: HashSet<OwnedRow> = HashSet::new();
+        let mut kept_keys: PkDigestSet = PkDigestSet::default();
         let mut filtered_batches: Vec<RecordBatch> = Vec::new();
 
         for batch in shard_batches {
@@ -7578,6 +8151,7 @@ impl CayenneTableProvider {
                     let (miss, hit, miss_keys) = Self::bloom_split_shard_batch(
                         &batch,
                         bloom,
+                        cold_existence.as_deref(),
                         pk_indices,
                         converter,
                         &incoming_keys,
@@ -7587,8 +8161,8 @@ impl CayenneTableProvider {
                     if let Some(miss) = miss
                         && miss.num_rows() > 0
                     {
-                        incoming_keys.extend(miss_keys.iter().cloned());
-                        kept_keys.extend(miss_keys);
+                        incoming_keys.extend_ref(&miss_keys);
+                        kept_keys.absorb(miss_keys);
                         filtered_batches.push(miss);
                     }
                     hit
@@ -7620,8 +8194,8 @@ impl CayenneTableProvider {
             deleted_inlined_pk_i64.extend(result.deleted_inlined_pk_i64);
             deleted_inlined_row_keys.extend(result.deleted_inlined_row_keys);
             reinserted_over_tombstone += result.reinserted_over_tombstone;
-            incoming_keys.extend(result.kept_keys.iter().cloned());
-            kept_keys.extend(result.kept_keys);
+            incoming_keys.extend_ref(&result.kept_keys);
+            kept_keys.absorb(result.kept_keys);
             if let Some(fb) = result.filtered_batch
                 && fb.num_rows() > 0
             {
@@ -7709,11 +8283,7 @@ impl CayenneTableProvider {
         //    rows across several shards (small multi-row txns) — take the inline
         //    branch below and skip the thread machinery, since there the spawn (not
         //    the validation) would bound apply throughput and thus lag.
-        let mut per_shard_validated: Vec<(
-            Vec<RecordBatch>,
-            OnConflictDeletions,
-            HashSet<OwnedRow>,
-        )> = {
+        let mut per_shard_validated: Vec<(Vec<RecordBatch>, OnConflictDeletions, PkDigestSet)> = {
             // Below this many total rows a MULTI-shard apply still validates inline
             // instead of spawning a validation thread per shard: one scoped OS
             // thread per non-empty shard costs ~34 µs at 4 shards (measured,
@@ -7746,7 +8316,11 @@ impl CayenneTableProvider {
                     .enumerate()
                     .map(|(s, shard_batches)| {
                         if shard_batches.is_empty() {
-                            Ok((Vec::new(), OnConflictDeletions::default(), HashSet::new()))
+                            Ok((
+                                Vec::new(),
+                                OnConflictDeletions::default(),
+                                PkDigestSet::default(),
+                            ))
                         } else {
                             self.validate_one_shard(
                                 s,
@@ -7789,9 +8363,11 @@ impl CayenneTableProvider {
                         .into_iter()
                         .map(|handle| match handle {
                             // Empty shard: no validation ran; yield the empty result.
-                            None => {
-                                Ok((Vec::new(), OnConflictDeletions::default(), HashSet::new()))
-                            }
+                            None => Ok((
+                                Vec::new(),
+                                OnConflictDeletions::default(),
+                                PkDigestSet::default(),
+                            )),
                             Some(h) => match h.join() {
                                 Ok(result) => result,
                                 // A panic in shard validation is a bug; re-raise it
@@ -7811,10 +8387,20 @@ impl CayenneTableProvider {
         //    branch is never taken; `sharded_index` is `None` for
         //    `pk_conflict_detection: none`, in which case there is nothing to
         //    restore and the appends record no keys.
-        let validated_keys: HashSet<OwnedRow> = per_shard_validated
+        // Union every shard's kept keys, reusing each key's stored digest so this
+        // merge does not re-hash keys the per-shard sets already keyed. Pre-sized
+        // to the summed shard totals (an upper bound; keys are disjoint across
+        // shards) so the merge does not rehash/reserve.
+        let validated_capacity: usize = per_shard_validated
             .iter()
-            .flat_map(|(_, _, kept)| kept.iter().cloned())
-            .collect();
+            .map(|(_, _, kept)| kept.len())
+            .sum();
+        let mut validated_keys = PkDigestSet::with_capacity(validated_capacity);
+        for (_, _, kept) in &per_shard_validated {
+            for (digest, key) in kept.iter_with_digest() {
+                validated_keys.insert_with_digest(digest, key.clone());
+            }
+        }
         if let Some(index) = sharded_index.take() {
             self.store_sharded_pk_index(index);
         }
@@ -9954,7 +10540,7 @@ impl CayenneTableProvider {
     /// Uses `DataFusion`'s `SortExec` which provides:
     /// - **Automatic disk spilling**: Handles datasets larger than available memory
     /// - **Streaming external merge sort**: Processes data incrementally without loading all into RAM
-    /// - **SIMD-optimized kernels**: Hardware-accelerated sorting (NEON on arm64, AVX2/AVX-512 on amd64)
+    /// - **SIMD-optimized kernels**: Hardware-accelerated sorting (NEON on arm64, AVX2 on amd64)
     /// - **Configurable spill compression**: Supports zstd, `lz4_frame`, or uncompressed spill files
     /// - **Memory management**: Integrates with `DataFusion`'s memory pool and reservation system
     ///
@@ -12692,7 +13278,7 @@ impl CayenneTableProvider {
     }
 
     /// Resolve the cold-tier clustering columns to schema indices:
-    /// `cayenne_cold_clustering_columns` → else `cayenne_sort_columns` → else the
+    /// `cayenne_datalake_clustering_columns` → else `cayenne_sort_columns` → else the
     /// primary key. Returns the indices that exist in the schema (empty = no
     /// clustering, promotion writes unsorted).
     fn resolve_cold_clustering_indices(&self) -> Vec<usize> {
@@ -12765,8 +13351,8 @@ impl CayenneTableProvider {
         let promotion_id = uuid::Uuid::now_v7().to_string();
         let cold_base = cold_location.trim_end_matches('/');
         let cold_dir_url = format!(
-            "{cold_base}/{}/cold/{promotion_id}/",
-            self.table_metadata.table_id
+            "{cold_base}/{}/data/{promotion_id}/",
+            self.table_metadata.datalake_dir_segment()
         );
 
         // A local `file://` cold tier needs its target directory created before
@@ -12780,9 +13366,13 @@ impl CayenneTableProvider {
             Self::ensure_snapshot_dir_exists(std::path::Path::new(local)).await?;
         }
 
-        let target_size_bytes =
-            self.table_metadata.vortex_config.cold_target_file_size_mb * 1024 * 1024;
-        let write_format = self.write_shard_format(1, target_size_bytes, None);
+        let cold_target_file_size_mb = self.table_metadata.vortex_config.cold_target_file_size_mb;
+        let target_size_bytes = cold_target_file_size_mb.saturating_mul(1024 * 1024);
+
+        let shard = self.write_shard_config(1, target_size_bytes, None);
+        let write_format = self
+            .context
+            .cold_write_format(cold_target_file_size_mb, shard);
         let cold_listing_table = Self::create_listing_table(
             &cold_dir_url,
             self.table_schema(),
@@ -12819,6 +13409,18 @@ impl CayenneTableProvider {
         let format = self.context.file_format();
         let prefix = cold_table_url.prefix().clone();
 
+        // Per-file PK bloom is built only for upsert-eligible PK tables (the only
+        // tables whose keyset rebuild can consume it — a `DoNothing` bloom false
+        // positive would wrongly drop a genuinely new row). Build the row
+        // converter once and reuse it per file (matches the `OwnedRow` byte
+        // encoding the CDC conflict-detection probe uses).
+        let bloom_converter = if self.upsert_bloom_eligible() && !self.pk_column_indices.is_empty()
+        {
+            Some(self.build_pk_converter(&self.pk_column_indices)?)
+        } else {
+            None
+        };
+
         let mut listing = store.list(Some(&prefix));
         let mut cold_files = Vec::new();
         let mut total_rows = 0u64;
@@ -12851,9 +13453,23 @@ impl CayenneTableProvider {
                         );
                         Vec::new()
                     });
+            let file_url = format!("{object_store_url_str}{}", meta.location);
+            let pk_bloom = if let Some(converter) = bloom_converter.as_ref() {
+                self.build_cold_file_pk_bloom(
+                    session_state.as_ref(),
+                    &file_url,
+                    format,
+                    &self.pk_column_indices,
+                    converter,
+                    row_count,
+                )
+                .await?
+            } else {
+                None
+            };
             cold_files.push(crate::metadata::ColdTierFile {
                 table_id: self.table_metadata.table_id.clone(),
-                file_url: format!("{object_store_url_str}{}", meta.location),
+                file_url,
                 row_count,
                 file_size_bytes: i64::try_from(meta.size).unwrap_or(i64::MAX),
                 // v1 promotion re-materializes the whole table, so a per-file
@@ -12862,23 +13478,118 @@ impl CayenneTableProvider {
                 min_sequence: 0,
                 max_sequence,
                 statistics_blob,
+                pk_bloom,
             });
         }
 
         Ok((cold_files, total_rows))
     }
 
-    /// Cold-tier graduation (storage-cascade bottom tier; v1 = whole-table).
+    /// Build the per-file primary-key existence bloom for a just-written cold
+    /// file by reading back ONLY its PK column(s) (deletes were already applied
+    /// at promotion, so raw PK values are the file's live keys). Sized ~10
+    /// bits/key. Returns `None` for an empty file or when the right-sized bloom
+    /// would exceed [`COLD_PK_BLOOM_PER_FILE_MAX_BYTES`] — the keyset rebuild
+    /// then falls back to the exact cold scan for the whole table, which is
+    /// always correct, just not accelerated.
+    async fn build_cold_file_pk_bloom(
+        &self,
+        session_state: &datafusion::execution::SessionState,
+        file_url: &str,
+        read_format: &Arc<VortexFormat>,
+        pk_indices: &[usize],
+        converter: &RowConverter,
+        row_count: i64,
+    ) -> Result<Option<Vec<u8>>> {
+        let Ok(expected_keys) = usize::try_from(row_count) else {
+            return Ok(None);
+        };
+        if expected_keys == 0 {
+            return Ok(None);
+        }
+        // Skip (fall back to the exact cold scan) when the right-sized bloom
+        // would blow the per-file cap — keeps the manifest/snapshot bounded on
+        // huge cold files.
+        if expected_keys.saturating_mul(10) / 8 > COLD_PK_BLOOM_PER_FILE_MAX_BYTES {
+            tracing::warn!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                file = file_url,
+                expected_keys,
+                "Cold-tier file exceeds the per-file PK-bloom cap; keyset rebuild falls back to the exact cold scan for this table"
+            );
+            return Ok(None);
+        }
+
+        let listing_table = Self::create_listing_table(
+            file_url,
+            self.table_schema(),
+            read_format,
+            &self.pk_deletion_strategy,
+        )?;
+        let projection: Vec<usize> = pk_indices.to_vec();
+        let scan_plan = listing_table
+            .scan(session_state, Some(&projection), &[], None)
+            .await?;
+        let mut stream =
+            datafusion_physical_plan::execute_stream(scan_plan, session_state.task_ctx())?;
+
+        let mut bloom =
+            PkBloom::with_expected_keys(expected_keys, COLD_PK_BLOOM_PER_FILE_MAX_BYTES);
+        // After projection, the PK columns are at indices 0..pk_indices.len(),
+        // in `pk_indices` order — the same order `converter` (built over
+        // `pk_indices`) and the CDC probe expect.
+        let mut inserted: usize = 0;
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let pk_columns: Vec<ArrayRef> = (0..pk_indices.len())
+                .map(|i| Arc::clone(batch.column(i)))
+                .collect();
+            let rows = converter.convert_columns(&pk_columns)?;
+            for i in 0..batch.num_rows() {
+                bloom.insert(rows.row(i).as_ref());
+            }
+            inserted += batch.num_rows();
+        }
+        // Defense-in-depth: the file was just written with deletes applied, so
+        // the read-back must see exactly the footer's row count. A silent
+        // under-read would produce a bloom with FALSE NEGATIVES (missed cold
+        // keys → upsert double-counting) — on any mismatch, publish no bloom so
+        // the keyset rebuild takes the exact cold scan instead.
+        if inserted != expected_keys {
+            tracing::warn!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                file = file_url,
+                expected_keys,
+                inserted,
+                "Cold-file PK bloom read-back row count mismatch; keyset rebuild falls back to the exact cold scan"
+            );
+            return Ok(None);
+        }
+        Ok(Some(bloom.to_bytes()))
+    }
+
+    /// Cold-tier graduation (storage-cascade bottom tier; incremental
+    /// carry-forward — promotion cost is proportional to the CHANGED data,
+    /// not total table size).
     ///
-    /// When the warm tier has grown past `cayenne_cold_tier_warm_max_bytes` /
-    /// `_files`, graduate the table's whole durable content to the cold object
-    /// store: flush the in-RAM/inline tiers, read the canonical visible stream
-    /// (all deletes applied, single-version per key — the proven rewrite read),
+    /// When the warm tier has grown past `cayenne_datalake_warm_max_bytes` /
+    /// `_files`: flush the in-RAM/inline tiers, classify the existing cold
+    /// manifest into dirty/clean against the durable tombstones
+    /// ([`Self::partition_cold_manifest_for_promotion`]), read the canonical
+    /// visible stream restricted to warm + dirty cold files (all deletes
+    /// applied, single-version per key — the proven rewrite read with a
+    /// [`super::cold_partition::ColdScanFileSubset`] session extension),
     /// Z-order cluster it, write read-optimized Vortex to the cold store, then
-    /// atomically register the cold files + overwrite-clear the warm tier + flip
-    /// to a fresh empty warm snapshot. Subsequent CDC writes accumulate in warm
-    /// again until the next graduation. Reuses `commit_overwrite` semantics, so a
-    /// crash is all-or-nothing.
+    /// atomically register the new files PLUS the carried-forward clean
+    /// manifest rows + overwrite-clear the warm tier + flip to a fresh empty
+    /// warm snapshot. Subsequent CDC writes accumulate in warm again until the
+    /// next graduation. Reuses `commit_overwrite` semantics, so a crash is
+    /// all-or-nothing.
     ///
     /// Returns `Ok(true)` if a graduation committed, `Ok(false)` if the cold tier
     /// is disabled, unsupported (position-delete), or not yet triggered.
@@ -12891,7 +13602,162 @@ impl CayenneTableProvider {
     /// Holds `write_lock` for the whole graduation (mirrors `begin_overwrite`), so
     /// no append races the capture→write→commit and the generation fence is
     /// unnecessary. Heavy + infrequent (gated by the warm-size thresholds).
+    ///
+    /// Records promotion telemetry under `kind="datalake"`, mirroring the
+    /// `kind="full"`/`"subset"` compaction passes: duration with a
+    /// `completed`/`failed` result label for passes that promoted or failed
+    /// (`Ok(false)` no-ops are not counted), plus the memory-exhausted counter.
     pub async fn promote_warm_to_cold(&self) -> Result<bool> {
+        let pass_start = Instant::now();
+        let result = self.promote_warm_to_cold_inner().await;
+        if matches!(result, Ok(true) | Err(_)) {
+            let table = self.table_metadata.table_name.clone();
+            let result_label = if result.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            };
+            telemetry::cayenne::track_compaction_duration(
+                pass_start.elapsed(),
+                &[
+                    telemetry::KeyValue::new("table", table.clone()),
+                    telemetry::KeyValue::new("kind", "datalake"),
+                    telemetry::KeyValue::new("result", result_label),
+                ],
+            );
+            if matches!(
+                &result,
+                Result::Err(Error::DataFusion {
+                    source: DataFusionError::ResourcesExhausted(_)
+                })
+            ) {
+                telemetry::cayenne::track_compaction_memory_exhausted(&[
+                    telemetry::KeyValue::new("table", table),
+                    telemetry::KeyValue::new("kind", "datalake"),
+                ]);
+            }
+        }
+        result
+    }
+
+    /// Classify the cold manifest into dirty/clean for the carry-forward
+    /// promotion (see [`super::cold_partition`]).
+    ///
+    /// Tombstoned keys come from the DURABLE deletion vectors — the in-memory
+    /// key index stores only key hashes, but the DV rows persist the
+    /// `RowConverter`-encoded key bytes (Int64-PK tables persist raw
+    /// big-endian `i64`). The caller runs after the mem-tier/inline
+    /// checkpoints, so the durable set is complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the deletion vectors cannot be listed/read or the
+    /// tombstone keys cannot be decoded — the promotion executor handles it
+    /// (warn + skip the pass); this function never logs or applies policy.
+    async fn partition_cold_manifest_for_promotion(
+        &self,
+        cold_files: Vec<crate::metadata::ColdTierFile>,
+    ) -> Result<super::cold_partition::ColdFilePartition> {
+        use super::cold_partition::{
+            ColdFilePartition, decode_int64_tombstone_keys, decode_tombstone_keys,
+            encode_int64_bloom_probes, partition_cold_files,
+        };
+
+        let internal = |message: String| Error::Internal {
+            table: self.table_metadata.table_name.clone(),
+            message,
+        };
+
+        if cold_files.is_empty() {
+            return Ok(ColdFilePartition {
+                dirty: Vec::new(),
+                clean: Vec::new(),
+                tombstones: 0,
+                cleared_by_min_max: 0,
+                cleared_by_bloom: 0,
+            });
+        }
+
+        // Durable tombstone keys (bytes) from the deletion-vector files.
+        let delete_files = self
+            .catalog
+            .get_table_delete_files(&self.table_metadata.table_id)
+            .await?;
+        if delete_files.is_empty() {
+            // No tombstones can touch cold data: everything carries forward.
+            return Ok(ColdFilePartition {
+                dirty: Vec::new(),
+                clean: cold_files,
+                tombstones: 0,
+                cleared_by_min_max: 0,
+                cleared_by_bloom: 0,
+            });
+        }
+        let (_, deleted_row_keys, _, _) = tokio::task::spawn_blocking(move || {
+            super::delete::detect_deletion_type_and_read(delete_files)
+        })
+        .await
+        .map_err(|join_error| {
+            internal(format!(
+                "carry-forward classification reader task failed: {join_error}"
+            ))
+        })??;
+        if deleted_row_keys.is_empty() {
+            return Ok(ColdFilePartition {
+                dirty: Vec::new(),
+                clean: cold_files,
+                tombstones: 0,
+                cleared_by_min_max: 0,
+                cleared_by_bloom: 0,
+            });
+        }
+
+        // Decode the key bytes into per-column scalars for the rectangle test.
+        let key_bytes: Vec<Box<[u8]>> = deleted_row_keys.into_keys().collect();
+        let decoded = if let Some(converter) = self.pk_row_converter.as_deref() {
+            decode_tombstone_keys(converter, &key_bytes).map_err(|e| {
+                internal(format!(
+                    "carry-forward classification failed to decode tombstone keys: {e}"
+                ))
+            })?
+        } else if matches!(
+            self.pk_deletion_strategy,
+            PkDeletionStrategyWithCache::Int64Pk { .. }
+        ) {
+            decode_int64_tombstone_keys(&key_bytes).map_err(|e| {
+                internal(format!(
+                    "carry-forward classification found malformed Int64 tombstone keys: {e}"
+                ))
+            })?
+        } else {
+            return Err(internal(
+                "carry-forward classification has no key decoder for this deletion strategy"
+                    .to_string(),
+            ));
+        };
+
+        // Bloom probe bytes, index-aligned with `decoded`: composite DV keys
+        // are already the converter row encoding the per-file blooms insert;
+        // Int64 DV keys are raw BE and must be re-encoded. `None` merely
+        // disables the bloom refinement (rectangle-only classification).
+        let bloom_probes: Option<Vec<Box<[u8]>>> = if self.pk_row_converter.is_some() {
+            Some(key_bytes)
+        } else {
+            self.build_pk_converter(&self.pk_column_indices)
+                .ok()
+                .and_then(|converter| encode_int64_bloom_probes(&converter, &decoded))
+        };
+
+        Ok(partition_cold_files(
+            cold_files,
+            &decoded,
+            bloom_probes.as_deref(),
+            &self.table_metadata.schema,
+            &self.pk_column_indices,
+        ))
+    }
+
+    async fn promote_warm_to_cold_inner(&self) -> Result<bool> {
         let vc = &self.table_metadata.vortex_config;
         if !vc.cold_tier_enabled() {
             return Ok(false);
@@ -12922,15 +13788,25 @@ impl CayenneTableProvider {
         let over_files =
             vc.cold_tier_warm_max_files > 0 && warm_files >= vc.cold_tier_warm_max_files;
         if !(over_bytes || over_files) {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                warm_bytes,
+                warm_files,
+                max_bytes = vc.cold_tier_warm_max_bytes,
+                max_files = vc.cold_tier_warm_max_files,
+                "Datalake promotion skipped; warm tier below thresholds"
+            );
             return Ok(false);
         }
 
+        let promotion_start = Instant::now();
         tracing::info!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             warm_bytes,
             warm_files,
-            "Promoting warm tier to cold object store (Z-order clustered graduation)"
+            "Promoting warm tier to datalake store (Z-order clustered graduation)"
         );
 
         // Exclude writers for the whole graduation (mirrors begin_overwrite).
@@ -12947,10 +13823,58 @@ impl CayenneTableProvider {
 
         let max_sequence = self.sequence_high_water().await;
 
+        // ---- Carry-forward partition (incremental promotion). Classify the
+        // existing cold manifest into DIRTY files (may contain a tombstoned
+        // key — must be re-read and rewritten) and CLEAN files (provably
+        // untouched — carried forward by manifest reference, never re-read).
+        // Promotion cost is thereby proportional to the changed data, not
+        // total table size.
+        let prior_cold = self
+            .catalog
+            .list_cold_tier_files(&self.table_metadata.table_id)
+            .await?;
+        let prior_cold_len = prior_cold.len();
+        let partition = match self.partition_cold_manifest_for_promotion(prior_cold).await {
+            Ok(partition) => partition,
+            Err(error) => {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    "Carry-forward classification failed; skipping this promotion pass (next tick retries)"
+                );
+                return Ok(false);
+            }
+        };
+        tracing::debug!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            tombstones = partition.tombstones,
+            dirty_files = partition.dirty.len(),
+            carried_files = partition.clean.len(),
+            cleared_by_min_max = partition.cleared_by_min_max,
+            cleared_by_bloom = partition.cleared_by_bloom,
+            "Classified datalake manifest for carry-forward"
+        );
+        // Deliberately no dirty-fraction guardrail: clean files are always
+        // carried, so carried files' PK ranges may increasingly overlap new
+        // files' across promotions. Watch `datalake_rewrite_selectivity`; if it
+        // ratchets up, the counter-measure is a recluster policy (full rewrite
+        // past a dirty-fraction threshold).
+        let (dirty_cold, clean_cold) = (partition.dirty, partition.clean);
+
         // Canonical visible read (all tiers, all deletes applied, single-version
         // per key) — reuses the proven rewrite read so cold is correct by
-        // construction.
-        let ctx = self.create_compaction_session_context();
+        // construction. The session's `ColdScanFileSubset` extension restricts
+        // its cold branch to the dirty files: clean files stay out of the
+        // stream entirely.
+        let dirty_urls: std::collections::HashSet<String> =
+            dirty_cold.iter().map(|f| f.file_url.clone()).collect();
+        let ctx = self.create_compaction_session_context_with_config(
+            SessionConfig::default().with_extension(Arc::new(
+                super::cold_partition::ColdScanFileSubset(dirty_urls),
+            )),
+        );
         let (stream, _generation_before) = self.visible_file_stream_for_rewrite(&ctx).await?;
 
         // Z-order cluster for a read-optimized cold layout.
@@ -12967,17 +13891,33 @@ impl CayenneTableProvider {
                 max_sequence,
             )
             .await?;
-        if cold_files.is_empty() {
-            // Nothing live to promote (e.g. every row deleted): the writer
-            // produced no cold files, so there is nothing to register or clean
-            // up. Gate on files-written rather than `total_rows` — a file that
-            // was written but whose footer row count couldn't be inferred must
-            // still be committed, not silently orphaned in the cold store.
+        if cold_files.is_empty() && dirty_cold.is_empty() {
+            // Nothing rewritten and nothing to drop. Gate on files-written, not
+            // `total_rows`: a written file whose footer row count couldn't be
+            // inferred must still be committed, not silently orphaned. (No new
+            // files with dirty files present IS a legitimate commit: every
+            // dirty row was deleted.)
             return Ok(false);
         }
 
-        // Commit: atomically register cold files + overwrite-clear warm + flip to
-        // a fresh empty warm snapshot, then sync the in-memory state.
+        // Commit: atomically register the NEW cold files plus the
+        // carried-forward CLEAN manifest rows (verbatim — their objects were
+        // never touched), overwrite-clear warm + the prior cold manifest, and
+        // flip to a fresh empty warm snapshot, then sync in-memory state. The
+        // deletion index is cleared by the same commit: every tombstone was
+        // physically applied by this rewrite (warm-resident keys by the warm
+        // stream, cold-resident keys by the dirty-file stream; conservative
+        // detection guarantees no tombstoned key hides in a carried file).
+        let written_files = cold_files.len();
+        let carried_datalake_files = clean_cold.len();
+        // Newly WRITTEN bytes only (carried files cost zero object-store IO) —
+        // the production check that promotion cost tracks the CHANGED data.
+        let written_bytes: u64 = cold_files
+            .iter()
+            .map(|f| u64::try_from(f.file_size_bytes.max(0)).unwrap_or(0))
+            .sum();
+        let mut cold_files = cold_files;
+        cold_files.extend(clean_cold);
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
         if !self.table_metadata.path.starts_with("s3://") {
             let dir = self.snapshot_dir_path_for(&new_snapshot_id);
@@ -12996,13 +13936,53 @@ impl CayenneTableProvider {
             );
         }
         self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
+        // Physical GC of the cold objects this promotion orphans is NOT inline —
+        // it runs as a periodic mark-and-sweep on the background tick
+        // (`run_cold_tier_gc_tick`), self-healing across restarts.
 
+        // Bytes WRITTEN this promotion (carried files cost nothing), reported to
+        // the shared cross-kind `cayenne_compaction_merged_bytes` metric —
+        // "merged bytes" is that family's name for a pass's written output. The
+        // datalake-specific vocabulary lives in the trace fields below.
+        telemetry::cayenne::track_compaction_merged_bytes(
+            written_bytes,
+            &[
+                telemetry::KeyValue::new("table", self.table_metadata.table_name.clone()),
+                telemetry::KeyValue::new("kind", "datalake"),
+            ],
+        );
+
+        // Trace fields come in three pairs: input (warm_files/warm_bytes),
+        // classification (rewritten/carried datalake files — sums to the prior
+        // manifest size), output (written_files/written_bytes). The headline
+        // `datalake_rewrite_selectivity` is the fraction of existing datalake
+        // files selected for rewrite — lower is better.
+        let rewritten_datalake_files = dirty_cold.len();
+        let datalake_rewrite_selectivity = if prior_cold_len == 0 {
+            "n/a (first promotion, no existing datalake files)".to_string()
+        } else {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "file counts are far below f64's exact-integer range; display only"
+            )]
+            let pct = (rewritten_datalake_files as f64 / prior_cold_len as f64) * 100.0;
+            format!(
+                "{pct:.1}% ({rewritten_datalake_files}/{prior_cold_len} existing datalake files)"
+            )
+        };
         tracing::info!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
-            cold_files = cold_files.len(),
+            datalake_rewrite_selectivity = %datalake_rewrite_selectivity,
+            warm_files,
+            warm_bytes,
+            rewritten_datalake_files,
+            carried_datalake_files,
+            written_files,
+            written_bytes,
             total_rows,
-            "Cold-tier promotion committed"
+            duration_ms = u64::try_from(promotion_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "Datalake-tier promotion committed"
         );
         Ok(true)
     }
@@ -14542,9 +15522,20 @@ impl CayenneTableProvider {
     /// snapshot rewrite cannot starve concurrent queries. Falls back to the
     /// shared query environment when no dedicated compaction env is set.
     fn create_compaction_session_context(&self) -> SessionContext {
+        self.create_compaction_session_context_with_config(SessionConfig::default())
+    }
+
+    /// [`Self::create_compaction_session_context`] with an explicit config —
+    /// the carry-forward promotion attaches its [`ColdScanFileSubset`]
+    /// extension here so its private session's cold branch reads only the
+    /// dirty files being rewritten.
+    fn create_compaction_session_context_with_config(
+        &self,
+        config: SessionConfig,
+    ) -> SessionContext {
         let runtime_env = super::compaction::compaction_runtime_env()
             .unwrap_or_else(|| Arc::clone(self.context.runtime_env()));
-        SessionContext::new_with_config_rt(SessionConfig::default(), runtime_env)
+        SessionContext::new_with_config_rt(config, runtime_env)
     }
 
     /// Wrap a plan with a `FilterExec` that enforces the retention filter.
@@ -16679,7 +17670,7 @@ impl CayenneTableProvider {
         let tier_version = crate::provider::mem_tier::ShardedMemTier::version_hash_of(shards);
         let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
         if let Some(memo) = self.merged_scan_deletions.load_full()
-            && memo.file_index_ptr == file_index_ptr
+            && memo.file_index_ptr() == Some(file_index_ptr)
             && memo.tier_version == tier_version
             && memo.structural_epoch == structural_epoch
         {
@@ -16688,7 +17679,10 @@ impl CayenneTableProvider {
         let merged = deletion_snapshot.with_mem_tier_tombstones_map(&union);
         self.merged_scan_deletions
             .store(Some(Arc::new(MergedScanDeletions {
-                file_index_ptr,
+                // Retain the file-side source snapshot (pins its index `Arc` so
+                // the `file_index_ptr` identity above stays ABA-safe — #11303);
+                // `deletion_snapshot` is unused past this point.
+                file_index: deletion_snapshot,
                 tier_version,
                 structural_epoch,
                 merged: merged.clone(),
@@ -17285,7 +18279,7 @@ impl CayenneTableProvider {
             // passed in so the shard append's lock-held region stays synchronous
             // (see `validate_and_append_sharded` / `append_to_shard`).
             let base_sequence = self.reserve_sequences_local(2).await?;
-            let no_keys: HashSet<OwnedRow> = HashSet::new();
+            let no_keys: PkDigestSet = PkDigestSet::default();
             self.append_to_shard(
                 0,
                 Vec::new(),
@@ -17340,7 +18334,7 @@ impl CayenneTableProvider {
         // checkpoint relies on (see `validate_and_append_sharded`).
         let base_sequence = self.reserve_sequences_local(2).await?;
         let reserved_sequences = (base_sequence, base_sequence + 1);
-        let no_keys: HashSet<OwnedRow> = HashSet::new();
+        let no_keys: PkDigestSet = PkDigestSet::default();
         let append_futures = per_shard
             .iter()
             .enumerate()
@@ -17601,7 +18595,7 @@ impl CayenneTableProvider {
         // N==1 / non-sharded callers record no keys into the sharded existence
         // cache (it is `None` off the sharded path) — byte-identical to the
         // pre-Phase-6 behavior.
-        let no_keys: HashSet<OwnedRow> = HashSet::new();
+        let no_keys: PkDigestSet = PkDigestSet::default();
         self.append_to_shard(
             0,
             batches,
@@ -17646,7 +18640,7 @@ impl CayenneTableProvider {
         // HIT-path validation against this shard observes the prior MISS-path appends.
         // EMPTY for the N==1 / non-sharded callers (the sharded cache is `None` off
         // the sharded path), so those callers stay byte-identical.
-        record_keys: &HashSet<OwnedRow>,
+        record_keys: &PkDigestSet,
         // Maintained-aggregate DELETE retraction rows (trunk #11389), advanced +
         // enqueued under THIS shard's publish lock. `Some` only on the N=1
         // retraction-aware delete entry (`append_to_mem_tier_inner`); `None` on the
@@ -17864,12 +18858,15 @@ impl CayenneTableProvider {
             if self.mem_tier_shard_count() == 1
                 && let Some(memo) = self.merged_scan_deletions.load_full()
                 && memo.tier_version == cur.version
-                && Some(memo.file_index_ptr) == self.pk_deletion_snapshot().index_ptr()
+                && memo.file_index_ptr() == self.pk_deletion_snapshot().index_ptr()
             {
                 let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
                 self.merged_scan_deletions
                     .store(Some(Arc::new(MergedScanDeletions {
-                        file_index_ptr: memo.file_index_ptr,
+                        // The file-side index is unchanged by a tier append —
+                        // carry the retained source snapshot forward (keeps its
+                        // `Arc` pinned so the ptr identity stays ABA-safe, #11303).
+                        file_index: memo.file_index.clone(),
                         tier_version: next_version,
                         structural_epoch,
                         merged: memo.merged.extended_by_delta(&tombstones),
@@ -19085,12 +20082,15 @@ impl CayenneTableProvider {
         // `filter_inlined_batch_for_deletions` reads live (`pk_deletion_strategy`
         // via `pk_deletion_snapshot`), so the key reflects what the memoized
         // batches were filtered against.
-        let file_index_ptr = self.pk_deletion_snapshot().index_ptr();
+        // Retain the file-side source snapshot in the memo (pins its index `Arc`
+        // so the `file_index_ptr` identity stays ABA-safe — #11303).
+        let file_index = self.pk_deletion_snapshot();
+        let file_index_ptr = file_index.index_ptr();
         let tier_version = crate::provider::mem_tier::ShardedMemTier::version_hash_of(shards);
         let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
 
         let segments = if let Some(memo) = self.mem_tier_visible_memo.load_full()
-            && memo.file_index_ptr == file_index_ptr
+            && memo.file_index_ptr() == file_index_ptr
             && memo.tier_version == tier_version
             && memo.structural_epoch == structural_epoch
         {
@@ -19107,7 +20107,7 @@ impl CayenneTableProvider {
             );
             self.mem_tier_visible_memo
                 .store(Some(Arc::new(MemTierVisibleMemo {
-                    file_index_ptr,
+                    file_index: Some(file_index),
                     tier_version,
                     structural_epoch,
                     segments: Arc::clone(&built),
@@ -20840,11 +21840,19 @@ impl CayenneTableProvider {
         scan_config: &SessionConfig,
         read_schema_override: Option<SchemaRef>,
     ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
-        // Cold tier disabled (no location) → no branch. The object store for the
-        // cold URLs is resolved from the session registry: the default local
-        // store for `file://` cold, or the cold S3 store registered at scan top.
+        // Cold tier disabled (no location) → no branch.
         if !self.table_metadata.vortex_config.cold_tier_enabled() {
             return Ok(None);
+        }
+
+        // Register the cold object store on THIS session's registry
+        // (idempotent). `scan()` also registers it at scan top, but other
+        // callers — e.g. the PK keyset rebuild — build fresh session contexts,
+        // and an unregistered s3:// URL falls back to a default-region S3
+        // client (region-redirect failures on non-us-east-1 buckets). A local
+        // `file://` cold location needs no registration.
+        if let Some(ref cold_config) = self.cold_object_store_config {
+            Self::register_object_store_if_needed(state.runtime_env(), cold_config);
         }
 
         let cold_files = self
@@ -20860,6 +21868,19 @@ impl CayenneTableProvider {
                     self.table_metadata.table_name
                 ))
             })?;
+        // Carry-forward promotion: the promotion's PRIVATE session carries a
+        // `ColdScanFileSubset` config extension restricting this branch to the
+        // dirty files being rewritten (clean files are carried forward by
+        // manifest reference, never re-read). User-query sessions never carry
+        // the extension, so queries always see the full manifest.
+        let cold_files =
+            match scan_config.get_extension::<super::cold_partition::ColdScanFileSubset>() {
+                Some(subset) => cold_files
+                    .into_iter()
+                    .filter(|f| subset.0.contains(&f.file_url))
+                    .collect(),
+                None => cold_files,
+            };
         // No early all-empty guard needed: the per-file loop skips zero-size
         // files and the `object_store_url is None` / `kept.is_empty()` checks
         // below both return `Ok(None)` when nothing survives.
@@ -21994,7 +23015,7 @@ impl TableProvider for CayenneTableProvider {
     }
 
     fn constraints(&self) -> Option<&Constraints> {
-        None
+        self.pk_constraints.as_ref()
     }
 
     async fn scan(
@@ -23595,6 +24616,24 @@ impl super::compaction::ColdTierPromotionRunner for CayenneTableProvider {
                 );
             }
         }
+
+        // Physical cold GC fires about every `cold_tier_gc_interval_ms`
+        // regardless of the (finer) promotion tick — even when nothing was
+        // promoted, so orphans from before a restart are swept on an idle table.
+        let gc_interval = std::time::Duration::from_millis(
+            self.table_metadata.vortex_config.cold_tier_gc_interval_ms,
+        );
+        let due = {
+            let last = self.cold_gc_last_run.lock();
+            last.is_none_or(|t| t.elapsed() >= gc_interval)
+        };
+        if due {
+            self.run_cold_tier_gc_tick().await;
+            // Stamped AFTER the sweep: a sweep that outlives the interval must
+            // not trigger a back-to-back run next tick. Ticks are serial per
+            // table, so there is no re-entrancy to guard during the await.
+            *self.cold_gc_last_run.lock() = Some(Instant::now());
+        }
     }
 
     fn cold_tier_promotion_target_name(&self) -> &str {
@@ -23759,6 +24798,143 @@ mod tests {
     use std::time::UNIX_EPOCH;
 
     use super::*;
+
+    fn url(s: &str) -> String {
+        s.to_string()
+    }
+
+    /// Mark-and-sweep core: an orphan (on store, not in manifest) is marked on
+    /// first sight and deleted only once observed for >= grace; a manifest-
+    /// referenced file is never touched.
+    #[test]
+    fn cold_gc_marks_then_sweeps_after_grace() {
+        let grace = std::time::Duration::from_mins(5);
+        let live: HashSet<String> = [url("s3://b/t/data/p2/live.vortex")].into_iter().collect();
+        let on_store = vec![
+            url("s3://b/t/data/p2/live.vortex"),
+            url("s3://b/t/data/p1/orphan.vortex"),
+        ];
+        let mut first_seen = HashMap::new();
+        let t0 = Instant::now();
+
+        // First sight: orphan marked, nothing deleted; the live file is never tracked.
+        let del = CayenneTableProvider::plan_cold_gc_deletions(
+            &on_store,
+            &live,
+            &mut first_seen,
+            t0,
+            grace,
+        );
+        assert!(del.is_empty(), "first sight deletes nothing");
+        assert!(first_seen.contains_key(&url("s3://b/t/data/p1/orphan.vortex")));
+        assert!(
+            !first_seen.contains_key(&url("s3://b/t/data/p2/live.vortex")),
+            "referenced file is not aged"
+        );
+
+        // Before grace (half a grace in): still nothing.
+        let del = CayenneTableProvider::plan_cold_gc_deletions(
+            &on_store,
+            &live,
+            &mut first_seen,
+            t0 + grace / 2,
+            grace,
+        );
+        assert!(del.is_empty(), "before grace deletes nothing");
+
+        // At grace (the second sweep): orphan deleted, live kept.
+        let del = CayenneTableProvider::plan_cold_gc_deletions(
+            &on_store,
+            &live,
+            &mut first_seen,
+            t0 + grace,
+            grace,
+        );
+        assert_eq!(del, vec![url("s3://b/t/data/p1/orphan.vortex")]);
+    }
+
+    /// Restart safety: a fresh (empty) `first_seen` — the post-restart state —
+    /// must re-mark an orphan and wait a full grace, never delete on first sight,
+    /// however old the orphan actually is.
+    #[test]
+    fn cold_gc_restart_resets_grace_never_premature() {
+        let grace = std::time::Duration::from_mins(5);
+        let live = HashSet::new();
+        let on_store = vec![url("s3://b/orphan.vortex")];
+        let mut first_seen = HashMap::new(); // as if just restarted
+        let t = Instant::now();
+
+        // Even "long after" the orphan was created, first observation only marks.
+        let del = CayenneTableProvider::plan_cold_gc_deletions(
+            &on_store,
+            &live,
+            &mut first_seen,
+            t + grace * 10,
+            grace,
+        );
+        assert!(
+            del.is_empty(),
+            "restart re-marks; never deletes on first sight"
+        );
+
+        // A grace after first observation: now collectible.
+        let del = CayenneTableProvider::plan_cold_gc_deletions(
+            &on_store,
+            &live,
+            &mut first_seen,
+            t + grace * 10 + grace,
+            grace,
+        );
+        assert_eq!(del, vec![url("s3://b/orphan.vortex")]);
+    }
+
+    /// A marked orphan that is no longer orphaned — re-referenced by the manifest,
+    /// or physically gone from the store — must have its aging timer pruned so it
+    /// is never (spuriously) deleted and the map stays bounded.
+    #[test]
+    fn cold_gc_prunes_no_longer_orphaned() {
+        let grace = std::time::Duration::from_mins(5);
+        let t0 = Instant::now();
+        let f = url("s3://b/f.vortex");
+        let mut first_seen = HashMap::new();
+        let empty: HashSet<String> = HashSet::new();
+
+        // Mark it as an orphan.
+        CayenneTableProvider::plan_cold_gc_deletions(
+            std::slice::from_ref(&f),
+            &empty,
+            &mut first_seen,
+            t0,
+            grace,
+        );
+        assert!(first_seen.contains_key(&f));
+
+        // Now referenced by the manifest → pruned, and never deleted even past grace.
+        let live: HashSet<String> = [f.clone()].into_iter().collect();
+        let del = CayenneTableProvider::plan_cold_gc_deletions(
+            std::slice::from_ref(&f),
+            &live,
+            &mut first_seen,
+            t0 + grace * 2,
+            grace,
+        );
+        assert!(del.is_empty());
+        assert!(!first_seen.contains_key(&f), "re-referenced entry pruned");
+
+        // Re-mark, then it disappears from the store entirely → pruned.
+        CayenneTableProvider::plan_cold_gc_deletions(
+            std::slice::from_ref(&f),
+            &empty,
+            &mut first_seen,
+            t0,
+            grace,
+        );
+        assert!(first_seen.contains_key(&f));
+        let del =
+            CayenneTableProvider::plan_cold_gc_deletions(&[], &empty, &mut first_seen, t0, grace);
+        assert!(del.is_empty());
+        assert!(first_seen.is_empty(), "gone-from-store entry pruned");
+    }
 
     /// The orphaned-DV sweep floor must never trust an empty manifest as genesis
     /// while data files still exist — that was the P1 resurrection bug (#9388 /
@@ -34658,6 +35834,107 @@ mod tests {
         );
     }
 
+    /// Strong count of the file-side deletion index held inside a
+    /// `PkDeletionSnapshot` (the allocation the scan memos key on by
+    /// `Arc::as_ptr`). `0` for position-based (no index).
+    fn file_index_strong_count(snapshot: &PkDeletionSnapshot) -> usize {
+        match snapshot {
+            PkDeletionSnapshot::Int64Pk { tombstones } => Arc::strong_count(tombstones),
+            PkDeletionSnapshot::RowConverterBased { tombstones } => Arc::strong_count(tombstones),
+            PkDeletionSnapshot::PositionBased => 0,
+        }
+    }
+
+    /// #11303 regression: the per-scan deletion memos must RETAIN (pin) the
+    /// file-side deletion index they key on, not merely cache its raw
+    /// `Arc::as_ptr`.
+    ///
+    /// The memo key compares `Arc::as_ptr(file_index)`. If the memo does not
+    /// keep that `Arc` alive, a deletion publish can free the index and a later
+    /// publish can reuse its freed address for a new generation — a false
+    /// pointer match (ABA) that serves a stale merged deletion view and
+    /// resurrects deleted rows. Pinning the source `Arc` makes the address
+    /// non-reusable while the memo is live, so a pointer match can only mean
+    /// "same generation".
+    ///
+    /// The ABA itself is allocator-dependent and non-deterministic to trigger,
+    /// so this asserts the retention INVARIANT that eliminates it: after a scan
+    /// builds the memos, clearing them must drop the file-side index's strong
+    /// count (the memos were holding references to it). On the pre-fix code the
+    /// memos held no reference, so clearing them would not move the count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deletion_memos_pin_file_index_against_aba() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "aba_pin",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+
+        // Durable rows + checkpoint (a file-side deletion index exists), then a
+        // RAM upsert tombstoning a durable key so a scan builds BOTH the merged
+        // and the visible-batch deletion memos.
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20]),
+        )
+        .await;
+        provider
+            .checkpoint_inlined_data()
+            .await
+            .expect("flush inline rows to the file tier");
+        let write = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[100])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("RAM upsert");
+        assert!(
+            write.in_memory_epoch().is_some(),
+            "upsert engaged the RAM tier"
+        );
+
+        // Build the memos and re-assert visibility over the memoized path.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "aba_pin").await,
+            vec![(1, 100), (2, 20)],
+            "tier tombstone must hide the durable copy of PK 1"
+        );
+        assert!(
+            provider.merged_scan_deletions.load_full().is_some(),
+            "the scan must have stored the merged-deletions memo"
+        );
+
+        // The live file-side deletion index. `pk_deletion_snapshot()` clones its
+        // inner `Arc`, giving the test exactly one reference to count against;
+        // no write happens after this, so the live cell still holds the same
+        // generation the memos keyed on.
+        let live = provider.pk_deletion_snapshot();
+        let count_with_memos = file_index_strong_count(&live);
+        // Clearing the memos must release the reference(s) they were PINNING.
+        provider.merged_scan_deletions.store(None);
+        provider.mem_tier_visible_memo.store(None);
+        let count_without_memos = file_index_strong_count(&live);
+
+        assert!(
+            count_with_memos > count_without_memos,
+            "the scan deletion memos must PIN the file-side index (ABA guard, #11303): \
+             strong count was {count_with_memos} with the memos present and \
+             {count_without_memos} after clearing them — a pre-fix memo that cached only \
+             the raw pointer would leave the count unchanged"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mem_tier_join_probe_keeps_dynamic_filter_pushdown() {
         use arrow::array::Int64Array;
@@ -35252,7 +36529,7 @@ mod tests {
             .build_pk_converter(&pk_indices)
             .expect("build pk converter");
         let keyset = provider
-            .load_existing_keyset(&pk_indices, &pk_converter)
+            .load_existing_keyset(&pk_indices, &pk_converter, true)
             .await
             .expect("cold keyset rebuild");
         provider.store_cached_pk_index(CachedPkIndex::Exact(keyset));
@@ -35273,8 +36550,7 @@ mod tests {
                 panic!("seed insert must leave an Exact cached keyset (None/Bloom found)");
             };
             let positioned = keyset
-                .keys
-                .values()
+                .locations()
                 .filter(|loc| matches!(loc, RowLocation::FilePositioned { .. }))
                 .count();
             assert_eq!(

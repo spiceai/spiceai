@@ -20,3 +20,6 @@ pin-project.workspace = true
 http.workspace = true
 sha2.workspace = true
 x509-certificate.workspace = true
+
+[lints]
+workspace = true

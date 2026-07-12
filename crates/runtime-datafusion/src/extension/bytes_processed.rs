@@ -90,7 +90,7 @@ impl PhysicalOptimizerRule for BytesProcessedPhysicalOptimizer {
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         plan.transform_down(|plan| {
-            if plan.downcast_ref::<BytesProcessedExec>().is_some() {
+            if plan.is::<BytesProcessedExec>() {
                 return Ok(Transformed::new(plan, false, TreeNodeRecursion::Jump));
             }
 

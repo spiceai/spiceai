@@ -46,8 +46,7 @@ limitations under the License.
 //! `spiced` never goes down because a rotation produced a bad file.
 
 use std::{
-    fs,
-    io::{self, Cursor},
+    fs, io,
     path::{Path, PathBuf},
     sync::{
         Arc, OnceLock,
@@ -65,14 +64,16 @@ use opentelemetry::{
 use rustls::{
     DistinguishedName, RootCertStore, SignatureScheme,
     client::danger::HandshakeSignatureValid,
-    pki_types::{CertificateDer, PrivateKeyDer, UnixTime},
+    pki_types::{
+        CertificateDer, PrivateKeyDer, UnixTime,
+        pem::{self, PemObject},
+    },
     server::{
         ClientHello, ResolvesServerCert, WebPkiClientVerifier,
         danger::{ClientCertVerified, ClientCertVerifier},
     },
     sign::CertifiedKey,
 };
-use rustls_pemfile::{certs, private_key};
 use snafu::Snafu;
 use tokio::sync::mpsc;
 
@@ -779,9 +780,7 @@ fn build_client_verifier(
     kind: ClientVerifierKind,
 ) -> Result<Arc<dyn ClientCertVerifier>, ReloadError> {
     let mut roots = RootCertStore::empty();
-    let ca_certs = certs(&mut Cursor::new(ca_pem))
-        .collect::<io::Result<Vec<_>>>()
-        .map_err(|source| ReloadError::ParseCert { source })?;
+    let ca_certs = load_certs(ca_pem)?;
     if ca_certs.is_empty() {
         return Err(ReloadError::EmptyClientCa);
     }
@@ -802,18 +801,28 @@ fn build_client_verifier(
         })
 }
 
-fn load_certs(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, ReloadError> {
-    let mut cursor = Cursor::new(pem);
-    certs(&mut cursor)
-        .collect::<io::Result<Vec<_>>>()
-        .map_err(|source| ReloadError::ParseCert { source })
+fn load_certs(pem_bytes: &[u8]) -> Result<Vec<CertificateDer<'static>>, ReloadError> {
+    // `pem_slice_iter` yields no items for empty/non-PEM input (rather than
+    // always erroring). Map `NoItemsFound` to an empty vec so callers can
+    // distinguish empty bundles (`EmptyCertChain` / `EmptyClientCa`) from
+    // real parse failures.
+    match CertificateDer::pem_slice_iter(pem_bytes).collect::<Result<Vec<_>, _>>() {
+        Ok(certs) => Ok(certs),
+        Err(pem::Error::NoItemsFound) => Ok(Vec::new()),
+        Err(err) => Err(ReloadError::ParseCert {
+            source: io::Error::new(io::ErrorKind::InvalidData, err),
+        }),
+    }
 }
 
-fn load_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, ReloadError> {
-    let mut cursor = Cursor::new(pem);
-    private_key(&mut cursor)
-        .map_err(|source| ReloadError::ParseKey { source })?
-        .ok_or(ReloadError::MissingKey)
+fn load_key(pem_bytes: &[u8]) -> Result<PrivateKeyDer<'static>, ReloadError> {
+    match PrivateKeyDer::from_pem_slice(pem_bytes) {
+        Ok(key) => Ok(key),
+        Err(pem::Error::NoItemsFound) => Err(ReloadError::MissingKey),
+        Err(err) => Err(ReloadError::ParseKey {
+            source: io::Error::new(io::ErrorKind::InvalidData, err),
+        }),
+    }
 }
 
 fn cert_fingerprint_short(ck: &CertifiedKey) -> String {

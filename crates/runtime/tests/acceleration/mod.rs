@@ -81,8 +81,9 @@ async fn wait_for_checkpoints(
     let mut checkpoint_futures = Vec::new();
 
     for dataset in datasets {
+        let registry = dataset.runtime.accelerator_engine_registry();
         let check_future = async move {
-            match DatasetCheckpoint::try_new(&dataset, OpenOption::OpenExisting).await {
+            match DatasetCheckpoint::try_new(&dataset, registry, OpenOption::OpenExisting).await {
                 Ok(checkpoint) => {
                     while !checkpoint.exists().await {
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

@@ -17,3 +17,6 @@ linkme.workspace = true
 paste.workspace = true
 runtime = { path = "../../runtime" }
 snafu.workspace = true
+
+[lints]
+workspace = true

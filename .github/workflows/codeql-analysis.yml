@@ -1,14 +1,12 @@
 name: 'CodeQL'
 
+# Security scanner: runs on push to trunk/release + a weekly schedule (and manual
+# dispatch), deliberately NOT in the merge queue — it isn't a required merge gate
+# and would add scan latency to every queue entry.
 on:
   workflow_dispatch:
   push:
     branches: [trunk, release-*]
-    paths-ignore:
-      - 'docs/**'
-      - '.github/**'
-  pull_request:
-    branches: [trunk, develop]
     paths-ignore:
       - 'docs/**'
       - '.github/**'

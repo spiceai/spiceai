@@ -61,6 +61,11 @@ on:
         required: false
         default: false
         type: boolean
+      skip_analytic_gate:
+        description: 'Skip the analytical-query correctness gate (re-runs every CH-benCH query against source + Spice and diffs results) to save time on experiments; the row-count gate still runs. Scheduled runs always leave this false.'
+        required: false
+        default: false
+        type: boolean
 
 # Serialize ALL SF100 + SF1000 CH-benCHmark runs across every variant (sqlite/turso cdc-tuned,
 # adaptive, duckdb): they share ONE concurrency group keyed only by scale factor, so
@@ -152,6 +157,7 @@ jobs:
             echo "| analytical concurrency | ${{ github.event.inputs.concurrency }} |"
             echo "| query overrides | ${{ github.event.inputs.query_overrides || 'none' }} |"
             echo "| runner | ${{ github.event.inputs.runner_type }} |"
+            echo "| analytic gate | ${{ github.event.inputs.skip_analytic_gate == 'true' && 'skipped' || 'enabled' }} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build Testoperator
@@ -236,9 +242,11 @@ jobs:
             ${{ github.event.inputs.query_overrides != '' && format('--query-overrides {0}', github.event.inputs.query_overrides) || '' }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             ${{ steps.set_spicepod_path.outputs.SOURCE_TYPE != 'mysql' && github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && '--skip-prepare' || '' }} \
+            ${{ github.event.inputs.skip_analytic_gate == 'true' && '--skip-analytic-gate' || '' }} \
             --disable-progress-bars \
             --metrics \
-            --metrics-dump "${GITHUB_WORKSPACE}/htap-metrics.json" 2>&1 | tee "${GITHUB_WORKSPACE}/htap-run.log"
+            --metrics-dump "${GITHUB_WORKSPACE}/htap-metrics.json" \
+            --summary-out "${GITHUB_WORKSPACE}/htap-summary.md" 2>&1 | tee "${GITHUB_WORKSPACE}/htap-run.log"
           # ${PIPESTATUS[0]} is testoperator's real exit (not tee's), so a failed
           # run fails the step even though it is piped to tee — this also avoids the
           # false-green where a benchmark/ready-wait timeout reported success.
@@ -274,6 +282,19 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+      # Append the headline results (tpmC, QPH, worst replication lag, per-query
+      # latencies) to the job summary so the outcome is visible without opening the
+      # run log. testoperator writes this Markdown via --summary-out. Runs even on
+      # failure (a partial summary is still useful).
+      - name: Render results to summary
+        if: always()
+        run: |
+          if [ -f "${GITHUB_WORKSPACE}/htap-summary.md" ]; then
+            cat "${GITHUB_WORKSPACE}/htap-summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "_No results summary produced (run did not reach the reporting stage)._" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       # Render the CDC-backpressure waterfall from the metrics dump into the job
       # summary so the "where is CDC falling behind" attribution is visible without
       # downloading the artifact. Runs even if the benchmark failed (partial data
@@ -301,6 +322,7 @@ jobs:
           path: |
             ${{ github.workspace }}/htap-metrics.json
             ${{ github.workspace }}/htap-run.log
+            ${{ github.workspace }}/htap-summary.md
           if-no-files-found: warn
           retention-days: 30
 
@@ -350,22 +372,26 @@ jobs:
             echo "No psql client available; skipping replication slot cleanup."
           fi
 
-      # The MinIO `benchmarks` bucket is shared across runs, so the Cayenne cold-object-store tier
-      # (cayenne_cold_tier_location: s3://benchmarks/cayenne-cold-sf1000/) would otherwise accumulate
+      # The MinIO `benchmarks` bucket is shared across runs, so the Cayenne datalake (cold) tier
+      # (cayenne_datalake_location: s3://benchmarks/cayenne-cold-*/) would otherwise accumulate
       # cold files every run: each promotion writes a new UUID-named prefix and nothing GCs them
       # (the query path reads the metastore manifest, never an S3 listing, so a fresh run never
       # references a prior run's objects — they are dead weight, not a collision). Drop the whole
-      # cold prefix after the run. Gated to the cold config; `mc` + the `spice-minio` alias come from
-      # the Install MinIO step above. Runs on failure/cancel too so a crashed run leaves no orphans.
-      - name: Clean up Cayenne cold-tier S3 objects
-        if: always() && endsWith(github.event.inputs.spicepod_path, 'cold-sf1000.yaml')
+      # cold prefix after the run. Gated to the cold configs (any `-cold` spicepod); `mc` + the
+      # `spice-minio` alias come from the Install MinIO step above. Runs on failure/cancel too so a
+      # crashed run leaves no orphans.
+      - name: Clean up Cayenne datalake-tier S3 objects
+        if: always() && contains(github.event.inputs.spicepod_path, '-cold')
         run: |
           if command -v mc >/dev/null 2>&1; then
-            echo "Removing cold-tier objects under spice-minio/benchmarks/cayenne-cold-sf1000/ (best-effort; an empty prefix is expected when no promotion ran) ..."
-            # Non-fatal: mc prints its own diagnostics (empty prefix, or an auth/endpoint failure) to
-            # the log, but a cleanup miss must never fail the benchmark run. No success/"already clean"
-            # message here, so a real mc failure is not misreported.
-            mc rm --recursive --force spice-minio/benchmarks/cayenne-cold-sf1000/ || true
+            # Non-fatal: a cleanup miss must never fail the benchmark run, so every mc call is guarded
+            # with `|| true`. We print a one-line size/count summary per prefix (mc du) before deleting.
+            for prefix in cayenne-cold-sf1000 cayenne-cold-sf10; do
+              target="spice-minio/benchmarks/${prefix}/"
+              summary=$(mc du "${target}" 2>/dev/null || true)
+              echo "Cleaning ${target} — ${summary:-empty (no promotion ran)}"
+              mc rm --recursive --force "${target}" >/dev/null 2>&1 || true
+            done
           else
-            echo "mc client not found; skipping cold-tier S3 cleanup."
+            echo "mc client not found; skipping datalake-tier S3 cleanup."
           fi

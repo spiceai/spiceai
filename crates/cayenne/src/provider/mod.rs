@@ -71,6 +71,7 @@ limitations under the License.
 //! - [`constants`]: Staging-dir name, WAL filename, and other shared constants.
 //! - [`partitioned_wal`]: Cross-partition WAL for the partitioned-table
 //!   coordinator (feature-gated).
+pub(crate) mod cold_partition;
 pub(crate) mod column_stats;
 pub(crate) mod compaction;
 pub(crate) mod compaction_writer;

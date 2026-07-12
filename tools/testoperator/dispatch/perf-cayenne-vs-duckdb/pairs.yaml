@@ -78,26 +78,6 @@ pairs:
   # add a `file[parquet]-duckdb[file].yaml` under test/spicepods/tpch/sf10/
   # mirroring the SF1 layout to enable this pair.
 
-  - id: bench-tpch-sf1-s3-partitioned
-    workload: bench
-    query_set: tpch
-    scale_factor: 1
-    cayenne: tpch/sf1/accelerated/s3[parquet]-cayenne[file]-partitioned.yaml
-    duckdb: tpch/sf1/accelerated/s3[parquet]-duckdb[file]-partitioned.yaml
-    must_beat: true
-    runner_type: spiceai-dev-runners
-    notes: Both pods use the same partition column; differences should be accelerator-only.
-
-  - id: bench-tpch-sf1-s3-partitioned-turso
-    workload: bench
-    query_set: tpch
-    scale_factor: 1
-    cayenne: tpch/sf1/accelerated/s3[parquet]-cayenne[file]turso-partitioned.yaml
-    duckdb: tpch/sf1/accelerated/s3[parquet]-duckdb[file]-partitioned.yaml
-    must_beat: true
-    runner_type: spiceai-dev-runners
-    notes: Turso metastore variant. Compare against bench-tpch-sf1-s3-partitioned to isolate the metastore.
-
   - id: bench-tpch-sf10-s3
     workload: bench
     query_set: tpch

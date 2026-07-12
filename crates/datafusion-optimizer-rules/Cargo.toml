@@ -44,3 +44,6 @@ duckdb = [
     "dep:duckdb",
     "dep:r2d2"
 ]
+
+[lints]
+workspace = true

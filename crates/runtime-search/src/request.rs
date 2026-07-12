@@ -15,6 +15,8 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
+use std::sync::Arc;
+
 use cache::key::SearchKey;
 use datafusion::common::Column;
 use datafusion::sql::TableReference;
@@ -139,10 +141,30 @@ impl From<SearchRequest> for SearchKey {
             Some(
                 req.additional_columns
                     .into_iter()
-                    .map(|c| c.to_string().as_str().into())
+                    .map(|c| c.to_string().into())
                     .collect(),
             ),
             req.keywords.into_iter().map(Into::into).collect(),
+        )
+    }
+}
+
+impl From<&SearchRequest> for SearchKey {
+    fn from(req: &SearchRequest) -> Self {
+        SearchKey::new(
+            Arc::from(req.text.as_str()),
+            req.datasets
+                .as_ref()
+                .map(|d| d.iter().map(|s| Arc::from(s.as_str())).collect()),
+            req.limit,
+            req.where_cond.clone(),
+            Some(
+                req.additional_columns
+                    .iter()
+                    .map(|c| Arc::from(c.to_string()))
+                    .collect(),
+            ),
+            req.keywords.iter().map(|k| Arc::from(k.as_str())).collect(),
         )
     }
 }
