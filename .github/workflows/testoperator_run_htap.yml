@@ -66,6 +66,16 @@ on:
         required: false
         default: false
         type: boolean
+      cayenne_delta_light_always:
+        description: 'A2 experiment: large mem-tier checkpoints encode LIGHT instead of the full BtrBlocks+FSST cascade (sets SPICE_CAYENNE_DELTA_LIGHT_ALWAYS). Default off.'
+        required: false
+        default: false
+        type: boolean
+      cayenne_apply_stats_pk_only:
+        description: 'B1 experiment: per-append mem-tier segment stats cover only the PK columns (sets SPICE_CAYENNE_APPLY_STATS_PK_ONLY). Default off.'
+        required: false
+        default: false
+        type: boolean
 
 # Serialize ALL SF100 + SF1000 CH-benCHmark runs across every variant (sqlite/turso cdc-tuned,
 # adaptive, duckdb): they share ONE concurrency group keyed only by scale factor, so
@@ -271,6 +281,11 @@ jobs:
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          # Cayenne write-path A/B experiment toggles (default off = unset-equivalent
+          # 'false', which spiced treats as off). testoperator spawns spiced as a
+          # child, so these step-env vars reach the spiced process.
+          SPICE_CAYENNE_DELTA_LIGHT_ALWAYS: ${{ github.event.inputs.cayenne_delta_light_always }}
+          SPICE_CAYENNE_APPLY_STATS_PK_ONLY: ${{ github.event.inputs.cayenne_apply_stats_pk_only }}
 
       # Upload the under-load diagnostics dir
       - name: Upload HTAP diagnostics
