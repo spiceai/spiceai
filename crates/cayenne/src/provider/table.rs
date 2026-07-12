@@ -1972,28 +1972,35 @@ fn protected_snapshot_size_tier(bytes: u64, base_bytes: u64, growth: u64) -> u32
     }
 }
 
-/// Select which same-size protected snapshots to consolidate this pass.
+/// Partition `inputs` (`(snapshot_id, deletion_threshold, bytes)`, oldest-first
+/// i.e. `UUIDv7` lexical order) into every size tier that has accumulated at
+/// least `min_runs` same-size runs (each capped at `max_width`, oldest-first
+/// within the tier).
 ///
-/// LSM-style leveling: assign every input to a size tier, then pick the
-/// **lowest** tier that has accumulated at least `min_runs` runs and merge
-/// those (oldest-first, capped at `max_width`). Merging only within a tier
-/// bounds write amplification to O(log N) per byte (a run is rewritten only
-/// when it levels up), while the `min_runs` threshold bounds read amplification
-/// by keeping at most `min_runs - 1` un-merged runs per tier. The large
-/// carried-forward run sits alone in a high tier and is rewritten rarely
-/// instead of on every pass.
+/// LSM-style leveling: assign every input to a size tier, then merge only
+/// within a tier — this bounds write amplification to O(log N) per byte (a
+/// run is rewritten only when it levels up), while the `min_runs` threshold
+/// bounds read amplification by keeping at most `min_runs - 1` un-merged runs
+/// per tier. The large carried-forward run sits alone in a high tier and is
+/// rewritten rarely instead of on every pass.
 ///
-/// `inputs` is `(snapshot_id, deletion_threshold, bytes)`. Returns the selected
-/// `(snapshot_id, deletion_threshold)` pairs oldest-first (input order is
-/// assumed oldest-first, i.e. `UUIDv7` lexical order), or empty if no tier has
-/// `>= min_runs` runs.
-fn select_protected_snapshot_merge_tier(
+/// Tiers are disjoint by construction (each input is assigned to exactly one
+/// tier bucket), so the returned `Vec`s never share a `snapshot_id` — a
+/// prerequisite for merging multiple tiers concurrently (see
+/// `compact_protected_snapshots_pipelined`): selecting tiers one at a time via
+/// repeated "lowest qualifying tier" calls would let two concurrent callers
+/// race to claim the same tier, whereas partitioning the whole set once up
+/// front hands each concurrent merge a distinct one. Single-merge-per-pass
+/// callers (position-delete tables; the pre-pipelining key-delete path) use
+/// only the first (lowest/smallest) entry, matching the old single-tier
+/// selector's behavior. Returned in ascending tier order.
+fn select_protected_snapshot_merge_tiers(
     inputs: &[(String, i64, u64)],
     min_runs: usize,
     max_width: usize,
     base_bytes: u64,
     growth: u64,
-) -> Vec<(String, i64)> {
+) -> Vec<Vec<(String, i64, u64)>> {
     if inputs.len() < 2 || min_runs < 2 {
         // A merge needs at least two runs, and a floor below 2 is meaningless.
         return Vec::new();
@@ -2006,22 +2013,32 @@ fn select_protected_snapshot_merge_tier(
         tiers.entry(tier).or_default().push(idx);
     }
 
-    // BTreeMap iterates tiers in ascending order, so the first qualifying tier
-    // is the lowest one.
-    for (_tier, indices) in tiers {
-        if indices.len() >= min_runs {
-            return indices
+    // BTreeMap iterates tiers in ascending order, so tiers stay ordered
+    // lowest-first in the output.
+    tiers
+        .into_values()
+        .filter(|indices| indices.len() >= min_runs)
+        .map(|indices| {
+            indices
                 .into_iter()
                 .take(max_width.max(2))
-                .map(|i| {
-                    let (id, threshold, _) = &inputs[i];
-                    (id.clone(), *threshold)
-                })
-                .collect();
-        }
-    }
+                .map(|i| inputs[i].clone())
+                .collect()
+        })
+        .collect()
+}
 
-    Vec::new()
+/// Phase-1 telemetry shared by every tier merge spawned from one coherent
+/// fence read — threaded through to [`Table::compact_protected_snapshot_tier`]
+/// purely so its log line stays comparable to the pre-pipelining
+/// single-merge-per-pass log (bundled in a struct rather than passed as loose
+/// fields to keep the method under the pedantic argument-count lint).
+struct ProtectedSnapshotTierPassContext {
+    pass_start: std::time::Instant,
+    phase1_fence_ms: u128,
+    sizing_ms: u128,
+    candidate_count: usize,
+    min_runs: usize,
 }
 
 /// Write shape — encoder fan-out cap and size estimate — for the
@@ -13984,7 +14001,7 @@ impl CayenneTableProvider {
     /// 2. Size-tier selection (outside the fence): assign inputs to LSM-style
     ///    size tiers and merge only the lowest tier that has accumulated enough
     ///    same-size runs, bounding write amplification. See
-    ///    [`select_protected_snapshot_merge_tier`].
+    ///    [`select_protected_snapshot_merge_tiers`].
     /// 3. Rewrite outside the lock: union-scan each selected input applying its
     ///    own partial deletion filter (`delete_seq > threshold_at_creation`),
     ///    exactly as a read would, streaming the result into a fresh snapshot.
@@ -14206,13 +14223,16 @@ impl CayenneTableProvider {
         // to at most `min_runs - 1` un-merged runs per tier — instead of folding
         // the large carried-forward blob back in on every pass.
         let min_runs = self.context.compaction_trigger_protected_snapshots().max(2);
-        let inputs = select_protected_snapshot_merge_tier(
+        let inputs = select_protected_snapshot_merge_tiers(
             &sized_candidates,
             min_runs,
             PROTECTED_MERGE_MAX_WIDTH,
             PROTECTED_TIER_BASE_BYTES,
             PROTECTED_TIER_GROWTH,
-        );
+        )
+        .into_iter()
+        .next()
+        .unwrap_or_default();
 
         if inputs.len() < 2 {
             tracing::debug!(
@@ -14226,15 +14246,43 @@ impl CayenneTableProvider {
             return Ok(false);
         }
 
-        // Diagnostics over the SELECTED (single-tier) input set.
-        let selected_ids: std::collections::HashSet<&str> =
-            inputs.iter().map(|(id, _)| id.as_str()).collect();
-        let selected_sizes: Vec<&(String, i64, u64)> = sized_candidates
-            .iter()
-            .filter(|(id, _, _)| selected_ids.contains(id.as_str()))
-            .collect();
-        let total_input_bytes: u64 = selected_sizes.iter().map(|(_, _, b)| *b).sum();
-        let largest_input_bytes = selected_sizes.iter().map(|(_, _, b)| *b).max().unwrap_or(0);
+        self.compact_protected_snapshot_tier(
+            inputs,
+            fence_max_delete_seq,
+            deletion_snapshot,
+            ProtectedSnapshotTierPassContext {
+                pass_start: compaction_start,
+                phase1_fence_ms,
+                sizing_ms,
+                candidate_count: sized_candidates.len(),
+                min_runs,
+            },
+        )
+        .await
+    }
+
+    /// Rewrite and commit one already-selected, disjoint size tier of
+    /// protected snapshots — Phase 2 (rewrite outside the lock) and Phase 3
+    /// (CAS commit + in-memory RCU publish) of the subset-compaction pass.
+    ///
+    /// `inputs` must be a single tier's `(snapshot_id, deletion_threshold,
+    /// bytes)` triples, as selected by [`select_protected_snapshot_merge_tiers`]
+    /// — disjoint from any other tier a concurrent caller may be merging via
+    /// this same method. `fence_max_delete_seq` and `deletion_snapshot` must
+    /// come from the SAME coherent Phase-1 fence read that produced the full
+    /// tier partition `inputs` was drawn from, so every concurrently-running
+    /// tier merge tags its output with a fence consistent with the deletions
+    /// it actually applied (see the caller and the pipelined multi-tier
+    /// entry point once it exists).
+    async fn compact_protected_snapshot_tier(
+        &self,
+        inputs: Vec<(String, i64, u64)>,
+        fence_max_delete_seq: i64,
+        deletion_snapshot: PkDeletionSnapshot,
+        pass: ProtectedSnapshotTierPassContext,
+    ) -> Result<bool> {
+        let total_input_bytes: u64 = inputs.iter().map(|(_, _, b)| *b).sum();
+        let largest_input_bytes = inputs.iter().map(|(_, _, b)| *b).max().unwrap_or(0);
         // Percent of selected bytes contributed by the single largest run,
         // computed with integer (u128) math to avoid any float cast. With
         // size-tiering this should stay low (runs are same-tier), in contrast to
@@ -14255,15 +14303,15 @@ impl CayenneTableProvider {
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             input_count = inputs.len(),
-            candidate_count = sized_candidates.len(),
+            candidate_count = pass.candidate_count,
             selected_tier,
-            min_runs,
+            min_runs = pass.min_runs,
             fence_max_delete_seq,
             total_input_bytes,
             largest_input_bytes,
             dominance_pct,
-            phase1_fence_ms,
-            sizing_ms,
+            phase1_fence_ms = pass.phase1_fence_ms,
+            sizing_ms = pass.sizing_ms,
             "Running fast protected-snapshot subset compaction"
         );
 
@@ -14277,7 +14325,7 @@ impl CayenneTableProvider {
         let pk_indices = self.pk_column_indices.clone();
 
         let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(inputs.len());
-        for (snapshot_id, threshold) in &inputs {
+        for (snapshot_id, threshold, _bytes) in &inputs {
             let plan = self
                 .create_snapshot_scan_plan(&state, snapshot_id, None, &[], None)
                 .await?;
@@ -14326,16 +14374,16 @@ impl CayenneTableProvider {
         //   `has_sort_columns()` — sharding a globally sorted stream would
         //   scatter its order across files;
         // - position-delete tables — BOTH families: PK tables whose resolved
-        //   `deletion_mode` is `position` (`serialize_position_deletes`, the
-        //   same predicate this function's writer/visibility guards use
-        //   above) and PK-less tables on the legacy `PositionBased` strategy.
-        //   Their tombstones are file-path scoped and the rewrite's position
+        //   `deletion_mode` is `position` (`should_capture_positions`, the
+        //   same predicate the caller's writer/visibility guards use) and
+        //   PK-less tables on the legacy `PositionBased` strategy. Their
+        //   tombstones are file-path scoped and the rewrite's position
         //   bake-in assumes a single output sequence, so they keep the serial
         //   single-WRITER shape explicitly (even a serial writer still rolls
         //   multiple files past the target size — see the
         //   `subset_merge_write_shape` docs).
         let keeps_positions_serial =
-            serialize_position_deletes || self.pk_deletion_strategy.is_position_based();
+            self.should_capture_positions() || self.pk_deletion_strategy.is_position_based();
         let (target_partitions, estimated_bytes) = subset_merge_write_shape(
             keeps_positions_serial,
             state.config().target_partitions(),
@@ -14384,7 +14432,7 @@ impl CayenneTableProvider {
             self.evict_compaction_output_pages(&new_snapshot_id).await;
         }
 
-        let old_ids: Vec<String> = inputs.iter().map(|(id, _)| id.clone()).collect();
+        let old_ids: Vec<String> = inputs.iter().map(|(id, _, _)| id.clone()).collect();
 
         // Manifest snapshot model: AUTHOR the merged output's manifest with its
         // true merged commit-seq range — `[min, max]` over the SELECTED INPUTS'
@@ -14469,7 +14517,7 @@ impl CayenneTableProvider {
             let _fence = self.listing_fence.write().await;
             self.protected_snapshots.rcu(|current| {
                 let mut new_map = (**current).clone();
-                for (id, _) in &inputs {
+                for (id, _, _) in &inputs {
                     new_map.remove(id);
                 }
                 new_map.insert(new_snapshot_id.clone(), fence_max_delete_seq);
@@ -14509,13 +14557,13 @@ impl CayenneTableProvider {
             total_input_bytes,
             largest_input_bytes,
             dominance_pct,
-            phase1_fence_ms,
-            sizing_ms,
+            phase1_fence_ms = pass.phase1_fence_ms,
+            sizing_ms = pass.sizing_ms,
             plan_build_ms,
             write_ms,
             phase2_rewrite_ms,
             phase3_commit_ms = phase3_start.elapsed().as_millis(),
-            duration_ms = compaction_start.elapsed().as_millis(),
+            duration_ms = pass.pass_start.elapsed().as_millis(),
             "Fast protected-snapshot subset compaction completed"
         );
 
@@ -25311,6 +25359,29 @@ mod tests {
         (id.to_string(), 0, bytes)
     }
 
+    /// Test-only shim over [`select_protected_snapshot_merge_tiers`] mirroring
+    /// the old single-tier selector: the lowest qualifying tier's ids, bytes
+    /// dropped. Production code now always selects the full tier partition
+    /// (see `compact_protected_snapshots_subset_inner`); this exists only so
+    /// the single-tier assertions below stay readable.
+    fn select_lowest_tier(
+        inputs: &[(String, i64, u64)],
+        min_runs: usize,
+        max_width: usize,
+        base_bytes: u64,
+        growth: u64,
+    ) -> Vec<(String, i64)> {
+        select_protected_snapshot_merge_tiers(inputs, min_runs, max_width, base_bytes, growth)
+            .into_iter()
+            .next()
+            .map(|tier| {
+                tier.into_iter()
+                    .map(|(id, threshold, _)| (id, threshold))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     #[test]
     fn select_merge_tier_picks_lowest_tier_with_enough_runs() {
         let base = 8 * 1024 * 1024;
@@ -25323,7 +25394,7 @@ mod tests {
             sized("c", base * 4), // tier 1
             sized("d", base * 5), // tier 1
         ];
-        let selected = select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth);
+        let selected = select_lowest_tier(&inputs, 2, 32, base, growth);
         let ids: Vec<&str> = selected.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b"]);
     }
@@ -25334,7 +25405,7 @@ mod tests {
         let growth = 8;
         // One run per tier — no tier reaches min_runs = 2.
         let inputs = vec![sized("a", 1024), sized("b", base * 4)];
-        let selected = select_protected_snapshot_merge_tier(&inputs, 2, 32, base, growth);
+        let selected = select_lowest_tier(&inputs, 2, 32, base, growth);
         assert!(selected.is_empty());
     }
 
@@ -25349,7 +25420,7 @@ mod tests {
             sized("c", 300),
             sized("d", 400),
         ];
-        let selected = select_protected_snapshot_merge_tier(&inputs, 2, 2, base, growth);
+        let selected = select_lowest_tier(&inputs, 2, 2, base, growth);
         let ids: Vec<&str> = selected.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b"]);
     }
@@ -25359,19 +25430,35 @@ mod tests {
         let base = 8 * 1024 * 1024;
         let growth = 8;
         // Fewer than two inputs, or a sub-2 floor, can never merge.
-        assert!(
-            select_protected_snapshot_merge_tier(&[sized("a", 1)], 2, 32, base, growth).is_empty()
-        );
-        assert!(
-            select_protected_snapshot_merge_tier(
-                &[sized("a", 1), sized("b", 2)],
-                1,
-                32,
-                base,
-                growth
-            )
-            .is_empty()
-        );
+        assert!(select_lowest_tier(&[sized("a", 1)], 2, 32, base, growth).is_empty());
+        assert!(select_lowest_tier(&[sized("a", 1), sized("b", 2)], 1, 32, base, growth).is_empty());
+    }
+
+    #[test]
+    fn select_merge_tiers_partitions_all_qualifying_tiers_disjointly() {
+        let base = 8 * 1024 * 1024;
+        let growth = 8;
+        // Two tier-0 runs and two tier-1 runs both qualify at min_runs=2; the
+        // pipelined path needs BOTH tiers back, not just the lowest, and the
+        // two tiers must never share an id.
+        let inputs = vec![
+            sized("a", 1024),     // tier 0
+            sized("b", 2048),     // tier 0
+            sized("c", base * 4), // tier 1
+            sized("d", base * 5), // tier 1
+        ];
+        let tiers =
+            select_protected_snapshot_merge_tiers(&inputs, 2, 32, base, growth);
+        assert_eq!(tiers.len(), 2, "expected both tier 0 and tier 1 to qualify");
+        let tier_ids: Vec<Vec<&str>> = tiers
+            .iter()
+            .map(|tier| tier.iter().map(|(id, _, _)| id.as_str()).collect())
+            .collect();
+        assert_eq!(tier_ids[0], vec!["a", "b"], "tier 0 returned first (ascending)");
+        assert_eq!(tier_ids[1], vec!["c", "d"]);
+        let all_ids: std::collections::HashSet<&str> =
+            tier_ids.iter().flatten().copied().collect();
+        assert_eq!(all_ids.len(), 4, "tiers must be disjoint — no id in both");
     }
 
     #[test]
