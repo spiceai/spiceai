@@ -2555,7 +2555,11 @@ impl CayenneTableProvider {
     /// Best-effort: missing `DeleteObject` grant or transient errors are logged
     /// and retried next pass. Runs on the background tick, off the hot paths.
     /// Public for integration tests and manual maintenance; normally driven by
-    /// the background promotion loop. Idempotent and safe to call at any time.
+    /// the background promotion loop, which serializes it with promotion. An
+    /// out-of-band call is idempotent but must not overlap an in-flight
+    /// promotion: GC derives orphans as (on-store − manifest), so a promotion
+    /// write phase that outlives the GC grace could have its not-yet-committed
+    /// objects swept (`NotFound` at commit).
     pub async fn run_cold_tier_gc_tick(&self) {
         if !self.table_metadata.vortex_config.cold_tier_enabled() {
             return;

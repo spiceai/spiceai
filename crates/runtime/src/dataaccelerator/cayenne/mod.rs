@@ -2015,8 +2015,8 @@ impl CayenneAccelerator {
                 }
             }
             Err(message) => {
-                return Err(Error::AccelerationCreationFailed {
-                    source: Box::new(std::io::Error::other(message)),
+                return Err(Error::InvalidConfiguration {
+                    detail: message.into(),
                 });
             }
         }
