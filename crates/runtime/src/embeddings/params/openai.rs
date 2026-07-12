@@ -26,7 +26,7 @@ pub struct OpenAiEmbeddingParams {
     #[param(runtime, default = "https://api.openai.com/v1")]
     pub endpoint: String,
     /// The OpenAI API key.
-    #[param(secret)]
+    #[param(autoload_secret)]
     pub api_key: Option<SecretString>,
     /// The OpenAI organization ID.
     pub org_id: Option<String>,

@@ -80,7 +80,7 @@ pub trait TypedParams: Sized {
     ///
     /// `component_name` is the user-facing resource label used in warnings
     /// (e.g. `"embedding my_embed"`). `secrets` is consulted only for fields
-    /// marked `#[param(secret)]` that are absent from the map.
+    /// marked `#[param(autoload_secret)]` that are absent from the map.
     fn try_from_params(
         component_name: &str,
         params: HashMap<String, SecretString>,
@@ -123,7 +123,7 @@ pub fn parse_param_with<T, E: Display>(
     })
 }
 
-/// Looks up an absent `#[param(secret)]` parameter in the configured secret
+/// Looks up an absent `#[param(autoload_secret)]` parameter in the configured secret
 /// stores by its user-facing (prefixed) key. Mirrors the autoload pass of
 /// [`crate::Parameters::try_new`]: store errors and misses resolve to `None`.
 pub async fn autoload_secret(
@@ -148,7 +148,7 @@ pub fn warn_deprecated(component_name: &str, user_key: &str, note: Option<&str>)
     if let Some(note) = note {
         tracing::warn!("Parameter '{user_key}' is deprecated for {component_name}: {note}");
     } else {
-        tracing::warn!("Parameter '{user_key}' is deprecated for {component_name}.")
+        tracing::warn!("Parameter '{user_key}' is deprecated for {component_name}.");
     }
 }
 
@@ -156,9 +156,9 @@ pub fn warn_deprecated(component_name: &str, user_key: &str, note: Option<&str>)
 /// keys, matching the wording of [`crate::Parameters::validate_and_format_key`]:
 /// a wrong-prefix hint when adding/removing the prefix would match a declared
 /// key, otherwise an unknown-parameter warning with a typo suggestion.
-pub fn warn_leftover_keys(
+pub fn warn_leftover_keys<S: std::hash::BuildHasher>(
     component_name: &str,
-    leftover: &HashMap<String, SecretString>,
+    leftover: &HashMap<String, SecretString, S>,
     known_user_keys: &[&str],
     prefix: &str,
 ) {

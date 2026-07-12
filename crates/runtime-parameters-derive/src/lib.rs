@@ -33,7 +33,7 @@ limitations under the License.
 //! - `rename = "key"` — spicepod key differs from the field identifier.
 //! - `alias = "key"` — additional accepted key; repeatable; prefixed like the field.
 //! - `default = "value"` — string default, parsed through the same path as user input.
-//! - `secret` — opt into secret autoload: when absent from the spicepod, the
+//! - `autoload_secret` — opt into secret autoload: when absent from the spicepod, the
 //!   prefixed key is looked up in the configured secret stores. The field must be
 //!   `SecretString` or `Option<SecretString>`.
 //! - `parse_with = path` — custom parser `fn(&str) -> Result<T, impl Display>`
@@ -64,7 +64,7 @@ struct FieldSpec {
     /// Declared type with any outer `Option` stripped.
     inner_ty: Type,
     optional: bool,
-    secret: bool,
+    autoload_secret: bool,
     runtime: bool,
     rename: Option<String>,
     aliases: Vec<String>,
@@ -222,9 +222,9 @@ fn expand_field(
         params.remove(#user_key) #(#alias_removals)*
     };
 
-    // Secret autoload: absent + `#[param(secret)]` → look up the prefixed key in
+    // Secret autoload: absent + `#[param(autoload_secret)]` → look up the prefixed key in
     // the secret stores (parity with `Parameters::try_new`).
-    if spec.secret {
+    if spec.autoload_secret {
         let autoload_key = apply_prefix(&spec.name(), prefix, false);
         raw = quote! {
             match #raw {
@@ -249,10 +249,10 @@ fn expand_field(
     }
 
     let is_secret_string = type_is_secret_string(inner_ty);
-    if spec.secret && !is_secret_string {
+    if spec.autoload_secret && !is_secret_string {
         return Err(syn::Error::new(
             ident.span(),
-            "#[param(secret)] fields must be `SecretString` or `Option<SecretString>`",
+            "#[param(autoload_secret)] fields must be `SecretString` or `Option<SecretString>`",
         ));
     }
     if spec.parse_with.is_some() && is_secret_string {
@@ -340,7 +340,7 @@ fn parse_field(field: &syn::Field) -> syn::Result<FieldSpec> {
         ident,
         inner_ty,
         optional,
-        secret: false,
+        autoload_secret: false,
         runtime: false,
         rename: None,
         aliases: Vec::new(),
@@ -366,8 +366,8 @@ fn parse_field(field: &syn::Field) -> syn::Result<FieldSpec> {
             attr.parse_nested_meta(|meta| {
                 if meta.path.is_ident("runtime") {
                     spec.runtime = true;
-                } else if meta.path.is_ident("secret") {
-                    spec.secret = true;
+                } else if meta.path.is_ident("autoload_secret") {
+                    spec.autoload_secret = true;
                 } else if meta.path.is_ident("rename") {
                     let lit: syn::LitStr = meta.value()?.parse()?;
                     spec.rename = Some(lit.value());
@@ -382,7 +382,7 @@ fn parse_field(field: &syn::Field) -> syn::Result<FieldSpec> {
                 } else {
                     return Err(meta.error(
                         "unsupported #[param(...)] key; expected one of \
-                         `runtime`, `secret`, `rename`, `alias`, `default`, `parse_with`",
+                         `runtime`, `autoload_secret`, `rename`, `alias`, `default`, `parse_with`",
                     ));
                 }
                 Ok(())
@@ -467,8 +467,8 @@ mod tests {
     use super::*;
     use syn::parse_quote;
 
-    fn expand_str(input: DeriveInput) -> Result<String, String> {
-        expand(&input)
+    fn expand_str(input: &DeriveInput) -> Result<String, String> {
+        expand(input)
             .map(|t| t.to_string())
             .map_err(|e| e.to_string())
     }
@@ -478,7 +478,7 @@ mod tests {
         let input: DeriveInput = parse_quote! {
             struct P { a: String }
         };
-        let err = expand_str(input).expect_err("should require #[params(prefix)]");
+        let err = expand_str(&input).expect_err("should require #[params(prefix)]");
         assert!(err.contains("prefix"), "unexpected error: {err}");
     }
 
@@ -487,11 +487,11 @@ mod tests {
         let input: DeriveInput = parse_quote! {
             #[params(prefix = "x")]
             struct P {
-                #[param(secret)]
+                #[param(autoload_secret)]
                 a: String,
             }
         };
-        let err = expand_str(input).expect_err("secret requires SecretString");
+        let err = expand_str(&input).expect_err("secret requires SecretString");
         assert!(err.contains("SecretString"), "unexpected error: {err}");
     }
 
@@ -504,7 +504,7 @@ mod tests {
                 a: Option<u32>,
             }
         };
-        let err = expand_str(input).expect_err("default on Option is contradictory");
+        let err = expand_str(&input).expect_err("default on Option is contradictory");
         assert!(err.contains("contradictory"), "unexpected error: {err}");
     }
 
@@ -514,7 +514,7 @@ mod tests {
             #[params(prefix = "x")]
             struct P<T> { a: T }
         };
-        let err = expand_str(input).expect_err("generics unsupported");
+        let err = expand_str(&input).expect_err("generics unsupported");
         assert!(err.contains("generic"), "unexpected error: {err}");
     }
 
@@ -527,7 +527,7 @@ mod tests {
                 a: SecretString,
             }
         };
-        let err = expand_str(input).expect_err("parse_with + SecretString invalid");
+        let err = expand_str(&input).expect_err("parse_with + SecretString invalid");
         assert!(err.contains("parse_with"), "unexpected error: {err}");
     }
 
@@ -537,7 +537,7 @@ mod tests {
             #[params(prefix = "openai")]
             struct P {
                 /// The OpenAI API key.
-                #[param(secret)]
+                #[param(autoload_secret)]
                 api_key: Option<SecretString>,
                 #[param(runtime, default = "https://api.openai.com/v1")]
                 endpoint: String,
@@ -545,7 +545,7 @@ mod tests {
                 org_id: String,
             }
         };
-        let out = expand_str(input).expect("valid struct should expand");
+        let out = expand_str(&input).expect("valid struct should expand");
         assert!(out.contains("\"openai_api_key\""), "expansion: {out}");
         assert!(out.contains("\"endpoint\""), "expansion: {out}");
         assert!(out.contains("\"openai_org_id\""), "expansion: {out}");
@@ -565,7 +565,7 @@ mod tests {
                 file_format: Option<String>,
             }
         };
-        let out = expand_str(input).expect("valid struct should expand");
+        let out = expand_str(&input).expect("valid struct should expand");
         assert!(out.contains("\"file_format\""), "expansion: {out}");
         assert!(!out.contains("file_file_format"), "expansion: {out}");
     }

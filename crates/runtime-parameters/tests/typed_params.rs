@@ -91,7 +91,7 @@ fn parse_percent(s: &str) -> Result<u8, String> {
 #[params(prefix = "acme")]
 struct AcmeParams {
     /// The Acme API key.
-    #[param(secret)]
+    #[param(autoload_secret)]
     api_key: Option<SecretString>,
     /// The Acme service endpoint.
     #[param(runtime, default = "https://api.acme.dev")]
@@ -301,7 +301,7 @@ async fn non_secret_fields_are_never_autoloaded() {
         &secrets_with(&[("acme_org_id", "from-store")]),
     )
     .await
-    .expect_err("org_id is not #[param(secret)], so the store must not satisfy it");
+    .expect_err("org_id is not #[param(autoload_secret)], so the store must not satisfy it");
     assert!(matches!(err, ParamsError::MissingRequired { .. }));
 }
 
@@ -311,7 +311,7 @@ async fn non_secret_fields_are_never_autoloaded() {
 #[params(prefix = "beta")]
 struct BetaParams {
     /// Secret with a fallback default.
-    #[param(secret, default = "default-token")]
+    #[param(autoload_secret, default = "default-token")]
     token: SecretString,
 }
 
@@ -340,7 +340,7 @@ async fn default_applies_when_autoload_misses() {
 #[params(prefix = "gamma")]
 struct GammaParams {
     /// The Gamma API key.
-    #[param(secret)]
+    #[param(autoload_secret)]
     api_key: SecretString,
 }
 
@@ -379,7 +379,7 @@ struct DeltaParams {
 
 #[tokio::test]
 async fn deprecated_field_still_deserializes() {
-    #[allow(deprecated)]
+    #[expect(deprecated)]
     let old_knob = DeltaParams::try_from_params(
         "component delta_test",
         params(&[("delta_old_knob", "v")]),

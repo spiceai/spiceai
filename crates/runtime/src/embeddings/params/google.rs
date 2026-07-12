@@ -22,7 +22,7 @@ use secrecy::SecretString;
 #[params(prefix = "google")]
 pub struct GoogleEmbeddingParams {
     /// The Google API key.
-    #[param(secret)]
+    #[param(autoload_secret)]
     pub api_key: SecretString,
     /// The number of dimensions for the embedding output.
     pub dimensions: Option<u32>,

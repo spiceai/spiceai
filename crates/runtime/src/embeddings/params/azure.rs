@@ -29,9 +29,9 @@ pub struct AzureEmbeddingParams {
     /// The name of the model deployment.
     pub deployment_name: Option<String>,
     /// The Azure OpenAI API key.
-    #[param(secret)]
+    #[param(autoload_secret)]
     pub api_key: Option<SecretString>,
     /// The Azure Entra token for authentication.
-    #[param(secret)]
+    #[param(autoload_secret)]
     pub entra_token: Option<SecretString>,
 }

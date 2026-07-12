@@ -22,7 +22,7 @@ use secrecy::SecretString;
 #[params(prefix = "model2vec")]
 pub struct Model2VecEmbeddingParams {
     /// The Hugging Face access token.
-    #[param(secret)]
+    #[param(autoload_secret)]
     pub hf_token: Option<SecretString>,
     /// The subfolder within the Hugging Face repo containing the model.
     pub subfolder: Option<String>,
