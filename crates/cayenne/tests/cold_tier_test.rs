@@ -601,9 +601,8 @@ async fn test_cold_tier_concurrent_scan_during_promotion_impl(
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
-    let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?,
-    );
+    let table =
+        Arc::new(CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?);
     ctx.register_table("race_t", Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
     // Promotion 1: fresh graduation of 400 rows.
@@ -611,7 +610,9 @@ async fn test_cold_tier_concurrent_scan_during_promotion_impl(
     flush_warm(&table).await;
     let hammer = spawn_scan_hammer(&ctx, "race_t", 4);
     assert!(table.promote_warm_to_cold().await?, "promotion 1 fires");
-    hammer.stop_and_assert_all(400, "promotion 1 (fresh)").await?;
+    hammer
+        .stop_and_assert_all(400, "promotion 1 (fresh)")
+        .await?;
 
     // Promotion 2: a tombstone dirties the prior cold generation, so this one
     // rewrites cold files (replace-then-register) while scans run.
@@ -784,9 +785,8 @@ async fn test_cold_tier_gc_end_to_end_impl(fixture: common::TestFixture) -> Test
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
-    let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?,
-    );
+    let table =
+        Arc::new(CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?);
     ctx.register_table("gc_t", Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
     insert_id_range(&table, &schema, 0..200).await?;

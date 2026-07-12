@@ -4699,7 +4699,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn test_validate_datalake_rejects_explicit_position_deletes() {
         let config = cayenne::metadata::VortexConfig {
