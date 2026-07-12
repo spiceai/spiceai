@@ -75,6 +75,49 @@ pub mod metastore;
 pub mod __bench_zorder {
     pub use crate::provider::zorder::zorder_keys;
 }
+
+/// Write-time statistics kernels, re-exported for benchmarks only. Not a stable
+/// API. Lets `benches/stats_single_pass.rs` measure the real per-append pruning
+/// stats (`statistics_from_record_batches`) and the per-batch write accumulator
+/// (`ColumnStatsAccumulator`) rather than a drift-prone mirror.
+#[doc(hidden)]
+pub mod __bench_stats {
+    use arrow::record_batch::RecordBatch;
+    use arrow_schema::SchemaRef;
+    use datafusion_common::{ColumnStatistics, Statistics};
+
+    /// The per-append mem-tier segment pruning stats (min/max/null over every
+    /// column). This is the exact call made by
+    /// `MemTier::append_segment_with_source_position`.
+    #[must_use]
+    pub fn statistics_from_record_batches(schema: &SchemaRef, batches: &[RecordBatch]) -> Statistics {
+        crate::provider::file_pruning::statistics_from_record_batches(schema, batches)
+    }
+
+    /// Per-column min/max/null-count primitive used by both stats paths.
+    #[must_use]
+    pub fn compute_column_stats(col: &dyn arrow::array::Array) -> ColumnStatistics {
+        crate::provider::column_stats::ColumnStatsAccumulator::compute_column_stats(col)
+    }
+
+    /// Drive the full write-time accumulator (min/max/null + optional NDV
+    /// `HyperLogLog` fold + per-batch Vortex `StatsSet` merge) across `batches`,
+    /// as `write_to_snapshot` does. Returns the accumulated row count so the work
+    /// cannot be optimized away.
+    #[must_use]
+    pub fn accumulate_write_stats(
+        schema: &arrow_schema::Schema,
+        batches: &[RecordBatch],
+        compute_ndv: bool,
+    ) -> i64 {
+        let acc =
+            crate::provider::column_stats::ColumnStatsAccumulator::new_with_ndv(schema, compute_ndv);
+        for batch in batches {
+            acc.update(batch);
+        }
+        acc.row_count()
+    }
+}
 pub mod optimizer_rules;
 #[cfg(feature = "partition-table-provider")]
 pub(crate) mod partition_creator;

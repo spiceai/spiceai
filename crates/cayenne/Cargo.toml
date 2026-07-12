@@ -445,6 +445,10 @@ name = "cdc_apply_simd"
 
 [[bench]]
 harness = false
+name = "stats_single_pass"
+
+[[bench]]
+harness = false
 name = "compaction_io_hygiene"
 
 [[bench]]
