@@ -2411,9 +2411,9 @@ mod tests {
             },
         );
         assert_eq!(warm_up_out, per_row_gets_key(&idx, &warm_up));
-        // `hashes`/`candidates` end each call empty (the loop's terminating
-        // chunk clears them before finding no more keys), so the reuse
-        // invariant under test is retained *capacity*, not a non-empty len.
+        // `hashes` ends each call empty (the loop's terminating iteration clears it
+        // before finding no more keys). `candidates` may retain a non-empty len,
+        // so the reuse invariant under test is retained *capacity*, not len.
         assert!(
             hashes.capacity() > 0,
             "scratch buffers should retain capacity after use"
