@@ -105,8 +105,17 @@ or memory-mode durable fallbacks: delete bursts, byte-cap spills).
 pending finalize before capture; bracket-and-abort like the full rewrite;
 or overwrite-clear by explicit folded snapshot ids instead of `table_id`.
 
-### F1a — Promotion vs fast protected-snapshot subset compaction: catalog
-half safe, in-memory half NOT (found 2026-07-11, code-reading confidence)
+### F1a — FIXED (2026-07-12): promotion vs subset-merge/bake in-memory publish
+Catalog half was always safe; the in-memory half is now guarded: both the
+subset merge and the seq-prefix bake capture `current_snapshot_id` in their
+Phase-1 fence read and REVALIDATE it under the Phase-3 write fence before
+the protected-map RCU — a mid-pass overwrite/promotion (which flips the id
+under the same fence) makes the pass discard its merged output (retired for
+cleanup) instead of re-inserting it into the freshly cleared map. Evidence
+this fires in practice: the instrumented SF1000 CI run (post bake-fix) still
+over-counted promoted tables by merged-snapshot-sized deltas (+0.78M/+3.49M
+/+2.09M) — the resurrection signature at a scale where promotions run 40–
+100 s and merges land mid-promotion routinely. Original analysis below.
 The two passes overlap (promotion: `write_lock` only; subset pass:
 `compaction_lock` only on key-mode tables). The CATALOG side is safe in both
 commit orders: the subset commit is a CAS (`swap_protected_snapshots_in_txn`

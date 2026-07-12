@@ -14274,9 +14274,16 @@ impl CayenneTableProvider {
         // Capture the protected set, each input's deletion threshold, the live
         // deletion snapshot, and the current max delete sequence together under
         // the read fence so the rewrite applies exactly the deletions visible at
-        // the fence and the merged snapshot can be tagged consistently.
-        let (candidates, fence_max_delete_seq, deletion_snapshot) = {
+        // the fence and the merged snapshot can be tagged consistently. The
+        // current snapshot id is captured alongside: Phase 3 revalidates it so
+        // an overwrite/promotion that committed mid-pass (its clear wiped the
+        // protected map AND the catalog rows) can never be followed by this
+        // pass re-inserting the merged snapshot into the emptied map — that
+        // would resurrect the whole pre-overwrite warm row set next to its
+        // cold/new copies.
+        let (candidates, fence_max_delete_seq, deletion_snapshot, snapshot_at_capture) = {
             let _fence = self.listing_fence.read().await;
+            let snapshot_at_capture = self.get_current_snapshot_id();
             let protected = self.protected_snapshots.load_full();
             if protected.len() < 2 {
                 return Ok(false);
@@ -14313,7 +14320,12 @@ impl CayenneTableProvider {
             let fence_max_delete_seq = self.protected_snapshot_merge_fence(
                 deletion_snapshot.max_sequence_number().unwrap_or(0),
             );
-            (candidates, fence_max_delete_seq, deletion_snapshot)
+            (
+                candidates,
+                fence_max_delete_seq,
+                deletion_snapshot,
+                snapshot_at_capture,
+            )
         };
         let phase1_fence_ms = compaction_start.elapsed().as_millis();
 
@@ -14611,6 +14623,26 @@ impl CayenneTableProvider {
         // protected set.
         {
             let _fence = self.listing_fence.write().await;
+            // OVERWRITE GUARD (resurrection-critical): an overwrite/promotion
+            // that committed after our CAS wiped BOTH the catalog rows (its
+            // delete-by-table_id removed the merged row we just inserted) and
+            // the in-memory protected map. Re-inserting the merged id into the
+            // emptied map here would make scans read the whole pre-overwrite
+            // row set ALONGSIDE its overwritten/cold copies — a silent
+            // double-count until restart. Any table-state replacement flips
+            // `current_snapshot_id` under this same fence, so comparing it to
+            // the Phase-1 capture detects every such interleaving.
+            if self.get_current_snapshot_id() != snapshot_at_capture {
+                drop(_fence);
+                tracing::info!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    "Subset-merge in-memory publish skipped: the table snapshot was replaced mid-pass (overwrite/promotion); discarding the merged output"
+                );
+                self.retire_snapshot_dirs(std::iter::once(new_snapshot_id.as_str()));
+                self.sweep_retired_snapshot_dirs();
+                return Ok(false);
+            }
             self.protected_snapshots.rcu(|current| {
                 let mut new_map = (**current).clone();
                 for (id, _) in &inputs {
@@ -14849,8 +14881,13 @@ impl CayenneTableProvider {
         // a separate max-delete-seq load could observe a newer ArcSwap version
         // than `deletion_snapshot`, tagging an un-applied deletion as
         // already-applied and resurrecting the rows it deletes).
-        let (ordered_ids, thresholds, fence_max_delete_seq, deletion_snapshot) = {
+        let (ordered_ids, thresholds, fence_max_delete_seq, deletion_snapshot, snapshot_at_capture) = {
             let _fence = self.listing_fence.read().await;
+            // Captured for the Phase-3 overwrite guard (see the subset-merge
+            // publish): an overwrite/promotion committing mid-pass must not be
+            // followed by this pass re-inserting its output into the emptied
+            // protected map (resurrection) or pruning the fresh deletion index.
+            let snapshot_at_capture = self.get_current_snapshot_id();
             let protected = self.protected_snapshots.load_full();
             // Need at least K newest-to-keep + 2 to merge an older prefix.
             if protected.len() < BAKE_KEEP_RECENT_SNAPSHOTS + 2 {
@@ -14869,7 +14906,13 @@ impl CayenneTableProvider {
             let fence_max_delete_seq = self.protected_snapshot_merge_fence(
                 deletion_snapshot.max_sequence_number().unwrap_or(0),
             );
-            (ids, thresholds, fence_max_delete_seq, deletion_snapshot)
+            (
+                ids,
+                thresholds,
+                fence_max_delete_seq,
+                deletion_snapshot,
+                snapshot_at_capture,
+            )
         };
 
         // --- Seq-prefix selection (replaces size-tier selection). ---
@@ -15137,6 +15180,22 @@ impl CayenneTableProvider {
         // in-memory work runs here — no I/O — so the fence is held briefly.
         {
             let _fence = self.listing_fence.write().await;
+            // OVERWRITE GUARD (resurrection-critical) — see the subset-merge
+            // publish: a mid-pass overwrite/promotion wiped the protected map
+            // and the catalog rows (including our just-swapped output);
+            // re-inserting the merged id here would resurrect the whole
+            // pre-overwrite row set, and pruning would gut the fresh index.
+            if self.get_current_snapshot_id() != snapshot_at_capture {
+                drop(_fence);
+                tracing::info!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    "Seq-prefix bake in-memory publish skipped: the table snapshot was replaced mid-pass (overwrite/promotion); discarding the merged output"
+                );
+                self.retire_snapshot_dirs(std::iter::once(new_snapshot_id.as_str()));
+                self.sweep_retired_snapshot_dirs();
+                return Ok(false);
+            }
             self.protected_snapshots.rcu(|current| {
                 let mut new_map = (**current).clone();
                 for (id, _) in &selected {
