@@ -145,7 +145,18 @@ jobs:
       # run is identifiable and reproducible even if it crashes mid-run. Results
       # are appended after the run below.
       - name: Write run summary header
+        env:
+          # Piped through env (never interpolated with ${{ }} into the script body) so an
+          # input containing shell metacharacters (e.g. `$(...)`) is inert data, not code the
+          # shell re-parses. See the "Export extra spiced env vars" step below for the same
+          # rule applied to the actual export.
+          SPICED_ENV_INPUT: ${{ github.event.inputs.spiced_env }}
         run: |
+          # Flatten to one line so a multi-entry value can't break the Markdown table row.
+          extra_spiced_env="none"
+          if [ -n "$SPICED_ENV_INPUT" ]; then
+            extra_spiced_env=$(printf '%s' "$SPICED_ENV_INPUT" | tr '\n' ';' | sed 's/;$//; s/;/; /g')
+          fi
           {
             echo "## CH-BenCHmark run"
             echo ""
@@ -163,7 +174,7 @@ jobs:
             echo "| query overrides | ${{ github.event.inputs.query_overrides || 'none' }} |"
             echo "| runner | ${{ github.event.inputs.runner_type }} |"
             echo "| analytic gate | ${{ github.event.inputs.skip_analytic_gate == 'true' && 'skipped' || 'enabled' }} |"
-            echo "| extra spiced env | ${{ github.event.inputs.spiced_env != '' && github.event.inputs.spiced_env || 'none' }} |"
+            echo "| extra spiced env | ${extra_spiced_env} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build Testoperator
@@ -207,15 +218,22 @@ jobs:
       # steps in this job, so only the "Run CH-benCHmark" step below sees them.
       - name: Export extra spiced env vars
         if: github.event.inputs.spiced_env != ''
+        env:
+          # Piped through env, not interpolated into the script via ${{ }} — the input is
+          # untrusted (free text from workflow_dispatch), and embedding it directly into the
+          # `run:` body would let shell metacharacters (e.g. `$(...)`) execute as the script
+          # is parsed, not just as inert data.
+          SPICED_ENV_INPUT: ${{ github.event.inputs.spiced_env }}
         run: |
           while IFS= read -r line; do
             [ -z "$line" ] && continue
-            if [[ "$line" != *"="* ]]; then
-              echo "::error::Invalid spiced_env entry (expected KEY=VALUE): $line"
+            key="${line%%=*}"
+            if [[ "$line" != *"="* ]] || [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+              echo "::error::Invalid spiced_env entry (expected KEY=VALUE with a valid variable name): $line"
               exit 1
             fi
             echo "$line" >> "$GITHUB_ENV"
-          done <<< "${{ github.event.inputs.spiced_env }}"
+          done <<< "$SPICED_ENV_INPUT"
 
       - name: Run CH-benCHmark - ${{ github.event.inputs.spicepod_path }}
         run: |
