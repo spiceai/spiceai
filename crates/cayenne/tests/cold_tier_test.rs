@@ -944,9 +944,8 @@ async fn test_cold_tier_upsert_after_promotion_impl(
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
-    let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?,
-    );
+    let table =
+        Arc::new(CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?);
     ctx.register_table("upsert_t", Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
     // Load 1000 rows (value = id * 2) and graduate them to the cold tier.
@@ -992,7 +991,10 @@ async fn test_cold_tier_upsert_after_promotion_impl(
         1000,
         "count stable after checkpointing the upsert delta"
     );
-    assert!(table.promote_warm_to_cold().await?, "second promotion fires");
+    assert!(
+        table.promote_warm_to_cold().await?,
+        "second promotion fires"
+    );
     assert_eq!(
         row_count(&ctx, "upsert_t").await?,
         1000,
@@ -1010,7 +1012,10 @@ async fn test_cold_tier_upsert_after_promotion_impl(
         .iter()
         .map(|f| f.row_count)
         .sum();
-    assert_eq!(manifest_rows, 1000, "cold manifest holds exactly the live set");
+    assert_eq!(
+        manifest_rows, 1000,
+        "cold manifest holds exactly the live set"
+    );
 
     Ok(())
 }
@@ -1091,9 +1096,8 @@ async fn test_cold_tier_cdc_memory_upsert_after_promotion_impl(
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
-    let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?,
-    );
+    let table =
+        Arc::new(CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?);
     assert!(
         table.is_cdc_memory_mode(),
         "test profile must arm the in-memory CDC tier"
@@ -1130,7 +1134,10 @@ async fn test_cold_tier_cdc_memory_upsert_after_promotion_impl(
         1000,
         "count stable after checkpointing the CDC update delta"
     );
-    assert!(table.promote_warm_to_cold().await?, "second promotion fires");
+    assert!(
+        table.promote_warm_to_cold().await?,
+        "second promotion fires"
+    );
     assert_eq!(
         row_count(&ctx, "cdc_mem_t").await?,
         1000,
@@ -1140,6 +1147,113 @@ async fn test_cold_tier_cdc_memory_upsert_after_promotion_impl(
         collect_pairs(&ctx, "SELECT id, value FROM cdc_mem_t WHERE id = 7").await?,
         vec![(7, 70)],
         "updated value survives the rewrite"
+    );
+
+    Ok(())
+}
+
+test_with_backends!(test_cold_tier_bake_preserves_cold_masking_tombstones_impl);
+
+/// THE CH-benCH `-cold` convergence bug: the seq-prefix bake rewrites WARM
+/// protected snapshots, physically applying tombstones, then prunes them from
+/// the deletion index — but it never rewrites COLD objects, so a pruned
+/// tombstone that was masking a superseded cold-resident key silently
+/// resurrects the stale cold row (observed as promoted tables over-counting
+/// by ≈ their update count). The prune cutoff must be capped at the cold
+/// manifest's max sequence so cold-masking tombstones survive until a
+/// promotion physically applies them.
+async fn test_cold_tier_bake_preserves_cold_masking_tombstones_impl(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let cold_dir = fixture.temp_dir.path().join("cold");
+    std::fs::create_dir_all(&cold_dir)?;
+
+    let options = cold_table_options_with_conflict(
+        &fixture,
+        "bake_t",
+        &schema,
+        &cold_dir,
+        300_000,
+        Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
+    );
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    let table =
+        Arc::new(CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?);
+    ctx.register_table("bake_t", Arc::clone(&table) as Arc<dyn TableProvider>)?;
+
+    // 1000 rows graduated to the cold tier.
+    insert_id_range(&table, &schema, 0..1000).await?;
+    flush_warm(&table).await;
+    assert!(table.promote_warm_to_cold().await?, "promotion fires");
+    assert_eq!(row_count(&ctx, "bake_t").await?, 1000);
+
+    // Rounds of upserts against cold-resident keys, each flushed into its own
+    // protected snapshot, until the bake's minimum input set exists. Each
+    // round updates a DISJOINT key range (as a real update stream spreads
+    // over keys over time), so the oldest rounds' cold versions are masked
+    // ONLY by their own tombstones — exactly the ones the bake prunes.
+    let rounds: i64 = 6;
+    for round in 0..rounds {
+        let ids: Vec<i64> = (round * 100..(round + 1) * 100).collect();
+        let values: Vec<i64> = ids.iter().map(|i| i * 100 + round + 1).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(Int64Array::from(values)),
+            ],
+        )?;
+        common::insert_batch(table.as_ref(), batch).await?;
+        flush_warm(&table).await;
+    }
+    assert_eq!(
+        row_count(&ctx, "bake_t").await?,
+        1000,
+        "pre-bake: upserted cold-resident keys are masked, not duplicated"
+    );
+
+    // Run the REAL seq-prefix bake (the production pass that pruned the
+    // cold-masking tombstones before the fix).
+    let baked = table.bake_seq_prefix_protected_snapshots().await?;
+    assert!(baked, "the bake must fire with 6 protected snapshots");
+
+    assert_eq!(
+        row_count(&ctx, "bake_t").await?,
+        1000,
+        "post-bake: cold-masking tombstones survive the prune — stale cold versions must not resurrect"
+    );
+    // Key 7 was updated in round 1 — the OLDEST round, squarely inside the
+    // baked prefix (keep=3 of 6): its cold version must stay hidden.
+    assert_eq!(
+        collect_pairs(&ctx, "SELECT id, value FROM bake_t WHERE id = 7").await?,
+        vec![(7, 701)],
+        "a baked-prefix upserted value wins after the bake (cold version stays hidden)"
+    );
+    assert_eq!(
+        collect_pairs(&ctx, "SELECT id, value FROM bake_t WHERE id = 900").await?,
+        vec![(900, 1800)],
+        "an un-upserted cold row keeps its original value after the bake"
+    );
+
+    // A subsequent promotion physically applies the retained tombstones and
+    // clears the index; the count must hold through it.
+    flush_warm(&table).await;
+    assert!(
+        table.promote_warm_to_cold().await?,
+        "post-bake promotion fires"
+    );
+    assert_eq!(
+        row_count(&ctx, "bake_t").await?,
+        1000,
+        "count stable after the dirty-rewrite promotion applies the retained tombstones"
     );
 
     Ok(())
@@ -1178,9 +1292,8 @@ async fn test_cold_tier_cdc_upserts_concurrent_with_promotion_impl(
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
-    let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?,
-    );
+    let table =
+        Arc::new(CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?);
     table.install_slot_advancer(Arc::new(NoopSlotAdvancer));
     ctx.register_table("cdc_race_t", Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
@@ -1197,8 +1310,7 @@ async fn test_cold_tier_cdc_upserts_concurrent_with_promotion_impl(
     let mut generation: i64 = 0;
     while !promotion.is_finished() {
         generation += 1;
-        let updates: Vec<(i64, i64)> =
-            (0..KEYS).map(|i| (i, i * 100 + generation)).collect();
+        let updates: Vec<(i64, i64)> = (0..KEYS).map(|i| (i, i * 100 + generation)).collect();
         cdc_upsert(&table, &schema, &updates).await?;
         tokio::task::yield_now().await;
     }
@@ -1210,8 +1322,7 @@ async fn test_cold_tier_cdc_upserts_concurrent_with_promotion_impl(
     // keys now cold-resident).
     for _ in 0..3 {
         generation += 1;
-        let updates: Vec<(i64, i64)> =
-            (0..KEYS).map(|i| (i, i * 100 + generation)).collect();
+        let updates: Vec<(i64, i64)> = (0..KEYS).map(|i| (i, i * 100 + generation)).collect();
         cdc_upsert(&table, &schema, &updates).await?;
     }
 
@@ -1224,7 +1335,10 @@ async fn test_cold_tier_cdc_upserts_concurrent_with_promotion_impl(
     // And the invariant must hold durably: checkpoint + second promotion.
     flush_warm(&table).await;
     assert_eq!(row_count(&ctx, "cdc_race_t").await?, KEYS);
-    assert!(table.promote_warm_to_cold().await?, "second promotion fires");
+    assert!(
+        table.promote_warm_to_cold().await?,
+        "second promotion fires"
+    );
     assert_eq!(
         row_count(&ctx, "cdc_race_t").await?,
         KEYS,

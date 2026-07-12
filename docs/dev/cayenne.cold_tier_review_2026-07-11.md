@@ -36,6 +36,32 @@ Priority items P1–P4 (see "Suggested priority order") are implemented on
 
 ## 1. Correctness findings (ranked)
 
+### F0 — CONFIRMED + FIXED (2026-07-12): seq-prefix bake resurrects superseded cold rows
+Found investigating the CH-benCH `-cold` non-convergence: every PROMOTED table
+over-counted by ≈ its update count (local SF100 runs 6/7, e.g. stock
+10,000,000 source vs 11,789,715 spiced). Post-mortem on run 7's persisted
+metastore: the cold manifest still held all 10M rows at seq ≤ 2870, and all
+3.72M key tombstones (seq 2871–42417, all key-scoped) existed in the catalog —
+yet the scan masked none of them. Mechanism: the **seq-prefix bake**
+(`bake_seq_prefix_protected_snapshots`) physically applies tombstones to the
+WARM snapshots it rewrites, then prunes them from the in-memory deletion index
+(`prune_deletion_index_at_or_below`) — but the bake never rewrites COLD
+objects, so a pruned tombstone that was masking a superseded cold-resident key
+silently resurrects the stale cold row. The full-rewrite prune
+(`prune_deletion_caches_after_full_rewrite`) had the same blind spot. Unit
+tests never triggered a bake, which is why delete/upsert-after-promotion tests
+passed while every sustained-update benchmark failed.
+
+**Fix:** cap both prune cutoffs at the cold manifest's max sequence
+(`cold_tombstone_prune_cap`) — tombstones above it stay load-bearing for the
+cold scan branch until a promotion physically applies them (the promotion
+commit then legitimately clears the index). Regression test
+`test_cold_tier_bake_preserves_cold_masking_tombstones` drives the real bake
+with disjoint-range update rounds; without the cap it fails at 1300 vs 1000
+(the 3 pruned rounds' cold rows resurrect), with it the full 9-test cold suite
+passes. Memory cost: tombstones accumulate between promotions instead of being
+baked away — bounded by the promotion cadence.
+
 ### F1 — CONFIRMED correctness bug: transient cross-tier over-count during promotion
 `promote_warm_to_cold_inner` publishes visibility at two unsynchronized points:
 `commit_overwrite_to_cold` (`table.rs:13970`) makes the NEW cold files visible via

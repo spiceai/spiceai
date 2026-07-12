@@ -13184,9 +13184,14 @@ impl CayenneTableProvider {
                 // Drop only what the rewrite materialized (`seq <= cutoff` +
                 // the folded protected snapshots); deletes/upserts that raced
                 // the rewrite (`seq > cutoff`, or a protected snapshot created
-                // during the window) are preserved.
+                // during the window) are preserved. Capped at the cold
+                // manifest's max sequence: this rewrite never touches cold
+                // objects, so tombstones masking cold-resident keys must
+                // survive until a promotion applies them.
                 Some((cutoff, folded)) => {
-                    self.prune_deletion_caches_after_full_rewrite(*cutoff, folded);
+                    let cold_cap = self.cold_tombstone_prune_cap().await;
+                    let prune_cutoff = cold_cap.map_or(*cutoff, |cap| (*cutoff).min(cap));
+                    self.prune_deletion_caches_after_full_rewrite(prune_cutoff, folded);
                 }
             }
 
@@ -15117,6 +15122,15 @@ impl CayenneTableProvider {
             .bake_clean_prefix_holds(&selected_set, prefix_cutoff)
             .await;
 
+        // The bake rewrote WARM snapshots only; a tombstone above the cold
+        // manifest's max sequence still masks a superseded cold-resident row
+        // and must survive until a promotion applies it to the cold tier.
+        // Computed outside the fence (metastore read); pruning less than
+        // `prefix_cutoff` is always safe — the physically-applied warm rows
+        // are gone, so a retained tombstone just probe-misses them.
+        let cold_cap = self.cold_tombstone_prune_cap().await;
+        let prune_cutoff = cold_cap.map_or(prefix_cutoff, |cap| prefix_cutoff.min(cap));
+
         // Publish the protected-set swap AND (when the clean-prefix invariant holds)
         // the deletion-index prune together under ONE write-fence hold, so a scan
         // never observes a torn state (swapped-but-not-pruned, or vice versa). Only
@@ -15132,7 +15146,7 @@ impl CayenneTableProvider {
                 Arc::new(new_map)
             });
             if clean_prefix_holds {
-                self.prune_deletion_index_at_or_below(prefix_cutoff);
+                self.prune_deletion_index_at_or_below(prune_cutoff);
             }
         }
 
@@ -16054,9 +16068,49 @@ impl CayenneTableProvider {
         );
     }
 
+    /// Highest commit sequence covered by the datalake (cold) manifest, when
+    /// the tier holds files. Warm-only rewrites (the seq-prefix bake, the
+    /// full-rewrite prune) must retain every tombstone ABOVE this cap: they
+    /// never rewrite cold objects, so a tombstone masking a cold-resident key
+    /// stays load-bearing for the cold scan branch until a promotion
+    /// physically applies it (the promotion commit then clears the index).
+    /// Pruning such a tombstone silently resurrects the stale cold version of
+    /// every key it masked (observed as CH-benCH over-counts ≈ the update
+    /// count on promoted tables).
+    ///
+    /// `None` = no cap (tier disabled, or empty cold manifest). On a metastore
+    /// error, caps at `i64::MIN` so the pass prunes nothing — the conservative
+    /// direction (retained tombstones cost memory, never correctness).
+    async fn cold_tombstone_prune_cap(&self) -> Option<i64> {
+        if !self.table_metadata.vortex_config.cold_tier_enabled() {
+            return None;
+        }
+        match self
+            .catalog
+            .list_cold_tier_files(&self.table_metadata.table_id)
+            .await
+        {
+            Ok(files) => files.iter().map(|f| f.max_sequence).max(),
+            Err(error) => {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    "Failed to read the cold manifest for the tombstone-prune cap; retaining all tombstones this pass"
+                );
+                Some(i64::MIN)
+            }
+        }
+    }
+
     /// Seq-prefix clear of the in-memory deletion index: drop every PK tombstone
     /// whose `delete_seq <= cutoff` (= `T`) while retaining tombstones with
     /// `delete_seq > cutoff` and all upsert re-insertion records.
+    ///
+    /// COLD-TIER CONTRACT: callers whose rewrite did not touch the cold tier
+    /// must cap `cutoff` at [`Self::cold_tombstone_prune_cap`] — tombstones
+    /// above the cold manifest's max sequence are the only thing hiding
+    /// superseded cold-resident rows from the cold scan branch.
     ///
     /// This is the deletion-index half of an incremental seq-prefix compaction
     /// (see [`Self::rewrite_seq_prefix_for_compaction`]). After the rewrite has
