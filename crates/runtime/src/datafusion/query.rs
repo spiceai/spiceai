@@ -1866,7 +1866,7 @@ where
         stream: Option<SendableRecordBatchStream>,
         token: tokio_util::sync::CancellationToken,
         query_id: Arc<str>,
-        timeout_state: QueryTimeoutState,
+        timeout: QueryTimeoutState,
         guard: Option<G>,
         emitted_cancel: bool,
     }
@@ -1878,9 +1878,7 @@ where
         }
 
         fn cancellation_error(&self) -> DataFusionError {
-            DataFusionError::External(Box::new(
-                self.timeout_state.cancellation_error(&self.query_id),
-            ))
+            DataFusionError::External(Box::new(self.timeout.cancellation_error(&self.query_id)))
         }
     }
 
@@ -1890,7 +1888,7 @@ where
         stream: Some(stream),
         token: cancellation_token,
         query_id,
-        timeout_state,
+        timeout: timeout_state,
         guard: Some(guard),
         emitted_cancel: false,
     };
