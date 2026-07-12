@@ -65,7 +65,7 @@ datasets:
         # all that enables the tier. Promotion trigger / cold file size / cadence are intentionally
         # left UNSET so they run on engine defaults / auto-tuning (this pod's whole point). The
         # location is namespaced by table_id, so one shared prefix is safe for every table here. ---
-        cayenne_datalake_location: s3://benchmarks/cayenne-cold-auto-sf1000/
+        cayenne_datalake_location: s3://benchmarks/cayenne-cold-sf1000/
         cayenne_datalake_s3_auth: key
         cayenne_datalake_s3_endpoint: ${secrets:S3_ENDPOINT}
         cayenne_datalake_s3_key: ${secrets:S3_KEY}
