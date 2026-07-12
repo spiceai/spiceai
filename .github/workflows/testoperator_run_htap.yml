@@ -67,7 +67,7 @@ on:
         default: false
         type: boolean
       spiced_env:
-        description: 'Extra environment variables for the spiced process under test, one SPICE_KEY=VALUE or SPICED_KEY=VALUE per line (e.g. SPICE_CAYENNE_EAGER_NDV=true). A handful of reserved SPICE*/SPICED* names owned by this workflow (SPICED_COMMIT, SPICED_BIN, SPICED_ENV_INPUT) are rejected. Applied only to the benchmark run, never to template seeding, so it never invalidates the cached CH-benCH template. Do not put secrets here: values are echoed into the job summary.'
+        description: 'Extra environment variables for the spiced process under test, one SPICE_KEY=VALUE or SPICED_KEY=VALUE per line (e.g. SPICE_CAYENNE_EAGER_NDV=true). A handful of reserved SPICE*/SPICED* names owned by this workflow or testoperator (SPICED_COMMIT, SPICED_BIN, SPICED_ENV_INPUT, SPICED_KEEP_ALIVE) are rejected. Applied only to the benchmark run, never to template seeding, so it never invalidates the cached CH-benCH template. Do not put secrets here: values are echoed into the job summary.'
         required: false
         default: ''
         type: string
@@ -164,7 +164,7 @@ jobs:
               | tr -d '\r' \
               | awk 'NF' \
               | tr '\n' ';' | sed 's/;$//; s/;/; /g' \
-              | sed 's/`/'"'"'/g; s/|/\\|/g')
+              | sed 's/`/\&#96;/g; s/|/\\|/g')
             [ -z "$extra_spiced_env" ] && extra_spiced_env="none"
           fi
           {
@@ -247,7 +247,10 @@ jobs:
           # they're owned by this workflow (provenance, internal plumbing) rather than
           # being spiced runtime config, so letting a dispatcher spoof them would corrupt
           # results/metrics attribution or the export mechanism itself.
-          reserved_names="SPICED_COMMIT SPICED_BIN SPICED_ENV_INPUT"
+          # SPICED_KEEP_ALIVE is a testoperator debug knob that blocks waiting on stdin
+          # (see tools/testoperator/src/commands/htap/mod.rs) — letting a dispatcher set
+          # it would hang the CI run indefinitely rather than just tweak spiced config.
+          reserved_names="SPICED_COMMIT SPICED_BIN SPICED_ENV_INPUT SPICED_KEEP_ALIVE"
           while IFS= read -r line; do
             line="${line%$'\r'}"
             # Skip blank/whitespace-only lines (consistent with the summary-header
