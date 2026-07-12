@@ -67,7 +67,7 @@ on:
         default: false
         type: boolean
       spiced_env:
-        description: 'Extra environment variables for the spiced process under test, one KEY=VALUE per line. Applied only to the benchmark run, never to template seeding, so it never invalidates the cached CH-benCH template.'
+        description: 'Extra environment variables for the spiced process under test, one KEY=VALUE per line. Applied only to the benchmark run, never to template seeding, so it never invalidates the cached CH-benCH template. Do not put secrets here: values are echoed into the job summary and run logs.'
         required: false
         default: ''
         type: string
@@ -152,10 +152,14 @@ jobs:
           # rule applied to the actual export.
           SPICED_ENV_INPUT: ${{ github.event.inputs.spiced_env }}
         run: |
-          # Flatten to one line so a multi-entry value can't break the Markdown table row.
+          # Flatten to one line and escape Markdown table-breaking characters (`|`, backtick,
+          # CR) so a multi-entry or adversarial value can't corrupt the summary table.
           extra_spiced_env="none"
           if [ -n "$SPICED_ENV_INPUT" ]; then
-            extra_spiced_env=$(printf '%s' "$SPICED_ENV_INPUT" | tr '\n' ';' | sed 's/;$//; s/;/; /g')
+            extra_spiced_env=$(printf '%s' "$SPICED_ENV_INPUT" \
+              | tr -d '\r' \
+              | tr '\n' ';' | sed 's/;$//; s/;/; /g' \
+              | sed 's/`/'"'"'/g; s/|/\\|/g')
           fi
           {
             echo "## CH-BenCHmark run"
@@ -214,8 +218,9 @@ jobs:
 
       # Deliberately placed after template restore/seed above: these vars must never be
       # visible to the `--prepare-only` seed run, or an experiment could silently change
-      # what gets frozen into the cached template. $GITHUB_ENV persists for all later
-      # steps in this job, so only the "Run CH-benCHmark" step below sees them.
+      # what gets frozen into the cached template. $GITHUB_ENV persists for every later
+      # step in this job (not just "Run CH-benCHmark"), so seeding is protected but
+      # subsequent diagnostics/cleanup steps also see these vars.
       - name: Export extra spiced env vars
         if: github.event.inputs.spiced_env != ''
         env:
@@ -226,13 +231,14 @@ jobs:
           SPICED_ENV_INPUT: ${{ github.event.inputs.spiced_env }}
         run: |
           while IFS= read -r line; do
+            line="${line%$'\r'}"
             [ -z "$line" ] && continue
             key="${line%%=*}"
             if [[ "$line" != *"="* ]] || [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
               echo "::error::Invalid spiced_env entry (expected KEY=VALUE with a valid variable name): $line"
               exit 1
             fi
-            echo "$line" >> "$GITHUB_ENV"
+            printf '%s\n' "$line" >> "$GITHUB_ENV"
           done <<< "$SPICED_ENV_INPUT"
 
       - name: Run CH-benCHmark - ${{ github.event.inputs.spicepod_path }}
