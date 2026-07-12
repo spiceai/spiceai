@@ -61,11 +61,6 @@ on:
         required: false
         default: false
         type: boolean
-      cayenne_eager_ndv:
-        description: 'Fold NDV eagerly on ingest (sets SPICE_CAYENNE_EAGER_NDV); default (false) = lazy, compute NDV on file spill'
-        required: false
-        default: false
-        type: boolean
       skip_analytic_gate:
         description: 'Skip the analytical-query correctness gate (re-runs every CH-benCH query against source + Spice and diffs results) to save time on experiments; the row-count gate still runs. Scheduled runs always leave this false.'
         required: false
@@ -276,10 +271,6 @@ jobs:
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-          # Eager vs lazy Cayenne NDV (default lazy). Inherited by the spiced
-          # process testoperator spawns; spiced logs the resolved mode once. Used
-          # to A/B the lazy-NDV change in the benchmark.
-          SPICE_CAYENNE_EAGER_NDV: ${{ github.event.inputs.cayenne_eager_ndv }}
 
       # Upload the under-load diagnostics dir
       - name: Upload HTAP diagnostics
@@ -393,12 +384,13 @@ jobs:
         if: always() && contains(github.event.inputs.spicepod_path, '-cold')
         run: |
           if command -v mc >/dev/null 2>&1; then
-            # Non-fatal: mc prints its own diagnostics (empty prefix, or an auth/endpoint failure) to
-            # the log, but a cleanup miss must never fail the benchmark run. No success/"already clean"
-            # message here, so a real mc failure is not misreported.
+            # Non-fatal: a cleanup miss must never fail the benchmark run, so every mc call is guarded
+            # with `|| true`. We print a one-line size/count summary per prefix (mc du) before deleting.
             for prefix in cayenne-cold-sf1000 cayenne-cold-sf10; do
-              echo "Removing datalake objects under spice-minio/benchmarks/${prefix}/ (best-effort; an empty prefix is expected when no promotion ran) ..."
-              mc rm --recursive --force "spice-minio/benchmarks/${prefix}/" || true
+              target="spice-minio/benchmarks/${prefix}/"
+              summary=$(mc du "${target}" 2>/dev/null || true)
+              echo "Cleaning ${target} — ${summary:-empty (no promotion ran)}"
+              mc rm --recursive --force "${target}" >/dev/null 2>&1 || true
             done
           else
             echo "mc client not found; skipping datalake-tier S3 cleanup."
