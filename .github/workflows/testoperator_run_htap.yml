@@ -156,10 +156,16 @@ jobs:
           # CR) so a multi-entry or adversarial value can't corrupt the summary table.
           extra_spiced_env="none"
           if [ -n "$SPICED_ENV_INPUT" ]; then
+            # awk 'NF' drops blank/whitespace-only lines before joining, so input that's
+            # only blank lines (e.g. a stray trailing newline) collapses to "none" below
+            # instead of a meaningless "; ; " row. (awk never fails on zero matches, unlike
+            # grep, so this stays safe under the runner's `set -eo pipefail`.)
             extra_spiced_env=$(printf '%s' "$SPICED_ENV_INPUT" \
               | tr -d '\r' \
+              | awk 'NF' \
               | tr '\n' ';' | sed 's/;$//; s/;/; /g' \
               | sed 's/`/'"'"'/g; s/|/\\|/g')
+            [ -z "$extra_spiced_env" ] && extra_spiced_env="none"
           fi
           {
             echo "## CH-BenCHmark run"
@@ -240,7 +246,13 @@ jobs:
             [ -z "$line" ] && continue
             key="${line%%=*}"
             if [[ "$line" != *"="* ]] || [[ ! "$key" =~ ^SPICE[A-Za-z0-9_]*$ ]]; then
-              echo "::error::Invalid spiced_env entry (expected SPICE*=VALUE with a variable name starting with SPICE): $line"
+              # Workflow-command values must have %, CR, LF escaped (%25/%0D/%0A) or an
+              # untrusted line containing them could corrupt the log or smuggle in
+              # additional workflow commands.
+              escaped="${line//%/%25}"
+              escaped="${escaped//$'\r'/%0D}"
+              escaped="${escaped//$'\n'/%0A}"
+              echo "::error::Invalid spiced_env entry (expected SPICE*=VALUE with a variable name starting with SPICE): ${escaped}"
               exit 1
             fi
             printf '%s\n' "$line" >> "$GITHUB_ENV"
