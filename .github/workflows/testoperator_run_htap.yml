@@ -261,6 +261,9 @@ jobs:
         env:
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          # DIAGNOSTIC BRANCH: promotion stage marks + compaction/promotion visibility for the
+          # cold-tier readiness-hang investigation (stage marks are DEBUG-level).
+          SPICED_LOG: "info,cayenne::compaction=debug"
           # Dedicated in-cluster PG pod on xlarge; per-run docker container (loopback) elsewhere.
           CHBENCH_PG_HOST: ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && 'chbench-postgres.dataplatform.svc.cluster.local' || '127.0.0.1' }}
           # Dedicated in-cluster MySQL pod on xlarge; per-run docker container (loopback) elsewhere. Used only when the spicepod is a MySQL source.
