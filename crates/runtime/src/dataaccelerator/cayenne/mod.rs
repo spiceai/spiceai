@@ -2142,13 +2142,17 @@ fn validate_datalake_table_options(
             Set 'cayenne_deletion_mode: key' (or remove it), or remove 'cayenne_datalake_location'."
         ));
     }
+    // Default values quoted in the error hints, derived so they can never
+    // drift from the actual `VortexConfig` defaults.
+    let defaults = cayenne::metadata::VortexConfig::default();
     // The promotion interval drives BOTH the promotion trigger and the
     // physical GC loop; 0 means the background task is never spawned, so the
     // tier never promotes and never reclaims superseded objects.
     if vc.cold_tier_background_interval_ms == 0 {
         return Err(format!(
             "Failed to register dataset {table_name} (cayenne): 'cayenne_datalake_promotion_interval_ms' is 0, which disables the background promotion and garbage-collection loop — the datalake tier would never promote or reclaim objects. \
-            Set a positive interval (default 60000), or remove 'cayenne_datalake_location'."
+            Set a positive interval (default {}), or remove 'cayenne_datalake_location'.",
+            defaults.cold_tier_background_interval_ms
         ));
     }
     // The GC interval doubles as the orphan grace: 0 would let a superseded
@@ -2156,7 +2160,8 @@ fn validate_datalake_table_options(
     if vc.cold_tier_gc_interval_ms == 0 {
         return Err(format!(
             "Failed to register dataset {table_name} (cayenne): 'cayenne_datalake_gc_interval_ms' is 0, which collapses the garbage-collection grace period to zero — a superseded datalake object could be deleted while a running query still reads it. \
-            Set a positive interval (default 300000), or remove 'cayenne_datalake_location'."
+            Set a positive interval (default {}), or remove 'cayenne_datalake_location'.",
+            defaults.cold_tier_gc_interval_ms
         ));
     }
     // Unknown clustering columns are dropped by the engine at promotion time
