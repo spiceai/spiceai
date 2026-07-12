@@ -997,10 +997,12 @@ pub struct Query {
     /// refreshes, health checks) are exempt. Enforcement is cooperative
     /// (best-effort): the query is cancelled at its next cancellation
     /// checkpoint, so actual runtime can slightly exceed the configured
-    /// value. On expiry the query fails with a timeout error (HTTP 504 /
-    /// gRPC `DEADLINE_EXCEEDED`); a result stream already in progress is
-    /// terminated with that error — data streamed before expiry will have
-    /// been delivered, but the stream never ends silently as if complete.
+    /// value. On expiry the query fails with a timeout error: HTTP 504 /
+    /// gRPC `DEADLINE_EXCEEDED` when the timeout is observed before the
+    /// response starts; once results are already streaming the status can
+    /// no longer change, so the in-progress stream is terminated with the
+    /// error instead — data streamed before expiry will have been
+    /// delivered, but the stream never ends silently as if complete.
     /// Unset = no timeout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<String>,

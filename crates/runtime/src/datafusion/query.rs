@@ -3050,22 +3050,18 @@ mod tests {
                 Handle::current(),
             )
             .max_concurrent_queries(Some(1))
-            .query_timeout(Some(Duration::from_millis(250)))
+            .query_timeout(Some(Duration::from_millis(500)))
             .build(),
         );
 
         // A holds the only permit for the whole test: its unpolled stream owns
-        // the permit, and a fired timeout token releases resources only when
-        // the stream is next polled — so A's own timer elapsing cannot free
-        // the permit.
-        let df_a = Arc::clone(&df);
-        let _query_a = Arc::new(RequestContext::builder(Protocol::Http).build())
-            .scope(async move {
-                QueryBuilder::new("SELECT 42 AS value", df_a)
-                    .build()
-                    .run()
-                    .await
-            })
+        // the permit until polled or dropped. A runs under the default
+        // internal request context, which is exempt from the timeout, so A
+        // can neither time out during startup (releasing the permit early)
+        // nor have its unpolled stream affected by a timer.
+        let _query_a = QueryBuilder::new("SELECT 42 AS value", Arc::clone(&df))
+            .build()
+            .run()
             .await
             .expect("query A should run");
 
@@ -3084,7 +3080,7 @@ mod tests {
         .expect_err("query B should fail with a timeout");
 
         match b_err {
-            Error::QueryTimedOut { timeout, .. } => assert_eq!(timeout, "250ms"),
+            Error::QueryTimedOut { timeout, .. } => assert_eq!(timeout, "500ms"),
             other => panic!("expected QueryTimedOut, got: {other:?}"),
         }
     }
@@ -3103,10 +3099,13 @@ mod tests {
                 Arc::new(AcceleratorEngineRegistry::new()),
                 Handle::current(),
             )
-            .query_timeout(Some(Duration::from_millis(100)))
+            .query_timeout(Some(Duration::from_secs(1)))
             .build(),
         );
 
+        // A 1s budget is generous enough that startup (planning/admission)
+        // cannot plausibly consume it on a loaded CI host, so the query
+        // reliably returns a stream before the timer fires.
         let df_q = Arc::clone(&df);
         let mut result = Arc::new(RequestContext::builder(Protocol::Http).build())
             .scope(async move {
@@ -3118,9 +3117,9 @@ mod tests {
             .await
             .expect("query should start successfully");
 
-        // Let the 100ms timer fire before the stream is polled (generous
-        // margin for slow CI).
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Let the 1s timer fire before the stream is polled (generous margin
+        // for slow CI).
+        tokio::time::sleep(Duration::from_millis(2500)).await;
 
         let err = result
             .data
@@ -3152,10 +3151,13 @@ mod tests {
                 Arc::new(AcceleratorEngineRegistry::new()),
                 Handle::current(),
             )
-            .query_timeout(Some(Duration::from_millis(100)))
+            .query_timeout(Some(Duration::from_secs(1)))
             .build(),
         );
 
+        // A 1s budget is generous enough that startup (planning/admission)
+        // cannot plausibly consume it on a loaded CI host, so the explicit
+        // cancel below reliably lands before the timer fires.
         let cancel_token = CancellationToken::new();
         let df_q = Arc::clone(&df);
         let token_q = cancel_token.clone();
@@ -3170,10 +3172,10 @@ mod tests {
             .await
             .expect("query should start successfully");
 
-        // Cancel first, then let the 100ms timeout window pass before the
+        // Cancel first, then let the 1s timeout window pass before the
         // stream observes anything.
         cancel_token.cancel();
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        tokio::time::sleep(Duration::from_millis(2500)).await;
 
         let err = result
             .data
