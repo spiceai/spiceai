@@ -170,6 +170,13 @@ pub enum Error {
 
     #[snafu(display("Query {query_id} was cancelled"))]
     QueryCancelled { query_id: String },
+
+    #[snafu(display(
+        "Query {query_id} exceeded the configured timeout of {timeout} and was cancelled. \
+        Increase 'runtime.query.timeout' or optimize the query. \
+        See: https://spiceai.org/docs/reference/spicepod"
+    ))]
+    QueryTimedOut { query_id: String, timeout: String },
 }
 
 impl Error {
@@ -248,15 +255,74 @@ enum DistributedSubmitMode {
     Resume,
 }
 
+/// Records whether the query's cancellation token was fired by the
+/// `runtime.query.timeout` timer rather than an explicit cancel or client
+/// disconnect, so every site that builds a cancellation error can report
+/// [`Error::QueryTimedOut`] instead of [`Error::QueryCancelled`].
+#[derive(Clone, Default)]
+pub(crate) struct QueryTimeoutState {
+    inner: Option<Arc<QueryTimeoutInner>>,
+}
+
+struct QueryTimeoutInner {
+    fired: std::sync::atomic::AtomicBool,
+    timeout: std::time::Duration,
+}
+
+impl QueryTimeoutState {
+    fn armed(timeout: std::time::Duration) -> Self {
+        Self {
+            inner: Some(Arc::new(QueryTimeoutInner {
+                fired: std::sync::atomic::AtomicBool::new(false),
+                timeout,
+            })),
+        }
+    }
+
+    fn mark_fired(&self) {
+        if let Some(inner) = &self.inner {
+            inner.fired.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// The error to report for a fired cancellation token: `QueryTimedOut`
+    /// when the timeout timer fired it, `QueryCancelled` otherwise.
+    fn cancellation_error(&self, query_id: &str) -> Error {
+        match &self.inner {
+            Some(inner) if inner.fired.load(std::sync::atomic::Ordering::SeqCst) => {
+                Error::QueryTimedOut {
+                    query_id: query_id.to_string(),
+                    timeout: format!("{:?}", inner.timeout),
+                }
+            }
+            _ => Error::QueryCancelled {
+                query_id: query_id.to_string(),
+            },
+        }
+    }
+}
+
+/// Aborts the `runtime.query.timeout` timer task when dropped, so the timer
+/// cannot fire after the query's result stream completes, errors, or is
+/// dropped. Bundled into the guard attached to the result stream.
+struct QueryTimeoutTimerGuard {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for QueryTimeoutTimerGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 impl Query {
     fn ensure_not_cancelled(
         token: &tokio_util::sync::CancellationToken,
         query_id: &str,
+        timeout_state: &QueryTimeoutState,
     ) -> Result<()> {
         if token.is_cancelled() {
-            return Err(Error::QueryCancelled {
-                query_id: query_id.to_string(),
-            });
+            return Err(timeout_state.cancellation_error(query_id));
         }
         Ok(())
     }
@@ -891,6 +957,32 @@ impl Query {
             None => request_context.child_cancellation_token(),
         };
 
+        // Arm the `runtime.query.timeout` timer: when it elapses it fires the
+        // query's cancellation token and the existing cancellation machinery
+        // tears the query down; the state marker distinguishes the resulting
+        // error as `QueryTimedOut`. The timer covers the query's full
+        // lifetime — planning, admission wait, execution, and result
+        // streaming — and is disarmed (via the guard bundled into the result
+        // stream) when the stream completes, errors, or is dropped. Internal
+        // runtime queries (acceleration refreshes, health checks, task
+        // history) are exempt: the timeout governs externally-issued queries.
+        let (timeout_state, timeout_timer_guard) = match self.df.query_timeout() {
+            Some(timeout) if request_context.protocol() != Protocol::Internal => {
+                let state = QueryTimeoutState::armed(timeout);
+                let timer_state = state.clone();
+                let timer_token = query_cancel_token.clone();
+                let handle = tokio::spawn(async move {
+                    tokio::time::sleep(timeout).await;
+                    // Mark before cancelling so observers of the fired token
+                    // always classify the cancellation as a timeout.
+                    timer_state.mark_fired();
+                    timer_token.cancel();
+                });
+                (state, Some(QueryTimeoutTimerGuard { handle }))
+            }
+            _ => (QueryTimeoutState::default(), None),
+        };
+
         // Register in the DataFusion-owned active-query registry so administrative
         // cancel endpoints can locate this query by id. The guard is captured
         // by the returned stream so the registration is removed on completion,
@@ -912,7 +1004,7 @@ impl Query {
 
         let query_result =
             async {
-                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
 
                 let mut session = self.get_session_state(&request_context);
 
@@ -938,7 +1030,11 @@ impl Query {
                         let plan = if let Some(plan) = pre_parsed_plan {
                             plan
                         } else {
-                            Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                            Self::ensure_not_cancelled(
+                                &query_cancel_token,
+                                &query_id_str,
+                                &timeout_state,
+                            )?;
                             match Self::get_plan(
                                 &ctx.df,
                                 &session,
@@ -966,7 +1062,11 @@ impl Query {
                                 },
                             }
                         };
-                        Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                        Self::ensure_not_cancelled(
+                            &query_cancel_token,
+                            &query_id_str,
+                            &timeout_state,
+                        )?;
                         let tables_referenced = plan.as_table_refs();
                         if let Some(disallowed_table) = tables_referenced
                             .iter()
@@ -1001,16 +1101,25 @@ impl Query {
                         .await?
                         {
                             PlanOrCached::Plan(plan, tracker, cache_manager) => {
-                                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                                Self::ensure_not_cancelled(
+                                    &query_cancel_token,
+                                    &query_id_str,
+                                    &timeout_state,
+                                )?;
                                 (plan, tracker, cache_manager)
                             }
                             PlanOrCached::Cached(query_result) => {
-                                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                                Self::ensure_not_cancelled(
+                                    &query_cancel_token,
+                                    &query_id_str,
+                                    &timeout_state,
+                                )?;
                                 return Ok(attach_cancellation_to_query_result(
                                     query_result,
                                     query_cancel_token.clone(),
                                     Arc::clone(&query_id_str),
-                                    active_query_guard,
+                                    timeout_state.clone(),
+                                    (active_query_guard, timeout_timer_guard),
                                 ));
                             }
                         }
@@ -1032,7 +1141,7 @@ impl Query {
                     }
                 };
 
-                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
 
                 if let Err(e) = validate_sql_query_operations(&plan, &ctx.df) {
                     let e = find_datafusion_root(e);
@@ -1133,7 +1242,11 @@ impl Query {
                 let admission_permit: Option<tokio::sync::OwnedSemaphorePermit> =
                     match ctx.df.query_admission_semaphore() {
                         Some(semaphore) if plan_executes_query => {
-                            Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                            Self::ensure_not_cancelled(
+                                &query_cancel_token,
+                                &query_id_str,
+                                &timeout_state,
+                            )?;
                             // Race permit acquisition against cancellation so a query
                             // cancelled WHILE QUEUED for a permit (client disconnect or
                             // `/cancel` under load) aborts promptly instead of blocking
@@ -1143,9 +1256,7 @@ impl Query {
                             tokio::select! {
                                 biased;
                                 () = query_cancel_token.cancelled() => {
-                                    return Err(Error::QueryCancelled {
-                                        query_id: query_id_str.to_string(),
-                                    });
+                                    return Err(timeout_state.cancellation_error(&query_id_str));
                                 }
                                 permit = semaphore.acquire_owned() => permit.ok(),
                             }
@@ -1177,7 +1288,7 @@ impl Query {
                         Arc::new(SessionContext::new_with_state(ctx.df.ctx.state()))
                     };
 
-                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
                     let dataframe = match session_ctx
                         .execute_logical_plan(plan.as_ref().clone())
                         .await
@@ -1196,7 +1307,7 @@ impl Query {
                         }
                     };
 
-                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
                     // Create a physical plan from the dataframe and execute it with our own TaskContext
                     // that includes the request context. This ensures BytesProcessedExec has access to it.
                     let df_plan = match dataframe.create_physical_plan().await {
@@ -1214,7 +1325,7 @@ impl Query {
                         }
                     };
 
-                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
                     let task_ctx = Arc::new(TaskContext::from(&session));
                     let stream = match execute_stream_preserving_output_order(
                         Arc::clone(&df_plan),
@@ -1236,7 +1347,7 @@ impl Query {
                     (stream, df_plan)
                 } else {
                     // For regular plans, use the standard physical plan execution
-                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
                     let mut physical_plan = match session.create_physical_plan(&plan).await {
                         Ok(stream) => stream,
                         Err(e) => {
@@ -1256,7 +1367,11 @@ impl Query {
                     if let Some(batch_size) =
                         Self::adaptive_flight_batch_size(&session, &request_context, &physical_plan)
                     {
-                        Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                        Self::ensure_not_cancelled(
+                            &query_cancel_token,
+                            &query_id_str,
+                            &timeout_state,
+                        )?;
                         let adaptive_session = Self::session_with_batch_size(&session, batch_size);
                         physical_plan = match adaptive_session.create_physical_plan(&plan).await {
                             Ok(stream) => stream,
@@ -1275,7 +1390,7 @@ impl Query {
                         execution_session = adaptive_session;
                     }
 
-                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
                     let task_ctx = Arc::new(TaskContext::from(&execution_session));
 
                     let stream = match execute_stream_preserving_output_order(
@@ -1295,11 +1410,11 @@ impl Query {
                             )
                         }
                     };
-                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
                     (stream, physical_plan)
                 };
 
-                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
 
                 // Skip schema verification for Statement plans (PREPARE/EXECUTE/DEALLOCATE),
                 // DDL plans (CREATE TABLE/DROP TABLE), DML Delete/Update plans, and Spice
@@ -1376,13 +1491,16 @@ impl Query {
                     final_stream,
                     query_cancel_token.clone(),
                     Arc::clone(&query_id_str),
-                    // Bundle the admission permit with the active-query guard so
-                    // BOTH release exactly when the result stream is fully drained
-                    // (completion, error, or cancellation) — the permit thus spans
-                    // the query's true lifetime, not merely until `run` returns
-                    // (Flight drains the stream lazily; the managed runtime drives
-                    // it on a separate task).
-                    (active_query_guard, admission_permit),
+                    timeout_state.clone(),
+                    // Bundle the admission permit and the timeout-timer guard
+                    // with the active-query guard so ALL release exactly when
+                    // the result stream is fully drained (completion, error, or
+                    // cancellation) — the permit thus spans the query's true
+                    // lifetime, not merely until `run` returns (Flight drains
+                    // the stream lazily; the managed runtime drives it on a
+                    // separate task), and the timeout timer is disarmed at the
+                    // same moment.
+                    (active_query_guard, admission_permit, timeout_timer_guard),
                 );
 
                 Ok(QueryResult::new(
@@ -1698,6 +1816,7 @@ fn attach_cancellation_to_query_result<G>(
     query_result: QueryResult,
     cancellation_token: tokio_util::sync::CancellationToken,
     query_id: Arc<str>,
+    timeout_state: QueryTimeoutState,
     guard: G,
 ) -> QueryResult
 where
@@ -1705,19 +1824,21 @@ where
 {
     let QueryResult { data, cache_status } = query_result;
     QueryResult::new(
-        attach_cancellation_to_stream(data, cancellation_token, query_id, guard),
+        attach_cancellation_to_stream(data, cancellation_token, query_id, timeout_state, guard),
         cache_status,
     )
 }
 
 /// Wraps a record batch stream so that cancellation via the supplied
 /// [`CancellationToken`] yields a single [`DataFusionError::External`] wrapping
-/// [`Error::QueryCancelled`] and terminates the stream.
+/// [`Error::QueryCancelled`] — or [`Error::QueryTimedOut`] when the
+/// `runtime.query.timeout` timer fired the token — and terminates the stream.
 ///
-/// Using [`Error::QueryCancelled`] lets downstream callers (HTTP status
-/// mapping, Flight status mapping, metrics) distinguish cancellation from
-/// other query failures via [`is_cancellation_error`] or an
-/// [`std::error::Error::downcast_ref`] on the external error source.
+/// Using these dedicated variants lets downstream callers (HTTP status
+/// mapping, Flight status mapping, metrics) distinguish cancellation and
+/// timeout from other query failures via [`is_cancellation_error`] /
+/// [`is_timeout_error`] or an [`std::error::Error::downcast_ref`] on the
+/// external error source.
 ///
 /// The wrapper also keeps ownership of any `guard` (typically an
 /// [`ActiveQueryGuard`]) so that the query's registry entry is removed when the
@@ -1726,6 +1847,7 @@ fn attach_cancellation_to_stream<G>(
     stream: SendableRecordBatchStream,
     cancellation_token: tokio_util::sync::CancellationToken,
     query_id: Arc<str>,
+    timeout_state: QueryTimeoutState,
     guard: G,
 ) -> SendableRecordBatchStream
 where
@@ -1735,6 +1857,7 @@ where
         stream: Option<SendableRecordBatchStream>,
         token: tokio_util::sync::CancellationToken,
         query_id: Arc<str>,
+        timeout_state: QueryTimeoutState,
         guard: Option<G>,
         emitted_cancel: bool,
     }
@@ -1744,12 +1867,12 @@ where
             self.stream.take();
             self.guard.take();
         }
-    }
 
-    fn cancellation_error(query_id: &str) -> DataFusionError {
-        DataFusionError::External(Box::new(Error::QueryCancelled {
-            query_id: query_id.to_string(),
-        }))
+        fn cancellation_error(&self) -> DataFusionError {
+            DataFusionError::External(Box::new(
+                self.timeout_state.cancellation_error(&self.query_id),
+            ))
+        }
     }
 
     let schema = stream.schema();
@@ -1758,6 +1881,7 @@ where
         stream: Some(stream),
         token: cancellation_token,
         query_id,
+        timeout_state,
         guard: Some(guard),
         emitted_cancel: false,
     };
@@ -1769,7 +1893,7 @@ where
         if state.token.is_cancelled() {
             state.emitted_cancel = true;
             state.release_query_resources();
-            return Some((Err(cancellation_error(&state.query_id)), state));
+            return Some((Err(state.cancellation_error()), state));
         }
         let token = state.token.clone();
         let mut stream = state.stream.take()?;
@@ -1778,7 +1902,7 @@ where
             () = token.cancelled() => {
                 state.emitted_cancel = true;
                 state.release_query_resources();
-                Some((Err(cancellation_error(&state.query_id)), state))
+                Some((Err(state.cancellation_error()), state))
             }
             next = stream.next() => {
                 state.stream = Some(stream);
@@ -1800,6 +1924,18 @@ pub fn is_cancellation_error(err: &DataFusionError) -> bool {
     source
         .downcast_ref::<Error>()
         .is_some_and(|e| matches!(e, Error::QueryCancelled { .. }))
+}
+
+/// Returns true if `err` represents a query cancelled by the
+/// `runtime.query.timeout` timer, produced by [`attach_cancellation_to_stream`].
+#[must_use]
+pub fn is_timeout_error(err: &DataFusionError) -> bool {
+    let DataFusionError::External(source) = err else {
+        return false;
+    };
+    source
+        .downcast_ref::<Error>()
+        .is_some_and(|e| matches!(e, Error::QueryTimedOut { .. }))
 }
 
 #[must_use]
@@ -2889,6 +3025,147 @@ mod tests {
         }
     }
 
+    /// [query timeout] A query still QUEUED for an admission permit when the
+    /// `runtime.query.timeout` timer elapses must return `QueryTimedOut` (not
+    /// `QueryCancelled`, and not block until the permit frees). Deterministic:
+    /// A holds the only permit for the whole test, so B can only exit via the
+    /// timeout — the short timeout value is the subject under test, not a
+    /// readiness wait.
+    #[tokio::test]
+    async fn query_timeout_while_queued_returns_timed_out() {
+        use std::time::Duration;
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .max_concurrent_queries(Some(1))
+            .query_timeout(Some(Duration::from_millis(250)))
+            .build(),
+        );
+
+        // A holds the only permit for the whole test: its unpolled stream owns
+        // the permit, and a fired timeout token releases resources only when
+        // the stream is next polled — so A's own timer elapsing cannot free
+        // the permit.
+        let df_a = Arc::clone(&df);
+        let _query_a = Arc::new(RequestContext::builder(Protocol::Http).build())
+            .scope(async move {
+                QueryBuilder::new("SELECT 42 AS value", df_a)
+                    .build()
+                    .run()
+                    .await
+            })
+            .await
+            .expect("query A should run");
+
+        let df_b = Arc::clone(&df);
+        let b_err = tokio::time::timeout(
+            Duration::from_secs(10),
+            Arc::new(RequestContext::builder(Protocol::Http).build()).scope(async move {
+                QueryBuilder::new("SELECT 43 AS value", df_b)
+                    .build()
+                    .run()
+                    .await
+            }),
+        )
+        .await
+        .expect("timed-out query B should return promptly, not block on the permit")
+        .expect_err("query B should fail with a timeout");
+
+        match b_err {
+            Error::QueryTimedOut { timeout, .. } => assert_eq!(timeout, "250ms"),
+            other => panic!("expected QueryTimedOut, got: {other:?}"),
+        }
+    }
+
+    /// [query timeout] A timeout that elapses while the result stream is still
+    /// being consumed must terminate the stream with a `QueryTimedOut` error
+    /// recognized by `is_timeout_error` (the ADBC TIMEOUT-vs-CANCELLED
+    /// distinction). The sleep is the subject under test (letting the armed
+    /// timer elapse), not a readiness wait.
+    #[tokio::test]
+    async fn query_timeout_terminates_result_stream() {
+        use std::time::Duration;
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .query_timeout(Some(Duration::from_millis(100)))
+            .build(),
+        );
+
+        let df_q = Arc::clone(&df);
+        let mut result = Arc::new(RequestContext::builder(Protocol::Http).build())
+            .scope(async move {
+                QueryBuilder::new("SELECT 42 AS value", df_q)
+                    .build()
+                    .run()
+                    .await
+            })
+            .await
+            .expect("query should start successfully");
+
+        // Let the 100ms timer fire before the stream is polled (generous
+        // margin for slow CI).
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let err = result
+            .data
+            .next()
+            .await
+            .expect("stream should yield the timeout error, not end")
+            .expect_err("stream item should be the timeout error");
+        assert!(
+            is_timeout_error(&err),
+            "expected a timeout error, got: {err}"
+        );
+        assert!(
+            !is_cancellation_error(&err),
+            "timeout must not be classified as a plain cancellation"
+        );
+    }
+
+    /// [query timeout] Internal runtime queries (health checks, acceleration
+    /// refreshes — anything under `Protocol::Internal`, which is also the
+    /// default outside a request scope) are exempt from `runtime.query.timeout`.
+    /// With a 50ms timeout configured and a 500ms pause before draining, the
+    /// stream must still deliver results. The pause lets a wrongly-armed timer
+    /// fire, so it is the subject under test, not a readiness wait.
+    #[tokio::test]
+    async fn query_timeout_exempts_internal_queries() {
+        use std::time::Duration;
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .query_timeout(Some(Duration::from_millis(50)))
+            .build(),
+        );
+
+        // No request-context scope → the internal request context applies.
+        let mut result = QueryBuilder::new("SELECT 42 AS value", Arc::clone(&df))
+            .build()
+            .run()
+            .await
+            .expect("internal query should start successfully");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let batch = result
+            .data
+            .next()
+            .await
+            .expect("internal query should yield data despite the elapsed timeout")
+            .expect("internal query batch should not be an error");
+        assert_eq!(batch.num_rows(), 1);
+    }
+
     #[tokio::test]
     async fn test_parameter_schema_ordering_basic() {
         use datafusion::execution::context::SessionContext;
@@ -3566,6 +3843,7 @@ mod tests {
             stream_from_batches(&schema, vec![batch]),
             cancel_token.clone(),
             Arc::clone(&query_id),
+            QueryTimeoutState::default(),
             DropFlag::new(Arc::clone(&guard_dropped)),
         );
 
@@ -3604,6 +3882,7 @@ mod tests {
             pending_stream(&schema),
             cancel_token.clone(),
             Arc::clone(&query_id),
+            QueryTimeoutState::default(),
             DropFlag::new(Arc::clone(&guard_dropped)),
         );
 

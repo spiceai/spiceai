@@ -987,6 +987,40 @@ pub struct Query {
     /// `DataFusion` default (`0`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eager_aggregation_max_pushed_groups: Option<usize>,
+
+    /// Maximum wall-clock duration a query may run before it is automatically
+    /// cancelled, as a human-readable duration (e.g. `30s`, `5m`). The clock
+    /// covers the query's full lifetime: planning, admission-control waits
+    /// (`max_concurrent_queries`), execution, and streaming results to the
+    /// client. Applies to queries issued through the runtime's query APIs
+    /// (HTTP, Flight, Flight SQL); internal runtime queries (acceleration
+    /// refreshes, health checks) are exempt. Enforcement is cooperative
+    /// (best-effort): the query is cancelled at its next cancellation
+    /// checkpoint, so actual runtime can slightly exceed the configured
+    /// value. On expiry the query fails with a timeout error (HTTP 504 /
+    /// gRPC `DEADLINE_EXCEEDED`) — partial results are never returned.
+    /// Unset = no timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+}
+
+impl Query {
+    pub fn timeout(&self) -> Result<Option<Duration>, Box<dyn Error + Send + Sync>> {
+        if let Some(timeout_str) = &self.timeout {
+            let duration = duration_parse::parse_duration(timeout_str)
+                .map_err(|e| format!("Failed to parse 'runtime.query.timeout': {e}"))?;
+
+            if duration.is_zero() {
+                return Err(
+                    "'runtime.query.timeout' must be a positive duration greater than 0".into(),
+                );
+            }
+
+            Ok(Some(duration))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1416,6 +1450,7 @@ mod tests {
                 eager_aggregation: None,
                 eager_aggregation_min_reduction_factor: None,
                 eager_aggregation_max_pushed_groups: None,
+                timeout: None,
             })
         );
 
@@ -1437,6 +1472,7 @@ mod tests {
                 eager_aggregation: None,
                 eager_aggregation_min_reduction_factor: None,
                 eager_aggregation_max_pushed_groups: None,
+                timeout: None,
             })
         );
 
@@ -1459,6 +1495,7 @@ mod tests {
                 eager_aggregation: None,
                 eager_aggregation_min_reduction_factor: None,
                 eager_aggregation_max_pushed_groups: None,
+                timeout: None,
             })
         );
 
@@ -1488,6 +1525,7 @@ mod tests {
                 eager_aggregation: None,
                 eager_aggregation_min_reduction_factor: None,
                 eager_aggregation_max_pushed_groups: None,
+                timeout: None,
             })
         );
 
@@ -1509,6 +1547,7 @@ mod tests {
                 eager_aggregation: None,
                 eager_aggregation_min_reduction_factor: None,
                 eager_aggregation_max_pushed_groups: None,
+                timeout: None,
             })
         );
 
@@ -1531,6 +1570,7 @@ mod tests {
                 eager_aggregation: None,
                 eager_aggregation_min_reduction_factor: None,
                 eager_aggregation_max_pushed_groups: None,
+                timeout: None,
             })
         );
 
@@ -1566,6 +1606,72 @@ mod tests {
                 .as_ref()
                 .and_then(|q| q.max_concurrent_queries),
             None
+        );
+    }
+
+    #[test]
+    fn test_query_timeout_parse() {
+        // Set: nested under runtime.query parses into the new field and the
+        // helper converts the human-readable duration.
+        let yaml = r"
+            query:
+                timeout: 30s
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let query = runtime.query.expect("query section should be present");
+        assert_eq!(query.timeout, Some("30s".to_string()));
+        assert_eq!(
+            query.timeout().expect("30s should parse"),
+            Some(Duration::from_secs(30))
+        );
+
+        // Minute-granularity durations parse too.
+        let query = Query {
+            timeout: Some("5m".to_string()),
+            ..Query::default()
+        };
+        assert_eq!(
+            query.timeout().expect("5m should parse"),
+            Some(Duration::from_mins(5))
+        );
+
+        // Absent → None (no timeout), guarding against a serde rename/regression.
+        let yaml = r"
+            query:
+                target_partitions: 8
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let query = runtime.query.expect("query section should be present");
+        assert_eq!(query.timeout, None);
+        assert_eq!(query.timeout().expect("absent timeout is valid"), None);
+    }
+
+    #[test]
+    fn test_query_timeout_invalid_values() {
+        // Zero is rejected: it would mean "cancel every query immediately".
+        let query = Query {
+            timeout: Some("0s".to_string()),
+            ..Query::default()
+        };
+        let err = query
+            .timeout()
+            .expect_err("zero timeout should be an error");
+        assert!(
+            err.to_string().contains("positive duration"),
+            "unexpected error: {err}"
+        );
+
+        // Unparseable values are rejected with the field name in the message.
+        let query = Query {
+            timeout: Some("not-a-duration".to_string()),
+            ..Query::default()
+        };
+        let err = query
+            .timeout()
+            .expect_err("garbage timeout should be an error");
+        assert!(
+            err.to_string().contains("runtime.query.timeout"),
+            "unexpected error: {err}"
         );
     }
 

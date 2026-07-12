@@ -379,6 +379,7 @@ pub struct DataFusionBuilder {
     temp_directory: Option<String>,
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
     query_admission_semaphore: Option<Arc<Semaphore>>,
+    query_timeout: Option<std::time::Duration>,
     task_history_enabled: bool,
     caching: Option<Arc<Caching>>,
     spill_compression: Option<SpillCompression>,
@@ -447,6 +448,7 @@ impl DataFusionBuilder {
             temp_directory: None,
             accelerated_refresh_semaphore: None,
             query_admission_semaphore: None,
+            query_timeout: None,
             task_history_enabled: true,
             caching: None,
             spill_compression: None,
@@ -558,6 +560,15 @@ impl DataFusionBuilder {
     pub fn max_concurrent_queries(mut self, max_concurrent_queries: Option<usize>) -> Self {
         self.query_admission_semaphore =
             max_concurrent_queries.map(|n| Arc::new(Semaphore::new(n.max(1))));
+        self
+    }
+
+    /// Maximum wall-clock lifetime for externally-issued queries
+    /// (`runtime.query.timeout`): planning, admission wait, execution, and
+    /// result streaming all count. `None` = no timeout.
+    #[must_use]
+    pub fn query_timeout(mut self, query_timeout: Option<std::time::Duration>) -> Self {
+        self.query_timeout = query_timeout;
         self
     }
 
@@ -1195,6 +1206,7 @@ impl DataFusionBuilder {
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
             query_admission_semaphore: self.query_admission_semaphore,
+            query_timeout: self.query_timeout,
             task_history_enabled: self.task_history_enabled,
             temp_directory: self.temp_directory.clone(),
             cpu_runtime: OnceLock::new(),
