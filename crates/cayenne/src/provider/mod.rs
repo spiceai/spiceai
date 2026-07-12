@@ -71,6 +71,7 @@ limitations under the License.
 //! - [`constants`]: Staging-dir name, WAL filename, and other shared constants.
 //! - [`partitioned_wal`]: Cross-partition WAL for the partitioned-table
 //!   coordinator (feature-gated).
+pub(crate) mod cold_partition;
 pub(crate) mod column_stats;
 pub(crate) mod compaction;
 pub(crate) mod compaction_writer;
@@ -110,7 +111,10 @@ pub(crate) mod write_budget;
 pub(crate) mod zorder;
 
 // Re-export the main type at the module level for convenience
-pub use compaction::{set_compaction_runtime_env, set_compaction_runtime_handle};
+pub use compaction::{
+    begin_compaction_shutdown, drain_compaction_tasks, in_flight_compaction_tasks,
+    reset_compaction_shutdown, set_compaction_runtime_env, set_compaction_runtime_handle,
+};
 pub use context::CayenneContext;
 pub use mem_tier::SlotAdvancer;
 pub use mem_tier_budget::{

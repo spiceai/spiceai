@@ -945,6 +945,7 @@ mod tests {
     fn source_column(name: &str) -> SourceColumn {
         SourceColumn {
             name: name.to_string(),
+            column_type: "varchar(255)".to_string(),
             enum_variants: None,
             set_variants: None,
             is_primary_key: false,

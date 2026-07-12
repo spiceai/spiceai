@@ -674,6 +674,7 @@ impl SqliteMetastore {
             min_sequence BIGINT NOT NULL DEFAULT 0,
             max_sequence BIGINT NOT NULL DEFAULT 0,
             statistics_blob BLOB NOT NULL,
+            pk_bloom_blob BLOB,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
             PRIMARY KEY (table_id, file_url)
         )
@@ -939,6 +940,15 @@ impl MetastoreBackend for SqliteMetastore {
                 // EXPECTED_TABLES column order.
                 let _ = conn.execute(
                     "ALTER TABLE cayenne_snapshot_file ADD COLUMN digest TEXT",
+                    [],
+                );
+
+                // Per-cold-file PK existence bloom. NULL (legacy / non-upsert /
+                // over-cap) makes the keyset rebuild fall back to the exact cold
+                // scan, so the column is forward- and downgrade-safe. Appended
+                // last to match CREATE TABLE and EXPECTED_TABLES column order.
+                let _ = conn.execute(
+                    "ALTER TABLE cayenne_cold_tier_file ADD COLUMN pk_bloom_blob BLOB",
                     [],
                 );
 

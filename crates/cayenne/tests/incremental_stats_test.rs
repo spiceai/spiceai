@@ -132,6 +132,13 @@ async fn test_live_num_rows_and_ndv_under_upsert(
     // 1. Insert 2000 distinct ids -> num_rows == 2000, NDV(id) ~ 2000.
     common::insert_batch(&table, batch(1, 2000, 10)).await?;
     table.flush_pending_maintenance().await?;
+    // NDV is computed lazily — folded only when rows spill from the in-memory
+    // inline tier to a persisted Vortex file. Spill the inline memtable before
+    // every NDV assertion so small inline inserts/upserts (steps 2-3, ≤ the
+    // inline cap) contribute their distinct counts. (Step 1's 2000 rows exceed
+    // the inline cap and take the staged file path, which already folds NDV, so
+    // this is a no-op here.) `num_rows` is unaffected by the fold timing.
+    table.checkpoint_inlined_data().await?;
 
     let stats = table
         .optimizer_table_statistics()
@@ -170,6 +177,8 @@ async fn test_live_num_rows_and_ndv_under_upsert(
     //    stay 2000 — inserted (1000) - superseded (1000) = 0 net — NOT 3000.
     common::insert_batch(&table, batch(1, 1000, 100)).await?;
     table.flush_pending_maintenance().await?;
+    // Spill the inline upsert so its (unchanged id set, new vals) reaches NDV.
+    table.checkpoint_inlined_data().await?;
 
     assert_eq!(
         count_star(&ctx, "inc_stats").await,
@@ -201,6 +210,8 @@ async fn test_live_num_rows_and_ndv_under_upsert(
     // 3. Insert 1000 brand-new ids -> num_rows == 3000, NDV(id) ~ 3000.
     common::insert_batch(&table, batch(2001, 1000, 10)).await?;
     table.flush_pending_maintenance().await?;
+    // Spill the 1000 brand-new inline ids so they are sketched into NDV.
+    table.checkpoint_inlined_data().await?;
 
     assert_eq!(
         count_star(&ctx, "inc_stats").await,

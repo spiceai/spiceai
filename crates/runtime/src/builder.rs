@@ -325,6 +325,12 @@ impl RuntimeBuilder {
             );
         }
 
+        // Cayenne compaction shutdown state is process-global. Reset it when a
+        // fresh Runtime is built so embedded/test runtimes created after a prior
+        // shutdown can start maintenance passes again, including when dedicated
+        // thread pools are disabled and no compaction runtime handle is injected.
+        cayenne::reset_compaction_shutdown();
+
         self.accelerator_engine_registry.register_all().await;
         dataconnector::register_all().await;
         catalogconnector::register_all().await;
@@ -749,7 +755,6 @@ impl RuntimeBuilder {
             app: shared_app,
             apply_app_lock: Arc::new(tokio::sync::Mutex::new(())),
             df,
-            models: Arc::new(RwLock::new(HashMap::new())),
             llm_runtime_stores: Arc::new(crate::model::LlmRuntimeStores::default()),
             http_rate_control_registry,
             workers: Arc::new(RwLock::new(HashMap::new())),
@@ -781,6 +786,14 @@ impl RuntimeBuilder {
             )),
             telemetry_config: self.telemetry_config,
         };
+
+        // Executors: register cluster status before any concurrent
+        // `load_components` / `start_servers` race so readiness cannot pass on
+        // dataset-only status while task slots are still closed (#11758 Fix B).
+        if is_cluster_executor {
+            rt.status
+                .update_cluster("executor", status::ComponentStatus::Initializing);
+        }
 
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();
         for factory in self.extensions {

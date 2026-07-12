@@ -21,3 +21,6 @@ tokio-stream.workspace = true
 tonic = { workspace = true, features = ["transport"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[lints]
+workspace = true

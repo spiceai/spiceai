@@ -25,3 +25,6 @@ runtime = { path = "../../runtime" }
 
 [features]
 default = []
+
+[lints]
+workspace = true

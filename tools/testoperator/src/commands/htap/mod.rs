@@ -43,12 +43,20 @@ use test_framework::{
 };
 
 use crate::{
-    args::HtapArgs, commands::bench::prepare_chbench_source, health::HealthMonitor,
+    args::{HtapArgs, SourceType},
+    commands::bench::prepare_chbench_source,
+    health::HealthMonitor,
     spiced_metrics::MetricsScraper,
 };
 
 pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     let test_args = &args.test_args;
+    // spiced names replication metrics per source connector; select the prefix
+    // matching the configured source so scraping picks up the right series.
+    let replication_engine = match test_args.source_type {
+        SourceType::Postgres => "postgres",
+        SourceType::Mysql => "mysql",
+    };
     let (app, mut start_request) = super::get_app_and_start_request(&test_args.common).await?;
 
     let query_set = test_args.load_query_set()?;
@@ -71,9 +79,14 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let terminals = args.terminals.unwrap_or((scale_factor * 10.0) as usize);
     let duration = Duration::from_secs(test_args.common.duration);
-    let driver: Arc<dyn chbench_driver::ChBenchDriver> = Arc::new(
-        prepare_chbench_source(scale_factor, terminals, args.rate, args.skip_prepare).await?,
-    );
+    let driver: Arc<dyn chbench_driver::ChBenchDriver> = prepare_chbench_source(
+        scale_factor,
+        terminals,
+        args.rate,
+        args.skip_prepare,
+        test_args.source_type,
+    )
+    .await?;
 
     // --prepare-only: the source is now seeded; exit before starting spiced so
     // an external harness can snapshot the pristine source (e.g. to a Postgres
@@ -135,6 +148,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
             .map_or_else(|| "unlimited".to_string(), |r| r.to_string()),
         "spicepod_path": test_args.common.spicepod_path.display().to_string(),
         "clock_skew_ms_estimate": clock_skew_ms_estimate,
+        "skip_analytic_gate": args.skip_analytic_gate,
     });
 
     let benchmark_resource = Resource::builder_empty()
@@ -156,6 +170,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
                 args.rate
                     .map_or_else(|| "unlimited".to_string(), |r| r.to_string()),
             ),
+            KeyValue::new("skip_analytic_gate", args.skip_analytic_gate.to_string()),
         ])
         .build();
 
@@ -268,11 +283,12 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
 
     // 7. Report analytical query metrics.
     let mut failures: Vec<String> = Vec::new();
+    let mut query_summary_rows: Vec<reporting::QuerySummaryRow> = Vec::new();
     for query in &metrics.metrics {
         let query_name = &query.query_name;
         let attributes = vec![KeyValue::new("query_name", query_name.to_string())];
 
-        let status: u64 = u64::from(match &query.query_status {
+        let passed = match &query.query_status {
             QueryStatus::Passed => true,
             QueryStatus::Failed(reason) => {
                 if let Some(reason) = reason {
@@ -282,6 +298,16 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
                 }
                 false
             }
+        };
+        let status: u64 = u64::from(passed);
+
+        query_summary_rows.push(reporting::QuerySummaryRow {
+            query_name: query_name.to_string(),
+            passed,
+            iterations: query.iterations,
+            median_ms: query.median_duration_ms,
+            p90_ms: query.percentile_90_duration_ms,
+            p99_ms: query.percentile_99_duration_ms,
         });
 
         crate::metrics::QUERY_STATUS.record(status, &attributes);
@@ -329,10 +355,17 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
 
     // 8. Report OLTP results.
     println!("\n=== TPC-C OLTP ===");
+    let mut oltp_summary: Option<reporting::OltpSummary> = None;
     match oltp_result {
         Ok(Ok(report)) => {
             report.print_summary();
             crate::metrics::OLTP_TPMC.record(report.tpmc, &[]);
+            oltp_summary = Some(reporting::OltpSummary {
+                tpmc: report.tpmc,
+                total_committed: report.total_committed,
+                total_aborted: report.total_aborted,
+                abort_rate: report.abort_rate,
+            });
         }
         Ok(Err(e)) => {
             eprintln!("OLTP workload error: {e}");
@@ -357,8 +390,15 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
 
     // Apply-phase coverage violations (populated below), gated at the end of the run.
     let mut coverage_violations: Vec<(String, f64)> = Vec::new();
+    let mut lag_summary: Option<reporting::ReplicationLagSummary> = None;
     if let Some(metrics) = &spiced_metrics {
-        reporting::emit_replication_metrics(metrics, &pg_stats, "under load", true);
+        lag_summary = reporting::emit_replication_metrics(
+            metrics,
+            replication_engine,
+            &pg_stats,
+            "under load",
+            true,
+        );
         // For Cayenne backend report additional metrics
         reporting::emit_cayenne_read_amp_percentiles(metrics);
         // Localize CDC backpressure across the pipeline stages (prefetch channel,
@@ -384,6 +424,26 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
             Err(e) => eprintln!(
                 "Failed to write metrics dump to {}: {e}",
                 dump_path.display()
+            ),
+        }
+    }
+
+    // Emit the headline results (tpmC, QPH, worst lag, per-query latencies) as a
+    // Markdown summary CI appends to the job summary.
+    if let Some(summary_path) = &args.summary_out {
+        let summary = reporting::RunSummary {
+            qph,
+            completed_queries,
+            elapsed_secs,
+            oltp: oltp_summary,
+            lag: lag_summary,
+            queries: query_summary_rows,
+        };
+        match reporting::write_run_summary(summary_path, &summary).await {
+            Ok(()) => println!("\nWrote run summary to {}", summary_path.display()),
+            Err(e) => eprintln!(
+                "Failed to write run summary to {}: {e}",
+                summary_path.display()
             ),
         }
     }
@@ -430,8 +490,11 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
                         // WAL rather than the current (post-drain) state.
                         let fresh_pg_stats =
                             crate::pg_stats::PgStatsScraper::sample_once_now().await;
-                        reporting::emit_replication_metrics(
+                        // Diagnostic re-scrape: the lag summary return is unused here
+                        // (the headline was already captured from the under-load scrape).
+                        let _ = reporting::emit_replication_metrics(
                             &metrics,
+                            replication_engine,
                             &fresh_pg_stats,
                             "post-drain re-scrape",
                             false,
@@ -449,9 +512,20 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
                 error_messages.push(message);
             }
 
-            // Analytical-correctness gate runs only when the row-count gate fully passed (replication converged + every table matches).
-            // Otherwise the underlying data is known to diverge, so comparing analytical query results adds no signal.
-            if row_count_message.is_none() {
+            // Analytical-correctness gate runs only when not explicitly skipped AND the
+            // row-count gate fully passed (replication converged + every table matches).
+            // Otherwise the underlying data is known to diverge, so comparing analytical
+            // query results adds no signal.
+            let skip_reason = match (args.skip_analytic_gate, row_count_message.is_some()) {
+                (true, true) => Some("--skip-analytic-gate set (row-count gate also did not pass)"),
+                (true, false) => Some("--skip-analytic-gate set"),
+                (false, true) => Some("row-count gate did not pass"),
+                (false, false) => None,
+            };
+
+            if let Some(reason) = skip_reason {
+                println!("\nSkipping analytical-query gate — {reason}");
+            } else {
                 let query_overrides = test_args
                     .query_overrides
                     .clone()
@@ -474,8 +548,6 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
                         error_messages.push(format!("HTAP analytical-query error: {e}"));
                     }
                 }
-            } else {
-                println!("\nSkipping analytical-query gate — row-count gate did not pass");
             }
         }
         Err(e) => {

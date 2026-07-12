@@ -19,6 +19,7 @@ limitations under the License.
 use std::path::PathBuf;
 use std::time::Duration;
 
+use pgwire_replication::PgOutputFormat;
 use secrecy::{ExposeSecret, SecretString};
 
 /// Parameters for a single dataset's replication stream.
@@ -68,6 +69,22 @@ pub struct ReplicationParams {
     /// (per-dataset generated) slot names keep the dedicated per-dataset
     /// stream.
     pub shared: bool,
+    /// Capacity of each shared-slot member's bounded delivery channel (envelopes).
+    /// Only consulted on the shared path ([`super::shared`]); the per-dataset
+    /// stream does not use it. A member's channel sits in front of the
+    /// accelerator's much larger prefetch buffer, so too small a value turns one
+    /// member's transient stall into slot-wide head-of-line blocking. Defaults to
+    /// [`super::shared::DEFAULT_MEMBER_CHANNEL_CAPACITY`].
+    pub member_channel_capacity: usize,
+
+    /// pgoutput column output format to request on the WAL stream. Internal —
+    /// not a spicepod parameter: the connector always sets [`PgOutputFormat::Binary`]
+    /// (binary decodes faster and avoids source-side text formatting). Exposed
+    /// as a field only so tests can force [`PgOutputFormat::Text`] to exercise
+    /// the text fallback and assert binary/text parity. Per-column the server
+    /// still emits text for types lacking a binary send function, so the text
+    /// decode path stays live regardless of this setting.
+    pub pg_output_format: PgOutputFormat,
 }
 
 impl std::fmt::Debug for ReplicationParams {
@@ -87,6 +104,8 @@ impl std::fmt::Debug for ReplicationParams {
             .field("status_interval", &self.status_interval)
             .field("bootstrap_batch_size", &self.bootstrap_batch_size)
             .field("shared", &self.shared)
+            .field("member_channel_capacity", &self.member_channel_capacity)
+            .field("pg_output_format", &self.pg_output_format)
             .finish_non_exhaustive()
     }
 }

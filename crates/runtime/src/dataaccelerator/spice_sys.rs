@@ -23,7 +23,6 @@ limitations under the License.
     feature = "postgres-accel"
 ))]
 use std::path::Path;
-#[cfg(any(feature = "duckdb", feature = "turso"))]
 use std::sync::Arc;
 
 use super::AccelerationSource;
@@ -53,7 +52,6 @@ use super::turso::{Error as TursoError, TursoAccelerator};
 #[cfg(feature = "duckdb")]
 use {
     super::duckdb::{DuckDBAccelerator, Error as DuckDbError},
-    super::partitioned_duckdb::{Error as PartitionedDuckDbError, PartitionedDuckDBAccelerator},
     datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
 };
 #[cfg(feature = "sqlite")]
@@ -63,13 +61,7 @@ use {
 };
 
 use crate::component::dataset::acceleration::Engine;
-#[cfg(any(
-    feature = "duckdb",
-    feature = "sqlite",
-    feature = "turso",
-    feature = "postgres-accel"
-))]
-use crate::dataaccelerator::get_registered_accelerator;
+use crate::dataaccelerator::AcceleratorEngineRegistry;
 
 pub mod dataset_checkpoint;
 #[cfg(feature = "debezium")]
@@ -124,10 +116,6 @@ pub enum Error {
     #[cfg(feature = "duckdb")]
     #[snafu(display("Unable to create DuckDB connection pool: {source}"))]
     DuckDbPool { source: DuckDbError },
-
-    #[cfg(feature = "duckdb")]
-    #[snafu(display("Unable to create Partitioned DuckDB connection pool: {source}"))]
-    PartitionedDuckDbPool { source: PartitionedDuckDbError },
 
     #[cfg(feature = "sqlite")]
     #[snafu(display("Failed to resolve SQLite file path: {source}"))]
@@ -233,13 +221,19 @@ async fn acceleration_connection(
         not(any(feature = "duckdb", feature = "sqlite", feature = "turso")),
         expect(unused_variables)
     )]
+    registry: Arc<AcceleratorEngineRegistry>,
+    #[cfg_attr(
+        not(any(feature = "duckdb", feature = "sqlite", feature = "turso")),
+        expect(unused_variables)
+    )]
     open_option: OpenOption,
 ) -> Result<AccelerationConnection> {
     let acceleration_settings = source.acceleration().context(AccelerationNotEnabledSnafu)?;
     match acceleration_settings.engine {
         #[cfg(feature = "duckdb")]
         Engine::DuckDB => {
-            let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
+            let accelerator = registry
+                .get_accelerator_engine(acceleration_settings.engine)
                 .await
                 .context(AcceleratorEngineUnavailableSnafu {
                     engine: Engine::DuckDB,
@@ -266,57 +260,12 @@ async fn acceleration_connection(
 
             Ok(AccelerationConnection::DuckDB(Arc::new(pool)))
         }
-        #[cfg(feature = "duckdb")]
-        Engine::PartitionedDuckDB => {
-            let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
-                .await
-                .context(AcceleratorEngineUnavailableSnafu {
-                    engine: Engine::PartitionedDuckDB,
-                })?;
-            let duckdb_accelerator = accelerator
-                .as_any()
-                .downcast_ref::<PartitionedDuckDBAccelerator>()
-                .context(DowncastFailedSnafu {
-                    target: "PartitionedDuckDBAccelerator",
-                })?;
-
-            let pool = duckdb_accelerator
-                .get_shared_pool(source)
-                .await
-                .context(PartitionedDuckDbPoolSnafu)?;
-
-            Ok(AccelerationConnection::DuckDB(pool))
-        }
-        #[cfg(feature = "duckdb")]
-        Engine::TableModePartitionedDuckDB => {
-            use crate::dataaccelerator::partitioned_duckdb::tables_mode::TablesModePartitionedDuckDBAccelerator;
-
-            let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
-                .await
-                .context(AcceleratorEngineUnavailableSnafu {
-                    engine: Engine::TableModePartitionedDuckDB,
-                })?;
-            let duckdb_accelerator = accelerator
-                .as_any()
-                .downcast_ref::<TablesModePartitionedDuckDBAccelerator>()
-                .context(DowncastFailedSnafu {
-                    target: "TableModePartitionedDuckDBAccelerator",
-                })?;
-
-            let pool = duckdb_accelerator
-                .get_shared_pool(source)
-                .await
-                .context(PartitionedDuckDbPoolSnafu)?;
-
-            Ok(AccelerationConnection::DuckDB(pool))
-        }
         #[cfg(not(feature = "duckdb"))]
-        Engine::DuckDB | Engine::PartitionedDuckDB | Engine::TableModePartitionedDuckDB => {
-            DuckDbFeatureNotEnabledSnafu.fail()
-        }
+        Engine::DuckDB => DuckDbFeatureNotEnabledSnafu.fail(),
         #[cfg(feature = "sqlite")]
         Engine::Sqlite => {
-            let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
+            let accelerator = registry
+                .get_accelerator_engine(acceleration_settings.engine)
                 .await
                 .context(AcceleratorEngineUnavailableSnafu {
                     engine: Engine::Sqlite,
@@ -359,7 +308,8 @@ async fn acceleration_connection(
 
         #[cfg(feature = "turso")]
         Engine::Turso => {
-            let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
+            let accelerator = registry
+                .get_accelerator_engine(acceleration_settings.engine)
                 .await
                 .context(AcceleratorEngineUnavailableSnafu {
                     engine: Engine::Turso,
@@ -390,9 +340,9 @@ async fn acceleration_connection(
         #[cfg(all(not(windows), feature = "sqlite"))]
         Engine::Cayenne => {
             use datafusion_table_providers::sqlite::SqliteTableProviderFactory;
-            use std::sync::Arc;
 
-            let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
+            let accelerator = registry
+                .get_accelerator_engine(acceleration_settings.engine)
                 .await
                 .context(AcceleratorEngineUnavailableSnafu {
                     engine: Engine::Cayenne,

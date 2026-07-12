@@ -64,12 +64,30 @@ pub struct HtapArgs {
     #[arg(long)]
     pub(crate) metrics_dump: Option<PathBuf>,
 
+    /// Write a human-readable Markdown results summary (headline tpmC, QPH, worst
+    /// replication lag, and the per-query latency table) to this path when the run
+    /// completes. CI appends it to the GitHub Actions job summary so the headline
+    /// results are visible without opening the run log.
+    #[arg(long)]
+    pub(crate) summary_out: Option<PathBuf>,
+
     /// Fail the run if any changes-mode table's apply-phase coverage (instrumented
     /// write-phase time ÷ apply-burst wall time) falls below this fraction (0.0–1.0).
     /// A low ratio means a CDC apply bottleneck hides in un-instrumented code. Default
     /// 0.0 = report only (no gate); set e.g. 0.85 on the HTAP smoke to catch regressions.
     #[arg(long, default_value_t = 0.0, value_parser = parse_phase_coverage)]
     pub(crate) min_phase_coverage: f64,
+
+    /// Skip the analytical-query correctness gate (re-running every CH-benCH
+    /// analytical query against both source and Spice and diffing results).
+    /// It is the most expensive correctness check and is not part of the
+    /// measurement, so experiments that only care about tpmC/QPH/lag can skip
+    /// it to save time; the row-count gate (replication drain + per-table
+    /// parity) always still runs. Default `false` (gate runs) to keep data
+    /// correctness the default — scheduled/monitoring runs should never set
+    /// this.
+    #[arg(long, default_value_t = false)]
+    pub(crate) skip_analytic_gate: bool,
 }
 
 /// Parse and validate `--min-phase-coverage`: a fraction in the inclusive range
