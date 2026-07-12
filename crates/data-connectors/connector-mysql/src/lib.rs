@@ -223,16 +223,6 @@ const PARAMETERS: &[ParameterSpec] = &[
              'rebootstrap' -> 'restart'.",
         )
         .help_link(MYSQL_DOCS),
-    ParameterSpec::component("replication_gtid")
-        .description(
-            "For `refresh_mode: changes`, how the stream resumes: by server-independent GTID set \
-             (failover-safe, `COM_BINLOG_DUMP_GTID`) or by binlog file+offset. 'auto' uses GTIDs \
-             when the source runs with gtid_mode = ON, else file+offset; 'enabled' requires \
-             gtid_mode = ON; 'disabled' always uses file+offset. Default: auto.",
-        )
-        .default("auto")
-        .one_of_ignore_ascii_case(&["auto", "enabled", "disabled"])
-        .help_link(MYSQL_DOCS),
 ];
 
 // https://github.com/apache/datafusion-sqlparser-rs/blob/87d19073/src/keywords.rs#L1053

@@ -39,7 +39,7 @@ use async_trait::async_trait;
 use data_components::cdc::{ChangeEnvelope, ChangesStream, StreamError};
 use data_components::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
 use data_components::mysql_replication::{
-    GtidMode, PersistedPosition, PositionStore, ReplicationMetricsCollector, ReplicationParams,
+    PersistedPosition, PositionStore, ReplicationMetricsCollector, ReplicationParams,
     ReplicationStreamInput, StoreError, encode_checkpoint_schema_json, start_replication_stream,
 };
 use futures::StreamExt;
@@ -99,7 +99,6 @@ fn params_for(port: u16, server_id: u32) -> ReplicationParams {
         checkpoint_interval: Duration::from_secs(1),
         invalid_position_behavior: InvalidCheckpointBehavior::Error,
         ready_lag: Duration::from_secs(2),
-        gtid_mode: GtidMode::Auto,
     }
 }
 

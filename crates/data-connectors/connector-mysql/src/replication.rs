@@ -32,9 +32,9 @@ use async_trait::async_trait;
 use data_components::cdc::{ChangesStream, StreamError};
 use data_components::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
 use data_components::mysql_replication::{
-    BinlogPosition, GtidMode, NoopPositionStore, PersistedPosition, PositionStore,
-    ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
-    StoreError, derive_server_id, process_nonce, start_replication_stream,
+    BinlogPosition, NoopPositionStore, PersistedPosition, PositionStore, ReplicationMetrics,
+    ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput, StoreError,
+    derive_server_id, process_nonce, start_replication_stream,
 };
 use datafusion::sql::TableReference;
 use futures::StreamExt;
@@ -584,8 +584,6 @@ fn replication_params_from_connector_params(
         "replication_ready_lag",
         data_components::cdc::DEFAULT_READY_LAG,
     )?;
-    let gtid_mode = parse_gtid_mode(params)?;
-
     Ok(ReplicationParams {
         opts,
         server_id,
@@ -594,20 +592,7 @@ fn replication_params_from_connector_params(
         checkpoint_interval,
         invalid_position_behavior,
         ready_lag,
-        gtid_mode,
     })
-}
-
-/// Resolve `mysql_replication_gtid` (`auto` | `enabled` | `disabled`),
-/// defaulting to [`GtidMode::Auto`] when unset.
-fn parse_gtid_mode(params: &Parameters) -> Result<GtidMode, String> {
-    Ok(optional_enum(
-        params,
-        "replication_gtid",
-        "'auto', 'enabled', or 'disabled'",
-        GtidMode::from_canonical,
-    )?
-    .unwrap_or_default())
 }
 
 /// Build `mysql_async::Opts` for the replication connections from the same
@@ -1074,36 +1059,6 @@ mod tests {
         assert_eq!(
             repl.invalid_position_behavior,
             InvalidCheckpointBehavior::Restart
-        );
-    }
-
-    #[test]
-    fn gtid_mode_parses_and_defaults() {
-        // Default is auto.
-        let params = params_with(&[("host", "localhost"), ("sslmode", "disabled")]);
-        let repl = replication_params_from_connector_params(&params, "orders")
-            .expect("valid params parse");
-        assert_eq!(repl.gtid_mode, GtidMode::Auto);
-
-        for (raw, expected) in [
-            ("auto", GtidMode::Auto),
-            ("enabled", GtidMode::Enabled),
-            ("DISABLED", GtidMode::Disabled),
-        ] {
-            let params = params_with(&[("replication_gtid", raw)]);
-            let repl = replication_params_from_connector_params(&params, "orders")
-                .expect("valid params parse");
-            assert_eq!(repl.gtid_mode, expected, "raw: {raw}");
-        }
-
-        // A typo must error loudly rather than silently disable failover-safety.
-        let params = params_with(&[("replication_gtid", "on")]);
-        let err = replication_params_from_connector_params(&params, "orders")
-            .expect_err("typo'd mode must error");
-        assert!(
-            err.contains("mysql_replication_gtid")
-                && err.contains("'auto', 'enabled', or 'disabled'"),
-            "got: {err}"
         );
     }
 

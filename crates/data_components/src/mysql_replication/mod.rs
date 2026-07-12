@@ -43,7 +43,7 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
-use snafu::{Snafu, ensure};
+use snafu::Snafu;
 
 use crate::cdc::{
     ChangeEnvelope, ChangesStream, CommitChange, CommitError, NoOpCommitter, StreamError,
@@ -51,7 +51,7 @@ use crate::cdc::{
 };
 
 use crate::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
-pub use config::{BinlogPosition, GtidMode, ReplicationParams, derive_server_id, process_nonce};
+pub use config::{BinlogPosition, ReplicationParams, derive_server_id, process_nonce};
 pub use gtid::GtidSet;
 pub use metrics::{Metrics as ReplicationMetrics, MetricsCollector as ReplicationMetricsCollector};
 
@@ -130,40 +130,27 @@ pub enum Error {
     GtidParse { message: String },
 
     #[snafu(display(
-        "Failed to start MySQL replication for {dataset} ({database}.{table}): \
-         `mysql_replication_gtid: enabled` requires the source server to run with \
-         `gtid_mode = ON`, but it is not. Enable GTIDs on the source \
-         (SET @@GLOBAL.enforce_gtid_consistency = ON; SET @@GLOBAL.gtid_mode = ON;), \
-         or set `mysql_replication_gtid: auto` to fall back to file+offset positioning. \
+        "Cannot resume MySQL replication for {dataset} ({database}.{table}): this dataset was \
+         bootstrapped with GTID auto-positioning, but the source server no longer reports \
+         `gtid_mode = ON` (it may have been reconfigured, or this is a different server without \
+         GTIDs). Resuming by file+offset instead would silently start from a server-local \
+         position that does not correspond to the applied GTID set. Restore `gtid_mode = ON` on \
+         the source, or drop the accelerator's persisted state (its `spice_sys_mysql_binlog` row) \
+         to re-bootstrap by file+offset. \
          See: https://spiceai.org/docs/components/data-connectors/mysql"
     ))]
-    GtidModeRequired {
+    GtidResumeUnavailable {
         dataset: String,
         database: String,
         table: String,
     },
 
     #[snafu(display(
-        "Cannot start MySQL replication for {dataset}: `mysql_replication_gtid: {configured}` \
-         requires a {required} resume cursor, but the persisted checkpoint is a {found} cursor. \
-         Switching an existing dataset's replication cursor type is never done implicitly — drop \
-         the accelerator's persisted state (its `spice_sys_mysql_binlog` row) to re-bootstrap \
-         under the new mode, or revert `mysql_replication_gtid`. \
-         See: https://spiceai.org/docs/components/data-connectors/mysql"
-    ))]
-    CursorTypeMismatch {
-        dataset: String,
-        configured: String,
-        required: String,
-        found: String,
-    },
-
-    #[snafu(display(
-        "MySQL replication for {dataset}: encountered an anonymous transaction while \
-         `mysql_replication_gtid: enabled`. The source emits transactions without GTIDs \
-         (gtid_mode is not fully ON, e.g. ON_PERMISSIVE), which cannot be resumed via GTID \
-         auto-positioning. Set `gtid_mode = ON` on the source, or use \
-         `mysql_replication_gtid: auto`."
+        "MySQL replication for {dataset}: this dataset is positioning by GTID, but the source \
+         emitted an anonymous transaction (no GTID). This means the source's `gtid_mode` is not \
+         fully ON (e.g. ON_PERMISSIVE), so the applied GTID set cannot describe every \
+         transaction. Set `gtid_mode = ON` on the source, or drop the accelerator's persisted \
+         state to re-bootstrap by file+offset."
     ))]
     AnonymousTransactionUnderGtid { dataset: String },
 }
@@ -516,25 +503,14 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
         );
     }
 
-    // Resolve GTID capability. `enabled` demands the server support GTIDs,
-    // independent of any existing checkpoint.
+    // Positioning is always automatic: prefer GTID auto-positioning
+    // (failover-safe) when the source supports it, else file+offset. There is
+    // no user knob — a dataset's cursor type is fixed at bootstrap and the
+    // persisted checkpoint's type is authoritative on resume.
     let gtid_on = setup::detect_gtid_on(&mut conn).await?;
-    ensure!(
-        params.gtid_mode != GtidMode::Enabled || gtid_on,
-        GtidModeRequiredSnafu {
-            dataset: dataset_name.clone(),
-            database: database.clone(),
-            table: table.clone(),
-        }
-    );
-    // Cursor type chosen for a cold start (no checkpoint) or a re-snapshot,
-    // from config × server capability. On *resume* the persisted checkpoint's
-    // type is authoritative instead (see below).
-    let cold_start_use_gtid = match params.gtid_mode {
-        GtidMode::Disabled => false,
-        GtidMode::Enabled => true,
-        GtidMode::Auto => gtid_on,
-    };
+    // Cursor type for a cold start (no checkpoint) or a re-snapshot: GTID iff
+    // the server currently supports it.
+    let cold_start_use_gtid = gtid_on;
 
     // 2. Load the persisted position and pick the start path.
     //
@@ -554,11 +530,12 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
     let checkpoint_schema_json = encode_checkpoint_schema_json(schema_json.as_deref(), &layout);
 
     // Resume plan. A persisted checkpoint's cursor type — GTID iff it carries a
-    // GTID set — is authoritative on resume: `auto` adopts the stored type,
-    // while `enabled`/`disabled` assert a type and a checkpoint of the *other*
-    // type is ALWAYS a hard error (never `invalid_checkpoint_behavior` —
-    // switching an existing dataset's cursor type is a deliberate operator
-    // action). `use_gtid` is the resolved positioning mode for this run.
+    // GTID set — is authoritative on resume: the dataset keeps the type it was
+    // bootstrapped with. A GTID checkpoint whose server can no longer do GTID
+    // is a hard error (never a silent downgrade to file+offset, which would
+    // resume from a server-local position unrelated to the applied GTID set); a
+    // file checkpoint keeps resuming file+offset even when the server now
+    // supports GTID (no implicit upgrade). `use_gtid` is the resolved mode.
     //
     // `resume_position` is the file+offset to resume from (`None` = snapshot);
     // `resume_gtid` is the executed GTID set to auto-position from, set only
@@ -576,28 +553,17 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
             }
             Some(persisted) => {
                 let checkpoint_is_gtid = persisted.gtid_set.is_some();
-                // Cursor-type mismatch under an explicit mode is always a hard
-                // error — not routed through `invalid_position_behavior`.
-                match (params.gtid_mode, checkpoint_is_gtid) {
-                    (GtidMode::Disabled, true) => {
-                        return CursorTypeMismatchSnafu {
-                            dataset: dataset_name.clone(),
-                            configured: "disabled".to_string(),
-                            required: "file+offset".to_string(),
-                            found: "GTID".to_string(),
-                        }
-                        .fail();
+                // A GTID-bootstrapped dataset cannot keep its cursor type if the
+                // server no longer supports GTID — hard error, never a silent
+                // file+offset downgrade (not routed through
+                // `invalid_position_behavior`).
+                if checkpoint_is_gtid && !gtid_on {
+                    return GtidResumeUnavailableSnafu {
+                        dataset: dataset_name.clone(),
+                        database: database.clone(),
+                        table: table.clone(),
                     }
-                    (GtidMode::Enabled, false) => {
-                        return CursorTypeMismatchSnafu {
-                            dataset: dataset_name.clone(),
-                            configured: "enabled".to_string(),
-                            required: "GTID".to_string(),
-                            found: "file+offset".to_string(),
-                        }
-                        .fail();
-                    }
-                    _ => {}
+                    .fail();
                 }
                 // Layout/schema drift is a same-type concern → honors
                 // `invalid_position_behavior`.

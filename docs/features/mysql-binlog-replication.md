@@ -202,12 +202,49 @@ Exposed under `dataset_mysql_*` alongside the connection-pool metrics:
 | `replication_schema_mismatch_errors_total` | Mid-stream DDL detections. |
 | `replication_recv_errors_total` / `replication_reconnects_total` | Transport health. |
 | `replication_checkpoint_persists_total` / `_errors_total` | Sidecar checkpoint writes. |
+| `replication_gtid_enabled` | `1` when resuming via GTID auto-positioning, `0` for file+offset. |
+
+## Failover-safe resume (GTID)
+
+Binlog file names and byte offsets are **server-local** — after a source
+failover (managed-MySQL promotion, group-replication switchover, planned
+maintenance), a persisted `binlog.000042:12345` is meaningless on the new
+primary and the dataset would re-snapshot. **GTID auto-positioning** avoids
+this: a GTID (`server_uuid:sequence`) is a globally unique transaction identity,
+so the executed GTID set is server-independent. On resume Spice sends the set
+via `COM_BINLOG_DUMP_GTID` and *any* server in the topology computes the correct
+start point.
+
+This is **fully automatic — there is no configuration**. When a dataset is first
+bootstrapped, Spice uses GTID positioning if the source runs with
+`gtid_mode = ON`, and file+offset otherwise. The executed set is captured
+atomically with the snapshot head, extended per committed transaction, and
+persisted alongside the file position in the `spice_sys_mysql_binlog` sidecar
+(`gtid_executed` column).
+
+**Requirements & notes:**
+
+- To get failover-safe resume, run the source with `gtid_mode = ON` (which
+  implies `enforce_gtid_consistency = ON`) *before* the dataset is bootstrapped.
+  Transitional states (`ON_PERMISSIVE`) are treated as not enabled.
+- **MariaDB** uses an incompatible GTID scheme, so datasets there bootstrap on
+  file+offset automatically.
+- **The cursor type is fixed at bootstrap.** A dataset keeps resuming with the
+  type it was bootstrapped with, and the type is never switched implicitly:
+  - A dataset bootstrapped on **file+offset** keeps using file+offset even after
+    you later turn on `gtid_mode` — turning GTIDs on never disturbs a running
+    dataset.
+  - A dataset bootstrapped on **GTID** must keep resuming via GTID. If the source
+    can no longer do GTID (`gtid_mode` turned off, or repointed at a non-GTID
+    server), resume is a **hard error** rather than a silent downgrade to a
+    server-local file position that does not correspond to the applied GTID set.
+  - To change a dataset's cursor type, drop the accelerator's persisted state
+    (its `spice_sys_mysql_binlog` row) and let it re-bootstrap.
+  (`mysql_replication_invalid_checkpoint_behavior` governs only same-type
+  problems — a purged position or a layout/schema change.)
 
 ## Limitations (current)
 
-- **File + position tracking, not GTID.** Resume positions do not survive a
-  source failover to a different primary. GTID auto-positioning is a planned
-  follow-up.
 - **One table per dataset**, one binlog connection per dataset. (Postgres
   offers shared slots; a shared binlog connection is a follow-up.)
 - **Schema evolution is block-mode only** — compatible `ALTER TABLE` is

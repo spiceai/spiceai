@@ -740,10 +740,11 @@ fn binlog_change_stream(
                             Some((Uuid::from_bytes(gtid_event.sid()), gtid_event.gno()));
                     }
                     Some(EventData::AnonymousGtidEvent(_)) => {
-                        // An anonymous transaction carries no GTID. Under
-                        // `gtid: enabled` this must not happen (gtid_mode not
-                        // fully ON) — fail loudly rather than silently persist a
-                        // GTID set that can't describe this transaction.
+                        // An anonymous transaction carries no GTID. When this
+                        // dataset is positioning by GTID it must not happen
+                        // (source not fully `gtid_mode = ON`) — fail loudly
+                        // rather than silently persist a GTID set that can't
+                        // describe this transaction.
                         if use_gtid {
                             metrics.inc_decode_error();
                             Err(super::err_to_stream(Error::AnonymousTransactionUnderGtid {

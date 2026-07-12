@@ -21,39 +21,6 @@ use std::time::Duration;
 
 use crate::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
 
-/// How the replication stream positions itself against the source: by
-/// server-independent GTID set (failover-safe) or by server-local binlog
-/// file+offset.
-///
-/// A `bool` can't grow the "detect it" middle state, so this is a
-/// behavior-describing enum (mirroring [`InitialSnapshotMode`]).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum GtidMode {
-    /// Use GTID auto-positioning when the source reports `gtid_mode = ON`;
-    /// otherwise fall back to file+offset. The conservative, back-compatible
-    /// default: no behavior change for servers without GTIDs (and `MariaDB`).
-    #[default]
-    Auto,
-    /// Require `gtid_mode = ON`; fail setup with a structured error otherwise.
-    Enabled,
-    /// Always position by file+offset, even on a GTID-enabled server.
-    Disabled,
-}
-
-impl GtidMode {
-    /// Parse the canonical `mysql_replication_gtid` values
-    /// (`auto` | `enabled` | `disabled`). Case-insensitive; caller lowercases.
-    #[must_use]
-    pub fn from_canonical(value: &str) -> Option<Self> {
-        match value {
-            "auto" => Some(Self::Auto),
-            "enabled" => Some(Self::Enabled),
-            "disabled" => Some(Self::Disabled),
-            _ => None,
-        }
-    }
-}
-
 /// Parameters for a single dataset's binlog replication stream.
 ///
 /// Built by the connector from spicepod params; see
@@ -88,9 +55,6 @@ pub struct ReplicationParams {
     /// dataset stays not-ready and never serves stale data. User param
     /// `mysql_replication_ready_lag` (default 2s).
     pub ready_lag: Duration,
-    /// Whether to resume via GTID auto-positioning (failover-safe) or binlog
-    /// file+offset. User param `mysql_replication_gtid` (default `auto`).
-    pub gtid_mode: GtidMode,
 }
 
 impl std::fmt::Debug for ReplicationParams {
@@ -106,7 +70,6 @@ impl std::fmt::Debug for ReplicationParams {
             .field("checkpoint_interval", &self.checkpoint_interval)
             .field("invalid_position_behavior", &self.invalid_position_behavior)
             .field("ready_lag", &self.ready_lag)
-            .field("gtid_mode", &self.gtid_mode)
             .finish_non_exhaustive()
     }
 }
