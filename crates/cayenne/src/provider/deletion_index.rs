@@ -2419,9 +2419,9 @@ mod tests {
             "scratch buffers should retain capacity after use"
         );
 
-        // Second probe reuses the same (non-empty) scratch buffers with a
-        // disjoint shape (chunk-spanning, mixed hit/miss); results must
-        // match a fresh per-row probe, not a mix of stale and fresh hits.
+        // Second probe reuses the same scratch buffers (retaining capacity) with a
+        // disjoint shape (chunk-spanning, mixed hit/miss); results must match a
+        // fresh per-row probe, not a mix of stale and fresh hits.
         let shapes: Vec<Vec<Box<[u8]>>> = vec![
             vec![],
             vec![byte_key(2)],
