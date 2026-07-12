@@ -59,7 +59,8 @@ commit then legitimately clears the index). Regression test
 `test_cold_tier_bake_preserves_cold_masking_tombstones` drives the real bake
 with disjoint-range update rounds; without the cap it fails at 1300 vs 1000
 (the 3 pruned rounds' cold rows resurrect), with it the full 9-test cold suite
-passes. Memory cost: tombstones accumulate between promotions instead of being
+passes — and the previously-failing CH-benCH SF100 run converges (verdict
+PASSED, all 7 tables match). Memory cost: tombstones accumulate between promotions instead of being
 baked away — bounded by the promotion cadence.
 
 ### F1 — CONFIRMED correctness bug: transient cross-tier over-count during promotion
