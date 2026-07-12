@@ -2490,21 +2490,41 @@ impl CayenneTableProvider {
     /// the in-memory pointer swaps — never an `.await` that touches disk or the
     /// metastore.
     pub(crate) async fn publish_overwrite_snapshot(&self, new_snapshot_id: &str) -> Result<()> {
+        // Build the new listing table BEFORE acquiring the fence (synchronous, no
+        // I/O), then flip every visibility-affecting pointer atomically below.
+        let new_listing_table = self.build_overwrite_listing_table(new_snapshot_id)?;
+        let _fence = self.listing_fence.write().await;
+        self.publish_overwrite_snapshot_fenced(new_snapshot_id, new_listing_table);
+        Ok(())
+    }
+
+    /// Build the new snapshot's listing table for an overwrite publish
+    /// (synchronous, no I/O) — the fallible half of
+    /// [`Self::publish_overwrite_snapshot`], separated so callers that must hold
+    /// `listing_fence.write()` across additional publication steps (the cold
+    /// promotion's metastore commit) can fail before taking the fence.
+    fn build_overwrite_listing_table(&self, new_snapshot_id: &str) -> Result<Arc<ListingTable>> {
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
             &self.table_metadata.table_id,
             new_snapshot_id,
         );
-        // Build the new listing table BEFORE acquiring the fence (synchronous, no
-        // I/O), then flip every visibility-affecting pointer atomically below.
-        let new_listing_table = Self::create_listing_table(
+        Self::create_listing_table(
             &snapshot_dir_url,
             self.table_schema(),
             self.context.file_format(),
             &self.pk_deletion_strategy,
-        )?;
+        )
+    }
 
-        let _fence = self.listing_fence.write().await;
+    /// The in-memory visibility flip of an overwrite publish. CALLER MUST HOLD
+    /// `listing_fence.write()` — every step is synchronous, so the fence guards
+    /// only pointer swaps.
+    fn publish_overwrite_snapshot_fenced(
+        &self,
+        new_snapshot_id: &str,
+        new_listing_table: Arc<ListingTable>,
+    ) {
         self.update_current_snapshot_id(new_snapshot_id);
         self.clear_all_deletion_caches();
         // `commit_overwrite_in_txn` already cleared the inlined data/deletes in the
@@ -2516,7 +2536,6 @@ impl CayenneTableProvider {
         // `update_current_snapshot_id` above already cleared the sorted-output
         // attestation; the overwrite rebinds to a non-sorted snapshot, so it stays cleared.
         self.listing_table.store(new_listing_table);
-        Ok(())
     }
 
     /// One physical-GC mark-and-sweep pass over the datalake (cold) tier:
@@ -2535,7 +2554,9 @@ impl CayenneTableProvider {
     ///
     /// Best-effort: missing `DeleteObject` grant or transient errors are logged
     /// and retried next pass. Runs on the background tick, off the hot paths.
-    async fn run_cold_tier_gc_tick(&self) {
+    /// Public for integration tests and manual maintenance; normally driven by
+    /// the background promotion loop. Idempotent and safe to call at any time.
+    pub async fn run_cold_tier_gc_tick(&self) {
         if !self.table_metadata.vortex_config.cold_tier_enabled() {
             return;
         }
@@ -13967,10 +13988,27 @@ impl CayenneTableProvider {
             let dir = self.snapshot_dir_path_for(&new_snapshot_id);
             Self::ensure_snapshot_dir_exists(&dir).await?;
         }
-        self.catalog
-            .commit_overwrite_to_cold(&self.table_metadata.table_id, &new_snapshot_id, &cold_files)
-            .await?;
-        self.publish_overwrite_snapshot(&new_snapshot_id).await?;
+        // A cold promotion has TWO visibility publication points: the metastore
+        // commit (scans list cold files straight from `cayenne_cold_tier_file`)
+        // and the in-memory snapshot flip (scans read the warm snapshot id from
+        // memory). Publishing them at different times lets a concurrent fenced
+        // scan pair the OLD warm snapshot with the NEW cold manifest and count
+        // the promoted rows twice. Hold ONE `listing_fence` write across both so
+        // they flip atomically w.r.t. scans — the deliberate exception to
+        // "no `.await` under the fence": for cold, the metastore commit IS a
+        // visibility flip, and it is a short single transaction.
+        let new_listing_table = self.build_overwrite_listing_table(&new_snapshot_id)?;
+        {
+            let _fence = self.listing_fence.write().await;
+            self.catalog
+                .commit_overwrite_to_cold(
+                    &self.table_metadata.table_id,
+                    &new_snapshot_id,
+                    &cold_files,
+                )
+                .await?;
+            self.publish_overwrite_snapshot_fenced(&new_snapshot_id, new_listing_table);
+        }
         if let Err(error) = self.prune_snapshot_manifest_to(&new_snapshot_id).await {
             tracing::warn!(
                 target: "cayenne::compaction",
