@@ -45,7 +45,6 @@ on:
           - 'odbc-databricks'
           - 'oracle'
           - 'duckdb-zero-results'
-          - 'duckdb-partitioned'
           - 'snowflake'
           - 'spark'
           - 'iceberg-sf1'
