@@ -34,11 +34,6 @@ on:
         type: boolean
         required: false
         default: false
-      test_filter:
-        description: 'Optional comma-separated test name substrings (nextest filter). When set, only matching integration tests run.'
-        type: string
-        required: false
-        default: ''
 
 concurrency:
   # Allow only one workflow per any non-trunk branch.
@@ -53,8 +48,6 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_GIT_FETCH_WITH_CLI: true
   HAS_TEST_MINIO_SECRET: ${{ secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
-  # Optional workflow_dispatch filter; empty on PR/push so the full suite runs.
-  INTEGRATION_TEST_FILTER: ${{ github.event.inputs.test_filter || '' }}
   INTEGRATION_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/integration-test-archive/integration.tar.zst
   INTEGRATION_RETENTION_OOM_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/integration-retention-oom-test-archive/retention_oom.tar.zst
   INTEGRATION_AWS_SDK_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/integration-aws-sdk-test-archive/integration_aws_sdk.tar.zst
@@ -257,36 +250,22 @@ jobs:
           retention-days: 3
           compression-level: 1
 
-  prepare-test-matrix:
-    name: Prepare integration test matrix
-    needs: check_changes
-    # Always run (including PR heads) so `test` can depend on matrix output for passthrough.
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
-    outputs:
-      matrix: ${{ steps.set.outputs.matrix }}
-    steps:
-      - name: Set matrix
-        id: set
-        run: |
-          set -euo pipefail
-          # PR heads only need a dummy single-shard matrix for required-check passthrough.
-          if [[ "${{ github.event_name }}" == "pull_request" ]] || [[ -n "${INTEGRATION_TEST_FILTER}" ]]; then
-            # Single shard, no nextest partition — keep filtered tests together.
-            echo 'matrix={"include":[{"label":"1","partition":""}]}' >> "$GITHUB_OUTPUT"
-          else
-            echo 'matrix={"include":[{"label":"1","partition":"count:1/3"},{"label":"2","partition":"count:2/3"},{"label":"3","partition":"count:3/3"}]}' >> "$GITHUB_OUTPUT"
-          fi
-
   test:
     name: Integration Tests (part ${{ matrix.label }})
-    needs: [build, check_changes, prepare-test-matrix]
-    # No job-level relevant_changes gate — PR heads must report this check via passthrough.
+    needs: [build, check_changes]
     permissions:
       contents: write
     runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.prepare-test-matrix.outputs.matrix) }}
+      matrix:
+        include:
+          - label: 1
+            partition: 'count:1/3'
+          - label: 2
+            partition: 'count:2/3'
+          - label: 3
+            partition: 'count:3/3'
     steps:
       - name: Pull request passthrough
         if: ${{ github.event_name == 'pull_request' }}
@@ -332,7 +311,7 @@ jobs:
           path: ./integration_test
 
       - name: Download retention OOM test archive from local MinIO
-        if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3' && env.HAS_TEST_MINIO_SECRET == 'true' && env.INTEGRATION_TEST_FILTER == ''
+        if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3' && env.HAS_TEST_MINIO_SECRET == 'true'
         env:
           MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
         run: |
@@ -342,7 +321,7 @@ jobs:
           mc cp "spice-minio/${INTEGRATION_RETENTION_OOM_TEST_ARCHIVE_S3_URI#s3://}" ./retention_oom_test/retention_oom.tar.zst
 
       - name: Download retention OOM test archive
-        if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3' && env.HAS_TEST_MINIO_SECRET != 'true' && env.INTEGRATION_TEST_FILTER == ''
+        if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3' && env.HAS_TEST_MINIO_SECRET != 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: integration-retention-oom-test-archive
@@ -360,7 +339,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Pull database images
-        if: needs.check_changes.outputs.relevant_changes == 'true' && env.INTEGRATION_TEST_FILTER == ''
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
           docker pull docker.io/library/postgres:latest
           docker pull docker.io/library/mysql:latest
@@ -434,50 +413,14 @@ jobs:
           AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
           AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
         run: |
-          set -euo pipefail
-
-          FILTER_ARGS=()
-          PARTITION_ARGS=()
-          if [[ -n "${INTEGRATION_TEST_FILTER}" ]]; then
-            # Build nextest filter expression: test(a) | test(b) | ...
-            # Allowlist characters so workflow_dispatch input cannot inject filter/shell syntax.
-            EXPR=""
-            IFS=',' read -ra NAMES <<< "${INTEGRATION_TEST_FILTER}"
-            for raw in "${NAMES[@]}"; do
-              # trim whitespace
-              name="${raw#"${raw%%[![:space:]]*}"}"
-              name="${name%"${name##*[![:space:]]}"}"
-              [[ -z "${name}" ]] && continue
-              if [[ ! "${name}" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
-                echo "Invalid test_filter name '${name}': only letters, digits, '_', '.', ':', and '-' are allowed" >&2
-                exit 1
-              fi
-              if [[ -n "${EXPR}" ]]; then
-                EXPR="${EXPR} | test(${name})"
-              else
-                EXPR="test(${name})"
-              fi
-            done
-            if [[ -z "${EXPR}" ]]; then
-              echo "test_filter was set but contained no test names" >&2
-              exit 1
-            fi
-            echo "Filtering integration tests with: ${EXPR}"
-            FILTER_ARGS+=(-E "${EXPR}")
-          else
-            if [[ -n "${{ matrix.partition }}" ]]; then
-              PARTITION_ARGS+=(--partition '${{ matrix.partition }}')
-            fi
-          fi
-
           if [ -n "$SPICE_SECRET_SPICEAI_KEY" ]; then
-            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" "${PARTITION_ARGS[@]}" --archive-file ./integration_test/integration.tar.zst "${FILTER_ARGS[@]}"
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_test/integration.tar.zst
           else
-            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" "${PARTITION_ARGS[@]}" --archive-file ./integration_test/integration.tar.zst --skip spiceai_integration_test "${FILTER_ARGS[@]}"
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_test/integration.tar.zst --skip spiceai_integration_test
           fi
 
       - name: Run retention OOM regression test
-        if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3' && env.INTEGRATION_TEST_FILTER == ''
+        if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3'
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./retention_oom_test/retention_oom.tar.zst
 
@@ -557,7 +500,7 @@ jobs:
   test-aws-sdk:
     name: AWS SDK Integration Tests
     needs: [build, check_changes]
-    if: needs.check_changes.outputs.relevant_changes == 'true' && (github.event.inputs.test_filter || '') == ''
+    if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
     runs-on: spiceai-dev-runners
     steps:
@@ -617,7 +560,7 @@ jobs:
   test-aws-sdk-credential-bridge:
     name: AWS SDK Credential Bridge Integration Tests
     needs: [build, check_changes]
-    if: needs.check_changes.outputs.relevant_changes == 'true' && (github.event.inputs.test_filter || '') == ''
+    if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
     runs-on: spiceai-dev-runners
     steps:
@@ -681,7 +624,7 @@ jobs:
   test-snapshot-refresh:
     name: Snapshot Refresh Mode Integration Tests
     needs: [build, check_changes]
-    if: needs.check_changes.outputs.relevant_changes == 'true' && (github.event.inputs.test_filter || '') == ''
+    if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
     runs-on: spiceai-dev-runners
     steps:
@@ -739,7 +682,7 @@ jobs:
   test-data-components:
     name: Data Components Integration Tests
     needs: [build, check_changes]
-    if: needs.check_changes.outputs.relevant_changes == 'true' && (github.event.inputs.test_filter || '') == ''
+    if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
     runs-on: spiceai-dev-runners
     steps:
@@ -790,7 +733,7 @@ jobs:
   test-runtime-partition:
     name: Partition Table Integration Tests
     needs: [build, check_changes]
-    if: needs.check_changes.outputs.relevant_changes == 'true' && (github.event.inputs.test_filter || '') == ''
+    if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-dev-runners
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
