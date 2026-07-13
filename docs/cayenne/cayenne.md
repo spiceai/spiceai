@@ -88,24 +88,29 @@ Everything below — the tiers, the locks, the deletion index, the CDC pipeline 
 Acceleration `mode:` selects how Cayenne persists data. This is distinct from
 `cdc_durability: memory` (a durability deferral on an otherwise file-backed table).
 
-- **`mode: file`** (default, durable): local SQLite/Turso metastore, Vortex data files
-  (local FS or S3 Express One Zone), level-0 inline + optional RAM mem-tier for CDC,
-  background compaction/seal/checkpoint. Survives restarts; CDC source slots are
-  deferred until a durable seal or checkpoint covers the burst.
-- **`mode: memory`** (fully in-RAM, ephemeral): all table data lives in the RAM
-  mem-tier; the catalog is an in-memory SQLite `memdb` (never written to disk).
-  Checkpointing, sealing, compaction, and the datalake (cold) tier are disabled.
-  On restart the table is empty and reloads from its source (like Arrow memory
-  acceleration). Because there is no durable covering checkpoint, a CDC
-  (`refresh_mode: changes`) source's replication slot is committed **immediately**
-  after each in-RAM write — not deferred behind a later seal/checkpoint.
-  Works for `full` / `append` / `changes` and for keyed or no-PK tables; a full
-  refresh atomically replaces the in-RAM tier. **Partitioning is rejected** at
-  accelerator config time (`partition_by` + `mode: memory` returns a configuration
-  error). A per-table hard RAM bound (`cayenne_cdc_mem_tier_max_bytes`; default
-  unbounded) is enforced as a structured error during buffering; peak checks count
-  **resident + incoming** even for overwrite, because the old tier stays live until
-  the atomic replace.
+Spicepod `acceleration.mode` defaults to **`memory`** (the same default as Arrow).
+Omitting `mode` on a Cayenne dataset therefore selects fully in-RAM Cayenne. Set
+`mode: file` explicitly when you need durable on-disk (or S3 Express) storage.
+
+- **`mode: file`** (durable; must be set explicitly): local SQLite/Turso metastore,
+  Vortex data files (local FS or S3 Express One Zone), level-0 inline + optional RAM
+  mem-tier for CDC, background compaction/seal/checkpoint. Survives restarts; CDC
+  source slots are deferred until a durable seal or checkpoint covers the burst.
+- **`mode: memory`** (fully in-RAM, ephemeral; spicepod default when `mode` is
+  omitted): all table data lives in the RAM mem-tier; the catalog is an in-memory
+  SQLite `memdb` (never written to disk). Checkpointing, sealing, compaction, and
+  the datalake (cold) tier are disabled. On restart the table is empty and reloads
+  from its source (like Arrow memory acceleration). Because there is no durable
+  covering checkpoint, a CDC (`refresh_mode: changes`) source's replication slot is
+  committed **immediately** after each in-RAM write — not deferred behind a later
+  seal/checkpoint. Works for `full` / `append` / `changes` and for keyed or no-PK
+  tables; a full refresh atomically replaces the in-RAM tier. **Partitioning is
+  rejected** at accelerator config time (`partition_by` + `mode: memory` returns a
+  configuration error). A per-table hard RAM bound (`cayenne_cdc_mem_tier_max_bytes`;
+  default unbounded) is enforced as a structured error during buffering; peak checks
+  count **resident + incoming** even for overwrite, because the old tier stays live
+  until the atomic replace. S3 Express / `cayenne_file_path` params are ignored in
+  this mode (no object store is built).
 
 Source: acceleration `mode` → `!is_file_accelerated()` in
 `crates/runtime/src/dataaccelerator/cayenne/mod.rs` (`apply_memory_mode_overrides`,
@@ -1233,7 +1238,7 @@ This document is a point-in-time snapshot of a fast-moving crate. Each entry rec
 
 | Date | Reviewed commit | Changes |
 |------|-----------------|---------|
-| 2026-07-13 | PR #11720 (pre-merge; doc otherwise baselined at `4685a3dd`) | **Acceleration `mode: memory`**: fully in-RAM Cayenne — mem-tier is the permanent store, in-memory `memdb` metastore, no Vortex/compaction/seal/checkpoint/datalake; CDC slot committed immediately after each in-RAM write; partitioning rejected at config; hard RAM bound (`cayenne_cdc_mem_tier_max_bytes`) counts resident + incoming even for overwrite. New *Storage modes* section + glossary entries; distinct from `cdc_durability: memory` on file-mode tables. |
+| 2026-07-13 | PR #11720 (pre-merge; doc otherwise baselined at `4685a3dd`) | **Acceleration `mode: memory`**: fully in-RAM Cayenne — mem-tier is the permanent store, in-memory `memdb` metastore, no Vortex/compaction/seal/checkpoint/datalake; CDC slot committed immediately after each in-RAM write; partitioning rejected at config; hard RAM bound (`cayenne_cdc_mem_tier_max_bytes`) counts resident + incoming even for overwrite. Spicepod `acceleration.mode` defaults to `memory` (same as Arrow) — durable Cayenne requires explicit `mode: file`. S3 Express params are ignored under `mode: memory`. New *Storage modes* section + glossary entries; distinct from `cdc_durability: memory` on file-mode tables. |
 | 2026-07-10 | (pre-merge; doc otherwise baselined at `4685a3dd`) | Datalake (cold) tier object layout: the per-table prefix segment changed from the bare `<table_id>` to `<sanitized_table_name>-<table_id>` (`TableMetadata::datalake_dir_segment`) so a shared `cayenne_datalake_location` bucket is navigable while the UUIDv7 suffix keeps prefixes collision-free. Lossy, path-safe name slug (`[A-Za-z0-9_-]`, 64-char cap, edge-trimmed; empty → bare `table_id`). Derived on demand (no metastore change) since `table_name` is immutable per `table_id`. Write + GC prefixes only; reads follow the manifest's absolute `file_url`. Warm tier remains keyed by the bare `table_id`. |
 | 2026-07-10 | PR #11806 (pre-merge; doc otherwise still baselined at `4685a3dd`) | Targeted **table statistics** update: the `SPICE_CAYENNE_EAGER_NDV` escape hatch is removed — lazy NDV (fold on file spill, not the inline tier0 CDC write) is now unconditional, so *Table statistics* no longer describes the inline write as folding "one hashed value per row into the sketch"; it now explains the lazy split and its bounded one-memtable lag explicitly. Also a perf-only change with no doc-visible behavior: per-value NDV hashing switched from a streaming to a one-shot XXH3-64 hash (byte-identical, ~21-25x faster per a new microbenchmark). |
 | 2026-07-09 | PR #11745 (pre-merge; doc otherwise still baselined at `4685a3dd`) | Targeted **datalake (cold) tier** update for #11731/#11745: promotion rewritten from whole-table re-materialization to **incremental carry-forward** (dirty/clean classification from manifest stats rectangles refined by per-file PK blooms; clean files carried by manifest reference; per-promotion `cold/<promotion_id>/` prefixes), per-file **PK bloom filters** serving upsert keyset rebuilds without a cold scan, periodic **mark-and-sweep GC** of orphaned cold objects, and the parameter rename to `cayenne_datalake_*` (`_location`, `_clustering_columns`, `_s3_*`, `_gc_interval_ms`) — versioning note and configuration cheat-sheet updated accordingly. |

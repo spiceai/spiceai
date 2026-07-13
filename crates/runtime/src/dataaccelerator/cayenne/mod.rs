@@ -1994,8 +1994,10 @@ impl CayenneAccelerator {
                 .await?
         };
 
-        // Check if using S3 Express One Zone storage
-        let is_s3_express = s3::is_s3_express_data_path(source);
+        // S3 Express One Zone is file-mode only. Memory mode never builds an
+        // object store; if S3 Express params linger while mode is memory, treat
+        // them as inactive so we don't fail with a missing object-store error.
+        let is_s3_express = !memory_mode && s3::is_s3_express_data_path(source);
         let workload = build_workload_profile(
             acceleration,
             schema.as_ref(),
