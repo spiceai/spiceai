@@ -58,7 +58,6 @@ pub use builder::QueryBuilder;
 mod cache;
 pub mod error_code;
 mod handle;
-mod metrics;
 pub mod registry;
 pub mod stage_history;
 mod tracker;
@@ -608,8 +607,10 @@ impl Query {
         // Get the session state for planning
         let session = session_ctx.state();
 
-        // Get logical plan and cache key, reusing existing cache infrastructure
-        let (plan, mut tracker, cache_key) = match &self.sql {
+        // Get logical plan and cache key, reusing existing cache infrastructure.
+        // Match by value so a pre-parsed plan / parameters can be moved rather
+        // than deep-cloned on the distributed submit path.
+        let (plan, mut tracker, cache_key) = match self.sql {
             QueryMethod::Text {
                 sql,
                 parameters,
@@ -621,19 +622,19 @@ impl Query {
                     // never short-circuit on a cached result (that would skip
                     // recover_job and leave the running job orphaned) nor write a
                     // fresh cache entry. Plan without consulting the result cache.
-                    let plan = if let Some(plan) = pre_parsed_plan.clone() {
+                    let plan = if let Some(plan) = pre_parsed_plan {
                         *plan
                     } else {
                         let cache_namespace = request_context.cache_namespace();
                         let (ns_tag, ns_id) = cache_namespace.hash_inputs();
-                        let sql_raw_cache_key = CacheKey::Query(sql, parameters.as_ref())
+                        let sql_raw_cache_key = CacheKey::Query(sql.as_ref(), parameters.as_ref())
                             .as_raw_key_in_namespace(Self::plan_hasher(&self.df), ns_tag, ns_id);
                         Query::get_plan(
                             &self.df,
                             &session,
-                            sql,
+                            sql.as_ref(),
                             &sql_raw_cache_key,
-                            parameters.clone(),
+                            parameters,
                         )
                         .await?
                     };
@@ -648,10 +649,10 @@ impl Query {
                         &self.df,
                         &session,
                         Arc::clone(&request_context),
-                        sql,
-                        parameters.clone(),
+                        sql.as_ref(),
+                        parameters,
                         tracker,
-                        pre_parsed_plan.clone(),
+                        pre_parsed_plan,
                     )
                     .await?
                     {
@@ -689,7 +690,7 @@ impl Query {
                 // never served across principals (mirrors the text-query path).
                 let cache_namespace = request_context.cache_namespace();
                 let (ns_tag, ns_id) = cache_namespace.hash_inputs();
-                let plan_cache_key = CacheKey::LogicalPlan(logical_plan).as_raw_key_in_namespace(
+                let plan_cache_key = CacheKey::LogicalPlan(&logical_plan).as_raw_key_in_namespace(
                     Self::plan_hasher(&self.df),
                     ns_tag,
                     ns_id,
@@ -730,7 +731,7 @@ impl Query {
 
                 // Don't cache results for a recovered job.
                 let cache_key = (mode != DistributedSubmitMode::Resume).then_some(plan_cache_key);
-                (logical_plan.as_ref().clone(), tracker, cache_key)
+                (*logical_plan, tracker, cache_key)
             }
         };
 
@@ -894,9 +895,10 @@ impl Query {
         // cancel endpoints can locate this query by id. The guard is captured
         // by the returned stream so the registration is removed on completion,
         // drop, or cancellation.
-        let sql_preview = match &self.sql {
-            QueryMethod::Text { sql, .. } => sql.as_ref(),
-            QueryMethod::Plan(_) => "<logical plan>",
+        // Own the SQL preview before moving `self.sql` into the planning match.
+        let sql_preview: Arc<str> = match &self.sql {
+            QueryMethod::Text { sql, .. } => Arc::clone(sql),
+            QueryMethod::Plan(_) => Arc::from("<logical plan>"),
         };
         let active_query_guard = self.df.query_cancel_registry().register(
             self.query_id,
@@ -904,7 +906,7 @@ impl Query {
             request_context.protocol(),
             query_cancel_token.clone(),
         );
-        let query_id_str = self.query_id.to_string();
+        let query_id_str: Arc<str> = Arc::from(self.query_id.to_string());
 
         let inner_span = span.clone();
 
@@ -922,26 +924,27 @@ impl Query {
                     .config_mut()
                     .set_extension(Arc::clone(&request_context));
 
-                // Get the `LogicalPlan` or cached results
-                let (plan, mut tracker, cache_manager) = match &ctx.sql {
+                // Get the `LogicalPlan` or cached results. Match by value so a
+                // pre-parsed plan / parameters can be moved rather than deep-cloned.
+                let (plan, mut tracker, cache_manager) = match ctx.sql {
                     QueryMethod::Text {
                         sql,
                         parameters,
                         table_allowlist: Some(allowlist),
                         pre_parsed_plan,
                     } => {
-                        let raw_cache_key = CacheKey::Query(sql, parameters.as_ref())
+                        let raw_cache_key = CacheKey::Query(sql.as_ref(), parameters.as_ref())
                             .as_raw_key(Query::plan_hasher(&ctx.df));
                         let plan = if let Some(plan) = pre_parsed_plan {
-                            plan.clone()
+                            plan
                         } else {
                             Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
                             match Self::get_plan(
                                 &ctx.df,
                                 &session,
-                                sql,
+                                sql.as_ref(),
                                 &raw_cache_key,
-                                parameters.clone(),
+                                parameters,
                             )
                             .await
                             {
@@ -990,10 +993,10 @@ impl Query {
                             &ctx.df,
                             &session,
                             Arc::clone(&request_context),
-                            sql,
-                            parameters.clone(),
+                            sql.as_ref(),
+                            parameters,
                             tracker,
-                            pre_parsed_plan.clone(),
+                            pre_parsed_plan,
                         )
                         .await?
                         {
@@ -1006,7 +1009,7 @@ impl Query {
                                 return Ok(attach_cancellation_to_query_result(
                                     query_result,
                                     query_cancel_token.clone(),
-                                    query_id_str.clone(),
+                                    Arc::clone(&query_id_str),
                                     active_query_guard,
                                 ));
                             }
@@ -1019,13 +1022,13 @@ impl Query {
                         let (ns_tag, ns_id) = cache_namespace.hash_inputs();
                         let cache_manager = RequestCacheManager::new(
                             CacheStatus::CacheMiss,
-                            CacheKey::LogicalPlan(logical_plan).as_raw_key_in_namespace(
+                            CacheKey::LogicalPlan(&logical_plan).as_raw_key_in_namespace(
                                 Query::plan_hasher(&ctx.df),
                                 ns_tag,
                                 ns_id,
                             ),
                         );
-                        (logical_plan.clone(), None, cache_manager)
+                        (logical_plan, None, cache_manager)
                     }
                 };
 
@@ -1141,7 +1144,7 @@ impl Query {
                                 biased;
                                 () = query_cancel_token.cancelled() => {
                                     return Err(Error::QueryCancelled {
-                                        query_id: query_id_str.clone(),
+                                        query_id: query_id_str.to_string(),
                                     });
                                 }
                                 permit = semaphore.acquire_owned() => permit.ok(),
@@ -1372,7 +1375,7 @@ impl Query {
                 let final_stream = attach_cancellation_to_stream(
                     final_stream,
                     query_cancel_token.clone(),
-                    query_id_str.clone(),
+                    Arc::clone(&query_id_str),
                     // Bundle the admission permit with the active-query guard so
                     // BOTH release exactly when the result stream is fully drained
                     // (completion, error, or cancellation) — the permit thus spans
@@ -1617,8 +1620,8 @@ fn attach_query_tracker_to_stream(
             }
         }
 
-        crate::metrics::telemetry::track_bytes_returned(num_output_bytes, &request_context.to_dimensions());
-        crate::metrics::telemetry::track_rows_returned(num_records, &request_context.to_dimensions());
+        runtime_metrics::telemetry::track_bytes_returned(num_output_bytes, &request_context.to_dimensions());
+        runtime_metrics::telemetry::track_rows_returned(num_records, &request_context.to_dimensions());
 
         tracker
             .schema(schema_copy)
@@ -1648,7 +1651,7 @@ impl QueryActiveGuard {
 
         let active = request_context.entered_top_level_query();
         if active {
-            crate::metrics::telemetry::inc_query_active_count(dimensions);
+            runtime_metrics::telemetry::inc_query_active_count(dimensions);
         }
 
         Self {
@@ -1663,7 +1666,7 @@ impl Drop for QueryActiveGuard {
     fn drop(&mut self) {
         let exited = self.request_context.exited_top_level_query();
         if self.active && exited {
-            crate::metrics::telemetry::dec_query_active_count(self.dimensions);
+            runtime_metrics::telemetry::dec_query_active_count(self.dimensions);
         }
     }
 }
@@ -1694,7 +1697,7 @@ fn attach_query_active_guard_to_stream(
 fn attach_cancellation_to_query_result<G>(
     query_result: QueryResult,
     cancellation_token: tokio_util::sync::CancellationToken,
-    query_id: String,
+    query_id: Arc<str>,
     guard: G,
 ) -> QueryResult
 where
@@ -1722,7 +1725,7 @@ where
 fn attach_cancellation_to_stream<G>(
     stream: SendableRecordBatchStream,
     cancellation_token: tokio_util::sync::CancellationToken,
-    query_id: String,
+    query_id: Arc<str>,
     guard: G,
 ) -> SendableRecordBatchStream
 where
@@ -1731,7 +1734,7 @@ where
     struct State<G> {
         stream: Option<SendableRecordBatchStream>,
         token: tokio_util::sync::CancellationToken,
-        query_id: String,
+        query_id: Arc<str>,
         guard: Option<G>,
         emitted_cancel: bool,
     }
@@ -1817,9 +1820,9 @@ fn attach_physical_plan_metrics_to_stream(
         let mut totals = PhysicalPlanMetricsTotals::default();
         collect_physical_plan_metrics(physical_plan.as_ref(), &mut totals);
 
-        crate::metrics::telemetry::track_produced_spills(totals.produced_spills, &request_context.to_dimensions());
-        crate::metrics::telemetry::track_spilled_bytes(totals.spilled_bytes, &request_context.to_dimensions());
-        crate::metrics::telemetry::track_spilled_rows(totals.spilled_rows, &request_context.to_dimensions());
+        runtime_metrics::telemetry::track_produced_spills(totals.produced_spills, &request_context.to_dimensions());
+        runtime_metrics::telemetry::track_spilled_bytes(totals.spilled_bytes, &request_context.to_dimensions());
+        runtime_metrics::telemetry::track_spilled_rows(totals.spilled_rows, &request_context.to_dimensions());
     };
 
     Box::pin(RecordBatchStreamAdapter::new(
@@ -3558,11 +3561,11 @@ mod tests {
         .expect("batch");
         let cancel_token = CancellationToken::new();
         let guard_dropped = Arc::new(AtomicBool::new(false));
-        let query_id = uuid::Uuid::new_v4().to_string();
+        let query_id = Arc::<str>::from(uuid::Uuid::new_v4().to_string());
         let mut stream = attach_cancellation_to_stream(
             stream_from_batches(&schema, vec![batch]),
             cancel_token.clone(),
-            query_id.clone(),
+            Arc::clone(&query_id),
             DropFlag::new(Arc::clone(&guard_dropped)),
         );
 
@@ -3596,11 +3599,11 @@ mod tests {
         )]));
         let cancel_token = CancellationToken::new();
         let guard_dropped = Arc::new(AtomicBool::new(false));
-        let query_id = uuid::Uuid::new_v4().to_string();
+        let query_id = Arc::<str>::from(uuid::Uuid::new_v4().to_string());
         let mut stream = attach_cancellation_to_stream(
             pending_stream(&schema),
             cancel_token.clone(),
-            query_id.clone(),
+            Arc::clone(&query_id),
             DropFlag::new(Arc::clone(&guard_dropped)),
         );
 

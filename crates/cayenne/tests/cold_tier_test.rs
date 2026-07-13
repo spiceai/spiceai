@@ -180,6 +180,17 @@ async fn test_cold_tier_promotion_cross_tier_scan_and_delete_impl(
         "expected at least one physical .vortex file on the cold store, got {physical_cold_files}"
     );
 
+    // Physical layout is grouped under `{sanitized_table_name}-{table_id}/data/`:
+    // the name prefix makes a shared datalake location navigable, and the UUIDv7
+    // suffix keeps the prefix collision-free across tables/instances.
+    let expected_segment = format!("cold_t-{}", table.table_id());
+    assert!(
+        cold_dir.join(&expected_segment).join("data").is_dir(),
+        "expected cold objects under '{expected_segment}/data/'; cold dir entries: {:?}",
+        std::fs::read_dir(&cold_dir)
+            .map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+    );
+
     // Cross-tier scan: warm is now an empty snapshot, so returning all rows
     // proves the cold branch is read + unioned correctly.
     assert_eq!(
@@ -216,10 +227,10 @@ async fn test_cold_tier_promotion_cross_tier_scan_and_delete_impl(
         "exactly one row removed across the cold tier"
     );
 
-    // Insert more warm rows, then promote AGAIN. Whole-table promotion
-    // re-materializes the entire visible table (warm + prior cold) into a new
-    // cold generation; replace-all in the commit must prevent gen-1 rows from
-    // being double-counted alongside gen-2.
+    // Insert more warm rows, then promote AGAIN. The tombstone for id=42
+    // dirties the (single) prior cold file, so this promotion rewrites it
+    // together with the warm delta; the commit's replace-then-register must
+    // prevent gen-1 rows from being double-counted alongside gen-2.
     let batch2 = RecordBatch::try_new(
         Arc::clone(&schema),
         vec![
@@ -274,4 +285,170 @@ fn count_vortex_files(dir: &std::path::Path) -> usize {
         }
     }
     count
+}
+
+test_with_backends!(test_cold_tier_carry_forward_promotion_impl);
+
+/// Carry-forward (incremental) promotion: a promotion rewrites only the warm
+/// data plus the cold files a tombstone may touch; every other cold file is
+/// carried forward by manifest reference — same `file_url`, its object never
+/// re-read or re-written.
+async fn test_cold_tier_carry_forward_promotion_impl(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    let cold_dir = fixture.temp_dir.path().join("cold");
+    std::fs::create_dir_all(&cold_dir)?;
+    let cold_url = format!("file://{}", cold_dir.to_string_lossy());
+
+    let table_options = CreateTableOptions {
+        table_name: "cf_t".to_string(),
+        schema: Arc::clone(&schema),
+        primary_key: vec!["id".to_string()],
+        on_conflict: None,
+        base_path: fixture.data_path.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: VortexConfig {
+            cold_tier_location: Some(cold_url),
+            cold_clustering_columns: vec!["id".to_string()],
+            cold_tier_warm_max_files: 1,
+            cold_target_file_size_mb: 16,
+            deletion_mode: DeletionMode::Key,
+            ..VortexConfig::default()
+        },
+    };
+
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
+    ctx.register_table("cf_t", Arc::clone(&table) as Arc<dyn TableProvider>)?;
+
+    let insert_range = |range: std::ops::Range<i64>| {
+        let ids: Vec<i64> = range.collect();
+        let values: Vec<i64> = ids.iter().map(|i| i * 2).collect();
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(Int64Array::from(values)),
+            ],
+        )
+    };
+
+    // Generation 1: ids 0..100.
+    common::insert_batch(table.as_ref(), insert_range(0..100)?).await?;
+    let _ = table.checkpoint_inlined_data().await;
+    let _ = table.checkpoint_mem_tier().await;
+    assert!(table.promote_warm_to_cold().await?, "promotion 1 fires");
+    let gen1: Vec<String> = fixture
+        .catalog
+        .list_cold_tier_files(table.table_id())
+        .await?
+        .into_iter()
+        .map(|f| f.file_url)
+        .collect();
+    assert!(!gen1.is_empty(), "generation 1 registered");
+
+    // Generation 2: ids 100..200. NO tombstones exist, so promotion 2 must
+    // carry every generation-1 file forward VERBATIM (same file_url) and add
+    // new files for the warm data only.
+    common::insert_batch(table.as_ref(), insert_range(100..200)?).await?;
+    let _ = table.checkpoint_inlined_data().await;
+    let _ = table.checkpoint_mem_tier().await;
+    assert!(table.promote_warm_to_cold().await?, "promotion 2 fires");
+    let after2 = fixture
+        .catalog
+        .list_cold_tier_files(table.table_id())
+        .await?;
+    let after2_urls: Vec<&String> = after2.iter().map(|f| &f.file_url).collect();
+    for url in &gen1 {
+        assert!(
+            after2_urls.contains(&url),
+            "tombstone-free promotion carries generation-1 file forward: {url}"
+        );
+    }
+    assert!(
+        after2.len() > gen1.len(),
+        "promotion 2 adds new files for the warm delta"
+    );
+    assert_eq!(row_count(&ctx, "cf_t").await?, 200, "all rows visible");
+
+    // Delete an id that lives in generation 1 (0..100), then promote again
+    // with fresh warm data. The tombstone dirties generation-1 files (their id
+    // rectangles contain 5); generation-2 files (100..200) are provably clean
+    // and must survive with their exact file_urls, while dirty files are
+    // rewritten (their old urls leave the manifest).
+    let deleted = delete_id(&table, 5).await?;
+    eprintln!("[carry_forward_test] DELETE id=5 rows-affected = {deleted}");
+    common::insert_batch(table.as_ref(), insert_range(200..203)?).await?;
+    let _ = table.checkpoint_inlined_data().await;
+    let _ = table.checkpoint_mem_tier().await;
+    assert!(table.promote_warm_to_cold().await?, "promotion 3 fires");
+
+    let after3 = fixture
+        .catalog
+        .list_cold_tier_files(table.table_id())
+        .await?;
+    let after3_urls: Vec<&String> = after3.iter().map(|f| &f.file_url).collect();
+    let gen2_only: Vec<&String> = after2
+        .iter()
+        .map(|f| &f.file_url)
+        .filter(|u| !gen1.contains(u))
+        .collect();
+    for url in &gen2_only {
+        assert!(
+            after3_urls.contains(url),
+            "clean generation-2 file carried through the dirty rewrite: {url}"
+        );
+    }
+    // A promotion writes MULTIPLE partition files, so generation 1 is several
+    // files covering id sub-ranges. The id=5 tombstone dirties only the file
+    // whose rectangle contains 5 — that one must be rewritten (url dropped);
+    // its clean siblings must be carried. Both sides firing proves the
+    // classification is file-granular WITHIN a generation.
+    let gen1_dropped = gen1.iter().filter(|u| !after3_urls.contains(u)).count();
+    let gen1_carried = gen1.len() - gen1_dropped;
+    assert!(
+        gen1_dropped >= 1,
+        "the generation-1 file containing the tombstoned id must be rewritten (none dropped of {})",
+        gen1.len()
+    );
+    assert!(
+        gen1.len() == 1 || gen1_carried >= 1,
+        "clean generation-1 sibling files must be carried, not rewritten (all {} dropped)",
+        gen1.len()
+    );
+
+    // Correctness across the carry-forward rewrite: the tombstoned row is
+    // physically gone, everything else is intact, no double counting.
+    assert_eq!(
+        row_count(&ctx, "cf_t").await?,
+        202,
+        "200 - 1 deleted + 3 new rows"
+    );
+    assert!(
+        collect_pairs(&ctx, "SELECT id, value FROM cf_t WHERE id = 5")
+            .await?
+            .is_empty(),
+        "tombstoned row physically dropped by the dirty rewrite"
+    );
+    assert_eq!(
+        collect_pairs(&ctx, "SELECT id, value FROM cf_t WHERE id = 150").await?,
+        vec![(150, 300)],
+        "carried generation-2 row still readable"
+    );
+    let manifest_rows: i64 = after3.iter().map(|f| f.row_count).sum();
+    assert_eq!(
+        manifest_rows, 202,
+        "manifest row counts match the live row set"
+    );
+
+    Ok(())
 }

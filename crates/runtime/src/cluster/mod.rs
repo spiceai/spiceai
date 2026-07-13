@@ -1246,6 +1246,13 @@ pub async fn initialize_cluster_executor(
     rt: Arc<Runtime>,
     shutdown_token: CancellationToken,
 ) -> crate::Result<impl Future<Output = crate::Result<()>>> {
+    // Register as Initializing immediately so `Runtime::status().is_ready()`
+    // (and harness `runtime_ready_check`) cannot return true from dataset-only
+    // readiness while task slots are still closed. Flipped to Ready only after
+    // object-store bind opens slots in the startup future below.
+    rt.status
+        .update_cluster("executor", ComponentStatus::Initializing);
+
     let runtime_handle = Arc::clone(&rt);
 
     let runtime_producer: RuntimeProducer =
@@ -1517,7 +1524,10 @@ pub async fn initialize_cluster_executor(
         metrics_collector::OtelExecutorMetricsCollector::new(metrics_node_id.clone());
 
     // Record task slots capacity for utilization metrics
-    crate::metrics::cluster::set_executor_task_slots(&metrics_node_id, u64::from(concurrent_tasks));
+    runtime_metrics::cluster::set_executor_task_slots(
+        &metrics_node_id,
+        u64::from(concurrent_tasks),
+    );
 
     let executor = Arc::new(Executor::new(
         executor_meta,
@@ -1545,10 +1555,13 @@ pub async fn initialize_cluster_executor(
     let (tx_ready, rx_ready) = oneshot::channel::<String>();
     let readiness_sender = Arc::new(Mutex::new(Some(tx_ready)));
 
-    // Create the shared semaphore for task slot management across all scheduler poll loops.
-    // This semaphore will be passed to each poll loop so the busy state can be tracked
-    // and shared across nodes in the scheduler shared state location metadata.
-    let available_task_slots = Arc::new(tokio::sync::Semaphore::new(concurrent_tasks as usize));
+    // Shared semaphore for task slot management across all scheduler poll loops.
+    // Start with 0 permits so the executor heartbeats/registers but accepts no
+    // tasks until object stores are bound (poll loops report num_free_slots=0
+    // in the meantime). Permits are added in the startup future after
+    // `executor_bind_object_stores` succeeds.
+    let available_task_slots = Arc::new(tokio::sync::Semaphore::new(0));
+    let available_task_slots_for_startup = Arc::clone(&available_task_slots);
 
     let scheduler_url_for_manager = scheduler_url.clone();
     let client_tls_config_for_manager = client_tls_config.clone();
@@ -1719,6 +1732,25 @@ pub async fn initialize_cluster_executor(
             .boxed()
             .context(FailedToStartClusterExecutorSnafu)?;
 
+        // Bind app + object stores and open task slots before partition
+        // allocation / DDL. `allocate_initial_partitions` can retry for a long
+        // time while the scheduler finishes loading accelerated tables; if
+        // slots stay at 0 through that window the executor is already
+        // registered (heartbeats) but cannot accept recovered or queued work.
+        // Pre-Fix-B behavior opened slots at process start; Fix B only needs
+        // to gate on object-store bind.
+        let executor_id_for_catchup = executor_id.clone();
+        executor_bind_app(&rt, executor_id, app_def, client_tls_config).await?;
+
+        // Bind object stores before DDL replay/catch-up so replayed DDL that
+        // touches S3-backed catalogs cannot poison the registry with a bare
+        // env-default store. Task slots stay closed until bind succeeds.
+        executor_bind_object_stores(Arc::clone(&rt)).await?;
+
+        available_task_slots_for_startup.add_permits(concurrent_tasks as usize);
+        tracing::info!("Object stores bound; opening {concurrent_tasks} task slots");
+        rt.status.update_cluster("executor", ComponentStatus::Ready);
+
         // Get initial allocation of Accelerated table partitions.
         // This also provides scheduler with executor_id to connect over FlightSQL to fetch partitions during SQL queries.
         //
@@ -1779,10 +1811,6 @@ pub async fn initialize_cluster_executor(
         );
         rt.set_partition_assignments(initial_partitions).await;
 
-        // Bind the already-fetched app and initialize secrets for object store configuration
-        let executor_id_for_catchup = executor_id.clone();
-        executor_bind_app(&rt, executor_id, app_def, client_tls_config).await?;
-
         // Replay DDL statements from the scheduler to create tables/schemas
         // that were added via DDL after cluster start (e.g. CREATE TABLE on a Cayenne catalog).
         if !ddl_statements.is_empty() {
@@ -1815,10 +1843,6 @@ pub async fn initialize_cluster_executor(
                 tracing::warn!("Failed to get DDL catch-up from scheduler: {e}");
             }
         }
-
-        executor_bind_object_stores(Arc::clone(&rt)).await?;
-
-        rt.status.update_cluster("executor", ComponentStatus::Ready);
 
         poll_manager
             .await
@@ -2243,6 +2267,10 @@ async fn create_cluster_service_client(
     let mut endpoint = Endpoint::from_shared(endpoint_url.clone())
         .boxed()
         .context(FailedToStartClusterExecutorSnafu)?;
+    // Bound connect so a unreachable/misconfigured scheduler fails the
+    // executor startup future instead of hanging until the harness ready
+    // timeout (OS TCP timeouts can exceed several minutes).
+    endpoint = endpoint.connect_timeout(Duration::from_secs(30));
     if let Some(tls_config) = client_tls_config {
         endpoint = endpoint
             .tls_config(tls_config)
@@ -2303,6 +2331,8 @@ impl runtime_secrets::ClusterSecretExpander for ClusterSecretExpanderImpl {
 
 /// - Binds the pre-fetched `App` to the runtime
 /// - Initializes and binds `SchedulerRPCSecretStore`
+/// - Ensures `runtime.task_history` exists when task history is enabled
+///   (normally created by `load_components`); fails closed if init fails
 /// - Loads catalogs, embeddings, models, and tools
 async fn executor_bind_app(
     rt: &Arc<Runtime>,
@@ -2326,6 +2356,38 @@ async fn executor_bind_app(
 
     let expander = Box::new(ClusterSecretExpanderImpl::new(secrets_cluster_client));
     *rt.secrets.write().await = Secrets::new_for_cluster_executor(expander, executor_id);
+
+    // Task history is created by `load_components` on a normal bring-up, but
+    // Fix B Ready/slots gate on this bind path — and the test harness skips
+    // concurrent `load_components` to avoid racing dataset load. Ensure the
+    // table exists here so federated `runtime.task_history` queries from the
+    // scheduler don't fail with "table not found" on the executor.
+    //
+    // Concurrent with `load_components` is fine: if we lose the race,
+    // `init_task_history` fails with "table already exists" and we re-check.
+    // Fail closed if init fails and the table is still absent — otherwise the
+    // executor can report Ready while scheduler federated queries break.
+    if rt.df.task_history_enabled {
+        let task_history_ref = ::datafusion::sql::TableReference::partial(
+            crate::datafusion::SPICE_RUNTIME_SCHEMA,
+            crate::task_history::DEFAULT_TASK_HISTORY_TABLE,
+        );
+        if rt.df.get_table(&task_history_ref).await.is_none() {
+            match Arc::clone(rt).init_task_history().await {
+                Ok(()) => {}
+                Err(err) if rt.df.get_table(&task_history_ref).await.is_some() => {
+                    tracing::debug!(
+                        "task_history already initialized by concurrent load_components: {err}"
+                    );
+                }
+                Err(err) => {
+                    return Err(FailedToStartClusterExecutor {
+                        source: Box::new(err),
+                    });
+                }
+            }
+        }
+    }
 
     Arc::clone(rt).load_catalogs().await;
     rt.load_embeddings().await;
@@ -2394,30 +2456,35 @@ async fn executor_bind_object_stores(rt: Arc<Runtime>) -> crate::Result<()> {
         });
     };
     let runtime_env = rt.df.ctx.runtime_env();
+    // Fail closed: task slots stay at 0 until every dataset's object stores are
+    // bound. Warn-and-continue would open slots with a partially empty registry,
+    // letting bare file-scan lookups permanently cache the wrong-region default.
     for dataset in Arc::clone(&rt).get_valid_datasets(app, LogErrors(true)) {
-        let connector = match Arc::clone(&rt)
+        let connector = Arc::clone(&rt)
             .get_dataconnector_from_dataset(Arc::clone(&dataset))
             .await
-        {
-            Ok(connector) => connector,
-            Err(error) => {
-                tracing::warn!(
-                    "Skipping object store registration for dataset {}: {error}",
-                    dataset.name
+            .map_err(|error| {
+                tracing::error!(
+                    dataset = %dataset.name,
+                    "Failed to resolve data connector while binding object stores: {error}"
                 );
-                continue;
-            }
-        };
+                FailedToStartClusterExecutor {
+                    source: Box::new(error),
+                }
+            })?;
 
-        if let Err(error) = connector
+        connector
             .register_object_stores(&dataset, &runtime_env)
             .await
-        {
-            tracing::warn!(
-                "Failed to register object stores for dataset {}: {error}",
-                dataset.name
-            );
-        }
+            .map_err(|error| {
+                tracing::error!(
+                    dataset = %dataset.name,
+                    "Failed to register object stores: {error}"
+                );
+                FailedToStartClusterExecutor {
+                    source: Box::new(error),
+                }
+            })?;
     }
 
     Ok(())

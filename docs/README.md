@@ -9,6 +9,10 @@ The project docs for contributors and community. For user documentation of the S
 - [Distributions](DISTRIBUTIONS.md)
 - [Extensibility](EXTENSIBILITY.md)
 
+## Architecture References
+
+- [Cayenne](cayenne/README.md) — technical reference for the `cayenne` CDC acceleration engine (built to a PDF in CI)
+
 ## Contributing
 
 - [CONTRIBUTING.md](../CONTRIBUTING.md)

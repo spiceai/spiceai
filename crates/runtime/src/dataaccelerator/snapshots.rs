@@ -23,7 +23,7 @@ use crate::dataaccelerator::cayenne::CayenneAccelerator;
 use crate::{
     component::dataset::acceleration::Acceleration,
     dataaccelerator::{
-        AccelerationSource, acceleration_file_path,
+        AccelerationSource, AcceleratorEngineRegistry, acceleration_file_path,
         spice_sys::{OpenOption, dataset_checkpoint::DatasetCheckpoint},
     },
 };
@@ -48,6 +48,7 @@ use snafu::{ResultExt, Snafu};
 pub(super) async fn download_snapshot_if_needed(
     acceleration: &Acceleration,
     source: &dyn AccelerationSource,
+    registry: Arc<AcceleratorEngineRegistry>,
     layout: AccelerationLayout,
     engine: AccelerationEngine,
     engine_override: Option<Arc<dyn SnapshotEngine>>,
@@ -72,11 +73,13 @@ pub(super) async fn download_snapshot_if_needed(
     let dataset_name = source.name().to_string();
     let source = source.clone_arc();
     let snapshot_behavior = acceleration.snapshot_behavior.clone();
+    let registry_for_cp = Arc::clone(&registry);
     let checkpoint_factory = make_checkpointer_factory(move || {
         let source = Arc::clone(&source);
         let snapshot_behavior = snapshot_behavior.clone();
+        let registry = Arc::clone(&registry_for_cp);
         async move {
-            DatasetCheckpoint::try_new(source.as_ref(), OpenOption::OpenExisting)
+            DatasetCheckpoint::try_new(source.as_ref(), registry, OpenOption::OpenExisting)
                 .await
                 .boxed()
                 .map(|checkpoint| {
@@ -194,6 +197,7 @@ pub(crate) async fn snapshot_before_recreate(
 
 pub(crate) async fn validate_snapshot_paths(
     sources: Vec<Arc<dyn AccelerationSource>>,
+    registry: &AcceleratorEngineRegistry,
 ) -> Result<(), SharedAccelerationSnapshotError> {
     let mut paths: HashMap<PathBuf, Vec<String>> = HashMap::new();
 
@@ -210,7 +214,7 @@ pub(crate) async fn validate_snapshot_paths(
             continue;
         }
 
-        match acceleration_file_path(source.as_ref()).await {
+        match acceleration_file_path(source.as_ref(), registry).await {
             Ok(path) => {
                 paths
                     .entry(path)
@@ -425,7 +429,7 @@ mod tests {
             unimplemented!("not needed for validation tests")
         }
 
-        fn runtime(&self) -> Arc<crate::Runtime> {
+        fn secrets(&self) -> Arc<tokio::sync::RwLock<crate::secrets::Secrets>> {
             unimplemented!("not needed for validation tests")
         }
 

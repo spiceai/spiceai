@@ -13,19 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
-use arrow::record_batch::RecordBatch;
-use datafusion::prelude::col;
-use datafusion::sql::TableReference;
-use model_components::model::{Error as ModelError, Model};
-use std::result::Result;
-use std::sync::Arc;
-use std::{collections::HashMap, io};
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 
 mod chat;
 mod embed;
-mod metrics;
+pub(crate) mod metrics;
 mod model_context;
 pub(crate) mod nsql;
 pub mod params;
@@ -91,48 +84,4 @@ impl LlmRuntimeStores {
     }
 }
 
-use crate::DataFusion;
-
 pub static ENABLE_MODEL_SUPPORT_MESSAGE: &str = "To enable model support, either: \n  1) `spice install ai` \n  2) Build spiced binary with flag `--features models`.";
-
-pub async fn run(m: Arc<Model>, df: Arc<DataFusion>) -> Result<RecordBatch, ModelError> {
-    let dataset = TableReference::parse_str(&m.model.datasets[0]);
-    let dataset_name = dataset
-        .clone()
-        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
-        .to_string();
-
-    let Some(provider) = df.get_table(&dataset).await else {
-        return Err(ModelError::UnableToRunModel {
-            source: Box::new(io::Error::other(format!(
-                "Model dataset not found: {dataset_name}"
-            ))),
-        });
-    };
-
-    let batches = df
-        .ctx
-        .read_table(provider)
-        .map_err(|e| ModelError::UnableToRunModel {
-            source: Box::new(e),
-        })?
-        .sort(vec![col("ts").sort(true, false)])
-        .map_err(|e| ModelError::UnableToRunModel {
-            source: Box::new(e),
-        })?
-        .collect()
-        .await
-        .map_err(|e| ModelError::UnableToRunModel {
-            source: Box::new(e),
-        })?;
-
-    // ONNX/tract inference is CPU-bound and synchronous; run it on the blocking
-    // pool so it doesn't stall the async runtime thread (which also serves
-    // `/health`). `spawn_blocking` (vs `block_in_place`) is safe regardless of
-    // the runtime flavor driving this call.
-    tokio::task::spawn_blocking(move || m.run(batches))
-        .await
-        .map_err(|e| ModelError::UnableToRunModel {
-            source: Box::new(e),
-        })?
-}

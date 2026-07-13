@@ -136,6 +136,50 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+impl From<runtime_acceleration::AccelerationParseError> for Error {
+    fn from(e: runtime_acceleration::AccelerationParseError) -> Self {
+        use runtime_acceleration::AccelerationParseError;
+        match e {
+            AccelerationParseError::UnableToParseColumnReference { column_ref, source } => {
+                Error::UnableToParseColumnReference { column_ref, source }
+            }
+            AccelerationParseError::UnableToParseFieldAsDuration { source, field } => {
+                Error::UnableToParseFieldAsDuration { source, field }
+            }
+            AccelerationParseError::MultipleRefreshExpressionSpecified => {
+                Error::MultipleRefreshExpressionSpecified
+            }
+            AccelerationParseError::IndexColumnNotFound {
+                index,
+                valid_columns,
+            } => Error::IndexColumnNotFound {
+                index,
+                valid_columns,
+            },
+            AccelerationParseError::PrimaryKeyColumnNotFound {
+                invalid_column,
+                valid_columns,
+            } => Error::PrimaryKeyColumnNotFound {
+                invalid_column,
+                valid_columns,
+            },
+            AccelerationParseError::AcceleratedSchemaEmpty { constraint } => {
+                Error::AcceleratedSchemaEmpty { constraint }
+            }
+            AccelerationParseError::UnableToGetTableConstraints { source } => {
+                Error::UnableToGetTableConstraints { source }
+            }
+            AccelerationParseError::OnConflictTargetMismatch { extra_detail } => {
+                Error::OnConflictTargetMismatch { extra_detail }
+            }
+            _ => Error::InvalidConfiguration {
+                config_key: "acceleration".into(),
+                message: e.to_string(),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum TimeFormat {
     #[default]
@@ -802,8 +846,8 @@ impl AccelerationSource for Dataset {
         self.app()
     }
 
-    fn runtime(&self) -> Arc<Runtime> {
-        self.runtime()
+    fn secrets(&self) -> Arc<tokio::sync::RwLock<crate::secrets::Secrets>> {
+        self.runtime.secrets()
     }
 
     fn acceleration(&self) -> Option<&Acceleration> {
@@ -820,6 +864,41 @@ impl AccelerationSource for Dataset {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn initialized_sources<'a>(
+        &'a self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Vec<Arc<dyn runtime_acceleration::AccelerationSource>>>
+                + Send
+                + 'a,
+        >,
+    > {
+        let app = self.app();
+        let runtime = Arc::clone(&self.runtime);
+        Box::pin(async move {
+            let datasets: Vec<Arc<dyn runtime_acceleration::AccelerationSource>> =
+                Arc::clone(&runtime)
+                    .get_initialized_datasets(&app, crate::LogErrors(false))
+                    .await
+                    .into_iter()
+                    .map(|ds| ds as Arc<dyn runtime_acceleration::AccelerationSource>)
+                    .collect();
+            #[cfg(feature = "duckdb")]
+            {
+                let views: Vec<Arc<dyn runtime_acceleration::AccelerationSource>> =
+                    Arc::clone(&runtime)
+                        .get_initialized_views(&app, crate::LogErrors(false))
+                        .await
+                        .into_iter()
+                        .map(|v| v as Arc<dyn runtime_acceleration::AccelerationSource>)
+                        .collect();
+                datasets.into_iter().chain(views).collect()
+            }
+            #[cfg(not(feature = "duckdb"))]
+            datasets
+        })
     }
 }
 

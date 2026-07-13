@@ -74,3 +74,6 @@ sqlite = [
   "datafusion-table-providers/sqlite",
   "datafusion-table-providers/sqlite-federation",
 ]
+
+[lints]
+workspace = true

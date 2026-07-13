@@ -43,6 +43,12 @@ use datafusion_federation::FederatedTableProviderAdaptor;
 ///   }
 /// ]
 /// ```
+///
+/// `foreign_table` is a fully-qualified `catalog.schema.table` name whose
+/// components are quoted following `PostgreSQL` `quote_ident` semantics
+/// (quoted only when required, doubling any embedded `"`). This keeps the
+/// name unambiguous — and round-trippable via `TableReference::parse_str` —
+/// when a component legally contains a `.`, e.g. `catalog."my.schema".table`.
 pub const FOREIGN_KEYS_METADATA_KEY: &str = "foreign_keys";
 
 /// Canonical Arrow metadata key for user-facing table and column descriptions.
@@ -148,6 +154,8 @@ pub mod mongodb;
 pub mod mssql;
 #[cfg(feature = "mysql")]
 pub mod mysql;
+#[cfg(feature = "mysql")]
+pub mod mysql_replication;
 #[cfg(feature = "odbc")]
 pub mod odbc;
 #[cfg(feature = "oracle")]

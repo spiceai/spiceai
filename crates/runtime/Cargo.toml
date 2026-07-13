@@ -94,7 +94,6 @@ jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 linkme.workspace = true
 llms = { path = "../llms", default-features = false }
 mediatype = "0.21.0"
-model_components = { path = "../model_components" }
 moka.workspace = true
 mysql_async = { workspace = true, optional = true }
 notify = "8.2.0"
@@ -136,6 +135,7 @@ rmcp = { workspace = true, optional = true, features = [
 runtime-acceleration = { path = "../runtime-acceleration" }
 runtime-api-types = { path = "../runtime-api-types" }
 runtime-async = { path = "../runtime-async" }
+runtime-metrics = { path = "../runtime-metrics" }
 runtime-auth = { path = "../runtime-auth" }
 runtime-cluster = { path = "../runtime-cluster" }
 runtime-datafusion = { path = "../runtime-datafusion" }
@@ -153,7 +153,6 @@ runtime-secrets = { path = "../runtime-secrets", default-features = false }
 runtime-table-partition = { path = "../runtime-table-partition" }
 rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
-rustls-pemfile.workspace = true
 elasticsearch = { path = "../elasticsearch", optional = true }
 duration-parse = { workspace = true, optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
@@ -335,7 +334,6 @@ metal = ["llms/metal"]
 distributed = ["llms/distributed", "models"]
 models = [
     "bedrock",
-    "model_components/full",
     "mcp",
     "runtime-datafusion-udfs/models",
     "search/llms",
@@ -351,6 +349,7 @@ openapi = [
     "dep:utoipa-swagger-ui",
     "dep:utoipa",
     "mcp",
+    "runtime-acceleration/openapi",
     "runtime-api-types/openapi",
     "runtime-search/openapi",
     "runtime-tools/openapi",
@@ -418,3 +417,10 @@ name = "flatten_json_properties"
 [[bench]]
 harness = false
 name = "cdc_cayenne_inline"
+
+[[bench]]
+harness = false
+name = "cdc_delete_burst"
+
+[lints]
+workspace = true

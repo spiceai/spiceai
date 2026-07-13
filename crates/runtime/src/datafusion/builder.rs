@@ -30,7 +30,7 @@ use crate::cluster::ExecutorRegistry;
 use crate::cluster::ResolvedClusterConfig;
 #[cfg(not(windows))]
 use crate::dataaccelerator::upsert_dedup::UpsertDedupTableProvider;
-use crate::{config::ClusterRole, metrics::telemetry::track_bytes_processed, status};
+use crate::{config::ClusterRole, status};
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use cache::Caching;
 #[cfg(not(windows))]
@@ -106,6 +106,7 @@ use runtime_datafusion::{
     url_table::{DynamicUrlCatalogList, SpiceUrlTableFactory},
 };
 use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
+use runtime_metrics::telemetry::track_bytes_processed;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use spicepod::component::runtime::SpillCompression as SpiceSpillCompression;
 use spicepod::metric::Metrics;
@@ -1399,9 +1400,7 @@ fn is_cayenne_accelerated_table_provider(provider: &dyn TableProvider) -> bool {
 
 #[cfg(not(windows))]
 fn is_cayenne_table_provider(provider: &dyn TableProvider) -> bool {
-    if provider.downcast_ref::<CayenneTableProvider>().is_some()
-        || has_cayenne_accelerator_metadata(provider)
-    {
+    if provider.is::<CayenneTableProvider>() || has_cayenne_accelerator_metadata(provider) {
         return true;
     }
 

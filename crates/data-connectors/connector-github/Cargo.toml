@@ -52,3 +52,6 @@ spicepod = { path = "../../spicepod" }
 
 [features]
 default = []
+
+[lints]
+workspace = true

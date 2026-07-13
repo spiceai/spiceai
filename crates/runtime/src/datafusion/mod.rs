@@ -556,9 +556,7 @@ fn validate_distributed_engine(
 fn engine_to_acceleration_engine(engine: Engine) -> Option<AccelerationEngine> {
     match engine {
         #[cfg(feature = "duckdb")]
-        Engine::DuckDB | Engine::PartitionedDuckDB | Engine::TableModePartitionedDuckDB => {
-            Some(AccelerationEngine::DuckDB)
-        }
+        Engine::DuckDB => Some(AccelerationEngine::DuckDB),
         #[cfg(feature = "sqlite")]
         Engine::Sqlite => Some(AccelerationEngine::Sqlite),
         #[cfg(feature = "turso")]
@@ -639,7 +637,11 @@ pub enum Table {
         /// Initial partition filter expressions to apply before the refresher starts.
         /// These are set on the `Refresh` during table registration to avoid a race
         /// where the first refresh runs before partition filters are applied.
-        initial_partition_filters: Vec<datafusion_expr::Expr>,
+        ///
+        /// Uses the `RefreshSQL` three-state partition-filter semantics: `None`
+        /// (not partition-scoped), `Some(filters)` (assigned partitions), or
+        /// `Some(empty)` (executor owns no partition — load no rows).
+        initial_partition_filters: Option<Vec<datafusion_expr::Expr>>,
     },
     Federated {
         data_connector: Arc<dyn DataConnector>,
@@ -1563,7 +1565,7 @@ impl DataFusion {
         if let Some(bytes) = self.compaction_memory_bytes {
             // The compaction metrics (incl. the pool-size gauge) are registered by
             // the binary AFTER metrics init via
-            // `telemetry::register_cayenne_compaction_metrics`. This runs before the
+            // `telemetry::cayenne::register_compaction_metrics`. This runs before the
             // Prometheus meter exists, so emitting the gauge here would bind it to
             // the noop meter and it would never reach `/metrics`.
             tracing::info!(
@@ -1980,7 +1982,7 @@ impl DataFusion {
             federated_table,
             Arc::clone(&pending_registration.secrets),
             BootstrapStatus::none(), // Sink datasets don't bootstrap from snapshots
-            vec![],
+            None,                    // Sink datasets are not partition-scoped
         )
         .await?;
 
@@ -2321,7 +2323,7 @@ impl DataFusion {
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
         bootstrap_status: BootstrapStatus,
-        initial_partition_filters: Vec<datafusion_expr::Expr>,
+        initial_partition_filters: Option<Vec<datafusion_expr::Expr>>,
     ) -> Result<AcceleratedTable> {
         tracing::trace!("Creating accelerated table {dataset:?}");
 
@@ -2526,8 +2528,12 @@ impl DataFusion {
             // Caching mode datasets are always ready immediately
             self.runtime_status
                 .update_dataset(&dataset.name, status::ComponentStatus::Ready);
-        } else if let Ok(checkpoint) =
-            DatasetCheckpoint::try_new(dataset, OpenOption::OpenExisting).await
+        } else if let Ok(checkpoint) = DatasetCheckpoint::try_new(
+            dataset,
+            self.accelerator_engine_registry(),
+            OpenOption::OpenExisting,
+        )
+        .await
             && checkpoint.exists().await
         {
             // For append refreshes that rely on a time column (i.e. file-based appends) that have
@@ -2599,15 +2605,17 @@ impl DataFusion {
             .context(InvalidTimeColumnTimeFormatSnafu)?;
 
         // Apply initial partition filters before the refresher starts to avoid a race
-        // where the first refresh runs without partition filters.
-        if !initial_partition_filters.is_empty() {
+        // where the first refresh runs without partition filters. `Some(empty)`
+        // (executor owns no partition of this table) is preserved so the refresh
+        // loads no rows rather than the entire source table.
+        if let Some(filters) = initial_partition_filters {
             use crate::accelerated_table::refresh::{RefreshSQL, RefreshSQLColumns};
             if let Some(ref mut sql) = refresh.sql {
-                sql.set_partition_filters(initial_partition_filters);
+                sql.set_partition_filters(Some(filters));
             } else {
                 let mut sql =
                     RefreshSQL::new(dataset.name.clone(), RefreshSQLColumns::All, vec![], None);
-                sql.set_partition_filters(initial_partition_filters);
+                sql.set_partition_filters(Some(filters));
                 refresh = refresh.refresh_sql(sql);
             }
         }
@@ -2761,7 +2769,10 @@ impl DataFusion {
         }
 
         // Get the acceleration layout (used for snapshots and size metrics)
-        let acceleration_layout = get_acceleration_layout(dataset).await.ok();
+        let acceleration_layout =
+            get_acceleration_layout(dataset, &self.accelerator_engine_registry)
+                .await
+                .ok();
 
         if acceleration_settings.snapshot_behavior.create_enabled() {
             if let Some(ref layout) = acceleration_layout {
@@ -2810,14 +2821,18 @@ impl DataFusion {
         }
 
         accelerated_table_builder.checkpointer_opt(
-            DatasetCheckpoint::try_new(dataset, OpenOption::CreateIfNotExists)
-                .await
-                .map(|checkpoint| {
-                    checkpoint
-                        .with_snapshot_behavior(acceleration_settings.snapshot_behavior)
-                        .to_arc()
-                })
-                .ok(),
+            DatasetCheckpoint::try_new(
+                dataset,
+                self.accelerator_engine_registry(),
+                OpenOption::CreateIfNotExists,
+            )
+            .await
+            .map(|checkpoint| {
+                checkpoint
+                    .with_snapshot_behavior(acceleration_settings.snapshot_behavior)
+                    .to_arc()
+            })
+            .ok(),
         );
 
         accelerated_table_builder.initial_load_complete(initial_load_complete);
@@ -2995,7 +3010,13 @@ impl DataFusion {
             return Ok(None);
         }
 
-        let Ok(cp) = DatasetCheckpoint::try_new(dataset, OpenOption::OpenExisting).await else {
+        let Ok(cp) = DatasetCheckpoint::try_new(
+            dataset,
+            self.accelerator_engine_registry(),
+            OpenOption::OpenExisting,
+        )
+        .await
+        else {
             return Ok(None);
         };
         let Some(existing_schema) = cp.get_schema().await.ok().flatten() else {
@@ -3248,7 +3269,8 @@ impl DataFusion {
             );
 
             // Snapshot before recreating (best-effort)
-            if let Ok(layout) = get_acceleration_layout(dataset).await
+            if let Ok(layout) =
+                get_acceleration_layout(dataset, &self.accelerator_engine_registry).await
                 && let Some(accel_engine) =
                     engine_to_acceleration_engine(acceleration_settings.engine)
             {
@@ -3434,7 +3456,7 @@ impl DataFusion {
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
         bootstrap_status: BootstrapStatus,
-        initial_partition_filters: Vec<datafusion_expr::Expr>,
+        initial_partition_filters: Option<Vec<datafusion_expr::Expr>>,
     ) -> Result<Option<Arc<Notify>>> {
         let mut accelerated_table = self
             .create_accelerated_table(
@@ -3641,10 +3663,14 @@ impl DataFusion {
     }
 
     /// Update only the partition filters on an accelerated table's refresh.
+    ///
+    /// `filters` carries the `RefreshSQL` three-state partition-filter semantics:
+    /// `None` (not partition-scoped), `Some(filters)` (assigned partitions), or
+    /// `Some(empty)` (no partitions assigned — load no rows).
     pub async fn update_partition_filters(
         &self,
         dataset_name: TableReference,
-        filters: Vec<datafusion_expr::Expr>,
+        filters: Option<Vec<datafusion_expr::Expr>>,
     ) -> Result<()> {
         let table = self
             .get_accelerated_table_provider(&dataset_name.to_string())
@@ -3951,7 +3977,12 @@ impl DataFusion {
 
         // Detect if data for view was already loaded so we don't need to wait for the first refresh to complete to mark it as ready.
         let mut initial_load_complete = false;
-        if let Ok(checkpoint) = DatasetCheckpoint::try_new(view, OpenOption::OpenExisting).await
+        if let Ok(checkpoint) = DatasetCheckpoint::try_new(
+            view,
+            self.accelerator_engine_registry(),
+            OpenOption::OpenExisting,
+        )
+        .await
             && checkpoint.exists().await
         {
             initial_load_complete = true;
@@ -3983,14 +4014,18 @@ impl DataFusion {
         builder.initial_load_complete(initial_load_complete);
         builder.caching(Some(Arc::clone(&self.caching)));
         builder.checkpointer_opt(
-            DatasetCheckpoint::try_new(view, OpenOption::CreateIfNotExists)
-                .await
-                .map(|checkpoint| {
-                    checkpoint
-                        .with_snapshot_behavior(acceleration.snapshot_behavior.clone())
-                        .to_arc()
-                })
-                .ok(),
+            DatasetCheckpoint::try_new(
+                view,
+                self.accelerator_engine_registry(),
+                OpenOption::CreateIfNotExists,
+            )
+            .await
+            .map(|checkpoint| {
+                checkpoint
+                    .with_snapshot_behavior(acceleration.snapshot_behavior.clone())
+                    .to_arc()
+            })
+            .ok(),
         );
         builder.refresh_on_startup(acceleration.refresh_on_startup);
         builder.ready_state(view.ready_state);
@@ -4124,7 +4159,7 @@ impl DataFusion {
             .table_names())
     }
 
-    pub fn query_builder<'a>(self: &Arc<Self>, sql: &'a str) -> QueryBuilder<'a> {
+    pub fn query_builder(self: &Arc<Self>, sql: &str) -> QueryBuilder {
         QueryBuilder::new(sql, Arc::clone(self))
     }
 
@@ -4786,9 +4821,7 @@ async fn build_snapshot_creation_config(
     ))]
     let acceleration_engine = match acceleration_settings.engine {
         #[cfg(feature = "duckdb")]
-        Engine::DuckDB | Engine::PartitionedDuckDB | Engine::TableModePartitionedDuckDB => {
-            AccelerationEngine::DuckDB
-        }
+        Engine::DuckDB => AccelerationEngine::DuckDB,
         #[cfg(feature = "sqlite")]
         Engine::Sqlite => AccelerationEngine::Sqlite,
         #[cfg(feature = "turso")]
@@ -4883,7 +4916,7 @@ async fn build_snapshot_refresh_state(
     }
 
     // 4. obtain (or warn) a SnapshotManager for this dataset.
-    let acceleration_layout = get_acceleration_layout(dataset)
+    let acceleration_layout = get_acceleration_layout(dataset, &df.accelerator_engine_registry)
         .await
         .context(SnapshotRefreshModeLayoutUnavailableSnafu)?;
     if !acceleration_layout.is_enabled() {
@@ -4909,15 +4942,17 @@ async fn build_snapshot_refresh_state(
     let source_for_checkpointer: Arc<dyn crate::dataaccelerator::AccelerationSource> =
         Arc::new(dataset.clone());
     let snapshot_behavior_for_checkpointer = acceleration_settings.snapshot_behavior.clone();
+    let registry_for_checkpointer = Arc::clone(&df.accelerator_engine_registry);
     let checkpoint_factory =
         runtime_acceleration::dataset_checkpoint::make_checkpointer_factory(move || {
             let source = Arc::clone(&source_for_checkpointer);
             let snapshot_behavior = snapshot_behavior_for_checkpointer.clone();
+            let registry = Arc::clone(&registry_for_checkpointer);
             async move {
                 use crate::dataaccelerator::spice_sys::OpenOption;
                 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
                 use snafu::ResultExt;
-                DatasetCheckpoint::try_new(source.as_ref(), OpenOption::OpenExisting)
+                DatasetCheckpoint::try_new(source.as_ref(), registry, OpenOption::OpenExisting)
                     .await
                     .boxed()
                     .map(|checkpoint| {
@@ -5181,7 +5216,7 @@ mod tests {
             .expect("should resolve the accelerated table provider");
 
         assert!(
-            resolved.downcast_ref::<MemTable>().is_some(),
+            resolved.is::<MemTable>(),
             "get_accelerated_table_provider must peel MetadataEnrichedTableProvider to reach the inner provider"
         );
     }
@@ -5785,37 +5820,6 @@ mod tests {
         }
 
         #[test]
-        fn partitioned_duckdb_rejected_in_distributed_mode() {
-            let config = make_cluster_config(ClusterRole::Scheduler);
-            let result =
-                validate_distributed_engine(&config, Engine::PartitionedDuckDB, "my_dataset");
-            assert!(
-                matches!(
-                    result,
-                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
-                ),
-                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
-            );
-        }
-
-        #[test]
-        fn table_mode_partitioned_duckdb_rejected_in_distributed_mode() {
-            let config = make_cluster_config(ClusterRole::Scheduler);
-            let result = validate_distributed_engine(
-                &config,
-                Engine::TableModePartitionedDuckDB,
-                "my_dataset",
-            );
-            assert!(
-                matches!(
-                    result,
-                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
-                ),
-                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
-            );
-        }
-
-        #[test]
         fn any_engine_allowed_in_non_distributed_mode() {
             let config = make_non_distributed_config();
             validate_distributed_engine(&config, Engine::DuckDB, "ds")
@@ -5826,11 +5830,6 @@ mod tests {
                 .expect("postgresql should be allowed when not in distributed mode");
             validate_distributed_engine(&config, Engine::Turso, "ds")
                 .expect("turso should be allowed when not in distributed mode");
-            validate_distributed_engine(&config, Engine::PartitionedDuckDB, "ds")
-                .expect("partitioned_duckdb should be allowed when not in distributed mode");
-            validate_distributed_engine(&config, Engine::TableModePartitionedDuckDB, "ds").expect(
-                "table_mode_partitioned_duckdb should be allowed when not in distributed mode",
-            );
             validate_distributed_engine(&config, Engine::Arrow, "ds")
                 .expect("arrow should be allowed when not in distributed mode");
             validate_distributed_engine(&config, Engine::Cayenne, "ds")

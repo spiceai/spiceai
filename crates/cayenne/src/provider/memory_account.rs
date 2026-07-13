@@ -40,6 +40,7 @@ pub(crate) struct CayenneMemoryAccount {
     reservation: ParkingMutex<MemoryReservation>,
     keyset_bytes: AtomicUsize,
     deletion_bytes: AtomicUsize,
+    cold_existence_bytes: AtomicUsize,
 }
 
 impl CayenneMemoryAccount {
@@ -51,6 +52,7 @@ impl CayenneMemoryAccount {
             ),
             keyset_bytes: AtomicUsize::new(0),
             deletion_bytes: AtomicUsize::new(0),
+            cold_existence_bytes: AtomicUsize::new(0),
         }
     }
 
@@ -58,7 +60,8 @@ impl CayenneMemoryAccount {
         let total = self
             .keyset_bytes
             .load(Ordering::Relaxed)
-            .saturating_add(self.deletion_bytes.load(Ordering::Relaxed));
+            .saturating_add(self.deletion_bytes.load(Ordering::Relaxed))
+            .saturating_add(self.cold_existence_bytes.load(Ordering::Relaxed));
         // `resize` is infallible (over-commits the greedy pool). See the type
         // docstring for why deletions must never fail-to-fit.
         self.reservation.lock().resize(total);
@@ -78,8 +81,15 @@ impl CayenneMemoryAccount {
         self.resize_to_total();
     }
 
-    /// Current total reserved bytes (keyset + deletions). For observability and
-    /// tests.
+    /// Account the resident bytes of the cold-tier PK existence view (the
+    /// per-cold-file bloom union). Reset to 0 whenever the view is cleared.
+    pub(crate) fn set_cold_existence_bytes(&self, bytes: usize) {
+        self.cold_existence_bytes.store(bytes, Ordering::Relaxed);
+        self.resize_to_total();
+    }
+
+    /// Current total reserved bytes (keyset + deletions + cold existence). For
+    /// observability and tests.
     #[must_use]
     pub(crate) fn reserved_bytes(&self) -> usize {
         self.reservation.lock().size()
@@ -119,8 +129,14 @@ mod tests {
         account.set_keyset_bytes(50);
         assert_eq!(account.reserved_bytes(), 650);
 
-        // Compaction clears the deletions; clearing the keyset releases the rest.
+        // The cold-tier existence view adds on top of both.
+        account.set_cold_existence_bytes(100);
+        assert_eq!(account.reserved_bytes(), 750);
+
+        // Compaction clears the deletions; clearing the rest releases all.
         account.set_deletion_bytes(0);
+        assert_eq!(account.reserved_bytes(), 150);
+        account.set_cold_existence_bytes(0);
         assert_eq!(account.reserved_bytes(), 50);
         account.set_keyset_bytes(0);
         assert_eq!(account.reserved_bytes(), 0);

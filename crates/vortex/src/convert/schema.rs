@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::collections::HashMap;
+
 use arrow_schema::DataType;
 use arrow_schema::Field;
 use arrow_schema::Schema;
@@ -31,12 +33,29 @@ pub fn calculate_physical_schema(
         ));
     };
 
+    // `Schema::field_with_name` is a linear scan (Arrow keeps no name index), so
+    // resolving each of the file's fields against the reference schema that way is
+    // O(fields^2) per file — and this runs on every file open, with the same
+    // reference schema, so the cost repeats per file across a scan. Index the
+    // reference schema once (first match wins, matching `field_with_name`) and the
+    // per-field lookup becomes O(1).
+    let logical_by_name: HashMap<&str, &Field> = {
+        let logical_fields = reference_logical_schema.fields();
+        let mut by_name = HashMap::with_capacity(logical_fields.len());
+        for field in logical_fields {
+            by_name
+                .entry(field.name().as_str())
+                .or_insert(field.as_ref());
+        }
+        by_name
+    };
+
     let fields: Vec<Field> = struct_dtype
         .names()
         .iter()
         .zip(struct_dtype.fields())
         .map(|(name, field_dtype)| {
-            let logical_field = reference_logical_schema.field_with_name(name.as_ref()).ok();
+            let logical_field = logical_by_name.get(name.as_ref()).copied();
             let arrow_type = match &logical_field {
                 Some(lf) => {
                     calculate_physical_field_type(&field_dtype, lf.data_type(), arrow_session)?
@@ -246,6 +265,62 @@ mod tests {
             physical_schema.field(0).data_type(),
             &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
         );
+    }
+
+    #[test]
+    fn test_reconciliation_matches_by_name_not_position() {
+        // The reference schema lists columns in the opposite order to the file
+        // DType. Reconciliation must match fields by name (via the name index),
+        // so each output field takes the matching reference field's preserved
+        // logical type regardless of position.
+        let logical_schema = Schema::new(vec![
+            Field::new(
+                "b_dict",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ),
+            Field::new("a_utf8", DataType::Utf8, false),
+        ]);
+        let dtype = DType::Struct(
+            StructFields::from_iter([
+                ("a_utf8", DType::Utf8(Nullability::NonNullable)),
+                ("b_dict", DType::Utf8(Nullability::Nullable)),
+            ]),
+            Nullability::NonNullable,
+        );
+
+        let physical = calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default())
+            .expect("schema should reconcile by name");
+
+        // Output follows the DType field order; types come from the matching
+        // reference fields.
+        assert_eq!(physical.field(0).name(), "a_utf8");
+        assert_eq!(physical.field(0).data_type(), &DataType::Utf8);
+        assert_eq!(physical.field(1).name(), "b_dict");
+        assert_eq!(
+            physical.field(1).data_type(),
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+        );
+    }
+
+    #[test]
+    fn test_duplicate_reference_name_uses_first_match() {
+        // A reference schema with duplicate field names must resolve against the
+        // FIRST match, matching Arrow's `field_with_name`; the name index
+        // preserves that via first-insert-wins.
+        let logical_schema = Schema::new(vec![
+            Field::new("x", DataType::Utf8, false),     // first "x" wins
+            Field::new("x", DataType::LargeUtf8, true), // second "x" ignored
+        ]);
+        let dtype = DType::Struct(
+            StructFields::from_iter([("x", DType::Utf8(Nullability::NonNullable))]),
+            Nullability::NonNullable,
+        );
+
+        let physical = calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default())
+            .expect("duplicate-name reconciliation should pick the first match");
+
+        assert_eq!(physical.field(0).data_type(), &DataType::Utf8);
     }
 
     #[test]

@@ -10,6 +10,7 @@ version.workspace = true
 
 [dependencies]
 app = { path = "../../crates/app" }
+arrow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 connector-abfs = { path = "../../crates/data-connectors/connector-abfs" }
 connector-adbc = { path = "../../crates/data-connectors/connector-adbc", optional = true }
@@ -60,8 +61,11 @@ reqwest.workspace = true
 runtime = { path = "../../crates/runtime" }
 runtime-auth = { path = "../../crates/runtime-auth" }
 runtime-async = { path = "../../crates/runtime-async" }
+runtime-cloud-connect = { workspace = true }
 runtime-datafusion = { path = "../../crates/runtime-datafusion" }
 runtime-query-engine = { path = "../../crates/runtime-query-engine" }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
 rustls.workspace = true
 yaml = { path = "../../crates/yaml" }
 snafu.workspace = true
@@ -175,3 +179,6 @@ sqlite = ["runtime/sqlite"]
 tpc-extension = ["dep:tpc-extension"]
 turso = ["runtime/turso"]
 vortex = ["runtime/vortex"]
+
+[lints]
+workspace = true
