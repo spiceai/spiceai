@@ -129,12 +129,17 @@ jobs:
         # check GH Actions considers the container ready as soon as it starts
         # (no image HEALTHCHECK is defined), so the benchmark step would race
         # spiced's connection attempts against the still-in-progress import.
+        # start-period must comfortably exceed the import time itself: Docker's
+        # retry countdown runs from container start regardless of the
+        # (long) --health-retries count once start-period elapses, so a short
+        # start-period here still flips to unhealthy well before the import
+        # (observed ~20-30s for SF1) finishes and touches the flag file.
         options: >-
           --health-cmd "test -f /var/lib/postgresql/data/data_loading_complete"
           --health-interval 5s
           --health-timeout 5s
-          --health-retries 60
-          --health-start-period 5s
+          --health-retries 3
+          --health-start-period 180s
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
