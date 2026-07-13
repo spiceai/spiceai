@@ -1,0 +1,222 @@
+version: v1
+kind: Spicepod
+name: postgres-cayenne[file]-adaptive-pipelined-lowtrigger
+#
+# Variant on postgres-cayenne[file]-adaptive-pipelined.yaml testing whether
+# lowering cayenne_compaction_trigger_protected_snapshots (min_runs per tier)
+# makes pipelining engage MORE: the SF1000 run of the max_merges=4 pod showed
+# cayenne_compaction_subset_inflight topping out at only 2 (order_line/stock),
+# which is consistent with today's min_runs=4 (confirmed via the
+# "Cayenne auto-tuned config: ... compaction_trigger_protected_snapshots=4"
+# startup log line — this value is NOT adaptively moved, it's a static
+# small-write-refresh-profile default) rarely letting two DIFFERENT tiers
+# both independently reach threshold before the compactor drains one of
+# them. Pinning it lower here gives tiers less time to sit unmerged, so more
+# of them should be simultaneously eligible when a pipelined pass runs —
+# at the cost of more frequent, smaller merges (higher write amplification;
+# see table.rs's select_protected_snapshot_merge_tiers doc). max_merges stays
+# at 4 (unchanged from the first pipelined pod) so this isolates the trigger
+# threshold as the only additional variable.
+
+# Default adaptive CH-BenCHmark config, set to the topology + prefetch that won the SF1000
+# benchmark sweep: the 7 CDC tables share FOUR replication slots (not one-per-table), and the CDC prefetch
+# buffers are pinned deep (16384). In that sweep the 1-slot topology failed the data-correctness
+# convergence gate at SF1000 (single apply pump, apply-bound), while the 4-slot grouping converged
+# with the LOWEST replication lag of any config (~320s vs ~440s for slot-per-table) — deep prefetch
+# accounted for most of that gain (4-slot default buffers were ~435s). See the -adaptive-1slot
+# pod to A/B the slot-count effect (1 vs 4 slots) with tuning and deep prefetch held constant;
+# 1-slot remains the goal (minimum source decode) but is still apply-bound at SF1000.
+#
+# Adaptive-tuning variant of the non-tuned postgres-cayenne[file] baseline. Instead of either
+# the static `auto` derivation (the baseline) or a hand-pinned -cdc-tuned-* config, every Cayenne
+# table runs `cayenne_tuning: adaptive`: the runtime still warm-starts each knob from the detected
+# host + inferred schema, then runs the closed-feedback loop that adapts those knobs over time
+# within the environment-derived [floor, ceiling] as the workload shifts.
+#
+# FOUR SHARED REPLICATION SLOTS group the changes-mode tables: the two heaviest producers
+# (order_line, stock) each get their own slot/pump, the bursty apply-bound new_order is isolated,
+# and the four light-write tables (customer/district/oorder/warehouse) share `spice_light`.
+# Each group derives its own `{slot}_pub`; server WAL decode is held at 4x (vs 7x slot-per-table).
+#
+# `schema_inference: extended` (per dataset) does double duty here, so nothing else is hand-set:
+#   - It auto-detects the primary key, secondary indexes, and (non-CDC) sort columns from the
+#     PostgreSQL source and seeds an `upsert` on_conflict on the inferred PK — exactly what
+#     `refresh_mode: changes` needs to apply UPDATE/DELETE events. So PK / on_conflict / indexes
+#     are intentionally NOT declared below; inference fills them (it is gap-filling only and never
+#     overrides a user-set value, so declaring them would just suppress the very thing we test).
+#   - It supplies the inferred row_count/table_bytes the adaptive loop's data-aware warm-start
+#     gates on; without extended inference adaptive silently falls back to `auto` (static).
+# Background compaction stays at the auto-derived (non-zero) default — the controller rides its
+# tick. The ONLY pinned knobs are the two CDC prefetch buffers (`cdc_prefetch_buffer` /
+# `cdc_max_coalesced_envelopes` = 16384, the runtime max) under `runtime.params` below: the sweep
+# showed deep prefetch is a clear, stable win, so we fix it here (this collapses those two knobs'
+# adaptive bounds to a point; adaptive still moves every other per-actuator knob freely).
+# The `cayenne_goal_*` SLOs (set globally under `runtime.params`) are NOT actuator knobs — they
+# are the high-level targets the closed loop converges toward (it still moves the un-pinned
+# actuators freely to hit them).
+#
+# sql_results / task_history stay off to match the baseline and the -cdc-tuned configs, so a
+# comparison isolates the effect of adaptive tuning, not caching/history overhead.
+
+postgres_connection_params: &postgres_params
+  pg_host: ${env:CHBENCH_PG_HOST}
+  pg_port: 5432
+  pg_db: chbench
+  pg_user: bench
+  pg_pass: bench
+  pg_sslmode: disable
+
+runtime:
+  flight:
+    ipc_compression: lz4_frame
+  caching:
+    sql_results:
+      enabled: false
+  task_history:
+    enabled: false
+  # Goal-driven adaptive SLOs, set GLOBALLY once here and inherited by every Cayenne
+  # dataset (override per-dataset via the same acceleration.params key). These are the
+  # high-level targets the closed loop converges toward — NOT actuator knobs.
+  # Replication-lag/freshness drive the CDC (changes) tables (inert on the full-refresh
+  # reference tables); query-latency (p99) applies to all. QPH is GLOBAL-ONLY: it is
+  # measured across all datasets (a query/join spans several, counted once), so it
+  # cannot be set per-dataset.
+  params:
+    # Deep prefetch: pin the CDC source-reader→apply channel and coalescing envelope cap to the
+    # runtime max (16384). This was the biggest single lever in the SF1000 benchmark sweep (4-slot
+    # replication lag ~435s at default buffers → ~320s deep).
+    cdc_prefetch_buffer: '16384'
+    cdc_max_coalesced_envelopes: '16384'
+    cayenne_goal_replication_lag: '5s'
+    cayenne_goal_freshness: '30s'
+    cayenne_goal_query_latency: '10s'
+    cayenne_goal_qph: '5000'
+
+datasets:
+  # ---- TPC-C core tables (mutated by OLTP workload) ----
+  # No primary_key / on_conflict / indexes: `schema_inference: extended` detects them from the
+  # PostgreSQL source and seeds the upsert on_conflict the CDC (changes) path requires.
+
+  - from: postgres:warehouse
+    name: warehouse
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_light
+      pg_replication_initial_snapshot: 'true'
+    acceleration: &cayenne_accel
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      params: &cayenne_params
+        cayenne_tuning: adaptive
+        # In-memory CDC intra-apply sharding: 4 PK-hash shards validate+append in
+        # parallel within one apply on the memory-tier (changes) tables. Inert on the
+        # full-refresh reference tables that share this anchor (not CDC memory mode).
+        cayenne_cdc_mem_tier_shards: '4'
+        # Goal-driven SLOs are set globally under `runtime.params` (above) and
+        # inherited by every dataset, so they are intentionally not repeated here.
+        # (A dataset that needed a sharper target would override the relevant
+        # cayenne_goal_* here; QPH is global-only and cannot be overridden.)
+        # A/B knob under test: merge up to 4 disjoint protected-snapshot size
+        # tiers concurrently per pass instead of only the lowest one (baseline
+        # pod default is 1). Pinned like cdc_prefetch_buffer above — the
+        # adaptive loop does not manage this knob yet, so it stays fixed.
+        cayenne_compaction_max_concurrent_merges: '4'
+        # Second knob under test in THIS variant: lower min_runs-per-tier (was
+        # 4, via the small-write-refresh-profile default) so tiers qualify for
+        # merging sooner, giving more of them a chance to be simultaneously
+        # eligible when a pipelined pass runs. Floor is 2 (a tier needs at
+        # least 2 runs to merge at all).
+        cayenne_compaction_trigger_protected_snapshots: '2'
+
+  - from: postgres:district
+    name: district
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_light
+      pg_replication_initial_snapshot: 'true'
+    acceleration: *cayenne_accel
+
+  - from: postgres:customer
+    name: customer
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_light
+      pg_replication_initial_snapshot: 'true'
+    acceleration: *cayenne_accel
+
+  - from: postgres:new_order
+    name: new_order
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_new_order
+      pg_replication_initial_snapshot: 'true'
+    acceleration: *cayenne_accel
+
+  - from: postgres:oorder
+    name: oorder
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_light
+      pg_replication_initial_snapshot: 'true'
+    acceleration: *cayenne_accel
+
+  - from: postgres:order_line
+    name: order_line
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_order_line
+      pg_replication_initial_snapshot: 'true'
+    acceleration: *cayenne_accel
+
+  - from: postgres:stock
+    name: stock
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_stock
+      pg_replication_initial_snapshot: 'true'
+    acceleration: *cayenne_accel
+
+  # ---- Static reference tables (no OLTP mutations, full refresh) ----
+  # Same: PK / on_conflict / indexes come from extended inference.
+
+  - from: postgres:item
+    name: item
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration: &cayenne_accel_full
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      params: *cayenne_params
+
+  - from: postgres:region
+    name: region
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration: *cayenne_accel_full
+
+  - from: postgres:nation
+    name: nation
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration: *cayenne_accel_full
+
+  - from: postgres:supplier
+    name: supplier
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration: *cayenne_accel_full
