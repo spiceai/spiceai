@@ -115,7 +115,8 @@ impl CayennePartitionCreator {
         on_conflict: Option<datafusion_table_providers::util::on_conflict::OnConflict>,
         runtime_env: Arc<RuntimeEnv>,
     ) -> Self {
-        let context = CayenneContext::new(&vortex_config, runtime_env, &table_name);
+        let context =
+            CayenneContext::new_for_partition_child(&vortex_config, runtime_env, &table_name);
         Self {
             table_name,
             base_path,

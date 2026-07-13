@@ -5035,9 +5035,17 @@ impl CayenneTableProvider {
         // `cdc_apply_fixed_cost_ms{phase="write"}` in the runtime apply loop). The
         // `cayenne_encode_acquire_wait_ms{class}` histogram inside `acquire_from`
         // carries the same signal without the table label; this one keys by table.
+        // Coupled writers (partition child tables, fed by a shared routing
+        // demux) bypass the budget entirely — parking a coupled write here
+        // deadlocks the demux against the permit holders (see `write_budget`
+        // module docs; spiceai/spiceai#11818).
         let encode_permit_wait_start = Instant::now();
-        let _encode_permits =
-            super::write_budget::acquire_encode_permits(encode_shards, write_class).await;
+        let _encode_permits = super::write_budget::acquire_encode_permits(
+            encode_shards,
+            write_class,
+            self.context.is_coupled_writer(),
+        )
+        .await;
         record_cayenne_write_phase(
             self.table_name(),
             "encode_permit_wait",

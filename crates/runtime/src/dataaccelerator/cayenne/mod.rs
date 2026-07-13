@@ -3176,33 +3176,32 @@ impl DataAccelerator for CayenneAccelerator {
 ///    path runs one concurrent insert task per partition
 ///    (`runtime_table_partition::insert`), so intra-write encode sharding
 ///    would multiply the aggregate encode-shard count by the partition count.
-/// 2. **Multi-shard child writes can deadlock the insert.** The per-partition
-///    insert tasks are coupled through one routing demux over bounded
-///    channels; a child write parked on the global encode budget stalls the
-///    demux, starving the permit-holding sibling writes of input — a
-///    hold-and-wait cycle that left partitioned tables permanently unready
-///    (spiceai/spiceai#11818). Single-shard writes are exempt from the encode
-///    budget (see `cayenne::provider::write_budget`), so serial children keep
-///    the demux draining for any partition count.
+/// 2. **Child writes bypass the global encode budget, so they must stay
+///    serial.** The per-partition insert tasks are coupled through one
+///    routing demux over bounded channels; a child write parked on the encode
+///    budget stalls the demux, starving the permit-holding sibling writes of
+///    input — a hold-and-wait cycle that left partitioned tables permanently
+///    unready (spiceai/spiceai#11818). Child tables are therefore created as
+///    coupled writers (`CayenneContext::new_for_partition_child`), exempt
+///    from the budget (see `cayenne::provider::write_budget`) — and an
+///    unmetered writer must contribute the minimum encode footprint, one
+///    shard, which this clamp guarantees.
 ///
 /// An operator-pinned `cayenne_write_concurrency > 1` is IGNORED (clamped to
 /// 1, with a warning), like schema evolution above: there is no safe way to
-/// honor it. Whether multi-shard children deadlock depends on
-/// `partitions × concurrency` versus the host-sized encode budget — the same
-/// spicepod is fine on one machine and hangs on another — and partition counts
-/// aren't statically bounded (time-based partitions grow indefinitely), so a
-/// config that is safe today can start deadlocking later.
+/// honor it — child writes are budget-exempt, so a multi-shard child would
+/// fan out unmetered, multiplied by a partition count that isn't statically
+/// bounded (time-based partitions grow indefinitely).
 fn serialize_partition_child_writes(
     config: &mut cayenne::metadata::VortexConfig,
     table_name: &str,
 ) {
-    if config.pinned_tuning_actuators.write_concurrency
-        && config.write_concurrency.unwrap_or(1) > 1
+    if config.pinned_tuning_actuators.write_concurrency && config.write_concurrency.unwrap_or(1) > 1
     {
         tracing::warn!(
             dataset = table_name,
             write_concurrency = ?config.write_concurrency,
-            "cayenne_write_concurrency is not supported for partitioned Cayenne tables (concurrent partition writes above the global encode budget deadlock the insert); writing each partition serially instead"
+            "cayenne_write_concurrency is not supported for partitioned Cayenne tables (partition writes bypass the global encode budget, so intra-partition sharding would fan out unmetered); writing each partition serially instead"
         );
     }
     config.write_concurrency = Some(1);
@@ -3283,7 +3282,11 @@ impl CayennePartitionCreator {
         // Create shared Cayenne context with cache once, to be shared across all partitions.
         // This ensures all partitions share the same footer/segment caches instead of
         // each partition creating its own cache.
-        let context = cayenne::CayenneContext::new(&vortex_config, runtime_env, &table_name);
+        let context = cayenne::CayenneContext::new_for_partition_child(
+            &vortex_config,
+            runtime_env,
+            &table_name,
+        );
 
         Self {
             table_name,
