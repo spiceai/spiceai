@@ -3168,8 +3168,7 @@ impl DataAccelerator for CayenneAccelerator {
     }
 }
 
-/// Force partition child tables to encode serially (one write shard), unless
-/// the operator pinned `cayenne_write_concurrency` explicitly.
+/// Force partition child tables to encode serially (one write shard).
 ///
 /// Two reasons, both specific to partitioned datasets:
 ///
@@ -3186,21 +3185,25 @@ impl DataAccelerator for CayenneAccelerator {
 ///    budget (see `cayenne::provider::write_budget`), so serial children keep
 ///    the demux draining for any partition count.
 ///
-/// An operator-pinned `cayenne_write_concurrency` is honored as configured,
-/// with a warning when it re-introduces the multi-shard deadlock risk.
+/// An operator-pinned `cayenne_write_concurrency > 1` is IGNORED (clamped to
+/// 1, with a warning), like schema evolution above: there is no safe way to
+/// honor it. Whether multi-shard children deadlock depends on
+/// `partitions × concurrency` versus the host-sized encode budget — the same
+/// spicepod is fine on one machine and hangs on another — and partition counts
+/// aren't statically bounded (time-based partitions grow indefinitely), so a
+/// config that is safe today can start deadlocking later.
 fn serialize_partition_child_writes(
     config: &mut cayenne::metadata::VortexConfig,
     table_name: &str,
 ) {
-    if config.pinned_tuning_actuators.write_concurrency {
-        if config.write_concurrency.unwrap_or(1) > 1 {
-            tracing::warn!(
-                dataset = table_name,
-                write_concurrency = ?config.write_concurrency,
-                "cayenne_write_concurrency > 1 on a partitioned dataset can deadlock inserts when concurrent partition writes exhaust the global encode budget; remove the parameter to use the safe serial default"
-            );
-        }
-        return;
+    if config.pinned_tuning_actuators.write_concurrency
+        && config.write_concurrency.unwrap_or(1) > 1
+    {
+        tracing::warn!(
+            dataset = table_name,
+            write_concurrency = ?config.write_concurrency,
+            "cayenne_write_concurrency is not supported for partitioned Cayenne tables (concurrent partition writes above the global encode budget deadlock the insert); writing each partition serially instead"
+        );
     }
     config.write_concurrency = Some(1);
 }
@@ -3603,17 +3606,18 @@ mod tests {
         assert_eq!(config.write_concurrency, Some(1));
     }
 
-    /// An operator-pinned `cayenne_write_concurrency` wins over the serial
-    /// default for partition children.
+    /// An operator-pinned `cayenne_write_concurrency > 1` is clamped to serial
+    /// for partition children — safety depends on the host-sized encode budget
+    /// and the (unbounded) partition count, so it cannot be honored safely.
     #[test]
-    fn partition_child_writes_honor_pinned_write_concurrency() {
+    fn partition_child_writes_clamp_pinned_write_concurrency() {
         let mut config = cayenne::metadata::VortexConfig {
             write_concurrency: Some(4),
             ..Default::default()
         };
         config.pinned_tuning_actuators.write_concurrency = true;
         serialize_partition_child_writes(&mut config, "t");
-        assert_eq!(config.write_concurrency, Some(4));
+        assert_eq!(config.write_concurrency, Some(1));
     }
 
     #[test]
