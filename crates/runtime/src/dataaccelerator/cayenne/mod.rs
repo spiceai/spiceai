@@ -2885,6 +2885,8 @@ impl DataAccelerator for CayenneAccelerator {
                 vortex_config.schema_evolution = cayenne::metadata::SchemaEvolutionMode::Disabled;
             }
 
+            serialize_partition_child_writes(&mut vortex_config, &table_name);
+
             // Log S3 Express configuration for partitioned tables
             if is_s3_express {
                 tracing::info!(
@@ -3164,6 +3166,43 @@ impl DataAccelerator for CayenneAccelerator {
 
         Ok(())
     }
+}
+
+/// Force partition child tables to encode serially (one write shard), unless
+/// the operator pinned `cayenne_write_concurrency` explicitly.
+///
+/// Two reasons, both specific to partitioned datasets:
+///
+/// 1. **Parallelism already comes from the partition fan-out.** The insert
+///    path runs one concurrent insert task per partition
+///    (`runtime_table_partition::insert`), so intra-write encode sharding
+///    would multiply the aggregate encode-shard count by the partition count.
+/// 2. **Multi-shard child writes can deadlock the insert.** The per-partition
+///    insert tasks are coupled through one routing demux over bounded
+///    channels; a child write parked on the global encode budget stalls the
+///    demux, starving the permit-holding sibling writes of input — a
+///    hold-and-wait cycle that left partitioned tables permanently unready
+///    (spiceai/spiceai#11818). Single-shard writes are exempt from the encode
+///    budget (see `cayenne::provider::write_budget`), so serial children keep
+///    the demux draining for any partition count.
+///
+/// An operator-pinned `cayenne_write_concurrency` is honored as configured,
+/// with a warning when it re-introduces the multi-shard deadlock risk.
+fn serialize_partition_child_writes(
+    config: &mut cayenne::metadata::VortexConfig,
+    table_name: &str,
+) {
+    if config.pinned_tuning_actuators.write_concurrency {
+        if config.write_concurrency.unwrap_or(1) > 1 {
+            tracing::warn!(
+                dataset = table_name,
+                write_concurrency = ?config.write_concurrency,
+                "cayenne_write_concurrency > 1 on a partitioned dataset can deadlock inserts when concurrent partition writes exhaust the global encode budget; remove the parameter to use the safe serial default"
+            );
+        }
+        return;
+    }
+    config.write_concurrency = Some(1);
 }
 
 /// Partition creator for Cayenne accelerator.
@@ -3542,6 +3581,40 @@ mod tests {
     use datafusion_table_providers::UnsupportedTypeAction;
     use search::index::{SearchIndex, VectorIndex};
     use std::sync::Arc;
+
+    /// Partition child tables default to serial writes (`write_concurrency: 1`):
+    /// multi-shard child writes can deadlock the partition insert demux against
+    /// the global encode budget (spiceai/spiceai#11818).
+    #[test]
+    fn partition_child_writes_default_to_serial() {
+        let mut config = cayenne::metadata::VortexConfig {
+            write_concurrency: None,
+            ..Default::default()
+        };
+        serialize_partition_child_writes(&mut config, "t");
+        assert_eq!(config.write_concurrency, Some(1));
+
+        // Auto-tuned (unpinned) values are overridden too.
+        let mut config = cayenne::metadata::VortexConfig {
+            write_concurrency: Some(8),
+            ..Default::default()
+        };
+        serialize_partition_child_writes(&mut config, "t");
+        assert_eq!(config.write_concurrency, Some(1));
+    }
+
+    /// An operator-pinned `cayenne_write_concurrency` wins over the serial
+    /// default for partition children.
+    #[test]
+    fn partition_child_writes_honor_pinned_write_concurrency() {
+        let mut config = cayenne::metadata::VortexConfig {
+            write_concurrency: Some(4),
+            ..Default::default()
+        };
+        config.pinned_tuning_actuators.write_concurrency = true;
+        serialize_partition_child_writes(&mut config, "t");
+        assert_eq!(config.write_concurrency, Some(4));
+    }
 
     #[test]
     fn resolve_goal_raw_global_default_then_per_dataset_override() {

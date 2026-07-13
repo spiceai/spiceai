@@ -35,6 +35,20 @@ limitations under the License.
 //! cap deadlock-free: a write can never hold some permits while waiting for the
 //! rest, so independent writes can't form a hold-and-wait cycle.
 //!
+//! That argument only holds for writes that are **independent**. Writes into a
+//! partitioned table are not: the partition insert path demuxes one input
+//! stream into per-partition writes over bounded channels
+//! (`runtime_table_partition::insert`), so a child write parked on this budget
+//! stalls the demux, which starves the permit-holding sibling writes of input —
+//! a hold-and-wait cycle *through the channels* that left partitioned tables
+//! permanently unready (spiceai/spiceai#11818). To keep such coupled writers
+//! live regardless of partition count, **single-shard writes are exempt from
+//! the budget** ([`acquire_for_write`]): a serial write is the pre-budget
+//! baseline the budget was never needed for (it exists to cap encode *fan-out*,
+//! and aggregate compaction concurrency is separately bounded by the
+//! compactor's own semaphore), and an exempt serial write can always drain its
+//! input, so the demux always makes progress.
+//!
 //! When unset (unit tests, embedders that don't wire it up) acquisition is a
 //! no-op and writes proceed ungated, preserving the prior per-table behavior.
 
@@ -301,17 +315,45 @@ pub fn encode_budget_snapshot() -> Option<EncodeBudgetSnapshot> {
 /// Acquire up to `shards` encode permits from the global budget, atomically.
 ///
 /// Returns the held permits (which release on drop, so callers scope them to
-/// the write) or `None` when no budget is installed (proceed ungated). `shards`
-/// is clamped to `[1, class cap]` so the request is always satisfiable and can
-/// never block forever waiting for more permits than the budget can ever hold.
-/// `Delta` writes may use the whole budget; `Maintenance` writes are capped to
-/// [`maintenance_gate_cap`] in aggregate (see `maintenance_gate`).
+/// the write) or `None` when the write proceeds ungated: no budget installed,
+/// or a single-shard write (see [`acquire_for_write`]). For gated writes,
+/// `shards` is clamped to `[2, class cap]` so the request is always satisfiable
+/// and can never block forever waiting for more permits than the budget can
+/// ever hold. `Delta` writes may use the whole budget; `Maintenance` writes are
+/// capped to [`maintenance_gate_cap`] in aggregate (see `maintenance_gate`).
 pub(crate) async fn acquire_encode_permits(
     shards: usize,
     class: WriteClass,
 ) -> Option<EncodePermits> {
     let budget = GLOBAL_ENCODE_BUDGET.read().clone()?;
-    acquire_from(&budget, shards, class).await
+    acquire_for_write(&budget, shards, class).await
+}
+
+/// Budget policy for a write with the given shard count: multi-shard writes
+/// acquire permits ([`acquire_from`]); **single-shard writes are exempt** and
+/// proceed ungated (`None`).
+///
+/// The exemption is load-bearing, not an optimization. Writes coupled through
+/// a shared input demux — partitioned-table inserts route one stream into
+/// per-partition writes over bounded channels — deadlock if a child write can
+/// park on this budget: the parked write stalls the demux, starving the
+/// permit-holding siblings of input, and no permit is ever released
+/// (spiceai/spiceai#11818). A single-shard write is guaranteed to make
+/// progress without ever parking here, which keeps any demux it is coupled to
+/// draining. The budget's purpose — capping aggregate encode *fan-out* — is
+/// unaffected: a serial write contributes exactly the one encode stream per
+/// writer that existed before intra-write sharding (and before this budget),
+/// and compaction's aggregate concurrency stays bounded by the
+/// `BackgroundCompactor` semaphore independently of this gate.
+async fn acquire_for_write(
+    budget: &EncodeBudget,
+    shards: usize,
+    class: WriteClass,
+) -> Option<EncodePermits> {
+    if shards <= 1 {
+        return None;
+    }
+    acquire_from(budget, shards, class).await
 }
 
 /// Acquire `min(shards, class cap)` permits from a specific budget. Extracted
@@ -610,5 +652,74 @@ mod tests {
     #[tokio::test]
     async fn acquire_encode_permits_is_noop_when_unset() {
         assert!(acquire_encode_permits(8, WriteClass::Delta).await.is_none());
+    }
+
+    /// REGRESSION (spiceai/spiceai#11818): a single-shard write must proceed
+    /// ungated even when the budget is fully held. Partitioned-table inserts
+    /// couple their per-partition writes through one bounded-channel demux, so
+    /// a serial child write that parks on the budget stalls the demux, starves
+    /// the permit-holding siblings of input, and deadlocks the whole insert —
+    /// datasets loaded but the table never ready.
+    #[tokio::test]
+    async fn single_shard_write_is_exempt_even_at_zero_headroom() {
+        let b = budget(2);
+        let held = acquire_from(&b, 2, WriteClass::Delta).await;
+        assert!(held.is_some());
+        assert_eq!(b.semaphore.available_permits(), 0, "budget fully held");
+
+        let exempt = tokio::time::timeout(
+            Duration::from_millis(500),
+            acquire_for_write(&b, 1, WriteClass::Delta),
+        )
+        .await
+        .expect("a single-shard write must never block on the budget");
+        assert!(exempt.is_none(), "exempt writes hold no permits");
+        assert_eq!(
+            b.semaphore.available_permits(),
+            0,
+            "the exemption consumes no budget"
+        );
+    }
+
+    /// The exemption applies to `Maintenance` too: a single-shard compaction
+    /// output (compaction pins its output to one shard) must not park on the
+    /// gate — its aggregate concurrency is bounded by the compactor's own
+    /// semaphore, not this budget.
+    #[tokio::test]
+    async fn single_shard_maintenance_is_exempt() {
+        let total = 16;
+        let b = budget(total);
+        let gate = maintenance_gate_cap(total);
+        let _held = acquire_from(&b, gate, WriteClass::Maintenance).await;
+        assert_eq!(b.maintenance_gate.available_permits(), 0, "gate exhausted");
+
+        let exempt = tokio::time::timeout(
+            Duration::from_millis(500),
+            acquire_for_write(&b, 1, WriteClass::Maintenance),
+        )
+        .await
+        .expect("a single-shard maintenance write must never block on the gate");
+        assert!(exempt.is_none());
+    }
+
+    /// Multi-shard writes stay gated: the exemption is strictly `shards <= 1`.
+    #[tokio::test]
+    async fn multi_shard_write_is_still_gated() {
+        let b = budget(2);
+        let held = acquire_for_write(&b, 2, WriteClass::Delta).await;
+        assert!(held.is_some(), "a gated acquire succeeds under headroom");
+        assert_eq!(b.semaphore.available_permits(), 0);
+
+        let mut pending = std::pin::pin!(acquire_for_write(&b, 2, WriteClass::Delta));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut pending)
+                .await
+                .is_err(),
+            "a second multi-shard write queues while the budget is held"
+        );
+        drop(held);
+        tokio::time::timeout(Duration::from_millis(500), &mut pending)
+            .await
+            .expect("the queued write proceeds once permits release");
     }
 }
