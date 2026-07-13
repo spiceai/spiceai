@@ -580,20 +580,41 @@ impl CommitChange for NoOpCommitter {
 ///
 /// `source_commit_ts_ms` is `None` for snapshot-boundary / no-timestamp commits
 /// (lag is then reported as `None`).
+/// Convert a [`SystemTime`] to milliseconds since the Unix epoch, or `None` if it
+/// predates the epoch or overflows `i64`.
+#[must_use]
+pub fn system_time_to_unix_ms(t: SystemTime) -> Option<i64> {
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+}
+
+/// Current wall-clock time as milliseconds since the Unix epoch, or `None` if the
+/// clock is unavailable.
+#[must_use]
+pub fn now_unix_ms() -> Option<i64> {
+    system_time_to_unix_ms(SystemTime::now())
+}
+
+/// Replication lag in milliseconds: wall-clock now minus the source-commit
+/// timestamp, clamped to `>= 0`. `None` when the source timestamp is unknown or
+/// the clock is unavailable. Shared by the `spice_cdc::*` log lines and the lag
+/// gauge so every CDC connector computes lag identically.
+#[must_use]
+pub fn replication_lag_ms(source_commit_ts_ms: Option<i64>) -> Option<i64> {
+    match (now_unix_ms(), source_commit_ts_ms) {
+        (Some(now), Some(ts)) => Some(now.saturating_sub(ts).max(0)),
+        _ => None,
+    }
+}
+
 pub fn log_committer_progress(
     connector: &str,
     dataset: &str,
     position: &str,
     source_commit_ts_ms: Option<i64>,
 ) {
-    let now_ms = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .ok()
-        .and_then(|d| i64::try_from(d.as_millis()).ok());
-    let lag_ms = match (now_ms, source_commit_ts_ms) {
-        (Some(now), Some(ts)) => Some(now.saturating_sub(ts)),
-        _ => None,
-    };
+    let lag_ms = replication_lag_ms(source_commit_ts_ms);
     tracing::debug!(
         target: "spice_cdc::commit",
         connector,
@@ -699,14 +720,9 @@ pub fn source_commit_within_ready_lag(
     source_commit_ts_ms: Option<i64>,
     ready_lag: Duration,
 ) -> bool {
-    let Some(ts_ms) = source_commit_ts_ms else {
+    let Some(lag_ms) = replication_lag_ms(source_commit_ts_ms) else {
         return false;
     };
-    let now_ms = match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
-        Ok(elapsed) => i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX),
-        Err(_) => return false,
-    };
-    let lag_ms = now_ms.saturating_sub(ts_ms).max(0);
     u128::from(lag_ms.unsigned_abs()) < ready_lag.as_millis()
 }
 

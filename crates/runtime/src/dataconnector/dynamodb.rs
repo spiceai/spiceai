@@ -86,7 +86,7 @@ const DEFAULT_TIME_FORMAT: &str = "2006-01-02T15:04:05.000Z07:00";
 /// `auto` (the `one_of` on the [`ParameterSpec`] already rejects bad values in
 /// production; this is a defensive default).
 fn parse_snapshot_mode(params: &Parameters, dataset_name: &TableReference) -> InitialSnapshotMode {
-    match params.get("dynamodb_replication_initial_snapshot").expose() {
+    match params.get("replication_initial_snapshot").expose() {
         ExposedParamLookup::Present(value) if !value.trim().is_empty() => {
             InitialSnapshotMode::from_canonical(value).unwrap_or_else(|| {
                 tracing::warn!(
@@ -111,7 +111,7 @@ fn parse_invalid_checkpoint_behavior(
     dataset_name: &TableReference,
 ) -> InvalidCheckpointBehavior {
     if let ExposedParamLookup::Present(value) = params
-        .get("dynamodb_replication_invalid_checkpoint_behavior")
+        .get("replication_invalid_checkpoint_behavior")
         .expose()
     {
         let trimmed = value.trim();
@@ -195,7 +195,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     // dual-read below (a user migrating from `ready_lag` would be silently
     // ignored). The 2s default comes from `DEFAULT_READY_LAG` at the parse
     // site, matching the sibling `dynamodb_replication_invalid_checkpoint_behavior`.
-    ParameterSpec::runtime("dynamodb_replication_ready_lag")
+    ParameterSpec::component("replication_ready_lag")
         .description("For `refresh_mode: changes`, the dataset is marked Ready once its replication lag (now minus the newest applied source-commit time) falls below this. It stays not-ready while snapshotting or draining a backlog, so it never serves stale data. Default: 2s."),
     // Deprecated alias of `dynamodb_replication_ready_lag`.
     ParameterSpec::runtime("ready_lag")
@@ -203,11 +203,11 @@ const PARAMETERS: &[ParameterSpec] = &[
         .deprecated("Renamed to 'dynamodb_replication_ready_lag'."),
     ParameterSpec::runtime("endpoint_url")
         .description("Custom endpoint URL for DynamoDB-compatible services (e.g., DynamoDB Local, ScyllaDB Alternator)."),
-    ParameterSpec::runtime("dynamodb_replication_initial_snapshot")
+    ParameterSpec::component("replication_initial_snapshot")
         .description("When `refresh_mode: changes` first loads the table's existing items: 'auto' (default) scans when no resumable stream checkpoint exists and resumes without a scan when one does; 'disabled' streams changes only, from the current stream tip; 'enabled' scans on every start, discarding any persisted checkpoint. Default: auto.")
         .default("auto")
         .one_of_ignore_ascii_case(InitialSnapshotMode::VALUES),
-    ParameterSpec::runtime("dynamodb_replication_invalid_checkpoint_behavior")
+    ParameterSpec::component("replication_invalid_checkpoint_behavior")
         .description("Behavior when the persisted stream checkpoint can no longer be honored (past the ~24h shard retention). 'error' (default) marks the dataset as Error; 'restart' re-bootstraps from a fresh scan. Default: error.")
         .one_of_ignore_ascii_case(InvalidCheckpointBehavior::VALUES),
     // Deprecated alias of `dynamodb_replication_invalid_checkpoint_behavior`.
@@ -377,7 +377,7 @@ impl DataConnector for DynamoDB {
         // the deprecated `ready_lag` alias; default to the shared CDC ready-lag.
         let ready_lag = self
             .params
-            .get("dynamodb_replication_ready_lag")
+            .get("replication_ready_lag")
             .expose()
             .ok()
             .filter(|v| !v.trim().is_empty())
@@ -874,22 +874,16 @@ async fn changes_stream_from_checkpoint(
                 // poll-cycle start, so an idle poll batch keeps the gauge fresh.
                 // This is a per-batch stamp on DynamoDB's own polled stream, not
                 // an injected heartbeat envelope through a shared pump.
-                let change_batch = change_batch.with_source_commit_ts_ms(watermark.and_then(|t| {
-                    t.duration_since(std::time::UNIX_EPOCH)
-                        .ok()
-                        .and_then(|d| i64::try_from(d.as_millis()).ok())
-                }));
+                let change_batch = change_batch.with_source_commit_ts_ms(
+                    watermark.and_then(data_components::cdc::system_time_to_unix_ms),
+                );
 
                 ChangeEnvelope::new(
                     Box::new(DynamoDBStreamCommitter::new(
                         Arc::clone(&dynamodb_sys),
                         checkpoint,
                         dataset_name.to_string(),
-                        watermark.and_then(|t| {
-                            t.duration_since(std::time::UNIX_EPOCH)
-                                .ok()
-                                .and_then(|d| i64::try_from(d.as_millis()).ok())
-                        }),
+                        watermark.and_then(data_components::cdc::system_time_to_unix_ms),
                     )),
                     change_batch,
                     lag.is_some_and(|l| l < acceptable_lag),

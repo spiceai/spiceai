@@ -341,7 +341,7 @@ pub fn build_changes_stream(
                         // An idle getMore closes the in-flight batch.
                         true
                     } else if !live_change_stream.is_alive() {
-                        tracing::info!(
+                        tracing::debug!(
                             dataset = %dataset.name,
                             collection = %collection_name,
                             "MongoDB Change Stream ended (collection dropped or invalidated); completing"
@@ -363,12 +363,9 @@ pub fn build_changes_stream(
                                     .map_err(|error| StreamError::Arrow(error.to_string()))?;
                             // Log the idle heartbeat so lag-based readiness can be
                             // verified from the logs (target spice_cdc::heartbeat).
-                            let heartbeat_lag_ms = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .ok()
-                                .and_then(|d| i64::try_from(d.as_millis()).ok())
-                                .map(|now| now.saturating_sub(cluster_time_ms));
-                            tracing::info!(
+                            let heartbeat_lag_ms =
+                                data_components::cdc::replication_lag_ms(Some(cluster_time_ms));
+                            tracing::debug!(
                                 target: "spice_cdc::heartbeat",
                                 connector = "mongodb",
                                 dataset = %dataset.name,
@@ -549,13 +546,13 @@ fn build_batch_committer(
 /// Resolve the initial-snapshot mode from `mongodb_replication_initial_snapshot`
 /// (`auto|enabled|disabled`); defaults to [`InitialSnapshotMode::Auto`].
 fn snapshot_mode_from_params(params: &Parameters) -> Result<InitialSnapshotMode, StreamError> {
-    match optional_string(params, "mongodb_replication_initial_snapshot") {
+    match optional_string(params, "replication_initial_snapshot") {
         None => Ok(InitialSnapshotMode::default()),
         Some(value) if value.trim().is_empty() => Ok(InitialSnapshotMode::default()),
         Some(value) => InitialSnapshotMode::from_canonical(&value).ok_or_else(|| {
             invalid_parameter_error(
                 params,
-                "mongodb_replication_initial_snapshot",
+                "replication_initial_snapshot",
                 format!(
                     "must be 'auto', 'enabled', or 'disabled', got {:?}",
                     value.trim()
@@ -569,7 +566,7 @@ fn snapshot_mode_from_params(params: &Parameters) -> Result<InitialSnapshotMode,
 /// (a duration); defaults to [`DEFAULT_READY_LAG`]. A `refresh_mode: changes`
 /// dataset is marked ready once its replication lag falls below this.
 fn ready_lag_from_params(params: &Parameters) -> Result<Duration, StreamError> {
-    optional_positive_duration(params, "mongodb_replication_ready_lag", DEFAULT_READY_LAG)
+    optional_positive_duration(params, "replication_ready_lag", DEFAULT_READY_LAG)
 }
 
 /// Resolve the invalid-checkpoint behavior, preferring the canonical
@@ -579,20 +576,20 @@ fn ready_lag_from_params(params: &Parameters) -> Result<Duration, StreamError> {
 fn invalid_checkpoint_behavior_from_params(
     params: &Parameters,
 ) -> Result<InvalidCheckpointBehavior, StreamError> {
-    if let Some(value) = optional_string(params, "mongodb_replication_invalid_checkpoint_behavior")
+    if let Some(value) = optional_string(params, "replication_invalid_checkpoint_behavior")
     {
         let trimmed = value.trim();
         if !trimmed.is_empty() {
             return InvalidCheckpointBehavior::from_canonical(trimmed).ok_or_else(|| {
                 invalid_parameter_error(
                     params,
-                    "mongodb_replication_invalid_checkpoint_behavior",
+                    "replication_invalid_checkpoint_behavior",
                     format!("must be 'error' or 'restart', got {trimmed:?}"),
                 )
             });
         }
     }
-    match optional_string(params, "mongodb_resume_token_invalid_behavior").as_deref() {
+    match optional_string(params, "resume_token_invalid_behavior").as_deref() {
         None => Ok(InvalidCheckpointBehavior::default()),
         Some(value) if value.trim().is_empty() => Ok(InvalidCheckpointBehavior::default()),
         Some(value) => match value.trim().to_ascii_lowercase().as_str() {
