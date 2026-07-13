@@ -1196,11 +1196,21 @@ impl RefreshTask {
         // The slot advancer is installed per all-deferrable upsert-only burst and
         // cleared for durable-only bursts, so non-replayable sources and deletes
         // never buffer un-acked rows in RAM.
+        //
+        // Excludes `mode: memory` (memory-resident) tables: they never checkpoint
+        // to durable Vortex, so the deferred committers' durability fence
+        // (`on_checkpoint_durable`) would never fire — the queue would grow
+        // unbounded and the source slot would stall. Memory mode is ephemeral
+        // (reload-from-source on restart), so its in-RAM CDC writes take the
+        // immediate-commit path below (`in_memory_epoch` with no queue), advancing
+        // the slot right after the write — correct because a restart re-snapshots.
         let deferred_commits: Option<DeferredCommitQueue> = {
             #[cfg(not(windows))]
             {
                 self.cayenne_accelerator()
-                    .filter(|cayenne| cayenne.is_cdc_memory_mode())
+                    .filter(|cayenne| {
+                        cayenne.is_cdc_memory_mode() && !cayenne.is_memory_resident_mode()
+                    })
                     .map(|_cayenne| {
                         Arc::new(tokio::sync::Mutex::new(VecDeque::new())) as DeferredCommitQueue
                     })
