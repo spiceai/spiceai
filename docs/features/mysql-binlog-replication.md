@@ -103,7 +103,7 @@ as the Postgres connector's snapshot/WAL boundary.
 | Parameter | Default | Description |
 | --- | --- | --- |
 | `mysql_replication_server_id` | derived | The `server_id` this replica registers with. Must be unique among all replicas attached to the source; the default is derived from the dataset name and process, so two spiced instances don't collide. |
-| `mysql_replication_initial_snapshot` | `auto` | When existing rows load: `auto` snapshots when no resumable position exists; `disabled` streams changes only; `enabled` re-snapshots on every start. (Deprecated alias: `mysql_replication_snapshot_mode` with `auto`/`never`/`always`.) |
+| `mysql_replication_initial_snapshot` | `auto` | When existing rows load: `auto` snapshots when no resumable position exists; `disabled` streams changes only; `always` re-snapshots on every start. (Deprecated alias: `mysql_replication_snapshot_mode` with `auto`/`never`/`always`.) |
 | `mysql_replication_checkpoint_interval` | `10s` | How often the committed position persists to the sidecar. Bounds crash-replay volume. |
 | `mysql_replication_bootstrap_batch_size` | `8192` | Rows per emitted snapshot batch (max `1048576`). |
 | `mysql_replication_invalid_checkpoint_behavior` | `error` | What to do when the persisted position was purged from the source: `error` or `restart` (drop the position and re-snapshot). (Deprecated alias: `mysql_replication_invalid_position_behavior` with `error`/`rebootstrap`.) |

@@ -116,10 +116,10 @@ pub fn build_changes_stream(
             persisted_checkpoint(mongo_sys.as_deref(), &dataset, current_schema_json.as_deref())
                 .await;
 
-        // `initial_snapshot: enabled` re-snapshots on every start: drop any
+        // `initial_snapshot: always` re-snapshots on every start: drop any
         // persisted resume token so the cold-bootstrap (snapshot) path below
         // runs unconditionally.
-        let persisted = if snapshot_mode == InitialSnapshotMode::Enabled {
+        let persisted = if snapshot_mode == InitialSnapshotMode::Always {
             if persisted.is_some() {
                 clear_persisted_token(mongo_sys.as_deref(), &dataset).await;
             }
@@ -554,7 +554,7 @@ fn snapshot_mode_from_params(params: &Parameters) -> Result<InitialSnapshotMode,
                 params,
                 "replication_initial_snapshot",
                 format!(
-                    "must be 'auto', 'enabled', or 'disabled', got {:?}",
+                    "must be 'auto', 'always', or 'disabled', got {:?}",
                     value.trim()
                 ),
             )
@@ -596,7 +596,7 @@ fn invalid_checkpoint_behavior_from_params(
             "rebootstrap" => Ok(InvalidCheckpointBehavior::Restart),
             other => Err(invalid_parameter_error(
                 params,
-                "mongodb_resume_token_invalid_behavior",
+                "resume_token_invalid_behavior",
                 format!("must be 'error' or 'rebootstrap', got {other:?}"),
             )),
         },
@@ -1007,7 +1007,7 @@ mod tests {
         );
         for (raw, expected) in [
             ("auto", InitialSnapshotMode::Auto),
-            ("ENABLED", InitialSnapshotMode::Enabled),
+            ("ALWAYS", InitialSnapshotMode::Always),
             ("disabled", InitialSnapshotMode::Disabled),
         ] {
             assert_eq!(
@@ -1050,7 +1050,7 @@ mod tests {
         // Deprecated alias still honored.
         assert_eq!(
             invalid_checkpoint_behavior_from_params(&params(&[(
-                "mongodb_resume_token_invalid_behavior",
+                "resume_token_invalid_behavior",
                 "rebootstrap"
             )]))
             .expect("deprecated alias parses"),

@@ -797,12 +797,12 @@ fn optional_bool(
 ///
 /// - `Auto` -> `(true, false)`: snapshot a freshly-created slot; the caller still
 ///   forces a resume snapshot for a non-persistent accelerator.
-/// - `Enabled` -> `(true, true)`: snapshot on every start, including slot resume.
+/// - `Always` -> `(true, true)`: snapshot on every start, including slot resume.
 /// - `Disabled` -> `(false, false)`: never snapshot.
 fn snapshot_flags(mode: InitialSnapshotMode) -> (bool, bool) {
     match mode {
         InitialSnapshotMode::Auto => (true, false),
-        InitialSnapshotMode::Enabled => (true, true),
+        InitialSnapshotMode::Always => (true, true),
         InitialSnapshotMode::Disabled => (false, false),
     }
 }

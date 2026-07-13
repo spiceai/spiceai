@@ -777,7 +777,7 @@ fn parse_snapshot_mode(params: &Parameters) -> Result<InitialSnapshotMode, Strin
     if let Some(mode) = optional_enum(
         params,
         "replication_initial_snapshot",
-        "'auto', 'enabled', or 'disabled'",
+        "'auto', 'always', or 'disabled'",
         InitialSnapshotMode::from_canonical,
     )? {
         return Ok(mode);
@@ -790,7 +790,7 @@ fn parse_snapshot_mode(params: &Parameters) -> Result<InitialSnapshotMode, Strin
         |value| match value {
             "auto" => Some(InitialSnapshotMode::Auto),
             "never" => Some(InitialSnapshotMode::Disabled),
-            "always" => Some(InitialSnapshotMode::Enabled),
+            "always" => Some(InitialSnapshotMode::Always),
             _ => None,
         },
     )?
@@ -963,7 +963,7 @@ mod tests {
         for (raw, expected) in [
             ("auto", InitialSnapshotMode::Auto),
             ("never", InitialSnapshotMode::Disabled),
-            ("ALWAYS", InitialSnapshotMode::Enabled),
+            ("ALWAYS", InitialSnapshotMode::Always),
         ] {
             let params = params_with(&[("replication_snapshot_mode", raw)]);
             let repl = replication_params_from_connector_params(&params, "orders")
@@ -988,7 +988,7 @@ mod tests {
         for (raw, expected) in [
             ("auto", InitialSnapshotMode::Auto),
             ("disabled", InitialSnapshotMode::Disabled),
-            ("ENABLED", InitialSnapshotMode::Enabled),
+            ("ALWAYS", InitialSnapshotMode::Always),
         ] {
             let params = params_with(&[("replication_initial_snapshot", raw)]);
             let repl = replication_params_from_connector_params(&params, "orders")
@@ -1001,7 +1001,7 @@ mod tests {
             .expect_err("typo'd mode must error");
         assert!(
             err.contains("mysql_replication_initial_snapshot")
-                && err.contains("'auto', 'enabled', or 'disabled'"),
+                && err.contains("'auto', 'always', or 'disabled'"),
             "got: {err}"
         );
     }

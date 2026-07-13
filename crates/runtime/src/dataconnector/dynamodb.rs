@@ -82,7 +82,7 @@ const SEGMENTS_AUTO_STR: &str = "auto";
 const DEFAULT_TIME_FORMAT: &str = "2006-01-02T15:04:05.000Z07:00";
 
 /// Resolve the initial-snapshot mode from `dynamodb_replication_initial_snapshot`
-/// (`auto|enabled|disabled`). An unrecognized value warns and falls back to
+/// (`auto|always|disabled`). An unrecognized value warns and falls back to
 /// `auto` (the `one_of` on the [`ParameterSpec`] already rejects bad values in
 /// production; this is a defensive default).
 fn parse_snapshot_mode(params: &Parameters, dataset_name: &TableReference) -> InitialSnapshotMode {
@@ -92,7 +92,7 @@ fn parse_snapshot_mode(params: &Parameters, dataset_name: &TableReference) -> In
                 tracing::warn!(
                     dataset = %dataset_name,
                     value = %value,
-                    "Unknown 'dynamodb_replication_initial_snapshot' (expected auto|enabled|disabled); defaulting to 'auto'"
+                    "Unknown 'dynamodb_replication_initial_snapshot' (expected auto|always|disabled); defaulting to 'auto'"
                 );
                 InitialSnapshotMode::Auto
             })
@@ -204,7 +204,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("endpoint_url")
         .description("Custom endpoint URL for DynamoDB-compatible services (e.g., DynamoDB Local, ScyllaDB Alternator)."),
     ParameterSpec::component("replication_initial_snapshot")
-        .description("When `refresh_mode: changes` first loads the table's existing items: 'auto' (default) scans when no resumable stream checkpoint exists and resumes without a scan when one does; 'disabled' streams changes only, from the current stream tip; 'enabled' scans on every start, discarding any persisted checkpoint. Default: auto.")
+        .description("When `refresh_mode: changes` first loads the table's existing items: 'auto' (default) scans when no resumable stream checkpoint exists and resumes without a scan when one does; 'disabled' streams changes only, from the current stream tip; 'always' scans on every start, discarding any persisted checkpoint. Default: auto.")
         .default("auto")
         .one_of_ignore_ascii_case(InitialSnapshotMode::VALUES),
     ParameterSpec::component("replication_invalid_checkpoint_behavior")
@@ -485,9 +485,9 @@ impl DataConnector for DynamoDB {
                 });
 
                 let (should_bootstrap, checkpoint, checkpoint_updated_at) = match snapshot_mode {
-                    // `enabled`: scan on every start from a fresh stream tip,
+                    // `always`: scan on every start from a fresh stream tip,
                     // discarding any saved checkpoint.
-                    InitialSnapshotMode::Enabled => (
+                    InitialSnapshotMode::Always => (
                         true,
                         get_latest_checkpoint(&dynamodb, &dataset_name).await?,
                         None,

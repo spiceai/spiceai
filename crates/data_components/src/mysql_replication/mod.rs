@@ -485,7 +485,7 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
     let checkpoint_schema_json = encode_checkpoint_schema_json(schema_json.as_deref(), &layout);
 
     let resume_position = match persisted {
-        Some(persisted) if params.snapshot_mode == InitialSnapshotMode::Enabled => {
+        Some(persisted) if params.snapshot_mode == InitialSnapshotMode::Always => {
             tracing::info!(
                 dataset = %dataset_name,
                 position = %persisted.position,

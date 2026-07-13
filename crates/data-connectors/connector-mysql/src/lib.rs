@@ -160,22 +160,21 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description(
             "When `refresh_mode: changes` loads the table's existing rows: 'auto' (default) \
              snapshots when no resumable binlog position exists and resumes without a snapshot \
-             when one does; 'disabled' streams changes only; 'enabled' re-snapshots on every \
+             when one does; 'disabled' streams changes only; 'always' re-snapshots on every \
              start, discarding any persisted position. Default: auto.",
         )
         .one_of_ignore_ascii_case(InitialSnapshotMode::VALUES)
         .help_link(MYSQL_DOCS),
     // Deprecated alias of `replication_initial_snapshot` (auto|never|always ->
-    // auto|enabled|disabled). Kept so existing spicepods keep loading.
+    // auto|always|disabled). Kept so existing spicepods keep loading.
     ParameterSpec::component("replication_snapshot_mode")
         .description(
-            "[deprecated] Use `mysql_replication_initial_snapshot` (auto|enabled|disabled) \
-             instead. 'never' maps to 'disabled', 'always' maps to 'enabled'.",
+            "[deprecated] Use `mysql_replication_initial_snapshot` (auto|always|disabled) \
+             instead. 'never' maps to 'disabled'.",
         )
         .one_of_ignore_ascii_case(&["auto", "never", "always"])
         .deprecated(
-            "Renamed to 'mysql_replication_initial_snapshot'; 'never' -> 'disabled', \
-             'always' -> 'enabled'.",
+            "Renamed to 'mysql_replication_initial_snapshot'; 'never' -> 'disabled'.",
         )
         .help_link(MYSQL_DOCS),
     ParameterSpec::component("replication_checkpoint_interval")

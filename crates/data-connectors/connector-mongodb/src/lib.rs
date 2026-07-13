@@ -147,7 +147,7 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("Number of Change Stream events MongoDB should request from the server per batch.")
         .default("1000"),
     ParameterSpec::component("replication_initial_snapshot")
-        .description("When `refresh_mode: changes` first loads the collection's existing documents: 'auto' (default) snapshots when no resumable resume token exists and resumes without a snapshot when one does; 'disabled' streams change events only, from the current point; 'enabled' snapshots on every start, discarding any persisted resume token. Default: auto.")
+        .description("When `refresh_mode: changes` first loads the collection's existing documents: 'auto' (default) snapshots when no resumable resume token exists and resumes without a snapshot when one does; 'disabled' streams change events only, from the current point; 'always' snapshots on every start, discarding any persisted resume token. Default: auto.")
         .default("auto")
         .one_of_ignore_ascii_case(InitialSnapshotMode::VALUES),
     ParameterSpec::component("replication_invalid_checkpoint_behavior")
