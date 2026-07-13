@@ -469,12 +469,12 @@ mod tests {
 
         // MySQL: bare host, no trailing comma before base_sql.
         let input = "VirtualExecutionPlan name=mysql compute_context=host=benchmark-mysql.dataplatform.svc.cluster.local,port=3306,db=tpch_sf1,user=root base_sql=SELECT `l_orderkey` FROM `lineitem`";
-        let expected =
-            "VirtualExecutionPlan name=mysql compute_context=<CONNECTION> base_sql=SELECT `l_orderkey` FROM `lineitem`";
+        let expected = "VirtualExecutionPlan name=mysql compute_context=<CONNECTION> base_sql=SELECT `l_orderkey` FROM `lineitem`";
         assert_eq!(regex.replace_all(input, replacement), expected);
 
         // Idempotent: an already-redacted snapshot is left unchanged.
-        let input = "VirtualExecutionPlan name=postgres compute_context=<CONNECTION> base_sql=SELECT 1";
+        let input =
+            "VirtualExecutionPlan name=postgres compute_context=<CONNECTION> base_sql=SELECT 1";
         assert_eq!(regex.replace_all(input, replacement), input);
 
         // The anchor `,port=\d+` prevents the greedy host match from consuming the
