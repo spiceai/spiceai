@@ -342,5 +342,164 @@ fn bench_compaction_write_amplification(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_compaction_write_amplification);
+// --- Pipelined vs serial: two disjoint tiers merged one-at-a-time vs
+// concurrently. -------------------------------------------------------------
+//
+// Reproducing genuinely separate on-disk size tiers from a bench (an external
+// crate that can only reach `pub` API, not `select_protected_snapshot_merge_tiers`
+// or `PROTECTED_TIER_BASE_BYTES`) is fragile — it depends on exact Vortex
+// compression ratios to cross the real tier-size boundary, and large
+// (100k+ row) single inserts were observed to make protected-snapshot catalog
+// registration (`cayenne_snapshot_sequence`) unreliable within a bounded wait,
+// for reasons outside this bench's scope to chase further. Sidestep both
+// problems: build `2 * TIER_RUNS` identically-shaped, reliably-registering
+// small deltas (proven reliable by `bench_compaction_write_amplification`
+// above), then split them into two explicit disjoint halves and merge each
+// half via `compact_protected_snapshot_tier_for_bench` — the SAME primitive
+// `compact_protected_snapshots_pipelined` drives internally, just with
+// caller-chosen tier membership instead of real byte-size selection. This
+// measures exactly the mechanism Phase 2 changed (does running two merges'
+// encode + catalog-commit concurrently beat running them serially), without
+// needing the real tier picker to agree the two halves are separate tiers.
+const TIER_RUNS: usize = COMPACTION_TRIGGER;
+
+/// Build a table with `2 * TIER_RUNS` same-shape protected snapshots and
+/// return them split into two disjoint halves (each `(snapshot_id,
+/// deletion_threshold, bytes)` triples, using the ACTUAL on-disk bytes —
+/// diagnostic-only for `compact_protected_snapshot_tier_for_bench`, not used
+/// to select which half a snapshot lands in).
+async fn accumulate_two_explicit_halves(
+    table: &str,
+    runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+) -> (
+    Fixture,
+    Vec<(String, i64, u64)>,
+    Vec<(String, i64, u64)>,
+) {
+    let fixture = setup_table(table, runtime_env).await;
+    let mut ids: Vec<String> = Vec::with_capacity(2 * TIER_RUNS);
+    for d in 0..2 * TIER_RUNS {
+        let rows = write_delta(&fixture, delta_batch(d)).await;
+        assert_eq!(rows as usize, ROWS_PER_DELTA, "delta {d} row count");
+    }
+    // Poll for full registration the same way `compaction_collapses_tiny_...`
+    // style integration tests do (bounded, not a fixed sleep): a merge whose
+    // input set includes a not-yet-registered snapshot loses its catalog CAS
+    // and reports `Ok(false)`, indistinguishable from "nothing to merge".
+    let expected = 2 * TIER_RUNS;
+    for _ in 0..100 {
+        let sequences = fixture
+            .catalog
+            .get_all_snapshot_sequences(&fixture.table_id)
+            .await
+            .expect("snapshot sequences");
+        if sequences.len() >= expected {
+            ids = sequences.into_keys().collect();
+            ids.sort();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        ids.len(),
+        expected,
+        "all {expected} protected snapshots must register before splitting into halves"
+    );
+
+    let mut sized: Vec<(String, i64, u64)> = Vec::with_capacity(expected);
+    for id in ids {
+        let files = fixture
+            .provider
+            .list_snapshot_files_with_sizes(&id)
+            .await
+            .expect("list snapshot files");
+        let bytes = files.iter().map(|(_, sz)| *sz).sum();
+        sized.push((id, 0, bytes));
+    }
+    let second_half = sized.split_off(TIER_RUNS);
+    (fixture, sized, second_half)
+}
+
+fn bench_pipelined_vs_serial_tier_merge(c: &mut Criterion) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    eprintln!(
+        "\n=== compaction_write_amplification pipelined-vs-serial: 2 explicit halves of \
+         {TIER_RUNS} same-shape protected snapshots ({ROWS_PER_DELTA} rows each) ==="
+    );
+
+    let mut group = c.benchmark_group("compaction_write_amplification");
+    group.sample_size(10);
+
+    let mut serial_lane = 0u64;
+    group.bench_function("serial_two_halves", |b| {
+        b.iter_batched(
+            || {
+                serial_lane += 1;
+                let ctx = SessionContext::new();
+                runtime.block_on(accumulate_two_explicit_halves(
+                    &format!("wamp_serial_{serial_lane}"),
+                    ctx.runtime_env(),
+                ))
+            },
+            |(fixture, first_half, second_half)| {
+                // Today's behavior: one merge completes before the next starts.
+                let first = runtime.block_on(
+                    fixture
+                        .provider
+                        .compact_protected_snapshot_tier_for_bench(first_half),
+                );
+                assert!(matches!(first, Ok(true)), "first half must merge: {first:?}");
+                let second = runtime.block_on(
+                    fixture
+                        .provider
+                        .compact_protected_snapshot_tier_for_bench(second_half),
+                );
+                assert!(matches!(second, Ok(true)), "second half must merge: {second:?}");
+                black_box(&fixture.catalog);
+            },
+            criterion::BatchSize::PerIteration,
+        );
+    });
+
+    let mut pipelined_lane = 0u64;
+    group.bench_function("pipelined_two_halves", |b| {
+        b.iter_batched(
+            || {
+                pipelined_lane += 1;
+                let ctx = SessionContext::new();
+                runtime.block_on(accumulate_two_explicit_halves(
+                    &format!("wamp_pipelined_{pipelined_lane}"),
+                    ctx.runtime_env(),
+                ))
+            },
+            |(fixture, first_half, second_half)| {
+                // Both halves merged concurrently — the mechanism
+                // `compact_protected_snapshots_pipelined` drives internally.
+                let (first, second) = runtime.block_on(futures::future::join(
+                    fixture
+                        .provider
+                        .compact_protected_snapshot_tier_for_bench(first_half),
+                    fixture
+                        .provider
+                        .compact_protected_snapshot_tier_for_bench(second_half),
+                ));
+                assert!(matches!(first, Ok(true)), "first half must merge: {first:?}");
+                assert!(matches!(second, Ok(true)), "second half must merge: {second:?}");
+                black_box(&fixture.catalog);
+            },
+            criterion::BatchSize::PerIteration,
+        );
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_compaction_write_amplification,
+    bench_pipelined_vs_serial_tier_merge
+);
 criterion_main!(benches);

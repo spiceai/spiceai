@@ -14264,6 +14264,43 @@ impl CayenneTableProvider {
         .await
     }
 
+    /// Test/benchmark-only entry point for [`Self::compact_protected_snapshot_tier`]:
+    /// merges a caller-chosen, explicitly disjoint set of real protected
+    /// snapshots, bypassing real byte-size-based tier SELECTION entirely.
+    ///
+    /// Reproducing genuinely separate on-disk size tiers from OUTSIDE the
+    /// crate (i.e. from `benches/`, which cannot select real tiers via
+    /// `select_protected_snapshot_merge_tiers` and can only reach `pub`
+    /// methods) is fragile — it depends on exact Vortex compression ratios to
+    /// cross the tier-size boundary. This lets a caller hand-pick disjoint id
+    /// sets from a small, reliable fixture instead (e.g. splitting N
+    /// same-size protected snapshots into two explicit halves) and time
+    /// `compact_protected_snapshots_pipelined`-style concurrent merges against
+    /// sequential ones, exactly as [`Self::compact_protected_snapshots_pipelined_inner`]
+    /// drives real tiers internally.
+    #[doc(hidden)]
+    pub async fn compact_protected_snapshot_tier_for_bench(
+        &self,
+        inputs: Vec<(String, i64, u64)>,
+    ) -> Result<bool> {
+        let deletion_snapshot = self.pk_deletion_snapshot();
+        let fence_max_delete_seq = self
+            .protected_snapshot_merge_fence(deletion_snapshot.max_sequence_number().unwrap_or(0));
+        self.compact_protected_snapshot_tier(
+            inputs,
+            fence_max_delete_seq,
+            deletion_snapshot,
+            ProtectedSnapshotTierPassContext {
+                pass_start: std::time::Instant::now(),
+                phase1_fence_ms: 0,
+                sizing_ms: 0,
+                candidate_count: 0,
+                min_runs: 0,
+            },
+        )
+        .await
+    }
+
     /// Rewrite and commit one already-selected, disjoint size tier of
     /// protected snapshots — Phase 2 (rewrite outside the lock) and Phase 3
     /// (CAS commit + in-memory RCU publish) of the subset-compaction pass.
