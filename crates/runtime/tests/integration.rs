@@ -104,6 +104,7 @@ mod mysql;
 mod odbc;
 #[cfg(feature = "oracle")]
 mod oracle;
+mod plan_capture;
 #[cfg(feature = "postgres")]
 mod postgres;
 mod prepared_statements;

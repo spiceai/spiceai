@@ -1541,7 +1541,10 @@ impl MetadataCatalog for CayenneCatalog {
         // final piece of the uniform local-FS durability contract (snapshot
         // dirs, _partitioned_wal/, deletions/, and now initial table creation).
         // Matches the contract we enforce everywhere else in the write path.
-        if !base_path.starts_with("s3://") {
+        // Memory mode (`mode: memory`) writes nothing to disk — the mem-tier is the
+        // store and the metastore is an in-RAM memdb — so skip creating the initial
+        // snapshot directory entirely.
+        if !base_path.starts_with("s3://") && !options.vortex_config.memory_mode {
             let table_root = std::path::PathBuf::from(&base_path).join(&table_id);
             let snapshot_dir = table_root.join(&initial_snapshot_id);
 
@@ -4126,8 +4129,10 @@ impl MetadataCatalog for CayenneCatalog {
         // table it is cleared explicitly (rather than relying on the
         // ON DELETE CASCADE FK) so a crash before the final `cayenne_table`
         // delete cannot leave orphan cold-file rows. NOTE: this removes the
-        // catalog rows only — the physical cold objects are swept separately by
-        // the table-drop physical cleanup (they live on the cold object store).
+        // catalog rows only — the physical cold objects are intentionally NOT
+        // deleted on drop (the datalake location is an operator-managed,
+        // possibly shared bucket); reclaiming a dropped table's
+        // `{name}-{table_id}/` prefix is an operator action.
         self.metastore
             .execute_helper(ExecuteParams {
                 sql: "DELETE FROM cayenne_cold_tier_file WHERE table_id = ?1",
@@ -4665,7 +4670,7 @@ mod tests {
 
         let with_bloom = ColdTierFile {
             table_id: table_id.clone(),
-            file_url: "s3://bucket/t/cold/p1/a.vortex".to_string(),
+            file_url: "s3://bucket/t/data/p1/a.vortex".to_string(),
             row_count: 100,
             file_size_bytes: 4096,
             min_sequence: 0,
@@ -4675,7 +4680,7 @@ mod tests {
         };
         let without_bloom = ColdTierFile {
             table_id: table_id.clone(),
-            file_url: "s3://bucket/t/cold/p1/b.vortex".to_string(),
+            file_url: "s3://bucket/t/data/p1/b.vortex".to_string(),
             row_count: 50,
             file_size_bytes: 2048,
             min_sequence: 0,
