@@ -37,7 +37,8 @@ A quick reference for the recurring terms below. Each is defined in more depth w
 - **Checkpoint** — the process that flushes the in-memory mem-tier to a durable, published Vortex file (and advances the source slot, if a seal hasn't already).
 - **Seal** — a cheap periodic pass (default every 2 s) that durably *shadows* the mem-tier's active segments into the unpublished inline corpus and advances the source slot — durability without a Vortex encode or a publish.
 - **Level-0 / tier-0** — the small-write landing tier: inline blobs (in the metastore) or the mem-tier, before flush to a Vortex file.
-- **Mem-tier** — the RAM tier used in `memory` durability mode; discarded on crash, recovered from its seal shadow plus a replay of the un-sealed tail.
+- **Mem-tier** — the RAM tier used in `cdc_durability: memory` (and as the permanent store under acceleration `mode: memory`); for file-mode CDC it is discarded on crash and recovered from its seal shadow plus a replay of the un-sealed tail. Under `mode: memory` there is no seal/checkpoint recovery — the tier is the whole table and dies with the process.
+- **`mode: memory`** — acceleration storage mode: fully in-RAM Cayenne (no Vortex, no durable metastore path); see *Storage modes*.
 - **Upsert / on-conflict** — an update modeled Iceberg-style as a re-insertion that tombstones the prior copy of the key.
 - **PK keyset** — the cached set of existing primary keys, used for `auto` conflict detection without rescanning data.
 
@@ -81,6 +82,41 @@ Most of Cayenne's design follows from a single discipline: **the expensive parts
 - State the read hot-path touches is published **wait-free** through `ArcSwap` cells, so readers never block on a writer's `Arc`-load.
 
 Everything below — the tiers, the locks, the deletion index, the CDC pipeline — is machinery in service of that one idea.
+
+## Storage modes: `mode: file` vs `mode: memory`
+
+Acceleration `mode:` selects how Cayenne persists data. This is distinct from
+`cdc_durability: memory` (a durability deferral on an otherwise file-backed table).
+
+Spicepod `acceleration.mode` defaults to **`memory`** (the same default as Arrow).
+Omitting `mode` on a Cayenne dataset therefore selects fully in-RAM Cayenne. Set
+`mode: file` explicitly when you need durable on-disk (or S3 Express) storage.
+
+- **`mode: file`** (durable; must be set explicitly): local SQLite/Turso metastore,
+  Vortex data files (local FS or S3 Express One Zone), level-0 inline + optional RAM
+  mem-tier for CDC, background compaction/seal/checkpoint. Survives restarts; CDC
+  source slots are deferred until a durable seal or checkpoint covers the burst.
+- **`mode: memory`** (fully in-RAM, ephemeral; spicepod default when `mode` is
+  omitted): all table data lives in the RAM mem-tier; the catalog is an in-memory
+  SQLite `memdb` (never written to disk). Checkpointing, sealing, compaction, and
+  the datalake (cold) tier are disabled. On restart the table is empty and reloads
+  from its source (like Arrow memory acceleration). Because there is no durable
+  covering checkpoint, a CDC (`refresh_mode: changes`) source's replication slot is
+  committed **immediately** after each in-RAM write — not deferred behind a later
+  seal/checkpoint. Works for `full` / `append` / `changes` and for keyed or no-PK
+  tables; a full refresh atomically replaces the in-RAM tier. **Partitioning is
+  rejected** at accelerator config time (`partition_by` + `mode: memory` returns a
+  configuration error). A per-table hard RAM bound (`cayenne_cdc_mem_tier_max_bytes`;
+  default unbounded) is enforced as a structured error during buffering; peak checks
+  count **resident + incoming** even for overwrite, because the old tier stays live
+  until the atomic replace. S3 Express / `cayenne_file_path` params are ignored in
+  this mode (no object store is built).
+
+Source: acceleration `mode` → `!is_file_accelerated()` in
+`crates/runtime/src/dataaccelerator/cayenne/mod.rs` (`apply_memory_mode_overrides`,
+partition reject), `VortexConfig.memory_mode`,
+`CayenneTableProvider::is_memory_resident_mode`, and the mem-tier write path in
+`provider/sink.rs` / `provider/mutation_writer.rs`.
 
 ## The three cooperating tiers
 
@@ -1202,10 +1238,11 @@ It takes Iceberg's sequence-ordered visibility and equality-delete idea, Delta's
 This document is a point-in-time snapshot of a fast-moving crate. Each entry records the date, the `spiceai` commit reviewed, and what changed here — so a future revision can be tied to the specific repository changes that prompted it. When updating, add a new row (newest first) and refresh the commit reference in *Scope and sourcing* at the top.
 
 | Date | Reviewed commit | Changes |
-| 2026-07-10 | (pre-merge; doc otherwise baselined at `4685a3dd`) | Datalake (cold) tier object layout: the per-table prefix segment changed from the bare `<table_id>` to `<sanitized_table_name>-<table_id>` (`TableMetadata::datalake_dir_segment`) so a shared `cayenne_datalake_location` bucket is navigable while the UUIDv7 suffix keeps prefixes collision-free. Lossy, path-safe name slug (`[A-Za-z0-9_-]`, 64-char cap, edge-trimmed; empty → bare `table_id`). Derived on demand (no metastore change) since `table_name` is immutable per `table_id`. Write + GC prefixes only; reads follow the manifest's absolute `file_url`. Warm tier remains keyed by the bare `table_id`. |
 |------|-----------------|---------|
-| 2026-07-12 | `f059f9cf6e` (recovery fix) + merge of `trunk` | Recovery no longer classifies protected-snapshot commit *solely* from the current-snapshot pointer. A single-table CDC upsert commits its protected-snapshot sequence synchronously in Stage A, and its writer-free Stage-B publish leaves the pointer unmoved (the target is a merge-on-read overlay), so `ensure_no_incomplete_write` now rolls a `ProtectedSnapshot` target **back only when it has no durable `cayenne_snapshot_sequence`** (genuinely uncommitted — e.g. a cross-partition crash before the coordinator `COMMIT`, whose sequence + pointer flip land in one transaction) and rolls it **forward** otherwise. The pointer-only check previously dropped durably-committed rows both at reopen and when the next write's recovery pass found a finalized batch's still-present WAL. Merged `trunk` (12 commits): folds in the lazy-NDV / one-shot-XXH3 and hash-PK-once perf work and the `cayenne_datalake_*` rename; PR #11808 removed the partitioned-DuckDB accelerator, retiring the branch's now-moot DuckDB-partition P0 fix. |
+| 2026-07-13 | PR #11720 (pre-merge; doc otherwise baselined at `4685a3dd`) | **Acceleration `mode: memory`**: fully in-RAM Cayenne — mem-tier is the permanent store, in-memory `memdb` metastore, no Vortex/compaction/seal/checkpoint/datalake; CDC slot committed immediately after each in-RAM write; partitioning rejected at config; hard RAM bound (`cayenne_cdc_mem_tier_max_bytes`) counts resident + incoming even for overwrite. Spicepod `acceleration.mode` defaults to `memory` (same as Arrow) — durable Cayenne requires explicit `mode: file`. S3 Express params are ignored under `mode: memory`. New *Storage modes* section + glossary entries; distinct from `cdc_durability: memory` on file-mode tables. |
+| 2026-07-12 | `f059f9cf6e` (recovery fix) + merge of `trunk` | Recovery no longer classifies protected-snapshot commit *solely* from the current-snapshot pointer. A single-table CDC upsert commits its protected-snapshot sequence synchronously in Stage A, and its writer-free Stage-B publish leaves the pointer unmoved (the target is a merge-on-read overlay), so `ensure_no_incomplete_write` now rolls a `ProtectedSnapshot` target **back only when it has no durable `cayenne_snapshot_sequence`** (genuinely uncommitted — e.g. a cross-partition crash before the coordinator `COMMIT`, whose sequence + pointer flip land in one transaction) and rolls it **forward** otherwise. The pointer-only check previously dropped durably-committed rows both at reopen and when the next write's recovery pass found a finalized batch's still-present WAL. Merged `trunk`: folds in the lazy-NDV / one-shot-XXH3 and hash-PK-once perf work and the `cayenne_datalake_*` rename; PR #11808 removed the partitioned-DuckDB accelerator, retiring the branch's now-moot DuckDB-partition P0 fix. |
 | 2026-07-11 | `6ed94e7f` + final working-tree audit (pre-merge) | Finalized the atomic-append hardening: mixed **or unreadable** durable pointer states now retain all WALs and physical files; cancellation-safe deletion-vector ownership is exact-path and waits for detached writers; inline tombstones activate by exact staged UUID under the replacement snapshot's listing fence with replay-safe durable flips; combined file-delete/inline rewrites commit atomically; object-store participant compatibility uses canonical backend identity plus WAL prefix rather than `Arc` identity; and recovery fully republishes catalog-backed state for committed protected snapshots. |
+| 2026-07-10 | (pre-merge; doc otherwise baselined at `4685a3dd`) | Datalake (cold) tier object layout: the per-table prefix segment changed from the bare `<table_id>` to `<sanitized_table_name>-<table_id>` (`TableMetadata::datalake_dir_segment`) so a shared `cayenne_datalake_location` bucket is navigable while the UUIDv7 suffix keeps prefixes collision-free. Lossy, path-safe name slug (`[A-Za-z0-9_-]`, 64-char cap, edge-trimmed; empty → bare `table_id`). Derived on demand (no metastore change) since `table_name` is immutable per `table_id`. Write + GC prefixes only; reads follow the manifest's absolute `file_url`. Warm tier remains keyed by the bare `table_id`. |
 | 2026-07-10 | PR #11806 (pre-merge; doc otherwise still baselined at `4685a3dd`) | Targeted **table statistics** update: the `SPICE_CAYENNE_EAGER_NDV` escape hatch is removed — lazy NDV (fold on file spill, not the inline tier0 CDC write) is now unconditional, so *Table statistics* no longer describes the inline write as folding "one hashed value per row into the sketch"; it now explains the lazy split and its bounded one-memtable lag explicitly. Also a perf-only change with no doc-visible behavior: per-value NDV hashing switched from a streaming to a one-shot XXH3-64 hash (byte-identical, ~21-25x faster per a new microbenchmark). |
 | 2026-07-09 | `2e4693c3` + working-tree audit (pre-merge) | Correctness hardening for **atomic cross-partition Cayenne appends**: private complete snapshots and exact manifests; one shared catalog transaction for participant pointers, deferred upsert/delete payloads, protected-snapshot sequences, manifests, and statistics invalidation; participant-set WAL recovery classified solely from durable catalog pointers; full same-process state rehydration after an ambiguous commit; replay-safe inline tombstones; checked position-vector range handling; and cancellation-safe exact-path ownership for deletion-vector writers and snapshot clones. |
 | 2026-07-09 | PR #11745 (pre-merge; doc otherwise still baselined at `4685a3dd`) | Targeted **datalake (cold) tier** update for #11731/#11745: promotion rewritten from whole-table re-materialization to **incremental carry-forward** (dirty/clean classification from manifest stats rectangles refined by per-file PK blooms; clean files carried by manifest reference; per-promotion `cold/<promotion_id>/` prefixes), per-file **PK bloom filters** serving upsert keyset rebuilds without a cold scan, periodic **mark-and-sweep GC** of orphaned cold objects, and the parameter rename to `cayenne_datalake_*` (`_location`, `_clustering_columns`, `_s3_*`, `_gc_interval_ms`) — versioning note and configuration cheat-sheet updated accordingly. |

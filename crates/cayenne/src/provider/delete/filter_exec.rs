@@ -559,6 +559,10 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
             min_delete_seq_to_apply,
             schema,
             metrics,
+            pk_columns_scratch: Vec::new(),
+            deleted_scratch: Vec::new(),
+            hashes_scratch: Vec::new(),
+            candidates_scratch: Vec::new(),
         }))
     }
 }
@@ -574,6 +578,23 @@ pub struct KeyBasedDeletionFilterStream {
     min_delete_seq_to_apply: Option<i64>,
     schema: arrow_schema::SchemaRef,
     metrics: DeletionFilterMetrics,
+    /// Per-batch scratch: the current batch's PK columns. Cleared (not
+    /// reallocated) at the top of every batch — the column count is fixed
+    /// for the stream's lifetime, so capacity is reached after the first
+    /// batch and never grows again.
+    pk_columns_scratch: Vec<ArrayRef>,
+    /// Per-batch scratch: row indices with an applicable (visible-hiding)
+    /// tombstone. Cleared and `reserve`d to `batch_size` at the top of every
+    /// batch instead of starting at zero capacity each time — without the
+    /// reserve, a batch with many deletions re-grows this geometrically from
+    /// empty on every single poll.
+    deleted_scratch: Vec<usize>,
+    /// Per-batch scratch owned by this stream and handed to
+    /// [`KeyDeletionIndex::get_batch_with_scratch`], so the ~40 KB pair of
+    /// `BATCH_SWEEP_CHUNK`-sized sweep buffers is allocated once for the
+    /// stream's lifetime instead of once per batch.
+    hashes_scratch: Vec<u128>,
+    candidates_scratch: Vec<u32>,
 }
 
 impl futures::Stream for KeyBasedDeletionFilterStream {
@@ -592,18 +613,27 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                         return std::task::Poll::Ready(Some(Ok(batch)));
                     }
 
+                    // Reborrow to a plain `&mut Self` for the rest of this batch:
+                    // `Pin<&mut Self>`'s field projections don't get the same
+                    // disjoint-borrow splitting as a bare `&mut Self` (each
+                    // access goes through `DerefMut`, so the compiler can't tell
+                    // two field accesses apart), which this function needs now
+                    // that several scratch fields are borrowed independently
+                    // (some mutably) within the same batch.
+                    let this = self.as_mut().get_mut();
+
                     // Time the probe + filter kernel so the merge-on-read read-tax is
                     // visible in EXPLAIN ANALYZE. Dropped on every return/continue below.
-                    let _timer = self.metrics.baseline.elapsed_compute().timer();
+                    let _timer = this.metrics.baseline.elapsed_compute().timer();
 
                     // Fast path: no deletions to apply (insert-only entries
                     // never affect visibility)
-                    if !self.tombstones.has_deletions() {
-                        self.metrics.baseline.record_output(batch_size);
+                    if !this.tombstones.has_deletions() {
+                        this.metrics.baseline.record_output(batch_size);
                         return std::task::Poll::Ready(Some(Ok(batch)));
                     }
 
-                    if self.pk_column_indices.is_empty() {
+                    if this.pk_column_indices.is_empty() {
                         return std::task::Poll::Ready(Some(Err(
                             datafusion_common::DataFusionError::Internal(
                                 "KeyBasedDeletionFilterExec requires at least one primary key column index".to_string(),
@@ -611,10 +641,12 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                         )));
                     }
 
-                    // Extract PK columns from the batch
-                    let mut pk_columns: Vec<ArrayRef> =
-                        Vec::with_capacity(self.pk_column_indices.len());
-                    for &idx in &self.pk_column_indices {
+                    // Extract PK columns from the batch. Scratch is cleared,
+                    // not reallocated: the column count is fixed for the
+                    // stream's lifetime, so capacity is reached after the
+                    // first batch (see `pk_columns_scratch` field doc).
+                    this.pk_columns_scratch.clear();
+                    for &idx in &this.pk_column_indices {
                         let Some(column) = batch.columns().get(idx) else {
                             return std::task::Poll::Ready(Some(Err(
                                 datafusion_common::DataFusionError::Internal(format!(
@@ -623,11 +655,11 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                                 )),
                             )));
                         };
-                        pk_columns.push(Arc::clone(column));
+                        this.pk_columns_scratch.push(Arc::clone(column));
                     }
 
                     // Convert PK columns to row bytes (single batched conversion).
-                    let rows = match self.row_converter.convert_columns(&pk_columns) {
+                    let rows = match this.row_converter.convert_columns(&this.pk_columns_scratch) {
                         Ok(rows) => rows,
                         Err(e) => {
                             return std::task::Poll::Ready(Some(Err(
@@ -640,27 +672,41 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                     // row's PK key TWICE — once in a standalone bloom
                     // `might_contain` sweep, then again in the per-row `get` — on
                     // this hot loop (the dominant query-side CPU cost under
-                    // merge-on-read). `KeyDeletionIndex::get_batch` does what the
-                    // sweep+probe did but hashes each key ONCE: it runs the bloom
-                    // sweep over the precomputed XXH3-128 hashes and walks the
-                    // delta/base tiers only for bloom survivors (probed by hash
-                    // identity). It is proven equivalent to the per-row `get` by
-                    // `get_batch_matches_per_row_get_composite`, and only calls
-                    // back for rows that have a real tombstone — a row with no
-                    // tombstone is visible, exactly as `is_pk_visible_row_key`
-                    // returns `true` on `get() == None`. The bloom-empty /
-                    // all-visible fast path is preserved below via `deleted`.
-                    let mut deleted: Vec<usize> = Vec::new();
-                    self.tombstones.get_batch(rows.iter(), |i, tombstone| {
-                        if !tombstone_visible(
-                            tombstone,
-                            self.insert_record_handling,
-                            self.min_delete_seq_to_apply,
-                        ) {
-                            deleted.push(i);
-                        }
-                    });
-                    let keep_count = batch_size - deleted.len();
+                    // merge-on-read). `KeyDeletionIndex::get_batch_with_scratch`
+                    // does what the sweep+probe did but hashes each key ONCE: it
+                    // runs the bloom sweep over the precomputed XXH3-128 hashes
+                    // and walks the delta/base tiers only for bloom survivors
+                    // (probed by hash identity), using this stream's own
+                    // `hashes_scratch`/`candidates_scratch` buffers instead of
+                    // allocating a fresh pair per batch. It is proven equivalent
+                    // to the per-row `get` by `get_batch_matches_per_row_get_composite`
+                    // (and to the allocating `get_batch` by
+                    // `get_batch_with_scratch_reuse_does_not_leak_across_calls`),
+                    // and only calls back for rows that have a real tombstone —
+                    // a row with no tombstone is visible, exactly as
+                    // `is_pk_visible_row_key` returns `true` on `get() == None`.
+                    // The bloom-empty / all-visible fast path is preserved below
+                    // via `deleted_scratch`.
+                    this.deleted_scratch.clear();
+                    this.deleted_scratch.reserve(batch_size);
+                    let insert_record_handling = this.insert_record_handling;
+                    let min_delete_seq_to_apply = this.min_delete_seq_to_apply;
+                    let deleted_scratch = &mut this.deleted_scratch;
+                    this.tombstones.get_batch_with_scratch(
+                        rows.iter(),
+                        &mut this.hashes_scratch,
+                        &mut this.candidates_scratch,
+                        |i, tombstone| {
+                            if !tombstone_visible(
+                                tombstone,
+                                insert_record_handling,
+                                min_delete_seq_to_apply,
+                            ) {
+                                deleted_scratch.push(i);
+                            }
+                        },
+                    );
+                    let keep_count = batch_size - this.deleted_scratch.len();
 
                     tracing::trace!(
                         "KeyBasedDeletionFilterStream: keeping {} of {} rows",
@@ -672,14 +718,14 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                     // batch as-is. Covers both the old bloom-empty early-out and
                     // the keep_count == batch_size fast path in one check, and
                     // avoids building a mask at all.
-                    if deleted.is_empty() {
-                        self.metrics.baseline.record_output(batch_size);
+                    if this.deleted_scratch.is_empty() {
+                        this.metrics.baseline.record_output(batch_size);
                         return std::task::Poll::Ready(Some(Ok(batch)));
                     }
 
                     // If all rows are deleted, skip this batch and continue to next
                     if keep_count == 0 {
-                        self.metrics.rows_deleted.add(batch_size);
+                        this.metrics.rows_deleted.add(batch_size);
                         continue;
                     }
 
@@ -687,7 +733,7 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                     // rows kept except the deleted positions reported above.
                     let mut keep_mask = BooleanBufferBuilder::new(batch_size);
                     keep_mask.append_n(batch_size, true);
-                    for &i in &deleted {
+                    for &i in &this.deleted_scratch {
                         keep_mask.set_bit(i, false);
                     }
 
@@ -707,10 +753,10 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                         };
 
                     let filtered_row_count = filtered_batch.num_rows();
-                    self.metrics
+                    this.metrics
                         .rows_deleted
                         .add(batch_size - filtered_row_count);
-                    self.metrics.baseline.record_output(filtered_row_count);
+                    this.metrics.baseline.record_output(filtered_row_count);
 
                     return std::task::Poll::Ready(Some(Ok(filtered_batch)));
                 }
@@ -1270,6 +1316,10 @@ mod tests {
             min_delete_seq_to_apply: None,
             schema,
             metrics: DeletionFilterMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+            pk_columns_scratch: Vec::new(),
+            deleted_scratch: Vec::new(),
+            hashes_scratch: Vec::new(),
+            candidates_scratch: Vec::new(),
         };
 
         let Some(batch) = stream.next().await.transpose()? else {
@@ -1726,6 +1776,10 @@ mod tests {
             min_delete_seq_to_apply: None,
             schema,
             metrics: DeletionFilterMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+            pk_columns_scratch: Vec::new(),
+            deleted_scratch: Vec::new(),
+            hashes_scratch: Vec::new(),
+            candidates_scratch: Vec::new(),
         };
         let mut out = Vec::new();
         while let Some(batch) = stream.next().await {

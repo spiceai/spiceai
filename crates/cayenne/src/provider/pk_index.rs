@@ -524,8 +524,9 @@ impl PkBloom {
 /// Upper bound on ONE cold file's persisted PK bloom. A file whose right-sized
 /// bloom (~10 bits/key) would exceed this is stored with no bloom (`None`), so
 /// the keyset rebuild falls back to the exact cold scan for the whole table
-/// rather than bloating the manifest/snapshot. ~16 MiB covers ~13M keys/file.
-pub(crate) const COLD_PK_BLOOM_PER_FILE_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// rather than bloating the manifest/snapshot. ~32 MiB covers ~26M keys/file;
+/// promotion additionally row-caps output files so they stay under this budget.
+pub(crate) const COLD_PK_BLOOM_PER_FILE_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 /// Table-global cold-tier PK existence view: one [`PkBloom`] per live cold file
 /// (from the `cayenne_cold_tier_file` manifest), probed at CDC-upsert
