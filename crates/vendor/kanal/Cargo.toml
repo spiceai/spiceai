@@ -1,0 +1,27 @@
+[package]
+name = "kanal"
+version = "0.1.1"
+edition = "2021"
+authors = ["Khashayar Fereidani"]
+description = "The fast sync and async channel that Rust deserves"
+repository = "https://github.com/fereidani/kanal"
+documentation = "https://docs.rs/kanal"
+keywords = ["channel", "mpsc", "mpmc", "async"]
+categories = ["concurrency", "data-structures", "asynchronous"]
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+futures-core = { version = "0.3", optional = true }
+lock_api = "0.4"
+
+[dev-dependencies]
+anyhow = "1.0"
+crossbeam = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "test-util", "macros"] }
+futures = "0.3"
+
+[features]
+async = ["futures-core"]
+std-mutex = []
+default = ["async"]
