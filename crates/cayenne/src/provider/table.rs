@@ -13703,13 +13703,13 @@ impl CayenneTableProvider {
     /// and log every task's async backtrace. A parked, zero-CPU pipeline owns
     /// no thread, so OS thread/stack dumps show nothing — the task dump is the
     /// only way to see where the futures are suspended. Active only in builds
-    /// with `RUSTFLAGS="--cfg tokio_unstable --cfg tokio_taskdump"` on Linux;
+    /// with the `stall-taskdump` feature + `RUSTFLAGS="--cfg tokio_unstable"` on Linux;
     /// everywhere else this is a plain passthrough.
     async fn run_promotion_with_stall_taskdump<F>(&self, inner: F) -> Result<bool>
     where
         F: Future<Output = Result<bool>>,
     {
-        #[cfg(all(tokio_unstable, tokio_taskdump, target_os = "linux"))]
+        #[cfg(all(tokio_unstable, feature = "stall-taskdump", target_os = "linux"))]
         {
             const STALL_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
             const MAX_DUMPS: u32 = 2;
@@ -13766,7 +13766,7 @@ impl CayenneTableProvider {
                 }
             }
         }
-        #[cfg(not(all(tokio_unstable, tokio_taskdump, target_os = "linux")))]
+        #[cfg(not(all(tokio_unstable, feature = "stall-taskdump", target_os = "linux")))]
         {
             inner.await
         }

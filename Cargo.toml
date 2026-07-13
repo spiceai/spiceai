@@ -116,7 +116,7 @@ version = "2.1.0-unstable"
 # per-worker tokio RuntimeMetrics (busy/park/steal). Declare it so the otherwise-unknown
 # cfg name doesn't trip the `unexpected_cfgs` lint on builds without the flag. Declared
 # workspace-wide (via each crate's `lints.workspace = true`) rather than per-crate.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)', 'cfg(tokio_taskdump)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 
 [workspace.lints.clippy]
 # Deny the pedantic group with a lower priority so the specific opt-outs below win.
