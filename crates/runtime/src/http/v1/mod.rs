@@ -35,9 +35,13 @@ pub mod status;
 pub mod tools;
 pub mod workers;
 
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use crate::{
+    accelerated_table::{
+        AcceleratedTable,
+        write::{CayenneWriteTarget, dual_write::extract_cayenne_write_target},
+    },
     component::dataset::Dataset,
     datafusion::{
         DataFusion,
@@ -50,6 +54,9 @@ use crate::{
     egress::EgressAccount,
     status::ComponentStatus,
 };
+use cayenne::CayenneTransaction;
+use datafusion::common::TableReference;
+use datafusion::logical_expr::LogicalPlan;
 use arrow::{array::RecordBatch, util::pretty::pretty_format_batches};
 use async_stream::try_stream;
 use axum::{
@@ -63,7 +70,6 @@ use cache::result::CacheStatus;
 use csv::Writer;
 use datafusion::common::ParamValues;
 use datafusion::execution::{SendableRecordBatchStream, memory_pool::MemoryPool};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::{ast::Statement as SqlStatement, dialect::PostgreSqlDialect};
 use headers_accept::Accept;
@@ -74,7 +80,6 @@ use http::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::ResultExt;
-use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use futures::{StreamExt, TryStreamExt};
 
@@ -324,13 +329,6 @@ async fn query_stream_to_http_response(
     (StatusCode::OK, headers, body).into_response()
 }
 
-/// Process-global serialization lock for `/v1/sql` transactions.
-///
-/// v1 is pessimistic and single-instance: each complete `BEGIN … COMMIT` body
-/// runs while holding this lock. Per-key optimistic concurrency, which would let
-/// transactions touching disjoint keys run in parallel, is tracked separately.
-static TRANSACTION_LOCK: LazyLock<Arc<Mutex<()>>> = LazyLock::new(|| Arc::new(Mutex::new(())));
-
 /// Returns the statements inside a well-formed `BEGIN … COMMIT` transaction.
 /// Transaction-control statements are stripped. A single statement or a
 /// multi-statement string not wrapped in `BEGIN … COMMIT` returns `None` and is
@@ -392,39 +390,49 @@ async fn run_transaction_statement(
     QueryBuilder::new(sql, Arc::clone(df))
         .parameters(parameters)
         .read_only(read_only)
-        // Every statement must observe current state and must not replace a
-        // previously cached result while the transaction lock is held.
+        // Gate + inner reads must see live committed state, not a (stale) cached
+        // result — the transaction is the serialization point, not the cache.
         .results_cache_mode(ResultsCacheMode::Bypass)
         .build()
         .run()
         .await
 }
 
-/// Keeps the transaction lock until the final statement's lazy result stream is
-/// fully consumed or dropped.
-fn attach_transaction_guard_to_stream(
-    stream: SendableRecordBatchStream,
-    guard: OwnedMutexGuard<()>,
-) -> SendableRecordBatchStream {
-    let schema = stream.schema();
-    let guarded = futures::stream::unfold((stream, guard), |(mut stream, guard)| async move {
-        stream
-            .next()
-            .await
-            .map(|batch_result| (batch_result, (stream, guard)))
-    });
-    Box::pin(RecordBatchStreamAdapter::new(schema, guarded))
+/// A stageable transaction write, resolved from the transaction body.
+struct TransactionWrite {
+    /// The write's target table, as it appears in the DML plan (used for the
+    /// post-commit results-cache invalidation).
+    table_ref: TableReference,
+    /// The armed transaction handle: carries the target table's
+    /// optimistic-concurrency token (captured before the gate read) and, after
+    /// the write stages, the staged handle. Installed on the request context so
+    /// the Cayenne write path stages (off-lock) instead of publishing.
+    txn: CayenneTransaction,
 }
 
-/// Executes each statement in a transaction in order under the process-wide
-/// serialization lock. Any statement error stops subsequent execution and is
-/// returned to the client.
+/// Executes a transaction body atomically.
 ///
-/// Intermediate result streams are drained batch-by-batch without buffering so
-/// writes finish and execution errors surface before the next statement. The
-/// final statement's result is streamed to the client. This executor does not
-/// provide rollback: writes completed by an earlier statement remain applied if
-/// a later statement fails.
+/// The whole `BEGIN … COMMIT` body runs through [`QueryBuilder`] — the single
+/// place authz, masking, logging, and tracing are applied — so the write is
+/// governed identically to any other query. Atomicity and lost-update
+/// prevention come from the Cayenne write path rather than from intercepting
+/// the plan:
+///
+/// 1. Resolve the single write's target, which must be a **non-partitioned,
+///    accelerator-only** Cayenne table, acquire its per-table write guard, and
+///    install a [`CayenneTransaction`] on the request context. Holding
+///    the guard from before the gate read closes the lost-update window.
+/// 2. Run every statement through `QueryBuilder` with the results cache
+///    bypassed (gate reads must see live committed state). The write's sink
+///    detects the active transaction and *stages* the rows instead of
+///    publishing them; a failed `assert()` gate (or any error) aborts.
+/// 3. On success, publish the staged write atomically at COMMIT and invalidate
+///    the results cache; on any failure, roll back the staged write.
+///
+/// v1 supports a single INSERT/UPDATE write per transaction (no DELETE/MERGE,
+/// no PK reassignment). Bound parameters are supported across statements via
+/// [`normalize_transaction_parameters`]. Durable propagation of the committed
+/// write back to the federated source is tracked separately.
 async fn execute_transaction(
     df: Arc<DataFusion>,
     statements: Vec<String>,
@@ -432,48 +440,226 @@ async fn execute_transaction(
     read_only: bool,
     format: ResponseMimeType,
 ) -> Response {
-    let Some((final_statement, intermediate_statements)) = statements.split_last() else {
-        return (StatusCode::OK, "COMMIT").into_response();
+    // Prepare the transaction: identify the single write, validate its target,
+    // acquire the guard, and install the transaction on the request context.
+    // A body with no write is a plain read-only transaction (no guard needed).
+    let write = match prepare_transaction(&df, &statements).await {
+        Ok(write) => write,
+        Err(response) => return response,
     };
 
-    let memory_pool = Arc::clone(&df.ctx.runtime_env().memory_pool);
     let parameters = normalize_transaction_parameters(parameters);
-    let transaction_guard = Arc::clone(&TRANSACTION_LOCK).lock_owned().await;
-
-    for statement in intermediate_statements {
+    let mut last: Option<(Vec<RecordBatch>, CacheStatus)> = None;
+    for statement in &statements {
         let query_res =
             match run_transaction_statement(&df, statement, parameters.clone(), read_only).await {
                 Ok(result) => result,
                 Err(error) => {
+                    abort_transaction(write.as_ref()).await;
                     let kind = SqlErrorKind::of_query_error(&error);
                     return sql_error_response(error.to_string(), kind);
                 }
             };
 
-        // Drain and immediately drop each batch. This executes writes and
-        // surfaces stream errors without materializing intermediate SELECTs.
-        let mut data_stream = query_res.data;
-        while let Some(batch_result) = data_stream.next().await {
-            if let Err(error) = batch_result {
-                return sql_error_response(
-                    error.to_string(),
-                    SqlErrorKind::of_datafusion_error(&error),
-                );
+        let cache_status = query_res.cache_status;
+        // Drain each statement fully so writes execute and any error (including a
+        // gate abort) surfaces before the next statement runs.
+        match query_res.data.try_collect::<Vec<RecordBatch>>().await {
+            Ok(batches) => last = Some((batches, cache_status)),
+            Err(e) => {
+                abort_transaction(write.as_ref()).await;
+                return sql_error_response(e.to_string(), SqlErrorKind::of_datafusion_error(&e));
             }
         }
     }
 
-    let query_res =
-        match run_transaction_statement(&df, final_statement, parameters, read_only).await {
-            Ok(result) => result,
-            Err(error) => {
-                let kind = SqlErrorKind::of_query_error(&error);
-                return sql_error_response(error.to_string(), kind);
-            }
+    // Every statement succeeded (the gate passed). Publish the staged write
+    // atomically; if it never staged, that is an internal invariant failure.
+    if let Some(write) = &write {
+        let Some(staged) = write.txn.take_staged() else {
+            abort_transaction(Some(write)).await;
+            return sql_error_response(
+                "transaction committed without a staged write".to_string(),
+                SqlErrorKind::General,
+            );
         };
+        match staged.commit().await {
+            Ok(_) => {}
+            Err(cayenne::provider::Error::WriteConflict { table }) => {
+                // Optimistic-concurrency conflict: the table was committed to
+                // between this transaction's start and commit. Retryable — map to
+                // 409 so the client can re-run at the newest committed state.
+                return (
+                    StatusCode::CONFLICT,
+                    format!(
+                        "transaction write conflict on '{table}': the table changed since the transaction started; retry"
+                    ),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return sql_error_response(
+                    format!("transaction publish failed: {e}"),
+                    SqlErrorKind::General,
+                );
+            }
+        }
+        // The write's plan-time cache invalidation ran before the rows were
+        // visible, so a concurrent SELECT could have repopulated the cache with
+        // pre-commit state. Re-invalidate now that the write is published.
+        if let Err(e) = df.caching().invalidate_for_table(write.table_ref.clone()) {
+            tracing::warn!(
+                "transaction: post-commit cache invalidation for {} failed: {e}",
+                write.table_ref
+            );
+        }
+    }
 
-    let data_stream = attach_transaction_guard_to_stream(query_res.data, transaction_guard);
-    query_stream_to_http_response(data_stream, query_res.cache_status, format, memory_pool).await
+    // Return the final statement's result (for the canonical gate+write shape,
+    // the write's row-count summary).
+    match last {
+        Some((batches, cache_status)) => {
+            to_http_response(batches, cache_status, format, ResponseMetadata::empty())
+                .await
+                .into_response()
+        }
+        None => (StatusCode::OK, "COMMIT").into_response(),
+    }
+}
+
+/// Identify the transaction's single write, validate its target as a
+/// non-partitioned accelerator-only Cayenne table, acquire the table write
+/// guard, and install the armed [`CayenneTransaction`] on the current
+/// request context.
+///
+/// Returns `Ok(None)` for a body with no write (a read-only transaction), or an
+/// error `Response` if the body is not a valid v1 transaction.
+async fn prepare_transaction(
+    df: &Arc<DataFusion>,
+    inner_sqls: &[String],
+) -> Result<Option<TransactionWrite>, Response> {
+    let session = df.ctx.state();
+    let mut write_table: Option<TableReference> = None;
+    for stmt_sql in inner_sqls {
+        let plan = session.create_logical_plan(stmt_sql).await.map_err(|e| {
+            sql_error_response(e.to_string(), SqlErrorKind::of_datafusion_error(&e))
+        })?;
+        match classify_transaction_write(&plan) {
+            None => {}
+            Some(Err(op)) => {
+                return Err(sql_error_response(
+                    format!(
+                        "transactions do not support {op} (v1 supports a single gated INSERT/UPDATE)"
+                    ),
+                    SqlErrorKind::General,
+                ));
+            }
+            Some(Ok(table)) => {
+                if write_table.is_some() {
+                    return Err(sql_error_response(
+                        "transactions support a single write statement (v1)"
+                            .to_string(),
+                        SqlErrorKind::General,
+                    ));
+                }
+                write_table = Some(table);
+            }
+        }
+    }
+
+    let Some(table_ref) = write_table else {
+        return Ok(None);
+    };
+
+    let cc_err = |msg: String| sql_error_response(msg, SqlErrorKind::General);
+
+    // Resolve the target to its underlying Cayenne provider. Only an
+    // accelerator-only table stages through the Cayenne write path — the
+    // write-through/write-back/dual-write modes route writes elsewhere, where
+    // the gate would not govern the write.
+    let table_name = table_ref.table();
+    let provider = df
+        .get_accelerated_table_provider(table_name)
+        .await
+        .map_err(|e| {
+            cc_err(format!(
+                "transaction target '{table_name}' is not an accelerated table: {e}"
+            ))
+        })?;
+    let Some(accel) = provider.downcast_ref::<AcceleratedTable>() else {
+        return Err(cc_err(format!(
+            "transaction target '{table_name}' is not an accelerated table"
+        )));
+    };
+    if !accel.is_accelerator_only() {
+        return Err(cc_err(format!(
+            "transaction target '{table_name}' must be an accelerator-only dataset (configure on_conflict without CDC); its writes route to the federated source"
+        )));
+    }
+    let accelerator = accel.get_accelerator();
+    let Some(CayenneWriteTarget::Staged(cayenne)) = extract_cayenne_write_target(&accelerator)
+    else {
+        return Err(cc_err(format!(
+            "transaction target '{table_name}' must be backed by a non-partitioned Cayenne table"
+        )));
+    };
+
+    // Capture the optimistic-concurrency token BEFORE any gate read runs, and
+    // arm the transaction. Staging is lock-free; at commit the write_lock is
+    // taken briefly and the token re-checked, so a concurrent commit to the
+    // table between here and commit makes this transaction abort (retryable
+    // conflict) rather than lose an update. Capturing before the gate read is
+    // load-bearing: a commit landing between the gate and the staged write would
+    // otherwise leave the gate verdict stale.
+    let token = cayenne.transaction_write_token().await;
+    let txn = CayenneTransaction::armed(cayenne.table_id().to_string(), token);
+    RequestContext::current(AsyncMarker::new().await).insert_extension(txn.clone());
+
+    Ok(Some(TransactionWrite { table_ref, txn }))
+}
+
+/// Classify an inner statement for a transaction:
+/// `None` for a read, `Some(Ok(table))` for a stageable INSERT/UPDATE write, or
+/// `Some(Err(op))` for a write form v1 cannot stage atomically (its sink is not
+/// transaction-aware), which must abort the transaction rather than publish.
+fn classify_transaction_write(
+    plan: &LogicalPlan,
+) -> Option<Result<TableReference, &'static str>> {
+    use datafusion::logical_expr::WriteOp;
+    match plan {
+        LogicalPlan::Dml(dml) => Some(match &dml.op {
+            WriteOp::Insert(_) | WriteOp::Update => Ok(dml.table_name.clone()),
+            WriteOp::Delete => Err("DELETE"),
+            WriteOp::Ctas | WriteOp::Truncate => Err("this operation"),
+        }),
+        LogicalPlan::Extension(ext) => {
+            let dml = ext
+                .node
+                .as_any()
+                .downcast_ref::<datafusion_dml::DmlExtensionNode>()?;
+            Some(match &dml.op {
+                datafusion_dml::DmlNodeOp::Insert(p) => Ok(p.table_name.clone()),
+                datafusion_dml::DmlNodeOp::Update(p) => Ok(p.table_name.clone()),
+                datafusion_dml::DmlNodeOp::Delete(_) => Err("DELETE"),
+                datafusion_dml::DmlNodeOp::Merge(_) => Err("MERGE"),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Roll back a transaction: discard the staged write (if the
+/// write reached the sink) and release the table write guard.
+async fn abort_transaction(write: Option<&TransactionWrite>) {
+    let Some(write) = write else { return };
+    if let Some(staged) = write.txn.take_staged() {
+        if let Err(e) = staged.rollback().await {
+            tracing::warn!("transaction rollback cleanup failed: {e}");
+        }
+    }
+    // Release the still-armed guard when the write never staged (e.g. the gate
+    // failed before the write statement ran).
+    write.txn.release();
 }
 
 /// Classifies a query error for HTTP status mapping: client-initiated

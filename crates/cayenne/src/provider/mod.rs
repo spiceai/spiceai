@@ -75,6 +75,7 @@ pub(crate) mod cold_partition;
 pub(crate) mod column_stats;
 pub(crate) mod compaction;
 pub(crate) mod compaction_writer;
+pub(crate) mod transaction;
 pub(crate) mod constants;
 pub(crate) mod context;
 pub(crate) mod delete;
@@ -116,6 +117,7 @@ pub use compaction::{
     begin_compaction_shutdown, drain_compaction_tasks, in_flight_compaction_tasks,
     reset_compaction_shutdown, set_compaction_runtime_env, set_compaction_runtime_handle,
 };
+pub use transaction::CayenneTransaction;
 pub use context::CayenneContext;
 pub use mem_tier::SlotAdvancer;
 pub use mem_tier_budget::{
@@ -245,6 +247,12 @@ pub enum Error {
     /// Operation is not yet implemented.
     #[snafu(display("Unsupported operation: {operation}"))]
     Unsupported { operation: &'static str },
+
+    /// A transaction lost an optimistic-concurrency race: the
+    /// target table was committed to between this transaction's start and its
+    /// commit. Retryable at the newest committed state.
+    #[snafu(display("Transaction write conflict on table '{table}': the table changed since the transaction started; retry"))]
+    WriteConflict { table: String },
 
     /// Invalid number of children provided to an execution plan.
     #[snafu(display(

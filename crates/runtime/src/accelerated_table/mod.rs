@@ -1227,6 +1227,15 @@ impl AcceleratedTable {
         self.write_mode.is_dual_write()
     }
 
+    /// Whether writes are directed to the local accelerator only (the
+    /// `on_conflict` / read-only-source case). Conditional-commit transactions
+    /// require this: their staging + atomic publish live in the accelerator
+    /// write path, which the write-through/write-back/dual-write modes bypass.
+    #[must_use]
+    pub(crate) fn is_accelerator_only(&self) -> bool {
+        matches!(self.write_mode, WriteMode::AcceleratorOnly)
+    }
+
     #[must_use]
     pub fn get_accelerator(&self) -> Arc<dyn TableProvider> {
         Arc::clone(&self.accelerator)

@@ -14,48 +14,40 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Staged **upsert** lifecycle for `CayenneTableProvider` (Analytical Replica
-//! dual-apply).
+//! Staged **upsert** lifecycle for `CayenneTableProvider`: a PK/on-conflict
+//! write is encoded into a fresh, **unreferenced** snapshot directory
+//! (invisible to readers) and published — or discarded — at a later moment.
+//! It is a split of the synchronous on-conflict path at the listing fence.
 //!
-//! [`super::staging_wal::CayenneStagedAppend`] stages append-only writes; it
-//! rejects primary-key / on-conflict tables. This module adds the PK-aware
-//! counterpart: a write into a table with a primary key and `on_conflict`
-//! upsert is staged **invisibly** and published (or discarded) at a later
-//! moment — the point at which the dual-apply driver has an ack (or a failure)
-//! from the federated source.
+//! Staging is **off-lock optimistic** ([`CayenneTableProvider::begin_staged_upsert_occ`]):
+//! validation (private keyset) + Vortex encode run **without** `write_lock`, so
+//! many transactions stage concurrently; the lock is taken only at
+//! [`CayenneStagedUpsert::commit`], briefly, to re-check the optimistic-concurrency
+//! token and publish. Detection is at per-table granularity: if any commit landed
+//! on the table between the token capture (at transaction begin, before the gate
+//! read) and this commit, the sequence high-water moved → the commit aborts with
+//! [`Error::WriteConflict`] (a retryable conflict) rather than risking a lost
+//! update.
 //!
-//! It is a split of the synchronous on-conflict path
-//! ([`CayenneTableProvider::write_new_snapshot_after_validation`]) at the
-//! listing fence:
+//! [`CayenneStagedUpsert::commit`] runs the fenced publish: apply the
+//! on-conflict deletions, reserve the protected-snapshot sequence (strictly
+//! above the delete sequence, so the staged rows survive their own conflict
+//! deletes), durably record it, then flip the deletion caches and the protected
+//! snapshot in one listing-fence write. [`CayenneStagedUpsert::rollback`]
+//! discards the staged snapshot directory.
 //!
-//! - [`CayenneTableProvider::begin_staged_upsert`] validates the incoming rows
-//!   for PK conflicts and writes them into a fresh, **unreferenced** snapshot
-//!   directory (`{table_id}/{new_snapshot}/`). Nothing durable in the catalog
-//!   is touched, so the rows are invisible to every reader and there is nothing
-//!   to compensate on abort. The captured [`OnConflictDeletions`] (which prior
-//!   versions this write supersedes) rides the returned handle.
-//! - [`CayenneStagedUpsert::commit`] runs the fenced publish: apply the
-//!   on-conflict deletions, reserve the protected-snapshot sequence (strictly
-//!   above the delete sequence, so the staged rows survive their own conflict
-//!   deletes), durably record it, then flip the deletion caches and the
-//!   protected snapshot in one listing-fence write. After this the rows are
-//!   visible.
-//! - [`CayenneStagedUpsert::rollback`] discards the staged snapshot directory.
+//! Sequence stamping is deferred by construction: the sync path already reserves
+//! every sequence at publish time, and the protected snapshot's deletion
+//! threshold is its own (highest) sequence, so a commit that lands between stage
+//! and publish never mis-orders the staged rows.
 //!
-//! Sequence stamping is deferred by construction: the sync path already
-//! reserves every sequence at publish time, and the protected snapshot's
-//! deletion threshold is its own (highest) sequence, so a commit that lands
-//! between stage and publish never mis-orders the staged rows.
-//!
-//! The stage is deliberately **not** durable: the federated source is the
-//! system of record and CDC (`refresh_mode: changes`) is the crash backstop, so
-//! a crash before commit simply drops the staged directory (recovered, if the
-//! source committed, by CDC replay).
+//! The stage is deliberately **not** durable: the federated source is the system
+//! of record and CDC (`refresh_mode: changes`) is the crash backstop, so a crash
+//! before commit simply drops the staged directory.
 
 use std::sync::Arc;
 
 use datafusion::execution::SendableRecordBatchStream;
-use tokio::sync::OwnedMutexGuard;
 
 use super::Error;
 use super::Result;
@@ -65,15 +57,45 @@ use super::on_conflict::{OnConflictDeletions, PostValidationState};
 use super::pk_index::PkDigestSet;
 use super::table::CayenneTableProvider;
 
-/// A staged upsert: the replacement rows have been written to a fresh snapshot
-/// directory, but no catalog visibility change has been made yet.
+/// Optimistic-concurrency token for an off-lock transaction write.
 ///
-/// The handle owns the table's write guard, so concurrent writers on the same
-/// table block until it is either committed via [`Self::commit`] or discarded
-/// via [`Self::rollback`] (or dropped — see the note on `Drop`).
+/// Captured at transaction **begin** (before the gate read) under a brief
+/// `write_lock` hold, and re-checked at commit under `write_lock`. It is the
+/// per-table sequence high-water plus a "no staging append in flight" bit —
+/// together, everything that changes key liveness on the table either advances
+/// the sequence or sets the staging bit, so an unchanged token at commit proves
+/// no intervening commit touched the table (see the module docs).
+#[derive(Debug, Clone, Copy)]
+pub struct TransactionWriteToken {
+    /// The table's sequence high-water at capture (`allocator.next - 1`).
+    stage_seq: i64,
+    /// Whether no pipelined staging append was in flight at capture. A staging
+    /// append's Stage-B finalize publishes without drawing a sequence, so it is
+    /// covered by this bit rather than by `stage_seq`.
+    staging_clean: bool,
+}
+
+/// The staged bits: rows written to a fresh invisible snapshot dir, plus the
+/// on-conflict deletions and validated keys captured during validation.
+struct StagedData {
+    new_snapshot_id: String,
+    on_conflict_deletions: OnConflictDeletions,
+    validated_keys: PkDigestSet,
+    stats: Arc<ColumnStatsAccumulator>,
+    row_count: u64,
+    /// Existing rows this upsert replaces (for the live-row-count delta),
+    /// captured before `on_conflict_deletions` is consumed.
+    superseded: usize,
+}
+
+/// A staged upsert: the replacement rows have been written to a fresh snapshot
+/// directory, but no catalog visibility change has been made yet. The rows are
+/// published (or discarded) at [`Self::commit`] / [`Self::rollback`].
 pub struct CayenneStagedUpsert {
     table: CayenneTableProvider,
-    write_guard: Option<OwnedMutexGuard<()>>,
+    /// Optimistic-concurrency token captured at transaction begin, re-checked at
+    /// commit against the table's live sequence high-water.
+    token: TransactionWriteToken,
     new_snapshot_id: String,
     /// The prior versions this upsert supersedes, captured at validation time
     /// and applied under the fence at commit. Taken (`mem::take`) on commit.
@@ -81,8 +103,6 @@ pub struct CayenneStagedUpsert {
     validated_keys: PkDigestSet,
     stats: Arc<ColumnStatsAccumulator>,
     row_count: u64,
-    /// Existing rows replaced by this upsert (for the live-row-count delta),
-    /// captured before `on_conflict_deletions` is consumed.
     superseded: usize,
 }
 
@@ -93,12 +113,24 @@ impl std::fmt::Debug for CayenneStagedUpsert {
             .field("new_snapshot_id", &self.new_snapshot_id)
             .field("row_count", &self.row_count)
             .field("superseded", &self.superseded)
-            .field("has_write_guard", &self.write_guard.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl CayenneStagedUpsert {
+    fn new(table: CayenneTableProvider, token: TransactionWriteToken, staged: StagedData) -> Self {
+        Self {
+            table,
+            token,
+            new_snapshot_id: staged.new_snapshot_id,
+            on_conflict_deletions: staged.on_conflict_deletions,
+            validated_keys: staged.validated_keys,
+            stats: staged.stats,
+            row_count: staged.row_count,
+            superseded: staged.superseded,
+        }
+    }
+
     /// Number of rows staged for commit.
     #[must_use]
     pub fn row_count(&self) -> u64 {
@@ -107,18 +139,37 @@ impl CayenneStagedUpsert {
 
     /// Publish the staged rows, making the upsert visible to readers.
     ///
-    /// Mirrors the fenced tail of
-    /// [`CayenneTableProvider::write_new_snapshot_after_validation`]: apply the
+    /// Acquires `write_lock` now (staging ran off-lock) and re-checks the
+    /// optimistic-concurrency token first, aborting with [`Error::WriteConflict`]
+    /// (staged dir cleaned up) if the table changed since the transaction began.
+    /// It then mirrors the fenced tail of the sync on-conflict publish: apply the
     /// on-conflict deletions, reserve the protected-snapshot sequence, record it
     /// durably, then flip the deletion caches + protected snapshot under one
     /// listing-fence write.
     ///
     /// # Errors
     ///
-    /// Returns an error if applying the deletions, reserving the sequence, or the
-    /// durable snapshot-sequence write fails. The staged snapshot directory is
-    /// left in place on error so the caller can retry the commit or roll back.
+    /// Returns [`Error::WriteConflict`] on a lost OCC race (retryable), or an
+    /// error if applying the deletions, reserving the sequence, or the durable
+    /// snapshot-sequence write fails. On a hard error the staged snapshot
+    /// directory is left in place so the caller can retry the commit or roll back.
     pub async fn commit(mut self) -> Result<u64> {
+        // Acquire the write lock now (staging ran off-lock), then re-check the
+        // token before touching anything visible — a moved sequence high-water
+        // (or a dirty staging bit at capture) means a concurrent commit could
+        // have changed a key we wrote, so this transaction must abort and retry.
+        let _write_guard = self.table.write_lock_arc().lock_owned().await;
+        self.table.ensure_no_incomplete_write().await?;
+        if !self.token.staging_clean
+            || self.table.sequence_high_water().await != self.token.stage_seq
+        {
+            drop(_write_guard);
+            cleanup_orphan_snapshot_dir(&self.table, &self.new_snapshot_id).await;
+            return Err(Error::WriteConflict {
+                table: self.table.table_name().to_string(),
+            });
+        }
+
         // visibility lock then listing fence — the same order as
         // `apply_under_barrier` and the sync on-conflict publish.
         let _visibility = self.table.visibility_lock_arc().lock_owned().await;
@@ -161,7 +212,7 @@ impl CayenneStagedUpsert {
         }
 
         Ok(self.row_count)
-        // `_fence`, `_visibility`, and `self.write_guard` drop here, in that order.
+        // `_fence`, `_visibility`, and `_write_guard` drop here, in that order.
     }
 
     /// Discard the staged upsert and remove its staged snapshot directory.
@@ -175,45 +226,69 @@ impl CayenneStagedUpsert {
     /// Infallible today; returns `Result` for symmetry with the other staged
     /// lifecycles and to allow future durable-cleanup steps.
     pub async fn rollback(self) -> Result<()> {
-        // Hold the write guard across cleanup so another writer cannot start a
-        // commit while the staged directory is mid-deletion.
-        let _write_guard = self.write_guard;
+        // Staging held no lock and the catalog was never touched, so this just
+        // removes the orphan directory.
         cleanup_orphan_snapshot_dir(&self.table, &self.new_snapshot_id).await;
         Ok(())
     }
 }
 
 impl CayenneTableProvider {
-    /// Stage a primary-key upsert without making the new rows visible.
+    /// Capture the optimistic-concurrency token for a transaction write.
     ///
-    /// Validates the incoming stream for PK conflicts and writes the rows into a
-    /// fresh snapshot directory, returning a [`CayenneStagedUpsert`] that the
-    /// caller commits (on federated-source ack) or rolls back (on source
-    /// failure). See the module documentation for the full lifecycle.
+    /// Must be called at transaction **begin**, before the gate read — a commit
+    /// landing between the gate read and staging would otherwise be invisible to
+    /// the staged validation while making the gate verdict stale (a lost update).
+    /// Holds `write_lock` only long enough to read the sequence high-water and
+    /// the staging-append flag (the documented soundness condition on
+    /// `sequence_high_water`).
+    pub async fn transaction_write_token(&self) -> TransactionWriteToken {
+        let _guard = self.write_lock_arc().lock_owned().await;
+        let stage_seq = self.sequence_high_water().await;
+        let staging_clean = !self.has_inflight_staging_appends();
+        TransactionWriteToken {
+            stage_seq,
+            staging_clean,
+        }
+    }
+
+    /// Stage a primary-key upsert **off-lock** for a transaction: validation +
+    /// encode run without `write_lock`; the guard is acquired and `token`
+    /// re-checked at [`CayenneStagedUpsert::commit`]. The caller must have
+    /// captured `token` via [`Self::transaction_write_token`] before the
+    /// transaction's gate read.
     ///
     /// # Errors
     ///
-    /// Returns an error if the table has an incomplete write, is partitioned
-    /// (unsupported for the staged-upsert MVP), or if writing the staged data
-    /// fails.
-    pub async fn begin_staged_upsert(
+    /// Returns an error if the table is partitioned (unsupported for the MVP) or
+    /// if writing the staged data fails.
+    pub async fn begin_staged_upsert_occ(
         &self,
+        token: TransactionWriteToken,
         data: SendableRecordBatchStream,
         target_partitions: usize,
     ) -> Result<CayenneStagedUpsert> {
-        let write_guard = self.write_lock_arc().lock_owned().await;
-        self.ensure_no_incomplete_write().await?;
+        let staged = self.stage_upsert_data(data, target_partitions).await?;
+        Ok(CayenneStagedUpsert::new(self.clone_for_write(), token, staged))
+    }
 
+    /// Validate the incoming rows for PK conflicts (off-lock: private keyset, no
+    /// shared-cache take/store) and encode them into a fresh, unreferenced
+    /// snapshot directory.
+    async fn stage_upsert_data(
+        &self,
+        data: SendableRecordBatchStream,
+        target_partitions: usize,
+    ) -> Result<StagedData> {
         // Partitioned tables publish across partitions; their visibility flip
-        // cannot be a single protected-snapshot publish. Out of scope for the MVP
-        // (§10 conditional Phase 3).
+        // cannot be a single protected-snapshot publish. Out of scope for the MVP.
         if self.metadata().partition_column.is_some() {
             return Err(Error::Unsupported {
                 operation: "staged upsert for partitioned Cayenne tables",
             });
         }
 
-        let prepared = self.prepare_stream_for_insert(data).await?;
+        let prepared = self.prepare_stream_for_insert_offlock(data).await?;
         let post_validation = prepared.post_validation();
 
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
@@ -242,17 +317,14 @@ impl CayenneTableProvider {
         // On-conflict deletions are computed by the validation stream as it is
         // consumed by `write_to_snapshot` above, so take them only now. A table
         // without a primary key (or with conflict detection disabled) yields the
-        // default (empty) state — a plain insert published as a protected
-        // snapshot.
+        // default (empty) state — a plain insert published as a protected snapshot.
         let PostValidationState {
             on_conflict_deletions,
             validated_keys,
         } = post_validation.lock().take().unwrap_or_default();
         let superseded = on_conflict_deletions.total_superseded();
 
-        Ok(CayenneStagedUpsert {
-            table: self.clone_for_write(),
-            write_guard: Some(write_guard),
+        Ok(StagedData {
             new_snapshot_id,
             on_conflict_deletions,
             validated_keys,

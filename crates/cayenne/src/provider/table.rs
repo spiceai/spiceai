@@ -5783,7 +5783,7 @@ impl CayenneTableProvider {
     /// sound compaction cutoff — a rewrite scan taken after this read sees every
     /// mutation `<= cutoff`, and mutations that arrive afterward (`> cutoff`) are
     /// carried forward rather than cleared.
-    async fn sequence_high_water(&self) -> i64 {
+    pub(crate) async fn sequence_high_water(&self) -> i64 {
         self.seq_allocator.lock().await.next - 1
     }
 
@@ -7353,6 +7353,27 @@ impl CayenneTableProvider {
         &self,
         stream: SendableRecordBatchStream,
     ) -> Result<PreparedInsertStream> {
+        self.prepare_stream_for_insert_inner(stream, false).await
+    }
+
+    /// Off-lock variant for conditional-commit staging: validates against a
+    /// **private** keyset (never taken from, nor stored back to, the shared PK
+    /// index cache), so it is safe to run WITHOUT holding `write_lock` while
+    /// ordinary writers concurrently update the shared cache. Optimistic
+    /// concurrency is re-checked at commit; a private keyset that is stale by
+    /// commit is caught there (the transaction's sequence gate aborts).
+    pub(crate) async fn prepare_stream_for_insert_offlock(
+        &self,
+        stream: SendableRecordBatchStream,
+    ) -> Result<PreparedInsertStream> {
+        self.prepare_stream_for_insert_inner(stream, true).await
+    }
+
+    async fn prepare_stream_for_insert_inner(
+        &self,
+        stream: SendableRecordBatchStream,
+        offlock: bool,
+    ) -> Result<PreparedInsertStream> {
         let Some(pk_indices) = self.primary_key_indices()? else {
             return Ok(PreparedInsertStream::immediate(stream));
         };
@@ -7366,7 +7387,13 @@ impl CayenneTableProvider {
         }
 
         let converter = self.build_pk_converter(&pk_indices)?;
-        let existing_keys = if let Some(existing_keys) = self.take_cached_pk_index() {
+        // Off-lock staging must NOT take/store the shared cache (it runs without
+        // `write_lock`); it builds a private keyset every time. The ordinary path
+        // reuses the shared cache and stores it back on finish.
+        let existing_keys = if offlock {
+            self.load_pk_index_for_validation(&pk_indices, &converter)
+                .await?
+        } else if let Some(existing_keys) = self.take_cached_pk_index() {
             tracing::trace!(
                 "prepare_stream_for_insert: reused {} cached existing keys for table {}",
                 existing_keys.len(),
@@ -7374,50 +7401,8 @@ impl CayenneTableProvider {
             );
             existing_keys
         } else {
-            // The full-table keyset rebuild is the dominant CDC-upsert cost for
-            // tables whose keyset exceeds the cache budget, yet it runs *before*
-            // the `vortex_write` phase timer and is otherwise invisible in
-            // per-phase telemetry. Time it explicitly (emitted only on a cache
-            // miss / cold rebuild) so retests attribute the cost correctly.
-            let keyset_rebuild_start = Instant::now();
-            // Resolve the datalake (cold) tier contribution first (rebuilds the
-            // cold PK existence bloom from the manifest, no object-store I/O).
-            // `Bloom` skips the cold scan; `Scan` forces a full rebuild (the
-            // warm-only checkpoint can't cover the incomplete-bloom case).
-            let cold_source = self.resolve_cold_keyset_source().await?;
-            let fold_cold = !matches!(cold_source, ColdKeysetSource::Bloom);
-            let allow_checkpoint = !matches!(cold_source, ColdKeysetSource::Scan);
-            // Fast path: reconstruct the index from the persisted bloom checkpoint
-            // (+ bounded post-checkpoint delta) and skip the full-table keyset
-            // scan. Falls back to the full scan on any miss/mismatch/corruption.
-            let existing_keys = if allow_checkpoint {
-                match self
-                    .try_load_persisted_pk_index(&pk_indices, &converter)
-                    .await
-                {
-                    Ok(Some(index)) => index,
-                    _ => CachedPkIndex::Exact(
-                        self.load_existing_keyset(&pk_indices, &converter, fold_cold)
-                            .await?,
-                    ),
-                }
-            } else {
-                CachedPkIndex::Exact(
-                    self.load_existing_keyset(&pk_indices, &converter, fold_cold)
-                        .await?,
-                )
-            };
-            record_cayenne_write_phase(
-                self.table_metadata.table_name.as_str(),
-                "keyset_rebuild",
-                keyset_rebuild_start,
-            );
-            tracing::debug!(
-                "prepare_stream_for_insert: loaded {} existing keys for table {}",
-                existing_keys.len(),
-                self.table_metadata.table_name
-            );
-            existing_keys
+            self.load_pk_index_for_validation(&pk_indices, &converter)
+                .await?
         };
 
         let on_conflict = self
@@ -7436,6 +7421,9 @@ impl CayenneTableProvider {
             existing_keys,
             on_conflict,
             Arc::clone(&post_validation),
+            // Ordinary path returns the keyset to the shared cache; off-lock
+            // staging drops its private keyset (never publishes it).
+            !offlock,
         );
 
         Ok(PreparedInsertStream::deferred(
@@ -7443,6 +7431,57 @@ impl CayenneTableProvider {
             post_validation,
             may_have_on_conflict_deletions,
         ))
+    }
+
+    /// Build a fresh PK existence index for validation from the persisted bloom
+    /// checkpoint (+ bounded delta) or, failing that, a full keyset scan. Does
+    /// not touch the shared cache — callers decide whether to store it back.
+    async fn load_pk_index_for_validation(
+        &self,
+        pk_indices: &[usize],
+        converter: &RowConverter,
+    ) -> Result<CachedPkIndex> {
+        // The full-table keyset rebuild is the dominant CDC-upsert cost for
+        // tables whose keyset exceeds the cache budget, yet it runs *before*
+        // the `vortex_write` phase timer and is otherwise invisible in
+        // per-phase telemetry. Time it explicitly (emitted only on a cache
+        // miss / cold rebuild) so retests attribute the cost correctly.
+        let keyset_rebuild_start = Instant::now();
+        // Resolve the datalake (cold) tier contribution first (rebuilds the
+        // cold PK existence bloom from the manifest, no object-store I/O).
+        // `Bloom` skips the cold scan; `Scan` forces a full rebuild (the
+        // warm-only checkpoint can't cover the incomplete-bloom case).
+        let cold_source = self.resolve_cold_keyset_source().await?;
+        let fold_cold = !matches!(cold_source, ColdKeysetSource::Bloom);
+        let allow_checkpoint = !matches!(cold_source, ColdKeysetSource::Scan);
+        // Fast path: reconstruct the index from the persisted bloom checkpoint
+        // (+ bounded post-checkpoint delta) and skip the full-table keyset
+        // scan. Falls back to the full scan on any miss/mismatch/corruption.
+        let existing_keys = if allow_checkpoint {
+            match self.try_load_persisted_pk_index(pk_indices, converter).await {
+                Ok(Some(index)) => index,
+                _ => CachedPkIndex::Exact(
+                    self.load_existing_keyset(pk_indices, converter, fold_cold)
+                        .await?,
+                ),
+            }
+        } else {
+            CachedPkIndex::Exact(
+                self.load_existing_keyset(pk_indices, converter, fold_cold)
+                    .await?,
+            )
+        };
+        record_cayenne_write_phase(
+            self.table_metadata.table_name.as_str(),
+            "keyset_rebuild",
+            keyset_rebuild_start,
+        );
+        tracing::debug!(
+            "prepare_stream_for_insert: loaded {} existing keys for table {}",
+            existing_keys.len(),
+            self.table_metadata.table_name
+        );
+        Ok(existing_keys)
     }
 
     /// Sharded analog of [`Self::prepare_stream_for_insert`] for the N>1 in-memory
@@ -24104,6 +24143,29 @@ impl TableProvider for CayenneTableProvider {
             .build()?;
 
         let source_plan = state.create_physical_plan(&plan).await?;
+
+        // Conditional-commit transaction: `UpdateExec` runs delete + insert, and
+        // its delete leg publishes deletion vectors immediately — that breaks
+        // atomicity (a rollback would lose rows, and even a successful commit
+        // exposes a torn "row missing" window between the delete and the insert
+        // publish). When a transaction is active for this table, run only the
+        // insert (upsert) leg: the staged upsert supersedes each prior row by
+        // primary key, and the executor applies those deletions atomically under
+        // the fence at COMMIT.
+        if transaction_active_for(state, self.table_id()) {
+            // The staged upsert supersedes by primary key, so a reassigned PK
+            // column would leave the prior row in place. Reject it (v1 supports
+            // value updates only).
+            for (col, _) in &assignments {
+                if self.metadata().primary_key.iter().any(|pk| pk == col) {
+                    return Err(datafusion_common::DataFusionError::Execution(format!(
+                        "conditional-commit UPDATE cannot reassign primary-key column '{col}'"
+                    )));
+                }
+            }
+            return self.insert_into(state, source_plan, InsertOp::Append).await;
+        }
+
         let session_state = state
             .as_any()
             .downcast_ref::<datafusion::execution::SessionState>()
@@ -24121,6 +24183,21 @@ impl TableProvider for CayenneTableProvider {
             filters,
         )))
     }
+}
+
+/// Whether a conditional-commit transaction is active for `table_id` on this
+/// session's request context.
+///
+/// Reads the transaction from the [`runtime_request_context::RequestContext`]
+/// typed extension on the session config — the same context the query builder
+/// installed for this request — so the check matches the one the sink makes at
+/// execution time.
+fn transaction_active_for(state: &dyn Session, table_id: &str) -> bool {
+    state
+        .config()
+        .get_extension::<runtime_request_context::RequestContext>()
+        .and_then(|rc| rc.extension::<super::transaction::CayenneTransaction>())
+        .is_some_and(|txn| txn.table_id() == table_id)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27116,10 +27193,10 @@ mod tests {
         ids
     }
 
-    // ── Staged upsert (Analytical Replica dual-apply, `begin_staged_upsert`) ──
+    // ── Off-lock staged upsert (`begin_staged_upsert_occ`) ──
 
     /// Build a file-mode provider with an `id` primary key and `on_conflict:
-    /// upsert` — the shape the Analytical Replica staged-upsert path targets.
+    /// upsert` — the shape the off-lock staged-upsert path targets.
     async fn build_staged_upsert_provider(
         ctx: &SessionContext,
         name: &str,
@@ -27179,14 +27256,15 @@ mod tests {
         let (provider, _tmp, schema) = build_staged_upsert_provider(&ctx, "su_commit").await;
 
         let stream = single_batch_stream(id_name_batch(&schema, &[1, 2], &["alice", "bob"]));
+        let token = provider.transaction_write_token().await;
         let staged = provider
-            .begin_staged_upsert(stream, 1)
+            .begin_staged_upsert_occ(token, stream, 1)
             .await
             .expect("begin staged upsert");
         assert_eq!(staged.row_count(), 2);
 
-        // Held handle keeps the write guard; scans do not need it, so the staged
-        // rows are observably invisible before commit.
+        // The catalog is untouched until commit, so the staged rows are
+        // observably invisible to scans.
         assert!(
             scan_sorted_ids(&provider).await.is_empty(),
             "staged rows must be invisible before commit"
@@ -27208,8 +27286,9 @@ mod tests {
         let (provider, _tmp, schema) = build_staged_upsert_provider(&ctx, "su_rollback").await;
 
         let stream = single_batch_stream(id_name_batch(&schema, &[1, 2], &["alice", "bob"]));
+        let token = provider.transaction_write_token().await;
         let staged = provider
-            .begin_staged_upsert(stream, 1)
+            .begin_staged_upsert_occ(token, stream, 1)
             .await
             .expect("begin staged upsert");
         staged.rollback().await.expect("rollback staged upsert");
@@ -27233,8 +27312,9 @@ mod tests {
 
         // Stage an upsert: id=1 -> alice2 (supersede), id=3 -> carol (new).
         let stream = single_batch_stream(id_name_batch(&schema, &[1, 3], &["alice2", "carol"]));
+        let token = provider.transaction_write_token().await;
         let staged = provider
-            .begin_staged_upsert(stream, 1)
+            .begin_staged_upsert_occ(token, stream, 1)
             .await
             .expect("begin staged upsert");
 
