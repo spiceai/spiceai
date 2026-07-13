@@ -75,7 +75,12 @@ message Hello {
   string public_ip_hint = 10;
   string operator_version = 30;
   map<string, string> runtime_versions = 31;
-  string agent_pubkey_pem = 32;
+  string agent_pubkey_pem = 32;     // client identity public key (PEM); set during enrollment
+  // PKCS#10 CSR (PEM) for the client-generated keypair. Present on the
+  // enrollment Hello; dp validates `credential`, signs this CSR with its
+  // issuing CA, and returns the leaf in Adopt.identity_cert_pem. Binding the
+  // issued cert to a client-proven key is what makes the subsequent mTLS real.
+  string csr_pem = 33;
 }
 
 message Heartbeat {
@@ -154,8 +159,9 @@ message UpgradeRuntime {
 message Adopt {
   string command_id = 1;
   string assigned_identifier = 2;
-  string identity_cert_pem = 3;
+  string identity_cert_pem = 3;     // leaf cert dp signed from Hello.csr_pem
   uint64 not_after_unix = 4;
+  string ca_bundle_pem = 5;         // dp issuing-CA chain the client pins for mTLS
 }
 
 message Forget {

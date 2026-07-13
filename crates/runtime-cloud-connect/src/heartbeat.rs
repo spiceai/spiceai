@@ -15,18 +15,16 @@ limitations under the License.
 */
 
 //! Helpers for building [`Heartbeat`] and [`Telemetry`] payloads.
+//!
+//! The heartbeat / telemetry cadences live on [`crate::CloudConnectConfig`]
+//! (see [`crate::config::DEFAULT_HEARTBEAT_INTERVAL`] /
+//! [`crate::config::DEFAULT_TELEMETRY_INTERVAL`]) so they can be overridden
+//! for tests; the driver reads them from the config.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::handlers::RuntimeHandle;
 use crate::proto;
-
-/// Default heartbeat cadence.
-pub(crate) const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
-
-/// Default telemetry cadence.
-pub(crate) const TELEMETRY_INTERVAL: Duration = Duration::from_mins(1);
 
 /// Build a heartbeat for the current runtime state.
 pub(crate) async fn build_heartbeat(
