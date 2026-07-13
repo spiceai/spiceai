@@ -61,7 +61,7 @@ pub use extract::{
 pub use index::{
     HashIndex, HashIndexBuilder, InsertResult, NUM_SHARDS, PrehashedBuildHasher, PrehashedHasher,
     RowLocation, XxHash3BuildHasher, XxHash3Hasher, hash_key, hash_key_128, hash_key_bytes,
-    hash_key_i64, index_threshold,
+    hash_key_bytes_oneshot, hash_key_i64, index_threshold,
 };
 pub use sbbf::SplitBlockBloomFilter;
 

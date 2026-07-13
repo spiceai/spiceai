@@ -140,6 +140,21 @@ pub fn hash_key_i64(key: i64) -> u64 {
     XxHash3_64::oneshot_with_seed(HASH_SEED, &key.to_ne_bytes())
 }
 
+/// One-shot XXH3-64 of a single byte slice. Produces the same value as
+/// calling [`hash_key_bytes`] with a single-element slice (`&[bytes]`) — both
+/// hash the same bytes with the crate seed — but skips the streaming hasher
+/// construction, which dominates
+/// per-call cost for small inputs hashed one value at a time (e.g. per-row NDV
+/// sketch folding). Only valid for a single part; callers hashing composite
+/// keys from multiple parts must use [`hash_key_bytes`] so every part is
+/// folded into one hash. The equality is pinned by the
+/// `hash_key_bytes_oneshot_matches_streaming` test.
+#[inline]
+#[must_use]
+pub fn hash_key_bytes_oneshot(bytes: &[u8]) -> u64 {
+    XxHash3_64::oneshot_with_seed(HASH_SEED, bytes)
+}
+
 /// [`BuildHasher`](std::hash::BuildHasher) producing seeded XXH3-64 hashers
 /// that agree with [`hash_key`], for keyed containers (e.g.
 /// `HashMap`/`im::HashMap`) that should share this crate's hashing instead of
@@ -303,6 +318,31 @@ mod hashing_tests {
             let mut hasher = XxHash3BuildHasher.build_hasher();
             std::hash::Hash::hash(&key, &mut hasher);
             assert_eq!(hasher.finish(), hash_key(&key), "mismatch for {key}");
+        }
+    }
+
+    /// Pins the one-shot/streaming equality NDV sketch hashing relies on:
+    /// `hash_key_bytes_oneshot(bytes)` must equal `hash_key_bytes(&[bytes])`
+    /// forever, since HLL sketches are persisted and merged over time — a
+    /// divergence here would silently desync new sketches from old ones.
+    #[test]
+    fn hash_key_bytes_oneshot_matches_streaming() {
+        let cases: &[&[u8]] = &[
+            b"",
+            b"a",
+            &0_i128.to_le_bytes(),
+            &(-1_i128).to_le_bytes(),
+            &i128::MAX.to_le_bytes(),
+            &i128::MIN.to_le_bytes(),
+            b"name-12345",
+            &[0_u8; 64],
+        ];
+        for bytes in cases {
+            assert_eq!(
+                hash_key_bytes_oneshot(bytes),
+                hash_key_bytes(&[bytes]),
+                "mismatch for {bytes:?}"
+            );
         }
     }
 

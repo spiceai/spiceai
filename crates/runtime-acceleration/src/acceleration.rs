@@ -24,8 +24,6 @@ use datafusion_table_providers::util::{
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
 use spicepod::acceleration::{SnapshotsCompaction, SnapshotsCreationPolicy, SnapshotsTrigger};
-#[cfg(feature = "duckdb")]
-use spicepod::param::Params as SpicepodParams;
 use spicepod::{
     acceleration::{self as spicepod_acceleration},
     param::Params,
@@ -85,43 +83,6 @@ pub enum ParseError {
 
     #[snafu(display("Only one on_conflict target can be specified: {extra_detail}"))]
     OnConflictTargetMismatch { extra_detail: String },
-}
-
-// ── DuckDB partition mode ────────────────────────────────────────────────────
-
-#[cfg(feature = "duckdb")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DuckDBPartitionMode {
-    Tables,
-    Files,
-}
-
-#[cfg(feature = "duckdb")]
-impl DuckDBPartitionMode {
-    pub fn parse_str(s: &str) -> Self {
-        match s {
-            "tables" => DuckDBPartitionMode::Tables,
-            "files" => DuckDBPartitionMode::Files,
-            other => {
-                tracing::warn!(
-                    "Unknown `partition_mode` '{}', defaulting to 'files' mode.",
-                    other
-                );
-                DuckDBPartitionMode::Files
-            }
-        }
-    }
-}
-
-#[cfg(feature = "duckdb")]
-#[must_use]
-pub fn get_duckdb_partition_mode(params: &Option<SpicepodParams>) -> DuckDBPartitionMode {
-    params
-        .as_ref()
-        .and_then(|p| p.as_string_map().get("partition_mode").cloned())
-        .map_or(DuckDBPartitionMode::Files, |v| {
-            DuckDBPartitionMode::parse_str(&v)
-        })
 }
 
 // ── Enums ────────────────────────────────────────────────────────────────────
@@ -761,13 +722,6 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             }
         })? {
             Engine::Arrow if !acceleration.partition_by.is_empty() => Engine::PartitionedArrow,
-            #[cfg(feature = "duckdb")]
-            Engine::DuckDB if !acceleration.partition_by.is_empty() => {
-                match get_duckdb_partition_mode(&params) {
-                    DuckDBPartitionMode::Tables => Engine::TableModePartitionedDuckDB,
-                    DuckDBPartitionMode::Files => Engine::PartitionedDuckDB,
-                }
-            }
             engine => engine,
         };
 
