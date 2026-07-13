@@ -277,16 +277,12 @@ impl CloudConnect for ControlServer {
                                     return;
                                 }
                             }
-                            // Force a reconnect (to exercise mTLS) by closing
-                            // the stream once the Adopt has had time to land
-                            // and the client has persisted its identity. The
-                            // client persists synchronously on receiving Adopt
-                            // (well within this window), so the reconnect finds
-                            // an identity and connects over mTLS.
-                            if drop_after_enroll.load(Ordering::SeqCst) {
-                                tokio::time::sleep(Duration::from_millis(500)).await;
-                                return;
-                            }
+                            // When drop_after_enroll is set we force an mTLS
+                            // reconnect by closing this stream, but not here: the
+                            // close is triggered deterministically from the
+                            // AdoptAck arm below (the client sends AdoptAck only
+                            // after it has persisted its identity), rather than
+                            // guessing at a fixed sleep.
                         } else {
                             captured
                                 .lock()
@@ -319,6 +315,18 @@ impl CloudConnect for ControlServer {
                     }
                     Some(proto::client_message::Body::AdoptAck(ack)) => {
                         captured.lock().await.adopt_acks.push(ack);
+                        // The client sends AdoptAck only after it has persisted
+                        // its identity, so this is the deterministic moment to
+                        // force an mTLS reconnect: close the stream by returning
+                        // (dropping the outbound sender). Abort the command
+                        // forwarder first so its cloned sender doesn't hold the
+                        // stream open and defeat the disconnect.
+                        if drop_after_enroll.load(Ordering::SeqCst) {
+                            if let Some(f) = forwarder.take() {
+                                f.abort();
+                            }
+                            return;
+                        }
                     }
                     Some(proto::client_message::Body::Result(result)) => {
                         captured.lock().await.results.push(result);

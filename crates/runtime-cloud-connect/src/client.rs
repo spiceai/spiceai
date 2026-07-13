@@ -141,9 +141,20 @@ impl ClientDriver {
             // keeps serving local traffic) and tell the user how to re-adopt,
             // mirroring the Forget path.
             let Some(mode) = self.plan_connection() else {
-                tracing::error!(
-                    "Cloud Connect: cannot connect (no identity and no usable adoption code); exiting cloud-connect. Run `spice connect <code>` and restart spiced to re-adopt."
-                );
+                // Distinguish the two `None` cases so the message names the real
+                // cause: a stored identity would have produced `Reconnect`, so
+                // when an adoption code is still present the failure was
+                // enrollment key generation (already logged above); otherwise
+                // there is genuinely no identity and no code to adopt with.
+                if self.config.adoption_code.is_some() {
+                    tracing::error!(
+                        "Cloud Connect: cannot connect (enrollment key material could not be generated; see the error above); exiting cloud-connect. Resolve the failure and restart spiced to re-adopt."
+                    );
+                } else {
+                    tracing::error!(
+                        "Cloud Connect: cannot connect (no identity and no adoption code); exiting cloud-connect. Run `spice connect <code>` and restart spiced to re-adopt."
+                    );
+                }
                 return Ok(());
             };
 
