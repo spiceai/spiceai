@@ -4665,7 +4665,7 @@ mod tests {
 
         let with_bloom = ColdTierFile {
             table_id: table_id.clone(),
-            file_url: "s3://bucket/t/cold/p1/a.vortex".to_string(),
+            file_url: "s3://bucket/t/data/p1/a.vortex".to_string(),
             row_count: 100,
             file_size_bytes: 4096,
             min_sequence: 0,
@@ -4675,7 +4675,7 @@ mod tests {
         };
         let without_bloom = ColdTierFile {
             table_id: table_id.clone(),
-            file_url: "s3://bucket/t/cold/p1/b.vortex".to_string(),
+            file_url: "s3://bucket/t/data/p1/b.vortex".to_string(),
             row_count: 50,
             file_size_bytes: 2048,
             min_sequence: 0,

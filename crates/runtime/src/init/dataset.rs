@@ -53,7 +53,6 @@ use crate::{
 };
 use app::App;
 use datafusion::sql::TableReference;
-#[cfg(any(feature = "duckdb", feature = "sqlite"))]
 use futures::StreamExt;
 use futures::future::join_all;
 use opentelemetry::KeyValue;

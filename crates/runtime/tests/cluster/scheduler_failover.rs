@@ -202,6 +202,26 @@ async fn build_executor(
         ..Default::default()
     };
 
+    // Wait until the scheduler cluster port accepts connections before starting
+    // the executor, so `initialize_cluster_executor`'s connect cannot hang on a
+    // not-yet-bound listener (scheduler `runtime_ready_check` only covers
+    // dataset readiness).
+    let start = Instant::now();
+    loop {
+        if tokio::net::TcpStream::connect(scheduler_cluster_addr)
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(30) {
+            return Err(anyhow::Error::msg(format!(
+                "timed out waiting for scheduler cluster port {scheduler_cluster_addr}"
+            )));
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
     let rt = Arc::new(
         Runtime::builder()
             .with_runtime_config(config.clone())
@@ -215,11 +235,33 @@ async fn build_executor(
     );
 
     let cloned = Arc::clone(&rt);
-    let handle = tokio::spawn(async move {
+    let mut handle = tokio::spawn(async move {
         Box::pin(cloned.start_servers(config, None, EndpointAuth::no_auth())).await
     });
-    Arc::clone(&rt).load_components().await;
-    runtime_ready_check(&rt).await;
+
+    // Do not call `load_components` on executors — Fix B gates Ready/slots on
+    // `executor_bind_app` + object-store bind; a concurrent load races that path.
+    tokio::select! {
+        () = sleep(Duration::from_mins(2)) => {
+            handle.abort();
+            let _ = handle.await;
+            return Err(anyhow::Error::msg(
+                "timed out waiting for executor to become ready (object stores bound / task slots open)",
+            ));
+        }
+        result = &mut handle => {
+            return Err(anyhow::Error::msg(match result {
+                Ok(Ok(())) => "executor server thread finished unexpectedly".to_string(),
+                Ok(Err(e)) => format!("executor server failed to start: {e}"),
+                Err(e) => format!("executor server thread panicked: {e}"),
+            }));
+        }
+        () = async {
+            while !rt.status().is_ready() {
+                sleep(Duration::from_millis(100)).await;
+            }
+        } => {}
+    }
 
     Ok((rt, handle))
 }
