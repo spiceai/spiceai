@@ -155,7 +155,10 @@ impl CompressionEstimate {
 
 struct ActiveFileWriter {
     path: Path,
-    sender: futures::channel::mpsc::Sender<RecordBatch>,
+    /// `Some` while the writer accepts batches; taken (dropped) to close the
+    /// channel so the writer task finalizes. tokio mpsc has no explicit
+    /// close — dropping the last sender is the close.
+    sender: Option<tokio::sync::mpsc::Sender<RecordBatch>>,
     task: JoinHandle<DFResult<WriteSummary>>,
 }
 
@@ -400,7 +403,7 @@ async fn write_record_batch_stream_to_files(
     let mut handles = Vec::with_capacity(num_shards);
     let started_paths = Arc::new(Mutex::new(HashSet::new()));
     for shard_id in 0..num_shards {
-        let (tx, rx) = futures::channel::mpsc::channel::<RecordBatch>(1);
+        let (tx, rx) = tokio::sync::mpsc::channel::<RecordBatch>(1);
         senders.push(tx);
         handles.push(tokio::spawn(run_shard_writer(
             session.clone(),
@@ -525,7 +528,7 @@ async fn run_shard_writer(
     session: VortexSession,
     object_store: Arc<dyn ObjectStore>,
     dtype: DType,
-    mut receiver: futures::channel::mpsc::Receiver<RecordBatch>,
+    mut receiver: tokio::sync::mpsc::Receiver<RecordBatch>,
     target: Option<u64>,
     write_id: String,
     base_output_path: ListingTableUrl,
@@ -542,7 +545,7 @@ async fn run_shard_writer(
     let mut compression_estimate = CompressionEstimate::identity();
 
     let write_result: DFResult<()> = async {
-        while let Some(batch) = receiver.next().await {
+        while let Some(batch) = receiver.recv().await {
             if active_writer.is_none() {
                 let file_path = output_file_path(
                     &base_output_path,
@@ -649,7 +652,7 @@ fn start_file_writer(
     dtype: DType,
 ) -> ActiveFileWriter {
     // Use a small bounded channel to enforce backpressure and avoid unbounded buffering.
-    let (sender, receiver) = futures::channel::mpsc::channel::<RecordBatch>(1);
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<RecordBatch>(1);
     let session = session.clone();
     let path_for_task = path.clone();
 
@@ -663,7 +666,8 @@ fn start_file_writer(
                 )
             })?;
 
-        let stream = receiver.map(|rb| ArrayRef::from_arrow(rb, false));
+        let stream = futures::stream::poll_fn(move |cx| receiver.poll_recv(cx))
+            .map(|rb| ArrayRef::from_arrow(rb, false));
         let stream_adapter = ArrayStreamAdapter::new(dtype, stream);
 
         let summary = session
@@ -681,7 +685,11 @@ fn start_file_writer(
         Ok(summary)
     });
 
-    ActiveFileWriter { path, sender, task }
+    ActiveFileWriter {
+        path,
+        sender: Some(sender),
+        task,
+    }
 }
 
 async fn cleanup_failed_write(
@@ -724,7 +732,11 @@ async fn send_batch_to_active_writer(
     let writer = active_writer
         .as_mut()
         .ok_or_else(|| exec_datafusion_err!("Missing active file writer for sink output"))?;
-    if writer.sender.send(batch).await.is_ok() {
+    let sender = writer
+        .sender
+        .as_ref()
+        .ok_or_else(|| exec_datafusion_err!("Vortex file writer channel already closed"))?;
+    if sender.send(batch).await.is_ok() {
         return Ok(());
     }
     let writer = active_writer
@@ -742,7 +754,9 @@ async fn send_batch_to_active_writer(
 }
 
 async fn finish_file_writer(mut writer: ActiveFileWriter) -> DFResult<WriteSummary> {
-    writer.sender.close_channel();
+    // Dropping the last sender closes the channel; the writer task then
+    // finalizes the file and returns its summary.
+    drop(writer.sender.take());
     match writer.task.await {
         Ok(result) => result,
         Err(e) => Err(exec_datafusion_err!(
@@ -1255,14 +1269,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_finish_file_writer_waits_for_task_completion() -> anyhow::Result<()> {
-        let (sender, receiver) = futures::channel::mpsc::channel::<RecordBatch>(1);
+        let (sender, receiver) = tokio::sync::mpsc::channel::<RecordBatch>(1);
         drop(receiver);
 
         let (gate_tx, gate_rx) = oneshot::channel::<()>();
 
         let writer = ActiveFileWriter {
             path: object_store::path::Path::from("table/pending.vortex"),
-            sender,
+            sender: Some(sender),
             task: tokio::spawn(async move {
                 let _ = gate_rx.await;
                 Err(exec_datafusion_err!(
