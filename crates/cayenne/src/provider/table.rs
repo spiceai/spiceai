@@ -155,11 +155,12 @@ use arc_swap::ArcSwap;
 
 const POST_WRITE_MAINTENANCE_DEBOUNCE: Duration = Duration::from_millis(100);
 const OBJECT_STORE_MOVE_CONCURRENCY: usize = 16;
-/// How long [`CayenneTableProvider::evolve_schema_live`] waits for in-flight
+/// How long [`CayenneTableProvider::evolve_schema_live`] and
+/// [`CayenneTableProvider::promote_warm_to_cold`] wait for in-flight
 /// pipelined Stage-B publishes (staged WALs + staged inline tombstones) to
 /// drain before giving up. Stage-B finalizes normally complete within
 /// milliseconds; the timeout only guards against a wedged background task.
-const SCHEMA_EVOLUTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const STAGED_WRITE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default intra-write encode-shard count for an unsorted write when no per-table
 /// `cayenne_write_concurrency` is configured. Deliberately small — NOT the host
 /// core count: the value is sized per table in isolation, so a high default makes
@@ -2134,7 +2135,7 @@ impl CayenneTableProvider {
     /// Returns an error when the plan's evolved schema is not a widening of
     /// the live schema (including any primary-key column change — typed PK
     /// row-encodings cannot be widened in place), when in-flight staged writes
-    /// fail to drain within [`SCHEMA_EVOLUTION_DRAIN_TIMEOUT`], or when a
+    /// fail to drain within [`STAGED_WRITE_DRAIN_TIMEOUT`], or when a
     /// flush/metastore step fails.
     pub async fn evolve_schema_live(&self, plan: &WideningPlan) -> Result<()> {
         let current = self.table_schema();
@@ -2168,7 +2169,7 @@ impl CayenneTableProvider {
 
         // Step 2: drain Stage-B publishes. They complete without `write_lock`
         // (visibility lock + listing fence only), and no new ones can start.
-        let drain_deadline = Instant::now() + SCHEMA_EVOLUTION_DRAIN_TIMEOUT;
+        let drain_deadline = Instant::now() + STAGED_WRITE_DRAIN_TIMEOUT;
         while self.has_inflight_staging_appends()
             || self.pending_inline_tombstones.load(Ordering::Acquire) > 0
         {
@@ -13923,6 +13924,25 @@ impl CayenneTableProvider {
 
         // Exclude writers for the whole graduation (mirrors begin_overwrite).
         let _write_guard = self.write_lock_arc().lock_owned().await;
+
+        // Drain in-flight pipelined Stage-B publishes before capturing the
+        // visible set (same discipline as `evolve_schema_live`). Stage-A has
+        // already written the staged snapshot's durable sequence row and acked
+        // the source slot, but its rows become visible only after Stage-B
+        let drain_deadline = Instant::now() + STAGED_WRITE_DRAIN_TIMEOUT;
+        while self.has_inflight_staging_appends()
+            || self.pending_inline_tombstones.load(Ordering::Acquire) > 0
+        {
+            if Instant::now() >= drain_deadline {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    "Datalake promotion skipped: in-flight staged writes did not drain in time; next tick retries"
+                );
+                return Ok(false);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         // Flush the in-RAM mem tier + inline into durable so the canonical visible
         // read below captures the whole live set.

@@ -530,7 +530,7 @@ async fn flush_warm(table: &CayenneTableProvider) {
 }
 
 // ============================================================================
-// Concurrent scan vs promotion (F1 regression)
+// Concurrent scan vs promotion (double-count regression)
 // ============================================================================
 
 /// Concurrent `COUNT(*)` hammer: tasks that scan `table` in a tight loop until
@@ -599,7 +599,7 @@ impl ScanHammer {
 
 test_with_backends!(test_cold_tier_concurrent_scan_during_promotion_impl);
 
-/// F1 regression: a cold promotion has TWO visibility publication points — the
+/// Double-count regression: a cold promotion has TWO visibility publication points — the
 /// metastore cold-manifest commit (the cold scan branch lists files straight
 /// from the metastore) and the in-memory warm snapshot flip. Before the fix
 /// they published at different times, so a scan racing the gap paired the OLD
@@ -1227,6 +1227,12 @@ async fn test_cold_tier_bake_preserves_cold_masking_tombstones_impl(
         "pre-bake: upserted cold-resident keys are masked, not duplicated"
     );
 
+    // Complete detached post-write maintenance before the bake: the bake
+    // `try_lock`s the compaction lock and DECLINES (returns false) if a
+    // maintenance pass from the last flush is still holding it
+    table.flush_pending_maintenance().await?;
+    table.drain_in_flight_maintenance().await?;
+
     // Run the REAL seq-prefix bake (the production pass that pruned the
     // cold-masking tombstones before the fix).
     let baked = table.bake_seq_prefix_protected_snapshots().await?;
@@ -1355,6 +1361,225 @@ async fn test_cold_tier_cdc_upserts_concurrent_with_promotion_impl(
         collect_pairs(&ctx, "SELECT id, value FROM cdc_race_t WHERE id = 7").await?,
         vec![(7, 700 + generation)],
         "the last generation's value wins"
+    );
+
+    Ok(())
+}
+
+// ============================================================================
+// Promotion vs pipelined Stage-B finalize
+// ============================================================================
+
+/// Build the standard cold-tier table options plus the exact routing that
+/// forces `write_cdc_append_stream` onto the staged pipelined branch —
+/// non-partitioned, PK + upsert, `cdc_durability: file`, `inline_max_rows: 0`.
+/// On that shape Stage-A stages the batch durably and returns a `CdcWrite`
+/// whose `finish()` is the real Stage-B publish.
+fn staged_pipelined_table_options(
+    fixture: &common::TestFixture,
+    table_name: &str,
+    schema: &Arc<Schema>,
+    cold_dir: &std::path::Path,
+) -> CreateTableOptions {
+    let mut options = cold_table_options_with_conflict(
+        fixture,
+        table_name,
+        schema,
+        cold_dir,
+        300_000,
+        Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
+    );
+    options.vortex_config.cdc_durability = CdcDurability::File;
+    options.vortex_config.inline_max_rows = 0;
+    options
+}
+
+/// (id, id * 2) rows for `range` as a single batch.
+fn id_range_batch(schema: &Arc<Schema>, range: std::ops::Range<i64>) -> TestResult<RecordBatch> {
+    let ids: Vec<i64> = range.collect();
+    let values: Vec<i64> = ids.iter().map(|i| i * 2).collect();
+    Ok(RecordBatch::try_new(
+        Arc::clone(schema),
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(Int64Array::from(values)),
+        ],
+    )?)
+}
+
+test_with_backends!(test_cold_tier_promotion_preserves_pending_stage_b_impl);
+
+/// A pipelined Stage-A-committed / Stage-B-pending write must survive a
+/// concurrent cold-tier promotion.
+async fn test_cold_tier_promotion_preserves_pending_stage_b_impl(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let cold_dir = fixture.temp_dir.path().join("cold");
+    std::fs::create_dir_all(&cold_dir)?;
+
+    let options = staged_pipelined_table_options(&fixture, "stage_b_t", &schema, &cold_dir);
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    let table =
+        Arc::new(CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?);
+    ctx.register_table("stage_b_t", Arc::clone(&table) as Arc<dyn TableProvider>)?;
+
+    // 1. Seed + settle so the warm tier has a durable file (promotion fires).
+    insert_id_range(&table, &schema, 0..100).await?;
+    flush_warm(&table).await;
+
+    // 2. Stage-A: staged pipelined write, Stage-B held open.
+    let write = table
+        .write_cdc_append_stream(
+            batch_to_stream(id_range_batch(&schema, 100..110)?),
+            &ctx.task_ctx(),
+        )
+        .await?;
+    // Load-bearing precondition: a future routing change (inlining default-on,
+    // a new fast path) could silently divert the batch to a completed write and
+    // the test would pass while testing nothing.
+    assert!(
+        write.has_pending_finalize(),
+        "repro precondition: batch must take the staged pipelined path \
+         (non-partitioned, file durability, inline_max_rows: 0)"
+    );
+
+    // 3. Promotion starts with Stage-B pending. It must drain the staged
+    //    publish before capturing the visible set, so `finish()` is spawned
+    //    (it completes during the drain — Stage-B needs only the visibility
+    //    lock + listing fence, which promotion does not hold at that point).
+    let finish_task = tokio::spawn(write.finish());
+    let promoted = table.promote_warm_to_cold().await?;
+    assert!(promoted, "promotion fires with a durable warm file");
+
+    // 4. Stage-B publish completed (either before the promotion's capture or
+    //    during its drain — never lost).
+    finish_task.await??;
+
+    // 5. Rows 100..110 must be visible now AND after reopen from a fresh
+    //    catalog connection (the loss manifests at restart).
+    assert_eq!(
+        row_count(&ctx, "stage_b_t").await?,
+        110,
+        "a Stage-B publish concurrent with a promotion must not lose the staged rows"
+    );
+    assert_eq!(
+        collect_pairs(&ctx, "SELECT id, value FROM stage_b_t WHERE id >= 100").await?,
+        (100..110).map(|i| (i, i * 2)).collect::<Vec<_>>(),
+        "the staged batch is visible after its Stage-B publish"
+    );
+
+    let catalog2 = Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+    catalog2.init().await?;
+    let ctx2 = SessionContext::new();
+    let reopened = Arc::new(
+        CayenneTableProviderBuilder::new(
+            Arc::clone(&catalog2) as Arc<dyn MetadataCatalog>,
+            ctx2.runtime_env(),
+        )
+        .open("stage_b_t")
+        .await?,
+    );
+    ctx2.register_table("stage_b_t", Arc::clone(&reopened) as Arc<dyn TableProvider>)?;
+    assert_eq!(
+        row_count(&ctx2, "stage_b_t").await?,
+        110,
+        "the staged batch survives a restart (source slot was acked at Stage-A — \
+         losing it here is silent, unrecoverable loss)"
+    );
+    assert_eq!(
+        collect_pairs(&ctx2, "SELECT id, value FROM stage_b_t WHERE id >= 100").await?,
+        (100..110).map(|i| (i, i * 2)).collect::<Vec<_>>(),
+        "the staged batch's rows are intact after restart"
+    );
+
+    Ok(())
+}
+
+test_with_backends!(test_cold_tier_promotion_racing_stage_b_finalize_impl);
+
+/// Concurrent variant: `finish()` (Stage-B publish) and the promotion run
+/// concurrently (`tokio::join!`), repeated so the publish lands at different
+/// points inside the promotion — a cheap deterministic sweep of the window.
+async fn test_cold_tier_promotion_racing_stage_b_finalize_impl(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let cold_dir = fixture.temp_dir.path().join("cold");
+    std::fs::create_dir_all(&cold_dir)?;
+
+    let options = staged_pipelined_table_options(&fixture, "stage_b_race_t", &schema, &cold_dir);
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    let table =
+        Arc::new(CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?);
+    ctx.register_table(
+        "stage_b_race_t",
+        Arc::clone(&table) as Arc<dyn TableProvider>,
+    )?;
+
+    let mut expected: i64 = 0;
+    for iter in 0..10i64 {
+        // Fresh warm data each round so the promotion trigger fires again.
+        let base = iter * 1000;
+        insert_id_range(&table, &schema, base..base + 50).await?;
+        flush_warm(&table).await;
+        expected += 50;
+
+        let write = table
+            .write_cdc_append_stream(
+                batch_to_stream(id_range_batch(&schema, base + 500..base + 510)?),
+                &ctx.task_ctx(),
+            )
+            .await?;
+        assert!(
+            write.has_pending_finalize(),
+            "repro precondition (iteration {iter}): batch must take the staged pipelined path"
+        );
+        expected += 10;
+
+        let (finished, promoted) = tokio::join!(write.finish(), table.promote_warm_to_cold());
+        finished?;
+        assert!(promoted?, "promotion fires on iteration {iter}");
+
+        assert_eq!(
+            row_count(&ctx, "stage_b_race_t").await?,
+            expected,
+            "iteration {iter}: a Stage-B publish racing the promotion must not lose rows"
+        );
+    }
+
+    // The loss manifests at restart (the source slot was acked at Stage-A).
+    let catalog2 = Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+    catalog2.init().await?;
+    let ctx2 = SessionContext::new();
+    let reopened = Arc::new(
+        CayenneTableProviderBuilder::new(
+            Arc::clone(&catalog2) as Arc<dyn MetadataCatalog>,
+            ctx2.runtime_env(),
+        )
+        .open("stage_b_race_t")
+        .await?,
+    );
+    ctx2.register_table(
+        "stage_b_race_t",
+        Arc::clone(&reopened) as Arc<dyn TableProvider>,
+    )?;
+    assert_eq!(
+        row_count(&ctx2, "stage_b_race_t").await?,
+        expected,
+        "every staged batch survives a restart"
     );
 
     Ok(())
