@@ -5061,17 +5061,13 @@ impl CayenneTableProvider {
         // regardless of `target_partitions` (see `snapshot_shard_count`).
         //
         // Delta writes additionally resolve a `cayenne_delta_encoding` level:
-        // small fresh deltas encode with a light scheme set (skipping the
+        // under `auto` every delta encodes with a light scheme set (skipping the
         // per-file BtrBlocks strategy search + FSST training that dominate
-        // small-write encode cost) and are re-encoded properly when compaction
-        // folds them. Maintenance writes (compaction, rewrites, overwrites)
-        // always use the full default strategy. See `provider::delta_encoding`.
-        let encoding_level = super::delta_encoding::effective_level(
-            self.context.delta_encoding(),
-            write_class,
-            estimated_bytes,
-            target_size_bytes,
-        );
+        // encode cost) and is re-encoded properly when compaction folds it.
+        // Maintenance writes (compaction, rewrites, overwrites) always use the
+        // full default strategy. See `provider::delta_encoding`.
+        let encoding_level =
+            super::delta_encoding::effective_level(self.context.delta_encoding(), write_class);
         let write_format = match super::delta_encoding::strategy_builder_for_level(encoding_level) {
             Some(strategy) => self.context.write_format_with_strategy(
                 strategy,
