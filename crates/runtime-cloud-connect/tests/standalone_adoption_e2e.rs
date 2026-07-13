@@ -482,8 +482,7 @@ impl RuntimeHandle for E2eRuntime {
             Field::new("id", DataType::Int64, false),
             Field::new("label", DataType::Utf8, false),
         ]);
-        let ids: Vec<i64> =
-            (0..i64::try_from(emit).expect("emit row count fits in i64")).collect();
+        let ids: Vec<i64> = (0..i64::try_from(emit).expect("emit row count fits in i64")).collect();
         let labels: Vec<String> = (0..emit).map(|i| format!("row-{i}")).collect();
         let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
         let batch = RecordBatch::try_new(
