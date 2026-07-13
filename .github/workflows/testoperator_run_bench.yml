@@ -124,6 +124,17 @@ jobs:
           - 5432:5432
         env:
           POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
+        # The image's entrypoint starts postgres, then imports the SF1 backup(s)
+        # in the background before touching this flag file; without a health
+        # check GH Actions considers the container ready as soon as it starts
+        # (no image HEALTHCHECK is defined), so the benchmark step would race
+        # spiced's connection attempts against the still-in-progress import.
+        options: >-
+          --health-cmd "test -f /var/lib/postgresql/data/data_loading_complete"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 60
+          --health-start-period 5s
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
