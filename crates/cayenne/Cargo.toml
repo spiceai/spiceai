@@ -47,7 +47,9 @@ telemetry = { path = "../telemetry" }
 tokio-rusqlite = { workspace = true }
 serde_json = { workspace = true }
 snafu = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }
+# "taskdump" is inert without RUSTFLAGS --cfg tokio_unstable (and Linux-only inside
+# tokio); it arms the TEMPORARY cold-promotion stall taskdump diagnostic.
+tokio = { workspace = true, features = ["rt-multi-thread", "fs", "taskdump"] }
 tracing = { workspace = true }
 turso = { workspace = true, optional = true }
 turso-shared = { workspace = true }
