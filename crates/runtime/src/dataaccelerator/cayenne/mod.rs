@@ -1350,23 +1350,23 @@ impl CayenneAccelerator {
             // and clamp consistently with the rest of the config surface.
             config.cold_target_file_size_mb = autotune::auto_or_usize(
                 acceleration,
-                &["cayenne_cold_target_file_size_mb"],
+                &["cayenne_datalake_target_file_size_mb"],
                 config.cold_target_file_size_mb,
             )
             .max(1);
             config.cold_tier_warm_max_bytes = autotune::auto_or_i64(
                 acceleration,
-                &["cayenne_cold_tier_warm_max_bytes"],
+                &["cayenne_datalake_warm_max_bytes"],
                 config.cold_tier_warm_max_bytes,
             );
             config.cold_tier_warm_max_files = autotune::auto_or_usize(
                 acceleration,
-                &["cayenne_cold_tier_warm_max_files"],
+                &["cayenne_datalake_warm_max_files"],
                 config.cold_tier_warm_max_files,
             );
             config.cold_tier_background_interval_ms = autotune::auto_or_u64(
                 acceleration,
-                &["cayenne_cold_tier_background_interval_ms"],
+                &["cayenne_datalake_promotion_interval_ms"],
                 config.cold_tier_background_interval_ms,
             );
             config.cold_tier_gc_interval_ms = autotune::auto_or_u64(
@@ -1391,27 +1391,26 @@ impl CayenneAccelerator {
                 )
                 .unwrap_or(i64::MAX);
                 tracing::info!(
-                    "Dataset '{table_name}': datalake promotion trigger defaulted to {} bytes. Set 'cayenne_cold_tier_warm_max_bytes' to override.",
+                    "Dataset '{table_name}': datalake promotion trigger defaulted to {} bytes. Set 'cayenne_datalake_warm_max_bytes' to override.",
                     config.cold_tier_warm_max_bytes
                 );
             }
             // The datalake (cold) tier requires key-based deletes: position
             // deletes are file-path scoped and cannot survive the warm→cold
-            // rewrite. Force key when the tier is enabled and a primary key
-            // exists (the engine additionally skips promotion for position-mode
-            // tables, so this keeps the tier from being silently inert — e.g.
-            // deletion_mode 'auto' resolves to 'position' for non-CDC tables).
+            // rewrite. An unresolved `auto` resolves to `key` here (otherwise
+            // it resolves to `position` for non-CDC tables and the tier is
+            // silently inert); an EXPLICIT `position` is left as-is and
+            // rejected with a structured error at registration
+            // (`validate_datalake_table_options`) — never silently overridden.
             // Must run AFTER cayenne_datalake_location is parsed above.
             if config.cold_tier_enabled()
                 && workload.has_primary_key
-                && config.deletion_mode != cayenne::metadata::DeletionMode::Key
+                && config.deletion_mode == cayenne::metadata::DeletionMode::Auto
             {
-                if config.deletion_mode == cayenne::metadata::DeletionMode::Position {
-                    tracing::warn!(
-                        "Dataset '{table_name}': the datalake tier (cayenne_datalake_location) requires key-based deletes; overriding cayenne_deletion_mode 'position' -> 'key'."
-                    );
-                }
                 config.deletion_mode = cayenne::metadata::DeletionMode::Key;
+                tracing::warn!(
+                    "Dataset '{table_name}': auto-resolved cayenne_deletion_mode to 'key' (the datalake tier requires key-based deletes)."
+                );
             }
 
             // Upload concurrency: `auto`/unset keeps the available-parallelism
@@ -2004,6 +2003,23 @@ impl CayenneAccelerator {
                 });
             }
         }
+        // Reject configurations that would leave the datalake tier silently
+        // inert or unsafe (explicit position deletes, disabled promotion/GC
+        // loops) and WARN on degraded ones (PK-less table → tier inactive,
+        // unknown clustering columns) — a diagnostic at registration beats a
+        // tier that never promotes with no explanation.
+        match validate_datalake_table_options(table_name, &table_options) {
+            Ok(warnings) => {
+                for warning in warnings {
+                    tracing::warn!("{warning}");
+                }
+            }
+            Err(message) => {
+                return Err(Error::InvalidConfiguration {
+                    detail: message.into(),
+                });
+            }
+        }
         // Datalake (cold) tier object store: built from the dedicated
         // `cayenne_datalake_s3_*` params (default `iam_role` auth falls back to environment/SDK credentials).
         let cold_object_store = if table_options.vortex_config.cold_tier_enabled()
@@ -2086,6 +2102,79 @@ impl CayenneAccelerator {
         }
         Ok(provider)
     }
+}
+
+/// Registration-time validation for datalake (cold) tier table options: the
+/// misconfigurations rejected here would otherwise leave the tier silently
+/// inert (a promoter that early-returns forever) or unsafe (a GC grace of
+/// zero). A no-op when the tier is disabled.
+///
+/// Returns `Err(message)` for configurations that must fail registration and
+/// `Ok(warnings)` for configurations that register but degrade — including a
+/// PK-less table, where the tier stays INACTIVE rather than failing (the
+/// dataset is fully serviceable from the warm tier, so a fleet-wide datalake
+/// location must not block PK-less datasets).
+/// Pure (no I/O, no logging) so each rule stays unit-testable.
+fn validate_datalake_table_options(
+    table_name: &str,
+    options: &cayenne::metadata::CreateTableOptions,
+) -> Result<Vec<String>, String> {
+    let vc = &options.vortex_config;
+    if !vc.cold_tier_enabled() {
+        return Ok(Vec::new());
+    }
+    let mut warnings = Vec::new();
+    if options.primary_key.is_empty() {
+        // Promotion classifies and rewrites cold files by primary key, and
+        // deletes against cold-resident rows are key-based, so the promoter
+        // early-returns for PK-less tables — the tier is configured but
+        // inactive. Warn loudly instead of failing registration.
+        warnings.push(format!(
+            "Dataset '{table_name}': 'cayenne_datalake_location' is set but the dataset has no primary key, so the datalake tier stays INACTIVE (data is never promoted and remains in the warm tier). Add 'primary_key' to the acceleration to activate it, or remove 'cayenne_datalake_location'."
+        ));
+    }
+    // Position deletes are file-path scoped and cannot survive the warm→cold
+    // rewrite; the engine skips promotion for position-mode tables. An
+    // explicit conflict is an error, not a silent override.
+    if vc.deletion_mode == cayenne::metadata::DeletionMode::Position {
+        return Err(format!(
+            "Failed to register dataset {table_name} (cayenne): the datalake tier requires key-based deletes, but 'cayenne_deletion_mode: position' is set. \
+            Set 'cayenne_deletion_mode: key' (or remove it), or remove 'cayenne_datalake_location'."
+        ));
+    }
+    // Default values quoted in the error hints, derived so they can never
+    // drift from the actual `VortexConfig` defaults.
+    let defaults = cayenne::metadata::VortexConfig::default();
+    // The promotion interval drives BOTH the promotion trigger and the
+    // physical GC loop; 0 means the background task is never spawned, so the
+    // tier never promotes and never reclaims superseded objects.
+    if vc.cold_tier_background_interval_ms == 0 {
+        return Err(format!(
+            "Failed to register dataset {table_name} (cayenne): 'cayenne_datalake_promotion_interval_ms' is 0, which disables the background promotion and garbage-collection loop — the datalake tier would never promote or reclaim objects. \
+            Set a positive interval (default {}), or remove 'cayenne_datalake_location'.",
+            defaults.cold_tier_background_interval_ms
+        ));
+    }
+    // The GC interval doubles as the orphan grace: 0 would let a superseded
+    // object be deleted while a running scan still reads it.
+    if vc.cold_tier_gc_interval_ms == 0 {
+        return Err(format!(
+            "Failed to register dataset {table_name} (cayenne): 'cayenne_datalake_gc_interval_ms' is 0, which collapses the garbage-collection grace period to zero — a superseded datalake object could be deleted while a running query still reads it. \
+            Set a positive interval (default {}), or remove 'cayenne_datalake_location'.",
+            defaults.cold_tier_gc_interval_ms
+        ));
+    }
+    // Unknown clustering columns are dropped by the engine at promotion time
+    // (falling back to sort columns, then the primary key) — surface the
+    // misconfiguration instead of silently clustering by something else.
+    for column in &vc.cold_clustering_columns {
+        if options.schema.column_with_name(column).is_none() {
+            warnings.push(format!(
+                "Dataset '{table_name}': 'cayenne_datalake_clustering_columns' entry '{column}' does not exist in the schema and is ignored; datalake clustering falls back to cayenne_sort_columns, then the primary key."
+            ));
+        }
+    }
+    Ok(warnings)
 }
 
 /// Build a [`NativeVectorIndex`] for each `FixedSizeList<Float32, N>` column in
@@ -2224,14 +2313,14 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Use unsigned payloads for datalake S3 uploads. Default: true.")
             .one_of(&["true", "false"])
             .default("true"),
-        ParameterSpec::component("cold_target_file_size_mb")
+        ParameterSpec::component("datalake_target_file_size_mb")
             .description("Target size for datalake (cold) tier Vortex files in MB. Larger than the warm cayenne_target_file_size_mb because object stores favor fewer, larger objects and cold scans are range reads. Default: 512."),
-        ParameterSpec::component("cold_tier_warm_max_bytes")
-            .description("The warm tier graduates to cold once its total Vortex bytes reach this threshold. 0 (default) disables the byte trigger; set with cold_tier_warm_max_files to bound warm-tier size."),
-        ParameterSpec::component("cold_tier_warm_max_files")
-            .description("The warm tier graduates to cold once its Vortex file count reaches this threshold. 0 (default) disables the file-count trigger."),
-        ParameterSpec::component("cold_tier_background_interval_ms")
-            .description("How often the background loop evaluates the warm→cold promotion trigger. Cold tiering is not latency-critical, so this is coarser than compaction. Default: 60000 (60s)."),
+        ParameterSpec::component("datalake_warm_max_bytes")
+            .description("The warm tier graduates to the datalake once its total Vortex bytes reach this threshold. Pairs with cayenne_datalake_warm_max_files; 0 disables the byte trigger, but when BOTH triggers are 0/unset this one defaults to 16 x cayenne_datalake_target_file_size_mb."),
+        ParameterSpec::component("datalake_warm_max_files")
+            .description("The warm tier graduates to the datalake once its Vortex file count reaches this threshold. 0 (default) disables the file-count trigger; when cayenne_datalake_warm_max_bytes is also 0/unset, the byte trigger defaults to 16 x cayenne_datalake_target_file_size_mb."),
+        ParameterSpec::component("datalake_promotion_interval_ms")
+            .description("How often the background loop evaluates the warm-to-datalake promotion trigger. Default: 60000 (60s)."),
         ParameterSpec::component("datalake_gc_interval_ms")
             .description("Physical-GC cadence and orphan grace for superseded datalake objects: the background sweep runs about this often and deletes an object no longer referenced by the manifest only once it has been observed orphaned for at least this long (so an in-flight scan has a full interval to finish). Default: 300000 (5min)."),
         ParameterSpec::component("sort_columns")
@@ -4559,6 +4648,122 @@ mod tests {
         )
         .await;
         assert_eq!(config.deletion_mode, cayenne::metadata::DeletionMode::Auto);
+    }
+
+    fn datalake_test_options(
+        primary_key: Vec<String>,
+        vortex_config: cayenne::metadata::VortexConfig,
+    ) -> cayenne::metadata::CreateTableOptions {
+        cayenne::metadata::CreateTableOptions {
+            table_name: "dl_t".to_string(),
+            schema: Arc::new(arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+                arrow_schema::Field::new("value", arrow_schema::DataType::Int64, false),
+            ])),
+            primary_key,
+            on_conflict: None,
+            base_path: "/tmp/dl_t".to_string(),
+            partition_column: None,
+            vortex_config,
+        }
+    }
+
+    fn datalake_enabled_config() -> cayenne::metadata::VortexConfig {
+        cayenne::metadata::VortexConfig {
+            cold_tier_location: Some("s3://bucket/prefix".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_validate_datalake_disabled_tier_is_silent() {
+        let options = datalake_test_options(vec![], cayenne::metadata::VortexConfig::default());
+        let warnings = validate_datalake_table_options("dl_t", &options)
+            .expect("disabled tier validates cleanly");
+        assert!(warnings.is_empty(), "disabled tier emits no warnings");
+    }
+
+    #[test]
+    fn test_validate_datalake_valid_config_is_silent() {
+        let options = datalake_test_options(vec!["id".to_string()], datalake_enabled_config());
+        let warnings = validate_datalake_table_options("dl_t", &options)
+            .expect("well-formed datalake config validates cleanly");
+        assert!(warnings.is_empty(), "well-formed config emits no warnings");
+    }
+
+    #[test]
+    fn test_validate_datalake_warns_pk_less_table_tier_inactive() {
+        let options = datalake_test_options(vec![], datalake_enabled_config());
+        let warnings = validate_datalake_table_options("dl_t", &options)
+            .expect("a PK-less datalake table registers (tier inactive), it must not fail");
+        assert_eq!(warnings.len(), 1, "exactly the inactive-tier warning");
+        assert!(
+            warnings[0].contains("INACTIVE"),
+            "unexpected warning: {}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn test_validate_datalake_rejects_explicit_position_deletes() {
+        let config = cayenne::metadata::VortexConfig {
+            deletion_mode: cayenne::metadata::DeletionMode::Position,
+            ..datalake_enabled_config()
+        };
+        let options = datalake_test_options(vec!["id".to_string()], config);
+        let error = validate_datalake_table_options("dl_t", &options)
+            .expect_err("explicit position deletes must fail registration");
+        assert!(
+            error.contains("cayenne_deletion_mode: position"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_validate_datalake_rejects_zero_promotion_interval() {
+        let config = cayenne::metadata::VortexConfig {
+            cold_tier_background_interval_ms: 0,
+            ..datalake_enabled_config()
+        };
+        let options = datalake_test_options(vec!["id".to_string()], config);
+        let error = validate_datalake_table_options("dl_t", &options)
+            .expect_err("promotion interval 0 must fail registration");
+        assert!(
+            error.contains("cayenne_datalake_promotion_interval_ms"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_validate_datalake_rejects_zero_gc_interval() {
+        let config = cayenne::metadata::VortexConfig {
+            cold_tier_gc_interval_ms: 0,
+            ..datalake_enabled_config()
+        };
+        let options = datalake_test_options(vec!["id".to_string()], config);
+        let error = validate_datalake_table_options("dl_t", &options)
+            .expect_err("GC interval 0 must fail registration");
+        assert!(
+            error.contains("cayenne_datalake_gc_interval_ms"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_validate_datalake_warns_on_unknown_clustering_column() {
+        let config = cayenne::metadata::VortexConfig {
+            cold_clustering_columns: vec!["id".to_string(), "no_such_column".to_string()],
+            ..datalake_enabled_config()
+        };
+        let options = datalake_test_options(vec!["id".to_string()], config);
+        let warnings = validate_datalake_table_options("dl_t", &options)
+            .expect("unknown clustering column is a warning, not an error");
+        assert_eq!(warnings.len(), 1, "exactly the unknown column is flagged");
+        assert!(
+            warnings[0].contains("no_such_column"),
+            "unexpected warning: {}",
+            warnings[0]
+        );
     }
 
     #[tokio::test]

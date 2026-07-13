@@ -36,6 +36,7 @@ use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::error::DataFusionError;
+use datafusion::execution::cache::file_statistics_cache::DefaultFileStatisticsCache;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::physical_plan::empty::EmptyExec;
@@ -1228,14 +1229,25 @@ pub trait ListingTableConnector: DataConnector {
             .with_schema(final_schema);
 
         // This shouldn't error because we're passing the schema and options correctly.
-        let table =
-            ListingTable::try_new(config)
-                .boxed()
-                .context(crate::dataconnector::InternalSnafu {
-                    dataconnector: format!("{self}"),
-                    connector_component: ConnectorComponent::from(dataset),
-                    code: "LTC-RP-LTTN".to_string(), // ListingTableConnector-ReadProvider-ListingTableTryNew
-                })?;
+        //
+        // Attach a file-statistics cache. With `collect_stat = true` (the
+        // DataFusion default), resolving a scan's statistics parses every
+        // file's Parquet footer; without a cache, `ListingTable` re-parses all
+        // footers on every plan. That makes stat-only queries (e.g. an
+        // unfiltered `COUNT(*)`, which the `AggregateStatistics` rule answers
+        // purely from statistics) scale linearly with file count on each query.
+        // The stock DataFusion `CREATE EXTERNAL TABLE` path wires this same
+        // cache; we mirror it so per-file footer stats are reused across
+        // queries. The cache invalidates per file on `ObjectMeta` change, so
+        // refreshing datasets still pick up new data.
+        let table = ListingTable::try_new(config)
+            .boxed()
+            .context(crate::dataconnector::InternalSnafu {
+                dataconnector: format!("{self}"),
+                connector_component: ConnectorComponent::from(dataset),
+                code: "LTC-RP-LTTN".to_string(), // ListingTableConnector-ReadProvider-ListingTableTryNew
+            })?
+            .with_cache(Some(Arc::new(DefaultFileStatisticsCache::default())));
 
         // For S3 single-file datasets with acceleration enabled, wrap with a caching layer
         // that checks ETag/Version ID to skip unnecessary re-fetches when file hasn't changed.
