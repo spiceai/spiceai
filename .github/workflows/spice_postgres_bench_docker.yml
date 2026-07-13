@@ -35,7 +35,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y git make gcc
 
       - name: Initialize TPCH data
-        working-directory: ./test/tpch
+        working-directory: ./test/tpc-bench
         run: |
           make tpch-init
           export PGPASSWORD='postgres'
@@ -58,8 +58,8 @@ jobs:
       - name: Build and push Docker image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
-          context: ./test/tpch/postgres-bench
-          file: ./test/tpch/postgres-bench/Dockerfile
+          context: ./test/tpc-bench/postgres-bench
+          file: ./test/tpc-bench/postgres-bench/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
