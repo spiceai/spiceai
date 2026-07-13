@@ -71,6 +71,14 @@ pub(crate) struct ColdFilePartition {
     /// Provably untouched by every tombstone — carried forward by manifest
     /// reference.
     pub clean: Vec<ColdTierFile>,
+    /// Tombstoned keys the split was computed against (observability only).
+    pub tombstones: usize,
+    /// Clean files excluded by their min/max rectangle alone (no tombstone
+    /// inside the bounds).
+    pub cleared_by_min_max: usize,
+    /// Clean files a tombstone's rectangle contained but every bloom probe
+    /// rejected — rewrites avoided purely by the bloom refinement.
+    pub cleared_by_bloom: usize,
 }
 
 /// Decode `RowConverter`-encoded tombstone keys into row-major
@@ -190,6 +198,9 @@ pub(crate) fn partition_cold_files(
         return ColdFilePartition {
             dirty: Vec::new(),
             clean: cold_files,
+            tombstones: 0,
+            cleared_by_min_max: 0,
+            cleared_by_bloom: 0,
         };
     }
     // A misaligned probe set can't be trusted — degrade to rectangle-only
@@ -198,29 +209,55 @@ pub(crate) fn partition_cold_files(
 
     let mut dirty = Vec::new();
     let mut clean = Vec::new();
+    let mut cleared_by_min_max = 0usize;
+    let mut cleared_by_bloom = 0usize;
     for file in cold_files {
         let bounds = pk_bounds_from_manifest(&file, schema, pk_indices);
         let mut bloom = LazyBloom::Unparsed(probes.and(file.pk_bloom.as_deref()));
+        // Which test did the excluding: `rect_hit` records whether any
+        // tombstone survived the rectangle, so a clean verdict is attributable
+        // to the rectangle (`!rect_hit`) or to the bloom refinement.
+        let mut rect_hit = false;
         let is_dirty = match (&bounds, probes) {
-            (Some(bounds), Some(probes)) => tombstone_keys
-                .iter()
-                .zip(probes.iter())
-                .any(|(key, probe)| key_within_bounds(key, bounds) && bloom.maybe_contains(probe)),
+            (Some(bounds), Some(probes)) => {
+                tombstone_keys
+                    .iter()
+                    .zip(probes.iter())
+                    .any(|(key, probe)| {
+                        let contained = key_within_bounds(key, bounds);
+                        rect_hit |= contained;
+                        contained && bloom.maybe_contains(probe)
+                    })
+            }
             (Some(bounds), None) => tombstone_keys
                 .iter()
                 .any(|key| key_within_bounds(key, bounds)),
             // No usable statistics → cannot prove clean by bounds; a bloom
             // (when present) can still clear the file on its own.
-            (None, Some(probes)) => probes.iter().any(|probe| bloom.maybe_contains(probe)),
+            (None, Some(probes)) => {
+                rect_hit = true; // no rectangle to credit
+                probes.iter().any(|probe| bloom.maybe_contains(probe))
+            }
             (None, None) => true,
         };
         if is_dirty {
             dirty.push(file);
         } else {
+            if rect_hit {
+                cleared_by_bloom += 1;
+            } else {
+                cleared_by_min_max += 1;
+            }
             clean.push(file);
         }
     }
-    ColdFilePartition { dirty, clean }
+    ColdFilePartition {
+        dirty,
+        clean,
+        tombstones: tombstone_keys.len(),
+        cleared_by_min_max,
+        cleared_by_bloom,
+    }
 }
 
 /// Extract the per-PK-column `[min, max]` bounds from a cold file's persisted
@@ -478,6 +515,12 @@ mod composite_key_tests {
             "only the o_id band containing the tombstones is dirty"
         );
         assert_eq!(clean, vec!["f1", "f3"], "sibling bands are provably clean");
+        assert_eq!(partition.tombstones, 2);
+        assert_eq!(
+            partition.cleared_by_min_max, 2,
+            "both clean files were excluded by rectangle alone"
+        );
+        assert_eq!(partition.cleared_by_bloom, 0);
     }
 
     #[test]
@@ -557,6 +600,11 @@ mod composite_key_tests {
         let clean: Vec<&str> = refined.clean.iter().map(|f| f.file_url.as_str()).collect();
         assert_eq!(dirty, vec!["f1"], "only the bloom-hit host file is dirty");
         assert_eq!(clean, vec!["f2"], "in-band but bloom-missed file is clean");
+        assert_eq!(
+            refined.cleared_by_bloom, 1,
+            "the clean verdict is attributed to the bloom, not the rectangle"
+        );
+        assert_eq!(refined.cleared_by_min_max, 0);
     }
 
     #[test]
