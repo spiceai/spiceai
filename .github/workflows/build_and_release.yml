@@ -232,10 +232,11 @@ jobs:
 
       # Default flavor - build both spiced and spice CLI together (runtime not built on Windows - use WSL)
       # Non-release builds include postgres-accel for benchmark testing
+      # TEMP (cold-hang diagnosis): tokio taskdump cfgs arm the promotion stall watchdog's async backtrace dumps on Linux
       - name: Build spiced and spice CLI
         if: contains(matrix.target.tags, 'default') && matrix.target.target_os != 'windows' && !matrix.target.is_tagged_release
         working-directory: bin/spiced
-        run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models,postgres-accel -p spiced -p spice --target-dir ../../target
+        run: RUSTFLAGS="${RUSTFLAGS} --cfg tokio_unstable --cfg tokio_taskdump" cargo build --profile ${{ env.RUST_PROFILE }} --features release,models,postgres-accel -p spiced -p spice --target-dir ../../target
 
       # Release builds exclude optional accelerators from the distributed binary
       - name: Build spiced and spice CLI (release)

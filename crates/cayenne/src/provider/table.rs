@@ -133,6 +133,7 @@ use parking_lot::{Mutex as ParkingMutex, RwLock};
 use roaring::RoaringBitmap;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
@@ -13696,13 +13697,95 @@ impl CayenneTableProvider {
     /// no append races the capture→write→commit and the generation fence is
     /// unnecessary. Heavy + infrequent (gated by the warm-size thresholds).
     ///
+    /// TEMPORARY DIAGNOSTIC (cold-promotion hang investigation; remove when
+    /// closed): drive a promotion pass and, if it does not complete within a
+    /// 10-minute window, capture a tokio task dump of the compaction runtime
+    /// and log every task's async backtrace. A parked, zero-CPU pipeline owns
+    /// no thread, so OS thread/stack dumps show nothing — the task dump is the
+    /// only way to see where the futures are suspended. Active only in builds
+    /// with `RUSTFLAGS="--cfg tokio_unstable --cfg tokio_taskdump"` on Linux;
+    /// everywhere else this is a plain passthrough.
+    async fn run_promotion_with_stall_taskdump<F>(&self, inner: F) -> Result<bool>
+    where
+        F: Future<Output = Result<bool>>,
+    {
+        #[cfg(all(tokio_unstable, tokio_taskdump, target_os = "linux"))]
+        {
+            const STALL_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+            const MAX_DUMPS: u32 = 2;
+            const MAX_TASKS_LOGGED: usize = 400;
+            const MAX_TRACE_CHARS: usize = 4000;
+            let mut inner = std::pin::pin!(inner);
+            let mut dumps_taken = 0u32;
+            loop {
+                match tokio::time::timeout(STALL_WINDOW, inner.as_mut()).await {
+                    Ok(result) => return result,
+                    Err(_elapsed) => {
+                        if dumps_taken >= MAX_DUMPS {
+                            continue;
+                        }
+                        dumps_taken += 1;
+                        tracing::warn!(
+                            target: "cayenne::compaction",
+                            table = self.table_metadata.table_name.as_str(),
+                            dumps_taken,
+                            "Cold-tier promotion pass made no completion within the stall window; capturing a tokio task dump of the compaction runtime"
+                        );
+                        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                            continue;
+                        };
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            handle.dump(),
+                        )
+                        .await
+                        {
+                            Ok(dump) => {
+                                for (task_idx, task) in
+                                    dump.tasks().iter().take(MAX_TASKS_LOGGED).enumerate()
+                                {
+                                    let mut trace =
+                                        task.trace().to_string().replace('\n', " | ");
+                                    trace.truncate(MAX_TRACE_CHARS);
+                                    tracing::warn!(
+                                        target: "cayenne::compaction",
+                                        task_idx,
+                                        trace = trace.as_str(),
+                                        "stall taskdump"
+                                    );
+                                }
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    target: "cayenne::compaction",
+                                    "stall taskdump timed out after 30s"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(not(all(tokio_unstable, tokio_taskdump, target_os = "linux")))]
+        {
+            inner.await
+        }
+    }
+
     /// Records promotion telemetry under `kind="datalake"`, mirroring the
     /// `kind="full"`/`"subset"` compaction passes: duration with a
     /// `completed`/`failed` result label for passes that promoted or failed
     /// (`Ok(false)` no-ops are not counted), plus the memory-exhausted counter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if flushing the mem/inline tiers, the canonical visible
+    /// read, the cold object-store write, or the atomic catalog commit fails.
     pub async fn promote_warm_to_cold(&self) -> Result<bool> {
         let pass_start = Instant::now();
-        let result = self.promote_warm_to_cold_inner().await;
+        let result = self
+            .run_promotion_with_stall_taskdump(self.promote_warm_to_cold_inner())
+            .await;
         if matches!(result, Ok(true) | Err(_)) {
             let table = self.table_metadata.table_name.clone();
             let result_label = if result.is_ok() {
