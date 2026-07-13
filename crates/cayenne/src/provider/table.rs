@@ -2167,20 +2167,18 @@ impl CayenneTableProvider {
         let started = Instant::now();
         let _write_guard = self.write_lock.lock().await;
 
-        // Step 2: drain Stage-B publishes. They complete without `write_lock`
-        // (visibility lock + listing fence only), and no new ones can start.
-        let drain_deadline = Instant::now() + STAGED_WRITE_DRAIN_TIMEOUT;
-        while self.has_inflight_staging_appends()
-            || self.pending_inline_tombstones.load(Ordering::Acquire) > 0
+        // Step 2: drain Stage-B publishes. A timeout is an ERROR here (unlike
+        // the promotion pass, which just skips): schema evolution was
+        // explicitly requested and cannot be silently deferred.
+        if !self
+            .drain_inflight_staged_writes(STAGED_WRITE_DRAIN_TIMEOUT)
+            .await
         {
-            if Instant::now() >= drain_deadline {
-                return Err(Error::Internal {
-                    table: self.table_metadata.table_name.clone(),
-                    message: "Timed out draining in-flight staged writes before schema evolution"
-                        .to_string(),
-                });
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            return Err(Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: "Timed out draining in-flight staged writes before schema evolution"
+                    .to_string(),
+            });
         }
 
         // Step 3: flush. `checkpoint_mem_tier` requires `mem_checkpoint_lock`
@@ -2311,6 +2309,27 @@ impl CayenneTableProvider {
 
     pub(crate) fn has_inflight_staging_appends(&self) -> bool {
         !self.inflight_staging_appends.lock().is_empty()
+    }
+
+    /// Wait for in-flight pipelined Stage-B publishes (staged WALs + staged
+    /// inline tombstones) to drain, up to `timeout`. Returns `false` on
+    /// timeout — the caller decides whether that is an error (schema
+    /// evolution) or a skipped pass (datalake promotion).
+    ///
+    /// Callers must hold `write_lock`: it blocks new Stage-A commits, so the
+    /// pending set can only shrink, while Stage-B needs only the visibility
+    /// lock + listing fence and therefore completes under the held lock.
+    pub(crate) async fn drain_inflight_staged_writes(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while self.has_inflight_staging_appends()
+            || self.pending_inline_tombstones.load(Ordering::Acquire) > 0
+        {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        true
     }
 
     pub(crate) fn staging_wal_present(&self) -> &AtomicBool {
@@ -13926,22 +13945,22 @@ impl CayenneTableProvider {
         let _write_guard = self.write_lock_arc().lock_owned().await;
 
         // Drain in-flight pipelined Stage-B publishes before capturing the
-        // visible set (same discipline as `evolve_schema_live`). Stage-A has
-        // already written the staged snapshot's durable sequence row and acked
-        // the source slot, but its rows become visible only after Stage-B
-        let drain_deadline = Instant::now() + STAGED_WRITE_DRAIN_TIMEOUT;
-        while self.has_inflight_staging_appends()
-            || self.pending_inline_tombstones.load(Ordering::Acquire) > 0
+        // visible set. Stage-A has already written the staged snapshot's
+        // durable sequence row and acked the source slot, but its rows become
+        // visible only at Stage-B — without the drain, the capture below
+        // misses the staged rows while the overwrite-clear commit deletes
+        // their sequence row: silent loss at restart. A timeout just SKIPS
+        // the pass — promotion is a background tick; the next one retries.
+        if !self
+            .drain_inflight_staged_writes(STAGED_WRITE_DRAIN_TIMEOUT)
+            .await
         {
-            if Instant::now() >= drain_deadline {
-                tracing::warn!(
-                    target: "cayenne::compaction",
-                    table = self.table_metadata.table_name.as_str(),
-                    "Datalake promotion skipped: in-flight staged writes did not drain in time; next tick retries"
-                );
-                return Ok(false);
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tracing::warn!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                "Datalake promotion skipped: in-flight staged writes did not drain in time; next tick retries"
+            );
+            return Ok(false);
         }
 
         // Flush the in-RAM mem tier + inline into durable so the canonical visible

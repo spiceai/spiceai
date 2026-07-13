@@ -268,7 +268,7 @@ async fn create_table(
             "cold fuzz configs require Mode::Key (promotion no-ops in position mode)"
         );
         let cold_dir = fixture.temp_dir.path().join(format!("cold_{name}"));
-        std::fs::create_dir_all(&cold_dir)?;
+        tokio::fs::create_dir_all(&cold_dir).await?;
         Some(format!("file://{}", cold_dir.to_string_lossy()))
     } else {
         None

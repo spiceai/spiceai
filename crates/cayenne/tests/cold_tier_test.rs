@@ -1421,7 +1421,7 @@ async fn test_cold_tier_promotion_preserves_pending_stage_b_impl(
         Field::new("value", DataType::Int64, false),
     ]));
     let cold_dir = fixture.temp_dir.path().join("cold");
-    std::fs::create_dir_all(&cold_dir)?;
+    tokio::fs::create_dir_all(&cold_dir).await?;
 
     let options = staged_pipelined_table_options(&fixture, "stage_b_t", &schema, &cold_dir);
     let catalog: Arc<dyn MetadataCatalog> =
@@ -1516,7 +1516,7 @@ async fn test_cold_tier_promotion_racing_stage_b_finalize_impl(
         Field::new("value", DataType::Int64, false),
     ]));
     let cold_dir = fixture.temp_dir.path().join("cold");
-    std::fs::create_dir_all(&cold_dir)?;
+    tokio::fs::create_dir_all(&cold_dir).await?;
 
     let options = staged_pipelined_table_options(&fixture, "stage_b_race_t", &schema, &cold_dir);
     let catalog: Arc<dyn MetadataCatalog> =
