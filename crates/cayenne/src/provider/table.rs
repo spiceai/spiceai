@@ -14321,6 +14321,19 @@ impl CayenneTableProvider {
         deletion_snapshot: PkDeletionSnapshot,
         pass: ProtectedSnapshotTierPassContext,
     ) -> Result<bool> {
+        // Observability for "is pipelining actually running concurrent tier
+        // merges": the guard's inc/dec brackets the ENTIRE rewrite+commit below
+        // (RAII, so every exit path — success, lost CAS, or an early `?`
+        // error — decrements exactly once). If cayenne_compaction_subset_inflight
+        // ever reads above the accelerated-table count, more than one tier is
+        // merging concurrently for a single table.
+        let table_dim = vec![telemetry::KeyValue::new(
+            "table",
+            self.table_metadata.table_name.clone(),
+        )];
+        telemetry::cayenne::track_compaction_subset_tier(&table_dim);
+        let _inflight_guard = telemetry::cayenne::SubsetInflightGuard::new(table_dim);
+
         let total_input_bytes: u64 = inputs.iter().map(|(_, _, b)| *b).sum();
         let largest_input_bytes = inputs.iter().map(|(_, _, b)| *b).max().unwrap_or(0);
         // Percent of selected bytes contributed by the single largest run,

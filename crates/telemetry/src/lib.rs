@@ -693,7 +693,7 @@ pub mod cayenne {
 
     use opentelemetry::KeyValue;
     use opentelemetry::global;
-    use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
+    use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, UpDownCounter};
 
     use super::{
         BYTES_HISTOGRAM_BUCKETS, CONTENTION_MS_HISTOGRAM_BUCKETS, CayenneAutotuneState,
@@ -981,6 +981,82 @@ pub mod cayenne {
         compaction_memory_exhausted().add(1, dimensions);
     }
 
+    static COMPACTION_SUBSET_TIER_TOTAL: OnceLock<Counter<u64>> = OnceLock::new();
+
+    /// Build-once accessor for the protected-snapshot tier-merge counter.
+    fn compaction_subset_tier_total() -> &'static Counter<u64> {
+        COMPACTION_SUBSET_TIER_TOTAL.get_or_init(|| {
+            operational_meter()
+                .u64_counter("cayenne_compaction_subset_tier_total")
+                .with_description(
+                    "Total protected-snapshot size-tier merges attempted (compact_protected_snapshot_tier calls). Incremented once PER TIER, not per pass — a pipelined pass merging N tiers concurrently increments this N times, so this is a finer count than the per-pass cayenne_compaction_duration_ms histogram.",
+                )
+                .with_unit("merges")
+                .build()
+        })
+    }
+
+    /// Counts one protected-snapshot tier-merge attempt (a single call to
+    /// `compact_protected_snapshot_tier`, whether reached via the single-tier
+    /// `compact_protected_snapshots_subset` path or a pipelined multi-tier pass).
+    /// `dimensions` should carry `table`.
+    pub fn track_compaction_subset_tier(dimensions: &[KeyValue]) {
+        compaction_subset_tier_total().add(1, dimensions);
+    }
+
+    static COMPACTION_SUBSET_INFLIGHT: OnceLock<UpDownCounter<i64>> = OnceLock::new();
+
+    /// Build-once accessor for the in-flight tier-merge gauge.
+    fn compaction_subset_inflight() -> &'static UpDownCounter<i64> {
+        COMPACTION_SUBSET_INFLIGHT.get_or_init(|| {
+            operational_meter()
+                .i64_up_down_counter("cayenne_compaction_subset_inflight")
+                .with_description(
+                    "Number of protected-snapshot tier merges (compact_protected_snapshot_tier) currently rewriting or committing, summed across all tables. If this ever reads above the accelerated-table count, more than one tier is merging concurrently for a single table — direct proof pipelined compaction (cayenne_compaction_max_concurrent_merges > 1) actually engaged, versus only the pre-existing cross-table fleet interleaving.",
+                )
+                .with_unit("merges")
+                .build()
+        })
+    }
+
+    /// Marks one protected-snapshot tier merge as started. Pair with
+    /// [`dec_compaction_subset_inflight`] around the rewrite + commit
+    /// (`compact_protected_snapshot_tier`) — prefer the RAII
+    /// [`SubsetInflightGuard`] over calling these directly so every exit path
+    /// (including an early `?`-propagated error) still decrements.
+    /// `dimensions` should carry `table`.
+    pub fn inc_compaction_subset_inflight(dimensions: &[KeyValue]) {
+        compaction_subset_inflight().add(1, dimensions);
+    }
+
+    /// Marks one protected-snapshot tier merge as finished (committed, lost its
+    /// catalog CAS, or errored).
+    pub fn dec_compaction_subset_inflight(dimensions: &[KeyValue]) {
+        compaction_subset_inflight().add(-1, dimensions);
+    }
+
+    /// RAII guard pairing [`inc_compaction_subset_inflight`] /
+    /// [`dec_compaction_subset_inflight`] so the gauge can never leak upward on
+    /// an early-return or `?`-propagated error inside a tier merge — construct
+    /// at the top of the merge and hold until it falls out of scope.
+    pub struct SubsetInflightGuard {
+        dimensions: Vec<KeyValue>,
+    }
+
+    impl SubsetInflightGuard {
+        #[must_use]
+        pub fn new(dimensions: Vec<KeyValue>) -> Self {
+            inc_compaction_subset_inflight(&dimensions);
+            Self { dimensions }
+        }
+    }
+
+    impl Drop for SubsetInflightGuard {
+        fn drop(&mut self) {
+            dec_compaction_subset_inflight(&self.dimensions);
+        }
+    }
+
     /// Register the Cayenne compaction instruments against the global meter so they
     /// appear in Prometheus `/metrics` from startup — and so the one-shot pool-size
     /// gauge binds to the real Prometheus meter rather than the early noop one.
@@ -994,6 +1070,8 @@ pub mod cayenne {
         // up at zero until the first compaction pass updates them.
         let _ = compaction_duration_ms();
         let _ = compaction_memory_exhausted();
+        let _ = compaction_subset_tier_total();
+        let _ = compaction_subset_inflight();
         // Publish the carved pool size against the real meter.
         compaction_memory_pool_bytes().record(compaction_pool_bytes, &[]);
     }
