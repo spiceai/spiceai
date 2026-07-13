@@ -27177,9 +27177,7 @@ mod tests {
         let replacement_bytes = replacement.get_array_memory_size() as u64;
         assert!(
             seed_bytes.saturating_add(replacement_bytes) >= cap,
-            "seed + replacement must exceed the cap (got {} + {} vs {cap})",
-            seed_bytes,
-            replacement_bytes
+            "seed + replacement must exceed the cap (got {seed_bytes} + {replacement_bytes} vs {cap})",
         );
         // Overwrite that would fit *after* replace must still fail while the old
         // tier is resident (peak = resident + incoming).
