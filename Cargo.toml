@@ -1,6 +1,6 @@
 [workspace]
 default-members = ["bin/spiced"]
-exclude = ["crates/data-connectors/connector-nfs", "crates/vendor/kanal"]
+exclude = ["crates/data-connectors/connector-nfs"]
 members = [
     "bin/spice/",
     "bin/spiced/",
@@ -400,13 +400,13 @@ flatbuffers = "25.2.10"
 # Vortex tagged releases publish version 0.1.0 in their Cargo.toml, not the actual release version,
 # so we specify git deps here directly. The [patch.crates-io] entries below exist to override
 # transitive vortex dependencies pulled in by other patched crates.
-vortex = { git = "https://github.com/spiceai/vortex.git", rev = "409505dfd09e60d34088c36ba12e3fea34bb394f" } # spiceai-54 (vortex 0.76.0)
-vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "409505dfd09e60d34088c36ba12e3fea34bb394f" } # spiceai-54 (vortex 0.76.0)
-vortex-btrblocks = { git = "https://github.com/spiceai/vortex.git", rev = "409505dfd09e60d34088c36ba12e3fea34bb394f" } # spiceai-54 (vortex 0.76.0)
+vortex = { git = "https://github.com/spiceai/vortex.git", rev = "7a778941d72054dd59ef6ac1a77778d457dd9f84" } # branch: spiceai-54-kanal-fix (vortex 0.76.0 + kanal master pin: async waker/state-reuse fixes)
+vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "7a778941d72054dd59ef6ac1a77778d457dd9f84" } # branch: spiceai-54-kanal-fix (vortex 0.76.0 + kanal master pin: async waker/state-reuse fixes)
+vortex-btrblocks = { git = "https://github.com/spiceai/vortex.git", rev = "7a778941d72054dd59ef6ac1a77778d457dd9f84" } # branch: spiceai-54-kanal-fix (vortex 0.76.0 + kanal master pin: async waker/state-reuse fixes)
 vortex-datafusion = { path = "crates/vortex" }
-vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "409505dfd09e60d34088c36ba12e3fea34bb394f" } # spiceai-54 (vortex 0.76.0)
-vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "409505dfd09e60d34088c36ba12e3fea34bb394f" } # spiceai-54 (vortex 0.76.0)
-vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "409505dfd09e60d34088c36ba12e3fea34bb394f" } # spiceai-54 (vortex 0.76.0)
+vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "7a778941d72054dd59ef6ac1a77778d457dd9f84" } # branch: spiceai-54-kanal-fix (vortex 0.76.0 + kanal master pin: async waker/state-reuse fixes)
+vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "7a778941d72054dd59ef6ac1a77778d457dd9f84" } # branch: spiceai-54-kanal-fix (vortex 0.76.0 + kanal master pin: async waker/state-reuse fixes)
+vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "7a778941d72054dd59ef6ac1a77778d457dd9f84" } # branch: spiceai-54-kanal-fix (vortex 0.76.0 + kanal master pin: async waker/state-reuse fixes)
 
 x509-certificate = "0.25.0"
 spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "93b75c3c7d1a812b23d00b45adf537d7a2415496" } # spiceai/spice-rs#77
@@ -442,16 +442,6 @@ inherits = "dev"
 lto = "off"
 
 [patch.crates-io]
-# kanal 0.1.1 + async waker fix (vendored; workspace-excluded). kanal 0.1.1's
-# SendFuture never re-registers a changed waker (the call is commented out) and
-# ReceiveFuture re-registers OUTSIDE the channel lock; under futures'
-# buffered()/buffer_unordered() (which give sub-futures their own waker) the
-# wake is then delivered to a STALE waker and the waiting side parks forever.
-# Vortex's file writer drives every segment/column through kanal
-# bounded_async(1) channels, so a cold-tier promotion could park permanently
-# while holding the table write_lock — blocking CDC apply and readiness.
-# Drop this patch when a fixed upstream release (> 0.1.1) ships.
-kanal = { path = "crates/vendor/kanal" }
 datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "3c74952f141055c29140bf50d210bbd90278880e" } # branch: spiceai-54
 datafusion-catalog = { git = "https://github.com/spiceai/datafusion.git", rev = "3c74952f141055c29140bf50d210bbd90278880e" }
 datafusion-catalog-listing = { git = "https://github.com/spiceai/datafusion.git", rev = "3c74952f141055c29140bf50d210bbd90278880e" }
@@ -551,9 +541,9 @@ arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a4037
 arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" } # branch: lukim/spiceai-58.3.0
 parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" }      # branch: lukim/spiceai-58.3.0
 
-vortex = { git = "https://github.com/spiceai/vortex.git", rev = "409505dfd09e60d34088c36ba12e3fea34bb394f" } # spiceai-54 (vortex 0.76.0)
-vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "409505dfd09e60d34088c36ba12e3fea34bb394f" } # spiceai-54 (vortex 0.76.0)
+vortex = { git = "https://github.com/spiceai/vortex.git", rev = "7a778941d72054dd59ef6ac1a77778d457dd9f84" } # branch: spiceai-54-kanal-fix (vortex 0.76.0 + kanal master pin: async waker/state-reuse fixes)
+vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "7a778941d72054dd59ef6ac1a77778d457dd9f84" } # branch: spiceai-54-kanal-fix (vortex 0.76.0 + kanal master pin: async waker/state-reuse fixes)
 vortex-datafusion = { path = "crates/vortex" }
-vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "409505dfd09e60d34088c36ba12e3fea34bb394f" } # spiceai-54 (vortex 0.76.0)
-vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "409505dfd09e60d34088c36ba12e3fea34bb394f" } # spiceai-54 (vortex 0.76.0)
-vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "409505dfd09e60d34088c36ba12e3fea34bb394f" } # spiceai-54 (vortex 0.76.0)
+vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "7a778941d72054dd59ef6ac1a77778d457dd9f84" } # branch: spiceai-54-kanal-fix (vortex 0.76.0 + kanal master pin: async waker/state-reuse fixes)
+vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "7a778941d72054dd59ef6ac1a77778d457dd9f84" } # branch: spiceai-54-kanal-fix (vortex 0.76.0 + kanal master pin: async waker/state-reuse fixes)
+vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "7a778941d72054dd59ef6ac1a77778d457dd9f84" } # branch: spiceai-54-kanal-fix (vortex 0.76.0 + kanal master pin: async waker/state-reuse fixes)
