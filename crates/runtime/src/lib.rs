@@ -1251,6 +1251,14 @@ impl Runtime {
         tls_config: Option<Arc<TlsConfig>>,
         endpoint_auth: EndpointAuth,
     ) -> Result<()> {
+        // Executors: mark cluster status Initializing before any await so a
+        // concurrent `load_components` cannot report ready from dataset-only
+        // status while task slots are still closed (Fix B for #11758).
+        if self.df.cluster_config.effective_role() == Some(ClusterRole::Executor) {
+            self.status
+                .update_cluster("executor", status::ComponentStatus::Initializing);
+        }
+
         Arc::clone(&self)
             .register_metrics_table(self.prometheus_registry.is_some())
             .await?;
