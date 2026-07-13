@@ -799,10 +799,10 @@ impl RuntimeStatus {
                 resolved.schema.to_string(),
                 resolved.table.to_string(),
             );
-            self.mark_ready(ComponentKey::dataset(&canonical));
+            self.mark_ready(&ComponentKey::dataset(&canonical));
         } else {
             for key in pending {
-                self.mark_ready(ComponentKey::dataset(&key));
+                self.mark_ready(&ComponentKey::dataset(&key));
             }
         }
 
