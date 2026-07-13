@@ -576,8 +576,7 @@ fn ready_lag_from_params(params: &Parameters) -> Result<Duration, StreamError> {
 fn invalid_checkpoint_behavior_from_params(
     params: &Parameters,
 ) -> Result<InvalidCheckpointBehavior, StreamError> {
-    if let Some(value) = optional_string(params, "replication_invalid_checkpoint_behavior")
-    {
+    if let Some(value) = optional_string(params, "replication_invalid_checkpoint_behavior") {
         let trimmed = value.trim();
         if !trimmed.is_empty() {
             return InvalidCheckpointBehavior::from_canonical(trimmed).ok_or_else(|| {
