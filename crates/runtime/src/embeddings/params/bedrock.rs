@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::parameters::ParameterSpec;
 
-const BEDROCK_PARAM_LEN: usize = 11;
+const BEDROCK_PARAM_LEN: usize = 14;
 
 pub const PARAMETERS: &[ParameterSpec] = &BEDROCK_PARAMETERS;
 
@@ -36,6 +36,12 @@ pub(crate) const BEDROCK_PARAMETERS: [ParameterSpec; BEDROCK_PARAM_LEN] = [
     ParameterSpec::runtime("aws_iam_role_source")
         .description("IAM role credential source. 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.")
         .one_of(&["auto", "metadata", "env"]),
+    ParameterSpec::runtime("aws_profile")
+        .description("The AWS profile name to use for credential resolution."),
+    ParameterSpec::runtime("requests_per_min_limit")
+        .description("Maximum number of Bedrock API requests per minute. Defaults to 1500."),
+    ParameterSpec::runtime("max_concurrent_invocations")
+        .description("Maximum number of concurrent Bedrock API invocations. Defaults to 50."),
     // Model-specific params — runtime (no prefix) to preserve backward compatibility with
     // pre-#10853 configs where these were bare keys.
     ParameterSpec::runtime("dimensions")

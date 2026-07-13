@@ -83,7 +83,7 @@ mod tests {
     async fn test_openai_params_roundtrip() {
         let params = build_params(
             &EmbeddingPrefix::OpenAi,
-            "openai_api_key: sk-test\nopenai_org_id: org-1\nopenai_project_id: proj-1\nendpoint: https://api.openai.com\nopenai_usage_tier: enterprise\n",
+            "openai_api_key: sk-test\nopenai_org_id: org-1\nopenai_project_id: proj-1\nendpoint: https://api.openai.com\nopenai_usage_tier: tier1\n",
         )
         .await;
         // Every key that embed.rs accesses for openai
@@ -151,7 +151,8 @@ mod tests {
             // AWS params (no prefix — runtime type)
             "aws_region: us-east-1\naws_access_key_id: AKIA\naws_secret_access_key: secret\naws_session_token: token\naws_iam_role_source: auto\n\
              # Titan/Nova model params\ndimensions: 256\nnormalize: true\n\
-             # Cohere/Nova truncation params\ntruncate_mode: END\ntruncate: END\ninput_type: classification\nembedding_purpose: storage\n",
+             # Cohere/Nova truncation params\ntruncate_mode: END\ntruncate: END\ninput_type: classification\nembedding_purpose: GENERIC_INDEX\n\
+             # Rate-limit and profile overrides\naws_profile: default\nrequests_per_min_limit: 1500\nmax_concurrent_invocations: 10\n",
         )
         .await;
         // AWS params consumed via get_runtime_params()
@@ -159,6 +160,9 @@ mod tests {
         assert!(runtime.contains_key("aws_region"), "aws_region missing from runtime params");
         assert!(runtime.contains_key("aws_access_key_id"), "aws_access_key_id missing from runtime params");
         assert!(runtime.contains_key("aws_secret_access_key"), "aws_secret_access_key missing from runtime params");
+        assert!(runtime.contains_key("aws_profile"), "aws_profile missing from runtime params");
+        assert!(runtime.contains_key("requests_per_min_limit"), "requests_per_min_limit missing from runtime params");
+        assert!(runtime.contains_key("max_concurrent_invocations"), "max_concurrent_invocations missing from runtime params");
         // Model-specific params accessed directly in embed.rs
         let _ = params.get("dimensions");
         let _ = params.get("normalize");
