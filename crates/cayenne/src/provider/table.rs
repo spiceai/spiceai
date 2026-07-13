@@ -2032,7 +2032,10 @@ fn select_protected_snapshot_merge_tiers(
 /// fence read — threaded through to [`Table::compact_protected_snapshot_tier`]
 /// purely so its log line stays comparable to the pre-pipelining
 /// single-merge-per-pass log (bundled in a struct rather than passed as loose
-/// fields to keep the method under the pedantic argument-count lint).
+/// fields to keep the method under the pedantic argument-count lint). `Copy`
+/// since every field is trivially copyable and the same context is shared,
+/// unmodified, across every concurrently-spawned tier merge from one pass.
+#[derive(Clone, Copy)]
 struct ProtectedSnapshotTierPassContext {
     pass_start: std::time::Instant,
     phase1_fence_ms: u128,
@@ -14599,6 +14602,272 @@ impl CayenneTableProvider {
         Ok(true)
     }
 
+    /// Public wrapper around [`Self::compact_protected_snapshots_pipelined_inner`]
+    /// with the same duration/failure telemetry contract as
+    /// [`Self::compact_protected_snapshots_subset`], tagged `kind="pipelined"` so
+    /// dashboards can tell a multi-tier pass apart from a single-tier one.
+    #[doc(hidden)]
+    pub async fn compact_protected_snapshots_pipelined(
+        &self,
+        max_inputs: usize,
+        max_merges: usize,
+    ) -> Result<bool> {
+        let pass_start = std::time::Instant::now();
+        let result = self
+            .compact_protected_snapshots_pipelined_inner(max_inputs, max_merges)
+            .await;
+
+        if matches!(result, Ok(true) | Err(_)) {
+            let table = self.table_metadata.table_name.clone();
+            let result_label = if result.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            };
+            telemetry::cayenne::track_compaction_duration(
+                pass_start.elapsed(),
+                &[
+                    telemetry::KeyValue::new("table", table.clone()),
+                    telemetry::KeyValue::new("kind", "pipelined"),
+                    telemetry::KeyValue::new("result", result_label),
+                ],
+            );
+            if matches!(
+                &result,
+                Result::Err(Error::DataFusion {
+                    source: DataFusionError::ResourcesExhausted(_)
+                })
+            ) {
+                telemetry::cayenne::track_compaction_memory_exhausted(&[
+                    telemetry::KeyValue::new("table", table),
+                    telemetry::KeyValue::new("kind", "pipelined"),
+                ]);
+            }
+        }
+
+        result
+    }
+
+    /// Run up to `max_merges` disjoint protected-snapshot size-tier merges
+    /// concurrently from ONE Phase-1 fence read, instead of the single
+    /// lowest-tier-per-pass path ([`Self::compact_protected_snapshots_subset`]).
+    /// Each concurrent merge draws its own `cayenne_write_concurrency` encode
+    /// permits from the process-global budget (see `write_budget`), so this is
+    /// what lets one table use more of an otherwise-idle encode pool per pass.
+    ///
+    /// Concurrency here is COOPERATIVE — `futures::future::join_all` over
+    /// `&self`-borrowing futures — not `spawn_compaction`-based: this method is
+    /// reached from [`super::compaction::CompactionRunner::run_compaction_trigger`],
+    /// which only receives `&self` (the provider keeps no persistent `Weak<Self>`
+    /// to upgrade for a `'static` spawn; the one that exists is a transient
+    /// spawn-time-only downgrade in `spawn_background_compaction`). This still
+    /// achieves real cross-core parallelism: the actual CPU work is already
+    /// offloaded per merge (`DataFusion`'s `collect()` inside `write_to_snapshot`
+    /// spawns one task per output shard), so `join_all` only needs to keep N
+    /// merges' outer futures alive long enough for their encode-permit
+    /// acquisitions and shard tasks to overlap — it doesn't need to provide the
+    /// parallelism itself.
+    ///
+    /// `compaction_lock` is still held for the whole pass (unchanged from the
+    /// single-tier path) — this only parallelizes the tiers WITHIN one held
+    /// pass; it does not let two independent triggers run concurrently against
+    /// the same table. That is a deliberate, conservative first cut: the
+    /// background compactor's own drain loop only ever has one
+    /// `run_compaction_trigger` in flight per table anyway (see
+    /// `MAX_DRAIN_PASSES_PER_WAKE`), so the primary goal — using more of the
+    /// encode-permit pool per pass — is achieved without removing the lock.
+    /// (Invariant 2 of the design — the catalog CAS in
+    /// `swap_protected_snapshots` is per-input-id, not whole-manifest — means
+    /// dropping the lock entirely would also be safe, just wastefully so today:
+    /// two overlapping triggers could still only have one winner per
+    /// overlapping id, the loser's rewrite discarded. Revisit if profiling ever
+    /// shows this lock itself, rather than tier-per-pass, is the bottleneck.)
+    ///
+    /// Key-delete tables only (invariant 3): position-delete tables fall back
+    /// to the single-tier serial path, matching
+    /// [`Self::compact_protected_snapshots_subset`] exactly.
+    async fn compact_protected_snapshots_pipelined_inner(
+        &self,
+        max_inputs: usize,
+        max_merges: usize,
+    ) -> Result<bool> {
+        // Defensive fallback, not the primary routing: `run_compaction_trigger`
+        // is expected to send position-delete tables to
+        // `compact_protected_snapshots_subset` directly, never here. If that
+        // routing is ever wrong, degrade to the single-tier path rather than
+        // silently skip the writer/visibility guards it depends on.
+        if self.should_capture_positions() || self.pk_deletion_strategy.is_position_based() {
+            tracing::warn!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                "compact_protected_snapshots_pipelined called for a position-delete table; \
+                 falling back to the single-tier path (callers should route position-delete \
+                 tables to compact_protected_snapshots_subset directly)"
+            );
+            return self.compact_protected_snapshots_subset_inner(max_inputs).await;
+        }
+
+        let Ok(_guard) = self.compaction_lock.try_lock() else {
+            tracing::trace!(
+                table = self.table_metadata.table_name.as_str(),
+                "Skipping pipelined protected-snapshot compaction: another pass already running",
+            );
+            return Ok(false);
+        };
+
+        let compaction_start = std::time::Instant::now();
+
+        // --- Phase 1: ONE short fence read for every tier this pass merges. ---
+        // Sharing one coherent (candidates, fence_max_delete_seq, deletion_snapshot)
+        // triple across every concurrently-spawned tier merge is what makes the
+        // tiers provably disjoint (see `select_protected_snapshot_merge_tiers`) —
+        // independent per-merge "pick the lowest tier" reads could otherwise race
+        // to claim the same runs.
+        let (candidates, fence_max_delete_seq, deletion_snapshot) = {
+            let _fence = self.listing_fence.read().await;
+            let protected = self.protected_snapshots.load_full();
+            if protected.len() < 2 {
+                return Ok(false);
+            }
+
+            // Protected snapshot ids are UUIDv7, so lexical order == creation
+            // order. Consider the oldest `max_inputs` (at least 2) snapshots.
+            let mut ids: Vec<String> = protected.keys().cloned().collect();
+            ids.sort();
+            let take = ids.len().min(max_inputs.max(2));
+            ids.truncate(take);
+
+            let candidates: Vec<(String, i64)> = ids
+                .into_iter()
+                .map(|id| {
+                    let threshold = protected.get(&id).copied().unwrap_or(0);
+                    (id, threshold)
+                })
+                .collect();
+
+            let deletion_snapshot = self.pk_deletion_snapshot();
+            let fence_max_delete_seq = self.protected_snapshot_merge_fence(
+                deletion_snapshot.max_sequence_number().unwrap_or(0),
+            );
+            (candidates, fence_max_delete_seq, deletion_snapshot)
+        };
+        let phase1_fence_ms = compaction_start.elapsed().as_millis();
+
+        // Per-input sizing, same as the single-tier path — diagnostic I/O
+        // outside the fence, shared across every tier this pass selects.
+        let sizing_start = std::time::Instant::now();
+        let mut sized_candidates: Vec<(String, i64, u64)> = Vec::with_capacity(candidates.len());
+        for (snapshot_id, threshold) in &candidates {
+            let bytes = match self.list_snapshot_files_with_sizes(snapshot_id).await {
+                Ok(files) => files.iter().map(|(_, sz)| *sz).sum(),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "cayenne::compaction",
+                        table = self.table_metadata.table_name.as_str(),
+                        snapshot_id = snapshot_id,
+                        "Failed to size protected-snapshot merge input for tiering: {e}"
+                    );
+                    0
+                }
+            };
+            sized_candidates.push((snapshot_id.clone(), *threshold, bytes));
+        }
+        let sizing_ms = sizing_start.elapsed().as_millis();
+
+        let min_runs = self.context.compaction_trigger_protected_snapshots().max(2);
+        let mut tiers = select_protected_snapshot_merge_tiers(
+            &sized_candidates,
+            min_runs,
+            PROTECTED_MERGE_MAX_WIDTH,
+            PROTECTED_TIER_BASE_BYTES,
+            PROTECTED_TIER_GROWTH,
+        );
+
+        if tiers.is_empty() {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                candidates = sized_candidates.len(),
+                min_runs,
+                tier_base_bytes = PROTECTED_TIER_BASE_BYTES,
+                "Skipping pipelined protected-snapshot compaction: no size tier has enough runs to merge"
+            );
+            return Ok(false);
+        }
+
+        // Lowest tiers first (same LSM leveling priority as the single-tier
+        // path — consolidate the smallest backlog first), capped at
+        // `max_merges`. Any tiers beyond the cap are simply left for the next
+        // pass rather than dropped: the next background wake re-reads and
+        // re-selects, so nothing here is lost, only deferred.
+        let total_qualifying_tiers = tiers.len();
+        tiers.truncate(max_merges.max(1));
+        let deferred_tiers = total_qualifying_tiers - tiers.len();
+        if deferred_tiers > 0 {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                deferred_tiers,
+                max_merges,
+                "More qualifying tiers than cayenne_compaction_max_concurrent_merges this pass; \
+                 remaining tiers deferred to a later pass"
+            );
+        }
+
+        let pass = ProtectedSnapshotTierPassContext {
+            pass_start: compaction_start,
+            phase1_fence_ms,
+            sizing_ms,
+            candidate_count: sized_candidates.len(),
+            min_runs,
+        };
+        let results = futures::future::join_all(tiers.into_iter().map(|tier| {
+            self.compact_protected_snapshot_tier(
+                tier,
+                fence_max_delete_seq,
+                deletion_snapshot.clone(),
+                pass,
+            )
+        }))
+        .await;
+
+        // Partial progress on error (invariant/acceptance criterion: one tier's
+        // ResourcesExhausted or catalog failure must not discard another tier's
+        // already-committed merge — disjoint inputs mean each result is fully
+        // independent). Report `Ok(true)` if ANY tier committed; otherwise
+        // surface the first error so the pass still reports failure the same
+        // way the single-tier path does, or `Ok(false)` if every tier simply
+        // had nothing to do (lost its CAS race, e.g.).
+        let mut committed = false;
+        let mut first_error = None;
+        for result in results {
+            match result {
+                Ok(true) => committed = true,
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        target: "cayenne::compaction",
+                        table = self.table_metadata.table_name.as_str(),
+                        error = %e,
+                        "One pipelined tier merge failed; other concurrent tiers still commit \
+                         independently"
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+            }
+        }
+
+        if committed {
+            Ok(true)
+        } else if let Some(e) = first_error {
+            Err(e)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Seq-prefix BAKE (Stage 2): consolidate the OLD protected snapshots that
     /// form a clean `max_sequence <= T` prefix — applying the deletion snapshot so
     /// the merged output holds only survivors — then PRUNE the in-memory deletion
@@ -24293,10 +24562,25 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
             return Ok(baked);
         }
 
-        let leveled = self
-            .compact_protected_snapshots_subset(usize::MAX)
+        // Key-delete tables can merge multiple disjoint size tiers in one pass
+        // (`compact_protected_snapshots_pipelined`, capped by
+        // `cayenne_compaction_max_concurrent_merges`, default 1 = today's
+        // single-tier behavior). Position-delete tables keep the single-tier
+        // path unchanged — their tombstones are file-path scoped and rely on
+        // the writer/visibility guards `compact_protected_snapshots_subset`
+        // takes (see `should_capture_positions`).
+        let leveled = if key_mode {
+            self.compact_protected_snapshots_pipelined(
+                usize::MAX,
+                self.context.compaction_max_concurrent_merges(),
+            )
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?
+        } else {
+            self.compact_protected_snapshots_subset(usize::MAX)
+                .await
+                .map_err(|e| e.to_string())?
+        };
         Ok(baked || leveled)
     }
 
@@ -32542,6 +32826,195 @@ mod tests {
              bake and reclaim more than the bake alone leaves: after_full={after_full} \
              should be < after_bake_only={after_bake_only}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Pipelined protected-snapshot compaction: concurrent disjoint tier merges.
+    // ------------------------------------------------------------------
+
+    /// Two concurrent [`CayenneTableProvider::compact_protected_snapshot_tier`]
+    /// calls over disjoint, real protected-snapshot inputs — sharing ONE
+    /// coherent Phase-1 fence (`fence_max_delete_seq` / `deletion_snapshot`),
+    /// exactly as [`CayenneTableProvider::compact_protected_snapshots_pipelined`]
+    /// drives them — must both commit independently with no lost/duplicated
+    /// rows and no spurious CAS abort.
+    ///
+    /// This is the direct test of the design's crux correctness invariant: the
+    /// catalog-side commit CAS (`swap_protected_snapshots` /
+    /// `cayenne_snapshot_sequence`) is keyed per-input-id, not a whole-manifest
+    /// version, so two concurrent merges touching disjoint id sets must not
+    /// invalidate each other's guard. If that CAS were ever changed to a
+    /// whole-manifest/epoch version, this test would start failing (one merge
+    /// losing its CAS and reporting `Ok(false)`) well before it could silently
+    /// regress in production.
+    #[tokio::test]
+    async fn concurrent_disjoint_tier_merges_both_commit_independently() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, ids) = build_seq_prefix_fixture(
+            "concurrent_tier_merges",
+            ctx.runtime_env(),
+            &[10, 20, 30, 40],
+        )
+        .await;
+        assert_eq!(ids.len(), 4, "fixture must produce exactly 4 snapshots");
+
+        // Partition the 4 real protected snapshots into two disjoint pairs —
+        // exactly what `select_protected_snapshot_merge_tiers` would hand back
+        // for two qualifying tiers, but constructed explicitly here so the
+        // test controls which ids land in which "tier" rather than depending
+        // on real on-disk byte-size boundaries.
+        let protected = provider.protected_snapshots.load_full();
+        let sized = |id: &str| -> (String, i64, u64) {
+            let threshold = protected.get(id).copied().unwrap_or(0);
+            (id.to_string(), threshold, 0)
+        };
+        let tier_a = vec![sized(&ids[0]), sized(&ids[1])];
+        let tier_b = vec![sized(&ids[2]), sized(&ids[3])];
+
+        // One coherent Phase-1 fence shared by both concurrent merges, matching
+        // `compact_protected_snapshots_pipelined_inner`'s single fence read.
+        let deletion_snapshot = provider.pk_deletion_snapshot();
+        let fence_max_delete_seq = provider
+            .protected_snapshot_merge_fence(deletion_snapshot.max_sequence_number().unwrap_or(0));
+        let pass = ProtectedSnapshotTierPassContext {
+            pass_start: std::time::Instant::now(),
+            phase1_fence_ms: 0,
+            sizing_ms: 0,
+            candidate_count: 4,
+            min_runs: 2,
+        };
+
+        let (result_a, result_b) = tokio::join!(
+            provider.compact_protected_snapshot_tier(
+                tier_a,
+                fence_max_delete_seq,
+                deletion_snapshot.clone(),
+                pass,
+            ),
+            provider.compact_protected_snapshot_tier(
+                tier_b,
+                fence_max_delete_seq,
+                deletion_snapshot.clone(),
+                pass,
+            )
+        );
+
+        assert!(
+            matches!(result_a, Ok(true)),
+            "tier A must commit, no spurious CAS abort from the concurrent tier B commit: {result_a:?}"
+        );
+        assert!(
+            matches!(result_b, Ok(true)),
+            "tier B must commit, no spurious CAS abort from the concurrent tier A commit: {result_b:?}"
+        );
+
+        // Final protected map = (all four originals removed) + (two new merged
+        // outputs) — disjoint RCU set-differences composing regardless of
+        // interleaving order.
+        let final_ids: std::collections::HashSet<String> =
+            provider.protected_snapshots.load_full().keys().cloned().collect();
+        assert_eq!(
+            final_ids.len(),
+            2,
+            "expected exactly 2 merged outputs (one per tier), got {final_ids:?}"
+        );
+        for original_id in &ids {
+            assert!(
+                !final_ids.contains(original_id),
+                "original input {original_id} must not survive the merge"
+            );
+        }
+
+        // Content-level check: all 4 originally-inserted rows (ids 0..4, one
+        // per seq, from `build_seq_prefix_fixture`) must still be present, none
+        // lost or duplicated by the concurrent commits.
+        let scan_ctx = SessionContext::new();
+        let plan = provider
+            .scan(&scan_ctx.state(), Some(&vec![0]), &[], None)
+            .await
+            .expect("scan plan");
+        let batches = datafusion_physical_plan::collect(plan, scan_ctx.task_ctx())
+            .await
+            .expect("collect rows");
+        let mut scanned_ids: Vec<i64> = Vec::new();
+        for batch in &batches {
+            let id_col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id column");
+            scanned_ids.extend(id_col.values().iter().copied());
+        }
+        scanned_ids.sort_unstable();
+        assert_eq!(
+            scanned_ids,
+            vec![0, 1, 2, 3],
+            "concurrent disjoint tier merges must preserve every row exactly once"
+        );
+    }
+
+    /// The actual orchestrator entry point,
+    /// [`CayenneTableProvider::compact_protected_snapshots_pipelined`], must
+    /// behave like [`CayenneTableProvider::compact_protected_snapshots_subset`]
+    /// when only one tier naturally qualifies (all inputs the same small
+    /// on-disk size) — the overwhelmingly common real-world case — including
+    /// when `max_merges` is set well above the number of tiers that actually
+    /// exist. This exercises the real Phase-1 fence read, sizing,
+    /// `select_protected_snapshot_merge_tiers` call, and `join_all` plumbing,
+    /// not just the underlying per-tier primitive
+    /// (`concurrent_disjoint_tier_merges_both_commit_independently` above).
+    #[tokio::test]
+    async fn pipelined_entry_point_merges_the_one_qualifying_tier() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, ids) = build_seq_prefix_fixture_with_config(
+            "pipelined_single_tier",
+            ctx.runtime_env(),
+            &[10, 20, 30, 40],
+            VortexConfig {
+                inline_max_rows: 0,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                compaction_trigger_protected_snapshots: 2,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        assert_eq!(ids.len(), 4);
+
+        // max_merges well above the 1 tier that actually qualifies — the
+        // pipelined path must not error or leave extra tiers half-processed
+        // when there simply aren't that many to run.
+        let committed = provider
+            .compact_protected_snapshots_pipelined(usize::MAX, 8)
+            .await
+            .expect("pipelined pass must succeed");
+        assert!(committed, "the single qualifying tier must merge");
+
+        let final_ids = provider.protected_snapshots.load_full();
+        assert_eq!(
+            final_ids.len(),
+            1,
+            "all 4 inputs merge into exactly 1 output when only one tier qualifies"
+        );
+
+        let scan_ctx = SessionContext::new();
+        let plan = provider
+            .scan(&scan_ctx.state(), Some(&vec![0]), &[], None)
+            .await
+            .expect("scan plan");
+        let batches = datafusion_physical_plan::collect(plan, scan_ctx.task_ctx())
+            .await
+            .expect("collect rows");
+        let mut scanned_ids: Vec<i64> = Vec::new();
+        for batch in &batches {
+            let id_col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id column");
+            scanned_ids.extend(id_col.values().iter().copied());
+        }
+        scanned_ids.sort_unstable();
+        assert_eq!(scanned_ids, vec![0, 1, 2, 3]);
     }
 
     // ------------------------------------------------------------------

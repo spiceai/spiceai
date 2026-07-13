@@ -1478,6 +1478,11 @@ impl CayenneAccelerator {
                 &["cayenne_compaction_max_files_per_pick"],
                 config.compaction_max_files_per_pick,
             );
+            config.compaction_max_concurrent_merges = autotune::auto_or_usize(
+                acceleration,
+                &["cayenne_compaction_max_concurrent_merges"],
+                config.compaction_max_concurrent_merges,
+            );
 
             config.inline_max_rows = autotune::auto_or_usize(
                 acceleration,
@@ -2163,8 +2168,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    62,
-    { S3_PARAMS_LEN + 62 },
+    63,
+    { S3_PARAMS_LEN + 63 },
 >(
     S3_PARAMETERS,
     [
@@ -2271,6 +2276,9 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("compaction_max_files_per_pick")
             .description("Maximum number of eligible file paths retained in one compaction candidate for trigger selection and observability. The current compactor rewrites the whole current snapshot once triggered, so this does not bound rewrite IO or memory. Default: 32.")
             .default("32"),
+        ParameterSpec::component("compaction_max_concurrent_merges")
+            .description("Maximum number of disjoint protected-snapshot size tiers a single key-delete compaction pass merges concurrently, instead of merging only the lowest qualifying tier. Each concurrent merge draws its own cayenne_write_concurrency encode permits from the process-global budget, so raising this lets a table use more of the encode pool per pass when write_concurrency is much smaller than the pool. Ignored for position-delete tables, which always merge one tier at a time. Default: 1 (0 is clamped to 1; today's single-tier-per-pass behavior).")
+            .default("1"),
         ParameterSpec::component("compaction_background_interval_ms")
             .description("Background compaction interval in milliseconds. The accelerator runs a per-table background task at this interval. Set to 0 to disable the background task — inline compaction on writes still runs. Default: 10000 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 30000 otherwise."),
         ParameterSpec::component("inline_max_rows")

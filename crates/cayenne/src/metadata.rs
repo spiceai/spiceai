@@ -820,6 +820,19 @@ pub struct VortexConfig {
     /// Defaults to 32.
     #[serde(default = "default_compaction_max_files_per_pick")]
     pub compaction_max_files_per_pick: usize,
+    /// Maximum number of disjoint protected-snapshot size tiers a single
+    /// key-delete compaction pass merges concurrently, instead of merging only
+    /// the lowest qualifying tier. Each concurrent merge draws its own
+    /// `cayenne_write_concurrency` encode permits from the process-global
+    /// budget, so raising this lets a table use more of the encode pool per
+    /// pass when `write_concurrency` is much smaller than the pool. Ignored
+    /// for position-delete tables (`should_capture_positions() == true`),
+    /// which always merge one tier at a time — their tombstones are file-path
+    /// scoped and rely on the single-tier writer/visibility guards.
+    ///
+    /// Defaults to 1 (today's single-tier-per-pass behavior; 0 is clamped to 1).
+    #[serde(default = "default_compaction_max_concurrent_merges")]
+    pub compaction_max_concurrent_merges: usize,
     /// Background compaction interval in milliseconds. The accelerator spawns a
     /// per-table background task that calls the compactor every interval. Set to
     /// 0 to disable the background task — inline compaction on writes still runs.
@@ -1190,6 +1203,10 @@ fn default_compaction_trigger_protected_snapshots() -> usize {
     8
 }
 
+fn default_compaction_max_concurrent_merges() -> usize {
+    1
+}
+
 fn default_compaction_trigger_snapshot_age_ms() -> u64 {
     300_000
 }
@@ -1413,6 +1430,7 @@ impl Default for VortexConfig {
             compaction_trigger_snapshot_age_ms: default_compaction_trigger_snapshot_age_ms(),
             compaction_max_levels: default_compaction_max_levels(),
             compaction_max_files_per_pick: default_compaction_max_files_per_pick(),
+            compaction_max_concurrent_merges: default_compaction_max_concurrent_merges(),
             compaction_background_interval_ms: default_compaction_background_interval_ms(),
             inline_max_rows: default_inline_max_rows(),
             inline_max_bytes: default_inline_max_bytes(),

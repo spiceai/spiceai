@@ -558,6 +558,14 @@ impl CayenneContext {
         self.config.compaction_trigger_protected_snapshots.max(1)
     }
 
+    /// Maximum disjoint protected-snapshot size tiers a single key-delete
+    /// compaction pass merges concurrently. Clamped to at least 1 (0 disables
+    /// pipelining, same as 1: one tier per pass, today's behavior).
+    #[must_use]
+    pub(crate) fn compaction_max_concurrent_merges(&self) -> usize {
+        self.config.compaction_max_concurrent_merges.max(1)
+    }
+
     /// Whether scans should resolve their file set from the per-snapshot
     /// manifest (`cayenne_snapshot_file`) rather than by listing the snapshot
     /// directory. Defaults to `false`; the scan falls back to directory listing

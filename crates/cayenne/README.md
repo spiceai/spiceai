@@ -278,6 +278,7 @@ pub struct VortexConfig {
     pub compaction_trigger_snapshot_age_ms: u64,        // small-write profile = 60_000, otherwise = 300_000; 0 disables age trigger
     pub compaction_max_levels: usize,                   // default 3
     pub compaction_max_files_per_pick: usize,           // default 32
+    pub compaction_max_concurrent_merges: usize,        // default 1 (single-tier-per-pass); key-delete tables only
     pub compaction_background_interval_ms: u64,         // small-write profile = 10_000, otherwise = 30_000; 0 disables background loop
 
     // Inline-write admission (per-call gate)
@@ -573,6 +574,7 @@ The runtime accelerator (`runtime/src/dataaccelerator/cayenne/mod.rs`) recognize
 | `cayenne_compaction_trigger_snapshot_age_ms`     | Protected-snapshot age trigger, 0 disables.                                                                                 | small = 60_000, otherwise = 300_000                                       |
 | `cayenne_compaction_max_levels`                  | Max consecutive compaction passes per trigger.                                                                              | `3`                                                                       |
 | `cayenne_compaction_max_files_per_pick`          | Files retained per candidate.                                                                                               | `32`                                                                      |
+| `cayenne_compaction_max_concurrent_merges`       | Disjoint protected-snapshot size tiers merged concurrently per pass (key-delete tables only).                              | `1`                                                                       |
 | `cayenne_compaction_background_interval_ms`      | Background compactor interval, 0 disables.                                                                                  | small = 10_000, otherwise = 30_000                                        |
 | `cayenne_inline_max_rows`                        | Per-write inline admission row cap, 0 disables.                                                                             | small = 1_024, otherwise = 0                                              |
 | `cayenne_inline_max_bytes`                       | Per-write inline admission IPC byte cap.                                                                                    | small = 1_048_576, otherwise = 0                                          |
