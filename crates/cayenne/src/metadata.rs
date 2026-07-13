@@ -831,6 +831,10 @@ pub struct VortexConfig {
     /// scoped and rely on the single-tier writer/visibility guards.
     ///
     /// Defaults to 1 (today's single-tier-per-pass behavior; 0 is clamped to 1).
+    /// Still experimental: settable per-table here, but also force-disabled
+    /// fleet-wide (regardless of this value) by the
+    /// `SPICE_CAYENNE_DISABLE_PIPELINED_COMPACTION` environment variable — see
+    /// `CayenneContext::compaction_max_concurrent_merges`.
     #[serde(default = "default_compaction_max_concurrent_merges")]
     pub compaction_max_concurrent_merges: usize,
     /// Background compaction interval in milliseconds. The accelerator spawns a

@@ -561,8 +561,33 @@ impl CayenneContext {
     /// Maximum disjoint protected-snapshot size tiers a single key-delete
     /// compaction pass merges concurrently. Clamped to at least 1 (0 disables
     /// pipelining, same as 1: one tier per pass, today's behavior).
+    ///
+    /// Force-disabled by the `SPICE_CAYENNE_DISABLE_PIPELINED_COMPACTION`
+    /// environment variable (any value), regardless of what any spicepod
+    /// configures — an operator kill switch for this still-experimental
+    /// feature that works fleet-wide without redeploying every affected
+    /// spicepod. Same escape-hatch pattern as `SPICE_CAYENNE_EAGER_NDV`
+    /// (`column_stats.rs`) and `SPICE_DISABLE_IMDS`
+    /// (`runtime/dataaccelerator/imds.rs`). Expected to be removed once
+    /// pipelined compaction is proven in production.
     #[must_use]
     pub(crate) fn compaction_max_concurrent_merges(&self) -> usize {
+        static DISABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            let disabled =
+                std::env::var_os("SPICE_CAYENNE_DISABLE_PIPELINED_COMPACTION").is_some();
+            if disabled {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    "Pipelined protected-snapshot compaction force-disabled via \
+                     SPICE_CAYENNE_DISABLE_PIPELINED_COMPACTION; ignoring any \
+                     cayenne_compaction_max_concurrent_merges > 1 in spicepod config",
+                );
+            }
+            disabled
+        });
+        if *DISABLED {
+            return 1;
+        }
         self.config.compaction_max_concurrent_merges.max(1)
     }
 
@@ -1101,3 +1126,4 @@ mod tests {
         );
     }
 }
+
