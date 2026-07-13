@@ -32,8 +32,10 @@ for sf in 1; do
     import_sql "$DB_NAME" "backup_${DB_NAME}.sql"
 done
 
-# Create a flag file to indicate data loading is complete
-touch /var/lib/postgresql/data/data_loading_complete
+# Create a flag file to indicate data loading is complete. /tmp is used
+# rather than PGDATA since its layout/location isn't guaranteed stable
+# across postgres image versions.
+touch /tmp/data_loading_complete
 
 # Wait for the original entrypoint script to finish
 wait
