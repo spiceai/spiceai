@@ -4906,6 +4906,25 @@ impl CayenneTableProvider {
             && !self.pk_deletion_strategy.is_position_based()
     }
 
+    /// Whether this table is a pure in-memory (`mode: memory`) accelerator: data
+    /// lives permanently in the RAM mem-tier (inline publishing is disabled), no
+    /// Vortex data files are ever written, and the durable drain (checkpoint/seal)
+    /// is disabled. Ephemeral — reloaded from source on restart; for CDC
+    /// (`changes`) the source slot is committed immediately after each in-RAM write
+    /// (there is no durable checkpoint to defer behind), which is safe because a
+    /// restart re-snapshots.
+    ///
+    /// This is the master switch for memory mode and is DISTINCT from
+    /// [`Self::is_cdc_memory_mode`] (a CDC-durability deferral that still drains to
+    /// durable Vortex and requires a primary key): memory mode covers ALL refresh
+    /// shapes (`full`/`append`/`changes`) and no-PK tables, and never drains.
+    /// Partitioned tables are excluded (their visibility flip can't be deferred).
+    #[must_use]
+    pub fn is_memory_resident_mode(&self) -> bool {
+        self.table_metadata.vortex_config.memory_mode
+            && self.table_metadata.partition_column.is_none()
+    }
+
     /// Number of PK-hash shards for the in-memory CDC tier (§2.3a). Default 1.
     /// The write path engages the per-shard validate+append fan-out only when this
     /// is > 1; at 1 every site behaves exactly as before.
@@ -18055,12 +18074,128 @@ impl CayenneTableProvider {
         if !self.mem_tier_per_table_cap_breached(incoming_bytes) {
             return Ok(());
         }
+        // Memory mode (`mode: memory`) never spills to disk — the mem-tier IS the
+        // permanent store — so a breach is a hard limit: reject the write with a
+        // structured error rather than checkpointing to Vortex (which memory mode
+        // does not do). The caller holds `write_lock`, so nothing regrows the tier
+        // between this check and the caller's append.
+        if self.is_memory_resident_mode() {
+            return Err(Error::MemTierLimitExceeded {
+                table: self.table_metadata.table_name.clone(),
+                limit_bytes: self.context.mem_tier_max_bytes_capped(),
+                resident_bytes: self.mem_tier.total_bytes(),
+                incoming_bytes,
+            });
+        }
         // The caller (the in-memory upsert/delete apply path) holds this table's
         // `write_lock`, so the checkpoint capture must NOT re-acquire it (tokio
         // mutexes are not reentrant). The apply has not yet fanned out its shard
         // appends at spill time, so the capture is already atomic regardless.
         self.checkpoint_mem_tier_holding_write_lock().await?;
         Ok(())
+    }
+
+    /// Memory-mode (`mode: memory`) hard RAM bound for the standard-DML write path
+    /// (full/append refresh). Memory mode never spills, so a breach returns a
+    /// structured error.
+    ///
+    /// Always counts **resident + incoming**: even a full-refresh overwrite keeps
+    /// the old tier in RAM until the atomic replace, so peak usage during buffering
+    /// (and until the swap) is resident + the new payload — not the final tier size
+    /// alone. Ignoring resident for overwrite would let a "fits after replace" write
+    /// OOM while both generations are live. A limit of `u64::MAX` (unset) disables
+    /// enforcement.
+    pub(crate) fn enforce_memory_limit(&self, incoming_bytes: u64) -> Result<()> {
+        let limit = self.context.mem_tier_max_bytes_capped();
+        if limit == u64::MAX {
+            return Ok(());
+        }
+        let resident = self.mem_tier.total_bytes();
+        if resident.saturating_add(incoming_bytes) >= limit {
+            return Err(Error::MemTierLimitExceeded {
+                table: self.table_metadata.table_name.clone(),
+                limit_bytes: limit,
+                resident_bytes: resident,
+                incoming_bytes,
+            });
+        }
+        Ok(())
+    }
+
+    /// Write `batches` into the RAM mem-tier for a `mode: memory` table via the
+    /// standard-DML (`full`/`append` refresh) path — the mem-tier is the permanent
+    /// store, so nothing is ever encoded to Vortex. `overwrite` (full refresh)
+    /// atomically REPLACES the tier; otherwise the batches are appended. Enforces
+    /// the hard RAM bound first (memory mode never spills). Returns the row count.
+    pub(crate) async fn write_batches_memory_mode(
+        &self,
+        batches: Vec<RecordBatch>,
+        incoming_bytes: u64,
+        overwrite: bool,
+    ) -> Result<u64> {
+        self.enforce_memory_limit(incoming_bytes)?;
+        if overwrite {
+            self.overwrite_mem_tier(batches, incoming_bytes).await
+        } else {
+            self.append_to_mem_tier(
+                batches,
+                &crate::provider::on_conflict::OnConflictDeletions::default(),
+                incoming_bytes,
+                0,
+            )
+            .await
+        }
+    }
+
+    /// Atomically REPLACE the entire RAM mem-tier with `batches` (memory-mode full
+    /// refresh). A single `ArcSwap` store per shard, so a concurrent scan captures
+    /// either the complete pre- or post-overwrite tier — never a partial or empty
+    /// view. Memory mode is single-shard (enforced by the accelerator's memory-mode
+    /// overrides), so this replaces shard 0 only.
+    async fn overwrite_mem_tier(
+        &self,
+        batches: Vec<RecordBatch>,
+        incoming_bytes: u64,
+    ) -> Result<u64> {
+        let incoming_rows: u64 = batches
+            .iter()
+            .map(|b| b.num_rows() as u64)
+            .fold(0, u64::saturating_add);
+        let arc_batches = Arc::new(batches);
+        // Full refresh replaces everything: no tombstones (empty deletions).
+        let mut tombstones = self.prepare_segment_tombstones(
+            &crate::provider::on_conflict::OnConflictDeletions::default(),
+        );
+
+        {
+            let _publish = self.mem_tier_publish_locks[0].lock().await;
+            // delete < data so fresh rows survive their own (empty) tombstones —
+            // matches the append path's sequence discipline.
+            let base_sequence = self.reserve_sequences_local(2).await?;
+            let (delete_sequence, data_sequence) = (base_sequence, base_sequence + 1);
+            tombstones.stamp(delete_sequence);
+            // retain_after(MAX) empties the current tier (version+1, epoch
+            // preserved); appending the fresh segment onto that (version+2) and
+            // storing ONCE makes the replace a single atomic swap.
+            let cur = self.mem_tier.shard(0).load();
+            let next = cur
+                .retain_after(usize::MAX)
+                .append_segment_with_source_position(
+                    Arc::clone(&arc_batches),
+                    data_sequence,
+                    tombstones,
+                    incoming_bytes,
+                    incoming_rows,
+                    0,
+                    None,
+                );
+            self.mem_tier.shard(0).store(Arc::new(next));
+            // Overwrite changes the entire visible set and invalidates every prior
+            // tombstone/visibility memo — drop them so the next scan rebuilds.
+            self.mem_tier_visible_memo.store(None);
+            self.merged_scan_deletions.store(None);
+        }
+        Ok(incoming_rows)
     }
 
     /// Global-budget twin of [`Self::spill_mem_tier_if_cap_breached`]: under
@@ -19009,6 +19144,11 @@ impl CayenneTableProvider {
     }
 
     async fn checkpoint_mem_tier_inner(&self, acquire_write_lock_for_capture: bool) -> Result<u64> {
+        // Memory mode (`mode: memory`) never checkpoints to Vortex — the mem-tier
+        // is the permanent in-RAM store, so this is a no-op.
+        if self.is_memory_resident_mode() {
+            return Ok(0);
+        }
         let checkpoint_start = Instant::now();
         // Capture the corpus to flush AND reserve this checkpoint's
         // snapshot_sequence ATOMICALLY under ALL shard `mem_tier_publish_locks`
@@ -19665,7 +19805,11 @@ impl CayenneTableProvider {
     /// it from the background tick via [`Self::seal_due`].
     #[doc(hidden)]
     pub async fn seal_mem_tier_durable(&self) -> Result<u64> {
-        if !self.is_cdc_memory_mode() {
+        // Memory mode (`mode: memory`) never seals to the durable inline corpus: the
+        // in-memory metastore is itself ephemeral (so the recovery shadow is
+        // pointless), and sealing advances the source slot — which would break the
+        // reload-from-source-on-restart contract. Data stays in the RAM mem-tier.
+        if !self.is_cdc_memory_mode() || self.is_memory_resident_mode() {
             return Ok(0);
         }
         let n = self.mem_tier.shard_count();
@@ -27004,6 +27148,217 @@ mod tests {
             scan_sorted_ids(&reopened2).await,
             vec![1, 2, 3, 4, 5],
             "checkpointed rows are durable across restart"
+        );
+    }
+
+    /// Memory mode (`mode: memory`): the standard-DML write path (`full`/`append`
+    /// refresh) routes batches into the RAM mem-tier — never Vortex — and a
+    /// full-refresh overwrite atomically REPLACES the tier. No primary key (the
+    /// common Arrow case), so this also exercises the position-based scan.
+    #[tokio::test]
+    async fn test_memory_mode_append_and_overwrite() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let runtime_env = SessionContext::new().runtime_env();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("init catalog");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let vortex_config = VortexConfig {
+            memory_mode: true,
+            ..VortexConfig::default()
+        };
+        let options = CreateTableOptions {
+            table_name: "mem_mode".to_string(),
+            schema,
+            primary_key: vec![], // no PK — the common Arrow (full/append) case
+            on_conflict: None,
+            base_path: data_dir.clone(),
+            partition_column: None,
+            vortex_config,
+        };
+        let provider = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .create(options)
+            .await
+            .expect("table created");
+        assert!(
+            provider.is_memory_resident_mode(),
+            "mode: memory must be active"
+        );
+
+        // Two appends land in the RAM tier and are immediately queryable.
+        let b1 = int64_id_batch(&[1, 2, 3]);
+        let bytes1 = b1.get_array_memory_size() as u64;
+        provider
+            .write_batches_memory_mode(vec![b1], bytes1, false)
+            .await
+            .expect("append 1");
+        let b2 = int64_id_batch(&[4, 5]);
+        let bytes2 = b2.get_array_memory_size() as u64;
+        provider
+            .write_batches_memory_mode(vec![b2], bytes2, false)
+            .await
+            .expect("append 2");
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1, 2, 3, 4, 5],
+            "both appends are visible in the RAM tier"
+        );
+
+        // A full-refresh overwrite atomically REPLACES the tier.
+        let b3 = int64_id_batch(&[10, 20, 30, 40]);
+        let bytes3 = b3.get_array_memory_size() as u64;
+        provider
+            .write_batches_memory_mode(vec![b3], bytes3, true)
+            .await
+            .expect("overwrite");
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![10, 20, 30, 40],
+            "overwrite replaced all prior rows"
+        );
+
+        // Memory mode must never write data files.
+        let data_file_count = std::fs::read_dir(&data_dir).map_or(0, |rd| {
+            rd.filter_map(std::result::Result::ok)
+                .filter(|e| e.path().is_file())
+                .count()
+        });
+        assert_eq!(
+            data_file_count, 0,
+            "memory mode must not write any Vortex data files"
+        );
+    }
+
+    /// Memory mode hard RAM bound (`cayenne_cdc_mem_tier_max_bytes`): a write that
+    /// would breach the per-table cap returns a structured `MemTierLimitExceeded`
+    /// error — never spilled to disk, never silently dropped.
+    #[tokio::test]
+    async fn test_memory_mode_ram_bound_errors() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let runtime_env = SessionContext::new().runtime_env();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db")).expect("catalog"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("init catalog");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let vortex_config = VortexConfig {
+            memory_mode: true,
+            // Tiny hard limit so a modest batch breaches it.
+            cdc_mem_tier_max_bytes: 64,
+            ..VortexConfig::default()
+        };
+        let options = CreateTableOptions {
+            table_name: "mem_bound".to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: format!("{}/data", temp_dir.path().to_str().expect("str")),
+            partition_column: None,
+            vortex_config,
+        };
+        let provider = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .create(options)
+            .await
+            .expect("table created");
+
+        // A batch far larger than the 64-byte cap must be rejected with the
+        // hard-limit error — not spilled to disk, not silently dropped.
+        let big = int64_id_batch(&(0..1000).collect::<Vec<_>>());
+        let bytes = big.get_array_memory_size() as u64;
+        assert!(
+            bytes > 64,
+            "batch ({bytes} bytes) must exceed the cap for the test to be meaningful"
+        );
+        let err = provider
+            .write_batches_memory_mode(vec![big], bytes, false)
+            .await
+            .expect_err("a write exceeding the memory limit must error");
+        assert!(
+            matches!(err, Error::MemTierLimitExceeded { .. }),
+            "expected MemTierLimitExceeded, got: {err:?}"
+        );
+    }
+
+    /// Overwrite still counts resident tier bytes: while buffering a full refresh
+    /// the old tier remains live, so peak RAM is resident + incoming (not just the
+    /// final post-replace size). A small overwrite that would fit after the swap
+    /// must still error if resident + incoming exceeds the hard cap.
+    #[tokio::test]
+    async fn test_memory_mode_overwrite_counts_resident_toward_limit() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let runtime_env = SessionContext::new().runtime_env();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db")).expect("catalog"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("init catalog");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        // Cap is sized after measuring the seed batch so one generation fits
+        // and two concurrent generations do not.
+        let seed = int64_id_batch(&(0..80).collect::<Vec<_>>());
+        let seed_bytes = seed.get_array_memory_size() as u64;
+        let cap = seed_bytes
+            .saturating_add(seed_bytes / 2)
+            .max(seed_bytes + 1);
+        let vortex_config = VortexConfig {
+            memory_mode: true,
+            cdc_mem_tier_max_bytes: i64::try_from(cap).expect("cap fits i64"),
+            ..VortexConfig::default()
+        };
+        let options = CreateTableOptions {
+            table_name: "mem_overwrite_bound".to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: format!("{}/data", temp_dir.path().to_str().expect("str")),
+            partition_column: None,
+            vortex_config,
+        };
+        let provider = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .create(options)
+            .await
+            .expect("table created");
+
+        assert!(
+            seed_bytes < cap,
+            "seed ({seed_bytes} bytes) must fit under the cap ({cap})"
+        );
+        provider
+            .write_batches_memory_mode(vec![seed], seed_bytes, false)
+            .await
+            .expect("seed write under cap");
+
+        let replacement = int64_id_batch(&(0..80).collect::<Vec<_>>());
+        let replacement_bytes = replacement.get_array_memory_size() as u64;
+        assert!(
+            seed_bytes.saturating_add(replacement_bytes) >= cap,
+            "seed + replacement must exceed the cap (got {seed_bytes} + {replacement_bytes} vs {cap})",
+        );
+        // Overwrite that would fit *after* replace must still fail while the old
+        // tier is resident (peak = resident + incoming).
+        let err = provider
+            .write_batches_memory_mode(vec![replacement], replacement_bytes, true)
+            .await
+            .expect_err("overwrite must count resident bytes toward the hard cap");
+        assert!(
+            matches!(err, Error::MemTierLimitExceeded { .. }),
+            "expected MemTierLimitExceeded, got: {err:?}"
         );
     }
 

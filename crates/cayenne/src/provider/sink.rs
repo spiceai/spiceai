@@ -153,6 +153,45 @@ impl DataSink for CayenneDataSink {
             }),
         ));
 
+        // Memory mode (`mode: memory`): all data lives in the RAM mem-tier, so
+        // collect the stream and route it there — an atomic replace on
+        // overwrite/full refresh, otherwise an append. Nothing is ever encoded to
+        // Vortex. The write lock serializes memory-mode writes so an overwrite never
+        // interleaves with a concurrent append.
+        if self.table.is_memory_resident_mode() {
+            let overwrite = self.overwrite == InsertOp::Overwrite;
+            let mut data = normalized;
+            let mut batches: Vec<arrow::record_batch::RecordBatch> = Vec::new();
+            let mut incoming_bytes: u64 = 0;
+            // Acquire the write lock BEFORE draining so memory-mode writes are
+            // serialized during buffering: two concurrent writes must not each buffer
+            // a large payload while both pass `enforce_memory_limit` against the same
+            // resident bytes, letting their combined footprint blow the RAM bound (and
+            // OOM) before either appends. Reads use `ArcSwap` (lock-free), so this only
+            // serializes writers.
+            let _write_guard = self.table.write_lock().lock().await;
+            while let Some(batch) = data.next().await {
+                let batch = batch?;
+                incoming_bytes =
+                    incoming_bytes.saturating_add(batch.get_array_memory_size() as u64);
+                // Enforce the hard RAM bound while buffering so an oversized refresh
+                // fails fast with a structured error instead of OOMing during
+                // collection (memory mode never spills). Always count resident +
+                // incoming: on overwrite the old tier stays live until the atomic
+                // replace, so peak is not just the final tier size. Holding the
+                // write lock makes this check reflect the only in-flight write.
+                self.table
+                    .enforce_memory_limit(incoming_bytes)
+                    .map_err(datafusion_common::DataFusionError::from)?;
+                batches.push(batch);
+            }
+            return self
+                .table
+                .write_batches_memory_mode(batches, incoming_bytes, overwrite)
+                .await
+                .map_err(Into::into);
+        }
+
         if self.overwrite == InsertOp::Overwrite {
             // Overwrite path: `CayenneTableProvider::begin_overwrite` acquires the
             // table write lock internally and the lock is held inside the

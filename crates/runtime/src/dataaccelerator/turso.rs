@@ -908,10 +908,18 @@ mod tests {
         let mut candidates = vec![db_path.to_path_buf()];
 
         if let (Some(parent), Some(file_name)) = (db_path.parent(), db_path.file_name()) {
-            for suffix in ["-wal", "-shm", "-journal"] {
+            // Turso may leave WAL/SHM/journal sidecars and an MVCC logical log.
+            // The MVCC log is often named `{stem}.db-log` even when the main
+            // file uses a `.turso` extension — clean both naming forms.
+            for suffix in ["-wal", "-shm", "-journal", "-log"] {
                 let mut sidecar = file_name.to_os_string();
                 sidecar.push(suffix);
                 candidates.push(parent.join(sidecar));
+            }
+            if let Some(stem) = db_path.file_stem() {
+                let mut db_log = stem.to_os_string();
+                db_log.push(".db-log");
+                candidates.push(parent.join(db_log));
             }
         }
 

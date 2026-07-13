@@ -474,14 +474,18 @@ impl<'a> AppendMutationWriter<'a> {
             ));
         }
 
-        // In-memory CDC durability mode: append the validated batch to the RAM
-        // tier and defer the source slot ack to a checkpoint, instead of
-        // persisting a per-batch durable BLOB. Gated to the key-based
-        // merge-on-read shape on a non-partitioned table (`is_cdc_memory_mode`) AND
-        // the runtime has armed deferral for a replayable source (`has_slot_advancer`);
-        // every other table/source keeps the durable path below, byte-identical.
-        let (mut prepared_stream, write_guard) = if self.table.is_cdc_memory_mode()
-            && self.table.has_slot_advancer()
+        // In-memory write path: append the validated batch to the RAM tier instead
+        // of persisting a per-batch durable BLOB. Taken when EITHER the table is a
+        // `mode: memory` accelerator (`is_memory_resident_mode` — the mem-tier is
+        // its permanent store) OR a key-based, non-partitioned CDC table
+        // (`is_cdc_memory_mode`) whose runtime has armed deferral for a replayable
+        // source (`has_slot_advancer`). The two differ in how the runtime acks the
+        // source slot: `mode: memory` never checkpoints, so the slot is committed
+        // immediately (nothing to defer behind); `cdc_durability: memory` defers the
+        // ack behind the covering durable checkpoint. Every other table/source keeps
+        // the durable path below, byte-identical.
+        let (mut prepared_stream, write_guard) = if self.table.is_memory_resident_mode()
+            || (self.table.is_cdc_memory_mode() && self.table.has_slot_advancer())
         {
             match self
                 .write_cdc_in_memory(prepared_stream, &post_validation, write_guard, write_start)
@@ -671,17 +675,21 @@ impl<'a> AppendMutationWriter<'a> {
         }
     }
 
-    /// In-memory CDC write path (`cdc_durability: memory`). Drains the validated
-    /// stream into RAM, computes the on-conflict tombstones in memory, and
-    /// appends to the mem tier — deferring the source slot ack to a checkpoint —
-    /// with byte caps (per-table, plus a process-wide one when the runtime has
-    /// installed the global budget) that spill (and, under sustained overload,
-    /// fall back to the durable path) so the resident tier cannot grow without
-    /// bound. The caps bound the resident tier, not a single apply: each prepared
-    /// burst is still buffered fully in RAM before the cap is checked.
+    /// In-memory CDC write path, shared by `cdc_durability: memory` and
+    /// `mode: memory`. Drains the validated stream into RAM, computes the
+    /// on-conflict tombstones in memory, and appends to the mem tier (returning the
+    /// mem-tier epoch) under byte caps (per-table, plus a process-wide one when the
+    /// runtime has installed the global budget) that bound the resident tier.
     ///
-    /// PK conflict validation still runs (it populated `post_validation` as the
-    /// stream was prepared); only the per-batch DURABILITY is deferred.
+    /// The modes diverge on cap breach and slot ack. `cdc_durability: memory`
+    /// buffers the whole burst, then on breach spills the tier durable (and, under
+    /// sustained overload, falls back to the durable path), and the runtime DEFERS
+    /// the source slot ack behind the covering durable checkpoint. `mode: memory`
+    /// never checkpoints or spills: it enforces the RAM bound incrementally as the
+    /// burst is buffered — an oversized burst returns `MemTierLimitExceeded` before
+    /// it can allocate toward OOM — and the runtime commits the slot immediately.
+    /// PK conflict validation still runs either way (it populated `post_validation`
+    /// as the stream was prepared).
     async fn write_cdc_in_memory(
         &self,
         mut prepared_stream: SendableRecordBatchStream,
@@ -701,6 +709,20 @@ impl<'a> AppendMutationWriter<'a> {
             let batch = batch?;
             incoming_bytes = incoming_bytes.saturating_add(batch.get_array_memory_size() as u64);
             incoming_rows = incoming_rows.saturating_add(batch.num_rows() as u64);
+            // Memory mode never spills, so enforce the per-table RAM bound AS the
+            // burst is buffered: an oversized burst fails fast with the structured
+            // error instead of allocating the whole burst toward OOM before the
+            // post-drain check. `spill_mem_tier_if_cap_breached` errors (does not
+            // checkpoint) in memory mode; the cheap `mem_tier_per_table_cap_breached`
+            // pre-check keeps it off the hot path until the cap is actually breached.
+            // Non-memory CDC keeps buffering here and spills after the drain (below).
+            if self.table.is_memory_resident_mode()
+                && self.table.mem_tier_per_table_cap_breached(incoming_bytes)
+            {
+                self.table
+                    .spill_mem_tier_if_cap_breached(incoming_bytes)
+                    .await?;
+            }
             batches.push(batch);
         }
         drop(prepared_stream);
@@ -751,7 +773,13 @@ impl<'a> AppendMutationWriter<'a> {
             spill_result?;
         }
 
-        if !mem_tier_budget::try_reserve_bytes(incoming_bytes) {
+        // Memory mode never spills to the durable path — the per-table RAM bound
+        // above (`spill_mem_tier_if_cap_breached`, which errors in memory mode) is
+        // the sole limit, so skip the process-global budget reserve/wait/fallback
+        // (which could otherwise force the Vortex durable write memory mode forbids).
+        if !self.table.is_memory_resident_mode()
+            && !mem_tier_budget::try_reserve_bytes(incoming_bytes)
+        {
             let wait_start = Instant::now();
             let admitted = self.table.wait_for_budget_or_spill(incoming_bytes).await;
             record_cayenne_write_phase(self.table.table_name(), "inmemory_budget_wait", wait_start);
@@ -796,7 +824,10 @@ impl<'a> AppendMutationWriter<'a> {
         {
             Ok(epoch) => epoch,
             Err(e) => {
-                mem_tier_budget::release_bytes(incoming_bytes);
+                // Memory mode skipped the reservation above, so must not release.
+                if !self.table.is_memory_resident_mode() {
+                    mem_tier_budget::release_bytes(incoming_bytes);
+                }
                 return Err(e);
             }
         };
@@ -872,7 +903,13 @@ impl<'a> AppendMutationWriter<'a> {
             spill_result?;
         }
 
-        if !mem_tier_budget::try_reserve_bytes(incoming_bytes) {
+        // Memory mode never spills to the durable path — the per-table RAM bound
+        // above (`spill_mem_tier_if_cap_breached`, which errors in memory mode) is
+        // the sole limit, so skip the process-global budget reserve/wait/fallback
+        // (which could otherwise force the Vortex durable write memory mode forbids).
+        if !self.table.is_memory_resident_mode()
+            && !mem_tier_budget::try_reserve_bytes(incoming_bytes)
+        {
             let wait_start = Instant::now();
             let admitted = self.table.wait_for_budget_or_spill(incoming_bytes).await;
             record_cayenne_write_phase(self.table.table_name(), "inmemory_budget_wait", wait_start);
@@ -913,7 +950,10 @@ impl<'a> AppendMutationWriter<'a> {
         {
             Ok(apply) => apply,
             Err(e) => {
-                mem_tier_budget::release_bytes(incoming_bytes);
+                // Memory mode skipped the reservation above, so must not release.
+                if !self.table.is_memory_resident_mode() {
+                    mem_tier_budget::release_bytes(incoming_bytes);
+                }
                 return Err(e);
             }
         };

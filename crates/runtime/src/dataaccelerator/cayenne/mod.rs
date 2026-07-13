@@ -275,6 +275,14 @@ pub(crate) fn transform_schema_for_vortex(
 
 pub struct CayenneAccelerator {
     catalog: Arc<OnceCell<Arc<dyn cayenne::MetadataCatalog>>>,
+    /// Separate catalog for `mode: memory` (in-RAM) tables, backed by an in-memory
+    /// `SQLite` `memdb` metastore. File-mode and memory-mode tables cannot share one
+    /// metastore (memory-mode data must never touch disk), so memory tables use this.
+    memory_catalog: Arc<OnceCell<Arc<dyn cayenne::MetadataCatalog>>>,
+    /// Process-unique id for this accelerator instance, used to name the in-memory
+    /// `memdb` metastore so separate instances (e.g. per-test runtimes) never share
+    /// one in-memory database.
+    instance_id: u64,
     footer_cache_mb: Option<usize>,
     /// Shared semaphore that bounds the number of concurrent per-table
     /// background compactions across all Cayenne tables registered with this
@@ -725,6 +733,12 @@ fn fs_probe_path(path: &str) -> &str {
     }
 }
 
+/// Process-wide counter giving each [`CayenneAccelerator`] instance a unique id,
+/// used to name its in-memory (`memdb`) metastore so distinct instances never
+/// share one in-memory database.
+static CAYENNE_ACCELERATOR_INSTANCE_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 impl CayenneAccelerator {
     #[must_use]
     pub fn new() -> Self {
@@ -739,6 +753,9 @@ impl CayenneAccelerator {
         let compaction_semaphore = Arc::new(tokio::sync::Semaphore::new(permits));
         Self {
             catalog: Arc::new(OnceCell::new()),
+            memory_catalog: Arc::new(OnceCell::new()),
+            instance_id: CAYENNE_ACCELERATOR_INSTANCE_COUNTER
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             footer_cache_mb,
             compaction_semaphore,
             compaction_permits_total: permits,
@@ -1816,6 +1833,35 @@ impl CayenneAccelerator {
         Ok(path_buf)
     }
 
+    /// Lazily initialize a Cayenne catalog into `cell` from `connection_string`,
+    /// sharing the init/`OnceCell` machinery between the file-mode and memory-mode
+    /// catalog getters.
+    async fn init_cayenne_catalog(
+        cell: &OnceCell<Arc<dyn cayenne::MetadataCatalog>>,
+        connection_string: String,
+    ) -> Result<Arc<dyn cayenne::MetadataCatalog>> {
+        cell.get_or_try_init(move || {
+            let connection_string = connection_string;
+            async move {
+                let catalog = Arc::new(
+                    cayenne::CayenneCatalog::new(connection_string)
+                        .boxed()
+                        .context(AccelerationInitializationFailedSnafu)?,
+                ) as Arc<dyn cayenne::MetadataCatalog>;
+
+                catalog
+                    .init()
+                    .await
+                    .boxed()
+                    .context(AccelerationInitializationFailedSnafu)?;
+
+                Ok::<Arc<dyn cayenne::MetadataCatalog>, Error>(catalog)
+            }
+        })
+        .await
+        .map(Arc::clone)
+    }
+
     async fn get_or_create_catalog(
         &self,
         metadata_dir: &str,
@@ -1825,28 +1871,52 @@ impl CayenneAccelerator {
             "turso" => format!("libsql://{metadata_dir}/cayenne.db"),
             _ => format!("sqlite://{metadata_dir}/cayenne.db"), // Default to SQLite
         };
+        Self::init_cayenne_catalog(&self.catalog, connection_string).await
+    }
 
-        self.catalog
-            .get_or_try_init(move || {
-                let connection_string = connection_string;
-                async move {
-                    let catalog = Arc::new(
-                        cayenne::CayenneCatalog::new(connection_string)
-                            .boxed()
-                            .context(AccelerationInitializationFailedSnafu)?,
-                    ) as Arc<dyn cayenne::MetadataCatalog>;
+    /// Get or create the shared in-memory (`memdb`) catalog for `mode: memory`
+    /// tables. The DSN uses `SQLite`'s `memdb` VFS keyed by this accelerator's
+    /// instance id, so the metastore lives entirely in RAM (nothing on disk) and
+    /// distinct accelerator instances stay isolated.
+    async fn get_or_create_memory_catalog(&self) -> Result<Arc<dyn cayenne::MetadataCatalog>> {
+        let connection_string =
+            format!("sqlite://file:/cayenne-mem-{}?vfs=memdb", self.instance_id);
+        Self::init_cayenne_catalog(&self.memory_catalog, connection_string).await
+    }
 
-                    catalog
-                        .init()
-                        .await
-                        .boxed()
-                        .context(AccelerationInitializationFailedSnafu)?;
-
-                    Ok::<Arc<dyn cayenne::MetadataCatalog>, Error>(catalog)
-                }
-            })
-            .await
-            .map(Arc::clone)
+    /// Apply the `mode: memory` overrides to a table's [`cayenne::metadata::VortexConfig`]:
+    /// make the mem-tier the permanent in-RAM store — never checkpoint/seal to
+    /// Vortex, no compaction/cold tier, single shard (so a full-refresh overwrite is
+    /// one atomic swap), and no inline-corpus publishing. The per-table byte cap
+    /// becomes the hard RAM bound (breach => error, never spill); default `0` =
+    /// unbounded (Arrow parity) unless the operator sets an explicit
+    /// `cayenne_cdc_mem_tier_max_bytes`.
+    ///
+    /// Note: with the drain disabled, an `append`/`changes` memory table accumulates
+    /// mem-tier segments with no in-RAM coalesce valve, so append cost grows with the
+    /// segment count. `full` refresh is unaffected (each overwrite resets the tier to
+    /// a single segment). A periodic in-RAM segment coalesce is a future follow-up.
+    fn apply_memory_mode_overrides(
+        config: &mut cayenne::metadata::VortexConfig,
+        acceleration: Option<&Acceleration>,
+    ) {
+        config.memory_mode = true;
+        config.cdc_mem_tier_shards = 1;
+        config.cdc_mem_tier_max_age_ms = 0;
+        config.cdc_mem_tier_checkpoint_interval_ms = 0;
+        config.cdc_mem_tier_seal_age_ms = 0;
+        config.compaction_background_interval_ms = 0;
+        config.cold_tier_location = None;
+        config.inline_max_rows = 0;
+        config.inline_max_bytes = 0;
+        config.inline_max_buffer_bytes = 0;
+        let explicit_limit = acceleration.is_some_and(|a| {
+            a.params.contains_key("cayenne_cdc_mem_tier_max_bytes")
+                || a.params.contains_key("cdc_mem_tier_max_bytes")
+        });
+        if !explicit_limit {
+            config.cdc_mem_tier_max_bytes = 0;
+        }
     }
 
     /// Builds a [`cayenne::TimeRetentionFilterBuilder`] from the acceleration
@@ -1919,25 +1989,33 @@ impl CayenneAccelerator {
             .map_or("sqlite", String::as_str)
             .to_string();
 
-        // Ensure metadata directory exists
-        std::fs::create_dir_all(&metadata_dir)
-            .boxed()
-            .context(AccelerationCreationFailedSnafu)?;
+        // Memory mode (`mode: memory`): fully in-RAM — an in-memory `memdb`
+        // metastore (nothing on disk) and no metadata directory. File mode creates
+        // the metadata dir and uses the shared on-disk catalog as before.
+        let memory_mode = !source.is_file_accelerated();
+        let catalog = if memory_mode {
+            self.get_or_create_memory_catalog().await?
+        } else {
+            // Ensure metadata directory exists
+            std::fs::create_dir_all(&metadata_dir)
+                .boxed()
+                .context(AccelerationCreationFailedSnafu)?;
+            // Get or create the shared catalog (lazy initialization)
+            self.get_or_create_catalog(&metadata_dir, &metastore_type)
+                .await?
+        };
 
-        // Get or create the shared catalog (lazy initialization)
-        let catalog = self
-            .get_or_create_catalog(&metadata_dir, &metastore_type)
-            .await?;
-
-        // Check if using S3 Express One Zone storage
-        let is_s3_express = s3::is_s3_express_data_path(source);
+        // S3 Express One Zone is file-mode only. Memory mode never builds an
+        // object store; if S3 Express params linger while mode is memory, treat
+        // them as inactive so we don't fail with a missing object-store error.
+        let is_s3_express = !memory_mode && s3::is_s3_express_data_path(source);
         let workload = build_workload_profile(
             acceleration,
             schema.as_ref(),
             &primary_keys,
             on_conflict.as_ref(),
         );
-        let vortex_config = Self::get_vortex_config_with_footer_cache(
+        let mut vortex_config = Self::get_vortex_config_with_footer_cache(
             table_name,
             source,
             self.footer_cache_mb,
@@ -1945,11 +2023,23 @@ impl CayenneAccelerator {
         )
         .await;
 
-        // Build S3 object store if using S3 Express One Zone storage
-        let object_store =
-            s3::build_s3_object_store(source, CayenneAccelerator::new().cayenne_data_dir(source)?)
+        // Memory mode: make the mem-tier the permanent in-RAM store — never
+        // checkpoint/seal to Vortex, no compaction/cold tier, single shard (so a
+        // full-refresh overwrite is one atomic swap), no inline-corpus publishing.
+        if memory_mode {
+            Self::apply_memory_mode_overrides(&mut vortex_config, acceleration);
+        }
+
+        // Build S3 object store if using S3 Express One Zone storage. Memory mode
+        // has no data directory or object store (and `cayenne_data_dir` errors for
+        // it), so skip this entirely — memory-mode data lives only in RAM.
+        let object_store = if memory_mode {
+            None
+        } else {
+            s3::build_s3_object_store(source, self.cayenne_data_dir(source)?)
                 .await
-                .context(S3Snafu)?;
+                .context(S3Snafu)?
+        };
 
         // Log S3 Express configuration
         if is_s3_express {
@@ -2091,26 +2181,34 @@ impl CayenneAccelerator {
             &self.compaction_semaphore,
             self.compaction_permits_total,
         );
-        let spawned = provider.spawn_background_compaction(Arc::clone(&self.compaction_semaphore));
-        if spawned {
-            tracing::debug!("Background compaction task spawned for Cayenne table {table_name}",);
-        }
-        // Periodic mem-tier checkpoint (cdc_durability: memory only); a no-op for
-        // file-mode tables. This is what advances the deferred source slot ack on
-        // an idle/pure-upsert stream so replication lag stays bounded.
-        if provider.spawn_background_mem_tier_checkpoint() {
-            tracing::debug!(
-                "Background mem-tier checkpoint task spawned for Cayenne table {table_name}",
-            );
-        }
-        // Cold-tier promotion (storage-cascade bottom tier); a no-op unless
-        // cayenne_datalake_location is set. Runs on the same internal
-        // background-worker infra as the mem-tier checkpointer, on its own
-        // cadence — no spicepod `workers:` section, nothing user-facing.
-        if provider.spawn_background_cold_tier_promotion() {
-            tracing::debug!(
-                "Background cold-tier promotion task spawned for Cayenne table {table_name}",
-            );
+        // Memory mode never drains to Vortex (no compaction, no mem-tier
+        // checkpoint/seal, no cold tier), so skip the background drain tasks
+        // entirely; the provider's own guards also no-op them defensively.
+        if !memory_mode {
+            let spawned =
+                provider.spawn_background_compaction(Arc::clone(&self.compaction_semaphore));
+            if spawned {
+                tracing::debug!(
+                    "Background compaction task spawned for Cayenne table {table_name}",
+                );
+            }
+            // Periodic mem-tier checkpoint (cdc_durability: memory only); a no-op for
+            // file-mode tables. This is what advances the deferred source slot ack on
+            // an idle/pure-upsert stream so replication lag stays bounded.
+            if provider.spawn_background_mem_tier_checkpoint() {
+                tracing::debug!(
+                    "Background mem-tier checkpoint task spawned for Cayenne table {table_name}",
+                );
+            }
+            // Cold-tier promotion (storage-cascade bottom tier); a no-op unless
+            // cayenne_datalake_location is set. Runs on the same internal
+            // background-worker infra as the mem-tier checkpointer, on its own
+            // cadence — no spicepod `workers:` section, nothing user-facing.
+            if provider.spawn_background_cold_tier_promotion() {
+                tracing::debug!(
+                    "Background cold-tier promotion task spawned for Cayenne table {table_name}",
+                );
+            }
         }
         Ok(provider)
     }
@@ -2500,11 +2598,10 @@ impl DataAccelerator for CayenneAccelerator {
         registry: Arc<AcceleratorEngineRegistry>,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         if !source.is_file_accelerated() {
-            return Err(Box::new(Error::InvalidConfiguration {
-                detail: Arc::from(
-                    "Cayenne data accelerator only supports file mode. Please configure the accelerator with mode: file",
-                ),
-            }));
+            // Memory mode (`mode: memory`) is fully in-RAM and ephemeral — there is
+            // nothing to bootstrap on disk; the dataset reloads from its federated
+            // source on startup, like the in-memory Arrow accelerator.
+            return Ok(BootstrapStatus::none());
         }
 
         if let Some(acceleration) = source.acceleration() {
@@ -2792,9 +2889,30 @@ impl DataAccelerator for CayenneAccelerator {
             }) as Box<dyn std::error::Error + Send + Sync>
         })?;
 
-        let dir_path = self.resolve_storage_config(source).boxed()?;
+        // Memory mode (`mode: memory`) writes no data files, so it needs no storage
+        // directory: derive a (never-written) base path and skip directory creation.
+        // File mode resolves and creates the data dir as before.
+        let memory_mode = !source.is_file_accelerated();
+        // Memory mode is non-partitioned only: `is_memory_resident_mode()` (the
+        // predicate the write/scan paths consult) requires no partition column, so a
+        // partitioned memory table would fall through to the durable Vortex path and
+        // silently write to disk. Reject it up front rather than half-configuring an
+        // on-disk partitioned table.
+        if memory_mode && !partition_by.is_empty() {
+            return Err(Box::new(Error::InvalidConfiguration {
+                detail: Arc::from(
+                    "Cayenne mode: memory is not supported with partitioning. Remove partition_by, or use mode: file for a partitioned accelerator.",
+                ),
+            }));
+        }
+        let dir_path = if memory_mode {
+            Self::resolve_default_data_path(&source.name().to_string().replace(['.', '/'], "_"))
+        } else {
+            let dir_path = self.resolve_storage_config(source).boxed()?;
+            let _ = Self::ensure_directory(&dir_path).boxed()?;
+            dir_path
+        };
         let arrow_schema = Self::transformed_arrow_schema(&cmd, source).boxed()?;
-        let _ = Self::ensure_directory(&dir_path).boxed()?;
 
         // Get the table name from the source
         let table_name = source.name().to_string();
