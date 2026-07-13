@@ -745,10 +745,6 @@ pub struct DataFusion {
     // EXECUTE (not lightweight PREPARE/DEALLOCATE/SET) — i.e. query admission
     // control; `None` = unbounded. Sized from `runtime.query.max_concurrent_queries`.
     query_admission_semaphore: Option<Arc<Semaphore>>,
-    // Maximum wall-clock lifetime for externally-issued queries (planning,
-    // admission wait, execution, and result streaming all count); `None` = no
-    // timeout. Sized from `runtime.query.timeout`.
-    query_timeout: Option<std::time::Duration>,
     pub(crate) task_history_enabled: bool,
     // Dedicated runtime for CPU-bound DataFusion queries
     cpu_runtime: OnceLock<ManagedTokioRuntime>,
@@ -934,12 +930,6 @@ impl DataFusion {
     /// `acceleration_refresh_semaphore` for the read/query side.
     pub(crate) fn query_admission_semaphore(&self) -> Option<Arc<Semaphore>> {
         self.query_admission_semaphore.clone()
-    }
-
-    /// The query timeout when `runtime.query.timeout` is set; `None` means
-    /// queries may run indefinitely.
-    pub(crate) fn query_timeout(&self) -> Option<std::time::Duration> {
-        self.query_timeout
     }
 
     #[must_use]

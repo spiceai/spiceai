@@ -349,12 +349,12 @@ impl RuntimeBuilder {
         let target_partitions = query.target_partitions;
         let max_concurrent_queries = query.max_concurrent_queries;
 
-        // Invalid values disable the timeout rather than failing startup,
-        // matching `memory_limit` handling above.
-        let query_timeout = query.timeout().unwrap_or_else(|e| {
+        // The effective timeout is resolved per request by
+        // `RequestContextBuilder::build` from the app's `runtime.query.timeout`;
+        // validate here so a misconfigured value is warned about once at startup
+        if let Err(e) = query.timeout() {
             tracing::warn!("{e} No query timeout will be applied.");
-            None
-        });
+        }
 
         let metrics = spicepod_rt.metrics.clone();
 
@@ -700,7 +700,6 @@ impl RuntimeBuilder {
         .memory_limit(memory_limit)
         .target_partitions(target_partitions)
         .max_concurrent_queries(max_concurrent_queries)
-        .query_timeout(query_timeout)
         .prefer_hash_join(query.prefer_hash_join)
         .eager_aggregation(query.eager_aggregation)
         .eager_aggregation_min_reduction_factor(query.eager_aggregation_min_reduction_factor)

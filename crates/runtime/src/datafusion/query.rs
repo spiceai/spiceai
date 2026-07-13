@@ -963,11 +963,13 @@ impl Query {
         // error as `QueryTimedOut`. The timer covers the query's full
         // lifetime — planning, admission wait, execution, and result
         // streaming — and is disarmed (via the guard bundled into the result
-        // stream) when the stream completes, errors, or is dropped. Internal
-        // runtime queries (acceleration refreshes, health checks, task
-        // history) are exempt: the timeout governs externally-issued queries.
-        let (timeout_state, timeout_timer_guard) = match self.df.query_timeout() {
-            Some(timeout) if request_context.protocol() != Protocol::Internal => {
+        // stream) when the stream completes, errors, or is dropped. The
+        // timeout is a property of the request context (resolved there from
+        // `runtime.query.timeout` or an explicit per-request override);
+        // internal runtime queries (acceleration refreshes, health checks,
+        // task history) carry no timeout unless explicitly overridden.
+        let (timeout_state, timeout_timer_guard) = match request_context.query_timeout() {
+            Some(timeout) => {
                 let state = QueryTimeoutState::armed(timeout);
                 let timer_state = state.clone();
                 let timer_token = query_cancel_token.clone();
@@ -3048,15 +3050,14 @@ mod tests {
                 Handle::current(),
             )
             .max_concurrent_queries(Some(1))
-            .query_timeout(Some(Duration::from_millis(500)))
             .build(),
         );
 
         // A holds the only permit for the whole test: its unpolled stream owns
         // the permit until polled or dropped. A runs under the default
-        // internal request context, which is exempt from the timeout, so A
-        // can neither time out during startup (releasing the permit early)
-        // nor have its unpolled stream affected by a timer.
+        // internal request context, which carries no timeout, so A can
+        // neither time out during startup (releasing the permit early) nor
+        // have its unpolled stream affected by a timer.
         let _query_a = QueryBuilder::new("SELECT 42 AS value", Arc::clone(&df))
             .build()
             .run()
@@ -3066,7 +3067,12 @@ mod tests {
         let df_b = Arc::clone(&df);
         let b_err = tokio::time::timeout(
             Duration::from_secs(10),
-            Arc::new(RequestContext::builder(Protocol::Http).build()).scope(async move {
+            Arc::new(
+                RequestContext::builder(Protocol::Http)
+                    .with_query_timeout(Some(Duration::from_millis(500)))
+                    .build(),
+            )
+            .scope(async move {
                 QueryBuilder::new("SELECT 43 AS value", df_b)
                     .build()
                     .run()
@@ -3097,7 +3103,6 @@ mod tests {
                 Arc::new(AcceleratorEngineRegistry::new()),
                 Handle::current(),
             )
-            .query_timeout(Some(Duration::from_secs(1)))
             .build(),
         );
 
@@ -3105,15 +3110,19 @@ mod tests {
         // cannot plausibly consume it on a loaded CI host, so the query
         // reliably returns a stream before the timer fires.
         let df_q = Arc::clone(&df);
-        let mut result = Arc::new(RequestContext::builder(Protocol::Http).build())
-            .scope(async move {
-                QueryBuilder::new("SELECT 42 AS value", df_q)
-                    .build()
-                    .run()
-                    .await
-            })
-            .await
-            .expect("query should start successfully");
+        let mut result = Arc::new(
+            RequestContext::builder(Protocol::Http)
+                .with_query_timeout(Some(Duration::from_secs(1)))
+                .build(),
+        )
+        .scope(async move {
+            QueryBuilder::new("SELECT 42 AS value", df_q)
+                .build()
+                .run()
+                .await
+        })
+        .await
+        .expect("query should start successfully");
 
         // Let the 1s timer fire before the stream is polled (generous margin
         // for slow CI).
@@ -3149,7 +3158,6 @@ mod tests {
                 Arc::new(AcceleratorEngineRegistry::new()),
                 Handle::current(),
             )
-            .query_timeout(Some(Duration::from_secs(1)))
             .build(),
         );
 
@@ -3159,16 +3167,20 @@ mod tests {
         let cancel_token = CancellationToken::new();
         let df_q = Arc::clone(&df);
         let token_q = cancel_token.clone();
-        let mut result = Arc::new(RequestContext::builder(Protocol::Http).build())
-            .scope(async move {
-                QueryBuilder::new("SELECT 42 AS value", df_q)
-                    .cancellation_token(token_q)
-                    .build()
-                    .run()
-                    .await
-            })
-            .await
-            .expect("query should start successfully");
+        let mut result = Arc::new(
+            RequestContext::builder(Protocol::Http)
+                .with_query_timeout(Some(Duration::from_secs(1)))
+                .build(),
+        )
+        .scope(async move {
+            QueryBuilder::new("SELECT 42 AS value", df_q)
+                .cancellation_token(token_q)
+                .build()
+                .run()
+                .await
+        })
+        .await
+        .expect("query should start successfully");
 
         // Cancel first, then let the 1s timeout window pass before the
         // stream observes anything.
@@ -3192,11 +3204,12 @@ mod tests {
     }
 
     /// [query timeout] Internal runtime queries (health checks, acceleration
-    /// refreshes — anything under `Protocol::Internal`, which is also the
-    /// default outside a request scope) are exempt from `runtime.query.timeout`.
-    /// With a 50ms timeout configured and a 500ms pause before draining, the
-    /// stream must still deliver results. The pause lets a wrongly-armed timer
-    /// fire, so it is the subject under test, not a readiness wait.
+    /// refreshes — anything under `Protocol::Internal`) are exempt from
+    /// `runtime.query.timeout`: the request context skips the app-derived
+    /// timeout for the internal protocol. With a 50ms timeout configured on
+    /// the app and a 500ms pause before draining, the stream must still
+    /// deliver results. The pause lets a wrongly-armed timer fire, so it is
+    /// the subject under test, not a readiness wait.
     #[tokio::test]
     async fn query_timeout_exempts_internal_queries() {
         use std::time::Duration;
@@ -3206,16 +3219,31 @@ mod tests {
                 Arc::new(AcceleratorEngineRegistry::new()),
                 Handle::current(),
             )
-            .query_timeout(Some(Duration::from_millis(50)))
             .build(),
         );
 
-        // No request-context scope → the internal request context applies.
-        let mut result = QueryBuilder::new("SELECT 42 AS value", Arc::clone(&df))
-            .build()
-            .run()
-            .await
-            .expect("internal query should start successfully");
+        let mut app = app::AppBuilder::new("test").build();
+        app.runtime.query = Some(spicepod::component::runtime::Query {
+            timeout: Some("50ms".to_string()),
+            ..Default::default()
+        });
+
+        // An internal-protocol context built with the app: the app-derived
+        // timeout must not apply.
+        let df_q = Arc::clone(&df);
+        let mut result = Arc::new(
+            RequestContext::builder(Protocol::Internal)
+                .with_app_opt(Some(Arc::new(app)))
+                .build(),
+        )
+        .scope(async move {
+            QueryBuilder::new("SELECT 42 AS value", df_q)
+                .build()
+                .run()
+                .await
+        })
+        .await
+        .expect("internal query should start successfully");
 
         tokio::time::sleep(Duration::from_millis(500)).await;
 
