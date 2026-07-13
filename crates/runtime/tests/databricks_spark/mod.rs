@@ -27,8 +27,9 @@ use futures::TryStreamExt;
 use runtime::Runtime;
 use spicepod::{component::catalog::Catalog, param::Params};
 
-fn make_catalog(path: &str, name: &str) -> Catalog {
-    let mut catalog = Catalog::new(format!("databricks:{path}"), name.to_string());
+fn make_catalog(name: &str) -> Catalog {
+    let mut catalog = Catalog::new("databricks:spiceai_sandbox".to_string(), name.to_string());
+    catalog.include = vec!["tpch.*".to_string()];
     catalog.params = Some(get_params());
     catalog
 }
@@ -78,10 +79,7 @@ async fn databricks_spark_integration_test() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("databricks_spark_connector")
-                .with_catalog(make_catalog(
-                    "catalog-dash-test",
-                    "db_uc",
-                ))
+                .with_catalog(make_catalog("db_uc"))
                 .build();
 
             configure_test_datafusion();
@@ -94,18 +92,18 @@ async fn databricks_spark_integration_test() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::new(rt.clone());
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
             }
 
             let queries: QueryTests = vec![(
-                "SELECT * FROM db_uc.default.databricks_demo ORDER BY network, isp LIMIT 10",
+                "SELECT * FROM db_uc.tpch.nation ORDER BY n_nationkey LIMIT 10",
                 "select",
                 Some(Box::new(|result_batches| {
                     for batch in &result_batches {
-                        assert_eq!(batch.num_columns(), 7, "num_cols: {}", batch.num_columns());
+                        assert_eq!(batch.num_columns(), 4, "num_cols: {}", batch.num_columns());
                         assert_eq!(batch.num_rows(), 10, "num_rows: {}", batch.num_rows());
                     }
 
@@ -154,7 +152,7 @@ async fn databricks_spark_schema_inference_test() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("databricks_spark_schema_test")
-                .with_catalog(make_catalog("catalog-dash-test", "db_uc"))
+                .with_catalog(make_catalog("db_uc"))
                 .build();
 
             configure_test_datafusion();
@@ -162,7 +160,7 @@ async fn databricks_spark_schema_inference_test() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -170,13 +168,13 @@ async fn databricks_spark_schema_inference_test() -> Result<(), anyhow::Error> {
 
             runtime_ready_check(&rt).await;
 
-            // Verify databricks_demo columns appear in information_schema
+            // Verify tpch.nation columns appear in information_schema
             let result = rt
                 .datafusion()
                 .query_builder(
                     "SELECT column_name FROM information_schema.columns \
-                     WHERE table_catalog = 'db_uc' AND table_schema = 'default' \
-                     AND table_name = 'databricks_demo' \
+                     WHERE table_catalog = 'db_uc' AND table_schema = 'tpch' \
+                     AND table_name = 'nation' \
                      ORDER BY ordinal_position",
                 )
                 .build()
@@ -193,8 +191,8 @@ async fn databricks_spark_schema_inference_test() -> Result<(), anyhow::Error> {
                 .map(datafusion::arrow::array::RecordBatch::num_rows)
                 .sum();
             assert_eq!(
-                total_columns, 7,
-                "Expected 7 columns in databricks_demo schema, got {total_columns}"
+                total_columns, 4,
+                "Expected 4 columns in tpch.nation schema, got {total_columns}"
             );
 
             Ok(())
@@ -217,7 +215,7 @@ async fn databricks_spark_dataset_registration_test() -> Result<(), anyhow::Erro
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("databricks_spark_registration_test")
-                .with_catalog(make_catalog("catalog-dash-test", "db_uc"))
+                .with_catalog(make_catalog("db_uc"))
                 .build();
 
             configure_test_datafusion();
@@ -225,7 +223,7 @@ async fn databricks_spark_dataset_registration_test() -> Result<(), anyhow::Erro
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
