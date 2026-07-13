@@ -190,9 +190,8 @@ pub struct GeneratedShard {
 
 struct CsvString<'a>(&'a str);
 
-impl Display for CsvString {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str("\"")?;
+impl<'a> std::fmt::Display for CsvString<'a> {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {        f.write_str("\"")?;
 
         for ch in self.0.chars() {
             match ch {
@@ -360,16 +359,16 @@ fn generate_warehouse_range(
             let s_data = tpcc_rand::rand_original_string(&mut wh_rng);
             tw_stock.write_line(&format!(
                 "{i},{w_id},{s_quantity},{},{},{},{},{},{},{},{},{},{},0,0,0,{}",
-                csv_str(&dists_0),
-                csv_str(&dists_1),
-                csv_str(&dists_2),
-                csv_str(&dists_3),
-                csv_str(&dists_4),
-                csv_str(&dists_5),
-                csv_str(&dists_6),
-                csv_str(&dists_7),
-                csv_str(&dists_8),
-                csv_str(&dists_9),
+                csv_str(&dist_0),
+                csv_str(&dist_1),
+                csv_str(&dist_2),
+                csv_str(&dist_3),
+                csv_str(&dist_4),
+                csv_str(&dist_5),
+                csv_str(&dist_6),
+                csv_str(&dist_7),
+                csv_str(&dist_8),
+                csv_str(&dist_9),
                 csv_str(&s_data),
             ))?;
         }
@@ -452,19 +451,23 @@ fn generate_warehouse_range(
                 let o_id = i32::try_from(i).unwrap_or(0) + 1;
                 for j in 1..=ol_cnt {
                     let ol_i_id: i32 = wh_rng.random_range(1..=100_000);
-                    let (ol_delivery_d, ol_amount): (String, f64) = if o_id < 2101 {
-                        (csv_str(INIT_LOAD_TIME), 0.00)
+                    if o_id < 2101 {
+                        let ol_delivery_d = csv_str(INIT_LOAD_TIME);
+                        let ol_amount: f64 = 0.00;
+                        let ol_dist_info = tpcc_rand::rand_chars(&mut wh_rng, 24, 24);
+                        tw_order_line.write_line(&format!(
+                            "{o_id},{d},{w_id},{j},{ol_i_id},{w_id},{ol_delivery_d},5,{ol_amount},{}",
+                            csv_str(&ol_dist_info),
+                        ))?;                        
                     } else {
-                        (
-                            "\\N".to_owned(),
-                            f64::from(wh_rng.random_range(1..=999_999)) / 100.0,
-                        )
-                    };
-                    let ol_dist_info = tpcc_rand::rand_chars(&mut wh_rng, 24, 24);
-                    tw_order_line.write_line(&format!(
-                        "{o_id},{d},{w_id},{j},{ol_i_id},{w_id},{ol_delivery_d},5,{ol_amount},{}",
-                        csv_str(&ol_dist_info),
-                    ))?;
+                        let ol_delivery_d = "\\N";
+                        let ol_amount = f64::from(wh_rng.random_range(1..=999_999)) / 100.0;
+                        let ol_dist_info = tpcc_rand::rand_chars(&mut wh_rng, 24, 24);
+                        tw_order_line.write_line(&format!(
+                            "{o_id},{d},{w_id},{j},{ol_i_id},{w_id},{ol_delivery_d},5,{ol_amount},{}",
+                            csv_str(&ol_dist_info),
+                        ))?;
+                    }
                 }
             }
         }
