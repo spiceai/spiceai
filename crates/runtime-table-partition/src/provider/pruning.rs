@@ -914,7 +914,7 @@ fn call(f: &ScalarUDF, args: Vec<ScalarValue>) -> Result<ScalarValue, DataFusion
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, TimeUnit};
-    use chrono::{NaiveDateTime, TimeZone as _, Utc};
+    use chrono::{NaiveDateTime, Utc};
     use datafusion::{
         functions::regex::regexp_match,
         prelude::{case, col, date_trunc, in_list, lit},

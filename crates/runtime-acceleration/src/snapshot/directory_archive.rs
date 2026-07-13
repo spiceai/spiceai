@@ -1501,7 +1501,7 @@ mod tests {
         let broad_dir = test_dir.path().join("broad");
         let specific_dir = test_dir.path().join("specific");
         let mappings = vec![
-            ("data".to_string(), broad_dir.clone()),
+            ("data".to_string(), broad_dir),
             ("data/nested".to_string(), specific_dir.clone()),
         ];
         let normalized = normalize_prefix_mappings(Some(&mappings))?;

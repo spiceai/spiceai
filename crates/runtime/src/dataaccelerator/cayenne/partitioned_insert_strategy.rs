@@ -814,8 +814,8 @@ fn classify_pointer_matches(pointer_matches: impl IntoIterator<Item = bool>) -> 
 }
 
 fn same_partitioned_wal_backend(
-    first: &Option<cayenne::provider::PartitionedWalObjectStore>,
-    participant: &Option<cayenne::provider::PartitionedWalObjectStore>,
+    first: Option<&cayenne::provider::PartitionedWalObjectStore>,
+    participant: Option<&cayenne::provider::PartitionedWalObjectStore>,
 ) -> bool {
     match (first, participant) {
         (None, None) => true,
@@ -1016,7 +1016,8 @@ impl DataSink for CayennePartitionedAppendSink {
             let participant_wal = participant
                 .partitioned_wal_object_store()
                 .map_err(DataFusionError::from)?;
-            let same_backend = same_partitioned_wal_backend(&object_store_wal, &participant_wal);
+            let same_backend =
+                same_partitioned_wal_backend(object_store_wal.as_ref(), participant_wal.as_ref());
             if !same_backend {
                 drop(fence_guards);
                 for receipt in prepared {
@@ -1517,8 +1518,8 @@ mod tests {
         assert!(!Arc::ptr_eq(&first, &second));
 
         assert!(same_partitioned_wal_backend(
-            &Some(object_store_wal(first, "shared/table", "s3://bucket")),
-            &Some(object_store_wal(second, "shared/table", "s3://bucket")),
+            Some(&object_store_wal(first, "shared/table", "s3://bucket")),
+            Some(&object_store_wal(second, "shared/table", "s3://bucket")),
         ));
     }
 
@@ -1528,8 +1529,8 @@ mod tests {
         let second = memory_store();
 
         assert!(!same_partitioned_wal_backend(
-            &Some(object_store_wal(first, "shared/table", "s3://bucket-a")),
-            &Some(object_store_wal(second, "shared/table", "s3://bucket-b")),
+            Some(&object_store_wal(first, "shared/table", "s3://bucket-a")),
+            Some(&object_store_wal(second, "shared/table", "s3://bucket-b")),
         ));
     }
 
@@ -1539,8 +1540,8 @@ mod tests {
         let second = memory_store();
 
         assert!(!same_partitioned_wal_backend(
-            &Some(object_store_wal(first, "table-a", "s3://bucket")),
-            &Some(object_store_wal(second, "table-b", "s3://bucket")),
+            Some(&object_store_wal(first, "table-a", "s3://bucket")),
+            Some(&object_store_wal(second, "table-b", "s3://bucket")),
         ));
     }
 }
