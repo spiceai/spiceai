@@ -49,7 +49,7 @@ jobs:
       matrix:
         branch:
           - 'trunk'
-          - 'release/2.0'
+          - 'release/2.1'
     concurrency:
       group: testoperator-dispatch-scheduled-${{ matrix.branch }}-${{ github.event.schedule || github.event.ref }}
       cancel-in-progress: false
