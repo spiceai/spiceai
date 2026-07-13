@@ -134,12 +134,17 @@ jobs:
         # (long) --health-retries count once start-period elapses, so a short
         # start-period here still flips to unhealthy well before the import
         # (observed ~20-30s for SF1) finishes and touches the flag file.
+        # --shm-size: postgres's default 64MB /dev/shm (Docker's own default)
+        # is too small for parallel-worker queries against SF1 data; several
+        # TPC-H queries fail with "could not resize shared memory segment"
+        # otherwise.
         options: >-
           --health-cmd "test -f /tmp/data_loading_complete"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 3
           --health-start-period 180s
+          --shm-size=1g
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
