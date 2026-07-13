@@ -101,9 +101,7 @@ async fn catalog_table_count(rt: &Runtime, catalog: &str) -> Result<i64, anyhow:
 /// cluster is Pending, so `load_components` can finish quickly with an empty catalog. Keep
 /// rebuilding until tables appear or [`LOAD_TIMEOUT`] elapses (same overall wait budget as
 /// `databricks_spark_m2m`).
-async fn load_runtime_waiting_for_catalog(
-    app_name: &str,
-) -> Result<Runtime, anyhow::Error> {
+async fn load_runtime_waiting_for_catalog(app_name: &str) -> Result<Runtime, anyhow::Error> {
     let start = Instant::now();
 
     loop {
@@ -220,8 +218,7 @@ async fn databricks_spark_schema_inference_test() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let rt =
-                load_runtime_waiting_for_catalog("databricks_spark_schema_test").await?;
+            let rt = load_runtime_waiting_for_catalog("databricks_spark_schema_test").await?;
 
             runtime_ready_check(&rt).await;
 
@@ -271,8 +268,7 @@ async fn databricks_spark_dataset_registration_test() -> Result<(), anyhow::Erro
 
     test_request_context()
         .scope(async {
-            let rt =
-                load_runtime_waiting_for_catalog("databricks_spark_registration_test").await?;
+            let rt = load_runtime_waiting_for_catalog("databricks_spark_registration_test").await?;
 
             runtime_ready_check(&rt).await;
 
