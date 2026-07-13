@@ -239,7 +239,6 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
             Err(e) => {
                 eprintln!("❌ Failed to dispatch {}. Error: {e:?}", path.display());
                 failed_dispatches.push((path.display().to_string(), e));
-                continue;
             }
             Ok(run_url) => {
                 // sleep to space out runs

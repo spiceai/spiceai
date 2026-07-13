@@ -84,6 +84,8 @@ impl GitHubWorkflow {
         )
         .parse()?;
 
+        // Only used for internal response decoding.
+        #[expect(clippy::items_after_statements)]
         #[derive(Deserialize)]
         struct WorkflowDispatchResponse {
             html_url: String,
