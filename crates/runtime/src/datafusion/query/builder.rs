@@ -41,6 +41,7 @@ pub struct QueryBuilder {
     query_id: Uuid,
     cancellation_token: Option<CancellationToken>,
     read_only: bool,
+    bypass_cache: bool,
 }
 
 impl QueryBuilder {
@@ -53,6 +54,7 @@ impl QueryBuilder {
             table_allowlist: None,
             cancellation_token: None,
             read_only: false,
+            bypass_cache: false,
         }
     }
 
@@ -70,6 +72,7 @@ impl QueryBuilder {
             table_allowlist: None,
             cancellation_token: None,
             read_only: false,
+            bypass_cache: false,
         }
     }
 
@@ -90,6 +93,7 @@ impl QueryBuilder {
             table_allowlist: None,
             read_only: false,
             cancellation_token: None,
+            bypass_cache: false,
         }
     }
 
@@ -139,6 +143,15 @@ impl QueryBuilder {
         self
     }
 
+    /// Bypass the SQL results cache for this query (no lookup, no store),
+    /// equivalent to `Cache-Control: no-cache`. Used by the conditional-commit
+    /// transaction executor so a gate read always sees live committed state.
+    #[must_use]
+    pub fn bypass_cache(mut self, bypass_cache: bool) -> Self {
+        self.bypass_cache = bypass_cache;
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> Query {
         let tracker = if self.df.task_history_enabled {
@@ -181,6 +194,7 @@ impl QueryBuilder {
             query_id: self.query_id,
             cancellation_token: self.cancellation_token,
             read_only: self.read_only,
+            bypass_cache: self.bypass_cache,
         }
     }
 }

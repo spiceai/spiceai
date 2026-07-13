@@ -238,6 +238,11 @@ pub struct Query {
     /// regardless of per-catalog writability. Set via [`QueryBuilder::read_only`];
     /// used by `/v1/tools/sql` and `/v1/nsql` to contain LLM-generated SQL.
     read_only: bool,
+    /// When true, this query bypasses the SQL results cache entirely (no lookup,
+    /// no store) — equivalent to `Cache-Control: no-cache`. Set via
+    /// [`QueryBuilder::bypass_cache`]; used by the conditional-commit transaction
+    /// executor so a gate read always sees live committed state.
+    bypass_cache: bool,
 }
 
 macro_rules! handle_error {
@@ -1032,6 +1037,7 @@ impl Query {
                 let mut session = self.get_session_state(&request_context);
 
                 let ctx = self;
+                let bypass_cache = ctx.bypass_cache;
                 let tracker = ctx.tracker;
 
                 // Sets the request context as an extension on DataFusion, to allow recovering it to track telemetry
@@ -1112,38 +1118,95 @@ impl Query {
                         table_allowlist: None,
                         pre_parsed_plan,
                     } => {
-                        match Self::get_plan_or_cached(
-                            &ctx.df,
-                            &session,
-                            Arc::clone(&request_context),
-                            sql.as_ref(),
-                            parameters,
-                            tracker,
-                            pre_parsed_plan,
-                        )
-                        .await?
-                        {
-                            PlanOrCached::Plan(plan, tracker, cache_manager) => {
+                        if bypass_cache {
+                            // Gate/inner reads in a conditional-commit transaction must
+                            // see live committed state, so skip the results cache entirely
+                            // (no lookup, no store) — mirrors the table-allowlist arm.
+                            let raw_cache_key = CacheKey::Query(sql.as_ref(), parameters.as_ref())
+                                .as_raw_key(Query::plan_hasher(&ctx.df));
+                            let plan = if let Some(plan) = pre_parsed_plan {
+                                plan
+                            } else {
                                 Self::ensure_not_cancelled(
                                     &query_cancel_token,
                                     &query_id_str,
                                     &timeout_state,
                                 )?;
-                                (plan, tracker, cache_manager)
-                            }
-                            PlanOrCached::Cached(query_result) => {
-                                Self::ensure_not_cancelled(
-                                    &query_cancel_token,
-                                    &query_id_str,
-                                    &timeout_state,
-                                )?;
-                                return Ok(attach_cancellation_to_query_result(
-                                    query_result,
-                                    query_cancel_token.clone(),
-                                    Arc::clone(&query_id_str),
-                                    timeout_state.clone(),
-                                    (active_query_guard, timeout_timer_guard),
-                                ));
+                                match Self::get_plan(
+                                    &ctx.df,
+                                    &session,
+                                    sql.as_ref(),
+                                    &raw_cache_key,
+                                    parameters,
+                                )
+                                .await
+                                {
+                                    Ok(plan) => Box::new(plan),
+                                    Err(e) => match e {
+                                        Error::UnableToExecuteQuery { source } => {
+                                            let code = ErrorCode::from(&source);
+                                            let snafu_err =
+                                                Error::UnableToExecuteQuery { source };
+                                            if let Some(t) = tracker {
+                                                t.finish_with_error(
+                                                    &request_context,
+                                                    snafu_err.to_string(),
+                                                    code,
+                                                );
+                                            }
+                                            return Err(snafu_err);
+                                        }
+                                        _ => return Err(e),
+                                    },
+                                }
+                            };
+                            Self::ensure_not_cancelled(
+                                &query_cancel_token,
+                                &query_id_str,
+                                &timeout_state,
+                            )?;
+                            (
+                                plan,
+                                tracker,
+                                RequestCacheManager::new(
+                                    CacheStatus::CacheDisabled,
+                                    raw_cache_key,
+                                ),
+                            )
+                        } else {
+                            match Self::get_plan_or_cached(
+                                &ctx.df,
+                                &session,
+                                Arc::clone(&request_context),
+                                sql.as_ref(),
+                                parameters,
+                                tracker,
+                                pre_parsed_plan,
+                            )
+                            .await?
+                            {
+                                PlanOrCached::Plan(plan, tracker, cache_manager) => {
+                                    Self::ensure_not_cancelled(
+                                        &query_cancel_token,
+                                        &query_id_str,
+                                        &timeout_state,
+                                    )?;
+                                    (plan, tracker, cache_manager)
+                                }
+                                PlanOrCached::Cached(query_result) => {
+                                    Self::ensure_not_cancelled(
+                                        &query_cancel_token,
+                                        &query_id_str,
+                                        &timeout_state,
+                                    )?;
+                                    return Ok(attach_cancellation_to_query_result(
+                                        query_result,
+                                        query_cancel_token.clone(),
+                                        Arc::clone(&query_id_str),
+                                        timeout_state.clone(),
+                                        (active_query_guard, timeout_timer_guard),
+                                    ));
+                                }
                             }
                         }
                     }
@@ -1566,6 +1629,7 @@ impl Query {
             query_id: uuid::Uuid::new_v4(),
             cancellation_token: None,
             read_only: false,
+            bypass_cache: false,
         }
     }
 

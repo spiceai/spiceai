@@ -62,6 +62,10 @@ use cache::result::CacheStatus;
 use csv::Writer;
 use datafusion::common::ParamValues;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::sql::parser::{DFParser, Statement as DFStatement};
+use datafusion::sql::sqlparser::{ast::Statement as SqlStatement, dialect::PostgreSqlDialect};
+use std::sync::LazyLock;
+use tokio::sync::Mutex;
 use headers_accept::Accept;
 use http::{
     HeaderValue,
@@ -255,6 +259,12 @@ pub async fn sql_to_http_response(
     format: ResponseMimeType,
     read_only: bool,
 ) -> Response {
+    // Conditional commits: a `BEGIN … COMMIT` transaction body is run by a dedicated
+    // serializing executor rather than the (rejected) single-statement path.
+    if let Some(inner) = detect_conditional_commit_transaction(&sql) {
+        return execute_conditional_commit(df, inner, read_only, format).await;
+    }
+
     // Capture the query memory pool before `df` is moved into the builder, so a
     // streamed body can charge its egress buffers against the pool the query ran
     // under (see `EgressAccount`).
@@ -300,6 +310,109 @@ pub async fn sql_to_http_response(
     let account = EgressAccount::register(&memory_pool, "http_egress");
     let body = Body::from_stream(json_array_body_stream(first, data_stream, account));
     (StatusCode::OK, headers, body).into_response()
+}
+
+/// Process-global serialization lock for conditional-commit transactions.
+///
+/// v1 is pessimistic and single-instance: the whole `BEGIN … COMMIT` body (the
+/// `assert()` gate read + the writes) runs while holding this lock, so concurrent
+/// gated transactions are serialized and a gate cannot be raced (no over-admit).
+/// Per-key optimistic concurrency — so transactions touching disjoint keys run in
+/// parallel — is the tracked follow-up (spiceai#11834/#11835).
+static CONDITIONAL_COMMIT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// Detects a `BEGIN … COMMIT` transaction body and returns its inner statements as
+/// SQL strings (transaction-control statements stripped), or `None` if `sql` is not
+/// a well-formed `BEGIN … COMMIT` body. A non-transaction (single statement, or a
+/// multi-statement string not wrapped in `BEGIN … COMMIT`) returns `None` and is
+/// handled by the ordinary path unchanged.
+fn detect_conditional_commit_transaction(sql: &str) -> Option<Vec<String>> {
+    let statements: Vec<DFStatement> = DFParser::parse_sql_with_dialect(sql, &PostgreSqlDialect {})
+        .ok()?
+        .into_iter()
+        .collect();
+    if statements.len() < 2 {
+        return None;
+    }
+    let first_is_begin = matches!(
+        statements.first(),
+        Some(DFStatement::Statement(s)) if matches!(s.as_ref(), SqlStatement::StartTransaction { .. })
+    );
+    let last_is_commit = matches!(
+        statements.last(),
+        Some(DFStatement::Statement(s)) if matches!(s.as_ref(), SqlStatement::Commit { .. })
+    );
+    if !(first_is_begin && last_is_commit) {
+        return None;
+    }
+    let inner: Vec<String> = statements[1..statements.len() - 1]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    if inner.is_empty() {
+        return None;
+    }
+    Some(inner)
+}
+
+/// Executes a conditional-commit transaction body: runs each inner statement in
+/// order while holding the serialization lock, so the `assert()` gate read and the
+/// writes are atomic with respect to other gated transactions. A failed `assert()`
+/// (or any statement error) aborts the transaction — subsequent statements do not
+/// run and the error is returned to the client.
+///
+/// v1 reuses the ordinary write path, so a Cayenne-accelerated `write_mode:
+/// write_back` dataset commits to the accelerator and propagates to the source as
+/// usual. It is not multi-statement atomic on failure (writes applied by an earlier
+/// statement are not rolled back); the canonical shape — gate first, then writes —
+/// means a gate failure applies no writes. Transaction-level bound parameters are
+/// not yet supported (use literal values in the body).
+async fn execute_conditional_commit(
+    df: Arc<DataFusion>,
+    inner_sqls: Vec<String>,
+    read_only: bool,
+    format: ResponseMimeType,
+) -> Response {
+    let _guard = CONDITIONAL_COMMIT_LOCK.lock().await;
+
+    let mut last: Option<(Vec<RecordBatch>, CacheStatus)> = None;
+    for stmt_sql in &inner_sqls {
+        let query_res = match QueryBuilder::new(stmt_sql, Arc::clone(&df))
+            .read_only(read_only)
+            // Gate + inner reads must see live committed state, not a (stale) cached
+            // result — the transaction is the serialization point, not the cache.
+            .bypass_cache(true)
+            .build()
+            .run()
+            .await
+        {
+            Ok(res) => res,
+            Err(e) => {
+                let kind = SqlErrorKind::of_query_error(&e);
+                return sql_error_response(e.to_string(), kind);
+            }
+        };
+        let cache_status = query_res.cache_status;
+        // Drain each statement fully so writes execute and any error (including a
+        // gate abort) surfaces before the next statement runs.
+        match query_res.data.try_collect::<Vec<RecordBatch>>().await {
+            Ok(batches) => last = Some((batches, cache_status)),
+            Err(e) => {
+                return sql_error_response(e.to_string(), SqlErrorKind::of_datafusion_error(&e));
+            }
+        }
+    }
+
+    // All statements succeeded — the transaction is committed. Return the final
+    // statement's result (for the canonical gate+write shape, the write's summary).
+    match last {
+        Some((batches, cache_status)) => {
+            to_http_response(batches, cache_status, format, ResponseMetadata::empty())
+                .await
+                .into_response()
+        }
+        None => (StatusCode::OK, "COMMIT").into_response(),
+    }
 }
 
 /// Classifies a query error for HTTP status mapping: client-initiated
