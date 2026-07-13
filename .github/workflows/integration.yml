@@ -260,8 +260,8 @@ jobs:
   prepare-test-matrix:
     name: Prepare integration test matrix
     needs: check_changes
-    if: needs.check_changes.outputs.relevant_changes == 'true'
-    runs-on: spiceai-dev-runners
+    # Always run (including PR heads) so `test` can depend on matrix output for passthrough.
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
     outputs:
       matrix: ${{ steps.set.outputs.matrix }}
     steps:
@@ -269,7 +269,8 @@ jobs:
         id: set
         run: |
           set -euo pipefail
-          if [[ -n "${{ github.event.inputs.test_filter || '' }}" ]]; then
+          # PR heads only need a dummy single-shard matrix for required-check passthrough.
+          if [[ "${{ github.event_name }}" == "pull_request" ]] || [[ -n "${INTEGRATION_TEST_FILTER}" ]]; then
             # Single shard, no nextest partition — keep filtered tests together.
             echo 'matrix={"include":[{"label":"1","partition":""}]}' >> "$GITHUB_OUTPUT"
           else
@@ -279,7 +280,7 @@ jobs:
   test:
     name: Integration Tests (part ${{ matrix.label }})
     needs: [build, check_changes, prepare-test-matrix]
-    if: needs.check_changes.outputs.relevant_changes == 'true'
+    # No job-level relevant_changes gate — PR heads must report this check via passthrough.
     permissions:
       contents: write
     runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
@@ -439,6 +440,7 @@ jobs:
           PARTITION_ARGS=()
           if [[ -n "${INTEGRATION_TEST_FILTER}" ]]; then
             # Build nextest filter expression: test(a) | test(b) | ...
+            # Allowlist characters so workflow_dispatch input cannot inject filter/shell syntax.
             EXPR=""
             IFS=',' read -ra NAMES <<< "${INTEGRATION_TEST_FILTER}"
             for raw in "${NAMES[@]}"; do
@@ -446,6 +448,10 @@ jobs:
               name="${raw#"${raw%%[![:space:]]*}"}"
               name="${name%"${name##*[![:space:]]}"}"
               [[ -z "${name}" ]] && continue
+              if [[ ! "${name}" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
+                echo "Invalid test_filter name '${name}': only letters, digits, '_', '.', ':', and '-' are allowed" >&2
+                exit 1
+              fi
               if [[ -n "${EXPR}" ]]; then
                 EXPR="${EXPR} | test(${name})"
               else
