@@ -112,6 +112,18 @@ jobs:
         env:
           MSSQL_SA_PASSWORD: S3cretP@ssw0rd
           DB_NAME: tpch_sf1
+      # Local, ephemeral PostgreSQL preloaded with TPC-H/TPC-DS SF1 data (used by
+      # both the postgres data connector and postgres catalog connector benches).
+      # Mirrors mssql_tpch above; avoids depending on an externally-provisioned
+      # benchmarking-postgres host (see #11730). Excludes ducklake[postgres+s3],
+      # which provisions its own local postgres catalog DB on the same port, and
+      # clickbench, whose postgres source uses a different (unseeded) database.
+      postgres_tpch:
+        image: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds')) && (github.event.inputs.query_set == 'tpcds' && 'ghcr.io/spiceai/spice-postgres-tpcds-bench:latest' || 'ghcr.io/spiceai/spice-postgres-bench:latest') || '' }}
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -378,8 +390,8 @@ jobs:
           MYSQL_PASSWORD: ${{ secrets.TEST_MYSQL_PASSWORD }}
           MONGODB_HOST: ${{ vars.TEST_MONGODB_HOST }}
           MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
-          POSTGRES_HOST: ${{ vars.TEST_POSTGRES_HOST }}
-          POSTGRES_RW_HOST: ${{ vars.TEST_POSTGRES_HOST }}
+          POSTGRES_HOST: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds')) && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
+          POSTGRES_RW_HOST: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds')) && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
           POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
           SPICEAI_TEST_ENDPOINT: ${{ vars.SPICE_SECRET_SPICEAI_TEST_ENDPOINT }}
           SPICEAI_TEST_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY }}
