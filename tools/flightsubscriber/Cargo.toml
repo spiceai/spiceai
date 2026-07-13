@@ -20,3 +20,6 @@ tonic = { workspace = true, features = [
 ] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[lints]
+workspace = true

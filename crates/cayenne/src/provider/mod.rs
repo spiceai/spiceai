@@ -71,6 +71,7 @@ limitations under the License.
 //! - [`constants`]: Staging-dir name, WAL filename, and other shared constants.
 //! - [`partitioned_wal`]: Cross-partition WAL for the partitioned-table
 //!   coordinator (feature-gated).
+pub(crate) mod cold_partition;
 pub(crate) mod column_stats;
 pub(crate) mod compaction;
 pub(crate) mod compaction_writer;
@@ -110,11 +111,15 @@ pub(crate) mod write_budget;
 pub(crate) mod zorder;
 
 // Re-export the main type at the module level for convenience
-pub use compaction::{set_compaction_runtime_env, set_compaction_runtime_handle};
+pub use compaction::{
+    begin_compaction_shutdown, drain_compaction_tasks, in_flight_compaction_tasks,
+    reset_compaction_shutdown, set_compaction_runtime_env, set_compaction_runtime_handle,
+};
 pub use context::CayenneContext;
 pub use mem_tier::SlotAdvancer;
 pub use mem_tier_budget::{
-    global_mem_tier_total, set_global_mem_tier_bytes, update_global_mem_tier_total,
+    global_mem_tier_total, global_mem_tier_used, set_global_mem_tier_bytes,
+    update_global_mem_tier_total,
 };
 pub use overwrite::PreparedOverwrite;
 pub use partitioned_wal::{PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry};
@@ -127,7 +132,10 @@ pub use tuning::{
     QueryObservations, deregister_query_observations, global_qph, record_global_query,
     record_query_latency, register_query_observations, set_cpu_burstable, set_global_memory_budget,
 };
-pub use write_budget::{cap_global_encode_concurrency, set_global_encode_concurrency};
+pub use write_budget::{
+    EncodeBudgetSnapshot, cap_global_encode_concurrency, encode_budget_snapshot,
+    set_global_encode_concurrency,
+};
 
 // Re-export deletion utilities for advanced use cases
 pub use delete::CayenneDeletionSink;
@@ -177,6 +185,23 @@ pub enum Error {
     /// Data constraint violation: null PK, duplicate PK, row overflow.
     #[snafu(display("Data validation failed for table '{table}': {message}"))]
     DataValidation { table: String, message: String },
+
+    /// A `mode: memory` (in-RAM) table reached its configured memory limit. Memory
+    /// mode never spills to disk, so the write is rejected rather than silently
+    /// dropped or grown unbounded.
+    #[snafu(display(
+        "Failed to write to dataset {table} (cayenne): the in-memory accelerator reached its \
+         memory limit ({limit_bytes} bytes; resident {resident_bytes} + incoming {incoming_bytes}). \
+         Use 'mode: file' for durable on-disk acceleration, or raise the limit with the \
+         'cayenne_cdc_mem_tier_max_bytes' parameter. \
+         See: https://spiceai.org/docs/components/data-accelerators"
+    ))]
+    MemTierLimitExceeded {
+        table: String,
+        limit_bytes: u64,
+        resident_bytes: u64,
+        incoming_bytes: u64,
+    },
 
     /// Failed to parse a snapshot or table URL.
     #[snafu(display("Failed to parse URL '{url}': {source}"))]

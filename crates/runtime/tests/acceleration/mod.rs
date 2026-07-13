@@ -25,6 +25,8 @@ mod caching_mode;
 mod caching_mode_per_principal;
 #[cfg(feature = "duckdb")]
 mod caching_mode_post_filter;
+#[cfg(not(target_os = "windows"))]
+mod cayenne_memory;
 #[cfg(feature = "duckdb")]
 mod checkpoint_duckdb;
 #[cfg(feature = "postgres-accel")]
@@ -41,6 +43,7 @@ mod hash_index;
 mod localpod_sync;
 #[cfg(all(feature = "postgres-accel", feature = "duckdb", feature = "sqlite"))]
 mod on_conflict;
+
 #[cfg(not(target_os = "windows"))]
 mod on_conflict_cayenne;
 #[cfg(feature = "duckdb")]
@@ -78,8 +81,9 @@ async fn wait_for_checkpoints(
     let mut checkpoint_futures = Vec::new();
 
     for dataset in datasets {
+        let registry = dataset.runtime.accelerator_engine_registry();
         let check_future = async move {
-            match DatasetCheckpoint::try_new(&dataset, OpenOption::OpenExisting).await {
+            match DatasetCheckpoint::try_new(&dataset, registry, OpenOption::OpenExisting).await {
                 Ok(checkpoint) => {
                     while !checkpoint.exists().await {
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

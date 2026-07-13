@@ -211,7 +211,7 @@ mod tests {
             &mut self,
             plan: &dyn datafusion_physical_plan::ExecutionPlan,
         ) -> Result<bool, Self::Error> {
-            if plan.downcast_ref::<DataSourceExec>().is_some() {
+            if plan.is::<DataSourceExec>() {
                 self.0 += 1;
                 Ok(false)
             } else {

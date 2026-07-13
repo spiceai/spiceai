@@ -8,15 +8,6 @@ spawn spice chat
 proc chat {message}  {
     global timeout
 
-    # Wait for the chat prompt to be ready before sending
-    expect {
-        "chat> " {}
-        timeout {
-            send_user "Timeout waiting for chat prompt\n"
-            exit 1
-        }
-    }
-
     send "$message\r"
 
     expect {
@@ -29,6 +20,10 @@ proc chat {message}  {
         "chat> " {
             # end of model response
         }
+        eof {
+            send_user "Chat process exited before returning a response\n"
+            exit 1
+        }
         timeout {
             send_user "Timeout waiting for expected response\n"
             exit 1
@@ -36,6 +31,21 @@ proc chat {message}  {
     }
 
     send_user "Model returned expected response\n"
+}
+
+# Wait once for the initial prompt. Each chat call consumes the prompt that
+# terminates its response, so waiting again at the start of the next call would
+# block while the REPL is already ready for input.
+expect {
+    "chat> " {}
+    eof {
+        send_user "Chat process exited before showing the initial prompt\n"
+        exit 1
+    }
+    timeout {
+        send_user "Timeout waiting for initial chat prompt\n"
+        exit 1
+    }
 }
 
 chat "What datasets you have access to?"

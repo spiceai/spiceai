@@ -489,13 +489,9 @@ fn maintained_aggregate_partial_input(plan: &Arc<dyn ExecutionPlan>) -> Option<&
         return Some(aggregate);
     }
 
-    if plan.downcast_ref::<RepartitionExec>().is_none()
-        && plan
-            .downcast_ref::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
-            .is_none()
-        && plan
-            .downcast_ref::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
-            .is_none()
+    if !plan.is::<RepartitionExec>()
+        && !plan.is::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
+        && !plan.is::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
     {
         return None;
     }
@@ -560,14 +556,10 @@ fn maintained_aggregate_source(
         ));
     }
 
-    if plan.downcast_ref::<RepartitionExec>().is_none()
-        && plan
-            .downcast_ref::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
-            .is_none()
-        && plan.downcast_ref::<SchemaCastScanExec>().is_none()
-        && plan
-            .downcast_ref::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
-            .is_none()
+    if !plan.is::<RepartitionExec>()
+        && !plan.is::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
+        && !plan.is::<SchemaCastScanExec>()
+        && !plan.is::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
     {
         return None;
     }
@@ -664,14 +656,10 @@ fn cayenne_scan_input(plan: &Arc<dyn ExecutionPlan>) -> Option<&CayenneAccelerat
         return Some(cayenne_scan);
     }
 
-    if plan.downcast_ref::<RepartitionExec>().is_none()
-        && plan
-            .downcast_ref::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
-            .is_none()
-        && plan.downcast_ref::<SchemaCastScanExec>().is_none()
-        && plan
-            .downcast_ref::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
-            .is_none()
+    if !plan.is::<RepartitionExec>()
+        && !plan.is::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
+        && !plan.is::<SchemaCastScanExec>()
+        && !plan.is::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
     {
         return None;
     }
@@ -1008,7 +996,7 @@ fn count_hash_joins(plan: &Arc<dyn ExecutionPlan>) -> usize {
 }
 
 fn count_hash_joins_inner(plan: &Arc<dyn ExecutionPlan>, count: &mut usize) {
-    if plan.downcast_ref::<HashJoinExec>().is_some() {
+    if plan.is::<HashJoinExec>() {
         *count += 1;
     }
     for child in plan.children() {
@@ -1543,10 +1531,7 @@ fn flatten_transparent_nodes(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn Executio
 fn hash_join_build_side_is_cayenne(join: &HashJoinExec) -> bool {
     let build_side = flatten_transparent_nodes(join.left());
 
-    if build_side
-        .downcast_ref::<CayenneAccelerationExec>()
-        .is_some()
-    {
+    if build_side.is::<CayenneAccelerationExec>() {
         true
     } else if let Some(nested_join) = build_side.downcast_ref::<HashJoinExec>() {
         // Recursively check the build side of the nested join
@@ -1572,10 +1557,7 @@ fn is_cayenne_backed_join(hash_join: &HashJoinExec) -> bool {
     // Check the probe side first (right child)
     let probe_side = flatten_transparent_nodes(hash_join.right());
 
-    if probe_side
-        .downcast_ref::<CayenneAccelerationExec>()
-        .is_some()
-    {
+    if probe_side.is::<CayenneAccelerationExec>() {
         return true;
     }
 
@@ -1844,11 +1826,7 @@ mod tests {
         let optimized = CayenneMaintainedAggregateRewriter::new()
             .optimize(aggregate, &ConfigOptions::default())?;
 
-        assert!(
-            optimized
-                .downcast_ref::<MaintainedAggregateExec>()
-                .is_some()
-        );
+        assert!(optimized.is::<MaintainedAggregateExec>());
         Ok(())
     }
 
@@ -1948,7 +1926,7 @@ mod tests {
             .optimize(Arc::clone(&aggregate), &ConfigOptions::default())?;
 
         assert!(
-            optimized.downcast_ref::<AggregateExec>().is_some(),
+            optimized.is::<AggregateExec>(),
             "stale maintained aggregate state must not rewrite"
         );
         Ok(())
@@ -2078,7 +2056,7 @@ mod tests {
             .optimize(aggregate, &ConfigOptions::default())?;
 
         assert!(
-            optimized.downcast_ref::<AggregateExec>().is_some(),
+            optimized.is::<AggregateExec>(),
             "a filtered view must not answer an unfiltered query"
         );
         Ok(())
@@ -2124,7 +2102,7 @@ mod tests {
             .optimize(Arc::clone(&aggregate), &ConfigOptions::default())?;
 
         assert!(
-            optimized.downcast_ref::<AggregateExec>().is_some(),
+            optimized.is::<AggregateExec>(),
             "a filtered scan must not fold from whole-file stats"
         );
         Ok(())
@@ -2151,7 +2129,7 @@ mod tests {
             .optimize(Arc::clone(&aggregate), &ConfigOptions::default())?;
 
         assert!(
-            optimized.downcast_ref::<AggregateExec>().is_some(),
+            optimized.is::<AggregateExec>(),
             "a base+delta union with an unknown-stat delta must not fold"
         );
         Ok(())
@@ -2757,7 +2735,7 @@ mod tests {
 
         let optimized = optimize_anti_join_sort_merge(join);
         assert!(
-            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
+            optimized.is::<SortMergeJoinExec>(),
             "same-source Cayenne LeftSemi join should use sort-merge join"
         );
     }
@@ -2783,11 +2761,11 @@ mod tests {
 
         assert_eq!(JoinType::LeftAnti, sort_merge.join_type());
         assert!(
-            sort_merge.left().downcast_ref::<SortExec>().is_some(),
+            sort_merge.left().is::<SortExec>(),
             "left anti-join input should be explicitly sorted"
         );
         assert!(
-            sort_merge.right().downcast_ref::<SortExec>().is_some(),
+            sort_merge.right().is::<SortExec>(),
             "right anti-join input should be explicitly sorted"
         );
     }
@@ -2903,7 +2881,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.downcast_ref::<HashJoinExec>().is_some(),
+            optimized.is::<HashJoinExec>(),
             "inner joins should stay as hash joins unless a more targeted rule proves a win"
         );
     }
@@ -2925,7 +2903,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.downcast_ref::<HashJoinExec>().is_some(),
+            optimized.is::<HashJoinExec>(),
             "outer joins should stay as hash joins unless a more targeted rule proves a win"
         );
     }
@@ -2946,7 +2924,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
+            optimized.is::<SortMergeJoinExec>(),
             "multi-key same-source Cayenne anti join should use sort-merge join"
         );
     }
@@ -2968,7 +2946,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.downcast_ref::<HashJoinExec>().is_some(),
+            optimized.is::<HashJoinExec>(),
             "anti joins over unrelated sources should stay as hash joins"
         );
     }
@@ -2990,7 +2968,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.downcast_ref::<HashJoinExec>().is_some(),
+            optimized.is::<HashJoinExec>(),
             "inner joins over unrelated sources should stay as hash joins"
         );
     }
@@ -3016,7 +2994,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.downcast_ref::<HashJoinExec>().is_some(),
+            optimized.is::<HashJoinExec>(),
             "same-source anti joins at or below the large-input threshold should stay as hash joins"
         );
     }
@@ -3038,7 +3016,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.downcast_ref::<HashJoinExec>().is_some(),
+            optimized.is::<HashJoinExec>(),
             "null-equal anti joins should stay as hash joins"
         );
     }
@@ -3065,7 +3043,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized.downcast_ref::<HashJoinExec>().is_some(),
+            optimized.is::<HashJoinExec>(),
             "configured min-row threshold should keep smaller build sides as hash joins"
         );
     }
@@ -3098,7 +3076,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
+            optimized.is::<SortMergeJoinExec>(),
             "low-row-count + wide-row build exceeding the byte gate should be rewritten to sort-merge"
         );
     }
@@ -3121,7 +3099,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized.downcast_ref::<HashJoinExec>().is_some(),
+            optimized.is::<HashJoinExec>(),
             "estimated build side within the configured memory fraction should stay a hash join"
         );
     }
@@ -3144,7 +3122,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
+            optimized.is::<SortMergeJoinExec>(),
             "estimated build side above the configured memory fraction should use sort-merge"
         );
     }
@@ -3170,7 +3148,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.downcast_ref::<HashJoinExec>().is_some(),
+            optimized.is::<HashJoinExec>(),
             "same-source anti joins with inexact preserved-side stats should stay as hash joins"
         );
     }
@@ -3192,7 +3170,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.downcast_ref::<HashJoinExec>().is_some(),
+            optimized.is::<HashJoinExec>(),
             "same-source anti joins with unknown preserved-side stats should stay as hash joins"
         );
     }
@@ -3214,7 +3192,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
+            optimized.is::<SortMergeJoinExec>(),
             "RightAnti should gate on the left build side, not the right preserved side"
         );
     }
@@ -3236,7 +3214,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.downcast_ref::<HashJoinExec>().is_some(),
+            optimized.is::<HashJoinExec>(),
             "RightAnti should stay hash join when the left build side has unknown stats"
         );
     }
@@ -3251,7 +3229,7 @@ mod tests {
         }
         for child in plan.children() {
             let filters = cayenne_scan_dynamic_filters(child);
-            if !filters.is_empty() || child.downcast_ref::<CayenneAccelerationExec>().is_some() {
+            if !filters.is_empty() || child.is::<CayenneAccelerationExec>() {
                 return filters;
             }
         }
@@ -3378,7 +3356,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
+            optimized.is::<SortMergeJoinExec>(),
             "a large inner hash join over the memory gate should become a sort-merge join"
         );
     }
@@ -3402,7 +3380,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
+            optimized.is::<SortMergeJoinExec>(),
             "a large full-outer hash join over the memory gate should become a sort-merge join"
         );
     }
@@ -3432,7 +3410,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
+            optimized.is::<SortMergeJoinExec>(),
             "an inexact-but-large inner build side should still be rewritten under the memory gate"
         );
     }
@@ -3457,7 +3435,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
+            optimized.is::<SortMergeJoinExec>(),
             "different-source inner joins are eligible under the memory gate"
         );
     }
@@ -3489,7 +3467,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized.downcast_ref::<HashJoinExec>().is_some(),
+            optimized.is::<HashJoinExec>(),
             "non-Cayenne joins are left to the prefer_hash_join knob, not the Cayenne rewriter"
         );
     }
@@ -3513,7 +3491,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized.downcast_ref::<HashJoinExec>().is_some(),
+            optimized.is::<HashJoinExec>(),
             "a lone inner join within the pool fraction should stay a hash join"
         );
     }
@@ -3551,7 +3529,7 @@ mod tests {
         assert_eq!(union.children().len(), 2, "union should keep both joins");
         for child in union.children() {
             assert!(
-                child.downcast_ref::<SortMergeJoinExec>().is_some(),
+                child.is::<SortMergeJoinExec>(),
                 "each concurrent inner join should be rewritten to sort-merge under fair-share"
             );
         }

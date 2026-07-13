@@ -30,6 +30,7 @@ use crate::{
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct Column {
     pub name: String,
 
@@ -148,6 +149,7 @@ impl From<&str> for Column {
 ///
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct ColumnLevelEmbeddingConfig {
     #[serde(rename = "from", default)]
     pub model: String,
@@ -270,6 +272,7 @@ where
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct FullTextSearchConfig {
     pub enabled: bool,
 
@@ -470,5 +473,77 @@ mod tests {
         let parsed: ColumnLevelEmbeddingConfig =
             yaml::from_str(yaml).expect("Failed to parse ColumnLevelEmbeddingConfig");
         assert_eq!(parsed.row_ids, None);
+    }
+
+    // Regression tests for #10972 — column-level configuration silently accepted
+    // typo'd/unknown fields. `Column`, `ColumnLevelEmbeddingConfig`, and
+    // `FullTextSearchConfig` now carry `#[serde(deny_unknown_fields)]`, matching
+    // their parent `Dataset` and the rest of the spicepod component structs.
+
+    #[test]
+    fn test_column_valid_fields_parse() {
+        let yaml = r"
+name: id
+type: bigint
+nullable: false
+description: primary key
+";
+        let column: Column = yaml::from_str(yaml).expect("Failed to parse Column");
+        assert_eq!(column.name, "id");
+        assert_eq!(column.r#type.as_deref(), Some("bigint"));
+        assert_eq!(column.nullable, Some(false));
+    }
+
+    #[test]
+    fn test_column_data_type_alias_still_parses() {
+        // `data_type` is an accepted alias for `type`; deny_unknown_fields must
+        // not reject aliased fields.
+        let yaml = r"
+name: id
+data_type: bigint
+";
+        let column: Column = yaml::from_str(yaml).expect("Failed to parse Column");
+        assert_eq!(column.r#type.as_deref(), Some("bigint"));
+    }
+
+    #[test]
+    fn test_column_unknown_field_rejected() {
+        // Issue #10972 case A: `typee`/`nulleble` were silently discarded.
+        let yaml = r"
+name: id
+typee: bigint
+nulleble: false
+";
+        let result: Result<Column, _> = yaml::from_str(yaml);
+        assert!(
+            result.is_err(),
+            "unknown fields on columns[] should be rejected due to deny_unknown_fields"
+        );
+    }
+
+    #[test]
+    fn test_column_embedding_config_unknown_field_rejected() {
+        let yaml = r"
+from: model_name
+vector_sizee: 384
+";
+        let result: Result<ColumnLevelEmbeddingConfig, _> = yaml::from_str(yaml);
+        assert!(
+            result.is_err(),
+            "unknown fields on columns[].embeddings[] should be rejected due to deny_unknown_fields"
+        );
+    }
+
+    #[test]
+    fn test_full_text_search_config_unknown_field_rejected() {
+        let yaml = r"
+enabled: true
+index_storee: memory
+";
+        let result: Result<FullTextSearchConfig, _> = yaml::from_str(yaml);
+        assert!(
+            result.is_err(),
+            "unknown fields on columns[].full_text_search should be rejected due to deny_unknown_fields"
+        );
     }
 }

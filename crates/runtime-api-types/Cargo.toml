@@ -16,3 +16,6 @@ utoipa = { version = "5", optional = true }
 [features]
 default = []
 openapi = ["dep:utoipa"]
+
+[lints]
+workspace = true

@@ -1,0 +1,14 @@
+[package]
+description = "Open a path or URL with the OS default application"
+edition.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "system-open"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

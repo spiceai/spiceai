@@ -191,17 +191,6 @@ jobs:
           tar -xzf $output
           Remove-Item $output
 
-      - name: Download a older spiced
-        shell: pwsh
-        if: matrix.target.target_os == 'windows'
-        run: |
-          Set-Location "./build"
-          $url = "https://github.com/spiceai/spiceai/releases/download/v${{ env.UPGRADE_FROM_VERSION }}/spiced.exe_windows_x86_64.tar.gz"
-          $output = "spiced.exe_windows_x86_64.tar.gz"
-          Invoke-WebRequest -Uri $url -OutFile $output
-          tar -xzf $output
-          Remove-Item $output
-
       - name: Download older spiced
         if: matrix.target.target_os != 'windows'
         run: |
@@ -219,26 +208,26 @@ jobs:
           build-path: ./build
 
       - name: Check pre-upgrade version
+        if: matrix.target.target_os != 'windows'
         shell: bash
         run: |
           spice version
           RUNTIME_VERSION=$(spice version 2>&1 | grep 'Runtime version:' | awk '{print $3}')
           EXPECTED="v${{ env.UPGRADE_FROM_VERSION }}"
           echo "Pre-upgrade Runtime version: $RUNTIME_VERSION (expected: $EXPECTED)"
-          # v1.11.x on Windows doesn't detect spiced.exe (looks for 'spiced' without extension)
-          if [[ "$RUNTIME_VERSION" == "not" ]]; then
-            echo "::warning::Runtime reported as 'not installed' (known v1.11.x Windows issue)"
-          elif [[ "$RUNTIME_VERSION" != "$EXPECTED"* ]]; then
+          if [[ "$RUNTIME_VERSION" != "$EXPECTED"* ]]; then
             echo "::error::Expected pre-upgrade Runtime version starting with $EXPECTED, got $RUNTIME_VERSION"
             exit 1
           fi
 
       - name: Run spice upgrade
+        if: matrix.target.target_os != 'windows'
         shell: bash
         run: |
           spice -v upgrade 2>&1 | tee /tmp/upgrade_output.log
 
       - name: Verify no models variant attempted for v2+
+        if: matrix.target.target_os != 'windows'
         shell: bash
         run: |
           VERSION="${{ env.REL_VERSION }}"
@@ -255,30 +244,23 @@ jobs:
             echo "Skipping models variant check for v1.x"
           fi
 
-      - name: Check the temp directory (Windows)
+      - name: Validate native Windows spice upgrade guidance
         if: matrix.target.target_os == 'windows'
+        shell: pwsh
         run: |
-          Write-Host "System temp directory: $env:TEMP"
-          Get-ChildItem -Path $env:TEMP -Recurse |
-              Where-Object { $_.Name -like "spice*" } |
-              Select-Object FullName, Length, LastWriteTime |
-              Format-Table -AutoSize
-
-      - name: Run spice upgrade again
-        if: matrix.target.target_os == 'windows'
-        run: |
-          spice upgrade
-
-      - name: Check the temp directory (Windows)
-        if: matrix.target.target_os == 'windows'
-        run: |
-          Write-Host "System temp directory: $env:TEMP"
-          Get-ChildItem -Path $env:TEMP -Recurse |
-              Where-Object { $_.Name -like "spice*" } |
-              Select-Object FullName, Length, LastWriteTime |
-              Format-Table -AutoSize
+          $expected = "Open WSL and run the Linux Spice CLI there instead."
+          $upgradeOutput = (& spice upgrade 2>&1 | Out-String)
+          Write-Host $upgradeOutput
+          if ($LASTEXITCODE -eq 0) {
+            throw "spice upgrade unexpectedly succeeded on native Windows"
+          }
+          if (-not $upgradeOutput.Contains($expected)) {
+            throw "spice upgrade did not print the expected WSL guidance"
+          }
+          exit 0
 
       - name: Run spice version
+        if: matrix.target.target_os != 'windows'
         shell: bash
         run: |
           spice version
@@ -358,11 +340,13 @@ jobs:
           build-path: ./build
 
       - name: Run spice upgrade
+        if: matrix.target.target_os != 'windows'
         shell: bash
         run: |
           spice -v upgrade 2>&1 | tee /tmp/upgrade_output.log
 
       - name: Verify no models variant attempted for v2+
+        if: matrix.target.target_os != 'windows'
         shell: bash
         run: |
           VERSION="${{ env.REL_VERSION }}"
@@ -379,30 +363,23 @@ jobs:
             echo "Skipping models variant check for v1.x"
           fi
 
-      - name: Check the temp directory (Windows)
+      - name: Validate native Windows spice upgrade guidance
         if: matrix.target.target_os == 'windows'
+        shell: pwsh
         run: |
-          Write-Host "System temp directory: $env:TEMP"
-          Get-ChildItem -Path $env:TEMP -Recurse |
-              Where-Object { $_.Name -like "spice*" } |
-              Select-Object FullName, Length, LastWriteTime |
-              Format-Table -AutoSize
-
-      - name: Run spice upgrade again
-        if: matrix.target.target_os == 'windows'
-        run: |
-          spice upgrade
-
-      - name: Check the temp directory (Windows)
-        if: matrix.target.target_os == 'windows'
-        run: |
-          Write-Host "System temp directory: $env:TEMP"
-          Get-ChildItem -Path $env:TEMP -Recurse |
-              Where-Object { $_.Name -like "spice*" } |
-              Select-Object FullName, Length, LastWriteTime |
-              Format-Table -AutoSize
+          $expected = "Open WSL and run the Linux Spice CLI there instead."
+          $upgradeOutput = (& spice upgrade 2>&1 | Out-String)
+          Write-Host $upgradeOutput
+          if ($LASTEXITCODE -eq 0) {
+            throw "spice upgrade unexpectedly succeeded on native Windows"
+          }
+          if (-not $upgradeOutput.Contains($expected)) {
+            throw "spice upgrade did not print the expected WSL guidance"
+          }
+          exit 0
 
       - name: Run spice version
+        if: matrix.target.target_os != 'windows'
         shell: bash
         run: |
           spice version

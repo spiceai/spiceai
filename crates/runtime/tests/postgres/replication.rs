@@ -33,7 +33,7 @@ use std::time::Duration;
 use arrow::array::AsArray;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use data_components::postgres_replication::{
-    ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput, config,
+    PgOutputFormat, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput, config,
     start_replication_stream,
 };
 use futures::StreamExt;
@@ -74,6 +74,9 @@ fn params_for(port: u16, slot_name: &str, publication_name: &str) -> Replication
         status_interval: Duration::from_secs(1),
         bootstrap_batch_size: 8192,
         shared: false,
+        member_channel_capacity:
+            data_components::postgres_replication::shared::DEFAULT_MEMBER_CHANNEL_CAPACITY,
+        pg_output_format: PgOutputFormat::Binary,
     }
 }
 
@@ -151,7 +154,7 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
     let envelope = tokio::time::timeout(Duration::from_secs(30), stream.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("bootstrap envelope missing"))??;
-    let (committer, change_batch, is_ready) = envelope.into_parts();
+    let (committer, change_batch, is_ready) = envelope.into_parts().expect("build change batch");
     let ops = change_batch
         .record
         .column_by_name("op")
@@ -174,7 +177,7 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
     let envelope = tokio::time::timeout(Duration::from_secs(15), stream.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("insert envelope missing"))??;
-    let (committer, change_batch, _) = envelope.into_parts();
+    let (committer, change_batch, _) = envelope.into_parts().expect("build change batch");
     let ops = change_batch
         .record
         .column_by_name("op")
@@ -198,7 +201,7 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
     let envelope = tokio::time::timeout(Duration::from_secs(15), stream.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("update envelope missing"))??;
-    let (committer, change_batch, _) = envelope.into_parts();
+    let (committer, change_batch, _) = envelope.into_parts().expect("build change batch");
     let ops = change_batch
         .record
         .column_by_name("op")
@@ -214,7 +217,7 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
     let envelope = tokio::time::timeout(Duration::from_secs(15), stream.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("delete envelope missing"))??;
-    let (committer, change_batch, _) = envelope.into_parts();
+    let (committer, change_batch, _) = envelope.into_parts().expect("build change batch");
     let ops = change_batch
         .record
         .column_by_name("op")
@@ -248,7 +251,7 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
     let envelope = tokio::time::timeout(Duration::from_secs(30), stream.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("forced resume snapshot missing"))??;
-    let (committer, change_batch, is_ready) = envelope.into_parts();
+    let (committer, change_batch, is_ready) = envelope.into_parts().expect("build change batch");
     assert_eq!(
         change_batch.record.num_rows(),
         2,
@@ -304,7 +307,7 @@ async fn large_value_and_burst_replicate_intact() -> Result<(), anyhow::Error> {
     let envelope = tokio::time::timeout(Duration::from_secs(30), stream.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("bootstrap envelope missing"))??;
-    let (committer, change_batch, is_ready) = envelope.into_parts();
+    let (committer, change_batch, is_ready) = envelope.into_parts().expect("build change batch");
     assert_eq!(change_batch.record.num_rows(), 1);
     assert!(is_ready, "bootstrap must mark dataset ready");
     committer.commit().await?;
@@ -320,7 +323,7 @@ async fn large_value_and_burst_replicate_intact() -> Result<(), anyhow::Error> {
     let envelope = tokio::time::timeout(Duration::from_secs(30), stream.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("large-value envelope missing"))??;
-    let (committer, change_batch, _) = envelope.into_parts();
+    let (committer, change_batch, _) = envelope.into_parts().expect("build change batch");
     assert_eq!(change_batch.record.num_rows(), 1);
     let data_struct = change_batch
         .record
@@ -370,7 +373,7 @@ async fn large_value_and_burst_replicate_intact() -> Result<(), anyhow::Error> {
                     seen.len()
                 )
             })??;
-        let (committer, change_batch, _) = envelope.into_parts();
+        let (committer, change_batch, _) = envelope.into_parts().expect("build change batch");
         let data_struct = change_batch
             .record
             .column_by_name("data")
@@ -436,8 +439,22 @@ async fn two_replicas_have_independent_slots() -> Result<(), anyhow::Error> {
     let env_b = tokio::time::timeout(Duration::from_secs(30), stream_b.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("bootstrap b missing"))??;
-    assert_eq!(env_a.change_batch.record.num_rows(), 2);
-    assert_eq!(env_b.change_batch.record.num_rows(), 2);
+    assert_eq!(
+        env_a
+            .change_batch()
+            .expect("built change batch")
+            .record
+            .num_rows(),
+        2
+    );
+    assert_eq!(
+        env_b
+            .change_batch()
+            .expect("built change batch")
+            .record
+            .num_rows(),
+        2
+    );
     env_a.commit().await?;
     env_b.commit().await?;
 
@@ -452,8 +469,22 @@ async fn two_replicas_have_independent_slots() -> Result<(), anyhow::Error> {
     let live_b = tokio::time::timeout(Duration::from_secs(15), stream_b.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("live b missing"))??;
-    assert_eq!(live_a.change_batch.record.num_rows(), 1);
-    assert_eq!(live_b.change_batch.record.num_rows(), 1);
+    assert_eq!(
+        live_a
+            .change_batch()
+            .expect("built change batch")
+            .record
+            .num_rows(),
+        1
+    );
+    assert_eq!(
+        live_b
+            .change_batch()
+            .expect("built change batch")
+            .record
+            .num_rows(),
+        1
+    );
     live_a.commit().await?;
     live_b.commit().await?;
 
@@ -474,6 +505,314 @@ async fn two_replicas_have_independent_slots() -> Result<(), anyhow::Error> {
     for slot in &["spice_itest_slot_r1", "spice_itest_slot_r2"] {
         drop_replication_slot_when_inactive(&source, slot).await?;
     }
+    Ok(())
+}
+
+/// Arrow schema covering every column type that has a distinct binary decoder,
+/// used by [`wide_column_types_binary_matches_text`].
+fn wide_schema() -> SchemaRef {
+    use arrow::datatypes::TimeUnit;
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("v_bool", DataType::Boolean, true),
+        Field::new("v_i2", DataType::Int16, true),
+        Field::new("v_i8", DataType::Int64, true),
+        Field::new("v_f4", DataType::Float32, true),
+        Field::new("v_f8", DataType::Float64, true),
+        Field::new("v_num", DataType::Decimal128(15, 2), true),
+        Field::new("v_date", DataType::Date32, true),
+        Field::new(
+            "v_ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        ),
+        Field::new("v_text", DataType::Utf8, true),
+    ]))
+}
+
+/// Every column type Postgres emits in pgoutput's *binary* format must decode to
+/// exactly the same Arrow value as its text form. The runtime now requests
+/// binary output by default, so this drives a wide-typed table end-to-end under
+/// BOTH [`PgOutputFormat::Binary`] and [`PgOutputFormat::Text`] and asserts the
+/// same decoded values for each — proving the binary decoders (including the
+/// hand-written numeric/date/timestamp paths) match the text fallback, and
+/// keeping the text path exercised now that binary is the default.
+#[tokio::test(flavor = "multi_thread")]
+async fn wide_column_types_binary_matches_text() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+    let port = common::get_random_port()?;
+    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let port = u16::try_from(port).expect("port fits in u16");
+
+    // Same scenario, both wire formats. Distinct table/slot/publication per run
+    // keeps them fully isolated.
+    run_wide_types_scenario(port, PgOutputFormat::Binary, "bin").await?;
+    run_wide_types_scenario(port, PgOutputFormat::Text, "txt").await?;
+    Ok(())
+}
+
+async fn run_wide_types_scenario(
+    port: u16,
+    format: PgOutputFormat,
+    tag: &str,
+) -> Result<(), anyhow::Error> {
+    use arrow::datatypes::{
+        Date32Type, Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
+        TimestampNanosecondType,
+    };
+
+    let table = format!("repl_wide_{tag}");
+    let slot = format!("spice_wide_slot_{tag}");
+    let publication = format!("spice_wide_pub_{tag}");
+
+    // Fresh, empty source table — we drive the live binary WAL decode path with
+    // INSERT/UPDATE/DELETE (bootstrap is skipped below), not the snapshot path.
+    let mut cfg = tokio_postgres::Config::new();
+    cfg.host("localhost")
+        .port(port)
+        .user("postgres")
+        .password(common::PG_PASSWORD)
+        .dbname("postgres");
+    let (source, connection) = cfg.connect(NoTls).await?;
+    tokio::spawn(async move {
+        let _: Result<(), tokio_postgres::Error> = connection.await;
+    });
+    source
+        .simple_query(&format!(
+            "CREATE TABLE IF NOT EXISTS public.{table} (\
+               id int4 PRIMARY KEY, v_bool boolean, v_i2 int2, v_i8 int8, v_f4 float4, \
+               v_f8 float8, v_num numeric(15,2), v_date date, v_ts timestamp, v_text text)"
+        ))
+        .await?;
+    source
+        .simple_query(&format!("TRUNCATE public.{table}"))
+        .await?;
+
+    let mut params = params_for(port, &slot, &publication);
+    // Skip bootstrap so the row arrives via the pgoutput WAL path (the decoder
+    // under test), not the snapshot reader.
+    params.initial_snapshot = false;
+    params.pg_output_format = format;
+    let input = ReplicationStreamInput {
+        dataset_name: table.clone(),
+        params,
+        schema: wide_schema(),
+        primary_keys: vec!["id".into()],
+        schema_name: "public".into(),
+        table_name: table.clone(),
+        metrics: ReplicationMetricsCollector::new(),
+    };
+    let mut stream = start_replication_stream(input);
+
+    // `initial_snapshot: false` emits an immediate empty ready envelope; the
+    // slot exists by the time we receive it, so the INSERT below is captured.
+    let ready = tokio::time::timeout(Duration::from_secs(30), stream.next())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("ready envelope missing ({tag})"))??;
+    let (_committer, ready_batch, is_ready) = ready.into_parts().expect("build change batch");
+    assert!(
+        is_ready,
+        "skip-bootstrap ready envelope must mark ready ({tag})"
+    );
+    assert_eq!(
+        ready_batch.record.num_rows(),
+        0,
+        "ready envelope must be empty ({tag})"
+    );
+
+    // --- INSERT: one row exercising every binary type decoder ---
+    source
+        .simple_query(&format!(
+            "INSERT INTO public.{table} VALUES \
+             (1, true, 12345, 9000000000, 1.5, 2.5, 172799.49, '2000-01-01', \
+              '2000-01-01 00:00:00', 'hello world')"
+        ))
+        .await?;
+    let env = tokio::time::timeout(Duration::from_secs(15), stream.next())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("insert envelope missing ({tag})"))??;
+    let (committer, batch, _) = env.into_parts().expect("build change batch");
+    assert_eq!(
+        batch
+            .record
+            .column_by_name("op")
+            .expect("op")
+            .as_string::<i32>()
+            .value(0),
+        "c",
+        "insert op ({tag})"
+    );
+    let data = batch.record.column_by_name("data").expect("data");
+    let data = data.as_struct();
+    assert_eq!(
+        data.column_by_name("id")
+            .expect("id")
+            .as_primitive::<Int32Type>()
+            .value(0),
+        1,
+        "id ({tag})"
+    );
+    assert!(
+        data.column_by_name("v_bool")
+            .expect("v_bool")
+            .as_boolean()
+            .value(0),
+        "v_bool ({tag})"
+    );
+    assert_eq!(
+        data.column_by_name("v_i2")
+            .expect("v_i2")
+            .as_primitive::<Int16Type>()
+            .value(0),
+        12345,
+        "v_i2 ({tag})"
+    );
+    assert_eq!(
+        data.column_by_name("v_i8")
+            .expect("v_i8")
+            .as_primitive::<Int64Type>()
+            .value(0),
+        9_000_000_000,
+        "v_i8 ({tag})"
+    );
+    assert!(
+        (data
+            .column_by_name("v_f4")
+            .expect("v_f4")
+            .as_primitive::<Float32Type>()
+            .value(0)
+            - 1.5)
+            .abs()
+            < f32::EPSILON,
+        "v_f4 ({tag})"
+    );
+    assert!(
+        (data
+            .column_by_name("v_f8")
+            .expect("v_f8")
+            .as_primitive::<Float64Type>()
+            .value(0)
+            - 2.5)
+            .abs()
+            < f64::EPSILON,
+        "v_f8 ({tag})"
+    );
+    // numeric(15,2) 172799.49 -> i128 scaled by 2.
+    assert_eq!(
+        data.column_by_name("v_num")
+            .expect("v_num")
+            .as_primitive::<Decimal128Type>()
+            .value(0),
+        17_279_949,
+        "v_num ({tag})"
+    );
+    // date 2000-01-01 == the Postgres epoch: 10957 days after the Unix epoch.
+    assert_eq!(
+        data.column_by_name("v_date")
+            .expect("v_date")
+            .as_primitive::<Date32Type>()
+            .value(0),
+        10_957,
+        "v_date ({tag})"
+    );
+    // timestamp 2000-01-01 00:00:00 in nanoseconds since the Unix epoch.
+    assert_eq!(
+        data.column_by_name("v_ts")
+            .expect("v_ts")
+            .as_primitive::<TimestampNanosecondType>()
+            .value(0),
+        946_684_800_000_000_000,
+        "v_ts ({tag})"
+    );
+    assert_eq!(
+        data.column_by_name("v_text")
+            .expect("v_text")
+            .as_string::<i32>()
+            .value(0),
+        "hello world",
+        "v_text ({tag})"
+    );
+    committer.commit().await?;
+
+    // --- UPDATE: change numeric / bool / text / int8 ---
+    source
+        .simple_query(&format!(
+            "UPDATE public.{table} SET v_num = 1.00, v_bool = false, \
+             v_text = 'updated', v_i8 = -1 WHERE id = 1"
+        ))
+        .await?;
+    let env = tokio::time::timeout(Duration::from_secs(15), stream.next())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("update envelope missing ({tag})"))??;
+    let (committer, batch, _) = env.into_parts().expect("build change batch");
+    assert_eq!(
+        batch
+            .record
+            .column_by_name("op")
+            .expect("op")
+            .as_string::<i32>()
+            .value(0),
+        "u",
+        "update op ({tag})"
+    );
+    let data = batch.record.column_by_name("data").expect("data");
+    let data = data.as_struct();
+    assert_eq!(
+        data.column_by_name("v_num")
+            .expect("v_num")
+            .as_primitive::<Decimal128Type>()
+            .value(0),
+        100,
+        "updated v_num ({tag})"
+    );
+    assert!(
+        !data
+            .column_by_name("v_bool")
+            .expect("v_bool")
+            .as_boolean()
+            .value(0),
+        "updated v_bool ({tag})"
+    );
+    assert_eq!(
+        data.column_by_name("v_text")
+            .expect("v_text")
+            .as_string::<i32>()
+            .value(0),
+        "updated",
+        "updated v_text ({tag})"
+    );
+    assert_eq!(
+        data.column_by_name("v_i8")
+            .expect("v_i8")
+            .as_primitive::<Int64Type>()
+            .value(0),
+        -1,
+        "updated v_i8 ({tag})"
+    );
+    committer.commit().await?;
+
+    // --- DELETE ---
+    source
+        .simple_query(&format!("DELETE FROM public.{table} WHERE id = 1"))
+        .await?;
+    let env = tokio::time::timeout(Duration::from_secs(15), stream.next())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("delete envelope missing ({tag})"))??;
+    let (committer, batch, _) = env.into_parts().expect("build change batch");
+    assert_eq!(
+        batch
+            .record
+            .column_by_name("op")
+            .expect("op")
+            .as_string::<i32>()
+            .value(0),
+        "d",
+        "delete op ({tag})"
+    );
+    committer.commit().await?;
+
+    drop(stream);
+    drop_replication_slot_when_inactive(&source, &slot).await?;
     Ok(())
 }
 

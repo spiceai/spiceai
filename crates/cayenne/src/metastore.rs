@@ -213,6 +213,7 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
             "min_sequence",
             "max_sequence",
             "statistics_blob",
+            "pk_bloom_blob",
         ],
     },
     ExpectedTable {
