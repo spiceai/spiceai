@@ -98,7 +98,7 @@ pub use metadata::{
 pub use metastore::sqlite::{SqliteAutoVacuum, SqliteMetastoreConfig, set_sqlite_metastore_config};
 pub use provider::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
 pub use provider::{
-    CayenneCdcWrite, CayenneContext, CayenneStagedAppend, CayenneTableProvider,
+    CayenneCdcWrite, CayenneContext, CayenneStagedAppend, CayenneStagedUpsert, CayenneTableProvider,
     CayenneTableProviderBuilder, EncodeBudgetSnapshot, PARTITIONED_WAL_DIR, PartitionedWal,
     PartitionedWalEntry, PreparedOverwrite, PreparedStagedAppend, QueryObservations, SlotAdvancer,
     TimeRetentionFilterBuilder, begin_compaction_shutdown, cap_global_encode_concurrency,

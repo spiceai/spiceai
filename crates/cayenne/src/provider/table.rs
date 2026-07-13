@@ -27116,6 +27116,167 @@ mod tests {
         ids
     }
 
+    // ── Staged upsert (Analytical Replica dual-apply, `begin_staged_upsert`) ──
+
+    /// Build a file-mode provider with an `id` primary key and `on_conflict:
+    /// upsert` — the shape the Analytical Replica staged-upsert path targets.
+    async fn build_staged_upsert_provider(
+        ctx: &SessionContext,
+        name: &str,
+    ) -> (CayenneTableProvider, TempDir, SchemaRef) {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog init");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let vortex_config = VortexConfig::default();
+        let context = CayenneContext::new(&vortex_config, ctx.runtime_env(), name);
+        let options = CreateTableOptions {
+            table_name: name.to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config,
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .with_context(context)
+            .create(options)
+            .await
+            .expect("table created");
+        (provider, temp_dir, schema)
+    }
+
+    fn id_name_batch(schema: &SchemaRef, ids: &[i64], names: &[&str]) -> RecordBatch {
+        use arrow::array::StringArray;
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(Int64Array::from(ids.to_vec())),
+                Arc::new(StringArray::from(names.to_vec())),
+            ],
+        )
+        .expect("valid id/name batch")
+    }
+
+    /// A staged upsert is invisible to scans until `commit`, then fully visible.
+    #[tokio::test]
+    async fn staged_upsert_invisible_until_commit() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, schema) = build_staged_upsert_provider(&ctx, "su_commit").await;
+
+        let stream = single_batch_stream(id_name_batch(&schema, &[1, 2], &["alice", "bob"]));
+        let staged = provider
+            .begin_staged_upsert(stream, 1)
+            .await
+            .expect("begin staged upsert");
+        assert_eq!(staged.row_count(), 2);
+
+        // Held handle keeps the write guard; scans do not need it, so the staged
+        // rows are observably invisible before commit.
+        assert!(
+            scan_sorted_ids(&provider).await.is_empty(),
+            "staged rows must be invisible before commit"
+        );
+
+        let rows = staged.commit().await.expect("commit staged upsert");
+        assert_eq!(rows, 2);
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1, 2],
+            "rows are visible after commit"
+        );
+    }
+
+    /// Rolling back a staged upsert leaves nothing visible (catalog untouched).
+    #[tokio::test]
+    async fn staged_upsert_rollback_discards() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, schema) = build_staged_upsert_provider(&ctx, "su_rollback").await;
+
+        let stream = single_batch_stream(id_name_batch(&schema, &[1, 2], &["alice", "bob"]));
+        let staged = provider
+            .begin_staged_upsert(stream, 1)
+            .await
+            .expect("begin staged upsert");
+        staged.rollback().await.expect("rollback staged upsert");
+
+        assert!(
+            scan_sorted_ids(&provider).await.is_empty(),
+            "rollback must leave nothing visible"
+        );
+    }
+
+    /// A staged upsert supersedes the prior version of a conflicting PK (no
+    /// duplicate) and adds new PKs, all published atomically on commit.
+    #[tokio::test]
+    async fn staged_upsert_supersedes_existing_pk() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, schema) = build_staged_upsert_provider(&ctx, "su_conflict").await;
+
+        // Committed initial state: id=1 -> alice.
+        insert_batch(&provider, id_name_batch(&schema, &[1], &["alice"])).await;
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1]);
+
+        // Stage an upsert: id=1 -> alice2 (supersede), id=3 -> carol (new).
+        let stream = single_batch_stream(id_name_batch(&schema, &[1, 3], &["alice2", "carol"]));
+        let staged = provider
+            .begin_staged_upsert(stream, 1)
+            .await
+            .expect("begin staged upsert");
+
+        // Pre-commit state is unchanged.
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1],
+            "pre-commit state must be unchanged"
+        );
+
+        staged.commit().await.expect("commit staged upsert");
+
+        // Exactly one id=1 (superseded, not duplicated) plus the new id=3.
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 3]);
+
+        // The surviving id=1 carries the staged (new) value.
+        use arrow::array::StringArray;
+        let batches = read_all(&ctx, &provider, "su_conflict").await;
+        let mut got = std::collections::BTreeMap::new();
+        for b in &batches {
+            let ids = b
+                .column(b.schema().index_of("id").expect("id col"))
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id Int64");
+            let names = b
+                .column(b.schema().index_of("name").expect("name col"))
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("name Utf8");
+            for i in 0..b.num_rows() {
+                got.insert(ids.value(i), names.value(i).to_string());
+            }
+        }
+        assert_eq!(
+            got.get(&1).map(String::as_str),
+            Some("alice2"),
+            "conflicting id=1 must reflect the staged value"
+        );
+        assert_eq!(got.get(&3).map(String::as_str), Some("carol"));
+    }
+
     /// Crash-recovery exactly-once (correctness item #5, gates promotion past
     /// P1): rows appended to the in-memory CDC tier are DISCARDED on a crash
     /// before any checkpoint (the slot is the source of truth), and re-applying

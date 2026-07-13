@@ -100,6 +100,7 @@ pub(crate) mod query_admission;
 pub(crate) mod retention;
 pub(crate) mod scan;
 pub(crate) mod sink;
+pub(crate) mod staged_upsert;
 pub(crate) mod staging_wal;
 pub(crate) mod streaming;
 pub(crate) mod table;
@@ -126,6 +127,7 @@ pub use partitioned_wal::{PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEnt
 pub use query_admission::set_query_admission_governor;
 pub use retention::TimeRetentionFilterBuilder;
 pub use scan::CayenneAccelerationExec;
+pub use staged_upsert::CayenneStagedUpsert;
 pub use staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
 pub use table::{CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder};
 pub use tuning::{
