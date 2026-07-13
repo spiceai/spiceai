@@ -12981,7 +12981,12 @@ impl CayenneTableProvider {
                 );
                 return Ok(false);
             }
-            (stream, Some((cutoff, folded_before)), generation_before)
+            (
+                stream,
+                Some((cutoff, folded_before)),
+                generation_before,
+                snapshot_id_before,
+            )
         };
 
         if self.context.has_sort_columns() {
@@ -13944,24 +13949,14 @@ impl CayenneTableProvider {
         let _write_guard = self.write_lock_arc().lock_owned().await;
 
         // Drain in-flight pipelined Stage-B publishes before capturing the
-        // visible set. Stage-A has already written the staged snapshot's
-        // durable sequence row and acked the source slot, but its rows become
-        // visible only at Stage-B — without the drain, the capture below
-        // misses the staged rows while the overwrite-clear commit deletes
-        // their sequence row: silent loss at restart. A timeout is an ERROR
-        // (not an `Ok(false)` no-op): it means a Stage-B publish has been
-        // wedged for the whole window — acked-but-unpublished data — which
-        // must reach the failure telemetry, not blend into the routine
-        // below-threshold skips. The background tick logs it and retries;
-        // the warm tier is left intact either way.
+        // visible set.
         if !self
             .drain_inflight_staged_writes(STAGED_WRITE_DRAIN_TIMEOUT)
             .await
         {
             return Err(Error::Internal {
                 table: self.table_metadata.table_name.clone(),
-                message: "Timed out draining in-flight staged writes before datalake promotion; \
-                          warm tier left intact (next tick retries)"
+                message: "Timed out draining in-flight staged writes before datalake promotion; warm tier left intact (next tick retries)"
                     .to_string(),
             });
         }
