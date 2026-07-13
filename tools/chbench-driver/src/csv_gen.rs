@@ -261,6 +261,23 @@ fn io_err(table: &'static str) -> impl FnOnce(std::io::Error) -> Error {
     }
 }
 
+/// Look up `table`'s column list from [`TABLE_COLUMNS`] — the single source
+/// of truth both the generator and the loaders use for column ordering.
+/// Every call site here passes a literal from that same table, so a miss can
+/// only happen if a future edit adds/renames a table inconsistently; fail
+/// loudly with a structured error rather than silently generating an empty
+/// column list, which would produce a confusing `COPY`/`LOAD DATA` SQL error
+/// far from the actual mistake.
+fn table_columns(table: &str) -> Result<&'static str> {
+    TABLE_COLUMNS
+        .iter()
+        .find(|(t, _)| *t == table)
+        .map(|(_, c)| *c)
+        .ok_or_else(|| Error::UnknownTable {
+            table: table.to_owned(),
+        })
+}
+
 /// Best-effort extraction of a message from a `std::thread::Result` panic
 /// payload (the common `&str`/`String` panic payloads; anything else falls
 /// back to a generic message rather than failing to report the panic at all).
@@ -286,21 +303,15 @@ fn generate_warehouse_range(
     end: usize,
     seed: u64,
 ) -> Result<Vec<GeneratedShard>> {
-    let cols = |table: &str| {
-        TABLE_COLUMNS
-            .iter()
-            .find(|(t, _)| *t == table)
-            .map_or("", |(_, c)| c)
-    };
-
-    let mut tw_warehouse = TableWriter::new(dir, "warehouse", cols("warehouse"), shard)?;
-    let mut tw_district = TableWriter::new(dir, "district", cols("district"), shard)?;
-    let mut tw_stock = TableWriter::new(dir, "stock", cols("stock"), shard)?;
-    let mut tw_customer = TableWriter::new(dir, "customer", cols("customer"), shard)?;
-    let mut tw_history = TableWriter::new(dir, "history", cols("history"), shard)?;
-    let mut tw_oorder = TableWriter::new(dir, "oorder", cols("oorder"), shard)?;
-    let mut tw_new_order = TableWriter::new(dir, "new_order", cols("new_order"), shard)?;
-    let mut tw_order_line = TableWriter::new(dir, "order_line", cols("order_line"), shard)?;
+    let mut tw_warehouse = TableWriter::new(dir, "warehouse", table_columns("warehouse")?, shard)?;
+    let mut tw_district = TableWriter::new(dir, "district", table_columns("district")?, shard)?;
+    let mut tw_stock = TableWriter::new(dir, "stock", table_columns("stock")?, shard)?;
+    let mut tw_customer = TableWriter::new(dir, "customer", table_columns("customer")?, shard)?;
+    let mut tw_history = TableWriter::new(dir, "history", table_columns("history")?, shard)?;
+    let mut tw_oorder = TableWriter::new(dir, "oorder", table_columns("oorder")?, shard)?;
+    let mut tw_new_order = TableWriter::new(dir, "new_order", table_columns("new_order")?, shard)?;
+    let mut tw_order_line =
+        TableWriter::new(dir, "order_line", table_columns("order_line")?, shard)?;
 
     for w in start..=end {
         let w_id = i32::try_from(w).unwrap_or(i32::MAX);
@@ -510,7 +521,7 @@ pub fn generate(dir: &Path, warehouses: usize, seed: Option<u64>) -> Result<Vec<
 
     // Shared tables (not warehouse-scoped): small, generated up front.
     {
-        let mut tw = TableWriter::new(dir, "item", "i_id, i_im_id, i_name, i_price, i_data", 0)?;
+        let mut tw = TableWriter::new(dir, "item", table_columns("item")?, 0)?;
         for i in 1..=MAX_ITEMS {
             let i_im_id: i32 = rng.random_range(1..=10_000);
             let i_price: f64 = f64::from(rng.random_range(100..=10_000)) / 100.0;
@@ -525,31 +536,21 @@ pub fn generate(dir: &Path, warehouses: usize, seed: Option<u64>) -> Result<Vec<
         shards.push(tw.finish()?);
     }
     {
-        let mut tw = TableWriter::new(
-            dir,
-            "nation",
-            "n_nationkey, n_name, n_regionkey, n_comment",
-            0,
-        )?;
+        let mut tw = TableWriter::new(dir, "nation", table_columns("nation")?, 0)?;
         for &(key, name, region) in NATIONS.iter().chain(EXTRA_NATIONS.iter()) {
             tw.write_line(&format!("{key},{},{region},\"\"", csv_str(name)))?;
         }
         shards.push(tw.finish()?);
     }
     {
-        let mut tw = TableWriter::new(dir, "region", "r_regionkey, r_name, r_comment", 0)?;
+        let mut tw = TableWriter::new(dir, "region", table_columns("region")?, 0)?;
         for &(key, name) in REGIONS {
             tw.write_line(&format!("{key},{},\"\"", csv_str(name)))?;
         }
         shards.push(tw.finish()?);
     }
     {
-        let mut tw = TableWriter::new(
-            dir,
-            "supplier",
-            "su_suppkey, su_name, su_address, su_nationkey, su_phone, su_acctbal, su_comment",
-            0,
-        )?;
+        let mut tw = TableWriter::new(dir, "supplier", table_columns("supplier")?, 0)?;
         let nation_count = i64::try_from(NATIONS.len() + EXTRA_NATIONS.len()).unwrap_or(62);
         for i in 1..=SUPPLIER_COUNT {
             let s_name = tpcc_rand::rand_chars(&mut rng, 25, 25);

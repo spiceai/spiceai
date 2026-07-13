@@ -41,7 +41,7 @@ limitations under the License.
 use std::path::PathBuf;
 use std::time::Instant;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::SinkExt;
 use tokio::io::AsyncReadExt;
 use tokio_postgres::Client;
@@ -172,10 +172,17 @@ async fn copy_shard(client: &Client, shard: &GeneratedShard) -> Result<()> {
             action: format!("open generated CSV {}", shard.path.display()),
             source,
         })?;
-    let mut buf = vec![0u8; 1 << 20];
+    // `reserve` every iteration (not just once) because `split()` below can
+    // leave `buf` with zero spare capacity: BytesMut::split() hands off
+    // [0, len) and leaves self with only [len, capacity) remaining, which is
+    // empty once a chunk fills the buffer exactly. Without re-reserving,
+    // read_buf would then read 0 bytes on the next call — indistinguishable
+    // from EOF — silently truncating the upload.
+    let mut buf = BytesMut::with_capacity(1 << 20);
     loop {
+        buf.reserve(1 << 20);
         let n = file
-            .read(&mut buf)
+            .read_buf(&mut buf)
             .await
             .map_err(|source| crate::Error::Io {
                 action: format!("read generated CSV {}", shard.path.display()),
@@ -184,7 +191,7 @@ async fn copy_shard(client: &Client, shard: &GeneratedShard) -> Result<()> {
         if n == 0 {
             break;
         }
-        sink.send(Bytes::copy_from_slice(&buf[..n]))
+        sink.send(buf.split().freeze())
             .await
             .map_err(|source| crate::Error::Sql {
                 action: format!("stream COPY data for {}", shard.table),

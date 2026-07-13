@@ -98,6 +98,11 @@ pub enum Error {
         action: String,
         source: std::io::Error,
     },
+
+    #[snafu(display(
+        "Internal error: no column list registered for table {table} in csv_gen::TABLE_COLUMNS"
+    ))]
+    UnknownTable { table: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -128,8 +133,17 @@ pub(crate) async fn join_loader_tasks(
                 message: format!("{what} loader task panicked: {e}"),
             },
         };
-        for handle in rest {
+        for handle in &rest {
             handle.abort();
+        }
+        // Wait for the aborted tasks to actually finish (not just request
+        // cancellation) before returning. The caller may drop a resource the
+        // workers were using right after this returns (e.g. the seed loaders'
+        // tempdir, deleted as soon as `load_all` returns its error) — without
+        // this, an aborted-but-still-running worker could race against that
+        // cleanup and produce a confusing secondary error alongside the real one.
+        for handle in rest {
+            let _ = handle.await;
         }
         return Err(err);
     }
