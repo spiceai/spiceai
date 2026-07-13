@@ -17,9 +17,16 @@ limitations under the License.
 //! Configuration for the Cloud Connect client.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Default endpoint for the Spice Cloud control plane.
 pub const DEFAULT_ENDPOINT: &str = "https://cloud.spice.ai";
+
+/// Default cadence for `Heartbeat` frames on an established stream.
+pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Default cadence for `Telemetry` frames on an established stream.
+pub const DEFAULT_TELEMETRY_INTERVAL: Duration = Duration::from_mins(1);
 
 /// File name (relative to `$SPICE_CONFIG_DIR`) where the cloud-managed
 /// spicepod is written when an `ApplySpicepod` command arrives.
@@ -77,6 +84,15 @@ pub struct CloudConnectConfig {
     /// Runtime semver-like string (`v2.0.0-build.deadbeef`). Sent in
     /// `Hello.runtime_version`.
     pub runtime_version: String,
+
+    /// Cadence for `Heartbeat` frames once a stream is established.
+    /// Defaults to [`DEFAULT_HEARTBEAT_INTERVAL`]; overridable so tests can
+    /// exercise heartbeat cadence without waiting the production interval.
+    pub heartbeat_interval: Duration,
+
+    /// Cadence for `Telemetry` frames once a stream is established.
+    /// Defaults to [`DEFAULT_TELEMETRY_INTERVAL`].
+    pub telemetry_interval: Duration,
 }
 
 impl CloudConnectConfig {
@@ -171,6 +187,8 @@ impl CloudConnectConfig {
             adoption_code,
             pending_adopt_code_path,
             runtime_version: runtime_version.into(),
+            heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            telemetry_interval: DEFAULT_TELEMETRY_INTERVAL,
         }
     }
 }
