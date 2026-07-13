@@ -3690,6 +3690,7 @@ version = "2.1.0-unstable"
 dependencies = [
  "arrow",
  "async-trait",
+ "bytes",
  "chrono",
  "datafusion-table-providers",
  "futures",
@@ -3698,6 +3699,7 @@ dependencies = [
  "rand 0.10.1",
  "secrecy",
  "snafu",
+ "tempfile",
  "tokio",
  "tokio-postgres",
  "tokio-util",
