@@ -180,11 +180,15 @@ pub async fn load_all(opts: &mysql_async::Opts, warehouses: usize, seed: Option<
     println!("  generating seed CSV data for {warehouses} warehouse(s)...");
     let gen_start = Instant::now();
     let gen_dir = dir.clone();
-    let shards = tokio::task::spawn_blocking(move || csv_gen::generate(&gen_dir, warehouses, seed))
-        .await
-        .map_err(|e| crate::Error::TaskJoin {
-            message: format!("csv generation task panicked: {e}"),
-        })??;
+let shards = tokio::task::spawn_blocking(move || csv_gen::generate(&gen_dir, warehouses, seed))
+    .await
+    .map_err(|e| crate::Error::TaskJoin {
+        message: if e.is_cancelled() {
+            format!("csv generation task was cancelled: {e}")
+        } else {
+            format!("csv generation task panicked: {e}")
+        },
+    })??;
     println!(
         "  generated {} CSV file(s) in {:.1?}",
         shards.len(),
