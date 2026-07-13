@@ -70,12 +70,7 @@ fn loader_concurrency() -> usize {
 /// # Errors
 ///
 /// Returns an error if CSV generation fails or any database operation fails.
-pub async fn load_all(
-    client: &Client,
-    conn_str: &str,
-    warehouses: usize,
-    seed: Option<u64>,
-) -> Result<()> {
+pub async fn load_all(conn_str: &str, warehouses: usize, seed: Option<u64>) -> Result<()> {
     let tmp_dir = tempfile::tempdir().map_err(|source| crate::Error::Io {
         action: "create seed CSV temp directory".into(),
         source,
@@ -88,19 +83,17 @@ pub async fn load_all(
     let shards = tokio::task::spawn_blocking(move || csv_gen::generate(&gen_dir, warehouses, seed))
         .await
         .map_err(|e| crate::Error::TaskJoin {
-            message: format!("csv generation task panicked: {e}"),
+            message: if e.is_panic() {
+                format!("csv generation task panicked: {e}")
+            } else {
+                format!("csv generation task was cancelled: {e}")
+            },
         })??;
     println!(
         "  generated {} CSV file(s) in {:.1?}",
         shards.len(),
         gen_start.elapsed()
     );
-
-    // `client` is used to keep this connection alive/consistent with the
-    // caller's session, but the parallel COPY workers open their own
-    // connections from `conn_str` — Postgres allows only one COPY per
-    // connection at a time.
-    let _ = client;
 
     let concurrency = loader_concurrency().min(shards.len().max(1));
     println!(
@@ -116,7 +109,11 @@ pub async fn load_all(
     Ok(())
 }
 
-async fn load_shards(conn_str: &str, shards: Vec<GeneratedShard>, concurrency: usize) -> Result<()> {
+async fn load_shards(
+    conn_str: &str,
+    shards: Vec<GeneratedShard>,
+    concurrency: usize,
+) -> Result<()> {
     // Round-robin shards across `concurrency` worker connections.
     let mut workers: Vec<Vec<GeneratedShard>> = (0..concurrency).map(|_| Vec::new()).collect();
     for (i, shard) in shards.into_iter().enumerate() {

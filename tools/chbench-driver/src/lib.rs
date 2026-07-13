@@ -278,13 +278,7 @@ impl ChBenchDriver for PostgresChBenchDriver {
         schema::drop_tables(&self.client).await?;
         schema::create_tables(&self.client).await?;
         let conn_str = self.source.connection_string();
-        loader::load_all(
-            &self.client,
-            &conn_str,
-            self.config.warehouses,
-            self.config.seed,
-        )
-        .await?;
+        loader::load_all(&conn_str, self.config.warehouses, self.config.seed).await?;
         // Build secondary indexes and attach the _bench_ts triggers *after* the
         // bulk load so neither is maintained per-row during the seed load.
         schema::create_indexes(&self.client).await?;

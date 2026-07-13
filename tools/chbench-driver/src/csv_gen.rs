@@ -190,8 +190,9 @@ pub struct GeneratedShard {
 
 struct CsvString<'a>(&'a str);
 
-impl<'a> std::fmt::Display for CsvString<'a> {
-     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {        f.write_str("\"")?;
+impl std::fmt::Display for CsvString<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("\"")?;
 
         for ch in self.0.chars() {
             match ch {
@@ -206,7 +207,7 @@ impl<'a> std::fmt::Display for CsvString<'a> {
 
 /// CSV-quote a string value (fields are alphanumeric by construction — see
 /// `crate::rand` — but quoted defensively in case that ever changes).
-fn csv_str<'a>(s: &'a str) -> CsvString<'a> {
+fn csv_str(s: &str) -> CsvString<'_> {
     CsvString(s)
 }
 
@@ -235,7 +236,9 @@ impl TableWriter {
     }
 
     fn write_line(&mut self, line: &str) -> Result<()> {
-        self.w.write_all(line.as_bytes()).map_err(io_err(self.table))?;
+        self.w
+            .write_all(line.as_bytes())
+            .map_err(io_err(self.table))?;
         self.w.write_all(b"\n").map_err(io_err(self.table))?;
         self.rows += 1;
         Ok(())
@@ -424,8 +427,7 @@ fn generate_warehouse_range(
                 let j = wh_rng.random_range(0..=i);
                 cids.swap(i, j);
             }
-            let mut ol_cnts =
-                Vec::with_capacity(usize::try_from(ORDERS_PER_DISTRICT).unwrap_or(0));
+            let mut ol_cnts = Vec::with_capacity(usize::try_from(ORDERS_PER_DISTRICT).unwrap_or(0));
             for i in 0..ORDERS_PER_DISTRICT {
                 let o_id = i + 1;
                 let o_c_id = cids[usize::try_from(i).unwrap_or(0)];
@@ -458,7 +460,7 @@ fn generate_warehouse_range(
                         tw_order_line.write_line(&format!(
                             "{o_id},{d},{w_id},{j},{ol_i_id},{w_id},{ol_delivery_d},5,{ol_amount},{}",
                             csv_str(&ol_dist_info),
-                        ))?;                        
+                        ))?;
                     } else {
                         let ol_delivery_d = "\\N";
                         let ol_amount = f64::from(wh_rng.random_range(1..=999_999)) / 100.0;
@@ -603,7 +605,10 @@ pub fn generate(dir: &Path, warehouses: usize, seed: Option<u64>) -> Result<Vec<
             .collect();
         handles
             .into_iter()
-            .map(|h| h.join().unwrap_or_else(|panic_payload| Err(panic_message(&panic_payload))))
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|panic_payload| Err(panic_message(&panic_payload)))
+            })
             .collect()
     });
     for shard in shard_results {

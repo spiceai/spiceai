@@ -170,7 +170,11 @@ fn loader_concurrency() -> usize {
 /// # Errors
 ///
 /// Returns an error if CSV generation fails or any database operation fails.
-pub async fn load_all(opts: &mysql_async::Opts, warehouses: usize, seed: Option<u64>) -> Result<()> {
+pub async fn load_all(
+    opts: &mysql_async::Opts,
+    warehouses: usize,
+    seed: Option<u64>,
+) -> Result<()> {
     let tmp_dir = tempfile::tempdir().map_err(|source| crate::Error::Io {
         action: "create seed CSV temp directory".into(),
         source,
@@ -183,7 +187,11 @@ pub async fn load_all(opts: &mysql_async::Opts, warehouses: usize, seed: Option<
     let shards = tokio::task::spawn_blocking(move || csv_gen::generate(&gen_dir, warehouses, seed))
         .await
         .map_err(|e| crate::Error::TaskJoin {
-            message: format!("csv generation task panicked: {e}"),
+            message: if e.is_panic() {
+                format!("csv generation task panicked: {e}")
+            } else {
+                format!("csv generation task was cancelled: {e}")
+            },
         })??;
     println!(
         "  generated {} CSV file(s) in {:.1?}",
@@ -245,13 +253,10 @@ async fn load_shards(
 /// logically-NULL fields (e.g. `ol_delivery_d` on undelivered order lines),
 /// so no explicit NULL-marker clause is needed here (unlike Postgres's COPY).
 async fn load_shard(conn: &mut mysql_async::Conn, shard: &GeneratedShard) -> Result<()> {
-    let path = shard
-         .path
-         .to_str()
-         .ok_or_else(|| crate::Error::Io {
-             action: format!("convert generated CSV path to UTF-8 for {}", shard.table),
-             source: std::io::Error::new(std::io::ErrorKind::InvalidData, "non-UTF-8 path"),
-         })?;
+    let path = shard.path.to_str().ok_or_else(|| crate::Error::Io {
+        action: format!("convert generated CSV path to UTF-8 for {}", shard.table),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, "non-UTF-8 path"),
+    })?;
     let path = path.replace('\'', "''");
     let sql = format!(
         "LOAD DATA LOCAL INFILE '{path}' INTO TABLE {} \
