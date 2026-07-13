@@ -158,7 +158,7 @@ const OBJECT_STORE_MOVE_CONCURRENCY: usize = 16;
 /// How long [`CayenneTableProvider::evolve_schema_live`] and
 /// [`CayenneTableProvider::promote_warm_to_cold`] wait for in-flight
 /// pipelined Stage-B publishes (staged WALs + staged inline tombstones) to
-/// drain before giving up. Stage-B finalizes normally complete within
+/// drain before giving up. A Stage-B finalize normally completes within
 /// milliseconds; the timeout only guards against a wedged background task.
 const STAGED_WRITE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default intra-write encode-shard count for an unsorted write when no per-table
@@ -2167,9 +2167,8 @@ impl CayenneTableProvider {
         let started = Instant::now();
         let _write_guard = self.write_lock.lock().await;
 
-        // Step 2: drain Stage-B publishes. A timeout is an ERROR here (unlike
-        // the promotion pass, which just skips): schema evolution was
-        // explicitly requested and cannot be silently deferred.
+        // Step 2: drain Stage-B publishes. They complete without `write_lock`
+        // (visibility lock + listing fence only), and no new ones can start.
         if !self
             .drain_inflight_staged_writes(STAGED_WRITE_DRAIN_TIMEOUT)
             .await
@@ -2313,8 +2312,8 @@ impl CayenneTableProvider {
 
     /// Wait for in-flight pipelined Stage-B publishes (staged WALs + staged
     /// inline tombstones) to drain, up to `timeout`. Returns `false` on
-    /// timeout — the caller decides whether that is an error (schema
-    /// evolution) or a skipped pass (datalake promotion).
+    /// timeout — the caller turns that into its own structured error (a
+    /// still-pending publish after the window means a wedged Stage-B task).
     ///
     /// Callers must hold `write_lock`: it blocks new Stage-A commits, so the
     /// pending set can only shrink, while Stage-B needs only the visibility
@@ -13949,18 +13948,22 @@ impl CayenneTableProvider {
         // durable sequence row and acked the source slot, but its rows become
         // visible only at Stage-B — without the drain, the capture below
         // misses the staged rows while the overwrite-clear commit deletes
-        // their sequence row: silent loss at restart. A timeout just SKIPS
-        // the pass — promotion is a background tick; the next one retries.
+        // their sequence row: silent loss at restart. A timeout is an ERROR
+        // (not an `Ok(false)` no-op): it means a Stage-B publish has been
+        // wedged for the whole window — acked-but-unpublished data — which
+        // must reach the failure telemetry, not blend into the routine
+        // below-threshold skips. The background tick logs it and retries;
+        // the warm tier is left intact either way.
         if !self
             .drain_inflight_staged_writes(STAGED_WRITE_DRAIN_TIMEOUT)
             .await
         {
-            tracing::warn!(
-                target: "cayenne::compaction",
-                table = self.table_metadata.table_name.as_str(),
-                "Datalake promotion skipped: in-flight staged writes did not drain in time; next tick retries"
-            );
-            return Ok(false);
+            return Err(Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: "Timed out draining in-flight staged writes before datalake promotion; \
+                          warm tier left intact (next tick retries)"
+                    .to_string(),
+            });
         }
 
         // Flush the in-RAM mem tier + inline into durable so the canonical visible
