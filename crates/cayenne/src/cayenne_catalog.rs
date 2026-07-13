@@ -1541,7 +1541,10 @@ impl MetadataCatalog for CayenneCatalog {
         // final piece of the uniform local-FS durability contract (snapshot
         // dirs, _partitioned_wal/, deletions/, and now initial table creation).
         // Matches the contract we enforce everywhere else in the write path.
-        if !base_path.starts_with("s3://") {
+        // Memory mode (`mode: memory`) writes nothing to disk — the mem-tier is the
+        // store and the metastore is an in-RAM memdb — so skip creating the initial
+        // snapshot directory entirely.
+        if !base_path.starts_with("s3://") && !options.vortex_config.memory_mode {
             let table_root = std::path::PathBuf::from(&base_path).join(&table_id);
             let snapshot_dir = table_root.join(&initial_snapshot_id);
 
