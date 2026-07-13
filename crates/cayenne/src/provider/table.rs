@@ -27142,7 +27142,9 @@ mod tests {
         // and two concurrent generations do not.
         let seed = int64_id_batch(&(0..80).collect::<Vec<_>>());
         let seed_bytes = seed.get_array_memory_size() as u64;
-        let cap = seed_bytes.saturating_add(seed_bytes / 2).max(seed_bytes + 1);
+        let cap = seed_bytes
+            .saturating_add(seed_bytes / 2)
+            .max(seed_bytes + 1);
         let vortex_config = VortexConfig {
             memory_mode: true,
             cdc_mem_tier_max_bytes: i64::try_from(cap).expect("cap fits i64"),
