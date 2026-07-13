@@ -256,7 +256,7 @@ async fn databricks_sql_warehouse_dataset_registration_test() -> Result<(), anyh
 /// Test querying an EXTERNAL table through the SQL Warehouse connector.
 /// EXTERNAL tables are UC tables backed by external storage locations.
 #[tokio::test]
-#[ignore = "Requires spiceai_sandbox.integration.external_table to be set up in the Databricks account"]
+#[ignore = "Requires spiceai_sandbox.integration.external_table to be set up in the Databricks account. Run with: cargo test -p runtime --test integration databricks_sql_warehouse_external_table_test --features spark,databricks,extended_tests -- --ignored"]
 async fn databricks_sql_warehouse_external_table_test() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
@@ -316,7 +316,7 @@ async fn databricks_sql_warehouse_external_table_test() -> Result<(), anyhow::Er
 /// SQL Warehouse connector. FOREIGN tables skip strict UC permission
 /// prechecks because Databricks validates access at query time.
 #[tokio::test]
-#[ignore = "Requires spiceai_sandbox.integration.foreign_table to be set up in the Databricks account"]
+#[ignore = "Requires spiceai_sandbox.integration.foreign_table to be set up in the Databricks account. Run with: cargo test -p runtime --test integration databricks_sql_warehouse_foreign_table_test --features spark,databricks,extended_tests -- --ignored"]
 async fn databricks_sql_warehouse_foreign_table_test() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
@@ -375,7 +375,7 @@ async fn databricks_sql_warehouse_foreign_table_test() -> Result<(), anyhow::Err
 /// Test querying a `MATERIALIZED_VIEW` through the SQL Warehouse connector.
 /// Materialized views are pre-computed result sets maintained by Databricks.
 #[tokio::test]
-#[ignore = "Requires spiceai_sandbox.integration.materialized_view_table to be set up in the Databricks account"]
+#[ignore = "Requires spiceai_sandbox.integration.materialized_view_table to be set up in the Databricks account. Run with: cargo test -p runtime --test integration databricks_sql_warehouse_materialized_view_test --features spark,databricks,extended_tests -- --ignored"]
 async fn databricks_sql_warehouse_materialized_view_test() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
