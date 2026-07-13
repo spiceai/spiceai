@@ -188,10 +188,27 @@ pub struct GeneratedShard {
     pub columns: &'static str,
 }
 
+struct CsvString<'a>(&'a str);
+
+impl Display for CsvString {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("\"")?;
+
+        for ch in self.0.chars() {
+            match ch {
+                '"' => f.write_str("\"\"")?,
+                _ => write!(f, "{ch}")?,
+            }
+        }
+
+        f.write_str("\"")
+    }
+}
+
 /// CSV-quote a string value (fields are alphanumeric by construction — see
 /// `crate::rand` — but quoted defensively in case that ever changes).
-fn csv_str(s: &str) -> String {
-    format!("\"{}\"", s.replace('"', "\"\""))
+fn csv_str<'a>(s: &'a str) -> CsvString<'a> {
+    CsvString(s)
 }
 
 struct TableWriter {
@@ -329,22 +346,30 @@ fn generate_warehouse_range(
 
         for i in 1..=STOCK_PER_WAREHOUSE {
             let s_quantity: i32 = wh_rng.random_range(10..=100);
-            let dists: Vec<String> = (0..10)
-                .map(|_| tpcc_rand::rand_letters(&mut wh_rng, 24, 24))
-                .collect();
+            let dist_0 = tpcc_rand::rand_letters(&mut wh_rng, 24, 24);
+            let dist_1 = tpcc_rand::rand_letters(&mut wh_rng, 24, 24);
+            let dist_2 = tpcc_rand::rand_letters(&mut wh_rng, 24, 24);
+            let dist_3 = tpcc_rand::rand_letters(&mut wh_rng, 24, 24);
+            let dist_4 = tpcc_rand::rand_letters(&mut wh_rng, 24, 24);
+            let dist_5 = tpcc_rand::rand_letters(&mut wh_rng, 24, 24);
+            let dist_6 = tpcc_rand::rand_letters(&mut wh_rng, 24, 24);
+            let dist_7 = tpcc_rand::rand_letters(&mut wh_rng, 24, 24);
+            let dist_8 = tpcc_rand::rand_letters(&mut wh_rng, 24, 24);
+            let dist_9 = tpcc_rand::rand_letters(&mut wh_rng, 24, 24);
+
             let s_data = tpcc_rand::rand_original_string(&mut wh_rng);
             tw_stock.write_line(&format!(
                 "{i},{w_id},{s_quantity},{},{},{},{},{},{},{},{},{},{},0,0,0,{}",
-                csv_str(&dists[0]),
-                csv_str(&dists[1]),
-                csv_str(&dists[2]),
-                csv_str(&dists[3]),
-                csv_str(&dists[4]),
-                csv_str(&dists[5]),
-                csv_str(&dists[6]),
-                csv_str(&dists[7]),
-                csv_str(&dists[8]),
-                csv_str(&dists[9]),
+                csv_str(&dists_0),
+                csv_str(&dists_1),
+                csv_str(&dists_2),
+                csv_str(&dists_3),
+                csv_str(&dists_4),
+                csv_str(&dists_5),
+                csv_str(&dists_6),
+                csv_str(&dists_7),
+                csv_str(&dists_8),
+                csv_str(&dists_9),
                 csv_str(&s_data),
             ))?;
         }

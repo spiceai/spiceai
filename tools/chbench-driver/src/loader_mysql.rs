@@ -245,7 +245,14 @@ async fn load_shards(
 /// logically-NULL fields (e.g. `ol_delivery_d` on undelivered order lines),
 /// so no explicit NULL-marker clause is needed here (unlike Postgres's COPY).
 async fn load_shard(conn: &mut mysql_async::Conn, shard: &GeneratedShard) -> Result<()> {
-    let path = shard.path.to_string_lossy();
+    let path = shard
+         .path
+         .to_str()
+         .ok_or_else(|| crate::Error::Io {
+             action: format!("convert generated CSV path to UTF-8 for {}", shard.table),
+             source: std::io::Error::new(std::io::ErrorKind::InvalidData, "non-UTF-8 path"),
+         })?;
+    let path = path.replace('\'', "''");
     let sql = format!(
         "LOAD DATA LOCAL INFILE '{path}' INTO TABLE {} \
          FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '\"' \
