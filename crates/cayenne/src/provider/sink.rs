@@ -176,10 +176,12 @@ impl DataSink for CayenneDataSink {
                     incoming_bytes.saturating_add(batch.get_array_memory_size() as u64);
                 // Enforce the hard RAM bound while buffering so an oversized refresh
                 // fails fast with a structured error instead of OOMing during
-                // collection (memory mode never spills). Holding the write lock makes
-                // this check reflect the only in-flight write.
+                // collection (memory mode never spills). Always count resident +
+                // incoming: on overwrite the old tier stays live until the atomic
+                // replace, so peak is not just the final tier size. Holding the
+                // write lock makes this check reflect the only in-flight write.
                 self.table
-                    .enforce_memory_limit(incoming_bytes, overwrite)
+                    .enforce_memory_limit(incoming_bytes)
                     .map_err(datafusion_common::DataFusionError::from)?;
                 batches.push(batch);
             }

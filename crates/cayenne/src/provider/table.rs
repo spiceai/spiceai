@@ -17949,19 +17949,20 @@ impl CayenneTableProvider {
 
     /// Memory-mode (`mode: memory`) hard RAM bound for the standard-DML write path
     /// (full/append refresh). Memory mode never spills, so a breach returns a
-    /// structured error. `overwrite` (full refresh) atomically replaces the tier,
-    /// so it compares only the incoming bytes; append compares resident + incoming.
-    /// A limit of `u64::MAX` (unset) disables enforcement.
-    pub(crate) fn enforce_memory_limit(&self, incoming_bytes: u64, overwrite: bool) -> Result<()> {
+    /// structured error.
+    ///
+    /// Always counts **resident + incoming**: even a full-refresh overwrite keeps
+    /// the old tier in RAM until the atomic replace, so peak usage during buffering
+    /// (and until the swap) is resident + the new payload — not the final tier size
+    /// alone. Ignoring resident for overwrite would let a "fits after replace" write
+    /// OOM while both generations are live. A limit of `u64::MAX` (unset) disables
+    /// enforcement.
+    pub(crate) fn enforce_memory_limit(&self, incoming_bytes: u64) -> Result<()> {
         let limit = self.context.mem_tier_max_bytes_capped();
         if limit == u64::MAX {
             return Ok(());
         }
-        let resident = if overwrite {
-            0
-        } else {
-            self.mem_tier.total_bytes()
-        };
+        let resident = self.mem_tier.total_bytes();
         if resident.saturating_add(incoming_bytes) >= limit {
             return Err(Error::MemTierLimitExceeded {
                 table: self.table_metadata.table_name.clone(),
@@ -17984,7 +17985,7 @@ impl CayenneTableProvider {
         incoming_bytes: u64,
         overwrite: bool,
     ) -> Result<u64> {
-        self.enforce_memory_limit(incoming_bytes, overwrite)?;
+        self.enforce_memory_limit(incoming_bytes)?;
         if overwrite {
             self.overwrite_mem_tier(batches, incoming_bytes).await
         } else {
@@ -27113,6 +27114,77 @@ mod tests {
             .write_batches_memory_mode(vec![big], bytes, false)
             .await
             .expect_err("a write exceeding the memory limit must error");
+        assert!(
+            matches!(err, Error::MemTierLimitExceeded { .. }),
+            "expected MemTierLimitExceeded, got: {err:?}"
+        );
+    }
+
+    /// Overwrite still counts resident tier bytes: while buffering a full refresh
+    /// the old tier remains live, so peak RAM is resident + incoming (not just the
+    /// final post-replace size). A small overwrite that would fit after the swap
+    /// must still error if resident + incoming exceeds the hard cap.
+    #[tokio::test]
+    async fn test_memory_mode_overwrite_counts_resident_toward_limit() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let runtime_env = SessionContext::new().runtime_env();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db")).expect("catalog"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("init catalog");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        // Cap is sized after measuring the seed batch so one generation fits
+        // and two concurrent generations do not.
+        let seed = int64_id_batch(&(0..80).collect::<Vec<_>>());
+        let seed_bytes = seed.get_array_memory_size() as u64;
+        let cap = seed_bytes.saturating_add(seed_bytes / 2).max(seed_bytes + 1);
+        let vortex_config = VortexConfig {
+            memory_mode: true,
+            cdc_mem_tier_max_bytes: i64::try_from(cap).expect("cap fits i64"),
+            ..VortexConfig::default()
+        };
+        let options = CreateTableOptions {
+            table_name: "mem_overwrite_bound".to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: format!("{}/data", temp_dir.path().to_str().expect("str")),
+            partition_column: None,
+            vortex_config,
+        };
+        let provider = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .create(options)
+            .await
+            .expect("table created");
+
+        assert!(
+            seed_bytes < cap,
+            "seed ({seed_bytes} bytes) must fit under the cap ({cap})"
+        );
+        provider
+            .write_batches_memory_mode(vec![seed], seed_bytes, false)
+            .await
+            .expect("seed write under cap");
+
+        let replacement = int64_id_batch(&(0..80).collect::<Vec<_>>());
+        let replacement_bytes = replacement.get_array_memory_size() as u64;
+        assert!(
+            seed_bytes.saturating_add(replacement_bytes) >= cap,
+            "seed + replacement must exceed the cap (got {} + {} vs {cap})",
+            seed_bytes,
+            replacement_bytes
+        );
+        // Overwrite that would fit *after* replace must still fail while the old
+        // tier is resident (peak = resident + incoming).
+        let err = provider
+            .write_batches_memory_mode(vec![replacement], replacement_bytes, true)
+            .await
+            .expect_err("overwrite must count resident bytes toward the hard cap");
         assert!(
             matches!(err, Error::MemTierLimitExceeded { .. }),
             "expected MemTierLimitExceeded, got: {err:?}"
