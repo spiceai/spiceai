@@ -1057,11 +1057,7 @@ impl ReciprocalRankFusion {
         let a = drop_embedding_cols(a)?;
         let b = drop_embedding_cols(b)?;
 
-        a.join_on(
-            b,
-            JoinType::Full,
-            vec![key_a.eq(key_b)],
-        )
+        a.join_on(b, JoinType::Full, vec![key_a.eq(key_b)])
     }
 
     // Window and rank a search subquery by its `_score` field.
@@ -1339,6 +1335,7 @@ impl TableProvider for ReciprocalRankFusion {
 
 #[cfg(test)]
 mod tests {
+    use crate::rrf::ReciprocalRankFusion;
     use crate::rrf::ReciprocalRankFusionArgs;
     use arrow::array::{Float64Array, StringArray};
     use arrow::record_batch::RecordBatch;
@@ -1537,14 +1534,16 @@ mod tests {
             Arc::new(
                 MemTable::try_new(
                     Arc::clone(&schema),
-                    vec![vec![RecordBatch::try_new(
-                        Arc::clone(&schema),
-                        vec![
-                            Arc::new(StringArray::from(ids)),
-                            Arc::new(Float64Array::from(ranks)),
-                        ],
-                    )
-                    .expect("valid batch")]],
+                    vec![vec![
+                        RecordBatch::try_new(
+                            Arc::clone(&schema),
+                            vec![
+                                Arc::new(StringArray::from(ids)),
+                                Arc::new(Float64Array::from(ranks)),
+                            ],
+                        )
+                        .expect("valid batch"),
+                    ]],
                 )
                 .expect("valid memtable"),
             )
@@ -1603,12 +1602,7 @@ mod tests {
         assert_eq!(
             formatted,
             concat!(
-                "+----+\n",
-                "| id |\n",
-                "+----+\n",
-                "| A  |\n",
-                "| B  |\n",
-                "+----+"
+                "+----+\n", "| id |\n", "+----+\n", "| A  |\n", "| B  |\n", "+----+"
             )
         );
     }

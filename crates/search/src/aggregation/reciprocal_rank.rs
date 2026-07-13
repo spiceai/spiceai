@@ -413,11 +413,7 @@ async fn reciprocal_rank_fusion_plan(
             left_key.eq(col(pk.clone().with_relation(table_name.clone())))
         });
 
-        builder = builder.join_on(
-            plan.clone(),
-            JoinType::Full,
-            on_exprs,
-        )?;
+        builder = builder.join_on(plan.clone(), JoinType::Full, on_exprs)?;
         joined_table_names.push(table_name.clone());
     }
 
