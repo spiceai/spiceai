@@ -207,13 +207,17 @@ pg-tpcds-init:
 	@echo "Creating tables from tpcds.sql..."
 	@psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -f ./tpcds-kit/tools/tpcds.sql
 
-	@if [ "$(ADD_INDEXES)" = "true" ] || [ "$(ADD_INDEXES)" = "1" ]; then \
-		echo "Applying indexes from tpcds_index.sql..."; \
-		psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -f tpcds_index.sql; \
-		echo "Indexes applied successfully."; \
-	fi
-
 	@echo "Database '$(DB_NAME)' has been successfully created or updated."
+
+# Indexes are built after pg-tpcds-load, not as part of pg-tpcds-init: building
+# them against empty tables means every bulk \copy in pg-tpcds-load has to
+# incrementally maintain each index row-by-row, instead of one efficient
+# sort-and-build pass over already-loaded data.
+# Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpch make pg-tpcds-create-index
+pg-tpcds-create-index:
+	@echo "Applying indexes from tpcds_index.sql..."
+	@psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -f tpcds_index.sql
+	@echo "Indexes applied successfully."
 
 # Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpch make pg-tpcds-load
 pg-tpcds-load:
