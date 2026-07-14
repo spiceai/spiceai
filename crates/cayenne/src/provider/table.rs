@@ -13353,6 +13353,11 @@ impl CayenneTableProvider {
         struct BoundedZOrderState {
             input: SendableRecordBatchStream,
             current_run: Option<SendableRecordBatchStream>,
+            current_run_start: Option<Instant>,
+            current_run_idx: usize,
+            current_run_output_batches: u64,
+            current_run_output_rows: u64,
+            current_run_first_batch_emitted: bool,
             next_run_idx: usize,
             input_exhausted: bool,
         }
@@ -13360,6 +13365,11 @@ impl CayenneTableProvider {
         let state = BoundedZOrderState {
             input: stream,
             current_run: None,
+            current_run_start: None,
+            current_run_idx: 0,
+            current_run_output_batches: 0,
+            current_run_output_rows: 0,
+            current_run_first_batch_emitted: false,
             next_run_idx: 0,
             input_exhausted: false,
         };
@@ -13374,9 +13384,49 @@ impl CayenneTableProvider {
                 loop {
                     if let Some(current_run) = state.current_run.as_mut() {
                         match current_run.next().await {
-                            Some(batch) => return Some((batch, state)),
+                            Some(batch) => {
+                                if let Ok(batch) = &batch {
+                                    state.current_run_output_batches =
+                                        state.current_run_output_batches.saturating_add(1);
+                                    state.current_run_output_rows =
+                                        state.current_run_output_rows.saturating_add(
+                                            u64::try_from(batch.num_rows()).unwrap_or(u64::MAX),
+                                        );
+                                    if !state.current_run_first_batch_emitted {
+                                        state.current_run_first_batch_emitted = true;
+                                        tracing::debug!(
+                                            target: "cayenne::compaction",
+                                            table = table_name.as_str(),
+                                            run_idx = state.current_run_idx,
+                                            rows = batch.num_rows(),
+                                            elapsed_ms = state
+                                                .current_run_start
+                                                .map(|start| start.elapsed().as_millis())
+                                                .unwrap_or(0),
+                                            "Datalake promotion: bounded Z-order sort run emitted first batch"
+                                        );
+                                    }
+                                }
+                                return Some((batch, state));
+                            }
                             None => {
+                                tracing::debug!(
+                                    target: "cayenne::compaction",
+                                    table = table_name.as_str(),
+                                    run_idx = state.current_run_idx,
+                                    output_batches = state.current_run_output_batches,
+                                    output_rows = state.current_run_output_rows,
+                                    elapsed_ms = state
+                                        .current_run_start
+                                        .map(|start| start.elapsed().as_millis())
+                                        .unwrap_or(0),
+                                    "Datalake promotion: bounded Z-order sort run complete"
+                                );
                                 state.current_run = None;
+                                state.current_run_start = None;
+                                state.current_run_output_batches = 0;
+                                state.current_run_output_rows = 0;
+                                state.current_run_first_batch_emitted = false;
                                 continue;
                             }
                         }
@@ -13388,6 +13438,7 @@ impl CayenneTableProvider {
 
                     let run_idx = state.next_run_idx;
                     state.next_run_idx = state.next_run_idx.saturating_add(1);
+                    state.current_run_idx = run_idx;
                     let mut run_batches = Vec::new();
                     let mut run_rows: usize = 0;
                     let mut run_bytes: usize = 0;
@@ -13420,6 +13471,7 @@ impl CayenneTableProvider {
                         run_size_bytes,
                         "Datalake promotion: bounded Z-order sort run starting"
                     );
+                    state.current_run_start = Some(Instant::now());
 
                     let idx = Arc::clone(&clustering_indices);
                     let augmented = stream::iter(
@@ -13492,7 +13544,7 @@ impl CayenneTableProvider {
         stream: SendableRecordBatchStream,
     ) -> Result<()> {
         let insert_start = Instant::now();
-        tracing::debug!(
+        tracing::trace!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             dir_url,
@@ -13507,7 +13559,7 @@ impl CayenneTableProvider {
         let input: Arc<dyn ExecutionPlan> =
             Arc::new(StreamingExec::new(self.table_schema(), stream));
         let plan_start = Instant::now();
-        tracing::debug!(
+        tracing::trace!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             dir_url,
@@ -13516,7 +13568,7 @@ impl CayenneTableProvider {
         let plan = listing
             .insert_into(session_state, input, InsertOp::Append)
             .await?;
-        tracing::debug!(
+        tracing::trace!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             dir_url,

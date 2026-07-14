@@ -399,7 +399,7 @@ async fn write_record_batch_stream_to_files(
     let extension = output_options.extension.to_string();
     let base_output_path = output_options.base_output_path.clone();
     let sink_start = Instant::now();
-    tracing::debug!(
+    tracing::trace!(
         target: "cayenne::compaction",
         base_prefix = %base_output_path.prefix(),
         write_id = write_id.as_str(),
@@ -523,7 +523,7 @@ async fn write_record_batch_stream_to_files(
         Ok(())
     }
     .await;
-    tracing::debug!(
+    tracing::trace!(
         target: "cayenne::compaction",
         write_id = write_id.as_str(),
         input_batches,
@@ -576,7 +576,7 @@ async fn write_record_batch_stream_to_files(
         return Err(err);
     }
 
-    tracing::debug!(
+    tracing::trace!(
         target: "cayenne::compaction",
         write_id = write_id.as_str(),
         files = results.len(),
