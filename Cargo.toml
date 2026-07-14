@@ -140,6 +140,7 @@ adbc_core = "0.23"
 adbc_driver_manager = "0.23"
 ahash = "0.8.12"
 anyhow = "1.0.103"
+async-channel = "1.9"
 arc-swap = "1.7"
 arrow = { version = "58.0.0", features = ["prettyprint"] }
 arrow-array = "58.0.0"

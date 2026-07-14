@@ -534,6 +534,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
                     Arc::clone(&driver),
                     &spice_clients,
                     query_overrides,
+                    args.analytic_gate_concurrency,
                 )
                 .await;
 
