@@ -39,7 +39,7 @@ RUN \
       cargo build --profile ${RUST_PROFILE} --features ${CARGO_FEATURES:-default}; \
     fi && \
     cp /build/target/${RUST_PROFILE}/spiced /root/spiced && \
-    cp /build/target/${RUST_PROFILE}/deps/libpdfium.so /root/libpdfium.so
+    cp "$(find /build/target -name libpdfium.so -print -quit)" /root/libpdfium.so
 
 FROM debian:trixie-slim as sandbox-setup
 

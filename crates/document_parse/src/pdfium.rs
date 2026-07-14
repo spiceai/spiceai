@@ -258,12 +258,22 @@ fn download_and_extract(asset: &str, expected_sha256: &str, dest: &Path) -> Resu
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
     }
-    if dest.exists() {
-        std::fs::remove_dir_all(dest).ok();
+
+    // Publish atomically. If another process won the race and already populated
+    // `dest`, keep theirs — the contents are equivalent (same verified archive) —
+    // and discard our temp, rather than deleting a directory a concurrent parse
+    // may already be loading from.
+    match std::fs::rename(&tmp, dest) {
+        Ok(()) => Ok(()),
+        Err(_) if dest.exists() => {
+            std::fs::remove_dir_all(&tmp).ok();
+            Ok(())
+        }
+        Err(e) => Err(format!(
+            "failed to move PDFium into {}: {e}",
+            dest.display()
+        )),
     }
-    std::fs::rename(&tmp, dest)
-        .map_err(|e| format!("failed to move PDFium into {}: {e}", dest.display()))?;
-    Ok(())
 }
 
 /// Verify `bytes` hash to `expected` (lowercase hex SHA-256).
