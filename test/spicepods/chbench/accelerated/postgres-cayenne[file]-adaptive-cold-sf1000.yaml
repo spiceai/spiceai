@@ -57,7 +57,9 @@ runtime:
 
 datasets:
   # ------------------------------------------------------------------
-  # High-volume PK upsert tables — adaptive tuning + COLD object-store tier.
+  # High-volume PK upsert tables — adaptive tuning. Only `order_line` has the COLD
+  # object-store tier enabled in this diagnostic variant, so promotions cannot
+  # overlap across the largest CDC tables while investigating SortExec stalls.
   # No primary_key / on_conflict / indexes: `schema_inference: extended` detects them from the
   # PostgreSQL source and seeds the upsert on_conflict the CDC (changes) path requires (it also
   # supplies the row_count/table_bytes the adaptive warm-start gates on, and the PK the cold tier
@@ -70,6 +72,51 @@ datasets:
       <<: *postgres_params
       pg_replication_slot: spice_district
       pg_replication_initial_snapshot: 'true'
+    acceleration: &cayenne_accel
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      params: &cayenne_params
+        cayenne_tuning: adaptive
+        # In-memory CDC intra-apply sharding: 4 PK-hash shards validate+append in parallel within
+        # one apply on the memory-tier (changes) tables. Not an adaptive actuator.
+        cayenne_cdc_mem_tier_shards: '4'
+
+  - from: postgres:customer
+    name: customer
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_customer
+      pg_replication_initial_snapshot: 'true'
+    acceleration: *cayenne_accel
+
+  - from: postgres:new_order
+    name: new_order
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_new_order
+      pg_replication_initial_snapshot: 'true'
+    acceleration: *cayenne_accel
+
+  - from: postgres:oorder
+    name: oorder
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_oorder
+      pg_replication_initial_snapshot: 'true'
+    acceleration: *cayenne_accel
+
+  - from: postgres:order_line
+    name: order_line
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_order_line
+      pg_replication_initial_snapshot: 'true'
     acceleration: &cayenne_accel_cold
       enabled: true
       engine: cayenne
@@ -77,8 +124,6 @@ datasets:
       refresh_mode: changes
       params: &cayenne_params_cold
         cayenne_tuning: adaptive
-        # In-memory CDC intra-apply sharding: 4 PK-hash shards validate+append in parallel within
-        # one apply on the memory-tier (changes) tables. Not an adaptive actuator.
         cayenne_cdc_mem_tier_shards: '4'
         # --- Datalake (cold) object-store tier (RAM mem-tier -> warm local disk -> COLD). All
         # static config; none of these are adaptive actuators, so setting them collapses no tuning
@@ -96,42 +141,6 @@ datasets:
         cayenne_datalake_target_file_size_mb: '750'
         cayenne_datalake_promotion_interval_ms: '30000'
 
-  - from: postgres:customer
-    name: customer
-    schema_inference: extended
-    params:
-      <<: *postgres_params
-      pg_replication_slot: spice_customer
-      pg_replication_initial_snapshot: 'true'
-    acceleration: *cayenne_accel_cold
-
-  - from: postgres:new_order
-    name: new_order
-    schema_inference: extended
-    params:
-      <<: *postgres_params
-      pg_replication_slot: spice_new_order
-      pg_replication_initial_snapshot: 'true'
-    acceleration: *cayenne_accel_cold
-
-  - from: postgres:oorder
-    name: oorder
-    schema_inference: extended
-    params:
-      <<: *postgres_params
-      pg_replication_slot: spice_oorder
-      pg_replication_initial_snapshot: 'true'
-    acceleration: *cayenne_accel_cold
-
-  - from: postgres:order_line
-    name: order_line
-    schema_inference: extended
-    params:
-      <<: *postgres_params
-      pg_replication_slot: spice_order_line
-      pg_replication_initial_snapshot: 'true'
-    acceleration: *cayenne_accel_cold
-
   - from: postgres:stock
     name: stock
     schema_inference: extended
@@ -139,7 +148,7 @@ datasets:
       <<: *postgres_params
       pg_replication_slot: spice_stock
       pg_replication_initial_snapshot: 'true'
-    acceleration: *cayenne_accel_cold
+    acceleration: *cayenne_accel
 
   # ------------------------------------------------------------------
   # Low-volume CDC reference table — adaptive, NO cold tier (it never crosses the warm-size trigger,
@@ -152,14 +161,7 @@ datasets:
       <<: *postgres_params
       pg_replication_slot: spice_warehouse
       pg_replication_initial_snapshot: 'true'
-    acceleration: &cayenne_accel
-      enabled: true
-      engine: cayenne
-      mode: file
-      refresh_mode: changes
-      params: &cayenne_params
-        cayenne_tuning: adaptive
-        cayenne_cdc_mem_tier_shards: '4'
+    acceleration: *cayenne_accel
 
   # ------------------------------------------------------------------
   # Static reference tables (no OLTP mutations, full refresh) — adaptive, no cold tier.
