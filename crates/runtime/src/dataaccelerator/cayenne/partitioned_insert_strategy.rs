@@ -27,9 +27,11 @@ limitations under the License.
 //!   [`MetastoreTransaction`] so the `current_snapshot_id` pointer flips
 //!   happen atomically — either every partition advances or none do.
 //! - **Append / Replace** ([`CayennePartitionedAppendSink`]): every
-//!   participating partition's `listing_fence.write()` is held for one
-//!   shared barrier window while files move into the current snapshot dir
-//!   and the in-memory `ListingTable` Arcs swap, anchored by a top-level
+//!   participating partition stages its data into a prepared *target* snapshot;
+//!   then, holding one shared `listing_fence.write()` barrier window, the staged
+//!   files are made durable and every partition's `current_snapshot_id` pointer
+//!   is advanced atomically in a single [`MetastoreTransaction`] (either every
+//!   partition advances or none do), anchored by a top-level
 //!   [`cayenne::PartitionedWal`] for crash recovery on local and object-store
 //!   tables.
 //!
@@ -1317,7 +1319,14 @@ impl CayennePartitionedAppendSink {
                 .set_current_snapshots_in_txn(&mut *txn, &snapshots)
                 .await
             {
-                drop(txn);
+                // Roll back explicitly (not via the transaction's best-effort,
+                // possibly-detached Drop) so the metastore writer lock is released
+                // deterministically before this attempt backs off and retries.
+                if let Err(rollback_error) = txn.rollback().await {
+                    tracing::warn!(
+                        "Failed to roll back cross-partition append transaction before retry: {rollback_error}"
+                    );
+                }
                 if attempt < max_attempts && cayenne::is_retryable_write_conflict(&error) {
                     tokio::time::sleep(turso_shared::retry_backoff_delay(attempt)).await;
                     continue;
@@ -1329,7 +1338,14 @@ impl CayennePartitionedAppendSink {
                     .apply_prepared_on_conflict_in_txn(&mut *txn, on_conflict)
                     .await
                 {
-                    drop(txn);
+                    // Roll back explicitly (not via the transaction's best-effort,
+                    // possibly-detached Drop) so the metastore writer lock is released
+                    // deterministically before this attempt backs off and retries.
+                    if let Err(rollback_error) = txn.rollback().await {
+                        tracing::warn!(
+                            "Failed to roll back cross-partition append transaction before retry: {rollback_error}"
+                        );
+                    }
                     if attempt < max_attempts && cayenne::is_retryable_write_conflict(&error) {
                         tokio::time::sleep(turso_shared::retry_backoff_delay(attempt)).await;
                         continue 'attempts;
@@ -1348,7 +1364,14 @@ impl CayennePartitionedAppendSink {
                         )
                         .await
                 {
-                    drop(txn);
+                    // Roll back explicitly (not via the transaction's best-effort,
+                    // possibly-detached Drop) so the metastore writer lock is released
+                    // deterministically before this attempt backs off and retries.
+                    if let Err(rollback_error) = txn.rollback().await {
+                        tracing::warn!(
+                            "Failed to roll back cross-partition append transaction before retry: {rollback_error}"
+                        );
+                    }
                     if attempt < max_attempts && cayenne::is_retryable_write_conflict(&error) {
                         tokio::time::sleep(turso_shared::retry_backoff_delay(attempt)).await;
                         continue 'attempts;
