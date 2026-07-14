@@ -8,7 +8,8 @@ on:
     # htap-sf1000 (other configs), once daily (0100) — the remaining SF1000 configs
     # (adaptive-turso, duckdb baseline) on the xlarge pool.
     - cron: '0 1 * * *'
-    # htap-sf1, twice daily (0600, 1800) — HTAP CH-benCHmark SF1 (spiceai-dev-large-runners)
+    # htap-sf1, twice daily (0600, 1800) — HTAP CH-benCHmark SF1 (spiceai-dev-large-runners),
+    # including adaptive-ivm (lower rate so IVM contribution indexes stay under the safety cap).
     - cron: '0 6,18 * * *'
     # htap-sf1000-cold, once daily (0800) — HTAP CH-benCHmark SF1000 adaptive cold-object-store tier
     # (spiceai-dev-xlarge-runners). Lighter once-a-day cadence; it shares the SF1000 serialized run

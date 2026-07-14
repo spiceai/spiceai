@@ -169,10 +169,11 @@ const STAGED_WRITE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// parallelism. See `snapshot_write_concurrency`.
 pub(crate) const DEFAULT_WRITE_CONCURRENCY: usize = 4;
 const TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT: usize = 256;
-/// Upper bound on total per-PK maintained-aggregate retraction index entries;
-/// exceeding it fails the registry safe to a base-table rebuild so memory stays
-/// bounded. TODO: derive from `runtime.query.memory_limit` once the budget is
-/// threaded to the provider (Pattern 9 — budget-derived caps).
+/// Upper bound on maintained-aggregate retained index entries (per-PK
+/// contributions plus distinct `MIN`/`MAX` multiset nodes); exceeding it fails
+/// the registry safe to a base-table rebuild so memory stays bounded.
+/// TODO: derive from `runtime.query.memory_limit` once the budget is threaded to
+/// the provider (Pattern 9 — budget-derived caps).
 const MAINTAINED_AGGREGATE_MAX_INDEX_ENTRIES: usize = 5_000_000;
 /// Bounded depth of the per-table maintained-aggregate apply queue. The CDC
 /// write path enqueues maintenance here and continues, so registry maintenance
@@ -1560,11 +1561,19 @@ pub struct CayenneTableProvider {
     post_write_maintenance: Arc<PostWriteMaintenance>,
     /// Optional table-scoped maintained aggregate state. Queries may only serve
     /// this state when a scan captured the same [`maintained_aggregate_epoch`]
-    /// under the listing fence and the registry is fresh at that epoch.
+    /// as its physical shard snapshots and the registry is fresh at that epoch.
     maintained_aggregates: Arc<MaintainedAggregateRegistry>,
     /// Visibility epoch for the maintained aggregate registry. Advanced under
     /// the same write barriers that publish scan-visible table changes.
     maintained_aggregate_epoch: Arc<AtomicU64>,
+    /// Seqlock generation binding a mem-tier shard snapshot to its maintained-
+    /// aggregate epoch. Even values are stable; odd values mean a mem-tier
+    /// publish is between its first visibility change and the final shard swap.
+    /// Scans decline the maintained-aggregate rewrite when this changes while
+    /// they capture the shard `ArcSwap`s and epoch, so the optimizer never
+    /// substitutes aggregate state from a different relation than the physical
+    /// scan it replaces.
+    maintained_aggregate_visibility_sequence: Arc<AtomicU64>,
     /// Sender to the single per-table background applier that maintains the
     /// maintained-aggregate registry off the CDC write path (so maintenance
     /// never blocks replication convergence). `None` when no maintained
@@ -1657,6 +1666,27 @@ struct PendingMaintainedAggregateDelete {
     epoch: u64,
     /// PK columns of the deleted rows, projected by name into `pk_columns` order.
     pk_batch: RecordBatch,
+}
+
+/// RAII writer side of the maintained-aggregate scan seqlock. Construction
+/// changes the generation from even to odd before any mem-tier visibility
+/// mutation; drop publishes the next even generation after the epoch and all
+/// affected shard snapshots agree. Production mem-tier writers are serialized
+/// by `write_lock` (and the N=1 seam by its shard publish lock), so only one of
+/// these guards may exist for a table at a time.
+struct MaintainedAggregateVisibilityWriteGuard<'a> {
+    sequence: &'a AtomicU64,
+}
+
+impl Drop for MaintainedAggregateVisibilityWriteGuard<'_> {
+    fn drop(&mut self) {
+        let previous = self.sequence.fetch_add(1, Ordering::Release);
+        debug_assert_eq!(
+            previous & 1,
+            1,
+            "maintained-aggregate visibility writer must finish an odd generation"
+        );
+    }
 }
 
 /// One ordered unit of maintained-aggregate maintenance. The CDC write path
@@ -4847,9 +4877,9 @@ impl CayenneTableProvider {
             .as_ref()
             .is_none_or(|(_, exact)| *exact);
         let table_statistics = loaded_table_statistics.map(|(df, _)| df);
-        // An empty `pk_column_indices` (no primary key) yields no index and the
-        // legacy insert-only behavior; otherwise the per-PK index is bounded by
-        // `MAINTAINED_AGGREGATE_MAX_INDEX_ENTRIES` (fail-safe to a base rebuild).
+        // An empty `pk_column_indices` (no primary key) yields the legacy
+        // insert-only behavior. Runtime configuration rejects no-PK MIN/MAX, and
+        // direct callers remain bounded by the provider-level retained-index cap.
         let maintained_aggregates = Arc::new(
             MaintainedAggregateRegistry::try_new_with_pk(
                 &maintained_aggregate_specs,
@@ -5064,6 +5094,7 @@ impl CayenneTableProvider {
             post_write_maintenance: Arc::new(PostWriteMaintenance::default()),
             maintained_aggregates,
             maintained_aggregate_epoch: Arc::new(AtomicU64::new(0)),
+            maintained_aggregate_visibility_sequence: Arc::new(AtomicU64::new(0)),
             maintained_aggregate_tx,
             background_compactor: Arc::new(std::sync::OnceLock::new()),
             background_mem_tier_checkpointer: Arc::new(std::sync::OnceLock::new()),
@@ -6020,6 +6051,9 @@ impl CayenneTableProvider {
             post_write_maintenance: Arc::clone(&self.post_write_maintenance),
             maintained_aggregates: Arc::clone(&self.maintained_aggregates),
             maintained_aggregate_epoch: Arc::clone(&self.maintained_aggregate_epoch),
+            maintained_aggregate_visibility_sequence: Arc::clone(
+                &self.maintained_aggregate_visibility_sequence,
+            ),
             // Clone the sender (never re-spawn): all provider clones feed the one
             // ordered background applier spawned by the original constructor.
             maintained_aggregate_tx: self.maintained_aggregate_tx.clone(),
@@ -8784,6 +8818,15 @@ impl CayenneTableProvider {
         // cuts the per-apply metastore seq reservations from 2N to 2.
         let base_sequence = self.reserve_sequences_local(2).await?;
         let reserved_sequences = (base_sequence, base_sequence + 1);
+        // Hold the scan seqlock across the pre-bump and every shard swap. A scan
+        // that races this apply keeps its base aggregate plan; a later scan may
+        // attach the epoch once it captures an even, unchanged generation.
+        let ivm_visibility_guard = self.begin_maintained_aggregate_visibility_write();
+        // Pre-bump the published IVM epoch before concurrent shard visibility
+        // swaps so scans cannot serve a Fresh registry that still includes rows
+        // this apply is about to hide/supersede. The serial feed after
+        // `try_join_all` reuses this epoch (dense applier chain).
+        let ivm_epoch = self.pre_bump_maintained_aggregate_epoch_for_concurrent_apply();
         let append_futures = per_shard_validated.iter().enumerate().filter_map(
             |(s, (filtered_batches, deletions, kept))| {
                 let has_rows = filtered_batches.iter().any(|b| b.num_rows() > 0);
@@ -8800,15 +8843,59 @@ impl CayenneTableProvider {
                     superseded,
                     Some(apply_epoch),
                     kept,
-                    // Upsert path: maintained-aggregate retraction is DELETE-driven.
+                    // Upsert path: maintained-aggregate retraction is DELETE-driven
+                    // (per-PK index on insert). N>1 defers the insert feed below.
                     None,
                     Some(reserved_sequences),
+                    true, // defer_maintained_aggregate — serial feed after join
                 ))
             },
         );
         // The per-shard `MemTier::epoch`s returned here are NOT the slot-ack axis at
         // N>1 (incommensurable); they are drained to surface append errors only.
         futures::future::try_join_all(append_futures).await?;
+        // The relation and published epoch now agree. Registry maintenance can
+        // remain asynchronous: scans at the new epoch fall back until it catches up.
+        drop(ivm_visibility_guard);
+
+        // Serial IVM insert feed for the whole apply (one epoch, one enqueue):
+        // concurrent per-shard enqueue would reorder the applier's strict
+        // epoch chain. With a per-PK retraction index, superseding upserts are
+        // maintained incrementally; without one, any supersede marks stale.
+        if let Some(epoch) = ivm_epoch {
+            let any_supersede = per_shard_validated
+                .iter()
+                .any(|(_, deletions, _)| deletions.total_superseded() > 0);
+            if self.maintained_aggregates.supports_retraction() || !any_supersede {
+                let mut combined_batches: Vec<RecordBatch> = Vec::new();
+                for (filtered_batches, _, _) in &per_shard_validated {
+                    for batch in filtered_batches {
+                        if batch.num_rows() > 0 {
+                            combined_batches.push(batch.clone());
+                        }
+                    }
+                }
+                // Always enqueue at the pre-bumped epoch (empty insert is a
+                // no-op that advances registry.state.epoch so the dense chain
+                // is not gapped when this apply had only tombstones).
+                let pending = self
+                    .prepare_maintained_aggregate_insert_batches_at_epoch(
+                        Arc::new(combined_batches),
+                        epoch,
+                    )
+                    .unwrap_or(PendingMaintainedAggregateInsert {
+                        epoch,
+                        batches: Arc::new(Vec::new()),
+                    });
+                self.apply_maintained_aggregate_insert_batches(Some(pending))
+                    .await;
+            } else {
+                // No PK index and this apply supersedes — cannot retract. Reuse
+                // the already-published epoch rather than creating a gap for a
+                // visibility change that has already been accounted for.
+                self.mark_maintained_aggregates_stale_at_epoch(epoch);
+            }
+        }
 
         // 5. Aggregate the combined post-validation state (union over shards —
         //    keys disjoint, so a plain concatenation) for the durable-fallback
@@ -15907,12 +15994,79 @@ impl CayenneTableProvider {
             + 1
     }
 
+    /// Start a mem-tier visibility publish that also changes the maintained-
+    /// aggregate epoch. The returned guard makes the scan seqlock odd until it
+    /// is dropped after the final shard swap and epoch assignment.
+    fn begin_maintained_aggregate_visibility_write(
+        &self,
+    ) -> Option<MaintainedAggregateVisibilityWriteGuard<'_>> {
+        if self.maintained_aggregates.is_empty() {
+            return None;
+        }
+        let previous = self
+            .maintained_aggregate_visibility_sequence
+            .fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(
+            previous & 1,
+            0,
+            "maintained-aggregate visibility writers must be serialized"
+        );
+        Some(MaintainedAggregateVisibilityWriteGuard {
+            sequence: &self.maintained_aggregate_visibility_sequence,
+        })
+    }
+
+    /// Capture every mem-tier shard and, when stable, the maintained-aggregate
+    /// epoch as one logical snapshot. A concurrent mem-tier writer makes the
+    /// seqlock odd before its first visibility change and advances it to the next
+    /// even value after its final shard swap. If the generation is odd or changes
+    /// during capture, return no epoch so the optimizer keeps the correct base-scan
+    /// aggregate instead of waiting or substituting a torn maintained snapshot.
+    fn capture_mem_tier_aggregate_scan_state(
+        &self,
+    ) -> (Vec<Arc<crate::provider::mem_tier::MemTier>>, Option<u64>) {
+        if self.maintained_aggregates.is_empty() {
+            return (
+                self.mem_tier
+                    .shards()
+                    .iter()
+                    .map(arc_swap::ArcSwap::load_full)
+                    .collect(),
+                None,
+            );
+        }
+
+        let before = self
+            .maintained_aggregate_visibility_sequence
+            .load(Ordering::Acquire);
+        let shards = self
+            .mem_tier
+            .shards()
+            .iter()
+            .map(arc_swap::ArcSwap::load_full)
+            .collect();
+        let epoch = self.maintained_aggregate_epoch.load(Ordering::Acquire);
+        let after = self
+            .maintained_aggregate_visibility_sequence
+            .load(Ordering::Acquire);
+        let stable_epoch = (before & 1 == 0 && before == after).then_some(epoch);
+        (shards, stable_epoch)
+    }
+
     pub(crate) fn mark_maintained_aggregates_stale(&self) {
         if self.maintained_aggregates.is_empty() {
             return;
         }
 
         let epoch = self.next_maintained_aggregate_epoch();
+        self.mark_maintained_aggregates_stale_at_epoch(epoch);
+    }
+
+    fn mark_maintained_aggregates_stale_at_epoch(&self, epoch: u64) {
+        if self.maintained_aggregates.is_empty() {
+            return;
+        }
+
         self.maintained_aggregates.mark_stale(epoch);
         tracing::debug!(
             table = %self.table_metadata.table_name,
@@ -15946,6 +16100,35 @@ impl CayenneTableProvider {
 
         let epoch = self.next_maintained_aggregate_epoch();
         Some(PendingMaintainedAggregateInsert { epoch, batches })
+    }
+
+    /// Like [`Self::prepare_maintained_aggregate_insert_batches`], but uses a
+    /// pre-assigned visibility epoch. Used by the N>1 concurrent-apply path: the
+    /// epoch is advanced **before** shard visibility swaps (so concurrent scans
+    /// cannot serve a Fresh registry against already-published tombstones /
+    /// inserts), then the single serial feed after `try_join_all` reuses that
+    /// epoch so the applier's strict `epoch == state.epoch + 1` chain stays dense.
+    fn prepare_maintained_aggregate_insert_batches_at_epoch(
+        &self,
+        batches: Arc<Vec<RecordBatch>>,
+        epoch: u64,
+    ) -> Option<PendingMaintainedAggregateInsert> {
+        if self.maintained_aggregates.is_empty() || batches.is_empty() {
+            return None;
+        }
+        Some(PendingMaintainedAggregateInsert { epoch, batches })
+    }
+
+    /// Advance the published IVM visibility epoch once before a concurrent N>1
+    /// apply mutates shard tiers. Scans that load the new epoch fail the exact-
+    /// match serve gate until the deferred serial feed applies the same epoch,
+    /// so they never answer from a Fresh registry that still includes rows the
+    /// apply is about to hide. Returns `None` when no IVM is configured.
+    fn pre_bump_maintained_aggregate_epoch_for_concurrent_apply(&self) -> Option<u64> {
+        if self.maintained_aggregates.is_empty() {
+            return None;
+        }
+        Some(self.next_maintained_aggregate_epoch())
     }
 
     /// Whether the staged write path should buffer + capture insert batches for an
@@ -16068,17 +16251,10 @@ impl CayenneTableProvider {
                 kind,
                 "Maintained-aggregate applier is unavailable; marking stale — queries fall back to base table scans"
             );
-            self.mark_maintained_aggregates_stale();
+            self.mark_maintained_aggregates_stale_at_epoch(epoch);
         }
     }
 
-    /// Project a CDC delete batch (source-schema column layout) onto the table's
-    /// primary-key columns, resolved BY NAME, in `pk_column_indices` order and
-    /// cast to the table column types — the layout
-    /// [`MaintainedAggregateRegistry::apply_pk_deletes`] expects, so retraction
-    /// does not depend on the delete batch's source-schema column order. Returns
-    /// `None` when a PK column is missing or null (the row can't be keyed). This
-    /// mirrors the by-name PK resolution in [`Self::cdc_delete_intents_from_batch`].
     /// Resolve this table's primary-key columns out of `batch` BY NAME (CDC
     /// batches carry the source-schema column order, not the table's), in
     /// `pk_column_indices` order, each cast to the table column type. Returns
@@ -16177,15 +16353,10 @@ impl CayenneTableProvider {
         &self,
         plan: Arc<dyn ExecutionPlan>,
         scan_guard: Arc<SnapshotScanRef>,
+        maintained_aggregate_epoch: Option<u64>,
     ) -> Arc<dyn ExecutionPlan> {
         let overlay = self.optimizer_stats_overlay_for_schema(&plan.schema());
-        if self.maintained_aggregates.is_empty() {
-            Arc::new(
-                CayenneAccelerationExec::with_guard(plan, scan_guard)
-                    .with_optimizer_column_overlay(overlay),
-            )
-        } else {
-            let epoch = self.maintained_aggregate_epoch.load(Ordering::Acquire);
+        if let Some(epoch) = maintained_aggregate_epoch {
             Arc::new(
                 CayenneAccelerationExec::with_guard_and_maintained_aggregates(
                     plan,
@@ -16194,6 +16365,11 @@ impl CayenneTableProvider {
                     epoch,
                 )
                 .with_optimizer_column_overlay(overlay),
+            )
+        } else {
+            Arc::new(
+                CayenneAccelerationExec::with_guard(plan, scan_guard)
+                    .with_optimizer_column_overlay(overlay),
             )
         }
     }
@@ -19085,6 +19261,8 @@ impl CayenneTableProvider {
             // (see `validate_and_append_sharded` / `append_to_shard`).
             let base_sequence = self.reserve_sequences_local(2).await?;
             let no_keys: PkDigestSet = PkDigestSet::default();
+            // Single-shard fallback at N>1: feed delete retraction here (not
+            // deferred) — same epoch-under-visibility contract as N=1.
             self.append_to_shard(
                 0,
                 Vec::new(),
@@ -19093,8 +19271,9 @@ impl CayenneTableProvider {
                 0,
                 Some(apply_epoch),
                 &no_keys,
-                None,
+                Some(delete_rows),
                 Some((base_sequence, base_sequence + 1)),
+                false, // feed IVM under this publish lock
             )
             .await?;
             return Ok(apply_epoch);
@@ -19140,6 +19319,12 @@ impl CayenneTableProvider {
         let base_sequence = self.reserve_sequences_local(2).await?;
         let reserved_sequences = (base_sequence, base_sequence + 1);
         let no_keys: PkDigestSet = PkDigestSet::default();
+        // Hold the scan seqlock across the pre-bump and every tombstone swap.
+        let ivm_visibility_guard = self.begin_maintained_aggregate_visibility_write();
+        // Pre-bump published IVM epoch before concurrent tombstone visibility so
+        // scans cannot serve a Fresh registry that still counts rows this apply
+        // is deleting. Serial delete feed after join reuses this epoch.
+        let ivm_epoch = self.pre_bump_maintained_aggregate_epoch_for_concurrent_apply();
         let append_futures = per_shard
             .iter()
             .enumerate()
@@ -19155,12 +19340,60 @@ impl CayenneTableProvider {
                     0,
                     Some(apply_epoch),
                     &no_keys,
-                    // N>1 sharded delete: no maintained-aggregate retraction (see append_to_shard).
+                    // Deferred: serial IVM delete feed after try_join_all below.
                     None,
                     Some(reserved_sequences),
+                    true, // defer_maintained_aggregate
                 ))
             });
         futures::future::try_join_all(append_futures).await?;
+        // Every shard now reflects the delete at the published epoch. The registry
+        // may catch up off-path; scans fall back while it is behind.
+        drop(ivm_visibility_guard);
+
+        // Serial DELETE retraction at the pre-bumped epoch so the applier sees a
+        // single dense step (not N concurrent enqueues). The original batch was
+        // already validated and split by these same PK columns, so project it once
+        // instead of concatenating shard prefixes repeatedly.
+        if let Some(epoch) = ivm_epoch {
+            if self.maintained_aggregates.supports_retraction() {
+                let pk_batch = match self.project_delete_pk_batch(delete_rows) {
+                    Ok(Some(pk_batch)) => pk_batch,
+                    Ok(None) => {
+                        // The shard split above resolved every PK successfully,
+                        // so this is defensive. Fail safe rather than applying an
+                        // incomplete retract.
+                        self.mark_maintained_aggregates_stale_at_epoch(epoch);
+                        return Ok(apply_epoch);
+                    }
+                    Err(error) => {
+                        self.mark_maintained_aggregates_stale_at_epoch(epoch);
+                        return Err(error.into());
+                    }
+                };
+                if pk_batch.num_rows() > 0 {
+                    self.apply_maintained_aggregate_delete_pending(Some(
+                        PendingMaintainedAggregateDelete { epoch, pk_batch },
+                    ))
+                    .await;
+                } else {
+                    // Epoch pre-bumped but no retractable rows: advance registry
+                    // via an empty insert so the dense chain is not gapped.
+                    self.apply_maintained_aggregate_insert_batches(Some(
+                        PendingMaintainedAggregateInsert {
+                            epoch,
+                            batches: Arc::new(Vec::new()),
+                        },
+                    ))
+                    .await;
+                }
+            } else {
+                // Deletes cannot be retracted without a PK contribution index.
+                // Mark stale at the epoch already paired with the shard publish.
+                self.mark_maintained_aggregates_stale_at_epoch(epoch);
+            }
+        }
+
         Ok(apply_epoch)
     }
 
@@ -19255,8 +19488,10 @@ impl CayenneTableProvider {
         // delete batch, so maintained-aggregate retraction (trunk #11389) advances
         // atomically with tombstone visibility under the publish lock; byte-identical
         // to the prior single append otherwise (shard 0, `source_position` None →
-        // `MemTier::epoch` stays the slot-ack currency). The N>1 sharded path does
-        // NOT retract (the known N>1 limit noted on `append_to_shard`).
+        // `MemTier::epoch` stays the slot-ack currency). The N>1 sharded path
+        // pre-bumps the published IVM epoch, swaps shards concurrently, then feeds
+        // DELETE retraction serially after `try_join_all` (see
+        // `append_delete_intents_sharded`).
         let n = self.mem_tier_shard_count();
         let epoch = if n <= 1 {
             match self
@@ -19414,6 +19649,9 @@ impl CayenneTableProvider {
             // lock inside `append_to_shard` (the N=1 checkpoint takes no write_lock,
             // so that lock is what serializes it against the checkpoint).
             None,
+            // N=1 feeds IVM under this shard's publish lock (epoch advanced
+            // atomically with the tier swap).
+            false,
         )
         .await
     }
@@ -19447,11 +19685,11 @@ impl CayenneTableProvider {
         // the sharded path), so those callers stay byte-identical.
         record_keys: &PkDigestSet,
         // Maintained-aggregate DELETE retraction rows (trunk #11389), advanced +
-        // enqueued under THIS shard's publish lock. `Some` only on the N=1
-        // retraction-aware delete entry (`append_to_mem_tier_inner`); `None` on the
-        // upsert path and the N>1 sharded delete path (`append_delete_intents_sharded`)
-        // — so a maintained aggregate over an N>1 table does not retract on the
-        // sharded path (a known limit of the opt-in N>1 path).
+        // enqueued under THIS shard's publish lock when `defer_maintained_aggregate`
+        // is false. `Some` on the N=1 retraction-aware delete entry
+        // (`append_to_mem_tier_inner`); `None` on the upsert path (retracts via the
+        // per-PK index on insert) and when the N>1 path defers IVM to a serial
+        // post-`try_join_all` feed under `write_lock`.
         maintained_aggregate_delete_rows: Option<&RecordBatch>,
         // Pre-reserved `(delete_sequence, data_sequence)` pair for this apply, or
         // `None` to reserve it here under the publish lock. `Some` ONLY on the N>1
@@ -19468,6 +19706,14 @@ impl CayenneTableProvider {
         // `write_lock`, so this lock is the only thing serializing the reservation
         // against the checkpoint's snapshot-sequence reservation).
         reserved_sequences: Option<(i64, i64)>,
+        // When true (N>1 concurrent shard fan-out), skip all IVM epoch / enqueue
+        // work inside this call. The caller pre-bumps the published epoch so scans
+        // cannot serve a stale Fresh registry against new visibility, then feeds
+        // insert/delete deltas serially after `try_join_all` with that epoch —
+        // preserving the applier's strict epoch order without serializing the
+        // tier swaps. When false (N=1), IVM is fed under this publish lock as
+        // before.
+        defer_maintained_aggregate: bool,
     ) -> Result<u64> {
         // INVARIANT: at N>1 every mem-tier append MUST carry a `source_position` (the
         // per-apply `apply_epoch` slot-ack axis). A `None`-stamped append on a sharded
@@ -19581,6 +19827,14 @@ impl CayenneTableProvider {
             );
             let epoch = next.epoch;
             let next_version = next.version;
+            // N=1 publishes the tier swap and IVM epoch under this shard lock. Use
+            // the same scan seqlock as N>1 so a reader cannot capture the new tier
+            // and then attach the old aggregate epoch (or the reverse).
+            let ivm_visibility_guard = if defer_maintained_aggregate {
+                None
+            } else {
+                self.begin_maintained_aggregate_visibility_write()
+            };
             // The apply is a pure segment push: no eagerly-materialized visible
             // view is maintained here. Scans always take the raw-segment path
             // (`visible_mem_tier_batches`), applying tombstones lazily via the
@@ -19691,39 +19945,50 @@ impl CayenneTableProvider {
             // rows an incremental aggregate already counted, so fall back to a
             // full rebuild (mark stale); a pure-insert append still updates
             // incrementally from the new batches.
-            let maintained_aggregate_insert = if self.maintained_aggregates.supports_retraction()
-                || !(superseded > 0
-                    || !tombstones.is_int64_empty()
-                    || !tombstones.is_row_keys_empty())
-            {
-                self.prepare_maintained_aggregate_insert_batches(Arc::clone(&arc_batches))
-            } else {
-                self.mark_maintained_aggregates_stale();
-                None
-            };
-            // Maintained-aggregate DELETE retraction, UNDER this publish lock so
-            // the epoch advances atomically with the tombstone visibility: a scan
-            // that observes the delete also observes the advanced epoch, and the
-            // exact-epoch serve gate falls back to a base scan until the applier
-            // catches up (never serving an aggregate that still counts the rows).
-            let retraction_rows = maintained_aggregate_delete_rows
-                .filter(|_| self.maintained_aggregates.supports_retraction());
-            let maintained_aggregate_delete = match retraction_rows
-                .map(|delete_rows| self.project_delete_pk_batch(delete_rows))
-            {
-                Some(Ok(Some(pk_batch))) => Some(PendingMaintainedAggregateDelete {
-                    epoch: self.next_maintained_aggregate_epoch(),
-                    pk_batch,
-                }),
-                // A delete batch whose PK cannot be resolved cannot be retracted,
-                // so fail safe to stale (also under this lock). `None` = no delete
-                // rows / no retraction support.
-                Some(Ok(None) | Err(_)) => {
-                    self.mark_maintained_aggregates_stale();
-                    None
-                }
-                None => None,
-            };
+            //
+            // N>1 concurrent path sets `defer_maintained_aggregate`: the caller
+            // pre-bumped the published epoch and will feed serially after the
+            // fan-out, so skip epoch/enqueue here (avoids out-of-order enqueue
+            // across shards and double-bumping epochs).
+            let (maintained_aggregate_insert, maintained_aggregate_delete) =
+                if defer_maintained_aggregate {
+                    (None, None)
+                } else {
+                    let maintained_aggregate_insert = if self
+                        .maintained_aggregates
+                        .supports_retraction()
+                        || !(superseded > 0
+                            || !tombstones.is_int64_empty()
+                            || !tombstones.is_row_keys_empty())
+                    {
+                        self.prepare_maintained_aggregate_insert_batches(Arc::clone(&arc_batches))
+                    } else {
+                        self.mark_maintained_aggregates_stale();
+                        None
+                    };
+                    // Maintained-aggregate DELETE retraction, UNDER this publish
+                    // lock so the epoch advances atomically with the tombstone
+                    // visibility: a scan that observes the delete also observes
+                    // the advanced epoch, and the exact-epoch serve gate falls
+                    // back to a base scan until the applier catches up.
+                    let retraction_rows = maintained_aggregate_delete_rows
+                        .filter(|_| self.maintained_aggregates.supports_retraction());
+                    let maintained_aggregate_delete = match retraction_rows
+                        .map(|delete_rows| self.project_delete_pk_batch(delete_rows))
+                    {
+                        Some(Ok(Some(pk_batch))) => Some(PendingMaintainedAggregateDelete {
+                            epoch: self.next_maintained_aggregate_epoch(),
+                            pk_batch,
+                        }),
+                        Some(Ok(None) | Err(_)) => {
+                            self.mark_maintained_aggregates_stale();
+                            None
+                        }
+                        None => None,
+                    };
+                    (maintained_aggregate_insert, maintained_aggregate_delete)
+                };
+            drop(ivm_visibility_guard);
             (
                 epoch,
                 maintained_aggregate_insert,
@@ -23912,13 +24177,14 @@ impl TableProvider for CayenneTableProvider {
         // partial-batch cross-key visibility window the CH-bench target does not
         // rely on. Empty (and skipped below) in file mode, so the file-mode plan
         // is byte-identical. At N==1 this captures the single shard exactly as
-        // the prior single `.tier().load_full()` did.
-        let mem_tier_shards: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
-            .mem_tier
-            .shards()
-            .iter()
-            .map(arc_swap::ArcSwap::load_full)
-            .collect();
+        // the prior single `.tier().load_full()` did. When maintained aggregates
+        // are configured, `capture_mem_tier_aggregate_scan_state` gates optimizer
+        // substitution on an even, unchanged seqlock generation around these
+        // loads and the IVM epoch. A racing scan keeps the base aggregate rather
+        // than waiting or using a torn maintained snapshot; ordinary base scans
+        // retain the accepted partial-batch cross-key visibility behavior.
+        let (mem_tier_shards, maintained_aggregate_epoch) =
+            self.capture_mem_tier_aggregate_scan_state();
         let mem_tier_any_rows = mem_tier_shards.iter().any(|s| !s.is_empty());
 
         // Capture the (deletion view, protected snapshot map, inlined data)
@@ -24418,10 +24684,14 @@ impl TableProvider for CayenneTableProvider {
         // but not originally requested by the query.
         if need_projection_strip && let Some(orig_proj) = projection {
             let plan = self.create_projection_strip(plan, orig_proj.len())?;
-            return Ok(self.wrap_scan_plan_with_cayenne_metadata(plan, scan_guard));
+            return Ok(self.wrap_scan_plan_with_cayenne_metadata(
+                plan,
+                scan_guard,
+                maintained_aggregate_epoch,
+            ));
         }
 
-        Ok(self.wrap_scan_plan_with_cayenne_metadata(plan, scan_guard))
+        Ok(self.wrap_scan_plan_with_cayenne_metadata(plan, scan_guard, maintained_aggregate_epoch))
     }
 
     // Filter-pushdown exactness contract (read before changing the arms below):
@@ -34890,6 +35160,33 @@ mod tests {
         rows
     }
 
+    /// A scan racing a mem-tier visibility publish must keep its base aggregate
+    /// plan rather than attach an epoch to a potentially torn shard capture.
+    /// Once the publish completes, a stable capture may use the new epoch.
+    #[tokio::test]
+    async fn test_mem_tier_scan_capture_declines_maintained_aggregate_during_visibility_publish() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_maintained_aggregates(
+            "ivm_scan_capture",
+            ctx.runtime_env(),
+            vec![id_count_sum_spec()],
+        )
+        .await;
+        let visibility_guard = provider
+            .begin_maintained_aggregate_visibility_write()
+            .expect("configured IVM must create a visibility guard");
+        let (_, racing_epoch) = provider.capture_mem_tier_aggregate_scan_state();
+        assert_eq!(
+            racing_epoch, None,
+            "a racing scan must keep the base aggregate plan"
+        );
+
+        let published_epoch = provider.next_maintained_aggregate_epoch();
+        drop(visibility_guard);
+        let (_, stable_epoch) = provider.capture_mem_tier_aggregate_scan_state();
+        assert_eq!(stable_epoch, Some(published_epoch));
+    }
+
     /// TEST 1 — the staged-disk CDC path feeds the maintained-aggregate registry.
     ///
     /// The table starts EMPTY, so the open-time rebuild initializes the registry
@@ -34943,6 +35240,340 @@ mod tests {
             collect_id_count_sum(&served),
             vec![(1, 1, 10), (2, 1, 20)],
             "staged feed must populate count(*)=1 and sum(value)=value per key"
+        );
+    }
+
+    /// N>1 mem-tier CDC: DELETE retracts maintained aggregates (pre-bump epoch +
+    /// serial post-join feed). Before this fix, `append_delete_intents_sharded`
+    /// passed `None` for retract rows, so a Fresh registry kept counting deleted
+    /// keys under sharding.
+    #[tokio::test]
+    async fn test_n_gt_1_mem_tier_delete_retracts_maintained_aggregate() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::atomic::Ordering;
+
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str"));
+        tokio::fs::create_dir_all(&metadata_dir)
+            .await
+            .expect("metadata dir");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("init catalog");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let options = CreateTableOptions {
+            table_name: "n_gt_1_ivm_delete".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config: VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                cdc_mem_tier_shards: 4,
+                cdc_mem_tier_min_flush_bytes: 0,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        };
+        let provider = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .with_maintained_aggregates(vec![id_count_sum_spec()])
+            .create(options)
+            .await
+            .expect("table created");
+        // Slot advancer required for in-memory CDC delete absorption + N>1 path.
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        assert!(provider.is_cdc_memory_mode());
+        assert!(
+            provider.mem_tier_shard_count() > 1,
+            "test requires N>1 sharding"
+        );
+        assert!(
+            provider.supports_in_memory_cdc_deletes(),
+            "upsert + memory mode must absorb deletes"
+        );
+
+        // Insert via the real sharded CDC path so keys fan out across shards.
+        let ids: Vec<i64> = (1..=16).collect();
+        let values: Vec<i64> = ids.iter().map(|i| i * 10).collect();
+        let write = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &ids, &values)),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("sharded CDC insert");
+        assert!(
+            write.in_memory_epoch().is_some(),
+            "insert must land in the mem tier"
+        );
+
+        let aggregate_exec = build_id_count_sum_aggregate_exec();
+        let served_before = poll_maintained_serve(&provider, &aggregate_exec).await;
+        assert_eq!(
+            collect_id_count_sum(&served_before).len(),
+            16,
+            "all 16 keys should be in the maintained view after insert"
+        );
+
+        // Delete a subset via the N>1 sharded delete path (takes write_lock internally).
+        let delete_ids = [1_i64, 5, 9, 13];
+        let delete_batch = int64_id_batch(&delete_ids);
+        let absorbed = provider
+            .write_cdc_delete_keys_in_memory(&delete_batch)
+            .await
+            .expect("sharded N>1 delete")
+            .expect("delete absorbed into mem tier");
+        assert!(absorbed > 0, "delete must advance a mem-tier epoch");
+
+        // After delete, maintained serve must drop those keys.
+        let expected_remaining: Vec<(i64, i64, i64)> = ids
+            .iter()
+            .filter(|id| !delete_ids.contains(id))
+            .map(|&id| (id, 1_i64, id * 10))
+            .collect();
+        let mut last = Vec::new();
+        for _ in 0..50 {
+            let epoch = provider.maintained_aggregate_epoch.load(Ordering::Acquire);
+            if let Ok(Some(batch)) = provider
+                .maintained_aggregates
+                .batch_for_aggregate(&aggregate_exec, epoch)
+            {
+                last = collect_id_count_sum(&batch);
+                if last == expected_remaining {
+                    return;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!(
+            "N>1 delete did not retract maintained aggregate within ~5s; \
+             last served={last:?}, expected={expected_remaining:?} \
+             (registry likely Fresh-but-stale or permanently Stale)"
+        );
+    }
+
+    /// GROUP BY id, MIN(value), MAX(value) — used by the N>1 min/max retract test.
+    fn id_min_max_spec() -> MaintainedAggregateSpec {
+        use crate::maintained_aggregate::{MaintainedAggregateExpr, MaintainedAggregateFunction};
+        MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["id".to_string()],
+            aggregates: vec![
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Min,
+                    column: Some("value".to_string()),
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Max,
+                    column: Some("value".to_string()),
+                },
+            ],
+        }
+    }
+
+    fn build_id_min_max_aggregate_exec() -> AggregateExec {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::physical_expr::aggregate::AggregateExprBuilder;
+        use datafusion::physical_expr::expressions::col;
+        use datafusion::physical_plan::aggregates::{AggregateMode, PhysicalGroupBy};
+        use datafusion_functions_aggregate::min_max::{max_udaf, min_udaf};
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let input = MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(&schema), None)
+            .expect("memory source exec for aggregate input");
+
+        let group_by = PhysicalGroupBy::new_single(vec![(
+            col("id", schema.as_ref()).expect("id column"),
+            "id".to_string(),
+        )]);
+
+        let min_expr = AggregateExprBuilder::new(
+            min_udaf(),
+            vec![col("value", schema.as_ref()).expect("value column")],
+        )
+        .schema(Arc::clone(&schema))
+        .alias("min(value)".to_string())
+        .build()
+        .map(Arc::new)
+        .expect("min(value) aggregate expr");
+        let max_expr = AggregateExprBuilder::new(
+            max_udaf(),
+            vec![col("value", schema.as_ref()).expect("value column")],
+        )
+        .schema(Arc::clone(&schema))
+        .alias("max(value)".to_string())
+        .build()
+        .map(Arc::new)
+        .expect("max(value) aggregate expr");
+
+        let aggr_exprs = vec![min_expr, max_expr];
+        let filters = vec![None; aggr_exprs.len()];
+        AggregateExec::try_new(
+            AggregateMode::Single,
+            group_by,
+            aggr_exprs,
+            filters,
+            input,
+            schema,
+        )
+        .expect("id/min/max AggregateExec")
+    }
+
+    fn collect_id_min_max(batch: &RecordBatch) -> Vec<(i64, i64, i64)> {
+        use arrow::array::Int64Array;
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id is Int64");
+        let mins = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("min(value) is Int64");
+        let maxs = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("max(value) is Int64");
+        let mut rows = Vec::with_capacity(batch.num_rows());
+        for i in 0..batch.num_rows() {
+            rows.push((ids.value(i), mins.value(i), maxs.value(i)));
+        }
+        rows.sort_by_key(|r| r.0);
+        rows
+    }
+
+    /// N>1 mem-tier CDC delete must retract MIN/MAX maintained aggregates (the
+    /// hard extremum path that needs the per-PK contribution index). Mirrors
+    /// [`test_n_gt_1_mem_tier_delete_retracts_maintained_aggregate`] for count/sum.
+    #[tokio::test]
+    async fn test_n_gt_1_mem_tier_delete_retracts_maintained_min_max() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::atomic::Ordering;
+
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str"));
+        tokio::fs::create_dir_all(&metadata_dir)
+            .await
+            .expect("metadata dir");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("init catalog");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let options = CreateTableOptions {
+            table_name: "n_gt_1_ivm_min_max_delete".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config: VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                cdc_mem_tier_shards: 4,
+                cdc_mem_tier_min_flush_bytes: 0,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        };
+        let provider = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .with_maintained_aggregates(vec![id_min_max_spec()])
+            .create(options)
+            .await
+            .expect("table created");
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        assert!(provider.is_cdc_memory_mode());
+        assert!(
+            provider.mem_tier_shard_count() > 1,
+            "test requires N>1 sharding"
+        );
+        assert!(provider.supports_in_memory_cdc_deletes());
+
+        // Per-id groups: each id has value = id * 10, so min == max == id * 10.
+        let ids: Vec<i64> = (1..=16).collect();
+        let values: Vec<i64> = ids.iter().map(|i| i * 10).collect();
+        let write = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &ids, &values)),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("sharded CDC insert");
+        assert!(
+            write.in_memory_epoch().is_some(),
+            "insert must land in the mem tier"
+        );
+
+        let aggregate_exec = build_id_min_max_aggregate_exec();
+        let served_before = poll_maintained_serve(&provider, &aggregate_exec).await;
+        assert_eq!(
+            collect_id_min_max(&served_before).len(),
+            16,
+            "all 16 keys should be in the maintained min/max view after insert"
+        );
+
+        // Delete a subset via the N>1 sharded delete path.
+        let delete_ids = [1_i64, 5, 9, 13];
+        let delete_batch = int64_id_batch(&delete_ids);
+        let absorbed = provider
+            .write_cdc_delete_keys_in_memory(&delete_batch)
+            .await
+            .expect("sharded N>1 delete")
+            .expect("delete absorbed into mem tier");
+        assert!(absorbed > 0, "delete must advance a mem-tier epoch");
+
+        let expected_remaining: Vec<(i64, i64, i64)> = ids
+            .iter()
+            .filter(|id| !delete_ids.contains(id))
+            .map(|&id| (id, id * 10, id * 10))
+            .collect();
+        let mut last = Vec::new();
+        for _ in 0..50 {
+            let epoch = provider.maintained_aggregate_epoch.load(Ordering::Acquire);
+            if let Ok(Some(batch)) = provider
+                .maintained_aggregates
+                .batch_for_aggregate(&aggregate_exec, epoch)
+            {
+                last = collect_id_min_max(&batch);
+                if last == expected_remaining {
+                    return;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!(
+            "N>1 delete did not retract maintained min/max within ~5s; \
+             last served={last:?}, expected={expected_remaining:?}"
         );
     }
 
