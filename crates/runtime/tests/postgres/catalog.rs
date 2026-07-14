@@ -137,9 +137,10 @@ fn pg_catalog(port: usize) -> Catalog {
 fn string_column_values(batches: &[RecordBatch], column: &str) -> Vec<String> {
     let mut values = Vec::new();
     for batch in batches {
-        let Ok(idx) = batch.schema().index_of(column) else {
-            continue;
-        };
+        let idx = batch
+            .schema()
+            .index_of(column)
+            .unwrap_or_else(|e| panic!("expected column `{column}` in query result: {e}"));
         let array = batch
             .column(idx)
             .as_any()
