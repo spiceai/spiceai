@@ -17,6 +17,17 @@ runs:
         # containers, so io_setup() returns EAGAIN and InnoDB aborts on startup
         # ("Cannot initialize AIO sub-system"). Simulated I/O is robust and the
         # throughput cost is irrelevant for a CI benchmark source.
+        #
+        # innodb_doublewrite=0 and innodb_flush_method=O_DIRECT_NO_FSYNC relax
+        # write durability the same way synchronous_commit=off/full_page_writes=off
+        # do for the Postgres container below — safe here because a crashed
+        # container just gets reseeded, not recovered. Measured locally: ~3x
+        # faster seed load (both the CSV loader and the plain baseline), the
+        # single biggest win of anything tried for MySQL seed speed.
+        #
+        # local-infile=1 is required for the seed loader's `LOAD DATA LOCAL
+        # INFILE` (chbench-driver's loader_mysql.rs) — client-streamed, so it
+        # doesn't need the FILE privilege or server filesystem access.
         docker run -d --name chbench-mysql \
           -e MYSQL_ROOT_PASSWORD=rootpw -e MYSQL_DATABASE=chbench \
           -e MYSQL_USER=bench -e MYSQL_PASSWORD=bench \
@@ -30,7 +41,10 @@ runs:
           --innodb-buffer-pool-size=8G \
           --sync-binlog=0 \
           --innodb-flush-log-at-trx-commit=0 \
-          --innodb-use-native-aio=0
+          --innodb-use-native-aio=0 \
+          --innodb-doublewrite=0 \
+          --innodb-flush-method=O_DIRECT_NO_FSYNC \
+          --local-infile=1
 
     - name: Wait for CH-benCH MySQL
       shell: bash
