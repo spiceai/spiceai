@@ -19,10 +19,14 @@ limitations under the License.
 use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use arrow::datatypes::SchemaRef;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::execution::memory_pool::MemoryLimit;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use futures::StreamExt;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{LexOrdering, OrderingRequirements, PhysicalSortExpr};
@@ -134,22 +138,42 @@ pub fn sort_stream(
     // phase (input counters moving) from the merge/output phase (input done,
     // output_rows moving) from a stall (everything frozen while one worker
     // burns CPU — the observed production signature).
-    let rows_in = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let batches_in = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rows_in = Arc::new(AtomicUsize::new(0));
+    let batches_in = Arc::new(AtomicUsize::new(0));
     let rows_in_tap = Arc::clone(&rows_in);
     let batches_in_tap = Arc::clone(&batches_in);
     let counted_input = stream.map(move |res| {
         if let Ok(batch) = &res {
-            rows_in_tap.fetch_add(batch.num_rows(), std::sync::atomic::Ordering::Relaxed);
-            batches_in_tap.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            rows_in_tap.fetch_add(batch.num_rows(), Ordering::Relaxed);
+            batches_in_tap.fetch_add(1, Ordering::Relaxed);
         }
         res
     });
-    let counted_input: SendableRecordBatchStream = Box::pin(
-        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-            Arc::clone(&schema),
-            counted_input,
-        ),
+    let counted_input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+        Arc::clone(&schema),
+        counted_input,
+    ));
+
+    // TEMPORARY DIAGNOSTIC: log the sort-shaping configuration once at start.
+    // These map directly onto the ExternalSorter's constant fields: batch_size,
+    // sort_in_place_threshold_bytes (below it buffered data is concatenated and
+    // sorted inside a SINGLE poll — a candidate for the non-yielding CPU spin),
+    // and sort_spill_reservation_bytes (memory pre-reserved for the merge phase).
+    let pool = Arc::clone(context.memory_pool());
+    let pool_limit = match pool.memory_limit() {
+        MemoryLimit::Finite(bytes) => bytes.to_string(),
+        MemoryLimit::Infinite => "infinite".to_string(),
+        MemoryLimit::Unknown => "unknown".to_string(),
+    };
+    let exec_cfg = &context.session_config().options().execution;
+    tracing::debug!(
+        target: "cayenne::compaction",
+        batch_size = exec_cfg.batch_size,
+        sort_spill_reservation_bytes = exec_cfg.sort_spill_reservation_bytes,
+        sort_in_place_threshold_bytes = exec_cfg.sort_in_place_threshold_bytes,
+        pool_limit_bytes = %pool_limit,
+        pool_reserved_bytes = pool.reserved(),
+        "sort starting"
     );
 
     // Create a streaming execution plan that yields the input stream
@@ -168,17 +192,15 @@ pub fn sort_stream(
     // everything frozen => a parked wait. Uses `Weak` so the sampler dies with
     // the operator instead of keeping it alive, plus an explicit done flag
     // flipped when the output stream finishes or is dropped.
-    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
     let sampler_done = Arc::clone(&done);
     let sort_weak = Arc::downgrade(&sort_exec);
-    let pool = Arc::clone(context.memory_pool());
-    let sampled = tokio::runtime::Handle::try_current().is_ok();
-    if sampled {
+    if tokio::runtime::Handle::try_current().is_ok() {
         tokio::spawn(async move {
             let start = std::time::Instant::now();
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                if sampler_done.load(std::sync::atomic::Ordering::Relaxed) {
+                if sampler_done.load(Ordering::Relaxed) {
                     return;
                 }
                 let Some(sort) = sort_weak.upgrade() else {
@@ -190,8 +212,8 @@ pub fn sort_stream(
                 tracing::debug!(
                     target: "cayenne::compaction",
                     elapsed_s = start.elapsed().as_secs(),
-                    input_batches = batches_in.load(std::sync::atomic::Ordering::Relaxed),
-                    input_rows = rows_in.load(std::sync::atomic::Ordering::Relaxed),
+                    input_batches = batches_in.load(Ordering::Relaxed),
+                    input_rows = rows_in.load(Ordering::Relaxed),
                     output_rows = metrics.output_rows().unwrap_or(0),
                     elapsed_compute_ms =
                         metrics.elapsed_compute().unwrap_or(0) / 1_000_000,
@@ -199,6 +221,7 @@ pub fn sort_stream(
                     spilled_bytes = metrics.spilled_bytes().unwrap_or(0),
                     spilled_rows = metrics.spilled_rows().unwrap_or(0),
                     pool_reserved_bytes = pool.reserved(),
+                    pool_limit_bytes = %pool_limit,
                     "sort progress sample"
                 );
             }
@@ -209,12 +232,12 @@ pub fn sort_stream(
     // sampler exits promptly; also keep the operator alive for metrics via the
     // captured Arc.
     struct SortDoneGuard {
-        done: Arc<std::sync::atomic::AtomicBool>,
+        done: Arc<AtomicBool>,
         _sort: Arc<SortExec>,
     }
     impl Drop for SortDoneGuard {
         fn drop(&mut self) {
-            self.done.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.done.store(true, Ordering::Relaxed);
         }
     }
     let guard = SortDoneGuard {
@@ -226,9 +249,9 @@ pub fn sort_stream(
         let _hold = &guard;
         item
     });
-    Ok(Box::pin(
-        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(out_schema, terminated),
-    ))
+    Ok(Box::pin(RecordBatchStreamAdapter::new(
+        out_schema, terminated,
+    )))
 }
 
 /// Parse one sort specification of the form
