@@ -120,8 +120,8 @@ fn scalar_fsl_cosine_distance(a: &ArrayRef, b: &ArrayRef) -> Vec<Option<f64>> {
         let start = row * dim;
         let end = start + dim;
 
-        let slice_a = flat_a.values().get(start..end).unwrap_or(&[]);
-        let slice_b = flat_b.values().get(start..end).unwrap_or(&[]);
+        let slice_a = &flat_a.values()[start..end];
+        let slice_b = &flat_b.values()[start..end];
 
         let mut dot: f64 = 0.0;
         let mut norm_a: f64 = 0.0;

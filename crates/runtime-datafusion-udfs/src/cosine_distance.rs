@@ -120,21 +120,14 @@ impl ScalarUDFImpl for CosineDistance {
 
         // Case 2: one is List<Float32>/LargeList<Float32>, the other is
         // FixedSizeList<Float32, N> → promote the List/LargeList to FSL so the
-        // SIMD path handles it. Only promote if the FSL is actually Float32.
-        let fsl_field = Arc::new(arrow_schema::Field::new("item", DataType::Float32, true));
-        if is_list_f32(lhs)
-            && is_fixed_size_list_f32(rhs)
-            && let FixedSizeList(_, n) = rhs
-        {
-            let fsl = DataType::FixedSizeList(Arc::clone(&fsl_field), *n);
-            return Ok(vec![fsl.clone(), fsl]);
+        // SIMD path handles it. Reuse the existing FSL type verbatim so its
+        // field name/nullability/metadata are preserved and no spurious cast is
+        // forced on the already-correct FSL argument.
+        if is_list_f32(lhs) && is_fixed_size_list_f32(rhs) {
+            return Ok(vec![rhs.clone(), rhs.clone()]);
         }
-        if is_fixed_size_list_f32(lhs)
-            && is_list_f32(rhs)
-            && let FixedSizeList(_, n) = lhs
-        {
-            let fsl = DataType::FixedSizeList(Arc::clone(&fsl_field), *n);
-            return Ok(vec![fsl.clone(), fsl]);
+        if is_fixed_size_list_f32(lhs) && is_list_f32(rhs) {
+            return Ok(vec![lhs.clone(), lhs.clone()]);
         }
 
         // Case 3: both are List/LargeList/FixedSizeList (any element type) →
