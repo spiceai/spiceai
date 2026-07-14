@@ -92,7 +92,7 @@ pub(crate) mod mem_tier;
 pub(crate) mod mem_tier_budget;
 pub(crate) mod memory_account;
 pub(crate) mod mutation_writer;
-pub mod on_conflict;
+pub(crate) mod on_conflict;
 pub(crate) mod overwrite;
 pub mod partitioned_wal;
 pub(crate) mod pk_index;

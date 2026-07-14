@@ -3134,8 +3134,9 @@ impl DataAccelerator for CayenneAccelerator {
                     .await
                     .boxed()
                     .context(AccelerationCreationFailedSnafu)?;
+            let partition_table_providers = partition_provider.partition_table_providers().await;
             insert_strategy
-                .recover_partitioned_wals(&partition_provider.partition_table_providers().await)
+                .recover_partitioned_wals(&partition_table_providers)
                 .await
                 .boxed()
                 .context(AccelerationCreationFailedSnafu)?;
@@ -3570,8 +3571,10 @@ impl PartitionCreator for CayennePartitionCreator {
 
         tracing::debug!("creating Cayenne partition at {partition_path}");
 
-        // Create the partition directory (including nested directories for composite partitions)
-        std::fs::create_dir_all(&partition_dir)
+        // Create the partition directory (including nested directories for composite partitions).
+        // Use tokio's async variant so partition creation does not block the runtime thread.
+        tokio::fs::create_dir_all(&partition_dir)
+            .await
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
         let partition_column_names = self.partition_column_labels();
