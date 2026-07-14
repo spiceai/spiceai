@@ -155,11 +155,12 @@ use arc_swap::ArcSwap;
 
 const POST_WRITE_MAINTENANCE_DEBOUNCE: Duration = Duration::from_millis(100);
 const OBJECT_STORE_MOVE_CONCURRENCY: usize = 16;
-/// How long [`CayenneTableProvider::evolve_schema_live`] waits for in-flight
+/// How long [`CayenneTableProvider::evolve_schema_live`] and
+/// [`CayenneTableProvider::promote_warm_to_cold`] wait for in-flight
 /// pipelined Stage-B publishes (staged WALs + staged inline tombstones) to
-/// drain before giving up. Stage-B finalizes normally complete within
+/// drain before giving up. A Stage-B finalize normally completes within
 /// milliseconds; the timeout only guards against a wedged background task.
-const SCHEMA_EVOLUTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const STAGED_WRITE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default intra-write encode-shard count for an unsorted write when no per-table
 /// `cayenne_write_concurrency` is configured. Deliberately small — NOT the host
 /// core count: the value is sized per table in isolation, so a high default makes
@@ -2157,7 +2158,7 @@ impl CayenneTableProvider {
     /// Returns an error when the plan's evolved schema is not a widening of
     /// the live schema (including any primary-key column change — typed PK
     /// row-encodings cannot be widened in place), when in-flight staged writes
-    /// fail to drain within [`SCHEMA_EVOLUTION_DRAIN_TIMEOUT`], or when a
+    /// fail to drain within [`STAGED_WRITE_DRAIN_TIMEOUT`], or when a
     /// flush/metastore step fails.
     pub async fn evolve_schema_live(&self, plan: &WideningPlan) -> Result<()> {
         let current = self.table_schema();
@@ -2191,18 +2192,15 @@ impl CayenneTableProvider {
 
         // Step 2: drain Stage-B publishes. They complete without `write_lock`
         // (visibility lock + listing fence only), and no new ones can start.
-        let drain_deadline = Instant::now() + SCHEMA_EVOLUTION_DRAIN_TIMEOUT;
-        while self.has_inflight_staging_appends()
-            || self.pending_inline_tombstones.load(Ordering::Acquire) > 0
+        if !self
+            .drain_inflight_staged_writes(STAGED_WRITE_DRAIN_TIMEOUT)
+            .await
         {
-            if Instant::now() >= drain_deadline {
-                return Err(Error::Internal {
-                    table: self.table_metadata.table_name.clone(),
-                    message: "Timed out draining in-flight staged writes before schema evolution"
-                        .to_string(),
-                });
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            return Err(Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: "Timed out draining in-flight staged writes before schema evolution"
+                    .to_string(),
+            });
         }
 
         // Step 3: flush. `checkpoint_mem_tier` requires `mem_checkpoint_lock`
@@ -2351,6 +2349,27 @@ impl CayenneTableProvider {
 
     pub(crate) fn has_inflight_staging_appends(&self) -> bool {
         !self.inflight_staging_appends.lock().is_empty()
+    }
+
+    /// Wait for in-flight pipelined Stage-B publishes (staged WALs + staged
+    /// inline tombstones) to drain, up to `timeout`. Returns `false` on
+    /// timeout — the caller turns that into its own structured error (a
+    /// still-pending publish after the window means a wedged Stage-B task).
+    ///
+    /// Callers must hold `write_lock`: it blocks new Stage-A commits, so the
+    /// pending set can only shrink, while Stage-B needs only the visibility
+    /// lock + listing fence and therefore completes under the held lock.
+    pub(crate) async fn drain_inflight_staged_writes(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while self.has_inflight_staging_appends()
+            || self.pending_inline_tombstones.load(Ordering::Acquire) > 0
+        {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        true
     }
 
     pub(crate) fn staging_wal_present(&self) -> &AtomicBool {
@@ -5384,17 +5403,13 @@ impl CayenneTableProvider {
         // regardless of `target_partitions` (see `snapshot_shard_count`).
         //
         // Delta writes additionally resolve a `cayenne_delta_encoding` level:
-        // small fresh deltas encode with a light scheme set (skipping the
+        // under `auto` every delta encodes with a light scheme set (skipping the
         // per-file BtrBlocks strategy search + FSST training that dominate
-        // small-write encode cost) and are re-encoded properly when compaction
-        // folds them. Maintenance writes (compaction, rewrites, overwrites)
-        // always use the full default strategy. See `provider::delta_encoding`.
-        let encoding_level = super::delta_encoding::effective_level(
-            self.context.delta_encoding(),
-            write_class,
-            estimated_bytes,
-            target_size_bytes,
-        );
+        // encode cost) and is re-encoded properly when compaction folds it.
+        // Maintenance writes (compaction, rewrites, overwrites) always use the
+        // full default strategy. See `provider::delta_encoding`.
+        let encoding_level =
+            super::delta_encoding::effective_level(self.context.delta_encoding(), write_class);
         let write_format = match super::delta_encoding::strategy_builder_for_level(encoding_level) {
             Some(strategy) => self.context.write_format_with_strategy(
                 strategy,
@@ -13251,7 +13266,8 @@ impl CayenneTableProvider {
         // injected, so this rewrite accounts its memory against the isolated
         // compaction pool rather than competing with queries for the query pool.
         let ctx = self.create_compaction_session_context();
-        // This rewrite is guarded by TWO independent, composed fences:
+        // This rewrite is guarded by two primary rewrite fences, plus a
+        // defense-in-depth replacement guard:
         //
         //   * `generation_before` — the concurrent-APPEND fence (current-dir
         //     generation sampled before the scan lists files, re-checked under the
@@ -13265,6 +13281,13 @@ impl CayenneTableProvider {
         //     and is carried forward (NOT cleared) at the end. The two fences are
         //     orthogonal — appends bump the generation (caught by the first),
         //     deletes do not (carried forward by the second) — so both are needed.
+        //   * `snapshot_id_before` — the table-REPLACEMENT publish guard. Cold
+        //     promotion is primarily serialized by `compaction_lock`; this guard is
+        //     a last-line check for replacement paths that do not share that lock
+        //     (for example INSERT OVERWRITE), future lock regressions, or reopened
+        //     providers with distinct in-memory locks. Such replacements flip
+        //     `current_snapshot_id` while leaving `current_dir_generation`
+        //     unrelated, so stale output must abort before catalog publish.
         //
         // The `write_lock` is dropped once the stream object exists (its inputs
         // are pinned), so the dominant cost — reading every input file and
@@ -13298,15 +13321,22 @@ impl CayenneTableProvider {
         // Position-delete tables already hold `write_lock` for the whole rewrite
         // (above) and clear everything at the end, so they need no key-delete
         // fence (their `fence` is `None`).
-        let (mut stream, fence, generation_before): (
+        let (mut stream, fence, generation_before, snapshot_id_before): (
             SendableRecordBatchStream,
             Option<(i64, std::collections::HashSet<String>)>,
             u64,
+            String,
         ) = if uses_position_deletes {
+            let snapshot_id_before = self.get_current_snapshot_id();
             let (stream, generation_before) = self.visible_file_stream_for_rewrite(&ctx).await?;
-            (stream, None, generation_before)
+            (stream, None, generation_before, snapshot_id_before)
         } else {
             let _capture_guard = self.write_lock_arc().lock_owned().await;
+            // Defense-in-depth for table replacement while this pass encodes.
+            // Promotion is serialized by `compaction_lock`; overwrite/reopened
+            // providers may still flip `current_snapshot_id` without moving the
+            // current-dir generation, so revalidate before catalog publish.
+            let snapshot_id_before = self.get_current_snapshot_id();
             if self.cached_inlined_row_count() > 0 {
                 self.checkpoint_inlined_data().await?;
             }
@@ -13336,7 +13366,12 @@ impl CayenneTableProvider {
                 );
                 return Ok(false);
             }
-            (stream, Some((cutoff, folded_before)), generation_before)
+            (
+                stream,
+                Some((cutoff, folded_before)),
+                generation_before,
+                snapshot_id_before,
+            )
         };
 
         if self.context.has_sort_columns() {
@@ -13538,6 +13573,26 @@ impl CayenneTableProvider {
         // already completed off-fence.
         {
             let listing_guard = self.listing_fence.write().await;
+            let snapshot_id_now = self.get_current_snapshot_id();
+            if snapshot_id_now != snapshot_id_before {
+                // Defense-in-depth: a table replacement committed while this rewrite
+                // was encoding. Promotion normally cannot reach this because it shares
+                // `compaction_lock`, but overwrite/future/reopened-lock paths can. No
+                // catalog/in-memory mutation happened; discard and retry.
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    new_snapshot_id = new_snapshot_id.as_str(),
+                    snapshot_id_before = snapshot_id_before.as_str(),
+                    snapshot_id_now = snapshot_id_now.as_str(),
+                    "Aborting current-snapshot compaction: table snapshot was replaced \
+                     during the re-encode; discarding output and retrying"
+                );
+                drop(listing_guard);
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Ok(false);
+            }
             let generation_now = self.current_dir_generation.load(Ordering::Relaxed);
             if generation_now != generation_before {
                 // No catalog/in-memory mutation happened; discard the rewritten
@@ -14085,9 +14140,13 @@ impl CayenneTableProvider {
     /// Returns an error if flushing the mem/inline tiers, the canonical visible
     /// read, the cold object-store write, or the atomic catalog commit fails.
     ///
-    /// Holds `write_lock` for the whole graduation (mirrors `begin_overwrite`), so
-    /// no append races the capture→write→commit and the generation fence is
-    /// unnecessary. Heavy + infrequent (gated by the warm-size thresholds).
+    /// Holds `compaction_lock` for the whole graduation, then `write_lock` for
+    /// capture→write→commit. The compaction lock is the primary protection against
+    /// promotion-vs-compaction interleavings: it serializes promotion against
+    /// current-snapshot rewrites, protected-snapshot merges, and seq-prefix bakes.
+    /// The full rewrite's snapshot-id publish check remains only as a
+    /// defense-in-depth guard for replacement paths outside this lock discipline.
+    /// Heavy + infrequent (gated by the warm-size thresholds).
     ///
     /// Records promotion telemetry under `kind="datalake"`, mirroring the
     /// `kind="full"`/`"subset"` compaction passes: duration with a
@@ -14256,6 +14315,20 @@ impl CayenneTableProvider {
             return Ok(false);
         }
 
+        // Primary protection for promotion-vs-compaction: serialize the whole
+        // promotion with warm-tier maintenance. Without this, a current-snapshot
+        // rewrite can plan against the pre-promotion warm set, spend the full
+        // encode/upload, then rely on its defense-in-depth snapshot-id guard to
+        // abort after promotion flips to a fresh empty warm snapshot. Holding this
+        // lock prevents the stale work and keeps promotion's overwrite-clear from
+        // racing bake/merge bookkeeping.
+        //
+        // Lock order matches compaction: `compaction_lock` before `write_lock`.
+        // A position-delete compaction path may briefly try `write_lock` first, but
+        // it uses `try_lock` on `compaction_lock`; if promotion owns the compaction
+        // lock it skips and drops `write_lock`, so no cycle can form.
+        let _compaction_guard = self.compaction_lock.lock().await;
+
         // Trigger: warm tier large/numerous enough to graduate.
         let current_snapshot_id = self.get_current_snapshot_id();
         let warm = self
@@ -14297,6 +14370,19 @@ impl CayenneTableProvider {
 
         // Exclude writers for the whole graduation (mirrors begin_overwrite).
         let _write_guard = self.write_lock_arc().lock_owned().await;
+
+        // Drain in-flight pipelined Stage-B publishes before capturing the
+        // visible set.
+        if !self
+            .drain_inflight_staged_writes(STAGED_WRITE_DRAIN_TIMEOUT)
+            .await
+        {
+            return Err(Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: "Timed out draining in-flight staged writes before datalake promotion; warm tier left intact (next tick retries)"
+                    .to_string(),
+            });
+        }
 
         // Flush the in-RAM mem tier + inline into durable so the canonical visible
         // read below captures the whole live set.
