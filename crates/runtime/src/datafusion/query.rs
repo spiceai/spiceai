@@ -56,6 +56,11 @@ pub(crate) use tracker::QueryTracker;
 pub mod builder;
 pub use builder::QueryBuilder;
 mod cache;
+pub mod transaction;
+pub use transaction::{
+    TransactionError, TransactionOutcome, run_transaction, schema_statement,
+    transaction_statements,
+};
 pub mod error_code;
 mod handle;
 pub mod plan_capture;

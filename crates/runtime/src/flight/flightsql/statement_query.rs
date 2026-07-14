@@ -23,11 +23,14 @@ use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::{
-    datafusion::request_context_extension::get_current_datafusion,
+    datafusion::{
+        query::{run_transaction, schema_statement, transaction_statements},
+        request_context_extension::get_current_datafusion,
+    },
     flight::{
-        Service,
+        Service, is_auth_read_only,
         metrics::track_flight_request,
-        to_tonic_err,
+        record_batches_to_flight_stream, to_tonic_err, transaction_error_to_status,
         util::{attach_cache_metadata, set_flightsql_protocol},
     },
 };
@@ -48,7 +51,13 @@ pub(crate) async fn get_flight_info(
     let context = RequestContext::current(AsyncMarker::new().await);
     let datafusion = get_current_datafusion(&context);
 
-    let (arrow_schema, _) = Service::get_arrow_schema(datafusion, sql)
+    // A `BEGIN … COMMIT` body advertises the schema of its FINAL statement (for
+    // the canonical gate+write shape, the write's row-count schema). Plan just
+    // that statement for its schema — the body is NOT executed here; any write
+    // runs at `do_get`.
+    let schema_sql = schema_statement(sql);
+
+    let (arrow_schema, _) = Service::get_arrow_schema(datafusion, &schema_sql)
         .await
         .map_err(to_tonic_err)?;
 
@@ -77,6 +86,24 @@ pub(crate) async fn do_get(
     let datafusion = get_current_datafusion(&context);
 
     tracing::trace!("do_get_statement: {:?}", cmd.query);
+
+    // A `BEGIN … COMMIT` body runs through the shared transaction orchestrator
+    // (one atomic staged commit across every table it touches); stream the final
+    // statement's result. A read-only principal running a write transaction is
+    // rejected by the write statement's read-only check inside the orchestrator.
+    if let Some(statements) = transaction_statements(&cmd.query) {
+        let read_only = is_auth_read_only(&context);
+        let outcome = run_transaction(&datafusion, &statements, None, read_only)
+            .await
+            .map_err(transaction_error_to_status)?;
+        let batches = outcome.result.map(|(batches, _)| batches).unwrap_or_default();
+        let stream = record_batches_to_flight_stream(batches);
+        let timed = TimedStream::new(stream, move || start);
+        return Ok(Response::new(
+            Box::pin(timed) as <Service as FlightService>::DoGetStream
+        ));
+    }
+
     let pre_parsed_plan =
         super::super::check_read_only_sql(&context, &datafusion, &cmd.query, None).await?;
     let (output, from_cache) = Box::pin(Service::sql_to_flight_stream(
