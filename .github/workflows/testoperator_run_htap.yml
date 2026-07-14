@@ -233,22 +233,37 @@ jobs:
             echo "diagnostics probes backgrounded (pids$DIAG_PIDS) -> $DIAG_DIR"
           fi
 
-          # TEMP (cold-hang diagnosis): on the promotion stall warning, capture native
-          # stacks of every spiced thread — async taskdumps can't see waits nested in
-          # futures combinators; native stacks discriminate parked vs starved workers.
+          # TEMP (cold-hang diagnosis): on the promotion stall warning, capture spiced
+          # thread state. gdb/ptrace is blocked on these containerized runners, so the
+          # primary capture is privilege-free /proc sampling: two snapshots of every
+          # thread's comm/state/wchan/utime+stime, 5s apart — parked (S, zero CPU
+          # delta) vs spinning (R, growing utime) vs blocked-IO (D) per thread name.
+          # gdb stays as best-effort after a ptrace_scope relax attempt.
           mkdir -p "$DIAG_DIR"
           (
-            command -v gdb >/dev/null 2>&1 || sudo apt-get install -y -qq gdb >/dev/null 2>&1
+            sudo -n sysctl -w kernel.yama.ptrace_scope=0 >/dev/null 2>&1 || true
+            command -v gdb >/dev/null 2>&1 || sudo -n apt-get install -y -qq gdb >/dev/null 2>&1 || true
+            snap() {
+              local out="$1"; local spid="$2"
+              for t in /proc/$spid/task/*; do
+                tid=$(basename "$t")
+                echo "$(cat $t/comm 2>/dev/null) state=$(awk '{print $3}' $t/stat 2>/dev/null) wchan=$(cat $t/wchan 2>/dev/null) $(awk '{print "tid="$1" utime="$14" stime="$15}' $t/stat 2>/dev/null)"
+              done > "$out" 2>&1
+            }
             for i in $(seq 1 240); do
               sleep 30
               if grep -q "made no completion within the stall window" "${GITHUB_WORKSPACE}/htap-run.log" 2>/dev/null; then
                 SPID=$(pgrep -x spiced | head -1)
-                [ -n "$SPID" ] && sudo gdb -p "$SPID" --batch -ex "set pagination off" -ex "thread apply all bt" \
-                  > "$DIAG_DIR/spiced-native-stacks-$i.txt" 2>&1
-                sleep 570
+                if [ -n "$SPID" ]; then
+                  snap "$DIAG_DIR/spiced-threads-$i-a.txt" "$SPID"
+                  sleep 5
+                  snap "$DIAG_DIR/spiced-threads-$i-b.txt" "$SPID"
+                  gdb -p "$SPID" --batch -ex "set pagination off" -ex "thread apply all bt" > "$DIAG_DIR/spiced-native-stacks-$i.txt" 2>&1 || true
+                fi
+                sleep 565
               fi
             done
-          ) > "$DIAG_DIR/gdb-watch.log" 2>&1 &
+          ) > "$DIAG_DIR/stall-watch.log" 2>&1 &
           DIAG_PIDS="$DIAG_PIDS $!"
 
           set +e
