@@ -1,35 +1,16 @@
 version: v1
 kind: Spicepod
-name: postgres-cayenne[file]-adaptive-cold-sf1000
+name: postgres-cayenne[file]-adaptive-cold-auto-sf1000
 
-# Adaptive-tuning variant of `…-cdc-tuned-memory-cold-sf1000`: the same three-tier storage cascade
-# (RAM mem-tier -> warm local-disk Vortex -> COLD object store), but every Cayenne table runs
-# `cayenne_tuning: adaptive` instead of the hand-pinned knobs. The runtime warm-starts each adaptive
-# actuator (inline-flush, mem-tier bytes, compaction interval / trigger-files, deletion-index bake,
-# write concurrency, WARM target file size, query-admission reserve) from the detected host +
-# `schema_inference: extended`, then adapts them toward the `cayenne_goal_*` SLOs.
+# "Auto" variant of `…-adaptive-cold-sf1000`: identical in every way EXCEPT it pins NO datalake
+# (cold-tier) knobs. Only `cayenne_datalake_location` (+ credentials) enables the tier; the
+# promotion trigger, cold file size, and promoter cadence all fall to engine defaults / whatever
+# auto-tuning provides. This is the A/B baseline for cold-tier promotion auto-tuning — compare it
+# against the hand-pinned sibling pod.
 #
-# The cold (datalake) tier is NOT adaptive-tuned — no cold knob is an actuator — so its static knobs
-# are set explicitly on the high-volume tables and collapse no adaptive tuning bound:
-#   - cayenne_datalake_location                enables the tier (unset => disabled). Datalake + an
-#                                              inferred PK auto-forces deletion_mode: key, so
-#                                              cayenne_deletion_mode is intentionally left unset.
-#   - cayenne_datalake_warm_max_bytes         4 GiB warm->cold promotion trigger (expert override;
-#                                              unset defaults to 16 x cayenne_datalake_target_file_size_mb
-#                                              = ~11.7 GiB at this pod's 750 MB file size — pin 4 GiB
-#                                              so the big tables graduate after bootstrap).
-#   - cayenne_datalake_target_file_size_mb         750 — read-optimized cold files, larger than the warm
-#                                              target so cold scans open fewer footers; kept under the
-#                                              per-file PK-bloom cap so cold files stay bloom-backed.
-#   - cayenne_datalake_promotion_interval_ms 30s promoter cadence.
-# NOTE: `cayenne_target_file_size_mb` (the WARM/hot file size) is deliberately NOT set — it is an
-# adaptive actuator, and pinning it would collapse its tuning bounds to a point. Only the COLD file
-# size is set here; they are different knobs.
-#
-# Cold store = the shared local MinIO (`s3://benchmarks`), reached via the dedicated
-# `cayenne_datalake_s3_*` credentials below. The HTAP run workflow provides
-# S3_ENDPOINT/S3_KEY/S3_SECRET (from the TEST_MINIO_* secrets).
-# Sized for a 64 vCPU / 256 GiB host (m7a.16xlarge-class) with EBS gp3.
+# Everything else matches the sibling: `cayenne_tuning: adaptive` on every table, the same
+# `cayenne_goal_*` SLOs, `schema_inference: extended` (PK/on_conflict/indexes), and the shared
+# MinIO cold store via `cayenne_datalake_s3_*`. Sized for a 64 vCPU / 256 GiB host.
 
 postgres_connection_params: &postgres_params
   pg_host: ${env:CHBENCH_PG_HOST}
@@ -57,7 +38,7 @@ runtime:
 
 datasets:
   # ------------------------------------------------------------------
-  # High-volume PK upsert tables — adaptive tuning + COLD object-store tier.
+  # High-volume PK upsert tables — adaptive tuning + COLD object-store tier, but NO manual cold knobs.
   # No primary_key / on_conflict / indexes: `schema_inference: extended` detects them from the
   # PostgreSQL source and seeds the upsert on_conflict the CDC (changes) path requires (it also
   # supplies the row_count/table_bytes the adaptive warm-start gates on, and the PK the cold tier
@@ -80,21 +61,16 @@ datasets:
         # In-memory CDC intra-apply sharding: 4 PK-hash shards validate+append in parallel within
         # one apply on the memory-tier (changes) tables. Not an adaptive actuator.
         cayenne_cdc_mem_tier_shards: '4'
-        # --- Datalake (cold) object-store tier (RAM mem-tier -> warm local disk -> COLD). All
-        # static config; none of these are adaptive actuators, so setting them collapses no tuning
-        # bound. The location is namespaced by table_id, so one shared prefix is safe for every
-        # table here. Dedicated datalake credentials (MinIO): the engine registers this store on
-        # the promotion, scan, and delete paths — no anchor dataset needed. ---
+        # --- Datalake (cold) object-store tier: ONLY the location + credentials are set, which is
+        # all that enables the tier. Promotion trigger / cold file size / cadence are intentionally
+        # left UNSET so they run on engine defaults / auto-tuning (this pod's whole point). The
+        # location is namespaced by table_id, so one shared prefix is safe for every table here. ---
         cayenne_datalake_location: s3://benchmarks/cayenne-cold-sf1000/
         cayenne_datalake_s3_auth: key
         cayenne_datalake_s3_endpoint: ${secrets:S3_ENDPOINT}
         cayenne_datalake_s3_key: ${secrets:S3_KEY}
         cayenne_datalake_s3_secret: ${secrets:S3_SECRET}
         cayenne_datalake_s3_allow_http: 'true'
-
-        cayenne_datalake_warm_max_bytes: '4294967296' # 4 GiB warm->cold promotion trigger
-        cayenne_datalake_target_file_size_mb: '750'
-        cayenne_datalake_promotion_interval_ms: '30000'
 
   - from: postgres:customer
     name: customer
@@ -142,8 +118,7 @@ datasets:
     acceleration: *cayenne_accel_cold
 
   # ------------------------------------------------------------------
-  # Low-volume CDC reference table — adaptive, NO cold tier (it never crosses the warm-size trigger,
-  # matching the tuned cold pod, which keeps warehouse on the warm tier).
+  # Low-volume CDC reference table — adaptive, NO cold tier.
   # ------------------------------------------------------------------
   - from: postgres:warehouse
     name: warehouse

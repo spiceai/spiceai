@@ -21,6 +21,13 @@ Cayenne provides a lakehouse format that enables efficient CRUD operations on co
 - **Snapshot engine** (`CayenneSnapshotEngine` in the runtime) that exports a per-dataset metastore "slice" (versioned JSON) so snapshots are portable across nodes with different data directories and never archive raw `cayenne.db*` files.
 - **Logical and physical optimizer rules** that surface Cayenne-friendly join shapes for HTAP workloads (predicate transitive closure for non-key dim filters, dynamic-filter sharing across same-source scans, anti/semi-join sort-merge rewrite above a 10M-row build side, in-list-to-range rewrite).
 
+## Storage modes: `mode: file` vs `mode: memory`
+
+Cayenne runs in one of two storage modes, selected by the acceleration `mode:` field:
+
+- **`mode: file`** (durable): metadata in a local `SQLite`/Turso metastore, immutable data in Vortex data files (local FS or S3 Express One Zone), an LSM level-0 inline tier, and background compaction. Survives restarts. This is Cayenne's original behavior.
+- **`mode: memory`** (fully in-RAM, ephemeral): all data lives in the RAM mem-tier, backed by an in-memory `memdb` `SQLite` metastore — **nothing is written to disk**. Checkpointing, sealing, compaction, and the cold tier are disabled. The dataset is ephemeral and reloads from its source on restart (like the in-memory Arrow accelerator); because there is no durable checkpoint, a CDC (`changes`) source's replication slot is committed immediately after each in-RAM write (not deferred), so source-side retention is not pinned. It works for all refresh modes (`full`/`append`/`changes`) and for both keyed and no-PK datasets, and a full refresh atomically replaces the in-RAM tier. **Partitioning is not supported** — if `partition_by` is set the accelerator returns a configuration error (use `mode: file` for a partitioned table). Since nothing spills to disk, a per-table hard RAM bound (`cayenne_cdc_mem_tier_max_bytes`; default unbounded) returns a structured error on breach rather than growing without limit.
+
 ## Architecture
 
 ```text

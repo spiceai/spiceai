@@ -169,6 +169,8 @@ async fn first_contact_adoption_persists_identity_and_acks() {
             identity_cert_pem:
                 "-----BEGIN CERTIFICATE-----\nUNIT-TEST\n-----END CERTIFICATE-----\n".to_string(),
             not_after_unix: 0,
+            ca_bundle_pem: "-----BEGIN CERTIFICATE-----\nUNIT-TEST-CA\n-----END CERTIFICATE-----\n"
+                .to_string(),
         })),
     };
     let mock = MockServer::new(vec![adopt_cmd]);
@@ -186,6 +188,8 @@ async fn first_contact_adoption_persists_identity_and_acks() {
         adoption_code: Some("SPICE-ADOPT-AAAA-BBBB".to_string()),
         pending_adopt_code_path: None,
         runtime_version: "v0.0.0-test".to_string(),
+        heartbeat_interval: Duration::from_secs(30),
+        telemetry_interval: Duration::from_mins(1),
     };
 
     let runtime: Arc<dyn RuntimeHandle> =
@@ -212,6 +216,11 @@ async fn first_contact_adoption_persists_identity_and_acks() {
     assert_eq!(identity.identifier, "inst_unit_test");
     assert!(identity.identity_cert_pem.contains("UNIT-TEST"));
     assert!(identity.public_key_pem.contains("PUBLIC KEY"));
+    // The CA bundle from Adopt is persisted for later mTLS reconnects.
+    assert!(
+        identity.ca_bundle_pem.contains("UNIT-TEST-CA"),
+        "adopt ca_bundle_pem should be persisted into identity.json"
+    );
 
     // Server should have received the Hello, AdoptAck, and a successful
     // CommandResult. The CommandResult lands last, so poll for it (rather than
@@ -235,6 +244,17 @@ async fn first_contact_adoption_persists_identity_and_acks() {
         "first hello has empty identifier"
     );
     assert_eq!(hello.credential, "SPICE-ADOPT-AAAA-BBBB");
+    // Ordering fix: the enrollment Hello proves key possession up front —
+    // it carries the PKCS#10 CSR and the agent public key *before* the
+    // control plane issues the leaf certificate.
+    assert!(
+        hello.csr_pem.contains("CERTIFICATE REQUEST"),
+        "enrollment Hello must carry a PKCS#10 CSR"
+    );
+    assert!(
+        hello.agent_pubkey_pem.contains("PUBLIC KEY"),
+        "enrollment Hello must carry the agent public key"
+    );
 
     let ack = s.last_adopt_ack.clone().expect("server saw AdoptAck");
     assert_eq!(ack.identifier, "inst_unit_test");
@@ -254,12 +274,15 @@ async fn apply_spicepod_writes_file_and_acks() {
     let identity_path = dir.path().join("identity.json");
     let config_dir = dir.path().to_path_buf();
 
-    // Pre-seed identity so the client connects in identity mode.
+    // Pre-seed identity so the client connects in identity mode. The
+    // transport is insecure (h2c) here, so the cert/key PEMs are never used
+    // for a real handshake — this test isolates the ApplySpicepod dispatch.
     let identity = runtime_cloud_connect::identity::Identity {
         identifier: "inst_pre_adopted".to_string(),
         identity_cert_pem: "PRE-ADOPTED-CERT".to_string(),
         private_key_pem: "PRE-ADOPTED-KEY".to_string(),
         public_key_pem: "PRE-ADOPTED-PUB".to_string(),
+        ca_bundle_pem: String::new(),
         not_after_unix: 0,
     };
     IdentityStore::store(&identity_path, &identity).unwrap();
@@ -292,6 +315,8 @@ async fn apply_spicepod_writes_file_and_acks() {
         adoption_code: None,
         pending_adopt_code_path: None,
         runtime_version: "v0.0.0-test".to_string(),
+        heartbeat_interval: Duration::from_secs(30),
+        telemetry_interval: Duration::from_mins(1),
     };
 
     let handle = runtime_cloud_connect::CloudConnect::start(config, runtime)
@@ -332,7 +357,14 @@ async fn apply_spicepod_writes_file_and_acks() {
     let s = mock_state.lock().await;
     let hello = s.last_hello.clone().expect("server saw Hello");
     assert_eq!(hello.identifier, "inst_pre_adopted");
-    assert_eq!(hello.credential, "PRE-ADOPTED-CERT");
+    // Reconnect contract: identity is proven by the client cert, so the
+    // reconnect Hello carries the identifier with an EMPTY credential (and no
+    // CSR — that is enrollment-only).
+    assert!(
+        hello.credential.is_empty(),
+        "reconnect Hello must carry an empty credential (mTLS proves identity)"
+    );
+    assert!(hello.csr_pem.is_empty(), "reconnect Hello carries no CSR");
 
     let result = s.last_result.clone().expect("server saw CommandResult");
     assert_eq!(result.command_id, "cmd-apply-1");
