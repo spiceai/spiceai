@@ -264,14 +264,17 @@ pub struct PartitionMetadata {
 impl PartitionMetadata {
     /// Returns a composite key string for this partition.
     ///
-    /// For single partitions: returns the single value (e.g., `"us-east-1"`).
-    /// For composite partitions: returns a slash-separated path (e.g., `"2025/10/15"`).
-    ///
-    /// This key uniquely identifies the partition within a table and is used
-    /// for `HashMap` lookups and Hive-style directory naming.
+    /// Components are length-prefixed so tuple boundaries are unambiguous even
+    /// for legacy values containing separators.
     #[must_use]
     pub fn composite_key(&self) -> String {
-        self.partition_values.join("/")
+        let mut composite = String::from("v1:");
+        for value in &self.partition_values {
+            composite.push_str(&value.len().to_string());
+            composite.push(':');
+            composite.push_str(value);
+        }
+        composite
     }
 
     /// Creates a new `PartitionMetadata` for a single partition column (legacy compatibility).
