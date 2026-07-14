@@ -129,8 +129,31 @@ pub fn sort_stream(
         sort_columns
     );
 
+    // TEMPORARY DIAGNOSTIC (cold-promotion hang investigation): count the rows
+    // and batches the sort CONSUMES so the sampler below can tell the insert
+    // phase (input counters moving) from the merge/output phase (input done,
+    // output_rows moving) from a stall (everything frozen while one worker
+    // burns CPU — the observed production signature).
+    let rows_in = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let batches_in = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rows_in_tap = Arc::clone(&rows_in);
+    let batches_in_tap = Arc::clone(&batches_in);
+    let counted_input = stream.map(move |res| {
+        if let Ok(batch) = &res {
+            rows_in_tap.fetch_add(batch.num_rows(), std::sync::atomic::Ordering::Relaxed);
+            batches_in_tap.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        res
+    });
+    let counted_input: SendableRecordBatchStream = Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            counted_input,
+        ),
+    );
+
     // Create a streaming execution plan that yields the input stream
-    let stream_exec = Arc::new(StreamingExec::new(&schema, stream));
+    let stream_exec = Arc::new(StreamingExec::new(&schema, counted_input));
 
     // Wrap with SortExec for external sorting with disk spilling
     let sort_exec = Arc::new(SortExec::new(lex_ordering, stream_exec));
@@ -138,7 +161,74 @@ pub fn sort_stream(
     // Execute the sort
     let sorted_stream = sort_exec.execute(0, Arc::clone(context))?;
 
-    Ok(sorted_stream)
+    // TEMPORARY DIAGNOSTIC: sample the operator's own metrics every 10s while
+    // the sort runs. The signature at a stall discriminates the failure mode:
+    // elapsed_compute climbing with frozen output => a compute spin inside the
+    // sort drive; spilled_bytes climbing forever => a spill/re-merge cycle;
+    // everything frozen => a parked wait. Uses `Weak` so the sampler dies with
+    // the operator instead of keeping it alive, plus an explicit done flag
+    // flipped when the output stream finishes or is dropped.
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sampler_done = Arc::clone(&done);
+    let sort_weak = Arc::downgrade(&sort_exec);
+    let pool = Arc::clone(context.memory_pool());
+    let sampled = tokio::runtime::Handle::try_current().is_ok();
+    if sampled {
+        tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                if sampler_done.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                let Some(sort) = sort_weak.upgrade() else {
+                    return;
+                };
+                let Some(metrics) = sort.metrics() else {
+                    continue;
+                };
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    elapsed_s = start.elapsed().as_secs(),
+                    input_batches = batches_in.load(std::sync::atomic::Ordering::Relaxed),
+                    input_rows = rows_in.load(std::sync::atomic::Ordering::Relaxed),
+                    output_rows = metrics.output_rows().unwrap_or(0),
+                    elapsed_compute_ms =
+                        metrics.elapsed_compute().unwrap_or(0) / 1_000_000,
+                    spill_count = metrics.spill_count().unwrap_or(0),
+                    spilled_bytes = metrics.spilled_bytes().unwrap_or(0),
+                    spilled_rows = metrics.spilled_rows().unwrap_or(0),
+                    pool_reserved_bytes = pool.reserved(),
+                    "sort progress sample"
+                );
+            }
+        });
+    }
+
+    // Flip the done flag when the sorted stream completes or is dropped so the
+    // sampler exits promptly; also keep the operator alive for metrics via the
+    // captured Arc.
+    struct SortDoneGuard {
+        done: Arc<std::sync::atomic::AtomicBool>,
+        _sort: Arc<SortExec>,
+    }
+    impl Drop for SortDoneGuard {
+        fn drop(&mut self) {
+            self.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let guard = SortDoneGuard {
+        done,
+        _sort: sort_exec,
+    };
+    let out_schema = sorted_stream.schema();
+    let terminated = sorted_stream.map(move |item| {
+        let _hold = &guard;
+        item
+    });
+    Ok(Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(out_schema, terminated),
+    ))
 }
 
 /// Parse one sort specification of the form

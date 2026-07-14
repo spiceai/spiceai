@@ -1354,6 +1354,11 @@ impl CayenneAccelerator {
                 config.cold_target_file_size_mb,
             )
             .max(1);
+            // Internal bounded Z-order clustering window. Keep this derived for
+            // now so the public cold-tier UX stays small; a later autotune pass
+            // can refine it from CPU/memory/storage facts.
+            config.cold_clustering_run_size_mb =
+                config.cold_target_file_size_mb.saturating_mul(16).max(1);
             config.cold_tier_warm_max_bytes = autotune::auto_or_i64(
                 acceleration,
                 &["cayenne_datalake_warm_max_bytes"],

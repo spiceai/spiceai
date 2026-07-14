@@ -1101,6 +1101,11 @@ pub struct VortexConfig {
     /// objects and cold scans are range reads. Set from
     /// `cayenne_datalake_target_file_size_mb`. Defaults to 512.
     pub cold_target_file_size_mb: usize,
+    /// Internal bounded Z-order clustering run size in MB for cold promotion.
+    /// Each run is independently clustered and may produce multiple cold files.
+    /// Derived from the cold target file size for now; future autotuning can
+    /// refine it from CPU/memory/storage facts.
+    pub cold_clustering_run_size_mb: usize,
     /// Promotion fires only once the warm tier exceeds this many bytes
     /// (`<= 0` disables the byte trigger). Set from
     /// `cayenne_datalake_warm_max_bytes`.
@@ -1451,6 +1456,7 @@ impl Default for VortexConfig {
             cold_tier_location: None,
             cold_clustering_columns: Vec::new(),
             cold_target_file_size_mb: 512,
+            cold_clustering_run_size_mb: 8192,
             cold_tier_warm_max_bytes: 0,
             cold_tier_warm_max_files: 0,
             cold_tier_background_interval_ms: 60_000,
@@ -1503,6 +1509,17 @@ mod tests {
         let config: VortexConfig = serde_json::from_str("{}").expect("valid empty config");
 
         assert_eq!(config.pk_conflict_detection, PkConflictDetection::Auto);
+    }
+
+    #[test]
+    fn test_vortex_config_deserializes_cold_clustering_run_size_default() {
+        let config: VortexConfig = serde_json::from_str("{}").expect("valid empty config");
+
+        assert_eq!(
+            config.cold_clustering_run_size_mb,
+            VortexConfig::default().cold_clustering_run_size_mb,
+            "old catalog rows without the internal cold clustering run size must deserialize with the default"
+        );
     }
 
     /// The mem-tier caps + periodic interval must default to NON-ZERO so the
