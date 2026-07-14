@@ -29,6 +29,7 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use app::AppBuilder;
+use arrow::array::{Array, RecordBatch, StringArray};
 use datafusion::assert_batches_eq;
 use runtime::Runtime;
 use secrecy::ExposeSecret;
@@ -132,6 +133,59 @@ fn pg_catalog(port: usize) -> Catalog {
     catalog
 }
 
+/// Collect the values of a `Utf8` column across every batch, in row order.
+fn string_column_values(batches: &[RecordBatch], column: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    for batch in batches {
+        let Ok(idx) = batch.schema().index_of(column) else {
+            continue;
+        };
+        let array = batch
+            .column(idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("column should be a Utf8 array");
+        for i in 0..array.len() {
+            values.push(array.value(i).to_string());
+        }
+    }
+    values
+}
+
+/// Seed a plain table, a materialized view over it, and (via `postgres_fdw`) a
+/// foreign table pointed at it, to confirm all three relation kinds are
+/// discovered (#11725).
+async fn seed_matview_and_foreign_table(port: usize) -> Result<(), anyhow::Error> {
+    let pool = common::get_postgres_connection_pool(port, None).await?;
+    let conn = pool
+        .connect_direct()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    conn.conn
+        .simple_query(
+            "CREATE TABLE source_data (id INT PRIMARY KEY, val TEXT); \
+             INSERT INTO source_data (id, val) VALUES (1, 'a'), (2, 'b'); \
+             CREATE MATERIALIZED VIEW mv_source_data AS SELECT * FROM source_data;",
+        )
+        .await?;
+
+    conn.conn
+        .simple_query(&format!(
+            "CREATE EXTENSION IF NOT EXISTS postgres_fdw; \
+             CREATE SERVER loopback FOREIGN DATA WRAPPER postgres_fdw \
+                 OPTIONS (host 'localhost', port '5432', dbname 'postgres'); \
+             CREATE USER MAPPING FOR postgres SERVER loopback \
+                 OPTIONS (user 'postgres', password '{}'); \
+             CREATE FOREIGN TABLE ft_source_data (id INT, val TEXT) \
+                 SERVER loopback OPTIONS (table_name 'source_data');",
+            common::PG_PASSWORD
+        ))
+        .await?;
+
+    Ok(())
+}
+
 async fn start_runtime(catalog: Catalog) -> Result<Arc<Runtime>, anyhow::Error> {
     register_test_connectors().await;
     let app = AppBuilder::new("postgres_catalog_partition_test")
@@ -211,6 +265,59 @@ async fn test_partitioned_table_registers_parent_only() -> Result<(), anyhow::Er
                 ],
                 &count
             );
+
+            Ok(())
+        })
+        .await
+}
+
+/// The catalog connector discovers materialized views and foreign tables, not
+/// just base tables and standard views (#11725).
+#[tokio::test]
+async fn test_materialized_view_and_foreign_table_discovered() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            let _container = common::start_postgres_docker_container(port).await?;
+
+            seed_matview_and_foreign_table(port).await?;
+
+            let rt = start_runtime(pg_catalog(port)).await?;
+
+            let tables = run_query(
+                &rt,
+                &format!(
+                    "SELECT table_name FROM information_schema.tables \
+                     WHERE table_catalog = '{CATALOG_NAME}' AND table_schema = 'public' \
+                     ORDER BY table_name"
+                ),
+            )
+            .await?;
+            assert_eq!(
+                string_column_values(&tables, "table_name"),
+                vec![
+                    "ft_source_data".to_string(),
+                    "mv_source_data".to_string(),
+                    "source_data".to_string(),
+                ],
+                "the base table, materialized view, and foreign table should all be registered"
+            );
+
+            let mv_count = run_query(
+                &rt,
+                &format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.mv_source_data"),
+            )
+            .await?;
+            assert_batches_eq!(&["+---+", "| n |", "+---+", "| 2 |", "+---+"], &mv_count);
+
+            let ft_count = run_query(
+                &rt,
+                &format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.ft_source_data"),
+            )
+            .await?;
+            assert_batches_eq!(&["+---+", "| n |", "+---+", "| 2 |", "+---+"], &ft_count);
 
             Ok(())
         })
