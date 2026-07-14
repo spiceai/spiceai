@@ -231,15 +231,6 @@ pub fn sort_stream(
     // Flip the done flag when the sorted stream completes or is dropped so the
     // sampler exits promptly; also keep the operator alive for metrics via the
     // captured Arc.
-    struct SortDoneGuard {
-        done: Arc<AtomicBool>,
-        _sort: Arc<SortExec>,
-    }
-    impl Drop for SortDoneGuard {
-        fn drop(&mut self) {
-            self.done.store(true, Ordering::Relaxed);
-        }
-    }
     let guard = SortDoneGuard {
         done,
         _sort: sort_exec,
@@ -252,6 +243,20 @@ pub fn sort_stream(
     Ok(Box::pin(RecordBatchStreamAdapter::new(
         out_schema, terminated,
     )))
+}
+
+/// TEMPORARY DIAGNOSTIC (cold-promotion hang investigation): dropped when the
+/// sorted stream finishes or is abandoned — flips the sampler's done flag and
+/// keeps the `SortExec` alive so the sampler can read its metrics until then.
+struct SortDoneGuard {
+    done: Arc<AtomicBool>,
+    _sort: Arc<SortExec>,
+}
+
+impl Drop for SortDoneGuard {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Parse one sort specification of the form
