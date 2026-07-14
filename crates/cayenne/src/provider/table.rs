@@ -14349,7 +14349,6 @@ impl CayenneTableProvider {
                     (id, threshold)
                 })
                 .collect();
-
             let deletion_snapshot = self.pk_deletion_snapshot();
             // Derive the fence from the SAME loaded deletion snapshot used for
             // the Phase 2 rewrite. A separate `get_max_delete_sequence()` load
@@ -14435,6 +14434,7 @@ impl CayenneTableProvider {
             inputs,
             fence_max_delete_seq,
             deletion_snapshot,
+            snapshot_at_capture,
             ProtectedSnapshotTierPassContext {
                 pass_start: compaction_start,
                 phase1_fence_ms,
@@ -14468,10 +14468,12 @@ impl CayenneTableProvider {
         let deletion_snapshot = self.pk_deletion_snapshot();
         let fence_max_delete_seq = self
             .protected_snapshot_merge_fence(deletion_snapshot.max_sequence_number().unwrap_or(0));
+        let snapshot_at_capture = self.get_current_snapshot_id();
         self.compact_protected_snapshot_tier(
             inputs,
             fence_max_delete_seq,
             deletion_snapshot,
+            snapshot_at_capture,
             ProtectedSnapshotTierPassContext {
                 pass_start: std::time::Instant::now(),
                 phase1_fence_ms: 0,
@@ -14490,17 +14492,19 @@ impl CayenneTableProvider {
     /// `inputs` must be a single tier's `(snapshot_id, deletion_threshold,
     /// bytes)` triples, as selected by [`select_protected_snapshot_merge_tiers`]
     /// — disjoint from any other tier a concurrent caller may be merging via
-    /// this same method. `fence_max_delete_seq` and `deletion_snapshot` must
-    /// come from the SAME coherent Phase-1 fence read that produced the full
-    /// tier partition `inputs` was drawn from, so every concurrently-running
-    /// tier merge tags its output with a fence consistent with the deletions
-    /// it actually applied (see the caller and the pipelined multi-tier
-    /// entry point once it exists).
+    /// this same method. `fence_max_delete_seq`, `deletion_snapshot`, and
+    /// `snapshot_at_capture` must come from the SAME coherent Phase-1 fence
+    /// read that produced the full tier partition `inputs` was drawn from, so
+    /// every concurrently-running tier merge tags its output with a fence
+    /// consistent with the deletions it actually applied and can detect a
+    /// concurrent overwrite/promotion against the same current-snapshot
+    /// capture (see the caller and the pipelined multi-tier entry point).
     async fn compact_protected_snapshot_tier(
         &self,
         inputs: Vec<(String, i64, u64)>,
         fence_max_delete_seq: i64,
         deletion_snapshot: PkDeletionSnapshot,
+        snapshot_at_capture: String,
         pass: ProtectedSnapshotTierPassContext,
     ) -> Result<bool> {
         // Observability for "is pipelining actually running concurrent tier
@@ -14975,8 +14979,9 @@ impl CayenneTableProvider {
         // tiers provably disjoint (see `select_protected_snapshot_merge_tiers`) —
         // independent per-merge "pick the lowest tier" reads could otherwise race
         // to claim the same runs.
-        let (candidates, fence_max_delete_seq, deletion_snapshot) = {
+        let (candidates, fence_max_delete_seq, deletion_snapshot, snapshot_at_capture) = {
             let _fence = self.listing_fence.read().await;
+            let snapshot_at_capture = self.get_current_snapshot_id();
             let protected = self.protected_snapshots.load_full();
             if protected.len() < 2 {
                 return Ok(false);
@@ -15001,7 +15006,12 @@ impl CayenneTableProvider {
             let fence_max_delete_seq = self.protected_snapshot_merge_fence(
                 deletion_snapshot.max_sequence_number().unwrap_or(0),
             );
-            (candidates, fence_max_delete_seq, deletion_snapshot)
+            (
+                candidates,
+                fence_max_delete_seq,
+                deletion_snapshot,
+                snapshot_at_capture,
+            )
         };
         let phase1_fence_ms = compaction_start.elapsed().as_millis();
 
@@ -15078,6 +15088,7 @@ impl CayenneTableProvider {
                 tier,
                 fence_max_delete_seq,
                 deletion_snapshot.clone(),
+                snapshot_at_capture.clone(),
                 pass,
             )
         }))
@@ -33564,6 +33575,7 @@ mod tests {
         let deletion_snapshot = provider.pk_deletion_snapshot();
         let fence_max_delete_seq = provider
             .protected_snapshot_merge_fence(deletion_snapshot.max_sequence_number().unwrap_or(0));
+        let snapshot_at_capture = provider.get_current_snapshot_id();
         let pass = ProtectedSnapshotTierPassContext {
             pass_start: std::time::Instant::now(),
             phase1_fence_ms: 0,
@@ -33577,12 +33589,14 @@ mod tests {
                 tier_a,
                 fence_max_delete_seq,
                 deletion_snapshot.clone(),
+                snapshot_at_capture.clone(),
                 pass,
             ),
             provider.compact_protected_snapshot_tier(
                 tier_b,
                 fence_max_delete_seq,
                 deletion_snapshot.clone(),
+                snapshot_at_capture.clone(),
                 pass,
             )
         );
