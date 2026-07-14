@@ -294,6 +294,24 @@ async fn test_unsupported_type_action_defaults_to_string() -> Result<(), anyhow:
                 "a table with an unsupported jsonb column should still be registered by default"
             );
 
+            // The unsupported `metadata` (jsonb) column must still be present —
+            // converted to a string, not silently dropped — alongside `id`.
+            let columns = run_query(
+                &rt,
+                &format!(
+                    "SELECT column_name FROM information_schema.columns \
+                     WHERE table_catalog = '{CATALOG_NAME}' AND table_schema = 'public' \
+                     AND table_name = 'widgets_jsonb' \
+                     ORDER BY column_name"
+                ),
+            )
+            .await?;
+            assert_eq!(
+                string_column_values(&columns, "column_name"),
+                vec!["id".to_string(), "metadata".to_string()],
+                "the unsupported jsonb column should be kept (converted to a string), not dropped"
+            );
+
             let count = run_query(
                 &rt,
                 &format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.widgets_jsonb"),

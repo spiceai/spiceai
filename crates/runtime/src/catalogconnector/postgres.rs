@@ -39,17 +39,17 @@ use std::sync::Arc;
 fn parse_unsupported_type_action(
     dataset_params: &HashMap<String, String>,
 ) -> Result<UnsupportedTypeAction, String> {
-    match dataset_params
-        .get("unsupported_type_action")
-        .map(String::as_str)
-    {
-        None | Some("string") => Ok(UnsupportedTypeAction::String),
-        Some("error") => Ok(UnsupportedTypeAction::Error),
-        Some("warn") => Ok(UnsupportedTypeAction::Warn),
-        Some("ignore") => Ok(UnsupportedTypeAction::Ignore),
-        Some(other) => Err(format!(
-            "Invalid value '{other}' for `unsupported_type_action`. Expected one of: error, warn, ignore, string."
-        )),
+    match dataset_params.get("unsupported_type_action") {
+        None => Ok(UnsupportedTypeAction::String),
+        Some(value) => match value.trim().to_lowercase().as_str() {
+            "string" => Ok(UnsupportedTypeAction::String),
+            "error" => Ok(UnsupportedTypeAction::Error),
+            "warn" => Ok(UnsupportedTypeAction::Warn),
+            "ignore" => Ok(UnsupportedTypeAction::Ignore),
+            other => Err(format!(
+                "Invalid value '{other}' for `unsupported_type_action`. Expected one of: error, warn, ignore, string."
+            )),
+        },
     }
 }
 
