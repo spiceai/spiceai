@@ -670,8 +670,8 @@ impl CayenneCatalog {
         for f in cold_files {
             txn.execute(ExecuteParams {
                 sql: "INSERT OR REPLACE INTO cayenne_cold_tier_file \
-                      (table_id, file_url, row_count, file_size_bytes, min_sequence, max_sequence, statistics_blob) \
-                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                      (table_id, file_url, row_count, file_size_bytes, min_sequence, max_sequence, statistics_blob, pk_bloom_blob) \
+                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params: vec![
                     MetastoreValue::Text(f.table_id.clone()),
                     MetastoreValue::Text(f.file_url.clone()),
@@ -680,6 +680,9 @@ impl CayenneCatalog {
                     MetastoreValue::Integer(f.min_sequence),
                     MetastoreValue::Integer(f.max_sequence),
                     MetastoreValue::Blob(f.statistics_blob.clone()),
+                    f.pk_bloom
+                        .clone()
+                        .map_or(MetastoreValue::Null, MetastoreValue::Blob),
                 ],
             })
             .await?;
@@ -1538,7 +1541,10 @@ impl MetadataCatalog for CayenneCatalog {
         // final piece of the uniform local-FS durability contract (snapshot
         // dirs, _partitioned_wal/, deletions/, and now initial table creation).
         // Matches the contract we enforce everywhere else in the write path.
-        if !base_path.starts_with("s3://") {
+        // Memory mode (`mode: memory`) writes nothing to disk — the mem-tier is the
+        // store and the metastore is an in-RAM memdb — so skip creating the initial
+        // snapshot directory entirely.
+        if !base_path.starts_with("s3://") && !options.vortex_config.memory_mode {
             let table_root = std::path::PathBuf::from(&base_path).join(&table_id);
             let snapshot_dir = table_root.join(&initial_snapshot_id);
 
@@ -3003,7 +3009,7 @@ impl MetadataCatalog for CayenneCatalog {
             .query_helper(
                 QueryParams {
                     sql: r"
-                    SELECT table_id, file_url, row_count, file_size_bytes, min_sequence, max_sequence, statistics_blob
+                    SELECT table_id, file_url, row_count, file_size_bytes, min_sequence, max_sequence, statistics_blob, pk_bloom_blob
                     FROM cayenne_cold_tier_file
                     WHERE table_id = ?1
                     ",
@@ -3018,6 +3024,7 @@ impl MetadataCatalog for CayenneCatalog {
                         min_sequence: row.get_i64(4)?,
                         max_sequence: row.get_i64(5)?,
                         statistics_blob: row.get_blob(6)?,
+                        pk_bloom: row.get_optional_blob(7)?,
                     })
                 },
             )
@@ -4122,8 +4129,10 @@ impl MetadataCatalog for CayenneCatalog {
         // table it is cleared explicitly (rather than relying on the
         // ON DELETE CASCADE FK) so a crash before the final `cayenne_table`
         // delete cannot leave orphan cold-file rows. NOTE: this removes the
-        // catalog rows only — the physical cold objects are swept separately by
-        // the table-drop physical cleanup (they live on the cold object store).
+        // catalog rows only — the physical cold objects are intentionally NOT
+        // deleted on drop (the datalake location is an operator-managed,
+        // possibly shared bucket); reclaiming a dropped table's
+        // `{name}-{table_id}/` prefix is an operator action.
         self.metastore
             .execute_helper(ExecuteParams {
                 sql: "DELETE FROM cayenne_cold_tier_file WHERE table_id = ?1",
@@ -4631,6 +4640,88 @@ mod tests {
     async fn test_catalog_creation() {
         let _catalog = CayenneCatalog::new("sqlite://./test.db").expect("Failed to create catalog");
         // Tests will be added once implementation is complete
+    }
+
+    /// The per-cold-file `pk_bloom` blob must survive the manifest write/read
+    /// round-trip (the `commit_overwrite_to_cold` INSERT and `list_cold_tier_files`
+    /// SELECT column wiring), and a `None` bloom must round-trip as SQL NULL →
+    /// `None` (the legacy / over-cap fallback the keyset rebuild relies on).
+    #[tokio::test]
+    async fn cold_tier_file_pk_bloom_round_trips() {
+        let test_db = format!("sqlite://./.test_cold_bloom_{}.db", uuid::Uuid::now_v7());
+        let catalog = Arc::new(CayenneCatalog::new(&test_db).expect("Failed to create catalog"));
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let options = CreateTableOptions {
+            table_name: "cold_bloom_tbl".to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_test_cold_bloom".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        let table_id = catalog.create_table(options).await.expect("create table");
+
+        let with_bloom = ColdTierFile {
+            table_id: table_id.clone(),
+            file_url: "s3://bucket/t/data/p1/a.vortex".to_string(),
+            row_count: 100,
+            file_size_bytes: 4096,
+            min_sequence: 0,
+            max_sequence: 10,
+            statistics_blob: Vec::new(),
+            pk_bloom: Some(vec![1, 2, 3, 4, 5, 250, 251]),
+        };
+        let without_bloom = ColdTierFile {
+            table_id: table_id.clone(),
+            file_url: "s3://bucket/t/data/p1/b.vortex".to_string(),
+            row_count: 50,
+            file_size_bytes: 2048,
+            min_sequence: 0,
+            max_sequence: 5,
+            statistics_blob: Vec::new(),
+            pk_bloom: None,
+        };
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+        catalog
+            .commit_overwrite_to_cold(
+                &table_id,
+                &new_snapshot_id,
+                &[with_bloom.clone(), without_bloom.clone()],
+            )
+            .await
+            .expect("commit cold files");
+
+        let listed = catalog
+            .list_cold_tier_files(&table_id)
+            .await
+            .expect("list cold files");
+        let mut by_url: std::collections::HashMap<String, Option<Vec<u8>>> = listed
+            .into_iter()
+            .map(|f| (f.file_url, f.pk_bloom))
+            .collect();
+
+        assert_eq!(
+            by_url.remove(&with_bloom.file_url).expect("row a present"),
+            Some(vec![1, 2, 3, 4, 5, 250, 251]),
+            "pk_bloom bytes must round-trip exactly"
+        );
+        assert_eq!(
+            by_url
+                .remove(&without_bloom.file_url)
+                .expect("row b present"),
+            None,
+            "NULL pk_bloom must round-trip as None"
+        );
+
+        drop(catalog);
+        let _ = std::fs::remove_file(test_db.trim_start_matches("sqlite://"));
     }
 
     #[tokio::test]

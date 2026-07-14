@@ -53,8 +53,9 @@ All contributions come through pull requests. To submit a proposed change, we re
 1. Create your change
    - Code changes require tests
 1. Update relevant documentation for the change
-1. Commit and open a PR
-1. Wait for the CI process to finish and make sure all checks are green
+1. Commit and push your branch
+1. Run `make signoff` to attest your change — it runs lint + unit tests on your machine and records a sign-off on the exact commit you pushed (see [CI Sign-off](/docs/dev/ci_signoff.md))
+1. Open a PR. A single **Attestation** check validates your sign-off; that plus a review is what adds the PR to the merge queue, where the full test suite runs as the required gate
 1. A maintainer of the project will be assigned, and you can expect a review within a few days
 
 ### Use work-in-progress PRs for early feedback

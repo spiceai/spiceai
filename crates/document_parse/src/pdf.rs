@@ -51,6 +51,12 @@ impl PdfParser {
 #[async_trait::async_trait]
 impl DocumentParser for PdfParser {
     async fn parse(&self, raw: &Bytes) -> Result<Arc<dyn Document>> {
+        // `liteparse` loads PDFium at runtime via `dlopen` and panics if it is
+        // missing. Provision it first (found next to the binary in Docker, or
+        // downloaded on demand for standalone installs) so an absent library
+        // surfaces as a structured error instead of a panic.
+        crate::pdfium::ensure_loaded().await?;
+
         let config = LiteParseConfig {
             ocr_enabled: false,
             output_format: OutputFormat::Text,
@@ -81,5 +87,40 @@ impl Document for PdfDocument {
 
     fn type_(&self) -> DocumentType {
         DocumentType::Pdf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal, well-formed single-page PDF whose content stream draws the
+    /// text "Spice Hello".
+    const SAMPLE_PDF: &[u8] = include_bytes!("../tests/fixtures/hello.pdf");
+
+    #[tokio::test]
+    async fn extracts_text_from_pdf() {
+        let parser = PdfParser::default();
+        let doc = parser
+            .parse(&Bytes::from_static(SAMPLE_PDF))
+            .await
+            .expect("sample PDF should parse");
+        let text = doc.as_flat_utf8().expect("flat utf8 text");
+        assert!(
+            text.contains("Spice"),
+            "expected extracted text to contain 'Spice', got: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_pdf_returns_error_without_panicking() {
+        let parser = PdfParser::default();
+        let result = parser
+            .parse(&Bytes::from_static(b"this is definitely not a pdf document"))
+            .await;
+        assert!(
+            result.is_err(),
+            "an invalid PDF must return a structured error, not succeed or panic"
+        );
     }
 }

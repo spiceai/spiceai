@@ -43,7 +43,10 @@ use arc_swap::ArcSwap;
 use rustls::{
     DigitallySignedStruct, DistinguishedName, SignatureScheme,
     client::danger::HandshakeSignatureValid,
-    pki_types::{CertificateDer, UnixTime},
+    pki_types::{
+        CertificateDer, PrivateKeyDer, UnixTime,
+        pem::{self, PemObject},
+    },
     server::{
         ClientHello, ParsedCertificate, ResolvesServerCert, WebPkiClientVerifier,
         danger::{ClientCertVerified, ClientCertVerifier},
@@ -302,9 +305,15 @@ fn parse_and_validate(paths: &ClusterPkiPaths) -> io::Result<ClusterPkiSnapshot>
 
     // CA-backed client verifier.
     let mut roots = rustls::RootCertStore::empty();
-    let ca_certs = rustls_pemfile::certs(&mut ca_pem.as_slice())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    let ca_certs = load_certs(&ca_pem).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "failed to parse CA certificates from {}: {err}",
+                paths.ca.display()
+            ),
+        )
+    })?;
     if ca_certs.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -414,9 +423,7 @@ fn validate_chain(
 }
 
 fn build_certified_key(cert_pem: &[u8], key_pem: &[u8]) -> Result<CertifiedKey, String> {
-    let cert_chain = rustls_pemfile::certs(&mut std::io::Cursor::new(cert_pem))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("cert parse error: {e}"))?;
+    let cert_chain = load_certs(cert_pem).map_err(|e| format!("cert parse error: {e}"))?;
     if cert_chain.is_empty() {
         return Err("empty certificate chain".into());
     }
@@ -424,12 +431,29 @@ fn build_certified_key(cert_pem: &[u8], key_pem: &[u8]) -> Result<CertifiedKey, 
     let _ = ParsedCertificate::try_from(&cert_chain[0])
         .map_err(|e| format!("leaf cert parse error: {e}"))?;
 
-    let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(key_pem))
-        .map_err(|e| format!("key parse error: {e}"))?
-        .ok_or("no private key found in PEM")?;
+    let key = load_key(key_pem)?;
     let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key)
         .map_err(|e| format!("private key not usable: {e}"))?;
     Ok(CertifiedKey::new(cert_chain, signing_key))
+}
+
+fn load_certs(pem_bytes: &[u8]) -> Result<Vec<CertificateDer<'static>>, pem::Error> {
+    // Empty / non-PEM input should surface as an empty vec so callers can emit
+    // the stable "no CA certificates" / "empty certificate chain" errors,
+    // rather than a generic parse failure.
+    match CertificateDer::pem_slice_iter(pem_bytes).collect::<Result<Vec<_>, _>>() {
+        Ok(certs) => Ok(certs),
+        Err(pem::Error::NoItemsFound) => Ok(Vec::new()),
+        Err(err) => Err(err),
+    }
+}
+
+fn load_key(pem_bytes: &[u8]) -> Result<PrivateKeyDer<'static>, String> {
+    match PrivateKeyDer::from_pem_slice(pem_bytes) {
+        Ok(key) => Ok(key),
+        Err(pem::Error::NoItemsFound) => Err("no private key found in PEM".into()),
+        Err(err) => Err(format!("key parse error: {err}")),
+    }
 }
 
 fn bundle_fingerprint(ca: &[u8], cert: &[u8], key: &[u8]) -> [u8; 32] {

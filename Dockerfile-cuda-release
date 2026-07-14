@@ -25,6 +25,17 @@ RUN set -eux; \
     chmod +x /root/spiced; \
     rm -f /tmp/spiced.tar.gz
 
+# PDFium is dlopen'd at runtime by the document parser (not linked into spiced),
+# so ship the shared library next to the binary. The release tag must match
+# PDFIUM_RELEASE_TAG in liteparse-pdfium-sys (chromium/7897). CUDA builds are
+# x86_64 only.
+RUN set -eux; \
+    curl -fSLo /tmp/pdfium.tgz "https://github.com/run-llama/pdfium-binaries/releases/download/chromium%2F7897/pdfium-linux-x64.tgz"; \
+    mkdir -p /tmp/pdfium; \
+    tar -C /tmp/pdfium -xzf /tmp/pdfium.tgz; \
+    cp /tmp/pdfium/lib/libpdfium.so /root/libpdfium.so; \
+    rm -rf /tmp/pdfium /tmp/pdfium.tgz
+
 FROM ${CUDA_RUNTIME_IMAGE} AS runtime
 
 ENV CUDA_NVCC_FLAGS=-fPIE
@@ -46,6 +57,9 @@ RUN if echo "$CARGO_FEATURES" | grep -q "odbc"; then \
   fi
 
 COPY --from=binary /root/spiced /usr/local/bin/spiced
+
+# Copy PDFium next to the binary (dlopen'd at runtime for PDF document parsing)
+COPY --from=binary /root/libpdfium.so /usr/local/bin/libpdfium.so
 
 ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
 ENV LD_LIBRARY_PATH=/usr/local/cuda-12.6/compat:${LD_LIBRARY_PATH}

@@ -149,8 +149,16 @@ def render(i):
     prefix = "" if block.lstrip().startswith("%%{init") else INIT
     svgs[i] = kroki_svg(prefix + block)
     sys.stdout.write("."); sys.stdout.flush()
-with ThreadPoolExecutor(max_workers=6) as ex:
-    list(ex.map(render, range(len(blocks))))
+# kroki_svg raises RuntimeError only for its own (retried) rendering
+# failures; exit 2 lets CI tell "kroki.io is flaking" apart from any other
+# uncaught exception (exit 1, e.g. a script bug or a WeasyPrint failure
+# below), which must still fail the build outright.
+try:
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        list(ex.map(render, range(len(blocks))))
+except RuntimeError as e:
+    print(f"\n{e}", file=sys.stderr, flush=True)
+    sys.exit(2)
 print(" done.", flush=True)
 
 # Markdown -> HTML

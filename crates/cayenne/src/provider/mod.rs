@@ -71,6 +71,7 @@ limitations under the License.
 //! - [`constants`]: Staging-dir name, WAL filename, and other shared constants.
 //! - [`partitioned_wal`]: Cross-partition WAL for the partitioned-table
 //!   coordinator (feature-gated).
+pub(crate) mod cold_partition;
 pub(crate) mod column_stats;
 pub(crate) mod compaction;
 pub(crate) mod compaction_writer;
@@ -184,6 +185,23 @@ pub enum Error {
     /// Data constraint violation: null PK, duplicate PK, row overflow.
     #[snafu(display("Data validation failed for table '{table}': {message}"))]
     DataValidation { table: String, message: String },
+
+    /// A `mode: memory` (in-RAM) table reached its configured memory limit. Memory
+    /// mode never spills to disk, so the write is rejected rather than silently
+    /// dropped or grown unbounded.
+    #[snafu(display(
+        "Failed to write to dataset {table} (cayenne): the in-memory accelerator reached its \
+         memory limit ({limit_bytes} bytes; resident {resident_bytes} + incoming {incoming_bytes}). \
+         Use 'mode: file' for durable on-disk acceleration, or raise the limit with the \
+         'cayenne_cdc_mem_tier_max_bytes' parameter. \
+         See: https://spiceai.org/docs/components/data-accelerators"
+    ))]
+    MemTierLimitExceeded {
+        table: String,
+        limit_bytes: u64,
+        resident_bytes: u64,
+        incoming_bytes: u64,
+    },
 
     /// Failed to parse a snapshot or table URL.
     #[snafu(display("Failed to parse URL '{url}': {source}"))]

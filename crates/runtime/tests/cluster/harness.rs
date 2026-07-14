@@ -60,8 +60,6 @@ use test_framework::pki::init_pki;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
 
-use crate::utils::runtime_ready_check;
-
 // ---------------------------------------------------------------------------
 // Port allocation
 // ---------------------------------------------------------------------------
@@ -311,7 +309,9 @@ impl ClusterHarnessBuilder {
     /// 2. Initialises a PKI (CA + per-node mTLS certs)
     /// 3. Allocates free ports for every node
     /// 4. Builds and starts the scheduler, then all executors in order
-    /// 5. Waits for each node to become ready before moving on
+    /// 5. Waits for each executor to become ready (object stores bound / slots open)
+    ///    via `cluster:executor` Ready — not a concurrent `load_components`, which
+    ///    races Fix B's bind path.
     pub async fn start(self) -> Result<ClusterHarness, anyhow::Error> {
         let _ = CryptoProvider::install_default(aws_lc_rs::default_provider());
 
@@ -489,10 +489,18 @@ async fn start_executor(
         Box::pin(cloned.start_servers(executor_config, None, EndpointAuth::no_auth())).await
     });
 
+    // Do not call `load_components` on executors. Fix B gates `cluster:executor`
+    // Ready (and task slots) on `executor_bind_app` + `executor_bind_object_stores`
+    // inside the startup future. A concurrent `load_components` races that path
+    // (double-loading datasets/catalogs) and can prevent Ready from ever being
+    // set — which is what `runtime_ready_check` waits for. Datasets come from
+    // the scheduler via `executor_bind_app`.
     tokio::select! {
-        () = tokio::time::sleep(Duration::from_mins(1)) => {
+        () = tokio::time::sleep(Duration::from_mins(2)) => {
+            executor_handle.abort();
+            let _ = executor_handle.await;
             return Err(anyhow::Error::msg(format!(
-                "Timed out waiting for {label} to start"
+                "Timed out waiting for {label} to become ready (object stores bound / task slots open)"
             )));
         }
         result = &mut executor_handle => {
@@ -502,10 +510,12 @@ async fn start_executor(
                 Err(e)    => format!("{label} server thread panicked: {e}"),
             }));
         }
-        () = Arc::clone(&executor_rt).load_components() => {}
+        () = async {
+            while !executor_rt.status().is_ready() {
+                sleep(Duration::from_millis(100)).await;
+            }
+        } => {}
     }
-
-    runtime_ready_check(&executor_rt).await;
 
     Ok((executor_rt, executor_handle))
 }

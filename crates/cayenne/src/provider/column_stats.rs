@@ -84,37 +84,6 @@ pub(crate) enum RowCountUpdate {
     Unchanged,
 }
 
-/// Whether NDV (`HyperLogLog`) sketches are folded **eagerly on the synchronous
-/// ingest (inline tier0) path**, instead of the default lazy behavior of folding
-/// them only when rows first spill to a persisted file (checkpoint/compaction).
-///
-/// Sourced once from the `SPICE_CAYENNE_EAGER_NDV` environment variable
-/// (`1`/`true`/`on`/`yes` = eager); default is lazy. This is a benchmark /
-/// escape-hatch toggle — it lets the HTAP CI job A/B eager vs lazy NDV — and is
-/// expected to be removed once lazy is the only path. The resolved mode is logged
-/// once (on first read) so a run's logs record which was active.
-pub(crate) fn eager_ndv_on_ingest() -> bool {
-    static EAGER_NDV: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        let eager = std::env::var("SPICE_CAYENNE_EAGER_NDV").is_ok_and(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "on" | "yes"
-            )
-        });
-        tracing::info!(
-            target: "cayenne",
-            "NDV computation mode: {} (default lazy; override with SPICE_CAYENNE_EAGER_NDV)",
-            if eager {
-                "eager (folded on inline ingest)"
-            } else {
-                "lazy (folded on file spill)"
-            },
-        );
-        eager
-    });
-    *EAGER_NDV
-}
-
 /// Accumulates per-column statistics across multiple `RecordBatch`es during a write.
 ///
 /// Builds Vortex [`StatsSet`] objects per column (min, max, null count) and tracks

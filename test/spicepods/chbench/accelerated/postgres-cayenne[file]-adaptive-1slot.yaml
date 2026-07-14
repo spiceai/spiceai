@@ -2,22 +2,22 @@ version: v1
 kind: Spicepod
 name: postgres-cayenne[file]-adaptive-1slot
 
-# SINGLE-SHARED-SLOT variant of `postgres-cayenne[file]-adaptive`. IDENTICAL to that pod (adaptive
-# self-tuning: `cayenne_tuning: adaptive` + `schema_inference: extended` on every dataset, the
-# global `cayenne_goal_*` SLOs, no hand-pinned actuator knobs) EXCEPT every changes-mode table
-# shares ONE replication slot instead of one slot per table. Kept as a SEPARATE pod so the slot
-# topology can be A/B'd against the slot-per-table baseline (`-adaptive`) and the 4-group variant
-# (`-adaptive-4slots`) while holding the adaptive tuning constant — isolating the effect of
-# replication-slot fan-out on the shared CDC pump.
+# SINGLE-SHARED-SLOT variant of the default `postgres-cayenne[file]-adaptive` (which is 4-slot +
+# deep prefetch). IDENTICAL to that pod — adaptive self-tuning (`cayenne_tuning: adaptive` +
+# `schema_inference: extended`), the global `cayenne_goal_*` SLOs, and the SAME deep CDC prefetch
+# (16384) + higher-coalescing (512 MB byte budget / 2000ms linger) — EXCEPT every changes-mode
+# table shares ONE replication slot instead of the default four. Kept as a SEPARATE pod to A/B the
+# slot-count effect against the 4-slot default with everything else (adaptive tuning + prefetch +
+# coalescing) held constant.
 #
-# ONE SHARED REPLICATION SLOT (`spiceai_cdc_all`) for all changes-mode tables.
-# A single Postgres logical slot spawns ONE walsender that decodes the FULL WAL stream once
-# (server decode held at 1x — the minimum), and the whole merged change stream is drained by a
-# SINGLE shared client pump. This is the topology the shared-pump work most directly targets: it
-# maximizes decode savings but concentrates all apply pressure on one pump, so it is the sharpest
-# test of the shared-pump's head-of-line-blocking and back-pressure handling. Trade-off:
-# confirmed_flush_lsn is the min across ALL members, so any one table stalling pins WAL retention
-# for the whole stream (acceptable for the bench).
+# This is the TARGET topology we are driving toward: ONE shared slot (`spice_all`) spawns ONE
+# walsender that decodes the FULL WAL stream exactly once (server decode at 1x — the minimum), and
+# the whole merged change stream is drained by a SINGLE shared client pump. It maximizes source
+# decode savings but concentrates ALL apply pressure on one pump. At SF1000 it is currently
+# apply-bound and fails the data-correctness convergence gate; the shared-pump / deferred-parsing /
+# ack-path work aims to make it viable. Trade-off: confirmed_flush_lsn is the min across ALL
+# members, so any one table stalling pins WAL retention for the whole stream (acceptable for the
+# bench).
 #
 # As in `-adaptive`, no primary_key / on_conflict / indexes are declared: `schema_inference:
 # extended` detects them from the PostgreSQL source and seeds the upsert on_conflict the CDC
@@ -43,6 +43,13 @@ runtime:
   # dataset. These are the high-level targets the closed loop converges toward — NOT
   # actuator knobs. QPH is GLOBAL-ONLY (measured across all datasets).
   params:
+    # Deep prefetch + higher-coalescing (byte budget + linger window), matching the default
+    # `-adaptive` pod so this 1-slot config differs from it ONLY in slot count (isolating the
+    # slot-count effect at the standard prefetch + coalescing settings).
+    cdc_prefetch_buffer: '16384'
+    cdc_max_coalesced_envelopes: '16384'
+    cdc_max_coalesced_bytes: '536870912' # 512 MB
+    cdc_max_coalesce_age_ms: '2000'
     cayenne_goal_replication_lag: '5s'
     cayenne_goal_freshness: '30s'
     cayenne_goal_query_latency: '10s'
@@ -52,14 +59,14 @@ datasets:
   # ---- TPC-C core tables (mutated by OLTP workload) ----
   # No primary_key / on_conflict / indexes: `schema_inference: extended` detects them from the
   # PostgreSQL source and seeds the upsert on_conflict the CDC (changes) path requires.
-  # All changes tables share the single slot `spiceai_cdc_all`.
+  # All changes tables share the single slot `spice_all`.
 
   - from: postgres:warehouse
     name: warehouse
     schema_inference: extended
     params:
       <<: *postgres_params
-      pg_replication_slot: spiceai_cdc_all
+      pg_replication_slot: spice_all
       pg_replication_initial_snapshot: 'true'
     acceleration: &cayenne_accel
       enabled: true
@@ -80,7 +87,7 @@ datasets:
     schema_inference: extended
     params:
       <<: *postgres_params
-      pg_replication_slot: spiceai_cdc_all
+      pg_replication_slot: spice_all
       pg_replication_initial_snapshot: 'true'
     acceleration: *cayenne_accel
 
@@ -89,7 +96,7 @@ datasets:
     schema_inference: extended
     params:
       <<: *postgres_params
-      pg_replication_slot: spiceai_cdc_all
+      pg_replication_slot: spice_all
       pg_replication_initial_snapshot: 'true'
     acceleration: *cayenne_accel
 
@@ -98,7 +105,7 @@ datasets:
     schema_inference: extended
     params:
       <<: *postgres_params
-      pg_replication_slot: spiceai_cdc_all
+      pg_replication_slot: spice_all
       pg_replication_initial_snapshot: 'true'
     acceleration: *cayenne_accel
 
@@ -107,7 +114,7 @@ datasets:
     schema_inference: extended
     params:
       <<: *postgres_params
-      pg_replication_slot: spiceai_cdc_all
+      pg_replication_slot: spice_all
       pg_replication_initial_snapshot: 'true'
     acceleration: *cayenne_accel
 
@@ -116,7 +123,7 @@ datasets:
     schema_inference: extended
     params:
       <<: *postgres_params
-      pg_replication_slot: spiceai_cdc_all
+      pg_replication_slot: spice_all
       pg_replication_initial_snapshot: 'true'
     acceleration: *cayenne_accel
 
@@ -125,7 +132,7 @@ datasets:
     schema_inference: extended
     params:
       <<: *postgres_params
-      pg_replication_slot: spiceai_cdc_all
+      pg_replication_slot: spice_all
       pg_replication_initial_snapshot: 'true'
     acceleration: *cayenne_accel
 
