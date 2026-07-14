@@ -1,6 +1,0 @@
-id,text
-1,"The quick brown fox jumps over the lazy dog."
-2,"Spice.ai is a federated SQL query and AI inference engine."
-3,"Embeddings are dense vector representations of text used for semantic search."
-4,"Apache Arrow and DataFusion power the Spice.ai query execution engine."
-5,"Vector search enables finding semantically similar documents at scale."
