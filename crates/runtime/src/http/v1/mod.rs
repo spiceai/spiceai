@@ -483,7 +483,9 @@ async fn execute_transaction(
                 SqlErrorKind::General,
             );
         };
-        match staged.commit().await {
+        // Per-key OCC: re-check the read footprint + write-set at commit.
+        let (footprint, footprint_complete) = write.txn.take_footprint();
+        match staged.commit(footprint, footprint_complete).await {
             Ok(_) => {}
             Err(cayenne::provider::Error::WriteConflict { table }) => {
                 // Optimistic-concurrency conflict: the table was committed to

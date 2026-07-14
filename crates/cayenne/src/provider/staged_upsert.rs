@@ -140,9 +140,11 @@ impl CayenneStagedUpsert {
     /// Publish the staged rows, making the upsert visible to readers.
     ///
     /// Acquires `write_lock` now (staging ran off-lock) and re-checks the
-    /// optimistic-concurrency token first, aborting with [`Error::WriteConflict`]
-    /// (staged dir cleaned up) if the table changed since the transaction began.
-    /// It then mirrors the fenced tail of the sync on-conflict publish: apply the
+    /// transaction's per-key read footprint + write-set first, aborting with
+    /// [`Error::WriteConflict`] (staged dir cleaned up) if any of those keys was
+    /// committed after the transaction began (or, when per-key state is
+    /// unavailable, if the table's high-water moved at all). It then mirrors the
+    /// fenced tail of the sync on-conflict publish: apply the
     /// on-conflict deletions, reserve the protected-snapshot sequence, record it
     /// durably, then flip the deletion caches + protected snapshot under one
     /// listing-fence write.
@@ -153,15 +155,27 @@ impl CayenneStagedUpsert {
     /// error if applying the deletions, reserving the sequence, or the durable
     /// snapshot-sequence write fails. On a hard error the staged snapshot
     /// directory is left in place so the caller can retry the commit or roll back.
-    pub async fn commit(mut self) -> Result<u64> {
+    pub async fn commit(
+        mut self,
+        footprint: std::collections::HashSet<u128>,
+        footprint_complete: bool,
+    ) -> Result<u64> {
         // Acquire the write lock now (staging ran off-lock), then re-check the
-        // token before touching anything visible — a moved sequence high-water
-        // (or a dirty staging bit at capture) means a concurrent commit could
-        // have changed a key we wrote, so this transaction must abort and retry.
+        // transaction's read footprint + write-set per-key before touching
+        // anything visible: if any of those keys was committed after this
+        // transaction began, it must abort and retry. Keys not in the footprint
+        // are unaffected, so disjoint-key transactions commit concurrently.
         let _write_guard = self.table.write_lock_arc().lock_owned().await;
         self.table.ensure_no_incomplete_write().await?;
+        let current_high_water = self.table.sequence_high_water().await;
         if !self.token.staging_clean
-            || self.table.sequence_high_water().await != self.token.stage_seq
+            || self.table.transaction_has_conflict(
+                self.token.stage_seq,
+                &footprint,
+                footprint_complete,
+                &self.validated_keys,
+                current_high_water,
+            )
         {
             drop(_write_guard);
             cleanup_orphan_snapshot_dir(&self.table, &self.new_snapshot_id).await;
@@ -208,7 +222,7 @@ impl CayenneStagedUpsert {
         if retention_requested {
             self.table.clear_cached_pk_keyset();
         } else {
-            self.table.record_file_pk_keys(&self.validated_keys);
+            self.table.record_file_pk_keys(&self.validated_keys, new_sequence);
         }
 
         Ok(self.row_count)

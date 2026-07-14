@@ -44,6 +44,8 @@ limitations under the License.
 //! immediately (an undetectable atomicity break).
 
 use std::any::Any;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::staged_upsert::{CayenneStagedUpsert, TransactionWriteToken};
@@ -65,6 +67,14 @@ struct TxnInner {
     /// `None` only transiently, while the sink moves the token into a staged
     /// handle. Never held across an await.
     stage: Mutex<Option<TxnStage>>,
+    /// Read footprint: digests of the primary keys the transaction's statements
+    /// read (extracted from pushed-down PK equality/IN predicates). Re-checked
+    /// per-key at commit against each key's stored commit sequence.
+    footprint: Mutex<HashSet<u128>>,
+    /// Set when a statement read this table with a predicate the footprint
+    /// capture could not resolve to a bounded key set (an unbounded-scan gate).
+    /// Forces the commit to fall back to the conservative per-table OCC check.
+    footprint_incomplete: AtomicBool,
 }
 
 /// A transaction handle. Cloning is a cheap `Arc` clone; the
@@ -88,6 +98,8 @@ impl CayenneTransaction {
         Self(Arc::new(TxnInner {
             table_id,
             stage: Mutex::new(Some(TxnStage::Armed(token))),
+            footprint: Mutex::new(HashSet::new()),
+            footprint_incomplete: AtomicBool::new(false),
         }))
     }
 
@@ -95,6 +107,35 @@ impl CayenneTransaction {
     #[must_use]
     pub fn table_id(&self) -> &str {
         &self.0.table_id
+    }
+
+    /// Record primary-key digests read by a statement into the transaction's
+    /// read footprint (called from the scan when a bounded PK predicate is
+    /// pushed down for this table).
+    pub fn record_read_keys(&self, digests: impl IntoIterator<Item = u128>) {
+        if let Ok(mut fp) = self.0.footprint.lock() {
+            fp.extend(digests);
+        }
+    }
+
+    /// Mark the read footprint incomplete — a statement read this table without
+    /// a bounded PK predicate, so commit must fall back to per-table OCC.
+    pub fn mark_footprint_incomplete(&self) {
+        self.0.footprint_incomplete.store(true, Ordering::Relaxed);
+    }
+
+    /// Take the accumulated read footprint and whether it is complete. Returns
+    /// `(digests, complete)`; `complete == false` forces per-table fallback.
+    #[must_use]
+    pub fn take_footprint(&self) -> (HashSet<u128>, bool) {
+        let complete = !self.0.footprint_incomplete.load(Ordering::Relaxed);
+        let digests = self
+            .0
+            .footprint
+            .lock()
+            .map(|mut fp| std::mem::take(&mut *fp))
+            .unwrap_or_default();
+        (digests, complete)
     }
 
     /// Take the armed OCC token so the caller can hand it to
