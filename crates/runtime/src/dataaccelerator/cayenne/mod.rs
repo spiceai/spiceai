@@ -170,6 +170,12 @@ fn maintained_aggregate_specs_for_cayenne(
                         spicepod_acceleration::MaintainedAggregateFunction::Avg => {
                             cayenne::maintained_aggregate::MaintainedAggregateFunction::Avg
                         }
+                        spicepod_acceleration::MaintainedAggregateFunction::Min => {
+                            cayenne::maintained_aggregate::MaintainedAggregateFunction::Min
+                        }
+                        spicepod_acceleration::MaintainedAggregateFunction::Max => {
+                            cayenne::maintained_aggregate::MaintainedAggregateFunction::Max
+                        }
                     };
 
                     cayenne::maintained_aggregate::MaintainedAggregateExpr {
@@ -3857,6 +3863,49 @@ mod tests {
             cayenne::maintained_aggregate::MaintainedAggregateFunction::Count
         );
         assert_eq!(specs[0].aggregates[0].column, None);
+    }
+
+    #[test]
+    fn maintained_aggregate_specs_convert_min_max() {
+        let acceleration = Acceleration {
+            maintained_aggregates: vec![spicepod_acceleration::MaintainedAggregate {
+                group_by: vec!["customer_id".to_string()],
+                aggregates: vec![
+                    spicepod_acceleration::MaintainedAggregateExpr {
+                        function: spicepod_acceleration::MaintainedAggregateFunction::Min,
+                        column: Some("amount".to_string()),
+                    },
+                    spicepod_acceleration::MaintainedAggregateExpr {
+                        function: spicepod_acceleration::MaintainedAggregateFunction::Max,
+                        column: Some("amount".to_string()),
+                    },
+                ],
+                filter_sql: None,
+            }]
+            .into(),
+            ..Default::default()
+        };
+
+        let specs = maintained_aggregate_specs_for_cayenne(
+            Some(&acceleration),
+            &maintained_aggregate_test_schema(),
+        )
+        .expect("min/max maintained aggregate config should convert");
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].aggregates.len(), 2);
+        assert_eq!(
+            specs[0].aggregates[0].function,
+            cayenne::maintained_aggregate::MaintainedAggregateFunction::Min
+        );
+        assert_eq!(
+            specs[0].aggregates[1].function,
+            cayenne::maintained_aggregate::MaintainedAggregateFunction::Max
+        );
+        assert_eq!(
+            specs[0].aggregates[0].column.as_deref(),
+            Some("amount")
+        );
     }
 
     #[test]
