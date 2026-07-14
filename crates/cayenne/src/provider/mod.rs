@@ -121,13 +121,17 @@ pub use mem_tier_budget::{
     global_mem_tier_total, global_mem_tier_used, set_global_mem_tier_bytes,
     update_global_mem_tier_total,
 };
+pub use on_conflict::PreparedOnConflictDeletionPublish;
 pub use overwrite::PreparedOverwrite;
 pub use partitioned_wal::{PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry};
 pub use query_admission::set_query_admission_governor;
 pub use retention::TimeRetentionFilterBuilder;
 pub use scan::CayenneAccelerationExec;
-pub use staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
-pub use table::{CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder};
+pub use staging_wal::{CayenneStagedAppend, PartitionedWalObjectStore, PreparedStagedAppend};
+pub use table::{
+    CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder,
+    PreparedAppendSnapshotPublish,
+};
 pub use tuning::{
     QueryObservations, deregister_query_observations, global_qph, record_global_query,
     record_query_latency, register_query_observations, set_cpu_burstable, set_global_memory_budget,
@@ -185,6 +189,23 @@ pub enum Error {
     /// Data constraint violation: null PK, duplicate PK, row overflow.
     #[snafu(display("Data validation failed for table '{table}': {message}"))]
     DataValidation { table: String, message: String },
+
+    /// A `mode: memory` (in-RAM) table reached its configured memory limit. Memory
+    /// mode never spills to disk, so the write is rejected rather than silently
+    /// dropped or grown unbounded.
+    #[snafu(display(
+        "Failed to write to dataset {table} (cayenne): the in-memory accelerator reached its \
+         memory limit ({limit_bytes} bytes; resident {resident_bytes} + incoming {incoming_bytes}). \
+         Use 'mode: file' for durable on-disk acceleration, or raise the limit with the \
+         'cayenne_cdc_mem_tier_max_bytes' parameter. \
+         See: https://spiceai.org/docs/components/data-accelerators"
+    ))]
+    MemTierLimitExceeded {
+        table: String,
+        limit_bytes: u64,
+        resident_bytes: u64,
+        incoming_bytes: u64,
+    },
 
     /// Failed to parse a snapshot or table URL.
     #[snafu(display("Failed to parse URL '{url}': {source}"))]
