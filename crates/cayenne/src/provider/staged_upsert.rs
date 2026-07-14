@@ -231,7 +231,7 @@ impl CayenneStagedUpsert {
         // anything visible: if any of those keys was committed after this
         // transaction began, it must abort and retry. Keys not in the footprint
         // are unaffected, so disjoint-key transactions commit concurrently.
-        let _write_guard = self.table.write_lock_arc().lock_owned().await;
+        let write_guard = self.table.write_lock_arc().lock_owned().await;
         self.table.ensure_no_incomplete_write().await?;
         let current_high_water = self.table.sequence_high_water().await;
         if !self.token.staging_clean
@@ -243,7 +243,7 @@ impl CayenneStagedUpsert {
                 current_high_water,
             )
         {
-            drop(_write_guard);
+            drop(write_guard);
             cleanup_orphan_snapshot_dir(&self.table, &self.new_snapshot_id).await;
             return Err(Error::WriteConflict {
                 table: self.table.table_name().to_string(),
@@ -296,7 +296,7 @@ impl CayenneStagedUpsert {
         }
 
         Ok(self.row_count)
-        // `_fence`, `_visibility`, and `_write_guard` drop here, in that order.
+        // `_fence`, `_visibility`, and `write_guard` drop here, in that order.
     }
 
     /// Discard the staged upsert and remove its staged snapshot directory.

@@ -28238,6 +28238,7 @@ mod tests {
     /// duplicate) and adds new PKs, all published atomically on commit.
     #[tokio::test]
     async fn staged_upsert_supersedes_existing_pk() {
+        use arrow::array::StringArray;
         let ctx = SessionContext::new();
         let (provider, _tmp, schema) = build_staged_upsert_provider(&ctx, "su_conflict").await;
 
@@ -28269,7 +28270,6 @@ mod tests {
         assert_eq!(scan_sorted_ids(&provider).await, vec![1, 3]);
 
         // The surviving id=1 carries the staged (new) value.
-        use arrow::array::StringArray;
         let batches = read_all(&ctx, &provider, "su_conflict").await;
         let mut got = std::collections::BTreeMap::new();
         for b in &batches {

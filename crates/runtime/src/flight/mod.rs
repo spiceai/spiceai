@@ -676,7 +676,7 @@ fn handle_query_error(e: query::Error) -> Status {
 }
 
 /// Map a shared-orchestrator [`TransactionError`](query::TransactionError) to the
-/// gRPC `Status` the FlightSQL transaction path returns. A `Conflict` is a
+/// gRPC `Status` the `FlightSQL` transaction path returns. A `Conflict` is a
 /// retryable optimistic-concurrency loss (`Aborted`).
 pub(crate) fn transaction_error_to_status(error: query::TransactionError) -> Status {
     use query::TransactionError;

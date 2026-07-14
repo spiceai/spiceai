@@ -348,14 +348,11 @@ async fn transaction_to_http_response(
 fn transaction_error_to_response(error: TransactionError) -> Response {
     match error {
         TransactionError::Rejected(message) => sql_error_response(message, SqlErrorKind::General),
-        TransactionError::Plan(e) => {
+        TransactionError::Plan(e) | TransactionError::Stream(e) => {
             sql_error_response(e.to_string(), SqlErrorKind::of_datafusion_error(&e))
         }
         TransactionError::Query(e) => {
             sql_error_response(e.to_string(), SqlErrorKind::of_query_error(&e))
-        }
-        TransactionError::Stream(e) => {
-            sql_error_response(e.to_string(), SqlErrorKind::of_datafusion_error(&e))
         }
         TransactionError::Conflict { table } => {
             // Optimistic-concurrency conflict: a participant was committed to

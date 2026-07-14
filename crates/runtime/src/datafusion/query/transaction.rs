@@ -20,7 +20,7 @@ limitations under the License.
 //! SQL body whose statements must all run through [`QueryBuilder`] — the one
 //! place authz, masking, logging, and tracing are applied — while still being
 //! atomic. [`run_transaction`] is called identically by the HTTP `/v1/sql` and
-//! FlightSQL entry points; each maps the returned [`TransactionOutcome`] /
+//! `FlightSQL` entry points; each maps the returned [`TransactionOutcome`] /
 //! [`TransactionError`] into its own transport (HTTP status / gRPC `Status`), so
 //! no transport concern lives here.
 //!
@@ -119,7 +119,7 @@ pub fn transaction_statements(sql: &str) -> Option<Vec<String>> {
     Some(inner)
 }
 
-/// The statement whose schema a FlightSQL `GetFlightInfo` /
+/// The statement whose schema a `FlightSQL` `GetFlightInfo` /
 /// `CreatePreparedStatement` should advertise for `sql`: the FINAL statement of
 /// a `BEGIN … COMMIT` body (planned for its schema without executing — the body
 /// itself is not a single plannable statement), or `sql` unchanged otherwise.
@@ -292,17 +292,16 @@ async fn prepare_transaction(
             .create_logical_plan(stmt_sql)
             .await
             .map_err(TransactionError::Plan)?;
-        match classify_transaction_write(&plan) {
-            None => {}
-            Some(Err(op)) => {
-                return Err(TransactionError::Rejected(format!(
+        // A read-only body (`None`) contributes no write ref; a write target
+        // must be a valid v1 transaction table (`Err` → rejected).
+        if let Some(result) = classify_transaction_write(&plan) {
+            let table = result.map_err(|op| {
+                TransactionError::Rejected(format!(
                     "transactions do not support {op} (v1 supports gated INSERT/UPDATE writes)"
-                )));
-            }
-            Some(Ok(table)) => {
-                if !write_refs.contains(&table) {
-                    write_refs.push(table);
-                }
+                ))
+            })?;
+            if !write_refs.contains(&table) {
+                write_refs.push(table);
             }
         }
         // Collect every scanned table (including gate/subquery reads) so each is

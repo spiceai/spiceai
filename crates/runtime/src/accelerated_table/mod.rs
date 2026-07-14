@@ -1268,7 +1268,7 @@ impl AcceleratedTable {
                 crate::accelerated_table::write::CayenneWriteTarget::Staged(provider) => {
                     provider.is_durable_write_back()
                 }
-                _ => false,
+                crate::accelerated_table::write::CayenneWriteTarget::Partitioned(_) => false,
             })
     }
 

@@ -105,6 +105,14 @@ pub(crate) struct PreparedOnConflictDurablePayload {
 }
 
 impl PreparedOnConflictDeletionPublish {
+    /// The commit sequence this staged upsert publishes under. An on-conflict
+    /// append carries no `append_sequence`, so this is the value its validated
+    /// primary keys must be stamped with for per-key optimistic concurrency.
+    #[must_use]
+    pub fn snapshot_sequence(&self) -> i64 {
+        self.snapshot_sequence
+    }
+
     /// Return the exact deletion-vector paths owned by abort cleanup.
     pub fn cleanup_paths(&self) -> Vec<std::path::PathBuf> {
         self.durable_payload
@@ -1089,6 +1097,10 @@ pub(crate) struct OnConflictValidationStream {
 }
 
 impl OnConflictValidationStream {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "distinct stream-construction inputs; grouping them into a struct would not aid clarity"
+    )]
     pub(crate) fn new(
         table: CayenneTableProvider,
         inner: SendableRecordBatchStream,

@@ -141,11 +141,7 @@ impl CayenneTransaction {
     /// Whether `table_id` is a registered participant of this transaction.
     #[must_use]
     pub fn is_participant(&self, table_id: &str) -> bool {
-        self.0
-            .tables
-            .lock()
-            .map(|t| t.contains_key(table_id))
-            .unwrap_or(false)
+        self.0.tables.lock().is_ok_and(|t| t.contains_key(table_id))
     }
 
     /// Record primary-key digests a statement read from `table_id` (from the
@@ -358,7 +354,7 @@ impl CayenneTransaction {
         }
 
         // 4. All written tables must share one metastore database.
-        let shared_catalog = prepared[0].provider().catalog().clone();
+        let shared_catalog = Arc::clone(prepared[0].provider().catalog());
         if prepared[1..]
             .iter()
             .any(|pc| !Arc::ptr_eq(pc.provider().catalog(), &shared_catalog))

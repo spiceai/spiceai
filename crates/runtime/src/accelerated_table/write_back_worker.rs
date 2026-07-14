@@ -42,7 +42,6 @@ use std::time::Duration;
 
 use arrow::array::{Array, ArrayRef};
 use cayenne::CayenneTableProvider;
-use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, col, lit};
@@ -164,7 +163,9 @@ impl WriteBackWorker {
         // object-store-backed scans.
         let ctx =
             SessionContext::new_with_config_rt(SessionConfig::new(), self.provider.runtime_env());
-        let accelerator: Arc<dyn TableProvider> = self.provider.clone();
+        // `Arc<CayenneTableProvider>` coerces to the `Arc<dyn TableProvider>`
+        // `read_table` expects at the call argument below.
+        let accelerator = Arc::clone(&self.provider);
         let current = ctx
             .read_table(accelerator)?
             .filter(filter.clone())?
@@ -211,6 +212,10 @@ fn pk_in_filter(pk_col: &str, values: &ArrayRef) -> DataFusionResult<Expr> {
     Ok(col(pk_col).in_list(list, false))
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "passed to `Result::map_err`, which moves the error value in"
+)]
 fn to_df_err(e: cayenne::provider::Error) -> DataFusionError {
     DataFusionError::Execution(format!("durable write-back: {e}"))
 }

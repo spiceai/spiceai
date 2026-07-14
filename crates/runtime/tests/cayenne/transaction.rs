@@ -97,9 +97,10 @@ fn make_txn_dataset(
 
 /// Write a two-column (`id VARCHAR`, `n BIGINT`) CSV seed file.
 fn write_seed_csv(path: &std::path::Path, rows: &[(&str, i64)]) -> Result<(), String> {
+    use std::fmt::Write as _;
     let mut body = String::from("id,n\n");
     for (id, n) in rows {
-        body.push_str(&format!("{id},{n}\n"));
+        writeln!(body, "{id},{n}").expect("writing to a String is infallible");
     }
     std::fs::write(path, body).map_err(|e| format!("failed to write seed CSV: {e}"))
 }
@@ -345,15 +346,9 @@ async fn test_txn_cap_enforcement() -> Result<(), String> {
                 }
             }
 
-            assert_eq!(
-                commits, CAP as usize,
-                "exactly `cap` commits should succeed"
-            );
-            assert_eq!(
-                aborts,
-                ATTEMPTS - CAP as usize,
-                "the rest must abort at the gate"
-            );
+            let cap = usize::try_from(CAP).expect("CAP is non-negative");
+            assert_eq!(commits, cap, "exactly `cap` commits should succeed");
+            assert_eq!(aborts, ATTEMPTS - cap, "the rest must abort at the gate");
             assert_eq!(
                 read_n(&rt, "t", "a").await,
                 Some(CAP),
