@@ -75,6 +75,21 @@ pub struct TransactionWriteToken {
     staging_clean: bool,
 }
 
+impl TransactionWriteToken {
+    /// The table's begin sequence high-water (per-table; each table's allocator
+    /// is independent).
+    #[must_use]
+    pub fn stage_seq(&self) -> i64 {
+        self.stage_seq
+    }
+
+    /// Whether no staging append was in flight at capture.
+    #[must_use]
+    pub fn staging_clean(&self) -> bool {
+        self.staging_clean
+    }
+}
+
 /// The staged bits: rows written to a fresh invisible snapshot dir, plus the
 /// on-conflict deletions and validated keys captured during validation.
 struct StagedData {
@@ -135,6 +150,42 @@ impl CayenneStagedUpsert {
     #[must_use]
     pub fn row_count(&self) -> u64 {
         self.row_count
+    }
+
+    /// The write-set (kept keys) of this staged upsert — union'd into the
+    /// commit-time per-key OCC re-check.
+    pub(crate) fn validated_keys(&self) -> &PkDigestSet {
+        &self.validated_keys
+    }
+
+    /// Prepare this staged upsert's durable payload for an atomic multi-table
+    /// commit: reserve sequences + write deletion-vector files (no metastore
+    /// commit). The caller holds the table `write_lock`; it applies the payload
+    /// via [`PreparedTxnCommit::apply_in_txn`] inside a shared transaction that
+    /// fuses all written tables, then publishes with [`PreparedTxnCommit::finish`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table needs the non-composable inline-tombstone or
+    /// position-deletion publish path (rejected for multi-table), or if reserving
+    /// sequences / writing deletion vectors fails.
+    pub async fn prepare_commit(mut self) -> Result<PreparedTxnCommit> {
+        let on_conflict_deletions = std::mem::take(&mut self.on_conflict_deletions);
+        let (delete_files, snapshot_commit, publish) = self
+            .table
+            .prepare_staged_upsert_for_txn(on_conflict_deletions, self.new_snapshot_id.clone())
+            .await?;
+        Ok(PreparedTxnCommit {
+            table: self.table,
+            new_snapshot_id: self.new_snapshot_id,
+            validated_keys: self.validated_keys,
+            stats: self.stats,
+            row_count: self.row_count,
+            superseded: self.superseded,
+            delete_files,
+            snapshot_commit,
+            publish,
+        })
     }
 
     /// Publish the staged rows, making the upsert visible to readers.
@@ -244,6 +295,103 @@ impl CayenneStagedUpsert {
         // removes the orphan directory.
         cleanup_orphan_snapshot_dir(&self.table, &self.new_snapshot_id).await;
         Ok(())
+    }
+}
+
+/// A staged upsert prepared for atomic commit inside a caller-owned
+/// `MetastoreTransaction` (multi-table fusion). Sequences are reserved and
+/// deletion-vector files written at [`CayenneStagedUpsert::prepare_commit`]; the
+/// durable catalog write happens in [`Self::apply_in_txn`] and the in-memory
+/// visibility flip in [`Self::finish`], after the shared transaction commits.
+pub struct PreparedTxnCommit {
+    table: CayenneTableProvider,
+    new_snapshot_id: String,
+    validated_keys: PkDigestSet,
+    stats: Arc<ColumnStatsAccumulator>,
+    row_count: u64,
+    superseded: usize,
+    delete_files: Vec<crate::metadata::DeleteFile>,
+    snapshot_commit: crate::catalog::SnapshotSequenceCommit,
+    publish: super::on_conflict::PreparedOnConflictDeletionPublish,
+}
+
+impl PreparedTxnCommit {
+    /// The written table's id (participants are committed in canonical id order).
+    #[must_use]
+    pub fn table_id(&self) -> &str {
+        self.table.table_id()
+    }
+
+    /// The written table's provider — the multi-table orchestrator holds its
+    /// visibility + listing-fence locks and reads its catalog for the shared txn.
+    pub(crate) fn provider(&self) -> &CayenneTableProvider {
+        &self.table
+    }
+
+    /// Rows to be published on commit.
+    #[must_use]
+    pub fn row_count(&self) -> u64 {
+        self.row_count
+    }
+
+    /// Append this table's durable publish statements (delete files + snapshot
+    /// sequence) to the caller-owned transaction. No `begin`/`commit`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first statement failure; the caller rolls back the shared
+    /// transaction and aborts the whole multi-table commit.
+    pub async fn apply_in_txn(
+        &self,
+        catalog: &crate::CayenneCatalog,
+        txn: &mut dyn crate::metastore::MetastoreTransaction,
+    ) -> crate::catalog::CatalogResult<()> {
+        catalog
+            .commit_staged_upsert_in_txn(
+                txn,
+                self.table.table_id(),
+                &self.delete_files,
+                Some(&self.snapshot_commit),
+                None,
+                &[],
+            )
+            .await
+    }
+
+    /// Flip in-memory visibility after the shared transaction committed. Must run
+    /// under the table's held listing fence; best-effort per the same crash
+    /// contract as [`super::overwrite::PreparedOverwrite::finish`] (a crash before
+    /// finish reconstructs the same state from the catalog on reopen).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if swapping the in-memory deletion caches fails.
+    pub fn finish(self) -> Result<u64> {
+        self.table
+            .publish_prepared_on_conflict_deletions(self.publish)?;
+        let retention_requested = self.table.has_retention_delete_filters();
+        let live_rows_delta = i64::try_from(self.row_count)
+            .unwrap_or(i64::MAX)
+            .saturating_sub(i64::try_from(self.superseded).unwrap_or(i64::MAX));
+        self.table.schedule_post_write_maintenance(
+            Some(Arc::clone(&self.stats)),
+            false,
+            retention_requested,
+            live_rows_delta,
+        );
+        if retention_requested {
+            self.table.clear_cached_pk_keyset();
+        } else {
+            self.table
+                .record_file_pk_keys(&self.validated_keys, self.snapshot_commit.sequence_number);
+        }
+        Ok(self.row_count)
+    }
+
+    /// Discard a prepared-but-uncommitted table (the shared transaction was not
+    /// committed): remove its unreferenced staged snapshot directory.
+    pub async fn rollback(self) {
+        cleanup_orphan_snapshot_dir(&self.table, &self.new_snapshot_id).await;
     }
 }
 

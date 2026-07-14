@@ -117,7 +117,7 @@ pub use compaction::{
     begin_compaction_shutdown, drain_compaction_tasks, in_flight_compaction_tasks,
     reset_compaction_shutdown, set_compaction_runtime_env, set_compaction_runtime_handle,
 };
-pub use transaction::CayenneTransaction;
+pub use transaction::{CayenneTransaction, TransactionCommit, TxnTable};
 pub use context::CayenneContext;
 pub use mem_tier::SlotAdvancer;
 pub use mem_tier_budget::{
@@ -129,7 +129,7 @@ pub use partitioned_wal::{PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEnt
 pub use query_admission::set_query_admission_governor;
 pub use retention::TimeRetentionFilterBuilder;
 pub use scan::CayenneAccelerationExec;
-pub use staged_upsert::CayenneStagedUpsert;
+pub use staged_upsert::{CayenneStagedUpsert, PreparedTxnCommit, TransactionWriteToken};
 pub use staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
 pub use table::{CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder};
 pub use tuning::{

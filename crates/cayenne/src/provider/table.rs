@@ -9723,6 +9723,116 @@ impl CayenneTableProvider {
         })
     }
 
+    /// Prepare a staged upsert's durable payload for composition into a shared
+    /// `MetastoreTransaction` (atomic multi-table commit). Reserves sequences
+    /// and writes deletion-vector files, but does NOT commit: the caller applies
+    /// the returned payload via [`crate::CayenneCatalog::commit_staged_upsert_in_txn`]
+    /// inside a transaction it owns (fusing N tables), then publishes in memory
+    /// via [`Self::publish_prepared_on_conflict_deletions`].
+    ///
+    /// Multi-table fusion supports the file-mode key-based path only; inline
+    /// tombstones and position-mode deletions publish through non-composable
+    /// side paths, so a written table needing either is rejected.
+    pub(crate) async fn prepare_staged_upsert_for_txn(
+        &self,
+        on_conflict_deletions: OnConflictDeletions,
+        target_snapshot_id: String,
+    ) -> CatalogResult<(
+        Vec<crate::metadata::DeleteFile>,
+        SnapshotSequenceCommit,
+        PreparedOnConflictDeletionPublish,
+    )> {
+        let superseded = on_conflict_deletions.total_superseded();
+        let OnConflictDeletions {
+            delete_specs,
+            deleted_pk_i64,
+            deleted_row_keys,
+            deleted_inlined_pk_i64,
+            deleted_inlined_row_keys,
+            reinserted_over_tombstone: _,
+        } = on_conflict_deletions;
+
+        if !delete_specs.is_empty() {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: format!(
+                    "multi-table transaction on position-deletion-mode table {} is unsupported",
+                    self.table_metadata.table_name
+                ),
+            });
+        }
+        if !deleted_inlined_pk_i64.is_empty() || !deleted_inlined_row_keys.is_empty() {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: format!(
+                    "multi-table transaction on inline-mode table {} is unsupported",
+                    self.table_metadata.table_name
+                ),
+            });
+        }
+
+        let has_key_deletions = !deleted_pk_i64.is_empty() || !deleted_row_keys.is_empty();
+        // [delete, insert, snapshot] with key deletions, else just [snapshot].
+        let sequence_count = if has_key_deletions { 3 } else { 1 };
+        let base = self.reserve_sequences_local(sequence_count).await.map_err(|err| {
+            CatalogError::InvalidOperationNoSource {
+                message: format!(
+                    "Failed to reserve sequence numbers for staged transaction commit: {err}"
+                ),
+            }
+        })?;
+        let (delete_sequence, insert_sequence, snapshot_sequence) = if has_key_deletions {
+            (Some(base), Some(base + 1), base + 2)
+        } else {
+            (None, None, base)
+        };
+
+        let mut delete_files = Vec::new();
+        let mut committed_deleted_row_keys = Vec::new();
+        if let Some(delete_sequence) = delete_sequence {
+            let row_keys = self
+                .build_pk_deletion_row_keys(&deleted_pk_i64, Cow::Owned(deleted_row_keys))
+                .into_owned();
+            if let Some(results) = self.write_key_deletion_vectors(delete_sequence, row_keys).await? {
+                delete_files.extend(results.iter().map(|result| result.delete_file.clone()));
+                committed_deleted_row_keys = results
+                    .into_iter()
+                    .find_map(|result| match result.identifiers {
+                        DeletionIdentifier::KeyBased(keys) => Some(keys),
+                        DeletionIdentifier::PositionBased { .. } => None,
+                    })
+                    .unwrap_or_default();
+            }
+            // Stamp the per-commit reinsert sequence on key-based delete files (the
+            // metadata-only-publish reinsert map), matching the folded sync path.
+            for delete_file in &mut delete_files {
+                delete_file.reinsert_sequence =
+                    if delete_file.deletion_type == crate::metadata::DeletionType::KeyBased {
+                        insert_sequence
+                    } else {
+                        None
+                    };
+            }
+        }
+
+        let snapshot_commit = SnapshotSequenceCommit {
+            snapshot_id: target_snapshot_id.clone(),
+            sequence_number: snapshot_sequence,
+        };
+        let publish = PreparedOnConflictDeletionPublish {
+            target_snapshot_id,
+            snapshot_sequence,
+            delete_sequence,
+            insert_sequence,
+            deleted_pk_i64,
+            deleted_row_keys: committed_deleted_row_keys,
+            deleted_inlined_pk_i64: Vec::new(),
+            deleted_inlined_row_keys: Vec::new(),
+            position_deletions: HashMap::new(),
+            inlined_delete_id: None,
+            superseded,
+        };
+        Ok((delete_files, snapshot_commit, publish))
+    }
+
     async fn write_position_deletion_vectors_for_staged_on_conflict(
         &self,
         delete_specs: HashMap<Arc<str>, Vec<u64>>,
@@ -23458,8 +23568,8 @@ impl TableProvider for CayenneTableProvider {
         // conservative per-table OCC check.
         if let Some(txn) = active_transaction(state, self.table_id()) {
             match self.footprint_digest_for(filters) {
-                Some(digest) => txn.record_read_keys([digest]),
-                None => txn.mark_footprint_incomplete(),
+                Some(digest) => txn.record_read_keys(self.table_id(), [digest]),
+                None => txn.mark_footprint_incomplete(self.table_id()),
             }
         }
 
@@ -24311,22 +24421,29 @@ impl TableProvider for CayenneTableProvider {
     }
 }
 
-/// The transaction active for `table_id` on this session's request context, if
-/// any.
+/// The transaction active for `table_id` on this session's request context, iff
+/// `table_id` is a registered participant.
 ///
 /// Reads the transaction from the [`runtime_request_context::RequestContext`]
 /// typed extension on the session config — the same context the query builder
 /// installed for this request — so it matches what the sink resolves at
-/// execution time.
+/// execution time. If a transaction is active but this table is NOT a
+/// participant, it flags `unregistered_read` (fail-closed: the commit aborts)
+/// and returns `None` so the read/write is not routed into the transaction.
 fn active_transaction(
     state: &dyn Session,
     table_id: &str,
 ) -> Option<super::transaction::CayenneTransaction> {
-    state
+    let txn = state
         .config()
-        .get_extension::<runtime_request_context::RequestContext>()
-        .and_then(|rc| rc.extension::<super::transaction::CayenneTransaction>())
-        .filter(|txn| txn.table_id() == table_id)
+        .get_extension::<runtime_request_context::RequestContext>()?
+        .extension::<super::transaction::CayenneTransaction>()?;
+    if txn.is_participant(table_id) {
+        Some(txn)
+    } else {
+        txn.mark_unregistered_read();
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

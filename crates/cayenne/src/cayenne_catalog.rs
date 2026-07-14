@@ -742,6 +742,81 @@ impl CayenneCatalog {
             })
     }
 
+    /// Run a staged upsert's durable publish statements against a caller-owned
+    /// transaction, so an atomic multi-table commit can fuse N tables into one
+    /// `MetastoreTransaction`. The statement set (and order) mirrors
+    /// [`Self::commit_on_conflict_deletions_with_tombstone`] — delete-file
+    /// INSERTs, snapshot-sequence INSERT/REPLACE, inline-tombstone INSERT,
+    /// deferred `published=1` flips — but performs no `begin`/`commit` and no
+    /// retry: the caller opens the transaction, applies this for every written
+    /// table, and commits once (retrying the whole transaction on conflict).
+    ///
+    /// `delete_files` must already carry their `reinsert_sequence` stamp and
+    /// `inline_tombstone` its `inlined_id` (both fixed at prepare time so a
+    /// whole-transaction retry is idempotent).
+    ///
+    /// # Errors
+    ///
+    /// Returns the first statement failure; the caller rolls back (drops) the
+    /// transaction and retries or aborts.
+    pub async fn commit_staged_upsert_in_txn(
+        &self,
+        txn: &mut dyn MetastoreTransaction,
+        table_id: &str,
+        delete_files: &[DeleteFile],
+        snapshot_sequence: Option<&SnapshotSequenceCommit>,
+        inline_tombstone: Option<&InlinedDelete>,
+        pending_durable_flips: &[String],
+    ) -> CatalogResult<()> {
+        const MAX_PARAMS: usize = 32_000;
+        const DELETE_FILE_PARAMS_PER_ROW: usize = 10;
+        const MAX_DELETE_FILE_ROWS_PER_CHUNK: usize = MAX_PARAMS / DELETE_FILE_PARAMS_PER_ROW;
+        const MAX_FLIP_ROWS_PER_CHUNK: usize = MAX_PARAMS - 1;
+
+        for chunk in delete_files.chunks(MAX_DELETE_FILE_ROWS_PER_CHUNK) {
+            let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
+            txn.execute(ExecuteParams { sql: &sql, params }).await?;
+        }
+
+        if let Some(seq) = snapshot_sequence {
+            txn.execute(ExecuteParams {
+                sql: "INSERT OR REPLACE INTO cayenne_snapshot_sequence (table_id, snapshot_id, sequence_number) VALUES (?1, ?2, ?3)",
+                params: vec![
+                    MetastoreValue::Text(table_id.to_string()),
+                    MetastoreValue::Text(seq.snapshot_id.clone()),
+                    MetastoreValue::Integer(seq.sequence_number),
+                ],
+            })
+            .await?;
+        }
+
+        if let Some(tombstone) = inline_tombstone {
+            txn.execute(ExecuteParams {
+                sql: r"
+                INSERT INTO cayenne_inlined_delete
+                    (inlined_id, table_id, delete_ipc, delete_count, sequence_number, published)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ",
+                params: vec![
+                    MetastoreValue::Text(tombstone.inlined_id.clone()),
+                    MetastoreValue::Text(tombstone.table_id.clone()),
+                    MetastoreValue::Blob(tombstone.delete_ipc.clone()),
+                    MetastoreValue::Integer(tombstone.delete_count),
+                    MetastoreValue::Integer(tombstone.sequence_number),
+                    MetastoreValue::Integer(i64::from(tombstone.published)),
+                ],
+            })
+            .await?;
+        }
+
+        for chunk in pending_durable_flips.chunks(MAX_FLIP_ROWS_PER_CHUNK) {
+            let (sql, params) = Self::build_flip_published_chunk_sql(table_id, chunk);
+            txn.execute(ExecuteParams { sql: &sql, params }).await?;
+        }
+
+        Ok(())
+    }
+
     /// Reconcile the datalake (cold tier) fields of a reopened table's stored
     /// `VortexConfig` with the currently configured options.
     ///
@@ -1402,6 +1477,10 @@ impl CayenneCatalog {
 
 #[async_trait]
 impl MetadataCatalog for CayenneCatalog {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn init(&self) -> CatalogResult<()> {
         // Create database directory if it doesn't exist
         let db_path = self.db_path();

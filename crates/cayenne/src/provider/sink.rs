@@ -251,32 +251,33 @@ impl CayenneDataSink {
         &self,
         context: &Arc<TaskContext>,
     ) -> Option<CayenneTransaction> {
-        resolve_request_context(context, false)?.extension::<CayenneTransaction>()
+        let txn = resolve_request_context(context, false)?.extension::<CayenneTransaction>()?;
+        if txn.is_participant(self.table.table_id()) {
+            Some(txn)
+        } else {
+            // A write to a Cayenne table outside the transaction's participant
+            // set: fail-closed (the commit aborts) rather than publishing.
+            txn.mark_unregistered_read();
+            None
+        }
     }
 
-    /// Stage a write for an active transaction instead of
-    /// publishing it: take the transaction's pre-acquired write guard, stage the
-    /// rows to an invisible snapshot via
-    /// [`CayenneTableProvider::begin_staged_upsert_with_guard`], and register the
-    /// handle on the transaction. The executor publishes (or rolls back) at
-    /// COMMIT.
+    /// Stage a write for an active transaction instead of publishing it: take
+    /// this table's begin token, stage the rows to an invisible snapshot via
+    /// [`CayenneTableProvider::begin_staged_upsert_occ`], and register the handle
+    /// on the transaction. The executor publishes (or rolls back) all
+    /// participating tables atomically at COMMIT.
     ///
     /// Fail-closed: any shape the staged-upsert substrate cannot publish
-    /// atomically — a write to a different table, an overwrite, a memory-mode
-    /// table, or a second write in the same transaction — is rejected rather
-    /// than silently published.
+    /// atomically — an overwrite, a memory-mode table, or a second write to the
+    /// same table in one transaction — is rejected rather than silently published.
     async fn write_all_transaction(
         &self,
         txn: &CayenneTransaction,
         data: SendableRecordBatchStream,
         context: &Arc<TaskContext>,
     ) -> super::Result<u64> {
-        if txn.table_id() != self.table.table_id() {
-            return Err(super::Error::Unsupported {
-                operation:
-                    "transaction write to a table other than the transaction's target",
-            });
-        }
+        let table_id = self.table.table_id();
         if self.overwrite != InsertOp::Append {
             return Err(super::Error::Unsupported {
                 operation: "transaction overwrite write",
@@ -287,23 +288,23 @@ impl CayenneDataSink {
                 operation: "transaction write on a memory-mode table",
             });
         }
-        // `None` here means the transaction is no longer armed — a second write
-        // in the same body (v1 supports exactly one). Reject rather than publish.
-        let Some(token) = txn.take_token() else {
+        // `None` means this table already staged a write — v1 allows one write
+        // per table per transaction. Reject rather than publish.
+        let Some(token) = txn.take_token(table_id) else {
             return Err(super::Error::Unsupported {
-                operation: "transaction with more than one write statement",
+                operation: "more than one write to a table in one transaction",
             });
         };
         let target_partitions = context.session_config().target_partitions();
         // Off-lock staging: encode into an invisible snapshot without holding the
         // write lock. The executor publishes (or rolls back) at COMMIT, where the
-        // token is re-checked for an optimistic-concurrency conflict.
+        // per-key footprint + write-set are re-checked for a conflict.
         let staged = self
             .table
             .begin_staged_upsert_occ(token, data, target_partitions)
             .await?;
         let row_count = staged.row_count();
-        txn.set_staged(staged);
+        txn.set_staged(table_id, staged);
         Ok(row_count)
     }
 
