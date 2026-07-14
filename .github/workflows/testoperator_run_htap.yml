@@ -48,6 +48,11 @@ on:
         required: true
         default: '300'
         type: string
+      disable_zorder_sort:
+        description: 'TEMP diag: set CAYENNE_DISABLE_COLD_ZORDER_SORT for spiced'
+        required: false
+        default: '1'
+        type: string
       runner_type:
         description: 'Runner type'
         required: true
@@ -279,7 +284,7 @@ jobs:
         env:
           SPICED_LOG: 'info,cayenne::compaction=debug'
           # Diagnostic A/B for Cayenne cold-tier promotion stalls: bypass cold Z-order SortExec.
-          CAYENNE_DISABLE_COLD_ZORDER_SORT: '1'
+          CAYENNE_DISABLE_COLD_ZORDER_SORT: ${{ github.event.inputs.disable_zorder_sort || '1' }}
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           # Dedicated in-cluster PG pod on xlarge; per-run docker container (loopback) elsewhere.
