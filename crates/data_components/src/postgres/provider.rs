@@ -148,10 +148,21 @@ impl PostgresCatalogProvider {
                 Arc::clone(&self.table_creator),
                 self.include.clone(),
             );
-            schema_provider
-                .refresh_tables(&foreign_keys, &comments)
-                .await?;
-            schemas.insert(schema_name.clone(), Arc::new(schema_provider));
+            match schema_provider.refresh_tables(&foreign_keys, &comments).await {
+                Ok(()) => {
+                    schemas.insert(schema_name.clone(), Arc::new(schema_provider));
+                }
+                Err(e) => {
+                    // A single schema's table discovery failing (e.g. a transient
+                    // connection reset or lock timeout) must not abort the whole
+                    // catalog load; skip just this schema and keep the others (#11724).
+                    tracing::warn!(
+                        schema = %schema_name,
+                        error = %e,
+                        "Failed to discover tables for schema, skipping schema"
+                    );
+                }
+            }
         }
 
         {
