@@ -98,20 +98,38 @@ pg-load:
 	done
 	@echo "Benchmark dataset has been successfully loaded to $(DB_NAME) database"
 
-# Secondary indexes covering the join/filter columns the TPC-H queries in
-# crates/test-framework/src/queries/tpch actually use that aren't already
-# covered by a primary key (l_orderkey, o_orderkey, ps_partkey+ps_suppkey,
-# etc. are all PK-indexed already and don't need a duplicate index here).
+# tpch-kit's dbgen/dss.ddl (used by pg-init) creates bare tables with no
+# PRIMARY KEY, FOREIGN KEY, or index of any kind - unlike a hand-written TPC-H
+# DDL (e.g. the postgres cookbook's load-tpch.py), which declares real keys.
+# So this target must create the nominal TPC-H primary/unique-key indexes
+# itself, not assume dss.ddl already created them, plus the secondary
+# indexes covering join/filter columns the TPC-H queries in
+# crates/test-framework/src/queries/tpch actually use.
 # idx_lineitem_l_partkey_l_suppkey must be the composite (l_partkey, l_suppkey),
 # not a standalone l_partkey index: Q20's correlated subquery filters lineitem
 # on both columns together, and without the composite it falls back to a full
 # scan per outer row (observed ~1h49m vs ~0.1s with the composite).
+# Missing the supplier(s_suppkey) key index specifically starves Q2's
+# correlated MIN(ps_supplycost) subquery of an index-driven nested loop,
+# forcing Postgres to rebuild a full supplier/nation/region hash join on every
+# one of tens of thousands of correlated invocations instead of a cheap probe.
 # ANALYZE runs after index creation so the planner has fresh statistics on the
 # just-bulk-loaded tables; without it, correlated-subquery queries (Q2, Q20)
 # can get planned as per-row full/seq scans instead of index lookups.
 # Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpch make pg-create-index
 pg-create-index:
-	@echo "Creating indexes in $(DB_NAME) database"
+	@echo "Creating primary/unique-key indexes in $(DB_NAME) database"
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "DROP INDEX IF EXISTS idx_part_p_partkey;";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "DROP INDEX IF EXISTS idx_partsupp_ps_partkey;";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE UNIQUE INDEX IF NOT EXISTS idx_region_pk ON region (r_regionkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE UNIQUE INDEX IF NOT EXISTS idx_nation_pk ON nation (n_nationkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE UNIQUE INDEX IF NOT EXISTS idx_part_pk ON part (p_partkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE UNIQUE INDEX IF NOT EXISTS idx_supplier_pk ON supplier (s_suppkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE UNIQUE INDEX IF NOT EXISTS idx_customer_pk ON customer (c_custkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_pk ON orders (o_orderkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE UNIQUE INDEX IF NOT EXISTS idx_partsupp_pk ON partsupp (ps_partkey, ps_suppkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE UNIQUE INDEX IF NOT EXISTS idx_lineitem_pk ON lineitem (l_orderkey, l_linenumber);";
+	@echo "Creating secondary indexes in $(DB_NAME) database"
 	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "DROP INDEX IF EXISTS idx_lineitem_l_partkey;";
 	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX IF NOT EXISTS idx_lineitem_l_partkey_l_suppkey ON lineitem (l_partkey, l_suppkey);";
 	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX IF NOT EXISTS idx_lineitem_l_suppkey ON lineitem (l_suppkey);";
