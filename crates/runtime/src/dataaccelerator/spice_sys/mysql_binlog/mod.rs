@@ -111,7 +111,41 @@ impl MySqlBinlogSys {
         }
     }
 
-    pub async fn upsert(
+    /// Persist a checkpoint, retrying briefly on a transient accelerator write
+    /// lock.
+    ///
+    /// The sidecar shares the accelerator's connection pool, so a checkpoint
+    /// upsert contends with the accelerator's own CDC-apply transactions for
+    /// the single writer lock. A large batch commit can hold that lock past the
+    /// engine's `busy_timeout`, surfacing as `SQLITE_BUSY` / "database is
+    /// locked" (and equivalents on the other file engines). Without a retry a
+    /// single contention drops the whole checkpoint interval and widens the
+    /// crash-replay window; a few short retries convert most of these into a
+    /// successful persist. Still best-effort — a persistent lock returns the
+    /// error and the replication layer retries on the next interval.
+    pub async fn upsert(&self, checkpoint: &MySqlBinlogCheckpoint) -> Result<()> {
+        let mut attempt: u32 = 1;
+        loop {
+            match self.upsert_once(checkpoint).await {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt < UPSERT_MAX_ATTEMPTS && is_retryable_lock_error(&e) => {
+                    let delay = upsert_retry_delay(attempt);
+                    tracing::debug!(
+                        dataset = %self.dataset_name,
+                        attempt,
+                        delay_ms = %delay.as_millis(),
+                        error = %e,
+                        "binlog checkpoint upsert hit a transient accelerator write lock; retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    async fn upsert_once(
         &self,
         #[cfg_attr(
             not(any(
@@ -203,4 +237,38 @@ impl MySqlBinlogSys {
     fn position_to_i64(pos: u64) -> i64 {
         i64::try_from(pos).unwrap_or(i64::MAX)
     }
+}
+
+/// Max attempts for a checkpoint upsert contending with the accelerator's
+/// writer lock. Bounded and short: the worst-case added latency (see
+/// [`upsert_retry_delay`]) stays well under one checkpoint interval, and a
+/// persistent lock just retries on the next interval anyway.
+const UPSERT_MAX_ATTEMPTS: u32 = 5;
+
+/// Exponential backoff (no jitter) for [`MySqlBinlogSys::upsert`] retries:
+/// 25ms, 50ms, 100ms, 200ms across attempts 1..=4 (worst case ~375ms total).
+fn upsert_retry_delay(attempt: u32) -> std::time::Duration {
+    let shift = attempt.saturating_sub(1).min(6);
+    std::time::Duration::from_millis(25u64 << shift)
+}
+
+/// Whether a sidecar write failure is a transient lock/contention error worth
+/// retrying rather than surfacing.
+///
+/// Deliberately a string heuristic over the boxed engine error (rusqlite,
+/// Turso, `DuckDB`, and tokio-postgres all report contention differently),
+/// mirroring the reconnect classifier in
+/// `data_components::mysql_replication::resilience`. Slight over-matching is
+/// harmless: retries are bounded, so a misclassified non-lock error only costs
+/// a few short sleeps before it is returned unchanged.
+fn is_retryable_lock_error(err: &Error) -> bool {
+    const MARKERS: &[&str] = &[
+        "database is locked",
+        "database table is locked",
+        "sqlite_busy",
+        "sqlite_locked",
+        "deadlock",
+    ];
+    let msg = err.to_string().to_ascii_lowercase();
+    MARKERS.iter().any(|marker| msg.contains(marker))
 }
