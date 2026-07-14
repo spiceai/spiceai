@@ -407,9 +407,30 @@ async fn test_txn_null_gate_fail_safe() -> Result<(), String> {
 /// Both datasets share one `cayenne_metadata_dir`; the runtime keeps a single
 /// `CayenneAccelerator` per engine, so both tables resolve to the same metastore
 /// catalog and the commit fuses their publishes into one metastore transaction.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test]
 #[cfg(not(target_os = "windows"))]
-async fn test_txn_multi_table_atomic() -> Result<(), String> {
+fn test_txn_multi_table_atomic() -> Result<(), String> {
+    // The two-table fused commit plans/unparses deeper than the ~2 MiB default
+    // test-thread stack in debug builds (single-table txns stay under it); run
+    // the body on a dedicated large-stack thread, mirroring
+    // `http::test_http_dynamic_request_headers_accelerated_view`.
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .thread_stack_size(16 * 1024 * 1024)
+                .enable_all()
+                .build()
+                .map_err(|e| format!("failed to build tokio runtime: {e}"))?
+                .block_on(run_test_txn_multi_table_atomic())
+        })
+        .map_err(|e| format!("failed to spawn test thread: {e}"))?
+        .join()
+        .map_err(|_| "test thread panicked".to_string())?
+}
+
+async fn run_test_txn_multi_table_atomic() -> Result<(), String> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
     test_request_context()

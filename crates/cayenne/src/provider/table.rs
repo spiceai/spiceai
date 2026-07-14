@@ -5211,6 +5211,16 @@ impl CayenneTableProvider {
         self.durable_write_back
     }
 
+    /// The shared [`RuntimeEnv`] this provider was created with — carries the
+    /// object-store registrations (e.g. S3), memory pool, and caches. A caller
+    /// that scans this table outside the query engine (the write-back delivery
+    /// worker) must build its `SessionContext` from this env, not a fresh
+    /// default one, or object-store-backed reads fail.
+    #[must_use]
+    pub fn runtime_env(&self) -> Arc<RuntimeEnv> {
+        Arc::clone(self.context.runtime_env())
+    }
+
     /// Downcast the metadata catalog to the concrete Cayenne catalog — the
     /// write-back marker CRUD is a Cayenne-specific concern (not on the trait).
     fn cayenne_catalog(&self) -> Option<&crate::CayenneCatalog> {

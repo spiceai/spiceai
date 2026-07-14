@@ -46,7 +46,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, col, lit};
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::scalar::ScalarValue;
 use tokio::task::JoinHandle;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
@@ -158,8 +158,14 @@ impl WriteBackWorker {
 
         // Read the claimed keys' current committed values from the accelerator,
         // AFTER the claim (a newer commit bumps the marker above the claimed
-        // sequence, so the clear below no-ops for it).
-        let ctx = SessionContext::new();
+        // sequence, so the clear below no-ops for it). Build the context from the
+        // provider's SHARED RuntimeEnv (object-store registrations for S3, memory
+        // pool, caches) — a fresh `SessionContext::new()` would lose them and fail
+        // object-store-backed scans.
+        let ctx = SessionContext::new_with_config_rt(
+            SessionConfig::new(),
+            self.provider.runtime_env(),
+        );
         let accelerator: Arc<dyn TableProvider> = self.provider.clone();
         let current = ctx
             .read_table(accelerator)?

@@ -93,7 +93,14 @@ pub(crate) async fn do_get(
     // rejected by the write statement's read-only check inside the orchestrator.
     if let Some(statements) = transaction_statements(&cmd.query) {
         let read_only = is_auth_read_only(&context);
-        let outcome = run_transaction(&datafusion, &statements, None, read_only)
+        // Scope the orchestrator to this request's context so the
+        // `CayenneTransaction` it installs is the exact one the write-path sink
+        // reads back (mirrors `prepared_statement_query::do_get`). Without the
+        // scope `RequestContext::current` can fall back to the internal context
+        // and the write would publish immediately, breaking atomicity/staging.
+        let context_clone = std::sync::Arc::clone(&context);
+        let outcome = context_clone
+            .scope(async { run_transaction(&datafusion, &statements, None, read_only).await })
             .await
             .map_err(transaction_error_to_status)?;
         let batches = outcome.result.map(|(batches, _)| batches).unwrap_or_default();
