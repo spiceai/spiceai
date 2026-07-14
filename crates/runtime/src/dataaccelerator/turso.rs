@@ -911,10 +911,12 @@ mod tests {
         // WAL/SHM/journal files (`<name>-wal`, ...) and the MVCC logical log
         // (`<stem>.db-log`). A stale MVCC log from a previous run makes the next
         // open fail with `Corrupt("MVCC logical log file exists ... but header
-        // indicates WAL mode")`, so match any sibling that is the stem followed by
-        // a `.` or `-` separator — covering both `<stem>.<ext>[-suffix]` and the
-        // extensionless `<stem>-<suffix>` form. Otherwise these tests only pass on
-        // a pristine tree and fail on re-run.
+        // indicates WAL mode")`, so match any sibling whose name is exactly the
+        // stem (`rest.is_empty()`, e.g. a leftover file named like the stem with
+        // no extension) or the stem followed by a `.` or `-` separator — covering
+        // both `<stem>.<ext>[-suffix]` and the extensionless `<stem>-<suffix>`
+        // form. Otherwise these tests only pass on a pristine tree and fail on
+        // re-run.
         let (Some(parent), Some(stem)) = (
             db_path.parent(),
             db_path.file_stem().and_then(std::ffi::OsStr::to_str),
