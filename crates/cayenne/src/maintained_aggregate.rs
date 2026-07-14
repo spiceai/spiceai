@@ -1475,11 +1475,11 @@ impl AggregateAccumulator {
                 column_index,
                 index,
             } => {
-                if !batch.column(*column_index).is_null(row) {
+                if batch.column(*column_index).is_null(row) {
+                    false
+                } else {
                     let scalar = ScalarValue::try_from_array(batch.column(*column_index), row)?;
                     index.insert(scalar)?
-                } else {
-                    false
                 }
             }
         };
