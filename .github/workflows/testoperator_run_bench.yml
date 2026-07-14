@@ -118,8 +118,11 @@ jobs:
       # benchmarking-postgres host (see #11730). Excludes ducklake[postgres+s3],
       # which provisions its own local postgres catalog DB on the same port, and
       # clickbench, whose postgres source uses a different (unseeded) database.
+      # SF1-only: the image only bakes in SF1 data, so larger scale factors
+      # (SF100+) fall through to benchmarking-postgres instead, seeded inline
+      # by the "Seed postgres ... on benchmarking-postgres" step below.
       postgres_tpch:
-        image: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds')) && (github.event.inputs.query_set == 'tpcds' && 'ghcr.io/spiceai/spice-postgres-tpcds-bench:latest' || 'ghcr.io/spiceai/spice-postgres-bench:latest') || '' }}
+        image: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && github.event.inputs.scale_factor == '1') && (github.event.inputs.query_set == 'tpcds' && 'ghcr.io/spiceai/spice-postgres-tpcds-bench:latest' || 'ghcr.io/spiceai/spice-postgres-bench:latest') || '' }}
         ports:
           - 5432:5432
         env:
@@ -237,6 +240,55 @@ jobs:
             echo "MYSQL_DB=tpch_sf1" >> $GITHUB_ENV
             echo "MYSQL_DB_SF100=tpch_sf100" >> $GITHUB_ENV
           fi
+
+      # For scale factors the postgres_tpch service image doesn't bake in
+      # (anything above SF1 — see the service's comment above), target
+      # benchmarking-postgres directly and seed it here on first use instead
+      # of depending on the separate, ts-dev-runner-backed
+      # `Load - Benchmark Data` workflow in spicehq/ai-platform. Checks for
+      # existing data first so repeat runs against an already-seeded scale
+      # factor skip straight through.
+      - name: Seed postgres TPC-H/TPC-DS data on benchmarking-postgres if missing
+        if: ${{ contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && github.event.inputs.scale_factor != '1' }}
+        timeout-minutes: 120
+        env:
+          PGHOST: ${{ vars.TEST_POSTGRES_HOST }}
+          PGPASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
+        run: |
+          set -e
+          QUERY_SET="${{ github.event.inputs.query_set }}"
+          QUERY_SET="${QUERY_SET%%\[*\]*}"
+          SCALE_FACTOR="${{ github.event.inputs.scale_factor }}"
+          DB_NAME="${QUERY_SET}_sf${SCALE_FACTOR}"
+
+          sudo apt-get update -y
+          sudo apt-get install -y postgresql-client
+
+          echo "Checking whether $DB_NAME already has data on $PGHOST..."
+          EXISTING_ROWS="$(PGCONNECT_TIMEOUT=10 psql -U postgres -d "$DB_NAME" -tAc 'SELECT count(*) FROM customer;' 2>/dev/null || echo 0)"
+
+          if [ "${EXISTING_ROWS:-0}" -gt 0 ] 2>/dev/null; then
+            echo "$DB_NAME already has $EXISTING_ROWS rows in 'customer' - skipping seed."
+            exit 0
+          fi
+
+          echo "$DB_NAME is missing or empty on $PGHOST - seeding it now."
+          sudo apt-get install -y git make gcc g++ flex bison byacc
+
+          cd test/tpc-bench
+          if [ "$QUERY_SET" = "tpcds" ]; then
+            make tpcds-init
+            DBGEN_SCALE=$SCALE_FACTOR make tpcds-gen
+            DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME ADD_INDEXES=true make pg-tpcds-init
+            DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-tpcds-load
+          else
+            make tpch-init
+            DBGEN_SCALE=$SCALE_FACTOR make tpch-gen
+            DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-init
+            DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-load
+            DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-create-index
+          fi
+          echo "Seed complete: $DB_NAME on $PGHOST."
 
       - name: Setup ODBC
         if: ${{ contains(github.event.inputs.spicepod_path, 'odbc') }}
@@ -411,8 +463,8 @@ jobs:
           MYSQL_PASSWORD: ${{ secrets.TEST_MYSQL_PASSWORD }}
           MONGODB_HOST: ${{ vars.TEST_MONGODB_HOST }}
           MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
-          POSTGRES_HOST: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds')) && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
-          POSTGRES_RW_HOST: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds')) && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
+          POSTGRES_HOST: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && github.event.inputs.scale_factor == '1') && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
+          POSTGRES_RW_HOST: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && github.event.inputs.scale_factor == '1') && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
           POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
           SPICEAI_TEST_ENDPOINT: ${{ vars.SPICE_SECRET_SPICEAI_TEST_ENDPOINT }}
           SPICEAI_TEST_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY }}
