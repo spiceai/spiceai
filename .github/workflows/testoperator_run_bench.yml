@@ -112,41 +112,31 @@ jobs:
         env:
           MSSQL_SA_PASSWORD: S3cretP@ssw0rd
           DB_NAME: tpch_sf1
-      # Local, ephemeral PostgreSQL preloaded with TPC-H/TPC-DS SF1 data (used by
-      # both the postgres data connector and postgres catalog connector benches).
-      # Mirrors mssql_tpch above; avoids depending on an externally-provisioned
-      # benchmarking-postgres host (see #11730). Excludes ducklake[postgres+s3],
-      # which provisions its own local postgres catalog DB on the same port, and
+      # Local, ephemeral PostgreSQL for TPC-H/TPC-DS SF1/SF10 (used by both the
+      # postgres data connector and postgres catalog connector benches); avoids
+      # depending on an externally-provisioned benchmarking-postgres host for
+      # these cheap-to-generate scale factors (see #11730). Larger scale
+      # factors (SF100+) target benchmarking-postgres directly instead. Either
+      # way the target starts empty and is seeded by the "Seed postgres..."
+      # step below (a plain postgres image with no pre-baked data, unlike the
+      # earlier iteration of this fix). Excludes ducklake[postgres+s3], which
+      # provisions its own local postgres catalog DB on the same port, and
       # clickbench, whose postgres source uses a different (unseeded) database.
-      # SF1-only: the image only bakes in SF1 data, so larger scale factors
-      # (SF100+) fall through to benchmarking-postgres instead, seeded inline
-      # by the "Seed postgres ... on benchmarking-postgres" step below.
       postgres_tpch:
-        image: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && github.event.inputs.scale_factor == '1') && (github.event.inputs.query_set == 'tpcds' && 'ghcr.io/spiceai/spice-postgres-tpcds-bench:latest' || 'ghcr.io/spiceai/spice-postgres-bench:latest') || '' }}
+        image: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')) && 'postgres:16' || '' }}
         ports:
           - 5432:5432
         env:
           POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
-        # The image's entrypoint starts postgres, then imports the SF1 backup(s)
-        # in the background before touching this flag file; without a health
-        # check GH Actions considers the container ready as soon as it starts
-        # (no image HEALTHCHECK is defined), so the benchmark step would race
-        # spiced's connection attempts against the still-in-progress import.
-        # start-period must comfortably exceed the import time itself: Docker's
-        # retry countdown runs from container start regardless of the
-        # (long) --health-retries count once start-period elapses, so a short
-        # start-period here still flips to unhealthy well before the import
-        # (observed ~20-30s for SF1) finishes and touches the flag file.
         # --shm-size: postgres's default 64MB /dev/shm (Docker's own default)
-        # is too small for parallel-worker queries against SF1 data; several
-        # TPC-H queries fail with "could not resize shared memory segment"
+        # is too small for parallel-worker queries against TPC-H/TPC-DS data;
+        # several queries fail with "could not resize shared memory segment"
         # otherwise.
         options: >-
-          --health-cmd "test -f /tmp/data_loading_complete"
+          --health-cmd "pg_isready -U postgres"
           --health-interval 5s
           --health-timeout 5s
-          --health-retries 3
-          --health-start-period 180s
+          --health-retries 10
           --shm-size=1g
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -241,18 +231,19 @@ jobs:
             echo "MYSQL_DB_SF100=tpch_sf100" >> $GITHUB_ENV
           fi
 
-      # For scale factors the postgres_tpch service image doesn't bake in
-      # (anything above SF1 — see the service's comment above), target
-      # benchmarking-postgres directly and seed it here on first use instead
-      # of depending on the separate, ts-dev-runner-backed
-      # `Load - Benchmark Data` workflow in spicehq/ai-platform. Checks for
-      # existing data first so repeat runs against an already-seeded scale
-      # factor skip straight through.
-      - name: Seed postgres TPC-H/TPC-DS data on benchmarking-postgres if missing
-        if: ${{ contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && github.event.inputs.scale_factor != '1' }}
+      # One seeding path for every scale factor, just pointed at a different
+      # (always-empty-until-seeded) target: the local postgres_tpch container
+      # for SF1/SF10, or benchmarking-postgres directly for SF100+ — avoiding
+      # the separate, ts-dev-runner-backed `Load - Benchmark Data` workflow in
+      # spicehq/ai-platform. Checks for existing data first, so the local
+      # container (always empty on a fresh run) always seeds, while a
+      # benchmarking-postgres scale factor that's already loaded skips
+      # straight through.
+      - name: Seed postgres TPC-H/TPC-DS data if missing
+        if: ${{ contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') }}
         timeout-minutes: 120
         env:
-          PGHOST: ${{ vars.TEST_POSTGRES_HOST }}
+          PGHOST: ${{ (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10') && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
           PGPASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
         run: |
           set -e
@@ -463,8 +454,8 @@ jobs:
           MYSQL_PASSWORD: ${{ secrets.TEST_MYSQL_PASSWORD }}
           MONGODB_HOST: ${{ vars.TEST_MONGODB_HOST }}
           MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
-          POSTGRES_HOST: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && github.event.inputs.scale_factor == '1') && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
-          POSTGRES_RW_HOST: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && github.event.inputs.scale_factor == '1') && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
+          POSTGRES_HOST: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')) && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
+          POSTGRES_RW_HOST: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')) && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
           POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
           SPICEAI_TEST_ENDPOINT: ${{ vars.SPICE_SECRET_SPICEAI_TEST_ENDPOINT }}
           SPICEAI_TEST_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY }}
