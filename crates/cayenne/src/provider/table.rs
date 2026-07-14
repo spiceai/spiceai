@@ -154,6 +154,21 @@ use super::staging_wal::PreparedStagedAppend;
 use super::vortex_format::PositionDeletionAccessPlanProvider;
 use arc_swap::ArcSwap;
 
+#[cfg(any(
+    test,
+    all(tokio_unstable, feature = "stall-taskdump", target_os = "linux")
+))]
+fn truncate_utf8_boundary(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    let boundary = (0..=max_bytes)
+        .rev()
+        .find(|idx| value.is_char_boundary(*idx))
+        .unwrap_or(0);
+    value.truncate(boundary);
+}
+
 const POST_WRITE_MAINTENANCE_DEBOUNCE: Duration = Duration::from_millis(100);
 const OBJECT_STORE_MOVE_CONCURRENCY: usize = 16;
 /// How long [`CayenneTableProvider::evolve_schema_live`] waits for in-flight
@@ -13365,6 +13380,13 @@ impl CayenneTableProvider {
         dir_url: &str,
         stream: SendableRecordBatchStream,
     ) -> Result<()> {
+        let insert_start = Instant::now();
+        tracing::debug!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            dir_url,
+            "Datalake promotion: cold insert listing table building"
+        );
         let listing = Self::create_listing_table(
             dir_url,
             self.table_schema(),
@@ -13373,10 +13395,39 @@ impl CayenneTableProvider {
         )?;
         let input: Arc<dyn ExecutionPlan> =
             Arc::new(StreamingExec::new(self.table_schema(), stream));
+        let plan_start = Instant::now();
+        tracing::debug!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            dir_url,
+            "Datalake promotion: cold insert plan building"
+        );
         let plan = listing
             .insert_into(session_state, input, InsertOp::Append)
             .await?;
+        tracing::debug!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            dir_url,
+            duration_ms = plan_start.elapsed().as_millis(),
+            "Datalake promotion: cold insert plan built"
+        );
+        let collect_start = Instant::now();
+        tracing::debug!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            dir_url,
+            "Datalake promotion: cold insert collect starting"
+        );
         collect(plan, session_state.task_ctx()).await?;
+        tracing::debug!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            dir_url,
+            collect_duration_ms = collect_start.elapsed().as_millis(),
+            total_duration_ms = insert_start.elapsed().as_millis(),
+            "Datalake promotion: cold insert collect complete"
+        );
         Ok(())
     }
 
@@ -13714,7 +13765,7 @@ impl CayenneTableProvider {
             const STALL_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
             const MAX_DUMPS: u32 = 2;
             const MAX_TASKS_LOGGED: usize = 400;
-            const MAX_TRACE_CHARS: usize = 4000;
+            const MAX_TRACE_CHARS: usize = 12_000;
             let mut inner = std::pin::pin!(inner);
             let mut dumps_taken = 0u32;
             loop {
@@ -13744,9 +13795,8 @@ impl CayenneTableProvider {
                                 for (task_idx, task) in
                                     dump.tasks().iter().take(MAX_TASKS_LOGGED).enumerate()
                                 {
-                                    let mut trace =
-                                        task.trace().to_string().replace('\n', " | ");
-                                    trace.truncate(MAX_TRACE_CHARS);
+                                    let mut trace = task.trace().to_string().replace('\n', " | ");
+                                    truncate_utf8_boundary(&mut trace, MAX_TRACE_CHARS);
                                     tracing::warn!(
                                         target: "cayenne::compaction",
                                         task_idx,
@@ -25024,6 +25074,21 @@ mod tests {
             row_cap < exact_key_budget,
             "row cap ({row_cap}) must leave headroom below the exact key budget ({exact_key_budget})"
         );
+    }
+
+    #[test]
+    fn taskdump_trace_truncation_preserves_utf8_boundary() {
+        let mut trace = "╼\u{a0}<core::future::poll_fn::PollFn<F>>::poll".to_string();
+        truncate_utf8_boundary(&mut trace, 1);
+
+        assert!(
+            trace.is_empty(),
+            "a one-byte limit lands inside the first multi-byte glyph and must truncate to empty"
+        );
+
+        let mut trace = "abc╼def".to_string();
+        truncate_utf8_boundary(&mut trace, 4);
+        assert_eq!(trace, "abc");
     }
 
     /// Mark-and-sweep core: an orphan (on store, not in manifest) is marked on

@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arrow_schema::Schema;
 use arrow_schema::SchemaRef;
@@ -44,6 +45,8 @@ use vortex::io::VortexWrite;
 use vortex::io::object_store::ObjectStoreWrite;
 use vortex::session::VortexSession;
 use vortex_utils::aliases::hash_set::HashSet;
+
+const SLOW_SINK_SEND_LOG_AFTER: Duration = Duration::from_secs(5);
 
 /// How [`VortexSink`] fans a single input stream into N concurrent file writers.
 ///
@@ -396,6 +399,17 @@ async fn write_record_batch_stream_to_files(
     let write_id = output_options.write_id.to_string();
     let extension = output_options.extension.to_string();
     let base_output_path = output_options.base_output_path.clone();
+    let sink_start = Instant::now();
+    tracing::debug!(
+        target: "cayenne::compaction",
+        base_prefix = %base_output_path.prefix(),
+        write_id = write_id.as_str(),
+        num_shards,
+        target_file_size_bytes = target.unwrap_or(0),
+        single_file_output,
+        shard_spec = ?output_options.shard_spec,
+        "Vortex sink write starting"
+    );
 
     // One writer task per shard, each fed by a bounded channel so a slow shard
     // exerts backpressure on the demux loop (peak buffer ~= 2 * N batches).
@@ -433,8 +447,13 @@ async fn write_record_batch_stream_to_files(
     // "receiver is gone". Genuine upstream/transform failures still propagate
     // via `?` and take precedence.
     let mut shard_closed_early = false;
+    let mut input_batches = 0_u64;
+    let mut input_rows = 0_u64;
     let demux_result: DFResult<()> = async {
         while let Some(batch) = data.next().await.transpose()? {
+            input_batches = input_batches.saturating_add(1);
+            input_rows =
+                input_rows.saturating_add(u64::try_from(batch.num_rows()).unwrap_or(u64::MAX));
             let batch = if output_options.keep_partition_by_columns
                 || output_options.partition_column_names.is_empty()
             {
@@ -445,7 +464,23 @@ async fn write_record_batch_stream_to_files(
 
             match partitioner.as_mut() {
                 None => {
-                    if senders[0].send(batch).await.is_err() {
+                    let batch_rows = batch.num_rows();
+                    let send_start = Instant::now();
+                    let send_result = senders[0].send(batch).await;
+                    let send_elapsed = send_start.elapsed();
+                    if send_elapsed >= SLOW_SINK_SEND_LOG_AFTER {
+                        tracing::debug!(
+                            target: "cayenne::compaction",
+                            write_id = write_id.as_str(),
+                            shard_id = 0,
+                            batch_rows,
+                            send_wait_ms = send_elapsed.as_millis(),
+                            input_batches,
+                            input_rows,
+                            "Vortex sink send waited on shard backpressure"
+                        );
+                    }
+                    if send_result.is_err() {
                         shard_closed_early = true;
                         break;
                     }
@@ -459,7 +494,23 @@ async fn write_record_batch_stream_to_files(
                         Ok(())
                     })?;
                     for (idx, sub) in routed {
-                        if senders[idx].send(sub).await.is_err() {
+                        let batch_rows = sub.num_rows();
+                        let send_start = Instant::now();
+                        let send_result = senders[idx].send(sub).await;
+                        let send_elapsed = send_start.elapsed();
+                        if send_elapsed >= SLOW_SINK_SEND_LOG_AFTER {
+                            tracing::debug!(
+                                target: "cayenne::compaction",
+                                write_id = write_id.as_str(),
+                                shard_id = idx,
+                                batch_rows,
+                                send_wait_ms = send_elapsed.as_millis(),
+                                input_batches,
+                                input_rows,
+                                "Vortex sink send waited on shard backpressure"
+                            );
+                        }
+                        if send_result.is_err() {
                             shard_closed_early = true;
                             break;
                         }
@@ -473,6 +524,16 @@ async fn write_record_batch_stream_to_files(
         Ok(())
     }
     .await;
+    tracing::debug!(
+        target: "cayenne::compaction",
+        write_id = write_id.as_str(),
+        input_batches,
+        input_rows,
+        demux_duration_ms = sink_start.elapsed().as_millis(),
+        demux_result = if demux_result.is_ok() { "ok" } else { "error" },
+        shard_closed_early,
+        "Vortex sink demux finished"
+    );
 
     // Close all senders so each shard finalizes its trailing file.
     drop(senders);
@@ -516,6 +577,14 @@ async fn write_record_batch_stream_to_files(
         return Err(err);
     }
 
+    tracing::debug!(
+        target: "cayenne::compaction",
+        write_id = write_id.as_str(),
+        files = results.len(),
+        duration_ms = sink_start.elapsed().as_millis(),
+        "Vortex sink write complete"
+    );
+
     Ok(results)
 }
 
@@ -541,8 +610,18 @@ async fn run_shard_writer(
     let mut results: Vec<(Path, WriteSummary)> = Vec::new();
     let mut active_writer: Option<ActiveFileWriter> = None;
     let mut uncompressed_bytes_in_file = 0_u64;
+    let mut rows_in_file = 0_u64;
     let mut file_index = 0_usize;
     let mut compression_estimate = CompressionEstimate::identity();
+    let shard_start = Instant::now();
+    tracing::debug!(
+        target: "cayenne::compaction",
+        write_id = write_id.as_str(),
+        shard_id,
+        num_shards,
+        target_file_size_bytes = target.unwrap_or(0),
+        "Vortex sink shard writer starting"
+    );
 
     let write_result: DFResult<()> = async {
         while let Some(batch) = receiver.recv().await {
@@ -557,6 +636,14 @@ async fn run_shard_writer(
                     num_shards,
                 );
                 started_paths.lock().await.insert(file_path.clone());
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    write_id = write_id.as_str(),
+                    shard_id,
+                    file_index,
+                    path = %file_path,
+                    "Vortex sink shard file starting"
+                );
                 active_writer = Some(start_file_writer(
                     &session,
                     Arc::clone(&object_store),
@@ -566,6 +653,7 @@ async fn run_shard_writer(
             }
 
             let batch_bytes = batch_uncompressed_bytes(&batch)?;
+            let batch_rows = u64::try_from(batch.num_rows()).unwrap_or(u64::MAX);
             send_batch_to_active_writer(&mut active_writer, batch).await?;
             let active_path = active_writer
                 .as_ref()
@@ -583,6 +671,7 @@ async fn run_shard_writer(
                         "Uncompressed byte counter overflow for sink output file {active_path}"
                     )
                 })?;
+            rows_in_file = rows_in_file.saturating_add(batch_rows);
 
             if let Some(target) = target {
                 let estimated_compressed =
@@ -594,7 +683,33 @@ async fn run_shard_writer(
                         )
                     })?;
                     let file_path = writer.path.clone();
+                    let finish_start = Instant::now();
+                    tracing::debug!(
+                        target: "cayenne::compaction",
+                        write_id = write_id.as_str(),
+                        shard_id,
+                        file_index,
+                        path = %file_path,
+                        rows_in_file,
+                        uncompressed_bytes_in_file,
+                        estimated_compressed,
+                        target_file_size_bytes = target,
+                        reason = "target_size",
+                        "Vortex sink shard file finalizing"
+                    );
                     let summary = finish_file_writer(writer).await?;
+                    tracing::debug!(
+                        target: "cayenne::compaction",
+                        write_id = write_id.as_str(),
+                        shard_id,
+                        file_index,
+                        path = %file_path,
+                        rows = summary.row_count(),
+                        file_size_bytes = summary.size(),
+                        duration_ms = finish_start.elapsed().as_millis(),
+                        reason = "target_size",
+                        "Vortex sink shard file finalized"
+                    );
                     if uncompressed_bytes_in_file > 0 {
                         compression_estimate = CompressionEstimate::from_file_sizes(
                             summary.size(),
@@ -604,6 +719,7 @@ async fn run_shard_writer(
 
                     results.push((file_path, summary));
                     uncompressed_bytes_in_file = 0;
+                    rows_in_file = 0;
                     file_index += 1;
                 }
             }
@@ -611,7 +727,31 @@ async fn run_shard_writer(
 
         if let Some(writer) = active_writer.take() {
             let file_path = writer.path.clone();
+            let finish_start = Instant::now();
+            tracing::debug!(
+                target: "cayenne::compaction",
+                write_id = write_id.as_str(),
+                shard_id,
+                file_index,
+                path = %file_path,
+                rows_in_file,
+                uncompressed_bytes_in_file,
+                reason = "end_of_stream",
+                "Vortex sink shard file finalizing"
+            );
             let summary = finish_file_writer(writer).await?;
+            tracing::debug!(
+                target: "cayenne::compaction",
+                write_id = write_id.as_str(),
+                shard_id,
+                file_index,
+                path = %file_path,
+                rows = summary.row_count(),
+                file_size_bytes = summary.size(),
+                duration_ms = finish_start.elapsed().as_millis(),
+                reason = "end_of_stream",
+                "Vortex sink shard file finalized"
+            );
             results.push((file_path, summary));
         }
 
@@ -628,6 +768,15 @@ async fn run_shard_writer(
         .await;
         return Err(err);
     }
+
+    tracing::debug!(
+        target: "cayenne::compaction",
+        write_id = write_id.as_str(),
+        shard_id,
+        files = results.len(),
+        duration_ms = shard_start.elapsed().as_millis(),
+        "Vortex sink shard writer complete"
+    );
 
     Ok(results)
 }
@@ -657,6 +806,18 @@ fn start_file_writer(
     let path_for_task = path.clone();
 
     let task = tokio::spawn(async move {
+        let writer_start = Instant::now();
+        tracing::debug!(
+            target: "cayenne::compaction",
+            path = %path_for_task,
+            "Vortex file writer task starting"
+        );
+        let object_writer_start = Instant::now();
+        tracing::debug!(
+            target: "cayenne::compaction",
+            path = %path_for_task,
+            "Vortex file writer object-store writer opening"
+        );
         let mut object_writer = ObjectStoreWrite::new(object_store, &path_for_task)
             .await
             .map_err(|e| {
@@ -665,11 +826,23 @@ fn start_file_writer(
                     path_for_task
                 )
             })?;
+        tracing::debug!(
+            target: "cayenne::compaction",
+            path = %path_for_task,
+            duration_ms = object_writer_start.elapsed().as_millis(),
+            "Vortex file writer object-store writer opened"
+        );
 
         let stream = futures::stream::poll_fn(move |cx| receiver.poll_recv(cx))
             .map(|rb| ArrayRef::from_arrow(rb, false));
         let stream_adapter = ArrayStreamAdapter::new(dtype, stream);
 
+        let encode_start = Instant::now();
+        tracing::debug!(
+            target: "cayenne::compaction",
+            path = %path_for_task,
+            "Vortex file writer encode/upload starting"
+        );
         let summary = session
             .write_options()
             .write(&mut object_writer, stream_adapter)
@@ -677,10 +850,31 @@ fn start_file_writer(
             .map_err(|e| {
                 exec_datafusion_err!("Failed to write Vortex file '{}': {e}", path_for_task)
             })?;
+        tracing::debug!(
+            target: "cayenne::compaction",
+            path = %path_for_task,
+            rows = summary.row_count(),
+            file_size_bytes = summary.size(),
+            duration_ms = encode_start.elapsed().as_millis(),
+            "Vortex file writer encode/upload complete"
+        );
 
+        let shutdown_start = Instant::now();
+        tracing::debug!(
+            target: "cayenne::compaction",
+            path = %path_for_task,
+            "Vortex file writer object-store shutdown starting"
+        );
         object_writer.shutdown().await.map_err(|e| {
             exec_datafusion_err!("Failed to shutdown Vortex writer '{}': {e}", path_for_task)
         })?;
+        tracing::debug!(
+            target: "cayenne::compaction",
+            path = %path_for_task,
+            duration_ms = shutdown_start.elapsed().as_millis(),
+            total_duration_ms = writer_start.elapsed().as_millis(),
+            "Vortex file writer task complete"
+        );
 
         Ok(summary)
     });
@@ -756,9 +950,24 @@ async fn send_batch_to_active_writer(
 async fn finish_file_writer(mut writer: ActiveFileWriter) -> DFResult<WriteSummary> {
     // Dropping the last sender closes the channel; the writer task then
     // finalizes the file and returns its summary.
+    let finish_start = Instant::now();
+    tracing::debug!(
+        target: "cayenne::compaction",
+        path = %writer.path,
+        "Vortex sink waiting for file writer task"
+    );
     drop(writer.sender.take());
     match writer.task.await {
-        Ok(result) => result,
+        Ok(result) => {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                path = %writer.path,
+                duration_ms = finish_start.elapsed().as_millis(),
+                result = if result.is_ok() { "ok" } else { "error" },
+                "Vortex sink file writer task joined"
+            );
+            result
+        }
         Err(e) => Err(exec_datafusion_err!(
             "Vortex writer task for '{}' failed to join: {e}",
             writer.path
