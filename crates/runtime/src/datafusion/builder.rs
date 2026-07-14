@@ -93,7 +93,7 @@ use datafusion_optimizer_rules::{
         cache_invalidation::CacheInvalidationOptimizerRule,
     },
     physical_plan::{
-        EmptyHashJoinExecPhysicalOptimization, HashJoinBuildCompaction, HttpParamsPushdown,
+        EmptyHashJoinExecPhysicalOptimization, HttpParamsPushdown,
         flightsql::aggregate_pushdown::FlightSQLPartialAggregatePushdown,
         flightsql::broadcast_join::{ExecutorAddressProvider, FlightSQLBroadcastJoinPushdown},
     },
@@ -1010,19 +1010,6 @@ impl DataFusionBuilder {
                     CayenneAntiJoinSortMergeRewriter::with_federated_flight_scans(),
                 ));
             }
-
-            // The scheduler's central hash joins often build the output of a
-            // partitioned aggregate, which emits its result as SLICES of one
-            // large batch per partition. The join's build reservation counts
-            // each slice's FULL parent buffer, so reserved bytes can exceed the
-            // actual build size by orders of magnitude and exhaust the memory
-            // pool while real usage is fine (TPC-H q17 at SF100: a ~500 MB
-            // aggregated build side reserved as ~37 GB). Compacting each build
-            // batch — one bounded copy; the join concatenates its build input
-            // anyway — makes the reservation truthful. Registered after the
-            // sort-merge rewrite so only the joins that remain hash joins are
-            // wrapped.
-            state = state.with_physical_optimizer_rule(Arc::new(HashJoinBuildCompaction::new()));
         }
 
         let mut state = state.build();
