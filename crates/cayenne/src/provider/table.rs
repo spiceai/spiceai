@@ -9117,9 +9117,10 @@ impl CayenneTableProvider {
             return Ok(());
         };
 
+        // Scan the LIVE in-memory index for flushed PKs that still carry a
+        // delete-only tombstone (its `insert_sequence` must be stamped so scans
+        // see the re-insert). Grouped by `delete_sequence` for a single rcu fold.
         let current = deletion_snapshot.load_full();
-        // Group PKs needing an upgrade by their existing delete_sequence so we
-        // can do one `extend_max_conflicts` call per group.
         let mut by_delete_seq: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
         for &pk in flushed_pks {
             if let Some(t) = current.tombstones.get(pk)
@@ -9128,30 +9129,63 @@ impl CayenneTableProvider {
                 by_delete_seq.entry(t.delete_sequence).or_default().push(pk);
             }
         }
+
+        // Persist the reinsert records. This upgrade commits no delete files, so
+        // the metadata-only publish path (`commit_on_conflict_deletions`, which
+        // stamps `reinsert_sequence` on delete-file rows) cannot carry it —
+        // persist per-key insert sequences through the `cayenne_insert_record`
+        // table instead; the merge-on-read reload reads both sides (∪ max), so
+        // the tombstones rebuild identically on restart.
+        //
+        // Crucially, the in-memory scan above can MISS a re-inserted key: a
+        // mem-tier bake (`prune_deletion_index_at_or_below`) prunes tombstones
+        // from the in-memory index only and never clears the durable delete
+        // vector, so a key deleted, absorbed by an earlier checkpoint, pruned,
+        // then re-inserted has a durable delete-only tombstone but no in-memory
+        // entry here. Without a reinsert record, reopen's `load_deletion_vectors_all`
+        // reloads that durable tombstone and the sequence-blind key-delete
+        // pushdown filter hides the just-flushed row — silent data loss. So when
+        // the table has ANY durable delete file, stamp a reinsert record for
+        // EVERY flushed PK (this flush is the latest sequence, so any durable
+        // `delete_sequence < flush_sequence` becomes visible again; a never-deleted
+        // PK's record is inert — no matching delete vector — exactly like the
+        // per-key insert records the pre-metadata-only-publish path always wrote).
+        // With no durable delete file there is nothing to reload, so fall back to
+        // stamping only the live in-memory tombstones, and delete-free tables keep
+        // the metadata-only-publish fast path.
+        let insert_pk_bytes: Vec<Vec<u8>> = if self
+            .catalog
+            .get_table_delete_files(&self.table_metadata.table_id)
+            .await
+            .map_err(|err| Error::Catalog { source: err })?
+            .is_empty()
+        {
+            by_delete_seq
+                .values()
+                .flatten()
+                .map(|pk| pk.to_be_bytes().to_vec())
+                .collect()
+        } else {
+            flushed_pks
+                .iter()
+                .map(|pk| pk.to_be_bytes().to_vec())
+                .collect()
+        };
+
+        if !insert_pk_bytes.is_empty() {
+            self.catalog
+                .add_insert_records_batch(
+                    &self.table_metadata.table_id,
+                    insert_pk_bytes,
+                    flush_sequence,
+                )
+                .await
+                .map_err(|err| Error::Catalog { source: err })?;
+        }
+
         if by_delete_seq.is_empty() {
             return Ok(());
         }
-
-        let insert_pk_bytes: Vec<Vec<u8>> = by_delete_seq
-            .values()
-            .flatten()
-            .map(|pk| pk.to_be_bytes().to_vec())
-            .collect();
-
-        // This upgrade commits no delete files, so the metadata-only publish
-        // path (`commit_on_conflict_deletions`, which stamps `reinsert_sequence`
-        // on delete-file rows) cannot carry it. Persist the per-key insert
-        // sequences through the legacy `cayenne_insert_record` table instead —
-        // the merge-on-read load reads both sides (∪ max), so the upgraded
-        // tombstones are rebuilt identically on restart.
-        self.catalog
-            .add_insert_records_batch(
-                &self.table_metadata.table_id,
-                insert_pk_bytes,
-                flush_sequence,
-            )
-            .await
-            .map_err(|err| Error::Catalog { source: err })?;
 
         // ATOMIC upgrade: replay the precomputed groups against the LIVE index
         // under `rcu`, folding EVERY group in one pass (a single bloom rebuild)

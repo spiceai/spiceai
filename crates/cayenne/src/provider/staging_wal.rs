@@ -367,7 +367,22 @@ impl CayenneStagedAppend {
         inflight_guard.disarm();
         Ok(PreparedStagedAppend {
             table: self.table,
-            write_guard: self.write_guard,
+            // Retain the per-table write guard through finalize ONLY for the
+            // deferred / protected-snapshot path (the cross-partition coordinator
+            // in `begin_deferred_snapshot_append` and the on-conflict deferred
+            // publish), which finalizes via `apply_under_held_barrier` and holds
+            // the lock across the coordinated commit. A single-table
+            // current-snapshot append finalizes via `finish` → `apply_under_barrier`,
+            // which RE-ACQUIRES `write_lock` in `lock_current_snapshot_for_apply`:
+            // keeping the guard here would self-deadlock that re-acquire and block
+            // any concurrent staged append. Dropping it (it stays held through this
+            // method's WAL write, then releases when `self` is consumed) mirrors the
+            // pre-refactor behavior and the `write_cdc_pipelined` guard handling.
+            write_guard: if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
+                None
+            } else {
+                self.write_guard
+            },
             staging_snapshot_id: self.staging_snapshot_id,
             source_snapshot_id: self.source_snapshot_id,
             target_snapshot_id: self.target_snapshot_id,
