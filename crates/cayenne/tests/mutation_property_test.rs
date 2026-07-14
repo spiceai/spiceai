@@ -1134,10 +1134,8 @@ fn sequential_cold() -> Workload {
         cold: true,
     }
 }
-// Concurrent cold: foreground mixed delete/upsert + promotions + restarts
-// racing the background compactor. The standing net for the
-// promotion-vs-compaction defect class (bake resurrecting tombstoned
-// cold-resident keys, cross-tier double-counts, merge re-inserts).
+// Concurrent cold: foreground mixed delete/upsert + promotions + restarts with
+// a background maintenance loop.
 fn concurrent_cold() -> Workload {
     Workload {
         mode: Mode::Key,
@@ -1207,29 +1205,9 @@ async fn prop_sequential_cold_impl(f: TestFixture) -> TestResult<()> {
 }
 test_with_backends!(prop_sequential_cold_impl);
 
-// Foreground promotions + restarts racing the background compactor (promotion
-// vs compaction/bake interleavings).
-//
-// KNOWN DEFECT (found by this config on first landing, 2026-07-13): under
-// load (scheduling-sensitive; reproduce with the `--ignored` flag under
-// `scripts/loaded_mutation_property_test.sh`-style CPU pressure), the walk
-// diverges with physically DUPLICATED rows (a key returned twice — the
-// duplicate sentinel in `wrong_value`), sometimes with RESURRECTION of
-// deleted keys — observed at the FINAL check, after quiesce + settle +
-// maintenance drain, so it is settled state, not a torn read. The racing
-// pair is promotion (holds `write_lock`, commits under the listing fence)
-// vs the background small-files compactor (serializes on the separate
-// `compaction_lock`) — a production-legal interleaving (the runtime's
-// promoter and compactor are independent tasks). NOT the staged Stage-B
-// publish loss (promotion's staged-write drain is in place and this still
-// reproduces); the shape points at an upsert's conflict tombstone against a
-// cold-resident key being lost/pruned across the promotion, or a compaction
-// commit re-registering rows the promotion graduated. Root cause not yet
-// isolated. Un-ignore with the fix.
+// Foreground promotions + restarts with a background compactor/bake loop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "open defect: cold promotion racing background small-files compaction resurrects \
-            deleted keys and duplicates rows (convergence failure under load; see the KNOWN \
-            DEFECT comment above)"]
+#[ignore = "open defect #11852: cold-tier convergence can resurrect deleted keys and duplicate rows"]
 async fn prop_concurrent_cold_sqlite() -> TestResult<()> {
     common::run_with_backend(BackendType::Sqlite, |f| run_workload(f, concurrent_cold()))
         .await
