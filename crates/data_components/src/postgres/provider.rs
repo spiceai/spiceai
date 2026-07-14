@@ -117,19 +117,6 @@ impl PostgresCatalogProvider {
     async fn refresh_schemas(&self) -> Result<()> {
         let schema_names = self.list_schemas().await?;
 
-        // Snapshot the last-known-good schemas before rebuilding. This provider
-        // is polled repeatedly by `RefreshingCatalogProvider`, so a transient
-        // failure to refresh a schema that was previously discovered fine must
-        // not remove it from the catalog on this cycle — only a schema that
-        // fails on every attempt (including its first) should be absent.
-        let previous_schemas = {
-            let guard = match self.schemas.read() {
-                Ok(guard) => guard,
-                Err(e) => e.into_inner(),
-            };
-            guard.clone()
-        };
-
         let mut schemas = HashMap::new();
         for schema_name in &schema_names {
             let foreign_keys = match self.list_foreign_keys(schema_name).await {
@@ -169,15 +156,37 @@ impl PostgresCatalogProvider {
                     // A single schema's table discovery failing (e.g. a transient
                     // connection reset or lock timeout) must not abort the whole
                     // catalog load; skip just this schema and keep the others (#11724).
-                    tracing::warn!(
-                        schema = %schema_name,
-                        error = %e,
-                        "Failed to discover tables for schema, keeping last-known-good state"
-                    );
-                    // Keep whatever was already known for this schema (if any)
-                    // rather than dropping it — see the `previous_schemas` note above.
-                    if let Some(previous) = previous_schemas.get(schema_name) {
-                        schemas.insert(schema_name.clone(), Arc::clone(previous));
+                    //
+                    // This provider is polled repeatedly by `RefreshingCatalogProvider`,
+                    // not just at initial load, so a transient failure on a schema
+                    // that previously refreshed fine must not remove it from the
+                    // catalog either. Look up (not clone) the last-known-good entry
+                    // for just this one schema — only reading `self.schemas` here,
+                    // on the failure path, avoids cloning the whole map on every
+                    // refresh cycle when nothing fails.
+                    let previous = {
+                        let guard = match self.schemas.read() {
+                            Ok(guard) => guard,
+                            Err(e) => e.into_inner(),
+                        };
+                        guard.get(schema_name).cloned()
+                    };
+                    match previous {
+                        Some(previous) => {
+                            tracing::warn!(
+                                schema = %schema_name,
+                                error = %e,
+                                "Failed to discover tables for schema, keeping last-known-good state"
+                            );
+                            schemas.insert(schema_name.clone(), previous);
+                        }
+                        None => {
+                            tracing::warn!(
+                                schema = %schema_name,
+                                error = %e,
+                                "Failed to discover tables for schema, skipping schema"
+                            );
+                        }
                     }
                 }
             }
