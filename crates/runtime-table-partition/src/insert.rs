@@ -723,8 +723,15 @@ mod tests {
                 _ => panic!("Expected Int32 for month"),
             };
 
-            // Verify key format
-            assert_eq!(*key, format!("{year}/{month}"));
+            // The composite key is the versioned, length-prefixed encoding of the
+            // partition values (see `encode_composite_key`) — injective and
+            // path-safe — not a slash-joined string. Assert it matches that
+            // canonical encoding rather than pinning a brittle literal.
+            assert_eq!(
+                *key,
+                crate::creator::filename::encode_composite_key(partition_values)
+                    .expect("encode composite key")
+            );
 
             // Verify row counts
             match (year, month) {
