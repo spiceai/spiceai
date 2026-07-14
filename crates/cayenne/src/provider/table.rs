@@ -6870,6 +6870,14 @@ impl CayenneTableProvider {
         // Finally fold in the un-checkpointed mem-tier keys (snapshotted at the top).
         Self::fold_mem_tier_keys_into_keyset(&mem_snapshots, pk_indices, converter, &mut keyset)?;
 
+        // Floor every rebuilt entry's per-key OCC sequence at the end-of-scan
+        // high-water. A commit that landed during the rebuild may not be
+        // reflected in the scanned keys, so any transaction that began before
+        // this rebuild must conservatively treat these keys as changed —
+        // stamping the end high-water makes the commit-time per-key check
+        // over-abort rather than miss the conflict (a silent lost update).
+        keyset.stamp_all_sequences_min(self.sequence_high_water().await);
+
         Ok(keyset)
     }
 
