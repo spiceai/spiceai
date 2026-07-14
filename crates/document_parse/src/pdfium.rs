@@ -26,8 +26,9 @@ limitations under the License.
 //!   access. This is the robust path for locked-down / air-gapped containers.
 //! - **Standalone binaries** (the release archives stay lean and do not bundle
 //!   `PDFium`) lazily download the matching `PDFium` build on first PDF parse
-//!   and load it explicitly. The download is size-bounded by timeouts and
-//!   verified against a pinned SHA-256 before it is trusted.
+//!   and load it explicitly. The download is capped in size, bounded by
+//!   connect/read timeouts, and verified against a pinned SHA-256 before it is
+//!   trusted.
 //!
 //! [`ensure_loaded`] wires both together: it first tries the discoverable
 //! locations, and only downloads when `PDFium` is genuinely absent. When
@@ -109,6 +110,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum idle time on any single socket read during the download, so a stalled
 /// connection fails instead of hanging a PDF parse indefinitely.
 const READ_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// Hard cap on the bytes read into memory before the SHA-256 check, so a wrong or
+/// oversized response can't balloon memory. Assets are a few MiB; 64 MiB is ample.
+const MAX_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Set once `PDFium` has been loaded so the common case is a single atomic read.
 static PDFIUM_LOADED: AtomicBool = AtomicBool::new(false);
@@ -212,15 +217,23 @@ fn download_and_extract(asset: &str, expected_sha256: &str, dest: &Path) -> Resu
         .timeout_connect(CONNECT_TIMEOUT)
         .timeout_read(READ_TIMEOUT)
         .build();
-    let mut reader = agent
+    let reader = agent
         .get(&url)
         .call()
         .map_err(|e| format!("failed to download PDFium from {url}: {e}"))?
         .into_reader();
+    // Cap the bytes read into memory so a wrong or oversized response can't
+    // balloon memory before the SHA-256 check runs.
     let mut archive_bytes = Vec::new();
     reader
+        .take(MAX_DOWNLOAD_BYTES + 1)
         .read_to_end(&mut archive_bytes)
         .map_err(|e| format!("failed to read PDFium download from {url}: {e}"))?;
+    if archive_bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
+        return Err(format!(
+            "PDFium download from {url} exceeded the {MAX_DOWNLOAD_BYTES}-byte size limit"
+        ));
+    }
 
     // Verify integrity against the pinned digest before trusting the archive —
     // this is a native library that will be dlopen'd.
