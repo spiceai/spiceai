@@ -13338,26 +13338,128 @@ impl CayenneTableProvider {
             return Ok(stream);
         }
         let original_schema = stream.schema();
+        let output_schema = Arc::clone(&original_schema);
         let augmented_schema = super::zorder::zorder_augmented_schema(&original_schema);
-        let idx = clustering_indices;
-        let augmented = stream
-            .map(move |res| res.and_then(|b| super::zorder::append_zorder_key_column(&b, &idx)));
-        let augmented_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
-            Arc::clone(&augmented_schema),
-            augmented,
-        ));
-        let sort_cols = vec![super::zorder::ZORDER_COLUMN_NAME.to_string()];
-        let sorted = util::stream_utils::sort_stream(augmented_stream, &sort_cols, task_ctx)
-            .map_err(|e| Error::Internal {
-                table: self.table_metadata.table_name.clone(),
-                message: format!("cold-tier Z-order sort failed: {e}"),
-            })?;
-        let orig = Arc::clone(&original_schema);
-        let stripped = sorted
-            .map(move |res| res.and_then(|b| super::zorder::strip_zorder_key_column(&b, &orig)));
+        let target_size_bytes = self
+            .table_metadata
+            .vortex_config
+            .cold_target_file_size_mb
+            .saturating_mul(1024 * 1024);
+        let run_size_bytes = target_size_bytes.saturating_mul(16).max(1);
+        let table_name = self.table_metadata.table_name.clone();
+        let task_ctx = Arc::clone(task_ctx);
+        let clustering_indices = Arc::new(clustering_indices);
+
+        struct BoundedZOrderState {
+            input: SendableRecordBatchStream,
+            current_run: Option<SendableRecordBatchStream>,
+            next_run_idx: usize,
+            input_exhausted: bool,
+        }
+
+        let state = BoundedZOrderState {
+            input: stream,
+            current_run: None,
+            next_run_idx: 0,
+            input_exhausted: false,
+        };
+
+        let sorted_runs = stream::unfold(state, move |mut state| {
+            let original_schema = Arc::clone(&original_schema);
+            let augmented_schema = Arc::clone(&augmented_schema);
+            let clustering_indices = Arc::clone(&clustering_indices);
+            let task_ctx = Arc::clone(&task_ctx);
+            let table_name = table_name.clone();
+            async move {
+                loop {
+                    if let Some(current_run) = state.current_run.as_mut() {
+                        match current_run.next().await {
+                            Some(batch) => return Some((batch, state)),
+                            None => {
+                                state.current_run = None;
+                                continue;
+                            }
+                        }
+                    }
+
+                    if state.input_exhausted {
+                        return None;
+                    }
+
+                    let run_idx = state.next_run_idx;
+                    state.next_run_idx = state.next_run_idx.saturating_add(1);
+                    let mut run_batches = Vec::new();
+                    let mut run_rows: usize = 0;
+                    let mut run_bytes: usize = 0;
+
+                    while run_bytes < run_size_bytes {
+                        match state.input.next().await {
+                            Some(Ok(batch)) => {
+                                run_rows = run_rows.saturating_add(batch.num_rows());
+                                run_bytes = run_bytes.saturating_add(batch.get_array_memory_size());
+                                run_batches.push(batch);
+                            }
+                            Some(Err(error)) => return Some((Err(error), state)),
+                            None => {
+                                state.input_exhausted = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if run_batches.is_empty() {
+                        return None;
+                    }
+
+                    tracing::debug!(
+                        target: "cayenne::compaction",
+                        table = table_name.as_str(),
+                        run_idx,
+                        run_rows,
+                        run_bytes,
+                        run_size_bytes,
+                        "Datalake promotion: bounded Z-order sort run starting"
+                    );
+
+                    let idx = Arc::clone(&clustering_indices);
+                    let augmented = stream::iter(
+                        run_batches.into_iter().map(Ok::<_, DataFusionError>),
+                    )
+                    .map(move |res| {
+                        res.and_then(|batch| {
+                            super::zorder::append_zorder_key_column(&batch, idx.as_ref())
+                        })
+                    });
+                    let augmented_stream: SendableRecordBatchStream = Box::pin(
+                        RecordBatchStreamAdapter::new(Arc::clone(&augmented_schema), augmented),
+                    );
+                    let sort_cols = vec![super::zorder::ZORDER_COLUMN_NAME.to_string()];
+                    let sorted = match util::stream_utils::sort_stream(
+                        augmented_stream,
+                        &sort_cols,
+                        &task_ctx,
+                    ) {
+                        Ok(sorted) => sorted,
+                        Err(error) => return Some((Err(error), state)),
+                    };
+                    let strip_schema = Arc::clone(&original_schema);
+                    let output_schema = Arc::clone(&original_schema);
+                    let stripped = sorted.map(move |res| {
+                        res.and_then(|batch| {
+                            super::zorder::strip_zorder_key_column(&batch, &strip_schema)
+                        })
+                    });
+                    state.current_run = Some(Box::pin(RecordBatchStreamAdapter::new(
+                        output_schema,
+                        stripped,
+                    )));
+                }
+            }
+        });
+
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            original_schema,
-            stripped,
+            output_schema,
+            sorted_runs,
         )))
     }
 
