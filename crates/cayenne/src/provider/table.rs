@@ -13791,6 +13791,53 @@ impl CayenneTableProvider {
                             dumps_taken,
                             "Cold-tier promotion pass made no completion within the stall window; capturing a tokio task dump of the compaction runtime"
                         );
+                        // /proc sampling showed the stall = ONE worker thread pegged
+                        // at 100% user CPU (a compute loop), which a taskdump cannot
+                        // see (running tasks are skipped). Sample the whole process
+                        // with an in-process signal profiler for 15s and log the
+                        // hottest stacks — this names the spinning function.
+                        match pprof::ProfilerGuardBuilder::default()
+                            .frequency(99)
+                            .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+                            .build()
+                        {
+                            Ok(guard) => {
+                                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                                if let Ok(report) = guard.report().build() {
+                                    let mut lines: Vec<(usize, String)> = report
+                                        .data
+                                        .iter()
+                                        .map(|(frames, count)| {
+                                            let stack = frames
+                                                .frames
+                                                .iter()
+                                                .flat_map(|f| f.iter())
+                                                .map(|s| s.name())
+                                                .collect::<Vec<_>>()
+                                                .join(" <- ");
+                                            (*count as usize, stack)
+                                        })
+                                        .collect();
+                                    lines.sort_by(|a, b| b.0.cmp(&a.0));
+                                    for (samples, mut stack) in lines.into_iter().take(10) {
+                                        truncate_utf8_boundary(&mut stack, MAX_TRACE_CHARS);
+                                        tracing::warn!(
+                                            target: "cayenne::compaction",
+                                            samples,
+                                            stack = stack.as_str(),
+                                            "stall cpu profile"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    target: "cayenne::compaction",
+                                    %error,
+                                    "stall cpu profiler failed to start"
+                                );
+                            }
+                        }
                         let mut targets: Vec<(&str, tokio::runtime::Handle)> = Vec::new();
                         if let Ok(handle) = tokio::runtime::Handle::try_current() {
                             targets.push(("compaction", handle));

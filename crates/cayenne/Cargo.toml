@@ -72,6 +72,10 @@ vortex-datafusion = { workspace = true }
 vortex-scan = { workspace = true }
 vortex-session = { workspace = true }
 duckdb = { workspace = true, features = ["bundled"], optional = true }
+# TEMPORARY (cold-promotion hang diagnosis): in-process signal-based CPU
+# sampler for the stall watchdog — names the function a pegged worker spins in
+# (ptrace/gdb are blocked on the CI runners). Linux-only via stall-taskdump.
+pprof = { version = "0.15", optional = true }
 chdb-rust = { version = "1", optional = true }
 # Force aegis to use pure-rust implementation for ARM64 builds to avoid C compilation issues
 [target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]
@@ -96,10 +100,10 @@ libc = "0.2"
 
 [features]
 default = []
-# TEMPORARY (cold-promotion hang diagnosis): arms the stall-taskdump watchdog.
-# Requires RUSTFLAGS="--cfg tokio_unstable" and Linux (tokio hard-errors on the
-# taskdump feature otherwise), so it must stay strictly opt-in.
-stall-taskdump = ["tokio/taskdump"]
+# TEMPORARY (cold-promotion hang diagnosis): arms the stall-taskdump watchdog
+# and the stall CPU profiler. Requires RUSTFLAGS="--cfg tokio_unstable" and
+# Linux (tokio hard-errors on the taskdump feature otherwise), strictly opt-in.
+stall-taskdump = ["tokio/taskdump", "dep:pprof"]
 turso = ["dep:turso"]
 partition-table-provider = ["dep:runtime-table-partition"]
 duckdb-bench = ["dep:duckdb"]
