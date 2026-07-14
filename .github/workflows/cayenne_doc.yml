@@ -3,9 +3,9 @@ name: Build Cayenne doc PDF
 # Renders the Cayenne technical reference (docs/cayenne/cayenne.md) to
 # Cayenne.pdf via docs/cayenne/build_pdf.py.
 #
-# Runs only after a merge to trunk that touches docs/cayenne/** (or this
-# workflow file), and on manual dispatch — it builds and uploads Cayenne.pdf
-# as a downloadable, linkable artifact of the current trunk.
+# Runs on push to trunk that touches docs/cayenne/** (or this workflow file),
+# and on manual dispatch — it builds and uploads Cayenne.pdf as a
+# downloadable, linkable artifact of the current trunk.
 #
 # Deliberately not run on pull_request: rendering depends on kroki.io to
 # resolve mermaid blocks, an external service that intermittently 400s
@@ -13,10 +13,12 @@ name: Build Cayenne doc PDF
 # `docs/cayenne/build_pdf.py` can still be run locally to verify a doc change
 # renders before merging.
 #
-# The build step itself also tolerates that same kroki.io flakiness
-# (continue-on-error): a render failure skips the artifact upload and leaves
-# a warning annotation instead of failing the job, since it's a transient
-# external error rather than a real problem with the doc change.
+# The build step also tolerates that same kroki.io flakiness: build_pdf.py
+# exits 2 specifically when kroki.io rendering fails (any other error, e.g. a
+# script bug or WeasyPrint failure, exits 1 and fails the job as normal). An
+# exit-2 failure skips the artifact upload and leaves a warning annotation
+# instead of failing the job, since it's a transient external error rather
+# than a real problem with the doc change.
 
 on:
   push:
@@ -26,7 +28,8 @@ on:
       - '.github/workflows/cayenne_doc.yml'
   workflow_dispatch:
 
-# Cancel a superseded run for the same ref (a newer push to trunk wins).
+# Cancel a superseded run for the same ref — from either a newer push to
+# trunk or a re-dispatch of this workflow.
 concurrency:
   group: cayenne-doc-${{ github.ref }}
   cancel-in-progress: true
@@ -82,21 +85,28 @@ jobs:
             exit 1
           fi
 
-      # continue-on-error: kroki.io intermittently 400s on an otherwise-valid
-      # mermaid block (see run 29299583614) — that's a transient rendering
-      # hiccup, not a doc defect, so it shouldn't turn a trunk push red.
+      # build_pdf.py exits 2 for a kroki.io rendering failure specifically
+      # (see comment there) — that's a transient hiccup, not a doc defect, so
+      # it shouldn't turn a trunk push red. Any other exit code is a real
+      # failure (script bug, WeasyPrint error, ...) and must fail the job.
       - name: Build Cayenne PDF
         id: build
         working-directory: docs/cayenne
-        continue-on-error: true
-        run: python3 build_pdf.py
+        run: |
+          if python3 build_pdf.py; then
+            echo "outcome=success" >> "$GITHUB_OUTPUT"
+          elif [ "$?" -eq 2 ]; then
+            echo "outcome=kroki_failure" >> "$GITHUB_OUTPUT"
+          else
+            exit 1
+          fi
 
-      - name: Warn on render failure
-        if: steps.build.outcome == 'failure'
+      - name: Warn on kroki render failure
+        if: steps.build.outputs.outcome == 'kroki_failure'
         run: echo "::warning::Cayenne PDF build failed, likely a transient kroki.io rendering error — see the 'Build Cayenne PDF' step logs. Re-run the job to retry; this does not indicate a problem with the doc change itself." | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload Cayenne PDF artifact
-        if: steps.build.outcome == 'success'
+        if: steps.build.outputs.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: Cayenne.pdf
