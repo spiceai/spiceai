@@ -88,12 +88,12 @@ pub enum MaintainedAggregateFunction {
     /// `DataFusion`'s `AVG` output type); integer inputs fold their running sum
     /// exactly into an `i128` accumulator, floats into an `f64` one.
     Avg,
-    /// SQL `MIN(column)` over the signed/unsigned integer families. Unlike
-    /// `SUM` (which widens to `BIGINT`), the output preserves the input type
-    /// (`MIN(Int32) -> Int32`). Retraction-hard: deleting the current minimum
-    /// needs the next-smallest value, so a per-group ordered multiset
-    /// ([`SortedScalarIndex`]) keeps the live values. Integer families only in
-    /// this slice; float `MIN`/`MAX` (NaN ordering) is a follow-up.
+    /// SQL `MIN(column)` over signed/unsigned integers, `Date32`/`Date64`,
+    /// `Timestamp`, and `Decimal128`. Unlike `SUM` (which widens to `BIGINT`),
+    /// the output preserves the input type (`MIN(Int32) -> Int32`).
+    /// Retraction-hard: deleting the current minimum needs the next-smallest
+    /// value, so a per-group ordered multiset ([`SortedScalarIndex`]) keeps the
+    /// live values. Float `MIN`/`MAX` (NaN ordering) is a follow-up.
     Min,
     /// SQL `MAX(column)` — the mirror of [`Self::Min`], reading the largest
     /// live value from the same ordered-multiset structure.
@@ -105,9 +105,9 @@ pub enum MaintainedAggregateFunction {
 pub struct MaintainedAggregateRegistry {
     state: RwLock<RegistryState>,
     /// Upper bound on retained index entries across all views: per-PK
-    /// contributions for indexed views, or distinct `MIN`/`MAX` multiset values
-    /// for insert-only views. When the total would exceed this, the registry
-    /// fails safe to `Stale` and clears its indexes.
+    /// contributions plus distinct `MIN`/`MAX` multiset values. When the total
+    /// would exceed this, the registry fails safe to `Stale` and clears all
+    /// retained state.
     max_index_entries: usize,
     /// Whether a per-PK index is maintained (a non-empty PK was configured), so
     /// UPDATE/DELETE can be retracted incrementally rather than marking stale.
@@ -146,6 +146,10 @@ struct MaintainedAggregateView {
     /// keyed by the primary key every CDC source delivers). Empty when
     /// `pk_columns` is empty.
     pk_index: HashMap<Vec<ScalarValue>, RowEntry>,
+    /// Exact number of distinct ordered-multiset nodes retained by this view.
+    /// Updated on every `MIN`/`MAX` insert/retract so cap checks stay O(1)
+    /// regardless of group cardinality.
+    retained_multiset_entries: usize,
 }
 
 /// One row's retraction record: which group it joined and the per-aggregate
@@ -155,6 +159,11 @@ struct RowEntry {
     group_key: Vec<ScalarValue>,
     inputs: Vec<Option<ScalarValue>>,
 }
+
+type RetiredViewState = (
+    HashMap<Vec<ScalarValue>, GroupAccumulator>,
+    HashMap<Vec<ScalarValue>, RowEntry>,
+);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedAggregateSpec {
@@ -223,14 +232,17 @@ enum AggregateAccumulator {
     SumInt64 {
         column_index: usize,
         value: Option<i64>,
+        non_null_count: u64,
     },
     SumUInt64 {
         column_index: usize,
         value: Option<u64>,
+        non_null_count: u64,
     },
     SumFloat64 {
         column_index: usize,
         value: Option<f64>,
+        non_null_count: u64,
     },
     AvgFloat64 {
         column_index: usize,
@@ -274,39 +286,36 @@ enum AggregateAccumulator {
 /// [`scalar_for_field`] requires the output scalar to match the column type
 /// exactly.
 ///
-/// Memory bound: for a PK-indexed view, every live multiset value corresponds to
-/// one bounded PK contribution. Without a PK, [`MaintainedAggregateView::index_len`]
-/// counts the distinct multiset entries directly. In both cases,
-/// `max_index_entries` fails the registry safe to [`RegistryStatus::Stale`] when
-/// the retained-entry count exceeds the cap. The runtime additionally rejects
-/// user-configured `MIN`/`MAX` without a primary key because retraction cannot be
-/// supported there.
+/// Memory bound: [`MaintainedAggregateView::index_len`] counts each distinct
+/// multiset node in addition to any per-PK contribution record. The exact count
+/// is maintained incrementally, so cap checks do not scan every group. The
+/// runtime additionally rejects user-configured `MIN`/`MAX` without a primary
+/// key because retraction cannot be supported there.
 #[derive(Debug, Clone, Default)]
 struct SortedScalarIndex {
     entries: BTreeMap<i128, (ScalarValue, u64)>,
 }
 
 impl SortedScalarIndex {
-    fn len(&self) -> usize {
-        self.entries.len()
-    }
-
     /// Add one live value. `checked_add` on the per-value count matches the
     /// crate-wide "never silently clamp a maintained counter" discipline.
-    fn insert(&mut self, scalar: ScalarValue) -> DataFusionResult<()> {
+    /// Returns whether this inserted a new distinct map entry.
+    fn insert(&mut self, scalar: ScalarValue) -> DataFusionResult<bool> {
         let key = scalar_order_key(&scalar)?;
         if let Some((_, count)) = self.entries.get_mut(&key) {
             *count = count.checked_add(1).ok_or_else(count_overflow)?;
+            Ok(false)
         } else {
             self.entries.insert(key, (scalar, 1));
+            Ok(true)
         }
-        Ok(())
     }
 
     /// Remove one live value (the inverse of [`Self::insert`]). A key that is
     /// absent, or a count that underflows, is a state inconsistency the caller
     /// turns into a fail-safe-to-stale, exactly like the additive retraction path.
-    fn retract(&mut self, scalar: &ScalarValue) -> DataFusionResult<()> {
+    /// Returns whether this removed a distinct map entry.
+    fn retract(&mut self, scalar: &ScalarValue) -> DataFusionResult<bool> {
         let key = scalar_order_key(scalar)?;
         let Some((_, count)) = self.entries.get_mut(&key) else {
             return Err(retract_underflow());
@@ -314,8 +323,9 @@ impl SortedScalarIndex {
         *count = count.checked_sub(1).ok_or_else(retract_underflow)?;
         if *count == 0 {
             self.entries.remove(&key);
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     /// The smallest live value (SQL `MIN`), or `None` when no non-null value
@@ -518,11 +528,33 @@ impl MaintainedAggregateRegistry {
         self.has_pk_index
     }
 
-    /// Mark all maintained aggregate views stale at `epoch`.
+    /// Mark all maintained aggregate views stale at `epoch` and detach their
+    /// retained state immediately. When called from a `Tokio` runtime, destruction
+    /// of the detached maps runs on the blocking pool so a large stale view does
+    /// not stall an async visibility fence.
     pub fn mark_stale(&self, epoch: u64) {
-        let mut state = self.state.write();
-        state.epoch = epoch;
-        state.status = RegistryStatus::Stale;
+        let retired = {
+            let mut state = self.state.write();
+            state.epoch = epoch;
+            state.status = RegistryStatus::Stale;
+            state
+                .views
+                .iter_mut()
+                .map(MaintainedAggregateView::take_retained_state)
+                .collect::<Vec<_>>()
+        };
+
+        if retired
+            .iter()
+            .all(|(groups, pk_index)| groups.is_empty() && pk_index.is_empty())
+        {
+            return;
+        }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            drop(handle.spawn_blocking(move || drop(retired)));
+        } else {
+            drop(retired);
+        }
     }
 
     /// Apply positive row deltas if the state is fresh, otherwise keep it stale.
@@ -556,6 +588,12 @@ impl MaintainedAggregateRegistry {
                     failure = Some(error);
                     break 'outer;
                 }
+            }
+            // Check after every Arrow batch so a multi-batch CDC envelope cannot
+            // accumulate unbounded retained state before the final cap check.
+            if retained_index_entries(&state.views) > self.max_index_entries {
+                failure = Some(index_cap_exceeded());
+                break 'outer;
             }
         }
 
@@ -623,10 +661,7 @@ impl MaintainedAggregateRegistry {
             // Bail incrementally so a table larger than the cap fails safe to
             // stale before the retained indexes grow unbounded (rather than only
             // after the full rebuild, which could OOM first).
-            if state.views.iter().fold(0_usize, |total, view| {
-                total.saturating_add(view.index_len())
-            }) > self.max_index_entries
-            {
+            if retained_index_entries(&state.views) > self.max_index_entries {
                 failure = Some(index_cap_exceeded());
                 break 'outer;
             }
@@ -764,6 +799,7 @@ impl MaintainedAggregateView {
             groups: HashMap::new(),
             pk_columns,
             pk_index: HashMap::new(),
+            retained_multiset_entries: 0,
         })
     }
 
@@ -802,35 +838,32 @@ impl MaintainedAggregateView {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => entry.insert(GroupAccumulator::try_new(&self.spec)?),
         };
-        group.apply_insert_row(batch, row)
+        let retained_entries_added = group.apply_insert_row(batch, row)?;
+        self.retained_multiset_entries = self
+            .retained_multiset_entries
+            .checked_add(retained_entries_added)
+            .ok_or_else(index_cap_exceeded)?;
+        Ok(())
     }
 
     fn clear(&mut self) {
         self.groups.clear();
         self.pk_index.clear();
+        self.retained_multiset_entries = 0;
+    }
+
+    fn take_retained_state(&mut self) -> RetiredViewState {
+        self.retained_multiset_entries = 0;
+        (
+            std::mem::take(&mut self.groups),
+            std::mem::take(&mut self.pk_index),
+        )
     }
 
     fn index_len(&self) -> usize {
-        if self.pk_columns.is_empty() {
-            // Runtime configuration rejects no-PK MIN/MAX, so the common
-            // insert-only COUNT/SUM/AVG path has no retained ordered index.
-            // Return in O(number of aggregate expressions) instead of scanning
-            // every accumulated group after every batch.
-            let has_ordered_index = self.spec.aggregates.iter().any(|aggregate| {
-                matches!(
-                    aggregate.function,
-                    MaintainedAggregateFunction::Min | MaintainedAggregateFunction::Max
-                )
-            });
-            if !has_ordered_index {
-                return 0;
-            }
-            self.groups
-                .values()
-                .fold(0, |total, group| total.saturating_add(group.index_len()))
-        } else {
-            self.pk_index.len()
-        }
+        self.pk_index
+            .len()
+            .saturating_add(self.retained_multiset_entries)
     }
 
     /// Build a key (group key or PK) from the given column indices at `row`.
@@ -871,9 +904,14 @@ impl MaintainedAggregateView {
     /// when it becomes empty.
     fn retract_entry(&mut self, entry: &RowEntry) -> DataFusionResult<()> {
         let Some(group) = self.groups.get_mut(&entry.group_key) else {
-            return Ok(());
+            return Err(retract_underflow());
         };
-        if group.retract_row(&entry.inputs)? {
+        let (group_is_empty, retained_entries_removed) = group.retract_row(&entry.inputs)?;
+        self.retained_multiset_entries = self
+            .retained_multiset_entries
+            .checked_sub(retained_entries_removed)
+            .ok_or_else(retract_underflow)?;
+        if group_is_empty {
             self.groups.remove(&entry.group_key);
         }
         Ok(())
@@ -1218,30 +1256,39 @@ impl GroupAccumulator {
         })
     }
 
-    fn apply_insert_row(&mut self, batch: &RecordBatch, row: usize) -> DataFusionResult<()> {
+    fn apply_insert_row(&mut self, batch: &RecordBatch, row: usize) -> DataFusionResult<usize> {
+        let mut retained_entries_added = 0_usize;
         for aggregate in &mut self.aggregates {
-            aggregate.apply_insert_row(batch, row)?;
+            retained_entries_added = retained_entries_added
+                .checked_add(aggregate.apply_insert_row(batch, row)?)
+                .ok_or_else(index_cap_exceeded)?;
         }
         // `checked_add` (not saturating): a silently-clamped counter would break
         // the "drop the group when its last row is retracted" invariant, so an
         // overflow must fail the registry safe to stale instead.
         self.rows = self.rows.checked_add(1).ok_or_else(count_overflow)?;
-        Ok(())
+        Ok(retained_entries_added)
     }
 
     /// Subtract a previously-captured row's per-aggregate contributions
-    /// (inverse of [`Self::apply_insert_row`]). Returns whether the group is
-    /// now empty so the caller can drop it.
-    fn retract_row(&mut self, inputs: &[Option<ScalarValue>]) -> DataFusionResult<bool> {
+    /// (inverse of [`Self::apply_insert_row`]). Returns whether the group is now
+    /// empty and how many distinct multiset entries were removed.
+    fn retract_row(&mut self, inputs: &[Option<ScalarValue>]) -> DataFusionResult<(bool, usize)> {
+        if inputs.len() != self.aggregates.len() {
+            return Err(retract_underflow());
+        }
+        let mut retained_entries_removed = 0_usize;
         for (aggregate, input) in self.aggregates.iter_mut().zip(inputs) {
-            aggregate.retract_row(input.as_ref())?;
+            retained_entries_removed = retained_entries_removed
+                .checked_add(aggregate.retract_row(input.as_ref())?)
+                .ok_or_else(retract_underflow)?;
         }
         // `checked_sub` (not saturating): if retractions ever outnumber inserts
         // for a group (index/state inconsistency), surface it as an error so the
         // caller fails safe to stale rather than silently clamping at 0 and
         // mis-dropping the group.
         self.rows = self.rows.checked_sub(1).ok_or_else(retract_underflow)?;
-        Ok(self.rows == 0)
+        Ok((self.rows == 0, retained_entries_removed))
     }
 
     fn scalar_value(
@@ -1256,22 +1303,9 @@ impl GroupAccumulator {
         };
         aggregate.scalar_value(field)
     }
-
-    fn index_len(&self) -> usize {
-        self.aggregates.iter().fold(0, |total, aggregate| {
-            total.saturating_add(aggregate.index_len())
-        })
-    }
 }
 
 impl AggregateAccumulator {
-    fn index_len(&self) -> usize {
-        match self {
-            Self::Min { index, .. } | Self::Max { index, .. } => index.len(),
-            _ => 0,
-        }
-    }
-
     fn try_new(expr: &ResolvedAggregateExpr) -> DataFusionResult<Self> {
         let accumulator = match (expr.function, expr.output_type, expr.column.as_ref()) {
             (MaintainedAggregateFunction::Count, _, None) => Self::CountAll { value: 0 },
@@ -1283,18 +1317,21 @@ impl AggregateAccumulator {
                 Self::SumInt64 {
                     column_index: column.index,
                     value: None,
+                    non_null_count: 0,
                 }
             }
             (MaintainedAggregateFunction::Sum, AggregateOutputType::UInt64, Some(column)) => {
                 Self::SumUInt64 {
                     column_index: column.index,
                     value: None,
+                    non_null_count: 0,
                 }
             }
             (MaintainedAggregateFunction::Sum, AggregateOutputType::Float64, Some(column)) => {
                 Self::SumFloat64 {
                     column_index: column.index,
                     value: None,
+                    non_null_count: 0,
                 }
             }
             (MaintainedAggregateFunction::Avg, AggregateOutputType::Float64, Some(column))
@@ -1335,10 +1372,11 @@ impl AggregateAccumulator {
         Ok(accumulator)
     }
 
-    fn apply_insert_row(&mut self, batch: &RecordBatch, row: usize) -> DataFusionResult<()> {
-        match self {
+    fn apply_insert_row(&mut self, batch: &RecordBatch, row: usize) -> DataFusionResult<usize> {
+        let inserted_multiset_entry = match self {
             Self::CountAll { value } => {
                 *value = value.checked_add(1).ok_or_else(count_overflow)?;
+                false
             }
             Self::CountColumn {
                 column_index,
@@ -1347,42 +1385,58 @@ impl AggregateAccumulator {
                 if !batch.column(*column_index).is_null(row) {
                     *value = value.checked_add(1).ok_or_else(count_overflow)?;
                 }
+                false
             }
             Self::SumInt64 {
                 column_index,
                 value,
+                non_null_count,
             } => {
                 if !batch.column(*column_index).is_null(row) {
                     let scalar = ScalarValue::try_from_array(batch.column(*column_index), row)?;
                     let delta = scalar_as_i64(&scalar)?;
-                    *value = Some(match *value {
+                    let next_value = match *value {
                         Some(current) => current.checked_add(delta).ok_or_else(sum_overflow)?,
                         None => delta,
-                    });
+                    };
+                    let next_count = non_null_count.checked_add(1).ok_or_else(count_overflow)?;
+                    *value = Some(next_value);
+                    *non_null_count = next_count;
                 }
+                false
             }
             Self::SumUInt64 {
                 column_index,
                 value,
+                non_null_count,
             } => {
                 if !batch.column(*column_index).is_null(row) {
                     let scalar = ScalarValue::try_from_array(batch.column(*column_index), row)?;
                     let delta = scalar_as_u64(&scalar)?;
-                    *value = Some(match *value {
+                    let next_value = match *value {
                         Some(current) => current.checked_add(delta).ok_or_else(sum_overflow)?,
                         None => delta,
-                    });
+                    };
+                    let next_count = non_null_count.checked_add(1).ok_or_else(count_overflow)?;
+                    *value = Some(next_value);
+                    *non_null_count = next_count;
                 }
+                false
             }
             Self::SumFloat64 {
                 column_index,
                 value,
+                non_null_count,
             } => {
                 if !batch.column(*column_index).is_null(row) {
                     let scalar = ScalarValue::try_from_array(batch.column(*column_index), row)?;
                     let delta = scalar_as_f64(&scalar)?;
-                    *value = Some(value.unwrap_or(0.0) + delta);
+                    let next_value = (*value).map_or(delta, |current| current + delta);
+                    let next_count = non_null_count.checked_add(1).ok_or_else(count_overflow)?;
+                    *value = Some(next_value);
+                    *non_null_count = next_count;
                 }
+                false
             }
             Self::AvgFloat64 {
                 column_index,
@@ -1395,6 +1449,7 @@ impl AggregateAccumulator {
                     *sum += delta;
                     *count = count.checked_add(1).ok_or_else(count_overflow)?;
                 }
+                false
             }
             Self::AvgInt128 {
                 column_index,
@@ -1407,6 +1462,7 @@ impl AggregateAccumulator {
                     *sum = sum.checked_add(delta).ok_or_else(avg_overflow)?;
                     *count = count.checked_add(1).ok_or_else(count_overflow)?;
                 }
+                false
             }
             // `MIN`/`MAX` insert identically — add the live value to the ordered
             // multiset; the query reads the min/max end. A null contributes
@@ -1421,71 +1477,122 @@ impl AggregateAccumulator {
             } => {
                 if !batch.column(*column_index).is_null(row) {
                     let scalar = ScalarValue::try_from_array(batch.column(*column_index), row)?;
-                    index.insert(scalar)?;
+                    index.insert(scalar)?
+                } else {
+                    false
                 }
             }
-        }
-        Ok(())
+        };
+        Ok(usize::from(inserted_multiset_entry))
     }
 
     /// Inverse of [`Self::apply_insert_row`], subtracting a previously-captured
-    /// input scalar. `COUNT`/`SUM(Int64|UInt64)`/`AVG(int)` are exactly
-    /// invertible; `SUM/AVG(Float64)` subtract and rely on a periodic
-    /// [`MaintainedAggregateRegistry::rebuild_from_batches`] to bound float
-    /// drift. A null input contributed nothing, so it retracts nothing.
-    fn retract_row(&mut self, input: Option<&ScalarValue>) -> DataFusionResult<()> {
-        match self {
+    /// input scalar. `SUM` also tracks its non-null cardinality so retracting the
+    /// last value restores SQL `NULL` even when null-valued rows keep the group
+    /// alive. `COUNT`/integer `SUM`/`AVG(int)` are exactly invertible;
+    /// floating-point `SUM`/`AVG` subtract and rely on a periodic
+    /// [`MaintainedAggregateRegistry::rebuild_from_batches`] to bound drift. A
+    /// null input contributed nothing, so it retracts nothing.
+    fn retract_row(&mut self, input: Option<&ScalarValue>) -> DataFusionResult<usize> {
+        let removed_multiset_entry = match self {
             Self::CountAll { value } => {
                 *value = value.checked_sub(1).ok_or_else(retract_underflow)?;
+                false
             }
             Self::CountColumn { value, .. } => {
                 if input.is_some_and(|scalar| !scalar.is_null()) {
                     *value = value.checked_sub(1).ok_or_else(retract_underflow)?;
                 }
+                false
             }
-            Self::SumInt64 { value, .. } => {
+            Self::SumInt64 {
+                value,
+                non_null_count,
+                ..
+            } => {
                 if let Some(scalar) = input
                     && !scalar.is_null()
                 {
                     let delta = scalar_as_i64(scalar)?;
                     let current = (*value).ok_or_else(retract_underflow)?;
-                    *value = Some(current.checked_sub(delta).ok_or_else(sum_overflow)?);
+                    let remaining = current.checked_sub(delta).ok_or_else(sum_overflow)?;
+                    let next_count = non_null_count
+                        .checked_sub(1)
+                        .ok_or_else(retract_underflow)?;
+                    if next_count == 0 && remaining != 0 {
+                        return Err(retract_underflow());
+                    }
+                    *value = (next_count != 0).then_some(remaining);
+                    *non_null_count = next_count;
                 }
+                false
             }
-            Self::SumUInt64 { value, .. } => {
+            Self::SumUInt64 {
+                value,
+                non_null_count,
+                ..
+            } => {
                 if let Some(scalar) = input
                     && !scalar.is_null()
                 {
                     let delta = scalar_as_u64(scalar)?;
                     let current = (*value).ok_or_else(retract_underflow)?;
-                    *value = Some(current.checked_sub(delta).ok_or_else(retract_underflow)?);
+                    let remaining = current.checked_sub(delta).ok_or_else(retract_underflow)?;
+                    let next_count = non_null_count
+                        .checked_sub(1)
+                        .ok_or_else(retract_underflow)?;
+                    if next_count == 0 && remaining != 0 {
+                        return Err(retract_underflow());
+                    }
+                    *value = (next_count != 0).then_some(remaining);
+                    *non_null_count = next_count;
                 }
+                false
             }
-            Self::SumFloat64 { value, .. } => {
+            Self::SumFloat64 {
+                value,
+                non_null_count,
+                ..
+            } => {
                 if let Some(scalar) = input
                     && !scalar.is_null()
                 {
                     let delta = scalar_as_f64(scalar)?;
-                    *value = Some(value.unwrap_or(0.0) - delta);
+                    let current = (*value).ok_or_else(retract_underflow)?;
+                    let next_count = non_null_count
+                        .checked_sub(1)
+                        .ok_or_else(retract_underflow)?;
+                    *value = (next_count != 0).then_some(current - delta);
+                    *non_null_count = next_count;
                 }
+                false
             }
             Self::AvgFloat64 { sum, count, .. } => {
                 if let Some(scalar) = input
                     && !scalar.is_null()
                 {
                     let delta = scalar_as_f64(scalar)?;
-                    *sum -= delta;
-                    *count = count.checked_sub(1).ok_or_else(retract_underflow)?;
+                    let next_count = count.checked_sub(1).ok_or_else(retract_underflow)?;
+                    let remaining = *sum - delta;
+                    *sum = if next_count == 0 { 0.0 } else { remaining };
+                    *count = next_count;
                 }
+                false
             }
             Self::AvgInt128 { sum, count, .. } => {
                 if let Some(scalar) = input
                     && !scalar.is_null()
                 {
                     let delta = scalar_as_i128(scalar)?;
-                    *sum = sum.checked_sub(delta).ok_or_else(retract_underflow)?;
-                    *count = count.checked_sub(1).ok_or_else(retract_underflow)?;
+                    let remaining = sum.checked_sub(delta).ok_or_else(retract_underflow)?;
+                    let next_count = count.checked_sub(1).ok_or_else(retract_underflow)?;
+                    if next_count == 0 && remaining != 0 {
+                        return Err(retract_underflow());
+                    }
+                    *sum = if next_count == 0 { 0 } else { remaining };
+                    *count = next_count;
                 }
+                false
             }
             // `MIN`/`MAX` retract identically — remove the captured live value
             // from the ordered multiset; the extremum falls back to the next
@@ -1495,11 +1602,13 @@ impl AggregateAccumulator {
                 if let Some(scalar) = input
                     && !scalar.is_null()
                 {
-                    index.retract(scalar)?;
+                    index.retract(scalar)?
+                } else {
+                    false
                 }
             }
-        }
-        Ok(())
+        };
+        Ok(usize::from(removed_multiset_entry))
     }
 
     fn scalar_value(&self, field: &FieldRef) -> DataFusionResult<ScalarValue> {
@@ -1887,9 +1996,7 @@ fn finalize_maintenance_pass(
     max_index_entries: usize,
     failure: Option<DataFusionError>,
 ) -> DataFusionResult<()> {
-    let over_cap = state.views.iter().fold(0_usize, |total, view| {
-        total.saturating_add(view.index_len())
-    }) > max_index_entries;
+    let over_cap = retained_index_entries(&state.views) > max_index_entries;
     if failure.is_some() || over_cap {
         for view in &mut state.views {
             view.clear();
@@ -1898,6 +2005,12 @@ fn finalize_maintenance_pass(
         return Err(failure.unwrap_or_else(index_cap_exceeded));
     }
     Ok(())
+}
+
+fn retained_index_entries(views: &[MaintainedAggregateView]) -> usize {
+    views.iter().fold(0_usize, |total, view| {
+        total.saturating_add(view.index_len())
+    })
 }
 
 fn index_cap_exceeded() -> DataFusionError {
@@ -2071,7 +2184,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_epoch_does_not_serve() -> DataFusionResult<()> {
+    fn stale_epoch_does_not_serve_and_releases_retained_state() -> DataFusionResult<()> {
         let spec = MaintainedAggregateSpec {
             filter: None,
             group_by: vec!["name".to_string()],
@@ -2082,7 +2195,23 @@ mod tests {
         };
         let registry = MaintainedAggregateRegistry::try_new(&[spec], &schema())?;
         registry.apply_insert_batches(1, &[batch()])?;
+        assert!(
+            !registry.state.read().views[0].groups.is_empty(),
+            "fresh registry retains group state"
+        );
         registry.mark_stale(2);
+
+        let state = registry.state.read();
+        assert!(
+            state.views[0].groups.is_empty(),
+            "stale registry must release group state"
+        );
+        assert!(
+            state.views[0].pk_index.is_empty(),
+            "stale registry must release PK contributions"
+        );
+        assert_eq!(state.views[0].retained_multiset_entries, 0);
+        drop(state);
 
         let aggregate =
             aggregate_exec_for(&[("count(*)", MaintainedAggregateFunction::Count, None)])?;
@@ -2535,6 +2664,26 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn pk_and_min_max_entries_all_count_toward_cap() -> DataFusionResult<()> {
+        // Two distinct rows retain two PK contribution records plus two `MIN`
+        // and two `MAX` multiset nodes: six entries total.
+        let at_cap =
+            MaintainedAggregateRegistry::try_new_with_pk(&[min_max_i_spec()], &schema(), &[2], 6)?;
+        at_cap.apply_insert_batches(1, &[group_batch(&[("a", 1, 10), ("a", 2, 20)])])?;
+        assert_eq!(at_cap.state.read().views[0].index_len(), 6);
+
+        let over_cap =
+            MaintainedAggregateRegistry::try_new_with_pk(&[min_max_i_spec()], &schema(), &[2], 5)?;
+        let result =
+            over_cap.apply_insert_batches(1, &[group_batch(&[("a", 1, 10), ("a", 2, 20)])]);
+        assert!(
+            result.is_err(),
+            "PK records and ordered-multiset nodes must share one exact cap"
+        );
+        Ok(())
+    }
+
     /// Build a (name, i=PK, u, f) batch — exercises every aggregate-input type
     /// so retraction covers all accumulator inverses. Float values are
     /// exact-representable in f64 so retraction stays bit-exact.
@@ -2648,6 +2797,129 @@ mod tests {
                 other => panic!("unexpected group {other}"),
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn retracting_last_non_null_sum_restores_sql_null() -> DataFusionResult<()> {
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("i", DataType::Int64, true),
+            Field::new("u", DataType::UInt64, true),
+            Field::new("f", DataType::Float64, true),
+            Field::new("pk", DataType::Int64, false),
+        ]));
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Sum,
+                    column: Some("i".to_string()),
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Sum,
+                    column: Some("u".to_string()),
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Sum,
+                    column: Some("f".to_string()),
+                },
+            ],
+        };
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            std::slice::from_ref(&spec),
+            &input_schema,
+            &[4],
+            usize::MAX,
+        )?;
+        let input = RecordBatch::try_new(
+            Arc::clone(&input_schema),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "a"])),
+                Arc::new(Int64Array::from(vec![None, Some(7)])),
+                Arc::new(UInt64Array::from(vec![None, Some(8)])),
+                Arc::new(Float64Array::from(vec![None, Some(1.5)])),
+                Arc::new(Int64Array::from(vec![1, 2])),
+            ],
+        )?;
+        registry.apply_insert_batches(1, &[input])?;
+
+        let delete_pk = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("pk", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![2]))],
+        )?;
+        registry.apply_pk_deletes(2, &delete_pk)?;
+
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("sum_i", DataType::Int64, true),
+            Field::new("sum_u", DataType::UInt64, true),
+            Field::new("sum_f", DataType::Float64, true),
+        ]));
+        let result = registry
+            .batch_for_spec(&spec, 2, output_schema)?
+            .expect("fresh sum view should serve");
+        assert_eq!(result.num_rows(), 1, "the all-NULL row keeps group a live");
+        assert_eq!(as_string_array(result.column(0))?.value(0), "a");
+        assert!(as_int64_array(result.column(1))?.is_null(0));
+        assert!(as_uint64_array(result.column(2))?.is_null(0));
+        assert!(as_float64_array(result.column(3))?.is_null(0));
+        Ok(())
+    }
+
+    #[test]
+    fn avg_resets_running_sum_after_last_non_null_retraction() -> DataFusionResult<()> {
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Avg,
+                column: Some("f".to_string()),
+            }],
+        };
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            std::slice::from_ref(&spec),
+            &schema(),
+            &[1],
+            usize::MAX,
+        )?;
+        let float_batch = |rows: &[(i64, Option<f64>)]| {
+            RecordBatch::try_new(
+                schema(),
+                vec![
+                    Arc::new(StringArray::from(vec![Some("a"); rows.len()])),
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|(pk, _)| *pk).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(UInt64Array::from(vec![None::<u64>; rows.len()])),
+                    Arc::new(Float64Array::from(
+                        rows.iter().map(|(_, value)| *value).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+        };
+        registry.apply_insert_batches(
+            1,
+            &[float_batch(&[
+                (1, None),
+                (2, Some(1.0e16)),
+                (3, Some(1.0)),
+            ])?],
+        )?;
+        registry.apply_pk_deletes(2, &float_batch(&[(2, None)])?.project(&[1])?)?;
+        registry.apply_pk_deletes(3, &float_batch(&[(3, None)])?.project(&[1])?)?;
+        registry.apply_insert_batches(4, &[float_batch(&[(4, Some(2.0))])?])?;
+
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("avg_f", DataType::Float64, true),
+        ]));
+        let result = registry
+            .batch_for_spec(&spec, 4, output_schema)?
+            .expect("fresh average view should serve");
+        let average = as_float64_array(result.column(1))?.value(0);
+        assert!((average - 2.0).abs() < f64::EPSILON);
         Ok(())
     }
 

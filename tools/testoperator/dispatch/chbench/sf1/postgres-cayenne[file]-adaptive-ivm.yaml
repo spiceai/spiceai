@@ -5,5 +5,5 @@ tests:
     scale_factor: 1
     duration: 900
     ready_wait: 60
-    # Keep 15 minutes of q1 + q6 contribution-index churn below the 5M cap.
+    # Keep q1 + q6 live contribution indexes below the 5M cap during 15 minutes.
     rate: 400

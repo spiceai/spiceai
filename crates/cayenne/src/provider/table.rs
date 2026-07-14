@@ -169,8 +169,8 @@ const SCHEMA_EVOLUTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const DEFAULT_WRITE_CONCURRENCY: usize = 4;
 const TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT: usize = 256;
 /// Upper bound on maintained-aggregate retained index entries (per-PK
-/// contributions, or direct-call `MIN`/`MAX` multisets without a PK); exceeding
-/// it fails the registry safe to a base-table rebuild so memory stays bounded.
+/// contributions plus distinct `MIN`/`MAX` multiset nodes); exceeding it fails
+/// the registry safe to a base-table rebuild so memory stays bounded.
 /// TODO: derive from `runtime.query.memory_limit` once the budget is threaded to
 /// the provider (Pattern 9 — budget-derived caps).
 const MAINTAINED_AGGREGATE_MAX_INDEX_ENTRIES: usize = 5_000_000;
@@ -8588,10 +8588,10 @@ impl CayenneTableProvider {
                 self.apply_maintained_aggregate_insert_batches(Some(pending))
                     .await;
             } else {
-                // No PK index and this apply supersedes — cannot retract; stale.
-                // Epoch already advanced by the pre-bump above; mark_stale advances
-                // again and clears indexes (fail-safe serve → base scan).
-                self.mark_maintained_aggregates_stale();
+                // No PK index and this apply supersedes — cannot retract. Reuse
+                // the already-published epoch rather than creating a gap for a
+                // visibility change that has already been accounted for.
+                self.mark_maintained_aggregates_stale_at_epoch(epoch);
             }
         }
 
@@ -15615,6 +15615,14 @@ impl CayenneTableProvider {
         }
 
         let epoch = self.next_maintained_aggregate_epoch();
+        self.mark_maintained_aggregates_stale_at_epoch(epoch);
+    }
+
+    fn mark_maintained_aggregates_stale_at_epoch(&self, epoch: u64) {
+        if self.maintained_aggregates.is_empty() {
+            return;
+        }
+
         self.maintained_aggregates.mark_stale(epoch);
         tracing::debug!(
             table = %self.table_metadata.table_name,
@@ -15799,7 +15807,7 @@ impl CayenneTableProvider {
                 kind,
                 "Maintained-aggregate applier is unavailable; marking stale — queries fall back to base table scans"
             );
-            self.mark_maintained_aggregates_stale();
+            self.mark_maintained_aggregates_stale_at_epoch(epoch);
         }
     }
 
@@ -18834,30 +18842,42 @@ impl CayenneTableProvider {
         // single dense step (not N concurrent enqueues). The original batch was
         // already validated and split by these same PK columns, so project it once
         // instead of concatenating shard prefixes repeatedly.
-        if let Some(epoch) = ivm_epoch
-            && self.maintained_aggregates.supports_retraction()
-        {
-            let Some(pk_batch) = self.project_delete_pk_batch(delete_rows)? else {
-                // The shard split above resolved every PK successfully, so this is
-                // defensive. Fail safe rather than applying an incomplete retract.
-                self.mark_maintained_aggregates_stale();
-                return Ok(apply_epoch);
-            };
-            if pk_batch.num_rows() > 0 {
-                self.apply_maintained_aggregate_delete_pending(Some(
-                    PendingMaintainedAggregateDelete { epoch, pk_batch },
-                ))
-                .await;
+        if let Some(epoch) = ivm_epoch {
+            if self.maintained_aggregates.supports_retraction() {
+                let pk_batch = match self.project_delete_pk_batch(delete_rows) {
+                    Ok(Some(pk_batch)) => pk_batch,
+                    Ok(None) => {
+                        // The shard split above resolved every PK successfully,
+                        // so this is defensive. Fail safe rather than applying an
+                        // incomplete retract.
+                        self.mark_maintained_aggregates_stale_at_epoch(epoch);
+                        return Ok(apply_epoch);
+                    }
+                    Err(error) => {
+                        self.mark_maintained_aggregates_stale_at_epoch(epoch);
+                        return Err(error.into());
+                    }
+                };
+                if pk_batch.num_rows() > 0 {
+                    self.apply_maintained_aggregate_delete_pending(Some(
+                        PendingMaintainedAggregateDelete { epoch, pk_batch },
+                    ))
+                    .await;
+                } else {
+                    // Epoch pre-bumped but no retractable rows: advance registry
+                    // via an empty insert so the dense chain is not gapped.
+                    self.apply_maintained_aggregate_insert_batches(Some(
+                        PendingMaintainedAggregateInsert {
+                            epoch,
+                            batches: Arc::new(Vec::new()),
+                        },
+                    ))
+                    .await;
+                }
             } else {
-                // Epoch pre-bumped but no retractable rows: advance registry via
-                // empty insert so the dense epoch chain is not gapped.
-                self.apply_maintained_aggregate_insert_batches(Some(
-                    PendingMaintainedAggregateInsert {
-                        epoch,
-                        batches: Arc::new(Vec::new()),
-                    },
-                ))
-                .await;
+                // Deletes cannot be retracted without a PK contribution index.
+                // Mark stale at the epoch already paired with the shard publish.
+                self.mark_maintained_aggregates_stale_at_epoch(epoch);
             }
         }
 

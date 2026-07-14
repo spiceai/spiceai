@@ -7,8 +7,8 @@ name: mysql-cayenne[file]-adaptive-ivm
 # Same adaptive topology as `mysql-cayenne[file]-adaptive`, plus predicate-aware
 # maintained aggregates on `order_line` for CH-benCH q1 and q6 (single-table
 # analytics over the heaviest CDC table). See the postgres adaptive-ivm pod for
-# the full design notes (SF1 measures the IVM fast path; SF1000 is the adaptive+IVM
-# HTAP counterpart, fail-safe to base scans if the retained-index cap is hit).
+# the full design notes. The scheduled SF1 run measures the IVM fast path while
+# its live contribution indexes remain below the retained-entry safety cap.
 #
 # Adaptive-tuning variant of the non-tuned baseline. Instead of either
 # the static `auto` derivation (the baseline) or a hand-pinned -cdc-tuned-* config, every Cayenne
