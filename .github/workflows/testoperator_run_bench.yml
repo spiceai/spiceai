@@ -258,15 +258,21 @@ jobs:
           echo "Checking whether $DB_NAME already has data on $PGHOST..."
           EXISTING_ROWS="$(PGCONNECT_TIMEOUT=10 psql -U postgres -d "$DB_NAME" -tAc 'SELECT count(*) FROM customer;' 2>/dev/null || echo 0)"
 
+          cd test/tpc-bench
+
           if [ "${EXISTING_ROWS:-0}" -gt 0 ] 2>/dev/null; then
-            echo "$DB_NAME already has $EXISTING_ROWS rows in 'customer' - skipping seed."
+            echo "$DB_NAME already has $EXISTING_ROWS rows in 'customer' - skipping data load, but ensuring indexes are up to date (idempotent, no rebuild if already present)."
+            if [ "$QUERY_SET" = "tpcds" ]; then
+              DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-tpcds-create-index
+            else
+              DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-create-index
+            fi
             exit 0
           fi
 
           echo "$DB_NAME is missing or empty on $PGHOST - seeding it now."
           sudo apt-get install -y git make gcc g++ flex bison byacc
 
-          cd test/tpc-bench
           if [ "$QUERY_SET" = "tpcds" ]; then
             make tpcds-init
             DBGEN_SCALE=$SCALE_FACTOR make tpcds-gen
