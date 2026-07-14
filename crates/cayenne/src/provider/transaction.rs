@@ -387,7 +387,7 @@ impl CayenneTransaction {
         }
 
         // Fuse every table's durable publish into one transaction; commit or none.
-        if let Err(e) = commit_fused(catalog, &prepared).await {
+        if let Err(e) = commit_fused(catalog, &mut prepared).await {
             drop(fence_guards);
             drop(visibility_guards);
             drop(write_guards);
@@ -421,13 +421,13 @@ impl CayenneTransaction {
 /// Fuse every prepared table's durable publish into one `MetastoreTransaction`.
 /// Bounded retry on a busy backend; an `apply` failure is terminal (the whole
 /// multi-table commit aborts). On success every table is durable together.
-async fn commit_fused(catalog: &CayenneCatalog, prepared: &[PreparedTxnCommit]) -> Result<()> {
+async fn commit_fused(catalog: &CayenneCatalog, prepared: &mut [PreparedTxnCommit]) -> Result<()> {
     use turso_shared::{DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS, retry_backoff_delay};
 
     for attempt in 1..=DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS {
         let mut txn = catalog.begin_transaction().await?;
         let mut apply_err = None;
-        for pc in prepared {
+        for pc in prepared.iter_mut() {
             if let Err(e) = pc.apply_in_txn(catalog, txn.as_mut()).await {
                 apply_err = Some(e);
                 break;
@@ -438,7 +438,14 @@ async fn commit_fused(catalog: &CayenneCatalog, prepared: &[PreparedTxnCommit]) 
             return Err(Error::from(e));
         }
         match txn.commit().await {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                // Durably committed — disarm each publish's abort cleanup so its
+                // `Drop` does not delete the now-live deletion-vector files.
+                for pc in prepared.iter_mut() {
+                    pc.mark_committed();
+                }
+                return Ok(());
+            }
             Err(e)
                 if attempt < DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS
                     && crate::is_retryable_write_conflict(&e) =>

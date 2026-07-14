@@ -1601,14 +1601,35 @@ impl Drop for SqliteTransaction {
             // tokio_rusqlite::Connection::call sends a closure to the bg
             // thread; it will execute even after this Drop returns.
             // We spawn a task to await the future properly.
-            tokio::spawn(async move {
+            let rollback = async move {
                 let _ = conn
                     .call(|conn| {
                         let _ = conn.execute_batch("ROLLBACK");
                         Ok::<_, rusqlite::Error>(())
                     })
                     .await;
-            });
+            };
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(rollback);
+            } else {
+                // No ambient Tokio runtime (dropped from a non-Tokio thread).
+                // `tokio_rusqlite::Connection::call` awaits the background
+                // connection thread over a Tokio channel, so drive the
+                // best-effort rollback on a small current-thread runtime instead
+                // of a bare `futures::executor::block_on` (mirrors the Turso
+                // metastore transaction Drop). Log if the runtime cannot be built.
+                std::thread::spawn(move || {
+                    match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt.block_on(rollback),
+                        Err(err) => tracing::error!(
+                            "Failed to build fallback Tokio runtime to auto-rollback SqliteTransaction on drop: {err}"
+                        ),
+                    }
+                });
+            }
         }
     }
 }

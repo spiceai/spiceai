@@ -543,7 +543,7 @@ async fn test_txn_occ_conflict_stale_token() -> Result<(), anyhow::Error> {
                 .await?
                 .collect()
                 .await?;
-            assert_eq!(occ_value(&ctx).await?, Some(20), "advancing upsert applied");
+            assert_eq!(row_a_value(&ctx, "occ_t").await?, Some(20), "advancing upsert applied");
             let txn = CayenneTransaction::new();
             txn.register(table_id.clone(), stale_token, provider.clone_for_write_operations());
             txn.set_staged(&table_id, staged);
@@ -563,9 +563,91 @@ async fn test_txn_occ_conflict_stale_token() -> Result<(), anyhow::Error> {
 
             // The conflicting write (n=99) must have rolled back.
             assert_eq!(
-                occ_value(&ctx).await?,
+                row_a_value(&ctx, "occ_t").await?,
                 Some(20),
                 "a lost OCC race must not publish (n must stay 20, not 99)"
+            );
+            Ok(())
+        })
+        .await
+}
+
+/// Inline-tier gated commit (regression for the fused-path inline-tombstone gap).
+///
+/// A gated upsert whose superseded row lives in the mem/inline tier (never
+/// checkpointed to a file) must now commit: the fused commit path composes the
+/// inline tombstone via trunk's deferred `durable_payload`. The earlier bespoke
+/// multi-table path rejected this with "multi-table transaction on inline-mode
+/// table ... unsupported" — this test guards against that regression returning.
+#[tokio::test]
+async fn test_txn_inline_tombstone_commits() -> Result<(), anyhow::Error> {
+    use cayenne::metadata::{CreateTableOptions, VortexConfig};
+    use cayenne::{CayenneCatalog, CayenneTableProvider, CayenneTransaction, MetadataCatalog};
+    use datafusion_table_providers::util::{
+        column_reference::ColumnReference, on_conflict::OnConflict,
+    };
+
+    let _tracing = crate::init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let temp = tempfile::tempdir()?;
+            let cayenne_dir = temp.path().join("cayenne_inline");
+            let metadata_db = temp.path().join("metadata_inline.db");
+            std::fs::create_dir_all(&cayenne_dir)?;
+
+            let schema = occ_schema();
+            let options = CreateTableOptions {
+                table_name: "inline_t".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+                base_path: cayenne_dir.to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: VortexConfig::default(),
+            };
+            let catalog = Arc::new(CayenneCatalog::new(format!(
+                "sqlite://{}",
+                metadata_db.to_string_lossy()
+            ))?);
+            catalog.init().await?;
+            let catalog_arc: Arc<dyn MetadataCatalog> = catalog;
+
+            let ctx = SessionContext::new();
+            let provider =
+                CayenneTableProvider::create_table(catalog_arc, options, ctx.runtime_env()).await?;
+            ctx.register_table(
+                "inline_t",
+                Arc::new(provider.clone_for_write_operations())
+                    as Arc<dyn datafusion::datasource::TableProvider>,
+            )?;
+            let table_id = provider.table_id().to_string();
+
+            // Seed a=0 and DO NOT checkpoint the mem/inline tier: the superseded
+            // row the gated upsert replaces is an INLINE row, so its on-conflict
+            // deletion is an inline tombstone.
+            ctx.sql("INSERT INTO inline_t (id, n) VALUES ('a', 0)")
+                .await?
+                .collect()
+                .await?;
+
+            // Gated upsert a=0 -> a=10 through the fused commit path.
+            let token = provider.transaction_write_token().await;
+            let staged = provider
+                .begin_staged_upsert_occ(token, single_row_stream(&schema, "a", 10), 1)
+                .await?;
+            let txn = CayenneTransaction::new();
+            txn.register(table_id.clone(), token, provider.clone_for_write_operations());
+            txn.set_staged(&table_id, staged);
+            txn.commit().await.map_err(|e| {
+                anyhow::anyhow!("inline-tier gated commit must succeed, not be rejected: {e}")
+            })?;
+
+            // The inline tombstone hid the old a=0; the upsert's a=10 is visible.
+            assert_eq!(
+                row_a_value(&ctx, "inline_t").await?,
+                Some(10),
+                "inline-tier gated upsert must publish a=10"
             );
             Ok(())
         })
@@ -596,10 +678,10 @@ fn single_row_stream(schema: &SchemaRef, id: &str, n: i64) -> SendableRecordBatc
     ))
 }
 
-/// Read `n` for `id='a'` from the standalone OCC `SessionContext`.
-async fn occ_value(ctx: &SessionContext) -> Result<Option<i64>, anyhow::Error> {
+/// Read `n` for `id='a'` from a standalone provider registered as `table`.
+async fn row_a_value(ctx: &SessionContext, table: &str) -> Result<Option<i64>, anyhow::Error> {
     let batches = ctx
-        .sql("SELECT n FROM occ_t WHERE id = 'a'")
+        .sql(&format!("SELECT n FROM {table} WHERE id = 'a'"))
         .await?
         .collect()
         .await?;

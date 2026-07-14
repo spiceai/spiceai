@@ -171,10 +171,27 @@ impl CayenneStagedUpsert {
     /// sequences / writing deletion vectors fails.
     pub async fn prepare_commit(mut self) -> Result<PreparedTxnCommit> {
         let on_conflict_deletions = std::mem::take(&mut self.on_conflict_deletions);
-        let (delete_files, snapshot_commit, publish) = self
+        // Reserve sequences + write deletion-vector files + build the inline
+        // tombstone, WITHOUT committing the catalog metadata — `defer_catalog_commit`
+        // carries them in the returned publish's `durable_payload` for application
+        // in the shared multi-table transaction. This composes inline-mode
+        // deletions (unlike the earlier bespoke path, which rejected them).
+        let mut publish = self
             .table
-            .prepare_staged_upsert_for_txn(on_conflict_deletions, self.new_snapshot_id.clone())
+            .prepare_on_conflict_deletions_for_staged_snapshot(
+                on_conflict_deletions,
+                self.new_snapshot_id.clone(),
+                true,
+            )
             .await?;
+        // `defer_catalog_commit` couples two concerns for the append path: it
+        // both defers the durable catalog write AND suppresses the in-memory
+        // protected-snapshot promotion (appends publish into the current
+        // snapshot, not a protected one). A staged UPSERT still needs the
+        // protected-snapshot promotion — the durable side is recorded by
+        // `apply_prepared_on_conflict_in_txn` — so re-enable just the in-memory
+        // promotion, which `finish` performs via `publish_prepared_on_conflict_deletions`.
+        publish.publish_as_protected_snapshot = true;
         Ok(PreparedTxnCommit {
             table: self.table,
             new_snapshot_id: self.new_snapshot_id,
@@ -182,8 +199,6 @@ impl CayenneStagedUpsert {
             stats: self.stats,
             row_count: self.row_count,
             superseded: self.superseded,
-            delete_files,
-            snapshot_commit,
             publish,
         })
     }
@@ -310,8 +325,11 @@ pub struct PreparedTxnCommit {
     stats: Arc<ColumnStatsAccumulator>,
     row_count: u64,
     superseded: usize,
-    delete_files: Vec<crate::metadata::DeleteFile>,
-    snapshot_commit: crate::catalog::SnapshotSequenceCommit,
+    /// The deferred on-conflict publish (trunk's `durable_payload` model): its
+    /// `durable_payload` carries the delete-vector files, protected-snapshot
+    /// sequence, inline tombstone, and deferred flips, applied in the shared
+    /// transaction by [`Self::apply_in_txn`]. Its `Drop` cleans up the staged
+    /// deletion-vector files unless [`Self::mark_committed`] disarms it.
     publish: super::on_conflict::PreparedOnConflictDeletionPublish,
 }
 
@@ -334,41 +352,51 @@ impl PreparedTxnCommit {
         self.row_count
     }
 
-    /// Append this table's durable publish statements (delete files + snapshot
-    /// sequence) to the caller-owned transaction. No `begin`/`commit`.
+    /// Append this table's deferred on-conflict payload (delete files + snapshot
+    /// sequence + inline tombstone + deferred flips) to the caller-owned
+    /// transaction, plus the durable write-back markers. No `begin`/`commit`.
     ///
     /// # Errors
     ///
     /// Returns the first statement failure; the caller rolls back the shared
     /// transaction and aborts the whole multi-table commit.
     pub async fn apply_in_txn(
-        &self,
+        &mut self,
         catalog: &crate::CayenneCatalog,
         txn: &mut dyn crate::metastore::MetastoreTransaction,
     ) -> crate::catalog::CatalogResult<()> {
+        catalog
+            .apply_prepared_on_conflict_in_txn(txn, &mut self.publish)
+            .await?;
         // Durable federated write-back (#11838): on a durable-write-back table,
-        // durably mark the written PKs (their `OwnedRow` encodings) in the same
+        // durably mark the written PKs (their `OwnedRow` encodings) in the SAME
         // commit transaction so the delivery worker reconciles them to the
-        // source. Empty otherwise — a non-write-back table never marks.
-        let dirty_pk_bytes: Vec<Vec<u8>> = if self.table.is_durable_write_back() {
-            self.validated_keys
+        // source. A non-write-back table never marks.
+        if self.table.is_durable_write_back() {
+            let dirty_pk_bytes: Vec<Vec<u8>> = self
+                .validated_keys
                 .iter()
                 .map(|row| row.as_ref().to_vec())
-                .collect()
-        } else {
-            Vec::new()
-        };
-        catalog
-            .commit_staged_upsert_in_txn(
-                txn,
-                self.table.table_id(),
-                &self.delete_files,
-                Some(&self.snapshot_commit),
-                None,
-                &[],
-                &dirty_pk_bytes,
-            )
-            .await
+                .collect();
+            if !dirty_pk_bytes.is_empty() {
+                catalog
+                    .mark_dirty_keys_in_txn(
+                        txn,
+                        self.table.table_id(),
+                        &dirty_pk_bytes,
+                        self.publish.snapshot_sequence,
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Disarm the publish's destructive abort cleanup after the shared
+    /// transaction has durably committed (mirrors the sync path's
+    /// post-commit `mark_catalog_committed`).
+    pub(crate) fn mark_committed(&mut self) {
+        self.publish.mark_catalog_committed();
     }
 
     /// Flip in-memory visibility after the shared transaction committed. Must run
@@ -380,8 +408,9 @@ impl PreparedTxnCommit {
     ///
     /// Returns an error only if swapping the in-memory deletion caches fails.
     pub fn finish(self) -> Result<u64> {
+        let sequence = self.publish.snapshot_sequence;
         self.table
-            .publish_prepared_on_conflict_deletions(self.publish)?;
+            .publish_prepared_on_conflict_deletions(self.publish);
         let retention_requested = self.table.has_retention_delete_filters();
         let live_rows_delta = i64::try_from(self.row_count)
             .unwrap_or(i64::MAX)
@@ -395,14 +424,15 @@ impl PreparedTxnCommit {
         if retention_requested {
             self.table.clear_cached_pk_keyset();
         } else {
-            self.table
-                .record_file_pk_keys(&self.validated_keys, self.snapshot_commit.sequence_number);
+            self.table.record_file_pk_keys(&self.validated_keys, sequence);
         }
         Ok(self.row_count)
     }
 
     /// Discard a prepared-but-uncommitted table (the shared transaction was not
-    /// committed): remove its unreferenced staged snapshot directory.
+    /// committed): the publish's `Drop` removes its staged deletion-vector files
+    /// (still armed — `mark_committed` was never called); this also removes the
+    /// unreferenced staged replacement-snapshot directory.
     pub async fn rollback(self) {
         cleanup_orphan_snapshot_dir(&self.table, &self.new_snapshot_id).await;
     }

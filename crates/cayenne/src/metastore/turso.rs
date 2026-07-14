@@ -1093,7 +1093,7 @@ pub struct TursoTransaction {
 impl Drop for TursoTransaction {
     fn drop(&mut self) {
         if let Some(guard) = self.conn.take() {
-            tokio::spawn(async move {
+            let rollback = async move {
                 tracing::debug!(
                     "TursoTransaction dropped without explicit commit or rollback; \
                      attempting auto-rollback"
@@ -1102,7 +1102,28 @@ impl Drop for TursoTransaction {
                     tracing::error!("Failed to auto-rollback TursoTransaction on drop: {err}");
                 }
                 // `guard` is dropped here, releasing the pool slot.
-            });
+            };
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(rollback);
+            } else {
+                // No ambient Tokio runtime (the transaction was dropped from a
+                // non-Tokio thread). `turso`'s connection I/O is Tokio-based, so
+                // `futures::executor::block_on` would run it without a reactor
+                // and could panic or stall. Build a small current-thread Tokio
+                // runtime to drive the best-effort rollback, logging if even
+                // the runtime cannot be created.
+                std::thread::spawn(move || {
+                    match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt.block_on(rollback),
+                        Err(err) => tracing::error!(
+                            "Failed to build fallback Tokio runtime to auto-rollback TursoTransaction on drop: {err}"
+                        ),
+                    }
+                });
+            }
         }
     }
 }
