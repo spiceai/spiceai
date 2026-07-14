@@ -54,14 +54,10 @@ mod tests {
     /// Parse YAML into a string map, construct `Parameters`, then exercise every
     /// `params.get(key)` the provider function calls. A panic here means a key
     /// is missing from the `ParameterSpec`.
-    async fn build_params(
-        prefix: &EmbeddingPrefix,
-        yaml: &str,
-    ) -> Parameters {
-        let string_map: std::collections::HashMap<String, String> =
-            yaml::from_str::<Params>(yaml)
-                .expect("YAML must parse")
-                .as_string_map();
+    async fn build_params(prefix: &EmbeddingPrefix, yaml: &str) -> Parameters {
+        let string_map: std::collections::HashMap<String, String> = yaml::from_str::<Params>(yaml)
+            .expect("YAML must parse")
+            .as_string_map();
         let secrets = Arc::new(RwLock::new(Secrets::default()));
         let params_with_secrets =
             runtime_secrets::get_params_with_secrets(Arc::clone(&secrets), &string_map)
@@ -157,12 +153,30 @@ mod tests {
         .await;
         // AWS params consumed via get_runtime_params()
         let runtime = params.get_runtime_params();
-        assert!(runtime.contains_key("aws_region"), "aws_region missing from runtime params");
-        assert!(runtime.contains_key("aws_access_key_id"), "aws_access_key_id missing from runtime params");
-        assert!(runtime.contains_key("aws_secret_access_key"), "aws_secret_access_key missing from runtime params");
-        assert!(runtime.contains_key("aws_profile"), "aws_profile missing from runtime params");
-        assert!(runtime.contains_key("requests_per_min_limit"), "requests_per_min_limit missing from runtime params");
-        assert!(runtime.contains_key("max_concurrent_invocations"), "max_concurrent_invocations missing from runtime params");
+        assert!(
+            runtime.contains_key("aws_region"),
+            "aws_region missing from runtime params"
+        );
+        assert!(
+            runtime.contains_key("aws_access_key_id"),
+            "aws_access_key_id missing from runtime params"
+        );
+        assert!(
+            runtime.contains_key("aws_secret_access_key"),
+            "aws_secret_access_key missing from runtime params"
+        );
+        assert!(
+            runtime.contains_key("aws_profile"),
+            "aws_profile missing from runtime params"
+        );
+        assert!(
+            runtime.contains_key("requests_per_min_limit"),
+            "requests_per_min_limit missing from runtime params"
+        );
+        assert!(
+            runtime.contains_key("max_concurrent_invocations"),
+            "max_concurrent_invocations missing from runtime params"
+        );
         // Model-specific params accessed directly in embed.rs
         let _ = params.get("dimensions");
         let _ = params.get("normalize");
