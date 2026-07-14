@@ -249,14 +249,15 @@ impl CayenneDataSink {
     /// (fail-closed).
     fn active_transaction(&self, context: &Arc<TaskContext>) -> Option<CayenneTransaction> {
         let txn = resolve_request_context(context, false)?.extension::<CayenneTransaction>()?;
-        if txn.is_participant(self.table.table_id()) {
-            Some(txn)
-        } else {
+        if !txn.is_participant(self.table.table_id()) {
             // A write to a Cayenne table outside the transaction's participant
-            // set: fail-closed (the commit aborts) rather than publishing.
+            // set: mark the transaction fail-closed (its commit aborts) and
+            // still route it through the staged path, which REJECTS the write.
+            // Returning `None` here would fall through to an immediate publish —
+            // an atomicity break if participant registration is ever missed.
             txn.mark_unregistered_read();
-            None
         }
+        Some(txn)
     }
 
     /// Stage a write for an active transaction instead of publishing it: take
@@ -275,6 +276,15 @@ impl CayenneDataSink {
         context: &Arc<TaskContext>,
     ) -> super::Result<u64> {
         let table_id = self.table.table_id();
+        if !txn.is_participant(table_id) {
+            // Fail-closed: the executor never registered this table as a
+            // participant (its begin token was never captured), so its write
+            // cannot be committed atomically with the rest. Reject rather than
+            // publish; the transaction then aborts (see `active_transaction`).
+            return Err(super::Error::Unsupported {
+                operation: "write to a table outside the transaction's participant set",
+            });
+        }
         if self.overwrite != InsertOp::Append {
             return Err(super::Error::Unsupported {
                 operation: "transaction overwrite write",
