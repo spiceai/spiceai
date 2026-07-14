@@ -26,7 +26,7 @@ use snafu::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
     path::{Component, Path, PathBuf},
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, Weak},
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -36,17 +36,139 @@ use tokio::{
 /// Global lock map for coordinating concurrent extractions to shared directories.
 /// This prevents race conditions when multiple Cayenne datasets try to extract
 /// snapshots to the same metadata directory simultaneously.
-static DIRECTORY_EXTRACTION_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
+static DIRECTORY_EXTRACTION_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Acquire an exclusive lock for extracting to a specific directory.
-/// Returns a guard that must be held during the extraction.
-async fn acquire_directory_lock(dir: &Path) -> Arc<Mutex<()>> {
-    let mut locks = DIRECTORY_EXTRACTION_LOCKS.lock().await;
-    let lock = locks
-        .entry(dir.to_path_buf())
-        .or_insert_with(|| Arc::new(Mutex::new(())));
-    Arc::clone(lock)
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedPrefixMapping {
+    prefix: PathBuf,
+    target_dir: PathBuf,
+}
+
+fn normalize_prefix_mappings(
+    mappings: Option<&Vec<(String, PathBuf)>>,
+) -> Result<Vec<NormalizedPrefixMapping>> {
+    let Some(mappings) = mappings else {
+        return Ok(Vec::new());
+    };
+    let mut normalized = mappings
+        .iter()
+        .map(|(prefix, target_dir)| {
+            Ok(NormalizedPrefixMapping {
+                prefix: validate_archive_relative_path(Path::new(prefix))?,
+                target_dir: target_dir.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Longest segment prefix wins. Lexical tie-breakers make the result stable
+    // regardless of caller-provided mapping order.
+    normalized.sort_by(|left, right| {
+        right
+            .prefix
+            .components()
+            .count()
+            .cmp(&left.prefix.components().count())
+            .then_with(|| left.prefix.cmp(&right.prefix))
+            .then_with(|| left.target_dir.cmp(&right.target_dir))
+    });
+    for pair in normalized.windows(2) {
+        if pair[0].prefix == pair[1].prefix && pair[0].target_dir != pair[1].target_dir {
+            return Err(ArchiveError::UnsafeArchivePath {
+                path: pair[0].prefix.clone(),
+                reason: "duplicate archive prefix maps to multiple destination directories"
+                    .to_string(),
+            });
+        }
+    }
+    normalized.dedup();
+    Ok(normalized)
+}
+
+async fn canonical_lock_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|source| ArchiveError::ExtractArchive {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .join(path)
+    };
+    let mut probe = absolute.as_path();
+    let mut missing = Vec::new();
+    loop {
+        match tokio::fs::canonicalize(probe).await {
+            Ok(mut canonical) => {
+                for component in missing.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = probe.file_name() else {
+                    return Err(ArchiveError::ExtractArchive {
+                        path: absolute,
+                        source: error,
+                    });
+                };
+                missing.push(name.to_os_string());
+                let Some(parent) = probe.parent() else {
+                    return Err(ArchiveError::ExtractArchive {
+                        path: absolute,
+                        source: error,
+                    });
+                };
+                probe = parent;
+            }
+            Err(source) => {
+                return Err(ArchiveError::ExtractArchive {
+                    path: absolute,
+                    source,
+                });
+            }
+        }
+    }
+}
+
+/// Acquire every destination-root lock in canonical lexical order. Holding all
+/// roots prevents two archives with different default targets but a shared
+/// prefix mapping from concurrently mutating that mapped directory.
+async fn acquire_extraction_locks(
+    target_dir: &Path,
+    mappings: &[NormalizedPrefixMapping],
+) -> Result<Vec<tokio::sync::OwnedMutexGuard<()>>> {
+    let mut roots = Vec::with_capacity(mappings.len() + 1);
+    roots.push(canonical_lock_path(target_dir).await?);
+    for mapping in mappings {
+        roots.push(canonical_lock_path(&mapping.target_dir).await?);
+    }
+    roots.sort();
+    roots.dedup();
+
+    let lock_handles = {
+        let mut locks = DIRECTORY_EXTRACTION_LOCKS.lock().await;
+        locks.retain(|_, lock| lock.upgrade().is_some());
+        roots
+            .into_iter()
+            .map(|root| {
+                if let Some(lock) = locks.get(&root).and_then(Weak::upgrade) {
+                    lock
+                } else {
+                    let lock = Arc::new(Mutex::new(()));
+                    locks.insert(root, Arc::downgrade(&lock));
+                    lock
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut guards = Vec::with_capacity(lock_handles.len());
+    for lock in lock_handles {
+        guards.push(lock.lock_owned().await);
+    }
+    Ok(guards)
 }
 
 #[derive(Debug, Snafu)]
@@ -232,6 +354,89 @@ where
     Ok(total_bytes)
 }
 
+/// Archive directories directly into a filesystem file without materializing
+/// the tar payload in memory.
+///
+/// # Errors
+/// Returns an error when the destination file or any archive input cannot be
+/// read or written.
+pub async fn archive_directories_to_file_with_plan(
+    dirs: &[(PathBuf, String)],
+    destination: &Path,
+    skip_relative_paths: &[PathBuf],
+    extras: &[(String, Vec<u8>)],
+) -> Result<u64> {
+    let dirs = dirs.to_vec();
+    let destination = destination.to_path_buf();
+    let skip: HashSet<PathBuf> = skip_relative_paths.iter().cloned().collect();
+    let extras = extras.to_vec();
+
+    tokio::task::spawn_blocking(move || {
+        let file =
+            std::fs::File::create(&destination).map_err(|source| ArchiveError::CreateArchive {
+                path: destination.clone(),
+                source,
+            })?;
+        let mut archive = tar::Builder::new(file);
+
+        for (dir_path, archive_prefix) in &dirs {
+            let metadata = match std::fs::symlink_metadata(dir_path) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::warn!("Directory {} does not exist, skipping", dir_path.display());
+                    continue;
+                }
+                Err(source) => {
+                    return Err(ArchiveError::CreateArchive {
+                        path: dir_path.clone(),
+                        source,
+                    });
+                }
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                tracing::warn!(
+                    "Directory {} is not archivable, skipping",
+                    dir_path.display()
+                );
+                continue;
+            }
+            add_directory_to_archive_filtered(&mut archive, dir_path, archive_prefix, &skip)
+                .map_err(|source| ArchiveError::CreateArchive {
+                    path: dir_path.clone(),
+                    source,
+                })?;
+        }
+
+        for (archive_path, bytes) in &extras {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_mtime(0);
+            archive
+                .append_data(&mut header, archive_path.as_str(), bytes.as_slice())
+                .map_err(|source| ArchiveError::WriteArchive { source })?;
+        }
+        archive
+            .finish()
+            .map_err(|source| ArchiveError::WriteArchive { source })?;
+        let mut file = archive
+            .into_inner()
+            .map_err(|source| ArchiveError::WriteArchive { source })?;
+        std::io::Write::flush(&mut file).map_err(|source| ArchiveError::WriteArchive { source })?;
+        file.metadata()
+            .map(|metadata| metadata.len())
+            .map_err(|source| ArchiveError::CreateArchive {
+                path: destination,
+                source,
+            })
+    })
+    .await
+    .map_err(|source| ArchiveError::WriteArchive {
+        source: std::io::Error::other(source),
+    })?
+}
+
 /// Options for controlling archive extraction behavior.
 #[derive(Debug, Clone, Default)]
 pub struct ExtractOptions {
@@ -339,14 +544,11 @@ where
     use tokio::io::AsyncReadExt;
     use tokio::task::spawn_blocking;
 
-    // Acquire directory lock to prevent concurrent extractions to the same directory.
-    // This is critical for data integrity when multiple Cayenne datasets share
-    // a metadata directory.
-    let dir_lock = acquire_directory_lock(target_dir).await;
-    let _lock_guard = dir_lock.lock().await;
+    let normalized_mappings = normalize_prefix_mappings(options.prefix_mappings.as_ref())?;
+    let _lock_guards = acquire_extraction_locks(target_dir, &normalized_mappings).await?;
 
     tracing::debug!(
-        "Acquired extraction lock for directory: {}",
+        "Acquired extraction locks for directory roots including: {}",
         target_dir.display()
     );
 
@@ -371,7 +573,12 @@ where
             source,
         })?;
 
-        extract_with_skip_existing_and_verify(&mut archive, &target_dir, &options)?;
+        extract_with_skip_existing_and_verify(
+            &mut archive,
+            &target_dir,
+            &options,
+            &normalized_mappings,
+        )?;
 
         Ok::<(), ArchiveError>(())
     })
@@ -379,6 +586,46 @@ where
     .map_err(|e| ArchiveError::ExtractArchive {
         path: target_dir_for_error,
         source: std::io::Error::other(e),
+    })??;
+
+    Ok(())
+}
+
+/// Extract an archive directly from a filesystem file without first reading the
+/// entire archive into memory.
+///
+/// # Errors
+/// Returns an error if the archive cannot be opened, validated, or extracted.
+pub async fn extract_archive_file_with_options(
+    archive_path: &Path,
+    target_dir: &Path,
+    options: ExtractOptions,
+) -> Result<()> {
+    let normalized_mappings = normalize_prefix_mappings(options.prefix_mappings.as_ref())?;
+    let _lock_guards = acquire_extraction_locks(target_dir, &normalized_mappings).await?;
+    let archive_path = archive_path.to_path_buf();
+    let target_dir = target_dir.to_path_buf();
+    let target_dir_for_error = target_dir.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(&archive_path)
+            .map_err(|source| ArchiveError::ReadArchive { source })?;
+        let mut archive = tar::Archive::new(file);
+        std::fs::create_dir_all(&target_dir).map_err(|source| ArchiveError::ExtractArchive {
+            path: target_dir.clone(),
+            source,
+        })?;
+        extract_with_skip_existing_and_verify(
+            &mut archive,
+            &target_dir,
+            &options,
+            &normalized_mappings,
+        )
+    })
+    .await
+    .map_err(|source| ArchiveError::ExtractArchive {
+        path: target_dir_for_error,
+        source: std::io::Error::other(source),
     })??;
 
     Ok(())
@@ -617,7 +864,8 @@ fn create_new_temp_file(temp_path: &Path, target_dir: &Path) -> Result<std::fs::
 fn set_archive_permissions(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    let permissions = std::fs::Permissions::from_mode(mode & 0o7777);
+    // Never restore setuid/setgid/sticky bits from an external archive.
+    let permissions = std::fs::Permissions::from_mode(mode & 0o777);
     std::fs::set_permissions(path, permissions).map_err(|source| ArchiveError::ExtractArchive {
         path: path.to_path_buf(),
         source,
@@ -627,25 +875,28 @@ fn set_archive_permissions(path: &Path, mode: u32) -> Result<()> {
 fn remap_entry_path(
     entry_path: &Path,
     default_target_dir: &Path,
-    prefix_mappings: Option<&Vec<(String, PathBuf)>>,
+    prefix_mappings: &[NormalizedPrefixMapping],
 ) -> Result<(PathBuf, PathBuf)> {
-    let entry_path_str = entry_path.to_string_lossy();
-
-    if let Some(mappings) = prefix_mappings {
-        for (prefix, target_dir) in mappings {
-            if entry_path_str.starts_with(prefix) {
-                // Strip the prefix and join with the target directory
-                let relative = entry_path_str
-                    .strip_prefix(prefix)
-                    .unwrap_or(&entry_path_str);
-                let dest_path = safe_destination_path(target_dir, Path::new(relative))?;
-                return Ok((dest_path, target_dir.clone()));
-            }
+    let entry_path = validate_archive_relative_path(entry_path)?;
+    for mapping in prefix_mappings {
+        if entry_path.starts_with(&mapping.prefix) {
+            let relative = entry_path.strip_prefix(&mapping.prefix).map_err(|_| {
+                ArchiveError::UnsafeArchivePath {
+                    path: entry_path.clone(),
+                    reason: "failed to strip a matched archive prefix".to_string(),
+                }
+            })?;
+            let dest_path = if relative.as_os_str().is_empty() {
+                mapping.target_dir.clone()
+            } else {
+                safe_destination_path(&mapping.target_dir, relative)?
+            };
+            return Ok((dest_path, mapping.target_dir.clone()));
         }
     }
 
     // No matching prefix, use default target directory
-    let dest_path = safe_destination_path(default_target_dir, entry_path)?;
+    let dest_path = safe_destination_path(default_target_dir, &entry_path)?;
     Ok((dest_path, default_target_dir.to_path_buf()))
 }
 
@@ -658,6 +909,7 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
     archive: &mut tar::Archive<R>,
     target_dir: &Path,
     options: &ExtractOptions,
+    prefix_mappings: &[NormalizedPrefixMapping],
 ) -> Result<()> {
     use std::fs;
 
@@ -669,8 +921,7 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
         let entry_path = entry
             .path()
             .map_err(|source| ArchiveError::ReadArchive { source })?;
-        let (dest_path, dest_root) =
-            remap_entry_path(&entry_path, target_dir, options.prefix_mappings.as_ref())?;
+        let (dest_path, dest_root) = remap_entry_path(&entry_path, target_dir, prefix_mappings)?;
 
         let entry_type = entry.header().entry_type();
         #[cfg(unix)]
@@ -818,6 +1069,21 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
             })?;
 
             #[cfg(unix)]
+            if let Some(parent) = dest_path.parent() {
+                let parent_dir =
+                    fs::File::open(parent).map_err(|source| ArchiveError::ExtractArchive {
+                        path: parent.to_path_buf(),
+                        source,
+                    })?;
+                parent_dir
+                    .sync_all()
+                    .map_err(|source| ArchiveError::ExtractArchive {
+                        path: parent.to_path_buf(),
+                        source,
+                    })?;
+            }
+
+            #[cfg(unix)]
             if let Some(mode) = entry_mode {
                 set_archive_permissions(&dest_path, mode)?;
             }
@@ -963,6 +1229,83 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o755);
+
+        Ok(())
+    }
+
+    /// Regression: setuid/setgid/sticky bits from an archived entry must NOT be
+    /// restored on extract (a malicious snapshot must not drop a setuid binary);
+    /// the ordinary permission bits are preserved.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_extract_strips_setuid_setgid_sticky_bits() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let test_dir = TempDir::new().expect("Failed to create temp dir");
+        // 0o7755 = setuid + setgid + sticky + rwxr-xr-x.
+        let archive_buffer = archive_with_file_mode("data/suid.sh", b"#!/bin/sh\n", 0o7755);
+
+        extract_archive(Cursor::new(archive_buffer), test_dir.path()).await?;
+
+        let full_mode = std::fs::metadata(test_dir.path().join("data/suid.sh"))
+            .expect("extracted file metadata should be readable")
+            .permissions()
+            .mode();
+        assert_eq!(
+            full_mode & 0o7000,
+            0,
+            "setuid/setgid/sticky bits must be stripped on extract"
+        );
+        assert_eq!(
+            full_mode & 0o777,
+            0o755,
+            "ordinary permission bits must be preserved"
+        );
+
+        Ok(())
+    }
+
+    /// Regression: the streaming (never-fully-in-memory) archive/extract APIs
+    /// used for large snapshots must round-trip directory contents and `extras`.
+    #[tokio::test]
+    async fn test_archive_to_file_and_extract_from_file_round_trip() -> Result<()> {
+        let test_dir = TempDir::new().expect("Failed to create temp dir");
+        let data_dir = test_dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("Failed to create data dir");
+        std::fs::write(data_dir.join("file1.vortex"), b"stream data 1").expect("write file1");
+        std::fs::write(data_dir.join("file2.vortex"), b"stream data 2").expect("write file2");
+
+        let archive_path = test_dir.path().join("snapshot.tar");
+        let dirs = vec![(data_dir.clone(), "data/".to_string())];
+        let extras = vec![("meta.json".to_string(), b"{\"v\":1}".to_vec())];
+        let bytes_written =
+            archive_directories_to_file_with_plan(&dirs, &archive_path, &[], &extras).await?;
+        assert!(bytes_written > 0);
+        assert!(archive_path.exists());
+
+        let extract_dir = TempDir::new().expect("Failed to create extract dir");
+        extract_archive_file_with_options(
+            &archive_path,
+            extract_dir.path(),
+            ExtractOptions::default(),
+        )
+        .await?;
+
+        assert_eq!(
+            std::fs::read_to_string(extract_dir.path().join("data/file1.vortex"))
+                .expect("read extracted file1"),
+            "stream data 1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(extract_dir.path().join("data/file2.vortex"))
+                .expect("read extracted file2"),
+            "stream data 2"
+        );
+        assert_eq!(
+            std::fs::read_to_string(extract_dir.path().join("meta.json"))
+                .expect("read extracted extra"),
+            "{\"v\":1}"
+        );
 
         Ok(())
     }
@@ -1149,6 +1492,62 @@ mod tests {
             Err(ArchiveError::UnsafeArchivePath { .. })
         ));
         assert!(!test_dir.path().join("outside.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_prefix_mapping_uses_longest_segment_prefix() -> Result<()> {
+        let test_dir = TempDir::new().expect("Failed to create temp dir");
+        let default_dir = test_dir.path().join("default");
+        let broad_dir = test_dir.path().join("broad");
+        let specific_dir = test_dir.path().join("specific");
+        let mappings = vec![
+            ("data".to_string(), broad_dir),
+            ("data/nested".to_string(), specific_dir.clone()),
+        ];
+        let normalized = normalize_prefix_mappings(Some(&mappings))?;
+
+        let (specific_path, _) = remap_entry_path(
+            Path::new("data/nested/file.vortex"),
+            &default_dir,
+            &normalized,
+        )?;
+        assert_eq!(specific_path, specific_dir.join("file.vortex"));
+
+        // Segment-aware matching must not route `database/...` through `data`.
+        let (default_path, _) =
+            remap_entry_path(Path::new("database/file.vortex"), &default_dir, &normalized)?;
+        assert_eq!(default_path, default_dir.join("database/file.vortex"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_extraction_lock_map_prunes_completed_roots() -> Result<()> {
+        let test_dir = TempDir::new().expect("Failed to create temp dir");
+        let first = test_dir.path().join("first");
+        let second = test_dir.path().join("second");
+        let first_key = canonical_lock_path(&first).await?;
+        let second_key = canonical_lock_path(&second).await?;
+
+        let first_guards = acquire_extraction_locks(&first, &[]).await?;
+        assert!(
+            DIRECTORY_EXTRACTION_LOCKS
+                .lock()
+                .await
+                .contains_key(&first_key)
+        );
+        drop(first_guards);
+
+        let second_guards = acquire_extraction_locks(&second, &[]).await?;
+        let locks = DIRECTORY_EXTRACTION_LOCKS.lock().await;
+        assert!(!locks.contains_key(&first_key));
+        assert!(
+            locks
+                .get(&second_key)
+                .is_some_and(|lock| lock.upgrade().is_some())
+        );
+        drop(locks);
+        drop(second_guards);
+        Ok(())
     }
 
     #[cfg(unix)]
