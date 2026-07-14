@@ -441,6 +441,26 @@ async fn settle(table: &Arc<CayenneTableProvider>, durability: Durability) -> Te
     Ok(())
 }
 
+/// One background maintenance pass without full current-snapshot compaction.
+///
+/// Cold-tier fuzz configs disable timer-driven small-file compaction
+/// (`compaction_background_interval_ms = 0`) and drive cold promotion explicitly
+/// through `MoveToColdTier`. Keep the concurrent cold background loop shaped like
+/// production by running protected-snapshot maintenance, but not the test-only
+/// full current-snapshot rewrite.
+async fn settle_protected_maintenance_only(
+    table: &Arc<CayenneTableProvider>,
+    durability: Durability,
+) -> TestResult<()> {
+    table.flush_pending_maintenance().await?;
+    if durability == Durability::Memory {
+        table.checkpoint_mem_tier().await?;
+        let _ = table.bake_seq_prefix_protected_snapshots().await?;
+    }
+    table.compact_protected_snapshots_subset(usize::MAX).await?;
+    Ok(())
+}
+
 /// Prepare enough warm-tier files for a cold-promotion.
 async fn materialize_warm_files_for_cold_promotion(
     table: &Arc<CayenneTableProvider>,
@@ -819,16 +839,16 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     }
     let mut model: Model = (0..w.population).map(|k| (k, k * 10)).collect();
 
-    // Restart-swappable table handle shared with the background compactor.
-    // Foreground ops AND compaction take a READ lock (so they still run
+    // Restart-swappable table handle shared with the background maintenance loop.
+    // Foreground ops AND maintenance take a READ lock (so they still run
     // concurrently — read locks are shared); a `Restart` op takes the WRITE
     // lock, which quiesces both, reopens the table from the catalog, and swaps
-    // the handle. This exercises restart/recovery CONCURRENTLY with compaction
-    // (the compactor holds its read lock across each pass, so a restart waits
-    // for an in-flight compaction rather than tearing it). The read context is
-    // tracked separately and only used for the post-quiesce assertions (the
-    // mutation helpers build their own contexts), so it just follows the latest
-    // reopened provider.
+    // the handle. This exercises restart/recovery CONCURRENTLY with maintenance
+    // (the loop holds its read lock across each pass, so a restart waits for an
+    // in-flight pass rather than tearing it). The read context is tracked
+    // separately and only used for the post-quiesce assertions (the mutation
+    // helpers build their own contexts), so it just follows the latest reopened
+    // provider.
     let handle = Arc::new(tokio::sync::RwLock::new(Arc::clone(&table0)));
     let mut ctx = ctx0;
     drop(table0);
@@ -837,15 +857,22 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     let bg_handle = Arc::clone(&handle);
     let bg_stop = Arc::clone(&stop);
     let bg_durability = w.durability;
+    let bg_protected_only = w.cold;
     let compactor = tokio::spawn(async move {
         while !bg_stop.load(Ordering::Relaxed) {
             {
                 // Hold the read lock across the pass so a concurrent restart
-                // (write lock) waits for it instead of swapping mid-compaction.
-                // For memory this also checkpoints the RAM tier + bakes — the
-                // background CDC checkpointer racing foreground mem-tier appends.
+                // (write lock) waits for it instead of swapping mid-maintenance.
+                // Cold configs keep this production-shaped: protected-snapshot
+                // maintenance only, because timer-driven small-file compaction is
+                // disabled for these tables.
                 let t = bg_handle.read().await;
-                let _ = settle(&t, bg_durability).await;
+                let result = if bg_protected_only {
+                    settle_protected_maintenance_only(&t, bg_durability).await
+                } else {
+                    settle(&t, bg_durability).await
+                };
+                let _ = result;
             }
             tokio::task::yield_now().await;
         }
@@ -853,8 +880,10 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
 
     // Foreground stream. `compact` is driven by the background loop (a foreground
     // Compact op is a no-op here); `restart` reopens under the write lock.
+    let mut history: Vec<Op> = Vec::with_capacity(w.ops);
     for _ in 0..w.ops {
         let op = gen_op(&mut rng, &w.weights, w.population, w.batch_size);
+        history.push(op.clone());
         match &op {
             Op::Upsert { rows } => {
                 let t = handle.read().await;
@@ -898,9 +927,9 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
             }
             Op::MoveToColdTier => {
                 // Foreground promotion under the shared read lock, racing the
-                // background compactor — promotion vs compaction/bake
-                // interleavings fall out for free. GC runs serialized after
-                // promote (production order); see the sequential arm.
+                // background protected-snapshot maintenance loop. GC runs
+                // serialized after promote (production order); see the
+                // sequential arm.
                 let t = handle.read().await;
                 materialize_warm_files_for_cold_promotion(&t, w.durability).await?;
                 let _ = t.promote_warm_to_cold().await?;
@@ -915,14 +944,18 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     stop.store(true, Ordering::Relaxed);
     compactor.await.expect("compaction task joins");
     let table = Arc::clone(&*handle.read().await);
-    settle(&table, w.durability).await?;
+    if w.cold {
+        settle_protected_maintenance_only(&table, w.durability).await?;
+    } else {
+        settle(&table, w.durability).await?;
+    }
     // Quiesce before the final assertion so no detached compaction from this (or
     // an earlier, since-replaced) instance commits mid-read.
     table.drain_in_flight_maintenance().await?;
 
     let live = read_rows(&ctx, &name).await?;
     let msg = format!(
-        "concurrent convergence failed mode={:?} durability={:?} seed={seed}",
+        "concurrent convergence failed mode={:?} durability={:?} seed={seed}\nhistory={history:?}",
         w.mode, w.durability,
     );
     assert_converged(&live, &model, &msg);
