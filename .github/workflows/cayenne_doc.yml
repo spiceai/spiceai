@@ -93,12 +93,16 @@ jobs:
         id: build
         working-directory: docs/cayenne
         run: |
-          if python3 build_pdf.py; then
+          set +e
+          python3 build_pdf.py
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
             echo "outcome=success" >> "$GITHUB_OUTPUT"
-          elif [ "$?" -eq 2 ]; then
+          elif [ "$status" -eq 2 ]; then
             echo "outcome=kroki_failure" >> "$GITHUB_OUTPUT"
           else
-            exit 1
+            exit "$status"
           fi
 
       - name: Warn on kroki render failure
