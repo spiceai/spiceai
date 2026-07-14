@@ -116,7 +116,9 @@ mod tests {
     async fn invalid_pdf_returns_error_without_panicking() {
         let parser = PdfParser::default();
         let result = parser
-            .parse(&Bytes::from_static(b"this is definitely not a pdf document"))
+            .parse(&Bytes::from_static(
+                b"this is definitely not a pdf document",
+            ))
             .await;
         assert!(
             result.is_err(),

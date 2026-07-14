@@ -98,7 +98,8 @@ pub(crate) async fn ensure_loaded() -> Result<(), Error> {
         }
     };
 
-    match tokio::task::spawn_blocking(move || liteparse_pdfium_sys::dynamic::load(&lib_path)).await {
+    match tokio::task::spawn_blocking(move || liteparse_pdfium_sys::dynamic::load(&lib_path)).await
+    {
         Ok(Ok(())) => {
             PDFIUM_LOADED.store(true, Ordering::Release);
             Ok(())
@@ -161,7 +162,8 @@ fn download_and_extract(asset: &str, dest: &Path) -> Result<(), String> {
     if tmp.exists() {
         std::fs::remove_dir_all(&tmp).ok();
     }
-    std::fs::create_dir_all(&tmp).map_err(|e| format!("failed to create {}: {e}", tmp.display()))?;
+    std::fs::create_dir_all(&tmp)
+        .map_err(|e| format!("failed to create {}: {e}", tmp.display()))?;
     archive
         .unpack(&tmp)
         .map_err(|e| format!("failed to extract PDFium archive from {url}: {e}"))?;
@@ -222,7 +224,11 @@ fn base_cache_dir() -> Result<PathBuf, String> {
 /// `pdfium-binaries` ships the Windows DLL under `bin/` and the Unix library
 /// under `lib/`.
 fn lib_subdir() -> &'static str {
-    if cfg!(target_os = "windows") { "bin" } else { "lib" }
+    if cfg!(target_os = "windows") {
+        "bin"
+    } else {
+        "lib"
+    }
 }
 
 /// The `PDFium` shared library file name for this target.
@@ -317,6 +323,10 @@ mod tests {
             return;
         };
         assert!(dir.ends_with("pdfium-linux-x64"), "{}", dir.display());
-        assert!(dir.to_string_lossy().contains("pdfium"), "{}", dir.display());
+        assert!(
+            dir.to_string_lossy().contains("pdfium"),
+            "{}",
+            dir.display()
+        );
     }
 }
