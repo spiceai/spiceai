@@ -904,6 +904,22 @@ pub struct VortexConfig {
     /// above-scan key-based filter.
     #[serde(default)]
     pub deletion_mode: DeletionMode,
+    /// Whether this table is a pure in-memory (`mode: memory`) accelerator: all
+    /// data lives in the RAM mem-tier (the in-memory metastore holds only metadata), no Vortex
+    /// data files are ever written (checkpoint + compaction disabled), it is
+    /// ephemeral (reload from the source on restart — for CDC `changes` the source
+    /// slot is committed immediately after each in-RAM write, since there is no
+    /// durable checkpoint to defer behind), and a hard RAM bound returns an error
+    /// on breach instead of spilling.
+    ///
+    /// Not a user param — `VortexConfig` is only serde-deserialized from the metastore
+    /// (never from user input; the accelerator builds it field-by-field), so this is
+    /// set programmatically by the accelerator from the acceleration `mode: memory`.
+    /// It IS serialized with the table config so it survives the create-time
+    /// metastore round-trip (`create` re-reads the table via `get_table`). For a
+    /// memory table the metastore is itself in-RAM; a file-mode table stores `false`.
+    #[serde(default)]
+    pub memory_mode: bool,
     /// Durability mode for the inline CDC write path. [`CdcDurability::Memory`]
     /// (default) appends to an in-RAM tier and defers the slot ack to a
     /// periodic/cap-triggered checkpoint — A/B-validated faster than `file`
@@ -1446,6 +1462,7 @@ impl Default for VortexConfig {
             pk_conflict_detection: PkConflictDetection::default(),
             pk_keyset_cache_mb: None,
             deletion_mode: DeletionMode::default(),
+            memory_mode: false,
             cdc_durability: CdcDurability::default(),
             cdc_mem_tier_max_bytes: default_cdc_mem_tier_max_bytes(),
             cdc_mem_tier_shards: default_cdc_mem_tier_shards(),

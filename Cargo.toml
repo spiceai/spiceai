@@ -102,7 +102,7 @@ license-file = "LICENSE"
 publish = false
 repository = "https://github.com/spiceai/spiceai"
 rust-version = "1.96.1"
-version = "2.1.0-unstable"
+version = "2.2.0-unstable"
 
 # Clippy lint levels for the workspace. Each member crate opts in with
 # `[lints]\nworkspace = true` so scoped `cargo clippy -p <crate>` and rust-analyzer
@@ -423,6 +423,17 @@ debug = 1                 # DWARF symbols for readable stack traces
 strip = "none"            # Ensure symbols not stripped
 incremental = false       # Deterministic builds
 lto = "thin"              # Keep prod-like LTO (thin is fast + optimized)
+
+# Faithful-to-release profiling build: identical codegen to `release` (no LTO or
+# panic override, unlike `release-debug`), so sampled hotspots match the binary we
+# actually benchmark. Debug info is emitted to a split sidecar (.dSYM on macOS,
+# .dwp on Linux) so the shipped binary stays lean; ship the sidecar alongside the
+# binary and a sampling profiler (samply/perf) resolves line & inline frames.
+[profile.release-profiling]
+inherits = "release"
+debug = 1                 # function + line + inline-frame info
+strip = "none"            # keep the symbol table in the binary too
+split-debuginfo = "packed"
 
 [profile.lint]
 debug = "line-tables-only"

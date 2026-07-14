@@ -383,7 +383,7 @@ async fn run_ai_query_with_timeout(
     query: &str,
     query_timeout: Duration,
 ) -> Result<String, anyhow::Error> {
-    use arrow::array::StringArray;
+    use arrow::util::display::array_value_to_string;
     use futures::TryStreamExt;
 
     let batches: Vec<_> = match timeout(query_timeout, async {
@@ -413,13 +413,7 @@ async fn run_ai_query_with_timeout(
     }
 
     let batch = &batches[0];
-    let col = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| anyhow::anyhow!("Expected StringArray"))?;
-
-    Ok(col.value(0).to_string())
+    array_value_to_string(batch.column(0).as_ref(), 0).map_err(anyhow::Error::from)
 }
 
 /// Helper to run a query that returns multiple columns
@@ -435,7 +429,7 @@ async fn run_ai_query_multiple_with_timeout(
     query: &str,
     query_timeout: Duration,
 ) -> Result<Vec<String>, anyhow::Error> {
-    use arrow::array::{Array, Int64Array, StringArray};
+    use arrow::util::display::array_value_to_string;
     use futures::TryStreamExt;
 
     let batches: Vec<_> = match timeout(query_timeout, async {
@@ -468,17 +462,7 @@ async fn run_ai_query_multiple_with_timeout(
     let mut results = Vec::new();
 
     for i in 0..batch.num_columns() {
-        let col = batch.column(i);
-
-        // Handle different column types
-        if let Some(str_array) = col.as_any().downcast_ref::<StringArray>() {
-            results.push(str_array.value(0).to_string());
-        } else if let Some(int_array) = col.as_any().downcast_ref::<Int64Array>() {
-            results.push(int_array.value(0).to_string());
-        } else {
-            // For other types, use Debug format
-            results.push(format!("{col:?}"));
-        }
+        results.push(array_value_to_string(batch.column(i).as_ref(), 0)?);
     }
 
     Ok(results)

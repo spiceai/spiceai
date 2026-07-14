@@ -337,12 +337,6 @@ mod tests {
         assert!(!engine_supports_in_place_evolution(
             Engine::PartitionedArrow
         ));
-        assert!(!engine_supports_in_place_evolution(
-            Engine::PartitionedDuckDB
-        ));
-        assert!(!engine_supports_in_place_evolution(
-            Engine::TableModePartitionedDuckDB
-        ));
         assert!(!engine_supports_in_place_evolution(Engine::PostgreSQL));
     }
 
@@ -355,10 +349,6 @@ mod tests {
         assert!(engine_supports_recreate(Engine::Cayenne));
         assert!(!engine_supports_recreate(Engine::Arrow));
         assert!(!engine_supports_recreate(Engine::PartitionedArrow));
-        assert!(!engine_supports_recreate(Engine::PartitionedDuckDB));
-        assert!(!engine_supports_recreate(
-            Engine::TableModePartitionedDuckDB
-        ));
         assert!(!engine_supports_recreate(Engine::PostgreSQL));
     }
 
