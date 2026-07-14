@@ -1,0 +1,174 @@
+version: v1
+kind: Spicepod
+name: postgres-cayenne[file]-adaptive-cold-auto-sf1000
+
+# "Auto" variant of `…-adaptive-cold-sf1000`: identical in every way EXCEPT it pins NO datalake
+# (cold-tier) knobs. Only `cayenne_datalake_location` (+ credentials) enables the tier; the
+# promotion trigger, cold file size, and promoter cadence all fall to engine defaults / whatever
+# auto-tuning provides. This is the A/B baseline for cold-tier promotion auto-tuning — compare it
+# against the hand-pinned sibling pod.
+#
+# Everything else matches the sibling: `cayenne_tuning: adaptive` on every table, the same
+# `cayenne_goal_*` SLOs, `schema_inference: extended` (PK/on_conflict/indexes), and the shared
+# MinIO cold store via `cayenne_datalake_s3_*`. Sized for a 64 vCPU / 256 GiB host.
+
+postgres_connection_params: &postgres_params
+  pg_host: ${env:CHBENCH_PG_HOST}
+  pg_port: 5432
+  pg_db: chbench
+  pg_user: bench
+  pg_pass: bench
+  pg_sslmode: disable
+
+runtime:
+  flight:
+    ipc_compression: lz4_frame
+  caching:
+    sql_results:
+      enabled: false
+  task_history:
+    enabled: false
+  # Goal-driven adaptive SLOs, set GLOBALLY once here and inherited by every Cayenne dataset — the
+  # high-level targets the closed loop converges toward (NOT actuator knobs). QPH is global-only.
+  params:
+    cayenne_goal_replication_lag: '5s'
+    cayenne_goal_freshness: '30s'
+    cayenne_goal_query_latency: '10s'
+    cayenne_goal_qph: '5000'
+
+datasets:
+  # ------------------------------------------------------------------
+  # High-volume PK upsert tables — adaptive tuning + COLD object-store tier, but NO manual cold knobs.
+  # No primary_key / on_conflict / indexes: `schema_inference: extended` detects them from the
+  # PostgreSQL source and seeds the upsert on_conflict the CDC (changes) path requires (it also
+  # supplies the row_count/table_bytes the adaptive warm-start gates on, and the PK the cold tier
+  # needs both to promote and to auto-force key deletes).
+  # ------------------------------------------------------------------
+  - from: postgres:district
+    name: district
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_district
+      pg_replication_initial_snapshot: 'true'
+    acceleration: &cayenne_accel_cold
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      params: &cayenne_params_cold
+        cayenne_tuning: adaptive
+        # In-memory CDC intra-apply sharding: 4 PK-hash shards validate+append in parallel within
+        # one apply on the memory-tier (changes) tables. Not an adaptive actuator.
+        cayenne_cdc_mem_tier_shards: '4'
+        # --- Datalake (cold) object-store tier: ONLY the location + credentials are set, which is
+        # all that enables the tier. Promotion trigger / cold file size / cadence are intentionally
+        # left UNSET so they run on engine defaults / auto-tuning (this pod's whole point). The
+        # location is namespaced by table_id, so one shared prefix is safe for every table here. ---
+        cayenne_datalake_location: s3://benchmarks/cayenne-cold-sf1000/
+        cayenne_datalake_s3_auth: key
+        cayenne_datalake_s3_endpoint: ${secrets:S3_ENDPOINT}
+        cayenne_datalake_s3_key: ${secrets:S3_KEY}
+        cayenne_datalake_s3_secret: ${secrets:S3_SECRET}
+        cayenne_datalake_s3_allow_http: 'true'
+
+  - from: postgres:customer
+    name: customer
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_customer
+      pg_replication_initial_snapshot: 'true'
+    acceleration: *cayenne_accel_cold
+
+  - from: postgres:new_order
+    name: new_order
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_new_order
+      pg_replication_initial_snapshot: 'true'
+    acceleration: *cayenne_accel_cold
+
+  - from: postgres:oorder
+    name: oorder
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_oorder
+      pg_replication_initial_snapshot: 'true'
+    acceleration: *cayenne_accel_cold
+
+  - from: postgres:order_line
+    name: order_line
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_order_line
+      pg_replication_initial_snapshot: 'true'
+    acceleration: *cayenne_accel_cold
+
+  - from: postgres:stock
+    name: stock
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_stock
+      pg_replication_initial_snapshot: 'true'
+    acceleration: *cayenne_accel_cold
+
+  # ------------------------------------------------------------------
+  # Low-volume CDC reference table — adaptive, NO cold tier.
+  # ------------------------------------------------------------------
+  - from: postgres:warehouse
+    name: warehouse
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_warehouse
+      pg_replication_initial_snapshot: 'true'
+    acceleration: &cayenne_accel
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      params: &cayenne_params
+        cayenne_tuning: adaptive
+        cayenne_cdc_mem_tier_shards: '4'
+
+  # ------------------------------------------------------------------
+  # Static reference tables (no OLTP mutations, full refresh) — adaptive, no cold tier.
+  # PK / on_conflict / indexes come from extended inference.
+  # ------------------------------------------------------------------
+  - from: postgres:item
+    name: item
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration: &cayenne_accel_full
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      params: *cayenne_params
+
+  - from: postgres:region
+    name: region
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration: *cayenne_accel_full
+
+  - from: postgres:nation
+    name: nation
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration: *cayenne_accel_full
+
+  - from: postgres:supplier
+    name: supplier
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration: *cayenne_accel_full

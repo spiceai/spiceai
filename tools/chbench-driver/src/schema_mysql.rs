@@ -266,7 +266,7 @@ pub async fn create_tables(conn: &mut mysql_async::Conn) -> Result<()> {
     // Add the _bench_ts column (with default) to all mutated TPC-C tables so the
     // seed rows are stamped by the column default. The BEFORE INSERT/UPDATE
     // triggers are created *after* the load (see `create_triggers`) so they do
-    // not fire per-row during the bulk seed/clone.
+    // not fire per-row during the bulk seed load.
     add_bench_ts_columns(conn).await?;
 
     Ok(())
@@ -276,7 +276,7 @@ pub async fn create_tables(conn: &mut mysql_async::Conn) -> Result<()> {
 ///
 /// Called *after* the bulk load so `InnoDB` builds each index once via its sorted
 /// bulk-index build, instead of maintaining the B-trees incrementally on every
-/// seed/clone insert.
+/// seed load insert.
 ///
 /// # Errors
 ///
@@ -353,7 +353,7 @@ async fn add_bench_ts_columns(conn: &mut mysql_async::Conn) -> Result<()> {
 
 /// Create the `_bench_ts` `BEFORE INSERT` and `BEFORE UPDATE` triggers on all
 /// mutated TPC-C tables. Called *after* the bulk load so the triggers do not
-/// fire per-row during the seed/clone — the seed rows are already stamped by
+/// fire per-row during the seed load — the seed rows are already stamped by
 /// the column default (see [`add_bench_ts_columns`]).
 ///
 /// `MySQL` cannot combine INSERT and UPDATE into a single trigger, so two
