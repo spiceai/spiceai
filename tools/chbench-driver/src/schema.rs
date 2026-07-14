@@ -313,7 +313,7 @@ pub async fn create_tables(client: &Client) -> Result<()> {
     // Add the _bench_ts column (with default) to all mutated TPC-C tables so the
     // seed rows are stamped by the column default. The BEFORE INSERT/UPDATE
     // triggers are created *after* the load (see `create_triggers`) so they do
-    // not fire per-row during the bulk seed/clone.
+    // not fire per-row during the bulk seed load.
     add_bench_ts_columns(client).await?;
 
     Ok(())
@@ -322,7 +322,7 @@ pub async fn create_tables(client: &Client) -> Result<()> {
 /// Create the 4 secondary indexes (matching go-tpc Postgres DDL).
 ///
 /// Called *after* the bulk load so the indexes are built once, in bulk, instead
-/// of being maintained incrementally on every seed/clone insert.
+/// of being maintained incrementally on every seed load insert.
 ///
 /// # Errors
 ///
@@ -414,7 +414,7 @@ async fn add_bench_ts_columns(client: &Client) -> Result<()> {
 
 /// Create the `_bench_ts` `BEFORE INSERT OR UPDATE` trigger on all mutated
 /// TPC-C tables. Called *after* the bulk load so the trigger does not fire
-/// per-row during the seed/clone — the seed rows are already stamped by the
+/// per-row during the seed load — the seed rows are already stamped by the
 /// column default (see [`add_bench_ts_columns`]).
 ///
 /// Uses `clock_timestamp()` (wall-clock time per statement) instead of `now()`
