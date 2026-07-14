@@ -179,6 +179,66 @@ async fn seed_int64_rows_to_files(
     Ok(())
 }
 
+/// Issue an unfiltered `DELETE` (delete-all) and return the reported count.
+async fn delete_all(table: &Arc<CayenneTableProvider>) -> TestResult<u64> {
+    let ctx = SessionContext::new();
+    let plan = table.delete_from(&ctx.state(), vec![]).await?;
+    let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
+    Ok(results
+        .first()
+        .and_then(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+        })
+        .and_then(|a| a.values().first())
+        .copied()
+        .unwrap_or(0))
+}
+
+// =============================================================================
+// Regression: delete-all (unfiltered DELETE) over file-resident rows
+// =============================================================================
+
+/// An unfiltered `DELETE` over file-resident Int64-PK rows must remove every
+/// row and report the exact count. Guards the streaming delete-all scan path.
+async fn test_int64_pk_delete_all_empty_filter_impl(fixture: TestFixture) -> TestResult<()> {
+    let (table, ctx, schema) = setup_int64_pk_table(&fixture, "int64_delete_all").await?;
+    seed_int64_rows_to_files(&table, &ctx, &schema, "int64_delete_all", 10).await?;
+
+    let deleted = delete_all(&table).await?;
+    assert_eq!(
+        deleted, 10,
+        "delete-all must report every file-resident row"
+    );
+    assert_eq!(get_row_count(&ctx, "int64_delete_all").await?, 0);
+    assert!(
+        get_ids(&ctx, "int64_delete_all").await?.is_empty(),
+        "no rows may remain after delete-all"
+    );
+    Ok(())
+}
+test_with_backends!(test_int64_pk_delete_all_empty_filter_impl);
+
+/// A delete-all larger than `PK_DELETE_FLUSH_BATCH_SIZE` (`50_000`) spans multiple
+/// deletion-vector flush chunks in one logical delete. Every chunk's vector file
+/// must be committed in a single metastore transaction and the tombstone cache
+/// published, so all rows are removed with no partial or lost deletions.
+async fn test_int64_pk_delete_all_multichunk_atomic_impl(fixture: TestFixture) -> TestResult<()> {
+    let (table, ctx, schema) = setup_int64_pk_table(&fixture, "int64_delete_multichunk").await?;
+    // 55_000 > 50_000 forces at least two flush chunks in one logical delete.
+    seed_int64_rows_to_files(&table, &ctx, &schema, "int64_delete_multichunk", 55_000).await?;
+
+    let deleted = delete_all(&table).await?;
+    assert_eq!(
+        deleted, 55_000,
+        "every row across all chunks must be deleted"
+    );
+    assert_eq!(get_row_count(&ctx, "int64_delete_multichunk").await?, 0);
+    Ok(())
+}
+test_with_backends!(test_int64_pk_delete_all_multichunk_atomic_impl);
+
 // =============================================================================
 // Edge Case 1: Empty deletion set (no matching rows)
 // =============================================================================
