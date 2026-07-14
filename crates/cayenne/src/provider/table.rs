@@ -13361,6 +13361,15 @@ impl CayenneTableProvider {
         )))
     }
 
+    fn cold_zorder_sort_disabled_for_diagnostics() -> bool {
+        matches!(
+            std::env::var("CAYENNE_DISABLE_COLD_ZORDER_SORT")
+                .as_deref()
+                .map(str::to_ascii_lowercase),
+            Ok(value) if matches!(value.as_str(), "1" | "true" | "yes" | "on")
+        )
+    }
+
     /// Per-file row cap so a file's PK bloom (~10 bits/key) stays within
     /// [`COLD_PK_BLOOM_PER_FILE_MAX_BYTES`] — over the cap the file gets no bloom
     /// and the keyset rebuild falls back to a full cold scan. 10% headroom absorbs
@@ -14122,9 +14131,19 @@ impl CayenneTableProvider {
         );
 
         // Z-order cluster for a read-optimized cold layout.
-        let clustering = self.resolve_cold_clustering_indices();
-        let task_ctx = ctx.task_ctx();
-        let stream = self.zorder_sort_stream(stream, clustering, &task_ctx)?;
+        let stream = if Self::cold_zorder_sort_disabled_for_diagnostics() {
+            tracing::warn!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                env = "CAYENNE_DISABLE_COLD_ZORDER_SORT",
+                "Datalake promotion: cold Z-order SortExec disabled for diagnostics; cold files will be written in upstream stream order"
+            );
+            stream
+        } else {
+            let clustering = self.resolve_cold_clustering_indices();
+            let task_ctx = ctx.task_ctx();
+            self.zorder_sort_stream(stream, clustering, &task_ctx)?
+        };
 
         // Write the clustered, deletes-applied rows to the cold object store.
         let (cold_files, total_rows) = self

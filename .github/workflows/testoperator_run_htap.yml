@@ -260,6 +260,8 @@ jobs:
           exit $testop_exit
         env:
           SPICED_LOG: 'info,cayenne::compaction=debug'
+          # Diagnostic A/B for Cayenne cold-tier promotion stalls: bypass cold Z-order SortExec.
+          CAYENNE_DISABLE_COLD_ZORDER_SORT: '1'
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           # Dedicated in-cluster PG pod on xlarge; per-run docker container (loopback) elsewhere.
