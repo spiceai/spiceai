@@ -1252,7 +1252,6 @@ test_with_backends!(prop_sequential_cold_impl);
 
 // Foreground promotions + restarts with a background compactor/bake loop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "open defect #11852: cold-tier convergence can resurrect deleted keys and duplicate rows"]
 async fn prop_concurrent_cold_sqlite() -> TestResult<()> {
     common::run_with_backend(BackendType::Sqlite, |f| run_workload(f, concurrent_cold()))
         .await
