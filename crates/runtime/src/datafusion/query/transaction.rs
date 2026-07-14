@@ -370,7 +370,11 @@ async fn resolve_cayenne_staged(
 ) -> Option<CayenneTableProvider> {
     let provider = df.get_accelerated_table_provider(table_name).await.ok()?;
     let accel = provider.downcast_ref::<AcceleratedTable>()?;
-    if !accel.is_accelerator_only() {
+    // Accelerator-only (the gate governs the sole accelerator write) OR durable
+    // write-back (the write stages to the accelerator, marks its keys, and a
+    // per-table worker reconciles them to the source — see #11838). Both stage
+    // through the Cayenne write path, so a gated transaction is safe.
+    if !accel.is_accelerator_only() && !accel.is_durable_write_back() {
         return None;
     }
     match extract_cayenne_write_target(&accel.get_accelerator()) {

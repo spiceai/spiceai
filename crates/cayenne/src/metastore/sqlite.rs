@@ -629,6 +629,38 @@ impl SqliteMetastore {
         ) WITHOUT ROWID
     ";
 
+    /// Schema for the `cayenne_pending_write_back` table (durable federated
+    /// write-back, #11838).
+    ///
+    /// Tracks the primary keys that a durable-write-back table has committed to
+    /// the accelerator but not yet reconciled to the federated source. One row
+    /// per undelivered key; the delivery worker claims rows, reconciles the
+    /// key's current committed value to the source, then clears the row.
+    ///
+    /// `table_id` is the 16 raw UUID bytes (as in `cayenne_insert_record`);
+    /// `pk_bytes` is the `RowConverter` `OwnedRow` encoding of the full primary
+    /// key (bit-identical to the keyset/footprint `pk_digest` input) so the
+    /// worker can rebuild both the accelerator point-scan filter and the source
+    /// key. `sequence_number` is the table commit sequence that last dirtied the
+    /// key; the marker upsert is **monotone** (keeps `MAX`) and the worker's
+    /// compare-and-clear is `<= claimed_seq`, so a newer commit landing during
+    /// delivery leaves the marker above the claimed sequence and the stale clear
+    /// no-ops. `first_marked_at` is the oldest-undelivered timestamp (lag metric)
+    /// and is never overwritten on re-mark.
+    ///
+    /// Unlike `cayenne_insert_record`, this table is **never** cleared at
+    /// checkpoint/overwrite (that would drop acked-but-undelivered writes);
+    /// `drop_table` deletes its rows explicitly.
+    const PENDING_WRITE_BACK_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_pending_write_back (
+            table_id BLOB NOT NULL,
+            pk_bytes BLOB NOT NULL,
+            sequence_number BIGINT NOT NULL,
+            first_marked_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            PRIMARY KEY (table_id, pk_bytes)
+        ) WITHOUT ROWID
+    ";
+
     /// Schema for the `cayenne_snapshot_sequence` table.
     ///
     /// Tracks the sequence number for each snapshot. This enables Iceberg-style
@@ -927,12 +959,13 @@ impl MetastoreBackend for SqliteMetastore {
             .call(|conn| {
                 // Create tables in a transaction
                 conn.execute_batch(&format!(
-                    "{}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
+                    "{}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
                     Self::TABLE_TABLE_DDL,
                     Self::TABLE_NAME_UNIQUE_INDEX_DDL,
                     Self::DELETE_FILE_TABLE_DDL,
                     Self::PARTITION_TABLE_DDL,
                     Self::INSERT_RECORD_TABLE_DDL,
+                    Self::PENDING_WRITE_BACK_TABLE_DDL,
                     Self::SNAPSHOT_SEQUENCE_TABLE_DDL,
                     Self::TABLE_STATISTICS_DDL,
                     Self::SNAPSHOT_FILE_STATISTICS_TABLE_DDL,

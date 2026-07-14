@@ -346,6 +346,18 @@ impl PreparedTxnCommit {
         catalog: &crate::CayenneCatalog,
         txn: &mut dyn crate::metastore::MetastoreTransaction,
     ) -> crate::catalog::CatalogResult<()> {
+        // Durable federated write-back (#11838): on a durable-write-back table,
+        // durably mark the written PKs (their `OwnedRow` encodings) in the same
+        // commit transaction so the delivery worker reconciles them to the
+        // source. Empty otherwise — a non-write-back table never marks.
+        let dirty_pk_bytes: Vec<Vec<u8>> = if self.table.is_durable_write_back() {
+            self.validated_keys
+                .iter()
+                .map(|row| row.as_ref().to_vec())
+                .collect()
+        } else {
+            Vec::new()
+        };
         catalog
             .commit_staged_upsert_in_txn(
                 txn,
@@ -354,6 +366,7 @@ impl PreparedTxnCommit {
                 Some(&self.snapshot_commit),
                 None,
                 &[],
+                &dirty_pk_bytes,
             )
             .await
     }

@@ -767,6 +767,7 @@ impl CayenneCatalog {
         snapshot_sequence: Option<&SnapshotSequenceCommit>,
         inline_tombstone: Option<&InlinedDelete>,
         pending_durable_flips: &[String],
+        dirty_pk_bytes: &[Vec<u8>],
     ) -> CatalogResult<()> {
         const MAX_PARAMS: usize = 32_000;
         const DELETE_FILE_PARAMS_PER_ROW: usize = 10;
@@ -788,6 +789,19 @@ impl CayenneCatalog {
                 ],
             })
             .await?;
+        }
+
+        // Durable federated write-back (#11838): mark the written PKs dirty in
+        // the SAME commit transaction, so a crash after commit / before delivery
+        // re-delivers on the next worker wake. Gated by the caller (only a
+        // durable-write-back table passes a non-empty `dirty_pk_bytes`), and the
+        // marker sequence is the commit's snapshot sequence — directly comparable
+        // with the per-key OCC sequences and monotone across re-marks.
+        if !dirty_pk_bytes.is_empty()
+            && let Some(seq) = snapshot_sequence
+        {
+            self.mark_dirty_keys_in_txn(txn, table_id, dirty_pk_bytes, seq.sequence_number)
+                .await?;
         }
 
         if let Some(tombstone) = inline_tombstone {
@@ -815,6 +829,117 @@ impl CayenneCatalog {
         }
 
         Ok(())
+    }
+
+    /// Mark primary keys dirty for durable federated write-back (#11838) inside
+    /// the caller's commit transaction. Chunked monotone upsert into
+    /// `cayenne_pending_write_back`: an existing marker keeps `MAX(old, new)`
+    /// sequence (never regresses) and its original `first_marked_at`.
+    ///
+    /// `dirty_pk_bytes` are the `RowConverter` `OwnedRow` encodings of the full
+    /// primary keys (bit-identical to the keyset/footprint `pk_digest` input).
+    pub(crate) async fn mark_dirty_keys_in_txn(
+        &self,
+        txn: &mut dyn MetastoreTransaction,
+        table_id: &str,
+        dirty_pk_bytes: &[Vec<u8>],
+        sequence_number: i64,
+    ) -> CatalogResult<()> {
+        use std::fmt::Write as _;
+        const MAX_PARAMS: usize = 32_000;
+        const PARAMS_PER_ROW: usize = 3;
+        const MAX_ROWS_PER_CHUNK: usize = MAX_PARAMS / PARAMS_PER_ROW;
+
+        for chunk in dirty_pk_bytes.chunks(MAX_ROWS_PER_CHUNK) {
+            const PREFIX: &str = "INSERT INTO cayenne_pending_write_back \
+                 (table_id, pk_bytes, sequence_number) VALUES ";
+            const SUFFIX: &str = " ON CONFLICT(table_id, pk_bytes) DO UPDATE SET \
+                 sequence_number = MAX(cayenne_pending_write_back.sequence_number, excluded.sequence_number)";
+            let mut sql = String::with_capacity(PREFIX.len() + SUFFIX.len() + chunk.len() * 20);
+            sql.push_str(PREFIX);
+            let mut params = Vec::with_capacity(chunk.len() * PARAMS_PER_ROW);
+            for (i, pk_bytes) in chunk.iter().enumerate() {
+                let base = i * PARAMS_PER_ROW + 1; // 1-indexed
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                let _ = write!(sql, "(?{}, ?{}, ?{})", base, base + 1, base + 2);
+                params.push(insert_record_table_id_value(table_id));
+                params.push(MetastoreValue::Blob(pk_bytes.clone()));
+                params.push(MetastoreValue::Integer(sequence_number));
+            }
+            sql.push_str(SUFFIX);
+            txn.execute(ExecuteParams { sql: &sql, params }).await?;
+        }
+        Ok(())
+    }
+
+    /// List up to `limit` undelivered write-back markers for `table_id`, oldest
+    /// commit sequence first. Returns `(pk_bytes, sequence_number)` pairs.
+    pub(crate) async fn list_pending_write_back(
+        &self,
+        table_id: &str,
+        limit: usize,
+    ) -> CatalogResult<Vec<(Vec<u8>, i64)>> {
+        self.metastore
+            .query_helper(
+                QueryParams {
+                    sql: "SELECT pk_bytes, sequence_number FROM cayenne_pending_write_back \
+                          WHERE table_id = ?1 ORDER BY sequence_number ASC LIMIT ?2",
+                    params: vec![
+                        insert_record_table_id_value(table_id),
+                        MetastoreValue::Integer(i64::try_from(limit).unwrap_or(i64::MAX)),
+                    ],
+                },
+                |row| Ok((row.get_blob(0)?, row.get_i64(1)?)),
+            )
+            .await
+    }
+
+    /// Compare-and-clear delivered markers: for each `(pk_bytes, claimed_seq)`,
+    /// delete the marker only if its stored sequence is still `<= claimed_seq`
+    /// (a newer commit that bumped it above `claimed_seq` during delivery leaves
+    /// it in place, so the stale delivery never clears a fresh mark). Batched in
+    /// one transaction.
+    pub(crate) async fn clear_pending_write_back(
+        &self,
+        table_id: &str,
+        keys: &[(Vec<u8>, i64)],
+    ) -> CatalogResult<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let txn = self.metastore.begin_transaction().await?;
+        let table_id_value = insert_record_table_id_value(table_id);
+        for (pk_bytes, claimed_seq) in keys {
+            txn.execute(ExecuteParams {
+                sql: "DELETE FROM cayenne_pending_write_back \
+                      WHERE table_id = ?1 AND pk_bytes = ?2 AND sequence_number <= ?3",
+                params: vec![
+                    table_id_value.clone(),
+                    MetastoreValue::Blob(pk_bytes.clone()),
+                    MetastoreValue::Integer(*claimed_seq),
+                ],
+            })
+            .await?;
+        }
+        txn.commit().await?;
+        Ok(())
+    }
+
+    /// Count undelivered write-back markers for `table_id` (backlog gauge).
+    pub(crate) async fn pending_write_back_count(&self, table_id: &str) -> CatalogResult<i64> {
+        let rows = self
+            .metastore
+            .query_helper(
+                QueryParams {
+                    sql: "SELECT COUNT(*) FROM cayenne_pending_write_back WHERE table_id = ?1",
+                    params: vec![insert_record_table_id_value(table_id)],
+                },
+                |row| row.get_i64(0),
+            )
+            .await?;
+        Ok(rows.into_iter().next().unwrap_or(0))
     }
 
     /// Reconcile the datalake (cold tier) fields of a reopened table's stored
@@ -4125,6 +4250,20 @@ impl MetadataCatalog for CayenneCatalog {
             .await
             .map_err(|e| CatalogError::InvalidOperation {
                 message: "Failed to delete insert records.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        // 1b. Delete durable write-back markers (#11838). Unlike the other
+        // tables this is never cleared at checkpoint/overwrite, so drop_table is
+        // the only place its rows are removed.
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "DELETE FROM cayenne_pending_write_back WHERE table_id = ?1",
+                params: vec![insert_record_table_id_value(&table_id)],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to delete pending write-back markers.".to_string(),
                 source: Box::new(e),
             })?;
 

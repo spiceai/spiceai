@@ -1054,6 +1054,13 @@ pub struct CayenneTableProvider {
     pk_row_converter: Option<Arc<RowConverter>>,
     /// Indices of primary key columns in the table schema.
     pk_column_indices: Vec<usize>,
+    /// Durable federated write-back (#11838): when set, every committed write on
+    /// this table durably marks its primary keys in `cayenne_pending_write_back`
+    /// (inside the commit transaction) so a per-table delivery worker can
+    /// reconcile them to the federated source. Not persisted in `TableMetadata`;
+    /// derived from the acceleration settings and set via the builder, and shared
+    /// across writer clones (a plain in-memory `bool`, `Copy`).
+    durable_write_back: bool,
     /// Write lock to serialize insert operations and prevent concurrent write races.
     /// This ensures that:
     /// - Only one `insert()` runs at a time per table
@@ -1627,6 +1634,7 @@ pub struct CayenneTableProviderBuilder {
     cold_object_store_config: Option<crate::metadata::ObjectStoreConfig>,
     context: Option<Arc<CayenneContext>>,
     maintained_aggregates: Vec<MaintainedAggregateSpec>,
+    durable_write_back: bool,
 }
 
 struct PendingMaintainedAggregateInsert {
@@ -1683,6 +1691,7 @@ struct CayenneTableProviderOpenOptions {
     cold_object_store_config: Option<crate::metadata::ObjectStoreConfig>,
     context: Option<Arc<CayenneContext>>,
     maintained_aggregate_specs: Vec<MaintainedAggregateSpec>,
+    durable_write_back: bool,
 }
 
 impl CayenneTableProviderBuilder {
@@ -1698,6 +1707,7 @@ impl CayenneTableProviderBuilder {
             cold_object_store_config: None,
             context: None,
             maintained_aggregates: Vec::new(),
+            durable_write_back: false,
         }
     }
 
@@ -1761,6 +1771,14 @@ impl CayenneTableProviderBuilder {
         self
     }
 
+    /// Enable durable federated write-back (#11838): every committed write marks
+    /// its primary keys in `cayenne_pending_write_back` for the delivery worker.
+    #[must_use]
+    pub fn with_durable_write_back(mut self, enabled: bool) -> Self {
+        self.durable_write_back = enabled;
+        self
+    }
+
     /// Open an existing table by name.
     ///
     /// # Errors
@@ -1775,6 +1793,7 @@ impl CayenneTableProviderBuilder {
             cold_object_store_config: self.cold_object_store_config,
             context: self.context,
             maintained_aggregate_specs: self.maintained_aggregates,
+            durable_write_back: self.durable_write_back,
         };
 
         CayenneTableProvider::new_internal(table_name, self.catalog, self.runtime_env, options)
@@ -1797,6 +1816,7 @@ impl CayenneTableProviderBuilder {
             cold_object_store_config: self.cold_object_store_config,
             context: self.context,
             maintained_aggregate_specs: self.maintained_aggregates,
+            durable_write_back: self.durable_write_back,
         };
 
         CayenneTableProvider::new_internal(&table_name, self.catalog, self.runtime_env, options)
@@ -4451,6 +4471,7 @@ impl CayenneTableProvider {
             cold_object_store_config,
             context,
             maintained_aggregate_specs,
+            durable_write_back,
         } = options;
 
         let table_metadata = catalog.get_table(table_name).await?;
@@ -4680,6 +4701,7 @@ impl CayenneTableProvider {
             pk_deletion_strategy,
             pk_row_converter,
             pk_column_indices,
+            durable_write_back,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             visibility_lock: Arc::new(tokio::sync::Mutex::new(())),
             scan_state_lock: Arc::new(tokio::sync::RwLock::new(())),
@@ -4882,6 +4904,92 @@ impl CayenneTableProvider {
     #[must_use]
     pub fn catalog(&self) -> &Arc<dyn MetadataCatalog> {
         &self.catalog
+    }
+
+    /// Durable federated write-back (#11838): whether committed writes on this
+    /// table mark their primary keys for reconciliation to the federated source.
+    #[must_use]
+    pub fn is_durable_write_back(&self) -> bool {
+        self.durable_write_back
+    }
+
+    /// Downcast the metadata catalog to the concrete Cayenne catalog — the
+    /// write-back marker CRUD is a Cayenne-specific concern (not on the trait).
+    fn cayenne_catalog(&self) -> Option<&crate::CayenneCatalog> {
+        self.catalog
+            .as_any()
+            .downcast_ref::<crate::CayenneCatalog>()
+    }
+
+    /// List up to `limit` undelivered write-back markers (oldest commit first)
+    /// as `(pk_bytes, sequence_number)`. The `pk_bytes` are opaque `OwnedRow`
+    /// encodings — feed them back to [`Self::decode_pk_keys`] /
+    /// [`Self::clear_dirty_keys`].
+    ///
+    /// # Errors
+    /// Propagates the underlying metastore error.
+    pub async fn list_dirty_keys(&self, limit: usize) -> Result<Vec<(Vec<u8>, i64)>> {
+        let Some(catalog) = self.cayenne_catalog() else {
+            return Ok(Vec::new());
+        };
+        Ok(catalog.list_pending_write_back(self.table_id(), limit).await?)
+    }
+
+    /// Compare-and-clear delivered write-back markers (see
+    /// [`crate::CayenneCatalog::clear_pending_write_back`]).
+    ///
+    /// # Errors
+    /// Propagates the underlying metastore error.
+    pub async fn clear_dirty_keys(&self, keys: &[(Vec<u8>, i64)]) -> Result<()> {
+        let Some(catalog) = self.cayenne_catalog() else {
+            return Ok(());
+        };
+        catalog
+            .clear_pending_write_back(self.table_id(), keys)
+            .await?;
+        Ok(())
+    }
+
+    /// Count undelivered write-back markers (backlog gauge).
+    ///
+    /// # Errors
+    /// Propagates the underlying metastore error.
+    pub async fn dirty_key_count(&self) -> Result<i64> {
+        let Some(catalog) = self.cayenne_catalog() else {
+            return Ok(0);
+        };
+        Ok(catalog.pending_write_back_count(self.table_id()).await?)
+    }
+
+    /// Decode marker `pk_bytes` (`RowConverter` `OwnedRow` encodings) back into
+    /// the primary-key column arrays, in key order — for the accelerator
+    /// point-scan filter and the source delivery key.
+    ///
+    /// # Errors
+    /// Returns an error if the table has no PK converter or the bytes are
+    /// malformed for its key schema.
+    pub fn decode_pk_keys(&self, pk_bytes: &[Vec<u8>]) -> Result<Vec<ArrayRef>> {
+        let converter = self.pk_row_converter.as_ref().ok_or_else(|| Error::Internal {
+            table: self.table_name().to_string(),
+            message: "decode_pk_keys requires a primary-key RowConverter".to_string(),
+        })?;
+        let rows = pk_bytes
+            .iter()
+            .map(|bytes| crate::row_converter::Row::from_encoded(bytes));
+        converter.convert_rows(rows).map_err(|e| Error::Internal {
+            table: self.table_name().to_string(),
+            message: format!("failed to decode write-back marker primary keys: {e}"),
+        })
+    }
+
+    /// The primary-key column names in key order (for the delivery adapter).
+    #[must_use]
+    pub fn pk_column_names(&self) -> Vec<String> {
+        let schema = self.table_schema();
+        self.pk_column_indices
+            .iter()
+            .filter_map(|&i| schema.fields().get(i).map(|f| f.name().clone()))
+            .collect()
     }
 
     /// Get the table metadata.
@@ -5656,6 +5764,7 @@ impl CayenneTableProvider {
             pk_deletion_strategy: self.pk_deletion_strategy.clone(),
             pk_row_converter: self.pk_row_converter.as_ref().map(Arc::clone),
             pk_column_indices: self.pk_column_indices.clone(),
+            durable_write_back: self.durable_write_back,
             write_lock: Arc::clone(&self.write_lock), // Shared across all clones for same table
             visibility_lock: Arc::clone(&self.visibility_lock),
             scan_state_lock: Arc::clone(&self.scan_state_lock),

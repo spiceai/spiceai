@@ -58,6 +58,7 @@ use super::{
     get_primary_keys_from_constraints, upsert_dedup,
 };
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
+use spicepod::acceleration::WriteMode;
 use crate::dataaccelerator::cayenne::s3::{S3_PARAMETERS, S3_PARAMS_LEN};
 use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
 use crate::parameters::ParameterSpec;
@@ -2055,11 +2056,23 @@ impl CayenneAccelerator {
             table_name,
         );
 
+        // Durable federated write-back (#11838): a write_back + on_conflict +
+        // refresh_mode:changes Cayenne dataset resolves to WriteMode::WriteBack
+        // (on_conflict with a non-`changes` refresh forces AcceleratorOnly). When
+        // so configured, every committed write durably marks its PKs so the
+        // delivery worker reconciles them to the federated source.
+        let durable_write_back = source.acceleration().is_some_and(|acceleration| {
+            acceleration.write_mode == WriteMode::WriteBack
+                && !acceleration.on_conflict.is_empty()
+                && acceleration.refresh_mode == Some(RefreshMode::Changes)
+        });
+
         // Create CayenneTableProvider with object store for S3 Express One Zone
         let mut builder = CayenneTableProviderBuilder::new(catalog, runtime_env)
             .with_context(context)
             .with_retention_filters(retention_filters)
-            .with_maintained_aggregates(maintained_aggregate_specs);
+            .with_maintained_aggregates(maintained_aggregate_specs)
+            .with_durable_write_back(durable_write_back);
         if let Some(retention_builder) = time_retention_filter_builder {
             builder = builder.with_time_retention_filter_builder(retention_builder);
         }
