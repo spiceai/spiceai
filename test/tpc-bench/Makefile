@@ -106,6 +106,9 @@ pg-load:
 # not a standalone l_partkey index: Q20's correlated subquery filters lineitem
 # on both columns together, and without the composite it falls back to a full
 # scan per outer row (observed ~1h49m vs ~0.1s with the composite).
+# ANALYZE runs after index creation so the planner has fresh statistics on the
+# just-bulk-loaded tables; without it, correlated-subquery queries (Q2, Q20)
+# can get planned as per-row full/seq scans instead of index lookups.
 # Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpch make pg-create-index
 pg-create-index:
 	@echo "Creating indexes in $(DB_NAME) database"
@@ -121,6 +124,9 @@ pg-create-index:
 	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX IF NOT EXISTS idx_partsupp_ps_suppkey ON partsupp (ps_suppkey);";
 	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX IF NOT EXISTS idx_part_p_brand_p_container ON part (p_brand, p_container);";
 	@echo "Indexes have been successfully created to $(DB_NAME) database"
+	@echo "Analyzing $(DB_NAME) database"
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "ANALYZE;";
+	@echo "Statistics have been refreshed for $(DB_NAME) database"
 
 # Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpch make tpch-run-pq
 tpch-run-pq:
@@ -224,6 +230,9 @@ pg-tpcds-create-index:
 	@echo "Applying indexes from tpcds_index.sql..."
 	@psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -f tpcds_index.sql
 	@echo "Indexes applied successfully."
+	@echo "Analyzing $(DB_NAME) database"
+	@psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -c "ANALYZE;";
+	@echo "Statistics have been refreshed for $(DB_NAME) database"
 
 # Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpch make pg-tpcds-load
 pg-tpcds-load:
