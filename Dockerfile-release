@@ -56,11 +56,12 @@ RUN set -eux; \
 # PDFIUM_RELEASE_TAG in liteparse-pdfium-sys (chromium/7897).
 RUN set -eux; \
     case "${TARGETARCH}" in \
-      amd64|"") pdfium_asset=pdfium-linux-x64 ;; \
-      arm64) pdfium_asset=pdfium-linux-arm64 ;; \
+      amd64|"") pdfium_asset=pdfium-linux-x64; pdfium_sha256=af96f21fd8e9d53955013dad1d17b003d0120025e787b7ce611a685d57287594 ;; \
+      arm64) pdfium_asset=pdfium-linux-arm64; pdfium_sha256=e81ec447dd00097eb2fc26cff88be53ea321495711a43af9ea7b50bebdea9226 ;; \
       *) echo "Unsupported TARGETARCH for pdfium: ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
     curl -fSLo /tmp/pdfium.tgz "https://github.com/run-llama/pdfium-binaries/releases/download/chromium%2F7897/${pdfium_asset}.tgz"; \
+    echo "${pdfium_sha256}  /tmp/pdfium.tgz" | sha256sum -c -; \
     mkdir -p /tmp/pdfium; \
     tar -C /tmp/pdfium -xzf /tmp/pdfium.tgz; \
     cp /tmp/pdfium/lib/libpdfium.so /root/libpdfium.so; \

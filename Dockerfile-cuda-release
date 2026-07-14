@@ -31,6 +31,7 @@ RUN set -eux; \
 # x86_64 only.
 RUN set -eux; \
     curl -fSLo /tmp/pdfium.tgz "https://github.com/run-llama/pdfium-binaries/releases/download/chromium%2F7897/pdfium-linux-x64.tgz"; \
+    echo "af96f21fd8e9d53955013dad1d17b003d0120025e787b7ce611a685d57287594  /tmp/pdfium.tgz" | sha256sum -c -; \
     mkdir -p /tmp/pdfium; \
     tar -C /tmp/pdfium -xzf /tmp/pdfium.tgz; \
     cp /tmp/pdfium/lib/libpdfium.so /root/libpdfium.so; \

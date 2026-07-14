@@ -26,7 +26,8 @@ limitations under the License.
 //!   access. This is the robust path for locked-down / air-gapped containers.
 //! - **Standalone binaries** (the release archives stay lean and do not bundle
 //!   `PDFium`) lazily download the matching `PDFium` build on first PDF parse
-//!   and load it explicitly. Nothing has to be installed ahead of time.
+//!   and load it explicitly. The download is size-bounded by timeouts and
+//!   verified against a pinned SHA-256 before it is trusted.
 //!
 //! [`ensure_loaded`] wires both together: it first tries the discoverable
 //! locations, and only downloads when `PDFium` is genuinely absent. When
@@ -34,10 +35,14 @@ limitations under the License.
 //! host) it returns a structured [`crate::Error`] instead of letting `liteparse`
 //! panic.
 
+use std::fmt::Write as _;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::Error;
@@ -46,14 +51,64 @@ use crate::Error;
 /// generated against.
 ///
 /// This MUST stay in lockstep with `PDFIUM_RELEASE_TAG` in
-/// `liteparse-pdfium-sys`'s `build.rs` (currently `chromium/7897`). Bump it
-/// whenever `liteparse` is upgraded — otherwise a standalone auto-download could
-/// fetch a `PDFium` build whose ABI does not match the compiled-in bindings.
+/// `liteparse-pdfium-sys`'s `build.rs` (currently `chromium/7897`) and with the
+/// pinned digests in [`PDFIUM_ASSETS`]. Bump all three together when `liteparse`
+/// is upgraded — otherwise a standalone auto-download could fetch a `PDFium`
+/// build whose ABI does not match the compiled-in bindings.
 const PDFIUM_RELEASE_TAG: &str = "chromium/7897";
 
 /// Base URL of the `PDFium` binaries the bindings target (a `run-llama` fork of
 /// the well-known `bblanchon/pdfium-binaries`).
 const PDFIUM_RELEASE_URL: &str = "https://github.com/run-llama/pdfium-binaries/releases/download";
+
+/// `(asset stem, SHA-256 of `<stem>.tgz`)` for every target Spice releases on,
+/// taken from the `chromium/7897` release's SLSA provenance attestation. The
+/// downloaded archive is checked against this before it is extracted or loaded,
+/// so a tampered or truncated download is rejected rather than `dlopen`ed.
+const PDFIUM_ASSETS: &[(&str, &str)] = &[
+    (
+        "pdfium-mac-arm64",
+        "954cd315ff7d7ec51824cc6289ad1b00a0981533cb9762a56fd122bcaa12cd27",
+    ),
+    (
+        "pdfium-mac-x64",
+        "dea5c9cdedcbdc7b1ce72bf845a2ec8bda1b9d23a5eef0b61e2d217f8b4477d3",
+    ),
+    (
+        "pdfium-linux-x64",
+        "af96f21fd8e9d53955013dad1d17b003d0120025e787b7ce611a685d57287594",
+    ),
+    (
+        "pdfium-linux-musl-x64",
+        "f8ef769331881d6bf2cfbac740f4a6b1d97b562f60800ef01665f8326b4926cc",
+    ),
+    (
+        "pdfium-linux-arm64",
+        "e81ec447dd00097eb2fc26cff88be53ea321495711a43af9ea7b50bebdea9226",
+    ),
+    (
+        "pdfium-linux-arm",
+        "7ec4661139fffe72f76e58ef2deb364527f19e38565cfd32fdfb19655e81252d",
+    ),
+    (
+        "pdfium-win-x64",
+        "fde13b38344b4db1df270737ceb15adb94ce3e31c6de4f1b56f02bfdb4e6b533",
+    ),
+    (
+        "pdfium-win-arm64",
+        "4c7d3f54a5bf1f41302e256b6d930c53839a52bda963f73f744d80dbfe9f4613",
+    ),
+    (
+        "pdfium-win-x86",
+        "b0ae78024c684d5b19083c1efb53a2f9fe1233d421c72753355a9982394bef58",
+    ),
+];
+
+/// Maximum time to establish the connection to the release host.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum idle time on any single socket read during the download, so a stalled
+/// connection fails instead of hanging a PDF parse indefinitely.
+const READ_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Set once `PDFium` has been loaded so the common case is a single atomic read.
 static PDFIUM_LOADED: AtomicBool = AtomicBool::new(false);
@@ -125,6 +180,8 @@ async fn try_load_default() -> bool {
 /// extracting it if necessary, and return the path to load. Blocking.
 fn provision_pdfium() -> Result<PathBuf, String> {
     let asset = pdfium_asset_stem()?;
+    let sha256 = expected_sha256(asset)
+        .ok_or_else(|| format!("no pinned SHA-256 for PDFium asset '{asset}'"))?;
     let dir = pdfium_cache_dir(asset)?;
     let lib_path = dir.join(lib_subdir()).join(dylib_file_name());
 
@@ -132,7 +189,7 @@ fn provision_pdfium() -> Result<PathBuf, String> {
         return Ok(lib_path);
     }
 
-    download_and_extract(asset, &dir)?;
+    download_and_extract(asset, sha256, &dir)?;
 
     if !lib_path.exists() {
         return Err(format!(
@@ -143,17 +200,33 @@ fn provision_pdfium() -> Result<PathBuf, String> {
     Ok(lib_path)
 }
 
-/// Download `<asset>.tgz` from the pinned `PDFium` release and extract it into
-/// `dest` (atomically, via a temp dir). Blocking network + IO.
-fn download_and_extract(asset: &str, dest: &Path) -> Result<(), String> {
+/// Download `<asset>.tgz` from the pinned `PDFium` release, verify its SHA-256,
+/// and extract it into `dest` (atomically, via a temp dir). Blocking network + IO.
+fn download_and_extract(asset: &str, expected_sha256: &str, dest: &Path) -> Result<(), String> {
     let tag_encoded = PDFIUM_RELEASE_TAG.replace('/', "%2F");
     let url = format!("{PDFIUM_RELEASE_URL}/{tag_encoded}/{asset}.tgz");
 
-    let reader = ureq::get(&url)
+    // Bounded timeouts so a slow or stalled connection can't block a PDF parse
+    // forever (this runs on the blocking pool, but would still hang the parse).
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(CONNECT_TIMEOUT)
+        .timeout_read(READ_TIMEOUT)
+        .build();
+    let mut reader = agent
+        .get(&url)
         .call()
         .map_err(|e| format!("failed to download PDFium from {url}: {e}"))?
         .into_reader();
-    let gz = flate2::read::GzDecoder::new(reader);
+    let mut archive_bytes = Vec::new();
+    reader
+        .read_to_end(&mut archive_bytes)
+        .map_err(|e| format!("failed to read PDFium download from {url}: {e}"))?;
+
+    // Verify integrity against the pinned digest before trusting the archive —
+    // this is a native library that will be dlopen'd.
+    verify_sha256(&archive_bytes, expected_sha256, asset)?;
+
+    let gz = flate2::read::GzDecoder::new(Cursor::new(archive_bytes));
     let mut archive = tar::Archive::new(gz);
 
     // Extract to a sibling temp dir, then rename into place atomically so a
@@ -178,6 +251,32 @@ fn download_and_extract(asset: &str, dest: &Path) -> Result<(), String> {
     std::fs::rename(&tmp, dest)
         .map_err(|e| format!("failed to move PDFium into {}: {e}", dest.display()))?;
     Ok(())
+}
+
+/// Verify `bytes` hash to `expected` (lowercase hex SHA-256).
+fn verify_sha256(bytes: &[u8], expected: &str, asset: &str) -> Result<(), String> {
+    let actual = Sha256::digest(bytes)
+        .iter()
+        .fold(String::new(), |mut acc, b| {
+            let _ = write!(acc, "{b:02x}");
+            acc
+        });
+    if actual.eq_ignore_ascii_case(expected) {
+        Ok(())
+    } else {
+        Err(format!(
+            "PDFium archive '{asset}' failed its integrity check \
+             (expected SHA-256 {expected}, got {actual})"
+        ))
+    }
+}
+
+/// The pinned SHA-256 for a `PDFium` asset stem, if known.
+fn expected_sha256(asset: &str) -> Option<&'static str> {
+    PDFIUM_ASSETS
+        .iter()
+        .find(|(stem, _)| *stem == asset)
+        .map(|(_, hash)| *hash)
 }
 
 /// Cache directory for the extracted `PDFium` build, namespaced by release tag
@@ -298,10 +397,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn asset_stem_resolves_for_current_platform() {
-        // Every target Spice compiles on must map to a downloadable asset.
+    fn current_platform_asset_has_pinned_hash() {
+        // Every target Spice compiles on must map to a downloadable, pinned asset.
         let stem = pdfium_asset_stem().expect("current platform must map to a PDFium asset");
         assert!(stem.starts_with("pdfium-"), "unexpected asset stem: {stem}");
+        let hash = expected_sha256(stem).expect("current platform asset must have a pinned hash");
+        assert_eq!(hash.len(), 64, "sha256 for {stem} must be 64 hex chars");
+    }
+
+    #[test]
+    fn all_pinned_hashes_are_well_formed() {
+        for (stem, hash) in PDFIUM_ASSETS {
+            assert!(stem.starts_with("pdfium-"), "bad stem: {stem}");
+            assert_eq!(hash.len(), 64, "sha256 for {stem} must be 64 hex chars");
+            assert!(
+                hash.chars().all(|c| c.is_ascii_hexdigit()),
+                "sha256 for {stem} must be hex"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_sha256_accepts_matching_and_rejects_mismatch() {
+        // SHA-256 of the empty input.
+        let empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        verify_sha256(b"", empty, "test").expect("empty input matches the empty-string hash");
+        verify_sha256(b"tampered", empty, "test")
+            .expect_err("tampered input must fail verification");
     }
 
     #[test]

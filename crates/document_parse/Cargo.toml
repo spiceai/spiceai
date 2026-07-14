@@ -20,6 +20,7 @@ liteparse = { version = "2.3", default-features = false }
 # a mismatch is a hard build error (duplicate `links = "pdfium"`), not a silent bug.
 liteparse-pdfium-sys = "1.3"
 quick-xml = "0.38"
+sha2 = "0.10"
 snafu.workspace = true
 tar = "0.4"
 tokio = { workspace = true, features = ["sync"] }
