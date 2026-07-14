@@ -441,6 +441,18 @@ async fn settle(table: &Arc<CayenneTableProvider>, durability: Durability) -> Te
     Ok(())
 }
 
+/// Prepare enough warm-tier files for a cold-promotion.
+async fn materialize_warm_files_for_cold_promotion(
+    table: &Arc<CayenneTableProvider>,
+    durability: Durability,
+) -> TestResult<()> {
+    table.flush_pending_maintenance().await?;
+    if durability == Durability::Memory {
+        table.checkpoint_mem_tier().await?;
+    }
+    Ok(())
+}
+
 async fn read_rows(ctx: &SessionContext, name: &str) -> TestResult<Model> {
     let df = ctx
         .sql(&format!("SELECT id, value FROM {name} ORDER BY id"))
@@ -750,7 +762,7 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
             }
             Op::MoveToColdTier => {
                 // Durable warm files must exist for the trigger to fire.
-                settle(&table, w.durability).await?;
+                materialize_warm_files_for_cold_promotion(&table, w.durability).await?;
                 // `Ok(false)` (warm tier below threshold) is fine.
                 let _ = table.promote_warm_to_cold().await?;
                 // GC serialized after promote, same task — the production
@@ -890,7 +902,7 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
                 // interleavings fall out for free. GC runs serialized after
                 // promote (production order); see the sequential arm.
                 let t = handle.read().await;
-                settle(&t, w.durability).await?;
+                materialize_warm_files_for_cold_promotion(&t, w.durability).await?;
                 let _ = t.promote_warm_to_cold().await?;
                 t.run_cold_tier_gc_tick().await;
             }
@@ -1207,7 +1219,6 @@ test_with_backends!(prop_sequential_cold_impl);
 
 // Foreground promotions + restarts with a background compactor/bake loop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "open defect #11852: cold-tier convergence can resurrect deleted keys and duplicate rows"]
 async fn prop_concurrent_cold_sqlite() -> TestResult<()> {
     common::run_with_backend(BackendType::Sqlite, |f| run_workload(f, concurrent_cold()))
         .await
