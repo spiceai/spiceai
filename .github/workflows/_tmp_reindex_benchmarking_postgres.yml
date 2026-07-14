@@ -1,0 +1,46 @@
+name: TEMP - reindex tpch_sf100 on benchmarking-postgres
+
+# One-off maintenance workflow: applies the corrected TPC-H secondary index
+# set (see #11730) to the tpch_sf100 database already loaded on
+# benchmarking-postgres, without a full reseed. Drops the old, mostly-
+# redundant indexes and adds the ones the actual queries need. Delete this
+# file once it's been run.
+on:
+  workflow_dispatch:
+
+jobs:
+  reindex:
+    runs-on: spiceai-dev-runners
+    timeout-minutes: 60
+    env:
+      PGHOST: ${{ vars.TEST_POSTGRES_HOST }}
+      PGPASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
+    steps:
+      - name: Install postgresql-client
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y postgresql-client
+
+      - name: Drop stale indexes and add the correct set
+        run: |
+          set -e
+          DB_NAME=tpch_sf100
+          echo "Dropping stale/redundant indexes on $DB_NAME..."
+          psql -U postgres -d "$DB_NAME" -c "DROP INDEX IF EXISTS idx_partsupp_ps_partkey;"
+          psql -U postgres -d "$DB_NAME" -c "DROP INDEX IF EXISTS idx_part_p_partkey;"
+
+          echo "Creating the corrected index set on $DB_NAME..."
+          psql -U postgres -d "$DB_NAME" -c "CREATE INDEX IF NOT EXISTS idx_lineitem_l_partkey ON lineitem (l_partkey);"
+          psql -U postgres -d "$DB_NAME" -c "CREATE INDEX IF NOT EXISTS idx_lineitem_l_suppkey ON lineitem (l_suppkey);"
+          psql -U postgres -d "$DB_NAME" -c "CREATE INDEX IF NOT EXISTS idx_lineitem_l_shipdate ON lineitem (l_shipdate);"
+          psql -U postgres -d "$DB_NAME" -c "CREATE INDEX IF NOT EXISTS idx_orders_o_custkey ON orders (o_custkey);"
+          psql -U postgres -d "$DB_NAME" -c "CREATE INDEX IF NOT EXISTS idx_orders_o_orderdate ON orders (o_orderdate);"
+          psql -U postgres -d "$DB_NAME" -c "CREATE INDEX IF NOT EXISTS idx_customer_c_nationkey ON customer (c_nationkey);"
+          psql -U postgres -d "$DB_NAME" -c "CREATE INDEX IF NOT EXISTS idx_supplier_s_nationkey ON supplier (s_nationkey);"
+          psql -U postgres -d "$DB_NAME" -c "CREATE INDEX IF NOT EXISTS idx_nation_n_regionkey ON nation (n_regionkey);"
+          psql -U postgres -d "$DB_NAME" -c "CREATE INDEX IF NOT EXISTS idx_partsupp_ps_suppkey ON partsupp (ps_suppkey);"
+          echo "Reindex complete."
+
+      - name: List indexes for confirmation
+        run: |
+          psql -U postgres -d tpch_sf100 -c "\di"
