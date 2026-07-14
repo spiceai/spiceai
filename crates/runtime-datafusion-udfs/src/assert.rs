@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -80,11 +80,13 @@ impl ScalarUDFImpl for Assert {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue, DataFusionError> {
-        let arg = args.args.into_iter().next().ok_or_else(|| {
+        let args: [ColumnarValue; 1] = args.args.try_into().map_err(|args: Vec<_>| {
             DataFusionError::Execution(format!(
-                "{ASSERT_FAILED_MARKER} assert() requires exactly one boolean argument"
+                "{ASSERT_FAILED_MARKER} assert() requires exactly one boolean argument, got {}",
+                args.len()
             ))
         })?;
+        let [arg] = args;
 
         match arg {
             // Scalar TRUE -> pass through.
@@ -110,7 +112,7 @@ impl ScalarUDFImpl for Assert {
                 }
                 Ok(ColumnarValue::Array(array))
             }
-            other => Err(DataFusionError::Execution(format!(
+            other @ ColumnarValue::Scalar(_) => Err(DataFusionError::Execution(format!(
                 "{ASSERT_FAILED_MARKER} assert() argument must be Boolean, got {}",
                 other.data_type()
             ))),
@@ -124,9 +126,9 @@ mod tests {
     use datafusion::config::ConfigOptions;
     use datafusion::logical_expr::ScalarFunctionArgs;
 
-    fn call(arg: ColumnarValue) -> Result<ColumnarValue, DataFusionError> {
+    fn call_args(args: Vec<ColumnarValue>) -> Result<ColumnarValue, DataFusionError> {
         Assert::new().invoke_with_args(ScalarFunctionArgs {
-            args: vec![arg],
+            args,
             arg_fields: vec![],
             number_rows: 1,
             return_field: std::sync::Arc::new(arrow::datatypes::Field::new(
@@ -138,28 +140,49 @@ mod tests {
         })
     }
 
+    fn call(arg: ColumnarValue) -> Result<ColumnarValue, DataFusionError> {
+        call_args(vec![arg])
+    }
+
     #[test]
     fn assert_true_passes() {
-        let r = call(ColumnarValue::Scalar(ScalarValue::Boolean(Some(true))));
-        assert!(r.is_ok());
+        let _ = call(ColumnarValue::Scalar(ScalarValue::Boolean(Some(true))))
+            .expect("TRUE should pass the assertion");
     }
 
     #[test]
     fn assert_false_aborts() {
-        let e = call(ColumnarValue::Scalar(ScalarValue::Boolean(Some(false)))).unwrap_err();
+        let e = call(ColumnarValue::Scalar(ScalarValue::Boolean(Some(false))))
+            .expect_err("FALSE should fail the assertion");
         assert!(e.to_string().contains(ASSERT_FAILED_MARKER));
     }
 
     #[test]
     fn assert_null_aborts() {
-        let e = call(ColumnarValue::Scalar(ScalarValue::Boolean(None))).unwrap_err();
+        let e = call(ColumnarValue::Scalar(ScalarValue::Boolean(None)))
+            .expect_err("NULL should fail the assertion");
         assert!(e.to_string().contains(ASSERT_FAILED_MARKER));
     }
 
     #[test]
     fn assert_array_any_false_aborts() {
         let arr = std::sync::Arc::new(BooleanArray::from(vec![Some(true), Some(false)]));
-        let e = call(ColumnarValue::Array(arr)).unwrap_err();
+        let e = call(ColumnarValue::Array(arr))
+            .expect_err("an array containing FALSE should fail the assertion");
         assert!(e.to_string().contains(ASSERT_FAILED_MARKER));
+    }
+
+    #[test]
+    fn assert_rejects_wrong_argument_count() {
+        for args in [
+            vec![],
+            vec![
+                ColumnarValue::Scalar(ScalarValue::Boolean(Some(true))),
+                ColumnarValue::Scalar(ScalarValue::Boolean(Some(false))),
+            ],
+        ] {
+            let e = call_args(args).expect_err("wrong argument count should fail");
+            assert!(e.to_string().contains("requires exactly one"));
+        }
     }
 }

@@ -35,15 +35,16 @@ pub mod status;
 pub mod tools;
 pub mod workers;
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use crate::{
     component::dataset::Dataset,
     datafusion::{
         DataFusion,
         query::{
-            Error as QueryError, QueryBuilder, is_cancellation_error, is_timeout_error,
-            json_array_writer, schema_has_union_columns, write_to_json_string, write_to_json_value,
+            Error as QueryError, QueryBuilder, ResultsCacheMode, is_cancellation_error,
+            is_timeout_error, json_array_writer, schema_has_union_columns, write_to_json_string,
+            write_to_json_value,
         },
     },
     egress::EgressAccount,
@@ -61,11 +62,10 @@ use bytes::Bytes;
 use cache::result::CacheStatus;
 use csv::Writer;
 use datafusion::common::ParamValues;
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion::execution::{SendableRecordBatchStream, memory_pool::MemoryPool};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::{ast::Statement as SqlStatement, dialect::PostgreSqlDialect};
-use std::sync::LazyLock;
-use tokio::sync::Mutex;
 use headers_accept::Accept;
 use http::{
     HeaderValue,
@@ -74,6 +74,7 @@ use http::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::ResultExt;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use futures::{StreamExt, TryStreamExt};
 
@@ -259,10 +260,10 @@ pub async fn sql_to_http_response(
     format: ResponseMimeType,
     read_only: bool,
 ) -> Response {
-    // Conditional commits: a `BEGIN … COMMIT` transaction body is run by a dedicated
-    // serializing executor rather than the (rejected) single-statement path.
-    if let Some(inner) = detect_conditional_commit_transaction(&sql) {
-        return execute_conditional_commit(df, inner, read_only, format).await;
+    // A `BEGIN … COMMIT` body is run by the transaction executor rather than
+    // the ordinary single-statement path.
+    if let Some(statements) = transaction_statements(&sql) {
+        return execute_transaction(df, statements, parameters, read_only, format).await;
     }
 
     // Capture the query memory pool before `df` is moved into the builder, so a
@@ -284,9 +285,20 @@ pub async fn sql_to_http_response(
         }
     };
 
-    let cache_status = query_res.cache_status;
-    let mut data_stream = query_res.data;
+    query_stream_to_http_response(query_res.data, query_res.cache_status, format, memory_pool).await
+}
 
+/// Converts a query stream to the requested HTTP response format.
+///
+/// Default JSON responses stream batch-by-batch. Formats that require complete
+/// result metadata, and JSON schemas containing union columns, use the buffered
+/// response path.
+async fn query_stream_to_http_response(
+    mut data_stream: SendableRecordBatchStream,
+    cache_status: CacheStatus,
+    format: ResponseMimeType,
+    memory_pool: Arc<dyn MemoryPool>,
+) -> Response {
     // Stream only the default JSON format with non-union columns; csv/plain/vnd
     // buffer via `to_http_response`, and union columns (which the arrow-json array
     // writer can't render) fall back to the buffered JSON path. Streamability is a
@@ -312,21 +324,18 @@ pub async fn sql_to_http_response(
     (StatusCode::OK, headers, body).into_response()
 }
 
-/// Process-global serialization lock for conditional-commit transactions.
+/// Process-global serialization lock for `/v1/sql` transactions.
 ///
-/// v1 is pessimistic and single-instance: the whole `BEGIN … COMMIT` body (the
-/// `assert()` gate read + the writes) runs while holding this lock, so concurrent
-/// gated transactions are serialized and a gate cannot be raced (no over-admit).
-/// Per-key optimistic concurrency — so transactions touching disjoint keys run in
-/// parallel — is the tracked follow-up (spiceai#11834/#11835).
-static CONDITIONAL_COMMIT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+/// v1 is pessimistic and single-instance: each complete `BEGIN … COMMIT` body
+/// runs while holding this lock. Per-key optimistic concurrency, which would let
+/// transactions touching disjoint keys run in parallel, is tracked separately.
+static TRANSACTION_LOCK: LazyLock<Arc<Mutex<()>>> = LazyLock::new(|| Arc::new(Mutex::new(())));
 
-/// Detects a `BEGIN … COMMIT` transaction body and returns its inner statements as
-/// SQL strings (transaction-control statements stripped), or `None` if `sql` is not
-/// a well-formed `BEGIN … COMMIT` body. A non-transaction (single statement, or a
-/// multi-statement string not wrapped in `BEGIN … COMMIT`) returns `None` and is
-/// handled by the ordinary path unchanged.
-fn detect_conditional_commit_transaction(sql: &str) -> Option<Vec<String>> {
+/// Returns the statements inside a well-formed `BEGIN … COMMIT` transaction.
+/// Transaction-control statements are stripped. A single statement or a
+/// multi-statement string not wrapped in `BEGIN … COMMIT` returns `None` and is
+/// handled by the ordinary query path.
+fn transaction_statements(sql: &str) -> Option<Vec<String>> {
     let statements: Vec<DFStatement> = DFParser::parse_sql_with_dialect(sql, &PostgreSqlDialect {})
         .ok()?
         .into_iter()
@@ -355,64 +364,116 @@ fn detect_conditional_commit_transaction(sql: &str) -> Option<Vec<String>> {
     Some(inner)
 }
 
-/// Executes a conditional-commit transaction body: runs each inner statement in
-/// order while holding the serialization lock, so the `assert()` gate read and the
-/// writes are atomic with respect to other gated transactions. A failed `assert()`
-/// (or any statement error) aborts the transaction — subsequent statements do not
-/// run and the error is returned to the client.
+/// Makes positional parameters reusable across transaction statements.
 ///
-/// v1 reuses the ordinary write path, so a Cayenne-accelerated `write_mode:
-/// write_back` dataset commits to the accelerator and propagates to the source as
-/// usual. It is not multi-statement atomic on failure (writes applied by an earlier
-/// statement are not rolled back); the canonical shape — gate first, then writes —
-/// means a gate failure applies no writes. Transaction-level bound parameters are
-/// not yet supported (use literal values in the body).
-async fn execute_conditional_commit(
+/// Each statement is planned independently, so a positional list containing
+/// `$1` and `$2` would otherwise fail validation when one statement references
+/// only a subset. Named values preserve the transaction-wide placeholder
+/// indexes while allowing each statement to bind the values it uses.
+fn normalize_transaction_parameters(parameters: Option<ParamValues>) -> Option<ParamValues> {
+    match parameters {
+        Some(ParamValues::List(values)) => Some(ParamValues::Map(
+            values
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| ((index + 1).to_string(), value))
+                .collect(),
+        )),
+        parameters => parameters,
+    }
+}
+
+async fn run_transaction_statement(
+    df: &Arc<DataFusion>,
+    sql: &str,
+    parameters: Option<ParamValues>,
+    read_only: bool,
+) -> Result<cache::result::query::QueryResult, QueryError> {
+    QueryBuilder::new(sql, Arc::clone(df))
+        .parameters(parameters)
+        .read_only(read_only)
+        // Every statement must observe current state and must not replace a
+        // previously cached result while the transaction lock is held.
+        .results_cache_mode(ResultsCacheMode::Bypass)
+        .build()
+        .run()
+        .await
+}
+
+/// Keeps the transaction lock until the final statement's lazy result stream is
+/// fully consumed or dropped.
+fn attach_transaction_guard_to_stream(
+    stream: SendableRecordBatchStream,
+    guard: OwnedMutexGuard<()>,
+) -> SendableRecordBatchStream {
+    let schema = stream.schema();
+    let guarded = futures::stream::unfold((stream, guard), |(mut stream, guard)| async move {
+        stream
+            .next()
+            .await
+            .map(|batch_result| (batch_result, (stream, guard)))
+    });
+    Box::pin(RecordBatchStreamAdapter::new(schema, guarded))
+}
+
+/// Executes each statement in a transaction in order under the process-wide
+/// serialization lock. Any statement error stops subsequent execution and is
+/// returned to the client.
+///
+/// Intermediate result streams are drained batch-by-batch without buffering so
+/// writes finish and execution errors surface before the next statement. The
+/// final statement's result is streamed to the client. This executor does not
+/// provide rollback: writes completed by an earlier statement remain applied if
+/// a later statement fails.
+async fn execute_transaction(
     df: Arc<DataFusion>,
-    inner_sqls: Vec<String>,
+    statements: Vec<String>,
+    parameters: Option<ParamValues>,
     read_only: bool,
     format: ResponseMimeType,
 ) -> Response {
-    let _guard = CONDITIONAL_COMMIT_LOCK.lock().await;
+    let Some((final_statement, intermediate_statements)) = statements.split_last() else {
+        return (StatusCode::OK, "COMMIT").into_response();
+    };
 
-    let mut last: Option<(Vec<RecordBatch>, CacheStatus)> = None;
-    for stmt_sql in &inner_sqls {
-        let query_res = match QueryBuilder::new(stmt_sql, Arc::clone(&df))
-            .read_only(read_only)
-            // Gate + inner reads must see live committed state, not a (stale) cached
-            // result — the transaction is the serialization point, not the cache.
-            .bypass_cache(true)
-            .build()
-            .run()
-            .await
-        {
-            Ok(res) => res,
-            Err(e) => {
-                let kind = SqlErrorKind::of_query_error(&e);
-                return sql_error_response(e.to_string(), kind);
+    let memory_pool = Arc::clone(&df.ctx.runtime_env().memory_pool);
+    let parameters = normalize_transaction_parameters(parameters);
+    let transaction_guard = Arc::clone(&TRANSACTION_LOCK).lock_owned().await;
+
+    for statement in intermediate_statements {
+        let query_res =
+            match run_transaction_statement(&df, statement, parameters.clone(), read_only).await {
+                Ok(result) => result,
+                Err(error) => {
+                    let kind = SqlErrorKind::of_query_error(&error);
+                    return sql_error_response(error.to_string(), kind);
+                }
+            };
+
+        // Drain and immediately drop each batch. This executes writes and
+        // surfaces stream errors without materializing intermediate SELECTs.
+        let mut data_stream = query_res.data;
+        while let Some(batch_result) = data_stream.next().await {
+            if let Err(error) = batch_result {
+                return sql_error_response(
+                    error.to_string(),
+                    SqlErrorKind::of_datafusion_error(&error),
+                );
+            }
+        }
+    }
+
+    let query_res =
+        match run_transaction_statement(&df, final_statement, parameters, read_only).await {
+            Ok(result) => result,
+            Err(error) => {
+                let kind = SqlErrorKind::of_query_error(&error);
+                return sql_error_response(error.to_string(), kind);
             }
         };
-        let cache_status = query_res.cache_status;
-        // Drain each statement fully so writes execute and any error (including a
-        // gate abort) surfaces before the next statement runs.
-        match query_res.data.try_collect::<Vec<RecordBatch>>().await {
-            Ok(batches) => last = Some((batches, cache_status)),
-            Err(e) => {
-                return sql_error_response(e.to_string(), SqlErrorKind::of_datafusion_error(&e));
-            }
-        }
-    }
 
-    // All statements succeeded — the transaction is committed. Return the final
-    // statement's result (for the canonical gate+write shape, the write's summary).
-    match last {
-        Some((batches, cache_status)) => {
-            to_http_response(batches, cache_status, format, ResponseMetadata::empty())
-                .await
-                .into_response()
-        }
-        None => (StatusCode::OK, "COMMIT").into_response(),
-    }
+    let data_stream = attach_transaction_guard_to_stream(query_res.data, transaction_guard);
+    query_stream_to_http_response(data_stream, query_res.cache_status, format, memory_pool).await
 }
 
 /// Classifies a query error for HTTP status mapping: client-initiated
@@ -766,7 +827,13 @@ mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::scalar::ScalarValue;
     use std::sync::Arc;
+
+    use crate::{
+        dataaccelerator::AcceleratorEngineRegistry, datafusion::builder::DataFusionBuilder,
+        status::RuntimeStatus,
+    };
 
     /// `/v1/sql` must let clients distinguish outcomes by status code: a
     /// `runtime.query.timeout` expiry maps to 504 Gateway Timeout, a
@@ -815,6 +882,47 @@ mod tests {
             SqlErrorKind::of_datafusion_error(&stream_cancel),
         );
         assert_eq!(response.status().as_u16(), 499);
+    }
+
+    #[test]
+    fn transaction_statements_requires_begin_and_commit() {
+        assert_eq!(
+            transaction_statements("BEGIN; SELECT 1; COMMIT"),
+            Some(vec!["SELECT 1".to_string()])
+        );
+        assert!(transaction_statements("SELECT 1; SELECT 2").is_none());
+        assert!(transaction_statements("BEGIN; COMMIT").is_none());
+    }
+
+    #[tokio::test]
+    async fn transaction_executes_bound_parameters_and_returns_final_result() {
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                tokio::runtime::Handle::current(),
+            )
+            .build(),
+        );
+        let parameters = ParamValues::from(vec![
+            ScalarValue::Int64(Some(41)),
+            ScalarValue::Int64(Some(42)),
+        ]);
+
+        let response = sql_to_http_response(
+            df,
+            Arc::from("BEGIN; SELECT $1 AS ignored; SELECT $2 AS value; COMMIT"),
+            Some(parameters),
+            ResponseMimeType::Json,
+            false,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("transaction response body should be readable");
+        assert_eq!(body.as_ref(), br#"[{"value":42}]"#);
     }
 
     #[test]

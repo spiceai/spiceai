@@ -220,6 +220,16 @@ impl Display for QueryMethod {
     }
 }
 
+/// Controls how a query interacts with the SQL results cache.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ResultsCacheMode {
+    /// Apply the request context's normal results-cache behavior.
+    #[default]
+    Default,
+    /// Skip both results-cache lookup and storage.
+    Bypass,
+}
+
 pub struct Query {
     df: Arc<crate::datafusion::DataFusion>,
     sql: QueryMethod,
@@ -238,11 +248,9 @@ pub struct Query {
     /// regardless of per-catalog writability. Set via [`QueryBuilder::read_only`];
     /// used by `/v1/tools/sql` and `/v1/nsql` to contain LLM-generated SQL.
     read_only: bool,
-    /// When true, this query bypasses the SQL results cache entirely (no lookup,
-    /// no store) — equivalent to `Cache-Control: no-cache`. Set via
-    /// [`QueryBuilder::bypass_cache`]; used by the conditional-commit transaction
-    /// executor so a gate read always sees live committed state.
-    bypass_cache: bool,
+    /// Controls results-cache lookup and storage. Set via
+    /// [`QueryBuilder::results_cache_mode`].
+    results_cache_mode: ResultsCacheMode,
 }
 
 macro_rules! handle_error {
@@ -657,6 +665,7 @@ impl Query {
         // Get the scheduler server
         let scheduler = Self::get_scheduler_server(&self.df)?;
         let tracker = self.tracker;
+        let results_cache_mode = self.results_cache_mode;
         let query_start = std::time::Instant::now();
         let sql_preview: Arc<str> = match &self.sql {
             QueryMethod::Text { sql, .. } => Arc::clone(sql),
@@ -722,17 +731,33 @@ impl Query {
                     // cache itself is namespaced per principal and refuses to
                     // store write-capable plans, so a read-only caller cannot
                     // observe a cached entry produced by a write-capable plan.
-                    match Query::get_plan_or_cached(
-                        &self.df,
-                        &session,
-                        Arc::clone(&request_context),
-                        sql.as_ref(),
-                        parameters,
-                        tracker,
-                        pre_parsed_plan,
-                    )
-                    .await?
-                    {
+                    let plan_or_cached = match results_cache_mode {
+                        ResultsCacheMode::Default => {
+                            Query::get_plan_or_cached(
+                                &self.df,
+                                &session,
+                                Arc::clone(&request_context),
+                                sql.as_ref(),
+                                parameters,
+                                tracker,
+                                pre_parsed_plan,
+                            )
+                            .await?
+                        }
+                        ResultsCacheMode::Bypass => {
+                            Query::get_plan_without_results_cache(
+                                &self.df,
+                                &session,
+                                &request_context,
+                                sql.as_ref(),
+                                parameters,
+                                tracker,
+                                pre_parsed_plan,
+                            )
+                            .await?
+                        }
+                    };
+                    match plan_or_cached {
                         cache::PlanOrCached::Cached(cached_result) => {
                             tracing::debug!(
                                 job_id,
@@ -778,6 +803,7 @@ impl Query {
                 // Resume drives the persisted graph, so skip the short-circuit
                 // entirely (returning a cached result would orphan the job).
                 if mode != DistributedSubmitMode::Resume
+                    && results_cache_mode == ResultsCacheMode::Default
                     && let Some(cache_provider) = self.df.results_cache_provider()
                     && let Ok(Some(cached_result)) =
                         cache_provider.get_raw_key(&plan_cache_key).await
@@ -808,8 +834,10 @@ impl Query {
                     }
                 }
 
-                // Don't cache results for a recovered job.
-                let cache_key = (mode != DistributedSubmitMode::Resume).then_some(plan_cache_key);
+                // Don't cache results for a recovered job or a query that bypasses caching.
+                let cache_key = (mode != DistributedSubmitMode::Resume
+                    && results_cache_mode == ResultsCacheMode::Default)
+                    .then_some(plan_cache_key);
                 (*logical_plan, tracker, cache_key)
             }
         };
@@ -1037,7 +1065,7 @@ impl Query {
                 let mut session = self.get_session_state(&request_context);
 
                 let ctx = self;
-                let bypass_cache = ctx.bypass_cache;
+                let results_cache_mode = ctx.results_cache_mode;
                 let tracker = ctx.tracker;
 
                 // Sets the request context as an extension on DataFusion, to allow recovering it to track telemetry
@@ -1118,95 +1146,54 @@ impl Query {
                         table_allowlist: None,
                         pre_parsed_plan,
                     } => {
-                        if bypass_cache {
-                            // Gate/inner reads in a conditional-commit transaction must
-                            // see live committed state, so skip the results cache entirely
-                            // (no lookup, no store) — mirrors the table-allowlist arm.
-                            let raw_cache_key = CacheKey::Query(sql.as_ref(), parameters.as_ref())
-                                .as_raw_key(Query::plan_hasher(&ctx.df));
-                            let plan = if let Some(plan) = pre_parsed_plan {
-                                plan
-                            } else {
+                        let plan_or_cached = match results_cache_mode {
+                            ResultsCacheMode::Default => {
+                                Self::get_plan_or_cached(
+                                    &ctx.df,
+                                    &session,
+                                    Arc::clone(&request_context),
+                                    sql.as_ref(),
+                                    parameters,
+                                    tracker,
+                                    pre_parsed_plan,
+                                )
+                                .await?
+                            }
+                            ResultsCacheMode::Bypass => {
+                                Self::get_plan_without_results_cache(
+                                    &ctx.df,
+                                    &session,
+                                    &request_context,
+                                    sql.as_ref(),
+                                    parameters,
+                                    tracker,
+                                    pre_parsed_plan,
+                                )
+                                .await?
+                            }
+                        };
+                        match plan_or_cached {
+                            PlanOrCached::Plan(plan, tracker, cache_manager) => {
                                 Self::ensure_not_cancelled(
                                     &query_cancel_token,
                                     &query_id_str,
                                     &timeout_state,
                                 )?;
-                                match Self::get_plan(
-                                    &ctx.df,
-                                    &session,
-                                    sql.as_ref(),
-                                    &raw_cache_key,
-                                    parameters,
-                                )
-                                .await
-                                {
-                                    Ok(plan) => Box::new(plan),
-                                    Err(e) => match e {
-                                        Error::UnableToExecuteQuery { source } => {
-                                            let code = ErrorCode::from(&source);
-                                            let snafu_err =
-                                                Error::UnableToExecuteQuery { source };
-                                            if let Some(t) = tracker {
-                                                t.finish_with_error(
-                                                    &request_context,
-                                                    snafu_err.to_string(),
-                                                    code,
-                                                );
-                                            }
-                                            return Err(snafu_err);
-                                        }
-                                        _ => return Err(e),
-                                    },
-                                }
-                            };
-                            Self::ensure_not_cancelled(
-                                &query_cancel_token,
-                                &query_id_str,
-                                &timeout_state,
-                            )?;
-                            (
-                                plan,
-                                tracker,
-                                RequestCacheManager::new(
-                                    CacheStatus::CacheDisabled,
-                                    raw_cache_key,
-                                ),
-                            )
-                        } else {
-                            match Self::get_plan_or_cached(
-                                &ctx.df,
-                                &session,
-                                Arc::clone(&request_context),
-                                sql.as_ref(),
-                                parameters,
-                                tracker,
-                                pre_parsed_plan,
-                            )
-                            .await?
-                            {
-                                PlanOrCached::Plan(plan, tracker, cache_manager) => {
-                                    Self::ensure_not_cancelled(
-                                        &query_cancel_token,
-                                        &query_id_str,
-                                        &timeout_state,
-                                    )?;
-                                    (plan, tracker, cache_manager)
-                                }
-                                PlanOrCached::Cached(query_result) => {
-                                    Self::ensure_not_cancelled(
-                                        &query_cancel_token,
-                                        &query_id_str,
-                                        &timeout_state,
-                                    )?;
-                                    return Ok(attach_cancellation_to_query_result(
-                                        query_result,
-                                        query_cancel_token.clone(),
-                                        Arc::clone(&query_id_str),
-                                        timeout_state.clone(),
-                                        (active_query_guard, timeout_timer_guard),
-                                    ));
-                                }
+                                (plan, tracker, cache_manager)
+                            }
+                            PlanOrCached::Cached(query_result) => {
+                                Self::ensure_not_cancelled(
+                                    &query_cancel_token,
+                                    &query_id_str,
+                                    &timeout_state,
+                                )?;
+                                return Ok(attach_cancellation_to_query_result(
+                                    query_result,
+                                    query_cancel_token.clone(),
+                                    Arc::clone(&query_id_str),
+                                    timeout_state.clone(),
+                                    (active_query_guard, timeout_timer_guard),
+                                ));
                             }
                         }
                     }
@@ -1215,8 +1202,12 @@ impl Query {
                         // plan-submitted result is never reused across principals.
                         let cache_namespace = request_context.cache_namespace();
                         let (ns_tag, ns_id) = cache_namespace.hash_inputs();
+                        let cache_status = match results_cache_mode {
+                            ResultsCacheMode::Default => CacheStatus::CacheMiss,
+                            ResultsCacheMode::Bypass => CacheStatus::CacheDisabled,
+                        };
                         let cache_manager = RequestCacheManager::new(
-                            CacheStatus::CacheMiss,
+                            cache_status,
                             CacheKey::LogicalPlan(&logical_plan).as_raw_key_in_namespace(
                                 Query::plan_hasher(&ctx.df),
                                 ns_tag,
@@ -1629,7 +1620,7 @@ impl Query {
             query_id: uuid::Uuid::new_v4(),
             cancellation_token: None,
             read_only: false,
-            bypass_cache: false,
+            results_cache_mode: ResultsCacheMode::default(),
         }
     }
 
