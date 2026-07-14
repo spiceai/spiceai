@@ -227,8 +227,12 @@ fn deletion_vector_write_parallelizes_files_and_coalesces_dir_sync() {
     // cleanup unlinks their paths — `try_join_all` would short-circuit and let a
     // still-running writer leak an orphan deletion vector past cleanup. What must
     // never creep back is a serial `for … .await` loop over the specs.
+    // `contains("join_all")` alone already matches `try_join_all` (substring),
+    // but check both explicitly so the assertion visibly matches the "either is
+    // fine" intent above. A serial `for … .await` loop over the specs contains
+    // neither and correctly fails.
     assert!(
-        write_body.contains("join_all"),
+        write_body.contains("join_all") || write_body.contains("try_join_all"),
         "DeletionVectorWriter::write must write the batch's deletion-vector \
          files concurrently (join_all/try_join_all) — serializing them \
          re-introduces N fsync round-trips per batch on network-attached storage."
