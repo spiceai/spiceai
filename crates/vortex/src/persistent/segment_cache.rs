@@ -122,7 +122,28 @@ struct PathSegmentCache {
 #[async_trait]
 impl SegmentCache for PathSegmentCache {
     async fn get(&self, id: SegmentId) -> VortexResult<Option<ByteBuffer>> {
-        let result = self.shared.cache.get(&(Arc::clone(&self.path), id)).await;
+        // TEMPORARY DIAGNOSTIC (cold-promotion hang): a moka future-cache wait
+        // is invisible to tokio taskdump (non-tokio leaf), so a lost wake here
+        // would park a scan silently. Surface any abnormal wait instead of
+        // hanging: after 60s treat it as a miss (the caller re-reads from disk)
+        // and WARN — a fired warning implicates the cache in the wedge.
+        let result = match tokio::time::timeout(
+            std::time::Duration::from_mins(1),
+            self.shared.cache.get(&(Arc::clone(&self.path), id)),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    path = %self.path,
+                    segment = ?id,
+                    "Segment cache get did not resolve within 1min; treating as a miss (possible lost wake in the cache)"
+                );
+                None
+            }
+        };
 
         // Segment-cache right-sizing telemetry: count accesses/hits and, every
         // SEGMENT_CACHE_STATS_SAMPLE_EVERY calls, publish the cumulative hit rate
@@ -149,10 +170,23 @@ impl SegmentCache for PathSegmentCache {
     }
 
     async fn put(&self, id: SegmentId, buffer: ByteBuffer) -> VortexResult<()> {
-        self.shared
-            .cache
-            .insert((Arc::clone(&self.path), id), buffer)
-            .await;
+        // TEMPORARY DIAGNOSTIC: see `get` — surface an abnormal cache wait
+        // instead of parking the writer silently; skipping an insert only
+        // costs a future cache miss.
+        if tokio::time::timeout(
+            std::time::Duration::from_mins(1),
+            self.shared.cache.insert((Arc::clone(&self.path), id), buffer),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                target: "cayenne::compaction",
+                path = %self.path,
+                segment = ?id,
+                "Segment cache insert did not resolve within 1min; skipping (possible lost wake in the cache)"
+            );
+        }
         Ok(())
     }
 }
