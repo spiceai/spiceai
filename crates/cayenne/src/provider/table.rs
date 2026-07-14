@@ -13324,10 +13324,11 @@ impl CayenneTableProvider {
             .collect()
     }
 
-    /// Z-order (Morton) cluster a stream by appending a transient interleaved-bits
-    /// key column, sorting on it via the proven external `SortExec` path
-    /// (`util::stream_utils::sort_stream`, disk-spilling), then stripping the key.
-    /// Empty `clustering_indices` returns the stream unchanged.
+    /// Z-order (Morton) cluster a stream in bounded runs by appending a transient
+    /// interleaved-bits key column, sorting each run via the external `SortExec`
+    /// path (`util::stream_utils::sort_stream`, disk-spilling), then stripping
+    /// the key. Files within a run get tight ordered slices; Z-order ranges may
+    /// overlap across runs. Empty `clustering_indices` returns the stream unchanged.
     fn zorder_sort_stream(
         &self,
         stream: SendableRecordBatchStream,
@@ -13337,18 +13338,34 @@ impl CayenneTableProvider {
         if clustering_indices.is_empty() {
             return Ok(stream);
         }
+        let run_size_bytes = self
+            .table_metadata
+            .vortex_config
+            .cold_clustering_run_size_mb
+            .saturating_mul(1024 * 1024)
+            .max(1);
+        Ok(Self::bounded_zorder_sort_stream(
+            self.table_metadata.table_name.clone(),
+            stream,
+            clustering_indices,
+            task_ctx,
+            run_size_bytes,
+        ))
+    }
+
+    fn bounded_zorder_sort_stream(
+        table_name: String,
+        stream: SendableRecordBatchStream,
+        clustering_indices: Vec<usize>,
+        task_ctx: &Arc<datafusion_execution::TaskContext>,
+        run_size_bytes: usize,
+    ) -> SendableRecordBatchStream {
         let original_schema = stream.schema();
         let output_schema = Arc::clone(&original_schema);
         let augmented_schema = super::zorder::zorder_augmented_schema(&original_schema);
-        let target_size_bytes = self
-            .table_metadata
-            .vortex_config
-            .cold_target_file_size_mb
-            .saturating_mul(1024 * 1024);
-        let run_size_bytes = target_size_bytes.saturating_mul(16).max(1);
-        let table_name = self.table_metadata.table_name.clone();
         let task_ctx = Arc::clone(task_ctx);
         let clustering_indices = Arc::new(clustering_indices);
+        let run_size_bytes = run_size_bytes.max(1);
 
         struct BoundedZOrderState {
             input: SendableRecordBatchStream,
@@ -13509,10 +13526,7 @@ impl CayenneTableProvider {
             }
         });
 
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            output_schema,
-            sorted_runs,
-        )))
+        Box::pin(RecordBatchStreamAdapter::new(output_schema, sorted_runs))
     }
 
     fn cold_zorder_sort_disabled_for_diagnostics() -> bool {
@@ -13950,9 +13964,12 @@ impl CayenneTableProvider {
                         // see (running tasks are skipped). Sample the whole process
                         // with an in-process signal profiler for 15s and log the
                         // hottest stacks — this names the spinning function.
+                        // No blocklist: pprof drops any sample whose stack touches a
+                        // blocklisted module, and a memcpy-heavy spin lives inside
+                        // libc frames almost every sample — the first capture came
+                        // back with 7 stray stacks because of exactly that filter.
                         match pprof::ProfilerGuardBuilder::default()
                             .frequency(99)
-                            .blocklist(&["libc", "libgcc", "pthread", "vdso"])
                             .build()
                         {
                             Ok(guard) => {
@@ -25330,6 +25347,67 @@ mod tests {
         assert!(
             row_cap < exact_key_budget,
             "row cap ({row_cap}) must leave headroom below the exact key budget ({exact_key_budget})"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_zorder_sort_stream_sorts_each_run_without_global_merge() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let batch1 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![3, 1]))],
+        )
+        .expect("batch1");
+        let batch2 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![4, 2]))],
+        )
+        .expect("batch2");
+        let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            stream::iter(vec![
+                Ok::<_, DataFusionError>(batch1),
+                Ok::<_, DataFusionError>(batch2),
+            ]),
+        ));
+        let task_ctx = Arc::new(datafusion_execution::TaskContext::default());
+
+        let output = CayenneTableProvider::bounded_zorder_sort_stream(
+            "bounded_zorder_test".to_string(),
+            input,
+            vec![0],
+            &task_ctx,
+            1,
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("bounded zorder sort should succeed");
+
+        let values = output
+            .iter()
+            .flat_map(|batch| {
+                assert_eq!(
+                    batch.num_columns(),
+                    1,
+                    "transient z-order key column must be stripped"
+                );
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id column");
+                (0..ids.len()).map(|row| ids.value(row)).collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            values,
+            vec![1, 3, 2, 4],
+            "each bounded run is sorted independently; runs are not globally merged"
         );
     }
 
