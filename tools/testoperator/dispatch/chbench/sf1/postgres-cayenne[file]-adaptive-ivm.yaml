@@ -1,0 +1,9 @@
+tests:
+  htap:
+    spicepod_path: accelerated/postgres-cayenne[file]-adaptive-ivm.yaml
+    runner_type: spiceai-dev-large-runners
+    scale_factor: 1
+    duration: 900
+    ready_wait: 60
+    # Keep 15 minutes of q1 + q6 contribution-index churn below the 5M cap.
+    rate: 400

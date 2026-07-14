@@ -104,11 +104,10 @@ pub enum MaintainedAggregateFunction {
 #[derive(Debug)]
 pub struct MaintainedAggregateRegistry {
     state: RwLock<RegistryState>,
-    /// Upper bound on total per-PK index entries across all views. When the
-    /// retraction index would exceed this, the registry fails safe to `Stale`
-    /// and clears its indexes (queries fall back to the base table until the
-    /// next rebuild), keeping memory bounded under `runtime.query.memory_limit`.
-    /// `usize::MAX` for registries built without a PK (no index is maintained).
+    /// Upper bound on retained index entries across all views: per-PK
+    /// contributions for indexed views, or distinct `MIN`/`MAX` multiset values
+    /// for insert-only views. When the total would exceed this, the registry
+    /// fails safe to `Stale` and clears its indexes.
     max_index_entries: usize,
     /// Whether a per-PK index is maintained (a non-empty PK was configured), so
     /// UPDATE/DELETE can be retracted incrementally rather than marking stale.
@@ -275,23 +274,23 @@ enum AggregateAccumulator {
 /// [`scalar_for_field`] requires the output scalar to match the column type
 /// exactly.
 ///
-/// Memory bound (PK-indexed views only): a PK-indexed `MIN`/`MAX` view stores
-/// exactly one multiset value per live PK, so its total multiset size tracks
-/// `pk_index.len()` (distinct values ≤ live rows) — the quantity
-/// [`MaintainedAggregateView::index_len`] returns and `max_index_entries` caps,
-/// fail-safe-to-[`RegistryStatus::Stale`]. So for the CDC norm (every CDC table
-/// carries a primary key), the multiset is co-bounded by that cap. An
-/// **insert-only view without a primary key** (`pk_columns` empty) is NOT
-/// covered: `index_len` counts only `pk_index` (empty here), so the multiset is
-/// bounded solely by the column's distinct-value cardinality, not the entry
-/// cap. Extending `index_len` to include the multiset size would close that gap
-/// (see the maintained-MIN/MAX follow-ups).
+/// Memory bound: for a PK-indexed view, every live multiset value corresponds to
+/// one bounded PK contribution. Without a PK, [`MaintainedAggregateView::index_len`]
+/// counts the distinct multiset entries directly. In both cases,
+/// `max_index_entries` fails the registry safe to [`RegistryStatus::Stale`] when
+/// the retained-entry count exceeds the cap. The runtime additionally rejects
+/// user-configured `MIN`/`MAX` without a primary key because retraction cannot be
+/// supported there.
 #[derive(Debug, Clone, Default)]
 struct SortedScalarIndex {
     entries: BTreeMap<i128, (ScalarValue, u64)>,
 }
 
 impl SortedScalarIndex {
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
     /// Add one live value. `checked_add` on the per-value count matches the
     /// crate-wide "never silently clamp a maintained counter" discipline.
     fn insert(&mut self, scalar: ScalarValue) -> DataFusionResult<()> {
@@ -465,8 +464,8 @@ impl MaintainedAggregateRegistry {
 
     /// As [`Self::try_new`], but maintains a per-PK contribution index keyed on
     /// `pk_columns` so UPDATE/DELETE can be retracted incrementally (see
-    /// [`Self::apply_pk_deletes`]). `max_index_entries` bounds the index across all
-    /// views; exceeding it fails the registry safe to `Stale`.
+    /// [`Self::apply_pk_deletes`]). `max_index_entries` bounds all retained index
+    /// entries across the views; exceeding it fails the registry safe to `Stale`.
     ///
     /// # Errors
     ///
@@ -527,14 +526,14 @@ impl MaintainedAggregateRegistry {
     }
 
     /// Apply positive row deltas if the state is fresh, otherwise keep it stale.
-    /// Bounds memory: if the per-PK index would exceed its cap the indexes are
+    /// Bounds memory: if the retained indexes would exceed their cap, all indexes are
     /// cleared and the registry fails safe to stale.
     ///
     /// # Errors
     ///
     /// Returns an error (after clearing the indexes and marking the registry
     /// stale) when a maintained accumulator overflows, Arrow scalar extraction
-    /// fails, or the per-PK index exceeds its entry cap. Queries then fall back
+    /// fails, or the retained indexes exceed their entry cap. Queries then fall back
     /// to base-table scans until the next rebuild.
     pub fn apply_insert_batches(
         &self,
@@ -593,7 +592,7 @@ impl MaintainedAggregateRegistry {
     }
 
     /// Rebuild every view from a complete table snapshot. Bounds memory: the
-    /// per-PK index is checked against its cap after each batch, so rebuilding a
+    /// retained index total is checked against its cap after each batch, so rebuilding a
     /// table larger than `max_index_entries` fails safe to stale (clearing the
     /// indexes) instead of growing the index unbounded.
     ///
@@ -601,7 +600,7 @@ impl MaintainedAggregateRegistry {
     ///
     /// Returns an error (after clearing the indexes and marking the registry
     /// stale) if a maintained accumulator overflows, Arrow scalar extraction
-    /// fails, or the per-PK index exceeds its entry cap.
+    /// fails, or the retained indexes exceed their entry cap.
     pub fn rebuild_from_batches(
         &self,
         epoch: u64,
@@ -622,14 +621,11 @@ impl MaintainedAggregateRegistry {
                 }
             }
             // Bail incrementally so a table larger than the cap fails safe to
-            // stale before the per-PK index grows unbounded (rather than only
+            // stale before the retained indexes grow unbounded (rather than only
             // after the full rebuild, which could OOM first).
-            if state
-                .views
-                .iter()
-                .map(MaintainedAggregateView::index_len)
-                .sum::<usize>()
-                > self.max_index_entries
+            if state.views.iter().fold(0_usize, |total, view| {
+                total.saturating_add(view.index_len())
+            }) > self.max_index_entries
             {
                 failure = Some(index_cap_exceeded());
                 break 'outer;
@@ -815,7 +811,26 @@ impl MaintainedAggregateView {
     }
 
     fn index_len(&self) -> usize {
-        self.pk_index.len()
+        if self.pk_columns.is_empty() {
+            // Runtime configuration rejects no-PK MIN/MAX, so the common
+            // insert-only COUNT/SUM/AVG path has no retained ordered index.
+            // Return in O(number of aggregate expressions) instead of scanning
+            // every accumulated group after every batch.
+            let has_ordered_index = self.spec.aggregates.iter().any(|aggregate| {
+                matches!(
+                    aggregate.function,
+                    MaintainedAggregateFunction::Min | MaintainedAggregateFunction::Max
+                )
+            });
+            if !has_ordered_index {
+                return 0;
+            }
+            self.groups
+                .values()
+                .fold(0, |total, group| total.saturating_add(group.index_len()))
+        } else {
+            self.pk_index.len()
+        }
     }
 
     /// Build a key (group key or PK) from the given column indices at `row`.
@@ -1241,9 +1256,22 @@ impl GroupAccumulator {
         };
         aggregate.scalar_value(field)
     }
+
+    fn index_len(&self) -> usize {
+        self.aggregates.iter().fold(0, |total, aggregate| {
+            total.saturating_add(aggregate.index_len())
+        })
+    }
 }
 
 impl AggregateAccumulator {
+    fn index_len(&self) -> usize {
+        match self {
+            Self::Min { index, .. } | Self::Max { index, .. } => index.len(),
+            _ => 0,
+        }
+    }
+
     fn try_new(expr: &ResolvedAggregateExpr) -> DataFusionResult<Self> {
         let accumulator = match (expr.function, expr.output_type, expr.column.as_ref()) {
             (MaintainedAggregateFunction::Count, _, None) => Self::CountAll { value: 0 },
@@ -1849,8 +1877,8 @@ fn begin_maintenance_pass(state: &mut RegistryState, epoch: u64) -> bool {
     !(state.status == RegistryStatus::Stale || state.views.is_empty())
 }
 
-/// Finalize a maintenance pass: if `failure` is set, or the per-PK index now
-/// exceeds `max_index_entries`, clear every index, mark the registry stale, and
+/// Finalize a maintenance pass: if `failure` is set, or the retained indexes now
+/// exceed `max_index_entries`, clear every index, mark the registry stale, and
 /// return the reason (so the write-path applier can log it); otherwise the
 /// registry stays fresh. Centralizes the fail-safe across the insert, PK-delete,
 /// and rebuild paths so memory is bounded on every mutating path.
@@ -1859,12 +1887,9 @@ fn finalize_maintenance_pass(
     max_index_entries: usize,
     failure: Option<DataFusionError>,
 ) -> DataFusionResult<()> {
-    let over_cap = state
-        .views
-        .iter()
-        .map(MaintainedAggregateView::index_len)
-        .sum::<usize>()
-        > max_index_entries;
+    let over_cap = state.views.iter().fold(0_usize, |total, view| {
+        total.saturating_add(view.index_len())
+    }) > max_index_entries;
     if failure.is_some() || over_cap {
         for view in &mut state.views {
             view.clear();
@@ -1877,7 +1902,7 @@ fn finalize_maintenance_pass(
 
 fn index_cap_exceeded() -> DataFusionError {
     DataFusionError::Execution(
-        "Maintained aggregate per-PK index exceeded its entry cap; falling back to base table scan"
+        "Maintained aggregate indexes exceeded their retained-entry cap; falling back to base table scan"
             .to_string(),
     )
 }
@@ -2478,6 +2503,34 @@ mod tests {
         assert!(
             registry.batch_for_aggregate(&aggregate, 1)?.is_none(),
             "over-cap registry must not serve"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn min_max_multiset_entries_count_toward_cap_without_pk() -> DataFusionResult<()> {
+        let spec = MaintainedAggregateSpec {
+            group_by: vec!["name".to_string()],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Min,
+                column: Some("i".to_string()),
+            }],
+            filter: None,
+        };
+        // No PK index, but two distinct extremum values still retain two BTreeMap
+        // entries and must exceed this one-entry cap.
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(&[spec], &schema(), &[], 1)?;
+        let result =
+            registry.apply_insert_batches(1, &[group_batch(&[("a", 1, 10), ("a", 2, 20)])]);
+        assert!(
+            result.is_err(),
+            "MIN multiset entries must be bounded even without a PK index"
+        );
+        let aggregate =
+            aggregate_exec_for(&[("min(i)", MaintainedAggregateFunction::Min, Some("i"))])?;
+        assert!(
+            registry.batch_for_aggregate(&aggregate, 1)?.is_none(),
+            "over-cap MIN registry must fall back to the base scan"
         );
         Ok(())
     }

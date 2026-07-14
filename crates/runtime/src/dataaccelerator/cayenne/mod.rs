@@ -125,6 +125,7 @@ static UNSUPPORTED_LOCAL_PARTITION_PATTERN: LazyLock<Regex> =
 fn maintained_aggregate_specs_for_cayenne(
     acceleration: Option<&Acceleration>,
     schema: &Schema,
+    primary_keys: &[String],
 ) -> Result<Vec<cayenne::maintained_aggregate::MaintainedAggregateSpec>> {
     let Some(acceleration) = acceleration else {
         return Ok(Vec::new());
@@ -139,6 +140,23 @@ fn maintained_aggregate_specs_for_cayenne(
         return Err(Error::InvalidConfiguration {
             detail: Arc::from(
                 "Cayenne maintained_aggregates is not yet supported on partitioned tables. Remove maintained_aggregates or remove partition_by from the acceleration configuration.",
+            ),
+        });
+    }
+
+    let has_min_or_max = maintained_aggregates.iter().any(|aggregate| {
+        aggregate.aggregates.iter().any(|expr| {
+            matches!(
+                expr.function,
+                spicepod_acceleration::MaintainedAggregateFunction::Min
+                    | spicepod_acceleration::MaintainedAggregateFunction::Max
+            )
+        })
+    });
+    if has_min_or_max && primary_keys.is_empty() {
+        return Err(Error::InvalidConfiguration {
+            detail: Arc::from(
+                "Cayenne maintained_aggregates MIN/MAX requires a primary key so UPDATE and DELETE changes can retract prior extrema within the retained-index cap. Set acceleration.primary_key, enable extended schema inference for a source primary key, or remove MIN/MAX from maintained_aggregates.",
             ),
         });
     }
@@ -1977,7 +1995,7 @@ impl CayenneAccelerator {
         let acceleration = source.acceleration();
         let metadata_dir = Self::resolve_metadata_dir(acceleration);
         let maintained_aggregate_specs =
-            maintained_aggregate_specs_for_cayenne(acceleration, &schema)?;
+            maintained_aggregate_specs_for_cayenne(acceleration, &schema, &primary_keys)?;
         let metastore_type = acceleration
             .and_then(|a| a.params.get("cayenne_metastore"))
             .map_or("sqlite", String::as_str)
@@ -3852,6 +3870,7 @@ mod tests {
         let specs = maintained_aggregate_specs_for_cayenne(
             Some(&acceleration),
             &maintained_aggregate_test_schema(),
+            &[],
         )
         .expect("unpartitioned maintained aggregate config should convert");
 
@@ -3889,6 +3908,7 @@ mod tests {
         let specs = maintained_aggregate_specs_for_cayenne(
             Some(&acceleration),
             &maintained_aggregate_test_schema(),
+            &["customer_id".to_string()],
         )
         .expect("min/max maintained aggregate config should convert");
 
@@ -3902,10 +3922,36 @@ mod tests {
             specs[0].aggregates[1].function,
             cayenne::maintained_aggregate::MaintainedAggregateFunction::Max
         );
-        assert_eq!(
-            specs[0].aggregates[0].column.as_deref(),
-            Some("amount")
-        );
+        assert_eq!(specs[0].aggregates[0].column.as_deref(), Some("amount"));
+    }
+
+    #[test]
+    fn maintained_aggregate_specs_reject_min_max_without_primary_key() {
+        let acceleration = Acceleration {
+            maintained_aggregates: vec![spicepod_acceleration::MaintainedAggregate {
+                group_by: Vec::new(),
+                aggregates: vec![spicepod_acceleration::MaintainedAggregateExpr {
+                    function: spicepod_acceleration::MaintainedAggregateFunction::Min,
+                    column: Some("amount".to_string()),
+                }],
+                filter_sql: None,
+            }]
+            .into(),
+            ..Default::default()
+        };
+
+        let error = maintained_aggregate_specs_for_cayenne(
+            Some(&acceleration),
+            &maintained_aggregate_test_schema(),
+            &[],
+        )
+        .expect_err("min/max without a primary key must be rejected");
+
+        let Error::InvalidConfiguration { detail } = error else {
+            panic!("expected InvalidConfiguration, got {error:?}");
+        };
+        assert!(detail.contains("MIN/MAX"));
+        assert!(detail.contains("primary key"));
     }
 
     #[test]
@@ -3919,6 +3965,7 @@ mod tests {
         let specs = maintained_aggregate_specs_for_cayenne(
             Some(&acceleration),
             &maintained_aggregate_test_schema(),
+            &[],
         )
         .expect("disabled maintained aggregate config should parse");
 
@@ -3936,6 +3983,7 @@ mod tests {
         let error = maintained_aggregate_specs_for_cayenne(
             Some(&acceleration),
             &maintained_aggregate_test_schema(),
+            &[],
         )
         .expect_err("partitioned maintained aggregate config should be rejected");
 
@@ -3965,6 +4013,7 @@ mod tests {
         let specs = maintained_aggregate_specs_for_cayenne(
             Some(&acceleration),
             &maintained_aggregate_test_schema(),
+            &[],
         )
         .expect("a valid maintained aggregate filter should convert");
 
@@ -3982,6 +4031,7 @@ mod tests {
         let error = maintained_aggregate_specs_for_cayenne(
             Some(&acceleration),
             &maintained_aggregate_test_schema(),
+            &[],
         )
         .expect_err("a filter referencing an unknown column must be rejected");
 
@@ -4002,6 +4052,7 @@ mod tests {
         let error = maintained_aggregate_specs_for_cayenne(
             Some(&acceleration),
             &maintained_aggregate_test_schema(),
+            &[],
         )
         .expect_err("a non-Boolean filter must be rejected at config time");
 

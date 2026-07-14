@@ -26,6 +26,8 @@ mod caching_mode_per_principal;
 #[cfg(feature = "duckdb")]
 mod caching_mode_post_filter;
 #[cfg(not(target_os = "windows"))]
+mod cayenne_maintained_aggregates;
+#[cfg(not(target_os = "windows"))]
 mod cayenne_memory;
 #[cfg(feature = "duckdb")]
 mod checkpoint_duckdb;
