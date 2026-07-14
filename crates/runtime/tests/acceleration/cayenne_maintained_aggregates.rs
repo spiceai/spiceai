@@ -99,7 +99,7 @@ impl SlotAdvancer for NoopSlotAdvancer {
     async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
 }
 
-/// SessionContext with the production maintained-aggregate physical rewrite.
+/// `SessionContext` with the production maintained-aggregate physical rewrite.
 fn cayenne_ctx() -> SessionContext {
     let state = SessionStateBuilder::new()
         .with_default_features()
