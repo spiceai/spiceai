@@ -21,16 +21,19 @@ limitations under the License.
 //! It reconciles the dirty-key markers a committed write leaves in
 //! `cayenne_pending_write_back` to the federated source, in strict order:
 //!
-//! 1. **Claim** a batch of markers (oldest commit sequence first).
-//! 2. **Read** the claimed keys' *current* committed values from the accelerator
-//!    (a fenced point scan), AFTER the claim.
-//! 3. **Deliver** to the source idempotently: delete the claimed keys, then
+//! 1. **List** a batch of the oldest markers (`list_dirty_keys`) — a plain
+//!    read, NOT an atomic reservation; concurrency safety comes from the
+//!    compare-and-clear in step 4, not from claiming these markers here.
+//! 2. **Read** those keys' *current* committed values from the accelerator
+//!    (a fenced point scan), AFTER the list.
+//! 3. **Deliver** to the source idempotently: delete those keys, then
 //!    insert the rows that are still present (delete-all-then-insert-present is
 //!    the same regardless of how many times it runs, so a re-delivery after a
 //!    crash converges).
-//! 4. **Compare-and-clear** the markers whose stored sequence is still
-//!    `<= claimed_seq` — a newer commit that bumped a marker during delivery
-//!    leaves it in place, so the stale delivery never clears a fresh mark.
+//! 4. **Compare-and-clear** the markers whose stored sequence is still at or
+//!    below the sequence listed in step 1 — a newer commit that bumped a marker
+//!    during delivery leaves it in place, so the stale delivery never clears a
+//!    fresh mark.
 //!
 //! Delivery failure never blocks accelerator commits; the dirty set simply
 //! grows until the next successful pass. Marking happens only in the
