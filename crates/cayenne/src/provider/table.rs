@@ -13782,34 +13782,47 @@ impl CayenneTableProvider {
                             dumps_taken,
                             "Cold-tier promotion pass made no completion within the stall window; capturing a tokio task dump of the compaction runtime"
                         );
-                        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-                            continue;
-                        };
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(30),
-                            handle.dump(),
-                        )
-                        .await
-                        {
-                            Ok(dump) => {
-                                for (task_idx, task) in
-                                    dump.tasks().iter().take(MAX_TASKS_LOGGED).enumerate()
-                                {
-                                    let mut trace = task.trace().to_string().replace('\n', " | ");
-                                    truncate_utf8_boundary(&mut trace, MAX_TRACE_CHARS);
+                        let mut targets: Vec<(&str, tokio::runtime::Handle)> = Vec::new();
+                        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                            targets.push(("compaction", handle));
+                        }
+                        // The setup(main) runtime owns the cold store's spawned
+                        // S3 request tasks (SpawnedReqwestConnector captured its
+                        // handle at accelerator setup); if it is wedged, those
+                        // requests are never polled and no timeout ever fires.
+                        if let Some(handle) = super::compaction::diag_setup_runtime_handle() {
+                            targets.push(("setup-main", handle));
+                        }
+                        for (runtime_name, handle) in targets {
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(30),
+                                handle.dump(),
+                            )
+                            .await
+                            {
+                                Ok(dump) => {
+                                    for (task_idx, task) in
+                                        dump.tasks().iter().take(MAX_TASKS_LOGGED).enumerate()
+                                    {
+                                        let mut trace =
+                                            task.trace().to_string().replace('\n', " | ");
+                                        truncate_utf8_boundary(&mut trace, MAX_TRACE_CHARS);
+                                        tracing::warn!(
+                                            target: "cayenne::compaction",
+                                            runtime = runtime_name,
+                                            task_idx,
+                                            trace = trace.as_str(),
+                                            "stall taskdump"
+                                        );
+                                    }
+                                }
+                                Err(_) => {
                                     tracing::warn!(
                                         target: "cayenne::compaction",
-                                        task_idx,
-                                        trace = trace.as_str(),
-                                        "stall taskdump"
+                                        runtime = runtime_name,
+                                        "stall taskdump timed out after 30s (a worker blocked >250ms is itself a finding)"
                                     );
                                 }
-                            }
-                            Err(_) => {
-                                tracing::warn!(
-                                    target: "cayenne::compaction",
-                                    "stall taskdump timed out after 30s"
-                                );
                             }
                         }
                     }

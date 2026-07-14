@@ -106,6 +106,7 @@ pub use provider::{
     global_mem_tier_total, global_mem_tier_used, global_qph, in_flight_compaction_tasks,
     record_global_query, record_query_latency, register_query_observations,
     reset_compaction_shutdown, set_compaction_runtime_env, set_compaction_runtime_handle,
+    set_diag_setup_runtime_handle,
     set_cpu_burstable, set_global_encode_concurrency, set_global_mem_tier_bytes,
     set_global_memory_budget, set_query_admission_governor, update_global_mem_tier_total,
 };

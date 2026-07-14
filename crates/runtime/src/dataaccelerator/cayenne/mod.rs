@@ -1897,6 +1897,12 @@ impl CayenneAccelerator {
 
         tracing::debug!("create_cayenne_table_provider: starting for table {table_name}");
 
+        // TEMPORARY DIAGNOSTIC (cold-promotion hang): this runtime is the one
+        // whose handle the cold store's SpawnedReqwestConnector captures below
+        // (build_datalake_object_store), so the promotion stall watchdog dumps
+        // it alongside the compaction runtime.
+        cayenne::set_diag_setup_runtime_handle(tokio::runtime::Handle::current());
+
         // Get metastore type and metadata directory
         let acceleration = source.acceleration();
         let metadata_dir = Self::resolve_metadata_dir(acceleration);

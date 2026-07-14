@@ -246,6 +246,26 @@ where
 static COMPACTION_RUNTIME_ENV: LazyLock<RwLock<Option<Arc<RuntimeEnv>>>> =
     LazyLock::new(|| RwLock::new(None));
 
+/// TEMPORARY DIAGNOSTIC (cold-promotion hang investigation): the runtime that
+/// owns the cold store's spawned S3 request tasks (`SpawnedReqwestConnector`
+/// captures `Handle::current()` at accelerator setup — spiced's main runtime).
+/// Stashed so the promotion stall watchdog can task-dump it alongside the
+/// compaction runtime: if that runtime is wedged, its spawned S3 requests are
+/// never polled, no reqwest timeout ever fires, and a cold upload stalls
+/// forever with no error.
+static DIAG_SETUP_RUNTIME: LazyLock<RwLock<Option<Handle>>> = LazyLock::new(|| RwLock::new(None));
+
+/// Record the accelerator-setup runtime for the stall watchdog's dual dump.
+pub fn set_diag_setup_runtime_handle(handle: Handle) {
+    *DIAG_SETUP_RUNTIME.write() = Some(handle);
+}
+
+/// The accelerator-setup runtime, if recorded.
+#[cfg(all(tokio_unstable, feature = "stall-taskdump", target_os = "linux"))]
+pub(crate) fn diag_setup_runtime_handle() -> Option<Handle> {
+    DIAG_SETUP_RUNTIME.read().clone()
+}
+
 /// Inject the dedicated compaction memory environment. Called once at process
 /// startup. Later calls replace the previous environment so tests do not retain
 /// stale global state.
