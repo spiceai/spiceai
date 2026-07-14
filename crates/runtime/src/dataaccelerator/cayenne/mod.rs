@@ -44,7 +44,7 @@ use datafusion::scalar::ScalarValue;
 use datafusion_table_providers::UnsupportedTypeAction;
 use runtime_table_partition::Partition;
 use runtime_table_partition::creator::filename::{
-    encode_key, parse_partition_value, to_hive_partition_dir,
+    encode_composite_key, encode_key, parse_partition_value, to_hive_partition_dir,
 };
 use runtime_table_partition::creator::{self, PartitionCreator};
 use runtime_table_partition::expression::PartitionedBy;
@@ -3129,13 +3129,19 @@ impl DataAccelerator for CayenneAccelerator {
                     PathBuf::from(&dir_path),
                 ),
             );
-            let partition_provider = Arc::new(
+            let partition_provider =
                 PartitionTableProvider::new(creator, partition_by, Arc::clone(&arrow_schema))
                     .await
                     .boxed()
-                    .context(AccelerationCreationFailedSnafu)?
-                    .with_insert_strategy(insert_strategy),
-            );
+                    .context(AccelerationCreationFailedSnafu)?;
+            let partition_table_providers = partition_provider.partition_table_providers().await;
+            insert_strategy
+                .recover_partitioned_wals(&partition_table_providers)
+                .await
+                .boxed()
+                .context(AccelerationCreationFailedSnafu)?;
+            let partition_provider =
+                Arc::new(partition_provider.with_insert_strategy(insert_strategy));
 
             // Wrap with upsert deduplication if needed based on on_conflict settings
             let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
@@ -3482,9 +3488,15 @@ impl CayennePartitionCreator {
 
     /// Generate a unique table name for this partition based on composite key.
     fn partition_table_name(&self, partition_key: &str) -> String {
-        // Replace "/" with "_" to create a valid table name
-        let safe_key = partition_key.replace('/', "_");
-        format!("{}_{}", self.table_name, safe_key)
+        format!(
+            "{}_p{}",
+            self.table_name,
+            encode_identifier_hex(partition_key)
+        )
+    }
+
+    fn legacy_partition_table_name(&self, partition_values: &[String]) -> String {
+        format!("{}_{}", self.table_name, partition_values.join("_"))
     }
 
     /// Generate partition directory path from multiple partition values.
@@ -3559,14 +3571,17 @@ impl PartitionCreator for CayennePartitionCreator {
 
         tracing::debug!("creating Cayenne partition at {partition_path}");
 
-        // Create the partition directory (including nested directories for composite partitions)
-        std::fs::create_dir_all(&partition_dir)
+        // Create the partition directory (including nested directories for composite partitions).
+        // Use tokio's async variant so partition creation does not block the runtime thread.
+        tokio::fs::create_dir_all(&partition_dir)
+            .await
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
         let partition_column_names = self.partition_column_labels();
 
-        // Create composite key for table naming (slash-separated values)
-        let partition_key = partition_value_strings.join("/");
+        let partition_key = encode_composite_key(&partition_values)
+            .boxed()
+            .context(creator::CreatePartitionSnafu)?;
 
         // Create partition metadata with composite key support
         let partition_metadata = cayenne::PartitionMetadata::new_composite(
@@ -3661,8 +3676,7 @@ impl PartitionCreator for CayennePartitionCreator {
                 partition_values.push(partition_value);
             }
 
-            // Create composite key for table lookup
-            let partition_key = partition_meta.partition_values.join("/");
+            let partition_key = partition_meta.composite_key();
             let partition_table_name = self.partition_table_name(&partition_key);
 
             // Use builder pattern to pass object store config for S3 support.
@@ -3679,11 +3693,38 @@ impl PartitionCreator for CayennePartitionCreator {
             if let Some(ref object_store) = self.object_store_config {
                 builder = builder.with_object_store(object_store.clone());
             }
-            let cayenne_table = builder
-                .open(&partition_table_name)
-                .await
-                .boxed()
-                .context(creator::InferringPartitionsSnafu)?;
+            let cayenne_table = match builder.open(&partition_table_name).await {
+                Ok(table) => table,
+                Err(cayenne::provider::Error::Catalog {
+                    source: cayenne::CatalogError::TableNotFound { .. },
+                }) => {
+                    let legacy_name =
+                        self.legacy_partition_table_name(&partition_meta.partition_values);
+                    let mut legacy_builder = cayenne::CayenneTableProviderBuilder::new(
+                        Arc::clone(&self.catalog),
+                        Arc::clone(self.context.runtime_env()),
+                    )
+                    .with_context(Arc::clone(&self.context))
+                    .with_retention_filters(self.retention_filters.clone());
+                    if let Some(ref retention_builder) = self.time_retention_filter_builder {
+                        legacy_builder = legacy_builder
+                            .with_time_retention_filter_builder(retention_builder.clone());
+                    }
+                    if let Some(ref object_store) = self.object_store_config {
+                        legacy_builder = legacy_builder.with_object_store(object_store.clone());
+                    }
+                    legacy_builder
+                        .open(&legacy_name)
+                        .await
+                        .boxed()
+                        .context(creator::InferringPartitionsSnafu)?
+                }
+                Err(error) => {
+                    return Err(creator::Error::InferringPartitions {
+                        source: Box::new(error),
+                    });
+                }
+            };
 
             let partition_provider = Arc::new(cayenne_table);
             partition_provider.spawn_background_compaction(Arc::clone(&self.compaction_semaphore));
@@ -3735,6 +3776,16 @@ impl PartitionCreator for CayennePartitionCreator {
             })
             .collect())
     }
+}
+
+fn encode_identifier_hex(value: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value.as_bytes() {
+        let _ = write!(encoded, "{byte:02X}");
+    }
+    encoded
 }
 
 register_data_accelerator!(Engine::Cayenne, CayenneAccelerator);
