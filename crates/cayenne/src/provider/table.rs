@@ -972,6 +972,12 @@ struct VisibleMemTierSegment {
     batches: Vec<RecordBatch>,
 }
 
+/// Test-only mid-pass hook: an async callback fired between a compaction
+/// pass's catalog CAS commit and its fenced in-memory publish. See
+/// `CayenneTableProvider::test_pre_publish_hook`.
+#[cfg(test)]
+type TestPrePublishHook = Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>;
+
 /// Cayenne table provider that reads from Vortex virtual files.
 ///
 /// This provider manages a table composed of multiple "virtual files", where each file
@@ -1094,6 +1100,12 @@ pub struct CayenneTableProvider {
     /// Uses `RwLock` for concurrent reads during normal operations with occasional
     /// writes on compaction. The lock is held briefly for string operations.
     current_snapshot_id: Arc<RwLock<String>>,
+    /// Test-only seam fired between the catalog CAS commit and the fenced
+    /// in-memory publish of the subset-merge/seq-prefix-bake passes, so a test
+    /// can commit a snapshot replacement (overwrite/promotion) inside the exact
+    /// window the mid-pass overwrite guard defends. Consumed on first fire.
+    #[cfg(test)]
+    test_pre_publish_hook: Arc<ParkingMutex<Option<TestPrePublishHook>>>,
     /// Protected snapshot IDs that should skip deletion filtering.
     ///
     /// When data is inserted while pending deletions exist, the new data is written
@@ -4655,6 +4667,8 @@ impl CayenneTableProvider {
 
         let provider = Self {
             current_snapshot_id: Arc::new(RwLock::new(table_metadata.current_snapshot_id.clone())),
+            #[cfg(test)]
+            test_pre_publish_hook: Arc::new(ParkingMutex::new(None)),
             table_schema: Arc::new(ArcSwap::new(Arc::<arrow_schema::Schema>::clone(
                 &table_metadata.schema,
             ))),
@@ -5663,6 +5677,8 @@ impl CayenneTableProvider {
                 &self.object_store_registered_runtime_envs,
             ),
             current_snapshot_id: Arc::clone(&self.current_snapshot_id),
+            #[cfg(test)]
+            test_pre_publish_hook: Arc::clone(&self.test_pre_publish_hook),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
             protected_snapshot_age_warning_keys: Arc::clone(
                 &self.protected_snapshot_age_warning_keys,
@@ -14530,6 +14546,9 @@ impl CayenneTableProvider {
             return Ok(false);
         }
 
+        #[cfg(test)]
+        self.run_test_pre_publish_hook().await;
+
         // Catalog committed — bring the in-memory protected set into agreement
         // under the scan fence. Scans capture the deletion snapshot and
         // protected-snapshot map while holding `listing_fence.read()`, so the
@@ -15060,6 +15079,9 @@ impl CayenneTableProvider {
                 .await;
             return Ok(false);
         }
+
+        #[cfg(test)]
+        self.run_test_pre_publish_hook().await;
 
         // Bring the in-memory protected set into agreement under the scan fence
         // (readers capture deletion snapshot + protected set together). We hold
@@ -16186,6 +16208,16 @@ impl CayenneTableProvider {
     pub(super) fn get_current_snapshot_id(&self) -> String {
         let guard = self.current_snapshot_id.read();
         guard.clone()
+    }
+
+    /// Fire (and consume) the test-only mid-pass hook, if one is installed.
+    /// See [`Self::test_pre_publish_hook`].
+    #[cfg(test)]
+    async fn run_test_pre_publish_hook(&self) {
+        let hook = self.test_pre_publish_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
     }
 
     /// Update the current snapshot ID after a compaction operation.
@@ -25905,6 +25937,114 @@ mod tests {
         }
     }
 
+    /// OVERWRITE-GUARD regression (issue #11823): an overwrite that commits
+    /// between the subset-merge's catalog CAS and its fenced in-memory publish
+    /// wipes the protected map (and, in production, the catalog rows);
+    /// publishing the merged snapshot into the emptied map anyway would make
+    /// scans read the whole pre-overwrite row set ALONGSIDE the overwrite's
+    /// data — the silent over-count behind the #11823 correctness-gate failure.
+    /// The pass must detect the snapshot flip, discard its output, and return
+    /// `false`.
+    #[tokio::test]
+    async fn subset_compaction_discards_output_when_snapshot_replaced_mid_pass() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        const TRIGGER: usize = 4;
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "subset_mid_pass_overwrite",
+            ctx.runtime_env(),
+            VortexConfig {
+                inline_max_rows: 0,
+                compaction_trigger_protected_snapshots: TRIGGER,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+
+        // Hold the compaction lock across setup so write-driven maintenance
+        // lanes skip instead of merging the snapshots the test needs (see
+        // `build_seq_prefix_fixture` for the full rationale).
+        let compaction_setup_guard = provider.compaction_lock.lock().await;
+        let n = i64::try_from(TRIGGER).expect("TRIGGER fits in i64") + 2;
+        for i in 0..n {
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &[i], &[i * 10]),
+            )
+            .await;
+        }
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain pending post-write maintenance");
+        assert!(
+            provider.protected_snapshots.load_full().len() >= TRIGGER,
+            "fixture must produce enough protected snapshots to merge"
+        );
+        drop(compaction_setup_guard);
+
+        // The mid-pass overwrite publishes a fresh EMPTY snapshot (the dir must
+        // exist for the listing swap): its in-memory flip empties the protected
+        // map, clears the deletion caches, and rotates `current_snapshot_id` —
+        // exactly the state the guard must not publish the merged output into.
+        let overwrite_snapshot_id = uuid::Uuid::now_v7().to_string();
+        std::fs::create_dir_all(provider.snapshot_dir_path_for(&overwrite_snapshot_id))
+            .expect("create empty overwrite snapshot dir");
+        let hook_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let provider_in_hook = provider.clone_for_write();
+            let overwrite_id = overwrite_snapshot_id.clone();
+            let fired = Arc::clone(&hook_fired);
+            *provider.test_pre_publish_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    provider_in_hook
+                        .publish_overwrite_snapshot(&overwrite_id)
+                        .await
+                        .expect("mid-pass overwrite publish");
+                    fired.store(true, Ordering::SeqCst);
+                })
+            }));
+        }
+
+        let merged = provider
+            .compact_protected_snapshots_subset(usize::MAX)
+            .await
+            .expect("subset pass must not error when the guard fires");
+        assert!(
+            hook_fired.load(Ordering::SeqCst),
+            "the pass must reach the post-CAS window (mid-pass hook consumed)"
+        );
+        assert!(
+            !merged,
+            "the guard must report no merge when the snapshot was replaced mid-pass"
+        );
+
+        // The merged snapshot must NOT be re-inserted into the overwrite-emptied
+        // protected map, and the overwrite's snapshot flip must stand.
+        assert!(
+            provider.protected_snapshots.load_full().is_empty(),
+            "guard must not publish the merged snapshot into the overwrite-emptied protected map"
+        );
+        assert_eq!(
+            provider.get_current_snapshot_id(),
+            overwrite_snapshot_id,
+            "the overwrite's snapshot flip must stand"
+        );
+        // Resurrection check: only the overwrite's (empty) data is visible — a
+        // broken guard would surface all pre-overwrite rows here.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "subset_mid_pass_overwrite").await,
+            Vec::<(i64, i64)>::new(),
+            "no pre-overwrite rows may survive the mid-pass overwrite"
+        );
+    }
+
     /// Engagement test for the size-aware PARALLEL merge encode: a subset
     /// merge whose selected inputs exceed one target file must shard its
     /// output across multiple concurrently-encoded files (bounded by the
@@ -32272,6 +32412,74 @@ mod tests {
             collect_id_value_pairs(&ctx, &provider, "bake_drops_tombstone").await,
             vec![(1, 10), (2, 20), (3, 30), (4, 40)],
             "key 0 stays deleted after the bake (no resurrection), others preserved"
+        );
+    }
+
+    /// OVERWRITE-GUARD regression (issue #11823), bake flavor — sibling of
+    /// `subset_compaction_discards_output_when_snapshot_replaced_mid_pass`: an
+    /// overwrite committing between the bake's catalog CAS and its fenced
+    /// in-memory publish must make the bake discard its merged output (and skip
+    /// the deletion-index prune) instead of resurrecting the pre-overwrite rows
+    /// into the emptied protected map.
+    #[tokio::test]
+    async fn seq_prefix_bake_discards_output_when_snapshot_replaced_mid_pass() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _ids) = build_seq_prefix_fixture(
+            "bake_mid_pass_overwrite",
+            ctx.runtime_env(),
+            &[10, 20, 30, 40, 50],
+        )
+        .await;
+        // A `<= T` tombstone so the bake has prune work it must then abandon.
+        install_int64_deletes(&provider, &[(0, 15)]);
+
+        let overwrite_snapshot_id = uuid::Uuid::now_v7().to_string();
+        std::fs::create_dir_all(provider.snapshot_dir_path_for(&overwrite_snapshot_id))
+            .expect("create empty overwrite snapshot dir");
+        let hook_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let provider_in_hook = provider.clone_for_write();
+            let overwrite_id = overwrite_snapshot_id.clone();
+            let fired = Arc::clone(&hook_fired);
+            *provider.test_pre_publish_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    provider_in_hook
+                        .publish_overwrite_snapshot(&overwrite_id)
+                        .await
+                        .expect("mid-pass overwrite publish");
+                    fired.store(true, Ordering::SeqCst);
+                })
+            }));
+        }
+
+        let baked = provider
+            .bake_seq_prefix_protected_snapshots()
+            .await
+            .expect("bake must not error when the guard fires");
+        assert!(
+            hook_fired.load(Ordering::SeqCst),
+            "the bake must reach the post-CAS window (mid-pass hook consumed)"
+        );
+        assert!(
+            !baked,
+            "the guard must report no bake when the snapshot was replaced mid-pass"
+        );
+
+        assert!(
+            provider.protected_snapshots.load_full().is_empty(),
+            "guard must not publish the baked snapshot into the overwrite-emptied protected map"
+        );
+        assert_eq!(
+            provider.get_current_snapshot_id(),
+            overwrite_snapshot_id,
+            "the overwrite's snapshot flip must stand"
+        );
+        // Resurrection check: only the overwrite's (empty) data is visible — a
+        // broken guard would surface the pre-overwrite fixture rows here.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "bake_mid_pass_overwrite").await,
+            Vec::<(i64, i64)>::new(),
+            "no pre-overwrite rows may survive the mid-pass overwrite"
         );
     }
 
