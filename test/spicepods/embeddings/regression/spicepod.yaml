@@ -1,0 +1,420 @@
+version: v1
+kind: Spicepod
+name: embedding-regression
+
+# Comprehensive regression test for all embedding providers and every declared ParameterSpec.
+#
+# Regression targets:
+#   - #10853: ParameterSpec definitions broke pre-existing param keys by requiring a prefix
+#             where none was expected (google `dimensions`, hf/model2vec `hf_token`, etc.).
+#   - post-#10853 fix: aws_profile / requests_per_min_limit / max_concurrent_invocations
+#             were omitted from BEDROCK_PARAMETERS and silently stripped.
+#   - deprecated alias `truncate` (bedrock) must survive Parameters::try_new unchanged.
+#
+# Each embedding entry uses EVERY parameter declared in that provider's ParameterSpec,
+# with the correct prefix/no-prefix form (runtime = no prefix, component = <provider>_ prefix).
+#
+# Required secrets — set via `spice login` or a .env file:
+#   OPENAI_API_KEY            openai + azure custom-endpoint variants
+#   OPENAI_ORG_ID             optional but tested
+#   OPENAI_PROJECT_ID         optional but tested
+#   AZURE_API_KEY             azure (api_key auth)
+#   AZURE_ENTRA_TOKEN         azure (entra_token auth, separate entry)
+#   GOOGLE_API_KEY            google
+#   HF_TOKEN                  huggingface + model2vec
+#   DATABRICKS_ENDPOINT       databricks
+#   DATABRICKS_TOKEN          databricks token-auth variant
+#   DATABRICKS_CLIENT_ID      databricks M2M-OAuth variant
+#   DATABRICKS_CLIENT_SECRET  databricks M2M-OAuth variant
+#   AWS_DEFAULT_REGION        bedrock
+#   AWS_ACCESS_KEY_ID         bedrock key-auth variants
+#   AWS_SECRET_ACCESS_KEY     bedrock key-auth variants
+#   AWS_SESSION_TOKEN         bedrock key-auth variants (optional, but tested)
+
+# ─── Corpus ────────────────────────────────────────────────────────────────────
+# A minimal file dataset with a text and id column, used to exercise the full
+# embedding pipeline end-to-end (not just provider instantiation).
+datasets:
+  - from: file:./corpus.csv
+    name: corpus
+    acceleration:
+      enabled: true
+    columns:
+      # Attach one entry per provider so each provider is exercised at load time.
+      # Only providers that don't require special infrastructure (API gateway) in CI
+      # are attached here; cloud providers are defined in `embeddings:` and exercised
+      # via the instantiation path rather than actual embedding computation.
+      - name: text
+        embeddings:
+          - from: openai_base
+            row_id: id
+          - from: openai_all_params
+            row_id: id
+            chunking:
+              enabled: true
+              target_chunk_size: 100
+              overlap_size: 20
+              trim_whitespace: true
+          - from: azure_apikey
+            row_id: id
+          - from: google_base
+            row_id: id
+          - from: databricks_token
+            row_id: id
+          - from: databricks_m2m
+            row_id: id
+          - from: bedrock_titan_keyauth
+            row_id: id
+          - from: bedrock_titan_profile
+            row_id: id
+          - from: bedrock_cohere_keyauth
+            row_id: id
+          - from: bedrock_cohere_truncate_alias
+            row_id: id
+          - from: bedrock_nova_keyauth
+            row_id: id
+
+  # Separate dataset for model2vec (no acceleration — tests federation path).
+  - from: file:./corpus.csv
+    name: corpus_hf
+    acceleration:
+      enabled: true
+    columns:
+      - name: text
+        embeddings:
+          - from: hf_mean
+            row_id: id
+          - from: hf_cls
+            row_id: id
+
+  - from: file:./corpus.csv
+    name: corpus_m2v
+    acceleration:
+      enabled: true
+    columns:
+      - name: text
+        embeddings:
+          - from: model2vec_base
+            row_id: id
+          - from: model2vec_all_params
+            row_id: id
+
+  # Old-style (dataset-level) embedding config — exercises the ColumnEmbeddingConfig path.
+  - from: file:./corpus.csv
+    name: corpus_legacy_style
+    acceleration:
+      enabled: true
+    embeddings:
+      - column: text
+        use: openai_base
+        column_pk:
+          - id
+        chunking:
+          enabled: true
+          target_chunk_size: 150
+          overlap_size: 30
+
+# ─── OpenAI ────────────────────────────────────────────────────────────────────
+embeddings:
+  # Minimal config — only the required api_key. `endpoint` defaults and `usage_tier`
+  # defaults to tier1. Tests that defaults are applied correctly.
+  - from: openai:text-embedding-3-small
+    name: openai_base
+    params:
+      openai_api_key: ${ secrets:OPENAI_API_KEY }
+
+  # All declared ParameterSpec params. Exercises every key in openai::PARAMETERS:
+  #   api_key (component → openai_ prefix), org_id (component), project_id (component),
+  #   usage_tier (component, one_of validated), endpoint (runtime → no prefix).
+  - from: openai:text-embedding-3-large
+    name: openai_all_params
+    params:
+      openai_api_key: ${ secrets:OPENAI_API_KEY }
+      openai_org_id: ${ secrets:OPENAI_ORG_ID }
+      openai_project_id: ${ secrets:OPENAI_PROJECT_ID }
+      openai_usage_tier: tier2
+      endpoint: https://api.openai.com/v1
+
+  # Free-tier config — exercises the other end of the usage_tier one_of enum.
+  - from: openai:text-embedding-3-small
+    name: openai_free_tier
+    params:
+      openai_api_key: ${ secrets:OPENAI_API_KEY }
+      openai_usage_tier: free
+
+  # Custom endpoint — exercises a non-default runtime `endpoint` value
+  # (e.g. a local vLLM or Azure-compatible proxy serving the OpenAI API).
+  - from: openai:text-embedding-3-small
+    name: openai_custom_endpoint
+    params:
+      openai_api_key: ${ secrets:OPENAI_API_KEY }
+      endpoint: https://api.openai.com/v1
+
+  # ─── Azure OpenAI ──────────────────────────────────────────────────────────
+  # api_key auth variant. Exercises: endpoint (runtime), api_version (component),
+  # deployment_name (component), api_key (component secret).
+  - from: azure:text-embedding-3-small
+    name: azure_apikey
+    params:
+      endpoint: https://my-resource.openai.azure.com
+      azure_api_version: "2024-02-01"
+      azure_deployment_name: text-embedding-3-small
+      azure_api_key: ${ secrets:AZURE_API_KEY }
+
+  # Entra token auth variant. Exercises: entra_token (component secret).
+  - from: azure:text-embedding-3-small
+    name: azure_entra
+    params:
+      endpoint: https://my-resource.openai.azure.com
+      azure_api_version: "2024-02-01"
+      azure_deployment_name: text-embedding-3-small
+      azure_entra_token: ${ secrets:AZURE_ENTRA_TOKEN }
+
+  # ─── Google ────────────────────────────────────────────────────────────────
+  # BASE: api_key required, dimensions optional.
+  # REGRESSION CHECK: `dimensions` must be unprefixed (runtime).
+  # Before fix: `google_dimensions` was required; after fix: `dimensions`.
+  - from: google:text-embedding-004
+    name: google_base
+    params:
+      google_api_key: ${ secrets:GOOGLE_API_KEY }
+
+  # With optional dimensions — exercises the runtime `dimensions` key.
+  # If this were still a `component` spec, `dimensions: 768` would be silently ignored.
+  - from: google:text-embedding-004
+    name: google_with_dimensions
+    params:
+      google_api_key: ${ secrets:GOOGLE_API_KEY }
+      dimensions: "768"
+
+  # ─── HuggingFace ───────────────────────────────────────────────────────────
+  # REGRESSION CHECK: `hf_token` must be unprefixed (runtime after fix).
+  # Before fix: required `huggingface_hf_token`; after fix: `hf_token`.
+  # `pooling` and `max_seq_length` were always runtime.
+  - from: huggingface:huggingface.co/sentence-transformers/all-MiniLM-L6-v2
+    name: hf_mean
+    params:
+      hf_token: ${ secrets:HF_TOKEN }
+      pooling: mean
+      max_seq_length: "512"
+
+  - from: huggingface:huggingface.co/sentence-transformers/all-MiniLM-L6-v2
+    name: hf_cls
+    params:
+      hf_token: ${ secrets:HF_TOKEN }
+      pooling: cls
+      max_seq_length: "256"
+
+  - from: huggingface:huggingface.co/BAAI/bge-small-en-v1.5
+    name: hf_splade
+    params:
+      hf_token: ${ secrets:HF_TOKEN }
+      pooling: splade
+      max_seq_length: "512"
+
+  # No token — tests anonymous HF access (public models only).
+  - from: huggingface:huggingface.co/sentence-transformers/all-MiniLM-L6-v2
+    name: hf_anon
+    params:
+      pooling: mean
+
+  # ─── Databricks ────────────────────────────────────────────────────────────
+  # Token auth: endpoint + token (all component → databricks_ prefix).
+  - from: databricks:databricks-bge-large-en
+    name: databricks_token
+    params:
+      databricks_endpoint: ${ secrets:DATABRICKS_ENDPOINT }
+      databricks_token: ${ secrets:DATABRICKS_TOKEN }
+
+  # M2M OAuth: endpoint + client_id + client_secret. No token.
+  - from: databricks:databricks-bge-large-en
+    name: databricks_m2m
+    params:
+      databricks_endpoint: ${ secrets:DATABRICKS_ENDPOINT }
+      databricks_client_id: ${ secrets:DATABRICKS_CLIENT_ID }
+      databricks_client_secret: ${ secrets:DATABRICKS_CLIENT_SECRET }
+
+  # ─── Model2Vec ─────────────────────────────────────────────────────────────
+  # REGRESSION CHECK: `hf_token`, `subfolder`, `normalize` must be unprefixed (runtime after fix).
+  # Before fix: `model2vec_hf_token`, `model2vec_subfolder`, `model2vec_normalize`.
+  - from: model2vec:minishlab/potion-base-8M
+    name: model2vec_base
+    params:
+      hf_token: ${ secrets:HF_TOKEN }
+      normalize: "true"
+
+  # All params: exercises every key in model2vec::PARAMETERS.
+  - from: model2vec:minishlab/potion-base-8M
+    name: model2vec_all_params
+    params:
+      hf_token: ${ secrets:HF_TOKEN }
+      normalize: "true"
+      parallelism: "4"
+      embed_max_token_length: "512"
+      embed_custom_batch_size: "32"
+
+  # With subfolder — exercises `subfolder` runtime param (was component before fix).
+  - from: model2vec:minishlab/potion-multilingual-128M
+    name: model2vec_subfolder
+    params:
+      hf_token: ${ secrets:HF_TOKEN }
+      subfolder: onnx
+      normalize: "false"
+      embed_max_token_length: "256"
+
+  # ─── File (local) ──────────────────────────────────────────────────────────
+  # Local safetensors model. `pooling` and `max_seq_length` are runtime (no prefix).
+  # Adjust the paths to wherever the model files are downloaded locally.
+  - from: file:data/models/sentence-transformers/all-MiniLM-L6-v2/model.safetensors
+    name: file_mean
+    files:
+      - path: data/models/sentence-transformers/all-MiniLM-L6-v2/config.json
+      - path: data/models/sentence-transformers/all-MiniLM-L6-v2/tokenizer.json
+    params:
+      pooling: mean
+      max_seq_length: "512"
+
+  - from: file:data/models/sentence-transformers/all-MiniLM-L6-v2/model.safetensors
+    name: file_cls
+    files:
+      - path: data/models/sentence-transformers/all-MiniLM-L6-v2/config.json
+      - path: data/models/sentence-transformers/all-MiniLM-L6-v2/tokenizer.json
+    params:
+      pooling: cls
+
+  # ─── Bedrock — Titan ───────────────────────────────────────────────────────
+  # All AWS params are runtime (no prefix) after fix.
+  # REGRESSION CHECK: aws_profile, requests_per_min_limit, max_concurrent_invocations
+  # were missing from BEDROCK_PARAMETERS before our fix and silently stripped.
+  #
+  # Titan v2: dimensions must be 256, 512, or 1024. normalize optional.
+  - from: bedrock:amazon.titan-embed-text-v2:0
+    name: bedrock_titan_keyauth
+    params:
+      aws_region: ${ secrets:AWS_DEFAULT_REGION }
+      aws_access_key_id: ${ secrets:AWS_ACCESS_KEY_ID }
+      aws_secret_access_key: ${ secrets:AWS_SECRET_ACCESS_KEY }
+      aws_session_token: ${ secrets:AWS_SESSION_TOKEN }
+      dimensions: "256"
+      normalize: "true"
+      requests_per_min_limit: "1500"
+      max_concurrent_invocations: "10"
+
+  # Profile-based auth — exercises aws_profile and aws_iam_role_source.
+  - from: bedrock:amazon.titan-embed-text-v2:0
+    name: bedrock_titan_profile
+    params:
+      aws_region: us-east-1
+      aws_profile: default
+      aws_iam_role_source: auto
+      dimensions: "512"
+      normalize: "false"
+      requests_per_min_limit: "1500"
+      max_concurrent_invocations: "20"
+
+  # IMDS/ECS metadata credential source.
+  - from: bedrock:amazon.titan-embed-text-v2:0
+    name: bedrock_titan_metadata
+    params:
+      aws_region: us-east-1
+      aws_iam_role_source: metadata
+      dimensions: "1024"
+      normalize: "true"
+
+  # ─── Bedrock — Cohere ──────────────────────────────────────────────────────
+  # truncate_mode and input_type params. No dimensions for Cohere.
+  - from: bedrock:cohere.embed-english-v3
+    name: bedrock_cohere_keyauth
+    params:
+      aws_region: ${ secrets:AWS_DEFAULT_REGION }
+      aws_access_key_id: ${ secrets:AWS_ACCESS_KEY_ID }
+      aws_secret_access_key: ${ secrets:AWS_SECRET_ACCESS_KEY }
+      truncate_mode: END
+      input_type: search_document
+      requests_per_min_limit: "600"
+      max_concurrent_invocations: "5"
+
+  # Deprecated `truncate` alias — must survive Parameters::try_new and reach the client.
+  # REGRESSION CHECK: if `truncate` is stripped or not recognised as a deprecated alias,
+  # the client would silently use the default truncation mode instead.
+  - from: bedrock:cohere.embed-multilingual-v3
+    name: bedrock_cohere_truncate_alias
+    params:
+      aws_region: ${ secrets:AWS_DEFAULT_REGION }
+      aws_access_key_id: ${ secrets:AWS_ACCESS_KEY_ID }
+      aws_secret_access_key: ${ secrets:AWS_SECRET_ACCESS_KEY }
+      truncate: END
+      input_type: search_query
+
+  # All Cohere input_type values exercised separately.
+  - from: bedrock:cohere.embed-english-v3
+    name: bedrock_cohere_classification
+    params:
+      aws_region: ${ secrets:AWS_DEFAULT_REGION }
+      aws_profile: default
+      truncate_mode: NONE
+      input_type: classification
+
+  - from: bedrock:cohere.embed-english-v3
+    name: bedrock_cohere_clustering
+    params:
+      aws_region: ${ secrets:AWS_DEFAULT_REGION }
+      aws_profile: default
+      truncate_mode: START
+      input_type: clustering
+
+  # ─── Bedrock — Nova multimodal ─────────────────────────────────────────────
+  # dimensions (256|384|1024|3072), embedding_purpose, truncate_mode.
+  - from: bedrock:amazon.nova-2-multimodal-embeddings-v1:0
+    name: bedrock_nova_keyauth
+    params:
+      aws_region: ${ secrets:AWS_DEFAULT_REGION }
+      aws_access_key_id: ${ secrets:AWS_ACCESS_KEY_ID }
+      aws_secret_access_key: ${ secrets:AWS_SECRET_ACCESS_KEY }
+      dimensions: "1024"
+      embedding_purpose: GENERIC_INDEX
+      truncate_mode: END
+      requests_per_min_limit: "300"
+      max_concurrent_invocations: "5"
+
+  # All valid embedding_purpose values are sampled to test one_of validation.
+  - from: bedrock:amazon.nova-2-multimodal-embeddings-v1:0
+    name: bedrock_nova_retrieval
+    params:
+      aws_region: ${ secrets:AWS_DEFAULT_REGION }
+      aws_profile: default
+      dimensions: "256"
+      embedding_purpose: TEXT_RETRIEVAL
+      truncate_mode: NONE
+
+  - from: bedrock:amazon.nova-2-multimodal-embeddings-v1:0
+    name: bedrock_nova_clustering
+    params:
+      aws_region: ${ secrets:AWS_DEFAULT_REGION }
+      aws_profile: default
+      dimensions: "384"
+      embedding_purpose: CLUSTERING
+
+  - from: bedrock:amazon.nova-2-multimodal-embeddings-v1:0
+    name: bedrock_nova_classification
+    params:
+      aws_region: ${ secrets:AWS_DEFAULT_REGION }
+      aws_profile: default
+      dimensions: "3072"
+      embedding_purpose: CLASSIFICATION
+
+  - from: bedrock:amazon.nova-2-multimodal-embeddings-v1:0
+    name: bedrock_nova_generic_retrieval
+    params:
+      aws_region: ${ secrets:AWS_DEFAULT_REGION }
+      aws_profile: default
+      dimensions: "1024"
+      embedding_purpose: GENERIC_RETRIEVAL
+
+  - from: bedrock:amazon.nova-2-multimodal-embeddings-v1:0
+    name: bedrock_nova_document_retrieval
+    params:
+      aws_region: ${ secrets:AWS_DEFAULT_REGION }
+      aws_profile: default
+      dimensions: "1024"
+      embedding_purpose: DOCUMENT_RETRIEVAL
