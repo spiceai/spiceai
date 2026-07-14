@@ -9,15 +9,10 @@ name: postgres-cayenne[file]-adaptive-ivm
 # CH-benCH queries (q1 and q6). The optimizer serves those from O(groups) state
 # instead of a full re-scan of the heaviest CDC table under continuous OLTP.
 #
-# Scale notes:
-# - SF1 (`dispatch/chbench/sf1/*-adaptive-ivm.yaml`) measures the IVM fast path:
-#   PK contribution indexes stay below Cayenne's retained-entry safety cap.
-# - SF1000 (`dispatch/chbench/sf1000-adaptive/*-adaptive-ivm.yaml`) is the
-#   adaptive+IVM counterpart of the SF1000 adaptive baseline: lag/QPH/correctness
-#   under continuous CDC with maintained views armed. If the retained-index cap
-#   is exceeded (q6 can index a large fraction of order_line), the registry fails
-#   safe to base scans so correctness holds; q1's smaller filtered group-by still
-#   typically stays on the maintained path.
+# The scheduled SF1 dispatch measures the IVM fast path with live contribution
+# indexes below Cayenne's retained-entry safety cap. SF1000 is intentionally not
+# dispatched for this pod: its initial `order_line` corpus exceeds the cap and
+# would measure the fail-safe base-scan fallback rather than maintained IVM.
 #
 # Default adaptive CH-BenCHmark config, set to the topology + prefetch that won the SF1000
 # benchmark sweep: the 7 CDC tables share FOUR replication slots (not one-per-table), and the CDC prefetch
