@@ -1192,7 +1192,9 @@ impl OnConflictValidationStream {
         let existing_keys = self.existing_keys.take();
         // Off-lock staging validates against a private keyset and must never
         // publish it to the shared cache (see `store_back`). Drop it instead.
-        if self.store_back && let Some(existing_keys) = existing_keys {
+        if self.store_back
+            && let Some(existing_keys) = existing_keys
+        {
             self.table.store_cached_pk_index(existing_keys);
         }
     }

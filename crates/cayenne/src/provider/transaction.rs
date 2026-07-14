@@ -303,7 +303,10 @@ impl CayenneTransaction {
             let empty = PkDigestSet::with_capacity(0);
             for p in &participants {
                 let current = p.provider.sequence_high_water().await;
-                let write_set = p.stage.as_ref().map_or(&empty, CayenneStagedUpsert::validated_keys);
+                let write_set = p
+                    .stage
+                    .as_ref()
+                    .map_or(&empty, CayenneStagedUpsert::validated_keys);
                 if !p.token.staging_clean()
                     || p.provider.transaction_has_conflict(
                         p.token.stage_seq(),
@@ -331,8 +334,10 @@ impl CayenneTransaction {
 
         // 3. Prepare each written table (reserve sequences + write DV files)
         //    before opening the shared transaction.
-        let staged: Vec<CayenneStagedUpsert> =
-            participants.iter_mut().filter_map(|p| p.stage.take()).collect();
+        let staged: Vec<CayenneStagedUpsert> = participants
+            .iter_mut()
+            .filter_map(|p| p.stage.take())
+            .collect();
         // The read-only participants are validated; only their held write_locks
         // matter now, so drop the `TxnTable`s and keep the guards.
         drop(participants);

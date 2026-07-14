@@ -210,8 +210,11 @@ pub(crate) async fn do_action_create_prepared_statement(
     // For a `BEGIN … COMMIT` body, advertise the final statement's schema (the
     // body is executed as a transaction at do_get, not planned as one here).
     let schema_sql = schema_statement(&query);
-    let (dataset_schema, parameter_schema) = match Service::get_arrow_schema(datafusion, &schema_sql)
-        .await
+    let (dataset_schema, parameter_schema) = match Service::get_arrow_schema(
+        datafusion,
+        &schema_sql,
+    )
+    .await
     {
         Ok(schemas) => schemas,
         Err(e) => {
@@ -350,10 +353,15 @@ pub(crate) async fn do_get(
         let read_only = is_auth_read_only(&context);
         let context_clone = Arc::clone(&context);
         let outcome = context_clone
-            .scope(async { run_transaction(&datafusion, &statements, param_values, read_only).await })
+            .scope(async {
+                run_transaction(&datafusion, &statements, param_values, read_only).await
+            })
             .await
             .map_err(transaction_error_to_status)?;
-        let batches = outcome.result.map(|(batches, _)| batches).unwrap_or_default();
+        let batches = outcome
+            .result
+            .map(|(batches, _)| batches)
+            .unwrap_or_default();
         let stream = record_batches_to_flight_stream(batches);
         let timed = TimedStream::new(stream, move || start);
         return Ok(Response::new(

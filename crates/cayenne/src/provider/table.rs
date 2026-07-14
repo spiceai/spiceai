@@ -5240,7 +5240,9 @@ impl CayenneTableProvider {
         let Some(catalog) = self.cayenne_catalog() else {
             return Ok(Vec::new());
         };
-        Ok(catalog.list_pending_write_back(self.table_id(), limit).await?)
+        Ok(catalog
+            .list_pending_write_back(self.table_id(), limit)
+            .await?)
     }
 
     /// Compare-and-clear delivered write-back markers (see
@@ -5277,10 +5279,13 @@ impl CayenneTableProvider {
     /// Returns an error if the table has no PK converter or the bytes are
     /// malformed for its key schema.
     pub fn decode_pk_keys(&self, pk_bytes: &[Vec<u8>]) -> Result<Vec<ArrayRef>> {
-        let converter = self.pk_row_converter.as_ref().ok_or_else(|| Error::Internal {
-            table: self.table_name().to_string(),
-            message: "decode_pk_keys requires a primary-key RowConverter".to_string(),
-        })?;
+        let converter = self
+            .pk_row_converter
+            .as_ref()
+            .ok_or_else(|| Error::Internal {
+                table: self.table_name().to_string(),
+                message: "decode_pk_keys requires a primary-key RowConverter".to_string(),
+            })?;
         let rows = pk_bytes
             .iter()
             .map(|bytes| crate::row_converter::Row::from_encoded(bytes));
@@ -7940,7 +7945,10 @@ impl CayenneTableProvider {
         // (+ bounded post-checkpoint delta) and skip the full-table keyset
         // scan. Falls back to the full scan on any miss/mismatch/corruption.
         let existing_keys = if allow_checkpoint {
-            match self.try_load_persisted_pk_index(pk_indices, converter).await {
+            match self
+                .try_load_persisted_pk_index(pk_indices, converter)
+                .await
+            {
                 Ok(Some(index)) => index,
                 _ => CachedPkIndex::Exact(
                     self.load_existing_keyset(pk_indices, converter, fold_cold)
@@ -23730,7 +23738,9 @@ impl CayenneTableProvider {
         let mut pk_columns = Vec::with_capacity(self.pk_column_indices.len());
         for &idx in &self.pk_column_indices {
             let field = table_schema.field(idx);
-            let scalar = filters.iter().find_map(|f| pk_scalar_for(f, field.name()))?;
+            let scalar = filters
+                .iter()
+                .find_map(|f| pk_scalar_for(f, field.name()))?;
             // Cast to the PK column's stored type so the encoded digest matches
             // the write path's (e.g. `id = '5'` against an Int64 PK column).
             let casted = scalar.cast_to(field.data_type()).ok()?;

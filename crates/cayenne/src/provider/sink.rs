@@ -32,10 +32,10 @@ use futures::StreamExt;
 
 use runtime_datafusion::extension::request_context::resolve_request_context;
 
-use super::transaction::CayenneTransaction;
 use super::context::CayenneContext;
 use super::mutation_writer::AppendMutationWriter;
 use super::table::CayenneTableProvider;
+use super::transaction::CayenneTransaction;
 
 /// A [`DataSink`] implementation that writes data to a Cayenne table.
 ///
@@ -247,10 +247,7 @@ impl CayenneDataSink {
     /// undetectable atomicity break). Returns the transaction regardless of its
     /// target table; [`Self::write_all_transaction`] enforces the table match
     /// (fail-closed).
-    fn active_transaction(
-        &self,
-        context: &Arc<TaskContext>,
-    ) -> Option<CayenneTransaction> {
+    fn active_transaction(&self, context: &Arc<TaskContext>) -> Option<CayenneTransaction> {
         let txn = resolve_request_context(context, false)?.extension::<CayenneTransaction>()?;
         if txn.is_participant(self.table.table_id()) {
             Some(txn)

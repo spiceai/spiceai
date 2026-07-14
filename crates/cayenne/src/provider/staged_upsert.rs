@@ -256,7 +256,10 @@ impl CayenneStagedUpsert {
         let _fence = self.table.lock_listing_fence_write_owned().await;
 
         let on_conflict_deletions = std::mem::take(&mut self.on_conflict_deletions);
-        let update = self.table.apply_on_conflict_deletions(on_conflict_deletions).await?;
+        let update = self
+            .table
+            .apply_on_conflict_deletions(on_conflict_deletions)
+            .await?;
 
         // Reserve the snapshot sequence AFTER `apply_on_conflict_deletions` (which
         // reserves the lower delete/insert sequences), so the protected snapshot's
@@ -288,7 +291,8 @@ impl CayenneStagedUpsert {
         if retention_requested {
             self.table.clear_cached_pk_keyset();
         } else {
-            self.table.record_file_pk_keys(&self.validated_keys, new_sequence);
+            self.table
+                .record_file_pk_keys(&self.validated_keys, new_sequence);
         }
 
         Ok(self.row_count)
@@ -424,7 +428,8 @@ impl PreparedTxnCommit {
         if retention_requested {
             self.table.clear_cached_pk_keyset();
         } else {
-            self.table.record_file_pk_keys(&self.validated_keys, sequence);
+            self.table
+                .record_file_pk_keys(&self.validated_keys, sequence);
         }
         Ok(self.row_count)
     }
@@ -474,7 +479,11 @@ impl CayenneTableProvider {
         target_partitions: usize,
     ) -> Result<CayenneStagedUpsert> {
         let staged = self.stage_upsert_data(data, target_partitions).await?;
-        Ok(CayenneStagedUpsert::new(self.clone_for_write(), token, staged))
+        Ok(CayenneStagedUpsert::new(
+            self.clone_for_write(),
+            token,
+            staged,
+        ))
     }
 
     /// Validate the incoming rows for PK conflicts (off-lock: private keyset, no

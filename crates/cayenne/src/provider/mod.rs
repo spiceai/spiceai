@@ -75,7 +75,6 @@ pub(crate) mod cold_partition;
 pub(crate) mod column_stats;
 pub(crate) mod compaction;
 pub(crate) mod compaction_writer;
-pub(crate) mod transaction;
 pub(crate) mod constants;
 pub(crate) mod context;
 pub(crate) mod delete;
@@ -105,6 +104,7 @@ pub(crate) mod staged_upsert;
 pub(crate) mod staging_wal;
 pub(crate) mod streaming;
 pub(crate) mod table;
+pub(crate) mod transaction;
 pub(crate) mod tuning;
 pub(crate) mod utils;
 pub(crate) mod vortex_format;
@@ -117,7 +117,6 @@ pub use compaction::{
     begin_compaction_shutdown, drain_compaction_tasks, in_flight_compaction_tasks,
     reset_compaction_shutdown, set_compaction_runtime_env, set_compaction_runtime_handle,
 };
-pub use transaction::{CayenneTransaction, TransactionCommit, TxnTable};
 pub use context::CayenneContext;
 pub use mem_tier::SlotAdvancer;
 pub use mem_tier_budget::{
@@ -136,6 +135,7 @@ pub use table::{
     CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder,
     PreparedAppendSnapshotPublish,
 };
+pub use transaction::{CayenneTransaction, TransactionCommit, TxnTable};
 pub use tuning::{
     QueryObservations, deregister_query_observations, global_qph, record_global_query,
     record_query_latency, register_query_observations, set_cpu_burstable, set_global_memory_budget,
@@ -255,7 +255,9 @@ pub enum Error {
     /// A transaction lost an optimistic-concurrency race: the
     /// target table was committed to between this transaction's start and its
     /// commit. Retryable at the newest committed state.
-    #[snafu(display("Transaction write conflict on table '{table}': the table changed since the transaction started; retry"))]
+    #[snafu(display(
+        "Transaction write conflict on table '{table}': the table changed since the transaction started; retry"
+    ))]
     WriteConflict { table: String },
 
     /// Invalid number of children provided to an execution plan.

@@ -847,7 +847,8 @@ impl<'a> AppendMutationWriter<'a> {
         // Record the inlined PK keys so a subsequent same-table upsert sees this
         // batch's rows as present (same bookkeeping as the durable inline path).
         let record_seq = self.table.sequence_high_water().await;
-        self.table.record_inlined_pk_keys(&validated_keys, record_seq);
+        self.table
+            .record_inlined_pk_keys(&validated_keys, record_seq);
 
         drop(write_guard);
         record_cayenne_write_phase(self.table.table_name(), "cdc_path_inmemory", write_start);

@@ -146,7 +146,12 @@ async fn run_txn(rt: &Runtime, sql: &str) -> Result<Vec<RecordBatch>, Transactio
     context
         .scope(async move { run_transaction(&df, &statements, None, false).await })
         .await
-        .map(|outcome| outcome.result.map(|(batches, _)| batches).unwrap_or_default())
+        .map(|outcome| {
+            outcome
+                .result
+                .map(|(batches, _)| batches)
+                .unwrap_or_default()
+        })
 }
 
 /// Human-readable rendering of a [`TransactionError`] (the type derives neither
@@ -270,10 +275,7 @@ async fn test_txn_gate_fail_rolls_back() -> Result<(), String> {
                 "BEGIN; UPDATE t SET n=99 WHERE id='a'; SELECT assert(false); COMMIT;",
             )
             .await;
-            assert!(
-                result.is_err(),
-                "a failing gate must abort the transaction"
-            );
+            assert!(result.is_err(), "a failing gate must abort the transaction");
 
             // The load-bearing assertion: the pre-gate UPDATE must have been
             // STAGED (not published), so the failed gate rolls it back.
@@ -343,8 +345,15 @@ async fn test_txn_cap_enforcement() -> Result<(), String> {
                 }
             }
 
-            assert_eq!(commits, CAP as usize, "exactly `cap` commits should succeed");
-            assert_eq!(aborts, ATTEMPTS - CAP as usize, "the rest must abort at the gate");
+            assert_eq!(
+                commits, CAP as usize,
+                "exactly `cap` commits should succeed"
+            );
+            assert_eq!(
+                aborts,
+                ATTEMPTS - CAP as usize,
+                "the rest must abort at the gate"
+            );
             assert_eq!(
                 read_n(&rt, "t", "a").await,
                 Some(CAP),
@@ -477,8 +486,16 @@ async fn run_test_txn_multi_table_atomic() -> Result<(), String> {
             )
             .await;
             assert!(failed.is_err(), "failing gate must abort the two-table txn");
-            assert_eq!(read_n(&rt, "t1", "a").await, Some(1), "t1 must be unchanged");
-            assert_eq!(read_n(&rt, "t2", "a").await, Some(1), "t2 must be unchanged");
+            assert_eq!(
+                read_n(&rt, "t1", "a").await,
+                Some(1),
+                "t1 must be unchanged"
+            );
+            assert_eq!(
+                read_n(&rt, "t2", "a").await,
+                Some(1),
+                "t2 must be unchanged"
+            );
             Ok(())
         })
         .await
@@ -524,7 +541,9 @@ async fn test_txn_occ_conflict_stale_token() -> Result<(), anyhow::Error> {
                 table_name: "occ_t".to_string(),
                 schema: Arc::clone(&schema),
                 primary_key: vec!["id".to_string()],
-                on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+                on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                    "id".to_string(),
+                ]))),
                 base_path: cayenne_dir.to_string_lossy().to_string(),
                 partition_column: None,
                 vortex_config: VortexConfig::default(),
@@ -542,7 +561,8 @@ async fn test_txn_occ_conflict_stale_token() -> Result<(), anyhow::Error> {
                 CayenneTableProvider::create_table(catalog_arc, options, ctx.runtime_env()).await?;
             ctx.register_table(
                 "occ_t",
-                Arc::new(provider.clone_for_write_operations()) as Arc<dyn datafusion::datasource::TableProvider>,
+                Arc::new(provider.clone_for_write_operations())
+                    as Arc<dyn datafusion::datasource::TableProvider>,
             )?;
             let table_id = provider.table_id().to_string();
 
@@ -564,9 +584,17 @@ async fn test_txn_occ_conflict_stale_token() -> Result<(), anyhow::Error> {
                 .await?
                 .collect()
                 .await?;
-            assert_eq!(row_a_value(&ctx, "occ_t").await?, Some(20), "advancing upsert applied");
+            assert_eq!(
+                row_a_value(&ctx, "occ_t").await?,
+                Some(20),
+                "advancing upsert applied"
+            );
             let txn = CayenneTransaction::new();
-            txn.register(table_id.clone(), stale_token, provider.clone_for_write_operations());
+            txn.register(
+                table_id.clone(),
+                stale_token,
+                provider.clone_for_write_operations(),
+            );
             txn.set_staged(&table_id, staged);
             match txn.commit().await {
                 Err(CayenneError::WriteConflict { .. }) => {}
@@ -622,7 +650,9 @@ async fn test_txn_inline_tombstone_commits() -> Result<(), anyhow::Error> {
                 table_name: "inline_t".to_string(),
                 schema: Arc::clone(&schema),
                 primary_key: vec!["id".to_string()],
-                on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+                on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                    "id".to_string(),
+                ]))),
                 base_path: cayenne_dir.to_string_lossy().to_string(),
                 partition_column: None,
                 vortex_config: VortexConfig::default(),
@@ -658,7 +688,11 @@ async fn test_txn_inline_tombstone_commits() -> Result<(), anyhow::Error> {
                 .begin_staged_upsert_occ(token, single_row_stream(&schema, "a", 10), 1)
                 .await?;
             let txn = CayenneTransaction::new();
-            txn.register(table_id.clone(), token, provider.clone_for_write_operations());
+            txn.register(
+                table_id.clone(),
+                token,
+                provider.clone_for_write_operations(),
+            );
             txn.set_staged(&table_id, staged);
             txn.commit().await.map_err(|e| {
                 anyhow::anyhow!("inline-tier gated commit must succeed, not be rejected: {e}")

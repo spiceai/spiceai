@@ -103,7 +103,10 @@ pub(crate) async fn do_get(
             .scope(async { run_transaction(&datafusion, &statements, None, read_only).await })
             .await
             .map_err(transaction_error_to_status)?;
-        let batches = outcome.result.map(|(batches, _)| batches).unwrap_or_default();
+        let batches = outcome
+            .result
+            .map(|(batches, _)| batches)
+            .unwrap_or_default();
         let stream = record_batches_to_flight_stream(batches);
         let timed = TimedStream::new(stream, move || start);
         return Ok(Response::new(

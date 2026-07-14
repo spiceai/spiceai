@@ -58,8 +58,7 @@ pub use builder::QueryBuilder;
 mod cache;
 pub mod transaction;
 pub use transaction::{
-    TransactionError, TransactionOutcome, run_transaction, schema_statement,
-    transaction_statements,
+    TransactionError, TransactionOutcome, run_transaction, schema_statement, transaction_statements,
 };
 pub mod error_code;
 mod handle;

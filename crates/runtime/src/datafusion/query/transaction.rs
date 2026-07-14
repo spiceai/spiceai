@@ -160,15 +160,14 @@ pub async fn run_transaction(
     let mut last: Option<(Vec<RecordBatch>, CacheStatus)> = None;
     let statement_count = statements.len();
     for (index, statement) in statements.iter().enumerate() {
-        let query_res = match run_transaction_statement(df, statement, parameters.clone(), read_only)
-            .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                abort_transaction(handle.as_ref()).await;
-                return Err(TransactionError::Query(error));
-            }
-        };
+        let query_res =
+            match run_transaction_statement(df, statement, parameters.clone(), read_only).await {
+                Ok(result) => result,
+                Err(error) => {
+                    abort_transaction(handle.as_ref()).await;
+                    return Err(TransactionError::Query(error));
+                }
+            };
 
         let cache_status = query_res.cache_status;
         let mut data = query_res.data;
@@ -387,9 +386,7 @@ async fn resolve_cayenne_staged(
 /// `None` for a read, `Some(Ok(table))` for a stageable INSERT/UPDATE write, or
 /// `Some(Err(op))` for a write form v1 cannot stage atomically (its sink is not
 /// transaction-aware), which must abort the transaction rather than publish.
-fn classify_transaction_write(
-    plan: &LogicalPlan,
-) -> Option<Result<TableReference, &'static str>> {
+fn classify_transaction_write(plan: &LogicalPlan) -> Option<Result<TableReference, &'static str>> {
     use datafusion::logical_expr::WriteOp;
     match plan {
         LogicalPlan::Dml(dml) => Some(match &dml.op {

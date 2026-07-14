@@ -250,7 +250,11 @@ impl CachedPkKeyset {
                 self.approx_bytes = self
                     .approx_bytes
                     .saturating_add(approx_pk_keyset_entry_bytes(&key));
-                entry.insert(PkKeysetEntry { row: key, location, sequence: 0 });
+                entry.insert(PkKeysetEntry {
+                    row: key,
+                    location,
+                    sequence: 0,
+                });
             }
         }
     }
@@ -304,7 +308,11 @@ impl CachedPkKeyset {
             self.approx_bytes = self
                 .approx_bytes
                 .saturating_add(approx_pk_keyset_entry_bytes(&key));
-            entry.insert(PkKeysetEntry { row: key, location, sequence: 0 });
+            entry.insert(PkKeysetEntry {
+                row: key,
+                location,
+                sequence: 0,
+            });
         }
     }
 

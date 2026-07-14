@@ -162,10 +162,8 @@ impl WriteBackWorker {
         // provider's SHARED RuntimeEnv (object-store registrations for S3, memory
         // pool, caches) — a fresh `SessionContext::new()` would lose them and fail
         // object-store-backed scans.
-        let ctx = SessionContext::new_with_config_rt(
-            SessionConfig::new(),
-            self.provider.runtime_env(),
-        );
+        let ctx =
+            SessionContext::new_with_config_rt(SessionConfig::new(), self.provider.runtime_env());
         let accelerator: Arc<dyn TableProvider> = self.provider.clone();
         let current = ctx
             .read_table(accelerator)?
