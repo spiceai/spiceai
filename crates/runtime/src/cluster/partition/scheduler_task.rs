@@ -203,12 +203,13 @@ impl PartitionAssignmentTask {
             .await
             .map_err(|e| Error::AssignmentCycle { source: e })?;
 
-        // Only open the gate once a cycle has actually distributed partitions to
-        // the executors connected during the startup window. `reconcile_all`
-        // returns `NoAssignment` when no executors were connected (or there was
-        // nothing to assign); opening the gate then would let a later-connecting
-        // executor proceed with an empty initial share — the exact failure the
-        // gate prevents. A subsequent cycle that assigns will open it.
+        // Only open the gate once a cycle has run its assignment pass with the
+        // executors connected during the startup window. `reconcile_all` returns
+        // `NoAssignment` when no executors were connected (or there were no
+        // partitioned tables), i.e. before the scheduler could distribute to any
+        // executor; opening the gate then would let a later-connecting executor
+        // proceed with an empty initial share — the exact failure the gate
+        // prevents. A subsequent cycle that runs the assignment pass will open it.
         //
         // Opening lets `allocate_initial_partitions` return each executor its
         // assigned share so its initial snapshot loads the right partitions.

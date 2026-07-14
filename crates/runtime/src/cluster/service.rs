@@ -722,8 +722,12 @@ impl ClusterService for ClusterServiceImpl {
         let mut table_partitions: HashMap<String, BytesArray> = HashMap::new();
 
         let partition_store = self.executor_registry().accelerations_partition_store();
-        let app_guard = self.app.read().await;
-        if let Some(app) = app_guard.as_ref() {
+        // Snapshot the `Arc<App>` out of the lock and release the guard before the
+        // loop — `partition_value_to_bytes` is awaited per partition below, and
+        // holding the async `RwLock` read guard across those awaits would block
+        // writers (and risk deadlock if an awaited path re-acquires the lock).
+        let app_snapshot = self.app.read().await.clone();
+        if let Some(app) = app_snapshot.as_ref() {
             // Partition assignment is driven solely by the scheduler's periodic
             // partition-assignment cycle, which fairly distributes partitions
             // across all connected executors and pushes them over the control

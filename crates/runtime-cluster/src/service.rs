@@ -188,12 +188,16 @@ struct CommitResult {
 /// scheduler task to decide whether to open the first-assignment gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconcileOutcome {
-    /// The cycle distributed partitions across the connected executors. Only
-    /// this outcome should open the `allocate_initial_partitions` gate.
+    /// The cycle ran its assignment pass with at least one connected executor,
+    /// so any unassigned partitions were distributed and the store now reflects
+    /// each executor's authoritative share (which may legitimately be empty when
+    /// there were no pending partitions). Only this outcome should open the
+    /// `allocate_initial_partitions` gate.
     Assigned,
-    /// The cycle assigned nothing — either no accelerated partitioned tables
-    /// exist, or no executors were connected during the cycle. Opening the gate
-    /// here would hand a connecting executor an empty initial share.
+    /// The cycle never reached its assignment pass — either no accelerated
+    /// partitioned tables exist, or no executors were connected during the
+    /// cycle. Opening the gate here would hand a connecting executor a share
+    /// before the scheduler has had a chance to distribute to it.
     NoAssignment,
 }
 
