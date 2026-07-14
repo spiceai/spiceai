@@ -222,6 +222,30 @@ jobs:
           CHBENCH_PG_USER: bench
           CHBENCH_PG_PASS: bench
 
+      # MySQL counterpart of the step above. MySQL has no server-side DB-clone
+      # primitive and the runner has no filesystem access to the pod, so instead
+      # of a physical template copy this caches a pristine seed as <table>_tmpl
+      # tables inside `chbench` and resets the working tables from them with
+      # TRUNCATE + INSERT ... SELECT (a server-internal row copy, over the same
+      # MySQL connection). On a miss it seeds once via `testoperator
+      # --prepare-only`, snapshots the template tables, then records a
+      # fingerprint. After this the run below uses `--skip-prepare`. Ephemeral
+      # docker-MySQL runners have nothing to cache, so they skip this and seed
+      # normally.
+      - name: Restore or seed CH-benCH MySQL from template
+        if: steps.set_spicepod_path.outputs.SOURCE_TYPE == 'mysql' && github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners'
+        run: bash .github/scripts/chbench_template_mysql.sh
+        env:
+          SCALE_FACTOR: ${{ github.event.inputs.scale_factor }}
+          TERMINALS: ${{ github.event.inputs.terminals }}
+          SPICEPOD_PATH: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
+          SPICED_BIN: /usr/local/bin/spiced
+          CHBENCH_MYSQL_HOST: chbench-mysql.dataplatform.svc.cluster.local
+          CHBENCH_MYSQL_PORT: '3306'
+          CHBENCH_MYSQL_USER: bench
+          CHBENCH_MYSQL_PASS: bench
+          CHBENCH_MYSQL_DB: chbench
+
       # Deliberately placed after template restore/seed above: these vars must never be
       # visible to the `--prepare-only` seed run, or an experiment could silently change
       # what gets frozen into the cached template. $GITHUB_ENV persists for every later
@@ -320,7 +344,7 @@ jobs:
             --concurrency ${{ github.event.inputs.concurrency }} \
             ${{ github.event.inputs.query_overrides != '' && format('--query-overrides {0}', github.event.inputs.query_overrides) || '' }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
-            ${{ steps.set_spicepod_path.outputs.SOURCE_TYPE != 'mysql' && github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && '--skip-prepare' || '' }} \
+            ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && '--skip-prepare' || '' }} \
             ${{ github.event.inputs.skip_analytic_gate == 'true' && '--skip-analytic-gate' || '' }} \
             --disable-progress-bars \
             --metrics \
