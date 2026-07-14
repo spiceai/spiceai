@@ -354,50 +354,48 @@ async fn evaluate_query(
         }
     };
 
-    let (outcome, max_rel_delta) =
-        if total_rows(&expected_sorted) == 0 && total_rows(&actual_sorted) == 0 {
-            (Outcome::Pass, None)
-        } else {
-            match validate_with_expected_batches(
-                query.name.as_ref(),
-                &actual_sorted,
-                &expected_sorted,
-            ) {
-                Ok(QueryValidationResult::Pass) => {
-                    // Structure, schema and row set agree within the string
-                    // comparator's tolerance. Now apply the tight, type-aware
-                    // numeric check (exact for integer/decimal, 0.1% for
-                    // float — including avg() that alignment cast to decimal)
-                    // and surface the magnitude either way.
-                    match (expected_sorted.first(), actual_sorted.first()) {
-                        (Some(e0), Some(a0)) => {
-                            let delta = compare::numeric_delta(e0, a0, &actual_source_floats);
-                            if delta.exceeded {
-                                (
-                                    Outcome::Divergence(format!(
-                                        "numeric drift exceeds tolerance — {}",
-                                        delta.worst.as_deref().unwrap_or("(unknown cell)")
-                                    )),
-                                    Some(delta.max_rel_delta),
-                                )
-                            } else {
-                                (Outcome::Pass, Some(delta.max_rel_delta))
-                            }
+    let (outcome, max_rel_delta) = if total_rows(&expected_sorted) == 0
+        && total_rows(&actual_sorted) == 0
+    {
+        (Outcome::Pass, None)
+    } else {
+        match validate_with_expected_batches(query.name.as_ref(), &actual_sorted, &expected_sorted)
+        {
+            Ok(QueryValidationResult::Pass) => {
+                // Structure, schema and row set agree within the string
+                // comparator's tolerance. Now apply the tight, type-aware
+                // numeric check (exact for integer/decimal, 0.1% for
+                // float — including avg() that alignment cast to decimal)
+                // and surface the magnitude either way.
+                match (expected_sorted.first(), actual_sorted.first()) {
+                    (Some(e0), Some(a0)) => {
+                        let delta = compare::numeric_delta(e0, a0, &actual_source_floats);
+                        if delta.exceeded {
+                            (
+                                Outcome::Divergence(format!(
+                                    "numeric drift exceeds tolerance — {}",
+                                    delta.worst.as_deref().unwrap_or("(unknown cell)")
+                                )),
+                                Some(delta.max_rel_delta),
+                            )
+                        } else {
+                            (Outcome::Pass, Some(delta.max_rel_delta))
                         }
-                        _ => (Outcome::Pass, None),
                     }
+                    _ => (Outcome::Pass, None),
                 }
-                Ok(QueryValidationResult::Fail(reason)) => (
-                    Outcome::Divergence(format!(
-                        "{reason:?} (source rows={}, spice rows={})",
-                        total_rows(&expected_sorted),
-                        total_rows(&actual_sorted),
-                    )),
-                    None,
-                ),
-                Err(e) => (Outcome::Fail(e.to_string()), None),
             }
-        };
+            Ok(QueryValidationResult::Fail(reason)) => (
+                Outcome::Divergence(format!(
+                    "{reason:?} (source rows={}, spice rows={})",
+                    total_rows(&expected_sorted),
+                    total_rows(&actual_sorted),
+                )),
+                None,
+            ),
+            Err(e) => (Outcome::Fail(e.to_string()), None),
+        }
+    };
 
     AnalyticalQueryResult {
         name,
