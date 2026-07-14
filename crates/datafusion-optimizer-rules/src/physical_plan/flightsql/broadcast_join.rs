@@ -327,7 +327,18 @@ fn try_rewrite(
     // One BroadcastJoinFlightSqlExec per fact-partition executor, all running
     // the identical join SQL against that executor's client.
     let output_schema = join.schema();
-    let statistics = Statistics::new_unknown(&output_schema);
+    // Stamp the replaced join's own estimated statistics onto the per-executor
+    // scans instead of leaving them unknown-cardinality leaves: the union of
+    // the per-executor joins produces exactly the rows the central join would
+    // have, so the join's estimate (downgraded to inexact) is the right total.
+    // Divide it across the children so the union's summed statistics reproduce
+    // it. An unknown leaf here blinds every consumer above — e.g. the
+    // scheduler's oversized-join sort-merge rewrite cannot budget a parent
+    // hash join that builds this union.
+    let statistics = join.partition_statistics(None).map_or_else(
+        |_| Statistics::new_unknown(&output_schema),
+        |stats| divide_statistics(stats.as_ref().clone().to_inexact(), fact.flight_execs.len()),
+    );
     let mut children: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(fact.flight_execs.len());
     for fe in &fact.flight_execs {
         children.push(Arc::new(BroadcastJoinFlightSqlExec::new(
@@ -369,6 +380,29 @@ fn try_rewrite(
             None => union,
         };
     Ok(Transformed::yes(result))
+}
+
+/// Spread a whole-join statistics estimate across `children` union branches so
+/// the union's summed statistics reproduce the original estimate. Row and byte
+/// counts are divided (always inexact — the true split across executors is
+/// unknowable at plan time); per-column bounds stay as-is, since each child's
+/// values fall within the whole join's bounds.
+fn divide_statistics(mut stats: Statistics, children: usize) -> Statistics {
+    let n = children.max(1);
+    stats.num_rows = divide_precision(stats.num_rows, n);
+    stats.total_byte_size = divide_precision(stats.total_byte_size, n);
+    stats
+}
+
+fn divide_precision(
+    precision: datafusion::common::stats::Precision<usize>,
+    n: usize,
+) -> datafusion::common::stats::Precision<usize> {
+    use datafusion::common::stats::Precision;
+    match precision {
+        Precision::Exact(v) | Precision::Inexact(v) => Precision::Inexact(v / n),
+        Precision::Absent => Precision::Absent,
+    }
 }
 
 /// Total estimated row count of a federated side = the SUM of its per-partition
