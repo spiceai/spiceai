@@ -228,6 +228,24 @@ jobs:
             echo "diagnostics probes backgrounded (pids$DIAG_PIDS) -> $DIAG_DIR"
           fi
 
+          # TEMP (cold-hang diagnosis): on the promotion stall warning, capture native
+          # stacks of every spiced thread — async taskdumps can't see waits nested in
+          # futures combinators; native stacks discriminate parked vs starved workers.
+          mkdir -p "$DIAG_DIR"
+          (
+            command -v gdb >/dev/null 2>&1 || sudo apt-get install -y -qq gdb >/dev/null 2>&1
+            for i in $(seq 1 240); do
+              sleep 30
+              if grep -q "made no completion within the stall window" "${GITHUB_WORKSPACE}/htap-run.log" 2>/dev/null; then
+                SPID=$(pgrep -x spiced | head -1)
+                [ -n "$SPID" ] && sudo gdb -p "$SPID" --batch -ex "set pagination off" -ex "thread apply all bt" \
+                  > "$DIAG_DIR/spiced-native-stacks-$i.txt" 2>&1
+                sleep 570
+              fi
+            done
+          ) > "$DIAG_DIR/gdb-watch.log" 2>&1 &
+          DIAG_PIDS="$DIAG_PIDS $!"
+
           set +e
           $TESTOP_PREFIX testoperator run htap \
             -s "${SPICED_BIN}" \

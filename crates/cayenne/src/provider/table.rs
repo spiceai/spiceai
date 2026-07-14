@@ -13854,6 +13854,30 @@ impl CayenneTableProvider {
     /// Returns an error if flushing the mem/inline tiers, the canonical visible
     /// read, the cold object-store write, or the atomic catalog commit fails.
     pub async fn promote_warm_to_cold(&self) -> Result<bool> {
+        // TEMPORARY DIAGNOSTIC (cold-hang investigation): the hang requires two
+        // promotions overlapping (sequential passes always complete), so a
+        // process-wide serialization knob is the cleanest discriminator for a
+        // shared-resource interaction: if serialized runs never hang, the cause
+        // is cross-promotion contention, not a per-pass bug.
+        static SERIALIZE: std::sync::LazyLock<Option<tokio::sync::Semaphore>> =
+            std::sync::LazyLock::new(|| {
+                std::env::var("CAYENNE_SERIALIZE_COLD_PROMOTIONS")
+                    .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .then(|| tokio::sync::Semaphore::new(1))
+            });
+        let _serialize_permit = match SERIALIZE.as_ref() {
+            Some(semaphore) => {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    env = "CAYENNE_SERIALIZE_COLD_PROMOTIONS",
+                    "Cold-tier promotions serialized process-wide for diagnostics"
+                );
+                // Never closed, so acquisition cannot fail.
+                semaphore.acquire().await.ok()
+            }
+            None => None,
+        };
         let pass_start = Instant::now();
         let result = self
             .run_promotion_with_stall_taskdump(self.promote_warm_to_cold_inner())
