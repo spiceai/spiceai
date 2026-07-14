@@ -867,12 +867,13 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
                 // maintenance only, because timer-driven small-file compaction is
                 // disabled for these tables.
                 let t = bg_handle.read().await;
-                let result = if bg_protected_only {
+                if let Err(e) = if bg_protected_only {
                     settle_protected_maintenance_only(&t, bg_durability).await
                 } else {
                     settle(&t, bg_durability).await
-                };
-                let _ = result;
+                } {
+                    panic!("background maintenance pass failed: {e}");
+                }
             }
             tokio::task::yield_now().await;
         }
@@ -942,7 +943,7 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     }
 
     stop.store(true, Ordering::Relaxed);
-    compactor.await.expect("compaction task joins");
+    compactor.await.expect("background maintenance task joins");
     let table = Arc::clone(&*handle.read().await);
     if w.cold {
         settle_protected_maintenance_only(&table, w.durability).await?;
