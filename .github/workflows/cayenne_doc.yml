@@ -3,12 +3,15 @@ name: Build Cayenne doc PDF
 # Renders the Cayenne technical reference (docs/cayenne/cayenne.md) to
 # Cayenne.pdf via docs/cayenne/build_pdf.py.
 #
-# - On pull requests touching docs/cayenne/**, this verifies the document still
-#   builds (mermaid blocks resolve via kroki.io, WeasyPrint succeeds) and
-#   uploads the rendered PDF as a run artifact for review.
-# - On push to trunk that touches docs/cayenne/** (or this workflow file), and on
-#   manual dispatch, it builds and uploads Cayenne.pdf as a downloadable, linkable
-#   artifact of the current trunk.
+# Runs only after a merge to trunk that touches docs/cayenne/** (or this
+# workflow file), and on manual dispatch — it builds and uploads Cayenne.pdf
+# as a downloadable, linkable artifact of the current trunk.
+#
+# Deliberately not run on pull_request: rendering depends on kroki.io to
+# resolve mermaid blocks, an external service that intermittently 400s
+# (see run 29299583614) — a flake there shouldn't block unrelated PRs.
+# `docs/cayenne/build_pdf.py` can still be run locally to verify a doc change
+# renders before merging.
 
 on:
   push:
@@ -16,14 +19,9 @@ on:
     paths:
       - 'docs/cayenne/**'
       - '.github/workflows/cayenne_doc.yml'
-  pull_request:
-    branches: [trunk]
-    paths:
-      - 'docs/cayenne/**'
-      - '.github/workflows/cayenne_doc.yml'
   workflow_dispatch:
 
-# Cancel superseded runs for the same ref (a newer push/PR update wins).
+# Cancel a superseded run for the same ref (a newer push to trunk wins).
 concurrency:
   group: cayenne-doc-${{ github.ref }}
   cancel-in-progress: true
