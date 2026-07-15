@@ -25,5 +25,6 @@ pub struct GoogleEmbeddingParams {
     #[param(autoload_secret)]
     pub api_key: SecretString,
     /// The number of dimensions for the embedding output.
+    #[param(runtime)]
     pub dimensions: Option<u32>,
 }

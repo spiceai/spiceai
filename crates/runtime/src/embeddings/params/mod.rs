@@ -141,14 +141,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn google_params_accept_runtime_dimensions() {
+        let typed = google::GoogleEmbeddingParams::try_from_params(
+            "embedding test",
+            params(&[("google_api_key", "key"), ("dimensions", "768")]),
+            &empty_secrets(),
+        )
+        .await
+        .expect("google params should deserialize");
+        assert_eq!(typed.dimensions, Some(768));
+    }
+
+    #[tokio::test]
     async fn huggingface_params_parse_pooling_enum() {
         let typed = huggingface::HuggingFaceEmbeddingParams::try_from_params(
             "embedding test",
-            params(&[("pooling", "mean"), ("max_seq_length", "512")]),
+            params(&[
+                ("hf_token", "hf_abc"),
+                ("pooling", "mean"),
+                ("max_seq_length", "512"),
+            ]),
             &empty_secrets(),
         )
         .await
         .expect("huggingface params should deserialize");
+        assert_eq!(
+            typed.hf_token.as_ref().map(ExposeSecret::expose_secret),
+            Some("hf_abc")
+        );
         assert_eq!(typed.pooling, Some(Pooling::Mean));
         assert_eq!(typed.max_seq_length, Some(512));
     }
@@ -189,22 +209,82 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn model2vec_params_accept_runtime_keys() {
+        let typed = model2vec::Model2VecEmbeddingParams::try_from_params(
+            "embedding test",
+            params(&[
+                ("hf_token", "hf_abc"),
+                ("subfolder", "onnx"),
+                ("normalize", "true"),
+                ("parallelism", "4"),
+                ("embed_max_token_length", "512"),
+                ("embed_custom_batch_size", "32"),
+            ]),
+            &empty_secrets(),
+        )
+        .await
+        .expect("model2vec params should deserialize");
+        assert_eq!(
+            typed.hf_token.as_ref().map(ExposeSecret::expose_secret),
+            Some("hf_abc")
+        );
+        assert_eq!(typed.subfolder.as_deref(), Some("onnx"));
+        assert_eq!(typed.normalize, Some(true));
+        assert_eq!(typed.parallelism, Some(4));
+        assert_eq!(typed.embed_max_token_length, Some(512));
+        assert_eq!(typed.embed_custom_batch_size, Some(32));
+    }
+
     #[cfg(feature = "bedrock")]
     #[tokio::test]
-    async fn bedrock_params_parse_typed_fields() {
+    async fn bedrock_params_accept_runtime_keys_and_legacy_truncate_alias() {
         let typed = bedrock::BedrockEmbeddingParams::try_from_params(
             "embedding test",
             params(&[
-                ("bedrock_dimensions", "1024"),
-                ("bedrock_normalize", "true"),
-                ("bedrock_input_type", "search_document"),
+                ("aws_access_key_id", "AKIA"),
+                ("aws_secret_access_key", "secret"),
+                ("aws_session_token", "token"),
+                ("aws_region", "us-east-1"),
+                ("aws_iam_role_source", "auto"),
+                ("aws_profile", "default"),
+                ("requests_per_min_limit", "1500"),
+                ("max_concurrent_invocations", "10"),
+                ("dimensions", "1024"),
+                ("normalize", "true"),
+                ("truncate", "END"),
+                ("input_type", "search_document"),
             ]),
             &empty_secrets(),
         )
         .await
         .expect("bedrock params should deserialize");
+        assert_eq!(
+            typed.aws_access_key_id
+                .as_ref()
+                .map(ExposeSecret::expose_secret),
+            Some("AKIA")
+        );
+        assert_eq!(
+            typed.aws_secret_access_key
+                .as_ref()
+                .map(ExposeSecret::expose_secret),
+            Some("secret")
+        );
+        assert_eq!(
+            typed.aws_session_token
+                .as_ref()
+                .map(ExposeSecret::expose_secret),
+            Some("token")
+        );
+        assert_eq!(typed.aws_region.as_deref(), Some("us-east-1"));
+        assert_eq!(typed.aws_iam_role_source.as_deref(), Some("auto"));
+        assert_eq!(typed.aws_profile.as_deref(), Some("default"));
+        assert_eq!(typed.requests_per_min_limit, 1500);
+        assert_eq!(typed.max_concurrent_invocations, 10);
         assert_eq!(typed.dimensions, Some(1024));
         assert_eq!(typed.normalize, Some(true));
+        assert_eq!(typed.truncate_mode.as_deref(), Some("END"));
         assert!(typed.input_type.is_some());
     }
 }

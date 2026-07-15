@@ -289,10 +289,8 @@ async fn bedrock(
         });
     };
 
-    // Bedrock embeddings declare no runtime-scoped AWS params, so the client is
-    // built from the ambient AWS credential chain (parity with the previous
-    // `get_runtime_params()` call, which always produced an empty map here).
-    let client = super::util::create_bedrock_client(&HashMap::new(), "bedrock-embed")
+    let runtime_params = params.runtime_params();
+    let client = super::util::create_bedrock_client(&runtime_params, "bedrock-embed")
         .await
         .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel { source: e })?;
 

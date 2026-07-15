@@ -22,11 +22,13 @@ use secrecy::SecretString;
 #[params(prefix = "model2vec")]
 pub struct Model2VecEmbeddingParams {
     /// The Hugging Face access token.
-    #[param(autoload_secret)]
+    #[param(runtime, autoload_secret)]
     pub hf_token: Option<SecretString>,
     /// The subfolder within the Hugging Face repo containing the model.
+    #[param(runtime)]
     pub subfolder: Option<String>,
     /// Whether to normalize the embedding output.
+    #[param(runtime)]
     pub normalize: Option<bool>,
     /// The number of threads to use for parallel inference.
     #[param(runtime)]

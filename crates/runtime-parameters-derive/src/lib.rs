@@ -147,10 +147,10 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     }
 
     let field_idents: Vec<&syn::Ident> = specs.iter().map(|s| &s.ident).collect();
-    let allow_deprecated = any_deprecated.then(|| quote! { #[allow(deprecated)] });
+    let expect_deprecated = any_deprecated.then(|| quote! { #[expect(deprecated)] });
 
     Ok(quote! {
-        #allow_deprecated
+        #expect_deprecated
         impl ::runtime_parameters::typed::TypedParams for #struct_ident {
             const PREFIX: &'static str = #prefix;
 
@@ -225,7 +225,7 @@ fn expand_field(
     // Secret autoload: absent + `#[param(autoload_secret)]` → look up the prefixed key in
     // the secret stores (parity with `Parameters::try_new`).
     if spec.autoload_secret {
-        let autoload_key = apply_prefix(&spec.name(), prefix, false);
+        let autoload_key = apply_prefix(&spec.name(), prefix, spec.runtime);
         raw = quote! {
             match #raw {
                 ::std::option::Option::Some(__v) => ::std::option::Option::Some(__v),

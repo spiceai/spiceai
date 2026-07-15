@@ -24,7 +24,7 @@ use super::Pooling;
 #[params(prefix = "huggingface")]
 pub struct HuggingFaceEmbeddingParams {
     /// The Hugging Face access token.
-    #[param(autoload_secret)]
+    #[param(runtime, autoload_secret)]
     pub hf_token: Option<SecretString>,
     /// The pooling strategy for the embedding model.
     #[param(runtime)]
