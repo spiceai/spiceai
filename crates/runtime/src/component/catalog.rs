@@ -43,7 +43,6 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct CatalogAcceleration {
     pub engine: CatalogAccelerationEngine,
     pub refresh_mode: CatalogRefreshMode,
-    pub on_missing_primary_key: OnMissingPrimaryKey,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -55,14 +54,6 @@ pub enum CatalogAccelerationEngine {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatalogRefreshMode {
     Changes,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum OnMissingPrimaryKey {
-    #[default]
-    Skip,
-    QueryThrough,
-    Error,
 }
 
 impl From<spicepod_catalog::CatalogAccelerationEngine> for CatalogAccelerationEngine {
@@ -81,24 +72,11 @@ impl From<spicepod_catalog::CatalogRefreshMode> for CatalogRefreshMode {
     }
 }
 
-impl From<spicepod_catalog::OnMissingPrimaryKey> for OnMissingPrimaryKey {
-    fn from(on_missing_primary_key: spicepod_catalog::OnMissingPrimaryKey) -> Self {
-        match on_missing_primary_key {
-            spicepod_catalog::OnMissingPrimaryKey::Skip => OnMissingPrimaryKey::Skip,
-            spicepod_catalog::OnMissingPrimaryKey::QueryThrough => {
-                OnMissingPrimaryKey::QueryThrough
-            }
-            spicepod_catalog::OnMissingPrimaryKey::Error => OnMissingPrimaryKey::Error,
-        }
-    }
-}
-
 impl From<spicepod_catalog::CatalogAcceleration> for CatalogAcceleration {
     fn from(acceleration: spicepod_catalog::CatalogAcceleration) -> Self {
         CatalogAcceleration {
             engine: acceleration.engine.into(),
             refresh_mode: acceleration.refresh_mode.into(),
-            on_missing_primary_key: acceleration.on_missing_primary_key.into(),
         }
     }
 }
@@ -439,7 +417,6 @@ mod tests {
         let acceleration = spicepod_catalog::CatalogAcceleration {
             engine: spicepod_catalog::CatalogAccelerationEngine::Cayenne,
             refresh_mode: spicepod_catalog::CatalogRefreshMode::Changes,
-            on_missing_primary_key: spicepod_catalog::OnMissingPrimaryKey::QueryThrough,
         };
 
         let builder = CatalogBuilder::try_from(spicepod_catalog(&[], &[], Some(acceleration)))
@@ -450,10 +427,6 @@ mod tests {
             .expect("acceleration should be mapped");
         assert_eq!(mapped.engine, CatalogAccelerationEngine::Cayenne);
         assert_eq!(mapped.refresh_mode, CatalogRefreshMode::Changes);
-        assert_eq!(
-            mapped.on_missing_primary_key,
-            OnMissingPrimaryKey::QueryThrough
-        );
     }
 
     #[test]

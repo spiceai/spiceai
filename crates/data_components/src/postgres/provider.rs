@@ -307,35 +307,40 @@ impl PostgresCatalogProvider {
     }
 
     async fn list_schemas(&self) -> Result<Vec<String>> {
-        let conn = self
-            .pool
-            .connect_direct()
-            .await
-            .context(ConnectionFailedSnafu)?;
-
-        let rows = conn
-            .conn
-            .query(
-                "SELECT schema_name FROM information_schema.schemata ORDER BY schema_name",
-                &[],
-            )
-            .await
-            .context(QueryFailedSnafu)?;
-
-        let names: Vec<String> = rows
-            .iter()
-            .filter_map(|row| {
-                let name: String = row.get(0);
-                if SYSTEM_SCHEMAS.contains(&name.as_str()) || name.starts_with("pg_temp") {
-                    None
-                } else {
-                    Some(name)
-                }
-            })
-            .collect();
-
-        Ok(names)
+        list_schemas(&self.pool).await
     }
+}
+
+/// Query `information_schema.schemata` for all user schemas, excluding system
+/// schemas (`information_schema`, `pg_catalog`, `pg_toast`, `pg_temp*`).
+///
+/// Shared between [`PostgresCatalogProvider`] and any other catalog/schema
+/// provider (e.g. an accelerated one) that needs the same discovery query.
+pub async fn list_schemas(pool: &PostgresConnectionPool) -> Result<Vec<String>> {
+    let conn = pool.connect_direct().await.context(ConnectionFailedSnafu)?;
+
+    let rows = conn
+        .conn
+        .query(
+            "SELECT schema_name FROM information_schema.schemata ORDER BY schema_name",
+            &[],
+        )
+        .await
+        .context(QueryFailedSnafu)?;
+
+    let names: Vec<String> = rows
+        .iter()
+        .filter_map(|row| {
+            let name: String = row.get(0);
+            if SYSTEM_SCHEMAS.contains(&name.as_str()) || name.starts_with("pg_temp") {
+                None
+            } else {
+                Some(name)
+            }
+        })
+        .collect();
+
+    Ok(names)
 }
 
 impl CatalogProvider for PostgresCatalogProvider {
@@ -429,48 +434,95 @@ impl PostgresSchemaProvider {
     }
 
     async fn list_tables(&self) -> Result<Vec<String>> {
-        let conn = self
-            .pool
-            .connect_direct()
-            .await
-            .context(ConnectionFailedSnafu)?;
-
-        // A declaratively-partitioned parent (relkind 'p') and every one of its
-        // leaf partitions (relkind 'r') all appear in `information_schema.tables`
-        // as `BASE TABLE`. Registering both the parent and its children would
-        // double-count the data (the parent is a union over its children) and
-        // clutter the catalog for tables with many partitions (#11726). It would
-        // also diverge from how the CDC path treats these tables: Spice publishes
-        // partitioned-table changes under the parent relation
-        // (`publish_via_partition_root = true`, see `postgres_replication::slot`),
-        // so the parent is the coherent unit either way. We therefore exclude any
-        // relation that is a child in `pg_inherits` (covering both declarative
-        // partitions and legacy table inheritance) and keep only the parent. The
-        // `pg_inherits` catalog exists on every supported PostgreSQL version and
-        // on Redshift (where it is empty), so this degrades to the prior
-        // behaviour on engines without partitioning.
-        let rows = conn
-            .conn
-            .query(
-                "SELECT t.table_name FROM information_schema.tables t \
-                 WHERE t.table_schema = $1 \
-                 AND t.table_type IN ('BASE TABLE', 'VIEW') \
-                 AND NOT EXISTS ( \
-                     SELECT 1 FROM pg_catalog.pg_inherits inh \
-                     JOIN pg_catalog.pg_class child ON child.oid = inh.inhrelid \
-                     JOIN pg_catalog.pg_namespace ns ON ns.oid = child.relnamespace \
-                     WHERE ns.nspname = t.table_schema \
-                     AND child.relname = t.table_name \
-                 ) \
-                 ORDER BY t.table_name",
-                &[&self.schema_name],
-            )
-            .await
-            .context(QueryFailedSnafu)?;
-
-        let names: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
-        Ok(names)
+        list_tables(&self.pool, &self.schema_name).await
     }
+}
+
+/// Query `information_schema.tables` for base tables/views in `schema_name`.
+///
+/// Shared between [`PostgresSchemaProvider`] and any other schema provider
+/// (e.g. an accelerated one) that needs the same discovery query.
+///
+/// A declaratively-partitioned parent (relkind 'p') and every one of its leaf
+/// partitions (relkind 'r') all appear in `information_schema.tables` as `BASE
+/// TABLE`. Registering both the parent and its children would double-count
+/// the data (the parent is a union over its children) and clutter the
+/// catalog for tables with many partitions (#11726). It would also diverge
+/// from how the CDC path treats these tables: Spice publishes
+/// partitioned-table changes under the parent relation
+/// (`publish_via_partition_root = true`, see `postgres_replication::slot`),
+/// so the parent is the coherent unit either way. We therefore exclude any
+/// relation that is a child in `pg_inherits` (covering both declarative
+/// partitions and legacy table inheritance) and keep only the parent. The
+/// `pg_inherits` catalog exists on every supported `PostgreSQL` version and on
+/// Redshift (where it is empty), so this degrades to the prior behaviour on
+/// engines without partitioning.
+pub async fn list_tables(pool: &PostgresConnectionPool, schema_name: &str) -> Result<Vec<String>> {
+    let conn = pool.connect_direct().await.context(ConnectionFailedSnafu)?;
+
+    let rows = conn
+        .conn
+        .query(
+            "SELECT t.table_name FROM information_schema.tables t \
+             WHERE t.table_schema = $1 \
+             AND t.table_type IN ('BASE TABLE', 'VIEW') \
+             AND NOT EXISTS ( \
+                 SELECT 1 FROM pg_catalog.pg_inherits inh \
+                 JOIN pg_catalog.pg_class child ON child.oid = inh.inhrelid \
+                 JOIN pg_catalog.pg_namespace ns ON ns.oid = child.relnamespace \
+                 WHERE ns.nspname = t.table_schema \
+                 AND child.relname = t.table_name \
+             ) \
+             ORDER BY t.table_name",
+            &[&schema_name],
+        )
+        .await
+        .context(QueryFailedSnafu)?;
+
+    let names: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
+    Ok(names)
+}
+
+/// Query `pg_catalog` for the primary-key columns of `schema_name.table_name`,
+/// in key order. Empty when the table has no primary key.
+///
+/// This is deliberately a minimal, self-contained lookup (primary key only) —
+/// not the fuller index/sort/statistics inference `connector-postgres` does
+/// for a dataset's own schema-inference pipeline — so catalog-level table
+/// classification (accelerate vs. skip vs. query-through) doesn't need a
+/// dependency on that crate.
+pub async fn primary_key_columns(
+    pool: &PostgresConnectionPool,
+    schema_name: &str,
+    table_name: &str,
+) -> Result<Vec<String>> {
+    let conn = pool.connect_direct().await.context(ConnectionFailedSnafu)?;
+    let table_path = format!("{schema_name}.{table_name}");
+
+    // `indkey` is an `int2vector`, not a plain array, so it's converted via
+    // `string_to_array(...)::int2[]` before unnesting `WITH ORDINALITY` to
+    // preserve key-column order — the same technique used by
+    // `connector-postgres`'s fuller schema-inference query.
+    let rows = conn
+        .conn
+        .query(
+            "SELECT a.attname AS column_name \
+             FROM pg_catalog.pg_index ix \
+             JOIN LATERAL unnest(string_to_array(ix.indkey::text, ' ')::int2[]) \
+                 WITH ORDINALITY AS k(attnum, ord) ON true \
+             JOIN pg_catalog.pg_attribute a \
+                 ON a.attrelid = ix.indrelid \
+                 AND a.attnum = k.attnum \
+             WHERE ix.indrelid = to_regclass($1) \
+             AND ix.indisprimary \
+             ORDER BY k.ord",
+            &[&table_path],
+        )
+        .await
+        .context(QueryFailedSnafu)?;
+
+    let columns: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
+    Ok(columns)
 }
 
 /// Build the fully-qualified name of a foreign-key target table

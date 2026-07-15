@@ -116,6 +116,11 @@ impl WithDependsOn<Catalog> for Catalog {
 /// CDC-accelerates every table the catalog connector discovers (subject to
 /// `include`/`exclude`), without per-table configuration.
 ///
+/// Every included table must have a primary key — catalog setup fails
+/// naming any table that doesn't, rather than silently skipping it or
+/// falling back to a heavier access pattern. Use `include`/`exclude` to keep
+/// tables without a primary key out of an accelerated catalog's scope.
+///
 /// Deliberately excludes per-table-only concepts (`primary_key`,
 /// `on_conflict`, `indexes`, per-table overrides) — those remain exclusively
 /// on a dataset's own `acceleration` block.
@@ -129,9 +134,6 @@ pub struct CatalogAcceleration {
     /// Required and explicit: there is no catalog-level default, since the
     /// only supported value today is `changes` (CDC).
     pub refresh_mode: CatalogRefreshMode,
-
-    #[serde(default)]
-    pub on_missing_primary_key: OnMissingPrimaryKey,
 }
 
 /// Accelerator engine used for catalog-wide acceleration. Only `cayenne` is
@@ -151,25 +153,6 @@ pub enum CatalogAccelerationEngine {
 #[serde(rename_all = "snake_case")]
 pub enum CatalogRefreshMode {
     Changes,
-}
-
-/// Behavior for a table discovered by a catalog with no usable primary key.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "schemars", derive(JsonSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum OnMissingPrimaryKey {
-    /// Exclude the table entirely: it is not visible or queryable through
-    /// this catalog. The default, since bootstrap+CDC puts minimal load on
-    /// the source — a table that can't be safely CDC'd is simply omitted
-    /// rather than silently falling back to a heavier access pattern.
-    #[default]
-    Skip,
-    /// Keep the table as a plain federated table: queries are pushed through
-    /// to the source directly. Not accelerated, and not the default, since
-    /// unlike bootstrap+CDC it can add meaningful query load to the source.
-    QueryThrough,
-    /// Fail catalog acceleration setup entirely, naming the table.
-    Error,
 }
 
 #[cfg(test)]
@@ -208,10 +191,6 @@ mod tests {
             .expect("acceleration should be present");
         assert_eq!(acceleration.engine, CatalogAccelerationEngine::Cayenne);
         assert_eq!(acceleration.refresh_mode, CatalogRefreshMode::Changes);
-        assert_eq!(
-            acceleration.on_missing_primary_key,
-            OnMissingPrimaryKey::Skip
-        );
     }
 
     #[test]
@@ -260,30 +239,20 @@ mod tests {
     }
 
     #[test]
-    fn test_catalog_acceleration_on_missing_primary_key_variants() {
-        for (yaml_value, expected) in [
-            ("skip", OnMissingPrimaryKey::Skip),
-            ("query_through", OnMissingPrimaryKey::QueryThrough),
-            ("error", OnMissingPrimaryKey::Error),
-        ] {
-            let catalog = parse(&format!(
-                "
-                    from: pg
-                    name: my_pg
-                    acceleration:
-                      refresh_mode: changes
-                      on_missing_primary_key: {yaml_value}
-                "
-            ));
-            assert_eq!(
-                catalog
-                    .acceleration
-                    .expect("acceleration should be present")
-                    .on_missing_primary_key,
-                expected,
-                "unexpected parse for on_missing_primary_key '{yaml_value}'"
-            );
-        }
+    fn test_catalog_acceleration_rejects_unknown_field() {
+        let result = yaml::from_str::<Catalog>(
+            "
+                from: pg
+                name: my_pg
+                acceleration:
+                  refresh_mode: changes
+                  on_missing_primary_key: skip
+            ",
+        );
+        assert!(
+            result.is_err(),
+            "on_missing_primary_key was removed; missing a primary key is always an error"
+        );
     }
 
     #[test]

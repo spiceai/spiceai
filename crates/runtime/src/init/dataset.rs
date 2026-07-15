@@ -571,6 +571,35 @@ impl Runtime {
         }
     }
 
+    /// Bootstraps the accelerator (if any) for a single dataset and loads it
+    /// through the normal dataset lifecycle (connector creation,
+    /// `AcceleratedTable` construction, `DataFusion` registration, retry with
+    /// backoff on transient failure) — identical to how every spicepod-declared
+    /// dataset is loaded via [`Runtime::load_dataset`].
+    ///
+    /// Used for datasets synthesized at runtime (e.g. by catalog-level
+    /// acceleration) rather than declared in the Spicepod `datasets:` list.
+    pub(crate) async fn load_synthesized_dataset(self: Arc<Self>, ds: Arc<Dataset>) {
+        let bootstrap_status = match self
+            .initialize_datasets_accelerators(std::slice::from_ref(&ds))
+            .await
+            .remove(&ds.name)
+        {
+            Some(Ok(status)) => status,
+            Some(Err(_)) => return, // error already logged in initialize_datasets_accelerators
+            None => {
+                tracing::error!(
+                    "Dataset {} missing from accelerator initialization results",
+                    ds.name
+                );
+                return;
+            }
+        };
+
+        let semaphore = Arc::clone(&self.dataset_load_semaphore);
+        self.load_dataset(ds, bootstrap_status, semaphore).await;
+    }
+
     /// Apply extended schema inference to a freshly-resolved dataset.
     ///
     /// When the dataset opts into `schema_inference: extended` and the source
