@@ -196,6 +196,14 @@ struct Workload {
     /// generates — the same convergence property the directory-listing path
     /// is already fuzzed against.
     scan_from_manifest: bool,
+    /// `true` = `stage_b_publish_mode: Manifest` (Stage 0b/0c pre-placement):
+    /// Stage A writes data files directly into the target snapshot and Stage B
+    /// publishes their manifest rows instead of moving files. Requires
+    /// `scan_from_manifest`. Fuzzes the pre-place + off-fence-append-only
+    /// publish path (and, for on-conflict tables, the under-fence upsert publish
+    /// over pre-placed files) against the model oracle — proving no
+    /// vanish/duplicate across upsert/delete/delete-all/compact/restart.
+    preplace: bool,
 }
 
 // ============================================================================
@@ -219,6 +227,7 @@ fn config(
     pk_keyset_cache_mb: Option<usize>,
     cold_url: Option<String>,
     scan_from_manifest: bool,
+    preplace: bool,
 ) -> VortexConfig {
     let base = VortexConfig {
         target_vortex_file_size_mb: 1,
@@ -234,6 +243,13 @@ fn config(
         // default exact index. Lets one harness fuzz both existence paths.
         pk_keyset_cache_mb,
         scan_from_manifest,
+        // Pre-placement (Stage 0b/0c) requires manifest scans; a preplace config
+        // is only ever constructed alongside `scan_from_manifest: true`.
+        stage_b_publish_mode: if preplace {
+            cayenne::metadata::StageBPublishMode::Manifest
+        } else {
+            cayenne::metadata::StageBPublishMode::RenameSync
+        },
         ..VortexConfig::default()
     };
     let base = match cold_url {
@@ -270,6 +286,7 @@ async fn create_table(
     pk_keyset_cache_mb: Option<usize>,
     cold: bool,
     scan_from_manifest: bool,
+    preplace: bool,
 ) -> TestResult<(Arc<CayenneTableProvider>, SessionContext)> {
     // Local `file://` cold store per table (no object-store config needed —
     // the default local store resolves it).
@@ -299,6 +316,7 @@ async fn create_table(
             pk_keyset_cache_mb,
             cold_url,
             scan_from_manifest,
+            preplace,
         ),
     };
     let catalog: Arc<dyn MetadataCatalog> =
@@ -756,6 +774,7 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
         w.pk_keyset_cache_mb,
         w.cold,
         w.scan_from_manifest,
+        w.preplace,
     )
     .await?;
     let mut rng = Rng::new(seed);
@@ -846,6 +865,7 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
         w.pk_keyset_cache_mb,
         w.cold,
         w.scan_from_manifest,
+        w.preplace,
     )
     .await?;
     let mut rng = Rng::new(seed);
@@ -1084,6 +1104,7 @@ fn sequential(mode: Mode) -> Workload {
         pk_keyset_cache_mb: None,
         cold: false,
         scan_from_manifest: false,
+        preplace: false,
     }
 }
 // Sequential memory-CDC: drives the mem-tier append + checkpoint + seq-prefix bake
@@ -1103,6 +1124,7 @@ fn sequential_memory() -> Workload {
         pk_keyset_cache_mb: None,
         cold: false,
         scan_from_manifest: false,
+        preplace: false,
     }
 }
 fn concurrent_mixed(mode: Mode) -> Workload {
@@ -1118,6 +1140,7 @@ fn concurrent_mixed(mode: Mode) -> Workload {
         pk_keyset_cache_mb: None,
         cold: false,
         scan_from_manifest: false,
+        preplace: false,
     }
 }
 // Concurrent memory-CDC: foreground mem-tier upserts/deletes racing a background
@@ -1135,6 +1158,7 @@ fn concurrent_memory() -> Workload {
         pk_keyset_cache_mb: None,
         cold: false,
         scan_from_manifest: false,
+        preplace: false,
     }
 }
 // High-collision variant: a small key space with many ops drives repeated
@@ -1161,6 +1185,7 @@ fn concurrent_mixed_dense(mode: Mode, pk_keyset_cache_mb: Option<usize>) -> Work
         pk_keyset_cache_mb,
         cold: false,
         scan_from_manifest: false,
+        preplace: false,
     }
 }
 fn concurrent_upsert_only(mode: Mode) -> Workload {
@@ -1176,6 +1201,7 @@ fn concurrent_upsert_only(mode: Mode) -> Workload {
         pk_keyset_cache_mb: None,
         cold: false,
         scan_from_manifest: false,
+        preplace: false,
     }
 }
 // Sequential cold walk: mixed ops + promotion/GC, model-checked after every op.
@@ -1204,6 +1230,7 @@ fn sequential_cold() -> Workload {
         pk_keyset_cache_mb: None,
         cold: true,
         scan_from_manifest: false,
+        preplace: false,
     }
 }
 // Concurrent cold: foreground mixed delete/upsert + promotions + restarts with
@@ -1229,6 +1256,7 @@ fn concurrent_cold() -> Workload {
         pk_keyset_cache_mb: None,
         cold: true,
         scan_from_manifest: false,
+        preplace: false,
     }
 }
 
@@ -1288,6 +1316,44 @@ async fn prop_concurrent_key_manifest_impl(f: TestFixture) -> TestResult<()> {
     .await
 }
 test_with_backends!(prop_concurrent_key_manifest_impl);
+
+// --- Manifest + PRE-PLACEMENT (Stage 0b/0c) convergence ---
+//
+// Same walks as the `*_manifest_impl` variants above, but with
+// `stage_b_publish_mode: Manifest` so Stage A pre-places data files into the
+// target snapshot and Stage B publishes their manifest rows instead of moving
+// files. This fuzzes BOTH publish paths Stage 0c splits: the append-only
+// off-fence publish, and — because these are on-conflict (upsert) tables — the
+// upsert publish over pre-placed files (currently under-fence; proves it is
+// correct before any off-fence upsert refactor). `assert_converged`'s per-op
+// model check proves no row vanishes or duplicates across every
+// upsert/delete/delete-all/compact/restart interleaving, including a background
+// compaction racing foreground pre-placed appends in the concurrent variant.
+async fn prop_sequential_key_manifest_preplace_impl(f: TestFixture) -> TestResult<()> {
+    run_workload(
+        f,
+        Workload {
+            scan_from_manifest: true,
+            preplace: true,
+            ..sequential(Mode::Key)
+        },
+    )
+    .await
+}
+test_with_backends!(prop_sequential_key_manifest_preplace_impl);
+
+async fn prop_concurrent_key_manifest_preplace_impl(f: TestFixture) -> TestResult<()> {
+    run_workload(
+        f,
+        Workload {
+            scan_from_manifest: true,
+            preplace: true,
+            ..concurrent_mixed(Mode::Key)
+        },
+    )
+    .await
+}
+test_with_backends!(prop_concurrent_key_manifest_preplace_impl);
 
 // --- Memory-CDC convergence + count-exactness (mem-tier checkpoint + bake) ---
 //
@@ -1366,7 +1432,7 @@ async fn reupsert_after_overwrite_delete_is_visible_impl(f: TestFixture) -> Test
     for mode in [Mode::Key, Mode::Position] {
         let name = format!("reupsert_min_{mode:?}");
         let (table, ctx) =
-            create_table(&f, &name, mode, Durability::File, None, false, false).await?;
+            create_table(&f, &name, mode, Durability::File, None, false, false, false).await?;
 
         overwrite(&table, &[(1, 100)]).await?;
         delete_key(&table, 1, Durability::File).await?;
@@ -1475,7 +1541,7 @@ async fn prop_concurrent_mixed_dense_bloom_position_sqlite() -> TestResult<()> {
 async fn run_concurrent_reads_seed(fixture: &TestFixture, mode: Mode, seed: u64) -> TestResult<()> {
     let name = format!("iso_{mode:?}_{seed}");
     let (table, ctx) =
-        create_table(fixture, &name, mode, Durability::File, None, false, false).await?;
+        create_table(fixture, &name, mode, Durability::File, None, false, false, false).await?;
     let mut rng = Rng::new(seed);
 
     let n: i64 = 200;
