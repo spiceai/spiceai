@@ -1015,6 +1015,7 @@ impl CayenneCatalog {
         let cold_fields_differ = stored_vc.cold_tier_location != new_vc.cold_tier_location
             || stored_vc.cold_clustering_columns != new_vc.cold_clustering_columns
             || stored_vc.cold_target_file_size_mb != new_vc.cold_target_file_size_mb
+            || stored_vc.cold_clustering_run_size_mb != new_vc.cold_clustering_run_size_mb
             || stored_vc.cold_tier_warm_max_bytes != new_vc.cold_tier_warm_max_bytes
             || stored_vc.cold_tier_warm_max_files != new_vc.cold_tier_warm_max_files
             || stored_vc.cold_tier_background_interval_ms
@@ -1032,6 +1033,7 @@ impl CayenneCatalog {
             .cold_clustering_columns
             .clone_from(&new_vc.cold_clustering_columns);
         stored.vortex_config.cold_target_file_size_mb = new_vc.cold_target_file_size_mb;
+        stored.vortex_config.cold_clustering_run_size_mb = new_vc.cold_clustering_run_size_mb;
         stored.vortex_config.cold_tier_warm_max_bytes = new_vc.cold_tier_warm_max_bytes;
         stored.vortex_config.cold_tier_warm_max_files = new_vc.cold_tier_warm_max_files;
         stored.vortex_config.cold_tier_background_interval_ms =
