@@ -264,7 +264,7 @@ async fn test_partitioned_table_registers_parent_only() -> Result<(), anyhow::Er
 
 /// By default (no `dataset_params` override), a table with an unsupported
 /// column type (`jsonb`) is registered with that column converted to a
-/// string — matching the direct PostgreSQL data connector's default
+/// string — matching the direct `PostgreSQL` data connector's default
 /// `unsupported_type_action: string` — rather than being dropped from the
 /// catalog entirely (#11728).
 #[tokio::test]
