@@ -662,13 +662,20 @@ fn evaluate_bucket_inequality(
 }
 
 /// Evaluates inequality for modulo partitions using statistics-based pruning.
-/// For col % divisor = `partition_value`, the values that map to this partition form
-/// an arithmetic sequence: `partition_value`, `partition_value` + divisor, `partition_value` + 2*divisor, ...
-/// We can prune if we know the filter range doesn't contain any values from this sequence.
+///
+/// `DataFusion` uses truncation-toward-zero remainder (Rust `%` semantics), so the
+/// sign of the partition key determines which half of the number line that partition
+/// occupies — the partition key is the remainder value stored for that partition:
+///
+/// - key > 0: all values in this partition are ≥ key  (e.g. key=5, divisor=10 → {5,15,25,…})
+/// - key < 0: all values in this partition are ≤ key  (e.g. key=-5, divisor=10 → {-5,-15,-25,…})
+/// - key = 0: partition contains multiples of divisor in both directions → cannot prune
+///
+/// This holds for any non-zero divisor regardless of its sign.
 fn evaluate_modulo_inequality(
-    _divisor: &ScalarValue,
-    _partition_value: &ScalarValue,
-    _filter_value: &ScalarValue,
+    divisor: &ScalarValue,
+    partition_value: &ScalarValue,
+    filter_value: &ScalarValue,
     op: Operator,
 ) -> Result<bool, DataFusionError> {
     if !matches!(
@@ -677,11 +684,57 @@ fn evaluate_modulo_inequality(
     ) {
         return Err(DataFusionError::Plan("Unsupported operator".to_string()));
     }
-    // A non-zero integer modulo class is unbounded in both directions. Every
-    // residue class can therefore satisfy every one-sided inequality; pruning
-    // here would require a sound bounded-range solver over DataFusion's signed
-    // remainder semantics. Conservatively retain the partition.
-    Ok(false)
+
+    match (divisor, partition_value, filter_value) {
+        (
+            ScalarValue::Int32(Some(divisor)),
+            ScalarValue::Int32(Some(key)),
+            ScalarValue::Int32(Some(threshold)),
+        ) => {
+            if *divisor == 0 {
+                return Ok(false);
+            }
+            Ok(match key.cmp(&0) {
+                // partition ⊆ [key, +∞): prune if the filter's upper bound is at or below key
+                std::cmp::Ordering::Greater => match op {
+                    Operator::Lt => threshold <= key,
+                    Operator::LtEq => threshold < key,
+                    _ => false,
+                },
+                // partition ⊆ (−∞, key]: prune if the filter's lower bound is at or above key
+                std::cmp::Ordering::Less => match op {
+                    Operator::Gt => threshold >= key,
+                    Operator::GtEq => threshold > key,
+                    _ => false,
+                },
+                // key = 0: multiples of divisor span both directions, cannot prune
+                std::cmp::Ordering::Equal => false,
+            })
+        }
+        (
+            ScalarValue::Int64(Some(divisor)),
+            ScalarValue::Int64(Some(key)),
+            ScalarValue::Int64(Some(threshold)),
+        ) => {
+            if *divisor == 0 {
+                return Ok(false);
+            }
+            Ok(match key.cmp(&0) {
+                std::cmp::Ordering::Greater => match op {
+                    Operator::Lt => threshold <= key,
+                    Operator::LtEq => threshold < key,
+                    _ => false,
+                },
+                std::cmp::Ordering::Less => match op {
+                    Operator::Gt => threshold >= key,
+                    Operator::GtEq => threshold > key,
+                    _ => false,
+                },
+                std::cmp::Ordering::Equal => false,
+            })
+        }
+        _ => Ok(false),
+    }
 }
 
 /// Evaluates inequality for truncate(step, col) partitions.
@@ -1544,13 +1597,17 @@ mod tests {
             [(0, false), (5, false), (6, false)]
         );
 
+        // Filter: a < -5
+        // Partition 0: contains multiples of 10 (…,-10, 0, 10,…) — unbounded, cannot prune
+        // Partition 5: contains {5, 15, 25,…} — all ≥ 5 > -5, so can prune
+        // Partition 9: contains {9, 19, 29,…} — all ≥ 9 > -5, so can prune
         let negative_filters = &[col("a").lt(lit(-5))];
         assert_prune_partition!(
             negative_filters,
             &partition_by,
             schema,
             Int32,
-            [(0, false), (5, false), (9, false)]
+            [(0, false), (5, true), (9, true)]
         );
         Ok(())
     }

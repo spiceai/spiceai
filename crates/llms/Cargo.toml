@@ -69,7 +69,7 @@ model2vec-rs = { git = "https://github.com/spiceai/model2vec-rs.git", rev = "f11
 anyhow.workspace = true
 aws-credential-types.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
-dotenvy.workspace = true
+dotenv.workspace = true
 insta = {workspace = true, features = ["json"] }
 jsonpath-rust = "0.7.3"
 paste.workspace = true
