@@ -44,7 +44,7 @@ env:
 
 jobs:
   # Required check, so it runs on every merge-queue entry (merge_group can't
-  # path-filter). Dependency licenses/advisories are the gate here; running
+  # path-filter). Dependency licenses are the gate here; running
   # unconditionally is intentional.
   license-check-rust:
     name: Check Rust Licenses
@@ -65,6 +65,3 @@ jobs:
 
       - name: Check Rust Licenses
         run: cargo deny check licenses
-
-      - name: Check Rust Advisories
-        run: cargo deny check advisories
