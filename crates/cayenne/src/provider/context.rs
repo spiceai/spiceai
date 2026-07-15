@@ -111,6 +111,23 @@ pub struct CayenneContext {
     /// inter-batch arrival interval (the offered-load signal). `None` until the
     /// first write.
     last_write: parking_lot::Mutex<Option<std::time::Instant>>,
+    /// Whether this table's writes are COUPLED to sibling writers through a
+    /// shared input demux — true for the partition child tables of a
+    /// partitioned dataset, whose per-partition writes are all fed by one
+    /// router over bounded channels. Coupled writes must never park on the
+    /// global encode budget: a parked child stalls the router, which starves
+    /// the permit-holding siblings of input — a hold-and-wait deadlock that
+    /// left partitioned tables permanently unready (spiceai/spiceai#11818).
+    /// Set only at construction ([`Self::new_for_partition_child`]); read by
+    /// the write path to bypass `write_budget` permit acquisition. Runtime-only
+    /// state — never persisted.
+    coupled_writer: std::sync::atomic::AtomicBool,
+    /// Set of data files whose integrity digest has already been verified this
+    /// process, keyed by `"<snapshot_id>/<file_path>"`. Used only when
+    /// `integrity_checksums` is enabled, to bound verification to one whole-file
+    /// read per file per process ("verify on first read"). Data files are
+    /// immutable once published, so a verified file never needs re-checking.
+    verified_data_files: parking_lot::Mutex<std::collections::HashSet<String>>,
 }
 
 /// Default byte budget for the in-memory PK keyset cache when
@@ -270,7 +287,37 @@ impl CayenneContext {
             bake_gate_last_samples: std::sync::atomic::AtomicU64::new(0),
             goal_stuck_ticks: std::sync::atomic::AtomicU64::new(0),
             last_write: parking_lot::Mutex::new(None),
+            coupled_writer: std::sync::atomic::AtomicBool::new(false),
+            verified_data_files: parking_lot::Mutex::new(std::collections::HashSet::new()),
         })
+    }
+
+    /// Create the shared context for the partition CHILD tables of a
+    /// partitioned dataset. Identical to [`Self::new`] except the tables are
+    /// marked as coupled writers (see [`Self::is_coupled_writer`]): their
+    /// writes are all fed by one routing demux over bounded channels, so they
+    /// must never park on the global encode budget.
+    #[must_use]
+    pub fn new_for_partition_child(
+        config: &VortexConfig,
+        runtime_env: Arc<RuntimeEnv>,
+        dataset: &str,
+    ) -> Arc<Self> {
+        let context = Self::new(config, runtime_env, dataset);
+        context
+            .coupled_writer
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        context
+    }
+
+    /// Whether this table's writes are coupled to sibling writers through a
+    /// shared input demux (partition child tables). Coupled writes bypass the
+    /// global encode budget — parking there deadlocks the demux
+    /// (spiceai/spiceai#11818).
+    #[must_use]
+    pub fn is_coupled_writer(&self) -> bool {
+        self.coupled_writer
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Encoding effort configured for delta writes (`cayenne_delta_encoding`).
@@ -869,6 +916,56 @@ mod tests {
         assert_eq!(
             context.file_format().options().projection_pushdown,
             ProjectionPushdown::On
+        );
+    }
+
+    /// Partition child contexts are marked as coupled writers (their writes
+    /// share one routing demux and must bypass the global encode budget —
+    /// spiceai/spiceai#11818); ordinary contexts are not.
+    #[test]
+    fn partition_child_context_is_coupled_writer() {
+        let runtime_env = Arc::new(RuntimeEnv::default());
+        let ordinary =
+            CayenneContext::new(&VortexConfig::default(), Arc::clone(&runtime_env), "test");
+        assert!(!ordinary.is_coupled_writer());
+
+        let child =
+            CayenneContext::new_for_partition_child(&VortexConfig::default(), runtime_env, "test");
+        assert!(child.is_coupled_writer());
+    }
+
+    /// Regression: the cold (datalake) promotion write must roll files at
+    /// `cayenne_datalake_target_file_size_mb`, not the warm `target_vortex_file_size_mb`.
+    ///
+    /// Every sorted / PK-upsert table earns a single write shard, so the warm
+    /// `write_shard_format` path returns the base format unchanged — whose
+    /// `target_file_size_mb` is the warm size. Cold promotion therefore silently
+    /// rolled files at the warm size, leaving `cayenne_datalake_target_file_size_mb`
+    /// inert. `cold_write_format` must build a format carrying the cold size.
+    #[test]
+    fn cold_write_format_rolls_files_at_cold_target_size() {
+        let runtime_env = Arc::new(RuntimeEnv::default());
+        let config = VortexConfig {
+            target_vortex_file_size_mb: 256,
+            cold_target_file_size_mb: 1024,
+            ..VortexConfig::default()
+        };
+        let context = CayenneContext::new(&config, runtime_env, "test");
+
+        // Baseline: the warm/base format rolls at the warm target size.
+        assert_eq!(
+            context.file_format().options().target_file_size_mb,
+            256,
+            "base (warm) format must use target_vortex_file_size_mb"
+        );
+
+        // Datalake: the cold format rolls at the cold target size, independent of the warm size;
+        // previously this file size was silently 256 (the warm size).
+        let cold = context.cold_write_format(config.cold_target_file_size_mb, None);
+        assert_eq!(
+            cold.options().target_file_size_mb,
+            1024,
+            "cold format must use cayenne_datalake_target_file_size_mb, not the warm size"
         );
     }
 
