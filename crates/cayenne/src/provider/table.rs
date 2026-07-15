@@ -4369,6 +4369,87 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    // ---- Stage 0c: pointer-only publish split ------------------------------
+    //
+    // `publish_preplaced_snapshot_files` above does three things at once —
+    // build the manifest rows (reading the snapshot sequence), durably upsert
+    // them to the catalog, and flip the in-memory manifest cache. Stage 0c
+    // needs those separated so only the last (a synchronous cache RCU) runs
+    // under the reader-blocking `listing_fence`, while the catalog await runs
+    // off it. `publish_preplaced_snapshot_files` is retained as-is for the
+    // crash-recovery reconciliation path (`ensure_no_incomplete_write`), which
+    // runs with a cold cache and no fence and simply needs the combined effect.
+
+    /// Build (but do not persist or publish) the `cayenne_snapshot_file` rows
+    /// for `files` freshly appended to `current_snapshot`. Reads the snapshot
+    /// sequence (async), so callers run it OFF the `listing_fence`. The
+    /// conservative `min_sequence = 0` / `max_sequence = current_sequence`
+    /// range matches `upsert_current_snapshot_manifest_rows` exactly.
+    pub(crate) async fn build_current_snapshot_manifest_rows(
+        &self,
+        current_snapshot: &str,
+        files: &[StagedFileMetadata],
+    ) -> Result<Vec<SnapshotFile>> {
+        let table_id = self.table_metadata.table_id.clone();
+        let current_sequence = self
+            .catalog
+            .get_snapshot_sequence(&table_id, current_snapshot)
+            .await?
+            .unwrap_or(0);
+        Ok(files
+            .iter()
+            .map(|file| SnapshotFile {
+                table_id: table_id.clone(),
+                snapshot_id: current_snapshot.to_string(),
+                file_path: file.file_name.clone(),
+                row_count: i64::try_from(file.row_count).unwrap_or(i64::MAX),
+                file_size_bytes: i64::try_from(file.file_size_bytes).unwrap_or(i64::MAX),
+                min_sequence: 0,
+                max_sequence: current_sequence,
+                digest: None,
+            })
+            .collect())
+    }
+
+    /// Durably persist pre-built manifest rows to the catalog. No cache
+    /// mutation (the caller flips the cache under the fence via
+    /// [`Self::flip_preplaced_manifest_cache`]). Runs OFF the `listing_fence`.
+    pub(crate) async fn materialize_current_snapshot_manifest_rows(
+        &self,
+        rows: &[SnapshotFile],
+    ) -> Result<()> {
+        self.catalog.upsert_snapshot_files(rows).await?;
+        self.record_current_snapshot_files_added(rows.len());
+        Ok(())
+    }
+
+    /// Flip the in-memory manifest cache for a pre-placed generation —
+    /// SYNCHRONOUS (an `ArcSwap` RCU), the only manifest-publish step that must
+    /// run under the held `listing_fence`. Authoritative only when the entry is
+    /// already warm; callers ensure that off-fence via
+    /// [`Self::warm_current_snapshot_manifest_cache`].
+    pub(crate) fn flip_preplaced_manifest_cache(
+        &self,
+        current_snapshot: &str,
+        rows: &[SnapshotFile],
+    ) {
+        self.apply_manifest_cache_delta(current_snapshot, rows);
+    }
+
+    /// Ensure the manifest cache entry for `snapshot_id` is populated, reading
+    /// through to the catalog on a cold miss (async). Run OFF the fence before
+    /// an under-fence [`Self::flip_preplaced_manifest_cache`] so the flip's
+    /// delta lands on a live entry (option A: the cache is authoritative for the
+    /// current snapshot, so a `scan()` never reads the catalog for it and thus
+    /// cannot observe the off-fence catalog commit early).
+    pub(crate) async fn warm_current_snapshot_manifest_cache(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<()> {
+        self.cached_snapshot_files(snapshot_id).await?;
+        Ok(())
+    }
+
     /// Remove exact pre-placed files while rolling back an unpublished staged
     /// generation. Files from other generations in the target snapshot are
     /// never touched.

@@ -553,6 +553,7 @@ test_with_backends!(test_manifest_publish_preplaces_then_atomically_exposes_file
 test_with_backends!(test_manifest_publish_rollback_removes_preplaced_files_impl);
 test_with_backends!(test_manifest_publish_recovers_durable_intent_impl);
 test_with_backends!(test_manifest_publish_reclaims_old_unowned_file_impl);
+test_with_backends!(test_manifest_offfence_publish_accumulates_impl);
 test_with_backends!(test_prepared_apply_under_barrier_waits_for_write_lock_impl);
 test_with_backends!(test_held_barrier_current_snapshot_requires_write_lock_impl);
 
@@ -669,6 +670,69 @@ async fn test_manifest_publish_preplaces_then_atomically_exposes_files_impl(
     assert_eq!(manifest.len(), preplaced_files.len());
     assert_eq!(row_count(&ctx, "manifest_preplacement").await, 2);
     prepared.finish().await?;
+    Ok(())
+}
+
+/// Stage 0c — pointer-only publish. An append-only, pre-placed, manifest-scan
+/// generation now commits the durable catalog rows and removes the WAL OFF the
+/// reader-blocking `listing_fence`, holding it only for the synchronous
+/// in-memory cache flip. The observable end-state must be byte-for-byte
+/// equivalent to the all-under-fence path across repeated publishes: rows become
+/// visible, the manifest stays consistent with the physical files, staging stays
+/// clean, and nothing is lost or duplicated.
+async fn test_manifest_offfence_publish_accumulates_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let vortex_config = cayenne::metadata::VortexConfig {
+        scan_from_manifest: true,
+        stage_b_publish_mode: cayenne::StageBPublishMode::Manifest,
+        inline_max_rows: 0,
+        compaction_background_interval_ms: 0,
+        ..Default::default()
+    };
+    let (table, ctx) =
+        setup_table_with_vortex_config(&fixture, "manifest_offfence_accumulate", vortex_config).await;
+    let staging = staging_dir(&table);
+
+    let batches: [&[(i64, &str)]; 3] = [&[(1, "A"), (2, "B")], &[(3, "C"), (4, "D")], &[(5, "E"), (6, "F")]];
+    for (batch_idx, rows) in batches.iter().enumerate() {
+        // commit() drives prepare -> apply_under_barrier -> finish; for this
+        // config apply_under_barrier takes the Stage 0c off-fence path.
+        begin_staged_append_with_rows(&table, rows)
+            .await?
+            .commit()
+            .await?;
+
+        let expected = (batch_idx + 1) * 2;
+        assert_eq!(
+            row_count(&ctx, "manifest_offfence_accumulate").await,
+            expected,
+            "off-fence publish #{batch_idx} must make its rows visible"
+        );
+        assert_staging_empty(&staging);
+
+        // After each off-fence publish the durable manifest must exactly match
+        // the physical files pre-placed in the current snapshot directory.
+        let meta = table.metadata();
+        let manifest = table
+            .catalog()
+            .get_snapshot_files(&meta.table_id, &meta.current_snapshot_id)
+            .await?;
+        let snapshot_dir = PathBuf::from(&meta.path)
+            .join(&meta.table_id)
+            .join(&meta.current_snapshot_id);
+        let files = vortex_file_names(&snapshot_dir)?;
+        assert_eq!(
+            manifest.len(),
+            files.len(),
+            "manifest rows must match physical file count after off-fence publish #{batch_idx}"
+        );
+    }
+
+    let all = query_all(&ctx, "manifest_offfence_accumulate").await;
+    assert_eq!(all.len(), 6);
+    assert_eq!(all.first(), Some(&(1, "A".to_string())));
+    assert_eq!(all.last(), Some(&(6, "F".to_string())));
     Ok(())
 }
 

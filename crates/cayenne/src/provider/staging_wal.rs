@@ -366,6 +366,18 @@ impl CayenneStagedAppend {
         self.table.publish_current_snapshot_files_changed().await;
     }
 
+    /// Stage 0c fast-path gate for the one-shot `finalize_staged_write` publish:
+    /// a pre-placed generation targeting the current snapshot on a manifest-scan
+    /// table. This entry point (`write_staged_append`) carries no on-conflict
+    /// deletions — it is structurally append-only — so, unlike the
+    /// `PreparedStagedAppend` variant, there is no `prepared_on_conflict` to
+    /// check. Mirrors `PreparedStagedAppend::is_preplaced_append_only_current_snapshot`.
+    fn is_preplaced_append_only_current_snapshot(&self) -> bool {
+        self.file_placement == StagedFilePlacement::TargetSnapshot
+            && self.target_kind == StagingWalTargetKind::CurrentSnapshot
+            && self.table.scan_from_manifest()
+    }
+
     /// Executes the full WAL finalize sequence in order.
     ///
     /// # Errors
@@ -384,6 +396,49 @@ impl CayenneStagedAppend {
         let wal_start = Instant::now();
         self.write_wal().await?;
         record_cayenne_write_phase(self.table.table_name(), "publish_wal_write", wal_start);
+
+        // Stage 0c — pointer-only publish (append-only, pre-placed, manifest
+        // scans): the catalog commit + WAL removal run OFF the reader-blocking
+        // `listing_fence`; only the synchronous visibility flip holds it. See
+        // `apply_under_barrier` for the correctness argument.
+        if self.is_preplaced_append_only_current_snapshot() {
+            let lock_start = Instant::now();
+            let _visibility_guard = self.table.visibility_lock_arc().lock_owned().await;
+            record_cayenne_write_phase(self.table.table_name(), "publish_lock_wait", lock_start);
+
+            self.table
+                .warm_current_snapshot_manifest_cache(&self.target_snapshot_id)
+                .await?;
+            let rows = self
+                .table
+                .build_current_snapshot_manifest_rows(
+                    &self.target_snapshot_id,
+                    &self.staged_file_metadata,
+                )
+                .await?;
+
+            // Off-fence durable catalog commit FIRST (the only fallible step);
+            // see `apply_under_barrier` for the ordering rationale.
+            let commit_start = Instant::now();
+            self.table
+                .materialize_current_snapshot_manifest_rows(&rows)
+                .await?;
+            record_cayenne_write_phase(self.table.table_name(), "publish_commit", commit_start);
+
+            let fence_start = Instant::now();
+            {
+                let _fence = self.table.lock_listing_fence_write_owned().await;
+                self.table
+                    .flip_preplaced_manifest_cache(&self.target_snapshot_id, &rows);
+                self.table
+                    .publish_current_snapshot_files_changed_under_held_fence();
+                self.table.mark_maintained_aggregates_stale();
+            }
+            record_cayenne_write_phase(self.table.table_name(), "publish_fence_flip", fence_start);
+
+            self.remove_wal().await?;
+            return Ok(());
+        }
 
         let lock_start = Instant::now();
         let _visibility_guard = self.table.visibility_lock_arc().lock_owned().await;
@@ -922,7 +977,57 @@ impl PreparedStagedAppend {
     pub async fn apply_under_barrier(&self) -> Result<()> {
         let _write_guard = self.lock_current_snapshot_for_apply().await;
         let _visibility_guard = self.table.visibility_lock_arc().lock_owned().await;
-        // Hold the listing fence for the entire move + WAL removal + listing
+
+        // Stage 0c — pointer-only publish. For an append-only, pre-placed
+        // current-snapshot generation under manifest scans, the durable catalog
+        // commit and WAL removal no longer run under the reader-blocking
+        // `listing_fence`: only the synchronous in-memory visibility flip does.
+        // `write_lock` + `visibility_lock` (held here, NOT taken by `scan()`)
+        // still serialize this against compaction and other writers, so the
+        // off-fence catalog work is safe; `scan()` (which takes only
+        // `listing_fence.read()`) is unblocked for its duration.
+        if self.is_preplaced_append_only_current_snapshot() {
+            self.ensure_current_snapshot_target_unchanged()?;
+            // Off-fence: make the manifest cache authoritative for this snapshot
+            // (so `scan()` never reads the catalog for it and cannot observe the
+            // off-fence commit early), then build the rows (reads the sequence).
+            self.table
+                .warm_current_snapshot_manifest_cache(&self.target_snapshot_id)
+                .await?;
+            let rows = self
+                .table
+                .build_current_snapshot_manifest_rows(
+                    &self.target_snapshot_id,
+                    &self.staged_file_metadata,
+                )
+                .await?;
+            // Off-fence: durably commit the catalog rows FIRST — the only
+            // fallible step here. Doing it before the flip means we never leave
+            // an in-memory flip stranded without a durable catalog commit; a
+            // crash between here and WAL removal is reconciled idempotently by
+            // `ensure_no_incomplete_write` from the still-present WAL.
+            self.table
+                .materialize_current_snapshot_manifest_rows(&rows)
+                .await?;
+            // Reader-blocking fence: synchronous, infallible flip only, no await.
+            {
+                let _fence = self.table.lock_listing_fence_write_owned().await;
+                self.table
+                    .flip_preplaced_manifest_cache(&self.target_snapshot_id, &rows);
+                self.table
+                    .publish_current_snapshot_files_changed_under_held_fence();
+                self.table
+                    .feed_staged_ivm_under_fence(self.ivm_feed_batches.as_ref());
+            }
+            // Off-fence: WAL removal is the last, purely-recoverable step.
+            self.table
+                .remove_staging_wal_for(&self.staging_snapshot_id)
+                .await?;
+            return Ok(());
+        }
+
+        // Default path (rename_sync mode, upsert/delete, or non-manifest scans):
+        // hold the listing fence for the entire move + WAL removal + listing
         // swap sequence. Without this, `CayenneTableProvider::scan()` (which
         // holds `listing_fence.read()` across DataFusion's listing call) can
         // interleave with the move and observe a torn directory snapshot.
@@ -943,6 +1048,19 @@ impl PreparedStagedAppend {
         self.table
             .feed_staged_ivm_under_fence(self.ivm_feed_batches.as_ref());
         Ok(())
+    }
+
+    /// Whether this receipt is the Stage 0c fast path: an append-only
+    /// (`prepared_on_conflict` is `None`), pre-placed generation targeting the
+    /// current snapshot on a manifest-scan table. Only this shape can publish
+    /// with the durable catalog commit moved off the `listing_fence`; every
+    /// other shape (rename_sync placement, upsert/delete tombstones,
+    /// protected-snapshot targets) keeps the all-under-fence path unchanged.
+    fn is_preplaced_append_only_current_snapshot(&self) -> bool {
+        self.file_placement == StagedFilePlacement::TargetSnapshot
+            && self.target_kind == StagingWalTargetKind::CurrentSnapshot
+            && self.prepared_on_conflict.is_none()
+            && self.table.scan_from_manifest()
     }
 
     /// Apply the staged write ASSUMING the caller already holds this
