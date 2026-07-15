@@ -83,7 +83,10 @@ use super::context::CayenneContext;
 use super::mem_tier_budget;
 use super::on_conflict::{PostValidationState, PreparedShardedInsertStream};
 use super::pk_index::PkDigestSet;
-use super::staging_wal::{CayenneStagedAppend, PreparedStagedAppend, StagingWalTargetKind};
+use super::staging_wal::{
+    CayenneStagedAppend, PreparedStagedAppend, StagingWalTargetKind,
+    staged_file_metadata_from_written_files,
+};
 use super::table::{CayenneCdcWrite, CayenneTableProvider, record_cayenne_write_phase};
 
 /// Record METRIC 4 (`cayenne_cdc_burst_rows` / `cayenne_cdc_burst_bytes`) for one
@@ -1451,9 +1454,9 @@ impl<'a> AppendMutationWriter<'a> {
             .store(true, Ordering::Release);
 
         let write_start = Instant::now();
-        let result = match self
+        let (result, written_files) = match self
             .table
-            .write_to_snapshot(
+            .write_to_snapshot_collecting_files(
                 stream,
                 target_size_bytes,
                 &staging_snapshot_id,
@@ -1482,12 +1485,15 @@ impl<'a> AppendMutationWriter<'a> {
         // Fold the encode + object-store/disk upload latency into the adaptive
         // tuner's I/O-bound signal (CDC-apply path only; compaction is excluded).
         self.context.record_io_latency(write_start.elapsed());
+        let staged_file_metadata =
+            staged_file_metadata_from_written_files(self.table.table_name(), written_files)?;
 
         let staged_append = CayenneStagedAppend::from_staged_append_in(
             self.table.clone_for_write_operations(),
             None,
             staging_snapshot_id,
             result.0,
+            staged_file_metadata,
         );
         let publish_start = Instant::now();
         staged_append.finalize_staged_write().await?;
@@ -1552,9 +1558,9 @@ impl<'a> AppendMutationWriter<'a> {
             };
 
         let write_start = Instant::now();
-        let (rows, writer_ops, stats_acc) = match self
+        let ((rows, writer_ops, stats_acc), written_files) = match self
             .table
-            .write_to_snapshot(
+            .write_to_snapshot_collecting_files(
                 stream,
                 target_size_bytes,
                 &target.staging_snapshot_id,
@@ -1583,6 +1589,8 @@ impl<'a> AppendMutationWriter<'a> {
         // Fold the encode + object-store/disk upload latency into the adaptive
         // tuner's I/O-bound signal (CDC-apply path only; compaction is excluded).
         self.context.record_io_latency(write_start.elapsed());
+        let staged_file_metadata =
+            staged_file_metadata_from_written_files(self.table.table_name(), written_files)?;
 
         let staged_append = CayenneStagedAppend::from_staged_append_to_snapshot(
             self.table.clone_for_write_operations(),
@@ -1592,6 +1600,7 @@ impl<'a> AppendMutationWriter<'a> {
             target.target_snapshot_id,
             target.target_kind,
             rows,
+            staged_file_metadata,
         );
         let prepare_start = Instant::now();
         let mut prepared_append = match staged_append.prepare().await {

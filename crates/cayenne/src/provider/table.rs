@@ -4238,9 +4238,8 @@ impl CayenneTableProvider {
             .await?
             .unwrap_or(0);
 
-        let mut written = Vec::new();
-        for (file_path, file_size_bytes, row_count) in rows {
-            let row = SnapshotFile {
+        let written = rows
+            .map(|(file_path, file_size_bytes, row_count)| SnapshotFile {
                 table_id: table_id.clone(),
                 snapshot_id: current_snapshot.to_string(),
                 file_path,
@@ -4249,10 +4248,9 @@ impl CayenneTableProvider {
                 min_sequence: 0,
                 max_sequence: current_sequence,
                 digest: None,
-            };
-            self.catalog.upsert_snapshot_file(&row).await?;
-            written.push(row);
-        }
+            })
+            .collect::<Vec<_>>();
+        self.catalog.upsert_snapshot_files(&written).await?;
         self.apply_manifest_cache_delta(current_snapshot, &written);
         Ok(())
     }
@@ -4783,10 +4781,10 @@ impl CayenneTableProvider {
         stream: SendableRecordBatchStream,
         staging_snapshot_id: &str,
         target_partitions: usize,
-    ) -> Result<u64> {
+    ) -> Result<(u64, Vec<vortex_datafusion::WrittenFile>)> {
         self.staging_may_have_files().store(true, Ordering::Release);
-        let (row_count, _writer_ops, _stats_acc) = self
-            .write_to_snapshot(
+        let ((row_count, _writer_ops, _stats_acc), written_files) = self
+            .write_to_snapshot_collecting_files(
                 stream,
                 self.target_file_size_bytes(),
                 staging_snapshot_id,
@@ -4795,7 +4793,7 @@ impl CayenneTableProvider {
                 super::delta_encoding::WriteClass::Delta,
             )
             .await?;
-        Ok(row_count)
+        Ok((row_count, written_files))
     }
 
     /// Sync a directory to ensure all files are durably written to disk.
@@ -5787,6 +5785,59 @@ impl CayenneTableProvider {
         estimated_bytes: Option<u64>,
         write_class: super::delta_encoding::WriteClass,
     ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
+        self.write_to_snapshot_with_collector(
+            stream,
+            target_size_bytes,
+            snapshot_id,
+            target_partitions,
+            estimated_bytes,
+            write_class,
+            None,
+        )
+        .await
+    }
+
+    /// Write a stream and return the exact files reported by the Vortex sink.
+    /// This is used by staged appends to persist durable publish intent without
+    /// listing the staging directory after the write.
+    pub(crate) async fn write_to_snapshot_collecting_files(
+        &self,
+        stream: SendableRecordBatchStream,
+        target_size_bytes: usize,
+        snapshot_id: &str,
+        target_partitions: usize,
+        estimated_bytes: Option<u64>,
+        write_class: super::delta_encoding::WriteClass,
+    ) -> Result<(
+        (u64, usize, Arc<ColumnStatsAccumulator>),
+        Vec<vortex_datafusion::WrittenFile>,
+    )> {
+        let collector = Arc::new(ParkingMutex::new(Vec::new()));
+        let result = self
+            .write_to_snapshot_with_collector(
+                stream,
+                target_size_bytes,
+                snapshot_id,
+                target_partitions,
+                estimated_bytes,
+                write_class,
+                Some(Arc::clone(&collector)),
+            )
+            .await?;
+        let files = std::mem::take(&mut *collector.lock());
+        Ok((result, files))
+    }
+
+    async fn write_to_snapshot_with_collector(
+        &self,
+        stream: SendableRecordBatchStream,
+        target_size_bytes: usize,
+        snapshot_id: &str,
+        target_partitions: usize,
+        estimated_bytes: Option<u64>,
+        write_class: super::delta_encoding::WriteClass,
+        supplied_collector: Option<vortex_datafusion::WrittenFilesCollector>,
+    ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
         use std::time::Instant;
 
@@ -5878,10 +5929,13 @@ impl CayenneTableProvider {
         // no directory LIST at all, instead of the full-relist
         // `upsert_snapshot_manifest_from_listing` fallback those two callers
         // used before this collector existed.
-        let maintain_current_snapshot_manifest =
-            self.scan_from_manifest() && snapshot_id == self.get_current_snapshot_id();
+        let maintain_current_snapshot_manifest = supplied_collector.is_none()
+            && self.scan_from_manifest()
+            && snapshot_id == self.get_current_snapshot_id();
         let written_files_collector: Option<vortex_datafusion::WrittenFilesCollector> =
-            maintain_current_snapshot_manifest.then(|| Arc::new(ParkingMutex::new(Vec::new())));
+            supplied_collector.or_else(|| {
+                maintain_current_snapshot_manifest.then(|| Arc::new(ParkingMutex::new(Vec::new())))
+            });
         let write_format = match written_files_collector.clone() {
             Some(collector) => Arc::new(write_format.with_written_files_collector(collector)),
             None => write_format,
@@ -6034,7 +6088,7 @@ impl CayenneTableProvider {
         // callers (see the collector's attachment above) with the exact files
         // the sink just reported — no directory LIST, no additional
         // object-store call at all.
-        if let Some(collector) = written_files_collector {
+        if maintain_current_snapshot_manifest && let Some(collector) = written_files_collector {
             let files = std::mem::take(&mut *collector.lock());
             if !files.is_empty() {
                 self.insert_current_snapshot_manifest_rows_from_written_files(snapshot_id, &files)
@@ -23824,35 +23878,28 @@ impl CayenneTableProvider {
     /// filter — so the manifest-built file list is byte-identical to the
     /// directory-built one for the same snapshot.
     ///
-    /// Returns `Ok(None)` (the caller then falls back to directory listing) when:
-    /// - the manifest read fails (transient metastore error) — an availability
-    ///   concern, not a correctness one: directory listing is still a valid,
-    ///   just slower, source of truth for whatever is physically present, or
-    /// - the table is partitioned (`table_partition_cols` non-empty) — the
+    /// Returns `Ok(None)` (the caller then falls back to directory listing) only
+    /// when the table is partitioned (`table_partition_cols` non-empty) — the
     ///   manifest does not persist partition values, so directory listing (which
     ///   derives them from the path) stays authoritative there.
+    ///
+    /// A manifest read failure for an eligible, unpartitioned table is returned
+    /// as an error. Falling back to the physical directory would make a future
+    /// pre-placed but not-yet-manifest-published file visible.
     async fn manifest_partitioned_files(
         &self,
         request: &SnapshotScanListingRequest<'_>,
-    ) -> Option<Vec<PartitionedFile>> {
+    ) -> DataFusionResult<Option<Vec<PartitionedFile>>> {
         // The manifest carries no partition values; let directory listing own
         // partitioned tables (it derives the values from the object path).
         if !request.options.table_partition_cols.is_empty() {
-            return None;
+            return Ok(None);
         }
 
-        let manifest = match self.cached_snapshot_files(request.snapshot_id).await {
-            Ok(rows) => rows,
-            Err(error) => {
-                tracing::debug!(
-                    table = %self.table_metadata.table_name,
-                    snapshot_id = request.snapshot_id,
-                    %error,
-                    "Manifest read failed; scan falls back to directory listing"
-                );
-                return None;
-            }
-        };
+        let manifest = self
+            .cached_snapshot_files(request.snapshot_id)
+            .await
+            .map_err(|error| datafusion_common::DataFusionError::External(Box::new(error)))?;
 
         if manifest.is_empty() {
             // This branch only runs when `scan_from_manifest` is on (see the
@@ -23865,7 +23912,7 @@ impl CayenneTableProvider {
             // An empty manifest here is therefore authoritative — this snapshot
             // genuinely has zero data files — not a "not yet populated" signal
             // to fall back to a directory LIST.
-            return Some(Vec::new());
+            return Ok(Some(Vec::new()));
         }
 
         // `prefix` is the parsed snapshot-directory path; joining the manifest's
@@ -23895,7 +23942,7 @@ impl CayenneTableProvider {
             })
             .collect::<Vec<_>>();
 
-        Some(files)
+        Ok(Some(files))
     }
 
     async fn list_files_for_snapshot_scan(
@@ -23930,7 +23977,7 @@ impl CayenneTableProvider {
         // (dual-source). The two sources are equal by construction — see
         // `manifest_partitioned_files` and `upsert_snapshot_manifest_from_listing`.
         let manifest_files = if self.context.scan_from_manifest() {
-            self.manifest_partitioned_files(request).await
+            self.manifest_partitioned_files(request).await?
         } else {
             None
         };
@@ -33610,6 +33657,7 @@ mod tests {
         let manifest_only = provider
             .manifest_partitioned_files(&request)
             .await
+            .expect("manifest resolution should succeed")
             .expect("manifest resolver returns Some when the manifest is populated");
         assert_eq!(
             manifest_only.len(),
@@ -33673,6 +33721,7 @@ mod tests {
         let cleared = provider
             .manifest_partitioned_files(&request)
             .await
+            .expect("manifest resolution should succeed")
             .expect("an empty manifest is authoritative (Some), not a fallback signal (None)");
         assert!(
             cleared.is_empty(),

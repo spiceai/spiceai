@@ -74,6 +74,77 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::OwnedMutexGuard;
 
+/// Exact metadata for one file produced during Stage A and recorded in the
+/// staging WAL. Legacy WALs omit this field and retain `staged_files` only.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) struct StagedFileMetadata {
+    pub file_name: String,
+    pub file_size_bytes: u64,
+    pub row_count: u64,
+}
+
+#[cfg(test)]
+mod staging_wal_format_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_wal_defaults_exact_file_metadata_to_empty() {
+        let wal: StagingWal = serde_json::from_str(
+            r#"{"table_name":"orders","target_snapshot":"snapshot-1","staged_files":["a.vortex"],"created_at":"2026-07-14T00:00:00Z"}"#,
+        )
+        .expect("legacy staging WAL should deserialize");
+
+        assert_eq!(wal.target_kind, StagingWalTargetKind::CurrentSnapshot);
+        assert!(wal.staged_file_metadata.is_empty());
+        assert_eq!(wal.staged_files, ["a.vortex"]);
+    }
+
+    #[test]
+    fn exact_file_metadata_round_trips() {
+        let wal = StagingWal {
+            table_name: "orders".to_string(),
+            target_snapshot: "snapshot-1".to_string(),
+            target_kind: StagingWalTargetKind::CurrentSnapshot,
+            staged_files: vec!["a.vortex".to_string()],
+            staged_file_metadata: vec![StagedFileMetadata {
+                file_name: "a.vortex".to_string(),
+                file_size_bytes: 4096,
+                row_count: 128,
+            }],
+            created_at: "2026-07-14T00:00:00Z".to_string(),
+        };
+
+        let encoded = serde_json::to_vec(&wal).expect("staging WAL should serialize");
+        let decoded: StagingWal =
+            serde_json::from_slice(&encoded).expect("staging WAL should deserialize");
+        assert_eq!(decoded.staged_file_metadata, wal.staged_file_metadata);
+        assert_eq!(decoded.staged_files, wal.staged_files);
+    }
+}
+
+pub(crate) fn staged_file_metadata_from_written_files(
+    table_name: &str,
+    files: Vec<vortex_datafusion::WrittenFile>,
+) -> Result<Vec<StagedFileMetadata>> {
+    files
+        .into_iter()
+        .map(|file| {
+            let file_name = file.path.filename().ok_or_else(|| Error::Internal {
+                table: table_name.to_string(),
+                message: format!(
+                    "Vortex sink reported a written path without a file name: {}",
+                    file.path
+                ),
+            })?;
+            Ok(StagedFileMetadata {
+                file_name: file_name.to_string(),
+                file_size_bytes: file.size_bytes,
+                row_count: file.row_count,
+            })
+        })
+        .collect()
+}
+
 /// Coordinates staged writes and the staging WAL lifecycle for a Cayenne table.
 ///
 /// This struct supports two usage patterns:
@@ -95,6 +166,7 @@ pub struct CayenneStagedAppend {
     target_snapshot_id: String,
     target_kind: StagingWalTargetKind,
     row_count: u64,
+    staged_file_metadata: Vec<StagedFileMetadata>,
 }
 
 impl std::fmt::Debug for CayenneStagedAppend {
@@ -107,6 +179,7 @@ impl std::fmt::Debug for CayenneStagedAppend {
             .field("target_snapshot_id", &self.target_snapshot_id)
             .field("target_kind", &self.target_kind)
             .field("row_count", &self.row_count)
+            .field("staged_file_count", &self.staged_file_metadata.len())
             .finish()
     }
 }
@@ -162,6 +235,7 @@ impl CayenneStagedAppend {
         write_guard: Option<OwnedMutexGuard<()>>,
         staging_snapshot_id: String,
         row_count: u64,
+        staged_file_metadata: Vec<StagedFileMetadata>,
     ) -> Self {
         let target_snapshot_id = table.get_current_snapshot_id();
         Self {
@@ -172,6 +246,7 @@ impl CayenneStagedAppend {
             target_snapshot_id,
             target_kind: StagingWalTargetKind::CurrentSnapshot,
             row_count,
+            staged_file_metadata,
         }
     }
 
@@ -183,6 +258,7 @@ impl CayenneStagedAppend {
         target_snapshot_id: String,
         target_kind: StagingWalTargetKind,
         row_count: u64,
+        staged_file_metadata: Vec<StagedFileMetadata>,
     ) -> Self {
         Self {
             table,
@@ -192,6 +268,7 @@ impl CayenneStagedAppend {
             target_snapshot_id,
             target_kind,
             row_count,
+            staged_file_metadata,
         }
     }
 
@@ -214,19 +291,14 @@ impl CayenneStagedAppend {
     ///
     /// Returns an error if writing the WAL file fails.
     pub async fn write_wal(&self) -> Result<()> {
-        if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
-            self.table
-                .write_staging_wal_for(&self.staging_snapshot_id)
-                .await
-        } else {
-            self.table
-                .write_staging_wal_for_target(
-                    &self.staging_snapshot_id,
-                    &self.target_snapshot_id,
-                    self.target_kind,
-                )
-                .await
-        }
+        self.table
+            .write_staging_wal_for_target(
+                &self.staging_snapshot_id,
+                &self.target_snapshot_id,
+                self.target_kind,
+                &self.staged_file_metadata,
+            )
+            .await
     }
 
     /// Moves staged files into the configured target snapshot.
@@ -346,19 +418,15 @@ impl CayenneStagedAppend {
         // disarmed once the receipt is built, handing the unregister to its `Drop`.
         let inflight_guard =
             InflightStagingAppendGuard::register(&self.table, &self.staging_snapshot_id);
-        let wal_write = if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
-            self.table
-                .write_staging_wal_for(&self.staging_snapshot_id)
-                .await
-        } else {
-            self.table
-                .write_staging_wal_for_target(
-                    &self.staging_snapshot_id,
-                    &self.target_snapshot_id,
-                    self.target_kind,
-                )
-                .await
-        };
+        let wal_write = self
+            .table
+            .write_staging_wal_for_target(
+                &self.staging_snapshot_id,
+                &self.target_snapshot_id,
+                self.target_kind,
+                &self.staged_file_metadata,
+            )
+            .await;
         // On a WAL-write error the `?` returns early here and `inflight_guard`
         // drops, reverting the registration.
         wal_write?;
@@ -388,6 +456,7 @@ impl CayenneStagedAppend {
             target_snapshot_id: self.target_snapshot_id,
             target_kind: self.target_kind,
             row_count: self.row_count,
+            staged_file_metadata: self.staged_file_metadata,
             // Default: no incremental IVM feed. The write path attaches captured
             // batches via `set_ivm_feed_batches` only for IVM tables.
             ivm_feed_batches: None,
@@ -436,6 +505,7 @@ pub struct PreparedStagedAppend {
     target_snapshot_id: String,
     target_kind: StagingWalTargetKind,
     row_count: u64,
+    staged_file_metadata: Vec<StagedFileMetadata>,
     /// IVM feed: the insert `RecordBatches` captured at Stage A, present ONLY when
     /// this table has a registered maintained aggregate AND the write is
     /// incrementally feedable (set by the write path; `None` for non-IVM tables —
@@ -462,6 +532,7 @@ impl std::fmt::Debug for PreparedStagedAppend {
             .field("target_snapshot_id", &self.target_snapshot_id)
             .field("target_kind", &self.target_kind)
             .field("row_count", &self.row_count)
+            .field("staged_file_count", &self.staged_file_metadata.len())
             .field("has_write_guard", &self.write_guard.is_some())
             .field("has_ivm_feed", &self.ivm_feed_batches.is_some())
             .field("has_on_conflict", &self.prepared_on_conflict.is_some())
@@ -1041,6 +1112,9 @@ pub(crate) struct StagingWal {
     pub target_kind: StagingWalTargetKind,
     /// Names of the data files in the staging directory.
     pub staged_files: Vec<String>,
+    /// Exact Stage-A file metadata. Empty for legacy WAL records.
+    #[serde(default)]
+    pub staged_file_metadata: Vec<StagedFileMetadata>,
     /// ISO-8601 timestamp when this WAL entry was created.
     pub created_at: String,
 }
@@ -1166,8 +1240,8 @@ impl CayenneTableProvider {
 
         self.staging_may_have_files().store(true, Ordering::Release);
 
-        let (row_count, _writer_ops, _stats_acc) = match self
-            .write_to_snapshot(
+        let ((row_count, _writer_ops, _stats_acc), written_files) = match self
+            .write_to_snapshot_collecting_files(
                 prepared_insert.stream,
                 self.target_file_size_bytes(),
                 &staging_snapshot_id,
@@ -1192,12 +1266,15 @@ impl CayenneTableProvider {
                 return Err(e);
             }
         };
+        let staged_file_metadata =
+            staged_file_metadata_from_written_files(self.table_name(), written_files)?;
 
         Ok(CayenneStagedAppend::from_staged_append_in(
             self.clone_for_write(),
             Some(write_guard),
             staging_snapshot_id,
             row_count,
+            staged_file_metadata,
         ))
     }
 
@@ -1290,7 +1367,7 @@ impl CayenneTableProvider {
         };
         let may_have_on_conflict_deletions = prepared_insert.may_have_on_conflict_deletions();
         let post_validation = prepared_insert.post_validation();
-        let row_count = match self
+        let (row_count, written_files) = match self
             .write_stream_to_staging_snapshot(
                 prepared_insert.stream,
                 &staging_snapshot_id,
@@ -1306,6 +1383,8 @@ impl CayenneTableProvider {
                 return Err(error);
             }
         };
+        let staged_file_metadata =
+            staged_file_metadata_from_written_files(self.table_name(), written_files)?;
         let PostValidationState {
             on_conflict_deletions,
             validated_keys,
@@ -1343,6 +1422,7 @@ impl CayenneTableProvider {
             target_snapshot_id,
             StagingWalTargetKind::ProtectedSnapshot,
             row_count,
+            staged_file_metadata,
         );
         let mut prepared = staged.prepare().await?;
         if let Some(on_conflict) = prepared_on_conflict {
@@ -1365,29 +1445,29 @@ impl CayenneTableProvider {
     ///
     /// The WAL file is placed at `{table_path}/{table_id}/_staging/<id>/_wal.json`
     /// (local FS) or at the corresponding S3 key.
-    pub(crate) async fn write_staging_wal_for(&self, staging_snapshot_id: &str) -> Result<()> {
-        let current_snapshot = self.get_current_snapshot_id();
-
-        self.write_staging_wal_for_target(
-            staging_snapshot_id,
-            &current_snapshot,
-            StagingWalTargetKind::CurrentSnapshot,
-        )
-        .await
-    }
-
-    pub(crate) async fn write_staging_wal_for_target(
+    async fn write_staging_wal_for_target(
         &self,
         staging_snapshot_id: &str,
         target_snapshot: &str,
         target_kind: StagingWalTargetKind,
+        staged_file_metadata: &[StagedFileMetadata],
     ) -> Result<()> {
         if self.table_path().starts_with("s3://") {
-            self.write_staging_wal_s3(staging_snapshot_id, target_snapshot, target_kind)
-                .await?;
+            self.write_staging_wal_s3(
+                staging_snapshot_id,
+                target_snapshot,
+                target_kind,
+                staged_file_metadata,
+            )
+            .await?;
         } else {
-            self.write_staging_wal_local(staging_snapshot_id, target_snapshot, target_kind)
-                .await?;
+            self.write_staging_wal_local(
+                staging_snapshot_id,
+                target_snapshot,
+                target_kind,
+                staged_file_metadata,
+            )
+            .await?;
         }
         self.staging_wal_present().store(true, Ordering::Release);
         Ok(())
@@ -1399,28 +1479,24 @@ impl CayenneTableProvider {
         staging_snapshot_id: &str,
         target_snapshot: &str,
         target_kind: StagingWalTargetKind,
+        exact_file_metadata: &[StagedFileMetadata],
     ) -> Result<()> {
         let staging_dir =
             Self::snapshot_dir_path(self.table_path(), self.table_id(), staging_snapshot_id);
         Self::ensure_snapshot_dir_exists(&staging_dir).await?;
 
         // Collect staged data file names (exclude WAL bookkeeping files).
-        let mut staged_files = Vec::new();
-        let mut entries = tokio::fs::read_dir(&staging_dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            if entry.file_type().await?.is_file() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name != STAGING_WAL_FILENAME && name != STAGING_WAL_TMP_FILENAME {
-                    staged_files.push(name);
-                }
-            }
-        }
+        let staged_files = exact_file_metadata
+            .iter()
+            .map(|file| file.file_name.clone())
+            .collect();
 
         let wal = StagingWal {
             table_name: self.table_name().to_string(),
             target_snapshot: target_snapshot.to_string(),
             target_kind,
             staged_files,
+            staged_file_metadata: exact_file_metadata.to_vec(),
             created_at: chrono::Utc::now().to_rfc3339(),
         };
 
@@ -1503,6 +1579,7 @@ impl CayenneTableProvider {
         staging_snapshot_id: &str,
         target_snapshot: &str,
         target_kind: StagingWalTargetKind,
+        exact_file_metadata: &[StagedFileMetadata],
     ) -> Result<()> {
         let config = self.require_object_store()?;
 
@@ -1510,32 +1587,9 @@ impl CayenneTableProvider {
             return Ok(());
         };
 
-        // List staged data files (exclude WAL bookkeeping objects).
-        let objects: Vec<_> = config
-            .store
-            .list(Some(&staging_prefix))
-            .try_collect()
-            .await
-            .map_err(|e| Error::ObjectStore {
-                operation: "list staging objects for WAL",
-                table: self.table_name().to_string(),
-                source: e,
-            })?;
-
-        let staged_files: Vec<String> = objects
+        let staged_files = exact_file_metadata
             .iter()
-            .filter_map(|meta| {
-                let name = meta
-                    .location
-                    .as_ref()
-                    .strip_prefix(staging_prefix.as_ref())
-                    .unwrap_or(meta.location.as_ref());
-                if name == STAGING_WAL_FILENAME || name == STAGING_WAL_TMP_FILENAME {
-                    None
-                } else {
-                    Some(name.to_string())
-                }
-            })
+            .map(|file| file.file_name.clone())
             .collect();
 
         let wal = StagingWal {
@@ -1543,6 +1597,7 @@ impl CayenneTableProvider {
             target_snapshot: target_snapshot.to_string(),
             target_kind,
             staged_files,
+            staged_file_metadata: exact_file_metadata.to_vec(),
             created_at: chrono::Utc::now().to_rfc3339(),
         };
 
