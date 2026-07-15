@@ -240,6 +240,12 @@ pub struct SnapshotSequenceCommit {
 /// including table creation and file tracking.
 #[async_trait]
 pub trait MetadataCatalog: Send + Sync {
+    /// Downcast hook so a caller holding `Arc<dyn MetadataCatalog>` can reach
+    /// concrete methods needed for atomic multi-table transaction commit
+    /// (`begin_transaction`, `apply_prepared_on_conflict_in_txn`), mirroring how the
+    /// overwrite path takes a concrete `&CayenneCatalog`.
+    fn as_any(&self) -> &dyn std::any::Any;
+
     /// Initialize the catalog, creating necessary tables if they don't exist.
     async fn init(&self) -> CatalogResult<()>;
 
