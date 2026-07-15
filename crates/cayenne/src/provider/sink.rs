@@ -30,9 +30,12 @@ use datafusion_execution::TaskContext;
 use datafusion_expr::dml::InsertOp;
 use futures::StreamExt;
 
+use runtime_datafusion::extension::request_context::resolve_request_context;
+
 use super::context::CayenneContext;
 use super::mutation_writer::AppendMutationWriter;
 use super::table::CayenneTableProvider;
+use super::transaction::CayenneTransaction;
 
 /// A [`DataSink`] implementation that writes data to a Cayenne table.
 ///
@@ -153,6 +156,18 @@ impl DataSink for CayenneDataSink {
             }),
         ));
 
+        // Transaction: when one is active for this table on
+        // the request context, the write must STAGE rather than publish, so the
+        // executor can publish it atomically at COMMIT (or roll it back). This is
+        // checked before the memory-mode and streaming-publish branches below,
+        // both of which publish immediately.
+        if let Some(txn) = self.active_transaction(context) {
+            return self
+                .write_all_transaction(&txn, normalized, context)
+                .await
+                .map_err(Into::into);
+        }
+
         // Memory mode (`mode: memory`): all data lives in the RAM mem-tier, so
         // collect the stream and route it there — an atomic replace on
         // overwrite/full refresh, otherwise an append. Nothing is ever encoded to
@@ -221,6 +236,85 @@ impl DataSink for CayenneDataSink {
 }
 
 impl CayenneDataSink {
+    /// Resolve the transaction active on this write's request
+    /// context, if any.
+    ///
+    /// Reads it from the [`runtime_request_context::RequestContext`] typed
+    /// extension on the task context (source 1 of `resolve_request_context`) —
+    /// the exact context the query builder installed — rather than the
+    /// task-local `RequestContext::current`, whose silent internal-context
+    /// fallback would make a missed installation publish immediately (an
+    /// undetectable atomicity break). Returns the transaction regardless of its
+    /// target table; [`Self::write_all_transaction`] enforces the table match
+    /// (fail-closed).
+    fn active_transaction(&self, context: &Arc<TaskContext>) -> Option<CayenneTransaction> {
+        let txn = resolve_request_context(context, false)?.extension::<CayenneTransaction>()?;
+        if !txn.is_participant(self.table.table_id()) {
+            // A write to a Cayenne table outside the transaction's participant
+            // set: mark the transaction fail-closed (its commit aborts) and
+            // still route it through the staged path, which REJECTS the write.
+            // Returning `None` here would fall through to an immediate publish —
+            // an atomicity break if participant registration is ever missed.
+            txn.mark_unregistered_read();
+        }
+        Some(txn)
+    }
+
+    /// Stage a write for an active transaction instead of publishing it: take
+    /// this table's begin token, stage the rows to an invisible snapshot via
+    /// [`CayenneTableProvider::begin_staged_upsert_occ`], and register the handle
+    /// on the transaction. The executor publishes (or rolls back) all
+    /// participating tables atomically at COMMIT.
+    ///
+    /// Fail-closed: any shape the staged-upsert substrate cannot publish
+    /// atomically — an overwrite, a memory-mode table, or a second write to the
+    /// same table in one transaction — is rejected rather than silently published.
+    async fn write_all_transaction(
+        &self,
+        txn: &CayenneTransaction,
+        data: SendableRecordBatchStream,
+        context: &Arc<TaskContext>,
+    ) -> super::Result<u64> {
+        let table_id = self.table.table_id();
+        if !txn.is_participant(table_id) {
+            // Fail-closed: the executor never registered this table as a
+            // participant (its begin token was never captured), so its write
+            // cannot be committed atomically with the rest. Reject rather than
+            // publish; the transaction then aborts (see `active_transaction`).
+            return Err(super::Error::Unsupported {
+                operation: "write to a table outside the transaction's participant set",
+            });
+        }
+        if self.overwrite != InsertOp::Append {
+            return Err(super::Error::Unsupported {
+                operation: "transaction overwrite write",
+            });
+        }
+        if self.table.is_memory_resident_mode() {
+            return Err(super::Error::Unsupported {
+                operation: "transaction write on a memory-mode table",
+            });
+        }
+        // `None` means this table already staged a write — v1 allows one write
+        // per table per transaction. Reject rather than publish.
+        let Some(token) = txn.take_token(table_id) else {
+            return Err(super::Error::Unsupported {
+                operation: "more than one write to a table in one transaction",
+            });
+        };
+        let target_partitions = context.session_config().target_partitions();
+        // Off-lock staging: encode into an invisible snapshot without holding the
+        // write lock. The executor publishes (or rolls back) at COMMIT, where the
+        // per-key footprint + write-set are re-checked for a conflict.
+        let staged = self
+            .table
+            .begin_staged_upsert_occ(token, data, target_partitions)
+            .await?;
+        let row_count = staged.row_count();
+        txn.set_staged(table_id, staged);
+        Ok(row_count)
+    }
+
     /// Append with bounded ingest-to-queryable latency: consume the input in
     /// segments, each capped by age (`interval`, measured from the segment's
     /// first buffered batch) and by in-memory size, and run the full existing

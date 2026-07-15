@@ -105,6 +105,14 @@ pub(crate) struct PreparedOnConflictDurablePayload {
 }
 
 impl PreparedOnConflictDeletionPublish {
+    /// The commit sequence this staged upsert publishes under. An on-conflict
+    /// append carries no `append_sequence`, so this is the value its validated
+    /// primary keys must be stamped with for per-key optimistic concurrency.
+    #[must_use]
+    pub fn snapshot_sequence(&self) -> i64 {
+        self.snapshot_sequence
+    }
+
     /// Return the exact deletion-vector paths owned by abort cleanup.
     pub fn cleanup_paths(&self) -> Vec<std::path::PathBuf> {
         self.durable_payload
@@ -1078,10 +1086,21 @@ pub(crate) struct OnConflictValidationStream {
     pub(crate) deleted_inlined_row_keys: Vec<Box<[u8]>>,
     reinserted_over_tombstone: usize,
     post_validation: Arc<ParkingMutex<Option<PostValidationState>>>,
+    /// Whether the validation keyset is stored back into the table's shared PK
+    /// index cache when the stream finishes. `true` for the ordinary write path
+    /// (the keyset was taken from the shared cache and is returned). `false` for
+    /// off-lock conditional-commit staging, which validates against a **private**
+    /// keyset without holding `write_lock` — storing it back would clobber a
+    /// concurrent ordinary writer's cache update and drop committed keys.
+    store_back: bool,
     finalized: bool,
 }
 
 impl OnConflictValidationStream {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "distinct stream-construction inputs; grouping them into a struct would not aid clarity"
+    )]
     pub(crate) fn new(
         table: CayenneTableProvider,
         inner: SendableRecordBatchStream,
@@ -1090,6 +1109,7 @@ impl OnConflictValidationStream {
         existing_keys: CachedPkIndex,
         on_conflict: OnConflict,
         post_validation: Arc<ParkingMutex<Option<PostValidationState>>>,
+        store_back: bool,
     ) -> Self {
         let schema = inner.schema();
         let upsert_options = on_conflict.get_upsert_options();
@@ -1111,6 +1131,7 @@ impl OnConflictValidationStream {
             deleted_inlined_row_keys: Vec::new(),
             reinserted_over_tombstone: 0,
             post_validation,
+            store_back,
             finalized: false,
         }
     }
@@ -1180,7 +1201,12 @@ impl OnConflictValidationStream {
     }
 
     fn store_existing_keyset(&mut self) {
-        if let Some(existing_keys) = self.existing_keys.take() {
+        let existing_keys = self.existing_keys.take();
+        // Off-lock staging validates against a private keyset and must never
+        // publish it to the shared cache (see `store_back`). Drop it instead.
+        if self.store_back
+            && let Some(existing_keys) = existing_keys
+        {
             self.table.store_cached_pk_index(existing_keys);
         }
     }
