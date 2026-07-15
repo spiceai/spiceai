@@ -1582,14 +1582,20 @@ impl CayenneAccelerator {
                 .params
                 .get("cayenne_tuning")
                 .map(|v| v.trim().to_ascii_lowercase());
-            if let Some(mode) = &tuning_mode
-                && mode != "auto"
-                && mode != "adaptive"
-            {
-                tracing::warn!(
-                    "Dataset '{table_name}' has an invalid `cayenne_tuning` value: '{mode}'. Expected 'auto' or 'adaptive'. Defaulting to 'auto'."
-                );
-            }
+            // Normalize an invalid value to `auto` so it behaves as the documented
+            // default everywhere downstream (including the goal-gate below), matching
+            // the warning — otherwise a stray value combined with a `cayenne_goal_*`
+            // would slip past the goal check (which tests `== "auto"`) and enable
+            // adaptive, contradicting the warning.
+            let tuning_mode = match tuning_mode {
+                Some(mode) if mode != "auto" && mode != "adaptive" => {
+                    tracing::warn!(
+                        "Dataset '{table_name}' has an invalid `cayenne_tuning` value: '{mode}'. Expected 'auto' or 'adaptive'. Defaulting to 'auto'."
+                    );
+                    Some("auto".to_string())
+                }
+                other => other,
+            };
             // Resolve the tuning mode. An explicit `cayenne_tuning` value always
             // wins; when it is UNSET the default is `auto` (static derivation from
             // the detected environment and inferred schema, no closed loop). Schema

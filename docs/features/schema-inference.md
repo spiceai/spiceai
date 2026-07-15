@@ -98,11 +98,11 @@ role/user on the source database. It never fails a dataset: if a catalog query i
 blocked (commonly the connection role lacks read access to the catalog), the runtime
 logs an **info** message describing exactly what it dropped and continues.
 
-- **PostgreSQL / MySQL** — if the catalog query cannot run, the dataset registers
-  with **base column/type inference only** (no primary key, indexes, or sort). The
-  runtime logs, e.g.: *"Schema inference degraded to base column/type inference
-  (postgres): could not read the PostgreSQL catalog … grant catalog read access for
-  full inference."*
+- **PostgreSQL / MySQL** — if the catalog queries cannot run, the dataset registers
+  with **base column/type inference only**: no primary key, indexes, sort, table
+  sizing, or — for PostgreSQL — per-column statistics are inferred. The runtime logs,
+  e.g.: *"Schema inference degraded to base column/type inference (postgres): could
+  not read the PostgreSQL catalog … grant catalog read access for full inference."*
 - **MongoDB** — the `_id` primary key is structural and is always inferred. If
   `listIndexes`/`listCollections`/`collStats` are blocked or time out, inference
   degrades to **`_id`-only** (no secondary indexes, sort, or sizing) and logs an info
