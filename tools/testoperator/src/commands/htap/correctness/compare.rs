@@ -84,6 +84,15 @@ fn is_float(dt: &DataType) -> bool {
     )
 }
 
+/// Whether a column is numeric *and* exact — integers and decimals, never
+/// floats. `SUM` over such a column is bit-identical across engines (no
+/// order-dependent rounding), so the fingerprint gate can compare it with zero
+/// tolerance; a floating `SUM` legitimately drifts and must not be summed.
+#[must_use]
+pub fn is_exact_numeric(dt: &DataType) -> bool {
+    is_numeric(dt) && !is_float(dt)
+}
+
 /// Per-column float-ness of a batch's schema, for the `actual_source_floats`
 /// argument of [`numeric_delta`].
 ///
