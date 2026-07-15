@@ -222,6 +222,47 @@ impl Query {
         ))
     }
 
+    /// Plans a query without consulting or populating the SQL results cache.
+    pub(super) async fn get_plan_without_results_cache(
+        df: &Arc<DataFusion>,
+        session: &SessionState,
+        request_context: &RequestContext,
+        sql: &str,
+        parameters: Option<ParamValues>,
+        tracker: Option<QueryTracker>,
+        pre_parsed_plan: Option<Box<LogicalPlan>>,
+    ) -> super::Result<PlanOrCached> {
+        let cache_namespace = request_context.cache_namespace();
+        let (ns_tag, ns_id) = cache_namespace.hash_inputs();
+        let raw_cache_key = CacheKey::Query(sql, parameters.as_ref()).as_raw_key_in_namespace(
+            Self::plan_hasher(df),
+            ns_tag,
+            ns_id,
+        );
+        let plan = if let Some(plan) = pre_parsed_plan {
+            plan
+        } else {
+            match Self::get_plan(df, session, sql, &raw_cache_key, parameters).await {
+                Ok(plan) => Box::new(plan),
+                Err(super::Error::UnableToExecuteQuery { source }) => {
+                    let code = ErrorCode::from(&source);
+                    let error = super::Error::UnableToExecuteQuery { source };
+                    if let Some(tracker) = tracker {
+                        tracker.finish_with_error(request_context, error.to_string(), code);
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        };
+
+        Ok(PlanOrCached::Plan(
+            plan,
+            tracker,
+            RequestCacheManager::new(CacheStatus::CacheDisabled, raw_cache_key),
+        ))
+    }
+
     /// Get the logical plan for the given SQL query, applying parameter values if provided.
     pub(super) async fn get_plan(
         df: &Arc<DataFusion>,
@@ -720,7 +761,10 @@ mod tests {
 
     use crate::{
         builder::RuntimeBuilder,
-        datafusion::{DataFusion, query::QueryBuilder},
+        datafusion::{
+            DataFusion,
+            query::{QueryBuilder, ResultsCacheMode},
+        },
         status,
     };
     use runtime_request_context::{
@@ -798,6 +842,69 @@ mod tests {
 
         let manager = RequestCacheManager::new(cache_status, raw_cache_key);
         assert!(manager.should_cache_results());
+    }
+
+    async fn run_i64_query(
+        df: &Arc<DataFusion>,
+        sql: &str,
+        results_cache_mode: ResultsCacheMode,
+    ) -> (CacheStatus, i64) {
+        let result = QueryBuilder::new(sql, Arc::clone(df))
+            .results_cache_mode(results_cache_mode)
+            .build()
+            .run()
+            .await
+            .expect("query should succeed");
+        let cache_status = result.cache_status;
+        let records = result
+            .data
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("query should return records");
+        let value = records
+            .first()
+            .expect("query should return one batch")
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("query should return an Int64 column")
+            .value(0);
+        (cache_status, value)
+    }
+
+    #[tokio::test]
+    async fn test_results_cache_bypass_skips_lookup_and_storage() {
+        let df = prepare_runtime(Some(SQLResultsCacheConfig {
+            item_ttl: Some("10m".to_string()),
+            cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+            ..Default::default()
+        }))
+        .await;
+        let request_context = create_test_request_context(
+            CacheControl::Cache(CacheKeyType::ClientSupplied),
+            Some("bypass-regression".to_string()),
+        );
+
+        let (status, value) = Arc::clone(&request_context)
+            .scope(run_i64_query(&df, "SELECT 1", ResultsCacheMode::Default))
+            .await;
+        assert_eq!(status, CacheStatus::CacheMiss);
+        assert_eq!(value, 1);
+
+        // The same client cache key is warm, but bypass must execute SELECT 2.
+        let (status, value) = Arc::clone(&request_context)
+            .scope(run_i64_query(&df, "SELECT 2", ResultsCacheMode::Bypass))
+            .await;
+        assert_eq!(status, CacheStatus::CacheDisabled);
+        assert_eq!(value, 2);
+
+        // Bypass must not replace the warm entry. A normal request with the same
+        // client key still returns the original SELECT 1 result, not SELECT 2.
+        let (status, value) = request_context
+            .scope(run_i64_query(&df, "SELECT 3", ResultsCacheMode::Default))
+            .await;
+        assert_eq!(status, CacheStatus::CacheHit);
+        assert_eq!(value, 1);
     }
 
     /// SWR background revalidation must run under the originating user's

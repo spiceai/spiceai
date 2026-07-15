@@ -264,6 +264,7 @@ enum MemShardedOutcome {
 
 struct PreparedStagedAppendTarget {
     staging_snapshot_id: String,
+    source_snapshot_id: String,
     target_snapshot_id: String,
     target_kind: StagingWalTargetKind,
     estimated_bytes: Option<u64>,
@@ -515,8 +516,9 @@ impl<'a> AppendMutationWriter<'a> {
                 rows,
                 post_validation,
             } => {
+                let record_seq = self.table.sequence_high_water().await;
                 self.table
-                    .record_inlined_pk_keys(&post_validation.validated_keys);
+                    .record_inlined_pk_keys(&post_validation.validated_keys, record_seq);
                 tracing::debug!(
                     table = self.table.table_name(),
                     rows,
@@ -570,11 +572,19 @@ impl<'a> AppendMutationWriter<'a> {
                     .clear_staging_snapshot_dir(&staging_snapshot_id)
                     .await?;
 
-                let (write_guard_for_prepare, held_write_guard) = if stage_on_conflict {
-                    (None, Some(write_guard))
-                } else {
-                    (Some(write_guard), None)
-                };
+                // Hold `write_lock` only through Stage A (staging the WAL and
+                // registering the in-flight append), then release it at the
+                // `drop(held_write_guard)` below — the same discipline the
+                // on-conflict path already uses. Retaining the guard in the
+                // prepared receipt would block a second pipelined Stage A on this
+                // write's finalize and self-deadlock finish()'s
+                // `lock_current_snapshot_for_apply` re-acquire. Compaction-skip
+                // (via the in-flight registration) and apply-time consistency
+                // (`ensure_current_snapshot_target_unchanged` + the re-acquired
+                // lock under the listing fence) do not need the guard held across
+                // the staged window. The cross-partition coordinator retains its
+                // own guard via a separate entry point (`begin_deferred_snapshot_append`).
+                let (write_guard_for_prepare, held_write_guard) = (None, Some(write_guard));
 
                 let (rows, writer_ops, stats_acc, prepared_append) = self
                     .write_staged_append_prepared(
@@ -583,6 +593,7 @@ impl<'a> AppendMutationWriter<'a> {
                         write_guard_for_prepare,
                         PreparedStagedAppendTarget {
                             staging_snapshot_id,
+                            source_snapshot_id: self.table.get_current_snapshot_id(),
                             target_snapshot_id: target_snapshot_id.clone(),
                             target_kind,
                             estimated_bytes,
@@ -616,6 +627,7 @@ impl<'a> AppendMutationWriter<'a> {
                         .prepare_on_conflict_deletions_for_staged_snapshot(
                             on_conflict_deletions,
                             target_snapshot_id,
+                            false,
                         )
                         .await
                     {
@@ -635,7 +647,8 @@ impl<'a> AppendMutationWriter<'a> {
                 };
 
                 if stage_on_conflict {
-                    self.table.record_file_pk_keys(&validated_keys);
+                    let record_seq = self.table.sequence_high_water().await;
+                    self.table.record_file_pk_keys(&validated_keys, record_seq);
                 }
                 drop(held_write_guard);
 
@@ -833,7 +846,9 @@ impl<'a> AppendMutationWriter<'a> {
         };
         // Record the inlined PK keys so a subsequent same-table upsert sees this
         // batch's rows as present (same bookkeeping as the durable inline path).
-        self.table.record_inlined_pk_keys(&validated_keys);
+        let record_seq = self.table.sequence_high_water().await;
+        self.table
+            .record_inlined_pk_keys(&validated_keys, record_seq);
 
         drop(write_guard);
         record_cayenne_write_phase(self.table.table_name(), "cdc_path_inmemory", write_start);
@@ -1052,8 +1067,9 @@ impl<'a> AppendMutationWriter<'a> {
                     rows,
                     post_validation,
                 } => {
+                    let record_seq = self.table.sequence_high_water().await;
                     self.table
-                        .record_inlined_pk_keys(&post_validation.validated_keys);
+                        .record_inlined_pk_keys(&post_validation.validated_keys, record_seq);
                     return Ok(rows);
                 }
                 InlineMutationOutcome::Fallback {
@@ -1150,7 +1166,8 @@ impl<'a> AppendMutationWriter<'a> {
             // count and cleared only when retention had actually deleted rows).
             self.table.clear_cached_pk_keyset();
         } else {
-            self.table.record_file_pk_keys(&validated_keys);
+            let record_seq = self.table.sequence_high_water().await;
+            self.table.record_file_pk_keys(&validated_keys, record_seq);
         }
 
         Ok(total_rows)
@@ -1551,6 +1568,7 @@ impl<'a> AppendMutationWriter<'a> {
             self.table.clone_for_write_operations(),
             write_guard,
             target.staging_snapshot_id.clone(),
+            target.source_snapshot_id,
             target.target_snapshot_id,
             target.target_kind,
             rows,

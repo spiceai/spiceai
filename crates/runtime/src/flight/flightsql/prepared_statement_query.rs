@@ -43,9 +43,13 @@ use tokio_stream::adapters::Peekable;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::{
-    datafusion::request_context_extension::get_current_datafusion,
+    datafusion::{
+        query::{run_transaction, schema_statement, transaction_statements},
+        request_context_extension::get_current_datafusion,
+    },
     flight::{
-        Service, metrics, to_tonic_err,
+        Service, is_auth_read_only, metrics, record_batches_to_flight_stream, to_tonic_err,
+        transaction_error_to_status,
         util::{attach_cache_metadata, set_flightsql_protocol},
     },
 };
@@ -203,8 +207,14 @@ pub(crate) async fn do_action_create_prepared_statement(
 
     // Try to get schema, but if it fails due to type inference issues with parameters,
     // we'll return empty schemas. The actual type checking will happen when parameters are bound.
-    let (dataset_schema, parameter_schema) = match Service::get_arrow_schema(datafusion, &query)
-        .await
+    // For a `BEGIN … COMMIT` body, advertise the final statement's schema (the
+    // body is executed as a transaction at do_get, not planned as one here).
+    let schema_sql = schema_statement(&query);
+    let (dataset_schema, parameter_schema) = match Service::get_arrow_schema(
+        datafusion,
+        &schema_sql,
+    )
+    .await
     {
         Ok(schemas) => schemas,
         Err(e) => {
@@ -268,7 +278,9 @@ pub(crate) async fn get_flight_info(
 
     // Try to get schema, but if it fails due to type inference issues with parameters,
     // we'll omit the schema from FlightInfo. The actual schema will be determined during execution.
-    let maybe_arrow_schema = match Service::get_arrow_schema(datafusion, &sql).await {
+    // For a `BEGIN … COMMIT` body, advertise the final statement's schema.
+    let schema_sql = schema_statement(&sql);
+    let maybe_arrow_schema = match Service::get_arrow_schema(datafusion, &schema_sql).await {
         Ok((schema, _)) => Some(schema),
         Err(e) => {
             let err_msg = e.to_string();
@@ -332,6 +344,30 @@ pub(crate) async fn do_get(
     let param_values = decode_param_values(&parameters).map_err(error_to_status)?;
 
     tracing::debug!("do_get: Decoded parameters: {:?}", param_values);
+
+    // A `BEGIN … COMMIT` body runs through the shared transaction orchestrator
+    // (one atomic staged commit across every table it touches); stream the final
+    // statement's result. Scoped so the `CayenneTransaction` the orchestrator
+    // installs on the request context is the one the write path's sink reads.
+    if let Some(statements) = transaction_statements(&sql) {
+        let read_only = is_auth_read_only(&context);
+        let context_clone = Arc::clone(&context);
+        let outcome = context_clone
+            .scope(async {
+                run_transaction(&datafusion, &statements, param_values, read_only).await
+            })
+            .await
+            .map_err(transaction_error_to_status)?;
+        let batches = outcome
+            .result
+            .map(|(batches, _)| batches)
+            .unwrap_or_default();
+        let stream = record_batches_to_flight_stream(batches);
+        let timed = TimedStream::new(stream, move || start);
+        return Ok(Response::new(
+            Box::pin(timed) as <Service as FlightService>::DoGetStream
+        ));
+    }
 
     // If we have parameter schema from DoPut, try to use it to help with type inference
     // by rewriting the SQL to include explicit type casts
