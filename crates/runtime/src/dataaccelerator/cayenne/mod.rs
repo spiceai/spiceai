@@ -1584,7 +1584,10 @@ impl CayenneAccelerator {
             // everywhere downstream — including the goal-gate below (which tests
             // `== "auto"`) — instead of slipping through as "not auto" and enabling
             // adaptive.
-            let raw_tuning = acceleration.params.get("cayenne_tuning").map(String::as_str);
+            let raw_tuning = acceleration
+                .params
+                .get("cayenne_tuning")
+                .map(String::as_str);
             let (tuning_mode, tuning_was_invalid) = normalize_cayenne_tuning(raw_tuning);
             if tuning_was_invalid {
                 tracing::warn!(
