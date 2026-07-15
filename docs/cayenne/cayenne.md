@@ -491,6 +491,24 @@ The expensive parts of a write — encoding, metastore transactions, checkpoint 
 These guards protect each cell *individually*. The `scan_state_lock` (above) is a separate concern: it makes the three views a scan reads — the deletion snapshot, `protected_snapshots`, and the inline batches — flip *together*, so a reader never pairs a new protected snapshot with an old deletion index even though each lives in its own `ArcSwap`.
 
 
+### Serializable transactions and per-key optimistic concurrency
+
+A client can wrap a gated read-modify-write in a single serializable transaction — the canonical shape is `BEGIN; SELECT assert(<gate>); UPDATE …; COMMIT;` submitted as one `/v1/sql` (or FlightSQL) body. `assert(<bool>)` is a volatile scalar UDF that errors — rolling the whole body back — when its argument is false or NULL; the "conditional"-ness is just the caller's optional use of it, the mechanism underneath is a plain serializable transaction over one or more accelerator-only Cayenne tables. Every statement runs through the ordinary query builder, so authorization, column masking, logging, and tracing apply uniformly; atomicity comes from a transaction-aware sink (`CayenneDataSink` reads the active transaction back off the request context and *stages* instead of publishing), not from intercepting the write plan.
+
+The discipline extends the per-table `write_lock` rather than replacing it. At `BEGIN` the executor captures, under a brief `write_lock`, a per-table begin token (`TransactionWriteToken` = the table's `sequence_high_water()` plus a staging-clean bit) for **every** participant table, *before* the gate reads. Staging then runs **off-lock**: the gate's reads and the write's Vortex encode hold no `write_lock`, so transactions touching disjoint keys stage concurrently. The `write_lock` is re-acquired only at `COMMIT`, held just long enough to re-validate and publish.
+
+Validation is **per-key**, not per-table. Every committed write stamps its commit sequence onto the `sequence` field of the primary keys it touches in the PK index (`PkKeysetEntry`); a transaction records the digests of the keys it *read* — captured from the scan's pushed-down PK-equality predicate and digested through the same PK `RowConverter` as the keyset, so the footprint is projection-independent and phantom-safe. At `COMMIT`, `transaction_has_conflict` aborts with a retryable `Error::WriteConflict` (surfaced as HTTP 409 / Flight `Aborted`) iff any key in the read footprint or write set carries a stored `sequence` newer than the begin token — otherwise disjoint-key transactions commit without contending. The per-key path applies only to a read expressed as a bounded full-PK equality point; an unbounded or composite read marks the footprint incomplete and falls back to the conservative per-table sequence gate. Reading a Cayenne table that was never registered as a participant fail-closes the transaction at commit.
+
+A transaction spanning **several** tables that share one metastore catalog commits atomically: the executor locks every participant in canonical (`table_id`-sorted) order, re-checks per-key OCC on all of them, then applies every staged write inside **one** `MetastoreTransaction` — a shared-catalog `Arc::ptr_eq` check guarantees they truly share a database — so all tables advance together or none do.
+
+> **v1 scope.** Comparison gates are NULL-safe (`assert((SELECT n WHERE id = …) < cap)` errors and rolls back when the row is absent), but a nullability-predicate gate such as `assert(… IS NOT NULL)` can be constant-folded to `TRUE` by the optimizer and is a known limitation. Explicit `ROLLBACK` as a terminal statement is not yet recognized — a client aborts by simply not sending `COMMIT` (nothing is published until then). One write per table per transaction.
+
+
+### Durable federated write-back
+
+An accelerator-only table serves its writes locally; a table configured for durable write-back (`write_mode: write_back`, which additionally requires dataset-level `replication.enabled: true`) also reconciles committed writes back to its federated source. A committed write records the primary keys it touched in the `cayenne_pending_write_back` marker table **inside the same commit `MetastoreTransaction`** — never on the CDC apply path, so an echo of Cayenne's own write cannot spawn a delivery. A per-table delivery worker then drains the markers in commit order: it claims a batch, point-scans those keys' *current* committed values from the accelerator, and reconciles to the source idempotently — delete-by-PK, then insert the rows still present — before clearing only the markers whose stored `sequence_number` is still at or below what it claimed (a newer commit that re-dirtied a key leaves its marker in place). Delivery failure never blocks accelerator commits; the dirty set simply grows until the next successful pass. v1 delivers single-column primary keys.
+
+
 ## The deletion subsystem
 
 Deletes never rewrite data. They are recorded as **deletion vectors** — Arrow-IPC files under `<snapshot_id>/deletions/<id>.arrow` — and applied **merge-on-read**. The *on-disk schema is the type discriminator* (it is inferred at read time, not stored as a column):
@@ -1126,11 +1144,11 @@ Cayenne is not trying to be a general open table format. Relative to the big thr
 
 ---
 
-# Appendix A — The metastore schema (12 tables)
+# Appendix A — The metastore schema (13 tables)
 
-`EXPECTED_TABLES` materializes twelve tables in the metastore. `table_id` (UUIDv7 text) is the spine — every dependent table references it via `FOREIGN KEY … ON DELETE CASCADE`. The DDL in `metastore/sqlite.rs` is authoritative; this is a map.
+`EXPECTED_TABLES` materializes thirteen tables in the metastore. `table_id` (UUIDv7 text) is the spine — every dependent table references it via `FOREIGN KEY … ON DELETE CASCADE`. The DDL in `metastore/sqlite.rs` is authoritative; this is a map.
 
-All twelve tables hang off `cayenne_table` by its `table_id`, with `ON DELETE CASCADE`. The hub-and-spoke shape below shows that spine and the functional grouping; the per-column detail is in the table that follows.
+All thirteen tables hang off `cayenne_table` by its `table_id`, with `ON DELETE CASCADE`. The hub-and-spoke shape below shows that spine and the functional grouping; the per-column detail is in the table that follows.
 
 ```mermaid
 %%{init: {"htmlLabels": false, "flowchart": {"htmlLabels": false, "curve": "basis", "nodeSpacing": 40, "rankSpacing": 40}, "securityLevel": "loose", "theme": "base", "themeVariables": {"fontFamily": "Helvetica, Arial, sans-serif", "fontSize": "14px", "primaryColor": "#ffffff", "primaryBorderColor": "#312e81", "primaryTextColor": "#0f172a", "lineColor": "#1e293b", "clusterBkg": "#f8fafc", "clusterBorder": "#6366f1"}}}%%
@@ -1156,12 +1174,13 @@ flowchart TB
         IDD["cayenne_inlined_delete"]
         ID ~~~ IDD
     end
-    subgraph MISC["Statistics, partitioning &amp; cold tier"]
+    subgraph MISC["Statistics, partitioning, cold tier &amp; write-back"]
         direction TB
         TS["cayenne_table_statistics"]
         PT["cayenne_partition"]
         CT["cayenne_cold_tier_file"]
-        TS ~~~ PT ~~~ CT
+        WB["cayenne_pending_write_back"]
+        TS ~~~ PT ~~~ CT ~~~ WB
     end
     HUB -->|"FK table_id"| SNAP
     HUB -->|"FK table_id"| DEL
@@ -1183,6 +1202,7 @@ flowchart TB
 | `cayenne_inlined_data` | LSM level-0 inline memtable (Arrow-IPC blobs) |
 | `cayenne_inlined_delete` | LSM level-0 inline tombstones (`published` activation flag) |
 | `cayenne_cold_tier_file` | cold object-store tier file manifest (Z-order-clustered Vortex); inline stats blob for zero-round-trip listing-time pruning |
+| `cayenne_pending_write_back` | durable-write-back dirty-key markers: one row per committed-but-undelivered primary key (`WITHOUT ROWID`; raw-UUID-byte `table_id` + `RowConverter`-encoded `pk_bytes`; `sequence_number` of the commit that dirtied it); the delivery worker claims, reconciles to the federated source, and clears |
 
 # Appendix B — Configuration cheat-sheet
 
@@ -1239,6 +1259,7 @@ This document is a point-in-time snapshot of a fast-moving crate. Each entry rec
 
 | Date | Reviewed commit | Changes |
 |------|-----------------|---------|
+| 2026-07-14 | PR #11870 (pre-merge; doc otherwise baselined at `4685a3dd`) | **Serializable gated transactions** (#11830): a `BEGIN; SELECT assert(<gate>); UPDATE …; COMMIT;` body over `/v1/sql` or FlightSQL commits atomically across one or more accelerator-only tables — `assert(<bool>)` is a volatile UDF (false/NULL ⇒ roll back) and the "conditional"-ness is just the caller's optional use of it. New *Serializable transactions and per-key optimistic concurrency* + *Durable federated write-back* subsections in Part 3: the per-table `write_lock` is now held only at `COMMIT` (staging runs off-lock, so disjoint-key transactions stage concurrently); a begin `TransactionWriteToken` (`sequence_high_water()` + staging-clean bit) captured before the gate read is re-checked at commit; **per-key OCC** stamps the commit `sequence` onto each touched `PkKeysetEntry` and aborts with a retryable `WriteConflict` (HTTP 409 / Flight `Aborted`) iff a read-footprint/write-set key advanced past the token, else falls back to a per-table gate for unbounded/composite reads; multi-table commits apply inside one `MetastoreTransaction` (shared-catalog `Arc::ptr_eq` check). **Durable federated write-back** (#11838): a `write_mode: write_back` table (requires dataset `replication.enabled: true`) records committed PKs in the new `cayenne_pending_write_back` marker table inside the commit transaction, and a per-table worker reconciles them to the source idempotently (delete-by-PK + insert-present), compare-and-clearing markers by `sequence_number`. Appendix A now lists **13 tables**. Documented v1 limits: single-column PK for write-back; comparison gates are NULL-safe but `IS NOT NULL` nullability-predicate gates are not; explicit terminal `ROLLBACK` is not yet recognized. |
 | 2026-07-14 | `44d7538e` (committed 2026-07-14; doc otherwise baselined at `4685a3dd`) | Hardened maintained-aggregate retraction and bounds: `SUM` now restores SQL `NULL` after its final non-null contribution is retracted; floating and integer `AVG` reset/validate empty state; each view tracks PK records plus distinct `MIN`/`MAX` nodes exactly in O(1); stale views detach all group/index state without blocking an async visibility fence; and pre-bumped N>1 stale paths reuse the published epoch instead of creating gaps. |
 | 2026-07-14 | `5c1316c7` (committed 2026-07-14; doc otherwise baselined at `4685a3dd`) | Exposed Spicepod `MIN`/`MAX` maintained aggregates with resolved-primary-key validation; bounded direct no-PK extremum multisets; added N>1 mem-tier UPDATE/DELETE maintenance as one pre-assigned, ordered IVM delta; and bound scan shard snapshots to the IVM epoch with an even/odd seqlock so optimizer substitution cannot cross visibility generations. The N>1 delete path projects the original PK batch once (no per-shard prefix concat). |
 | 2026-07-13 | PR #11720 (pre-merge; doc otherwise baselined at `4685a3dd`) | **Acceleration `mode: memory`**: fully in-RAM Cayenne — mem-tier is the permanent store, in-memory `memdb` metastore, no Vortex/compaction/seal/checkpoint/datalake; CDC slot committed immediately after each in-RAM write; partitioning rejected at config; hard RAM bound (`cayenne_cdc_mem_tier_max_bytes`) counts resident + incoming even for overwrite. Spicepod `acceleration.mode` defaults to `memory` (same as Arrow) — durable Cayenne requires explicit `mode: file`. S3 Express params are ignored under `mode: memory`. New *Storage modes* section + glossary entries; distinct from `cdc_durability: memory` on file-mode tables. |

@@ -3534,6 +3534,7 @@ dependencies = [
  "roaring",
  "rstest 0.26.1",
  "runtime-datafusion",
+ "runtime-request-context",
  "runtime-table-partition",
  "rusqlite",
  "rustc-hash 2.1.2",
