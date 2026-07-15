@@ -25,6 +25,11 @@ limitations under the License.
 //! creation, `AcceleratedTable` construction, refresh loop, status/metrics —
 //! see [`Runtime::load_synthesized_dataset`]).
 //!
+//! Every synthesized dataset is given the same explicit replication slot
+//! name (derived once from the catalog's own name), so every table shares
+//! one replication connection and one publication instead of each opening
+//! its own — WAL is decoded once for the whole catalog, not once per table.
+//!
 //! Every included table must have a primary key: catalog setup fails,
 //! naming the table, if one is missing. Use `include`/`exclude` to keep
 //! tables without a primary key out of an accelerated catalog's scope.
@@ -41,6 +46,7 @@ use app::App;
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use data_components::postgres::provider::{list_schemas, list_tables, primary_key_columns};
+use data_components::postgres_replication::config::default_slot_name;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
@@ -54,6 +60,14 @@ use spicepod::param::Params;
 use crate::Runtime;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::builder::DatasetBuilder;
+
+/// Dataset param key carrying an explicit replication slot name (see
+/// `connector-postgres`'s `replication_slot` parameter spec, exposed to
+/// datasets as `pg_replication_slot`). Every synthesized per-table dataset
+/// is given the *same* slot name so they share one replication connection
+/// and one publication instead of each opening its own -- this is the
+/// catalog's single shared slot.
+const REPLICATION_SLOT_PARAM: &str = "pg_replication_slot";
 
 /// Accelerator engine name written onto every synthesized per-table dataset.
 /// Matches `CatalogAccelerationEngine`'s only variant.
@@ -86,6 +100,10 @@ pub struct AcceleratedCatalogProvider {
     /// the same `pg_host`/`pg_port`/... the catalog itself was configured
     /// with.
     dataset_params: HashMap<String, String>,
+    /// One replication slot name shared by every synthesized dataset in
+    /// this catalog, so WAL is decoded once by one shared connection rather
+    /// than once per table.
+    slot_name: String,
     include: Option<Arc<GlobSet>>,
     exclude: Option<Arc<GlobSet>>,
     schemas: RwLock<HashMap<String, Arc<AcceleratedSchemaProvider>>>,
@@ -102,12 +120,15 @@ impl std::fmt::Debug for AcceleratedCatalogProvider {
 impl AcceleratedCatalogProvider {
     #[must_use]
     pub fn new(catalog: &Catalog, pool: Arc<PostgresConnectionPool>) -> Self {
+        let slot_name = default_slot_name(&catalog.name);
+
         Self {
             catalog_name: catalog.name.clone(),
             pool,
             runtime: catalog.runtime(),
             app: catalog.app(),
             dataset_params: catalog.params.clone(),
+            slot_name,
             include: catalog.include.clone().map(Arc::new),
             exclude: catalog.exclude.clone().map(Arc::new),
             schemas: RwLock::new(HashMap::new()),
@@ -126,11 +147,14 @@ impl AcceleratedCatalogProvider {
     ) -> Result<String, crate::Error> {
         let dataset_name = synthesized_dataset_name(&self.catalog_name, schema_name, table_name);
 
+        let mut params = self.dataset_params.clone();
+        params.insert(REPLICATION_SLOT_PARAM.to_string(), self.slot_name.clone());
+
         let mut spicepod_ds = SpicepodDataset::new(
             format!("postgres:{schema_name}.{table_name}"),
             dataset_name.clone(),
         )
-        .with_params(Params::from_string_map(self.dataset_params.clone()));
+        .with_params(Params::from_string_map(params));
         spicepod_ds.schema_inference = SchemaInference::Extended;
         spicepod_ds.acceleration = Some(SpicepodAcceleration {
             engine: Some(CAYENNE_ENGINE.to_string()),
@@ -207,8 +231,10 @@ impl RefreshableCatalogProvider for AcceleratedCatalogProvider {
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
         let mut schemas = HashMap::new();
+        let mut total_tables = 0usize;
         for schema_name in &schema_names {
             let schema_provider = self.build_schema_provider(schema_name).await?;
+            total_tables += schema_provider.table_names().len();
             schemas.insert(schema_name.clone(), Arc::new(schema_provider));
         }
 
@@ -219,6 +245,13 @@ impl RefreshableCatalogProvider for AcceleratedCatalogProvider {
             };
             *guard = schemas;
         }
+
+        tracing::info!(
+            "Catalog '{}': accelerating {total_tables} table{} via CDC (shared replication slot '{}').",
+            self.catalog_name,
+            if total_tables == 1 { "" } else { "s" },
+            self.slot_name,
+        );
 
         Ok(())
     }

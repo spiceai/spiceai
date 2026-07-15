@@ -24,12 +24,14 @@ limitations under the License.
 //! through the exact same lifecycle as any spicepod-declared dataset.
 //!
 //! Every included table must have a primary key -- catalog setup fails
-//! naming the table if one is missing.
+//! naming the table if one is missing. Every synthesized dataset shares one
+//! replication slot, so a multi-table catalog opens exactly one replication
+//! connection rather than one per table.
 //!
 //! This is the first genuinely workable, end-to-end slice: it proves
 //! bootstrap through the catalog path works. It deliberately does not yet
-//! assert CDC convergence after a source mutation or a shared replication
-//! slot -- those land in follow-up commits.
+//! assert CDC convergence after a source mutation -- that lands in a
+//! follow-up commit.
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -52,8 +54,9 @@ use crate::{
 
 const CATALOG_NAME: &str = "pg_accel_e2e";
 
-/// Seed a table with a primary key and a couple of rows.
-async fn seed_orders_table(port: usize) -> Result<(), anyhow::Error> {
+/// Seed two tables with primary keys and a couple of rows each, so the
+/// shared-replication-slot behavior has more than one table to share across.
+async fn seed_tables(port: usize) -> Result<(), anyhow::Error> {
     let pool = common::get_postgres_connection_pool(port, None).await?;
     let conn = pool
         .connect_direct()
@@ -63,11 +66,30 @@ async fn seed_orders_table(port: usize) -> Result<(), anyhow::Error> {
     conn.conn
         .simple_query(
             "CREATE TABLE orders (id INT PRIMARY KEY, customer TEXT NOT NULL); \
-             INSERT INTO orders (id, customer) VALUES (1, 'alice'), (2, 'bob');",
+             INSERT INTO orders (id, customer) VALUES (1, 'alice'), (2, 'bob'); \
+             CREATE TABLE items (id INT PRIMARY KEY, name TEXT NOT NULL); \
+             INSERT INTO items (id, name) VALUES (1, 'widget'), (2, 'gadget'), (3, 'gizmo');",
         )
         .await?;
 
     Ok(())
+}
+
+/// Number of rows in `pg_replication_slots` on the source database --
+/// asserts how many replication connections a multi-table catalog opened.
+async fn replication_slot_count(port: usize) -> Result<i64, anyhow::Error> {
+    let pool = common::get_postgres_connection_pool(port, None).await?;
+    let conn = pool
+        .connect_direct()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let count: i64 = conn
+        .conn
+        .query_one("SELECT COUNT(*) FROM pg_replication_slots", &[])
+        .await?
+        .get(0);
+    Ok(count)
 }
 
 /// Build a `PostgreSQL` catalog with catalog-level CDC acceleration enabled.
@@ -105,12 +127,38 @@ async fn start_runtime(catalog: Catalog) -> Result<Arc<Runtime>, anyhow::Error> 
     Ok(rt)
 }
 
-/// A table with a primary key, discovered by a catalog with `acceleration:
-/// { refresh_mode: changes }`, becomes queryable through the catalog's own
-/// namespace once its synthesized dataset finishes bootstrapping -- with
-/// zero per-table configuration.
+/// Poll until `SELECT COUNT(*) FROM {CATALOG_NAME}.public.{table}` returns
+/// at least one row -- the synthesized dataset bootstraps in the background
+/// (fire-and-forget, same as any spicepod-declared dataset), so this can't
+/// be assumed ready the instant catalog registration returns.
+async fn wait_for_table_ready(rt: &Arc<Runtime>, table: &str) -> Result<(), anyhow::Error> {
+    let ready = wait_until_true(Duration::from_mins(2), || {
+        let rt = Arc::clone(rt);
+        async move {
+            run_query(
+                &rt,
+                &format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.{table}"),
+            )
+            .await
+            .is_ok_and(|batches| batches.first().is_some_and(|b| b.num_rows() > 0))
+        }
+    })
+    .await;
+    anyhow::ensure!(
+        ready,
+        "accelerated table {CATALOG_NAME}.public.{table} never became queryable"
+    );
+    Ok(())
+}
+
+/// Every table with a primary key, discovered by a catalog with
+/// `acceleration: { refresh_mode: changes }`, becomes queryable through the
+/// catalog's own namespace once its synthesized dataset finishes
+/// bootstrapping -- with zero per-table configuration. Every synthesized
+/// dataset shares one replication slot, so a two-table catalog opens
+/// exactly one replication connection rather than two.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_catalog_acceleration_bootstraps_table_with_primary_key() -> Result<(), anyhow::Error>
+async fn test_catalog_acceleration_bootstraps_tables_with_primary_key() -> Result<(), anyhow::Error>
 {
     let _tracing = init_tracing(Some("integration=debug,info,runtime::catalogconnector=debug"));
 
@@ -119,40 +167,16 @@ async fn test_catalog_acceleration_bootstraps_table_with_primary_key() -> Result
             let port = common::get_random_port()?;
             let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
 
-            seed_orders_table(port).await?;
+            seed_tables(port).await?;
 
             let rt = start_runtime(accelerated_pg_catalog(port)).await?;
 
-            // The synthesized per-table dataset bootstraps in the background
-            // (fire-and-forget, same as any spicepod-declared dataset) --
-            // poll until it's ready rather than assuming it's ready the
-            // instant catalog registration returns.
-            let ready = wait_until_true(Duration::from_mins(2), || {
-                let rt = Arc::clone(&rt);
-                async move {
-                    run_query(
-                        &rt,
-                        &format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.orders"),
-                    )
-                    .await
-                    .is_ok_and(|batches| {
-                        batches
-                            .first()
-                            .is_some_and(|b| b.num_rows() > 0)
-                    })
-                }
-            })
-            .await;
-            anyhow::ensure!(
-                ready,
-                "accelerated table {CATALOG_NAME}.public.orders never became queryable"
-            );
+            wait_for_table_ready(&rt, "orders").await?;
+            wait_for_table_ready(&rt, "items").await?;
 
-            let count = run_query(
-                &rt,
-                &format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.orders"),
-            )
-            .await?;
+            let orders_count =
+                run_query(&rt, &format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.orders"))
+                    .await?;
             assert_batches_eq!(
                 &[
                     "+---+", //
@@ -161,7 +185,27 @@ async fn test_catalog_acceleration_bootstraps_table_with_primary_key() -> Result
                     "| 2 |", //
                     "+---+", //
                 ],
-                &count
+                &orders_count
+            );
+
+            let items_count =
+                run_query(&rt, &format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.items"))
+                    .await?;
+            assert_batches_eq!(
+                &[
+                    "+---+", //
+                    "| n |", //
+                    "+---+", //
+                    "| 3 |", //
+                    "+---+", //
+                ],
+                &items_count
+            );
+
+            let slot_count = replication_slot_count(port).await?;
+            assert_eq!(
+                slot_count, 1,
+                "both tables should share one replication slot, found {slot_count}"
             );
 
             Ok(())
