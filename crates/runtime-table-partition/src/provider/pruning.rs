@@ -664,12 +664,12 @@ fn evaluate_bucket_inequality(
 /// Evaluates inequality for modulo partitions using statistics-based pruning.
 ///
 /// DataFusion uses truncation-toward-zero remainder (Rust `%` semantics), so the
-/// sign of `partition_value` (pv) determines which half of the number line the
-/// partition occupies:
+/// sign of the partition key determines which half of the number line that partition
+/// occupies — the partition key is the remainder value stored for that partition:
 ///
-/// - `pv > 0`: all values in this partition are ≥ pv  (e.g. pv=5, d=10 → {5,15,25,…})
-/// - `pv < 0`: all values in this partition are ≤ pv  (e.g. pv=-5, d=10 → {-5,-15,-25,…})
-/// - `pv = 0`: partition contains multiples of d in both directions → cannot prune
+/// - key > 0: all values in this partition are ≥ key  (e.g. key=5, divisor=10 → {5,15,25,…})
+/// - key < 0: all values in this partition are ≤ key  (e.g. key=-5, divisor=10 → {-5,-15,-25,…})
+/// - key = 0: partition contains multiples of divisor in both directions → cannot prune
 ///
 /// This holds for any non-zero divisor regardless of its sign.
 fn evaluate_modulo_inequality(
@@ -686,24 +686,24 @@ fn evaluate_modulo_inequality(
     }
 
     macro_rules! modulo_prune {
-        ($d:expr, $pv:expr, $fv:expr) => {{
-            if *$d == 0 {
+        ($divisor:expr, $key:expr, $threshold:expr) => {{
+            if *$divisor == 0 {
                 return Ok(false);
             }
-            Ok(match $pv.cmp(&0) {
-                // partition ⊆ [pv, +∞): prune if filter ceiling is at or below pv
+            Ok(match $key.cmp(&0) {
+                // partition ⊆ [key, +∞): prune if the filter's upper bound is at or below key
                 std::cmp::Ordering::Greater => match op {
-                    Operator::Lt => $fv <= $pv,
-                    Operator::LtEq => $fv < $pv,
+                    Operator::Lt => $threshold <= $key,
+                    Operator::LtEq => $threshold < $key,
                     _ => false,
                 },
-                // partition ⊆ (−∞, pv]: prune if filter floor is at or above pv
+                // partition ⊆ (−∞, key]: prune if the filter's lower bound is at or above key
                 std::cmp::Ordering::Less => match op {
-                    Operator::Gt => $fv >= $pv,
-                    Operator::GtEq => $fv > $pv,
+                    Operator::Gt => $threshold >= $key,
+                    Operator::GtEq => $threshold > $key,
                     _ => false,
                 },
-                // pv = 0: multiples of d span both directions, cannot prune
+                // key = 0: multiples of divisor span both directions, cannot prune
                 std::cmp::Ordering::Equal => false,
             })
         }};
@@ -711,15 +711,15 @@ fn evaluate_modulo_inequality(
 
     match (divisor, partition_value, filter_value) {
         (
-            ScalarValue::Int32(Some(d)),
-            ScalarValue::Int32(Some(pv)),
-            ScalarValue::Int32(Some(fv)),
-        ) => modulo_prune!(d, pv, fv),
+            ScalarValue::Int32(Some(divisor)),
+            ScalarValue::Int32(Some(key)),
+            ScalarValue::Int32(Some(threshold)),
+        ) => modulo_prune!(divisor, key, threshold),
         (
-            ScalarValue::Int64(Some(d)),
-            ScalarValue::Int64(Some(pv)),
-            ScalarValue::Int64(Some(fv)),
-        ) => modulo_prune!(d, pv, fv),
+            ScalarValue::Int64(Some(divisor)),
+            ScalarValue::Int64(Some(key)),
+            ScalarValue::Int64(Some(threshold)),
+        ) => modulo_prune!(divisor, key, threshold),
         _ => Ok(false),
     }
 }
