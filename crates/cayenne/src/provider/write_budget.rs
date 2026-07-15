@@ -35,6 +35,22 @@ limitations under the License.
 //! cap deadlock-free: a write can never hold some permits while waiting for the
 //! rest, so independent writes can't form a hold-and-wait cycle.
 //!
+//! That argument only holds for writes that are **independent**. Writes into a
+//! partitioned table are not: the partition insert path demuxes one input
+//! stream into per-partition writes over bounded channels
+//! (`runtime_table_partition::insert`), so a child write parked on this budget
+//! stalls the demux, which starves the permit-holding sibling writes of input —
+//! a hold-and-wait cycle *through the channels* that left partitioned tables
+//! permanently unready (spiceai/spiceai#11818). Such COUPLED writers — tables
+//! whose writes someone else stands behind, marked at construction via
+//! `CayenneContext::new_for_partition_child` — are therefore **exempt from the
+//! budget** ([`acquire_for_write`]): an exempt write can always drain its
+//! input, so the demux always makes progress, for any partition count. The
+//! exemption is safe because coupled tables are also forced to serial writes
+//! (one encode shard — the pre-budget baseline; the budget exists to cap
+//! encode *fan-out*), so an exempt child contributes the minimum possible
+//! encode footprint. Every uncoupled write, serial included, still queues.
+//!
 //! When unset (unit tests, embedders that don't wire it up) acquisition is a
 //! no-op and writes proceed ungated, preserving the prior per-table behavior.
 
@@ -267,17 +283,51 @@ pub fn cap_global_encode_concurrency(max_permits: usize) {
 /// Acquire up to `shards` encode permits from the global budget, atomically.
 ///
 /// Returns the held permits (which release on drop, so callers scope them to
-/// the write) or `None` when no budget is installed (proceed ungated). `shards`
+/// the write) or `None` when the write proceeds ungated: no budget installed,
+/// or a coupled writer (see [`acquire_for_write`]). For gated writes, `shards`
 /// is clamped to `[1, class cap]` so the request is always satisfiable and can
 /// never block forever waiting for more permits than the budget can ever hold.
 /// `Delta` writes may use the whole budget; `Maintenance` writes are capped to
 /// [`maintenance_gate_cap`] in aggregate (see `maintenance_gate`).
+///
+/// `coupled_writer` is `CayenneContext::is_coupled_writer()` — whether this
+/// table's writes are fed by a shared demux alongside sibling writers
+/// (partition child tables).
 pub(crate) async fn acquire_encode_permits(
     shards: usize,
     class: WriteClass,
+    coupled_writer: bool,
 ) -> Option<EncodePermits> {
     let budget = GLOBAL_ENCODE_BUDGET.read().clone()?;
-    acquire_from(&budget, shards, class).await
+    acquire_for_write(&budget, shards, class, coupled_writer).await
+}
+
+/// Budget policy for a write: independent writes acquire permits
+/// ([`acquire_from`]); **coupled writers are exempt** and proceed ungated
+/// (`None`).
+///
+/// The exemption is load-bearing, not an optimization. Coupled writers — the
+/// partition child tables of a partitioned dataset — are all fed by one
+/// routing demux over bounded channels, and deadlock if any of them can park
+/// on this budget: the parked write stalls the demux, starving the
+/// permit-holding siblings of input, and no permit is ever released
+/// (spiceai/spiceai#11818). An exempt write never parks, so the demux always
+/// drains, for any partition count. The budget's purpose — capping aggregate
+/// encode *fan-out* — is preserved: coupled tables are also forced to serial
+/// (single-shard) writes at creation, the pre-budget baseline of one encode
+/// stream per writer, and compaction's aggregate concurrency stays bounded by
+/// the `BackgroundCompactor` semaphore independently of this gate. Uncoupled
+/// writes — including serial ones — queue exactly as before.
+async fn acquire_for_write(
+    budget: &EncodeBudget,
+    shards: usize,
+    class: WriteClass,
+    coupled_writer: bool,
+) -> Option<EncodePermits> {
+    if coupled_writer {
+        return None;
+    }
+    acquire_from(budget, shards, class).await
 }
 
 /// Acquire `min(shards, class cap)` permits from a specific budget. Extracted
@@ -562,6 +612,81 @@ mod tests {
     /// here — keeping this free of cross-test interference.
     #[tokio::test]
     async fn acquire_encode_permits_is_noop_when_unset() {
-        assert!(acquire_encode_permits(8, WriteClass::Delta).await.is_none());
+        assert!(
+            acquire_encode_permits(8, WriteClass::Delta, false)
+                .await
+                .is_none()
+        );
+    }
+
+    /// REGRESSION (spiceai/spiceai#11818): a coupled write must proceed
+    /// ungated even when the budget is fully held. Partitioned-table inserts
+    /// feed their per-partition writes through one bounded-channel demux, so a
+    /// child write that parks on the budget stalls the demux, starves the
+    /// permit-holding siblings of input, and deadlocks the whole insert —
+    /// datasets loaded but the table never ready.
+    #[tokio::test]
+    async fn coupled_write_is_exempt_even_at_zero_headroom() {
+        let b = budget(2);
+        let held = acquire_from(&b, 2, WriteClass::Delta).await;
+        assert!(held.is_some());
+        assert_eq!(b.semaphore.available_permits(), 0, "budget fully held");
+
+        let exempt = tokio::time::timeout(
+            Duration::from_millis(500),
+            acquire_for_write(&b, 1, WriteClass::Delta, true),
+        )
+        .await
+        .expect("a coupled write must never block on the budget");
+        assert!(exempt.is_none(), "exempt writes hold no permits");
+        assert_eq!(
+            b.semaphore.available_permits(),
+            0,
+            "the exemption consumes no budget"
+        );
+    }
+
+    /// The exemption applies to `Maintenance` too: a coupled table's
+    /// compaction output must not park on the gate — its aggregate concurrency
+    /// is bounded by the compactor's own semaphore, not this budget.
+    #[tokio::test]
+    async fn coupled_maintenance_is_exempt() {
+        let total = 16;
+        let b = budget(total);
+        let gate = maintenance_gate_cap(total);
+        let _held = acquire_from(&b, gate, WriteClass::Maintenance).await;
+        assert_eq!(b.maintenance_gate.available_permits(), 0, "gate exhausted");
+
+        let exempt = tokio::time::timeout(
+            Duration::from_millis(500),
+            acquire_for_write(&b, 1, WriteClass::Maintenance, true),
+        )
+        .await
+        .expect("a coupled maintenance write must never block on the gate");
+        assert!(exempt.is_none());
+    }
+
+    /// Uncoupled writes stay gated — the exemption is strictly for coupled
+    /// writers. A serial (1-shard) independent write still claims its permit
+    /// and queues at zero headroom, preserving the budget's aggregate
+    /// accounting for everything outside partitioned inserts.
+    #[tokio::test]
+    async fn uncoupled_writes_stay_gated() {
+        let b = budget(2);
+        let held = acquire_for_write(&b, 2, WriteClass::Delta, false).await;
+        assert!(held.is_some(), "a gated acquire succeeds under headroom");
+        assert_eq!(b.semaphore.available_permits(), 0);
+
+        let mut pending = std::pin::pin!(acquire_for_write(&b, 1, WriteClass::Delta, false));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut pending)
+                .await
+                .is_err(),
+            "an uncoupled serial write queues while the budget is held"
+        );
+        drop(held);
+        tokio::time::timeout(Duration::from_millis(500), &mut pending)
+            .await
+            .expect("the queued write proceeds once permits release");
     }
 }
