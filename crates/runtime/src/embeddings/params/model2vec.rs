@@ -21,12 +21,13 @@ const MODEL2VEC_PARAM_LEN: usize = 6;
 pub const PARAMETERS: &[ParameterSpec] = &MODEL2VEC_PARAMETERS;
 
 pub(crate) const MODEL2VEC_PARAMETERS: [ParameterSpec; MODEL2VEC_PARAM_LEN] = [
-    ParameterSpec::component("hf_token")
+    // runtime (no prefix) to match docs and preserve backward compatibility.
+    ParameterSpec::runtime("hf_token")
         .secret()
         .description("The Hugging Face access token."),
-    ParameterSpec::component("subfolder")
+    ParameterSpec::runtime("subfolder")
         .description("The subfolder within the Hugging Face repo containing the model."),
-    ParameterSpec::component("normalize")
+    ParameterSpec::runtime("normalize")
         .description("Whether to normalize the embedding output.")
         .one_of(&["true", "false"]),
     ParameterSpec::runtime("parallelism")

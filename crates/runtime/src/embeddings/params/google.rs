@@ -24,6 +24,7 @@ pub(crate) const GOOGLE_PARAMETERS: [ParameterSpec; GOOGLE_PARAM_LEN] = [
     ParameterSpec::component("api_key")
         .secret()
         .description("The Google API key."),
-    ParameterSpec::component("dimensions")
+    // runtime (no prefix) to match docs and preserve backward compatibility.
+    ParameterSpec::runtime("dimensions")
         .description("The number of dimensions for the embedding output."),
 ];
