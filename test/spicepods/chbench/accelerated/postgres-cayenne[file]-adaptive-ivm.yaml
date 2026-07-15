@@ -40,8 +40,9 @@ name: postgres-cayenne[file]-adaptive-ivm
 #     `refresh_mode: changes` needs to apply UPDATE/DELETE events. So PK / on_conflict / indexes
 #     are intentionally NOT declared below; inference fills them (it is gap-filling only and never
 #     overrides a user-set value, so declaring them would just suppress the very thing we test).
-#   - It supplies the inferred row_count/table_bytes the adaptive loop's data-aware warm-start
-#     gates on; without extended inference adaptive silently falls back to `auto` (static).
+#   - It supplies inferred row_count/table_bytes that sharpen the adaptive loop's data-aware
+#     warm-start. Adaptive is set explicitly, so it runs regardless; without inferred metadata
+#     the loop just relearns the row width from observed ingest.
 # Background compaction stays at the auto-derived (non-zero) default — the controller rides its
 # tick. The ONLY pinned knobs are the two CDC prefetch buffers (`cdc_prefetch_buffer` /
 # `cdc_max_coalesced_envelopes` = 16384, the runtime max) under `runtime.params` below: the sweep
@@ -193,7 +194,7 @@ datasets:
     acceleration: *cayenne_accel
 
   # ---- Static reference tables (no OLTP mutations, full refresh) ----
-  # Same: PK / on_conflict / indexes come from extended inference.
+  # Same: PK / on_conflict / indexes come from schema inference (always on).
 
   - from: postgres:item
     name: item

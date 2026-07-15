@@ -535,6 +535,26 @@ mod check_availability_tests {
 }
 
 #[cfg(test)]
+mod schema_inference_removed_tests {
+    use super::*;
+    use yaml;
+
+    /// `schema_inference` was removed; because `DatasetDeserializer` denies unknown
+    /// fields, a Spicepod still specifying it must fail to parse rather than be
+    /// silently ignored. Guards the breaking-change behavior.
+    #[test]
+    fn schema_inference_field_is_rejected() {
+        let yaml = r"
+            name: test
+            from: postgres:public.orders
+            schema_inference: extended
+        ";
+        yaml::from_str::<Dataset>(yaml)
+            .expect_err("`schema_inference` must be rejected as an unknown field");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use yaml;

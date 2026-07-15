@@ -130,7 +130,7 @@ datasets:
     acceleration: *cayenne_accel
 
   # ---- Static reference tables (no OLTP mutations, full refresh) ----
-  # Same: PK / on_conflict / indexes come from extended inference.
+  # Same: PK / on_conflict / indexes come from schema inference (always on).
 
   - from: postgres:item
     name: item
