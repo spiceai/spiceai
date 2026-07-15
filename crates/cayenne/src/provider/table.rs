@@ -1129,6 +1129,20 @@ pub struct CayenneTableProvider {
     /// `ArcSwap`: scan paths take `Arc::clone` instead of cloning the
     /// `HashMap`; writes use `rcu` to publish a copy-on-write update.
     protected_snapshots: Arc<ArcSwap<HashMap<String, i64>>>,
+    /// In-memory cache of `cayenne_snapshot_file` rows, keyed by `snapshot_id`,
+    /// so a manifest-mode scan of an already-cached snapshot (the current
+    /// snapshot, or a still-protected one) reads from memory instead of
+    /// round-tripping the catalog on every scan. Wait-free reads via
+    /// `ArcSwap`, copy-on-write updates via `rcu` — same pattern as
+    /// `protected_snapshots`. A miss is always safe (falls through to a fresh
+    /// catalog read, which populates the entry); staleness is the real
+    /// concern, so every manifest-row writer keeps this in sync: incremental
+    /// inserts (`Self::apply_manifest_cache_delta`, called from
+    /// `Self::upsert_current_snapshot_manifest_rows`) delta-apply, wholesale
+    /// rebuilds (`Self::upsert_snapshot_manifest_from_listing`) replace the
+    /// entry outright, and `Self::prune_snapshot_manifest_to` drops every
+    /// entry except the one being kept.
+    manifest_cache: Arc<ArcSwap<HashMap<String, Arc<Vec<SnapshotFile>>>>>,
     /// Table-scoped warning dedupe for protected snapshot ids that cannot
     /// provide a `UUIDv7` timestamp for age-triggered maintenance.
     protected_snapshot_age_warning_keys: Arc<ParkingMutex<BoundedFifoSet>>,
@@ -4166,6 +4180,57 @@ impl CayenneTableProvider {
         current_snapshot: &str,
         metas: &[ObjectMeta],
     ) -> Result<()> {
+        let rows = metas.iter().filter_map(|meta| {
+            let file_name = meta.location.filename()?;
+            Some((
+                file_name.to_string(),
+                i64::try_from(meta.size).unwrap_or(i64::MAX),
+                0_i64,
+            ))
+        });
+        self.upsert_current_snapshot_manifest_rows(current_snapshot, rows)
+            .await
+    }
+
+    /// Same as [`Self::insert_current_snapshot_manifest_rows`], but for files
+    /// reported directly by a [`Self::write_to_snapshot`] call via a
+    /// [`vortex_datafusion::WrittenFilesCollector`] — carrying a real
+    /// footer-derived `row_count` rather than the ObjectMeta-based path's
+    /// best-effort `0`, and requiring no object-store call at all (the sink
+    /// already knows size and row count from the write itself).
+    async fn insert_current_snapshot_manifest_rows_from_written_files(
+        &self,
+        current_snapshot: &str,
+        files: &[vortex_datafusion::WrittenFile],
+    ) -> Result<()> {
+        let rows = files.iter().filter_map(|file| {
+            let file_name = file.path.filename()?;
+            Some((
+                file_name.to_string(),
+                i64::try_from(file.size_bytes).unwrap_or(i64::MAX),
+                i64::try_from(file.row_count).unwrap_or(i64::MAX),
+            ))
+        });
+        self.upsert_current_snapshot_manifest_rows(current_snapshot, rows)
+            .await
+    }
+
+    /// Shared upsert loop for both incremental manifest-row sources above: an
+    /// `(file_name, file_size_bytes, row_count)` triple per newly-written file,
+    /// tagged with `min_sequence = 0` / `max_sequence = current_sequence` — the
+    /// same conservative, always-bake-eligible, never-resurrecting range
+    /// `Self::upsert_snapshot_manifest_from_listing`'s `PreserveOrUniform` mode
+    /// falls back to for an untagged current-snapshot file (see its doc
+    /// comment). `row_count`/`digest` beyond what's passed in are left as the
+    /// same best-effort hints that path already treats as optional (0 / `None`
+    /// is correct-but-imprecise, never wrong; backfilled later by the periodic
+    /// reconciliation sweep or the next scan that reads the file's footer
+    /// stats).
+    async fn upsert_current_snapshot_manifest_rows(
+        &self,
+        current_snapshot: &str,
+        rows: impl Iterator<Item = (String, i64, i64)>,
+    ) -> Result<()> {
         let table_id = self.table_metadata.table_id.clone();
         let current_sequence = self
             .catalog
@@ -4173,24 +4238,102 @@ impl CayenneTableProvider {
             .await?
             .unwrap_or(0);
 
-        for meta in metas {
-            let Some(file_name) = meta.location.filename() else {
-                continue;
+        let mut written = Vec::new();
+        for (file_path, file_size_bytes, row_count) in rows {
+            let row = SnapshotFile {
+                table_id: table_id.clone(),
+                snapshot_id: current_snapshot.to_string(),
+                file_path,
+                row_count,
+                file_size_bytes,
+                min_sequence: 0,
+                max_sequence: current_sequence,
+                digest: None,
             };
-            self.catalog
-                .upsert_snapshot_file(&SnapshotFile {
-                    table_id: table_id.clone(),
-                    snapshot_id: current_snapshot.to_string(),
-                    file_path: file_name.to_string(),
-                    row_count: 0,
-                    file_size_bytes: i64::try_from(meta.size).unwrap_or(i64::MAX),
-                    min_sequence: 0,
-                    max_sequence: current_sequence,
-                    digest: None,
-                })
-                .await?;
+            self.catalog.upsert_snapshot_file(&row).await?;
+            written.push(row);
         }
+        self.apply_manifest_cache_delta(current_snapshot, &written);
         Ok(())
+    }
+
+    /// Merge `additions` onto the cached manifest listing for `snapshot_id`,
+    /// mirroring `Self::apply_list_files_cache_additions`'s delta-apply for
+    /// the sibling `DataFusion` list-files cache. Only applied onto an
+    /// EXISTING cache entry — a cold miss is left alone (the next
+    /// `Self::cached_snapshot_files` read re-fetches the now-complete listing
+    /// straight from the catalog, which is always correct, just uncached for
+    /// that one read). A row sharing an existing entry's `file_path` replaces
+    /// it (upsert semantics, matching the catalog's `INSERT OR REPLACE`)
+    /// rather than duplicating it.
+    fn apply_manifest_cache_delta(&self, snapshot_id: &str, additions: &[SnapshotFile]) {
+        if additions.is_empty() {
+            return;
+        }
+        self.manifest_cache.rcu(|current| {
+            let Some(existing) = current.get(snapshot_id) else {
+                return Arc::clone(current);
+            };
+            let mut files = (**existing).clone();
+            files.retain(|f| !additions.iter().any(|a| a.file_path == f.file_path));
+            files.extend(additions.iter().cloned());
+            let mut new_map = (**current).clone();
+            new_map.insert(snapshot_id.to_string(), Arc::new(files));
+            Arc::new(new_map)
+        });
+    }
+
+    /// Replace the cached manifest listing for `snapshot_id` wholesale —
+    /// used after a full rebuild (`Self::upsert_snapshot_manifest_from_listing`)
+    /// rather than the incremental delta-apply above, since a rebuild's
+    /// output is already the complete, authoritative file set.
+    fn replace_manifest_cache_entry(&self, snapshot_id: &str, rows: &[SnapshotFile]) {
+        let rows = Arc::new(rows.to_vec());
+        self.manifest_cache.rcu(|current| {
+            let mut new_map = (**current).clone();
+            new_map.insert(snapshot_id.to_string(), Arc::clone(&rows));
+            Arc::new(new_map)
+        });
+    }
+
+    /// Drop every cached manifest entry except `keep_snapshot_id`'s, mirroring
+    /// `Self::prune_snapshot_manifest_to`'s catalog-side GC of stale manifest
+    /// rows for every other snapshot.
+    fn prune_manifest_cache_to(&self, keep_snapshot_id: &str) {
+        self.manifest_cache.rcu(|current| {
+            if current.len() <= 1 && current.contains_key(keep_snapshot_id) {
+                return Arc::clone(current);
+            }
+            let mut new_map = HashMap::new();
+            if let Some(rows) = current.get(keep_snapshot_id) {
+                new_map.insert(keep_snapshot_id.to_string(), Arc::clone(rows));
+            }
+            Arc::new(new_map)
+        });
+    }
+
+    /// Read `cayenne_snapshot_file` rows for `snapshot_id`, serving from
+    /// `Self::manifest_cache` when present so a manifest-mode scan of an
+    /// already-cached snapshot avoids the catalog round-trip. On a miss,
+    /// reads through to the catalog and populates the entry for next time.
+    async fn cached_snapshot_files(
+        &self,
+        snapshot_id: &str,
+    ) -> CatalogResult<Arc<Vec<SnapshotFile>>> {
+        if let Some(cached) = self.manifest_cache.load().get(snapshot_id) {
+            return Ok(Arc::clone(cached));
+        }
+        let rows = Arc::new(
+            self.catalog
+                .get_snapshot_files(&self.table_metadata.table_id, snapshot_id)
+                .await?,
+        );
+        self.manifest_cache.rcu(|current| {
+            let mut new_map = (**current).clone();
+            new_map.insert(snapshot_id.to_string(), Arc::clone(&rows));
+            Arc::new(new_map)
+        });
+        Ok(rows)
     }
 
     /// Reconcile manifest rows for a staged append recovered by
@@ -5178,6 +5321,7 @@ impl CayenneTableProvider {
                 object_store_registered_runtime_envs,
             )),
             protected_snapshots: Arc::new(ArcSwap::from_pointee(protected_snapshots)),
+            manifest_cache: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             protected_snapshot_age_warning_keys: Arc::new(ParkingMutex::new(
                 BoundedFifoSet::with_capacity(PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT),
             )),
@@ -5723,6 +5867,26 @@ impl CayenneTableProvider {
             None => self.write_shard_format(target_partitions, target_size_bytes, estimated_bytes),
         };
 
+        // This write lands directly in the live current snapshot directory
+        // (the position-based mem-tier/inlined-data checkpoint paths — every
+        // other caller targets either a `_staging/<uuid>` dir or a brand-new,
+        // not-yet-current snapshot id, neither of which can equal
+        // `get_current_snapshot_id()` at this point). For those two callers,
+        // under `scan_from_manifest`, attach a collector so the Vortex sink
+        // reports exactly which file(s) it wrote — size and row count
+        // included — letting the manifest be updated incrementally below with
+        // no directory LIST at all, instead of the full-relist
+        // `upsert_snapshot_manifest_from_listing` fallback those two callers
+        // used before this collector existed.
+        let maintain_current_snapshot_manifest =
+            self.scan_from_manifest() && snapshot_id == self.get_current_snapshot_id();
+        let written_files_collector: Option<vortex_datafusion::WrittenFilesCollector> =
+            maintain_current_snapshot_manifest.then(|| Arc::new(ParkingMutex::new(Vec::new())));
+        let write_format = match written_files_collector.clone() {
+            Some(collector) => Arc::new(write_format.with_written_files_collector(collector)),
+            None => write_format,
+        };
+
         // Create a new ListingTable pointing to the snapshot directory
         let snapshot_listing_table = Self::create_listing_table(
             &snapshot_dir_url,
@@ -5865,6 +6029,18 @@ impl CayenneTableProvider {
             .await?;
 
         collect(insert_plan, session_state.task_ctx()).await?;
+
+        // Maintain the manifest for the two position-based checkpoint
+        // callers (see the collector's attachment above) with the exact files
+        // the sink just reported — no directory LIST, no additional
+        // object-store call at all.
+        if let Some(collector) = written_files_collector {
+            let files = std::mem::take(&mut *collector.lock());
+            if !files.is_empty() {
+                self.insert_current_snapshot_manifest_rows_from_written_files(snapshot_id, &files)
+                    .await?;
+            }
+        }
 
         let total_rows = total_rows_written.load(Ordering::Relaxed);
         // Files added ≈ number of concurrent shard writers (each writes ≥1 file
@@ -6266,6 +6442,7 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_pre_publish_hook: Arc::clone(&self.test_pre_publish_hook),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
+            manifest_cache: Arc::clone(&self.manifest_cache),
             protected_snapshot_age_warning_keys: Arc::clone(
                 &self.protected_snapshot_age_warning_keys,
             ),
@@ -13261,6 +13438,7 @@ impl CayenneTableProvider {
         self.catalog
             .replace_snapshot_files(&table_id, snapshot_id, &replacement)
             .await?;
+        self.replace_manifest_cache_entry(snapshot_id, &replacement);
 
         Ok(files)
     }
@@ -13279,7 +13457,25 @@ impl CayenneTableProvider {
     ) -> CatalogResult<()> {
         self.catalog
             .clear_snapshot_files_except(&self.table_metadata.table_id, keep_snapshot_id)
-            .await
+            .await?;
+        self.prune_manifest_cache_to(keep_snapshot_id);
+        Ok(())
+    }
+
+    /// Clear every manifest row for this table, AND the in-memory manifest
+    /// cache (`Self::manifest_cache`) — the wholesale-clear counterpart to
+    /// `Self::prune_snapshot_manifest_to`'s catalog-side GC. Wraps
+    /// `MetadataCatalog::clear_snapshot_files` so a caller cannot forget the
+    /// cache half of the invariant: any code that clears manifest rows
+    /// through the raw catalog call directly (bypassing this) leaves a stale
+    /// cached listing behind for whatever snapshot was last read.
+    #[cfg(test)]
+    pub(crate) async fn clear_snapshot_manifest_for_test(&self) -> CatalogResult<()> {
+        self.catalog
+            .clear_snapshot_files(&self.table_metadata.table_id)
+            .await?;
+        self.manifest_cache.store(Arc::new(HashMap::new()));
+        Ok(())
     }
 
     /// Author one snapshot's manifest with a single uniform commit-seq range
@@ -20949,27 +21145,12 @@ impl CayenneTableProvider {
                     super::delta_encoding::WriteClass::Delta,
                 )
                 .await?;
-            // Same gap as `checkpoint_inlined_data`'s position-based branch:
-            // this writes straight into the current snapshot directory with no
-            // staging WAL, so it bypasses `insert_current_snapshot_manifest_rows`'s
-            // gate entirely. Full relist rather than an incremental insert, for
-            // the same reason (no per-file metadata returned here to build an
-            // incremental row from).
-            if self.scan_from_manifest() {
-                let current_sequence = self
-                    .catalog
-                    .get_snapshot_sequence(&self.table_metadata.table_id, &current_snapshot)
-                    .await?
-                    .unwrap_or(self.table_metadata.current_sequence_number);
-                self.upsert_snapshot_manifest_from_listing(
-                    &current_snapshot,
-                    ManifestSequenceTag::PreserveOrUniform {
-                        min: 0,
-                        max: current_sequence,
-                    },
-                )
-                .await?;
-            }
+            // This write lands straight in the current snapshot directory with
+            // no staging WAL, so it bypasses `insert_current_snapshot_manifest_rows`'s
+            // gate entirely — but `write_to_snapshot` itself maintains the
+            // manifest incrementally for exactly this case (see its
+            // `written_files_collector`), so no separate full-relist call is
+            // needed here.
             // Clear under the publish locks (inner to the held fence), uniform
             // with phase 2. Position-based tables never engage `append_to_mem_tier`
             // (`is_cdc_memory_mode()` is false for them — always a single shard),
@@ -22142,28 +22323,10 @@ impl CayenneTableProvider {
                 // This writes straight into the current snapshot directory
                 // (no staging WAL, no `move_staged_files_to_snapshot`), so it
                 // bypasses `insert_current_snapshot_manifest_rows`'s own gate
-                // entirely — a fourth instance of the same gap found and
-                // fixed elsewhere in this hardening work. A full relist (like
-                // `rebuild_live_snapshot_manifests` uses for the append path)
-                // rather than an incremental insert: this checkpoint's
-                // `write_to_snapshot` call doesn't return per-file metadata to
-                // build an incremental row from, and checkpoints are
-                // infrequent enough that the relist cost is not a concern.
-                if self.scan_from_manifest() {
-                    let current_sequence = self
-                        .catalog
-                        .get_snapshot_sequence(&self.table_metadata.table_id, &current_snapshot)
-                        .await?
-                        .unwrap_or(self.table_metadata.current_sequence_number);
-                    self.upsert_snapshot_manifest_from_listing(
-                        &current_snapshot,
-                        ManifestSequenceTag::PreserveOrUniform {
-                            min: 0,
-                            max: current_sequence,
-                        },
-                    )
-                    .await?;
-                }
+                // entirely — but `write_to_snapshot` itself maintains the
+                // manifest incrementally for exactly this case (see its
+                // `written_files_collector`), so no separate full-relist call
+                // is needed here.
                 stats
             } else {
                 // Lever B2: the checkpoint flush's new snapshot sequence comes
@@ -23678,11 +23841,7 @@ impl CayenneTableProvider {
             return None;
         }
 
-        let manifest = match self
-            .catalog
-            .get_snapshot_files(&self.table_metadata.table_id, request.snapshot_id)
-            .await
-        {
+        let manifest = match self.cached_snapshot_files(request.snapshot_id).await {
             Ok(rows) => rows,
             Err(error) => {
                 tracing::debug!(
@@ -23715,7 +23874,7 @@ impl CayenneTableProvider {
         // uses for the list-files-cache delta-apply).
         let prefix = request.table_url.prefix();
         let files = manifest
-            .into_iter()
+            .iter()
             // Mirror the listing's `size > 0` filter so empty placeholder files
             // (if any) are excluded identically.
             .filter(|file| file.file_size_bytes > 0)
@@ -33508,8 +33667,7 @@ mod tests {
         // must NOT fall back to a directory listing that would silently
         // resurrect a file set the manifest no longer vouches for.
         provider
-            .catalog
-            .clear_snapshot_files(&provider.table_metadata.table_id)
+            .clear_snapshot_manifest_for_test()
             .await
             .expect("manifest cleared");
         let cleared = provider
@@ -33636,8 +33794,7 @@ mod tests {
             "the two on-disk-file inserts must produce a multi-file snapshot to backfill"
         );
         provider
-            .catalog
-            .clear_snapshot_files(&table_id)
+            .clear_snapshot_manifest_for_test()
             .await
             .expect("clear manifest to simulate a pre-population snapshot");
         assert!(
@@ -34765,8 +34922,7 @@ mod tests {
         let table_id = provider.table_metadata.table_id.clone();
         let empty_id = ids[2].clone();
         provider
-            .catalog
-            .clear_snapshot_files(&table_id)
+            .clear_snapshot_manifest_for_test()
             .await
             .expect("clear all manifests");
         let seqs = [10_i64, 20, 30, 40, 50, 60];

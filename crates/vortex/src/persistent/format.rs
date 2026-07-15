@@ -252,6 +252,7 @@ pub struct VortexFormat {
     access_plan_provider: Option<Arc<dyn VortexAccessPlanProvider>>,
     segment_cache: Option<Arc<SharedSegmentCache>>,
     write_shard: Option<WriteShardConfig>,
+    written_files: Option<crate::persistent::sink::WrittenFilesCollector>,
 }
 
 impl Debug for VortexFormat {
@@ -407,6 +408,7 @@ impl VortexFormat {
             access_plan_provider: None,
             segment_cache,
             write_shard: None,
+            written_files: None,
         }
     }
 
@@ -429,6 +431,7 @@ impl VortexFormat {
             access_plan_provider: Some(access_plan_provider),
             segment_cache: self.segment_cache.clone(),
             write_shard: self.write_shard.clone(),
+            written_files: self.written_files.clone(),
         }
     }
 
@@ -444,6 +447,28 @@ impl VortexFormat {
             access_plan_provider: self.access_plan_provider.clone(),
             segment_cache: self.segment_cache.clone(),
             write_shard: Some(config),
+            written_files: self.written_files.clone(),
+        }
+    }
+
+    /// Returns a format whose Vortex sink reports every file it writes (path,
+    /// size, row count) into `collector`, populated once the write completes.
+    /// Used by write-only formats built for a single statement so the caller
+    /// can maintain external file-level metadata (e.g. an incremental
+    /// manifest) without listing the output directory afterward. Scans never
+    /// consult this — it only affects `create_writer_physical_plan`.
+    #[must_use]
+    pub fn with_written_files_collector(
+        &self,
+        collector: crate::persistent::sink::WrittenFilesCollector,
+    ) -> Self {
+        Self {
+            session: self.session.clone(),
+            opts: self.opts.clone(),
+            access_plan_provider: self.access_plan_provider.clone(),
+            segment_cache: self.segment_cache.clone(),
+            write_shard: self.write_shard.clone(),
+            written_files: Some(collector),
         }
     }
 
@@ -466,6 +491,7 @@ impl VortexFormat {
             access_plan_provider: self.access_plan_provider.clone(),
             segment_cache,
             write_shard: self.write_shard.clone(),
+            written_files: self.written_files.clone(),
         }
     }
 
@@ -915,6 +941,7 @@ impl FileFormat for VortexFormat {
             self.session.clone(),
             target_file_size,
             shard_spec,
+            self.written_files.clone(),
         ));
 
         Ok(Arc::new(DataSinkExec::new(input, sink, order_requirements)) as _)

@@ -159,12 +159,34 @@ struct ActiveFileWriter {
     task: JoinHandle<DFResult<WriteSummary>>,
 }
 
+/// One file produced by a [`VortexSink`] write, reported back through an
+/// optional [`WrittenFilesCollector`] so a caller that maintains its own
+/// file-level metadata (e.g. an incremental manifest) can learn exactly what
+/// was written — size and row count included — without listing the output
+/// directory afterward. Only populated on the non-partitioned write path (see
+/// [`DataSink::write_all`]); Hive-partitioned writes never populate it.
+#[derive(Debug, Clone)]
+pub struct WrittenFile {
+    /// The object-store path this file was written to.
+    pub path: Path,
+    /// The file's total size in bytes.
+    pub size_bytes: u64,
+    /// The file's total row count.
+    pub row_count: u64,
+}
+
+/// Shared sink for a single write's [`WrittenFile`]s. Populated exactly once,
+/// after all shard writers finish, so a plain (non-async) mutex is
+/// sufficient — never held across an `.await`.
+pub type WrittenFilesCollector = Arc<parking_lot::Mutex<Vec<WrittenFile>>>;
+
 pub struct VortexSink {
     config: FileSinkConfig,
     schema: SchemaRef,
     session: VortexSession,
     target_file_size: Option<u64>,
     shard_spec: ShardSpec,
+    written_files: Option<WrittenFilesCollector>,
 }
 
 impl VortexSink {
@@ -174,6 +196,7 @@ impl VortexSink {
         session: VortexSession,
         target_file_size: Option<u64>,
         shard_spec: ShardSpec,
+        written_files: Option<WrittenFilesCollector>,
     ) -> Self {
         Self {
             config,
@@ -181,6 +204,7 @@ impl VortexSink {
             session,
             target_file_size,
             shard_spec,
+            written_files,
         }
     }
 
@@ -343,6 +367,7 @@ impl DataSink for VortexSink {
         .await?;
 
         let mut row_count = 0_u64;
+        let mut newly_written = self.written_files.is_some().then(Vec::new);
         for (path, summary) in summaries {
             row_count = row_count.checked_add(summary.row_count()).ok_or_else(|| {
                 exec_datafusion_err!(
@@ -352,6 +377,16 @@ impl DataSink for VortexSink {
                 )
             })?;
             tracing::debug!(path = %path, "Successfully written file");
+            if let Some(newly_written) = newly_written.as_mut() {
+                newly_written.push(WrittenFile {
+                    path,
+                    size_bytes: summary.size(),
+                    row_count: summary.row_count(),
+                });
+            }
+        }
+        if let (Some(collector), Some(newly_written)) = (&self.written_files, newly_written) {
+            collector.lock().extend(newly_written);
         }
 
         Ok(row_count)
