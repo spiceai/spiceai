@@ -663,7 +663,7 @@ fn evaluate_bucket_inequality(
 
 /// Evaluates inequality for modulo partitions using statistics-based pruning.
 ///
-/// DataFusion uses truncation-toward-zero remainder (Rust `%` semantics), so the
+/// `DataFusion` uses truncation-toward-zero remainder (Rust `%` semantics), so the
 /// sign of the partition key determines which half of the number line that partition
 /// occupies — the partition key is the remainder value stored for that partition:
 ///
