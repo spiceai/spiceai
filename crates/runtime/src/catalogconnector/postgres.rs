@@ -41,15 +41,18 @@ fn parse_unsupported_type_action(
 ) -> Result<UnsupportedTypeAction, String> {
     match dataset_params.get("unsupported_type_action") {
         None => Ok(UnsupportedTypeAction::String),
-        Some(value) => match value.trim().to_lowercase().as_str() {
-            "string" => Ok(UnsupportedTypeAction::String),
-            "error" => Ok(UnsupportedTypeAction::Error),
-            "warn" => Ok(UnsupportedTypeAction::Warn),
-            "ignore" => Ok(UnsupportedTypeAction::Ignore),
-            other => Err(format!(
-                "Invalid value '{other}' for `unsupported_type_action`. Expected one of: error, warn, ignore, string."
-            )),
-        },
+        Some(value) => {
+            let trimmed = value.trim();
+            match trimmed.to_ascii_lowercase().as_str() {
+                "string" => Ok(UnsupportedTypeAction::String),
+                "error" => Ok(UnsupportedTypeAction::Error),
+                "warn" => Ok(UnsupportedTypeAction::Warn),
+                "ignore" => Ok(UnsupportedTypeAction::Ignore),
+                _ => Err(format!(
+                    "Invalid value '{trimmed}' for `unsupported_type_action`. Expected one of: error, warn, ignore, string."
+                )),
+            }
+        }
     }
 }
 
