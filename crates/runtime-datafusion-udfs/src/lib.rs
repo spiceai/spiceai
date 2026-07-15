@@ -17,6 +17,7 @@ limitations under the License.
 #[cfg(feature = "models")]
 pub mod ai;
 pub mod alias;
+pub mod assert;
 pub mod bucket;
 pub mod cosine_distance;
 pub mod digest_many;

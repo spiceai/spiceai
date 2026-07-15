@@ -73,6 +73,7 @@ pub(crate) mod snapshots;
 mod synchronized_table;
 mod timestamp_metrics_utils;
 pub mod write;
+mod write_back_worker;
 
 pub(crate) use write::WriteMode;
 
@@ -1110,6 +1111,22 @@ impl Builder {
             WriteMode::WriteThrough
         };
 
+        // Durable federated write-back (#11838): a WriteBack Cayenne table whose
+        // commit path marks dirty keys gets a per-table delivery worker that
+        // reconciles those keys to the federated source. Aborted on drop with
+        // the other handlers.
+        if matches!(write_mode, WriteMode::WriteBack)
+            && let Some(write::CayenneWriteTarget::Staged(cayenne)) =
+                write::dual_write::extract_cayenne_write_target(&self.accelerator)
+            && cayenne.is_durable_write_back()
+        {
+            handlers.push(write_back_worker::WriteBackWorker::spawn(
+                *cayenne,
+                Arc::clone(&self.federated),
+                self.dataset_name.to_string(),
+            ));
+        }
+
         Ok(AcceleratedTable {
             dataset_name: self.dataset_name,
             accelerator: self.accelerator,
@@ -1225,6 +1242,34 @@ impl AcceleratedTable {
     #[must_use]
     pub fn is_dual_write(&self) -> bool {
         self.write_mode.is_dual_write()
+    }
+
+    /// Whether writes are directed to the local accelerator only (the
+    /// `on_conflict` / read-only-source case). Conditional-commit transactions
+    /// require this: their staging + atomic publish live in the accelerator
+    /// write path, which the write-through/write-back/dual-write modes bypass.
+    #[must_use]
+    pub(crate) fn is_accelerator_only(&self) -> bool {
+        matches!(self.write_mode, WriteMode::AcceleratorOnly)
+    }
+
+    /// Durable federated write-back (#11838): `WriteMode::WriteBack` backed by a
+    /// Cayenne Staged accelerator whose commit path marks dirty keys. Writes
+    /// commit to the accelerator (staged/gated) and a per-table worker reconciles
+    /// them to the source, so — like accelerator-only — a gated transaction may
+    /// safely stage against it.
+    #[must_use]
+    pub(crate) fn is_durable_write_back(&self) -> bool {
+        matches!(self.write_mode, WriteMode::WriteBack)
+            && crate::accelerated_table::write::dual_write::extract_cayenne_write_target(
+                &self.accelerator,
+            )
+            .is_some_and(|target| match target {
+                crate::accelerated_table::write::CayenneWriteTarget::Staged(provider) => {
+                    provider.is_durable_write_back()
+                }
+                crate::accelerated_table::write::CayenneWriteTarget::Partitioned(_) => false,
+            })
     }
 
     #[must_use]

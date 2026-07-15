@@ -349,6 +349,13 @@ impl RuntimeBuilder {
         let target_partitions = query.target_partitions;
         let max_concurrent_queries = query.max_concurrent_queries;
 
+        // The effective timeout is resolved per request by
+        // `RequestContextBuilder::build` from the app's `runtime.query.timeout`;
+        // validate here so a misconfigured value is warned about once at startup
+        if let Err(e) = query.timeout() {
+            tracing::warn!("{e} No query timeout will be applied.");
+        }
+
         let metrics = spicepod_rt.metrics.clone();
 
         let dataset_parallelism = spicepod_rt.dataset_load_parallelism;
@@ -786,6 +793,14 @@ impl RuntimeBuilder {
             )),
             telemetry_config: self.telemetry_config,
         };
+
+        // Executors: register cluster status before any concurrent
+        // `load_components` / `start_servers` race so readiness cannot pass on
+        // dataset-only status while task slots are still closed (#11758 Fix B).
+        if is_cluster_executor {
+            rt.status
+                .update_cluster("executor", status::ComponentStatus::Initializing);
+        }
 
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();
         for factory in self.extensions {

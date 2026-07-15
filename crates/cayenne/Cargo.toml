@@ -40,6 +40,7 @@ object_store = { workspace = true }
 parking_lot = { workspace = true }
 roaring = { workspace = true }
 runtime-datafusion = { path = "../runtime-datafusion" }
+runtime-request-context = { path = "../runtime-request-context" }
 runtime-table-partition = { path = "../runtime-table-partition", optional = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
@@ -112,7 +113,8 @@ datafusion-functions = { workspace = true }
 insta = { workspace = true, features = ["json"] }
 paste.workspace = true
 rstest = "0.26.1"
-# Only for the `pk_key_hashing` bench, to evaluate FxHash for native integer PK keys.
+# For the `pk_key_hashing` bench (FxHash for native integer PK keys) and the
+# `hll_ndv_hashing` bench (FxHash vs XXH3 for NDV sketch value hashing).
 rustc-hash = "2.1.2"
 tempfile = { workspace = true }
 test-framework = { path = "../test-framework" }
@@ -357,6 +359,10 @@ name = "int64_pk_filter_keep_mask_alloc"
 
 [[bench]]
 harness = false
+name = "key_based_filter_scratch_reuse_alloc"
+
+[[bench]]
+harness = false
 name = "position_delete_redundant_walks"
 
 [[bench]]
@@ -449,6 +455,10 @@ name = "compaction_io_hygiene"
 [[bench]]
 harness = false
 name = "pk_key_hashing"
+
+[[bench]]
+harness = false
+name = "hll_ndv_hashing"
 
 [[bench]]
 harness = false

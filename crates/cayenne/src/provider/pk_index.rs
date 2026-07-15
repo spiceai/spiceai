@@ -131,6 +131,13 @@ impl PkDigestSet {
 struct PkKeysetEntry {
     row: OwnedRow,
     location: RowLocation,
+    /// Sequence of the last commit that wrote this key's live row (0 = unknown,
+    /// treated as "older than any transaction"). Used by transaction per-key OCC:
+    /// a read-footprint / write-set key whose stored `sequence` exceeds the
+    /// transaction's begin high-water was modified after the transaction began →
+    /// conflict. Stamped by `record_sequence` on every committed write and by the
+    /// keyset rebuild's end-of-scan high-water.
+    sequence: i64,
 }
 
 // Approximate per-entry `HashMap` control/allocation overhead used for the
@@ -243,7 +250,11 @@ impl CachedPkKeyset {
                 self.approx_bytes = self
                     .approx_bytes
                     .saturating_add(approx_pk_keyset_entry_bytes(&key));
-                entry.insert(PkKeysetEntry { row: key, location });
+                entry.insert(PkKeysetEntry {
+                    row: key,
+                    location,
+                    sequence: 0,
+                });
             }
         }
     }
@@ -280,6 +291,7 @@ impl CachedPkKeyset {
                 entry.insert(PkKeysetEntry {
                     row: key.clone(),
                     location,
+                    sequence: 0,
                 });
                 PkKeysetInsertOutcome::Inserted
             }
@@ -296,7 +308,11 @@ impl CachedPkKeyset {
             self.approx_bytes = self
                 .approx_bytes
                 .saturating_add(approx_pk_keyset_entry_bytes(&key));
-            entry.insert(PkKeysetEntry { row: key, location });
+            entry.insert(PkKeysetEntry {
+                row: key,
+                location,
+                sequence: 0,
+            });
         }
     }
 
@@ -305,6 +321,32 @@ impl CachedPkKeyset {
     #[inline]
     pub(crate) fn location_by_digest(&self, digest: u128) -> Option<&RowLocation> {
         self.keys.get(&digest).map(|entry| &entry.location)
+    }
+
+    /// The stored commit sequence for a key with this precomputed digest, or
+    /// `None` if the key is absent. Drives per-key transaction OCC re-check.
+    #[inline]
+    pub(crate) fn sequence_by_digest(&self, digest: u128) -> Option<i64> {
+        self.keys.get(&digest).map(|entry| entry.sequence)
+    }
+
+    /// Stamp a present key's last-commit sequence (monotonic max). Called after a
+    /// committed write records the key. No-op if the key is absent (over budget /
+    /// bloomed) — those tables fall back to per-table OCC.
+    pub(crate) fn record_sequence(&mut self, digest: u128, sequence: i64) {
+        if let Some(entry) = self.keys.get_mut(&digest) {
+            entry.sequence = entry.sequence.max(sequence);
+        }
+    }
+
+    /// Raise every entry's sequence to at least `sequence` — the end-of-scan
+    /// high-water after a full keyset rebuild, so any key that might have been
+    /// modified concurrently during the rebuild is conservatively treated as
+    /// changed (over-abort, never a missed conflict).
+    pub(crate) fn stamp_all_sequences_min(&mut self, sequence: i64) {
+        for entry in self.keys.values_mut() {
+            entry.sequence = entry.sequence.max(sequence);
+        }
     }
 
     /// Mutable access to a key's [`RowLocation`] (position-capture upgrade).
@@ -524,8 +566,9 @@ impl PkBloom {
 /// Upper bound on ONE cold file's persisted PK bloom. A file whose right-sized
 /// bloom (~10 bits/key) would exceed this is stored with no bloom (`None`), so
 /// the keyset rebuild falls back to the exact cold scan for the whole table
-/// rather than bloating the manifest/snapshot. ~16 MiB covers ~13M keys/file.
-pub(crate) const COLD_PK_BLOOM_PER_FILE_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// rather than bloating the manifest/snapshot. ~32 MiB covers ~26M keys/file;
+/// promotion additionally row-caps output files so they stay under this budget.
+pub(crate) const COLD_PK_BLOOM_PER_FILE_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 /// Table-global cold-tier PK existence view: one [`PkBloom`] per live cold file
 /// (from the `cayenne_cold_tier_file` manifest), probed at CDC-upsert

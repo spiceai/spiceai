@@ -16,6 +16,7 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use snafu::prelude::*;
 use std::{
@@ -28,6 +29,7 @@ use tokio::sync::Mutex;
 
 mod docx;
 mod pdf;
+mod pdfium;
 mod pptx;
 mod xlsx;
 pub use docx::DocxParser;
@@ -42,6 +44,15 @@ pub enum Error {
         format: DocumentType,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display(
+        "Failed to parse PDF document: the PDFium library could not be loaded ({reason}). \
+        Docker images ship PDFium next to the runtime; for a standalone install, ensure the \
+        host can reach GitHub so it can be downloaded automatically, or set the PDFIUM_LIB_PATH \
+        environment variable to a directory containing the PDFium shared library. \
+        See: https://spiceai.org/docs/features/document-processing"
+    ))]
+    PdfiumUnavailable { reason: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -86,8 +97,9 @@ pub trait DocumentParserFactory: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
+#[async_trait]
 pub trait DocumentParser: Send + Sync {
-    fn parse(&self, raw: &Bytes) -> Result<Arc<dyn Document>>;
+    async fn parse(&self, raw: &Bytes) -> Result<Arc<dyn Document>>;
 }
 
 pub trait Document {

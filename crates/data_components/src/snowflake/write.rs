@@ -569,6 +569,7 @@ struct SnowflakeDeletionSink {
 impl DeletionSink for SnowflakeDeletionSink {
     async fn delete_from(
         &self,
+        _context: Arc<TaskContext>,
     ) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let _write_guard = self.write_lock.lock().await;
         let table_name = self.table_reference.to_quoted_string();

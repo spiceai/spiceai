@@ -19,6 +19,7 @@ limitations under the License.
 //! Creates 12 tables (9 TPC-C + 3 CH supplemental), loads seed data,
 /// and runs a TPC-C OLTP workload with configurable terminals.
 pub mod config;
+pub mod csv_gen;
 pub mod loader;
 pub mod loader_mysql;
 pub mod metrics;
@@ -91,15 +92,26 @@ pub enum Error {
          restore a matching template or drop --skip-prepare to re-seed"
     ))]
     SourceScaleMismatch { found: u64, expected: u64 },
+
+    #[snafu(display("Failed to {action}: {source}"))]
+    Io {
+        action: String,
+        source: std::io::Error,
+    },
+
+    #[snafu(display(
+        "Internal error: no column list registered for table {table} in csv_gen::TABLE_COLUMNS"
+    ))]
+    UnknownTable { table: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Await a batch of spawned loader tasks (from either the Postgres or `MySQL`
-/// seed/clone phases), propagating the first task error — or a panic as
+/// seed load workers), propagating the first task error — or a panic as
 /// [`Error::TaskJoin`]. On failure, the tasks not yet finished are aborted so a
 /// failed load does not leave workers mutating the database detached. `what`
-/// names the phase for the panic message (e.g. "seed warehouse").
+/// names the phase for the panic message (e.g. "COPY load").
 ///
 /// Tasks are polled concurrently via `select_all`, so a failure in *any* task is
 /// noticed as soon as it completes — the abort is not delayed behind an earlier
@@ -121,8 +133,17 @@ pub(crate) async fn join_loader_tasks(
                 message: format!("{what} loader task panicked: {e}"),
             },
         };
-        for handle in rest {
+        for handle in &rest {
             handle.abort();
+        }
+        // Wait for the aborted tasks to actually finish (not just request
+        // cancellation) before returning. The caller may drop a resource the
+        // workers were using right after this returns (e.g. the seed loaders'
+        // tempdir, deleted as soon as `load_all` returns its error) — without
+        // this, an aborted-but-still-running worker could race against that
+        // cleanup and produce a confusing secondary error alongside the real one.
+        for handle in rest {
+            let _ = handle.await;
         }
         return Err(err);
     }
@@ -271,15 +292,9 @@ impl ChBenchDriver for PostgresChBenchDriver {
         schema::drop_tables(&self.client).await?;
         schema::create_tables(&self.client).await?;
         let conn_str = self.source.connection_string();
-        loader::load_all(
-            &self.client,
-            &conn_str,
-            self.config.warehouses,
-            self.config.seed,
-        )
-        .await?;
+        loader::load_all(&conn_str, self.config.warehouses, self.config.seed).await?;
         // Build secondary indexes and attach the _bench_ts triggers *after* the
-        // bulk load so neither is maintained per-row during the seed/clone.
+        // bulk load so neither is maintained per-row during the seed load.
         schema::create_indexes(&self.client).await?;
         schema::create_triggers(&self.client).await?;
 
@@ -629,7 +644,7 @@ impl ChBenchDriver for MysqlChBenchDriver {
         // used for the DDL before and after.
         loader_mysql::load_all(&self.opts, self.config.warehouses, self.config.seed).await?;
         // Build secondary indexes and attach the _bench_ts triggers *after* the
-        // bulk load so neither is maintained per-row during the seed/clone.
+        // bulk load so neither is maintained per-row during the seed load.
         schema_mysql::create_indexes(&mut conn).await?;
         schema_mysql::create_triggers(&mut conn).await?;
 

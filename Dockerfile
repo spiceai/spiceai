@@ -38,7 +38,8 @@ RUN \
     else \
       cargo build --profile ${RUST_PROFILE} --features ${CARGO_FEATURES:-default}; \
     fi && \
-    cp /build/target/${RUST_PROFILE}/spiced /root/spiced
+    cp /build/target/${RUST_PROFILE}/spiced /root/spiced && \
+    cp "$(find /build/target -name libpdfium.so -print -quit)" /root/libpdfium.so
 
 FROM debian:trixie-slim as sandbox-setup
 
@@ -71,6 +72,11 @@ RUN mkdir -p /spice_sandbox/bin && \
 # Copy the binary
 COPY --from=build /root/spiced /spice_sandbox/usr/local/bin/
 
+# Copy PDFium (used for PDF document parsing). liteparse dlopen's it at runtime,
+# so it is not linked into spiced and is not reported by ldd; ship it next to the
+# binary where the loader's "next to the executable" search path finds it.
+COPY --from=build /root/libpdfium.so /spice_sandbox/usr/local/bin/
+
 # Copy CA certificates
 RUN cp -r /etc/ssl/certs /spice_sandbox/etc/ssl/certs
 
@@ -79,6 +85,10 @@ RUN cp -r /usr/share/zoneinfo /spice_sandbox/usr/share/zoneinfo
 
 # Copy every dependent library reported by ldd
 RUN ldd /spice_sandbox/usr/local/bin/spiced | grep -o '/[^ ]*' | xargs -I '{}' sh -c 'mkdir -p /spice_sandbox/$(dirname "{}") && cp "{}" "/spice_sandbox{}"'
+
+# Copy PDFium's own shared-library dependencies (they are a subset of spiced's,
+# but sweep explicitly since ldd on spiced does not see the dlopen'd PDFium)
+RUN ldd /spice_sandbox/usr/local/bin/libpdfium.so | grep -o '/[^ ]*' | xargs -I '{}' sh -c 'mkdir -p /spice_sandbox/$(dirname "{}") && cp "{}" "/spice_sandbox{}"'
 
 # Copy additional required libraries
 RUN find /lib /usr/lib -name 'libpthread.so.0' -exec sh -c 'mkdir -p /spice_sandbox/$(dirname "{}") && cp "{}" "/spice_sandbox{}"' \;

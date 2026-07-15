@@ -61,11 +61,16 @@ on:
         required: false
         default: false
         type: boolean
-      cayenne_eager_ndv:
-        description: 'Fold NDV eagerly on ingest (sets SPICE_CAYENNE_EAGER_NDV); default (false) = lazy, compute NDV on file spill'
+      skip_analytic_gate:
+        description: 'Skip the analytical-query correctness gate (re-runs every CH-benCH query against source + Spice and diffs results) to save time on experiments; the row-count gate still runs. Scheduled runs always leave this false.'
         required: false
         default: false
         type: boolean
+      spiced_env:
+        description: 'Extra environment variables for the spiced process under test, one SPICE_KEY=VALUE or SPICED_KEY=VALUE per line (e.g. SPICE_CAYENNE_EAGER_NDV=true). A handful of reserved SPICE*/SPICED* names owned by this workflow or testoperator (SPICED_COMMIT, SPICED_BIN, SPICED_ENV_INPUT, SPICED_KEEP_ALIVE) are rejected. Applied only to the benchmark run, never to template seeding, so it never invalidates the cached CH-benCH template. Do not put secrets here: values are echoed into the job summary.'
+        required: false
+        default: ''
+        type: string
 
 # Serialize ALL SF100 + SF1000 CH-benCHmark runs across every variant (sqlite/turso cdc-tuned,
 # adaptive, duckdb): they share ONE concurrency group keyed only by scale factor, so
@@ -140,7 +145,28 @@ jobs:
       # run is identifiable and reproducible even if it crashes mid-run. Results
       # are appended after the run below.
       - name: Write run summary header
+        env:
+          # Piped through env (never interpolated with ${{ }} into the script body) so an
+          # input containing shell metacharacters (e.g. `$(...)`) is inert data, not code the
+          # shell re-parses. See the "Export extra spiced env vars" step below for the same
+          # rule applied to the actual export.
+          SPICED_ENV_INPUT: ${{ github.event.inputs.spiced_env }}
         run: |
+          # Flatten to one line and escape Markdown table-breaking characters (`|`, backtick,
+          # CR) so a multi-entry or adversarial value can't corrupt the summary table.
+          extra_spiced_env="none"
+          if [ -n "$SPICED_ENV_INPUT" ]; then
+            # awk 'NF' drops blank/whitespace-only lines before joining, so input that's
+            # only blank lines (e.g. a stray trailing newline) collapses to "none" below
+            # instead of a meaningless "; ; " row. (awk never fails on zero matches, unlike
+            # grep, so this stays safe under the runner's `set -eo pipefail`.)
+            extra_spiced_env=$(printf '%s' "$SPICED_ENV_INPUT" \
+              | tr -d '\r' \
+              | awk 'NF' \
+              | tr '\n' ';' | sed 's/;$//; s/;/; /g' \
+              | sed 's/`/\&#96;/g; s/|/\\|/g')
+            [ -z "$extra_spiced_env" ] && extra_spiced_env="none"
+          fi
           {
             echo "## CH-BenCHmark run"
             echo ""
@@ -157,6 +183,8 @@ jobs:
             echo "| analytical concurrency | ${{ github.event.inputs.concurrency }} |"
             echo "| query overrides | ${{ github.event.inputs.query_overrides || 'none' }} |"
             echo "| runner | ${{ github.event.inputs.runner_type }} |"
+            echo "| analytic gate | ${{ github.event.inputs.skip_analytic_gate == 'true' && 'skipped' || 'enabled' }} |"
+            echo "| extra spiced env | ${extra_spiced_env} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build Testoperator
@@ -193,6 +221,58 @@ jobs:
           CHBENCH_PG_PORT: '5432'
           CHBENCH_PG_USER: bench
           CHBENCH_PG_PASS: bench
+
+      # Deliberately placed after template restore/seed above: these vars must never be
+      # visible to the `--prepare-only` seed run, or an experiment could silently change
+      # what gets frozen into the cached template. $GITHUB_ENV persists for every later
+      # step in this job (not just "Run CH-benCHmark"), so seeding is protected but
+      # subsequent diagnostics/cleanup steps also see these vars.
+      - name: Export extra spiced env vars
+        if: github.event.inputs.spiced_env != ''
+        env:
+          # Piped through env, not interpolated into the script via ${{ }} — the input is
+          # untrusted (free text from workflow_dispatch), and embedding it directly into the
+          # `run:` body would let shell metacharacters (e.g. `$(...)`) execute as the script
+          # is parsed, not just as inert data.
+          SPICED_ENV_INPUT: ${{ github.event.inputs.spiced_env }}
+        run: |
+          # Allowlist SPICE_* / SPICED_* (underscore required, so e.g. SPICEAI_* or bare
+          # SPICE/SPICED don't slip through) — covers both naming conventions used across
+          # the codebase, e.g. SPICE_CAYENNE_EAGER_NDV, SPICED_METRICS_ADDR — so a
+          # dispatcher can never overwrite reserved runner/Actions variables (GITHUB_*,
+          # RUNNER_*, ACTIONS_*, PATH, HOME, ...) or otherwise alter the runner
+          # environment outside spiced's own config.
+          #
+          # A few SPICE_*/SPICED_* names ARE reserved even though they match that prefix:
+          # they're owned by this workflow (provenance, internal plumbing) rather than
+          # being spiced runtime config, so letting a dispatcher spoof them would corrupt
+          # results/metrics attribution or the export mechanism itself.
+          # SPICED_KEEP_ALIVE is a testoperator debug knob that blocks waiting on stdin
+          # (see tools/testoperator/src/commands/htap/mod.rs) — letting a dispatcher set
+          # it would hang the CI run indefinitely rather than just tweak spiced config.
+          reserved_names="SPICED_COMMIT SPICED_BIN SPICED_ENV_INPUT SPICED_KEEP_ALIVE"
+          while IFS= read -r line; do
+            line="${line%$'\r'}"
+            # Skip blank/whitespace-only lines (consistent with the summary-header
+            # step's `awk 'NF'`), so copy/paste padding doesn't fail the run.
+            [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+            key="${line%%=*}"
+            reserved=0
+            for r in $reserved_names; do
+              [ "$key" = "$r" ] && reserved=1 && break
+            done
+            if [[ "$line" != *"="* ]] || [[ ! "$key" =~ ^SPICED?_[A-Za-z0-9_]+$ ]] || [ "$reserved" = "1" ]; then
+              # Workflow-command values must have %, CR, LF escaped (%25/%0D/%0A) or an
+              # untrusted line containing them could corrupt the log or smuggle in
+              # additional workflow commands.
+              escaped="${line//%/%25}"
+              escaped="${escaped//$'\r'/%0D}"
+              escaped="${escaped//$'\n'/%0A}"
+              echo "::error::Invalid spiced_env entry (must be SPICE_KEY=VALUE or SPICED_KEY=VALUE, and KEY must not be a reserved name): ${escaped}"
+              exit 1
+            fi
+            printf '%s\n' "$line" >> "$GITHUB_ENV"
+          done <<< "$SPICED_ENV_INPUT"
 
       - name: Run CH-benCHmark - ${{ github.event.inputs.spicepod_path }}
         run: |
@@ -241,6 +321,7 @@ jobs:
             ${{ github.event.inputs.query_overrides != '' && format('--query-overrides {0}', github.event.inputs.query_overrides) || '' }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             ${{ steps.set_spicepod_path.outputs.SOURCE_TYPE != 'mysql' && github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && '--skip-prepare' || '' }} \
+            ${{ github.event.inputs.skip_analytic_gate == 'true' && '--skip-analytic-gate' || '' }} \
             --disable-progress-bars \
             --metrics \
             --metrics-dump "${GITHUB_WORKSPACE}/htap-metrics.json" \
@@ -269,10 +350,6 @@ jobs:
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-          # Eager vs lazy Cayenne NDV (default lazy). Inherited by the spiced
-          # process testoperator spawns; spiced logs the resolved mode once. Used
-          # to A/B the lazy-NDV change in the benchmark.
-          SPICE_CAYENNE_EAGER_NDV: ${{ github.event.inputs.cayenne_eager_ndv }}
 
       # Upload the under-load diagnostics dir
       - name: Upload HTAP diagnostics
