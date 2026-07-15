@@ -1190,7 +1190,7 @@ async fn test_modulo_partition_inequality_snapshot() -> Result<(), Box<dyn std::
     explain_plan = lines.join("\n") + "\n";
     insta::assert_snapshot!("modulo_greater_than", explain_plan);
 
-    // Test 3: Less than (value < 5) - only partitions 0-4 can have values < 5
+    // Test 3: Less than (value < 5) - partitions 5-9 pruned (all their values ≥ 5 under T-toward-zero remainder)
     let df = ctx.sql("SELECT * FROM test_table WHERE value < 5").await?;
     let physical_plan = df.create_physical_plan().await?;
     let mut explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
@@ -1200,6 +1200,217 @@ async fn test_modulo_partition_inequality_snapshot() -> Result<(), Box<dyn std::
     lines[1..].sort_unstable();
     explain_plan = lines.join("\n") + "\n";
     insta::assert_snapshot!("modulo_less_than", explain_plan);
+
+    Ok(())
+}
+
+/// Tests every decision boundary for modulo inequality partition pruning.
+///
+/// For each case we insert a single row `value = partition_key` (so the partition key equals
+/// the inserted value, given `|partition_key| < 10`), run the query, and assert the row count.
+/// A count of 0 when expected > 0 means the pruner incorrectly dropped a partition (data loss).
+///
+/// Key invariants under truncation-toward-zero remainder semantics:
+///   key > 0 → partition ⊆ [key, +∞) → prune for `< threshold` when threshold ≤ key
+///   key < 0 → partition ⊆ (−∞, key] → prune for `> threshold` when threshold ≥ key
+///   key = 0 → contains multiples of divisor in both directions → never prune
+#[tokio::test]
+async fn test_modulo_pruning_boundary_cases() -> Result<(), Box<dyn std::error::Error>> {
+    struct Case {
+        partition_key: i32,
+        op: &'static str,
+        threshold: i32,
+        expected_rows: i64,
+    }
+    let cases = [
+        // ── key > 0: partition ⊆ [key, +∞) ────────────────────────────────────────
+        // Lt: prune when threshold ≤ key (every value in the partition is ≥ key, so ≥ threshold)
+        Case {
+            partition_key: 5,
+            op: "<",
+            threshold: 4,
+            expected_rows: 0,
+        }, // threshold < key → prune
+        Case {
+            partition_key: 5,
+            op: "<",
+            threshold: 5,
+            expected_rows: 0,
+        }, // threshold = key → prune  ← boundary
+        Case {
+            partition_key: 5,
+            op: "<",
+            threshold: 6,
+            expected_rows: 1,
+        }, // threshold > key → keep, row matches
+        // LtEq: prune when threshold < key
+        Case {
+            partition_key: 5,
+            op: "<=",
+            threshold: 4,
+            expected_rows: 0,
+        }, // threshold < key → prune
+        Case {
+            partition_key: 5,
+            op: "<=",
+            threshold: 5,
+            expected_rows: 1,
+        }, // threshold = key → keep  ← boundary
+        Case {
+            partition_key: 5,
+            op: "<=",
+            threshold: 6,
+            expected_rows: 1,
+        }, // threshold > key → keep, row matches
+        // Gt/GtEq: never prune — only assert cases where the row matches, since
+        // pushed-down filters are used for partition selection only, not row re-filtering
+        Case {
+            partition_key: 5,
+            op: ">",
+            threshold: 4,
+            expected_rows: 1,
+        }, // row matches
+        Case {
+            partition_key: 5,
+            op: ">=",
+            threshold: 4,
+            expected_rows: 1,
+        },
+        Case {
+            partition_key: 5,
+            op: ">=",
+            threshold: 5,
+            expected_rows: 1,
+        }, // row matches ← boundary
+        // ── key < 0: partition ⊆ (−∞, key] ────────────────────────────────────────
+        // Gt: prune when threshold ≥ key (every value in the partition is ≤ key, so ≤ threshold)
+        Case {
+            partition_key: -5,
+            op: ">",
+            threshold: -6,
+            expected_rows: 1,
+        }, // threshold < key → keep, row matches
+        Case {
+            partition_key: -5,
+            op: ">",
+            threshold: -5,
+            expected_rows: 0,
+        }, // threshold = key → prune  ← boundary
+        Case {
+            partition_key: -5,
+            op: ">",
+            threshold: -4,
+            expected_rows: 0,
+        }, // threshold > key → prune
+        // GtEq: prune when threshold > key
+        Case {
+            partition_key: -5,
+            op: ">=",
+            threshold: -6,
+            expected_rows: 1,
+        }, // threshold < key → keep, row matches
+        Case {
+            partition_key: -5,
+            op: ">=",
+            threshold: -5,
+            expected_rows: 1,
+        }, // threshold = key → keep  ← boundary
+        Case {
+            partition_key: -5,
+            op: ">=",
+            threshold: -4,
+            expected_rows: 0,
+        }, // threshold > key → prune
+        // Lt/LtEq: never prune — only assert cases where the row matches
+        Case {
+            partition_key: -5,
+            op: "<",
+            threshold: -4,
+            expected_rows: 1,
+        }, // row matches
+        Case {
+            partition_key: -5,
+            op: "<=",
+            threshold: -4,
+            expected_rows: 1,
+        },
+        Case {
+            partition_key: -5,
+            op: "<=",
+            threshold: -5,
+            expected_rows: 1,
+        }, // row matches ← boundary
+        // ── key = 0: multiples of divisor span both directions, never prune ────────
+        // key = 0: never prune — only assert cases where the row matches
+        Case {
+            partition_key: 0,
+            op: "<",
+            threshold: 1,
+            expected_rows: 1,
+        }, // 0 < 1
+        Case {
+            partition_key: 0,
+            op: "<=",
+            threshold: 0,
+            expected_rows: 1,
+        }, // 0 <= 0
+        Case {
+            partition_key: 0,
+            op: ">",
+            threshold: -1,
+            expected_rows: 1,
+        }, // 0 > -1
+        Case {
+            partition_key: 0,
+            op: ">=",
+            threshold: 0,
+            expected_rows: 1,
+        }, // 0 >= 0
+    ];
+
+    for case in &cases {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let creator = Arc::new(TestPartitionCreator::new(Arc::clone(&schema)));
+        let table_provider = PartitionTableProvider::new(
+            Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+            vec![PartitionedBy {
+                name: "value_mod_10".to_string(),
+                expression: col("value") % lit(10),
+            }],
+            Arc::clone(&schema),
+        )
+        .await?;
+
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(table_provider))?;
+        ctx.read_batch(RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![case.partition_key]))],
+        )?)?
+        .write_table("t", DataFrameWriteOptions::new())
+        .await?;
+
+        // Use SELECT value (not COUNT(*)) to force a real scan — COUNT(*) can be
+        // answered from row-count statistics, bypassing the WHERE filter entirely.
+        let sql = format!(
+            "SELECT value FROM t WHERE value {} {}",
+            case.op, case.threshold
+        );
+        let batches = ctx.sql(&sql).await?.collect().await?;
+
+        #[expect(clippy::cast_possible_wrap)]
+        let row_count: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
+
+        assert_eq!(
+            row_count, case.expected_rows,
+            "partition_key={} op={} threshold={}: expected {} row(s) got {}",
+            case.partition_key, case.op, case.threshold, case.expected_rows, row_count
+        );
+    }
 
     Ok(())
 }
