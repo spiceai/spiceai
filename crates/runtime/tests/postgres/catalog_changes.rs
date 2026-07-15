@@ -26,7 +26,11 @@ limitations under the License.
 //! Every included table must have a primary key -- catalog setup fails
 //! naming the table if one is missing. Every synthesized dataset shares one
 //! replication slot, so a multi-table catalog opens exactly one replication
-//! connection rather than one per table.
+//! connection rather than one per table. A table matched by `exclude` is
+//! never synthesized at all -- absent from the catalog's namespace, not
+//! merely unaccelerated. `check_cdc_prerequisites` fails catalog setup fast,
+//! naming the problem, before any table is touched, when the source can't
+//! do CDC at all (e.g. `wal_level` isn't `logical`).
 //!
 //! This is the first genuinely workable, end-to-end slice: it proves
 //! bootstrap through the catalog path works. It deliberately does not yet
@@ -36,6 +40,7 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use app::AppBuilder;
+use data_components::postgres::provider::check_cdc_prerequisites;
 use datafusion::assert_batches_eq;
 use runtime::Runtime;
 use secrecy::ExposeSecret;
@@ -105,6 +110,16 @@ fn accelerated_pg_catalog(port: usize) -> Catalog {
         engine: CatalogAccelerationEngine::Cayenne,
         refresh_mode: CatalogRefreshMode::Changes,
     });
+    catalog
+}
+
+/// Same as [`accelerated_pg_catalog`], but excluding `items` -- validates
+/// what the catalog's startup summary counts as "excluded by include/exclude
+/// filters": the table is never synthesized into a dataset at all, so it's
+/// simply absent from the catalog's namespace (not merely unaccelerated).
+fn accelerated_pg_catalog_excluding_items(port: usize) -> Catalog {
+    let mut catalog = accelerated_pg_catalog(port);
+    catalog.exclude = vec!["public.items".to_string()];
     catalog
 }
 
@@ -206,6 +221,70 @@ async fn test_catalog_acceleration_bootstraps_tables_with_primary_key() -> Resul
             assert_eq!(
                 slot_count, 1,
                 "both tables should share one replication slot, found {slot_count}"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// A table excluded by the catalog's `exclude` patterns is never
+/// synthesized into a dataset -- it's simply absent from the catalog's
+/// namespace, not merely left unaccelerated. This is what the startup
+/// summary's "excluded by include/exclude filters" count reflects.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_catalog_acceleration_respects_exclude_filter() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info,runtime::catalogconnector=debug"));
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+
+            seed_tables(port).await?;
+
+            let rt = start_runtime(accelerated_pg_catalog_excluding_items(port)).await?;
+
+            wait_for_table_ready(&rt, "orders").await?;
+
+            let items_result = run_query(
+                &rt,
+                &format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.items"),
+            )
+            .await;
+            anyhow::ensure!(
+                items_result.is_err(),
+                "excluded table {CATALOG_NAME}.public.items should not be queryable, \
+                but the query succeeded"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// `check_cdc_prerequisites` fails fast, naming the specific problem, when
+/// `wal_level` isn't `logical` -- catalog acceleration should never get as
+/// far as discovering tables against a source that can't do CDC at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_check_cdc_prerequisites_rejects_non_logical_wal_level() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            // Deliberately the plain container (default wal_level, not
+            // `logical`) rather than `..._with_logical_wal`.
+            let _container = common::start_postgres_docker_container(port).await?;
+
+            let pool = common::get_postgres_connection_pool(port, None).await?;
+
+            let result = check_cdc_prerequisites(&pool).await;
+            let err = result.expect_err("expected wal_level check to fail");
+            let message = err.to_string();
+            anyhow::ensure!(
+                message.contains("wal_level"),
+                "expected error naming wal_level, got: {message}"
             );
 
             Ok(())

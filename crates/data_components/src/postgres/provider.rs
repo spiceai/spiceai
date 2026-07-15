@@ -50,6 +50,18 @@ pub enum Error {
         "PostgreSQL query failed: {source}. Check SQL syntax and that referenced tables exist. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
     ))]
     QueryFailed { source: tokio_postgres::Error },
+
+    #[snafu(display(
+        "Cannot start CDC catalog acceleration: PostgreSQL `wal_level` is '{wal_level}', but 'logical' is required. \
+        Run `ALTER SYSTEM SET wal_level = 'logical';` and restart PostgreSQL. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
+    ))]
+    WalLevelNotLogical { wal_level: String },
+
+    #[snafu(display(
+        "Cannot start CDC catalog acceleration: PostgreSQL role '{role}' is not permitted to start replication. \
+        Grant it with `ALTER ROLE {role} REPLICATION;`, or connect as a superuser. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
+    ))]
+    MissingReplicationPrivilege { role: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -523,6 +535,42 @@ pub async fn primary_key_columns(
 
     let columns: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
     Ok(columns)
+}
+
+/// Validate the `PostgreSQL` prerequisites CDC catalog acceleration needs
+/// before discovering or accelerating any tables, returning a specific,
+/// actionable error naming the exact fix: `wal_level = logical`, and the
+/// connecting role can start replication (either `REPLICATION` directly, or
+/// transitively via superuser).
+///
+/// Deliberately just a clear pass/fail at the connection level -- not a
+/// per-table CDC-readiness report (e.g. `REPLICA IDENTITY`), which is out
+/// of scope for now.
+pub async fn check_cdc_prerequisites(pool: &PostgresConnectionPool) -> Result<()> {
+    let conn = pool.connect_direct().await.context(ConnectionFailedSnafu)?;
+
+    let wal_level: String = conn
+        .conn
+        .query_one("SHOW wal_level", &[])
+        .await
+        .context(QueryFailedSnafu)?
+        .get(0);
+    ensure!(wal_level == "logical", WalLevelNotLogicalSnafu { wal_level });
+
+    let row = conn
+        .conn
+        .query_one(
+            "SELECT current_user::text, (rolreplication OR rolsuper) \
+             FROM pg_roles WHERE rolname = current_user",
+            &[],
+        )
+        .await
+        .context(QueryFailedSnafu)?;
+    let role: String = row.get(0);
+    let can_replicate: bool = row.get(1);
+    ensure!(can_replicate, MissingReplicationPrivilegeSnafu { role });
+
+    Ok(())
 }
 
 /// Build the fully-qualified name of a foreign-key target table

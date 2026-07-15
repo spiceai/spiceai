@@ -34,6 +34,11 @@ limitations under the License.
 //! naming the table, if one is missing. Use `include`/`exclude` to keep
 //! tables without a primary key out of an accelerated catalog's scope.
 //!
+//! Before touching any table, `refresh()` validates the `PostgreSQL`
+//! prerequisites CDC needs (`wal_level = logical`, replication privilege)
+//! and fails fast with a specific, actionable error if either is missing —
+//! a clear pass/fail, not a full per-table CDC-readiness report.
+//!
 //! There is deliberately no federated stand-in for an accelerated table
 //! while its dataset is still bootstrapping — `AcceleratedSchemaProvider`
 //! reports it as not-yet-present rather than serving reads through the
@@ -45,7 +50,9 @@ use std::sync::{Arc, RwLock};
 use app::App;
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
-use data_components::postgres::provider::{list_schemas, list_tables, primary_key_columns};
+use data_components::postgres::provider::{
+    check_cdc_prerequisites, list_schemas, list_tables, primary_key_columns,
+};
 use data_components::postgres_replication::config::default_slot_name;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::datasource::TableProvider;
@@ -176,15 +183,19 @@ impl AcceleratedCatalogProvider {
         Ok(dataset_name)
     }
 
+    /// Returns the schema provider along with the number of discovered
+    /// tables that `include`/`exclude` excluded from it, for the catalog's
+    /// startup summary.
     async fn build_schema_provider(
         &self,
         schema_name: &str,
-    ) -> Result<AcceleratedSchemaProvider, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(AcceleratedSchemaProvider, usize), Box<dyn std::error::Error + Send + Sync>> {
         let table_names = list_tables(&self.pool, schema_name)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
         let mut tables = HashMap::new();
+        let mut excluded = 0usize;
         for table_name in table_names {
             if !table_is_selected(
                 schema_name,
@@ -192,6 +203,7 @@ impl AcceleratedCatalogProvider {
                 self.include.as_deref(),
                 self.exclude.as_deref(),
             ) {
+                excluded += 1;
                 continue;
             }
 
@@ -216,25 +228,38 @@ impl AcceleratedCatalogProvider {
             tables.insert(table_name, dataset_name);
         }
 
-        Ok(AcceleratedSchemaProvider {
-            runtime: Arc::clone(&self.runtime),
-            tables: RwLock::new(tables),
-        })
+        Ok((
+            AcceleratedSchemaProvider {
+                runtime: Arc::clone(&self.runtime),
+                tables: RwLock::new(tables),
+            },
+            excluded,
+        ))
     }
 }
 
 #[async_trait]
 impl RefreshableCatalogProvider for AcceleratedCatalogProvider {
     async fn refresh(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Fail fast with a clear, actionable error before touching any
+        // tables, rather than only surfacing a wal_level/permission problem
+        // later when the first table's CDC pump tries (and fails) to open
+        // a replication connection.
+        check_cdc_prerequisites(&self.pool)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
         let schema_names = list_schemas(&self.pool)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
         let mut schemas = HashMap::new();
-        let mut total_tables = 0usize;
+        let mut included_tables = 0usize;
+        let mut excluded_tables = 0usize;
         for schema_name in &schema_names {
-            let schema_provider = self.build_schema_provider(schema_name).await?;
-            total_tables += schema_provider.table_names().len();
+            let (schema_provider, excluded) = self.build_schema_provider(schema_name).await?;
+            included_tables += schema_provider.table_names().len();
+            excluded_tables += excluded;
             schemas.insert(schema_name.clone(), Arc::new(schema_provider));
         }
 
@@ -247,10 +272,11 @@ impl RefreshableCatalogProvider for AcceleratedCatalogProvider {
         }
 
         tracing::info!(
-            "Catalog '{}': accelerating {total_tables} table{} via CDC (shared replication slot '{}').",
+            "Catalog '{}': accelerating {included_tables} table{} via CDC (shared replication slot '{}'); {excluded_tables} table{} excluded by include/exclude filters.",
             self.catalog_name,
-            if total_tables == 1 { "" } else { "s" },
+            if included_tables == 1 { "" } else { "s" },
             self.slot_name,
+            if excluded_tables == 1 { "" } else { "s" },
         );
 
         Ok(())
