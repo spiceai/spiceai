@@ -1584,13 +1584,17 @@ mod tests {
             [(0, false), (5, false), (6, false)]
         );
 
+        // Filter: a < -5
+        // Partition 0: contains multiples of 10 (…,-10, 0, 10,…) — unbounded, cannot prune
+        // Partition 5: contains {5, 15, 25,…} — all ≥ 5 > -5, so can prune
+        // Partition 9: contains {9, 19, 29,…} — all ≥ 9 > -5, so can prune
         let negative_filters = &[col("a").lt(lit(-5))];
         assert_prune_partition!(
             negative_filters,
             &partition_by,
             schema,
             Int32,
-            [(0, false), (5, false), (9, false)]
+            [(0, false), (5, true), (9, true)]
         );
         Ok(())
     }
