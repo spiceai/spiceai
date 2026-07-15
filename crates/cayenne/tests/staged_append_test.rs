@@ -552,6 +552,7 @@ test_with_backends!(test_prepared_lifecycle_matches_commit_impl);
 test_with_backends!(test_manifest_publish_preplaces_then_atomically_exposes_files_impl);
 test_with_backends!(test_manifest_publish_rollback_removes_preplaced_files_impl);
 test_with_backends!(test_manifest_publish_recovers_durable_intent_impl);
+test_with_backends!(test_manifest_publish_reclaims_old_unowned_file_impl);
 test_with_backends!(test_prepared_apply_under_barrier_waits_for_write_lock_impl);
 test_with_backends!(test_held_barrier_current_snapshot_requires_write_lock_impl);
 
@@ -732,6 +733,61 @@ async fn test_manifest_publish_recovers_durable_intent_impl(
     assert!(!abandoned_wal.exists());
     assert_eq!(
         query_all(&ctx, "manifest_recovery").await,
+        vec![(1, "Alice".to_string())]
+    );
+    Ok(())
+}
+
+async fn test_manifest_publish_reclaims_old_unowned_file_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let vortex_config = cayenne::metadata::VortexConfig {
+        scan_from_manifest: true,
+        stage_b_publish_mode: cayenne::StageBPublishMode::Manifest,
+        inline_max_rows: 0,
+        compaction_background_interval_ms: 0,
+        ..Default::default()
+    };
+    let (table, ctx) =
+        setup_table_with_vortex_config(&fixture, "manifest_orphan_sweep", vortex_config).await;
+    let meta = table.metadata();
+    let snapshot_dir = PathBuf::from(&meta.path)
+        .join(&meta.table_id)
+        .join(&meta.current_snapshot_id);
+    std::fs::create_dir_all(&snapshot_dir)?;
+    let orphan_path = snapshot_dir.join("abandoned-stage-a.vortex");
+    let orphan = std::fs::File::create(&orphan_path)?;
+    orphan.set_times(
+        std::fs::FileTimes::new()
+            .set_accessed(std::time::UNIX_EPOCH)
+            .set_modified(std::time::UNIX_EPOCH),
+    )?;
+    drop(orphan);
+
+    ctx.sql("INSERT INTO manifest_orphan_sweep VALUES (1, 'Alice')")
+        .await?
+        .collect()
+        .await?;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut interval = tokio::time::interval(Duration::from_millis(10));
+        while orphan_path.exists() {
+            interval.tick().await;
+        }
+    })
+    .await
+    .expect("post-write orphan sweep should reclaim the old unowned file");
+    let manifest = table
+        .catalog()
+        .get_snapshot_files(&meta.table_id, &meta.current_snapshot_id)
+        .await?;
+    assert!(
+        manifest
+            .iter()
+            .all(|file| file.file_path != "abandoned-stage-a.vortex")
+    );
+    assert_eq!(
+        query_all(&ctx, "manifest_orphan_sweep").await,
         vec![(1, "Alice".to_string())]
     );
     Ok(())

@@ -3062,6 +3062,139 @@ impl CayenneTableProvider {
     ///   ~1 dir/s of 32 MiB checkpoints holds ≤ ~120 dirs / a few GiB
     ///   transiently, and the sweep retries failed deletes each pass.
     const RETIRED_SNAPSHOT_DIR_GRACE: std::time::Duration = std::time::Duration::from_mins(2);
+    /// Minimum age before an unreferenced file in a live snapshot can be
+    /// reclaimed as abandoned pre-placement output.
+    const PREPLACED_ORPHAN_MIN_AGE: std::time::Duration = std::time::Duration::from_mins(5);
+    /// Bound one pass so cleanup never monopolizes the write lane.
+    const PREPLACED_ORPHAN_MAX_PER_PASS: usize = 64;
+
+    /// Reclaim old files that were pre-placed in a live snapshot but never
+    /// reached durable WAL or manifest publication. The write lock excludes an
+    /// active Stage A whose file names are not known until the sink completes;
+    /// incomplete-WAL recovery runs first and either publishes or retains every
+    /// durably owned generation. The remaining age-qualified, non-manifest files
+    /// are therefore abandoned output.
+    async fn sweep_preplaced_orphan_files(&self) {
+        if !self.preplace_staged_files() {
+            return;
+        }
+        let Ok(_write_guard) = self.write_lock_arc().try_lock_owned() else {
+            return;
+        };
+        if let Err(error) = self.ensure_no_incomplete_write().await {
+            tracing::warn!(
+                table = self.table_name(),
+                %error,
+                "Pre-placed orphan sweep skipped: staging-WAL recovery did not complete"
+            );
+            return;
+        }
+        if let Err(error) = self.sweep_preplaced_orphan_files_once().await {
+            tracing::warn!(
+                table = self.table_name(),
+                %error,
+                "Pre-placed orphan sweep failed (will retry)"
+            );
+        }
+    }
+
+    async fn sweep_preplaced_orphan_files_once(&self) -> Result<usize> {
+        let current = self.get_current_snapshot_id();
+        let protected = self.protected_snapshots.load();
+        let mut live_snapshot_ids = protected.keys().cloned().collect::<HashSet<_>>();
+        live_snapshot_ids.insert(current);
+        let all_rows = self
+            .catalog
+            .get_all_snapshot_files(&self.table_metadata.table_id)
+            .await?;
+        let referenced = Self::live_referenced_relative_paths(&all_rows, &live_snapshot_ids);
+        let mut removed = 0_usize;
+
+        for snapshot_id in live_snapshot_ids {
+            if removed >= Self::PREPLACED_ORPHAN_MAX_PER_PASS {
+                break;
+            }
+            if self.table_path().starts_with("s3://") {
+                let Some(prefix) = self.snapshot_object_store_prefix(&snapshot_id)? else {
+                    continue;
+                };
+                let config = self.require_object_store()?;
+                let mut objects = config.store.list(Some(&prefix));
+                while let Some(meta) = objects.next().await {
+                    let meta = meta.map_err(|source| Error::ObjectStore {
+                        operation: "list live snapshot for pre-placed orphan cleanup",
+                        table: self.table_name().to_string(),
+                        source,
+                    })?;
+                    let Some(file_name) = meta.location.filename() else {
+                        continue;
+                    };
+                    let relative = Self::manifest_file_relative_path(&snapshot_id, file_name);
+                    let old_enough = chrono::Utc::now()
+                        .signed_duration_since(meta.last_modified)
+                        .to_std()
+                        .is_ok_and(|age| age >= Self::PREPLACED_ORPHAN_MIN_AGE);
+                    if Self::is_compactable_data_file(file_name)
+                        && !referenced.contains(&relative)
+                        && old_enough
+                    {
+                        config
+                            .store
+                            .delete(&meta.location)
+                            .await
+                            .map_err(|source| Error::ObjectStore {
+                                operation: "delete abandoned pre-placed snapshot file",
+                                table: self.table_name().to_string(),
+                                source,
+                            })?;
+                        removed += 1;
+                        if removed >= Self::PREPLACED_ORPHAN_MAX_PER_PASS {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                let dir = Self::snapshot_dir_path(self.table_path(), self.table_id(), &snapshot_id);
+                let mut entries = match tokio::fs::read_dir(&dir).await {
+                    Ok(entries) => entries,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                while let Some(entry) = entries.next_entry().await? {
+                    let file_name = entry.file_name().to_string_lossy().into_owned();
+                    let relative = Self::manifest_file_relative_path(&snapshot_id, &file_name);
+                    let old_enough = entry
+                        .metadata()
+                        .await?
+                        .modified()
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age >= Self::PREPLACED_ORPHAN_MIN_AGE);
+                    if Self::is_compactable_data_file(&file_name)
+                        && !referenced.contains(&relative)
+                        && old_enough
+                    {
+                        match tokio::fs::remove_file(entry.path()).await {
+                            Ok(()) => removed += 1,
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(error) => return Err(error.into()),
+                        }
+                        if removed >= Self::PREPLACED_ORPHAN_MAX_PER_PASS {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if removed > 0 {
+            tracing::info!(
+                table = self.table_name(),
+                removed,
+                "Reclaimed abandoned pre-placed snapshot file(s)"
+            );
+        }
+        Ok(removed)
+    }
 
     /// Record that the catalog no longer references these snapshot dirs (their
     /// contents were merged into a successor snapshot). Physical deletion
@@ -5535,6 +5668,7 @@ impl CayenneTableProvider {
         // listing. For a `scan_from_manifest` table, failing to even determine
         // the manifest's state is not swallowed — the table fails to open.
         provider.backfill_snapshot_manifest_if_empty().await?;
+        provider.sweep_preplaced_orphan_files().await;
 
         if let Err(error) = provider
             .rebuild_maintained_aggregates_from_visible_state()
@@ -12866,6 +13000,7 @@ impl CayenneTableProvider {
 
         if state.refresh_listing || had_stats || retention_deleted > 0 {
             self.schedule_post_write_compaction();
+            self.sweep_preplaced_orphan_files().await;
         }
 
         // b1★ (cycle-4): persist any durable tombstone flips that the staged-batch
@@ -13780,6 +13915,13 @@ impl CayenneTableProvider {
     /// manifest is not yet the scan's file source, so an incomplete manifest
     /// cannot make a scan miss a live file or read one outside its snapshot.
     async fn rebuild_live_snapshot_manifests(&self) {
+        // In pre-placement mode the manifest is the visibility boundary. A
+        // directory-derived rebuild would turn an abandoned, never-committed
+        // Stage-A file into visible data. Exact write/compaction transactions
+        // maintain this mode's manifest; physical listing is cleanup input only.
+        if self.preplace_staged_files() {
+            return;
+        }
         // Snapshot the live set as one coherent read (current + protected). The
         // held `compaction_lock` keeps a compaction from repointing it mid-pass.
         let current_snapshot = self.get_current_snapshot_id();
@@ -13871,6 +14013,14 @@ impl CayenneTableProvider {
     /// Returns an error only when `scan_from_manifest` is enabled and the
     /// existing-manifest read fails; otherwise always `Ok(())` (best-effort).
     async fn backfill_snapshot_manifest_if_empty(&self) -> CatalogResult<()> {
+        // An empty manifest is authoritative in pre-placement mode. Rebuilding
+        // it from physical files could publish output from a process that died
+        // before making its WAL durable. Enabling this mode on an existing
+        // table therefore requires manifest hardening/backfill before the mode
+        // is persisted; open-time listing must never guess intent.
+        if self.preplace_staged_files() {
+            return Ok(());
+        }
         match self
             .catalog
             .get_all_snapshot_files(&self.table_metadata.table_id)
