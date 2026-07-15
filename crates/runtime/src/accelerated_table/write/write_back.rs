@@ -266,9 +266,11 @@ impl DeletionSink for WriteBackDeletionSink {
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         // Execute under the LIVE execution context so a delete inside a Cayenne
         // transaction STAGES rather than publishing immediately (see request_in_transaction).
-        let batches =
-            datafusion::physical_plan::collect(Arc::clone(&self.accelerator_plan), Arc::clone(&context))
-                .await?;
+        let batches = datafusion::physical_plan::collect(
+            Arc::clone(&self.accelerator_plan),
+            Arc::clone(&context),
+        )
+        .await?;
         let count = extract_dml_count(&batches);
 
         // Inside a transaction, the delivery worker reconciles the change to the source.
@@ -656,7 +658,10 @@ mod tests {
             session_state,
         };
 
-        let count = sink.delete_from(session_state.task_ctx()).await.expect("deletion should succeed");
+        let count = sink
+            .delete_from(session_state.task_ctx())
+            .await
+            .expect("deletion should succeed");
         assert_eq!(count, 42);
     }
 
@@ -673,7 +678,10 @@ mod tests {
             session_state,
         };
 
-        let err = sink.delete_from(session_state.task_ctx()).await.expect_err("deletion should fail");
+        let err = sink
+            .delete_from(session_state.task_ctx())
+            .await
+            .expect_err("deletion should fail");
         assert!(err.to_string().contains("accelerator delete failed"));
     }
 
@@ -693,7 +701,10 @@ mod tests {
             session_state,
         };
 
-        let count = sink.delete_from(session_state.task_ctx()).await.expect("update should succeed");
+        let count = sink
+            .delete_from(session_state.task_ctx())
+            .await
+            .expect("update should succeed");
         assert_eq!(count, 7);
     }
 
@@ -711,7 +722,10 @@ mod tests {
             session_state,
         };
 
-        let err = sink.delete_from(session_state.task_ctx()).await.expect_err("update should fail");
+        let err = sink
+            .delete_from(session_state.task_ctx())
+            .await
+            .expect_err("update should fail");
         assert!(err.to_string().contains("accelerator update failed"));
     }
 }

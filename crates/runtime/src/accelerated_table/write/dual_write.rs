@@ -814,7 +814,10 @@ mod tests {
             session_state: SessionContext::new().state(),
         };
 
-        let count = sink.delete_from(Arc::new(TaskContext::default())).await.expect("deletion should succeed");
+        let count = sink
+            .delete_from(Arc::new(TaskContext::default()))
+            .await
+            .expect("deletion should succeed");
         assert_eq!(count, 5);
     }
 
@@ -826,7 +829,10 @@ mod tests {
             session_state: SessionContext::new().state(),
         };
 
-        let err = sink.delete_from(Arc::new(TaskContext::default())).await.expect_err("deletion should fail");
+        let err = sink
+            .delete_from(Arc::new(TaskContext::default()))
+            .await
+            .expect_err("deletion should fail");
         assert!(err.to_string().contains("federated delete failed"));
     }
 
@@ -838,7 +844,10 @@ mod tests {
             session_state: SessionContext::new().state(),
         };
 
-        let err = sink.delete_from(Arc::new(TaskContext::default())).await.expect_err("deletion should fail");
+        let err = sink
+            .delete_from(Arc::new(TaskContext::default()))
+            .await
+            .expect_err("deletion should fail");
         assert!(err.to_string().contains("accelerator delete failed"));
     }
 
@@ -852,7 +861,10 @@ mod tests {
             session_state: SessionContext::new().state(),
         };
 
-        let count = sink.delete_from(Arc::new(TaskContext::default())).await.expect("update should succeed");
+        let count = sink
+            .delete_from(Arc::new(TaskContext::default()))
+            .await
+            .expect("update should succeed");
         assert_eq!(count, 3);
     }
 
@@ -864,7 +876,10 @@ mod tests {
             session_state: SessionContext::new().state(),
         };
 
-        let err = sink.delete_from(Arc::new(TaskContext::default())).await.expect_err("update should fail");
+        let err = sink
+            .delete_from(Arc::new(TaskContext::default()))
+            .await
+            .expect_err("update should fail");
         assert!(err.to_string().contains("federated update failed"));
     }
 
@@ -876,7 +891,10 @@ mod tests {
             session_state: SessionContext::new().state(),
         };
 
-        let err = sink.delete_from(Arc::new(TaskContext::default())).await.expect_err("update should fail");
+        let err = sink
+            .delete_from(Arc::new(TaskContext::default()))
+            .await
+            .expect_err("update should fail");
         assert!(err.to_string().contains("accelerator update failed"));
     }
 }

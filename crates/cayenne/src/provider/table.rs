@@ -25257,12 +25257,16 @@ impl TableProvider for CayenneTableProvider {
             // would otherwise have every partition but 0 silently dropped by the
             // sink, staging zero rows (a lost update). Point-lookup file scans are
             // already single-partition, so this is a no-op there.
-            let source_plan: Arc<dyn ExecutionPlan> =
-                if source_plan.properties().output_partitioning().partition_count() > 1 {
-                    Arc::new(CoalescePartitionsExec::new(source_plan))
-                } else {
-                    source_plan
-                };
+            let source_plan: Arc<dyn ExecutionPlan> = if source_plan
+                .properties()
+                .output_partitioning()
+                .partition_count()
+                > 1
+            {
+                Arc::new(CoalescePartitionsExec::new(source_plan))
+            } else {
+                source_plan
+            };
             return self.insert_into(state, source_plan, InsertOp::Append).await;
         }
 
