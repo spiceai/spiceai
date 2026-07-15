@@ -104,8 +104,11 @@ impl EnvSecretStore {
 ///
 /// # Safety
 ///
-/// `std::env::set_var` is called during store construction (single-threaded init)
-/// before any other threads are spawned.
+/// `std::env::set_var` is unsafe in the 2024 edition because mutating the
+/// environment while another thread reads it is undefined behavior. The store
+/// is constructed during runtime startup, before request-serving workloads
+/// run, which keeps the writes confined to initialization; do not call this
+/// from steady-state code paths.
 fn load_iter<I>(iter: I, label: &str)
 where
     I: Iterator<Item = Result<(String, String), dotenv::Error>>,
@@ -187,6 +190,13 @@ impl SecretStore for EnvSecretStore {
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+    use std::sync::{Mutex, PoisonError};
+
+    /// Serializes the tests that mutate the process environment: under plain
+    /// `cargo test` all tests share one process, and concurrent `set_var` /
+    /// env reads are undefined behavior in the 2024 edition. (`cargo nextest`
+    /// runs each test in its own process and needs no serialization.)
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     /// Values containing `$` characters must be preserved literally.
     ///
@@ -243,6 +253,7 @@ TEST_PATCH_MULTIPLE_DOLLARS=$$double$$dollars$$
     /// parse error and discarded all subsequent lines.
     #[test]
     fn test_malformed_line_does_not_block_valid_entries() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(PoisonError::into_inner);
         let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
         let env_file = temp_dir.path().join(".env.malformed");
 
@@ -281,6 +292,7 @@ MALFORMED_VALID_SECOND=second_value
     /// (loaded first) takes priority over `.env`.
     #[test]
     fn test_load_iter_preserves_existing_vars() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(PoisonError::into_inner);
         let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
         let env_file = temp_dir.path().join(".env.preserve");
 

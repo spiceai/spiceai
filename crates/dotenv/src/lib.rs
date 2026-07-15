@@ -137,7 +137,12 @@ pub unsafe fn from_filename<P: AsRef<Path>>(filename: P) -> Result<PathBuf> {
 /// Searches for `filename` in the current directory and its ancestors,
 /// returning the resolved path and an iterator over the file's entries.
 fn find(filename: &Path) -> Result<(PathBuf, Iter)> {
-    let mut dir = env::current_dir().map_err(Error::Io)?;
+    find_from(env::current_dir().map_err(Error::Io)?, filename)
+}
+
+/// Searches for `filename` in `start_dir` and its ancestors.
+fn find_from(start_dir: PathBuf, filename: &Path) -> Result<(PathBuf, Iter)> {
+    let mut dir = start_dir;
     loop {
         let candidate = dir.join(filename);
         match fs::read_to_string(&candidate) {
@@ -153,7 +158,7 @@ fn find(filename: &Path) -> Result<(PathBuf, Iter)> {
             return Err(Error::Io(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!(
-                    "{} not found in the current directory or any parent",
+                    "{} not found in the starting directory or any parent",
                     filename.display()
                 ),
             )));
@@ -722,22 +727,30 @@ DOUBLE="literal $VAR and ${VAR}"
         std::fs::write(temp_dir.path().join(".env.find"), "FOUND=yes\n")
             .expect("failed to write test .env file");
 
-        // `find` walks up from the current directory; emulate it from `nested`
-        // by resolving the same candidate chain.
-        let mut dir = nested;
-        let resolved = loop {
-            let candidate = dir.join(".env.find");
-            if candidate.is_file() {
-                break candidate;
-            }
-            assert!(dir.pop(), "should have found .env.find in an ancestor");
-        };
-        assert_eq!(resolved, temp_dir.path().join(".env.find"));
-
-        let entries = from_path_iter(&resolved)
-            .expect("failed to open found file")
+        let (path, iter) = find_from(nested.clone(), Path::new(".env.find"))
+            .expect("the file should be found in an ancestor directory");
+        assert_eq!(path, temp_dir.path().join(".env.find"));
+        let entries = iter
             .collect::<Result<Vec<_>>>()
             .expect("failed to parse found file");
         assert_eq!(entries, vec![("FOUND".to_string(), "yes".to_string())]);
+
+        // A name that exists nowhere in the ancestor chain: the temp dir's
+        // unique basename guarantees no accidental match up to the root.
+        let absent = format!(
+            ".env.absent-{}",
+            temp_dir
+                .path()
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .expect("temp dir must have a UTF-8 basename")
+        );
+        let Err(err) = find_from(nested, Path::new(&absent)) else {
+            panic!("expected the search to fail for {absent}");
+        };
+        match err {
+            Error::Io(err) => assert_eq!(err.kind(), io::ErrorKind::NotFound),
+            Error::LineParse(..) => panic!("expected Io, got LineParse"),
+        }
     }
 }
