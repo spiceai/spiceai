@@ -23,6 +23,10 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
+    common::{
+        Column,
+        tree_node::{Transformed, TreeNode},
+    },
     datasource::{DefaultTableSource, TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
@@ -30,19 +34,23 @@ use datafusion::{
     physical_expr::EquivalenceProperties,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
-        PlanProperties, coalesce_partitions::CoalescePartitionsExec,
+        PlanProperties,
+        coalesce_partitions::CoalescePartitionsExec,
+        execution_plan::{Boundedness, EmissionType},
         stream::RecordBatchStreamAdapter,
     },
     prelude::cast,
 };
-use datafusion_expr::ident;
+use datafusion_expr::{TableProviderFilterPushDown, ident};
 use futures::{StreamExt, TryStreamExt, stream};
 
 /// Build a [`LogicalPlan`] that returns the rows of `primary`, or — if `primary` produces
 /// zero rows — the rows of `secondary`, projected and cast onto the primary plan's schema.
 ///
 /// The fallback decision is made at execution time by [`FallbackOnEmptyScanExec`]; the
-/// secondary plan is only executed when the primary produced no rows.
+/// secondary plan is only executed when the primary produced no rows. Filters pushed down
+/// by DataFusion are applied to **both** plans before that decision, so a primary result
+/// emptied out by a `WHERE` clause still falls back to the (equally filtered) secondary.
 ///
 /// Every column of the primary plan's schema must exist (by unqualified name) in the
 /// secondary plan's schema; otherwise a plan error is returned. Columns whose types differ
@@ -115,19 +123,43 @@ impl TableProvider for FallbackOnEmptyTableProvider {
         TableType::Base
     }
 
+    /// All filters are accepted as [`TableProviderFilterPushDown::Exact`]: [`Self::scan`]
+    /// applies them to *both* the primary and secondary plans itself, so the fallback
+    /// decision is made on the **filtered** primary result. The inner plans are re-optimized
+    /// during physical planning, so DataFusion pushes the filter further down into the
+    /// primary index's scan where supported; if the secondary index cannot push it down, the
+    /// `Filter` node applied here post-filters above it.
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
+    }
+
     async fn scan(
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // The projection and limit apply identically to both sides: limiting each side to `n`
-        // rows commutes with "primary if non-empty, else secondary" (a non-empty primary stays
-        // non-empty under a limit of n >= 1; DataFusion never pushes down a zero limit as a
-        // scan, and even then both sides would be empty).
+        // Filters, projection and limit apply identically to both sides. Ordering matters:
+        // filters run first (they may reference columns the projection drops), and limiting
+        // each side to `n` rows commutes with "primary if non-empty, else secondary" (a
+        // non-empty primary stays non-empty under a limit of n >= 1; DataFusion never pushes
+        // down a zero limit as a scan, and even then both sides would be empty).
+        let predicate = filters
+            .iter()
+            .cloned()
+            .map(unqualify_columns)
+            .collect::<DataFusionResult<Vec<_>>>()?
+            .into_iter()
+            .reduce(Expr::and);
         let apply = |plan: &Arc<LogicalPlan>| -> DataFusionResult<LogicalPlan> {
             let mut builder = LogicalPlanBuilder::new_from_arc(Arc::clone(plan));
+            if let Some(predicate) = predicate.clone() {
+                builder = builder.filter(predicate)?;
+            }
             if let Some(indices) = projection {
                 builder =
                     builder.project(indices.iter().map(|i| ident(self.schema.field(*i).name())))?;
@@ -141,6 +173,22 @@ impl TableProvider for FallbackOnEmptyTableProvider {
         let secondary = state.create_physical_plan(&apply(&self.secondary)?).await?;
         Ok(Arc::new(FallbackOnEmptyScanExec::new(primary, secondary)))
     }
+}
+
+/// Rewrite every column reference in `expr` to be unqualified. Filters pushed into the
+/// fallback provider's scan reference the outer scan's relation (`compound_index.<col>`),
+/// but the inner plans carry their own qualifiers — unqualified references resolve against
+/// either.
+fn unqualify_columns(expr: Expr) -> DataFusionResult<Expr> {
+    expr.transform(|e| {
+        Ok(match e {
+            Expr::Column(column) => {
+                Transformed::yes(Expr::Column(Column::new_unqualified(column.name)))
+            }
+            other => Transformed::no(other),
+        })
+    })
+    .map(|t| t.data)
 }
 
 /// Executes the primary plan; if it yields zero rows in total, executes the secondary plan.
@@ -162,17 +210,50 @@ impl FallbackOnEmptyScanExec {
         if secondary.output_partitioning().partition_count() != 1 {
             secondary = Arc::new(CoalescePartitionsExec::new(secondary));
         }
+        // Either child's stream may end up serving the query, so emission type and
+        // boundedness are the conservative combination of both (mirrors DataFusion's
+        // crate-private `emission_type_from_children`/`boundedness_from_children`).
         let properties = PlanProperties::new(
             EquivalenceProperties::new(primary.schema()),
             Partitioning::UnknownPartitioning(1),
-            primary.pipeline_behavior(),
-            primary.boundedness(),
+            combined_emission_type(primary.pipeline_behavior(), secondary.pipeline_behavior()),
+            combined_boundedness(primary.boundedness(), secondary.boundedness()),
         );
         Self {
             primary,
             secondary,
             properties,
         }
+    }
+}
+
+/// Conservative [`Boundedness`] for a plan that may emit either child's stream: unbounded if
+/// either child is unbounded, requiring infinite memory if either does.
+fn combined_boundedness(primary: Boundedness, secondary: Boundedness) -> Boundedness {
+    match (primary, secondary) {
+        (Boundedness::Bounded, Boundedness::Bounded) => Boundedness::Bounded,
+        (
+            Boundedness::Unbounded {
+                requires_infinite_memory: a,
+            },
+            Boundedness::Unbounded {
+                requires_infinite_memory: b,
+            },
+        ) => Boundedness::Unbounded {
+            requires_infinite_memory: a || b,
+        },
+        (unbounded @ Boundedness::Unbounded { .. }, Boundedness::Bounded)
+        | (Boundedness::Bounded, unbounded @ Boundedness::Unbounded { .. }) => unbounded,
+    }
+}
+
+/// Conservative [`EmissionType`] for a plan that may emit either child's stream:
+/// `Final` dominates, then `Both`, then `Incremental`.
+fn combined_emission_type(primary: EmissionType, secondary: EmissionType) -> EmissionType {
+    match (primary, secondary) {
+        (EmissionType::Final, _) | (_, EmissionType::Final) => EmissionType::Final,
+        (EmissionType::Both, _) | (_, EmissionType::Both) => EmissionType::Both,
+        (EmissionType::Incremental, EmissionType::Incremental) => EmissionType::Incremental,
     }
 }
 

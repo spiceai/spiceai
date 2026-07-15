@@ -149,8 +149,11 @@ impl SearchIndex for MockIndex {
         if self.fail_write {
             return Err(Box::from(format!("{} write failed", self.label)));
         }
-        let rows = self.write_output_rows.unwrap_or(record.num_rows());
-        let record = record.slice(0, rows.min(record.num_rows()));
+        let rows = self
+            .write_output_rows
+            .unwrap_or(record.num_rows())
+            .min(record.num_rows());
+        let record = record.slice(0, rows);
         let Some(extra) = self.write_output_column else {
             return Ok(record);
         };
@@ -599,6 +602,65 @@ fn query_fallback_rejects_secondary_missing_a_primary_column() {
         .query_table_provider("q")
         .expect_err("secondary missing a primary column must fail at plan time");
     assert!(err.to_string().contains("source"), "{err}");
+}
+
+/// Filters pushed into the fallback provider's scan apply to both plans *before* the
+/// emptiness decision: a primary that has rows but none matching the filter must fall back
+/// to the secondary, and the secondary's rows are filtered too.
+#[tokio::test]
+async fn query_fallback_applies_pushed_filters_before_deciding() {
+    use datafusion::prelude::{col, lit};
+
+    let events = Arc::new(Mutex::new(vec![]));
+    let mut primary = MockIndex::new("primary", &events);
+    primary.query_batches = vec![result_batch(&[1, 2], "primary")];
+    let mut secondary = MockIndex::new("secondary", &events);
+    secondary.query_batches = vec![result_batch(&[3, 5, 6], "secondary")];
+
+    let idx = compound(primary, secondary, CompoundReadMode::FallbackToSecondary);
+    let plan = idx.query_table_provider("q").expect("plan builds");
+
+    let ctx = SessionContext::new();
+    let batches = ctx
+        .execute_logical_plan(Arc::unwrap_or_clone(plan))
+        .await
+        .expect("plan executes")
+        .filter(col("id").gt(lit(4_i64)))
+        .expect("filters")
+        .collect()
+        .await
+        .expect("collects");
+
+    let mut ids = vec![];
+    let mut sources = vec![];
+    for batch in &batches {
+        let id_col = batch
+            .column_by_name("id")
+            .expect("id column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 ids");
+        let source_col = batch
+            .column_by_name("source")
+            .expect("source column")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("utf8 sources");
+        for i in 0..batch.num_rows() {
+            ids.push(id_col.value(i));
+            sources.push(source_col.value(i).to_string());
+        }
+    }
+    ids.sort_unstable();
+    sources.sort();
+    sources.dedup();
+
+    assert_eq!(
+        sources,
+        vec!["secondary".to_string()],
+        "primary has no rows matching the filter, so the (filtered) secondary must serve the query"
+    );
+    assert_eq!(ids, vec![5, 6], "the secondary's rows must be filtered too");
 }
 
 /// Projection and limit pushed into the fallback provider's scan must apply to whichever

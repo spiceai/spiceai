@@ -148,7 +148,14 @@ fn validate_compatibility(
         fields
             .iter()
             .sorted_by(|a, b| a.name().cmp(b.name()))
-            .map(|f| format!("{}: {}", f.name(), f.data_type()))
+            .map(|f| {
+                format!(
+                    "{}: {}{}",
+                    f.name(),
+                    f.data_type(),
+                    if f.is_nullable() { " (nullable)" } else { "" }
+                )
+            })
             .join(", ")
     };
     let primary_pk = primary.primary_fields();
@@ -225,9 +232,14 @@ async fn compound_write(
             arrays.push(Arc::clone(secondary_out.column(i)));
         }
     }
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
-        .context(MergeWriteOutputsSnafu)
-        .boxed()
+    // Preserve the primary output's schema-level metadata — some indexes rely on it
+    // (e.g. `DuckDBVectorIndex` forwards its source schema metadata).
+    RecordBatch::try_new(
+        Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
+        arrays,
+    )
+    .context(MergeWriteOutputsSnafu)
+    .boxed()
 }
 
 /// Union of the two indexes' required columns, preserving the primary's order.
