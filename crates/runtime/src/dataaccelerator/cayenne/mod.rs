@@ -157,7 +157,7 @@ fn maintained_aggregate_specs_for_cayenne(
     if has_min_or_max && primary_keys.is_empty() {
         return Err(Error::InvalidConfiguration {
             detail: Arc::from(
-                "Cayenne maintained_aggregates MIN/MAX require a primary key so UPDATE and DELETE changes can retract prior extrema within the retained-index cap. Set acceleration.primary_key, enable extended schema inference for a source primary key, or remove MIN/MAX from maintained_aggregates.",
+                "Cayenne maintained_aggregates MIN/MAX require a primary key so UPDATE and DELETE changes can retract prior extrema within the retained-index cap. Set acceleration.primary_key, ensure the source table declares a primary key (schema inference detects it automatically), or remove MIN/MAX from maintained_aggregates.",
             ),
         });
     }
@@ -704,8 +704,8 @@ fn is_upsert_on_conflict(
 }
 
 /// Build the auto-tune [`autotune::WorkloadProfile`] from the dataset's refresh
-/// mode, its resolved primary keys / `on_conflict`, and any extended-schema-
-/// inference metadata carried on the Arrow schema (`spice.inferred_row_count` /
+/// mode, its resolved primary keys / `on_conflict`, and any schema-inference
+/// metadata carried on the Arrow schema (`spice.inferred_row_count` /
 /// `spice.inferred_table_bytes`, see `data_components::inferred_schema`). Every
 /// signal degrades gracefully: an unknown one falls back to the hardware-only
 /// derivation.

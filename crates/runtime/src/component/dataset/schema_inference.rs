@@ -144,7 +144,7 @@ pub fn apply_inferred_schema(
         indexes = applied_indexes,
         sort_applied = applied_sort,
         shard_key_applied = applied_shard_key,
-        "Applied extended schema inference to acceleration settings"
+        "Applied schema inference to acceleration settings"
     );
 }
 

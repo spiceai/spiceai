@@ -637,7 +637,7 @@ impl Runtime {
                     tracing::debug!(
                         dataset = %ds.name,
                         %error,
-                        "Skipping extended schema inference; could not parse refresh_sql to validate inferred columns"
+                        "Skipping schema inference; could not parse refresh_sql to validate inferred columns"
                     );
                     return ds;
                 }
@@ -661,7 +661,7 @@ impl Runtime {
         load_semaphore: Option<Arc<Semaphore>>,
     ) -> Result<()> {
         // Owned (not borrowed from `ds`) so the dataset can be rebuilt below by
-        // extended schema inference without holding a borrow across the reassignment.
+        // schema inference without holding a borrow across the reassignment.
         let source = ds.source().to_string();
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
         if let Some(acceleration) = &ds.acceleration

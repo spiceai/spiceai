@@ -32093,7 +32093,7 @@ mod tests {
         let ctx = SessionContext::new();
         let vortex_config = VortexConfig {
             // The source's declared distribution key (e.g. a Postgres partition
-            // key applied by extended schema inference) clusters files by it.
+            // key applied by schema inference) clusters files by it.
             shard_key_columns: vec!["tenant_id".to_string()],
             ..VortexConfig::default()
         };
