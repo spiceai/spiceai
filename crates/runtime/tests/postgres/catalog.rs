@@ -1,0 +1,218 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! Integration test for the `PostgreSQL` catalog connector's handling of
+//! declaratively-partitioned tables (#11726).
+//!
+//! A partitioned parent with two leaf partitions (plus a plain table) is seeded,
+//! then discovered through the catalog connector. The connector must
+//! register the partitioned parent but *not* its leaf partitions: the parent is a
+//! union over its children, so registering both would double-count aggregates and
+//! clutter the catalog. Querying the parent still returns rows from every
+//! partition. This mirrors how the CDC path attributes partitioned-table changes
+//! to the parent (`publish_via_partition_root = true`), so the one-time import and
+//! the streamed import agree on the parent as the unit of a partitioned table.
+
+use std::{collections::HashMap, sync::Arc, time::Duration};
+
+use app::AppBuilder;
+use datafusion::assert_batches_eq;
+use runtime::Runtime;
+use secrecy::ExposeSecret;
+use spicepod::{component::catalog::Catalog, param::Params};
+
+use crate::{
+    configure_test_datafusion, init_tracing,
+    postgres::common::{self, get_pg_params},
+    utils::{register_test_connectors, run_query, runtime_ready_check, test_request_context},
+};
+
+const CATALOG_NAME: &str = "pg_e2e";
+
+/// Seed a range-partitioned `events` table with two leaf partitions, populate it
+/// both by inserting directly into each child and by inserting into the parent
+/// (which `PostgreSQL` auto-routes to the matching leaf), and add a plain table to
+/// confirm non-partitioned tables still surface. Verifies at the source that the
+/// parent-routed rows physically landed in the leaves.
+async fn seed_partitioned_schema(port: usize) -> Result<(), anyhow::Error> {
+    let pool = common::get_postgres_connection_pool(port, None).await?;
+    let conn = pool
+        .connect_direct()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Range-partitioned parent (relkind 'p') with two leaf partitions (relkind
+    // 'r'). The partition key must be part of the primary key for a partitioned
+    // PK, matching real-world declarative partitioning.
+    conn.conn
+        .simple_query(
+            "CREATE TABLE events ( \
+                 id      INT  NOT NULL, \
+                 payload TEXT NOT NULL, \
+                 PRIMARY KEY (id) \
+             ) PARTITION BY RANGE (id); \
+             CREATE TABLE events_lo PARTITION OF events FOR VALUES FROM (0) TO (100); \
+             CREATE TABLE events_hi PARTITION OF events FOR VALUES FROM (100) TO (1000);",
+        )
+        .await?;
+
+    // Insert directly into each child (3 into `events_lo`, 2 into `events_hi`)...
+    conn.conn
+        .simple_query(
+            "INSERT INTO events_lo (id, payload) VALUES (1, 'a'), (2, 'b'), (3, 'c'); \
+             INSERT INTO events_hi (id, payload) VALUES (100, 'd'), (200, 'e');",
+        )
+        .await?;
+
+    // ...and insert into the parent, letting PostgreSQL auto-route by the
+    // partition key: id 50 -> `events_lo`, id 150 -> `events_hi`. Seven rows total.
+    conn.conn
+        .simple_query("INSERT INTO events (id, payload) VALUES (50, 'f'), (150, 'g');")
+        .await?;
+
+    // The parent stores no rows of its own; every row lives in a leaf. This
+    // confirms the parent-routed inserts landed in the leaves (auto-partitioning).
+    let only_parent: i64 = conn
+        .conn
+        .query_one("SELECT COUNT(*) FROM ONLY events", &[])
+        .await?
+        .get(0);
+    anyhow::ensure!(
+        only_parent == 0,
+        "partitioned parent should store no rows itself, found {only_parent}"
+    );
+    let lo: i64 = conn
+        .conn
+        .query_one("SELECT COUNT(*) FROM events_lo", &[])
+        .await?
+        .get(0);
+    let hi: i64 = conn
+        .conn
+        .query_one("SELECT COUNT(*) FROM events_hi", &[])
+        .await?
+        .get(0);
+    anyhow::ensure!(
+        lo == 4 && hi == 3,
+        "expected 4 rows in events_lo and 3 in events_hi after auto-routing, found lo={lo} hi={hi}"
+    );
+
+    // A plain (non-partitioned) table must still be discovered.
+    conn.conn
+        .simple_query(
+            "CREATE TABLE widgets (id INT PRIMARY KEY, name TEXT NOT NULL); \
+             INSERT INTO widgets (id, name) VALUES (1, 'widget');",
+        )
+        .await?;
+
+    Ok(())
+}
+
+/// Build a `PostgreSQL` catalog against the seeded database.
+fn pg_catalog(port: usize) -> Catalog {
+    let mut catalog = Catalog::new("pg:postgres".to_string(), CATALOG_NAME.to_string());
+    catalog.params = Some(Params::from_string_map(
+        get_pg_params(port)
+            .into_iter()
+            .map(|(k, v)| (k, v.expose_secret().to_string()))
+            .collect::<HashMap<String, String>>(),
+    ));
+    catalog
+}
+
+async fn start_runtime(catalog: Catalog) -> Result<Arc<Runtime>, anyhow::Error> {
+    register_test_connectors().await;
+    let app = AppBuilder::new("postgres_catalog_partition_test")
+        .with_catalog(catalog)
+        .build();
+
+    configure_test_datafusion();
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+    tokio::select! {
+        () = tokio::time::sleep(Duration::from_mins(2)) => {
+            return Err(anyhow::anyhow!("Timed out waiting for catalog to load"));
+        }
+        () = Arc::clone(&rt).load_components() => {}
+    }
+
+    runtime_ready_check(&rt).await;
+    Ok(rt)
+}
+
+/// The catalog connector registers the partitioned parent but omits its leaf
+/// partitions, and the parent still exposes every partition's rows.
+#[tokio::test]
+async fn test_partitioned_table_registers_parent_only() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            let _container = common::start_postgres_docker_container(port).await?;
+
+            seed_partitioned_schema(port).await?;
+
+            let rt = start_runtime(pg_catalog(port)).await?;
+
+            // Only the partitioned parent and the plain table are registered
+            // under the catalog — the two leaf partitions (`events_lo`,
+            // `events_hi`) must be absent, otherwise a "count across all tables"
+            // would double-count the parent's rows.
+            let tables = run_query(
+                &rt,
+                &format!(
+                    "SELECT table_name FROM information_schema.tables \
+                     WHERE table_catalog = '{CATALOG_NAME}' AND table_schema = 'public' \
+                     ORDER BY table_name"
+                ),
+            )
+            .await?;
+            assert_batches_eq!(
+                &[
+                    "+------------+",
+                    "| table_name |",
+                    "+------------+",
+                    "| events     |",
+                    "| widgets    |",
+                    "+------------+",
+                ],
+                &tables
+            );
+
+            // The parent exposes rows from both leaf partitions — the five
+            // inserted directly into children plus the two auto-routed through
+            // the parent (7 total) — proving parent-only registration loses no
+            // data regardless of how rows were inserted.
+            let count = run_query(
+                &rt,
+                &format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.events"),
+            )
+            .await?;
+            assert_batches_eq!(
+                &[
+                    "+---+", //
+                    "| n |", //
+                    "+---+", //
+                    "| 7 |", //
+                    "+---+", //
+                ],
+                &count
+            );
+
+            Ok(())
+        })
+        .await
+}

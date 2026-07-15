@@ -30,9 +30,12 @@ use datafusion_execution::TaskContext;
 use datafusion_expr::dml::InsertOp;
 use futures::StreamExt;
 
+use runtime_datafusion::extension::request_context::resolve_request_context;
+
 use super::context::CayenneContext;
 use super::mutation_writer::AppendMutationWriter;
 use super::table::CayenneTableProvider;
+use super::transaction::CayenneTransaction;
 
 /// A [`DataSink`] implementation that writes data to a Cayenne table.
 ///
@@ -153,6 +156,57 @@ impl DataSink for CayenneDataSink {
             }),
         ));
 
+        // Transaction: when one is active for this table on
+        // the request context, the write must STAGE rather than publish, so the
+        // executor can publish it atomically at COMMIT (or roll it back). This is
+        // checked before the memory-mode and streaming-publish branches below,
+        // both of which publish immediately.
+        if let Some(txn) = self.active_transaction(context) {
+            return self
+                .write_all_transaction(&txn, normalized, context)
+                .await
+                .map_err(Into::into);
+        }
+
+        // Memory mode (`mode: memory`): all data lives in the RAM mem-tier, so
+        // collect the stream and route it there — an atomic replace on
+        // overwrite/full refresh, otherwise an append. Nothing is ever encoded to
+        // Vortex. The write lock serializes memory-mode writes so an overwrite never
+        // interleaves with a concurrent append.
+        if self.table.is_memory_resident_mode() {
+            let overwrite = self.overwrite == InsertOp::Overwrite;
+            let mut data = normalized;
+            let mut batches: Vec<arrow::record_batch::RecordBatch> = Vec::new();
+            let mut incoming_bytes: u64 = 0;
+            // Acquire the write lock BEFORE draining so memory-mode writes are
+            // serialized during buffering: two concurrent writes must not each buffer
+            // a large payload while both pass `enforce_memory_limit` against the same
+            // resident bytes, letting their combined footprint blow the RAM bound (and
+            // OOM) before either appends. Reads use `ArcSwap` (lock-free), so this only
+            // serializes writers.
+            let _write_guard = self.table.write_lock().lock().await;
+            while let Some(batch) = data.next().await {
+                let batch = batch?;
+                incoming_bytes =
+                    incoming_bytes.saturating_add(batch.get_array_memory_size() as u64);
+                // Enforce the hard RAM bound while buffering so an oversized refresh
+                // fails fast with a structured error instead of OOMing during
+                // collection (memory mode never spills). Always count resident +
+                // incoming: on overwrite the old tier stays live until the atomic
+                // replace, so peak is not just the final tier size. Holding the
+                // write lock makes this check reflect the only in-flight write.
+                self.table
+                    .enforce_memory_limit(incoming_bytes)
+                    .map_err(datafusion_common::DataFusionError::from)?;
+                batches.push(batch);
+            }
+            return self
+                .table
+                .write_batches_memory_mode(batches, incoming_bytes, overwrite)
+                .await
+                .map_err(Into::into);
+        }
+
         if self.overwrite == InsertOp::Overwrite {
             // Overwrite path: `CayenneTableProvider::begin_overwrite` acquires the
             // table write lock internally and the lock is held inside the
@@ -182,6 +236,85 @@ impl DataSink for CayenneDataSink {
 }
 
 impl CayenneDataSink {
+    /// Resolve the transaction active on this write's request
+    /// context, if any.
+    ///
+    /// Reads it from the [`runtime_request_context::RequestContext`] typed
+    /// extension on the task context (source 1 of `resolve_request_context`) —
+    /// the exact context the query builder installed — rather than the
+    /// task-local `RequestContext::current`, whose silent internal-context
+    /// fallback would make a missed installation publish immediately (an
+    /// undetectable atomicity break). Returns the transaction regardless of its
+    /// target table; [`Self::write_all_transaction`] enforces the table match
+    /// (fail-closed).
+    fn active_transaction(&self, context: &Arc<TaskContext>) -> Option<CayenneTransaction> {
+        let txn = resolve_request_context(context, false)?.extension::<CayenneTransaction>()?;
+        if !txn.is_participant(self.table.table_id()) {
+            // A write to a Cayenne table outside the transaction's participant
+            // set: mark the transaction fail-closed (its commit aborts) and
+            // still route it through the staged path, which REJECTS the write.
+            // Returning `None` here would fall through to an immediate publish —
+            // an atomicity break if participant registration is ever missed.
+            txn.mark_unregistered_read();
+        }
+        Some(txn)
+    }
+
+    /// Stage a write for an active transaction instead of publishing it: take
+    /// this table's begin token, stage the rows to an invisible snapshot via
+    /// [`CayenneTableProvider::begin_staged_upsert_occ`], and register the handle
+    /// on the transaction. The executor publishes (or rolls back) all
+    /// participating tables atomically at COMMIT.
+    ///
+    /// Fail-closed: any shape the staged-upsert substrate cannot publish
+    /// atomically — an overwrite, a memory-mode table, or a second write to the
+    /// same table in one transaction — is rejected rather than silently published.
+    async fn write_all_transaction(
+        &self,
+        txn: &CayenneTransaction,
+        data: SendableRecordBatchStream,
+        context: &Arc<TaskContext>,
+    ) -> super::Result<u64> {
+        let table_id = self.table.table_id();
+        if !txn.is_participant(table_id) {
+            // Fail-closed: the executor never registered this table as a
+            // participant (its begin token was never captured), so its write
+            // cannot be committed atomically with the rest. Reject rather than
+            // publish; the transaction then aborts (see `active_transaction`).
+            return Err(super::Error::Unsupported {
+                operation: "write to a table outside the transaction's participant set",
+            });
+        }
+        if self.overwrite != InsertOp::Append {
+            return Err(super::Error::Unsupported {
+                operation: "transaction overwrite write",
+            });
+        }
+        if self.table.is_memory_resident_mode() {
+            return Err(super::Error::Unsupported {
+                operation: "transaction write on a memory-mode table",
+            });
+        }
+        // `None` means this table already staged a write — v1 allows one write
+        // per table per transaction. Reject rather than publish.
+        let Some(token) = txn.take_token(table_id) else {
+            return Err(super::Error::Unsupported {
+                operation: "more than one write to a table in one transaction",
+            });
+        };
+        let target_partitions = context.session_config().target_partitions();
+        // Off-lock staging: encode into an invisible snapshot without holding the
+        // write lock. The executor publishes (or rolls back) at COMMIT, where the
+        // per-key footprint + write-set are re-checked for a conflict.
+        let staged = self
+            .table
+            .begin_staged_upsert_occ(token, data, target_partitions)
+            .await?;
+        let row_count = staged.row_count();
+        txn.set_staged(table_id, staged);
+        Ok(row_count)
+    }
+
     /// Append with bounded ingest-to-queryable latency: consume the input in
     /// segments, each capped by age (`interval`, measured from the segment's
     /// first buffered batch) and by in-memory size, and run the full existing
@@ -355,6 +488,7 @@ mod tests {
     use arrow::array::Int64Array;
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::datasource::TableProvider;
     use datafusion::datasource::sink::DataSink;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion::prelude::SessionContext;
@@ -481,5 +615,142 @@ mod tests {
             3,
             "all rows visible after stream end"
         );
+    }
+
+    fn int64_batch(schema: &Arc<Schema>, values: Vec<i64>) -> RecordBatch {
+        RecordBatch::try_new(Arc::clone(schema), vec![Arc::new(Int64Array::from(values))])
+            .expect("batch")
+    }
+
+    async fn append_rows(
+        provider: &CayenneTableProvider,
+        context: &Arc<CayenneContext>,
+        schema: &Arc<Schema>,
+        ctx: &SessionContext,
+        batches: Vec<RecordBatch>,
+    ) -> datafusion::error::Result<u64> {
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(schema),
+            futures::stream::iter(batches.into_iter().map(Ok)),
+        ));
+        let sink = CayenneDataSink::new(
+            provider.clone_for_write(),
+            InsertOp::Append,
+            Arc::clone(schema),
+            Arc::clone(context),
+        );
+        sink.write_all(stream, &ctx.task_ctx()).await
+    }
+
+    /// An append that carries no rows must complete as a successful no-op —
+    /// including on the upsert + retention-filter shape, where the inline
+    /// memtable path is barred and the write goes to a new Vortex snapshot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn zero_row_upsert_append_with_retention_filters_is_a_successful_noop() {
+        use datafusion_expr::{col, lit};
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog init");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let vortex_config = VortexConfig {
+            // Publish on stream end (the refresh-write shape). The segmented
+            // streaming-publish path never publishes an empty segment, so it
+            // would short-circuit a zero-row stream before it reaches the
+            // append writer this test exercises.
+            stream_publish_interval_ms: 0,
+            ..VortexConfig::default()
+        };
+        let context = CayenneContext::new(&vortex_config, ctx.runtime_env(), "zero_row_append");
+        let options = CreateTableOptions {
+            table_name: "zero_row_append".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                "id".to_string(),
+            ]))),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config,
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .with_context(Arc::clone(&context))
+            // A retention delete filter (matching nothing) bars the inline
+            // path, routing appends through the new-snapshot write — the
+            // same shape as a dataset configured with `retention_sql`.
+            .with_retention_filters(vec![col("id").lt(lit(0_i64))])
+            .create(options)
+            .await
+            .expect("table created");
+
+        // Seed the table so the zero-row append below runs against a
+        // populated accelerator, mirroring a post-initial-load refresh.
+        let seeded = append_rows(
+            &provider,
+            &context,
+            &schema,
+            &ctx,
+            vec![int64_batch(&schema, vec![1, 2, 3])],
+        )
+        .await
+        .expect("seed write");
+        assert_eq!(seeded, 3);
+        assert_eq!(visible_rows(&ctx, &provider).await, 3);
+
+        // An empty stream is a no-op append: it must succeed, report zero
+        // rows, and leave the visible data untouched.
+        let appended = append_rows(&provider, &context, &schema, &ctx, vec![])
+            .await
+            .expect("zero-row append must succeed");
+        assert_eq!(appended, 0);
+        assert_eq!(
+            visible_rows(&ctx, &provider).await,
+            3,
+            "zero-row append must not change visible data"
+        );
+
+        // Retention-style DELETE of every row (the `retention_sql` shape),
+        // leaving pending key-deletion tombstones. Subsequent appends isolate
+        // from those tombstones by writing to a new snapshot.
+        let delete_plan = provider
+            .delete_from(&ctx.state(), vec![col("id").gt_eq(lit(0_i64))])
+            .await
+            .expect("delete plan");
+        datafusion::physical_plan::collect(delete_plan, ctx.task_ctx())
+            .await
+            .expect("retention delete");
+        assert_eq!(visible_rows(&ctx, &provider).await, 0);
+
+        // A zero-row append over pending deletions must also be a successful
+        // no-op: it has no rows to isolate, produces no data files, and must
+        // not publish (or fsync) a snapshot directory that was never
+        // materialized. This is the steady state of a scheduled
+        // `refresh_mode: append` dataset whose retention has evicted
+        // everything and whose source has no new rows.
+        let appended = append_rows(&provider, &context, &schema, &ctx, vec![])
+            .await
+            .expect("zero-row append over pending deletions must succeed");
+        assert_eq!(appended, 0);
+        assert_eq!(visible_rows(&ctx, &provider).await, 0);
+
+        // The table must remain fully writable afterwards.
+        let appended = append_rows(
+            &provider,
+            &context,
+            &schema,
+            &ctx,
+            vec![int64_batch(&schema, vec![4])],
+        )
+        .await
+        .expect("subsequent write");
+        assert_eq!(appended, 1);
+        assert_eq!(visible_rows(&ctx, &provider).await, 1);
     }
 }

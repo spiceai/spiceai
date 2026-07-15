@@ -1,0 +1,489 @@
+#!/usr/bin/env bash
+# Copyright 2024-2026 The Spice.ai OSS Authors
+#
+# scripts/signoff — Local CI attestation ("developer sign-off").
+#
+# Run the fast quality checks on your own machine, then attest to the exact
+# commit you pushed. On the pull request a single `Attestation` check validates
+# your sign-off and lets the PR into the merge queue, where the *full* suite of
+# tests and checks runs as the real gate.
+#
+# This is Spice's take on 37signals' approach of moving CI back to developer
+# machines (https://world.hey.com/dhh/we-re-moving-continuous-integration-back-to-developer-machines-3ac6c611),
+# modeled on their open-source tool basecamp/gh-signoff. The twist: local
+# sign-off only gates *entry* to the merge queue — the queue still runs the
+# whole suite on the merged result, so a bad attestation can never reach trunk.
+#
+# Usage:
+#   scripts/signoff                 Run checks, then sign off on HEAD  (or: make signoff)
+#   scripts/signoff -f              Sign off even with a dirty/unpushed tree
+#   scripts/signoff --no-verify     Sign off without running the checks (honor system)
+#   scripts/signoff status          Show the sign-off status of HEAD
+#   scripts/signoff check           Show whether trunk requires sign-off
+#   scripts/signoff install         Configure the trunk ruleset (maintainers)
+#   scripts/signoff install --yes   Apply the ruleset change (default is a dry-run)
+#
+# Environment:
+#   SIGNOFF_BRANCH    Branch/ruleset to target for install/check (default: trunk)
+#   SIGNOFF_REMOTE    Git remote to use in a JJ workspace (default: origin)
+#   SIGNOFF_DEBUG     Set to any value for verbose debug logging
+
+set -euo pipefail
+
+readonly VERSION="1.0.0"
+# Fixed, not configurable: it must match the hardcoded context the Attestation
+# workflow (pr.yml) looks for, so an env override would silently break the gate.
+readonly STATUS_CONTEXT="signoff"
+readonly TARGET_BRANCH="${SIGNOFF_BRANCH:-trunk}"
+readonly TARGET_REMOTE="${SIGNOFF_REMOTE:-origin}"
+DEBUG="${SIGNOFF_DEBUG:-}"
+VCS=""
+JJ_REMOTE_URL=""
+
+# The single source of truth for the checks required to merge. `install` writes
+# exactly this list into the trunk ruleset's required status checks. Every name
+# here must be produced under the same name on both the PR head (to allow
+# queue entry) and `merge_group` (to gate the merged result).
+readonly REQUIRED_CHECKS=(
+  "Attestation"              # sign-off gate (pr.yml) — the PR's only quality check
+  "enforce-pull-with-spice"  # PR hygiene (enforce-pulls-with-spice.yml)
+  "Rust Lint"                # pr.yml
+  "Build and Test"           # pr.yml
+  "Build (release profile)"  # pr.yml
+  "Integration Tests (part 1)"
+  "Integration Tests (part 2)"
+  "Integration Tests (part 3)"
+  "ADBC Integration Tests"   # integration_adbc.yml
+  "Features Check"           # features.yml
+  "Check Rust Licenses"      # license_check.yml
+  "E2E Test CI"              # e2e_test_ci.yml (gate job)
+)
+# GitHub Actions app id — pins each required check to Actions so a hand-POSTed
+# commit status can't satisfy a required check (only `signoff` is a raw status).
+readonly ACTIONS_INTEGRATION_ID=15368
+
+# --- output helpers ----------------------------------------------------------
+
+readonly OK="✓"
+readonly NO="✗"
+
+debug() { [[ -n "$DEBUG" ]] && echo "debug: $*" >&2 || true; }
+info()  { echo "$*" >&2; }
+fail()  { echo "${NO} $*" >&2; exit 1; }
+
+# Prefix each non-empty line of stdin with "$1" (for indented list output).
+bullet() { local prefix="$1" line; while IFS= read -r line; do [[ -n "$line" ]] && echo "${prefix}${line}"; done; }
+
+# --- preconditions -----------------------------------------------------------
+
+# Detect Git first so colocated JJ repositories retain the existing Git behavior.
+# Fall back to JJ for non-colocated workspaces, which intentionally have no .git
+# directory for Git or gh to discover.
+detect_vcs() {
+  if command -v git >/dev/null 2>&1 && git rev-parse --show-toplevel >/dev/null 2>&1; then
+    VCS="git"
+    return
+  fi
+
+  if command -v jj >/dev/null 2>&1 && jj root >/dev/null 2>&1; then
+    VCS="jj"
+    [[ "$TARGET_REMOTE" =~ ^[[:alnum:]_.:/-]+$ ]] \
+      || fail "invalid JJ remote name: '${TARGET_REMOTE}'"
+
+    local name url remotes
+    remotes=$(jj --color=never git remote list) \
+      || fail "could not list JJ remotes"
+    while read -r name url; do
+      if [[ "$name" == "$TARGET_REMOTE" ]]; then
+        JJ_REMOTE_URL="$url"
+        break
+      fi
+    done <<<"$remotes"
+    [[ -n "$JJ_REMOTE_URL" ]] \
+      || fail "JJ remote '${TARGET_REMOTE}' not found — add it with 'jj git remote add', or set SIGNOFF_REMOTE"
+    [[ "$JJ_REMOTE_URL" != -* ]] \
+      || fail "invalid URL for JJ remote '${TARGET_REMOTE}'"
+    return
+  fi
+
+  fail "not inside a Git checkout or JJ workspace"
+}
+
+# gh covers every path; Git is used in a Git checkout and JJ in a non-colocated
+# workspace. The default signoff flow parses JSON via `gh --jq`, not jq itself.
+require_tools() {
+  command -v gh >/dev/null 2>&1 || fail "GitHub CLI (gh) not found — install from https://cli.github.com"
+  detect_vcs
+  gh auth status >/dev/null 2>&1 || fail "not logged in to GitHub — run 'gh auth login'"
+}
+
+# Only the subcommands that parse JSON with the jq binary (status/check/install).
+require_jq() {
+  command -v jq >/dev/null 2>&1 || fail "jq not found — install from https://jqlang.github.io/jq"
+}
+
+# owner/repo of the current checkout, from the gh context. gh cannot infer a
+# repository from a non-colocated JJ workspace, so give it that workspace's
+# configured remote URL explicitly.
+repo_slug() {
+  if [[ "$VCS" == "jj" ]]; then
+    gh repo view "$JJ_REMOTE_URL" --json nameWithOwner --jq .nameWithOwner 2>/dev/null \
+      || fail "could not determine the GitHub repository from JJ remote '${TARGET_REMOTE}'"
+  else
+    gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null \
+      || fail "could not determine the GitHub repository — run this inside a clone of the repo"
+  fi
+}
+
+jj_revision_is_remote() {
+  local revision="$1" sha
+  sha=$(jj --color=never --no-pager log \
+    -r "${revision} & remote_bookmarks(remote=exact:\"${TARGET_REMOTE}\")" \
+    --no-graph -T 'commit_id') \
+    || fail "could not inspect JJ bookmarks on '${TARGET_REMOTE}'"
+  [[ -n "$sha" ]]
+}
+
+# A normal `jj commit` leaves an empty working-copy commit on top of the commit
+# that was bookmarked and pushed. Treat that parent as HEAD. If @ itself has a
+# bookmark, contains changes, or is already a remote bookmark, it is the commit
+# the developer is trying to attest instead.
+current_revision() {
+  local force="${1:-false}"
+  if [[ "$VCS" == "git" ]]; then
+    echo "HEAD"
+    return
+  fi
+
+  local at_bookmark at_empty
+  at_bookmark=$(jj --color=never --no-pager log -r '@ & bookmarks()' --no-graph -T 'commit_id') \
+    || fail "could not inspect JJ bookmarks"
+  at_empty=$(jj --color=never --no-pager log -r '@ & empty()' --no-graph -T 'commit_id') \
+    || fail "could not inspect the JJ working-copy commit"
+  if jj_revision_is_remote "@" || [[ -n "$at_bookmark" ]] || [[ -z "$at_empty" ]]; then
+    echo "@"
+    return
+  fi
+
+  local parent_count
+  parent_count=$(jj --color=never --no-pager log -r '@' --no-graph -T 'parents.len()') \
+    || fail "could not inspect the JJ working-copy parent"
+  if [[ "$parent_count" == "1" ]]; then
+    echo "@-"
+  elif $force; then
+    echo "@"
+  else
+    fail "empty JJ working-copy commit has ${parent_count} parents — select the commit to sign off, or pass -f"
+  fi
+}
+
+revision_sha() {
+  local revision="$1"
+  if [[ "$VCS" == "jj" ]]; then
+    jj --color=never --no-pager log -r "$revision" --no-graph -T 'commit_id'
+  else
+    git rev-parse "$revision"
+  fi
+}
+
+local_user_name() {
+  if [[ "$VCS" == "jj" ]]; then
+    jj config get user.name 2>/dev/null
+  else
+    git config user.name 2>/dev/null
+  fi
+}
+
+# Refuse to sign off on a tree that isn't exactly what's pushed: the attestation
+# is bound to a single commit SHA, so it must match the commit under review.
+ensure_clean_and_pushed() {
+  local revision="$1"
+  if [[ "$VCS" == "jj" ]]; then
+    jj_revision_is_remote "$revision" \
+      || fail "JJ revision ${revision} is not a bookmark tip on '${TARGET_REMOTE}' — bookmark and push it with 'jj git push', or pass -f"
+    return
+  fi
+
+  if [[ -n "$(git status --porcelain)" ]]; then
+    fail "working tree has uncommitted changes — commit or stash them, or pass -f"
+  fi
+  if ! git rev-parse --abbrev-ref '@{push}' >/dev/null 2>&1; then
+    fail "current branch has no upstream — push it first (git push -u origin HEAD), or pass -f"
+  fi
+  if [[ -n "$(git log '@{push}..' --oneline)" ]]; then
+    fail "branch has commits that aren't pushed — push them first, or pass -f"
+  fi
+  # ...and not behind either, so HEAD is exactly the pushed tip under review.
+  if [[ -n "$(git log 'HEAD..@{push}' --oneline)" ]]; then
+    fail "branch is behind its remote — pull the latest, then sign off (or pass -f)"
+  fi
+}
+
+# --- commands ----------------------------------------------------------------
+
+# Run the same fast checks the old PR build ran: lint + build + unit tests.
+# The heavier suite (release build, integration, e2e, ...) runs in the merge
+# queue, so it deliberately isn't part of the local sign-off.
+#
+# Output streams straight to the terminal — call this bare, never `$(run_checks)`,
+# which would capture make's stdout.
+run_checks() {
+  info "Running Rust lint (make lint-rust)…"
+  make lint-rust
+
+  info "Building the CLI and running unit tests (make build-cli nextest)…"
+  make build-cli nextest
+}
+
+# After a successful sign-off, the PR's `Attestation` job (pr.yml) only
+# re-evaluates the `signoff` commit status when its workflow run executes. If
+# that run already completed — e.g. sign-off happened after the PR's checks
+# ran — `Attestation` is stuck showing a stale failure until something
+# re-triggers it. Re-run that job instead of making the developer open or
+# refresh the PR by hand. `gh` is already required by require_tools() before
+# cmd_signoff can reach this point, but the check stays here so this function
+# remains correct if it's ever called on its own.
+refresh_attestation_check() {
+  local sha="$1" repo="$2"
+  local fallback="Open/refresh the PR and it will pick up the sign-off."
+  local run run_id run_status run_conclusion
+
+  if ! command -v gh >/dev/null 2>&1; then
+    info "  Install the GitHub CLI (https://cli.github.com) so signoff can auto-refresh the 'Attestation' check."
+    info "  ${fallback}"
+    return 0
+  fi
+
+  run=$(gh run list --repo "$repo" --commit "$sha" --workflow pr.yml --event pull_request \
+    --json databaseId,status,conclusion --jq 'first(.[]) | "\(.databaseId) \(.status) \(.conclusion)"' 2>/dev/null) \
+    || { debug "could not list 'pr' workflow runs for ${sha} on ${repo}"; info "  ${fallback}"; return 0; }
+
+  read -r run_id run_status run_conclusion <<<"$run"
+  # A missing run renders as an empty string, but an empty `--jq` match can
+  # also render as the literal word "null" for each field — check run_id
+  # looks like a real numeric database id rather than trusting non-emptiness.
+  if [[ ! "$run_id" =~ ^[0-9]+$ ]]; then
+    debug "no 'pr' workflow run found yet for ${sha} — nothing to refresh"
+    info "  ${fallback}"
+    return 0
+  fi
+  if [[ "$run_status" != "completed" ]]; then
+    info "  The 'Attestation' check (run ${run_id}) is still ${run_status} — it will evaluate the sign-off once it finishes."
+    return 0
+  fi
+  if [[ "$run_conclusion" == "success" ]]; then
+    debug "run ${run_id} already succeeded — nothing to refresh"
+    return 0
+  fi
+
+  # Not `--failed`: that only reruns jobs with conclusion=failure and no-ops
+  # on cancelled/skipped runs. Rerunning the whole run is fine here — on a
+  # `pull_request` event, pr.yml executes nothing but the Attestation job.
+  if gh run rerun "$run_id" --repo "$repo" >/dev/null 2>&1; then
+    echo "  Re-ran the 'Attestation' check (run ${run_id}) — it will turn green shortly."
+  else
+    info "  Could not auto-refresh the 'Attestation' check — ${fallback}"
+  fi
+}
+
+cmd_signoff() {
+  local force=false verify=true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f|--force)     force=true;  shift ;;
+      --no-verify)    verify=false; shift ;;
+      -h|--help)      cmd_help; exit 0 ;;
+      *)              fail "unknown option: $1 (see: scripts/signoff --help)" ;;
+    esac
+  done
+
+  require_tools
+
+  local revision sha user repo description start
+  revision=$(current_revision "$force")
+  $force || ensure_clean_and_pushed "$revision"
+  sha=$(revision_sha "$revision") || fail "could not resolve ${revision}"
+  user=$(gh api user --jq .login 2>/dev/null || local_user_name || echo "unknown")
+  repo=$(repo_slug)
+
+  if $verify; then
+    start=$(date +%s)
+    run_checks
+    description="Signed off by ${user} — lint+test passed in $(( $(date +%s) - start ))s"
+  else
+    description="Signed off by ${user} (checks not verified locally)"
+  fi
+  # Commit-status descriptions are capped at 140 characters.
+  description="${description:0:140}"
+
+  debug "posting ${STATUS_CONTEXT}=success on ${repo}@${sha}"
+  gh api --method POST "repos/${repo}/statuses/${sha}" \
+    -f state=success \
+    -f context="${STATUS_CONTEXT}" \
+    -f "description=${description}" >/dev/null \
+    || fail "failed to post the sign-off status (do you have write access to ${repo}?)"
+
+  echo "${OK} Signed off on ${sha:0:12} — ${description}"
+  refresh_attestation_check "$sha" "$repo"
+}
+
+cmd_status() {
+  require_tools
+  require_jq
+  local revision sha repo combined state desc
+  revision=$(current_revision)
+  sha=$(revision_sha "$revision")
+  repo=$(repo_slug)
+  # Fetch the combined status once, then pick the first matching entry with jq.
+  # (Piping `gh --jq ... | head -n1` would SIGPIPE the writer under pipefail.)
+  # Fail on a real API error rather than falling back to {} → "not signed off".
+  combined=$(gh api "repos/${repo}/commits/${sha}/status") \
+    || fail "failed to read commit status for ${sha} on ${repo} (auth/rate-limit/network?)"
+  state=$(jq -r "first(.statuses[]? | select(.context==\"${STATUS_CONTEXT}\") | .state) // \"\"" <<<"$combined")
+  if [[ "$state" == "success" ]]; then
+    desc=$(jq -r "first(.statuses[]? | select(.context==\"${STATUS_CONTEXT}\") | .description) // \"\"" <<<"$combined")
+    echo "${OK} ${sha:0:12} is signed off — ${desc}"
+  else
+    echo "${NO} ${sha:0:12} is not signed off — run: make signoff"
+    exit 1
+  fi
+}
+
+# Resolve the ruleset id for TARGET_BRANCH by name. `first(...)` returns a single
+# id inside jq — avoids `head`, which SIGPIPEs the writer under pipefail.
+ruleset_id() {
+  local repo="$1" rulesets
+  rulesets=$(gh api "repos/${repo}/rulesets") \
+    || fail "failed to list rulesets on ${repo} (auth/rate-limit/network?)"
+  jq -r "first(.[] | select(.name==\"${TARGET_BRANCH}\") | .id) // empty" <<<"$rulesets"
+}
+
+cmd_check() {
+  require_tools
+  require_jq
+  local repo id ruleset checks
+  repo=$(repo_slug)
+  id=$(ruleset_id "$repo")
+  [[ -n "$id" ]] || fail "no ruleset named '${TARGET_BRANCH}' on ${repo}"
+  # Fail loudly on an API error instead of reporting "not required" — a swallowed
+  # auth/rate-limit/network error would otherwise look like a missing sign-off gate.
+  ruleset=$(gh api "repos/${repo}/rulesets/${id}") \
+    || fail "failed to read ruleset ${id} on ${repo} (auth/rate-limit/network?)"
+  checks=$(jq -r '.rules[]? | select(.type=="required_status_checks") | .parameters.required_status_checks[]?.context' <<<"$ruleset")
+  if grep -qx "Attestation" <<<"$checks"; then
+    echo "${OK} '${TARGET_BRANCH}' requires developer sign-off (Attestation). Required checks:"
+  else
+    echo "${NO} '${TARGET_BRANCH}' does not yet require sign-off. Run: scripts/signoff install --yes"
+  fi
+  # `|| true`: bullet returns non-zero on an empty list, which under pipefail
+  # would otherwise make this (last) statement exit the command non-zero.
+  echo "$checks" | bullet "  - " || true
+}
+
+cmd_install() {
+  local apply=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes|-y) apply=true; shift ;;
+      -h|--help) cmd_help; exit 0 ;;
+      *) fail "unknown option: $1" ;;
+    esac
+  done
+
+  require_tools
+  require_jq
+  local repo id ruleset
+  repo=$(repo_slug)
+  id=$(ruleset_id "$repo")
+  [[ -n "$id" ]] || fail "no ruleset named '${TARGET_BRANCH}' on ${repo} (create it in the repo settings first)"
+  # Fetch the ruleset once; both the preview and the PUT body derive from it.
+  ruleset=$(gh api "repos/${repo}/rulesets/${id}") \
+    || fail "failed to read ruleset ${id} on ${repo}"
+
+  info "Ruleset '${TARGET_BRANCH}' (id ${id}) on ${repo}"
+  info ""
+  info "Current required checks:"
+  jq -r '.rules[]? | select(.type=="required_status_checks") | .parameters.required_status_checks[]?.context' <<<"$ruleset" \
+    | bullet "  - " >&2 || info "  (none)"
+  info ""
+  info "New required checks:"
+  printf '%s\n' "${REQUIRED_CHECKS[@]}" | bullet "  + " >&2
+
+  if ! $apply; then
+    info ""
+    info "Dry run. Re-run with --yes to apply:  scripts/signoff install --yes"
+    return 0
+  fi
+
+  # Swap only the required_status_checks array, preserving every other rule
+  # (pull_request approvals, merge_queue, etc.).
+  local desired body
+  desired=$(jq -n --argjson iid "$ACTIONS_INTEGRATION_ID" \
+    '$ARGS.positional | map({context: ., integration_id: $iid})' --args "${REQUIRED_CHECKS[@]}")
+  body=$(jq --argjson checks "$desired" '
+    {
+      name,
+      target,
+      enforcement,
+      conditions,
+      bypass_actors: (.bypass_actors // []),
+      rules: (
+        if any((.rules // [])[]; .type == "required_status_checks")
+        then (.rules | map(
+          if .type == "required_status_checks"
+          then (.parameters.required_status_checks = $checks)
+          else . end
+        ))
+        else ((.rules // []) + [{
+          type: "required_status_checks",
+          parameters: {
+            strict_required_status_checks_policy: false,
+            do_not_enforce_on_create: false,
+            required_status_checks: $checks
+          }
+        }])
+        end
+      )
+    }' <<<"$ruleset")
+
+  echo "$body" | gh api --method PUT "repos/${repo}/rulesets/${id}" --input - >/dev/null \
+    || fail "failed to update ruleset ${id} (need admin on ${repo})"
+  echo "${OK} '${TARGET_BRANCH}' now requires developer sign-off + the full merge-queue suite."
+}
+
+cmd_help() {
+  cat >&2 <<EOF
+scripts/signoff ${VERSION} — local CI attestation for Spice.ai
+
+Developers:
+  make signoff                 Run lint + unit tests, then sign off on HEAD
+  scripts/signoff -f           Sign off even with a dirty/unpushed tree
+  scripts/signoff --no-verify  Sign off without running checks (honor system)
+  scripts/signoff status       Show the sign-off status of HEAD
+
+Maintainers:
+  scripts/signoff check        Show whether '${TARGET_BRANCH}' requires sign-off
+  scripts/signoff install      Preview the required-checks change (dry run)
+  scripts/signoff install --yes  Apply it (needs admin on the repo)
+
+The sign-off is a '${STATUS_CONTEXT}' commit status bound to the exact commit you
+pushed. Sign off again after any code change or manual conflict resolution. The
+Attestation check can carry a sign-off across a first-parent chain of unmodified,
+conflict-free base merges. The full test suite runs in the merge queue.
+EOF
+}
+
+main() {
+  case "${1:-}" in
+    ""|signoff) shift || true; cmd_signoff "$@" ;;
+    -f|--force|--no-verify) cmd_signoff "$@" ;;
+    status)   shift; cmd_status "$@" ;;
+    check)    shift; cmd_check "$@" ;;
+    install)  shift; cmd_install "$@" ;;
+    version|--version) echo "signoff ${VERSION}" ;;
+    -h|--help) cmd_help ;;
+    *) fail "unknown command: $1 (see: scripts/signoff --help)" ;;
+  esac
+}
+
+main "$@"

@@ -20,7 +20,6 @@ pub mod datasets;
 pub mod embeddings;
 pub mod functions;
 pub mod iceberg;
-pub mod inference;
 pub mod responses;
 pub mod snapshots;
 
@@ -43,8 +42,9 @@ use crate::{
     datafusion::{
         DataFusion,
         query::{
-            Error as QueryError, QueryBuilder, is_cancellation_error, json_array_writer,
-            schema_has_union_columns, write_to_json_string, write_to_json_value,
+            Error as QueryError, QueryBuilder, TransactionError, is_cancellation_error,
+            is_timeout_error, json_array_writer, run_transaction, schema_has_union_columns,
+            transaction_statements, write_to_json_string, write_to_json_value,
         },
     },
     egress::EgressAccount,
@@ -62,7 +62,7 @@ use bytes::Bytes;
 use cache::result::CacheStatus;
 use csv::Writer;
 use datafusion::common::ParamValues;
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion::execution::{SendableRecordBatchStream, memory_pool::MemoryPool};
 use headers_accept::Accept;
 use http::{
     HeaderValue,
@@ -251,17 +251,23 @@ fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
 // columns — still buffer via `to_http_response`.
 pub async fn sql_to_http_response(
     df: Arc<DataFusion>,
-    sql: &str,
+    sql: Arc<str>,
     parameters: Option<ParamValues>,
     format: ResponseMimeType,
     read_only: bool,
 ) -> Response {
+    // A `BEGIN … COMMIT` body is run by the shared transaction orchestrator
+    // rather than the ordinary single-statement path.
+    if let Some(statements) = transaction_statements(&sql) {
+        return transaction_to_http_response(df, statements, parameters, read_only, format).await;
+    }
+
     // Capture the query memory pool before `df` is moved into the builder, so a
     // streamed body can charge its egress buffers against the pool the query ran
     // under (see `EgressAccount`).
     let memory_pool = Arc::clone(&df.ctx.runtime_env().memory_pool);
 
-    let query_res = match QueryBuilder::new(sql, df)
+    let query_res = match QueryBuilder::new_arc(sql, df)
         .parameters(parameters)
         .read_only(read_only)
         .build()
@@ -270,14 +276,25 @@ pub async fn sql_to_http_response(
     {
         Ok(res) => res,
         Err(e) => {
-            let is_cancellation = matches!(e, QueryError::QueryCancelled { .. });
-            return sql_error_response(e.to_string(), is_cancellation);
+            let kind = SqlErrorKind::of_query_error(&e);
+            return sql_error_response(e.to_string(), kind);
         }
     };
 
-    let cache_status = query_res.cache_status;
-    let mut data_stream = query_res.data;
+    query_stream_to_http_response(query_res.data, query_res.cache_status, format, memory_pool).await
+}
 
+/// Converts a query stream to the requested HTTP response format.
+///
+/// Default JSON responses stream batch-by-batch. Formats that require complete
+/// result metadata, and JSON schemas containing union columns, use the buffered
+/// response path.
+async fn query_stream_to_http_response(
+    mut data_stream: SendableRecordBatchStream,
+    cache_status: CacheStatus,
+    format: ResponseMimeType,
+    memory_pool: Arc<dyn MemoryPool>,
+) -> Response {
     // Stream only the default JSON format with non-union columns; csv/plain/vnd
     // buffer via `to_http_response`, and union columns (which the arrow-json array
     // writer can't render) fall back to the buffered JSON path. Streamability is a
@@ -291,7 +308,9 @@ pub async fn sql_to_http_response(
     // yields a clean status code instead of a truncated 200 response.
     let first = match data_stream.next().await {
         Some(Ok(batch)) => Some(batch),
-        Some(Err(e)) => return sql_error_response(e.to_string(), is_cancellation_error(&e)),
+        Some(Err(e)) => {
+            return sql_error_response(e.to_string(), SqlErrorKind::of_datafusion_error(&e));
+        }
         None => None,
     };
 
@@ -301,14 +320,99 @@ pub async fn sql_to_http_response(
     (StatusCode::OK, headers, body).into_response()
 }
 
+/// Run a `BEGIN … COMMIT` body through the shared transaction orchestrator
+/// and shape the outcome (or error) into an HTTP response.
+async fn transaction_to_http_response(
+    df: Arc<DataFusion>,
+    statements: Vec<String>,
+    parameters: Option<ParamValues>,
+    read_only: bool,
+    format: ResponseMimeType,
+) -> Response {
+    match run_transaction(&df, &statements, parameters, read_only).await {
+        Ok(outcome) => match outcome.result {
+            // Return the final statement's result (for the canonical gate+write
+            // shape, the write's row-count summary).
+            Some((batches, cache_status)) => {
+                to_http_response(batches, cache_status, format, ResponseMetadata::empty())
+                    .await
+                    .into_response()
+            }
+            None => (StatusCode::OK, "COMMIT").into_response(),
+        },
+        Err(error) => transaction_error_to_response(error),
+    }
+}
+
+/// Map a [`TransactionError`] to the HTTP response the `/v1/sql` path returns.
+fn transaction_error_to_response(error: TransactionError) -> Response {
+    match error {
+        TransactionError::Rejected(message) => sql_error_response(message, SqlErrorKind::General),
+        TransactionError::Plan(e) | TransactionError::Stream(e) => {
+            sql_error_response(e.to_string(), SqlErrorKind::of_datafusion_error(&e))
+        }
+        TransactionError::Query(e) => {
+            sql_error_response(e.to_string(), SqlErrorKind::of_query_error(&e))
+        }
+        TransactionError::Conflict { table } => {
+            // Optimistic-concurrency conflict: a participant was committed to
+            // between this transaction's start and commit. Retryable — map to
+            // 409 so the client can re-run at the newest committed state.
+            (
+                StatusCode::CONFLICT,
+                format!(
+                    "transaction write conflict on '{table}': a participant table changed since the transaction started; retry"
+                ),
+            )
+                .into_response()
+        }
+        TransactionError::Publish(message) => sql_error_response(
+            format!("transaction publish failed: {message}"),
+            SqlErrorKind::General,
+        ),
+    }
+}
+
+/// Classifies a query error for HTTP status mapping: client-initiated
+/// cancellation maps to 499 Client Closed Request, a `runtime.query.timeout`
+/// expiry maps to 504 Gateway Timeout, everything else falls through to
+/// [`status_for_sql_error`].
+#[derive(Clone, Copy)]
+enum SqlErrorKind {
+    General,
+    Cancellation,
+    Timeout,
+}
+
+impl SqlErrorKind {
+    fn of_query_error(e: &QueryError) -> Self {
+        match e {
+            QueryError::QueryCancelled { .. } => Self::Cancellation,
+            QueryError::QueryTimedOut { .. } => Self::Timeout,
+            _ => Self::General,
+        }
+    }
+
+    fn of_datafusion_error(e: &datafusion::error::DataFusionError) -> Self {
+        if is_cancellation_error(e) {
+            Self::Cancellation
+        } else if is_timeout_error(e) {
+            Self::Timeout
+        } else {
+            Self::General
+        }
+    }
+}
+
 /// Maps a query error message to an HTTP response, distinguishing cancellation
-/// (499 Client Closed Request) from other errors.
-fn sql_error_response(message: String, is_cancellation: bool) -> Response {
+/// (499 Client Closed Request) and query timeout (504 Gateway Timeout) from
+/// other errors.
+fn sql_error_response(message: String, kind: SqlErrorKind) -> Response {
     tracing::debug!("Error executing query: {message}");
-    let status = if is_cancellation {
-        StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST)
-    } else {
-        status_for_sql_error(&message)
+    let status = match kind {
+        SqlErrorKind::Cancellation => StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
+        SqlErrorKind::Timeout => StatusCode::GATEWAY_TIMEOUT,
+        SqlErrorKind::General => status_for_sql_error(&message),
     };
     (status, message).into_response()
 }
@@ -321,7 +425,7 @@ async fn buffered_sql_response(
 ) -> Response {
     let data = match data_stream.try_collect::<Vec<RecordBatch>>().await {
         Ok(data) => data,
-        Err(e) => return sql_error_response(e.to_string(), is_cancellation_error(&e)),
+        Err(e) => return sql_error_response(e.to_string(), SqlErrorKind::of_datafusion_error(&e)),
     };
     to_http_response(data, cache_status, format, ResponseMetadata::empty())
         .await
@@ -620,7 +724,103 @@ mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::scalar::ScalarValue;
     use std::sync::Arc;
+
+    use crate::{
+        dataaccelerator::AcceleratorEngineRegistry, datafusion::builder::DataFusionBuilder,
+        status::RuntimeStatus,
+    };
+
+    /// `/v1/sql` must let clients distinguish outcomes by status code: a
+    /// `runtime.query.timeout` expiry maps to 504 Gateway Timeout, a
+    /// client-initiated cancel to 499, and both classifications must hold for
+    /// the pre-stream (`QueryError`) and mid-stream (`DataFusionError`) paths.
+    #[test]
+    fn sql_error_response_status_for_timeout_and_cancellation() {
+        let timeout_err = QueryError::QueryTimedOut {
+            query_id: "q1".to_string(),
+            timeout: "30s".to_string(),
+        };
+        let response = sql_error_response(
+            timeout_err.to_string(),
+            SqlErrorKind::of_query_error(&timeout_err),
+        );
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+
+        let cancel_err = QueryError::QueryCancelled {
+            query_id: "q1".to_string(),
+        };
+        let response = sql_error_response(
+            cancel_err.to_string(),
+            SqlErrorKind::of_query_error(&cancel_err),
+        );
+        assert_eq!(response.status().as_u16(), 499);
+
+        // Mid-stream errors arrive as DataFusionError::External wrapping the
+        // query error (produced by `attach_cancellation_to_stream`).
+        let stream_timeout =
+            datafusion::error::DataFusionError::External(Box::new(QueryError::QueryTimedOut {
+                query_id: "q1".to_string(),
+                timeout: "30s".to_string(),
+            }));
+        let response = sql_error_response(
+            stream_timeout.to_string(),
+            SqlErrorKind::of_datafusion_error(&stream_timeout),
+        );
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+
+        let stream_cancel =
+            datafusion::error::DataFusionError::External(Box::new(QueryError::QueryCancelled {
+                query_id: "q1".to_string(),
+            }));
+        let response = sql_error_response(
+            stream_cancel.to_string(),
+            SqlErrorKind::of_datafusion_error(&stream_cancel),
+        );
+        assert_eq!(response.status().as_u16(), 499);
+    }
+
+    #[test]
+    fn transaction_statements_requires_begin_and_commit() {
+        assert_eq!(
+            transaction_statements("BEGIN; SELECT 1; COMMIT"),
+            Some(vec!["SELECT 1".to_string()])
+        );
+        assert!(transaction_statements("SELECT 1; SELECT 2").is_none());
+        assert!(transaction_statements("BEGIN; COMMIT").is_none());
+    }
+
+    #[tokio::test]
+    async fn transaction_executes_bound_parameters_and_returns_final_result() {
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                tokio::runtime::Handle::current(),
+            )
+            .build(),
+        );
+        let parameters = ParamValues::from(vec![
+            ScalarValue::Int64(Some(41)),
+            ScalarValue::Int64(Some(42)),
+        ]);
+
+        let response = sql_to_http_response(
+            df,
+            Arc::from("BEGIN; SELECT $1 AS ignored; SELECT $2 AS value; COMMIT"),
+            Some(parameters),
+            ResponseMimeType::Json,
+            false,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("transaction response body should be readable");
+        assert_eq!(body.as_ref(), br#"[{"value":42}]"#);
+    }
 
     #[test]
     fn test_arrow_to_vnd_json_v1() {

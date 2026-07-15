@@ -1190,6 +1190,7 @@ impl DataFusionBuilder {
             pending_initializations: TokioRwLock::new(HashMap::new()),
             pending_initializations_count: std::sync::atomic::AtomicUsize::new(0),
             query_cancel_registry: Arc::new(super::query::registry::QueryCancelRegistry::new()),
+            plan_capture: OnceLock::new(),
             write_stats_notify: tokio::sync::Notify::new(),
             accelerated_tables: TokioRwLock::new(HashSet::new()),
             accelerator_engine_registry: self.accelerator_engine_registry,
@@ -1400,9 +1401,7 @@ fn is_cayenne_accelerated_table_provider(provider: &dyn TableProvider) -> bool {
 
 #[cfg(not(windows))]
 fn is_cayenne_table_provider(provider: &dyn TableProvider) -> bool {
-    if provider.downcast_ref::<CayenneTableProvider>().is_some()
-        || has_cayenne_accelerator_metadata(provider)
-    {
+    if provider.is::<CayenneTableProvider>() || has_cayenne_accelerator_metadata(provider) {
         return true;
     }
 

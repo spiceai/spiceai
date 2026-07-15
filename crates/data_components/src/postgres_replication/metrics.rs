@@ -89,6 +89,16 @@ pub struct MetricsCollector {
     /// therefore every other member on the slot); the server connection itself
     /// stays alive throughout. Only ever set for shared-slot datasets.
     member_send_stalled_seconds_total: AtomicU64,
+    /// Cumulative microseconds the shared-slot pump spent `await`ing this
+    /// member's bounded channel while delivering committed changes. Unlike
+    /// `member_send_stalled_seconds_total` (which only ticks after a full
+    /// `MEMBER_SEND_STALL_WARN` interval elapses), this accrues the *full*
+    /// per-commit wait, including sub-second waits. The pump already subtracts
+    /// this wait from `reader_processing_micros_total` at the source (so that
+    /// counter stays decode-only, not inflated by downstream back-pressure);
+    /// this counter exports the subtracted amount so the waterfall can attribute
+    /// it to apply back-pressure rather than lose it. Only set for shared slots.
+    member_send_wait_micros_total: AtomicU64,
 
     // Shared-slot membership liveness. `member_attached` is `1` while this
     // dataset is an attached member of its shared replication slot and `0` once
@@ -260,6 +270,15 @@ impl MetricsCollector {
     pub fn add_send_stalled(&self, secs: u64) {
         self.member_send_stalled_seconds_total
             .fetch_add(secs, Ordering::Relaxed);
+    }
+    /// Add microseconds the shared-slot pump spent `await`ing this member's
+    /// channel during commit delivery (shared slot). The pump subtracts the
+    /// same amount from `reader_processing_micros_total` at the source, so that
+    /// counter stays decode-only; this exports the subtracted wait for
+    /// attribution.
+    pub fn add_member_send_wait_micros(&self, us: u64) {
+        self.member_send_wait_micros_total
+            .fetch_add(us, Ordering::Relaxed);
     }
     pub fn inc_reconnect(&self) {
         self.replication_reconnects_total
@@ -470,6 +489,13 @@ impl Metrics {
         } else {
             None
         }
+    }
+
+    #[must_use]
+    pub fn member_send_wait_micros_total(&self) -> u64 {
+        self.collector
+            .member_send_wait_micros_total
+            .load(Ordering::Relaxed)
     }
 }
 

@@ -157,6 +157,15 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
         columns: &["table_id", "pk_bytes", "sequence_number"],
     },
     ExpectedTable {
+        // Durable federated write-back marker set (#11838): one row per PK a
+        // durable-write-back table has committed to the accelerator but not yet
+        // reconciled to the federated source. Same (table_id, pk_bytes) shape as
+        // cayenne_insert_record plus first_marked_at (lag metric). Never cleared
+        // at checkpoint/overwrite.
+        name: "cayenne_pending_write_back",
+        columns: &["table_id", "pk_bytes", "sequence_number", "first_marked_at"],
+    },
+    ExpectedTable {
         name: "cayenne_snapshot_sequence",
         columns: &["table_id", "snapshot_id", "sequence_number"],
     },
@@ -213,6 +222,7 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
             "min_sequence",
             "max_sequence",
             "statistics_blob",
+            "pk_bloom_blob",
         ],
     },
     ExpectedTable {

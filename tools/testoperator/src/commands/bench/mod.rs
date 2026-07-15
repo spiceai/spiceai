@@ -15,7 +15,11 @@ limitations under the License.
 */
 
 use super::{RowCounts, get_dataset_app_and_start_request, load_app};
-use crate::{args::DatasetTestArgs, health::HealthMonitor, spiced_metrics::MetricsScraper};
+use crate::{
+    args::{DatasetTestArgs, SourceType},
+    health::HealthMonitor,
+    spiced_metrics::MetricsScraper,
+};
 use chbench_driver::ChBenchDriver as _;
 use std::{
     path::Path,
@@ -87,7 +91,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
             let scale_factor = args.scale_factor.unwrap_or(1.0);
             #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let terminals = (scale_factor * 10.0) as usize;
-            prepare_chbench_source(scale_factor, terminals, None, false).await?;
+            prepare_chbench_source(scale_factor, terminals, None, false, args.source_type).await?;
         }
 
         let instance = SpicedInstance::start(start_request).await?;
@@ -341,8 +345,40 @@ pub(crate) fn chbench_source_from_env() -> anyhow::Result<chbench_driver::Postgr
     Ok(source)
 }
 
+/// Build CH-benCH `MySQL` source config from environment variables.
+///
+/// | Variable | Default |
+/// |----------|---------|
+/// | `CHBENCH_MYSQL_HOST` | `127.0.0.1` |
+/// | `CHBENCH_MYSQL_PORT` | `3306` |
+/// | `CHBENCH_MYSQL_DB` | `chbench` |
+/// | `CHBENCH_MYSQL_USER` | `bench` |
+/// | `CHBENCH_MYSQL_PASS` | `bench` |
+fn chbench_mysql_source_from_env() -> anyhow::Result<chbench_driver::MysqlSourceConfig> {
+    let mut source = chbench_driver::MysqlSourceConfig::default();
+    if let Ok(v) = std::env::var("CHBENCH_MYSQL_HOST") {
+        source.host = v;
+    }
+    if let Ok(v) = std::env::var("CHBENCH_MYSQL_PORT") {
+        source.port = v.parse().map_err(|e| {
+            anyhow::anyhow!("CHBENCH_MYSQL_PORT={v:?} is not a valid port number: {e}")
+        })?;
+    }
+    if let Ok(v) = std::env::var("CHBENCH_MYSQL_DB") {
+        source.db = v;
+    }
+    if let Ok(v) = std::env::var("CHBENCH_MYSQL_USER") {
+        source.user = v;
+    }
+    if let Ok(v) = std::env::var("CHBENCH_MYSQL_PASS") {
+        source.pass = v;
+    }
+    Ok(source)
+}
+
 /// Validate scale factor, build the CH-benCH config, and connect to the source
-/// Postgres. Unless `skip_prepare` is set, also create the schema and load seed data.
+/// database (`Postgres` or `MySQL`, per `source_type`). Unless `skip_prepare` is
+/// set, also create the schema and load seed data.
 ///
 /// `scale_factor` maps to TPC-C warehouses (must be a positive integer >= 1).
 /// `terminals` specifies the target number of terminals.
@@ -355,7 +391,8 @@ pub(crate) async fn prepare_chbench_source(
     terminals: usize,
     rate: Option<u32>,
     skip_prepare: bool,
-) -> anyhow::Result<chbench_driver::PostgresChBenchDriver> {
+    source_type: SourceType,
+) -> anyhow::Result<std::sync::Arc<dyn chbench_driver::ChBenchDriver>> {
     if scale_factor < 1.0 || scale_factor.fract() != 0.0 {
         anyhow::bail!(
             "CH-benCH --scale-factor must be a positive integer (>= 1), got {scale_factor}. \
@@ -374,21 +411,39 @@ pub(crate) async fn prepare_chbench_source(
     };
 
     println!(
-        "Preparing CH-benCHmark source, SF{scale_factor}: {warehouses} warehouse(s), {terminals} terminal(s)"
+        "Preparing CH-benCHmark source ({source_type:?}), SF{scale_factor}: {warehouses} warehouse(s), {terminals} terminal(s)"
     );
 
-    let source = chbench_source_from_env()?;
-    let driver = chbench_driver::PostgresChBenchDriver::connect(config, source).await?;
-    if skip_prepare {
-        // Source is assumed already populated (e.g. restored from a template).
-        // Verify it actually is — and matches the requested scale factor —
-        // before running against it; a missing/mismatched source would otherwise
-        // yield silently-wrong results instead of a clear error.
-        driver.verify_prepared().await?;
-        println!("Skipping CH-benCHmark seed (--skip-prepare): verified existing source");
-    } else {
-        driver.prepare().await?;
-    }
+    // `verify_prepared`/`prepare` are inherent methods on the concrete driver, so
+    // run the prepare/verify step before erasing the type to `dyn ChBenchDriver`.
+    let driver: std::sync::Arc<dyn chbench_driver::ChBenchDriver> = match source_type {
+        SourceType::Postgres => {
+            let source = chbench_source_from_env()?;
+            let driver = chbench_driver::PostgresChBenchDriver::connect(config, source).await?;
+            if skip_prepare {
+                // Source is assumed already populated (e.g. restored from a template).
+                // Verify it actually is — and matches the requested scale factor —
+                // before running against it; a missing/mismatched source would otherwise
+                // yield silently-wrong results instead of a clear error.
+                driver.verify_prepared().await?;
+                println!("Skipping CH-benCHmark seed (--skip-prepare): verified existing source");
+            } else {
+                driver.prepare().await?;
+            }
+            std::sync::Arc::new(driver)
+        }
+        SourceType::Mysql => {
+            let source = chbench_mysql_source_from_env()?;
+            let driver = chbench_driver::MysqlChBenchDriver::connect(config, source).await?;
+            if skip_prepare {
+                driver.verify_prepared().await?;
+                println!("Skipping CH-benCH seed (--skip-prepare): verified existing source");
+            } else {
+                driver.prepare().await?;
+            }
+            std::sync::Arc::new(driver)
+        }
+    };
 
     println!("CH-benCHmark source is ready");
     Ok(driver)

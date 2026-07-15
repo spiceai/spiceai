@@ -25,26 +25,45 @@ use uuid::Uuid;
 
 use crate::datafusion::{DataFusion, query::QueryMethod};
 
-use super::{Query, tracker::QueryTracker};
+use super::{Query, ResultsCacheMode, tracker::QueryTracker};
 
-enum SqlOrPlan<'a> {
-    Sql(&'a str),
+enum SqlOrPlan {
+    Sql(Arc<str>),
     /// Pre-parsed plan with the original SQL retained for cache key compatibility.
     Plan(Box<LogicalPlan>, Arc<str>),
 }
 
-pub struct QueryBuilder<'a> {
+pub struct QueryBuilder {
     df: Arc<DataFusion>,
-    method: SqlOrPlan<'a>,
+    method: SqlOrPlan,
     parameters: Option<ParamValues>,
     table_allowlist: Option<ResolvedTableAwareAllowlist>,
     query_id: Uuid,
     cancellation_token: Option<CancellationToken>,
     read_only: bool,
+    results_cache_mode: ResultsCacheMode,
 }
 
-impl<'a> QueryBuilder<'a> {
-    pub fn new(sql: &'a str, df: Arc<DataFusion>) -> Self {
+impl QueryBuilder {
+    pub fn new(sql: &str, df: Arc<DataFusion>) -> Self {
+        Self {
+            df,
+            method: SqlOrPlan::Sql(Arc::from(sql)),
+            parameters: None,
+            query_id: Uuid::new_v4(),
+            table_allowlist: None,
+            cancellation_token: None,
+            read_only: false,
+            results_cache_mode: ResultsCacheMode::default(),
+        }
+    }
+
+    /// Build a query from an already-owned [`Arc<str>`] SQL string.
+    ///
+    /// Prefer this over [`Self::new`] when the caller already holds an
+    /// `Arc<str>` (for example after decoding an HTTP body) so the SQL is not
+    /// copied again.
+    pub fn new_arc(sql: Arc<str>, df: Arc<DataFusion>) -> Self {
         Self {
             df,
             method: SqlOrPlan::Sql(sql),
@@ -53,6 +72,7 @@ impl<'a> QueryBuilder<'a> {
             table_allowlist: None,
             cancellation_token: None,
             read_only: false,
+            results_cache_mode: ResultsCacheMode::default(),
         }
     }
 
@@ -73,6 +93,7 @@ impl<'a> QueryBuilder<'a> {
             table_allowlist: None,
             read_only: false,
             cancellation_token: None,
+            results_cache_mode: ResultsCacheMode::default(),
         }
     }
 
@@ -122,6 +143,16 @@ impl<'a> QueryBuilder<'a> {
         self
     }
 
+    /// Sets how this query interacts with the SQL results cache.
+    ///
+    /// [`ResultsCacheMode::Bypass`] skips both lookup and storage, ensuring the
+    /// query executes against the current table state.
+    #[must_use]
+    pub fn results_cache_mode(mut self, results_cache_mode: ResultsCacheMode) -> Self {
+        self.results_cache_mode = results_cache_mode;
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> Query {
         let tracker = if self.df.task_history_enabled {
@@ -144,7 +175,7 @@ impl<'a> QueryBuilder<'a> {
 
         let query_method = match self.method {
             SqlOrPlan::Sql(sql) => QueryMethod::Text {
-                sql: sql.into(),
+                sql,
                 parameters: self.parameters,
                 table_allowlist: self.table_allowlist,
                 pre_parsed_plan: None,
@@ -164,6 +195,7 @@ impl<'a> QueryBuilder<'a> {
             query_id: self.query_id,
             cancellation_token: self.cancellation_token,
             read_only: self.read_only,
+            results_cache_mode: self.results_cache_mode,
         }
     }
 }

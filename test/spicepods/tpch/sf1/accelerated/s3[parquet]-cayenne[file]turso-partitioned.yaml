@@ -18,7 +18,6 @@ datasets:
       partition_by:
         - bucket(5, c_name)
       params:
-        partition_mode: tables
         cayenne_metastore: turso
   - from: s3://benchmarks/tpch_sf1/lineitem.parquet
     name: lineitem
@@ -30,7 +29,6 @@ datasets:
       partition_by:
         - date_part('year', l_shipdate)
       params:
-        partition_mode: tables
         cayenne_metastore: turso
   - from: s3://benchmarks/tpch_sf1/nation.parquet
     name: nation
@@ -51,7 +49,6 @@ datasets:
       partition_by:
         - bucket(5, o_custkey)
       params:
-        partition_mode: tables
         cayenne_metastore: turso
   - from: s3://benchmarks/tpch_sf1/part.parquet
     name: part

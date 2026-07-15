@@ -199,6 +199,15 @@ pub enum CatalogError {
     ChangedConfiguration { table_name: String },
 
     #[snafu(display(
+        "Failed to load table {table_name}: the datalake location changed from '{stored}' to '{configured}' while published datalake files exist. Revert 'cayenne_datalake_location' to '{stored}', or delete the acceleration and re-register the dataset to publish to the new location."
+    ))]
+    ColdTierLocationChanged {
+        table_name: String,
+        stored: String,
+        configured: String,
+    },
+
+    #[snafu(display(
         "Table '{table_name}' metadata is invalid or corrupted. Delete the acceleration, and try again. {source}"
     ))]
     InvalidMetadata {
@@ -231,6 +240,12 @@ pub struct SnapshotSequenceCommit {
 /// including table creation and file tracking.
 #[async_trait]
 pub trait MetadataCatalog: Send + Sync {
+    /// Downcast hook so a caller holding `Arc<dyn MetadataCatalog>` can reach
+    /// concrete methods needed for atomic multi-table transaction commit
+    /// (`begin_transaction`, `apply_prepared_on_conflict_in_txn`), mirroring how the
+    /// overwrite path takes a concrete `&CayenneCatalog`.
+    fn as_any(&self) -> &dyn std::any::Any;
+
     /// Initialize the catalog, creating necessary tables if they don't exist.
     async fn init(&self) -> CatalogResult<()>;
 
@@ -291,6 +306,20 @@ pub trait MetadataCatalog: Send + Sync {
     /// Tracks a deletion vector file that marks rows as deleted in a specific
     /// virtual file (`ListingTable`).
     async fn add_delete_file(&self, delete_file: DeleteFile) -> CatalogResult<String>;
+
+    /// Atomically add every deletion-vector file produced by one logical delete.
+    /// If any row fails validation or insertion, none become visible.
+    async fn add_delete_files(&self, delete_files: Vec<DeleteFile>) -> CatalogResult<()>;
+
+    /// Atomically commit deletion-vector rows and an inline-data rewrite for
+    /// one logical delete. A failure leaves both catalog areas unchanged.
+    async fn commit_delete_files_with_inlined_rewrite(
+        &self,
+        delete_files: Vec<DeleteFile>,
+        table_id: &str,
+        updated_data: Vec<InlinedData>,
+        deleted_inlined_ids: Vec<String>,
+    ) -> CatalogResult<()>;
 
     /// Get all active delete files for a table (across all virtual files).
     async fn get_table_delete_files(&self, table_id: &str) -> CatalogResult<Vec<DeleteFile>>;
@@ -659,6 +688,16 @@ pub trait MetadataCatalog: Send + Sync {
     /// (`cayenne_snapshot_file`) — the complete file set for a snapshot.
     async fn upsert_snapshot_file(&self, file: &SnapshotFile) -> CatalogResult<()>;
 
+    /// Atomically replace the complete manifest for one snapshot. Readers see
+    /// either the old complete set or the new complete set, never a partial
+    /// prefix if an insert fails.
+    async fn replace_snapshot_files(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+        files: &[SnapshotFile],
+    ) -> CatalogResult<()>;
+
     /// Get the complete manifest file set for a snapshot. In the manifest
     /// snapshot model this is the scan's authoritative file source (rather than
     /// directory listing).
@@ -870,6 +909,13 @@ pub trait MetadataCatalog: Send + Sync {
     /// hidden) rather than leaving a duplicate. There are no in-flight runtime
     /// writers at open time, so this never races a live stage.
     async fn publish_orphan_inlined_deletes(&self, table_id: &str) -> CatalogResult<u64>;
+
+    /// Return exact IDs of currently-unpublished inline tombstones without
+    /// changing their durable activation state.
+    async fn get_unpublished_inlined_delete_ids(
+        &self,
+        table_id: &str,
+    ) -> CatalogResult<Vec<String>>;
 
     /// Atomically rewrite existing inline data rows, remove emptied inline data rows,
     /// and append new inline data rows.

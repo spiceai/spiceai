@@ -82,6 +82,7 @@ use super::column_stats::ColumnStatsAccumulator;
 use super::context::CayenneContext;
 use super::mem_tier_budget;
 use super::on_conflict::{PostValidationState, PreparedShardedInsertStream};
+use super::pk_index::PkDigestSet;
 use super::staging_wal::{CayenneStagedAppend, PreparedStagedAppend, StagingWalTargetKind};
 use super::table::{CayenneCdcWrite, CayenneTableProvider, record_cayenne_write_phase};
 
@@ -263,6 +264,7 @@ enum MemShardedOutcome {
 
 struct PreparedStagedAppendTarget {
     staging_snapshot_id: String,
+    source_snapshot_id: String,
     target_snapshot_id: String,
     target_kind: StagingWalTargetKind,
     estimated_bytes: Option<u64>,
@@ -473,14 +475,18 @@ impl<'a> AppendMutationWriter<'a> {
             ));
         }
 
-        // In-memory CDC durability mode: append the validated batch to the RAM
-        // tier and defer the source slot ack to a checkpoint, instead of
-        // persisting a per-batch durable BLOB. Gated to the key-based
-        // merge-on-read shape on a non-partitioned table (`is_cdc_memory_mode`) AND
-        // the runtime has armed deferral for a replayable source (`has_slot_advancer`);
-        // every other table/source keeps the durable path below, byte-identical.
-        let (mut prepared_stream, write_guard) = if self.table.is_cdc_memory_mode()
-            && self.table.has_slot_advancer()
+        // In-memory write path: append the validated batch to the RAM tier instead
+        // of persisting a per-batch durable BLOB. Taken when EITHER the table is a
+        // `mode: memory` accelerator (`is_memory_resident_mode` — the mem-tier is
+        // its permanent store) OR a key-based, non-partitioned CDC table
+        // (`is_cdc_memory_mode`) whose runtime has armed deferral for a replayable
+        // source (`has_slot_advancer`). The two differ in how the runtime acks the
+        // source slot: `mode: memory` never checkpoints, so the slot is committed
+        // immediately (nothing to defer behind); `cdc_durability: memory` defers the
+        // ack behind the covering durable checkpoint. Every other table/source keeps
+        // the durable path below, byte-identical.
+        let (mut prepared_stream, write_guard) = if self.table.is_memory_resident_mode()
+            || (self.table.is_cdc_memory_mode() && self.table.has_slot_advancer())
         {
             match self
                 .write_cdc_in_memory(prepared_stream, &post_validation, write_guard, write_start)
@@ -510,8 +516,9 @@ impl<'a> AppendMutationWriter<'a> {
                 rows,
                 post_validation,
             } => {
+                let record_seq = self.table.sequence_high_water().await;
                 self.table
-                    .record_inlined_pk_keys(&post_validation.validated_keys);
+                    .record_inlined_pk_keys(&post_validation.validated_keys, record_seq);
                 tracing::debug!(
                     table = self.table.table_name(),
                     rows,
@@ -565,11 +572,19 @@ impl<'a> AppendMutationWriter<'a> {
                     .clear_staging_snapshot_dir(&staging_snapshot_id)
                     .await?;
 
-                let (write_guard_for_prepare, held_write_guard) = if stage_on_conflict {
-                    (None, Some(write_guard))
-                } else {
-                    (Some(write_guard), None)
-                };
+                // Hold `write_lock` only through Stage A (staging the WAL and
+                // registering the in-flight append), then release it at the
+                // `drop(held_write_guard)` below — the same discipline the
+                // on-conflict path already uses. Retaining the guard in the
+                // prepared receipt would block a second pipelined Stage A on this
+                // write's finalize and self-deadlock finish()'s
+                // `lock_current_snapshot_for_apply` re-acquire. Compaction-skip
+                // (via the in-flight registration) and apply-time consistency
+                // (`ensure_current_snapshot_target_unchanged` + the re-acquired
+                // lock under the listing fence) do not need the guard held across
+                // the staged window. The cross-partition coordinator retains its
+                // own guard via a separate entry point (`begin_deferred_snapshot_append`).
+                let (write_guard_for_prepare, held_write_guard) = (None, Some(write_guard));
 
                 let (rows, writer_ops, stats_acc, prepared_append) = self
                     .write_staged_append_prepared(
@@ -578,6 +593,7 @@ impl<'a> AppendMutationWriter<'a> {
                         write_guard_for_prepare,
                         PreparedStagedAppendTarget {
                             staging_snapshot_id,
+                            source_snapshot_id: self.table.get_current_snapshot_id(),
                             target_snapshot_id: target_snapshot_id.clone(),
                             target_kind,
                             estimated_bytes,
@@ -611,6 +627,7 @@ impl<'a> AppendMutationWriter<'a> {
                         .prepare_on_conflict_deletions_for_staged_snapshot(
                             on_conflict_deletions,
                             target_snapshot_id,
+                            false,
                         )
                         .await
                     {
@@ -630,7 +647,8 @@ impl<'a> AppendMutationWriter<'a> {
                 };
 
                 if stage_on_conflict {
-                    self.table.record_file_pk_keys(&validated_keys);
+                    let record_seq = self.table.sequence_high_water().await;
+                    self.table.record_file_pk_keys(&validated_keys, record_seq);
                 }
                 drop(held_write_guard);
 
@@ -670,17 +688,21 @@ impl<'a> AppendMutationWriter<'a> {
         }
     }
 
-    /// In-memory CDC write path (`cdc_durability: memory`). Drains the validated
-    /// stream into RAM, computes the on-conflict tombstones in memory, and
-    /// appends to the mem tier — deferring the source slot ack to a checkpoint —
-    /// with byte caps (per-table, plus a process-wide one when the runtime has
-    /// installed the global budget) that spill (and, under sustained overload,
-    /// fall back to the durable path) so the resident tier cannot grow without
-    /// bound. The caps bound the resident tier, not a single apply: each prepared
-    /// burst is still buffered fully in RAM before the cap is checked.
+    /// In-memory CDC write path, shared by `cdc_durability: memory` and
+    /// `mode: memory`. Drains the validated stream into RAM, computes the
+    /// on-conflict tombstones in memory, and appends to the mem tier (returning the
+    /// mem-tier epoch) under byte caps (per-table, plus a process-wide one when the
+    /// runtime has installed the global budget) that bound the resident tier.
     ///
-    /// PK conflict validation still runs (it populated `post_validation` as the
-    /// stream was prepared); only the per-batch DURABILITY is deferred.
+    /// The modes diverge on cap breach and slot ack. `cdc_durability: memory`
+    /// buffers the whole burst, then on breach spills the tier durable (and, under
+    /// sustained overload, falls back to the durable path), and the runtime DEFERS
+    /// the source slot ack behind the covering durable checkpoint. `mode: memory`
+    /// never checkpoints or spills: it enforces the RAM bound incrementally as the
+    /// burst is buffered — an oversized burst returns `MemTierLimitExceeded` before
+    /// it can allocate toward OOM — and the runtime commits the slot immediately.
+    /// PK conflict validation still runs either way (it populated `post_validation`
+    /// as the stream was prepared).
     async fn write_cdc_in_memory(
         &self,
         mut prepared_stream: SendableRecordBatchStream,
@@ -700,6 +722,20 @@ impl<'a> AppendMutationWriter<'a> {
             let batch = batch?;
             incoming_bytes = incoming_bytes.saturating_add(batch.get_array_memory_size() as u64);
             incoming_rows = incoming_rows.saturating_add(batch.num_rows() as u64);
+            // Memory mode never spills, so enforce the per-table RAM bound AS the
+            // burst is buffered: an oversized burst fails fast with the structured
+            // error instead of allocating the whole burst toward OOM before the
+            // post-drain check. `spill_mem_tier_if_cap_breached` errors (does not
+            // checkpoint) in memory mode; the cheap `mem_tier_per_table_cap_breached`
+            // pre-check keeps it off the hot path until the cap is actually breached.
+            // Non-memory CDC keeps buffering here and spills after the drain (below).
+            if self.table.is_memory_resident_mode()
+                && self.table.mem_tier_per_table_cap_breached(incoming_bytes)
+            {
+                self.table
+                    .spill_mem_tier_if_cap_breached(incoming_bytes)
+                    .await?;
+            }
             batches.push(batch);
         }
         drop(prepared_stream);
@@ -750,7 +786,13 @@ impl<'a> AppendMutationWriter<'a> {
             spill_result?;
         }
 
-        if !mem_tier_budget::try_reserve_bytes(incoming_bytes) {
+        // Memory mode never spills to the durable path — the per-table RAM bound
+        // above (`spill_mem_tier_if_cap_breached`, which errors in memory mode) is
+        // the sole limit, so skip the process-global budget reserve/wait/fallback
+        // (which could otherwise force the Vortex durable write memory mode forbids).
+        if !self.table.is_memory_resident_mode()
+            && !mem_tier_budget::try_reserve_bytes(incoming_bytes)
+        {
             let wait_start = Instant::now();
             let admitted = self.table.wait_for_budget_or_spill(incoming_bytes).await;
             record_cayenne_write_phase(self.table.table_name(), "inmemory_budget_wait", wait_start);
@@ -795,13 +837,18 @@ impl<'a> AppendMutationWriter<'a> {
         {
             Ok(epoch) => epoch,
             Err(e) => {
-                mem_tier_budget::release_bytes(incoming_bytes);
+                // Memory mode skipped the reservation above, so must not release.
+                if !self.table.is_memory_resident_mode() {
+                    mem_tier_budget::release_bytes(incoming_bytes);
+                }
                 return Err(e);
             }
         };
         // Record the inlined PK keys so a subsequent same-table upsert sees this
         // batch's rows as present (same bookkeeping as the durable inline path).
-        self.table.record_inlined_pk_keys(&validated_keys);
+        let record_seq = self.table.sequence_high_water().await;
+        self.table
+            .record_inlined_pk_keys(&validated_keys, record_seq);
 
         drop(write_guard);
         record_cayenne_write_phase(self.table.table_name(), "cdc_path_inmemory", write_start);
@@ -871,7 +918,13 @@ impl<'a> AppendMutationWriter<'a> {
             spill_result?;
         }
 
-        if !mem_tier_budget::try_reserve_bytes(incoming_bytes) {
+        // Memory mode never spills to the durable path — the per-table RAM bound
+        // above (`spill_mem_tier_if_cap_breached`, which errors in memory mode) is
+        // the sole limit, so skip the process-global budget reserve/wait/fallback
+        // (which could otherwise force the Vortex durable write memory mode forbids).
+        if !self.table.is_memory_resident_mode()
+            && !mem_tier_budget::try_reserve_bytes(incoming_bytes)
+        {
             let wait_start = Instant::now();
             let admitted = self.table.wait_for_budget_or_spill(incoming_bytes).await;
             record_cayenne_write_phase(self.table.table_name(), "inmemory_budget_wait", wait_start);
@@ -912,7 +965,10 @@ impl<'a> AppendMutationWriter<'a> {
         {
             Ok(apply) => apply,
             Err(e) => {
-                mem_tier_budget::release_bytes(incoming_bytes);
+                // Memory mode skipped the reservation above, so must not release.
+                if !self.table.is_memory_resident_mode() {
+                    mem_tier_budget::release_bytes(incoming_bytes);
+                }
                 return Err(e);
             }
         };
@@ -1011,8 +1067,9 @@ impl<'a> AppendMutationWriter<'a> {
                     rows,
                     post_validation,
                 } => {
+                    let record_seq = self.table.sequence_high_water().await;
                     self.table
-                        .record_inlined_pk_keys(&post_validation.validated_keys);
+                        .record_inlined_pk_keys(&post_validation.validated_keys, record_seq);
                     return Ok(rows);
                 }
                 InlineMutationOutcome::Fallback {
@@ -1109,7 +1166,8 @@ impl<'a> AppendMutationWriter<'a> {
             // count and cleared only when retention had actually deleted rows).
             self.table.clear_cached_pk_keyset();
         } else {
-            self.table.record_file_pk_keys(&validated_keys);
+            let record_seq = self.table.sequence_high_water().await;
+            self.table.record_file_pk_keys(&validated_keys, record_seq);
         }
 
         Ok(total_rows)
@@ -1120,12 +1178,7 @@ impl<'a> AppendMutationWriter<'a> {
         prepared_stream: SendableRecordBatchStream,
         post_validation: &Arc<ParkingMutex<Option<PostValidationState>>>,
         estimated_bytes: Option<u64>,
-    ) -> Result<(
-        u64,
-        Arc<ColumnStatsAccumulator>,
-        std::collections::HashSet<crate::row_converter::OwnedRow>,
-        usize,
-    )> {
+    ) -> Result<(u64, Arc<ColumnStatsAccumulator>, PkDigestSet, usize)> {
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
         let target_size_bytes = self.context.target_file_size_bytes();
         let write_start = Instant::now();
@@ -1188,6 +1241,20 @@ impl<'a> AppendMutationWriter<'a> {
             "apply_on_conflict_deletions",
             deletion_start,
         );
+
+        // A write that carried no rows produced no data files, so the snapshot
+        // directory was never materialized on disk (the Vortex sink only
+        // creates it when writing a file) and there is nothing to fsync,
+        // sequence, or protect. Publish any on-conflict update without a
+        // protected-snapshot entry and skip the sequence record — recording a
+        // snapshot that has no directory would fail the directory sync with
+        // NotFound and leave the catalog referencing a phantom snapshot. This
+        // is the steady state of a scheduled append refresh whose source has
+        // no new rows.
+        if rows == 0 {
+            self.table.commit_on_conflict_publish(update, None).await;
+            return Ok((rows, stats_acc, validated_keys, superseded));
+        }
 
         // `publish` is the metastore finalization total; the sub-phases attribute
         // it — `publish_seq` is sequence allocation + the durable sequence record,
@@ -1259,7 +1326,12 @@ impl<'a> AppendMutationWriter<'a> {
                 )
                 .await?
             {
-                let stats_acc = ColumnStatsAccumulator::new(&schema);
+                // Inline tier0 (metastore BLOB) write — the synchronous CDC hot
+                // loop. Always skip NDV here (lazy): these rows contribute their
+                // distinct-count for free when the inline memtable later spills to
+                // a Vortex file at checkpoint (`write_to_snapshot` folds NDV
+                // there). Min/max/null-count stats are maintained regardless.
+                let stats_acc = ColumnStatsAccumulator::new_with_ndv(&schema, false);
                 for batch in buffer.batches() {
                     stats_acc.update(batch);
                 }
@@ -1496,6 +1568,7 @@ impl<'a> AppendMutationWriter<'a> {
             self.table.clone_for_write_operations(),
             write_guard,
             target.staging_snapshot_id.clone(),
+            target.source_snapshot_id,
             target.target_snapshot_id,
             target.target_kind,
             rows,

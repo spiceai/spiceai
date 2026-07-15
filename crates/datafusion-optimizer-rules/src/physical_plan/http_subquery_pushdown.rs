@@ -228,7 +228,7 @@ fn http_join_param_column(join_exec: &HashJoinExec) -> Option<String> {
 
 /// Recursively check whether `plan` or any descendant is an `HttpExec`.
 fn contains_http_exec(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    if plan.downcast_ref::<HttpExec>().is_some() {
+    if plan.is::<HttpExec>() {
         return true;
     }
     plan.children()
@@ -814,7 +814,7 @@ mod tests {
 
         // Should remain a HashJoinExec (no rewrite)
         assert!(
-            result.downcast_ref::<HashJoinExec>().is_some(),
+            result.is::<HashJoinExec>(),
             "expected HashJoinExec unchanged, got {}",
             result.name()
         );
@@ -842,7 +842,7 @@ mod tests {
             .expect("optimize should succeed");
 
         assert!(
-            result.downcast_ref::<HashJoinExec>().is_some(),
+            result.is::<HashJoinExec>(),
             "expected HashJoinExec unchanged when no HttpExec is present"
         );
     }
