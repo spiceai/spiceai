@@ -59,7 +59,7 @@ pub enum Error {
 
     #[snafu(display(
         "Cannot start CDC catalog acceleration: PostgreSQL role '{role}' is not permitted to start replication. \
-        Grant it with `ALTER ROLE {role} REPLICATION;`, or connect as a superuser. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
+        Grant it with `ALTER ROLE \"{role}\" REPLICATION;`, or connect as a superuser. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
     ))]
     MissingReplicationPrivilege { role: String },
 }

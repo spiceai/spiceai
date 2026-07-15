@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -94,12 +94,34 @@ fn table_is_selected(
     included && !excluded
 }
 
+/// Hex-encodes `s` so the result contains only `[0-9a-f]` -- always a valid
+/// SQL identifier word, regardless of what characters `s` itself contains.
+fn hex_encode(s: &str) -> String {
+    use std::fmt::Write;
+    s.bytes().fold(String::with_capacity(s.len() * 2), |mut out, b| {
+        let _ = write!(out, "{b:02x}");
+        out
+    })
+}
+
 /// A sanitized, collision-safe internal name for the per-table dataset
 /// synthesized for `catalog_name.schema_name.table_name`. Never exposed to
 /// users directly — they query the table through the catalog's own
 /// namespace; this is only the registration key under the default catalog.
+///
+/// Catalog/schema/table names discovered from `PostgreSQL` can contain any
+/// character a quoted identifier allows (e.g. `-`, spaces), which plain
+/// concatenation would carry into a name `validate_identifier` rejects. Each
+/// component is hex-encoded so the result is always a valid identifier and
+/// component boundaries can't collide (a hex-encoded segment can't itself
+/// contain the `_` separator).
 fn synthesized_dataset_name(catalog_name: &str, schema_name: &str, table_name: &str) -> String {
-    format!("__catalog_accel_{catalog_name}_{schema_name}_{table_name}")
+    format!(
+        "__catalog_accel_{}_{}_{}",
+        hex_encode(catalog_name),
+        hex_encode(schema_name),
+        hex_encode(table_name)
+    )
 }
 
 /// A catalog provider that CDC-accelerates every table it discovers (subject
@@ -217,7 +239,7 @@ impl AcceleratedCatalogProvider {
             let table_path = format!("{schema_name}.{table_name}");
             let primary_key = primary_key_columns(&self.pool, schema_name, &table_name)
                 .await
-                .unwrap_or_default();
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
             if primary_key.is_empty() {
                 return Err(format!(
@@ -347,7 +369,9 @@ impl SchemaProvider for AcceleratedSchemaProvider {
         };
 
         // Not yet registered (dataset still bootstrapping) simply reads as
-        // "table not found" -- no federated stand-in during bootstrap.
+        // "table not found" -- no federated stand-in during bootstrap. Any
+        // other failure (e.g. a registration inconsistency) is logged so
+        // it's not indistinguishable from an in-progress bootstrap.
         match self
             .runtime
             .df
@@ -355,7 +379,12 @@ impl SchemaProvider for AcceleratedSchemaProvider {
             .await
         {
             Ok(provider) => Ok(Some(provider)),
-            Err(_) => Ok(None),
+            Err(e) => {
+                tracing::debug!(
+                    "Accelerated table '{dataset_name}' not yet available (table '{name}'): {e}"
+                );
+                Ok(None)
+            }
         }
     }
 
@@ -365,5 +394,38 @@ impl SchemaProvider for AcceleratedSchemaProvider {
             Err(e) => e.into_inner(),
         };
         guard.contains_key(name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_synthesized_dataset_name_is_valid_identifier_for_special_chars() {
+        // Real PostgreSQL identifiers permitted via quoting can contain
+        // characters (e.g. `-`) that plain concatenation would carry into a
+        // name `validate_identifier` rejects.
+        let name = synthesized_dataset_name("my-catalog", "my schema", "my-table");
+        crate::component::validate_identifier(&name).expect("should be a valid identifier");
+    }
+
+    #[test]
+    fn test_synthesized_dataset_name_is_deterministic_and_distinct() {
+        let a = synthesized_dataset_name("cat", "public", "orders");
+        let b = synthesized_dataset_name("cat", "public", "orders");
+        assert_eq!(a, b, "same inputs must produce the same name");
+
+        let different_table = synthesized_dataset_name("cat", "public", "items");
+        assert_ne!(a, different_table);
+
+        // A naive "join with '_'" scheme collides here: schema="a_b",
+        // table="c" and schema="a", table="b_c" both naively join to
+        // "a_b_c". Hex-encoding each component before joining rules this
+        // out, since a hex-encoded segment can never contain the `_`
+        // separator itself.
+        let shifted_left = synthesized_dataset_name("cat", "a_b", "c");
+        let shifted_right = synthesized_dataset_name("cat", "a", "b_c");
+        assert_ne!(shifted_left, shifted_right);
     }
 }

@@ -86,12 +86,12 @@ impl CatalogConnector for PostgresCatalog {
             })?;
 
         let pool = Arc::new(pool);
-        let table_factory = Arc::new(PostgresTableFactory::new(Arc::clone(&pool)));
 
         let catalog_provider: Arc<dyn RefreshableCatalogProvider> =
             if catalog.acceleration.is_some() {
                 Arc::new(AcceleratedCatalogProvider::new(catalog, pool))
             } else {
+                let table_factory = Arc::new(PostgresTableFactory::new(Arc::clone(&pool)));
                 Arc::new(PostgresCatalogProvider::new(
                     catalog.name.clone(),
                     pool,
