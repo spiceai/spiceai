@@ -97,6 +97,7 @@ impl CatalogConnector for PostgresCatalog {
                     pool,
                     table_factory,
                     catalog.include.clone(),
+                    catalog.exclude.clone(),
                 ))
             };
 

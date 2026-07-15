@@ -100,6 +100,7 @@ pub struct PostgresCatalogProvider {
     table_creator: Arc<dyn Read>,
     schemas: RwLock<HashMap<String, Arc<PostgresSchemaProvider>>>,
     include: Option<Arc<GlobSet>>,
+    exclude: Option<Arc<GlobSet>>,
 }
 
 impl std::fmt::Debug for PostgresCatalogProvider {
@@ -116,6 +117,7 @@ impl PostgresCatalogProvider {
         pool: Arc<PostgresConnectionPool>,
         table_creator: Arc<dyn Read>,
         include: Option<GlobSet>,
+        exclude: Option<GlobSet>,
     ) -> Self {
         Self {
             catalog_name,
@@ -123,6 +125,7 @@ impl PostgresCatalogProvider {
             table_creator,
             schemas: RwLock::new(HashMap::new()),
             include: include.map(Arc::new),
+            exclude: exclude.map(Arc::new),
         }
     }
 
@@ -159,6 +162,7 @@ impl PostgresCatalogProvider {
                 schema_name.clone(),
                 Arc::clone(&self.table_creator),
                 self.include.clone(),
+                self.exclude.clone(),
             );
             schema_provider
                 .refresh_tables(&foreign_keys, &comments)
@@ -390,6 +394,7 @@ pub struct PostgresSchemaProvider {
     table_creator: Arc<dyn Read>,
     tables: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
     include: Option<Arc<GlobSet>>,
+    exclude: Option<Arc<GlobSet>>,
 }
 
 impl std::fmt::Debug for PostgresSchemaProvider {
@@ -407,6 +412,7 @@ impl PostgresSchemaProvider {
         schema_name: String,
         table_creator: Arc<dyn Read>,
         include: Option<Arc<GlobSet>>,
+        exclude: Option<Arc<GlobSet>>,
     ) -> Self {
         Self {
             pool,
@@ -414,6 +420,7 @@ impl PostgresSchemaProvider {
             table_creator,
             tables: RwLock::new(HashMap::new()),
             include,
+            exclude,
         }
     }
 
@@ -429,6 +436,7 @@ impl PostgresSchemaProvider {
             table_names,
             &self.table_creator,
             self.include.as_deref(),
+            self.exclude.as_deref(),
             foreign_keys,
             comments,
         )
@@ -602,9 +610,16 @@ fn foreign_key_target(catalog: &str, schema: &str, table: &str) -> String {
     )
 }
 
-fn is_table_included(schema_name: &str, table_name: &str, include: Option<&GlobSet>) -> bool {
+fn is_table_selected(
+    schema_name: &str,
+    table_name: &str,
+    include: Option<&GlobSet>,
+    exclude: Option<&GlobSet>,
+) -> bool {
     let schema_with_table = format!("{schema_name}.{table_name}");
-    include.is_none_or(|globset| globset.is_match(&schema_with_table))
+    let included = include.is_none_or(|globset| globset.is_match(&schema_with_table));
+    let excluded = exclude.is_some_and(|globset| globset.is_match(&schema_with_table));
+    included && !excluded
 }
 
 async fn build_table_providers_for_schema(
@@ -612,6 +627,7 @@ async fn build_table_providers_for_schema(
     table_names: Vec<String>,
     table_creator: &Arc<dyn Read>,
     include: Option<&GlobSet>,
+    exclude: Option<&GlobSet>,
     foreign_keys: &ForeignKeyMap,
     comments: &CommentMap,
 ) -> HashMap<String, Arc<dyn TableProvider>> {
@@ -619,7 +635,7 @@ async fn build_table_providers_for_schema(
 
     for table_name in table_names {
         let schema_with_table = format!("{schema_name}.{table_name}");
-        if !is_table_included(schema_name, &table_name, include) {
+        if !is_table_selected(schema_name, &table_name, include, exclude) {
             tracing::debug!("Table {schema_with_table} is not included, skipping");
             continue;
         }
@@ -756,7 +772,7 @@ impl SchemaProvider for PostgresSchemaProvider {
 mod tests {
     use super::{
         CommentMap, ForeignKeyConstraint, ForeignKeyMap, TableComments,
-        build_table_providers_for_schema, foreign_key_target, is_table_included,
+        build_table_providers_for_schema, foreign_key_target, is_table_selected,
     };
     use crate::{
         DESCRIPTION_METADATA_KEY, FOREIGN_KEYS_METADATA_KEY, Read, SOURCE_TYPE_METADATA_KEY,
@@ -852,7 +868,7 @@ mod tests {
         }
     }
 
-    fn make_include(patterns: &[&str]) -> Arc<globset::GlobSet> {
+    fn make_globset(patterns: &[&str]) -> Arc<globset::GlobSet> {
         let mut builder = GlobSetBuilder::new();
         for pattern in patterns {
             builder.add(Glob::new(pattern).expect("glob pattern should parse"));
@@ -902,16 +918,23 @@ mod tests {
     }
 
     #[test]
-    fn test_is_table_included_with_glob_filter() {
-        let include = make_include(&["public.orders"]);
-        assert!(is_table_included("public", "orders", Some(&include)));
-        assert!(!is_table_included("public", "lineitem", Some(&include)));
+    fn test_is_table_selected_with_glob_filter() {
+        let include = make_globset(&["public.orders"]);
+        assert!(is_table_selected("public", "orders", Some(&include), None));
+        assert!(!is_table_selected("public", "lineitem", Some(&include), None));
+    }
+
+    #[test]
+    fn test_is_table_selected_with_exclude_filter() {
+        let exclude = make_globset(&["public.secrets"]);
+        assert!(is_table_selected("public", "orders", None, Some(&exclude)));
+        assert!(!is_table_selected("public", "secrets", None, Some(&exclude)));
     }
 
     #[tokio::test]
     async fn test_build_table_providers_applies_include_filter_before_factory() {
         let read = Arc::new(MockRead::new(HashSet::new()));
-        let include = make_include(&["public.orders"]);
+        let include = make_globset(&["public.orders"]);
         let table_creator: Arc<dyn Read> = Arc::<MockRead>::clone(&read);
         let no_fks: ForeignKeyMap = HashMap::new();
         let no_comments: CommentMap = HashMap::new();
@@ -921,6 +944,31 @@ mod tests {
             vec!["orders".to_string(), "lineitem".to_string()],
             &table_creator,
             Some(&include),
+            None,
+            &no_fks,
+            &no_comments,
+        )
+        .await;
+
+        assert_eq!(tables.len(), 1);
+        assert!(tables.contains_key("orders"));
+        assert_eq!(read.seen_tables(), vec!["public.orders".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_build_table_providers_applies_exclude_filter_before_factory() {
+        let read = Arc::new(MockRead::new(HashSet::new()));
+        let exclude = make_globset(&["public.lineitem"]);
+        let table_creator: Arc<dyn Read> = Arc::<MockRead>::clone(&read);
+        let no_fks: ForeignKeyMap = HashMap::new();
+        let no_comments: CommentMap = HashMap::new();
+
+        let tables = build_table_providers_for_schema(
+            "public",
+            vec!["orders".to_string(), "lineitem".to_string()],
+            &table_creator,
+            None,
+            Some(&exclude),
             &no_fks,
             &no_comments,
         )
@@ -944,6 +992,7 @@ mod tests {
             "public",
             vec!["orders".to_string(), "lineitem".to_string()],
             &table_creator,
+            None,
             None,
             &no_fks,
             &no_comments,
@@ -974,6 +1023,7 @@ mod tests {
             vec!["orders".to_string(), "lineitem".to_string()],
             &table_creator,
             None,
+            None,
             &no_fks,
             &no_comments,
         )
@@ -1002,6 +1052,7 @@ mod tests {
             "public",
             vec!["orders".to_string(), "lineitem".to_string()],
             &table_creator,
+            None,
             None,
             &fk_map,
             &no_comments,
@@ -1053,6 +1104,7 @@ mod tests {
             "public",
             vec!["order_lines".to_string()],
             &table_creator,
+            None,
             None,
             &fk_map,
             &no_comments,
@@ -1107,6 +1159,7 @@ mod tests {
             "public",
             vec!["orders".to_string()],
             &table_creator,
+            None,
             None,
             &no_fks,
             &comments,

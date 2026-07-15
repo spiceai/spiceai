@@ -45,7 +45,7 @@ limitations under the License.
 //! source.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use app::App;
 use async_trait::async_trait;
@@ -60,6 +60,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use globset::GlobSet;
+use parking_lot::RwLock;
 use snafu::prelude::*;
 use spicepod::acceleration::{
     Acceleration as SpicepodAcceleration, RefreshMode as SpicepodRefreshMode,
@@ -165,12 +166,19 @@ impl AcceleratedCatalogProvider {
     pub fn new(catalog: &Catalog, pool: Arc<PostgresConnectionPool>) -> Self {
         let slot_name = default_slot_name(&catalog.name);
 
+        // Seed from the catalog's connection params, then let `dataset_params`
+        // override -- the same precedence other catalog connectors use (e.g.
+        // `UnityCatalog`, `Databricks`) for per-dataset overrides of
+        // catalog-level connection settings.
+        let mut dataset_params = catalog.params.clone();
+        dataset_params.extend(catalog.dataset_params.clone());
+
         Self {
             catalog_name: catalog.name.clone(),
             pool,
             runtime: catalog.runtime(),
             app: catalog.app(),
-            dataset_params: catalog.params.clone(),
+            dataset_params,
             slot_name,
             include: catalog.include.clone().map(Arc::new),
             exclude: catalog.exclude.clone().map(Arc::new),
@@ -259,10 +267,7 @@ impl AcceleratedCatalogProvider {
             // task for a table `refresh()` already knows about.
             let spawn_key = format!("{schema_name}.{table_name}");
             let already_spawned = {
-                let guard = match self.spawned.read() {
-                    Ok(guard) => guard,
-                    Err(e) => e.into_inner(),
-                };
+                let guard = self.spawned.read();
                 guard.get(&spawn_key).cloned()
             };
 
@@ -288,10 +293,7 @@ impl AcceleratedCatalogProvider {
                     .spawn_accelerated_dataset(schema_name, &table_name)
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-                let mut guard = match self.spawned.write() {
-                    Ok(guard) => guard,
-                    Err(e) => e.into_inner(),
-                };
+                let mut guard = self.spawned.write();
                 guard.insert(spawn_key, dataset_name.clone());
 
                 dataset_name
@@ -336,10 +338,7 @@ impl RefreshableCatalogProvider for AcceleratedCatalogProvider {
         }
 
         {
-            let mut guard = match self.schemas.write() {
-                Ok(guard) => guard,
-                Err(e) => e.into_inner(),
-            };
+            let mut guard = self.schemas.write();
             *guard = schemas;
         }
 
@@ -357,18 +356,12 @@ impl RefreshableCatalogProvider for AcceleratedCatalogProvider {
 
 impl CatalogProvider for AcceleratedCatalogProvider {
     fn schema_names(&self) -> Vec<String> {
-        let guard = match self.schemas.read() {
-            Ok(guard) => guard,
-            Err(e) => e.into_inner(),
-        };
+        let guard = self.schemas.read();
         guard.keys().cloned().collect()
     }
 
     fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        let guard = match self.schemas.read() {
-            Ok(guard) => guard,
-            Err(e) => e.into_inner(),
-        };
+        let guard = self.schemas.read();
         guard
             .get(name)
             .map(|s| Arc::clone(s) as Arc<dyn SchemaProvider>)
@@ -392,19 +385,13 @@ impl std::fmt::Debug for AcceleratedSchemaProvider {
 #[async_trait]
 impl SchemaProvider for AcceleratedSchemaProvider {
     fn table_names(&self) -> Vec<String> {
-        let guard = match self.tables.read() {
-            Ok(guard) => guard,
-            Err(e) => e.into_inner(),
-        };
+        let guard = self.tables.read();
         guard.keys().cloned().collect()
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
         let dataset_name = {
-            let guard = match self.tables.read() {
-                Ok(guard) => guard,
-                Err(e) => e.into_inner(),
-            };
+            let guard = self.tables.read();
             match guard.get(name) {
                 Some(dataset_name) => dataset_name.clone(),
                 None => return Ok(None),
@@ -432,10 +419,7 @@ impl SchemaProvider for AcceleratedSchemaProvider {
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        let guard = match self.tables.read() {
-            Ok(guard) => guard,
-            Err(e) => e.into_inner(),
-        };
+        let guard = self.tables.read();
         guard.contains_key(name)
     }
 }
