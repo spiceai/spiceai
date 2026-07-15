@@ -1292,6 +1292,18 @@ impl CayenneAccelerator {
                     );
                 }
             }
+            if let Some((key, value)) = ["cayenne_ingest_cores", "ingest_cores"]
+                .iter()
+                .find_map(|key| acceleration.params.get(*key).map(|value| (*key, value)))
+            {
+                if let Some(cores) = cayenne::metadata::IngestCores::parse(value) {
+                    config.ingest_cores = cores;
+                } else {
+                    tracing::warn!(
+                        "Dataset '{table_name}' contains an invalid `{key}` value: '{value}'. Expected `auto` or a positive integer core count. Using the default (auto)."
+                    );
+                }
+            }
             config.cdc_mem_tier_max_bytes = parse_usize_aliases_as_i64(
                 acceleration,
                 &["cayenne_cdc_mem_tier_max_bytes", "cdc_mem_tier_max_bytes"],
@@ -2408,8 +2420,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    63,
-    { S3_PARAMS_LEN + 63 },
+    64,
+    { S3_PARAMS_LEN + 64 },
 >(
     S3_PARAMETERS,
     [
@@ -2548,6 +2560,9 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Periodic background mem-tier checkpoint interval in milliseconds, in cdc_durability: memory mode only. The accelerator spawns a per-table background task that checkpoints the RAM tier every interval (mirroring the background compactor); this advances the deferred source slot ack on an idle or pure-upsert stream that never trips a delete/truncate event trigger or a write-path cap. Default 1000 (1 s). Set 0 to disable the periodic task."),
         ParameterSpec::component("cdc_mem_tier_shards")
             .description("Number of PK-hash shards the in-RAM CDC tier is partitioned into, in cdc_durability: memory mode only (non-partitioned, key-based merge-on-read tables). Each shard is an independent serial validate->append domain keyed by the RowConverter OwnedRow bytes, so disjoint keys validate and append in parallel within one apply (intra-apply fan-out) while a key's whole version history — upserts AND delete tombstones — stays confined to its one owning shard (last-writer-wins preserved). Checkpoints are always all-shards-atomic on a single source-position axis. Default 1 (the byte-identical serial path). Raise (e.g. 4) on update/insert-heavy CDC tables to lift the per-apply serialization ceiling."),
+        ParameterSpec::component("ingest_cores")
+            .description("How many CPU cores the process-global CDC ingest pool reserves, pinning one worker thread per core (morsel pipeline). Machine-wide, not per-table — the pool is shared across every memory-mode table. 'auto' (default) reserves 1 core (apply is serial, so one worker saturates it while the rest stay available for queries); a positive integer reserves exactly that many. The ingest reservation is hard for ingest workers and advisory (OS-scheduled) for the unpinned query runtime.")
+            .default("auto"),
         ParameterSpec::component("tuning")
             .description("Auto-tuning mode. 'auto': derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate, delete fraction, and arrival burstiness AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adapts the inline-memtable flush caps, the in-memory CDC tier byte cap, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. DEFAULT: when this is unset, the mode is 'adaptive' if extended schema inference produced metadata (the dataset set 'schema_inference: extended' and the source emitted it) — opting into extended schema enables self-tuning, and that metadata is the adaptive warm-start — otherwise 'auto'. Set 'cayenne_tuning: auto' explicitly to opt out of the closed loop even with extended schema. 'schema_inference: extended' also sharpens the 'adaptive' warm-start (inferred cardinality/size) but is not required for an explicit 'adaptive' — without it the controller relearns the row width from observed ingest and converges from the hardware-derived warm-start. In BOTH modes an explicit per-parameter value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set actuator is pinned (the loop will not move it).")
             .one_of(&["auto", "adaptive"]),

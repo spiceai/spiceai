@@ -206,6 +206,12 @@ clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0
     "tokio_io",
     "tls",
 ] }
+# Cayenne ingest substrate (morsel pipeline, Stage 1 #3): a pinned std::thread
+# ingest pool over an MPMC channel. `core_affinity` pins ingest workers to
+# reserved cores; `crossbeam-channel` is the edge→pool descriptor channel. Both
+# were already in the lock transitively — naming them here makes them direct.
+core_affinity = "0.8"
+crossbeam-channel = "0.5"
 datafusion = "54.0.0"
 datafusion-catalog = "54.0.0"
 datafusion-common = "54.0.0"

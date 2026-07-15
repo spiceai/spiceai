@@ -65,6 +65,7 @@ pub mod hll;
 #[cfg(feature = "partition-table-provider")]
 pub use ddl::CayenneDdlHandler;
 pub(crate) mod bounded_fifo;
+pub mod ingest_pool;
 pub mod logical_optimizer;
 pub mod maintained_aggregate;
 pub mod metadata;
@@ -91,8 +92,12 @@ pub use catalog_provider::{
     CayenneCatalogProvider, CayenneCatalogProviderConfig, CayenneSchemaProvider,
 };
 pub use cayenne_catalog::{CayenneCatalog, is_retryable_write_conflict};
+pub use ingest_pool::{
+    IngestPool, ProbeReport, Task as IngestTask, install_global_ingest_pool,
+    submit_to_global_ingest_pool, uninstall_global_ingest_pool,
+};
 pub use metadata::{
-    CdcDurability, DataFile, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
+    CdcDurability, DataFile, DeleteFile, IngestCores, InlinedData, InlinedDataStats, InlinedDelete,
     ObjectStoreConfig, PartitionMetadata, StageBPublishMode, StorageClass, TableMetadata,
     TableStatistics,
 };

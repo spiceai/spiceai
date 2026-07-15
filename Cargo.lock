@@ -3529,7 +3529,9 @@ dependencies = [
  "bytes",
  "chdb-rust",
  "chrono",
+ "core_affinity",
  "criterion 0.7.0",
+ "crossbeam-channel",
  "data_components",
  "datafusion",
  "datafusion-catalog",
@@ -4829,6 +4831,17 @@ dependencies = [
  "bitflags 1.3.2",
  "core-foundation 0.9.4",
  "libc",
+]
+
+[[package]]
+name = "core_affinity"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a034b3a7b624016c6e13f5df875747cc25f884156aad2abd12b6c46797971342"
+dependencies = [
+ "libc",
+ "num_cpus",
+ "winapi",
 ]
 
 [[package]]

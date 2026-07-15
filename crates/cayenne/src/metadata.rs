@@ -674,6 +674,72 @@ impl StageBPublishMode {
     }
 }
 
+/// How many CPU cores the process-global ingest pool reserves for CDC apply
+/// (morsel pipeline, proposal §8). The pool pins one `std::thread` worker per
+/// reserved core; the count is machine-wide, not per-table (the pool is a
+/// process-global substrate shared across every memory-mode table, like the
+/// in-memory CDC tier byte budget). Runtime-only — it never affects data
+/// layout, so it is not compared by `configuration_matches`.
+///
+/// The `auto`/`fixed` split is the enum `CLAUDE.md` requires (no user-facing
+/// booleans); the *integer* core count carried by `Fixed` is a plain size, not
+/// a hidden two-state flag, so it is allowed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestCores {
+    /// Runtime picks the ingest-core reservation. In Stage 1 this is **1**
+    /// pinned worker: apply is serial (the edge holds `write_guard` across the
+    /// submit/await), so a single worker saturates it, and holding back the
+    /// remaining cores keeps them available for query execution. The adaptive
+    /// grow/shrink partition controller (proposal §8.1 `n_ingest_cores`) is
+    /// Stage 2c; Stage 1 ships this static knob.
+    #[default]
+    Auto,
+    /// Reserve exactly `n` cores (pin `n` ingest workers). A value of `0` is
+    /// treated as `1` by [`IngestCores::worker_count`] — the pool always keeps
+    /// at least one worker so submitted apply work can drain.
+    Fixed(usize),
+}
+
+impl IngestCores {
+    /// Parse a spicepod parameter value: `auto`, or a bare integer `N`
+    /// (`fixed(N)`). Returns `None` for anything else so the caller can warn and
+    /// fall back to the default.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        let trimmed = value.trim();
+        if trimmed.eq_ignore_ascii_case("auto") {
+            return Some(Self::Auto);
+        }
+        trimmed.parse::<usize>().ok().map(Self::Fixed)
+    }
+
+    /// Whether this is the default `Auto` policy (used to skip serializing the
+    /// common case — this knob is runtime-only and process-global). Takes `&self`
+    /// so serde's `skip_serializing_if` can call it directly.
+    #[must_use]
+    pub const fn is_auto(&self) -> bool {
+        matches!(self, Self::Auto)
+    }
+
+    /// Number of pinned ingest workers this policy asks for. `Auto` = 1 in
+    /// Stage 1; `Fixed(n)` = `n`, clamped up to a minimum of 1 (the pool always
+    /// keeps one worker so apply work can drain).
+    #[must_use]
+    pub const fn worker_count(self) -> usize {
+        match self {
+            Self::Auto => 1,
+            Self::Fixed(n) => {
+                if n == 0 {
+                    1
+                } else {
+                    n
+                }
+            }
+        }
+    }
+}
+
 /// Which adaptive-tunable knobs the operator pinned with an explicit value. In
 /// `adaptive` mode the closed-loop controller must not move a pinned knob — its
 /// tuning bounds collapse to a single point so `decide()` naturally skips it and
@@ -1183,6 +1249,13 @@ pub struct VortexConfig {
     /// interval to finish. From `cayenne_datalake_gc_interval_ms`; defaults to
     /// 5min, lowered in tests.
     pub cold_tier_gc_interval_ms: u64,
+    /// How many cores the process-global ingest pool reserves for CDC apply
+    /// (morsel pipeline, Stage 1 #3). Set from `cayenne_ingest_cores`. Defaults
+    /// to [`IngestCores::Auto`] (1 pinned worker in Stage 1). Process-global and
+    /// runtime-only — never compared by `configuration_matches` (does not affect
+    /// data layout), and skipped when serializing the common `Auto` case.
+    #[serde(default, skip_serializing_if = "IngestCores::is_auto")]
+    pub ingest_cores: IngestCores,
 }
 
 impl VortexConfig {
@@ -1531,6 +1604,7 @@ impl Default for VortexConfig {
             cold_tier_warm_max_files: 0,
             cold_tier_background_interval_ms: 60_000,
             cold_tier_gc_interval_ms: 300_000,
+            ingest_cores: IngestCores::default(),
         }
     }
 }
