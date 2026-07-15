@@ -301,6 +301,20 @@ pub trait MetadataCatalog: Send + Sync {
     /// virtual file (`ListingTable`).
     async fn add_delete_file(&self, delete_file: DeleteFile) -> CatalogResult<String>;
 
+    /// Atomically add every deletion-vector file produced by one logical delete.
+    /// If any row fails validation or insertion, none become visible.
+    async fn add_delete_files(&self, delete_files: Vec<DeleteFile>) -> CatalogResult<()>;
+
+    /// Atomically commit deletion-vector rows and an inline-data rewrite for
+    /// one logical delete. A failure leaves both catalog areas unchanged.
+    async fn commit_delete_files_with_inlined_rewrite(
+        &self,
+        delete_files: Vec<DeleteFile>,
+        table_id: &str,
+        updated_data: Vec<InlinedData>,
+        deleted_inlined_ids: Vec<String>,
+    ) -> CatalogResult<()>;
+
     /// Get all active delete files for a table (across all virtual files).
     async fn get_table_delete_files(&self, table_id: &str) -> CatalogResult<Vec<DeleteFile>>;
 
@@ -668,6 +682,16 @@ pub trait MetadataCatalog: Send + Sync {
     /// (`cayenne_snapshot_file`) — the complete file set for a snapshot.
     async fn upsert_snapshot_file(&self, file: &SnapshotFile) -> CatalogResult<()>;
 
+    /// Atomically replace the complete manifest for one snapshot. Readers see
+    /// either the old complete set or the new complete set, never a partial
+    /// prefix if an insert fails.
+    async fn replace_snapshot_files(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+        files: &[SnapshotFile],
+    ) -> CatalogResult<()>;
+
     /// Get the complete manifest file set for a snapshot. In the manifest
     /// snapshot model this is the scan's authoritative file source (rather than
     /// directory listing).
@@ -879,6 +903,13 @@ pub trait MetadataCatalog: Send + Sync {
     /// hidden) rather than leaving a duplicate. There are no in-flight runtime
     /// writers at open time, so this never races a live stage.
     async fn publish_orphan_inlined_deletes(&self, table_id: &str) -> CatalogResult<u64>;
+
+    /// Return exact IDs of currently-unpublished inline tombstones without
+    /// changing their durable activation state.
+    async fn get_unpublished_inlined_delete_ids(
+        &self,
+        table_id: &str,
+    ) -> CatalogResult<Vec<String>>;
 
     /// Atomically rewrite existing inline data rows, remove emptied inline data rows,
     /// and append new inline data rows.

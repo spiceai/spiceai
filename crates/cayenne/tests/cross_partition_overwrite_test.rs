@@ -515,6 +515,7 @@ async fn cross_partition_append_commits_atomically_under_barrier() {
         .iter()
         .map(|p| cayenne::PartitionedWalEntry {
             table_id: p.table_id().to_string(),
+            target_snapshot_id: None,
             staging_wal_path: Some(p.staging_wal_path().to_string_lossy().to_string()),
         })
         .collect();
@@ -604,6 +605,7 @@ async fn mid_barrier_failure_leaves_top_level_wal() {
         .iter()
         .map(|p| cayenne::PartitionedWalEntry {
             table_id: p.table_id().to_string(),
+            target_snapshot_id: None,
             staging_wal_path: Some(p.staging_wal_path().to_string_lossy().to_string()),
         })
         .collect();
