@@ -153,7 +153,6 @@ runtime-secrets = { path = "../runtime-secrets", default-features = false }
 runtime-table-partition = { path = "../runtime-table-partition" }
 rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
-rustls-pemfile.workspace = true
 elasticsearch = { path = "../elasticsearch", optional = true }
 duration-parse = { workspace = true, optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }

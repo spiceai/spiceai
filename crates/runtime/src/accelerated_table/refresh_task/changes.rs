@@ -112,7 +112,7 @@ impl cayenne::SlotAdvancer for CayenneSlotAdvancer {
         // Pull out every committer whose epoch is now durable, preserving FIFO
         // order. Hold the lock only to splice out the ready prefix, not across
         // the (network) commits.
-        let mut ready: VecDeque<(u64, Vec<Box<dyn cdc::CommitChange + Send + Sync>>)> = {
+        let ready: VecDeque<(u64, Vec<Box<dyn cdc::CommitChange + Send + Sync>>)> = {
             let mut queue = self.queue.lock().await;
             let mut ready = VecDeque::new();
             while let Some((epoch, _)) = queue.front() {
@@ -123,6 +123,28 @@ impl cayenne::SlotAdvancer for CayenneSlotAdvancer {
                     break;
                 }
             }
+            ready
+        };
+
+        // Cross-epoch coalescing is legal here (unlike at push time): every
+        // committer in `ready` is at or below the durable fence, so folding the
+        // whole prefix to a single max-LSN commit and acking once is equivalent
+        // to acking each epoch in turn — O(epochs) work becomes one `fetch_max`.
+        // A dataset's deferred queue holds a single committer type, so this is
+        // all-or-nothing: only when *every* committer is coalescable do we
+        // collapse to a single entry tagged with the highest folded epoch.
+        // Order-sensitive or fallible sources are left with their per-epoch
+        // structure completely untouched, preserving the in-order,
+        // requeue-on-failure drain byte for byte.
+        let mut ready = if prefix_is_coalescable(&ready) {
+            // `prefix_is_coalescable` guaranteed a non-empty prefix, so `max` is
+            // always `Some` here; `unwrap_or(0)` is just the lint-clean spelling
+            // of that (this crate denies `unwrap`/`expect` in non-test code). The
+            // fold only ever reduces a non-empty input, so `folded` is non-empty.
+            let max_epoch = ready.iter().map(|(epoch, _)| *epoch).max().unwrap_or(0);
+            let folded = fold_committers(ready.into_iter().flat_map(|(_, cs)| cs).collect());
+            VecDeque::from([(max_epoch, folded)])
+        } else {
             ready
         };
 
@@ -156,6 +178,65 @@ impl cayenne::SlotAdvancer for CayenneSlotAdvancer {
             }
         }
     }
+}
+
+/// Whether the whole deferred-drain prefix opts into coalescing — i.e. every
+/// committer is coalesce-identifiable (`as_any` is `Some`, which only the
+/// infallible, order-insensitive committers override). Empty prefix -> `false`.
+/// A dataset's queue holds a single committer type, so in practice this is
+/// all-or-nothing; requiring *all* of them (not just the first) is a cheap guard
+/// that keeps a hypothetical mixed queue on the safe per-epoch, in-order,
+/// requeue-on-failure drain rather than wrongly collapsing epochs.
+fn prefix_is_coalescable(
+    ready: &VecDeque<(u64, Vec<Box<dyn cdc::CommitChange + Send + Sync>>)>,
+) -> bool {
+    ready.iter().any(|(_, committers)| !committers.is_empty())
+        && ready
+            .iter()
+            .flat_map(|(_, committers)| committers.iter())
+            .all(|committer| committer.as_any().is_some())
+}
+
+/// Coalesce a run of consecutive committers via [`cdc::CommitChange::try_absorb`]:
+/// each is folded into the previous retained committer where the source permits
+/// (a shared-slot member folds to its max LSN), collapsing an N-envelope burst
+/// to as few as one commit — which turns the ordered background commit chain
+/// into a single `fetch_max` for that source. Anything that refuses to fold
+/// (the default for order-sensitive sources) is retained in order, so those
+/// connectors are byte-identical.
+fn fold_committers(
+    committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>>,
+) -> Vec<Box<dyn cdc::CommitChange + Send + Sync>> {
+    // Fast path — nothing can fold: a lone committer, or a run whose committers
+    // don't opt into coalescing (`as_any` is `None`, the default). Return the
+    // input untouched so the common no-coalesce burst allocates nothing, keeping
+    // the pre-existing apply cost.
+    if committers.len() <= 1 || committers.first().is_none_or(|c| c.as_any().is_none()) {
+        return committers;
+    }
+    let mut folded: Vec<Box<dyn cdc::CommitChange + Send + Sync>> =
+        Vec::with_capacity(committers.len());
+    for committer in committers {
+        if let Some(last) = folded.last_mut() {
+            if last.try_absorb(committer.as_ref()) {
+                continue;
+            }
+            // Within a single dataset's run every coalesce-capable committer
+            // targets the same stream position (e.g. one Postgres member slot),
+            // so two of the same concrete type must always absorb; a failure
+            // means two members' commits were routed into one dataset's run — an
+            // upstream (pump) bug, not something to paper over here.
+            debug_assert!(
+                !matches!(
+                    (last.as_any(), committer.as_any()),
+                    (Some(a), Some(b)) if a.type_id() == b.type_id()
+                ),
+                "two coalesce-capable committers of the same type failed to absorb"
+            );
+        }
+        folded.push(committer);
+    }
+    folded
 }
 
 #[cfg(not(windows))]
@@ -1115,11 +1196,21 @@ impl RefreshTask {
         // The slot advancer is installed per all-deferrable upsert-only burst and
         // cleared for durable-only bursts, so non-replayable sources and deletes
         // never buffer un-acked rows in RAM.
+        //
+        // Excludes `mode: memory` (memory-resident) tables: they never checkpoint
+        // to durable Vortex, so the deferred committers' durability fence
+        // (`on_checkpoint_durable`) would never fire — the queue would grow
+        // unbounded and the source slot would stall. Memory mode is ephemeral
+        // (reload-from-source on restart), so its in-RAM CDC writes take the
+        // immediate-commit path below (`in_memory_epoch` with no queue), advancing
+        // the slot right after the write — correct because a restart re-snapshots.
         let deferred_commits: Option<DeferredCommitQueue> = {
             #[cfg(not(windows))]
             {
                 self.cayenne_accelerator()
-                    .filter(|cayenne| cayenne.is_cdc_memory_mode())
+                    .filter(|cayenne| {
+                        cayenne.is_cdc_memory_mode() && !cayenne.is_memory_resident_mode()
+                    })
                     .map(|_cayenne| {
                         Arc::new(tokio::sync::Mutex::new(VecDeque::new())) as DeferredCommitQueue
                     })
@@ -1866,6 +1957,12 @@ impl RefreshTask {
         committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>>,
         mark_ready: bool,
     ) -> CoalescedRunOutcome {
+        // The group's batches are about to be concatenated into one write, so
+        // its committers can coalesce too: for a shared-slot source this folds
+        // the whole burst to a single max-LSN commit (see `fold_committers`),
+        // shrinking both the immediate ordered commit chain and any deferred
+        // queue entry below. Order-sensitive sources fold to a no-op.
+        let committers = fold_committers(committers);
         let coalesce_start = Instant::now();
         // Fast path: a single envelope (low-load / serial behavior). Skips
         // concat allocation entirely so the no-coalesce path matches the
@@ -4960,6 +5057,160 @@ mod tests {
         fn supports_deferral(&self) -> bool {
             true
         }
+    }
+
+    /// A coalescable, infallible committer mirroring `SharedLsnCommitter`'s
+    /// max-fold shape: absorbs siblings by keeping the higher value, records the
+    /// value it finally commits. Used to exercise `fold_committers` and the
+    /// cross-epoch drain collapse without pulling in the Postgres crate.
+    struct FoldableCommitter {
+        value: u64,
+        log: Arc<TokioMutex<Vec<u64>>>,
+    }
+
+    #[async_trait]
+    impl CommitChange for FoldableCommitter {
+        async fn commit(&self) -> Result<(), CommitError> {
+            self.log.lock().await.push(self.value);
+            Ok(())
+        }
+
+        fn supports_deferral(&self) -> bool {
+            true
+        }
+
+        fn try_absorb(&mut self, other: &dyn CommitChange) -> bool {
+            match other
+                .as_any()
+                .and_then(<dyn std::any::Any>::downcast_ref::<FoldableCommitter>)
+            {
+                Some(other) => {
+                    self.value = self.value.max(other.value);
+                    true
+                }
+                None => false,
+            }
+        }
+
+        fn as_any(&self) -> Option<&dyn std::any::Any> {
+            Some(self)
+        }
+    }
+
+    #[test]
+    fn fold_committers_collapses_a_coalescable_run() {
+        let log = Arc::new(TokioMutex::new(Vec::new()));
+        let committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>> = (1..=5u64)
+            .map(|value| {
+                Box::new(FoldableCommitter {
+                    value,
+                    log: Arc::clone(&log),
+                }) as Box<dyn cdc::CommitChange + Send + Sync>
+            })
+            .collect();
+        let folded = fold_committers(committers);
+        assert_eq!(folded.len(), 1, "a coalescable run folds to one committer");
+    }
+
+    #[test]
+    fn fold_committers_leaves_non_coalescable_committers_untouched() {
+        let log = CommitLog::new();
+        let committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>> = (1..=3i32)
+            .map(|id| {
+                Box::new(TrackingCommitter {
+                    id,
+                    log: Arc::clone(&log),
+                    outcome: Ok(()),
+                }) as Box<dyn cdc::CommitChange + Send + Sync>
+            })
+            .collect();
+        let folded = fold_committers(committers);
+        assert_eq!(
+            folded.len(),
+            3,
+            "order-sensitive committers keep their per-item structure"
+        );
+    }
+
+    /// The drain-collapse gate: only an all-coalescable prefix collapses. A mixed
+    /// prefix (coalescable followed by non-coalescable) must NOT collapse, so it
+    /// keeps the safe per-epoch, requeue-on-failure drain.
+    #[test]
+    fn prefix_is_coalescable_requires_every_committer_to_opt_in() {
+        let u64_log = Arc::new(TokioMutex::new(Vec::new()));
+        let cc_log = CommitLog::new();
+        let foldable = || {
+            Box::new(FoldableCommitter {
+                value: 1,
+                log: Arc::clone(&u64_log),
+            }) as Box<dyn cdc::CommitChange + Send + Sync>
+        };
+        let plain = || {
+            Box::new(TrackingCommitter {
+                id: 1,
+                log: Arc::clone(&cc_log),
+                outcome: Ok(()),
+            }) as Box<dyn cdc::CommitChange + Send + Sync>
+        };
+
+        assert!(!prefix_is_coalescable(&VecDeque::new()), "empty prefix");
+        assert!(
+            !prefix_is_coalescable(&VecDeque::from([(1u64, vec![])])),
+            "prefix of only empty committer vecs"
+        );
+        assert!(
+            prefix_is_coalescable(&VecDeque::from([
+                (1u64, vec![foldable()]),
+                (2u64, vec![foldable()]),
+            ])),
+            "every committer coalescable"
+        );
+        assert!(
+            !prefix_is_coalescable(&VecDeque::from([
+                (1u64, vec![foldable()]),
+                (2u64, vec![plain()]),
+            ])),
+            "mixed prefix must not collapse (the first-only-check hazard)"
+        );
+        assert!(
+            !prefix_is_coalescable(&VecDeque::from([(1u64, vec![plain()])])),
+            "no committer coalescable"
+        );
+    }
+
+    /// The cross-epoch drain collapse: a coalescable dataset's whole
+    /// `epoch <= durable` prefix folds to ONE commit carrying the max value —
+    /// O(epochs) work becomes a single ack.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn slot_advancer_collapses_coalescable_epochs_to_one_commit() {
+        let log = Arc::new(TokioMutex::new(Vec::new()));
+        let queue: DeferredCommitQueue = Arc::new(TokioMutex::new(VecDeque::new()));
+        for epoch in 1..=4u64 {
+            queue.lock().await.push_back((
+                epoch,
+                vec![Box::new(FoldableCommitter {
+                    value: epoch * 10,
+                    log: Arc::clone(&log),
+                })
+                    as Box<dyn cdc::CommitChange + Send + Sync>],
+            ));
+        }
+        let advancer = CayenneSlotAdvancer {
+            queue: Arc::clone(&queue),
+            dataset_name: TableReference::bare("test"),
+            runtime_status: crate::status::RuntimeStatus::new(),
+        };
+        <CayenneSlotAdvancer as cayenne::SlotAdvancer>::on_checkpoint_durable(&advancer, 4).await;
+        assert_eq!(
+            *log.lock().await,
+            vec![40],
+            "the four durable epochs fold to a single commit carrying the max LSN"
+        );
+        assert!(
+            queue.lock().await.is_empty(),
+            "the whole coalesced prefix is drained"
+        );
     }
 
     #[cfg(not(windows))]

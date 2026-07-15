@@ -371,6 +371,7 @@ impl TursoMetastore {
             min_sequence BIGINT NOT NULL DEFAULT 0,
             max_sequence BIGINT NOT NULL DEFAULT 0,
             statistics_blob BLOB NOT NULL,
+            pk_bloom_blob BLOB,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
             PRIMARY KEY (table_id, file_url)
         )
@@ -672,6 +673,17 @@ impl MetastoreBackend for TursoMetastore {
         let _ = conn
             .execute(
                 "ALTER TABLE cayenne_snapshot_file ADD COLUMN digest TEXT",
+                (),
+            )
+            .await;
+
+        // Per-cold-file PK existence bloom. NULL (legacy / non-upsert /
+        // over-cap) makes the keyset rebuild fall back to the exact cold
+        // scan, so the column is forward- and downgrade-safe. Appended
+        // last to match CREATE TABLE and EXPECTED_TABLES column order.
+        let _ = conn
+            .execute(
+                "ALTER TABLE cayenne_cold_tier_file ADD COLUMN pk_bloom_blob BLOB",
                 (),
             )
             .await;
@@ -1067,7 +1079,7 @@ pub struct TursoTransaction {
 impl Drop for TursoTransaction {
     fn drop(&mut self) {
         if let Some(guard) = self.conn.take() {
-            tokio::spawn(async move {
+            let rollback = async move {
                 tracing::debug!(
                     "TursoTransaction dropped without explicit commit or rollback; \
                      attempting auto-rollback"
@@ -1076,7 +1088,28 @@ impl Drop for TursoTransaction {
                     tracing::error!("Failed to auto-rollback TursoTransaction on drop: {err}");
                 }
                 // `guard` is dropped here, releasing the pool slot.
-            });
+            };
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(rollback);
+            } else {
+                // No ambient Tokio runtime (the transaction was dropped from a
+                // non-Tokio thread). `turso`'s connection I/O is Tokio-based, so
+                // `futures::executor::block_on` would run it without a reactor
+                // and could panic or stall. Build a small current-thread Tokio
+                // runtime to drive the best-effort rollback, logging if even
+                // the runtime cannot be created.
+                std::thread::spawn(move || {
+                    match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt.block_on(rollback),
+                        Err(err) => tracing::error!(
+                            "Failed to build fallback Tokio runtime to auto-rollback TursoTransaction on drop: {err}"
+                        ),
+                    }
+                });
+            }
         }
     }
 }
