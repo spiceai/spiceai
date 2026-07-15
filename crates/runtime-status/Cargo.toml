@@ -17,3 +17,6 @@ runtime-metrics = { path = "../runtime-metrics" }
 tokio = { workspace = true, features = ["sync", "time"] }
 tokio-util = { workspace = true, features = ["rt"] }
 util = { path = "../util", features = ["datafusion"] }
+
+[lints]
+workspace = true

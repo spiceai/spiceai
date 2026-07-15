@@ -1592,11 +1592,6 @@ impl Runtime {
                 self.status
                     .mark_initializing(status::ComponentKey::tool_catalog(catalog_name));
             }
-
-            for model in &app.models {
-                self.status
-                    .mark_initializing(status::ComponentKey::model(&model.name));
-            }
         }
 
         let valid_catalogs = Arc::clone(&self).get_valid_catalogs(&app, LogErrors(false));

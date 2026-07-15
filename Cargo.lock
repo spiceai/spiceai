@@ -16856,7 +16856,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-status"
-version = "2.1.0-unstable"
+version = "2.2.0-unstable"
 dependencies = [
  "datafusion",
  "opentelemetry",

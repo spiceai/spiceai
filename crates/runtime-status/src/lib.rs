@@ -922,9 +922,11 @@ impl RuntimeStatus {
                 return;
             }
 
-            // Wait for next change; return if channel closed (runtime shutting down)
-            if receiver.changed().await.is_err() {
-                return;
+            tokio::select! {
+                result = receiver.changed() => {
+                    if result.is_err() { return; }
+                }
+                () = self.shutdown_token.cancelled() => return,
             }
         }
     }
@@ -938,8 +940,11 @@ impl RuntimeStatus {
             if !matches!(*receiver.borrow(), ComponentStatus::Initializing) {
                 return;
             }
-            if receiver.changed().await.is_err() {
-                return;
+            tokio::select! {
+                result = receiver.changed() => {
+                    if result.is_err() { return; }
+                }
+                () = self.shutdown_token.cancelled() => return,
             }
         }
     }
@@ -1025,14 +1030,15 @@ impl RuntimeStatus {
             .map(resolve_table_reference)
             .collect::<Vec<_>>();
 
-        let _ = retry(retry_strategy, || async {
-            if self.first_unready_dependency(&dependent_tables).is_some() {
-                return Err(RetryError::transient(()));
-            }
-
-            Ok(())
-        })
-        .await;
+        tokio::select! {
+            _ = retry(retry_strategy, || async {
+                if self.first_unready_dependency(&dependent_tables).is_some() {
+                    return Err(RetryError::transient(()));
+                }
+                Ok(())
+            }) => {}
+            () = self.shutdown_token.cancelled() => {}
+        }
     }
 
     /// Waits for the entire runtime to be ready (all registered components have been ready at least once).
@@ -1045,7 +1051,10 @@ impl RuntimeStatus {
             if self.is_ready() {
                 return;
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
+            tokio::select! {
+                () = tokio::time::sleep(POLL_INTERVAL) => {}
+                () = self.shutdown_token.cancelled() => return,
+            }
         }
     }
 }
