@@ -1365,10 +1365,11 @@ pub struct CayenneTableProvider {
     /// attestation is observed by scanning clones and invalidated for all on a write.
     current_sorted_snapshot: Arc<ArcSwap<Option<String>>>,
     /// Serializes mem-tier checkpoints (spills) for this table so a single
-    /// checkpoint is in flight at a time. The write path uses
-    /// `try_lock()` on this to detect "a checkpoint is already running" and take
-    /// the spill-then-fallback path rather than growing the tier unboundedly
-    /// (the OOM-safety guard). Shared across writer clones.
+    /// checkpoint is in flight at a time. The write path blocks on
+    /// `.lock().await`/`.lock_owned().await` when it needs a spill (the
+    /// OOM-safety guard), so a second writer simply waits for the in-flight
+    /// checkpoint to finish rather than racing it — natural backpressure, not
+    /// a try-lock-with-fallback. Shared across writer clones.
     mem_checkpoint_lock: Arc<tokio::sync::Mutex<()>>,
     /// Serializes the mem-tier *publish* (the `ArcSwap` swap + sequence
     /// reservation) across all writers — DECOUPLED from [`Self::listing_fence`]
