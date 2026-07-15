@@ -156,19 +156,15 @@ fn has_transient_http_error_responses(batches: &[RecordBatch]) -> bool {
     false
 }
 
-/// Returns the batches that should be written to cache.
+/// Returns whether the batches should be written to cache.
 ///
 /// For HTTP-shaped results, any presence of a transient error response (5xx/429)
 /// skips the entire cache write to avoid storing a partial result set. Non-HTTP
-/// results are returned unchanged, even if they contain a `response_status`
-/// column for unrelated business logic.
+/// results are cacheable, even if they contain a `response_status` column for
+/// unrelated business logic.
 #[must_use]
-pub fn batches_to_cache(batches: &[RecordBatch]) -> Option<Vec<RecordBatch>> {
-    if has_transient_http_error_responses(batches) {
-        return None;
-    }
-
-    Some(batches.to_vec())
+pub fn batches_cacheable(batches: &[RecordBatch]) -> bool {
+    !has_transient_http_error_responses(batches)
 }
 
 #[must_use]
@@ -208,53 +204,49 @@ pub fn to_cached_record_batch_stream(
         // When an encoder is present, defer the size check until after encoding
         // so that compressed results that fit in the cache are not prematurely rejected.
         if records_size < cache_max_size || has_encoder {
-            match batches_to_cache(&records) {
-                // `batches_to_cache` only returns `None` when transient HTTP
-                // error responses (5xx/429) are present, which requires a
-                // non-empty result set — skip the write to avoid caching a
-                // partial result.
-                None => {
-                    tracing::debug!(
-                        "Transient HTTP error responses were present, skipping cache storage"
-                    );
-                }
+            // `batches_cacheable` is false only when transient HTTP error
+            // responses (5xx/429) are present, which requires a non-empty
+            // result set — skip the write to avoid caching a partial result.
+            if batches_cacheable(&records) {
                 // Cache the result, including genuinely empty (0-row / 0-batch)
                 // result sets. The schema is stored separately in
                 // `CachedQueryResult`, so an empty result round-trips with the
                 // correct schema, and caching it lets repeat queries that
                 // legitimately return no rows be served from cache instead of
                 // re-executing on every request.
-                Some(records_to_cache) => {
-                    let cached_at = std::time::Instant::now();
-                    let encoder = cache_provider.encoder();
+                let cached_at = std::time::Instant::now();
+                let encoder = cache_provider.encoder();
 
-                    match CachedQueryResult::from_batches(
-                        &records_to_cache,
-                        cache_schema,
-                        input_tables,
-                        cached_at,
-                        encoder,
-                    )
-                    .await
-                    {
-                        Ok(cached_result) => {
-                            // Check the actual (possibly encoded) size before caching
-                            let actual_size = cached_result.get_memory_size();
-                            if actual_size > cache_max_size {
-                                tracing::debug!(
-                                    actual_size,
-                                    cache_max_size,
-                                    "Encoded query result still exceeds cache max size, skipping"
-                                );
-                            } else if let Err(e) = cache_provider.put_raw_key(&raw_cache_key, cached_result).await {
-                                tracing::error!("Failed to cache query results: {e}");
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to encode query results for caching: {e}");
+                match CachedQueryResult::from_batches(
+                    records,
+                    cache_schema,
+                    input_tables,
+                    cached_at,
+                    encoder,
+                )
+                .await
+                {
+                    Ok(cached_result) => {
+                        // Check the actual (possibly encoded) size before caching
+                        let actual_size = cached_result.get_memory_size();
+                        if actual_size > cache_max_size {
+                            tracing::debug!(
+                                actual_size,
+                                cache_max_size,
+                                "Encoded query result still exceeds cache max size, skipping"
+                            );
+                        } else if let Err(e) = cache_provider.put_raw_key(&raw_cache_key, cached_result).await {
+                            tracing::error!("Failed to cache query results: {e}");
                         }
                     }
+                    Err(e) => {
+                        tracing::error!("Failed to encode query results for caching: {e}");
+                    }
                 }
+            } else {
+                tracing::debug!(
+                    "Transient HTTP error responses were present, skipping cache storage"
+                );
             }
         }
     };
