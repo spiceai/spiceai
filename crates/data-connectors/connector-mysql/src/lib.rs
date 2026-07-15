@@ -480,9 +480,11 @@ async fn mysql_inferred_schema_metadata(
 
 /// Enrich the provider's schema with `MySQL` metadata: column/table comments and
 /// source types, plus the inferred primary key / sizing. Schema inference is
-/// always attempted and degrades gracefully (see the info log below) when the
-/// source blocks the `information_schema` queries. Mirrors the `PostgreSQL`
-/// connector's `enrich_with_postgres_metadata`.
+/// always attempted. If the `information_schema` query fails (`Err`) it degrades to
+/// base column/type inference with an **info** log (see below); the best-effort
+/// sizing sub-query fails at debug level and still returns `Ok`, so a sizing-only
+/// gap may surface no info log. Mirrors the `PostgreSQL` connector's
+/// `enrich_with_postgres_metadata`.
 async fn enrich_with_mysql_metadata(
     pool: &Arc<MySQLConnectionPool>,
     dataset: &Dataset,

@@ -841,8 +841,10 @@ fn natural_order_sort_candidate(
 
 /// Enrich the provider's schema with `PostgreSQL` metadata: column/table comments
 /// and source types, plus inferred primary key / indexes / sort columns. Schema
-/// inference is always attempted and degrades gracefully (see the info log below)
-/// when the source blocks the `pg_catalog` queries.
+/// inference is always attempted. If the base `pg_catalog` query is blocked it
+/// degrades to base column/type inference with an **info** log (see below); the
+/// best-effort sub-queries (partition key, sizing, per-column stats) fail
+/// independently at debug level, so a partial gap may surface no info log.
 async fn enrich_with_postgres_metadata(
     pool: &Arc<PostgresConnectionPool>,
     dataset: &Dataset,

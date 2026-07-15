@@ -157,7 +157,7 @@ fn maintained_aggregate_specs_for_cayenne(
     if has_min_or_max && primary_keys.is_empty() {
         return Err(Error::InvalidConfiguration {
             detail: Arc::from(
-                "Cayenne maintained_aggregates MIN/MAX require a primary key so UPDATE and DELETE changes can retract prior extrema within the retained-index cap. Set acceleration.primary_key, ensure the source table declares a primary key (schema inference detects it automatically), or remove MIN/MAX from maintained_aggregates.",
+                "Cayenne maintained_aggregates MIN/MAX require a primary key so UPDATE and DELETE changes can retract prior extrema within the retained-index cap. Set acceleration.primary_key, ensure the source table has a primary key that schema inference can read (the connection role needs catalog read access), or remove MIN/MAX from maintained_aggregates.",
             ),
         });
     }
