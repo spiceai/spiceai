@@ -6,7 +6,7 @@ all: build
 
 .PHONY: build-cli
 build-cli:
-	cargo build --release -p spice
+	cargo build $(CARGO_PROFILE) -p spice
 
 .PHONY: build-cli-dev
 build-cli-dev:
@@ -80,10 +80,16 @@ else
 	NEXTEST_CARGO_PROFILE := --cargo-profile dev
 endif
 
+# Feature set shared by lint-rust (clippy) and nextest so both steps use the
+# same (profile × features) fingerprint and reuse each other's compiled artifacts
+# instead of forcing a second full-workspace recompile. Keep this in sync with
+# the --features list in the lint-rust target below.
+LINT_FEATURES := adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control,spicebench
+
 .PHONY: nextest
 nextest:
-	@cargo nextest run --all --lib $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
-	@cargo nextest run -p cayenne --tests $(NEXTEST_CARGO_PROFILE)
+	@cargo nextest run --all --lib $(NEXTEST_CARGO_PROFILE) --features $(LINT_FEATURES) $(NEXTEST_FLAG)
+	@cargo nextest run -p cayenne --tests $(NEXTEST_CARGO_PROFILE) --features $(LINT_FEATURES)
 
 # Also update .github/workflows/integration.yml with changes to this target
 .PHONY: test-integration
@@ -114,7 +120,7 @@ lint: lint-rust
 lint-rust:
 	cargo fmt --all -- --check
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going --lib --bins --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control,spicebench --workspace --exclude libnfs --exclude lopdf --exclude ttf-parser --exclude pdf-extract -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going --lib --bins --features $(LINT_FEATURES) --workspace --exclude libnfs --exclude lopdf --exclude ttf-parser --exclude pdf-extract -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -129,7 +135,7 @@ lint-rust:
 		-Dclippy::todo \
 		-Dclippy::assertions_on_result_states \
 		-Dclippy::allow_attributes
-	cargo clippy $(CARGO_PROFILE) --keep-going --tests --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control,spicebench --workspace --exclude libnfs --exclude lopdf --exclude ttf-parser --exclude pdf-extract -- \
+	cargo clippy $(CARGO_PROFILE) --keep-going --tests --features $(LINT_FEATURES) --workspace --exclude libnfs --exclude lopdf --exclude ttf-parser --exclude pdf-extract -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -166,7 +172,7 @@ _FEATURES_FLAGS := --features $(FEATURES)
 else ifdef PACKAGES
 _FEATURES_FLAGS :=
 else
-_FEATURES_FLAGS := --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control,spicebench
+_FEATURES_FLAGS := --features $(LINT_FEATURES)
 endif
 
 lint-rust-fix:
