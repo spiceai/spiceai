@@ -19674,6 +19674,8 @@ dependencies = [
  "duckdb",
  "flight_client",
  "futures",
+ "http 1.4.1",
+ "http-body-util",
  "indicatif 0.18.4",
  "insta",
  "nix 0.30.1",
