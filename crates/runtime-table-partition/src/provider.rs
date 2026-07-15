@@ -614,7 +614,10 @@ impl PartitionedDeletionSink {
 
 #[async_trait]
 impl DeletionSink for PartitionedDeletionSink {
-    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    async fn delete_from(
+        &self,
+        _context: Arc<TaskContext>,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let mut total_deleted = 0u64;
 
         for partition in &self.partitions {
@@ -671,7 +674,10 @@ impl PartitionedUpdateSink {
 
 #[async_trait]
 impl DeletionSink for PartitionedUpdateSink {
-    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    async fn delete_from(
+        &self,
+        _context: Arc<TaskContext>,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let mut total_updated = 0u64;
         let session_ctx = datafusion::execution::context::SessionContext::new();
         let _state = session_ctx.state();
