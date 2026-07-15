@@ -424,7 +424,7 @@ pub struct CayenneDeletionSink {
     /// `CayenneTableProvider`. The DML `DELETE` sink routes its sequence
     /// allocations through the SAME allocator as every other writer of this
     /// table, so memory and the DB `current_sequence_number` never diverge.
-    seq_allocator: Arc<TokioMutex<super::super::table::SeqAllocator>>,
+    seq_allocator: Arc<super::super::table::SeqAllocator>,
     /// Whether this sink must return a VERIFIED deleted-row count — i.e. it backs
     /// a user-visible `DELETE`, where the count is surfaced to the SQL client as
     /// "rows affected". When false (the CDC/internal default), the `pk IN (...)`
@@ -454,7 +454,7 @@ impl CayenneDeletionSink {
         additional_scan_tables: Vec<Arc<ListingTable>>,
         runtime_env: Arc<RuntimeEnv>,
         write_lock: Option<Arc<TokioMutex<()>>>,
-        seq_allocator: Arc<TokioMutex<super::super::table::SeqAllocator>>,
+        seq_allocator: Arc<super::super::table::SeqAllocator>,
     ) -> Self {
         Self {
             table_metadata,

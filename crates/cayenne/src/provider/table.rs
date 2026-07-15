@@ -865,10 +865,65 @@ pub(crate) const SEQ_RESERVE_BLOCK: i64 = 1024;
 /// reseeds from a DB high-water that is `>=` every value ever handed out and
 /// therefore never reissues one. See `reserve_sequences_local`.
 pub(crate) struct SeqAllocator {
-    /// Next sequence number to hand out.
-    next: i64,
+    /// Next sequence number to hand out (lowest UNUSED). Advanced lock-free by
+    /// the `try_reserve` CAS fast path; re-based to a fresh block on refill.
+    next: AtomicI64,
     /// Highest value durably written to `cayenne_table.current_sequence_number`.
-    persisted_hi: i64,
+    /// Monotonically increasing; published (`Release`) after the durable refill.
+    persisted_hi: AtomicI64,
+    /// Serializes the (rare) durable refill so only one winner issues the
+    /// metastore `UPDATE` per block exhaustion; losers re-check and retry the
+    /// lock-free fast path. Held ONLY on the refill path — never on the fast
+    /// path (§6.1: lock-free within a chunk, one-winner refill at exhaustion).
+    refill_lock: tokio::sync::Mutex<()>,
+}
+
+impl SeqAllocator {
+    /// Construct from a durable high-water: `next = persisted_hi + 1` is the
+    /// first unused sequence (the invariant `next - 1 == persisted_hi` holds at
+    /// open).
+    pub(crate) fn new(persisted_hi: i64) -> Self {
+        Self {
+            next: AtomicI64::new(persisted_hi + 1),
+            persisted_hi: AtomicI64::new(persisted_hi),
+            refill_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// The highest sequence handed out so far (`next - 1`). See
+    /// [`CayenneTableProvider::sequence_high_water`] for the required lock.
+    pub(crate) fn high_water(&self) -> i64 {
+        self.next.load(Ordering::Acquire) - 1
+    }
+
+    /// Lock-free fast path (§6.1 G0): reserve `count` (>= 1) consecutive
+    /// sequences iff the durable high-water already covers them. Returns the
+    /// first of `[first, first + count)`, or `None` when a refill is required
+    /// (the caller must durably advance `persisted_hi` and retry).
+    ///
+    /// Synchronous and await-free — callable from a pinned pool worker. Safe
+    /// because: (1) it never returns a value `> persisted_hi` (the check
+    /// precedes the claim and `persisted_hi` only ever increases, so the bound
+    /// cannot lapse between check and CAS); (2) the CAS makes each
+    /// `cur -> cur + count` transition single-winner, so no sequence is issued
+    /// twice.
+    fn try_reserve(&self, count: i64) -> Option<i64> {
+        loop {
+            let cur = self.next.load(Ordering::Acquire);
+            let last = cur.checked_add(count - 1)?;
+            if last > self.persisted_hi.load(Ordering::Acquire) {
+                return None; // block exhausted — refill needed
+            }
+            if self
+                .next
+                .compare_exchange_weak(cur, cur + count, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(cur);
+            }
+            // Lost the race for `cur` — another reserver advanced `next`; retry.
+        }
+    }
 }
 
 /// Reserve `count` (>= 1) consecutive sequence numbers from a shared in-memory
@@ -882,16 +937,38 @@ pub(crate) struct SeqAllocator {
 /// See [`CayenneTableProvider::reserve_sequences_local`] for the
 /// monotonicity-on-reopen correctness argument.
 pub(crate) async fn reserve_sequences_in(
-    allocator: &tokio::sync::Mutex<SeqAllocator>,
+    allocator: &SeqAllocator,
     catalog: &Arc<dyn MetadataCatalog>,
     table_id: &str,
     table_name: &str,
     count: u32,
 ) -> CatalogResult<i64> {
     let count = i64::from(count.max(1));
-    let mut allocator = allocator.lock().await;
+    loop {
+        // Fast path: lock-free CAS, no await, no metastore round trip. The
+        // common case once a block is reserved.
+        if let Some(first) = allocator.try_reserve(count) {
+            return Ok(first);
+        }
 
-    if allocator.next + count - 1 > allocator.persisted_hi {
+        // Slow path: the block is exhausted. Serialize the durable refill so
+        // exactly one winner issues the metastore UPDATE; losers block briefly
+        // on the refill lock, then find the block already grown and retry the
+        // fast path.
+        let _refill = allocator.refill_lock.lock().await;
+        // Re-attempt under the lock: a prior winner may already have refilled
+        // enough while we waited for the lock.
+        if let Some(first) = allocator.try_reserve(count) {
+            return Ok(first);
+        }
+
+        // We are the winner. Durably reserve a fresh block, then publish it:
+        // advance `next`'s floor to the block start (`fetch_max` tolerates a gap
+        // when a concurrent process claimed the previous DB high-water), THEN
+        // store `persisted_hi` with `Release` — so any reserver that observes the
+        // new `persisted_hi` (`Acquire`) also observes the re-based `next`,
+        // preserving the invariant `next - 1 <= persisted_hi` at every point an
+        // observer (or the next process after a crash) can read either value.
         let bump = std::cmp::max(SEQ_RESERVE_BLOCK, count);
         let bump_u32 = u32::try_from(bump).unwrap_or(u32::MAX);
         let block_first = catalog.reserve_sequence_numbers(table_id, bump_u32).await?;
@@ -903,19 +980,10 @@ pub(crate) async fn reserve_sequences_in(
                 ),
             }
         })?;
-        allocator.next = std::cmp::max(allocator.next, block_first);
-        allocator.persisted_hi = new_hi;
+        allocator.next.fetch_max(block_first, Ordering::AcqRel);
+        allocator.persisted_hi.store(new_hi, Ordering::Release);
+        // Loop: the fast path now succeeds against the grown block.
     }
-
-    let first = allocator.next;
-    allocator.next += count;
-    debug_assert!(
-        allocator.next - 1 <= allocator.persisted_hi,
-        "B2 invariant violated: next-1 ({}) > persisted_hi ({})",
-        allocator.next - 1,
-        allocator.persisted_hi,
-    );
-    Ok(first)
 }
 
 /// One memoized, deletion-filtered mem-tier visible set for the scan path.
@@ -1272,7 +1340,7 @@ pub struct CayenneTableProvider {
     /// common (in-block) path takes the lock, does arithmetic, drops it (no
     /// `await`). Shared across `clone_for_write` clones — the provider is a
     /// per-table singleton, so all writers of one table share one allocator.
-    seq_allocator: Arc<tokio::sync::Mutex<SeqAllocator>>,
+    seq_allocator: Arc<SeqAllocator>,
     /// Inline-conflict tombstones (Option D) that Stage-B has activated IN
     /// MEMORY but whose DURABLE `published = 1` flip has been deferred (cycle-4
     /// lever b1★ — Stage-B writer-free).
@@ -5523,10 +5591,7 @@ impl CayenneTableProvider {
         // ever monotonically increasing) DB row, so every previously handed-out
         // value is strictly below the new `next` — nothing is reissued.
         let persisted_hi = table_metadata.current_sequence_number;
-        let seq_allocator = Arc::new(tokio::sync::Mutex::new(SeqAllocator {
-            next: persisted_hi + 1,
-            persisted_hi,
-        }));
+        let seq_allocator = Arc::new(SeqAllocator::new(persisted_hi));
 
         let force_staging_probe_on_startup = table_metadata.path.starts_with("s3://");
 
@@ -6914,7 +6979,7 @@ impl CayenneTableProvider {
     /// mutation `<= cutoff`, and mutations that arrive afterward (`> cutoff`) are
     /// carried forward rather than cleared.
     pub(crate) async fn sequence_high_water(&self) -> i64 {
-        self.seq_allocator.lock().await.next - 1
+        self.seq_allocator.high_water()
     }
 
     /// Load the persisted optimizer statistics AND their exactness flag
