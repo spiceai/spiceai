@@ -1054,7 +1054,7 @@ impl PreparedStagedAppend {
     /// (`prepared_on_conflict` is `None`), pre-placed generation targeting the
     /// current snapshot on a manifest-scan table. Only this shape can publish
     /// with the durable catalog commit moved off the `listing_fence`; every
-    /// other shape (rename_sync placement, upsert/delete tombstones,
+    /// other shape (`rename_sync` placement, upsert/delete tombstones,
     /// protected-snapshot targets) keeps the all-under-fence path unchanged.
     fn is_preplaced_append_only_current_snapshot(&self) -> bool {
         self.file_placement == StagedFilePlacement::TargetSnapshot

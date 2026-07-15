@@ -488,7 +488,7 @@ mod tests {
         assert_eq!(
             ids_after_grow.len(),
             {
-                let mut u = ids_after_grow.clone();
+                let mut u = ids_after_grow;
                 u.sort_unstable();
                 u.dedup();
                 u.len()
