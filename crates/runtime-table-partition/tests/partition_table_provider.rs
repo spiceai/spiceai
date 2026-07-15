@@ -1190,7 +1190,7 @@ async fn test_modulo_partition_inequality_snapshot() -> Result<(), Box<dyn std::
     explain_plan = lines.join("\n") + "\n";
     insta::assert_snapshot!("modulo_greater_than", explain_plan);
 
-    // Test 3: Less than (value < 5) - only partitions 0-4 can have values < 5
+    // Test 3: Less than (value < 5) - partitions 5-9 pruned (all their values ≥ 5 under T-toward-zero remainder)
     let df = ctx.sql("SELECT * FROM test_table WHERE value < 5").await?;
     let physical_plan = df.create_physical_plan().await?;
     let mut explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
@@ -1200,6 +1200,200 @@ async fn test_modulo_partition_inequality_snapshot() -> Result<(), Box<dyn std::
     lines[1..].sort_unstable();
     explain_plan = lines.join("\n") + "\n";
     insta::assert_snapshot!("modulo_less_than", explain_plan);
+
+    Ok(())
+}
+
+/// Tests every decision boundary for modulo inequality partition pruning.
+///
+/// For each case we insert a single row `value = pv` (so partition key = pv, given |pv| < 10),
+/// run `SELECT value FROM t WHERE value <op> fv`, and assert the row count.
+/// A count of 0 when expected > 0 means the pruner incorrectly dropped a partition.
+/// A count > 0 when expected = 0 is a scan-side false positive (not a pruning bug, but noted).
+///
+/// Key invariants under truncation-toward-zero remainder semantics:
+///   pv > 0 → partition ⊆ [pv, +∞) → prune for `< fv` when fv ≤ pv, `<= fv` when fv < pv
+///   pv < 0 → partition ⊆ (−∞, pv] → prune for `> fv` when fv ≥ pv, `>= fv` when fv > pv
+///   pv = 0 → contains multiples of d in both directions → never prune
+#[tokio::test]
+async fn test_modulo_pruning_boundary_cases() -> Result<(), Box<dyn std::error::Error>> {
+    struct Case {
+        pv: i32,
+        op: &'static str,
+        fv: i32,
+        expected: i64,
+    }
+    let cases = [
+        // ── pv > 0: partition ⊆ [pv, +∞) ──────────────────────────────────────────
+        // Lt: prune if fv ≤ pv
+        Case { pv: 5, op: "<",  fv: 4, expected: 0 }, // fv < pv → prune
+        Case { pv: 5, op: "<",  fv: 5, expected: 0 }, // fv = pv → prune  ← boundary
+        Case { pv: 5, op: "<",  fv: 6, expected: 1 }, // fv > pv → keep, row matches
+        // LtEq: prune if fv < pv
+        Case { pv: 5, op: "<=", fv: 4, expected: 0 }, // fv < pv → prune
+        Case { pv: 5, op: "<=", fv: 5, expected: 1 }, // fv = pv → keep  ← boundary
+        Case { pv: 5, op: "<=", fv: 6, expected: 1 }, // fv > pv → keep, row matches
+        // Gt/GtEq: never prune (row may or may not match, but partition is always scanned)
+        Case { pv: 5, op: ">",  fv: 4, expected: 1 }, // row matches
+        Case { pv: 5, op: ">",  fv: 5, expected: 0 }, // no match (not a prune issue)
+        Case { pv: 5, op: ">",  fv: 6, expected: 0 },
+        Case { pv: 5, op: ">=", fv: 4, expected: 1 },
+        Case { pv: 5, op: ">=", fv: 5, expected: 1 }, // row matches  ← boundary
+        Case { pv: 5, op: ">=", fv: 6, expected: 0 },
+
+        // ── pv < 0: partition ⊆ (−∞, pv] ──────────────────────────────────────────
+        // Gt: prune if fv ≥ pv
+        Case { pv: -5, op: ">",  fv: -6, expected: 1 }, // fv < pv → keep, row matches
+        Case { pv: -5, op: ">",  fv: -5, expected: 0 }, // fv = pv → prune  ← boundary
+        Case { pv: -5, op: ">",  fv: -4, expected: 0 }, // fv > pv → prune
+        // GtEq: prune if fv > pv
+        Case { pv: -5, op: ">=", fv: -6, expected: 1 }, // fv < pv → keep, row matches
+        Case { pv: -5, op: ">=", fv: -5, expected: 1 }, // fv = pv → keep  ← boundary
+        Case { pv: -5, op: ">=", fv: -4, expected: 0 }, // fv > pv → prune
+        // Lt/LtEq: never prune
+        Case { pv: -5, op: "<",  fv: -4, expected: 1 }, // row matches
+        Case { pv: -5, op: "<",  fv: -5, expected: 0 }, // no match
+        Case { pv: -5, op: "<",  fv: -6, expected: 0 },
+        Case { pv: -5, op: "<=", fv: -4, expected: 1 },
+        Case { pv: -5, op: "<=", fv: -5, expected: 1 }, // row matches  ← boundary
+        Case { pv: -5, op: "<=", fv: -6, expected: 0 },
+
+        // ── pv = 0: multiples of d span both directions, never prune ───────────────
+        Case { pv: 0, op: "<",  fv:  1, expected: 1 }, // 0 < 1
+        Case { pv: 0, op: "<",  fv:  0, expected: 0 }, // 0 not < 0
+        Case { pv: 0, op: "<=", fv:  0, expected: 1 }, // 0 <= 0
+        Case { pv: 0, op: ">",  fv: -1, expected: 1 }, // 0 > -1
+        Case { pv: 0, op: ">",  fv:  0, expected: 0 }, // 0 not > 0
+        Case { pv: 0, op: ">=", fv:  0, expected: 1 }, // 0 >= 0
+    ];
+
+    for case in &cases {
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int32, false)]));
+        let creator = Arc::new(TestPartitionCreator::new(Arc::clone(&schema)));
+        let partition_by = vec![PartitionedBy {
+            name: "value_mod_10".to_string(),
+            expression: col("value") % lit(10),
+        }];
+        let table_provider = PartitionTableProvider::new(
+            Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+            partition_by,
+            Arc::clone(&schema),
+        )
+        .await?;
+
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(table_provider))?;
+        ctx.read_batch(RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![case.pv]))],
+        )?)?
+        .write_table("t", DataFrameWriteOptions::new())
+        .await?;
+
+        // Use SELECT value (not COUNT(*)) to force a real scan — COUNT(*) can be
+        // answered from row-count statistics, bypassing the WHERE filter entirely.
+        let sql = format!("SELECT value FROM t WHERE value {} {}", case.op, case.fv);
+        let batches = ctx.sql(&sql).await?.collect().await?;
+        let count: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
+
+        assert_eq!(
+            count, case.expected,
+            "pv={} op={} fv={}: expected count={} got {}",
+            case.pv, case.op, case.fv, case.expected, count
+        );
+    }
+
+    Ok(())
+}
+
+/// Randomised fuzz test for modulo inequality pruning correctness.
+///
+/// Uses a deterministic `SplitMix64` PRNG (same pattern as `cayenne/tests/mutation_property_test.rs`)
+/// so failures are fully reproducible from the logged seed. For each seed we draw:
+///   - `d`  : divisor in `[1, 20]`
+///   - `pv` : partition key — a value whose remainder mod d equals itself (i.e. `|pv| < d`)
+///   - `fv` : filter value in `[pv - d - 1, pv + d + 1]` to concentrate around boundaries
+///   - `op` : one of `<`, `<=`, `>`, `>=`
+///
+/// We insert a single row `value = pv`, run the query, and compare to a reference
+/// implementation that evaluates the filter directly on the scalar — no pruning involved.
+/// A mismatch means the pruner dropped a partition it shouldn't have (data loss).
+///
+/// Scale via `MODULO_PRUNE_FUZZ_SEEDS` (default 200).
+#[tokio::test]
+async fn test_modulo_pruning_fuzz() -> Result<(), Box<dyn std::error::Error>> {
+    let seeds: u64 = std::env::var("MODULO_PRUNE_FUZZ_SEEDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200);
+
+    // SplitMix64 — same PRNG as cayenne property tests for consistency
+    struct Rng(u64);
+    impl Rng {
+        fn new(seed: u64) -> Self { Rng(seed ^ 0x2545_F491_4F6C_DD1D) }
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn range_i32(&mut self, lo: i32, hi: i32) -> i32 {
+            // inclusive [lo, hi]
+            let span = (hi - lo + 1) as u64;
+            lo + (self.next_u64() % span) as i32
+        }
+    }
+
+    let ops: [(&str, fn(i32, i32) -> bool); 4] = [
+        ("<",  |pv, fv| pv <  fv),
+        ("<=", |pv, fv| pv <= fv),
+        (">",  |pv, fv| pv >  fv),
+        (">=", |pv, fv| pv >= fv),
+    ];
+
+    for seed in 0..seeds {
+        let mut rng = Rng::new(seed);
+
+        let d  = rng.range_i32(1, 20);
+        // pv must be a valid remainder: for positive d, pv ∈ (-(d-1), d-1)
+        let pv = rng.range_i32(-(d - 1), d - 1);
+        // concentrate fv near the boundary pv ± d so we hit pruning edges
+        let fv = rng.range_i32(pv - d - 1, pv + d + 1);
+        let (op_str, op_fn) = ops[rng.next_u64() as usize % 4];
+
+        let expected: i64 = if op_fn(pv, fv) { 1 } else { 0 };
+
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int32, false)]));
+        let creator = Arc::new(TestPartitionCreator::new(Arc::clone(&schema)));
+        let table_provider = PartitionTableProvider::new(
+            Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+            vec![PartitionedBy {
+                name: "value_mod_d".to_string(),
+                expression: col("value") % lit(d),
+            }],
+            Arc::clone(&schema),
+        )
+        .await?;
+
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(table_provider))?;
+        ctx.read_batch(RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![pv]))],
+        )?)?
+        .write_table("t", DataFrameWriteOptions::new())
+        .await?;
+
+        let sql = format!("SELECT value FROM t WHERE value {} {}", op_str, fv);
+        let batches = ctx.sql(&sql).await?.collect().await?;
+        let count: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
+
+        assert_eq!(
+            count, expected,
+            "seed={seed} d={d} pv={pv} op={op_str} fv={fv}: expected={expected} got={count}"
+        );
+    }
 
     Ok(())
 }

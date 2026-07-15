@@ -662,13 +662,20 @@ fn evaluate_bucket_inequality(
 }
 
 /// Evaluates inequality for modulo partitions using statistics-based pruning.
-/// For col % divisor = `partition_value`, the values that map to this partition form
-/// an arithmetic sequence: `partition_value`, `partition_value` + divisor, `partition_value` + 2*divisor, ...
-/// We can prune if we know the filter range doesn't contain any values from this sequence.
+///
+/// DataFusion uses truncation-toward-zero remainder (Rust `%` semantics), so the
+/// sign of `partition_value` (pv) determines which half of the number line the
+/// partition occupies:
+///
+/// - `pv > 0`: all values in this partition are ≥ pv  (e.g. pv=5, d=10 → {5,15,25,…})
+/// - `pv < 0`: all values in this partition are ≤ pv  (e.g. pv=-5, d=10 → {-5,-15,-25,…})
+/// - `pv = 0`: partition contains multiples of d in both directions → cannot prune
+///
+/// This holds for any non-zero divisor regardless of its sign.
 fn evaluate_modulo_inequality(
-    _divisor: &ScalarValue,
-    _partition_value: &ScalarValue,
-    _filter_value: &ScalarValue,
+    divisor: &ScalarValue,
+    partition_value: &ScalarValue,
+    filter_value: &ScalarValue,
     op: Operator,
 ) -> Result<bool, DataFusionError> {
     if !matches!(
@@ -677,11 +684,44 @@ fn evaluate_modulo_inequality(
     ) {
         return Err(DataFusionError::Plan("Unsupported operator".to_string()));
     }
-    // A non-zero integer modulo class is unbounded in both directions. Every
-    // residue class can therefore satisfy every one-sided inequality; pruning
-    // here would require a sound bounded-range solver over DataFusion's signed
-    // remainder semantics. Conservatively retain the partition.
-    Ok(false)
+
+    macro_rules! modulo_prune {
+        ($d:expr, $pv:expr, $fv:expr) => {{
+            if *$d == 0 {
+                return Ok(false);
+            }
+            Ok(match $pv.cmp(&0) {
+                // partition ⊆ [pv, +∞): prune if filter ceiling is at or below pv
+                std::cmp::Ordering::Greater => match op {
+                    Operator::Lt => $fv <= $pv,
+                    Operator::LtEq => $fv < $pv,
+                    _ => false,
+                },
+                // partition ⊆ (−∞, pv]: prune if filter floor is at or above pv
+                std::cmp::Ordering::Less => match op {
+                    Operator::Gt => $fv >= $pv,
+                    Operator::GtEq => $fv > $pv,
+                    _ => false,
+                },
+                // pv = 0: multiples of d span both directions, cannot prune
+                std::cmp::Ordering::Equal => false,
+            })
+        }};
+    }
+
+    match (divisor, partition_value, filter_value) {
+        (
+            ScalarValue::Int32(Some(d)),
+            ScalarValue::Int32(Some(pv)),
+            ScalarValue::Int32(Some(fv)),
+        ) => modulo_prune!(d, pv, fv),
+        (
+            ScalarValue::Int64(Some(d)),
+            ScalarValue::Int64(Some(pv)),
+            ScalarValue::Int64(Some(fv)),
+        ) => modulo_prune!(d, pv, fv),
+        _ => Ok(false),
+    }
 }
 
 /// Evaluates inequality for truncate(step, col) partitions.
