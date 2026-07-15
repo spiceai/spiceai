@@ -509,7 +509,16 @@ pub async fn primary_key_columns(
     table_name: &str,
 ) -> Result<Vec<String>> {
     let conn = pool.connect_direct().await.context(ConnectionFailedSnafu)?;
-    let table_path = format!("{schema_name}.{table_name}");
+    // `to_regclass` parses its argument as a (possibly qualified, possibly
+    // quoted) SQL identifier, not a literal string match -- an unquoted
+    // mixed-case or special-character name would resolve to the wrong
+    // relation (or nothing), so each component is quoted the same way
+    // `foreign_key_target` quotes identifiers for `TableReference` round-trips.
+    let table_path = format!(
+        "{}.{}",
+        quote_identifier(schema_name),
+        quote_identifier(table_name)
+    );
 
     // `indkey` is an `int2vector`, not a plain array, so it's converted via
     // `string_to_array(...)::int2[]` before unnesting `WITH ORDINALITY` to

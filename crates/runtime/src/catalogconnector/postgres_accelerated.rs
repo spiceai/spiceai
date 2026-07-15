@@ -55,6 +55,7 @@ use data_components::postgres::provider::{
 };
 use data_components::postgres_replication::config::default_slot_name;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
+use datafusion::common::utils::quote_identifier;
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
@@ -143,6 +144,12 @@ pub struct AcceleratedCatalogProvider {
     include: Option<Arc<GlobSet>>,
     exclude: Option<Arc<GlobSet>>,
     schemas: RwLock<HashMap<String, Arc<AcceleratedSchemaProvider>>>,
+    /// `"{schema_name}.{table_name}"` -> the dataset name it was already
+    /// spawned under, tracked across refreshes so a periodic `refresh()`
+    /// (every `refresh_check_interval`, default 1 minute -- see
+    /// `RefreshingCatalogProvider::start_refresh`) doesn't re-spawn a
+    /// duplicate bootstrap/CDC task for a table that's already running.
+    spawned: RwLock<HashMap<String, String>>,
 }
 
 impl std::fmt::Debug for AcceleratedCatalogProvider {
@@ -168,6 +175,7 @@ impl AcceleratedCatalogProvider {
             include: catalog.include.clone().map(Arc::new),
             exclude: catalog.exclude.clone().map(Arc::new),
             schemas: RwLock::new(HashMap::new()),
+            spawned: RwLock::new(HashMap::new()),
         }
     }
 
@@ -186,8 +194,18 @@ impl AcceleratedCatalogProvider {
         let mut params = self.dataset_params.clone();
         params.insert(REPLICATION_SLOT_PARAM.to_string(), self.slot_name.clone());
 
+        // Each component is quoted (only when required) via the same
+        // DataFusion helper `foreign_key_target` uses, so the joined path
+        // round-trips back through `TableReference::parse_str` (which
+        // `dataset.path()` is parsed with downstream) even when a component
+        // needs quoting to resolve correctly -- e.g. mixed case, embedded
+        // `.`, or embedded spaces. See #11727 for the same class of bug.
         let mut spicepod_ds = SpicepodDataset::new(
-            format!("postgres:{schema_name}.{table_name}"),
+            format!(
+                "postgres:{}.{}",
+                quote_identifier(schema_name),
+                quote_identifier(table_name)
+            ),
             dataset_name.clone(),
         )
         .with_params(Params::from_string_map(params));
@@ -236,24 +254,49 @@ impl AcceleratedCatalogProvider {
                 continue;
             }
 
-            let table_path = format!("{schema_name}.{table_name}");
-            let primary_key = primary_key_columns(&self.pool, schema_name, &table_name)
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            // Already running from a previous refresh -- reuse it rather
+            // than re-validating and re-spawning a duplicate bootstrap/CDC
+            // task for a table `refresh()` already knows about.
+            let spawn_key = format!("{schema_name}.{table_name}");
+            let already_spawned = {
+                let guard = match self.spawned.read() {
+                    Ok(guard) => guard,
+                    Err(e) => e.into_inner(),
+                };
+                guard.get(&spawn_key).cloned()
+            };
 
-            if primary_key.is_empty() {
-                return Err(format!(
-                    "Catalog '{}': table {table_path} has no primary key. Every table \
-                    included in an accelerated catalog must have a primary key -- add one, \
-                    or exclude the table via the catalog's `include`/`exclude` patterns.",
-                    self.catalog_name
-                )
-                .into());
-            }
+            let dataset_name = if let Some(dataset_name) = already_spawned {
+                dataset_name
+            } else {
+                let table_path = format!("{schema_name}.{table_name}");
+                let primary_key = primary_key_columns(&self.pool, schema_name, &table_name)
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-            let dataset_name = self
-                .spawn_accelerated_dataset(schema_name, &table_name)
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                if primary_key.is_empty() {
+                    return Err(format!(
+                        "Catalog '{}': table {table_path} has no primary key. Every table \
+                        included in an accelerated catalog must have a primary key -- add one, \
+                        or exclude the table via the catalog's `include`/`exclude` patterns.",
+                        self.catalog_name
+                    )
+                    .into());
+                }
+
+                let dataset_name = self
+                    .spawn_accelerated_dataset(schema_name, &table_name)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+                let mut guard = match self.spawned.write() {
+                    Ok(guard) => guard,
+                    Err(e) => e.into_inner(),
+                };
+                guard.insert(spawn_key, dataset_name.clone());
+
+                dataset_name
+            };
+
             tables.insert(table_name, dataset_name);
         }
 
