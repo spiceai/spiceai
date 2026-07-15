@@ -116,6 +116,12 @@ pg-load:
 # ANALYZE runs after index creation so the planner has fresh statistics on the
 # just-bulk-loaded tables; without it, correlated-subquery queries (Q2, Q20)
 # can get planned as per-row full/seq scans instead of index lookups.
+# statement_timeout is set on the database as a backstop: a cancelled CI run
+# only stops the GitHub runner, not the Postgres backend connection - we've
+# observed cancelled benchmark queries keep running server-side for hours,
+# competing for resources with every subsequent run. 90 minutes gives ample
+# headroom over the slowest known-good query (~52 min at SF100) while
+# bounding how long a leaked connection can hold resources.
 # Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpch make pg-create-index
 pg-create-index:
 	@echo "Creating primary/unique-key indexes in $(DB_NAME) database"
@@ -145,6 +151,8 @@ pg-create-index:
 	@echo "Analyzing $(DB_NAME) database"
 	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "ANALYZE;";
 	@echo "Statistics have been refreshed for $(DB_NAME) database"
+	@echo "Setting statement_timeout on $(DB_NAME) database"
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "ALTER DATABASE $(DB_NAME) SET statement_timeout = '5400000';";
 
 # Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpch make tpch-run-pq
 tpch-run-pq:
@@ -251,6 +259,8 @@ pg-tpcds-create-index:
 	@echo "Analyzing $(DB_NAME) database"
 	@psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -c "ANALYZE;";
 	@echo "Statistics have been refreshed for $(DB_NAME) database"
+	@echo "Setting statement_timeout on $(DB_NAME) database"
+	@psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -c "ALTER DATABASE $(DB_NAME) SET statement_timeout = '5400000';";
 
 # Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpch make pg-tpcds-load
 pg-tpcds-load:
