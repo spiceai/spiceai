@@ -685,41 +685,54 @@ fn evaluate_modulo_inequality(
         return Err(DataFusionError::Plan("Unsupported operator".to_string()));
     }
 
-    macro_rules! modulo_prune {
-        ($divisor:expr, $key:expr, $threshold:expr) => {{
-            if *$divisor == 0 {
-                return Ok(false);
-            }
-            Ok(match $key.cmp(&0) {
-                // partition ⊆ [key, +∞): prune if the filter's upper bound is at or below key
-                std::cmp::Ordering::Greater => match op {
-                    Operator::Lt => $threshold <= $key,
-                    Operator::LtEq => $threshold < $key,
-                    _ => false,
-                },
-                // partition ⊆ (−∞, key]: prune if the filter's lower bound is at or above key
-                std::cmp::Ordering::Less => match op {
-                    Operator::Gt => $threshold >= $key,
-                    Operator::GtEq => $threshold > $key,
-                    _ => false,
-                },
-                // key = 0: multiples of divisor span both directions, cannot prune
-                std::cmp::Ordering::Equal => false,
-            })
-        }};
-    }
-
     match (divisor, partition_value, filter_value) {
         (
             ScalarValue::Int32(Some(divisor)),
             ScalarValue::Int32(Some(key)),
             ScalarValue::Int32(Some(threshold)),
-        ) => modulo_prune!(divisor, key, threshold),
+        ) => {
+            if *divisor == 0 {
+                return Ok(false);
+            }
+            Ok(match key.cmp(&0) {
+                // partition ⊆ [key, +∞): prune if the filter's upper bound is at or below key
+                std::cmp::Ordering::Greater => match op {
+                    Operator::Lt => threshold <= key,
+                    Operator::LtEq => threshold < key,
+                    _ => false,
+                },
+                // partition ⊆ (−∞, key]: prune if the filter's lower bound is at or above key
+                std::cmp::Ordering::Less => match op {
+                    Operator::Gt => threshold >= key,
+                    Operator::GtEq => threshold > key,
+                    _ => false,
+                },
+                // key = 0: multiples of divisor span both directions, cannot prune
+                std::cmp::Ordering::Equal => false,
+            })
+        }
         (
             ScalarValue::Int64(Some(divisor)),
             ScalarValue::Int64(Some(key)),
             ScalarValue::Int64(Some(threshold)),
-        ) => modulo_prune!(divisor, key, threshold),
+        ) => {
+            if *divisor == 0 {
+                return Ok(false);
+            }
+            Ok(match key.cmp(&0) {
+                std::cmp::Ordering::Greater => match op {
+                    Operator::Lt => threshold <= key,
+                    Operator::LtEq => threshold < key,
+                    _ => false,
+                },
+                std::cmp::Ordering::Less => match op {
+                    Operator::Gt => threshold >= key,
+                    Operator::GtEq => threshold > key,
+                    _ => false,
+                },
+                std::cmp::Ordering::Equal => false,
+            })
+        }
         _ => Ok(false),
     }
 }
