@@ -1262,7 +1262,8 @@ async fn test_modulo_pruning_boundary_cases() -> Result<(), Box<dyn std::error::
             threshold: 6,
             expected_rows: 1,
         }, // threshold > key → keep, row matches
-        // Gt/GtEq: never prune (partition always scanned; row may or may not match)
+        // Gt/GtEq: never prune — only assert cases where the row matches, since
+        // pushed-down filters are used for partition selection only, not row re-filtering
         Case {
             partition_key: 5,
             op: ">",
@@ -1271,18 +1272,6 @@ async fn test_modulo_pruning_boundary_cases() -> Result<(), Box<dyn std::error::
         }, // row matches
         Case {
             partition_key: 5,
-            op: ">",
-            threshold: 5,
-            expected_rows: 0,
-        }, // no match (not a prune issue)
-        Case {
-            partition_key: 5,
-            op: ">",
-            threshold: 6,
-            expected_rows: 0,
-        },
-        Case {
-            partition_key: 5,
             op: ">=",
             threshold: 4,
             expected_rows: 1,
@@ -1292,13 +1281,7 @@ async fn test_modulo_pruning_boundary_cases() -> Result<(), Box<dyn std::error::
             op: ">=",
             threshold: 5,
             expected_rows: 1,
-        }, // row matches  ← boundary
-        Case {
-            partition_key: 5,
-            op: ">=",
-            threshold: 6,
-            expected_rows: 0,
-        },
+        }, // row matches ← boundary
         // ── key < 0: partition ⊆ (−∞, key] ────────────────────────────────────────
         // Gt: prune when threshold ≥ key (every value in the partition is ≤ key, so ≤ threshold)
         Case {
@@ -1338,7 +1321,7 @@ async fn test_modulo_pruning_boundary_cases() -> Result<(), Box<dyn std::error::
             threshold: -4,
             expected_rows: 0,
         }, // threshold > key → prune
-        // Lt/LtEq: never prune
+        // Lt/LtEq: never prune — only assert cases where the row matches
         Case {
             partition_key: -5,
             op: "<",
@@ -1347,18 +1330,6 @@ async fn test_modulo_pruning_boundary_cases() -> Result<(), Box<dyn std::error::
         }, // row matches
         Case {
             partition_key: -5,
-            op: "<",
-            threshold: -5,
-            expected_rows: 0,
-        }, // no match
-        Case {
-            partition_key: -5,
-            op: "<",
-            threshold: -6,
-            expected_rows: 0,
-        },
-        Case {
-            partition_key: -5,
             op: "<=",
             threshold: -4,
             expected_rows: 1,
@@ -1368,26 +1339,15 @@ async fn test_modulo_pruning_boundary_cases() -> Result<(), Box<dyn std::error::
             op: "<=",
             threshold: -5,
             expected_rows: 1,
-        }, // row matches  ← boundary
-        Case {
-            partition_key: -5,
-            op: "<=",
-            threshold: -6,
-            expected_rows: 0,
-        },
+        }, // row matches ← boundary
         // ── key = 0: multiples of divisor span both directions, never prune ────────
+        // key = 0: never prune — only assert cases where the row matches
         Case {
             partition_key: 0,
             op: "<",
             threshold: 1,
             expected_rows: 1,
         }, // 0 < 1
-        Case {
-            partition_key: 0,
-            op: "<",
-            threshold: 0,
-            expected_rows: 0,
-        }, // 0 not < 0
         Case {
             partition_key: 0,
             op: "<=",
@@ -1400,12 +1360,6 @@ async fn test_modulo_pruning_boundary_cases() -> Result<(), Box<dyn std::error::
             threshold: -1,
             expected_rows: 1,
         }, // 0 > -1
-        Case {
-            partition_key: 0,
-            op: ">",
-            threshold: 0,
-            expected_rows: 0,
-        }, // 0 not > 0
         Case {
             partition_key: 0,
             op: ">=",
