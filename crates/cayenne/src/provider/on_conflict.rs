@@ -31,6 +31,7 @@ use arrow_schema::SchemaRef;
 use crate::row_converter::RowConverter;
 use async_trait::async_trait;
 use data_components::delete::DeletionSink;
+use datafusion::execution::TaskContext;
 use datafusion_catalog::Session;
 use datafusion_expr::Expr;
 use datafusion_physical_plan::{RecordBatchStream, SendableRecordBatchStream};
@@ -392,9 +393,10 @@ pub(crate) struct PkKeysetInvalidatingDeletionSink {
 impl DeletionSink for PkKeysetInvalidatingDeletionSink {
     async fn delete_from(
         &self,
+        context: Arc<TaskContext>,
     ) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         self.table.mark_maintained_aggregates_stale();
-        let deleted = self.inner.delete_from().await?;
+        let deleted = self.inner.delete_from(context).await?;
         if deleted > 0 {
             // Keyset clear-on-delete avoidance (cycle-4 incremental lever).
             //
@@ -438,6 +440,7 @@ impl DeletionSink for PkKeysetInvalidatingDeletionSink {
 impl DeletionSink for InlineAwareDeletionSink {
     async fn delete_from(
         &self,
+        _context: Arc<TaskContext>,
     ) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let _write_guard = self.table.write_lock.lock().await;
         self.table.mark_maintained_aggregates_stale();

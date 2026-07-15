@@ -7230,9 +7230,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77c90badedccf4105eca100756a0b1289e191f6fcbdadd3cee1d2f614f97da8f"
 
 [[package]]
-name = "dotenvy"
-version = "0.15.7"
-source = "git+https://github.com/spiceai/dotenvy.git?rev=e5cef1871b08003198949dfe2da988633eaad78f#e5cef1871b08003198949dfe2da988633eaad78f"
+name = "dotenv"
+version = "2.2.0-unstable"
+dependencies = [
+ "tempfile",
+]
 
 [[package]]
 name = "downcast-rs"
@@ -11170,7 +11172,7 @@ dependencies = [
  "cache",
  "chunking",
  "cudarc 0.19.7",
- "dotenvy",
+ "dotenv 2.2.0-unstable",
  "either",
  "futures",
  "google-genai",
@@ -17012,7 +17014,7 @@ dependencies = [
  "azure_identity",
  "azure_security_keyvault_secrets",
  "base64 0.22.1",
- "dotenvy",
+ "dotenv 2.2.0-unstable",
  "futures",
  "indexmap 2.14.0",
  "keyring",
@@ -18625,7 +18627,7 @@ dependencies = [
  "comfy-table",
  "dialoguer",
  "dirs",
- "dotenvy",
+ "dotenv 2.2.0-unstable",
  "flate2",
  "fundu",
  "futures",
@@ -18704,7 +18706,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
- "dotenv",
+ "dotenv 0.15.0",
  "futures",
  "prost",
  "prost-types",
