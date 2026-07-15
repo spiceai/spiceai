@@ -16762,7 +16762,7 @@ impl CayenneTableProvider {
         );
 
         let deleted_count = sink
-            .delete_from(Arc::new(TaskContext::default()))
+            .delete_from(Arc::new(datafusion_execution::TaskContext::default()))
             .await
             .map_err(|err| CatalogError::InvalidOperation {
                 message: "Failed to execute retention filters.".to_string(),
@@ -25531,7 +25531,7 @@ impl CayenneTableProvider {
             filters: filters.to_vec(),
         };
         let deleted = sink
-            .delete_from(Arc::new(TaskContext::default()))
+            .delete_from(Arc::new(datafusion_execution::TaskContext::default()))
             .await
             .map_err(datafusion_common::DataFusionError::External)?;
         Ok(Some(deleted))
