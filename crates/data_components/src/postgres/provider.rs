@@ -555,7 +555,10 @@ pub async fn check_cdc_prerequisites(pool: &PostgresConnectionPool) -> Result<()
         .await
         .context(QueryFailedSnafu)?
         .get(0);
-    ensure!(wal_level == "logical", WalLevelNotLogicalSnafu { wal_level });
+    ensure!(
+        wal_level == "logical",
+        WalLevelNotLogicalSnafu { wal_level }
+    );
 
     let row = conn
         .conn

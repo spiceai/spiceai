@@ -53,7 +53,10 @@ use spicepod::{
 use crate::{
     init_tracing,
     postgres::common::{self, get_pg_params},
-    utils::{register_test_connectors, run_query, runtime_ready_check, test_request_context, wait_until_true},
+    utils::{
+        register_test_connectors, run_query, runtime_ready_check, test_request_context,
+        wait_until_true,
+    },
 };
 
 const CATALOG_NAME: &str = "pg_accel_e2e";
@@ -202,7 +205,9 @@ async fn query_string(rt: &Arc<Runtime>, sql: &str) -> Option<String> {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_catalog_acceleration_bootstraps_tables_with_primary_key() -> Result<(), anyhow::Error>
 {
-    let _tracing = init_tracing(Some("integration=debug,info,runtime::catalogconnector=debug"));
+    let _tracing = init_tracing(Some(
+        "integration=debug,info,runtime::catalogconnector=debug",
+    ));
 
     test_request_context()
         .scope(async {
@@ -216,9 +221,11 @@ async fn test_catalog_acceleration_bootstraps_tables_with_primary_key() -> Resul
             wait_for_table_ready(&rt, "orders").await?;
             wait_for_table_ready(&rt, "items").await?;
 
-            let orders_count =
-                run_query(&rt, &format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.orders"))
-                    .await?;
+            let orders_count = run_query(
+                &rt,
+                &format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.orders"),
+            )
+            .await?;
             assert_batches_eq!(
                 &[
                     "+---+", //
@@ -230,9 +237,11 @@ async fn test_catalog_acceleration_bootstraps_tables_with_primary_key() -> Resul
                 &orders_count
             );
 
-            let items_count =
-                run_query(&rt, &format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.items"))
-                    .await?;
+            let items_count = run_query(
+                &rt,
+                &format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.items"),
+            )
+            .await?;
             assert_batches_eq!(
                 &[
                     "+---+", //
@@ -261,7 +270,9 @@ async fn test_catalog_acceleration_bootstraps_tables_with_primary_key() -> Resul
 /// summary's "excluded by include/exclude filters" count reflects.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_catalog_acceleration_respects_exclude_filter() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info,runtime::catalogconnector=debug"));
+    let _tracing = init_tracing(Some(
+        "integration=debug,info,runtime::catalogconnector=debug",
+    ));
 
     test_request_context()
         .scope(async {
@@ -325,7 +336,9 @@ async fn test_check_cdc_prerequisites_rejects_non_logical_wal_level() -> Result<
 /// CDC stream, not a one-time snapshot.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_catalog_acceleration_converges_after_source_mutation() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info,runtime::catalogconnector=debug"));
+    let _tracing = init_tracing(Some(
+        "integration=debug,info,runtime::catalogconnector=debug",
+    ));
 
     test_request_context()
         .scope(async {
@@ -356,9 +369,8 @@ async fn test_catalog_acceleration_converges_after_source_mutation() -> Result<(
 
             let orders_count_sql =
                 format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.orders");
-            let updated_customer_sql = format!(
-                "SELECT customer FROM {CATALOG_NAME}.public.orders WHERE id = 1"
-            );
+            let updated_customer_sql =
+                format!("SELECT customer FROM {CATALOG_NAME}.public.orders WHERE id = 1");
             let items_count_sql = format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.items");
 
             let converged = wait_until_true(Duration::from_mins(2), || {

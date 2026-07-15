@@ -60,7 +60,9 @@ use datafusion::error::Result as DFResult;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use globset::GlobSet;
 use snafu::prelude::*;
-use spicepod::acceleration::{Acceleration as SpicepodAcceleration, RefreshMode as SpicepodRefreshMode};
+use spicepod::acceleration::{
+    Acceleration as SpicepodAcceleration, RefreshMode as SpicepodRefreshMode,
+};
 use spicepod::component::dataset::{Dataset as SpicepodDataset, SchemaInference};
 use spicepod::param::Params;
 
@@ -80,7 +82,12 @@ const REPLICATION_SLOT_PARAM: &str = "pg_replication_slot";
 /// Matches `CatalogAccelerationEngine`'s only variant.
 const CAYENNE_ENGINE: &str = "cayenne";
 
-fn table_is_selected(schema_name: &str, table_name: &str, include: Option<&GlobSet>, exclude: Option<&GlobSet>) -> bool {
+fn table_is_selected(
+    schema_name: &str,
+    table_name: &str,
+    include: Option<&GlobSet>,
+    exclude: Option<&GlobSet>,
+) -> bool {
     let schema_with_table = format!("{schema_name}.{table_name}");
     let included = include.is_none_or(|globset| globset.is_match(&schema_with_table));
     let excluded = exclude.is_some_and(|globset| globset.is_match(&schema_with_table));
@@ -312,7 +319,8 @@ struct AcceleratedSchemaProvider {
 
 impl std::fmt::Debug for AcceleratedSchemaProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AcceleratedSchemaProvider").finish_non_exhaustive()
+        f.debug_struct("AcceleratedSchemaProvider")
+            .finish_non_exhaustive()
     }
 }
 
@@ -340,7 +348,12 @@ impl SchemaProvider for AcceleratedSchemaProvider {
 
         // Not yet registered (dataset still bootstrapping) simply reads as
         // "table not found" -- no federated stand-in during bootstrap.
-        match self.runtime.df.get_accelerated_table_provider(&dataset_name).await {
+        match self
+            .runtime
+            .df
+            .get_accelerated_table_provider(&dataset_name)
+            .await
+        {
             Ok(provider) => Ok(Some(provider)),
             Err(_) => Ok(None),
         }

@@ -59,7 +59,9 @@ pub enum CatalogRefreshMode {
 impl From<spicepod_catalog::CatalogAccelerationEngine> for CatalogAccelerationEngine {
     fn from(engine: spicepod_catalog::CatalogAccelerationEngine) -> Self {
         match engine {
-            spicepod_catalog::CatalogAccelerationEngine::Cayenne => CatalogAccelerationEngine::Cayenne,
+            spicepod_catalog::CatalogAccelerationEngine::Cayenne => {
+                CatalogAccelerationEngine::Cayenne
+            }
         }
     }
 }
@@ -224,8 +226,7 @@ fn compile_globset(patterns: &[String]) -> std::result::Result<Option<GlobSet>, 
 
     let mut globset_builder = GlobSetBuilder::new();
     for pattern in patterns {
-        let glob =
-            Glob::new(pattern).context(crate::InvalidGlobPatternSnafu { pattern })?;
+        let glob = Glob::new(pattern).context(crate::InvalidGlobPatternSnafu { pattern })?;
         globset_builder.add(glob);
     }
 
@@ -390,8 +391,8 @@ mod tests {
 
     #[test]
     fn test_try_from_without_acceleration() {
-        let builder = CatalogBuilder::try_from(spicepod_catalog(&[], &[], None))
-            .expect("should build");
+        let builder =
+            CatalogBuilder::try_from(spicepod_catalog(&[], &[], None)).expect("should build");
         assert_eq!(builder.acceleration, None);
         assert!(builder.include.is_none());
         assert!(builder.exclude.is_none());
@@ -422,9 +423,7 @@ mod tests {
         let builder = CatalogBuilder::try_from(spicepod_catalog(&[], &[], Some(acceleration)))
             .expect("should build");
 
-        let mapped = builder
-            .acceleration
-            .expect("acceleration should be mapped");
+        let mapped = builder.acceleration.expect("acceleration should be mapped");
         assert_eq!(mapped.engine, CatalogAccelerationEngine::Cayenne);
         assert_eq!(mapped.refresh_mode, CatalogRefreshMode::Changes);
     }
