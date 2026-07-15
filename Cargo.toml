@@ -17,6 +17,7 @@ members = [
     "crates/data_components",
     "crates/dataformat-json",
     "crates/document_parse",
+    "crates/dotenv",
     "crates/duration-parse",
     "crates/dynamodb-streams",
     "crates/event_stream",
@@ -234,7 +235,7 @@ delta_kernel = { version = "0.23.0", features = [
     "internal-api",
 ] }
 derive_builder = "0.20.2"
-dotenvy = "0.15"
+dotenv = { path = "crates/dotenv" }
 duration-parse = { path = "crates/duration-parse" }
 duckdb = "1.10503" # 1.10503.x corresponds to DuckDB v1.5.3
 dyn-hash = "1.0.0"
@@ -508,9 +509,6 @@ delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "4387e69564d85a411802e0782bc503b53577c50d" } # branch: spiceai-58-arrow58
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd" } # master @ tip (PR #2 merged: rusqlite 0.40.1 + bundled-decimal)
 tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = "b10df82e3bbc4f4700562a14a3a00714cbc2f0c7" }
-
-# Tracking Issue: https://github.com/allan2/dotenvy/issues/113
-dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
 
 iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "61df0778b5f1b675233710bf40a970757d4758d6" } # branch: spiceai-0.9.1-df-54
 iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "61df0778b5f1b675233710bf40a970757d4758d6" } # branch: spiceai-0.9.1-df-54
