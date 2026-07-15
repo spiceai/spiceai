@@ -516,8 +516,9 @@ impl<'a> AppendMutationWriter<'a> {
                 rows,
                 post_validation,
             } => {
+                let record_seq = self.table.sequence_high_water().await;
                 self.table
-                    .record_inlined_pk_keys(&post_validation.validated_keys);
+                    .record_inlined_pk_keys(&post_validation.validated_keys, record_seq);
                 tracing::debug!(
                     table = self.table.table_name(),
                     rows,
@@ -646,7 +647,8 @@ impl<'a> AppendMutationWriter<'a> {
                 };
 
                 if stage_on_conflict {
-                    self.table.record_file_pk_keys(&validated_keys);
+                    let record_seq = self.table.sequence_high_water().await;
+                    self.table.record_file_pk_keys(&validated_keys, record_seq);
                 }
                 drop(held_write_guard);
 
@@ -844,7 +846,9 @@ impl<'a> AppendMutationWriter<'a> {
         };
         // Record the inlined PK keys so a subsequent same-table upsert sees this
         // batch's rows as present (same bookkeeping as the durable inline path).
-        self.table.record_inlined_pk_keys(&validated_keys);
+        let record_seq = self.table.sequence_high_water().await;
+        self.table
+            .record_inlined_pk_keys(&validated_keys, record_seq);
 
         drop(write_guard);
         record_cayenne_write_phase(self.table.table_name(), "cdc_path_inmemory", write_start);
@@ -1063,8 +1067,9 @@ impl<'a> AppendMutationWriter<'a> {
                     rows,
                     post_validation,
                 } => {
+                    let record_seq = self.table.sequence_high_water().await;
                     self.table
-                        .record_inlined_pk_keys(&post_validation.validated_keys);
+                        .record_inlined_pk_keys(&post_validation.validated_keys, record_seq);
                     return Ok(rows);
                 }
                 InlineMutationOutcome::Fallback {
@@ -1161,7 +1166,8 @@ impl<'a> AppendMutationWriter<'a> {
             // count and cleared only when retention had actually deleted rows).
             self.table.clear_cached_pk_keyset();
         } else {
-            self.table.record_file_pk_keys(&validated_keys);
+            let record_seq = self.table.sequence_high_water().await;
+            self.table.record_file_pk_keys(&validated_keys, record_seq);
         }
 
         Ok(total_rows)

@@ -675,6 +675,24 @@ fn handle_query_error(e: query::Error) -> Status {
     }
 }
 
+/// Map a shared-orchestrator [`TransactionError`](query::TransactionError) to the
+/// gRPC `Status` the `FlightSQL` transaction path returns. A `Conflict` is a
+/// retryable optimistic-concurrency loss (`Aborted`).
+pub(crate) fn transaction_error_to_status(error: query::TransactionError) -> Status {
+    use query::TransactionError;
+    match error {
+        TransactionError::Rejected(message) => Status::invalid_argument(message),
+        TransactionError::Plan(e) | TransactionError::Stream(e) => handle_datafusion_error(e),
+        TransactionError::Query(e) => handle_query_error(e),
+        TransactionError::Conflict { table } => Status::aborted(format!(
+            "transaction write conflict on '{table}': a participant table changed since the transaction started; retry"
+        )),
+        TransactionError::Publish(message) => {
+            Status::internal(format!("transaction publish failed: {message}"))
+        }
+    }
+}
+
 pub(crate) fn handle_datafusion_error(e: DataFusionError) -> Status {
     if query::is_cancellation_error(&e) {
         return Status::cancelled(e.to_string());
