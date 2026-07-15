@@ -47,10 +47,23 @@ TESTOP_PREFIX="${TESTOP_PREFIX:-}"
 
 MARKER="_chbench_tmpl_fp"
 
+# SF flows into the fingerprint that is written as a single-quoted SQL literal;
+# it comes from a workflow_dispatch input, so reject anything non-numeric before
+# it reaches SQL (guards against malformed input / quoting surprises).
+case "$SF" in
+  ''|*[!0-9]*) echo "error: SCALE_FACTOR must be a positive integer, got '$SF'" >&2; exit 1;;
+esac
+
 # The mysql client may not be preinstalled on the runner (mirrors the Postgres
-# script installing psql). default-mysql-client provides the `mysql` CLI.
+# script installing psql). default-mysql-client provides the `mysql` CLI. Fail
+# fast with a clear message if it is still missing after the install attempt,
+# rather than letting a later `mysql` call error with an opaque not-found.
 if ! command -v mysql >/dev/null 2>&1; then
   sudo apt-get update -qq && sudo apt-get install -y -qq default-mysql-client || true
+fi
+if ! command -v mysql >/dev/null 2>&1; then
+  echo "error: mysql client not found and could not be installed (default-mysql-client)" >&2
+  exit 1
 fi
 
 # Scalar query against `chbench`: -N (no column names) -B (tab-separated, no box).
@@ -88,16 +101,26 @@ list_base_tables() {
 }
 
 # Decide HIT vs MISS: the marker table must exist, its stored fingerprint must
-# match, and at least one template table must be present.
+# match, and the template set must be COMPLETE — one <t>_tmpl for every base
+# table. Requiring completeness (not merely "some template exists") means a
+# partially-dropped cache on the long-lived pod is treated as a MISS and
+# reseeded, instead of failing mid-reset on an `INSERT ... SELECT` from a
+# missing <t>_tmpl.
 hit=0
 marker_exists=$(my_scalar "SELECT COUNT(*) FROM information_schema.tables
                            WHERE table_schema = DATABASE() AND table_name = '${MARKER}'")
 if [ "${marker_exists:-0}" != "0" ]; then
   cur=$(my_scalar "SELECT fp FROM \`${MARKER}\` LIMIT 1" || true)
+  base_count=$(my_scalar "SELECT COUNT(*) FROM information_schema.tables
+                          WHERE table_schema = DATABASE()
+                            AND RIGHT(table_name, 5) <> '_tmpl'
+                            AND table_name <> '${MARKER}'")
   tmpl_count=$(my_scalar "SELECT COUNT(*) FROM information_schema.tables
                           WHERE table_schema = DATABASE() AND RIGHT(table_name, 5) = '_tmpl'")
-  if [ "$cur" = "$fp" ] && [ "${tmpl_count:-0}" != "0" ]; then
+  if [ "$cur" = "$fp" ] && [ "${base_count:-0}" != "0" ] && [ "${tmpl_count:-0}" = "${base_count:-0}" ]; then
     hit=1
+  elif [ "$cur" = "$fp" ]; then
+    echo "template INCOMPLETE (${tmpl_count:-0} template(s) for ${base_count:-0} base table(s)) -> reseeding"
   elif [ -n "${cur:-}" ]; then
     echo "template STALE (fingerprint '$cur' != '$fp') -> reseeding"
   fi

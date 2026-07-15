@@ -15,7 +15,7 @@ arrow = { workspace = true, features = ["prettyprint", "chrono-tz"] }
 arrow_tools = { path = "../arrow_tools" }
 arrow-json.workspace = true
 arrow-schema = { workspace = true, features = ["serde"] }
-async-channel = "2.3"
+async-channel.workspace = true
 async-openai.workspace = true
 async-trait.workspace = true
 bytes.workspace = true

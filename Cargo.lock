@@ -19745,7 +19745,7 @@ dependencies = [
  "arrow",
  "arrow-json",
  "arrow_tools",
- "async-channel 1.9.0",
+ "async-channel 2.5.0",
  "async-trait",
  "aws-config",
  "aws-credential-types",
