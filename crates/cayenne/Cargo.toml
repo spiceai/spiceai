@@ -40,6 +40,7 @@ object_store = { workspace = true }
 parking_lot = { workspace = true }
 roaring = { workspace = true }
 runtime-datafusion = { path = "../runtime-datafusion" }
+runtime-request-context = { path = "../runtime-request-context" }
 runtime-table-partition = { path = "../runtime-table-partition", optional = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
