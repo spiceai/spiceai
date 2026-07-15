@@ -1579,24 +1579,19 @@ impl CayenneAccelerator {
             // Independently, an explicit per-knob value always overrides the
             // derived value — and under `adaptive` it *pins* that knob, so the
             // loop leaves it alone (its bounds collapse to a point downstream).
-            let tuning_mode = acceleration
-                .params
-                .get("cayenne_tuning")
-                .map(|v| v.trim().to_ascii_lowercase());
-            // Normalize an invalid value to `auto` so it behaves as the documented
-            // default everywhere downstream (including the goal-gate below), matching
-            // the warning — otherwise a stray value combined with a `cayenne_goal_*`
-            // would slip past the goal check (which tests `== "auto"`) and enable
-            // adaptive, contradicting the warning.
-            let tuning_mode = match tuning_mode {
-                Some(mode) if mode != "auto" && mode != "adaptive" => {
-                    tracing::warn!(
-                        "Dataset '{table_name}' has an invalid `cayenne_tuning` value: '{mode}'. Expected 'auto' or 'adaptive'. Defaulting to 'auto'."
-                    );
-                    Some("auto".to_string())
-                }
-                other => other,
-            };
+            // Normalize `cayenne_tuning` up front (see `normalize_cayenne_tuning`): an
+            // invalid value folds to `auto` so it behaves as the documented default
+            // everywhere downstream — including the goal-gate below (which tests
+            // `== "auto"`) — instead of slipping through as "not auto" and enabling
+            // adaptive.
+            let raw_tuning = acceleration.params.get("cayenne_tuning").map(String::as_str);
+            let (tuning_mode, tuning_was_invalid) = normalize_cayenne_tuning(raw_tuning);
+            if tuning_was_invalid {
+                tracing::warn!(
+                    "Dataset '{table_name}' has an invalid `cayenne_tuning` value: '{}'. Expected 'auto' or 'adaptive'. Defaulting to 'auto'.",
+                    raw_tuning.unwrap_or_default().trim()
+                );
+            }
             // Resolve the tuning mode. An explicit `cayenne_tuning` value always
             // wins; when it is UNSET the default is `auto` (static derivation from
             // the detected environment and inferred schema, no closed loop). Schema
@@ -3816,9 +3811,46 @@ fn encode_identifier_hex(value: &str) -> String {
 
 register_data_accelerator!(Engine::Cayenne, CayenneAccelerator);
 
+/// Normalize a raw `cayenne_tuning` value: trim + lowercase, mapping `auto`/`adaptive`
+/// through unchanged and any *other* value to `Some("auto")` (the documented default).
+/// Returns `(normalized_mode, was_invalid)`. Folding an invalid value to `auto` keeps
+/// it behaving as the default everywhere downstream — including the `cayenne_goal_*`
+/// gate that tests `== "auto"` — instead of slipping through as "not auto" and
+/// enabling adaptive.
+fn normalize_cayenne_tuning(raw: Option<&str>) -> (Option<String>, bool) {
+    match raw.map(|v| v.trim().to_ascii_lowercase()) {
+        Some(mode) if mode != "auto" && mode != "adaptive" => (Some("auto".to_string()), true),
+        other => (other, false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_cayenne_tuning_folds_invalid_to_auto() {
+        // Unset stays unset; `auto`/`adaptive` pass through (trim + lowercase).
+        assert_eq!(normalize_cayenne_tuning(None), (None, false));
+        assert_eq!(
+            normalize_cayenne_tuning(Some("auto")),
+            (Some("auto".to_string()), false)
+        );
+        assert_eq!(
+            normalize_cayenne_tuning(Some("  Adaptive ")),
+            (Some("adaptive".to_string()), false)
+        );
+        // An invalid value folds to `auto` (flagged invalid), so it can NEVER enable
+        // adaptive, and the `cayenne_goal_*` gate (which tests `== "auto"`) treats it
+        // as auto rather than "not auto".
+        let (mode, invalid) = normalize_cayenne_tuning(Some("nonsense"));
+        assert!(invalid, "an unrecognized value is flagged invalid");
+        assert_eq!(mode.as_deref(), Some("auto"), "invalid folds to auto");
+        assert!(
+            !matches!(mode.as_deref(), Some("adaptive")),
+            "invalid must not enable adaptive tuning"
+        );
+    }
     use crate::component::dataset::acceleration::{Acceleration, Mode, RefreshMode};
     use crate::component::dataset::builder::DatasetBuilder;
     use app::AppBuilder;

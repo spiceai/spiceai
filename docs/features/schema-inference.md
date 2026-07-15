@@ -38,7 +38,7 @@ no-op for them, never an error).
 
 | Connector | Primary key | Indexes | Sort / clustering | Table size |
 | --- | --- | --- | --- | --- |
-| [PostgreSQL](#postgresql) | `pg_index` (`indisprimary`) | unique & non-unique `pg_index` entries | clustered index (`indisclustered`) with ASC/DESC, else primary key | `pg_class.reltuples` + `pg_relation_size` |
+| [PostgreSQL](#postgresql) | `pg_index` (`indisprimary`) | unique & non-unique `pg_index` entries | clustered index (`indisclustered`, ASC/DESC); else partition key or a natural-order `pg_stats` column; else primary key | `pg_class.reltuples` + `pg_relation_size` |
 | [MySQL](#mysql) | `information_schema` key columns | — | — | `information_schema.tables` rows + data length |
 | [MongoDB](#mongodb) | always `_id` | `listIndexes` (unique & non-unique) | clustered collection key (5.3+), else `_id` | `collStats` count + size |
 
