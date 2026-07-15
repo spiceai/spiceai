@@ -14,12 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Connector-agnostic application of **extended schema inference**.
+//! Connector-agnostic application of **schema inference**.
 //!
-//! When a dataset sets `schema_inference: extended`, a connector emits the source
-//! table's inferred primary key, secondary indexes, and sort/clustering order as
-//! Arrow schema metadata (see [`data_components::inferred_schema`]). This module
-//! reads that metadata back and fills any acceleration settings the user left
+//! A connector emits the source table's inferred primary key, secondary indexes,
+//! and sort/clustering order as Arrow schema metadata (see
+//! [`data_components::inferred_schema`]). Inference is always attempted and
+//! degrades gracefully with the source permissions available; this module reads
+//! whatever metadata was emitted and fills any acceleration settings the user left
 //! unset — applied early (before registration), so every refresh mode, including
 //! CDC (`refresh_mode: changes`), observes the inferred values.
 

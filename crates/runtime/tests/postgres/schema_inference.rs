@@ -14,15 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Integration tests for extended schema inference on the `PostgreSQL` connector.
+//! Integration test for schema inference on the `PostgreSQL` connector.
 //!
 //! A real `PostgreSQL` table is seeded with a composite primary key and a variety of
 //! secondary indexes — unique, non-unique, partial, expression, and a clustered
-//! (DESC) index. The dataset is then accelerated with `DuckDB` under
-//! `schema_inference: extended`, exercising the full pipeline end-to-end: the
-//! `pg_catalog` query (the riskiest new SQL) must run on the real server, and the
-//! inferred primary key / indexes / sort order must be accepted by the accelerator
-//! without error. A `standard` (default) control confirms inference is opt-in.
+//! (DESC) index. The dataset is then accelerated with `DuckDB`, exercising the full
+//! always-on pipeline end-to-end: the `pg_catalog` inference query (the riskiest
+//! SQL) must run on the real server, and the inferred primary key / indexes / sort
+//! order must be accepted by the accelerator without error.
 //!
 //! Precise value-level checks of the inference mapping live in fast unit tests:
 //! `data_components::inferred_schema` (the wire contract) and
@@ -35,7 +34,7 @@ use datafusion::assert_batches_eq;
 use secrecy::ExposeSecret;
 use spicepod::{
     acceleration::{Acceleration, RefreshMode},
-    component::dataset::{Dataset, SchemaInference},
+    component::dataset::Dataset,
     param::Params,
 };
 
@@ -45,9 +44,9 @@ use crate::{
     utils::{register_test_connectors, run_query, runtime_ready_check, test_request_context},
 };
 
-/// Build an `inventory` dataset accelerated with `DuckDB` (full refresh) at the
-/// given schema-inference level.
-fn inventory_dataset(port: usize, schema_inference: SchemaInference) -> Dataset {
+/// Build an `inventory` dataset accelerated with `DuckDB` (full refresh). Schema
+/// inference is always on, so there is no level to configure.
+fn inventory_dataset(port: usize) -> Dataset {
     let mut ds = Dataset::new("postgres:inventory".to_string(), "inventory".to_string());
     ds.params = Some(Params::from_string_map(
         get_pg_params(port)
@@ -55,7 +54,6 @@ fn inventory_dataset(port: usize, schema_inference: SchemaInference) -> Dataset 
             .map(|(k, v)| (k, v.expose_secret().to_string()))
             .collect::<HashMap<String, String>>(),
     ));
-    ds.schema_inference = schema_inference;
     ds.acceleration = Some(Acceleration {
         enabled: true,
         engine: Some("duckdb".to_string()),
@@ -159,11 +157,11 @@ async fn start_runtime(dataset: Dataset) -> Result<Arc<runtime::Runtime>, anyhow
     Ok(rt)
 }
 
-/// With `schema_inference: extended`, the rich-index table loads end-to-end and
-/// returns correct data — proving the `pg_catalog` query runs on the real server
-/// and the inferred primary key, indexes, and sort order are accepted by `DuckDB`.
+/// The rich-index table loads end-to-end and returns correct data — proving the
+/// always-on `pg_catalog` inference query runs on the real server and the inferred
+/// primary key, indexes, and sort order are accepted by `DuckDB`.
 #[tokio::test]
-async fn test_extended_schema_inference_loads_and_queries() -> Result<(), anyhow::Error> {
+async fn test_schema_inference_loads_and_queries() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
@@ -173,9 +171,9 @@ async fn test_extended_schema_inference_loads_and_queries() -> Result<(), anyhow
 
             seed_inventory(port).await?;
 
-            let rt = start_runtime(inventory_dataset(port, SchemaInference::Extended)).await?;
+            let rt = start_runtime(inventory_dataset(port)).await?;
 
-            // The whole extended pipeline must succeed end-to-end: the pg_catalog
+            // The whole inference pipeline must succeed end-to-end: the pg_catalog
             // inference query runs on the real server, and the inferred primary key,
             // indexes, and sort order are all accepted by the DuckDB accelerator. A
             // correct row count proves the dataset loaded without any of those steps
@@ -204,38 +202,6 @@ async fn test_extended_schema_inference_loads_and_queries() -> Result<(), anyhow
                     "+---+", //
                 ],
                 &active
-            );
-
-            Ok(())
-        })
-        .await
-}
-
-/// With the default `schema_inference: standard`, the same table still loads and
-/// queries correctly — inference is opt-in and never required.
-#[tokio::test]
-async fn test_standard_schema_inference_loads_and_queries() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-
-    test_request_context()
-        .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container(port).await?;
-
-            seed_inventory(port).await?;
-
-            let rt = start_runtime(inventory_dataset(port, SchemaInference::Standard)).await?;
-
-            let results = run_query(&rt, "SELECT COUNT(*) AS n FROM inventory").await?;
-            assert_batches_eq!(
-                &[
-                    "+---+", //
-                    "| n |", //
-                    "+---+", //
-                    "| 3 |", //
-                    "+---+", //
-                ],
-                &results
             );
 
             Ok(())

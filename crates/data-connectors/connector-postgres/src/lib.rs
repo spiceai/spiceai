@@ -840,8 +840,9 @@ fn natural_order_sort_candidate(
 }
 
 /// Enrich the provider's schema with `PostgreSQL` metadata: column/table comments
-/// and source types (always), plus inferred primary key / indexes / sort columns
-/// when the dataset opts into `schema_inference: extended`.
+/// and source types, plus inferred primary key / indexes / sort columns. Schema
+/// inference is always attempted and degrades gracefully (see the info log below)
+/// when the source blocks the `pg_catalog` queries.
 async fn enrich_with_postgres_metadata(
     pool: &Arc<PostgresConnectionPool>,
     dataset: &Dataset,
@@ -861,31 +862,36 @@ async fn enrich_with_postgres_metadata(
             }
         };
 
-    if dataset.schema_inference.is_extended() {
-        match postgres_inferred_schema_metadata(pool, dataset.path()).await {
-            Ok(inferred) => {
-                if !inferred.is_empty() {
-                    tracing::debug!(
-                        dataset = %dataset.name,
-                        source = %dataset.path(),
-                        primary_key = ?inferred.primary_key,
-                        indexes = inferred.indexes.len(),
-                        sort_columns = inferred.sort_columns.len(),
-                        row_count = ?inferred.row_count,
-                        table_bytes = ?inferred.table_bytes,
-                        "Inferred extended schema metadata from PostgreSQL catalog"
-                    );
-                }
-                table_metadata.extend(inferred.to_metadata());
-            }
-            Err(error) => {
-                tracing::warn!(
+    // Always attempt maximum schema inference; degrade gracefully when the source
+    // blocks the catalog queries (commonly the connection role lacks read access to
+    // pg_catalog), falling back to base column/type inference only.
+    match postgres_inferred_schema_metadata(pool, dataset.path()).await {
+        Ok(inferred) => {
+            if !inferred.is_empty() {
+                tracing::debug!(
                     dataset = %dataset.name,
                     source = %dataset.path(),
-                    error = %error,
-                    "Failed to infer extended schema from PostgreSQL catalog; registering without inferred metadata"
+                    primary_key = ?inferred.primary_key,
+                    indexes = inferred.indexes.len(),
+                    sort_columns = inferred.sort_columns.len(),
+                    row_count = ?inferred.row_count,
+                    table_bytes = ?inferred.table_bytes,
+                    "Inferred schema metadata from PostgreSQL catalog"
                 );
             }
+            table_metadata.extend(inferred.to_metadata());
+        }
+        Err(error) => {
+            // Graceful degradation, not a failure: the source blocked the catalog
+            // inference queries (commonly the connection role lacks pg_catalog read
+            // access). Fall back to base column/type inference — primary key,
+            // indexes, and sort are simply not inferred — and log at info.
+            tracing::info!(
+                dataset = %dataset.name,
+                source = %dataset.path(),
+                error = %error,
+                "Schema inference degraded to base column/type inference (postgres): could not read the PostgreSQL catalog, usually because the connection role lacks read access. Primary key, indexes, and sort order were not inferred; grant catalog read access for full inference."
+            );
         }
     }
 

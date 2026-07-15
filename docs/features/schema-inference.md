@@ -1,31 +1,29 @@
-# Extended Schema Inference (`schema_inference`)
+# Schema Inference
 
-Every connector always infers a dataset's **column schema** (names and types)
-from the source. *Extended* schema inference goes deeper: it auto-detects the
-source table's **primary key**, **secondary indexes**, **sort/clustering
-order**, and a **rough table size**, and applies them to the dataset's
-acceleration settings (and table statistics) that you did **not** specify in the
-Spicepod.
+Every connector always infers a dataset's **column schema** (names and types) from
+the source. On top of that, Spice **always attempts the deepest schema inference it
+can** — auto-detecting the source table's **primary key**, **secondary indexes**,
+**sort/clustering order**, a **rough table size**, and (where available) **per-column
+statistics** — and applies them to the acceleration settings (and table statistics)
+you did **not** specify in the Spicepod.
 
-This is opt-in per dataset:
+There is **no configuration** for this: inference is on by default and requires no
+Spicepod field. It runs read-only catalog queries against the source and **degrades
+gracefully** to whatever the source permits — see [Graceful degradation](#graceful-degradation).
 
 ```yaml
 datasets:
   - from: postgres:public.orders
     name: orders
-    schema_inference: extended      # default: standard
+    # No primary_key / indexes / sort needed — schema inference fills them.
     acceleration:
       engine: duckdb
       refresh_mode: full
 ```
 
-- `standard` (default) — only the column schema is inferred, exactly as before.
-- `extended` — additionally infer and apply primary key, indexes, sort columns,
-  and a rough table size when they are unset.
-
-Inference is strictly **gap-filling**: a value you configure explicitly always
-wins. It applies to **all refresh modes** (`full`, `append`, `changes`,
-`snapshot`, `caching`), and is applied before registration so change-data-capture
+Inference is strictly **gap-filling**: a value you configure explicitly always wins.
+It applies to **all refresh modes** (`full`, `append`, `changes`, `snapshot`,
+`caching`), and is applied before registration so change-data-capture
 (`refresh_mode: changes`) sees the inferred primary key too. The one exception is
 inferred **sort** order, which is *not* applied for `refresh_mode: changes`: CDC is
 driven by the upsert (primary) key rather than a refresh-time sort, and applying a
@@ -34,18 +32,20 @@ still inferred for CDC.
 
 ## Supported connectors
 
+Inference detects as much as each source exposes. Connectors not listed here still
+infer the column schema; they simply do not yet emit the deeper metadata (it is a
+no-op for them, never an error).
+
 | Connector | Primary key | Indexes | Sort / clustering | Table size |
 | --- | --- | --- | --- | --- |
 | [PostgreSQL](#postgresql) | `pg_index` (`indisprimary`) | unique & non-unique `pg_index` entries | clustered index (`indisclustered`) with ASC/DESC, else primary key | `pg_class.reltuples` + `pg_relation_size` |
+| [MySQL](#mysql) | `information_schema` key columns | — | — | `information_schema.tables` rows + data length |
 | [MongoDB](#mongodb) | always `_id` | `listIndexes` (unique & non-unique) | clustered collection key (5.3+), else `_id` | `collStats` count + size |
-
-Other connectors treat `extended` as a no-op (they do not yet emit inferred
-metadata).
 
 ### PostgreSQL
 
 Inferred from `pg_catalog` (a single read-only query against
-`pg_index`/`pg_class`/`pg_attribute`, run only when `extended`):
+`pg_index`/`pg_class`/`pg_attribute`):
 
 - **Primary key** → `acceleration.primary_key` (plus an `upsert` `on_conflict`
   on that key, so the accelerator upserts by primary key).
@@ -58,28 +58,63 @@ Inferred from `pg_catalog` (a single read-only query against
   direction (`pg_index.indoption`); if the table has no clustered index, the
   primary key (ascending) is used.
 
+### MySQL
+
+Inferred from `information_schema` (read-only):
+
+- **Primary key** → `acceleration.primary_key` (plus an `upsert` `on_conflict`
+  on that key). This makes `refresh_mode: changes` (binlog replication) work
+  without a hand-declared `primary_key`.
+- **Table size** → an estimated row count and data byte size from
+  `information_schema.tables`.
+
+Secondary indexes and sort/clustering order are not inferred for MySQL.
+
 ### MongoDB
 
-Inferred from `listIndexes` / `listCollections` (run only when `extended`):
+Inferred from `listIndexes` / `listCollections` / `collStats`:
 
-- **Primary key** → always `_id`, MongoDB's document key. This makes
-  **MongoDB Streams** (`refresh_mode: changes`) work without manual
-  configuration — the change-stream path requires `primary_key: _id` and a
-  matching `on_conflict` upsert, both of which inference now supplies.
+- **Primary key** → always `_id`, MongoDB's document key. This is structural and
+  needs no catalog access, so it is inferred even when the rest of the catalog is
+  restricted. It makes **MongoDB Streams** (`refresh_mode: changes`) work without
+  manual configuration — the change-stream path requires `primary_key: _id` and a
+  matching `on_conflict` upsert, both of which inference supplies.
 - **Indexes** → secondary indexes from `listIndexes` (unique & non-unique).
   The `_id_` index, partial indexes, and non-b-tree key types (`text`,
   `2dsphere`, `hashed`, …) are skipped.
 - **Sort columns** → a clustered collection's cluster key (MongoDB 5.3+) with
   direction, else `_id` ascending.
 
+## Graceful degradation
+
+Schema inference always **attempts the maximum**, then falls back a level at a time
+to whatever the source lets it read — driven by the permissions of the connection's
+role/user on the source database. It never fails a dataset: if a catalog query is
+blocked (commonly the connection role lacks read access to the catalog), the runtime
+logs an **info** message describing exactly what it dropped and continues.
+
+- **PostgreSQL / MySQL** — if the catalog query cannot run, the dataset registers
+  with **base column/type inference only** (no primary key, indexes, or sort). The
+  runtime logs, e.g.: *"Schema inference degraded to base column/type inference
+  (postgres): could not read the PostgreSQL catalog … grant catalog read access for
+  full inference."*
+- **MongoDB** — the `_id` primary key is structural and is always inferred. If
+  `listIndexes`/`listCollections`/`collStats` are blocked or time out, inference
+  degrades to **`_id`-only** (no secondary indexes, sort, or sizing) and logs an info
+  message.
+
+Because inference is gap-filling, degradation only means the runtime auto-fills
+*fewer* acceleration settings — you can always set `primary_key`, `indexes`, or a
+sort parameter explicitly to supply what the source did not expose.
+
 ## Table sizing
 
-`extended` also captures a **rough table size** — an estimated row count and
-data byte size — from the source catalog (no table scan): PostgreSQL reads
-`pg_class.reltuples` and `pg_relation_size`; MongoDB reads `collStats` `count`
-and `size`. The estimate is surfaced as DataFusion **table statistics**
-(`num_rows` and `total_byte_size`, both marked *inexact*) on the source table
-provider, so it serves three purposes from one place:
+Inference also captures a **rough table size** — an estimated row count and data
+byte size — from the source catalog (no table scan): PostgreSQL reads
+`pg_class.reltuples` and `pg_relation_size`; MySQL reads `information_schema.tables`;
+MongoDB reads `collStats` `count` and `size`. The estimate is surfaced as DataFusion
+**table statistics** (`num_rows` and `total_byte_size`, both marked *inexact*) on the
+source table provider, so it serves three purposes from one place:
 
 - **Query planning** — the optimizer uses the row/byte estimates (federated
   sources otherwise report unknown statistics).

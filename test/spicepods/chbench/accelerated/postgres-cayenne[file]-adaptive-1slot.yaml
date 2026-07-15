@@ -3,8 +3,8 @@ kind: Spicepod
 name: postgres-cayenne[file]-adaptive-1slot
 
 # SINGLE-SHARED-SLOT variant of the default `postgres-cayenne[file]-adaptive` (which is 4-slot +
-# deep prefetch). IDENTICAL to that pod — adaptive self-tuning (`cayenne_tuning: adaptive` +
-# `schema_inference: extended`), the global `cayenne_goal_*` SLOs, and the SAME deep CDC prefetch
+# deep prefetch). IDENTICAL to that pod — adaptive self-tuning (`cayenne_tuning: adaptive`;
+# schema inference is always on), the global `cayenne_goal_*` SLOs, and the SAME deep CDC prefetch
 # (16384) + higher-coalescing (512 MB byte budget / 2000ms linger) — EXCEPT every changes-mode
 # table shares ONE replication slot instead of the default four. Kept as a SEPARATE pod to A/B the
 # slot-count effect against the 4-slot default with everything else (adaptive tuning + prefetch +
@@ -19,8 +19,8 @@ name: postgres-cayenne[file]-adaptive-1slot
 # members, so any one table stalling pins WAL retention for the whole stream (acceptable for the
 # bench).
 #
-# As in `-adaptive`, no primary_key / on_conflict / indexes are declared: `schema_inference:
-# extended` detects them from the PostgreSQL source and seeds the upsert on_conflict the CDC
+# As in `-adaptive`, no primary_key / on_conflict / indexes are declared: schema inference
+# (always on) detects them from the PostgreSQL source and seeds the upsert on_conflict the CDC
 # (changes) path requires. sql_results / task_history stay off to match the baseline.
 
 postgres_connection_params: &postgres_params
@@ -57,13 +57,12 @@ runtime:
 
 datasets:
   # ---- TPC-C core tables (mutated by OLTP workload) ----
-  # No primary_key / on_conflict / indexes: `schema_inference: extended` detects them from the
+  # No primary_key / on_conflict / indexes: schema inference (always on) detects them from the
   # PostgreSQL source and seeds the upsert on_conflict the CDC (changes) path requires.
   # All changes tables share the single slot `spice_all`.
 
   - from: postgres:warehouse
     name: warehouse
-    schema_inference: extended
     params:
       <<: *postgres_params
       pg_replication_slot: spice_all
@@ -84,7 +83,6 @@ datasets:
 
   - from: postgres:district
     name: district
-    schema_inference: extended
     params:
       <<: *postgres_params
       pg_replication_slot: spice_all
@@ -93,7 +91,6 @@ datasets:
 
   - from: postgres:customer
     name: customer
-    schema_inference: extended
     params:
       <<: *postgres_params
       pg_replication_slot: spice_all
@@ -102,7 +99,6 @@ datasets:
 
   - from: postgres:new_order
     name: new_order
-    schema_inference: extended
     params:
       <<: *postgres_params
       pg_replication_slot: spice_all
@@ -111,7 +107,6 @@ datasets:
 
   - from: postgres:oorder
     name: oorder
-    schema_inference: extended
     params:
       <<: *postgres_params
       pg_replication_slot: spice_all
@@ -120,7 +115,6 @@ datasets:
 
   - from: postgres:order_line
     name: order_line
-    schema_inference: extended
     params:
       <<: *postgres_params
       pg_replication_slot: spice_all
@@ -129,7 +123,6 @@ datasets:
 
   - from: postgres:stock
     name: stock
-    schema_inference: extended
     params:
       <<: *postgres_params
       pg_replication_slot: spice_all
@@ -141,7 +134,6 @@ datasets:
 
   - from: postgres:item
     name: item
-    schema_inference: extended
     params:
       <<: *postgres_params
     acceleration: &cayenne_accel_full
@@ -153,21 +145,18 @@ datasets:
 
   - from: postgres:region
     name: region
-    schema_inference: extended
     params:
       <<: *postgres_params
     acceleration: *cayenne_accel_full
 
   - from: postgres:nation
     name: nation
-    schema_inference: extended
     params:
       <<: *postgres_params
     acceleration: *cayenne_accel_full
 
   - from: postgres:supplier
     name: supplier
-    schema_inference: extended
     params:
       <<: *postgres_params
     acceleration: *cayenne_accel_full

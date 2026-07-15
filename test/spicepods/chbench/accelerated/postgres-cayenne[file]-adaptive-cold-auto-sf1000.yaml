@@ -9,7 +9,7 @@ name: postgres-cayenne[file]-adaptive-cold-auto-sf1000
 # against the hand-pinned sibling pod.
 #
 # Everything else matches the sibling: `cayenne_tuning: adaptive` on every table, the same
-# `cayenne_goal_*` SLOs, `schema_inference: extended` (PK/on_conflict/indexes), and the shared
+# `cayenne_goal_*` SLOs, schema inference (PK/on_conflict/indexes, always on), and the shared
 # MinIO cold store via `cayenne_datalake_s3_*`. Sized for a 64 vCPU / 256 GiB host.
 
 postgres_connection_params: &postgres_params
@@ -39,14 +39,13 @@ runtime:
 datasets:
   # ------------------------------------------------------------------
   # High-volume PK upsert tables — adaptive tuning + COLD object-store tier, but NO manual cold knobs.
-  # No primary_key / on_conflict / indexes: `schema_inference: extended` detects them from the
+  # No primary_key / on_conflict / indexes: schema inference (always on) detects them from the
   # PostgreSQL source and seeds the upsert on_conflict the CDC (changes) path requires (it also
   # supplies the row_count/table_bytes the adaptive warm-start gates on, and the PK the cold tier
   # needs both to promote and to auto-force key deletes).
   # ------------------------------------------------------------------
   - from: postgres:district
     name: district
-    schema_inference: extended
     params:
       <<: *postgres_params
       pg_replication_slot: spice_district
@@ -74,7 +73,6 @@ datasets:
 
   - from: postgres:customer
     name: customer
-    schema_inference: extended
     params:
       <<: *postgres_params
       pg_replication_slot: spice_customer
@@ -83,7 +81,6 @@ datasets:
 
   - from: postgres:new_order
     name: new_order
-    schema_inference: extended
     params:
       <<: *postgres_params
       pg_replication_slot: spice_new_order
@@ -92,7 +89,6 @@ datasets:
 
   - from: postgres:oorder
     name: oorder
-    schema_inference: extended
     params:
       <<: *postgres_params
       pg_replication_slot: spice_oorder
@@ -101,7 +97,6 @@ datasets:
 
   - from: postgres:order_line
     name: order_line
-    schema_inference: extended
     params:
       <<: *postgres_params
       pg_replication_slot: spice_order_line
@@ -110,7 +105,6 @@ datasets:
 
   - from: postgres:stock
     name: stock
-    schema_inference: extended
     params:
       <<: *postgres_params
       pg_replication_slot: spice_stock
@@ -122,7 +116,6 @@ datasets:
   # ------------------------------------------------------------------
   - from: postgres:warehouse
     name: warehouse
-    schema_inference: extended
     params:
       <<: *postgres_params
       pg_replication_slot: spice_warehouse
@@ -142,7 +135,6 @@ datasets:
   # ------------------------------------------------------------------
   - from: postgres:item
     name: item
-    schema_inference: extended
     params:
       <<: *postgres_params
     acceleration: &cayenne_accel_full
@@ -154,21 +146,18 @@ datasets:
 
   - from: postgres:region
     name: region
-    schema_inference: extended
     params:
       <<: *postgres_params
     acceleration: *cayenne_accel_full
 
   - from: postgres:nation
     name: nation
-    schema_inference: extended
     params:
       <<: *postgres_params
     acceleration: *cayenne_accel_full
 
   - from: postgres:supplier
     name: supplier
-    schema_inference: extended
     params:
       <<: *postgres_params
     acceleration: *cayenne_accel_full
