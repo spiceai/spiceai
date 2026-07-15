@@ -260,19 +260,22 @@ mod tests {
         .await
         .expect("bedrock params should deserialize");
         assert_eq!(
-            typed.aws_access_key_id
+            typed
+                .aws_access_key_id
                 .as_ref()
                 .map(ExposeSecret::expose_secret),
             Some("AKIA")
         );
         assert_eq!(
-            typed.aws_secret_access_key
+            typed
+                .aws_secret_access_key
                 .as_ref()
                 .map(ExposeSecret::expose_secret),
             Some("secret")
         );
         assert_eq!(
-            typed.aws_session_token
+            typed
+                .aws_session_token
                 .as_ref()
                 .map(ExposeSecret::expose_secret),
             Some("token")
