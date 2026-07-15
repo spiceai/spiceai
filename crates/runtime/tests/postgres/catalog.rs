@@ -29,6 +29,7 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use app::AppBuilder;
+use arrow::array::{Array, RecordBatch, StringArray};
 use datafusion::assert_batches_eq;
 use runtime::Runtime;
 use secrecy::ExposeSecret;
@@ -132,6 +133,50 @@ fn pg_catalog(port: usize) -> Catalog {
     catalog
 }
 
+/// Collect the values of a `Utf8` column across every batch, in row order.
+fn string_column_values(batches: &[RecordBatch], column: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    for batch in batches {
+        let idx = batch
+            .schema()
+            .index_of(column)
+            .unwrap_or_else(|e| panic!("expected column `{column}` in query result: {e}"));
+        let array = batch
+            .column(idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("column should be a Utf8 array");
+        for i in 0..array.len() {
+            values.push(array.value(i).to_string());
+        }
+    }
+    values
+}
+
+/// Seed a table with a `jsonb` column (the type the underlying connector
+/// documents as convertible under `unsupported_type_action: string`, see
+/// `pg_data_type_to_arrow_type` in `datafusion-table-providers`) plus real rows.
+async fn seed_unsupported_type_table(port: usize) -> Result<(), anyhow::Error> {
+    let pool = common::get_postgres_connection_pool(port, None).await?;
+    let conn = pool
+        .connect_direct()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    conn.conn
+        .simple_query(
+            "CREATE TABLE widgets_jsonb ( \
+                 id       INT  PRIMARY KEY, \
+                 metadata JSONB NOT NULL \
+             ); \
+             INSERT INTO widgets_jsonb (id, metadata) VALUES \
+                 (1, '{\"color\": \"red\"}'), (2, '{\"color\": \"blue\"}');",
+        )
+        .await?;
+
+    Ok(())
+}
+
 async fn start_runtime(catalog: Catalog) -> Result<Arc<Runtime>, anyhow::Error> {
     register_test_connectors().await;
     let app = AppBuilder::new("postgres_catalog_partition_test")
@@ -210,6 +255,110 @@ async fn test_partitioned_table_registers_parent_only() -> Result<(), anyhow::Er
                     "+---+", //
                 ],
                 &count
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// By default (no `dataset_params` override), a table with an unsupported
+/// column type (`jsonb`) is registered with that column converted to a
+/// string — matching the direct `PostgreSQL` data connector's default
+/// `unsupported_type_action: string` — rather than being dropped from the
+/// catalog entirely (#11728).
+#[tokio::test]
+async fn test_unsupported_type_action_defaults_to_string() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            let _container = common::start_postgres_docker_container(port).await?;
+
+            seed_unsupported_type_table(port).await?;
+
+            let rt = start_runtime(pg_catalog(port)).await?;
+
+            let tables = run_query(
+                &rt,
+                &format!(
+                    "SELECT table_name FROM information_schema.tables \
+                     WHERE table_catalog = '{CATALOG_NAME}' AND table_schema = 'public' \
+                     AND table_name = 'widgets_jsonb'"
+                ),
+            )
+            .await?;
+            assert_eq!(
+                string_column_values(&tables, "table_name"),
+                vec!["widgets_jsonb".to_string()],
+                "a table with an unsupported jsonb column should still be registered by default"
+            );
+
+            // The unsupported `metadata` (jsonb) column must still be present —
+            // converted to a string, not silently dropped — alongside `id`.
+            let columns = run_query(
+                &rt,
+                &format!(
+                    "SELECT column_name FROM information_schema.columns \
+                     WHERE table_catalog = '{CATALOG_NAME}' AND table_schema = 'public' \
+                     AND table_name = 'widgets_jsonb' \
+                     ORDER BY column_name"
+                ),
+            )
+            .await?;
+            assert_eq!(
+                string_column_values(&columns, "column_name"),
+                vec!["id".to_string(), "metadata".to_string()],
+                "the unsupported jsonb column should be kept (converted to a string), not dropped"
+            );
+
+            let count = run_query(
+                &rt,
+                &format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.widgets_jsonb"),
+            )
+            .await?;
+            assert_batches_eq!(&["+---+", "| n |", "+---+", "| 2 |", "+---+"], &count);
+
+            Ok(())
+        })
+        .await
+}
+
+/// Setting `dataset_params.unsupported_type_action: error` on the catalog
+/// threads through to the underlying connection pool, restoring the stricter
+/// whole-table-dropped behavior for callers who want it (#11728).
+#[tokio::test]
+async fn test_unsupported_type_action_override_drops_table() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            let _container = common::start_postgres_docker_container(port).await?;
+
+            seed_unsupported_type_table(port).await?;
+
+            let mut catalog = pg_catalog(port);
+            catalog.dataset_params = Some(Params::from_string_map(HashMap::from([(
+                "unsupported_type_action".to_string(),
+                "error".to_string(),
+            )])));
+
+            let rt = start_runtime(catalog).await?;
+
+            let tables = run_query(
+                &rt,
+                &format!(
+                    "SELECT table_name FROM information_schema.tables \
+                     WHERE table_catalog = '{CATALOG_NAME}' AND table_schema = 'public' \
+                     AND table_name = 'widgets_jsonb'"
+                ),
+            )
+            .await?;
+            assert!(
+                string_column_values(&tables, "table_name").is_empty(),
+                "a table with an unsupported jsonb column should be dropped when unsupported_type_action=error"
             );
 
             Ok(())
