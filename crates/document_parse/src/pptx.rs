@@ -51,8 +51,9 @@ impl PptxParser {
     }
 }
 
+#[async_trait::async_trait]
 impl DocumentParser for PptxParser {
-    fn parse(&self, raw: &Bytes) -> Result<Arc<dyn Document>> {
+    async fn parse(&self, raw: &Bytes) -> Result<Arc<dyn Document>> {
         // Cap the decompressed size of each slide entry to defend against
         // decompression ("zip") bombs: a small malicious .pptx whose slide
         // XML inflates to many gigabytes would otherwise drive an unbounded
@@ -223,7 +224,10 @@ mod tests {
         }
         let buf = zip.finish().expect("finish").into_inner();
 
-        let result = PptxParser::default().parse(&Bytes::from(buf));
+        let result = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("create tokio runtime")
+            .block_on(PptxParser::default().parse(&Bytes::from(buf)));
         assert!(
             result.is_err(),
             "a slide exceeding the decompression cap should be rejected"

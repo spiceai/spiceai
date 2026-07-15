@@ -379,6 +379,7 @@ impl SharepointClient {
             if let Some(formatter) = &formatter {
                 let doc = formatter
                     .parse(&raw)
+                    .await
                     .map_err(|e| Error::DocumentParsing { source: e })?;
                 let processed = doc
                     .as_flat_utf8()
