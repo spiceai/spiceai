@@ -106,10 +106,6 @@ struct PushdownMemTable(MemTable);
 
 #[async_trait]
 impl TableProvider for PushdownMemTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.0.schema()
     }

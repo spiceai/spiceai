@@ -17,7 +17,7 @@ limitations under the License.
 //! Plan-level "fall back to a secondary plan on zero results" machinery used by compound
 //! indexes in [`CompoundReadMode::FallbackToSecondary`](super::CompoundReadMode::FallbackToSecondary).
 
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -105,7 +105,6 @@ pub(super) fn fallback_on_empty_plan(
 
 /// A [`TableProvider`] over two [`LogicalPlan`]s with identical schemas: scans return the
 /// primary plan's rows, falling back to the secondary plan when the primary is empty.
-#[derive(Debug)]
 struct FallbackOnEmptyTableProvider {
     schema: SchemaRef,
     primary: Arc<LogicalPlan>,
@@ -115,6 +114,12 @@ struct FallbackOnEmptyTableProvider {
     /// [`TableProvider::supports_filters_pushdown`]. `None` when the primary plan does not
     /// contain exactly one scan — filter pushdown is then disabled (conservative).
     primary_source: Option<Arc<dyn TableSource>>,
+}
+
+impl fmt::Debug for FallbackOnEmptyTableProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "FallbackOnEmptyTableProvider")
+    }
 }
 
 /// The single [`LogicalPlan::TableScan`] source of `plan`, if the plan contains exactly one.
@@ -136,10 +141,6 @@ fn single_table_source(plan: &LogicalPlan) -> Option<Arc<dyn TableSource>> {
 
 #[async_trait]
 impl TableProvider for FallbackOnEmptyTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -249,7 +250,7 @@ fn unqualify_columns(expr: Expr) -> DataFusionResult<Expr> {
 struct FallbackOnEmptyScanExec {
     primary: Arc<dyn ExecutionPlan>,
     secondary: Arc<dyn ExecutionPlan>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl FallbackOnEmptyScanExec {
@@ -263,12 +264,12 @@ impl FallbackOnEmptyScanExec {
         // Either child's stream may end up serving the query, so emission type and
         // boundedness are the conservative combination of both (mirrors DataFusion's
         // crate-private `emission_type_from_children`/`boundedness_from_children`).
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(primary.schema()),
             Partitioning::UnknownPartitioning(1),
             combined_emission_type(primary.pipeline_behavior(), secondary.pipeline_behavior()),
             combined_boundedness(primary.boundedness(), secondary.boundedness()),
-        );
+        ));
         Self {
             primary,
             secondary,
@@ -324,11 +325,7 @@ impl ExecutionPlan for FallbackOnEmptyScanExec {
         "FallbackOnEmptyScanExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

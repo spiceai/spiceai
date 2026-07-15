@@ -46,7 +46,7 @@ use snafu::{ResultExt, Snafu, ensure};
 pub use search_index::CompoundSearchIndex;
 pub use vector_index::CompoundVectorIndex;
 
-use crate::index::{SearchIndex, VectorIndex};
+use crate::index::SearchIndex;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
