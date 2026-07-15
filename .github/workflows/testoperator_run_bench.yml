@@ -256,7 +256,24 @@ jobs:
           sudo apt-get install -y postgresql-client
 
           echo "Checking whether $DB_NAME already has data on $PGHOST..."
-          EXISTING_ROWS="$(PGCONNECT_TIMEOUT=10 psql -U postgres -d "$DB_NAME" -tAc 'SELECT count(*) FROM customer;' 2>/dev/null || echo 0)"
+          set +e
+          PSQL_OUTPUT="$(PGCONNECT_TIMEOUT=10 psql -U postgres -d "$DB_NAME" -tAc 'SELECT count(*) FROM customer;' 2>&1)"
+          PSQL_EXIT=$?
+          set -e
+
+          if [ "$PSQL_EXIT" -eq 0 ]; then
+            EXISTING_ROWS="$PSQL_OUTPUT"
+          elif echo "$PSQL_OUTPUT" | grep -qi "does not exist"; then
+            # Database or the customer table doesn't exist yet - genuinely unseeded.
+            echo "$DB_NAME (or its customer table) doesn't exist yet on $PGHOST."
+            EXISTING_ROWS=0
+          else
+            # Any other failure (auth, network, host unreachable, timeout) is a
+            # real problem, not "unseeded" - don't silently treat it as empty.
+            echo "::error::Could not check $DB_NAME on $PGHOST - this looks like a connectivity or authentication problem, not a missing database:"
+            echo "$PSQL_OUTPUT"
+            exit 1
+          fi
 
           cd test/tpc-bench
 

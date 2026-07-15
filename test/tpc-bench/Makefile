@@ -251,7 +251,7 @@ pg-tpcds-init:
 # them against empty tables means every bulk \copy in pg-tpcds-load has to
 # incrementally maintain each index row-by-row, instead of one efficient
 # sort-and-build pass over already-loaded data.
-# Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpch make pg-tpcds-create-index
+# Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpcds make pg-tpcds-create-index
 pg-tpcds-create-index:
 	@echo "Applying indexes from tpcds_index.sql..."
 	@psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -f tpcds_index.sql
@@ -262,7 +262,7 @@ pg-tpcds-create-index:
 	@echo "Setting statement_timeout on $(DB_NAME) database"
 	@psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -c "ALTER DATABASE \"$(DB_NAME)\" SET statement_timeout = '5400000';";
 
-# Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpch make pg-tpcds-load
+# Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpcds make pg-tpcds-load
 pg-tpcds-load:
 	@mkdir -p ./tmp
 	@for table in call_center catalog_page catalog_returns catalog_sales customer customer_address customer_demographics date_dim household_demographics income_band inventory item promotion reason ship_mode store store_returns store_sales time_dim warehouse web_page web_returns web_sales web_site; do \
