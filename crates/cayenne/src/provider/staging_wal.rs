@@ -507,9 +507,19 @@ impl PreparedStagedAppend {
     }
 
     /// Publish primary-key digests validated while the staged snapshot was private.
-    pub fn publish_validated_file_keys(&self) {
+    ///
+    /// `on_conflict_sequence` is the publish sequence when this append carries a
+    /// prepared on-conflict deletion (whose `prepared_on_conflict` was moved out
+    /// before publication). It takes precedence because an on-conflict append has
+    /// no `append_sequence` — stamping the fallback `0` would let a later
+    /// transaction that read these keys miss the conflict (silent lost update).
+    pub fn publish_validated_file_keys(&self, on_conflict_sequence: Option<i64>) {
         if let Some(keys) = &self.validated_file_keys {
-            self.table.record_file_pk_keys(keys);
+            // Stamp the appended keys with this append's commit sequence for the
+            // per-key optimistic-concurrency check (a transaction that read these
+            // keys before the append sees them advance and conflicts).
+            let sequence = on_conflict_sequence.or(self.append_sequence).unwrap_or(0);
+            self.table.record_file_pk_keys(keys, sequence);
         }
     }
 

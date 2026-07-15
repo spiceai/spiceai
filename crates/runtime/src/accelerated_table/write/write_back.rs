@@ -54,6 +54,8 @@ use datafusion_datasource::source::DataSourceExec;
 use futures::StreamExt;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 
+use runtime_datafusion::extension::request_context::resolve_request_context;
+
 use crate::accelerated_table::refresh::Refresher;
 use crate::federated_table::FederatedTable;
 
@@ -166,6 +168,20 @@ impl DataSink for WriteBackDataSink {
         })?;
 
         self.refresher.set_initial_load_completed(true);
+
+        // Durable federated write-back (#11838): a write inside a Cayenne
+        // transaction STAGES to the accelerator and is reconciled to the source
+        // by the delivery worker (from the dirty-key markers written in the same
+        // commit) — NOT by this fire-and-forget forward. Forwarding here would
+        // push staged-but-uncommitted batches to the source before COMMIT (and
+        // duplicate what the worker delivers), so skip it when a transaction is
+        // active on this request context. Non-transaction writes keep the
+        // ordinary write-back forward.
+        let in_transaction = resolve_request_context(context, false)
+            .is_some_and(|rc| rc.extension::<cayenne::CayenneTransaction>().is_some());
+        if in_transaction {
+            return Ok(row_count);
+        }
 
         // Forward the same buffered batches to the federated source in the
         // background. Failures are logged but do not affect the synchronous
@@ -363,7 +379,7 @@ pub(super) fn extract_dml_count(batches: &[RecordBatch]) -> u64 {
 /// cast to the target provider's schema so differences between the
 /// accelerator and federated source schemas (extra columns, differing
 /// types) don't cause incorrect writes.
-async fn execute_insert(
+pub(crate) async fn execute_insert(
     table: Arc<dyn TableProvider>,
     input_schema: SchemaRef,
     batches: Vec<RecordBatch>,
