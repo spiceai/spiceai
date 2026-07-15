@@ -596,6 +596,9 @@ impl Runtime {
             }
         };
 
+        self.status
+            .update_dataset(&ds.name, status::ComponentStatus::Initializing);
+
         let semaphore = Arc::clone(&self.dataset_load_semaphore);
         self.load_dataset(ds, bootstrap_status, semaphore).await;
     }

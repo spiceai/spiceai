@@ -145,12 +145,19 @@ pub struct AcceleratedCatalogProvider {
     include: Option<Arc<GlobSet>>,
     exclude: Option<Arc<GlobSet>>,
     schemas: RwLock<HashMap<String, Arc<AcceleratedSchemaProvider>>>,
-    /// `"{schema_name}.{table_name}"` -> the dataset name it was already
+    /// `(schema_name, table_name)` -> the dataset name it was already
     /// spawned under, tracked across refreshes so a periodic `refresh()`
     /// (every `refresh_check_interval`, default 1 minute -- see
     /// `RefreshingCatalogProvider::start_refresh`) doesn't re-spawn a
     /// duplicate bootstrap/CDC task for a table that's already running.
-    spawned: RwLock<HashMap<String, String>>,
+    ///
+    /// Keyed by the `(schema, table)` pair rather than a joined
+    /// `"{schema}.{table}"` string -- `PostgreSQL` allows `.` in a quoted
+    /// identifier, so a joined string key can collide (e.g. schema `"a.b"`,
+    /// table `"c"` vs. schema `"a"`, table `"b.c"`), which would make one
+    /// table reuse another's dataset name and silently route queries to the
+    /// wrong accelerated table.
+    spawned: RwLock<HashMap<(String, String), String>>,
 }
 
 impl std::fmt::Debug for AcceleratedCatalogProvider {
@@ -265,7 +272,7 @@ impl AcceleratedCatalogProvider {
             // Already running from a previous refresh -- reuse it rather
             // than re-validating and re-spawning a duplicate bootstrap/CDC
             // task for a table `refresh()` already knows about.
-            let spawn_key = format!("{schema_name}.{table_name}");
+            let spawn_key = (schema_name.to_string(), table_name.clone());
             let already_spawned = {
                 let guard = self.spawned.read();
                 guard.get(&spawn_key).cloned()
