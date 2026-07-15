@@ -64,7 +64,7 @@ jobs:
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
             const body = [
               marker,
-              '`cargo deny check advisories` found Rust dependency advisory violations on the default branch.',
+'`cargo deny check advisories` found Rust dependency advisory violations.',
               '',
               `Run: ${runUrl}`,
               `Commit: ${context.sha}`,
