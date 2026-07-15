@@ -138,11 +138,12 @@ fn scalar_fsl_cosine_distance(a: &ArrayRef, b: &ArrayRef) -> Vec<Option<f64>> {
         }
 
         let denom = norm_a.sqrt() * norm_b.sqrt();
-        let dist = if denom == 0.0 || !denom.is_finite() {
-            None
+        let similarity = if denom == 0.0 || !denom.is_finite() {
+            0.0 // zero-magnitude → orthogonal convention, matches production paths
         } else {
-            Some((1.0 - dot / denom) / 2.0)
+            dot / denom
         };
+        let dist = Some((1.0 - similarity) / 2.0);
         results.push(dist);
     }
 

@@ -26,9 +26,8 @@ limitations under the License.
 //!   type → plain Rust loop, backwards-compatible with the original implementation.
 //!
 //! Both paths return `(1 - cosine_similarity) / 2` ∈ `[0, 1]` (0 = identical,
-//! 1 = opposite). Zero-magnitude vectors have undefined cosine direction; the
-//! scalar path returns SQL NULL (NaN guard), while the SIMD path treats them as
-//! orthogonal and returns 0.5.
+//! 1 = opposite). Zero-magnitude vectors have undefined cosine direction; both
+//! paths treat them as orthogonal and return 0.5.
 
 use arrow::array::{Array, ArrayRef, Float64Array, LargeListArray, ListArray, OffsetSizeTrait};
 use arrow_schema::DataType;
@@ -291,10 +290,9 @@ fn compute_cosine_distance(
 
 /// Computes the cosine distance between two equal-length vectors.
 ///
-/// Returns `None` when either vector has zero magnitude (e.g. an all-zero or
-/// failed embedding): cosine similarity is undefined there (`0.0 / 0.0` is
-/// `NaN`), and a `NaN` score sorts ahead of every real score in
-/// `ORDER BY _score DESC`, surfacing failed embeddings as top matches.
+/// Zero-magnitude vectors have no defined direction; they are treated as
+/// orthogonal (cosine similarity = 0), returning distance `0.5`, consistent
+/// with the SIMD path.
 fn cosine_distance(x: &Float64Array, y: &Float64Array) -> Option<f64> {
     let mut x_length: f64 = 0.0;
     let mut y_length: f64 = 0.0;
@@ -315,12 +313,9 @@ fn cosine_distance(x: &Float64Array, y: &Float64Array) -> Option<f64> {
 
     let similarity = sum_squares / (x_length.sqrt() * y_length.sqrt());
 
-    // A zero-magnitude vector makes `similarity` NaN (and a non-finite value can
-    // otherwise only arise from overflow). Guard it so callers get a NULL score
-    // rather than a NaN that would sort to the top of `ORDER BY _score DESC`.
-    if !similarity.is_finite() {
-        return None;
-    }
+    // Zero-magnitude vectors produce NaN (0/0); treat as zero similarity
+    // (orthogonal) so behavior matches the SIMD path → distance 0.5.
+    let similarity = if similarity.is_finite() { similarity } else { 0.0 };
 
     // Convert cosine similarity [-1.0, 1.0] to cosine distance [0.0, 1.0]
     Some((1.0 - similarity) / 2.0)
@@ -395,42 +390,32 @@ mod tests {
     }
 
     #[test]
-    fn test_cosine_distance_zero_vector_is_null() {
-        // A zero-magnitude vector has no defined direction; the distance must be
-        // NULL (None) rather than NaN so failed/empty embeddings do not sort to
-        // the top of `ORDER BY _score DESC`.
-        assert_eq!(
-            None,
-            cosine_distance(
-                &Float64Array::from(vec![0.0, 0.0, 0.0]),
-                &Float64Array::from(vec![1.0, 2.0, 3.0]),
-            )
-        );
-        assert_eq!(
-            None,
-            cosine_distance(
-                &Float64Array::from(vec![1.0, 2.0, 3.0]),
-                &Float64Array::from(vec![0.0, 0.0, 0.0]),
-            )
-        );
-        assert_eq!(
-            None,
-            cosine_distance(
-                &Float64Array::from(vec![0.0, 0.0]),
-                &Float64Array::from(vec![0.0, 0.0]),
-            )
-        );
+    fn test_cosine_distance_zero_vector_yields_orthogonal_distance() {
+        // Zero-magnitude vectors are treated as orthogonal → distance 0.5,
+        // consistent with the SIMD path.
+        let half = |d: Option<f64>| matches!(d, Some(v) if (v - 0.5).abs() < 1e-10);
+        assert!(half(cosine_distance(
+            &Float64Array::from(vec![0.0, 0.0, 0.0]),
+            &Float64Array::from(vec![1.0, 2.0, 3.0]),
+        )));
+        assert!(half(cosine_distance(
+            &Float64Array::from(vec![1.0, 2.0, 3.0]),
+            &Float64Array::from(vec![0.0, 0.0, 0.0]),
+        )));
+        assert!(half(cosine_distance(
+            &Float64Array::from(vec![0.0, 0.0]),
+            &Float64Array::from(vec![0.0, 0.0]),
+        )));
     }
 
     #[test]
-    fn test_compute_cosine_distance_zero_vector_propagates_null() {
-        // Exercise the production wrapper: a zero-magnitude vector must surface
-        // as `Ok(None)` (SQL NULL), not `Ok(Some(NaN))`.
+    fn test_compute_cosine_distance_zero_vector_yields_orthogonal_distance() {
+        // Exercise the production wrapper: zero-magnitude vector → 0.5.
         let zero: ArrayRef = Arc::new(Float64Array::from(vec![0.0, 0.0, 0.0]));
         let nonzero: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0]));
 
         let result = compute_cosine_distance(Some(zero), Some(nonzero));
-        assert!(matches!(result, Ok(None)));
+        assert!(matches!(result, Ok(Some(v)) if (v - 0.5).abs() < 1e-10));
 
         // A normal pair still yields a finite distance.
         let a: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0]));
