@@ -260,12 +260,7 @@ struct WriteBackDeletionSink {
 
 #[async_trait]
 impl DeletionSink for WriteBackDeletionSink {
-    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        self.delete_from_with_context(self.session_state.task_ctx())
-            .await
-    }
-
-    async fn delete_from_with_context(
+    async fn delete_from(
         &self,
         context: Arc<TaskContext>,
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
@@ -349,15 +344,7 @@ struct WriteBackUpdateSink {
 
 #[async_trait]
 impl DeletionSink for WriteBackUpdateSink {
-    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        // Fallback for callers that don't supply the live context; the real path is
-        // `delete_from_with_context`, which `DeletionExec` invokes with the execution
-        // context carrying any active Cayenne transaction.
-        self.delete_from_with_context(self.session_state.task_ctx())
-            .await
-    }
-
-    async fn delete_from_with_context(
+    async fn delete_from(
         &self,
         context: Arc<TaskContext>,
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
@@ -669,7 +656,7 @@ mod tests {
             session_state,
         };
 
-        let count = sink.delete_from().await.expect("deletion should succeed");
+        let count = sink.delete_from(session_state.task_ctx()).await.expect("deletion should succeed");
         assert_eq!(count, 42);
     }
 
@@ -686,7 +673,7 @@ mod tests {
             session_state,
         };
 
-        let err = sink.delete_from().await.expect_err("deletion should fail");
+        let err = sink.delete_from(session_state.task_ctx()).await.expect_err("deletion should fail");
         assert!(err.to_string().contains("accelerator delete failed"));
     }
 
@@ -706,7 +693,7 @@ mod tests {
             session_state,
         };
 
-        let count = sink.delete_from().await.expect("update should succeed");
+        let count = sink.delete_from(session_state.task_ctx()).await.expect("update should succeed");
         assert_eq!(count, 7);
     }
 
@@ -724,7 +711,7 @@ mod tests {
             session_state,
         };
 
-        let err = sink.delete_from().await.expect_err("update should fail");
+        let err = sink.delete_from(session_state.task_ctx()).await.expect_err("update should fail");
         assert!(err.to_string().contains("accelerator update failed"));
     }
 }

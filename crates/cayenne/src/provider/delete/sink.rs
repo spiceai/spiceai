@@ -78,6 +78,7 @@ use datafusion_common::DFSchema;
 use datafusion_common::tree_node::TreeNode;
 use datafusion_expr::Expr;
 use datafusion_expr::execution_props::ExecutionProps;
+use datafusion::execution::TaskContext;
 use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use futures::StreamExt;
 use std::collections::HashSet;
@@ -1162,7 +1163,10 @@ impl CayenneDeletionSink {
 
 #[async_trait]
 impl DeletionSink for CayenneDeletionSink {
-    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    async fn delete_from(
+        &self,
+        _context: Arc<TaskContext>,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         // Acquire write lock (if provided) to prevent racing with concurrent inserts or catalog refreshes.
         // When called from within write_all_append (e.g. retention filters), the caller already
         // holds the lock, so write_lock is None to avoid deadlocking the non-reentrant mutex.

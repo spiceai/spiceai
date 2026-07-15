@@ -40,6 +40,7 @@ use async_trait::async_trait;
 use data_components::delete::DeletionSink;
 use datafusion::datasource::listing::ListingTable;
 use datafusion::execution::config::SessionConfig;
+use datafusion::execution::TaskContext;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion_catalog::TableProvider;
@@ -419,7 +420,10 @@ impl FileBasedDeletionSink {
 
 #[async_trait]
 impl DeletionSink for FileBasedDeletionSink {
-    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    async fn delete_from(
+        &self,
+        _context: Arc<TaskContext>,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         // Acquire write lock to prevent racing with concurrent inserts or catalog refreshes.
         let _write_guard = self.write_lock.lock().await;
         // Acquire the listing fence in write mode so new scan plan-builds

@@ -16761,13 +16761,13 @@ impl CayenneTableProvider {
             Arc::clone(&self.seq_allocator),
         );
 
-        let deleted_count =
-            sink.delete_from()
-                .await
-                .map_err(|err| CatalogError::InvalidOperation {
-                    message: "Failed to execute retention filters.".to_string(),
-                    source: err,
-                })?;
+        let deleted_count = sink
+            .delete_from(Arc::new(TaskContext::default()))
+            .await
+            .map_err(|err| CatalogError::InvalidOperation {
+                message: "Failed to execute retention filters.".to_string(),
+                source: err,
+            })?;
 
         // Refresh deletion cache after applying retention filters
         if deleted_count > 0 {
@@ -25531,7 +25531,7 @@ impl CayenneTableProvider {
             filters: filters.to_vec(),
         };
         let deleted = sink
-            .delete_from()
+            .delete_from(Arc::new(TaskContext::default()))
             .await
             .map_err(datafusion_common::DataFusionError::External)?;
         Ok(Some(deleted))

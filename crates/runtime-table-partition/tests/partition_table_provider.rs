@@ -1552,7 +1552,10 @@ struct MockDeletionSink {
 
 #[async_trait]
 impl DeletionSink for MockDeletionSink {
-    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    async fn delete_from(
+        &self,
+        _context: Arc<datafusion::execution::TaskContext>,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let mut guard = self.count.write().await;
         *guard += self.count_per_call;
         Ok(self.count_per_call)
