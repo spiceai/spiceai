@@ -32,10 +32,9 @@ limitations under the License.
 //! naming the problem, before any table is touched, when the source can't
 //! do CDC at all (e.g. `wal_level` isn't `logical`).
 //!
-//! This is the first genuinely workable, end-to-end slice: it proves
-//! bootstrap through the catalog path works. It deliberately does not yet
-//! assert CDC convergence after a source mutation -- that lands in a
-//! follow-up commit.
+//! After bootstrap, source inserts/updates/deletes propagate through the
+//! shared replication slot and are reflected in the catalog's queryable
+//! tables -- this isn't just a one-time snapshot.
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -166,6 +165,34 @@ async fn wait_for_table_ready(rt: &Arc<Runtime>, table: &str) -> Result<(), anyh
     Ok(())
 }
 
+/// Run `sql` (expected to select a single `BIGINT`/`COUNT(*)`-shaped column)
+/// and return the scalar value, or `None` if the query itself failed.
+async fn query_i64(rt: &Arc<Runtime>, sql: &str) -> Option<i64> {
+    let batches = run_query(rt, sql).await.ok()?;
+    let batch = batches.first()?;
+    batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .map(|arr| arr.value(0))
+}
+
+/// Run `sql` (expected to select a single `TEXT`-shaped column) and return
+/// the scalar value, or `None` if the query itself failed or returned no
+/// rows.
+async fn query_string(rt: &Arc<Runtime>, sql: &str) -> Option<String> {
+    let batches = run_query(rt, sql).await.ok()?;
+    let batch = batches.first()?;
+    if batch.num_rows() == 0 {
+        return None;
+    }
+    batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .map(|arr| arr.value(0).to_string())
+}
+
 /// Every table with a primary key, discovered by a catalog with
 /// `acceleration: { refresh_mode: changes }`, becomes queryable through the
 /// catalog's own namespace once its synthesized dataset finishes
@@ -285,6 +312,75 @@ async fn test_check_cdc_prerequisites_rejects_non_logical_wal_level() -> Result<
             anyhow::ensure!(
                 message.contains("wal_level"),
                 "expected error naming wal_level, got: {message}"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// After bootstrap, an insert, an update, and a delete on the source all
+/// propagate through the catalog's single shared replication slot and are
+/// reflected in the catalog's queryable tables -- proving this is a live
+/// CDC stream, not a one-time snapshot.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_catalog_acceleration_converges_after_source_mutation() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info,runtime::catalogconnector=debug"));
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+
+            seed_tables(port).await?;
+
+            let rt = start_runtime(accelerated_pg_catalog(port)).await?;
+
+            wait_for_table_ready(&rt, "orders").await?;
+            wait_for_table_ready(&rt, "items").await?;
+
+            // Insert a new order, update an existing order's customer, and
+            // delete an item -- one of each change type CDC must apply.
+            let pool = common::get_postgres_connection_pool(port, None).await?;
+            let conn = pool
+                .connect_direct()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            conn.conn
+                .simple_query(
+                    "INSERT INTO orders (id, customer) VALUES (3, 'carol'); \
+                     UPDATE orders SET customer = 'alice2' WHERE id = 1; \
+                     DELETE FROM items WHERE id = 2;",
+                )
+                .await?;
+
+            let orders_count_sql =
+                format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.orders");
+            let updated_customer_sql = format!(
+                "SELECT customer FROM {CATALOG_NAME}.public.orders WHERE id = 1"
+            );
+            let items_count_sql = format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.items");
+
+            let converged = wait_until_true(Duration::from_mins(2), || {
+                let rt = Arc::clone(&rt);
+                let orders_count_sql = orders_count_sql.clone();
+                let updated_customer_sql = updated_customer_sql.clone();
+                let items_count_sql = items_count_sql.clone();
+                async move {
+                    query_i64(&rt, &orders_count_sql).await == Some(3)
+                        && query_string(&rt, &updated_customer_sql).await.as_deref()
+                            == Some("alice2")
+                        && query_i64(&rt, &items_count_sql).await == Some(2)
+                }
+            })
+            .await;
+            anyhow::ensure!(
+                converged,
+                "source insert/update/delete never converged through CDC: \
+                orders_count={:?}, updated_customer={:?}, items_count={:?}",
+                query_i64(&rt, &orders_count_sql).await,
+                query_string(&rt, &updated_customer_sql).await,
+                query_i64(&rt, &items_count_sql).await,
             );
 
             Ok(())
