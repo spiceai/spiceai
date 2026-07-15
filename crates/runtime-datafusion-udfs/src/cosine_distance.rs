@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,7 +26,9 @@ limitations under the License.
 //!   type → plain Rust loop, backwards-compatible with the original implementation.
 //!
 //! Both paths return `(1 - cosine_similarity) / 2` ∈ `[0, 1]` (0 = identical,
-//! 1 = opposite). Zero-magnitude vectors produce SQL NULL on both paths.
+//! 1 = opposite). Zero-magnitude vectors have undefined cosine direction; the
+//! scalar path returns SQL NULL (NaN guard), while the SIMD path treats them as
+//! orthogonal and returns 0.5.
 
 use arrow::array::{Array, ArrayRef, Float64Array, LargeListArray, ListArray, OffsetSizeTrait};
 use arrow_schema::DataType;
@@ -171,9 +173,8 @@ pub(crate) fn cosine_distance_inner(args: &[ArrayRef]) -> DataFusionResult<Array
         // SIMD path: both inputs are FixedSizeList<Float32, N>.
         // `simsimd`'s `cos` kernel returns `1 - cosine_similarity` ∈ [0, 2];
         // divide by 2 to map into the standard [0, 1] distance range.
-        // Zero-magnitude vectors produce non-finite results (NaN); guard those
-        // so they emit NULL instead, preventing NaNs from sorting to the top
-        // of `ORDER BY _score DESC`.
+        // Zero-magnitude vectors have an undefined direction; simsimd treats the
+        // dot product as zero (orthogonal), yielding distance 0.5.
         (FixedSizeList(_, _), FixedSizeList(_, _)) => compute_fsl_f32_cosine(args),
         (List(_), List(_)) => general_cosine_distance::<i32>(args),
         (LargeList(_), LargeList(_)) => general_cosine_distance::<i64>(args),
@@ -185,7 +186,7 @@ pub(crate) fn cosine_distance_inner(args: &[ArrayRef]) -> DataFusionResult<Array
     }
 }
 
-/// Compute cosine distance for `FixedSizeList<Float32>` with NULL-on-non-finite guard.
+/// Compute cosine distance for `FixedSizeList<Float32>` with a non-finite safety guard.
 fn compute_fsl_f32_cosine(args: &[ArrayRef]) -> DataFusionResult<ArrayRef> {
     let result = compute_fsl_f32(args, Kernel::Cosine, |v| v / 2.0)?;
     let float64 = result
@@ -195,8 +196,8 @@ fn compute_fsl_f32_cosine(args: &[ArrayRef]) -> DataFusionResult<ArrayRef> {
             DataFusionError::Internal("compute_fsl_f32 should return Float64Array".to_string())
         })?;
 
-    // Guard non-finite values (can arise from zero-magnitude vectors where
-    // cosine is undefined). Convert them to NULL for sorting safety.
+    // Safety net: convert any non-finite output to NULL to prevent NaN from
+    // sorting ahead of real scores in `ORDER BY _score DESC`.
     let mut builder = arrow::array::Float64Builder::with_capacity(float64.len());
     for i in 0..float64.len() {
         if float64.is_null(i) {
@@ -483,16 +484,16 @@ mod tests {
     }
 
     #[test]
-    fn simd_zero_magnitude_vector_yields_null() {
-        // A zero-magnitude vector has no defined direction; the SIMD path must
-        // emit a NULL row (not an error) so failed embeddings don't bubble up.
+    fn simd_zero_magnitude_vector_yields_orthogonal_distance() {
+        // A zero-magnitude vector has no defined direction; simsimd treats the
+        // dot product as zero (orthogonal), so the SIMD path returns 0.5.
         let a = fsl_f32(&[&[0.0_f32, 0.0, 0.0]]) as ArrayRef;
         let b = fsl_f32(&[&[1.0_f32, 2.0, 3.0]]) as ArrayRef;
         let out = cosine_distance_inner(&[a, b]).expect("ok");
         let out = out.as_primitive::<Float64Type>();
         assert!(
-            out.is_null(0),
-            "expected NULL for zero-magnitude vector, got {}",
+            !out.is_null(0) && (out.value(0) - 0.5).abs() < 1e-5,
+            "expected 0.5 for zero-magnitude vector, got {}",
             out.value(0)
         );
     }

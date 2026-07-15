@@ -388,8 +388,6 @@ mod tests {
             None
         } else {
             let v = out.value(0);
-            // Zero-magnitude vectors produce NaN from simsimd; treat as NULL,
-            // matching the guard in `compute_fsl_f32_cosine`.
             v.is_finite().then_some(v)
         }
     }
@@ -416,12 +414,12 @@ mod tests {
     }
 
     #[test]
-    fn cosine_zero_magnitude_vector_yields_null() {
-        // zero-magnitude vector → simsimd returns NaN → row must be NULL, not an error
+    fn cosine_zero_magnitude_vector_yields_orthogonal_distance() {
+        // zero-magnitude vector → simsimd treats dot product as 0 (orthogonal) → distance 0.5
         let d = cosine_distance_via_simd(&[0.0, 0.0, 0.0], &[1.0, 2.0, 3.0]);
         assert!(
-            d.is_none(),
-            "expected NULL for zero-magnitude input, got: {d:?}"
+            matches!(d, Some(v) if (v - 0.5).abs() < 1e-5),
+            "expected 0.5 for zero-magnitude input, got: {d:?}"
         );
     }
 }

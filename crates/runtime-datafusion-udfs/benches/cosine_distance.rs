@@ -43,6 +43,7 @@ use std::sync::Arc;
 // ---------------------------------------------------------------------------
 
 /// Build a `FixedSizeList<Float32, dim>` array with `rows` rows of random data.
+#[expect(clippy::expect_used, reason = "bench setup — panics are acceptable")]
 fn build_fsl_f32(rows: usize, dim: usize) -> ArrayRef {
     let field = Arc::new(Field::new("item", DataType::Float32, true));
     let dim_i32 = i32::try_from(dim).expect("dim fits in i32");
@@ -90,6 +91,7 @@ fn build_list_f32(rows: usize, dim: usize) -> ArrayRef {
 // `cosine_distance_inner`.
 // ---------------------------------------------------------------------------
 
+#[expect(clippy::expect_used, reason = "bench setup — panics are acceptable")]
 fn scalar_fsl_cosine_distance(a: &ArrayRef, b: &ArrayRef) -> Vec<Option<f64>> {
     let fsl_a = a
         .as_any()
@@ -151,6 +153,7 @@ fn scalar_fsl_cosine_distance(a: &ArrayRef, b: &ArrayRef) -> Vec<Option<f64>> {
 // Benchmark groups
 // ---------------------------------------------------------------------------
 
+#[expect(clippy::expect_used, reason = "bench setup — panics are acceptable")]
 fn invoke(a: ArrayRef, b: ArrayRef, rows: usize) -> ColumnarValue {
     let return_field = Arc::new(Field::new("f", DataType::Float64, true));
     CosineDistance::new()
@@ -202,6 +205,7 @@ fn bench_fsl_f32(c: &mut Criterion) {
 }
 
 /// Group 2: `List<Float32>` — Spice scalar fallback vs DataFusion `ArrayDistance`.
+#[expect(clippy::expect_used, reason = "bench setup — panics are acceptable")]
 fn bench_list_f32(c: &mut Criterion) {
     let mut group = c.benchmark_group("cosine_distance/list_f32");
 
