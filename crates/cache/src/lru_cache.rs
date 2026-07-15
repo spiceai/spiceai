@@ -616,7 +616,7 @@ mod tests {
         let encoder = crate::encoding::get_encoder(spicepod::component::caching::Encoding::None);
 
         CachedQueryResult::from_batches(
-            &[record_batch],
+            vec![record_batch],
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
             Arc::new(input_tables),
             std::time::Instant::now(),
@@ -1201,7 +1201,7 @@ mod tests {
         });
         let encoder = crate::encoding::get_encoder(spicepod::component::caching::Encoding::None);
         let result_other_table = CachedQueryResult::from_batches(
-            &[different_table_batch],
+            vec![different_table_batch],
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
             Arc::new(different_input_tables),
             std::time::Instant::now(),

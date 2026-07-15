@@ -722,7 +722,7 @@ impl CacheRefreshHelper {
         let batches = Self::fetch_from_source(&federated, dataset_name, filters, None).await?;
 
         // Skip cache writes if the source response contains transient HTTP errors.
-        let Some(batches) = cache::batches_to_cache(&batches) else {
+        if !cache::batches_cacheable(&batches) {
             tracing::debug!(
                 "No cacheable data for dataset={dataset_name} (source returned transient HTTP error responses)"
             );
@@ -730,7 +730,7 @@ impl CacheRefreshHelper {
             let mut in_flight = in_flight_revalidations.lock().await;
             in_flight.remove(&cache_key);
             return Ok(0);
-        };
+        }
 
         if batches.is_empty() {
             tracing::debug!("No cacheable data for dataset={dataset_name} (source returned empty)");
@@ -1421,23 +1421,26 @@ impl CacheRefreshHelper {
 
                 // Skip cache writes if the source response contains transient HTTP
                 // errors. User still receives all fetched data.
-                let batches_for_cache = cache::batches_to_cache(&batches);
+                let batches_cacheable = cache::batches_cacheable(&batches);
 
                 // Clone batches for propagation to children.
                 // RecordBatch::clone() is cheap - only clones Arc pointers, not the underlying data.
-                let batches_for_propagate = batches_for_cache.clone().unwrap_or_default();
+                let batches_for_propagate = if batches_cacheable {
+                    batches.clone()
+                } else {
+                    Vec::new()
+                };
                 let filters_clone: Vec<Expr> = filters.to_vec();
                 let cache_key =
                     compute_cache_key_from_filters_and_namespace(filters, namespace.storage_id());
 
-                if let Some(batches_for_cache) = batches_for_cache {
-                    if batches_for_cache.is_empty() {
+                if batches_cacheable {
+                    if batches.is_empty() {
                         tracing::debug!(
                             "Fetch returned no rows, skipping cache write for dataset={dataset_name}"
                         );
                     } else {
-                        let cache_rows: usize =
-                            batches_for_cache.iter().map(RecordBatch::num_rows).sum();
+                        let cache_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
 
                         // Send write request to batched consumer. The flush
                         // task is the one that stamps `__spice_cache_namespace`
@@ -1446,7 +1449,7 @@ impl CacheRefreshHelper {
                         // actual storage schema (extended in real deployments,
                         // unextended in unit-test mocks).
                         let write_request = CacheWriteRequest {
-                            batches: batches_for_cache,
+                            batches: batches.clone(),
                             filters: filters.to_vec(),
                             is_upsert: is_expired,
                             cache_key,

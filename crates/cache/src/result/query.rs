@@ -121,7 +121,7 @@ impl CachedQueryResult {
     ///
     /// Returns an error if encoding fails.
     pub async fn from_batches(
-        records: &[RecordBatch],
+        records: Vec<RecordBatch>,
         schema: SchemaRef,
         input_tables: Arc<HashSet<TableReference>>,
         cached_at: Instant,
@@ -130,10 +130,10 @@ impl CachedQueryResult {
     ) -> Result<Self, crate::encoding::Error> {
         // Only store encoded data if an encoder is provided
         let data = if let Some(encoder) = encoder.as_ref() {
-            let encoded_data = encoder.encode(records).await?;
+            let encoded_data = encoder.encode(&records).await?;
             CachedData::Encoded(Bytes::from(encoded_data))
         } else {
-            CachedData::Raw(Arc::new(records.to_vec()))
+            CachedData::Raw(Arc::new(records))
         };
 
         Ok(Self {
@@ -151,12 +151,12 @@ impl CachedQueryResult {
     /// # Errors
     ///
     /// Returns an error if decoding fails.
-    pub async fn records(&self) -> Result<Vec<RecordBatch>, crate::encoding::Error> {
+    pub async fn records(&self) -> Result<Arc<Vec<RecordBatch>>, crate::encoding::Error> {
         match &self.data {
-            CachedData::Raw(batches) => Ok((**batches).clone()),
+            CachedData::Raw(batches) => Ok(Arc::clone(batches)),
             CachedData::Encoded(bytes) => {
                 if let Some(encoder) = &self.encoder {
-                    encoder.decode(bytes).await
+                    encoder.decode(bytes).await.map(Arc::new)
                 } else {
                     Err(crate::encoding::Error::NoEncoderSpecified)
                 }
@@ -481,7 +481,7 @@ mod tests {
         ]));
 
         let cached_result = CachedQueryResult::from_batches(
-            &[],
+            Vec::new(),
             Arc::clone(&schema),
             Arc::new(HashSet::new()),
             Instant::now(),
@@ -502,7 +502,7 @@ mod tests {
         let records = cached_result.records().await.expect("should decode");
         assert!(records.is_empty(), "Should have no record batches");
 
-        let stream = CachedStream::new(Arc::new(records), Arc::clone(&cached_result.schema));
+        let stream = CachedStream::new(records, Arc::clone(&cached_result.schema));
         assert_eq!(
             stream.schema().fields().len(),
             3,

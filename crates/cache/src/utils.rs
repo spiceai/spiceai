@@ -157,20 +157,23 @@ fn has_transient_http_error_responses(batches: &[RecordBatch]) -> bool {
     false
 }
 
-/// Returns the batches that should be written to cache.
+/// Returns whether the batches should be written to cache.
 ///
 /// For HTTP-shaped results, any presence of a transient error response (5xx/429)
 /// skips the entire cache write to avoid storing a partial result set. Non-HTTP
-/// results are returned unchanged, even if they contain a `response_status`
-/// column for unrelated business logic.
+/// results are cacheable, even if they contain a `response_status` column for
+/// unrelated business logic.
 #[must_use]
-pub fn batches_to_cache(batches: &[RecordBatch]) -> Option<Vec<RecordBatch>> {
-    if has_transient_http_error_responses(batches) {
-        return None;
-    }
-
-    Some(batches.to_vec())
+pub fn batches_cacheable(batches: &[RecordBatch]) -> bool {
+    !has_transient_http_error_responses(batches)
 }
+
+/// How much larger than the cache limit a raw result may grow while
+/// accumulating for an encoded (compressed) cache write. Encoding can shrink
+/// a result well below its raw in-memory size, so accumulation continues past
+/// the cache limit up to this factor; beyond it the result cannot plausibly
+/// fit once encoded, and caching is abandoned to bound the memory held.
+const MAX_ENCODING_COMPRESSION_RATIO: usize = 16;
 
 /// Wraps `stream` so its results are stored in the cache once it has been
 /// drained.
@@ -200,15 +203,25 @@ pub fn to_cached_record_batch_stream(
         // moka-rs operates by `u32` for records size, so max single record size is `u32::MAX` / 4 GB
         let cache_max_size = usize::try_from(cache_provider.max_size().min(u64::from(u32::MAX))).unwrap_or_default();
 
+        // When an encoder is present, the encoded result may be much smaller
+        // than the raw size, so keep accumulating past the cache limit (up to
+        // the optimistic compression bound) and check the encoded size after
+        // encoding. Without an encoder the raw size is the stored size.
+        let raw_size_limit = if has_encoder {
+            cache_max_size.saturating_mul(MAX_ENCODING_COMPRESSION_RATIO)
+        } else {
+            cache_max_size
+        };
+
         while let Some(batch_result) = stream.next().await {
-            if records_size < cache_max_size && let Ok(batch) = &batch_result {
+            if records_size < raw_size_limit && let Ok(batch) = &batch_result {
                 records.push(batch.clone());
-                records_size += batch.get_array_memory_size();
-            } else if !records.is_empty() && records_size >= cache_max_size && !has_encoder {
-                // Eagerly clear the cached records when there is no encoder, as
-                // the unencoded result won't fit in the cache. When an encoder is
-                // present, the encoded size may be much smaller than the raw size,
-                // so we keep accumulating and check the encoded size later.
+                records_size = records_size.saturating_add(batch.get_array_memory_size());
+            } else if !records.is_empty() && records_size >= raw_size_limit {
+                // The result can no longer fit in the cache: eagerly drop the
+                // accumulated batches. Caching must be abandoned entirely —
+                // a prefix of the result set must never be cached, as it would
+                // be served as a complete result.
                 records.clear();
                 records.shrink_to_fit();
             }
@@ -216,9 +229,10 @@ pub fn to_cached_record_batch_stream(
             yield batch_result;
         }
 
-        // When an encoder is present, defer the size check until after encoding
-        // so that compressed results that fit in the cache are not prematurely rejected.
-        if records_size < cache_max_size || has_encoder {
+        if records_size < raw_size_limit {
+            // `batches_cacheable` is false only when transient HTTP error
+            // responses (5xx/429) are present, which requires a non-empty
+            // result set — skip the write to avoid caching a partial result.
             if cache_provider.tables_invalidated_since(&input_tables, read_started_at) {
                 // Not the guard — correctness comes from the check every cache
                 // hit performs. This only avoids encoding and storing a result
@@ -226,56 +240,47 @@ pub fn to_cached_record_batch_stream(
                 tracing::debug!(
                     "A table read by this query was invalidated while it ran, skipping cache storage"
                 );
-            } else {
-                match batches_to_cache(&records) {
-                    // `batches_to_cache` only returns `None` when transient HTTP
-                    // error responses (5xx/429) are present, which requires a
-                    // non-empty result set — skip the write to avoid caching a
-                    // partial result.
-                    None => {
-                        tracing::debug!(
-                            "Transient HTTP error responses were present, skipping cache storage"
-                        );
-                    }
-                    // Cache the result, including genuinely empty (0-row / 0-batch)
-                    // result sets. The schema is stored separately in
-                    // `CachedQueryResult`, so an empty result round-trips with the
-                    // correct schema, and caching it lets repeat queries that
-                    // legitimately return no rows be served from cache instead of
-                    // re-executing on every request.
-                    Some(records_to_cache) => {
-                        let cached_at = std::time::Instant::now();
-                        let encoder = cache_provider.encoder();
+            } else if batches_cacheable(&records) {
+                // Cache the result, including genuinely empty (0-row / 0-batch)
+                // result sets. The schema is stored separately in
+                // `CachedQueryResult`, so an empty result round-trips with the
+                // correct schema, and caching it lets repeat queries that
+                // legitimately return no rows be served from cache instead of
+                // re-executing on every request.
+                let cached_at = std::time::Instant::now();
+                let encoder = cache_provider.encoder();
 
-                        match CachedQueryResult::from_batches(
-                            &records_to_cache,
-                            cache_schema,
-                            input_tables,
-                            cached_at,
-                            read_started_at,
-                            encoder,
-                        )
-                        .await
-                        {
-                            Ok(cached_result) => {
-                                // Check the actual (possibly encoded) size before caching
-                                let actual_size = cached_result.get_memory_size();
-                                if actual_size > cache_max_size {
-                                    tracing::debug!(
-                                        actual_size,
-                                        cache_max_size,
-                                        "Encoded query result still exceeds cache max size, skipping"
-                                    );
-                                } else if let Err(e) = cache_provider.put_raw_key(&raw_cache_key, cached_result).await {
-                                    tracing::error!("Failed to cache query results: {e}");
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to encode query results for caching: {e}");
-                            }
+                match CachedQueryResult::from_batches(
+                    records,
+                    cache_schema,
+                    input_tables,
+                    cached_at,
+                    read_started_at,
+                    encoder,
+                )
+                .await
+                {
+                    Ok(cached_result) => {
+                        // Check the actual (possibly encoded) size before caching
+                        let actual_size = cached_result.get_memory_size();
+                        if actual_size > cache_max_size {
+                            tracing::debug!(
+                                actual_size,
+                                cache_max_size,
+                                "Encoded query result still exceeds cache max size, skipping"
+                            );
+                        } else if let Err(e) = cache_provider.put_raw_key(&raw_cache_key, cached_result).await {
+                            tracing::error!("Failed to cache query results: {e}");
                         }
                     }
+                    Err(e) => {
+                        tracing::error!("Failed to encode query results for caching: {e}");
+                    }
                 }
+            } else {
+                tracing::debug!(
+                    "Transient HTTP error responses were present, skipping cache storage"
+                );
             }
         }
     };
@@ -1176,6 +1181,148 @@ pub(crate) mod tests {
             .expect("cached result should decode");
         assert_eq!(cached_batches.len(), 1);
         assert_eq!(cached_batches[0].num_rows(), n);
+    }
+
+    /// Regression test: with an encoder, accumulation must continue past the
+    /// raw cache limit across **multiple batches**. Previously accumulation
+    /// stopped at the limit while the encoded write still proceeded, caching a
+    /// prefix of the result set that would then be served as a complete result.
+    #[tokio::test]
+    async fn test_encoded_multi_batch_result_cached_in_full() {
+        use arrow::array::{Array, Int32Array};
+        use datafusion::error::DataFusionError;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use futures::TryStreamExt;
+        use spicepod::component::caching::SQLResultsCacheConfig;
+
+        let cache_provider = Arc::new(
+            crate::QueryResultsCacheProvider::try_new(
+                &SQLResultsCacheConfig {
+                    item_ttl: Some("10m".to_string()),
+                    max_size: Some("2KiB".to_string()),
+                    encoding: spicepod::component::caching::Encoding::Zstd,
+                    ..Default::default()
+                },
+                Box::new([]),
+            )
+            .expect("valid cache provider"),
+        );
+
+        // Two compressible batches, each alone larger than the 2 KiB cache
+        // limit, so the raw limit is crossed before the second batch arrives.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let n = 300; // 300 rows × 2 cols × 4 bytes = 2400 bytes raw > 2048 limit
+        let make_batch = || {
+            let col: Arc<dyn Array> = Arc::new(Int32Array::from(vec![0i32; n]));
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::clone(&col), col])
+                .expect("to create batch")
+        };
+
+        let raw_cache_key = crate::key::CacheKey::Query("zstd-multi-batch", None)
+            .as_raw_key(cache_provider.hasher());
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(vec![
+                Ok::<RecordBatch, DataFusionError>(make_batch()),
+                Ok::<RecordBatch, DataFusionError>(make_batch()),
+            ]),
+        ));
+
+        let cached_stream = to_cached_record_batch_stream(
+            Arc::clone(&cache_provider),
+            stream,
+            raw_cache_key,
+            Arc::new(HashSet::from(["test_table".into()])),
+            std::time::Instant::now(),
+        );
+
+        let _output = cached_stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("stream should be collected successfully");
+
+        let cached = cache_provider
+            .get_raw_key(&raw_cache_key)
+            .await
+            .expect("cache lookup should succeed")
+            .expect("compressed multi-batch result should be cached");
+
+        let cached_batches = cached.records().await.expect("cached result should decode");
+        let cached_rows: usize = cached_batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            cached_rows,
+            2 * n,
+            "The full result set must be cached, never a prefix"
+        );
+    }
+
+    /// A result whose raw size exceeds the optimistic compression bound
+    /// (`MAX_ENCODING_COMPRESSION_RATIO` × cache limit) must not be cached at
+    /// all — in particular, no prefix of it.
+    #[tokio::test]
+    async fn test_encoded_result_beyond_compression_bound_not_cached() {
+        use arrow::array::{Array, Int32Array};
+        use datafusion::error::DataFusionError;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use futures::TryStreamExt;
+        use spicepod::component::caching::SQLResultsCacheConfig;
+
+        let cache_provider = Arc::new(
+            crate::QueryResultsCacheProvider::try_new(
+                &SQLResultsCacheConfig {
+                    item_ttl: Some("10m".to_string()),
+                    max_size: Some("2KiB".to_string()),
+                    encoding: spicepod::component::caching::Encoding::Zstd,
+                    ..Default::default()
+                },
+                Box::new([]),
+            )
+            .expect("valid cache provider"),
+        );
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        // Each batch is ~8 KiB raw; five batches (~40 KiB) exceed the
+        // 16 × 2 KiB = 32 KiB accumulation bound.
+        let n = 2048;
+        let make_batch = || {
+            let col: Arc<dyn Array> = Arc::new(Int32Array::from(vec![0i32; n]));
+            RecordBatch::try_new(Arc::clone(&schema), vec![col]).expect("to create batch")
+        };
+        let batches: Vec<Result<RecordBatch, DataFusionError>> =
+            (0..5).map(|_| Ok(make_batch())).collect();
+
+        let raw_cache_key = crate::key::CacheKey::Query("zstd-beyond-bound", None)
+            .as_raw_key(cache_provider.hasher());
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(batches),
+        ));
+
+        let cached_stream = to_cached_record_batch_stream(
+            Arc::clone(&cache_provider),
+            stream,
+            raw_cache_key,
+            Arc::new(HashSet::from(["test_table".into()])),
+            std::time::Instant::now(),
+        );
+
+        let output = cached_stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("stream should be collected successfully");
+        assert_eq!(output.len(), 5, "All batches must reach the caller");
+
+        let cached = cache_provider
+            .get_raw_key(&raw_cache_key)
+            .await
+            .expect("cache lookup should succeed");
+        assert!(
+            cached.is_none(),
+            "A result beyond the accumulation bound must not be cached (not even a prefix)"
+        );
     }
 
     /// Regression test: a query that returns an empty result set by yielding

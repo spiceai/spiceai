@@ -714,7 +714,7 @@ impl Query {
                             "Returning cached result for distributed query (plan)"
                         );
                         let stream = ::cache::result::query::CachedStream::new(
-                            Arc::new(records),
+                            records,
                             cached_result.schema,
                         );
                         return Ok(QueryHandle::new_with_cached_result(

@@ -393,7 +393,7 @@ impl Query {
         });
 
         let records = match cached_result.records().await {
-            Ok(records) => Arc::new(records),
+            Ok(records) => records,
             Err(e) => {
                 tracing::error!("Failed to decode cached query result: {e}");
                 return Ok(CacheResponse::from(
@@ -536,13 +536,13 @@ impl Query {
             // Skip cache writes if the revalidation result contains transient HTTP
             // error responses. Preserve the existing stale cache entry instead of
             // storing a partial result set.
-            let Some(batches_to_cache) = cache::batches_to_cache(&batches) else {
+            if !cache::batches_cacheable(&batches) {
                 tracing::debug!(
                     cache_key = cache_key_u64,
                     "Background revalidation returned transient HTTP error responses, preserving stale cache"
                 );
                 return;
-            };
+            }
 
             // Empty (0-row) revalidation results are cached too. The schema is
             // preserved separately in `CachedQueryResult`, so an empty result
@@ -552,7 +552,7 @@ impl Query {
             let encoder = cache_provider.encoder();
 
             match cache::result::query::CachedQueryResult::from_batches(
-                &batches_to_cache,
+                batches,
                 schema,
                 input_tables,
                 cached_at,

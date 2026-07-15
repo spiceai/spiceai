@@ -311,10 +311,13 @@ fn build_documents(
             }
             value_buf.clear();
             encoder.encode(row, &mut value_buf);
-            let v: Value =
-                serde_json::from_slice(&value_buf).context(IssueWithJsonProcessingSnafu {
+            // `with_context` keeps the error-message allocation off the happy
+            // path — this runs once per cell (rows x columns).
+            let v: Value = serde_json::from_slice(&value_buf).with_context(|_| {
+                IssueWithJsonProcessingSnafu {
                     index: es_index.to_string(),
-                })?;
+                }
+            })?;
             doc.insert(name.clone(), v);
         }
 

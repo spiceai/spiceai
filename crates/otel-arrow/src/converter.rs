@@ -564,9 +564,10 @@ impl OtelToArrowConverter {
 
             self.flags_builder.append_null();
 
-            let attributes: Vec<opentelemetry::KeyValue> =
-                data_point.attributes().cloned().collect();
-            Self::add_attributes_to_builder(&mut self.attributes_builder, &attributes)?;
+            Self::add_attributes_to_builder(
+                &mut self.attributes_builder,
+                data_point.attributes().map(|kv| (&kv.key, &kv.value)),
+            )?;
 
             data_point.value().append(&mut self.data_number_builder)?;
             self.data_histogram_builder.append(false);
@@ -602,9 +603,10 @@ impl OtelToArrowConverter {
 
             self.flags_builder.append_null();
 
-            let attributes: Vec<opentelemetry::KeyValue> =
-                data_point.attributes().cloned().collect();
-            Self::add_attributes_to_builder(&mut self.attributes_builder, &attributes)?;
+            Self::add_attributes_to_builder(
+                &mut self.attributes_builder,
+                data_point.attributes().map(|kv| (&kv.key, &kv.value)),
+            )?;
 
             data_point.value().append(&mut self.data_number_builder)?;
             self.data_histogram_builder.append(false);
@@ -642,9 +644,10 @@ impl OtelToArrowConverter {
 
             self.flags_builder.append_null();
 
-            let attributes: Vec<opentelemetry::KeyValue> =
-                data_point.attributes().cloned().collect();
-            Self::add_attributes_to_builder(&mut self.attributes_builder, &attributes)?;
+            Self::add_attributes_to_builder(
+                &mut self.attributes_builder,
+                data_point.attributes().map(|kv| (&kv.key, &kv.value)),
+            )?;
 
             self.data_number_builder.append(false);
 
@@ -681,13 +684,9 @@ impl OtelToArrowConverter {
             .schema_url_builder
             .append_option(resource.schema_url().as_ref());
 
-        let attributes: Vec<opentelemetry::KeyValue> = resource
-            .iter()
-            .map(|(key, value)| opentelemetry::KeyValue::new(key.clone(), value.clone()))
-            .collect();
         Self::add_attributes_to_builder(
             &mut self.resource_builder.attributes_builder,
-            &attributes,
+            resource.iter(),
         )?;
 
         self.resource_builder
@@ -707,7 +706,7 @@ impl OtelToArrowConverter {
 
         Self::add_attributes_to_builder(
             &mut self.scope_builder.attributes_builder,
-            scope.attributes().cloned().collect::<Vec<_>>().as_slice(),
+            scope.attributes().map(|kv| (&kv.key, &kv.value)),
         )?;
 
         self.scope_builder
@@ -720,13 +719,13 @@ impl OtelToArrowConverter {
         Ok(())
     }
 
-    fn add_attributes_to_builder(
+    fn add_attributes_to_builder<'a>(
         builder: &mut AttributesBuilder,
-        attributes: &[opentelemetry::KeyValue],
+        attributes: impl IntoIterator<Item = (&'a opentelemetry::Key, &'a opentelemetry::Value)>,
     ) -> Result<(), ConversionError> {
-        for kv in attributes {
-            builder.key_builder.append_value(kv.key.as_str());
-            match &kv.value {
+        for (key, value) in attributes {
+            builder.key_builder.append_value(key.as_str());
+            match value {
                 opentelemetry::Value::String(s) => {
                     builder
                         .type_builder

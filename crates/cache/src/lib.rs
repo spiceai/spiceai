@@ -55,7 +55,7 @@ pub use metrics::EvictionReason;
 pub use simple_cache::SimpleCache;
 use spicepod::component::caching::SQLResultsCacheConfig;
 pub use utils::RESPONSE_STATUS_COLUMN;
-pub use utils::batches_to_cache;
+pub use utils::batches_cacheable;
 pub use utils::filter_transient_error_responses;
 pub use utils::get_logical_plan_input_tables;
 pub use utils::to_cached_record_batch_stream;
@@ -1069,7 +1069,7 @@ mod tests {
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         result::query::CachedQueryResult::from_batches(
-            &[arrow::array::RecordBatch::new_empty(Arc::clone(&schema))],
+            vec![arrow::array::RecordBatch::new_empty(Arc::clone(&schema))],
             schema,
             Arc::new(HashSet::from([TableReference::bare(table)])),
             Instant::now(),
