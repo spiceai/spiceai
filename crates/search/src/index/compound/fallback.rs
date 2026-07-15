@@ -25,7 +25,7 @@ use datafusion::{
     catalog::Session,
     common::{
         Column,
-        tree_node::{Transformed, TreeNode},
+        tree_node::{Transformed, TreeNode, TreeNodeRecursion},
     },
     datasource::{DefaultTableSource, TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
@@ -41,16 +41,18 @@ use datafusion::{
     },
     prelude::cast,
 };
-use datafusion_expr::{TableProviderFilterPushDown, ident};
+use datafusion_expr::{TableProviderFilterPushDown, TableSource, ident};
 use futures::{StreamExt, TryStreamExt, stream};
 
 /// Build a [`LogicalPlan`] that returns the rows of `primary`, or — if `primary` produces
 /// zero rows — the rows of `secondary`, projected and cast onto the primary plan's schema.
 ///
 /// The fallback decision is made at execution time by [`FallbackOnEmptyScanExec`]; the
-/// secondary plan is only executed when the primary produced no rows. Filters pushed down
-/// by DataFusion are applied to **both** plans before that decision, so a primary result
-/// emptied out by a `WHERE` clause still falls back to the (equally filtered) secondary.
+/// secondary plan is only executed when the primary produced no rows. Filters the *primary*
+/// index supports pushing down (per its provider's `supports_filters_pushdown`) are pushed
+/// into this scan by DataFusion and applied to **both** plans before that decision, so a
+/// primary result emptied out by a `WHERE` clause still falls back to the (equally
+/// filtered) secondary — even when the secondary itself cannot push the filter down.
 ///
 /// Every column of the primary plan's schema must exist (by unqualified name) in the
 /// secondary plan's schema; otherwise a plan error is returned. Columns whose types differ
@@ -86,10 +88,12 @@ pub(super) fn fallback_on_empty_plan(
         .project(projection)?
         .build()?;
 
+    let primary_source = single_table_source(&primary);
     let provider = Arc::new(FallbackOnEmptyTableProvider {
         schema,
         primary,
         secondary: Arc::new(secondary_projected),
+        primary_source,
     });
     LogicalPlanBuilder::scan(
         "compound_index",
@@ -107,6 +111,27 @@ struct FallbackOnEmptyTableProvider {
     primary: Arc<LogicalPlan>,
     /// Already projected onto `schema` by [`fallback_on_empty_plan`].
     secondary: Arc<LogicalPlan>,
+    /// The primary plan's single `TableScan` source, used to delegate
+    /// [`TableProvider::supports_filters_pushdown`]. `None` when the primary plan does not
+    /// contain exactly one scan — filter pushdown is then disabled (conservative).
+    primary_source: Option<Arc<dyn TableSource>>,
+}
+
+/// The single [`LogicalPlan::TableScan`] source of `plan`, if the plan contains exactly one.
+fn single_table_source(plan: &LogicalPlan) -> Option<Arc<dyn TableSource>> {
+    let mut sources: Vec<Arc<dyn TableSource>> = vec![];
+    plan.apply(|node| {
+        if let LogicalPlan::TableScan(scan) = node {
+            sources.push(Arc::clone(&scan.source));
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .ok()?;
+    if sources.len() == 1 {
+        sources.pop()
+    } else {
+        None
+    }
 }
 
 #[async_trait]
@@ -123,17 +148,42 @@ impl TableProvider for FallbackOnEmptyTableProvider {
         TableType::Base
     }
 
-    /// All filters are accepted as [`TableProviderFilterPushDown::Exact`]: [`Self::scan`]
-    /// applies them to *both* the primary and secondary plans itself, so the fallback
-    /// decision is made on the **filtered** primary result. The inner plans are re-optimized
-    /// during physical planning, so DataFusion pushes the filter further down into the
-    /// primary index's scan where supported; if the secondary index cannot push it down, the
-    /// `Filter` node applied here post-filters above it.
+    /// Delegates to the *primary* plan's underlying source, so DataFusion plans pushdown
+    /// exactly as it would against the primary index alone. Filters the primary accepts are
+    /// then applied to *both* plans in [`Self::scan`], so the fallback decision is made on
+    /// the **filtered** primary result; if the secondary index cannot push a filter down,
+    /// the `Filter` node applied there post-filters above it.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
+        let Some(source) = &self.primary_source else {
+            return Ok(vec![
+                TableProviderFilterPushDown::Unsupported;
+                filters.len()
+            ]);
+        };
+        // The filters reference this scan's qualifier (`compound_index.<col>`); rewrite to
+        // unqualified so they resolve against the primary source's schema.
+        let unqualified = filters
+            .iter()
+            .map(|f| unqualify_columns((*f).clone()))
+            .collect::<DataFusionResult<Vec<_>>>()?;
+        match source.supports_filters_pushdown(&unqualified.iter().collect::<Vec<_>>()) {
+            Ok(support) => Ok(support),
+            // A failed capability probe (e.g. a filter on a column computed above the
+            // primary's scan, like the score column) must not fail planning — report the
+            // filters as unsupported so DataFusion keeps filtering above this scan.
+            Err(e) => {
+                tracing::trace!(
+                    "Compound fallback index could not probe the primary index for filter pushdown; keeping filters above the scan: {e}"
+                );
+                Ok(vec![
+                    TableProviderFilterPushDown::Unsupported;
+                    filters.len()
+                ])
+            }
+        }
     }
 
     async fn scan(

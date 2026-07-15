@@ -23,9 +23,11 @@ use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
-    datasource::{DefaultTableSource, MemTable, TableProvider},
-    error::DataFusionError,
-    logical_expr::{LogicalPlan, LogicalPlanBuilder},
+    catalog::Session,
+    datasource::{DefaultTableSource, MemTable, TableProvider, TableType},
+    error::{DataFusionError, Result as DataFusionResult},
+    logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, TableProviderFilterPushDown},
+    physical_plan::ExecutionPlan,
     prelude::SessionContext,
 };
 use runtime_datafusion_index::Index;
@@ -83,7 +85,7 @@ impl MockIndex {
             .first()
             .map(RecordBatch::schema)
             .expect("mock plans need at least one (possibly empty) batch");
-        let table = MemTable::try_new(schema, vec![batches.to_vec()])?;
+        let table = PushdownMemTable(MemTable::try_new(schema, vec![batches.to_vec()])?);
         LogicalPlanBuilder::scan(
             "mock",
             Arc::new(DefaultTableSource::new(
@@ -92,6 +94,45 @@ impl MockIndex {
             None,
         )?
         .build()
+    }
+}
+
+/// A [`MemTable`] that reports [`TableProviderFilterPushDown::Inexact`] support for every
+/// filter, so the fallback provider (which delegates its pushdown decision to the primary's
+/// source) receives pushed-down filters in tests. `Inexact` means DataFusion re-applies the
+/// filters above the scan, so ignoring them in [`TableProvider::scan`] stays correct.
+#[derive(Debug)]
+struct PushdownMemTable(MemTable);
+
+#[async_trait]
+impl TableProvider for PushdownMemTable {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.0.schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        self.0.table_type()
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.0.scan(state, projection, &[], limit).await
     }
 }
 
