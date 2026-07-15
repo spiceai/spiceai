@@ -170,7 +170,9 @@ async fn run_test(
     as_stream: bool,
     json_path_checks: Vec<(&str, &str)>,
 ) -> Result<Option<CreateChatCompletionResponse>, anyhow::Error> {
-    let _ = dotenvy::from_filename(".env").expect("failed to load .env file");
+    // SAFETY: `.env` loading mutates the process environment; tests only read
+    // these variables afterwards.
+    let _ = unsafe { spice_dotenv::from_filename(".env") }.expect("failed to load .env file");
     init_tracing(None);
 
     if TEST_ARGS.skip_model(model_name) {

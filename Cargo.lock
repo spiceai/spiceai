@@ -7167,11 +7167,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77c90badedccf4105eca100756a0b1289e191f6fcbdadd3cee1d2f614f97da8f"
 
 [[package]]
-name = "dotenvy"
-version = "0.15.7"
-source = "git+https://github.com/spiceai/dotenvy.git?rev=e5cef1871b08003198949dfe2da988633eaad78f#e5cef1871b08003198949dfe2da988633eaad78f"
-
-[[package]]
 name = "downcast-rs"
 version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11004,7 +10999,6 @@ dependencies = [
  "cache",
  "chunking",
  "cudarc 0.19.7",
- "dotenvy",
  "either",
  "futures",
  "google-genai",
@@ -11029,6 +11023,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snafu",
+ "spice-dotenv",
  "spicepod",
  "tempfile",
  "text-embeddings-backend",
@@ -16834,7 +16829,6 @@ dependencies = [
  "azure_identity",
  "azure_security_keyvault_secrets",
  "base64 0.22.1",
- "dotenvy",
  "futures",
  "indexmap 2.14.0",
  "keyring",
@@ -16846,6 +16840,7 @@ dependencies = [
  "secrecy",
  "serde_json",
  "snafu",
+ "spice-dotenv",
  "spicepod",
  "tempfile",
  "tokio",
@@ -18447,7 +18442,6 @@ dependencies = [
  "comfy-table",
  "dialoguer",
  "dirs",
- "dotenvy",
  "flate2",
  "fundu",
  "futures",
@@ -18471,6 +18465,7 @@ dependencies = [
  "serde_json",
  "snafu",
  "spice-cloud-client",
+ "spice-dotenv",
  "spiceai",
  "spicepod",
  "system-open",
@@ -18512,6 +18507,13 @@ dependencies = [
  "serde_json",
  "snafu",
  "url",
+]
+
+[[package]]
+name = "spice-dotenv"
+version = "2.2.0-unstable"
+dependencies = [
+ "tempfile",
 ]
 
 [[package]]
