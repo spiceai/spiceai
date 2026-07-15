@@ -4849,9 +4849,14 @@ mod tests {
     #[test]
     fn freshness_shrink_respects_operator_pin() {
         // An operator hard-pin collapses the mem-tier bounds to a point; the shrink
-        // must no-op rather than fight the pin.
+        // must no-op rather than fight the pin. Snapshot is apply-behind so the
+        // freshness-shrink tier is *eligible* — otherwise a healthy
+        // `apply_vs_arrival` from `snap()` would vacuous-pass this test.
         let s = IngestSnapshot {
             freshness_secs: Some(5.0),
+            apply_ms: 150.0,
+            arrival_gap_ms: 100.0,
+            apply_vs_arrival: 1.5,
             ..snap()
         };
         let goals = Goals::from_targets(None, Some(3.0), None, None, Duration::from_mins(1));
@@ -4860,6 +4865,9 @@ mod tests {
             mem_tier_max_bytes: (a.mem_tier_max_bytes, a.mem_tier_max_bytes),
             ..bounds()
         };
+        // Unpinned control: same snapshot must still shrink.
+        let unpinned = goal_decide(&s, &a, &bounds(), &goals).expect("eligible shrink");
+        assert_eq!(unpinned.actuator, Actuator::MemTierMaxBytes);
         let adj = decide_with_goals(&s, &a, &pinned, ms(60_000), ms(30_000), 0, &goals);
         assert!(
             adj.is_none_or(|adj| adj.actuator != Actuator::MemTierMaxBytes),
