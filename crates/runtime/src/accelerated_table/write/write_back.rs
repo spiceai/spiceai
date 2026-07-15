@@ -595,16 +595,16 @@ mod tests {
         }
     }
 
-    /// A federated `TableProvider` that fires `forwarded` whenever one of its write
-    /// methods runs, so a test can assert whether the write-back sink's fire-and-forget
-    /// federated forward was spawned.
+    /// A federated `TableProvider` that sets `forwarded` whenever one of its write methods
+    /// runs, so a test can assert whether the write-back sink's fire-and-forget federated
+    /// forward was spawned.
     struct SignalingTableProvider {
         schema: SchemaRef,
-        forwarded: Arc<tokio::sync::Notify>,
+        forwarded: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl SignalingTableProvider {
-        fn new_arc(forwarded: Arc<tokio::sync::Notify>) -> Arc<dyn TableProvider> {
+        fn new_arc(forwarded: Arc<std::sync::atomic::AtomicBool>) -> Arc<dyn TableProvider> {
             Arc::new(Self {
                 schema: Arc::new(Schema::new(vec![Field::new(
                     "count",
@@ -613,6 +613,18 @@ mod tests {
                 )])),
                 forwarded,
             })
+        }
+    }
+
+    /// Drain any fire-and-forget task the sink may have spawned. `#[tokio::test]` uses a
+    /// current-thread runtime, so a `tokio::spawn`ed task only makes progress when the test
+    /// yields; after enough yields the `forwarded` flag deterministically reflects whether
+    /// the forward ran — no wall-clock timeout, so a slow/busy CI cannot cause a false pass.
+    /// (The positive-control tests below prove this drain is sufficient: they observe the
+    /// flag set through the same path.)
+    async fn drain_spawned_tasks() {
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
         }
     }
 
@@ -644,7 +656,8 @@ mod tests {
             _state: &dyn Session,
             _filters: Vec<Expr>,
         ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-            self.forwarded.notify_one();
+            self.forwarded
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(count_exec(0))
         }
         async fn update(
@@ -653,7 +666,8 @@ mod tests {
             _assignments: Vec<(String, Expr)>,
             _filters: Vec<Expr>,
         ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-            self.forwarded.notify_one();
+            self.forwarded
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(count_exec(0))
         }
     }
@@ -812,7 +826,7 @@ mod tests {
         // Positive control: outside a transaction the delete is published, so the
         // fire-and-forget federated forward runs (proving the mock detects it).
         let session_state = SessionContext::new().state();
-        let forwarded = Arc::new(tokio::sync::Notify::new());
+        let forwarded = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let federated = Arc::new(FederatedTable::Immediate(SignalingTableProvider::new_arc(
             Arc::clone(&forwarded),
         )));
@@ -828,9 +842,11 @@ mod tests {
             .await
             .expect("deletion should succeed");
         assert_eq!(count, 3);
-        tokio::time::timeout(std::time::Duration::from_secs(2), forwarded.notified())
-            .await
-            .expect("federated forward must run when not in a transaction");
+        drain_spawned_tasks().await;
+        assert!(
+            forwarded.load(std::sync::atomic::Ordering::SeqCst),
+            "federated forward must run when not in a transaction"
+        );
     }
 
     #[tokio::test]
@@ -839,7 +855,7 @@ mod tests {
         // from the commit markers, so the sink must NOT fire the federated forward (that
         // would push a staged-but-uncommitted delete to the source).
         let session_state = SessionContext::new().state();
-        let forwarded = Arc::new(tokio::sync::Notify::new());
+        let forwarded = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let federated = Arc::new(FederatedTable::Immediate(SignalingTableProvider::new_arc(
             Arc::clone(&forwarded),
         )));
@@ -855,12 +871,9 @@ mod tests {
             .await
             .expect("deletion should succeed");
         assert_eq!(count, 42);
-        let forwarded_fired =
-            tokio::time::timeout(std::time::Duration::from_millis(300), forwarded.notified())
-                .await
-                .is_ok();
+        drain_spawned_tasks().await;
         assert!(
-            !forwarded_fired,
+            !forwarded.load(std::sync::atomic::Ordering::SeqCst),
             "federated forward must be skipped inside a transaction"
         );
     }
@@ -868,7 +881,7 @@ mod tests {
     #[tokio::test]
     async fn write_back_update_forwards_when_not_in_transaction() {
         let session_state = SessionContext::new().state();
-        let forwarded = Arc::new(tokio::sync::Notify::new());
+        let forwarded = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let federated = Arc::new(FederatedTable::Immediate(SignalingTableProvider::new_arc(
             Arc::clone(&forwarded),
         )));
@@ -885,15 +898,17 @@ mod tests {
             .await
             .expect("update should succeed");
         assert_eq!(count, 5);
-        tokio::time::timeout(std::time::Duration::from_secs(2), forwarded.notified())
-            .await
-            .expect("federated forward must run when not in a transaction");
+        drain_spawned_tasks().await;
+        assert!(
+            forwarded.load(std::sync::atomic::Ordering::SeqCst),
+            "federated forward must run when not in a transaction"
+        );
     }
 
     #[tokio::test]
     async fn write_back_update_skips_forward_in_transaction() {
         let session_state = SessionContext::new().state();
-        let forwarded = Arc::new(tokio::sync::Notify::new());
+        let forwarded = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let federated = Arc::new(FederatedTable::Immediate(SignalingTableProvider::new_arc(
             Arc::clone(&forwarded),
         )));
@@ -910,12 +925,9 @@ mod tests {
             .await
             .expect("update should succeed");
         assert_eq!(count, 7);
-        let forwarded_fired =
-            tokio::time::timeout(std::time::Duration::from_millis(300), forwarded.notified())
-                .await
-                .is_ok();
+        drain_spawned_tasks().await;
         assert!(
-            !forwarded_fired,
+            !forwarded.load(std::sync::atomic::Ordering::SeqCst),
             "federated forward must be skipped inside a transaction"
         );
     }

@@ -621,18 +621,21 @@ struct DualWriteDeletionSink {
 impl DeletionSink for DualWriteDeletionSink {
     async fn delete_from(
         &self,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let task_ctx = self.session_state.task_ctx();
-
         let federated_batches = datafusion::physical_plan::collect(
             Arc::clone(&self.federated_plan),
-            Arc::clone(&task_ctx),
+            self.session_state.task_ctx(),
         )
         .await?;
         let count = super::write_back::extract_dml_count(&federated_batches);
 
-        datafusion::physical_plan::collect(Arc::clone(&self.accelerator_plan), task_ctx).await?;
+        // Run the accelerator plan under the LIVE execution context so a Cayenne
+        // transaction (if one were active) STAGES rather than publishing — the same
+        // reason the write-back sinks thread the context. Dual-write datasets are
+        // currently rejected as transaction participants (see `resolve_cayenne_staged`),
+        // so this is defense-in-depth and keeps request-scoped config on the write.
+        datafusion::physical_plan::collect(Arc::clone(&self.accelerator_plan), context).await?;
 
         Ok(count)
     }
@@ -679,18 +682,21 @@ struct DualWriteUpdateSink {
 impl DeletionSink for DualWriteUpdateSink {
     async fn delete_from(
         &self,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let task_ctx = self.session_state.task_ctx();
-
         let federated_batches = datafusion::physical_plan::collect(
             Arc::clone(&self.federated_plan),
-            Arc::clone(&task_ctx),
+            self.session_state.task_ctx(),
         )
         .await?;
         let count = super::write_back::extract_dml_count(&federated_batches);
 
-        datafusion::physical_plan::collect(Arc::clone(&self.accelerator_plan), task_ctx).await?;
+        // Run the accelerator plan under the LIVE execution context so a Cayenne
+        // transaction (if one were active) STAGES rather than publishing — the same
+        // reason the write-back sinks thread the context. Dual-write datasets are
+        // currently rejected as transaction participants (see `resolve_cayenne_staged`),
+        // so this is defense-in-depth and keeps request-scoped config on the write.
+        datafusion::physical_plan::collect(Arc::clone(&self.accelerator_plan), context).await?;
 
         Ok(count)
     }
