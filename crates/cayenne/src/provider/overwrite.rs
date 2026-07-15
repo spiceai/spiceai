@@ -336,16 +336,17 @@ impl CayenneTableProvider {
         // with a bogus `[0, 0]` range would make seq-based decisions (the
         // seq-prefix bake) treat this snapshot as "very old" and risk an unsafe
         // prune. Skip authoring entirely and leave the scan on directory listing.
-        match self.reserve_sequences_local(1).await {
-            Ok(overwrite_sequence) => {
-                if let Err(error) = self
-                    .author_uniform_snapshot_manifest(
-                        &new_snapshot_id,
-                        overwrite_sequence,
-                        overwrite_sequence,
-                    )
-                    .await
-                {
+        let manifest_authored = match self.reserve_sequences_local(1).await {
+            Ok(overwrite_sequence) => match self
+                .author_uniform_snapshot_manifest(
+                    &new_snapshot_id,
+                    overwrite_sequence,
+                    overwrite_sequence,
+                )
+                .await
+            {
+                Ok(_files) => true,
+                Err(error) => {
                     tracing::warn!(
                         table = self.table_name(),
                         %error,
@@ -353,8 +354,9 @@ impl CayenneTableProvider {
                         "Failed to author overwrite snapshot manifest before commit; \
                          scan falls back to directory listing"
                     );
+                    false
                 }
-            }
+            },
             Err(error) => {
                 tracing::warn!(
                     table = self.table_name(),
@@ -363,7 +365,29 @@ impl CayenneTableProvider {
                     "Failed to reserve a sequence for the overwrite snapshot manifest; \
                      skipping manifest authoring — scan falls back to directory listing"
                 );
+                false
             }
+        };
+
+        // A `scan_from_manifest` table has no directory-LIST fallback, so this
+        // overwrite must not be handed back to the caller to commit without a
+        // populated manifest — that would publish a live snapshot with zero
+        // manifest rows, and a scan resolving from it would silently read back no
+        // rows. Unlike compaction (which just retries on a later background
+        // trigger), an overwrite is a one-shot caller-driven operation, so the
+        // correct response is a structured error, not a silent discard. The
+        // already-written new snapshot directory is rolled back since nothing
+        // will ever call `PreparedOverwrite::rollback` for it.
+        if self.scan_from_manifest() && !manifest_authored {
+            self.clear_snapshot_dir(&new_snapshot_id).await?;
+            return Err(super::Error::Internal {
+                table: self.table_name().to_string(),
+                message: format!(
+                    "scan_from_manifest is enabled but the overwrite snapshot's manifest \
+                     failed to populate for snapshot '{new_snapshot_id}'; aborting the \
+                     overwrite rather than committing a snapshot with no manifest rows"
+                ),
+            });
         }
 
         Ok(PreparedOverwrite {

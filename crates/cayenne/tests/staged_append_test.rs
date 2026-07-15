@@ -1112,6 +1112,136 @@ async fn test_wal_with_files_in_snapshot_self_heals_impl(
 }
 
 // ============================================================================
+// Manifest hardening: recovering a WAL whose files were already moved into the
+// snapshot (the same benign "crash after move, before WAL removal" shape as
+// `test_wal_with_files_in_snapshot_self_heals_impl`) must also reconcile
+// `cayenne_snapshot_file` manifest rows for those files, not just unlink the
+// stale WAL. Without this, a table using `scan_from_manifest` (no
+// directory-LIST fallback) would silently never see rows written just before
+// a crash that landed in this exact window.
+// ============================================================================
+
+async fn test_wal_recovery_reconciles_manifest_rows_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Reconciliation is gated on `scan_from_manifest` (a directory-listing
+    // table never writes incremental manifest rows in the first place, so
+    // there is nothing to reconcile for it — see
+    // `insert_current_snapshot_manifest_rows`'s own gate) — this test exists
+    // specifically to prove the manifest gap this mode would otherwise have.
+    let vortex_config = cayenne::metadata::VortexConfig {
+        scan_from_manifest: true,
+        ..Default::default()
+    };
+    let (table, ctx) =
+        setup_table_with_vortex_config(&fixture, "wal_manifest_reconcile", vortex_config).await;
+
+    // Force the write through the Vortex-file path (bypassing the inline
+    // memtable's <INLINE_MAX_ROWS fast path) by inserting a large batch
+    // directly. After this, the current snapshot directory holds real
+    // `.vortex` files we can reference in a stale WAL.
+    let large_rows: i64 = 2000;
+    let ids: Vec<i64> = (1..=large_rows).collect();
+    let names: Vec<String> = ids.iter().map(|i| format!("n_{i}")).collect();
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let schema = table.schema();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(name_refs)),
+        ],
+    )?;
+    common::insert_batch(&table, batch).await?;
+
+    let meta = table.metadata();
+    let snapshot_dir = PathBuf::from(&meta.path)
+        .join(&meta.table_id)
+        .join(&meta.current_snapshot_id);
+    let vortex_files: Vec<String> = std::fs::read_dir(&snapshot_dir)?
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".vortex") {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        !vortex_files.is_empty(),
+        "test setup requires at least one Vortex file in the snapshot \
+         after the large batch insert; got an inline-only write instead"
+    );
+
+    // The normal insert path above already committed manifest rows for these
+    // files (this commit's Stage-B fix). Wipe them to reproduce the crash
+    // window this test targets: files durably moved into the snapshot, but
+    // their manifest rows never committed before the process died.
+    table
+        .catalog()
+        .clear_snapshot_files_except(&meta.table_id, "unrelated-nonexistent-snapshot")
+        .await?;
+    let rows_before_recovery = table
+        .catalog()
+        .get_snapshot_files(&meta.table_id, &meta.current_snapshot_id)
+        .await?;
+    assert!(
+        rows_before_recovery.is_empty(),
+        "test setup requires the manifest to be empty before triggering recovery"
+    );
+
+    // Plant a WAL referencing those (already-moved) files, identical in shape
+    // to `test_wal_with_files_in_snapshot_self_heals_impl` — staging is empty,
+    // so the audit finds every listed file already in the target snapshot.
+    let wal_content = serde_json::json!({
+        "table_name": "wal_manifest_reconcile",
+        "target_snapshot": &meta.current_snapshot_id,
+        "staged_files": &vortex_files,
+        "created_at": "2026-03-01T12:00:00Z"
+    });
+    let wal_path = write_manual_staging_wal(&table, "manual-manifest-reconcile", &wal_content)?;
+
+    // A subsequent staged write drives through `ensure_no_incomplete_write`.
+    let staged = begin_staged_append_with_rows(&table, &[(9002, "Z")]).await?;
+    staged.commit().await?;
+
+    assert!(
+        !wal_path.exists(),
+        "auto-recovery must unlink the stale WAL once it has verified that \
+         all listed files are accounted for in the snapshot"
+    );
+
+    let rows_after_recovery = table
+        .catalog()
+        .get_snapshot_files(&meta.table_id, &meta.current_snapshot_id)
+        .await?;
+    let reconciled_paths: std::collections::BTreeSet<&str> = rows_after_recovery
+        .iter()
+        .map(|f| f.file_path.as_str())
+        .collect();
+    for file_name in &vortex_files {
+        assert!(
+            reconciled_paths.contains(file_name.as_str()),
+            "recovery must reconcile a manifest row for '{file_name}', which was \
+             already durably moved into the snapshot before the simulated crash \
+             but had no manifest row committed"
+        );
+    }
+
+    let total = row_count(&ctx, "wal_manifest_reconcile").await;
+    assert_eq!(
+        total,
+        usize::try_from(large_rows).expect("row count fits") + 1
+    );
+
+    Ok(())
+}
+
+test_with_backends!(test_wal_recovery_reconciles_manifest_rows_impl);
+
+// ============================================================================
 // Integrity checksums (#11639): a checksum-framed staging WAL that fails its
 // integrity check is DETECTED and DISCARDED on recovery (not parsed as garbage
 // nor surfaced as a fatal "manual resolution" fault), converging to the last

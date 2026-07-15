@@ -4121,6 +4121,16 @@ impl CayenneTableProvider {
                     )
                     .await
                 {
+                    // Only pay the extra catalog round-trips (one read, one
+                    // write per file) when this table actually resolves scans
+                    // from the manifest — a directory-listing table keeps
+                    // today's exact cost/behavior and relies on the periodic
+                    // best-effort `rebuild_live_snapshot_manifests` sweep
+                    // instead, exactly as before this change.
+                    if self.scan_from_manifest() {
+                        self.insert_current_snapshot_manifest_rows(current_snapshot, &metas)
+                            .await?;
+                    }
                     *self.last_moved_snapshot_files.lock() =
                         Some((current_snapshot.to_string(), metas));
                 }
@@ -4128,6 +4138,128 @@ impl CayenneTableProvider {
         }
 
         Ok(())
+    }
+
+    /// Incrementally commit manifest rows (`cayenne_snapshot_file`) for files
+    /// just moved into the live current snapshot, as part of the same apply that
+    /// moved them — the append-path counterpart to
+    /// [`Self::upsert_snapshot_manifest_from_listing`]'s full-relist rebuild
+    /// (used by compaction/rewrite, which mints a whole new snapshot).
+    ///
+    /// Mandatory, not best-effort: `scan_from_manifest` no longer falls back to a
+    /// live directory LIST for a table whose manifest is otherwise established, so
+    /// a plain append MUST keep the manifest complete for it to stay correct.
+    /// Errors propagate (`?`) rather than log-and-continue.
+    ///
+    /// Tags every row with `[0, current_sequence]` — the same conservative,
+    /// always-bake-eligible range [`Self::rebuild_live_snapshot_manifests`] uses
+    /// for the current snapshot (a plain append cannot yet form a tighter range
+    /// cheaply here without threading the burst's reserved sequence through the
+    /// staged-append/WAL plumbing — a follow-up worth doing once this path is the
+    /// one Stage-B consumes, rather than before). `row_count`/`digest` are left as
+    /// the same best-effort hints [`Self::upsert_snapshot_manifest_from_listing`]
+    /// already treats as optional (0 / `None` is correct-but-imprecise, never
+    /// wrong; backfilled later by the periodic reconciliation sweep or the next
+    /// scan that reads the file's footer stats).
+    async fn insert_current_snapshot_manifest_rows(
+        &self,
+        current_snapshot: &str,
+        metas: &[ObjectMeta],
+    ) -> Result<()> {
+        let table_id = self.table_metadata.table_id.clone();
+        let current_sequence = self
+            .catalog
+            .get_snapshot_sequence(&table_id, current_snapshot)
+            .await?
+            .unwrap_or(0);
+
+        for meta in metas {
+            let Some(file_name) = meta.location.filename() else {
+                continue;
+            };
+            self.catalog
+                .upsert_snapshot_file(&SnapshotFile {
+                    table_id: table_id.clone(),
+                    snapshot_id: current_snapshot.to_string(),
+                    file_path: file_name.to_string(),
+                    row_count: 0,
+                    file_size_bytes: i64::try_from(meta.size).unwrap_or(i64::MAX),
+                    min_sequence: 0,
+                    max_sequence: current_sequence,
+                    digest: None,
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Reconcile manifest rows for a staged append recovered by
+    /// `ensure_no_incomplete_write`'s "resume the move" path, for the crash
+    /// window `Self::insert_current_snapshot_manifest_rows` alone cannot close:
+    /// the crash happened AFTER every staged file was already renamed/copied
+    /// into `target_snapshot` but BEFORE their manifest rows were committed.
+    /// `move_staged_files_to_snapshot` is then a no-op on retry (nothing left in
+    /// staging to move), so the manifest-insert that normally rides along with
+    /// the move never runs for these files — without this reconciliation step
+    /// they would be a permanent, silent orphan once `scan_from_manifest` has no
+    /// directory-LIST fallback to catch them.
+    ///
+    /// Idempotent (`upsert_snapshot_file` is `INSERT OR REPLACE`), so it is safe
+    /// to call unconditionally on every successful recovery of a
+    /// `CurrentSnapshot`-targeted WAL, whether or not the move actually moved
+    /// any files this time.
+    pub(crate) async fn reconcile_current_snapshot_manifest_rows_after_recovery(
+        &self,
+        target_snapshot: &str,
+        staged_files: &[String],
+    ) -> Result<()> {
+        if staged_files.is_empty() {
+            return Ok(());
+        }
+
+        let metas = if self.table_metadata.path.starts_with("s3://") {
+            let config = self.require_object_store()?;
+            let Some(prefix) = self.snapshot_object_store_prefix(target_snapshot)? else {
+                return Ok(());
+            };
+            let store = Arc::clone(&config.store);
+            let mut metas = Vec::with_capacity(staged_files.len());
+            for file_name in staged_files {
+                let path = ObjectStorePath::from(format!("{}{file_name}", prefix.as_ref()));
+                let meta = store.head(&path).await.map_err(|e| Error::ObjectStore {
+                    operation: "stat recovered snapshot file for manifest reconciliation",
+                    table: self.table_metadata.table_name.clone(),
+                    source: e,
+                })?;
+                metas.push(meta);
+            }
+            metas
+        } else {
+            let target_dir = Self::snapshot_dir_path(
+                &self.table_metadata.path,
+                &self.table_metadata.table_id,
+                target_snapshot,
+            );
+            let snapshot_dir_url = Self::snapshot_dir_url(
+                &self.table_metadata.path,
+                &self.table_metadata.table_id,
+                target_snapshot,
+            );
+            let moved_file_names: Vec<std::ffi::OsString> =
+                staged_files.iter().map(std::ffi::OsString::from).collect();
+            self.stat_moved_files_as_object_metas(&snapshot_dir_url, &target_dir, &moved_file_names)
+                .await
+                .ok_or_else(|| Error::Internal {
+                    table: self.table_metadata.table_name.clone(),
+                    message: format!(
+                        "Failed to stat recovered snapshot files for manifest reconciliation \
+                         in snapshot '{target_snapshot}'"
+                    ),
+                })?
+        };
+
+        self.insert_current_snapshot_manifest_rows(target_snapshot, &metas)
+            .await
     }
 
     /// Build the [`ObjectMeta`] entries for `moved_file_names` (just renamed into
@@ -4319,6 +4451,12 @@ impl CayenneTableProvider {
             && !moved_metas.is_empty()
             && moved_metas.len() == file_moves.len()
         {
+            // See the local-FS path: only pay the extra catalog round-trips
+            // when this table actually resolves scans from the manifest.
+            if self.scan_from_manifest() {
+                self.insert_current_snapshot_manifest_rows(current_snapshot, &moved_metas)
+                    .await?;
+            }
             *self.last_moved_snapshot_files.lock() =
                 Some((current_snapshot.to_string(), moved_metas));
         }
@@ -5171,9 +5309,11 @@ impl CayenneTableProvider {
         // above already moved any interrupted staged append into its snapshot, so
         // the directory listing this reads is the final, committed file set. No
         // background task is running yet, so this cannot race a write or
-        // compaction. Best-effort: it leaves the manifest empty on failure and
-        // the scan falls back to directory listing.
-        provider.backfill_snapshot_manifest_if_empty().await;
+        // compaction. Best-effort for a directory-listing table: it leaves the
+        // manifest empty on failure and the scan falls back to directory
+        // listing. For a `scan_from_manifest` table, failing to even determine
+        // the manifest's state is not swallowed — the table fails to open.
+        provider.backfill_snapshot_manifest_if_empty().await?;
 
         if let Err(error) = provider
             .rebuild_maintained_aggregates_from_visible_state()
@@ -11480,6 +11620,34 @@ impl CayenneTableProvider {
             }
         }
 
+        // Author this rewrite's manifest with the merged commit-seq range over
+        // every live snapshot (current + protected) it just consolidated —
+        // same computation and same rationale as the full-rewrite compaction
+        // path (`rewrite_current_snapshot_for_compaction`): the output
+        // materializes the FULL visible stream, so `[min over inputs
+        // min_sequence, max over inputs max_sequence]` is its true range;
+        // falls back to the conservative `[0, current table sequence]` when no
+        // input manifest is available. Unlike compaction, this path had no
+        // manifest-authoring call at all until now — same gap, same fix as
+        // `write_new_snapshot_after_validation` and `checkpoint_mem_tier_inner`.
+        // A `scan_from_manifest` table has no directory-LIST fallback, so a
+        // failure here aborts the rewrite instead of publishing a snapshot
+        // with zero manifest rows; a directory-listing table is unaffected
+        // (no manifest-authoring call on this path at all, same as before).
+        if self.scan_from_manifest() {
+            let (merged_min, merged_max) = self
+                .merged_sequence_range_over_live_snapshots()
+                .await
+                .unwrap_or((0, self.table_metadata.current_sequence_number));
+            if let Err(e) = self
+                .author_uniform_snapshot_manifest(&new_snapshot_id, merged_min, merged_max)
+                .await
+            {
+                cleanup_failed_snapshot.await;
+                return Err(Error::Catalog { source: e });
+            }
+        }
+
         // Pre-create the listing table before committing to catalog.
         // This ensures that if listing table creation fails, we haven't committed
         // the catalog yet, avoiding an inconsistent state.
@@ -13357,10 +13525,23 @@ impl CayenneTableProvider {
     /// pays the directory listing — the same listing a scan would do anyway. Runs
     /// at open before the background compactor starts, so the live set cannot
     /// shift under it (no lock contention) and no scan can observe a partial
-    /// manifest. Best-effort: any failure leaves the manifest empty and is logged
-    /// — the dual-source read path then lists the directory, so a backfill error
-    /// can never make a scan miss a live file or read one outside its snapshot.
-    async fn backfill_snapshot_manifest_if_empty(&self) {
+    /// manifest.
+    ///
+    /// Best-effort for a table still on directory listing: any failure leaves
+    /// the manifest empty and is logged — the dual-source read path then lists
+    /// the directory, so a backfill error can never make a scan miss a live file
+    /// or read one outside its snapshot. For a `scan_from_manifest` table there
+    /// is no directory-LIST fallback left once this manifest is trusted, so
+    /// failing to even determine whether it needs backfilling must not be
+    /// silently swallowed — proceeding on an unknown manifest state risks
+    /// serving an incomplete file set as if it were complete; the table fails
+    /// to open instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when `scan_from_manifest` is enabled and the
+    /// existing-manifest read fails; otherwise always `Ok(())` (best-effort).
+    async fn backfill_snapshot_manifest_if_empty(&self) -> CatalogResult<()> {
         match self
             .catalog
             .get_all_snapshot_files(&self.table_metadata.table_id)
@@ -13369,12 +13550,15 @@ impl CayenneTableProvider {
             Ok(rows) if !rows.is_empty() => {
                 // Manifest already populated (write path or a prior backfill);
                 // leave it to the live write/compaction paths.
-                return;
+                return Ok(());
             }
             Ok(_) => {
                 // Empty: fall through to backfill from directory listing.
             }
             Err(error) => {
+                if self.context.scan_from_manifest() {
+                    return Err(error);
+                }
                 // Could not determine emptiness; skip rather than risk writing a
                 // partial manifest atop an unknown state. Directory listing
                 // remains the scan's source.
@@ -13384,7 +13568,7 @@ impl CayenneTableProvider {
                     "Snapshot manifest backfill skipped: failed to read existing manifest; \
                      scan falls back to directory listing"
                 );
-                return;
+                return Ok(());
             }
         }
 
@@ -13397,6 +13581,7 @@ impl CayenneTableProvider {
             "Backfilling empty snapshot manifest from directory listing at open"
         );
         self.rebuild_live_snapshot_manifests().await;
+        Ok(())
     }
 
     /// Debug-only observability check: every file the caller just authored
@@ -13922,6 +14107,30 @@ impl CayenneTableProvider {
                     generation_now,
                     "Aborting current-snapshot compaction: a concurrent append \
                      landed during the re-encode; discarding output and retrying"
+                );
+                drop(listing_guard);
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Ok(false);
+            }
+            // `scan_from_manifest` tables no longer fall back to a directory LIST
+            // (that's the whole point of hardening), so a snapshot flip MUST NOT
+            // proceed without a populated manifest for `new_snapshot_id` — an
+            // empty manifest on the new current snapshot would silently read back
+            // zero rows for a table that has data. `manifest_listed` is `None`
+            // only when `upsert_snapshot_manifest_from_listing` failed above; no
+            // catalog/in-memory mutation has happened yet, so this is a plain
+            // discard-and-retry, same as the other pre-commit checks in this
+            // block. Tables still on directory listing are unaffected: a failed
+            // population there is harmless (the scan already falls back to LIST).
+            if self.context.scan_from_manifest() && manifest_listed.is_none() {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    new_snapshot_id = new_snapshot_id.as_str(),
+                    "Aborting current-snapshot compaction: scan_from_manifest is enabled but \
+                     the new snapshot's manifest failed to populate; discarding output and \
+                     retrying rather than flipping to a snapshot with no manifest rows"
                 );
                 drop(listing_guard);
                 self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
@@ -15372,7 +15581,7 @@ impl CayenneTableProvider {
             .merged_sequence_range_over_snapshots(&old_ids)
             .await
             .unwrap_or((0, fence_max_delete_seq));
-        if let Err(error) = self
+        let manifest_authored = match self
             .upsert_snapshot_manifest_from_listing(
                 &new_snapshot_id,
                 ManifestSequenceTag::Uniform {
@@ -15382,14 +15591,40 @@ impl CayenneTableProvider {
             )
             .await
         {
+            Ok(_files) => true,
+            Err(error) => {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    new_snapshot_id = new_snapshot_id.as_str(),
+                    "Failed to author merged subset-compaction manifest before swap; \
+                     scan falls back to directory listing"
+                );
+                false
+            }
+        };
+
+        // `scan_from_manifest` tables have no directory-LIST fallback, so the CAS
+        // swap below MUST NOT publish `new_snapshot_id` as protected without a
+        // populated manifest — that would leave a live, referenced snapshot with
+        // zero manifest rows, and a scan resolving from it would silently read
+        // back no rows. No catalog mutation has happened yet, so this is a plain
+        // discard-and-retry (same as the other abort paths in this function).
+        // Tables still on directory listing are unaffected: a failed population
+        // there is harmless (the scan already falls back to LIST).
+        if self.context.scan_from_manifest() && !manifest_authored {
             tracing::warn!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
-                %error,
                 new_snapshot_id = new_snapshot_id.as_str(),
-                "Failed to author merged subset-compaction manifest before swap; \
-                 scan falls back to directory listing"
+                "Aborting subset-merge compaction: scan_from_manifest is enabled but the \
+                 merged snapshot's manifest failed to populate; discarding output and \
+                 retrying rather than publishing a snapshot with no manifest rows"
             );
+            self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                .await;
+            return Ok(false);
         }
 
         // --- Phase 3: CAS commit. ---
@@ -15912,7 +16147,7 @@ impl CayenneTableProvider {
             .merged_sequence_range_over_snapshots(&old_ids)
             .await
             .unwrap_or((0, fence_max_delete_seq));
-        if let Err(error) = self
+        let manifest_authored = match self
             .upsert_snapshot_manifest_from_listing(
                 &new_snapshot_id,
                 ManifestSequenceTag::Uniform {
@@ -15922,14 +16157,35 @@ impl CayenneTableProvider {
             )
             .await
         {
+            Ok(_files) => true,
+            Err(error) => {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    new_snapshot_id = new_snapshot_id.as_str(),
+                    "Failed to author merged seq-prefix-bake manifest before swap; \
+                     scan falls back to directory listing"
+                );
+                false
+            }
+        };
+
+        // See the subset-merge compaction path for the rationale: a
+        // `scan_from_manifest` table must never have a protected snapshot
+        // published without a populated manifest (no LIST fallback to save it).
+        if self.context.scan_from_manifest() && !manifest_authored {
             tracing::warn!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
-                %error,
                 new_snapshot_id = new_snapshot_id.as_str(),
-                "Failed to author merged seq-prefix-bake manifest before swap; \
-                 scan falls back to directory listing"
+                "Aborting seq-prefix-bake compaction: scan_from_manifest is enabled but the \
+                 merged snapshot's manifest failed to populate; discarding output and \
+                 retrying rather than publishing a snapshot with no manifest rows"
             );
+            self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                .await;
+            return Ok(false);
         }
 
         // --- Phase 3: CAS commit (atomically deactivate inputs, activate M). ---
@@ -17178,6 +17434,15 @@ impl CayenneTableProvider {
     pub(super) fn get_current_snapshot_id(&self) -> String {
         let guard = self.current_snapshot_id.read();
         guard.clone()
+    }
+
+    /// Whether this table resolves scans from the per-snapshot manifest
+    /// (`cayenne_snapshot_file`) rather than a directory listing. `self.context`
+    /// is private to this module, so other `provider` submodules (compaction,
+    /// overwrite) that need to gate a snapshot-publishing commit on manifest
+    /// population go through this accessor instead.
+    pub(super) fn scan_from_manifest(&self) -> bool {
+        self.context.scan_from_manifest()
     }
 
     /// Return the snapshot currently published by this provider.
@@ -20673,16 +20938,38 @@ impl CayenneTableProvider {
         let stats = if self.pk_deletion_strategy.is_position_based() {
             let _fence = self.listing_fence.write().await;
             let target_size_bytes = self.context.target_file_size_bytes();
+            let current_snapshot = self.get_current_snapshot_id();
             let (_rows, _ops, stats) = self
                 .write_to_snapshot(
                     stream,
                     target_size_bytes,
-                    &self.get_current_snapshot_id(),
+                    &current_snapshot,
                     ctx.state().config().target_partitions(),
                     estimated_bytes,
                     super::delta_encoding::WriteClass::Delta,
                 )
                 .await?;
+            // Same gap as `checkpoint_inlined_data`'s position-based branch:
+            // this writes straight into the current snapshot directory with no
+            // staging WAL, so it bypasses `insert_current_snapshot_manifest_rows`'s
+            // gate entirely. Full relist rather than an incremental insert, for
+            // the same reason (no per-file metadata returned here to build an
+            // incremental row from).
+            if self.scan_from_manifest() {
+                let current_sequence = self
+                    .catalog
+                    .get_snapshot_sequence(&self.table_metadata.table_id, &current_snapshot)
+                    .await?
+                    .unwrap_or(self.table_metadata.current_sequence_number);
+                self.upsert_snapshot_manifest_from_listing(
+                    &current_snapshot,
+                    ManifestSequenceTag::PreserveOrUniform {
+                        min: 0,
+                        max: current_sequence,
+                    },
+                )
+                .await?;
+            }
             // Clear under the publish locks (inner to the held fence), uniform
             // with phase 2. Position-based tables never engage `append_to_mem_tier`
             // (`is_cdc_memory_mode()` is false for them — always a single shard),
@@ -20770,6 +21057,25 @@ impl CayenneTableProvider {
                     &corpus_keys,
                 )
                 .await?;
+
+            // Author this checkpoint's protected-snapshot manifest with its
+            // exact commit-seq range `[sequence_number, sequence_number]` —
+            // every file here was written by this one checkpoint — BEFORE it
+            // becomes visible below. Same gap and same fix as the on-conflict
+            // append path in `mutation_writer.rs::write_new_snapshot_after_validation`:
+            // this mem-tier checkpoint flush never authored a manifest at all,
+            // so a `scan_from_manifest` table (no directory-LIST fallback)
+            // would silently never see the flushed rows. Only attempted (and
+            // only a hard failure) when the table actually resolves scans
+            // from the manifest.
+            if self.scan_from_manifest() {
+                self.author_uniform_snapshot_manifest(
+                    &new_snapshot_id,
+                    sequence_number,
+                    sequence_number,
+                )
+                .await?;
+            }
 
             // PHASE 2 — in-memory visibility swap, UNDER the fence. Cheap: an
             // ArcSwap publish, a tier clear, and a listing-table refresh — no
@@ -21659,6 +21965,24 @@ impl CayenneTableProvider {
             )
             .await?;
 
+        // Author this protected snapshot's manifest with its exact commit-seq
+        // range `[sequence_number, sequence_number]` — every file here was
+        // written by this one commit — BEFORE it becomes visible below. Same
+        // gap and same fix as `write_new_snapshot_after_validation` and
+        // `checkpoint_mem_tier_inner`: this inline-checkpoint-flush path
+        // authored no manifest at all, so a `scan_from_manifest` table (no
+        // directory-LIST fallback) would silently never see the flushed rows.
+        // Only attempted (and only a hard failure) when the table actually
+        // resolves scans from the manifest.
+        if self.scan_from_manifest() {
+            self.author_uniform_snapshot_manifest(
+                &new_snapshot_id,
+                sequence_number,
+                sequence_number,
+            )
+            .await?;
+        }
+
         // Protect this snapshot using its OWN allocated `sequence_number` as the
         // deletion threshold: the same value just persisted to
         // `cayenne_snapshot_sequence` and reloaded by `load_protected_snapshots` on
@@ -21804,16 +22128,42 @@ impl CayenneTableProvider {
 
             let stats = if self.pk_deletion_strategy.is_position_based() {
                 let target_size_bytes = self.context.target_file_size_bytes();
+                let current_snapshot = self.get_current_snapshot_id();
                 let (_rows, _ops, stats) = self
                     .write_to_snapshot(
                         stream,
                         target_size_bytes,
-                        &self.get_current_snapshot_id(),
+                        &current_snapshot,
                         ctx.state().config().target_partitions(),
                         estimated_bytes,
                         super::delta_encoding::WriteClass::Delta,
                     )
                     .await?;
+                // This writes straight into the current snapshot directory
+                // (no staging WAL, no `move_staged_files_to_snapshot`), so it
+                // bypasses `insert_current_snapshot_manifest_rows`'s own gate
+                // entirely — a fourth instance of the same gap found and
+                // fixed elsewhere in this hardening work. A full relist (like
+                // `rebuild_live_snapshot_manifests` uses for the append path)
+                // rather than an incremental insert: this checkpoint's
+                // `write_to_snapshot` call doesn't return per-file metadata to
+                // build an incremental row from, and checkpoints are
+                // infrequent enough that the relist cost is not a concern.
+                if self.scan_from_manifest() {
+                    let current_sequence = self
+                        .catalog
+                        .get_snapshot_sequence(&self.table_metadata.table_id, &current_snapshot)
+                        .await?
+                        .unwrap_or(self.table_metadata.current_sequence_number);
+                    self.upsert_snapshot_manifest_from_listing(
+                        &current_snapshot,
+                        ManifestSequenceTag::PreserveOrUniform {
+                            min: 0,
+                            max: current_sequence,
+                        },
+                    )
+                    .await?;
+                }
                 stats
             } else {
                 // Lever B2: the checkpoint flush's new snapshot sequence comes
@@ -23298,26 +23648,26 @@ impl CayenneTableProvider {
     /// Resolve a snapshot's data files from the manifest (`cayenne_snapshot_file`)
     /// instead of by listing the snapshot directory.
     ///
-    /// Returns `Ok(Some(files))` only when the manifest is non-empty AND the scan
-    /// is unpartitioned. The manifest stores bare file *names* (the same strings a
-    /// directory listing yields); each is joined onto the snapshot directory
-    /// prefix and turned into a [`PartitionedFile`] exactly the way
-    /// [`pruned_partition_list`] does for an unpartitioned table — same
-    /// `ObjectMeta`-to-`PartitionedFile` conversion, same zero-size filter — so
-    /// the manifest-built file list is byte-identical to the directory-built one
-    /// for the same snapshot.
+    /// Returns `Ok(Some(files))` when the scan is unpartitioned — including
+    /// `Some(Vec::new())` for a snapshot whose manifest has zero rows, which
+    /// (now that manifest maintenance is mandatory wherever `scan_from_manifest`
+    /// is on — see `backfill_snapshot_manifest_if_empty` and
+    /// `insert_current_snapshot_manifest_rows`) means the snapshot genuinely has
+    /// no data files, not "not yet populated." The manifest stores bare file
+    /// *names* (the same strings a directory listing yields); each is joined
+    /// onto the snapshot directory prefix and turned into a [`PartitionedFile`]
+    /// exactly the way [`pruned_partition_list`] does for an unpartitioned table
+    /// — same `ObjectMeta`-to-`PartitionedFile` conversion, same zero-size
+    /// filter — so the manifest-built file list is byte-identical to the
+    /// directory-built one for the same snapshot.
     ///
     /// Returns `Ok(None)` (the caller then falls back to directory listing) when:
-    /// - the manifest read fails (transient metastore error),
-    /// - the manifest has no rows for this snapshot (written before population,
-    ///   or a post-write rebuild that has not run / failed), or
+    /// - the manifest read fails (transient metastore error) — an availability
+    ///   concern, not a correctness one: directory listing is still a valid,
+    ///   just slower, source of truth for whatever is physically present, or
     /// - the table is partitioned (`table_partition_cols` non-empty) — the
     ///   manifest does not persist partition values, so directory listing (which
     ///   derives them from the path) stays authoritative there.
-    ///
-    /// This `None`-on-empty fallback is what keeps the flag from ever making a
-    /// scan miss a live file: an incomplete manifest degrades to listing, never
-    /// to a short read.
     async fn manifest_partitioned_files(
         &self,
         request: &SnapshotScanListingRequest<'_>,
@@ -23346,9 +23696,17 @@ impl CayenneTableProvider {
         };
 
         if manifest.is_empty() {
-            // Snapshot predates manifest population, or a post-write rebuild has
-            // not run yet: directory listing is still the authoritative source.
-            return None;
+            // This branch only runs when `scan_from_manifest` is on (see the
+            // caller), which means `backfill_snapshot_manifest_if_empty` already
+            // guaranteed at table-open time that the manifest is complete for
+            // every live snapshot (hard-erroring the open otherwise) and every
+            // snapshot-publishing commit since has kept it that way
+            // incrementally (`insert_current_snapshot_manifest_rows`,
+            // `upsert_snapshot_manifest_from_listing`'s now-mandatory callers).
+            // An empty manifest here is therefore authoritative — this snapshot
+            // genuinely has zero data files — not a "not yet populated" signal
+            // to fall back to a directory LIST.
+            return Some(Vec::new());
         }
 
         // `prefix` is the parsed snapshot-directory path; joining the manifest's
@@ -33138,31 +33496,38 @@ mod tests {
         );
         assert_eq!(manifest_files.statistics, listing_files.statistics);
 
-        // Dual-source fallback: clear the manifest and the resolver must return
-        // `None`, so the scan falls back to directory listing rather than reading
-        // a short (incomplete) file set.
+        // Hardened manifest model: an explicitly-cleared manifest is now
+        // AUTHORITATIVE, not a "not yet populated" signal — manifest
+        // maintenance is mandatory wherever `scan_from_manifest` is on
+        // (`backfill_snapshot_manifest_if_empty` at open,
+        // `insert_current_snapshot_manifest_rows` on every append, the
+        // mandatory manifest-population gate on every compaction/overwrite
+        // commit), so a real gap here means the snapshot genuinely has zero
+        // files, not that the manifest hasn't caught up yet. The resolver
+        // returns `Some(Vec::new())`, and the scan resolves zero files — it
+        // must NOT fall back to a directory listing that would silently
+        // resurrect a file set the manifest no longer vouches for.
         provider
             .catalog
             .clear_snapshot_files(&provider.table_metadata.table_id)
             .await
             .expect("manifest cleared");
+        let cleared = provider
+            .manifest_partitioned_files(&request)
+            .await
+            .expect("an empty manifest is authoritative (Some), not a fallback signal (None)");
         assert!(
-            provider
-                .manifest_partitioned_files(&request)
-                .await
-                .is_none(),
-            "an empty manifest must fall back to directory listing (Some -> None)"
+            cleared.is_empty(),
+            "a cleared manifest must resolve to zero files, not the directory listing's files"
         );
-        // The end-to-end listing must still succeed (and match the directory
-        // baseline) via the fallback even with the flag ON.
-        let fallback_files = provider
+        let cleared_scan = provider
             .list_files_for_snapshot_scan(&request)
             .await
-            .expect("scan file listing should fall back to directory listing");
-        assert_eq!(
-            path_row_counts(&fallback_files.file_groups),
-            path_row_counts(&listing_files.file_groups),
-            "with an empty manifest the flag-ON scan must fall back to the directory listing"
+            .expect("scan file listing should succeed against an authoritatively-empty manifest");
+        assert!(
+            path_row_counts(&cleared_scan.file_groups).is_empty(),
+            "with a cleared (authoritatively empty) manifest the flag-ON scan must resolve zero \
+             files, not fall back to the directory listing"
         );
     }
 

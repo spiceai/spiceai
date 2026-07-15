@@ -1271,6 +1271,26 @@ impl<'a> AppendMutationWriter<'a> {
             .record_written_snapshot_sequence(&new_snapshot_id, new_sequence)
             .await?;
         record_cayenne_write_phase(self.table.table_name(), "publish_seq", seq_start);
+
+        // Author this protected snapshot's manifest with its exact commit-seq
+        // range `[new_sequence, new_sequence]` — every file here was written by
+        // this one commit — BEFORE it becomes visible below. Unlike
+        // overwrite/compaction (which already authored a manifest here before
+        // this change), this path authored none at all: a `scan_from_manifest`
+        // table has no directory-LIST fallback, so publishing a protected
+        // snapshot with zero manifest rows would make its real, just-written
+        // data silently invisible to any scan. Only attempted (and only a hard
+        // failure) when the table actually resolves scans from the manifest —
+        // a directory-listing table keeps today's exact cost/behavior: no
+        // manifest-authoring call on this path at all, same as before this
+        // change, relying on the periodic best-effort
+        // `rebuild_live_snapshot_manifests` sweep instead.
+        if self.table.scan_from_manifest() {
+            self.table
+                .author_uniform_snapshot_manifest(&new_snapshot_id, new_sequence, new_sequence)
+                .await?;
+        }
+
         // Atomically publish the deletion-cache update and the protected snapshot
         // so concurrent scans never observe the new protected snapshot with a stale deletion view (the duplicate-PK window).
         let cas_start = Instant::now();

@@ -2069,6 +2069,51 @@ impl CayenneTableProvider {
                 .await
             {
                 Ok(()) => {
+                    // Close the crash window between "files renamed into the
+                    // target snapshot" and "manifest rows committed" that a plain
+                    // resumed move alone cannot close: if every staged file was
+                    // already in place before this recovery pass ran (the crash
+                    // landed after the move but before the manifest write),
+                    // `move_staged_files_to_snapshot` above is a no-op and never
+                    // re-triggers `insert_current_snapshot_manifest_rows`. Must
+                    // run BEFORE the WAL is removed below — a failure here must
+                    // leave the WAL in place so a later retry can complete it,
+                    // exactly like a failed move would. Protected-snapshot
+                    // targets are out of scope: they author their manifest via a
+                    // different (catalog-transaction) path, not this
+                    // current-snapshot-specific one.
+                    // Also skipped entirely for a directory-listing table: it
+                    // never wrote incremental manifest rows for this
+                    // generation in the first place (see
+                    // `insert_current_snapshot_manifest_rows`'s own gate), so
+                    // there is nothing to reconcile, and this keeps recovery's
+                    // cost identical to before this change for such tables.
+                    if wal.target_kind == StagingWalTargetKind::CurrentSnapshot
+                        && self.scan_from_manifest()
+                        && let Err(e) = self
+                            .reconcile_current_snapshot_manifest_rows_after_recovery(
+                                &wal.target_snapshot,
+                                &wal.staged_files,
+                            )
+                            .await
+                    {
+                        tracing::error!(
+                            table = table_name.as_str(),
+                            error = %e,
+                            "Automated recovery moved staged files but failed to reconcile \
+                             their snapshot manifest rows"
+                        );
+                        return Err(Error::IncompleteWrite {
+                            table: table_name,
+                            message: format!(
+                                "A previous write was interrupted while moving {} file(s) to '{}' (started at {}). Automated recovery moved the staged files, but failed to reconcile their manifest rows ({}). Refusing writes until the underlying issue is resolved. The WAL file is located at '{wal_location}'.{extra}",
+                                wal.staged_files.len(),
+                                wal.target_snapshot,
+                                wal.created_at,
+                                e
+                            ),
+                        });
+                    }
                     if let Err(e) = self.remove_staging_wal_for(&staging_snapshot_id).await {
                         tracing::error!(
                             table = table_name.as_str(),
