@@ -16,13 +16,15 @@ limitations under the License.
 
 //! Compound (writethrough) search indexes.
 //!
-//! A [`CompoundSearchIndex`] (and its vector counterpart, [`CompoundVectorIndex`]) pairs a
-//! primary index A with a secondary index B:
+//! A [`CompoundIndex`] pairs a primary index A with a secondary index B:
 //!
 //!  - **Writes** go to both A and B (writethrough).
 //!  - **List & query** are served from A. With
 //!    [`CompoundReadMode::FallbackToSecondary`], a list/query that returns zero rows from A
 //!    is retried against B at execution time.
+//!
+//! [`CompoundSearchIndex`] and [`CompoundVectorIndex`] are the trait-object aliases used when
+//! the underlying index types are only known at runtime.
 //!
 //! The two indexes must be compatible: same search column, same primary-key fields, and the
 //! same trait variant (both plain [`SearchIndex`]es, or both [`VectorIndex`]es with equal
@@ -30,23 +32,25 @@ limitations under the License.
 //! structured [`Error`].
 
 mod fallback;
-mod search_index;
+mod index;
 #[cfg(test)]
 mod tests;
-mod vector_index;
 
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
-use arrow_schema::{ArrowError, Field, FieldRef, Schema};
-use datafusion::error::DataFusionError;
+use arrow_schema::{ArrowError, Field};
 use itertools::Itertools;
-use snafu::{ResultExt, Snafu, ensure};
+use snafu::{Snafu, ensure};
 
-pub use search_index::CompoundSearchIndex;
-pub use vector_index::CompoundVectorIndex;
+pub use index::CompoundIndex;
 
 use crate::index::{SearchIndex, VectorIndex};
+
+/// A [`CompoundIndex`] over two dynamically-typed [`SearchIndex`]es.
+pub type CompoundSearchIndex = CompoundIndex<dyn SearchIndex, dyn SearchIndex>;
+
+/// A [`CompoundIndex`] over two dynamically-typed [`VectorIndex`]es.
+pub type CompoundVectorIndex = CompoundIndex<dyn VectorIndex, dyn VectorIndex>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -123,10 +127,11 @@ pub enum CompoundReadMode {
 
 /// Validate that two indexes can be compounded: same search column, same primary-key fields
 /// and the same trait variant (with matching dimensions for vector indexes).
-pub(super) fn validate_compatibility(
-    primary: &Arc<dyn SearchIndex>,
-    secondary: &Arc<dyn SearchIndex>,
-) -> Result<(), Error> {
+fn validate_compatibility<A, B>(primary: &Arc<A>, secondary: &Arc<B>) -> Result<(), Error>
+where
+    A: SearchIndex + ?Sized,
+    B: SearchIndex + ?Sized,
+{
     ensure!(
         primary.search_column() == secondary.search_column(),
         SearchColumnMismatchSnafu {
@@ -191,83 +196,4 @@ pub(super) fn validate_compatibility(
         }
     }
     Ok(())
-}
-
-/// Write `record` to both indexes and merge their outputs (primary's columns win; secondary
-/// columns not present on the primary output are appended). Both writes run concurrently and
-/// both are driven to completion even if one fails, so neither index is left mid-write.
-pub(super) async fn compound_write(
-    primary: &Arc<dyn SearchIndex>,
-    secondary: &Arc<dyn SearchIndex>,
-    record: RecordBatch,
-) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
-    let (primary_result, secondary_result) =
-        futures::join!(primary.write(record.clone()), secondary.write(record));
-    let primary_out = primary_result.context(PrimaryIndexWriteSnafu).boxed()?;
-    let secondary_out = secondary_result.context(SecondaryIndexWriteSnafu).boxed()?;
-
-    if primary_out.num_rows() != secondary_out.num_rows() {
-        return WriteRowCountMismatchSnafu {
-            primary_rows: primary_out.num_rows(),
-            secondary_rows: secondary_out.num_rows(),
-        }
-        .fail()
-        .boxed();
-    }
-
-    let (schema, mut arrays, _) = primary_out.into_parts();
-    let mut fields: Vec<FieldRef> = schema.fields().iter().cloned().collect();
-    let secondary_schema = secondary_out.schema();
-    for (i, field) in secondary_schema.fields().iter().enumerate() {
-        if schema.column_with_name(field.name()).is_none() {
-            fields.push(Arc::clone(field));
-            arrays.push(Arc::clone(secondary_out.column(i)));
-        }
-    }
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
-        .context(MergeWriteOutputsSnafu)
-        .boxed()
-}
-
-/// Union of the two indexes' required columns, preserving the primary's order.
-pub(super) fn compound_required_columns(
-    primary: &Arc<dyn SearchIndex>,
-    secondary: &Arc<dyn SearchIndex>,
-) -> Vec<String> {
-    let mut columns = primary.required_columns();
-    for column in secondary.required_columns() {
-        if !columns.contains(&column) {
-            columns.push(column);
-        }
-    }
-    columns
-}
-
-/// Start a bounded write window on both indexes. If the secondary fails to start after the
-/// primary already started, the primary's window is rolled back (best effort) so the two
-/// indexes never disagree about whether a write window is open.
-pub(super) async fn compound_on_write_start(
-    primary: &Arc<dyn SearchIndex>,
-    secondary: &Arc<dyn SearchIndex>,
-) -> Result<(), DataFusionError> {
-    primary.on_write_start().await?;
-    if let Err(secondary_err) = secondary.on_write_start().await {
-        if let Err(rollback_err) = primary.on_write_failed().await {
-            tracing::warn!(
-                "Failed to roll back the primary index of a compound search index after the secondary index failed to start a write: {rollback_err}"
-            );
-        }
-        return Err(secondary_err);
-    }
-    Ok(())
-}
-
-/// Run a lifecycle callback on both indexes, driving both to completion, and return the first
-/// error (a failure on one index must not skip the callback on the other).
-pub(super) async fn compound_lifecycle_both(
-    primary: impl Future<Output = Result<(), DataFusionError>>,
-    secondary: impl Future<Output = Result<(), DataFusionError>>,
-) -> Result<(), DataFusionError> {
-    let (primary_result, secondary_result) = futures::join!(primary, secondary);
-    primary_result.and(secondary_result)
 }
