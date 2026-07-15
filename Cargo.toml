@@ -17,6 +17,7 @@ members = [
     "crates/data_components",
     "crates/dataformat-json",
     "crates/document_parse",
+    "crates/dotenv",
     "crates/duration-parse",
     "crates/dynamodb-streams",
     "crates/event_stream",
@@ -58,7 +59,6 @@ members = [
     "crates/search",
     "crates/spice_cloud",
     "crates/spice-cloud-client",
-    "crates/spice-dotenv",
     "crates/spicepod",
     "crates/system-open",
     "crates/telemetry",
@@ -235,6 +235,7 @@ delta_kernel = { version = "0.23.0", features = [
     "internal-api",
 ] }
 derive_builder = "0.20.2"
+dotenv = { path = "crates/dotenv" }
 duration-parse = { path = "crates/duration-parse" }
 duckdb = "1.10503" # 1.10503.x corresponds to DuckDB v1.5.3
 dyn-hash = "1.0.0"
@@ -342,7 +343,6 @@ sha2 = "0.10.8"
 snafu = "0.8.6"
 runtime-cloud-connect = { path = "crates/runtime-cloud-connect" }
 spice-cloud-client = { path = "crates/spice-cloud-client" }
-spice-dotenv = { path = "crates/spice-dotenv" }
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "744ffd77fe82171a805562ce001a341a94d52541" } # branch: spiceai-58
 sqlparser = "0.59.0"
 ssh2 = { version = "0.9.5" }

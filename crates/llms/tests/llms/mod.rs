@@ -172,7 +172,7 @@ async fn run_test(
 ) -> Result<Option<CreateChatCompletionResponse>, anyhow::Error> {
     // SAFETY: `.env` loading mutates the process environment; tests only read
     // these variables afterwards.
-    let _ = unsafe { spice_dotenv::from_filename(".env") }.expect("failed to load .env file");
+    let _ = unsafe { dotenv::from_filename(".env") }.expect("failed to load .env file");
     init_tracing(None);
 
     if TEST_ARGS.skip_model(model_name) {

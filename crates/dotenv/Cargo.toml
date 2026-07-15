@@ -1,5 +1,5 @@
 [package]
-name = "spice-dotenv"
+name = "dotenv"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

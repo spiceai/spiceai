@@ -685,32 +685,32 @@ DOUBLE="literal $VAR and ${VAR}"
         let env_file = temp_dir.path().join(".env.load");
         std::fs::write(
             &env_file,
-            "SPICE_DOTENV_TEST_EXISTING=from_file\nSPICE_DOTENV_TEST_NEW=first\nSPICE_DOTENV_TEST_NEW=second\n",
+            "DOTENV_TEST_EXISTING=from_file\nDOTENV_TEST_NEW=first\nDOTENV_TEST_NEW=second\n",
         )
         .expect("failed to write test .env file");
 
         // SAFETY: tests in this module use unique variable names and this is
         // the only test mutating them.
         unsafe {
-            env::set_var("SPICE_DOTENV_TEST_EXISTING", "from_env");
+            env::set_var("DOTENV_TEST_EXISTING", "from_env");
             from_path(&env_file).expect("failed to load .env file");
         }
 
         assert_eq!(
-            env::var("SPICE_DOTENV_TEST_EXISTING").as_deref(),
+            env::var("DOTENV_TEST_EXISTING").as_deref(),
             Ok("from_env"),
             "existing environment variables must be preserved"
         );
         assert_eq!(
-            env::var("SPICE_DOTENV_TEST_NEW").as_deref(),
+            env::var("DOTENV_TEST_NEW").as_deref(),
             Ok("first"),
             "the first occurrence of a key within the file must win"
         );
 
         // SAFETY: single-threaded test cleanup of variables owned by this test.
         unsafe {
-            env::remove_var("SPICE_DOTENV_TEST_EXISTING");
-            env::remove_var("SPICE_DOTENV_TEST_NEW");
+            env::remove_var("DOTENV_TEST_EXISTING");
+            env::remove_var("DOTENV_TEST_NEW");
         }
     }
 

@@ -83,20 +83,19 @@ pub struct EnvSecretStore {
 impl EnvSecretStore {
     fn load(&self) {
         if let Some(path) = &self.path
-            && load_from_iter(path, spice_dotenv::from_path_iter(path))
+            && load_from_iter(path, dotenv::from_path_iter(path))
         {
             return;
         }
         // `.env.local` is loaded before `.env` so that its values take priority:
         // `load_iter` preserves existing `std::env` vars and does not overwrite
         // them, so the first file loaded wins.
-        let _ = spice_dotenv::from_filename_iter(".env.local")
-            .map(|iter| load_iter(iter, ".env.local"));
-        let _ = spice_dotenv::from_filename_iter(".env").map(|iter| load_iter(iter, ".env"));
+        let _ = dotenv::from_filename_iter(".env.local").map(|iter| load_iter(iter, ".env.local"));
+        let _ = dotenv::from_filename_iter(".env").map(|iter| load_iter(iter, ".env"));
     }
 }
 
-/// Iterates parsed entries from a [`spice_dotenv`] iterator, setting each valid
+/// Iterates parsed entries from a [`dotenv`] iterator, setting each valid
 /// key-value pair into the environment. Variables already present in the
 /// environment are preserved, so earlier-loaded files take priority over later
 /// ones. Malformed lines are logged with their line number and content so users
@@ -109,7 +108,7 @@ impl EnvSecretStore {
 /// before any other threads are spawned.
 fn load_iter<I>(iter: I, label: &str)
 where
-    I: Iterator<Item = Result<(String, String), spice_dotenv::Error>>,
+    I: Iterator<Item = Result<(String, String), dotenv::Error>>,
 {
     for item in iter {
         match item {
@@ -120,7 +119,7 @@ where
                     }
                 }
             }
-            Err(spice_dotenv::Error::LineParse(line_num, content)) => {
+            Err(dotenv::Error::LineParse(line_num, content)) => {
                 tracing::warn!(
                     "{label}: line {line_num} is malformed and was skipped: `{content}`"
                 );
@@ -139,7 +138,7 @@ where
 /// can fall back to the default `.env` / `.env.local` search.
 fn load_from_iter<I, E>(path: &std::path::Path, result: Result<I, E>) -> bool
 where
-    I: Iterator<Item = Result<(String, String), spice_dotenv::Error>>,
+    I: Iterator<Item = Result<(String, String), dotenv::Error>>,
     E: std::fmt::Display,
 {
     match result {
@@ -191,7 +190,7 @@ mod tests {
 
     /// Values containing `$` characters must be preserved literally.
     ///
-    /// `spice_dotenv` performs no shell-style variable substitution — with
+    /// `dotenv` performs no shell-style variable substitution — with
     /// substitution (as in upstream `dotenvy`, see
     /// <https://github.com/allan2/dotenvy/issues/113>), values like
     /// `API_KEY=sk-abc$123` would be parsed as variable references and come
@@ -216,11 +215,10 @@ TEST_PATCH_MULTIPLE_DOLLARS=$$double$$dollars$$
             .expect("Failed to write test .env file");
         drop(file);
 
-        let entries: std::collections::HashMap<String, String> =
-            spice_dotenv::from_path_iter(&env_file)
-                .expect("Failed to open .env file")
-                .collect::<Result<_, _>>()
-                .expect("Failed to parse .env file");
+        let entries: std::collections::HashMap<String, String> = dotenv::from_path_iter(&env_file)
+            .expect("Failed to open .env file")
+            .collect::<Result<_, _>>()
+            .expect("Failed to parse .env file");
 
         // Verify each value is preserved literally (no variable substitution)
         let test_cases = [
@@ -257,7 +255,7 @@ MALFORMED_VALID_SECOND=second_value
             .expect("Failed to write test .env file");
         drop(file);
 
-        let iter = spice_dotenv::from_path_iter(&env_file).expect("Failed to open .env file");
+        let iter = dotenv::from_path_iter(&env_file).expect("Failed to open .env file");
         super::load_iter(iter, ".env.malformed");
 
         assert_eq!(
@@ -296,7 +294,7 @@ MALFORMED_VALID_SECOND=second_value
             std::env::set_var("PRESERVE_EXISTING", "from_env");
         }
 
-        let iter = spice_dotenv::from_path_iter(&env_file).expect("Failed to open .env file");
+        let iter = dotenv::from_path_iter(&env_file).expect("Failed to open .env file");
         super::load_iter(iter, ".env.preserve");
 
         assert_eq!(
