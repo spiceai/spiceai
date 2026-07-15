@@ -270,8 +270,31 @@ jobs:
             exit 0
           fi
 
+          # SF1/SF10 always run against the self-contained postgres:16 service
+          # container (PGHOST=127.0.0.1), so generating fresh data inline is
+          # cheap and expected. Anything larger targets the shared hosted
+          # cluster - generating+loading that inline risks a multi-hour job
+          # that can time out or exhaust the runner's disk, and a failure
+          # partway through would leave the shared database partially seeded.
+          # Require those scale factors to be pre-provisioned instead.
+          if [ "$PGHOST" != "127.0.0.1" ]; then
+            echo "::error::$DB_NAME is missing or empty on the hosted $PGHOST cluster. Scale factor $SCALE_FACTOR is too large to safely generate and load inline from a CI runner. Pre-provision it first, e.g.:"
+            echo "  cd test/tpc-bench && DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME DBGEN_SCALE=$SCALE_FACTOR make tpch-init tpch-gen pg-init pg-load pg-create-index"
+            echo "(substitute the tpcds-* targets for a tpcds run)"
+            exit 1
+          fi
+
           echo "$DB_NAME is missing or empty on $PGHOST - seeding it now."
-          sudo apt-get install -y git make gcc g++ flex bison byacc
+          sudo apt-get install -y git make flex bison byacc
+          if [ "$QUERY_SET" = "tpcds" ]; then
+            # tpcds-kit's tools/Makefile hardcodes CC=gcc-9 on Linux; ubuntu-24.04's
+            # default gcc isn't named gcc-9, so install it explicitly via the PPA.
+            sudo add-apt-repository ppa:ubuntu-toolchain-r/ppa -y
+            sudo apt-get update -y
+            sudo apt-get install -y gcc-9 g++-9
+          else
+            sudo apt-get install -y gcc g++
+          fi
 
           if [ "$QUERY_SET" = "tpcds" ]; then
             make tpcds-init

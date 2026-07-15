@@ -152,7 +152,7 @@ pg-create-index:
 	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "ANALYZE;";
 	@echo "Statistics have been refreshed for $(DB_NAME) database"
 	@echo "Setting statement_timeout on $(DB_NAME) database"
-	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "ALTER DATABASE $(DB_NAME) SET statement_timeout = '5400000';";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "ALTER DATABASE \"$(DB_NAME)\" SET statement_timeout = '5400000';";
 
 # Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpch make tpch-run-pq
 tpch-run-pq:
@@ -260,7 +260,7 @@ pg-tpcds-create-index:
 	@psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -c "ANALYZE;";
 	@echo "Statistics have been refreshed for $(DB_NAME) database"
 	@echo "Setting statement_timeout on $(DB_NAME) database"
-	@psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -c "ALTER DATABASE $(DB_NAME) SET statement_timeout = '5400000';";
+	@psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -c "ALTER DATABASE \"$(DB_NAME)\" SET statement_timeout = '5400000';";
 
 # Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpch make pg-tpcds-load
 pg-tpcds-load:
