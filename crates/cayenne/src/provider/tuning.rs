@@ -4125,7 +4125,7 @@ mod tests {
     }
 
     #[test]
-    fn freshness_goal_violated_shrinks_mem_tier_not_memtable() {
+    fn freshness_goal_violated_behind_apply_shrinks_mem_tier_not_memtable() {
         // A violated freshness SLO *with apply behind* SHRINKS the in-memory CDC
         // tier and WITHHOLDS the buffer-grow levers. Healthy-apply freshness no
         // longer shrinks (ladder A scar) — see
@@ -4731,7 +4731,7 @@ mod tests {
     }
 
     #[test]
-    fn freshness_violation_shrinks_mem_tier() {
+    fn freshness_violation_behind_apply_shrinks_mem_tier() {
         // A violated freshness SLO *with apply behind offered load* shrinks the
         // in-memory CDC tier (deep apply backlog → smaller epochs sooner).
         // `apply_vs_arrival >= BEHIND_RATIO` is required — see
@@ -4822,7 +4822,7 @@ mod tests {
     }
 
     #[test]
-    fn freshness_and_lag_both_violated_shrinks_not_grows() {
+    fn freshness_and_lag_both_violated_behind_apply_shrinks_not_grows() {
         // Both violated *and apply behind*: freshness OWNS the tier — it shrinks,
         // and the lag-grow is suppressed on the same tick (no-limit-cycle).
         let s = IngestSnapshot {
