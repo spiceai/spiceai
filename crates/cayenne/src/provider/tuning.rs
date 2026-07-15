@@ -2683,7 +2683,10 @@ fn decide_goal(
     // `!freshness_violated` so freshness still owns the *direction* on the tier
     // when shrink is eligible. `clamp_move_i64(…, b.mem_tier_max_bytes)` supplies
     // the floor + pin-respect. No `mem_ok` gate — shrink never needs headroom.
-    let apply_backlogged = s.apply_vs_arrival >= BEHIND_RATIO;
+    // Match the rest of the controller: "behind" is strict `>` (see `behind` at
+    // the adaptive ingest gate), not `>=`, so the equality boundary is one
+    // definition across levers.
+    let apply_backlogged = s.apply_vs_arrival > BEHIND_RATIO;
     if freshness_violated
         && apply_backlogged
         && !mutation_heavy
@@ -4734,7 +4737,7 @@ mod tests {
     fn freshness_violation_behind_apply_shrinks_mem_tier() {
         // A violated freshness SLO *with apply behind offered load* shrinks the
         // in-memory CDC tier (deep apply backlog → smaller epochs sooner).
-        // `apply_vs_arrival >= BEHIND_RATIO` is required — see
+        // `apply_vs_arrival > BEHIND_RATIO` is required — see
         // `freshness_violation_healthy_apply_does_not_shrink`.
         let s = IngestSnapshot {
             freshness_secs: Some(5.0),
