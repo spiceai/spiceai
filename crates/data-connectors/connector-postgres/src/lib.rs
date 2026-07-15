@@ -890,7 +890,7 @@ async fn enrich_with_postgres_metadata(
                 dataset = %dataset.name,
                 source = %dataset.path(),
                 error = %error,
-                "Schema inference degraded to base column/type inference (postgres): could not read the PostgreSQL catalog, usually because the connection role lacks read access. Primary key, indexes, and sort order were not inferred; grant catalog read access for full inference."
+                "Schema inference degraded to base column/type inference (postgres): could not read the PostgreSQL catalog, usually because the connection role lacks read access. Primary key, indexes, sort order, table sizing, and column statistics were not inferred; grant catalog read access for full inference."
             );
         }
     }

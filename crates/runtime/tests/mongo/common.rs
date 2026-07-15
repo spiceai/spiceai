@@ -60,7 +60,7 @@ pub fn make_mongodb_dataset(path: &str, name: &str, port: u16, accelerated: bool
 /// key and surfaces the collection's secondary indexes and sort order. The non-CDC
 /// counterpart to [`make_mongodb_change_stream_dataset_inferred`].
 #[cfg(feature = "duckdb")]
-pub fn make_mongodb_extended_inference_dataset(path: &str, name: &str, port: u16) -> Dataset {
+pub fn make_mongodb_inference_dataset(path: &str, name: &str, port: u16) -> Dataset {
     let mut dataset = make_mongodb_dataset(path, name, port, false);
     dataset.acceleration = Some(Acceleration {
         enabled: true,

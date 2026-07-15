@@ -23,7 +23,7 @@ use common::{get_mongodb_client, make_mongodb_dataset, start_mongodb_docker_cont
 #[cfg(feature = "duckdb")]
 use common::{
     get_mongodb_replica_set_client, make_mongodb_change_stream_dataset,
-    make_mongodb_change_stream_dataset_inferred, make_mongodb_extended_inference_dataset,
+    make_mongodb_change_stream_dataset_inferred, make_mongodb_inference_dataset,
     make_mongodb_widen_dataset, start_mongodb_replica_set_docker_container,
 };
 #[cfg(feature = "duckdb")]
@@ -474,7 +474,7 @@ async fn mongodb_schema_inference_loads_and_queries() -> Result<(), anyhow::Erro
             .await?;
 
             let app = AppBuilder::new("mongodb_schema_inference")
-                .with_dataset(make_mongodb_extended_inference_dataset(
+                .with_dataset(make_mongodb_inference_dataset(
                     "inventory",
                     "inventory",
                     MONGODB_INFERENCE_PORT,

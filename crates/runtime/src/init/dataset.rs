@@ -571,7 +571,7 @@ impl Runtime {
         }
     }
 
-    /// Apply extended schema inference to a freshly-resolved dataset.
+    /// Apply schema inference to a freshly-resolved dataset.
     ///
     /// When the source connector emitted inferred-schema metadata, this fills any
     /// acceleration settings the user left unset (primary key, indexes, sort

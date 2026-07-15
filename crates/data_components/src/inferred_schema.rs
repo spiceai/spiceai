@@ -16,11 +16,12 @@ limitations under the License.
 
 //! Connector-agnostic contract for **schema inference**.
 //!
-//! Base column/type inference is always performed by every connector. In addition,
-//! a connector always attempts to discover the source table's primary key,
-//! secondary indexes, sort/clustering order, declared distribution/shard key, and
-//! rough sizing and per-column statistics — degrading gracefully to whatever the
-//! source permits — and emits them as JSON in the Arrow schema metadata via
+//! Base column/type inference is always performed by every connector. Connectors
+//! that support deeper inference (currently `PostgreSQL`, `MySQL`, and `MongoDB`)
+//! additionally attempt to discover — as far as each connector and the source
+//! permit — the table's primary key, secondary indexes, sort/clustering order,
+//! declared distribution/shard key, and rough sizing and per-column statistics,
+//! emitting them as JSON in the Arrow schema metadata via
 //! [`InferredSchema::to_metadata`]. The runtime reads them back with
 //! [`InferredSchema::from_metadata`] and fills any acceleration settings the user
 //! left unspecified.
