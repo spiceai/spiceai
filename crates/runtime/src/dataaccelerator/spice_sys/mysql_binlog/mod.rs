@@ -40,6 +40,7 @@ limitations under the License.
 
 use super::{AccelerationConnection, Error, Result, acceleration_connection};
 use crate::{component::dataset::Dataset, dataaccelerator::spice_sys::OpenOption};
+use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 #[cfg_attr(
     not(any(
@@ -124,25 +125,26 @@ impl MySqlBinlogSys {
     /// successful persist. Still best-effort — a persistent lock returns the
     /// error and the replication layer retries on the next interval.
     pub async fn upsert(&self, checkpoint: &MySqlBinlogCheckpoint) -> Result<()> {
-        let mut attempt: u32 = 1;
-        loop {
-            match self.upsert_once(checkpoint).await {
-                Ok(()) => return Ok(()),
-                Err(e) if attempt < UPSERT_MAX_ATTEMPTS && is_retryable_lock_error(&e) => {
-                    let delay = upsert_retry_delay(attempt);
+        let backoff = FibonacciBackoffBuilder::new()
+            .max_retries(Some(UPSERT_MAX_RETRIES))
+            .max_duration(Some(UPSERT_MAX_RETRY_DELAY))
+            .build();
+
+        retry(backoff, || async {
+            self.upsert_once(checkpoint).await.map_err(|e| {
+                if is_retryable_lock_error(&e) {
                     tracing::debug!(
                         dataset = %self.dataset_name,
-                        attempt,
-                        delay_ms = %delay.as_millis(),
                         error = %e,
-                        "binlog checkpoint upsert hit a transient accelerator write lock; retrying"
+                        "binlog checkpoint upsert hit a transient accelerator write lock"
                     );
-                    tokio::time::sleep(delay).await;
-                    attempt += 1;
+                    RetryError::transient(e)
+                } else {
+                    RetryError::permanent(e)
                 }
-                Err(e) => return Err(e),
-            }
-        }
+            })
+        })
+        .await
     }
 
     async fn upsert_once(
@@ -239,18 +241,19 @@ impl MySqlBinlogSys {
     }
 }
 
-/// Max attempts for a checkpoint upsert contending with the accelerator's
-/// writer lock. Bounded and short: the worst-case added latency (see
-/// [`upsert_retry_delay`]) stays well under one checkpoint interval, and a
-/// persistent lock just retries on the next interval anyway.
-const UPSERT_MAX_ATTEMPTS: u32 = 5;
+/// Retries for a checkpoint upsert contending with the accelerator's writer
+/// lock, on top of the initial attempt. Bounded and short: paired with
+/// [`UPSERT_MAX_RETRY_DELAY`] the worst-case added latency stays well under one
+/// checkpoint interval, and a persistent lock just retries on the next interval
+/// anyway.
+const UPSERT_MAX_RETRIES: usize = 4;
 
-/// Exponential backoff (no jitter) for [`MySqlBinlogSys::upsert`] retries:
-/// 25ms, 50ms, 100ms, 200ms across attempts 1..=4 (worst case ~375ms total).
-fn upsert_retry_delay(attempt: u32) -> std::time::Duration {
-    let shift = attempt.saturating_sub(1).min(6);
-    std::time::Duration::from_millis(25u64 << shift)
-}
+/// Per-attempt cap on the [`FibonacciBackoffBuilder`] delay for
+/// [`MySqlBinlogSys::upsert`] retries. The shared Fibonacci schedule starts at
+/// 1s, far longer than a transient writer-lock hand-off needs, so clamp each
+/// delay to keep the whole retry budget (~4 × 100ms) short relative to the
+/// checkpoint interval.
+const UPSERT_MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Whether a sidecar write failure is a transient lock/contention error worth
 /// retrying rather than surfacing.
