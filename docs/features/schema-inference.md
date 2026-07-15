@@ -44,8 +44,10 @@ no-op for them, never an error).
 
 ### PostgreSQL
 
-Inferred from `pg_catalog` (a single read-only query against
-`pg_index`/`pg_class`/`pg_attribute`):
+Inferred from `pg_catalog` with a few read-only catalog queries
+(`pg_index`/`pg_class`/`pg_attribute` for keys and indexes, plus the partition
+key, table sizing via `pg_class.reltuples`/`pg_relation_size`, and per-column
+statistics from `pg_stats`):
 
 - **Primary key** → `acceleration.primary_key` (plus an `upsert` `on_conflict`
   on that key, so the accelerator upserts by primary key).
@@ -54,9 +56,12 @@ Inferred from `pg_catalog` (a single read-only query against
   duplicated. **Partial** and **expression** indexes are skipped (a partial
   unique index is not a table-wide guarantee, and expression keys have no plain
   column to apply).
-- **Sort columns** → the clustered index's columns and their `ASC`/`DESC`
-  direction (`pg_index.indoption`); if the table has no clustered index, the
-  primary key (ascending) is used.
+- **Sort columns** → strongest signal first: (1) the clustered index's columns
+  and their `ASC`/`DESC` direction (`pg_index.indoption`); else (2) the range/list
+  partition key, then any remaining primary-key columns; else (3) a natural-order
+  column from `pg_stats` — a high-cardinality column whose physical-order
+  correlation is near `±1` (an append-mostly heap ordered by e.g. `created_at`) —
+  then the remaining primary key; else (4) the primary key, ascending.
 
 ### MySQL
 

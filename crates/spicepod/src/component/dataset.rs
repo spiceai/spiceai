@@ -549,8 +549,15 @@ mod schema_inference_removed_tests {
             from: postgres:public.orders
             schema_inference: extended
         ";
-        yaml::from_str::<Dataset>(yaml)
+        let err = yaml::from_str::<Dataset>(yaml)
             .expect_err("`schema_inference` must be rejected as an unknown field");
+        // Assert it failed for the RIGHT reason — the deny_unknown_fields rejection
+        // naming `schema_inference` — not some unrelated YAML/serde error.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown field") && msg.contains("schema_inference"),
+            "expected an unknown-field error naming `schema_inference`, got: {msg}"
+        );
     }
 }
 
