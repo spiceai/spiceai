@@ -549,6 +549,9 @@ async fn test_wal_persists_on_move_failure_impl(
 // ============================================================================
 
 test_with_backends!(test_prepared_lifecycle_matches_commit_impl);
+test_with_backends!(test_manifest_publish_preplaces_then_atomically_exposes_files_impl);
+test_with_backends!(test_manifest_publish_rollback_removes_preplaced_files_impl);
+test_with_backends!(test_manifest_publish_recovers_durable_intent_impl);
 test_with_backends!(test_prepared_apply_under_barrier_waits_for_write_lock_impl);
 test_with_backends!(test_held_barrier_current_snapshot_requires_write_lock_impl);
 
@@ -610,6 +613,127 @@ async fn test_prepared_lifecycle_matches_commit_impl(
     );
     assert_staging_empty(&staging);
 
+    Ok(())
+}
+
+async fn test_manifest_publish_preplaces_then_atomically_exposes_files_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let vortex_config = cayenne::metadata::VortexConfig {
+        scan_from_manifest: true,
+        stage_b_publish_mode: cayenne::StageBPublishMode::Manifest,
+        inline_max_rows: 0,
+        compaction_background_interval_ms: 0,
+        ..Default::default()
+    };
+    let (table, ctx) =
+        setup_table_with_vortex_config(&fixture, "manifest_preplacement", vortex_config).await;
+    let staged = begin_staged_append_with_rows(&table, &[(1, "Alice"), (2, "Bob")]).await?;
+
+    let meta = table.metadata();
+    let snapshot_dir = PathBuf::from(&meta.path)
+        .join(&meta.table_id)
+        .join(&meta.current_snapshot_id);
+    let preplaced_files = vortex_file_names(&snapshot_dir)?;
+    assert!(
+        !preplaced_files.is_empty(),
+        "Stage A must write data files directly into the target snapshot"
+    );
+    assert_eq!(
+        row_count(&ctx, "manifest_preplacement").await,
+        0,
+        "a physically pre-placed file must remain invisible before manifest publication"
+    );
+    assert!(
+        table
+            .catalog()
+            .get_snapshot_files(&meta.table_id, &meta.current_snapshot_id)
+            .await?
+            .is_empty(),
+        "Stage A must not publish manifest rows"
+    );
+
+    let prepared = staged.prepare().await?;
+    let staging_data_files = vortex_file_names(&staging_dir(&table))?;
+    assert!(
+        staging_data_files.is_empty(),
+        "manifest mode must not write data files under _staging"
+    );
+    prepared.apply_under_barrier().await?;
+
+    let manifest = table
+        .catalog()
+        .get_snapshot_files(&meta.table_id, &meta.current_snapshot_id)
+        .await?;
+    assert_eq!(manifest.len(), preplaced_files.len());
+    assert_eq!(row_count(&ctx, "manifest_preplacement").await, 2);
+    prepared.finish().await?;
+    Ok(())
+}
+
+async fn test_manifest_publish_rollback_removes_preplaced_files_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let vortex_config = cayenne::metadata::VortexConfig {
+        scan_from_manifest: true,
+        stage_b_publish_mode: cayenne::StageBPublishMode::Manifest,
+        inline_max_rows: 0,
+        compaction_background_interval_ms: 0,
+        ..Default::default()
+    };
+    let (table, ctx) =
+        setup_table_with_vortex_config(&fixture, "manifest_rollback", vortex_config).await;
+    let prepared = begin_staged_append_with_rows(&table, &[(1, "Alice")])
+        .await?
+        .prepare()
+        .await?;
+    let meta = table.metadata();
+    let snapshot_dir = PathBuf::from(&meta.path)
+        .join(&meta.table_id)
+        .join(&meta.current_snapshot_id);
+    assert!(!vortex_file_names(&snapshot_dir)?.is_empty());
+
+    prepared.rollback().await?;
+
+    assert!(vortex_file_names(&snapshot_dir)?.is_empty());
+    assert_eq!(row_count(&ctx, "manifest_rollback").await, 0);
+    assert_staging_empty(&staging_dir(&table));
+    Ok(())
+}
+
+async fn test_manifest_publish_recovers_durable_intent_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let vortex_config = cayenne::metadata::VortexConfig {
+        scan_from_manifest: true,
+        stage_b_publish_mode: cayenne::StageBPublishMode::Manifest,
+        inline_max_rows: 0,
+        compaction_background_interval_ms: 0,
+        ..Default::default()
+    };
+    let (table, ctx) =
+        setup_table_with_vortex_config(&fixture, "manifest_recovery", vortex_config).await;
+
+    let prepared = begin_staged_append_with_rows(&table, &[(1, "Alice")])
+        .await?
+        .prepare()
+        .await?;
+    let abandoned_wal = prepared.staging_wal_path();
+    assert!(abandoned_wal.exists());
+    drop(prepared);
+    assert_eq!(row_count(&ctx, "manifest_recovery").await, 0);
+
+    // Starting the next append invokes incomplete-write recovery. The durable
+    // exact intent must publish idempotently without moving the already-final
+    // file. Roll back the second append so only the recovered generation remains.
+    let next = begin_staged_append_with_rows(&table, &[(2, "Bob")]).await?;
+    next.rollback().await?;
+
+    assert!(!abandoned_wal.exists());
+    assert_eq!(
+        query_all(&ctx, "manifest_recovery").await,
+        vec![(1, "Alice".to_string())]
+    );
     Ok(())
 }
 
@@ -1901,6 +2025,21 @@ async fn begin_staged_append_with_batch(
 ) -> Result<CayenneStagedAppend, Box<dyn std::error::Error>> {
     let stream = batch_stream(batch);
     Ok(table.begin_staged_append(stream, 1).await?)
+}
+
+fn vortex_file_names(dir: &std::path::Path) -> std::io::Result<Vec<String>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    std::fs::read_dir(dir)?
+        .filter_map(|entry| match entry {
+            Ok(entry) => {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.ends_with(".vortex").then_some(Ok(name))
+            }
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
 }
 
 fn batch_stream(batch: RecordBatch) -> SendableRecordBatchStream {

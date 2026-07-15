@@ -643,6 +643,37 @@ impl CdcDurability {
     }
 }
 
+/// How a staged append places and publishes its immutable data files.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageBPublishMode {
+    /// Write into `_staging`, then rename/copy files into the target snapshot
+    /// while holding the publication fence.
+    #[default]
+    RenameSync,
+    /// Write immutable files directly into the target snapshot during Stage A;
+    /// Stage B publishes their exact manifest rows without moving data files.
+    Manifest,
+}
+
+impl StageBPublishMode {
+    /// Parse a spicepod parameter value (`rename_sync` | `manifest`).
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "rename_sync" => Some(Self::RenameSync),
+            "manifest" => Some(Self::Manifest),
+            _ => None,
+        }
+    }
+
+    /// Whether Stage A pre-places files in their final snapshot directory.
+    #[must_use]
+    pub const fn preplaces_files(self) -> bool {
+        matches!(self, Self::Manifest)
+    }
+}
+
 /// Which adaptive-tunable knobs the operator pinned with an explicit value. In
 /// `adaptive` mode the closed-loop controller must not move a pinned knob — its
 /// tuning bounds collapse to a single point so `decide()` naturally skips it and
@@ -1017,6 +1048,11 @@ pub struct VortexConfig {
     /// `upsert_snapshot_manifest_from_listing`).
     #[serde(default)]
     pub scan_from_manifest: bool,
+    /// Stage-B publication mode. `rename_sync` preserves the historical
+    /// staging-directory move. `manifest` pre-places immutable files during
+    /// Stage A and publishes them through the authoritative manifest.
+    #[serde(default)]
+    pub stage_b_publish_mode: StageBPublishMode,
     /// Which widening schema differences detected at table open (the requested
     /// schema vs the stored metastore schema) may be committed in place via
     /// `update_table_schema` instead of pinning the stored schema. Set by the
@@ -1474,6 +1510,7 @@ impl Default for VortexConfig {
             // Directory listing stays the scan's file source by default; the
             // manifest is a dual-source supplement until proven complete.
             scan_from_manifest: false,
+            stage_b_publish_mode: StageBPublishMode::default(),
             schema_evolution: SchemaEvolutionMode::default(),
             goal_replication_lag_secs: None,
             goal_freshness_secs: None,
@@ -1500,7 +1537,7 @@ impl Default for VortexConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{PkConflictDetection, VortexConfig};
+    use super::{PkConflictDetection, StageBPublishMode, VortexConfig};
 
     #[test]
     fn test_concurrency_defaults_use_available_parallelism_where_global() {
@@ -1535,6 +1572,22 @@ mod tests {
             opted_in.scan_from_manifest,
             "an explicit scan_from_manifest = true must deserialize as opt-in"
         );
+    }
+
+    #[test]
+    fn test_stage_b_publish_mode_defaults_to_rename_sync() {
+        assert_eq!(
+            VortexConfig::default().stage_b_publish_mode,
+            StageBPublishMode::RenameSync
+        );
+        let from_empty: VortexConfig = serde_json::from_str("{}").expect("valid empty config");
+        assert_eq!(
+            from_empty.stage_b_publish_mode,
+            StageBPublishMode::RenameSync
+        );
+        let opted_in: VortexConfig = serde_json::from_str(r#"{"stage_b_publish_mode":"manifest"}"#)
+            .expect("valid manifest publish mode");
+        assert_eq!(opted_in.stage_b_publish_mode, StageBPublishMode::Manifest);
     }
 
     #[test]

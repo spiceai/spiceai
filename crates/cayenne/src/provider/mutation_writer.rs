@@ -84,7 +84,7 @@ use super::mem_tier_budget;
 use super::on_conflict::{PostValidationState, PreparedShardedInsertStream};
 use super::pk_index::PkDigestSet;
 use super::staging_wal::{
-    CayenneStagedAppend, PreparedStagedAppend, StagingWalTargetKind,
+    CayenneStagedAppend, PreparedStagedAppend, StagedFilePlacement, StagingWalTargetKind,
     staged_file_metadata_from_written_files,
 };
 use super::table::{CayenneCdcWrite, CayenneTableProvider, record_cayenne_write_phase};
@@ -1444,6 +1444,16 @@ impl<'a> AppendMutationWriter<'a> {
         self.table
             .clear_staging_snapshot_dir(&staging_snapshot_id)
             .await?;
+        let target_snapshot_id = self.table.get_current_snapshot_id();
+        let file_placement = if self.table.preplace_staged_files() {
+            StagedFilePlacement::TargetSnapshot
+        } else {
+            StagedFilePlacement::Staging
+        };
+        let write_snapshot_id = match file_placement {
+            StagedFilePlacement::Staging => &staging_snapshot_id,
+            StagedFilePlacement::TargetSnapshot => &target_snapshot_id,
+        };
 
         // We are about to (or have started to) write Vortex files into the
         // staging directory. Mark it "dirty" so recovery/root cleanup
@@ -1459,7 +1469,7 @@ impl<'a> AppendMutationWriter<'a> {
             .write_to_snapshot_collecting_files(
                 stream,
                 target_size_bytes,
-                &staging_snapshot_id,
+                write_snapshot_id,
                 self.task_context.session_config().target_partitions(),
                 estimated_bytes,
                 crate::provider::delta_encoding::WriteClass::Delta,
@@ -1494,6 +1504,7 @@ impl<'a> AppendMutationWriter<'a> {
             staging_snapshot_id,
             result.0,
             staged_file_metadata,
+            file_placement,
         );
         let publish_start = Instant::now();
         staged_append.finalize_staged_write().await?;
@@ -1558,12 +1569,21 @@ impl<'a> AppendMutationWriter<'a> {
             };
 
         let write_start = Instant::now();
+        let file_placement = if self.table.preplace_staged_files() {
+            StagedFilePlacement::TargetSnapshot
+        } else {
+            StagedFilePlacement::Staging
+        };
+        let write_snapshot_id = match file_placement {
+            StagedFilePlacement::Staging => &target.staging_snapshot_id,
+            StagedFilePlacement::TargetSnapshot => &target.target_snapshot_id,
+        };
         let ((rows, writer_ops, stats_acc), written_files) = match self
             .table
             .write_to_snapshot_collecting_files(
                 stream,
                 target_size_bytes,
-                &target.staging_snapshot_id,
+                write_snapshot_id,
                 self.task_context.session_config().target_partitions(),
                 target.estimated_bytes,
                 crate::provider::delta_encoding::WriteClass::Delta,
@@ -1601,6 +1621,7 @@ impl<'a> AppendMutationWriter<'a> {
             target.target_kind,
             rows,
             staged_file_metadata,
+            file_placement,
         );
         let prepare_start = Instant::now();
         let mut prepared_append = match staged_append.prepare().await {

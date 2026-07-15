@@ -149,7 +149,7 @@ use super::deletion_strategy::{
     PositionDeletionVector, RowConverterDeletionSnapshot,
 };
 use super::memory_account::CayenneMemoryAccount;
-use super::staging_wal::PreparedStagedAppend;
+use super::staging_wal::{PreparedStagedAppend, StagedFileMetadata};
 use super::vortex_format::PositionDeletionAccessPlanProvider;
 use arc_swap::ArcSwap;
 
@@ -4215,6 +4215,70 @@ impl CayenneTableProvider {
             .await
     }
 
+    /// Atomically publish a pre-placed staged generation using the exact file
+    /// metadata persisted in its WAL. No data-file operation or directory LIST
+    /// occurs here.
+    pub(crate) async fn publish_preplaced_snapshot_files(
+        &self,
+        target_snapshot: &str,
+        files: &[StagedFileMetadata],
+    ) -> Result<()> {
+        let rows = files.iter().map(|file| {
+            (
+                file.file_name.clone(),
+                i64::try_from(file.file_size_bytes).unwrap_or(i64::MAX),
+                i64::try_from(file.row_count).unwrap_or(i64::MAX),
+            )
+        });
+        self.upsert_current_snapshot_manifest_rows(target_snapshot, rows)
+            .await?;
+        self.record_current_snapshot_files_added(files.len());
+        Ok(())
+    }
+
+    /// Remove exact pre-placed files while rolling back an unpublished staged
+    /// generation. Files from other generations in the target snapshot are
+    /// never touched.
+    pub(crate) async fn remove_preplaced_snapshot_files(
+        &self,
+        target_snapshot: &str,
+        files: &[StagedFileMetadata],
+    ) -> Result<()> {
+        if self.table_path().starts_with("s3://") {
+            let config = self.require_object_store()?;
+            let Some(prefix) = self.snapshot_object_store_prefix(target_snapshot)? else {
+                return Ok(());
+            };
+            for file in files {
+                let path = ObjectStorePath::from(format!(
+                    "{}{name}",
+                    prefix.as_ref(),
+                    name = file.file_name
+                ));
+                config
+                    .store
+                    .delete(&path)
+                    .await
+                    .map_err(|source| Error::ObjectStore {
+                        operation: "delete unpublished pre-placed snapshot file",
+                        table: self.table_name().to_string(),
+                        source,
+                    })?;
+            }
+        } else {
+            let target_dir =
+                Self::snapshot_dir_path(self.table_path(), self.table_id(), target_snapshot);
+            for file in files {
+                match tokio::fs::remove_file(target_dir.join(&file.file_name)).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Shared upsert loop for both incremental manifest-row sources above: an
     /// `(file_name, file_size_bytes, row_count)` triple per newly-written file,
     /// tagged with `min_sequence = 0` / `max_sequence = current_sequence` — the
@@ -5081,6 +5145,21 @@ impl CayenneTableProvider {
         } = options;
 
         let table_metadata = catalog.get_table(table_name).await?;
+
+        if table_metadata
+            .vortex_config
+            .stage_b_publish_mode
+            .preplaces_files()
+            && (table_metadata.partition_column.is_some()
+                || !table_metadata.vortex_config.scan_from_manifest)
+        {
+            return Err(Error::Internal {
+                table: table_name.to_string(),
+                message: "stage_b_publish_mode 'manifest' requires an unpartitioned table with authoritative manifest scans"
+                    .to_string(),
+            }
+            .into());
+        }
 
         // Use the provided context (for partition cache sharing) or build a
         // fresh one from this table's VortexConfig and the shared RuntimeEnv.
@@ -17693,6 +17772,13 @@ impl CayenneTableProvider {
     /// population go through this accessor instead.
     pub(super) fn scan_from_manifest(&self) -> bool {
         self.context.scan_from_manifest()
+    }
+
+    #[must_use]
+    pub(super) fn preplace_staged_files(&self) -> bool {
+        self.context.preplace_staged_files()
+            && self.table_metadata.partition_column.is_none()
+            && self.scan_from_manifest()
     }
 
     /// Return the snapshot currently published by this provider.

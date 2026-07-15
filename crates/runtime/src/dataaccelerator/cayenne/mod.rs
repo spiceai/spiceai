@@ -1271,6 +1271,27 @@ impl CayenneAccelerator {
                 }
                 config.cdc_durability = cayenne::metadata::CdcDurability::File;
             }
+            if let Some((key, value)) = ["cayenne_stage_b_publish_mode", "stage_b_publish_mode"]
+                .iter()
+                .find_map(|key| acceleration.params.get(*key).map(|value| (*key, value)))
+            {
+                if let Some(mode) = cayenne::metadata::StageBPublishMode::parse(value) {
+                    if mode.preplaces_files() && !acceleration.partition_by.is_empty() {
+                        tracing::warn!(
+                            "Dataset '{table_name}' set `{key}: manifest`, but manifest publication is not supported for partitioned Cayenne tables. Using `rename_sync`."
+                        );
+                    } else {
+                        config.stage_b_publish_mode = mode;
+                        if mode.preplaces_files() {
+                            config.scan_from_manifest = true;
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        "Dataset '{table_name}' contains an invalid `{key}` value: '{value}'. Expected one of: rename_sync, manifest. Using the default (rename_sync)."
+                    );
+                }
+            }
             config.cdc_mem_tier_max_bytes = parse_usize_aliases_as_i64(
                 acceleration,
                 &["cayenne_cdc_mem_tier_max_bytes", "cdc_mem_tier_max_bytes"],
@@ -2387,8 +2408,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    62,
-    { S3_PARAMS_LEN + 62 },
+    63,
+    { S3_PARAMS_LEN + 63 },
 >(
     S3_PARAMETERS,
     [
@@ -2513,6 +2534,10 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Durability mode for the inline CDC write path. 'memory' (default, eligibility-gated) appends batches to an in-RAM tier and defers the source slot ack to a periodic/cap-triggered checkpoint, collapsing per-batch durability cost; on crash the un-checkpointed tail is replayed from the source slot (the apply is PK-idempotent, so exactly-once). Bounded by a per-table byte cap and a process-global byte budget so it cannot OOM. The memory path applies only to the small-write/CDC profile and non-partitioned tables; other profiles use 'file'. 'file' persists each CDC batch durably before advancing the source slot and remains the explicit conservative opt-out.")
             .one_of(&["file", "memory"])
             .default("memory"),
+        ParameterSpec::component("stage_b_publish_mode")
+            .description("How staged Cayenne files become visible. 'rename_sync' (default) writes under _staging and moves files into the snapshot during Stage B. 'manifest' pre-places immutable files in the target snapshot during Stage A and makes them visible with an atomic manifest update, eliminating data-file move/copy/fsync work from Stage B. Manifest mode is currently limited to unpartitioned tables.")
+            .one_of(&["rename_sync", "manifest"])
+            .default("rename_sync"),
         ParameterSpec::component("cdc_mem_tier_max_bytes")
             .description("Per-table RAM-tier byte cap before a forced spill (checkpoint) and slot advance, in cdc_durability: memory mode only. Auto-derived from host memory (~1/64 of RAM, clamped to 256 MiB - 1 GiB; 256 MiB on hosts at or under 16 GiB) — a rare backstop now that the non-fence-blocking background checkpointer is the primary flush. Set 0 to disable the per-table cap; the process-global byte budget still bounds aggregate resident memory. When both are set, whichever is breached first triggers the spill."),
         ParameterSpec::component("cdc_mem_tier_max_age_ms")
