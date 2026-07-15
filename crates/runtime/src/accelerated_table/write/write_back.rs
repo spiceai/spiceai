@@ -595,6 +595,82 @@ mod tests {
         }
     }
 
+    /// A federated `TableProvider` that fires `forwarded` whenever one of its write
+    /// methods runs, so a test can assert whether the write-back sink's fire-and-forget
+    /// federated forward was spawned.
+    struct SignalingTableProvider {
+        schema: SchemaRef,
+        forwarded: Arc<tokio::sync::Notify>,
+    }
+
+    impl SignalingTableProvider {
+        fn new_arc(forwarded: Arc<tokio::sync::Notify>) -> Arc<dyn TableProvider> {
+            Arc::new(Self {
+                schema: Arc::new(Schema::new(vec![Field::new(
+                    "count",
+                    DataType::UInt64,
+                    false,
+                )])),
+                forwarded,
+            })
+        }
+    }
+
+    impl std::fmt::Debug for SignalingTableProvider {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "SignalingTableProvider")
+        }
+    }
+
+    #[async_trait]
+    impl TableProvider for SignalingTableProvider {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+        async fn scan(
+            &self,
+            _state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Err(DataFusionError::NotImplemented("scan".to_string()))
+        }
+        async fn delete_from(
+            &self,
+            _state: &dyn Session,
+            _filters: Vec<Expr>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.forwarded.notify_one();
+            Ok(count_exec(0))
+        }
+        async fn update(
+            &self,
+            _state: &dyn Session,
+            _assignments: Vec<(String, Expr)>,
+            _filters: Vec<Expr>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.forwarded.notify_one();
+            Ok(count_exec(0))
+        }
+    }
+
+    /// Build a `TaskContext` whose session config carries a `RequestContext` with an active
+    /// `CayenneTransaction` — the exact shape `resolve_request_context` reads at execution
+    /// time, so the sinks' `request_in_transaction` check sees a live transaction.
+    fn task_ctx_in_transaction() -> Arc<TaskContext> {
+        use datafusion::prelude::SessionConfig;
+        use runtime_request_context::{Protocol, RequestContextBuilder};
+
+        let request_context = Arc::new(RequestContextBuilder::new(Protocol::Internal).build());
+        request_context.insert_extension(cayenne::CayenneTransaction::new());
+        let config = SessionConfig::new().with_extension(request_context);
+        Arc::new(TaskContext::default().with_session_config(config))
+    }
+
     // ── extract_dml_count ────────────────────────────────────────────────
 
     #[test]
@@ -655,7 +731,7 @@ mod tests {
             accelerator_plan: count_exec(42),
             federated,
             filters: vec![],
-            session_state,
+            session_state: session_state.clone(),
         };
 
         let count = sink
@@ -675,7 +751,7 @@ mod tests {
             accelerator_plan: ErrorExec::new_arc("accelerator delete failed"),
             federated,
             filters: vec![],
-            session_state,
+            session_state: session_state.clone(),
         };
 
         let err = sink
@@ -698,7 +774,7 @@ mod tests {
             federated,
             assignments: vec![],
             filters: vec![],
-            session_state,
+            session_state: session_state.clone(),
         };
 
         let count = sink
@@ -719,7 +795,7 @@ mod tests {
             federated,
             assignments: vec![],
             filters: vec![],
-            session_state,
+            session_state: session_state.clone(),
         };
 
         let err = sink
@@ -727,5 +803,120 @@ mod tests {
             .await
             .expect_err("update should fail");
         assert!(err.to_string().contains("accelerator update failed"));
+    }
+
+    // ── transaction-aware federated forward (skip while in a transaction) ─
+
+    #[tokio::test]
+    async fn write_back_deletion_forwards_when_not_in_transaction() {
+        // Positive control: outside a transaction the delete is published, so the
+        // fire-and-forget federated forward runs (proving the mock detects it).
+        let session_state = SessionContext::new().state();
+        let forwarded = Arc::new(tokio::sync::Notify::new());
+        let federated = Arc::new(FederatedTable::Immediate(SignalingTableProvider::new_arc(
+            Arc::clone(&forwarded),
+        )));
+        let sink = WriteBackDeletionSink {
+            accelerator_plan: count_exec(3),
+            federated,
+            filters: vec![],
+            session_state: session_state.clone(),
+        };
+
+        let count = sink
+            .delete_from(session_state.task_ctx())
+            .await
+            .expect("deletion should succeed");
+        assert_eq!(count, 3);
+        tokio::time::timeout(std::time::Duration::from_secs(2), forwarded.notified())
+            .await
+            .expect("federated forward must run when not in a transaction");
+    }
+
+    #[tokio::test]
+    async fn write_back_deletion_skips_forward_in_transaction() {
+        // Inside a transaction the delete only STAGES; the delivery worker reconciles it
+        // from the commit markers, so the sink must NOT fire the federated forward (that
+        // would push a staged-but-uncommitted delete to the source).
+        let session_state = SessionContext::new().state();
+        let forwarded = Arc::new(tokio::sync::Notify::new());
+        let federated = Arc::new(FederatedTable::Immediate(SignalingTableProvider::new_arc(
+            Arc::clone(&forwarded),
+        )));
+        let sink = WriteBackDeletionSink {
+            accelerator_plan: count_exec(42),
+            federated,
+            filters: vec![],
+            session_state,
+        };
+
+        let count = sink
+            .delete_from(task_ctx_in_transaction())
+            .await
+            .expect("deletion should succeed");
+        assert_eq!(count, 42);
+        let forwarded_fired =
+            tokio::time::timeout(std::time::Duration::from_millis(300), forwarded.notified())
+                .await
+                .is_ok();
+        assert!(
+            !forwarded_fired,
+            "federated forward must be skipped inside a transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_back_update_forwards_when_not_in_transaction() {
+        let session_state = SessionContext::new().state();
+        let forwarded = Arc::new(tokio::sync::Notify::new());
+        let federated = Arc::new(FederatedTable::Immediate(SignalingTableProvider::new_arc(
+            Arc::clone(&forwarded),
+        )));
+        let sink = WriteBackUpdateSink {
+            accelerator_plan: count_exec(5),
+            federated,
+            assignments: vec![],
+            filters: vec![],
+            session_state: session_state.clone(),
+        };
+
+        let count = sink
+            .delete_from(session_state.task_ctx())
+            .await
+            .expect("update should succeed");
+        assert_eq!(count, 5);
+        tokio::time::timeout(std::time::Duration::from_secs(2), forwarded.notified())
+            .await
+            .expect("federated forward must run when not in a transaction");
+    }
+
+    #[tokio::test]
+    async fn write_back_update_skips_forward_in_transaction() {
+        let session_state = SessionContext::new().state();
+        let forwarded = Arc::new(tokio::sync::Notify::new());
+        let federated = Arc::new(FederatedTable::Immediate(SignalingTableProvider::new_arc(
+            Arc::clone(&forwarded),
+        )));
+        let sink = WriteBackUpdateSink {
+            accelerator_plan: count_exec(7),
+            federated,
+            assignments: vec![],
+            filters: vec![],
+            session_state,
+        };
+
+        let count = sink
+            .delete_from(task_ctx_in_transaction())
+            .await
+            .expect("update should succeed");
+        assert_eq!(count, 7);
+        let forwarded_fired =
+            tokio::time::timeout(std::time::Duration::from_millis(300), forwarded.notified())
+                .await
+                .is_ok();
+        assert!(
+            !forwarded_fired,
+            "federated forward must be skipped inside a transaction"
+        );
     }
 }
