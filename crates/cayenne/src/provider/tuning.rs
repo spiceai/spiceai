@@ -2673,9 +2673,9 @@ fn decide_goal(
     // the inter-batch gap), the lag is source-side / multi-table / coalesce — not a
     // deep tier. Shrinking then collapses the absorb buffer (measured 1 GiB→67 MiB)
     // and *raises* order_line p99 freshness (base 5–9s → 11.6s; +shards 41s). Also
-    // withhold shrink on mutation-heavy streams (upsert/delete fraction): each
-    // spill/checkpoint multiplies key-churn cost the same way write-concurrency
-    // is withheld (`MUTATION_HEAVY_FRACTION`).
+    // withhold shrink on mutation-heavy streams (`delete_fraction` above
+    // `MUTATION_HEAVY_FRACTION`): each spill/checkpoint multiplies key-churn
+    // cost the same way write-concurrency is withheld.
     //
     // When the gates block shrink, fall through to the ingest tier (write
     // concurrency / compaction) which can still act on `ingest_violated`. Ordered
@@ -4790,7 +4790,7 @@ mod tests {
             apply_ms: 150.0,
             arrival_gap_ms: 100.0,
             apply_vs_arrival: 1.5,
-            delete_fraction: 0.45, // upsert-heavy order_line shape
+            delete_fraction: 0.45, // delete-/mutation-heavy order_line shape
             ..snap()
         };
         let goals = Goals::from_targets(None, Some(3.0), None, None, Duration::from_mins(1));
