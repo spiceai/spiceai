@@ -94,9 +94,10 @@ Inferred from `listIndexes` / `listCollections` / `collStats`:
 
 Schema inference always **attempts the maximum**, then falls back a level at a time
 to whatever the source lets it read — driven by the permissions of the connection's
-role/user on the source database. It never fails a dataset: if a catalog query is
-blocked (commonly the connection role lacks read access to the catalog), the runtime
-logs an **info** message describing exactly what it dropped and continues.
+role/user on the source database. Inference degradation is itself non-fatal: if a
+catalog query is blocked (commonly the connection role lacks read access to the
+catalog), the runtime logs an **info** message describing exactly what it dropped and
+continues.
 
 - **PostgreSQL / MySQL** — if the catalog queries cannot run, the dataset registers
   with **base column/type inference only**: no primary key, indexes, sort, table
@@ -111,6 +112,14 @@ logs an **info** message describing exactly what it dropped and continues.
 Because inference is gap-filling, degradation only means the runtime auto-fills
 *fewer* acceleration settings — you can always set `primary_key`, `indexes`, or a
 sort parameter explicitly to supply what the source did not expose.
+
+**Exception — CDC needs a primary key.** `refresh_mode: changes` (PostgreSQL/MySQL
+replication) requires a primary key to route `UPDATE`/`DELETE` events. If the source
+primary key can't be inferred (e.g. the catalog is unreadable) *and* you have not set
+`acceleration.primary_key` (with a matching `on_conflict`), the changes stream
+hard-fails with "no primary key available". So while inference degradation is
+non-fatal on its own, a CDC dataset with neither an inferable nor a configured primary
+key will not load — set `acceleration.primary_key` explicitly in that case.
 
 ## Table sizing
 
