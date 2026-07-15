@@ -25246,6 +25246,22 @@ impl TableProvider for CayenneTableProvider {
                     )));
                 }
             }
+            // Coalesce the read side to a single partition before staging. A
+            // `DataSinkExec` requires single-partition input, which the physical
+            // optimizer normally guarantees by inserting a `CoalescePartitionsExec`.
+            // The transaction-staging plan built here, however, is executed
+            // DIRECTLY (write-back sinks run it via `collect` without re-optimizing),
+            // so a multi-partition source — a union of the file branch and the
+            // in-memory CDC tier branch, as produced for CDC/`changes`-mode data —
+            // would otherwise have every partition but 0 silently dropped by the
+            // sink, staging zero rows (a lost update). Point-lookup file scans are
+            // already single-partition, so this is a no-op there.
+            let source_plan: Arc<dyn ExecutionPlan> =
+                if source_plan.properties().output_partitioning().partition_count() > 1 {
+                    Arc::new(CoalescePartitionsExec::new(source_plan))
+                } else {
+                    source_plan
+                };
             return self.insert_into(state, source_plan, InsertOp::Append).await;
         }
 

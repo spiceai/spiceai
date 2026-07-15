@@ -36,6 +36,18 @@ use datafusion::{
 #[async_trait]
 pub trait DeletionSink: Send + Sync {
     async fn delete_from(&self) -> Result<u64, Box<dyn Error + Send + Sync>>;
+
+    /// Same as [`Self::delete_from`], but given the live [`TaskContext`] the plan is being
+    /// executed under. The default ignores it and delegates to [`Self::delete_from`].
+    /// Sinks that must execute an inner plan under the caller's context (e.g. write-back
+    /// DML, so an accelerator write inside a Cayenne transaction STAGES rather than
+    /// publishing) override this to use `context`.
+    async fn delete_from_with_context(
+        &self,
+        _context: Arc<TaskContext>,
+    ) -> Result<u64, Box<dyn Error + Send + Sync>> {
+        self.delete_from().await
+    }
 }
 
 pub struct DeletionExec {
@@ -104,7 +116,7 @@ impl ExecutionPlan for DeletionExec {
     fn execute(
         &self,
         _partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> datafusion::error::Result<SendableRecordBatchStream> {
         let count_schema = Arc::new(Schema::new(vec![Field::new(
             "count",
@@ -116,7 +128,7 @@ impl ExecutionPlan for DeletionExec {
         Ok(Box::pin(RecordBatchStreamAdapter::new(count_schema, {
             futures::stream::once(async move {
                 let count = deletion_sink
-                    .delete_from()
+                    .delete_from_with_context(context)
                     .await
                     .map_err(datafusion::error::DataFusionError::from)?;
                 let array = Arc::new(UInt64Array::from(vec![count])) as ArrayRef;

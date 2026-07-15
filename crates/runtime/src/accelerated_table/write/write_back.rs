@@ -59,6 +59,17 @@ use runtime_datafusion::extension::request_context::resolve_request_context;
 use crate::accelerated_table::refresh::Refresher;
 use crate::federated_table::FederatedTable;
 
+/// Whether a Cayenne transaction is active on the live execution context. When it is, the
+/// write STAGES to the accelerator (published/rolled back atomically at COMMIT) and the
+/// delivery worker reconciles it to the source from the dirty-key markers written in the
+/// commit transaction — so the sink must NOT also fire-and-forget the write to the source
+/// (that would push staged-but-uncommitted rows and duplicate the worker's delivery).
+/// Mirrors the INSERT path (`WriteBackDataSink::write_all`).
+fn request_in_transaction(context: &TaskContext) -> bool {
+    resolve_request_context(context, false)
+        .is_some_and(|rc| rc.extension::<cayenne::CayenneTransaction>().is_some())
+}
+
 pub(crate) fn validate_insert_op(insert_op: InsertOp) -> DataFusionResult<()> {
     match insert_op {
         InsertOp::Append => Ok(()),
@@ -250,13 +261,25 @@ struct WriteBackDeletionSink {
 #[async_trait]
 impl DeletionSink for WriteBackDeletionSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let task_ctx = self.session_state.task_ctx();
-        let batches = datafusion::physical_plan::collect(
-            Arc::clone(&self.accelerator_plan),
-            Arc::clone(&task_ctx),
-        )
-        .await?;
+        self.delete_from_with_context(self.session_state.task_ctx())
+            .await
+    }
+
+    async fn delete_from_with_context(
+        &self,
+        context: Arc<TaskContext>,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        // Execute under the LIVE execution context so a delete inside a Cayenne
+        // transaction STAGES rather than publishing immediately (see request_in_transaction).
+        let batches =
+            datafusion::physical_plan::collect(Arc::clone(&self.accelerator_plan), Arc::clone(&context))
+                .await?;
         let count = extract_dml_count(&batches);
+
+        // Inside a transaction, the delivery worker reconciles the change to the source.
+        if request_in_transaction(&context) {
+            return Ok(count);
+        }
 
         let federated = Arc::clone(&self.federated);
         let filters = self.filters.clone();
@@ -327,13 +350,33 @@ struct WriteBackUpdateSink {
 #[async_trait]
 impl DeletionSink for WriteBackUpdateSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let task_ctx = self.session_state.task_ctx();
+        // Fallback for callers that don't supply the live context; the real path is
+        // `delete_from_with_context`, which `DeletionExec` invokes with the execution
+        // context carrying any active Cayenne transaction.
+        self.delete_from_with_context(self.session_state.task_ctx())
+            .await
+    }
+
+    async fn delete_from_with_context(
+        &self,
+        context: Arc<TaskContext>,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        // Execute the accelerator plan under the LIVE execution context so a write inside
+        // a Cayenne transaction STAGES (and is published/rolled back atomically at COMMIT)
+        // rather than publishing immediately. Using a fresh context here would make the
+        // accelerator's transaction-aware sink publish, defeating gated rollback.
         let batches = datafusion::physical_plan::collect(
             Arc::clone(&self.accelerator_plan),
-            Arc::clone(&task_ctx),
+            Arc::clone(&context),
         )
         .await?;
         let count = extract_dml_count(&batches);
+
+        // Inside a transaction, the delivery worker reconciles the committed change to the
+        // source from the commit-transaction markers; do NOT also fire-and-forget it here.
+        if request_in_transaction(&context) {
+            return Ok(count);
+        }
 
         let federated = Arc::clone(&self.federated);
         let assignments = self.assignments.clone();
