@@ -69,6 +69,7 @@ use crate::metadata::{
     CreateTableOptions, InlinedData, InlinedDataStats, InlinedDelete, PkConflictDetection,
     SnapshotFile, SnapshotFileStatistics, TableMetadata, TableStatistics,
 };
+use crate::provider::drain::{FrozenDrainLedger, FrozenGeneration, GenState};
 use crate::provider::scan::{
     CayenneAccelerationExec, SnapshotScanRef, round_robin_repartition_if_needed,
 };
@@ -21980,6 +21981,35 @@ impl CayenneTableProvider {
         // clear's `retain_after`. A no-op when the caller holds `write_lock`
         // (spill/evolve): `capture_write_guard` is None.
         drop(capture_write_guard.take());
+        // At N==1 the slot-ack currency stays the single shard's `MemTier::epoch`
+        // (no `source_position` stamped), byte-identical to the pre-shard path. At
+        // N>1 it is the shared per-apply `durable_epoch` MAX computed above.
+        let flushed_epoch = durable_epoch.unwrap_or(snapshot.epoch);
+        // FREEZE (Model B, proposal §4.5): hoist the captured prefix into a depth-1
+        // drain ledger. The live tier is UNTOUCHED — the durable encode/commit below
+        // read only these captured immutable snapshots, and publish removes the front
+        // `flushed_counts` segments per shard via `retain_after`. At D=1 the ledger
+        // holds exactly this one generation for the duration of the
+        // (`mem_checkpoint_lock`-serialized) flush; the checkpoint bakes an un-sealed
+        // frozen tier directly, so it walks `Frozen → Spilling → Published → Reclaimed`
+        // and acks at publish (the un-decoupled §4.5 edge). Stage 2b promotes the
+        // ledger to a shared field once the seal-single / spill-multi
+        // drain-serialization audit lands; `flushed_epoch` / `reserved_snapshot_sequence`
+        // stay Copy locals so the durable-ack fires unchanged. This is a pure
+        // refactor: behavior is byte-identical to the pre-2a capture.
+        let mut drain = FrozenDrainLedger::new(1);
+        let generation = drain
+            .freeze(FrozenGeneration::freeze(
+                shard_snapshots,
+                flushed_counts,
+                reserved_snapshot_sequence,
+                flushed_epoch,
+            ))
+            .map_err(|_| Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: "mem-tier drain ledger rejected the initial checkpoint freeze (D=1 invariant broken)"
+                    .to_string(),
+            })?;
         // Emptiness must be judged on the REAL captured shard snapshots, not the
         // synthetic union view: `union_snapshot_view` carries the cross-shard
         // tombstone union + the summed byte/row counts but ALWAYS has empty
@@ -21992,7 +22022,7 @@ impl CayenneTableProvider {
         let nothing_to_flush = if n == 1 {
             snapshot.is_empty()
         } else {
-            shard_snapshots.iter().all(|s| s.is_empty())
+            generation.shard_snapshots.iter().all(|s| s.is_empty())
         };
         if nothing_to_flush {
             // The tier is fully empty — every epoch ever appended has already
@@ -22010,10 +22040,8 @@ impl CayenneTableProvider {
             self.refire_last_durable_slot_advancer().await;
             return Ok(0);
         }
-        // At N==1 the slot-ack currency stays the single shard's `MemTier::epoch`
-        // (no `source_position` stamped), byte-identical to the pre-shard path. At
-        // N>1 it is the shared per-apply `durable_epoch` MAX computed above.
-        let flushed_epoch = durable_epoch.unwrap_or(snapshot.epoch);
+        // Committed to draining this generation: claim it for the bake.
+        generation.transition(GenState::Spilling);
         let inlined_view = self.cached_inlined_view().await?;
         // The inline removal map is the WHOLE-TIER tombstone union (carried on
         // `snapshot.tombstones` — shard 0's at N==1, the cross-shard union at N>1),
@@ -22025,7 +22053,7 @@ impl CayenneTableProvider {
         // groups concatenate, each shard applying its OWN tombstones (§2.3e). At N==1
         // this is exactly `[visible_mem_tier_batches(shard 0)]`.
         let mut shard_groups: Vec<Vec<RecordBatch>> = Vec::new();
-        for shard in &shard_snapshots {
+        for shard in &generation.shard_snapshots {
             if shard.is_empty() || shard.segments.is_empty() {
                 continue;
             }
@@ -22078,7 +22106,7 @@ impl CayenneTableProvider {
             // moves past the deletes. All keys are pure deletes here (the
             // corpus is empty), so the commit writes delete-only entries and
             // registers no snapshot.
-            if let Some(sequence_number) = reserved_snapshot_sequence
+            if let Some(sequence_number) = generation.reserved_seq
                 && Self::mem_tier_has_tombstones(&snapshot)
             {
                 let update = self
@@ -22099,7 +22127,7 @@ impl CayenneTableProvider {
                 self.commit_on_conflict_publish(update, None).await;
                 // All-shards clear (acquires each shard's publish lock itself).
                 self.clear_flushed_mem_tier_state_all_shards(
-                    &flushed_counts,
+                    &generation.relative_counts,
                     !inlined_view.is_empty()
                         || self
                             .mem_tier_shadow_present
@@ -22114,7 +22142,7 @@ impl CayenneTableProvider {
                 // There is no durable state to publish here, so no listing fence is
                 // needed.
                 self.clear_flushed_mem_tier_state_all_shards(
-                    &flushed_counts,
+                    &generation.relative_counts,
                     !inlined_view.is_empty()
                         || self
                             .mem_tier_shadow_present
@@ -22127,7 +22155,12 @@ impl CayenneTableProvider {
                 "mem_tier_checkpoint",
                 checkpoint_start,
             );
-            self.fire_slot_advancer(flushed_epoch).await;
+            // Tombstones-only drain: the durable DVs are committed and the front
+            // prefix cleared — the generation's whole-unit publish is complete. The
+            // generation is the ack authority; fire off its durable epoch, then reclaim.
+            generation.transition(GenState::Published);
+            self.fire_slot_advancer(generation.epoch).await;
+            drain.reclaim_front();
             return Ok(0);
         }
 
@@ -22199,7 +22232,7 @@ impl CayenneTableProvider {
             // publish lock") unconditional. Lock order: fence (outer) → publish
             // (inner), same as phase 2.
             self.clear_flushed_mem_tier_state_all_shards(
-                &flushed_counts,
+                &generation.relative_counts,
                 !inlined_view.is_empty()
                     || self
                         .mem_tier_shadow_present
@@ -22214,7 +22247,7 @@ impl CayenneTableProvider {
             // concurrent scan sees the RAM rows (correct) and never the file yet.
             // snapshot_sequence was reserved under the fence at capture time —
             // see the capture block for the ordering invariant.
-            let Some(sequence_number) = reserved_snapshot_sequence else {
+            let Some(sequence_number) = generation.reserved_seq else {
                 return Err(Error::DataValidation {
                     table: self.table_name().to_string(),
                     message: "non-position checkpoint reserved its snapshot_sequence at capture"
@@ -22341,7 +22374,7 @@ impl CayenneTableProvider {
                         .await?;
                 }
                 self.clear_flushed_mem_tier_state_all_shards(
-                    &flushed_counts,
+                    &generation.relative_counts,
                     !inlined_view.is_empty()
                         || self
                             .mem_tier_shadow_present
@@ -22379,6 +22412,11 @@ impl CayenneTableProvider {
             self.record_current_snapshot_files_added(checkpoint_file_count);
             stats
         };
+        // The whole-unit atomic publish (file + DV in, front prefix out, under the
+        // listing fence) has completed for both the position-based and two-phase
+        // arms — the generation is published. Its captured Arcs are reclaimed after
+        // the post-fence slot ack fires off its durable epoch (below).
+        generation.transition(GenState::Published);
 
         // Seed the persisted live `num_rows` from the mem-tier rows that just
         // became durable. Unlike the inline/staged path — which persists
@@ -22437,8 +22475,10 @@ impl CayenneTableProvider {
             "Mem-tier checkpoint flushed a durable snapshot"
         );
         // ONLY NOW — after the Vortex file + metastore pointer are durable — tell
-        // the runtime it may advance the source slot to cover this epoch.
-        self.fire_slot_advancer(flushed_epoch).await;
+        // the runtime it may advance the source slot to cover this epoch (the
+        // generation is the ack authority). Reclaim its captured Arcs afterward.
+        self.fire_slot_advancer(generation.epoch).await;
+        drain.reclaim_front();
 
         Ok(u64::try_from(flushed_mem_rows).unwrap_or(u64::MAX))
     }
@@ -22562,6 +22602,30 @@ impl CayenneTableProvider {
         // reads only the captured immutable snapshots + the reserved seal sequence.
         drop(capture_write_guard.take());
 
+        // FREEZE (Model B, proposal §4.5): record the captured active prefix as a
+        // drain generation in a depth-1 ledger. The live tier is UNTOUCHED — the seal
+        // marks the per-shard boundary (`active → sealed`) without removing segments,
+        // so the rows stay in the read union; the durable shadow below reads only
+        // these captured immutable snapshots. The seal walks `Frozen → Sealed` (the
+        // lightweight durability + slot-ack cadence; no Vortex bake) and its
+        // generation leaves the ledger after `Sealed`. `seal_epoch` stays a Copy local
+        // (the ack fires off it); the reserved seal sequence is stamped after the
+        // off-lock reservation below. Stage 2b promotes the ledger to the shared drain
+        // field. Byte-identical to the pre-2a seal.
+        let mut drain = FrozenDrainLedger::new(1);
+        let generation = drain
+            .freeze(FrozenGeneration::freeze(
+                shard_snapshots,
+                sealed_through,
+                None,
+                seal_epoch,
+            ))
+            .map_err(|_| Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: "mem-tier drain ledger rejected the initial seal freeze (D=1 invariant broken)"
+                    .to_string(),
+            })?;
+
         // === BUILD the union delta from the captured snapshots (off-lock) ===
         // Each shard's active piece as a delta view (tombstone/byte aggregates
         // rebuilt from just its active segments — NOT the whole tier; the sealed
@@ -22569,7 +22633,8 @@ impl CayenneTableProvider {
         // ⇒ the visible rows CONCATENATE and the tombstones UNION with no cross-shard
         // collision (the §2.3e argument the sharded checkpoint relies on). At N==1
         // this is exactly shard 0's delta — byte-identical to the pre-sharding seal.
-        let deltas: Vec<Arc<crate::provider::mem_tier::MemTier>> = shard_snapshots
+        let deltas: Vec<Arc<crate::provider::mem_tier::MemTier>> = generation
+            .shard_snapshots
             .iter()
             .map(|s| Arc::new(s.unsealed_view()))
             .collect();
@@ -22587,9 +22652,12 @@ impl CayenneTableProvider {
             // Every active row was superseded within the delta and no tombstone hides
             // a durable row: the epoch is vacuously durable. Advance the per-shard
             // boundary + the slot so the active pieces are not re-scanned next seal.
-            for (shard_id, &through) in sealed_through.iter().enumerate() {
+            for (shard_id, &through) in generation.relative_counts.iter().enumerate() {
                 self.mark_shard_sealed_through(shard_id, through);
             }
+            // Vacuously durable: the boundary is marked, so the generation is sealed.
+            generation.transition(GenState::Sealed);
+            drain.reclaim_front();
             self.fire_slot_advancer(seal_epoch).await;
             return Ok(0);
         }
@@ -22609,6 +22677,8 @@ impl CayenneTableProvider {
             .reserve_sequences_local(1)
             .await
             .map_err(|source| Error::Catalog { source })?;
+        // Stamp the off-lock reservation onto the generation (freeze recorded `None`).
+        generation.set_reserved_seq(seal_sequence);
 
         // (a) Durable INSERTS → ONE unpublished inline-corpus BLOB over the
         // concatenated cross-shard visible rows. Durable commit only — NO
@@ -22666,9 +22736,13 @@ impl CayenneTableProvider {
         // Advance each shard's ingestion/immutable split (active → sealed) under that
         // shard's publish lock so the boundary store is atomic w.r.t. a concurrent
         // append's tier swap.
-        for (shard_id, &through) in sealed_through.iter().enumerate() {
+        for (shard_id, &through) in generation.relative_counts.iter().enumerate() {
             self.mark_shard_sealed_through(shard_id, through);
         }
+        // The active prefix is durable (inserts + tombstones) and the boundary marked
+        // — the generation is sealed and leaves the ledger.
+        generation.transition(GenState::Sealed);
+        drain.reclaim_front();
 
         // ONLY NOW — after every shard's active delta is durable — may the runtime
         // advance the source slot to cover `seal_epoch`. A crash before this point
@@ -31934,6 +32008,188 @@ mod tests {
             Vec::<i64>::new(),
             "the inside-window row never became durable"
         );
+    }
+
+    /// Stage 2a MODEL-BASED FUZZ — the frozen-tier drain ledger at `D = 1` is
+    /// byte-identical to a single-tier reference under EVERY interleaving of
+    /// insert / delete / seal / checkpoint (proposal §4.5; the 2a deliverable).
+    ///
+    /// The reference is a plain `BTreeSet<i64>` (the logical corpus). For each
+    /// bounded schedule the test drives the real provider and, after every op,
+    /// asserts:
+    ///
+    /// - **scan-equality + row-count** — the visible rows equal the reference set
+    ///   (a resurrected row appears, a lost row vanishes — both caught);
+    /// - **ack-safety** — the durable slot epoch is monotone non-decreasing (never
+    ///   a backward or premature ack; at `D = 1` the sole in-flight generation is
+    ///   trivially the min-across-in-flight watermark).
+    ///
+    /// After the whole schedule it drops the provider and reopens from catalog (a
+    /// clean restart) and asserts convergence to the DURABLE reference — the corpus
+    /// as of the last seal/checkpoint — proving no resurrection or loss across the
+    /// durability boundary (RAM-only tail is expected to be re-streamed from source,
+    /// so it is absent on reopen).
+    #[tokio::test]
+    async fn stage2a_drain_ledger_model_matches_single_tier_reference() {
+        #[derive(Clone, Copy, Debug)]
+        enum Op {
+            Insert(i64),
+            Delete(i64),
+            Seal,
+            Checkpoint,
+        }
+
+        // Exhaustive schedule length (base-`alphabet.len()` enumeration below).
+        const DEPTH: u32 = 4;
+
+        // Compact adversarial alphabet: two keys (so supersede / delete-then-
+        // reinsert across a drain boundary is exercised) plus both drain ops. Depth 4
+        // enumerates the load-bearing interleavings — e.g. insert→seal→delete→
+        // checkpoint (delete a sealed row, then bake) and insert→checkpoint→delete→
+        // seal (durable tombstone over a baked row).
+        let alphabet = [
+            Op::Insert(1),
+            Op::Insert(2),
+            Op::Delete(1),
+            Op::Seal,
+            Op::Checkpoint,
+        ];
+
+        // A handful of deeper curated schedules that exceed the exhaustive depth,
+        // stressing multi-generation drain sequences at D=1.
+        let curated: Vec<Vec<Op>> = vec![
+            vec![
+                Op::Insert(1),
+                Op::Seal,
+                Op::Insert(2),
+                Op::Checkpoint,
+                Op::Delete(1),
+                Op::Seal,
+                Op::Delete(2),
+                Op::Checkpoint,
+            ],
+            vec![
+                Op::Insert(1),
+                Op::Insert(2),
+                Op::Checkpoint,
+                Op::Delete(1),
+                Op::Insert(1),
+                Op::Seal,
+                Op::Checkpoint,
+            ],
+            vec![
+                Op::Delete(1),
+                Op::Seal,
+                Op::Insert(1),
+                Op::Delete(1),
+                Op::Checkpoint,
+                Op::Insert(2),
+                Op::Seal,
+            ],
+        ];
+
+        let runtime_env = SessionContext::new().runtime_env();
+        let n = alphabet.len();
+        let exhaustive = n.pow(DEPTH);
+
+        for schedule_idx in 0..(exhaustive + curated.len()) {
+            // Decode the schedule: exhaustive base-`n` schedules first, then curated.
+            let schedule: Vec<Op> = if schedule_idx < exhaustive {
+                let mut code = schedule_idx;
+                (0..DEPTH)
+                    .map(|_| {
+                        let op = alphabet[code % n];
+                        code /= n;
+                        op
+                    })
+                    .collect()
+            } else {
+                curated[schedule_idx - exhaustive].clone()
+            };
+
+            let table_name = format!("s2a_model_{schedule_idx}");
+            let (provider, catalog, _tmp) =
+                create_memory_mode_upsert_table(&table_name, Arc::clone(&runtime_env)).await;
+            let durable = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            provider.install_slot_advancer(std::sync::Arc::new(EpochRecorder(
+                std::sync::Arc::clone(&durable),
+            )));
+            let no_deletions = OnConflictDeletions::default();
+
+            // The logical corpus (live) and the durable corpus (as of the last drain).
+            let mut model: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+            let mut durable_model: std::collections::BTreeSet<i64> =
+                std::collections::BTreeSet::new();
+            let mut last_durable_epoch = 0u64;
+
+            for (op_idx, op) in schedule.iter().enumerate() {
+                match op {
+                    Op::Insert(key) => {
+                        // `append_to_mem_tier` is the RAW segment append (no upsert
+                        // supersede); a re-insert of an already-live key in this
+                        // id-only upsert table is a no-op to the visible set, so gate
+                        // the append on the reference actually gaining the key. A
+                        // re-insert AFTER a delete does append (the key left the model
+                        // on delete) — that reinsert-over-tombstone case is exercised.
+                        if model.insert(*key) {
+                            let batch = int64_id_batch(&[*key]);
+                            let bytes = batch.get_array_memory_size() as u64;
+                            provider
+                                .append_to_mem_tier(vec![batch], &no_deletions, bytes, 0)
+                                .await
+                                .expect("insert append");
+                        }
+                    }
+                    Op::Delete(key) => {
+                        // Ignore the returned absorb count; deleting an absent key is
+                        // a no-op in both the provider and the model.
+                        provider
+                            .write_cdc_delete_keys_in_memory(&int64_id_batch(&[*key]))
+                            .await
+                            .expect("delete");
+                        model.remove(key);
+                    }
+                    Op::Seal => {
+                        provider.seal_mem_tier_durable().await.expect("seal");
+                        // The seal makes the current visible corpus crash-recoverable.
+                        durable_model = model.clone();
+                    }
+                    Op::Checkpoint => {
+                        provider.checkpoint_mem_tier().await.expect("checkpoint");
+                        // The bake makes the current visible corpus durable.
+                        durable_model = model.clone();
+                    }
+                }
+
+                // scan-equality + row-count after EVERY op.
+                let got = scan_sorted_ids(&provider).await;
+                let want: Vec<i64> = model.iter().copied().collect();
+                assert_eq!(
+                    got, want,
+                    "schedule#{schedule_idx} {schedule:?} op#{op_idx} {op:?}: live scan != reference"
+                );
+                // ack-safety: durable epoch never regresses.
+                let now = durable.load(std::sync::atomic::Ordering::SeqCst);
+                assert!(
+                    now >= last_durable_epoch,
+                    "schedule#{schedule_idx} op#{op_idx}: durable epoch regressed {last_durable_epoch} -> {now}"
+                );
+                last_durable_epoch = now;
+            }
+
+            // Clean-restart convergence: reopen sees exactly the durable corpus.
+            drop(provider);
+            let reopened = CayenneTableProviderBuilder::new(catalog, Arc::clone(&runtime_env))
+                .open(&table_name)
+                .await
+                .expect("reopen");
+            let got = scan_sorted_ids(&reopened).await;
+            let want: Vec<i64> = durable_model.iter().copied().collect();
+            assert_eq!(
+                got, want,
+                "schedule#{schedule_idx} {schedule:?}: reopen != durable reference (resurrection or loss across the durability boundary)"
+            );
+        }
     }
 
     /// The delete-absorb capability requires BOTH memory mode and
