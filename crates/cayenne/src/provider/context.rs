@@ -122,12 +122,6 @@ pub struct CayenneContext {
     /// the write path to bypass `write_budget` permit acquisition. Runtime-only
     /// state — never persisted.
     coupled_writer: std::sync::atomic::AtomicBool,
-    /// Set of data files whose integrity digest has already been verified this
-    /// process, keyed by `"<snapshot_id>/<file_path>"`. Used only when
-    /// `integrity_checksums` is enabled, to bound verification to one whole-file
-    /// read per file per process ("verify on first read"). Data files are
-    /// immutable once published, so a verified file never needs re-checking.
-    verified_data_files: parking_lot::Mutex<std::collections::HashSet<String>>,
 }
 
 /// Default byte budget for the in-memory PK keyset cache when
@@ -288,7 +282,6 @@ impl CayenneContext {
             goal_stuck_ticks: std::sync::atomic::AtomicU64::new(0),
             last_write: parking_lot::Mutex::new(None),
             coupled_writer: std::sync::atomic::AtomicBool::new(false),
-            verified_data_files: parking_lot::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
