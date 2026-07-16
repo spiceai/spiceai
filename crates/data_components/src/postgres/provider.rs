@@ -148,48 +148,49 @@ impl PostgresCatalogProvider {
                 Arc::clone(&self.table_creator),
                 self.include.clone(),
             );
-            match schema_provider
-                .refresh_tables(&foreign_keys, &comments)
-                .await
-            {
-                Ok(()) => {
+            // A single schema's table discovery failing (e.g. a transient
+            // connection reset or lock timeout) must not abort the whole catalog
+            // load; skip just this schema and keep the others (#11724).
+            //
+            // This provider is polled repeatedly by `RefreshingCatalogProvider`,
+            // not just at initial load, so a transient failure on a schema that
+            // previously refreshed fine must not remove it from the catalog
+            // either. Look up (not clone) the last-known-good entry for just this
+            // one schema — only reading `self.schemas` on the failure path avoids
+            // cloning the whole map on every refresh cycle when nothing fails.
+            let refresh_result = schema_provider.refresh_tables(&foreign_keys, &comments).await;
+            let previous = if refresh_result.is_ok() {
+                None
+            } else {
+                let guard = match self.schemas.read() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.get(schema_name).cloned()
+            };
+
+            match schema_refresh_outcome(refresh_result.is_ok(), previous.is_some()) {
+                SchemaRefreshOutcome::InsertNew => {
                     schemas.insert(schema_name.clone(), Arc::new(schema_provider));
                 }
-                Err(e) => {
-                    // A single schema's table discovery failing (e.g. a transient
-                    // connection reset or lock timeout) must not abort the whole
-                    // catalog load; skip just this schema and keep the others (#11724).
-                    //
-                    // This provider is polled repeatedly by `RefreshingCatalogProvider`,
-                    // not just at initial load, so a transient failure on a schema
-                    // that previously refreshed fine must not remove it from the
-                    // catalog either. Look up (not clone) the last-known-good entry
-                    // for just this one schema — only reading `self.schemas` here,
-                    // on the failure path, avoids cloning the whole map on every
-                    // refresh cycle when nothing fails.
-                    let previous = {
-                        let guard = match self.schemas.read() {
-                            Ok(guard) => guard,
-                            Err(e) => e.into_inner(),
-                        };
-                        guard.get(schema_name).cloned()
-                    };
-                    match previous {
-                        Some(previous) => {
-                            tracing::warn!(
-                                schema = %schema_name,
-                                error = %e,
-                                "Failed to discover tables for schema, keeping last-known-good state"
-                            );
-                            schemas.insert(schema_name.clone(), previous);
-                        }
-                        None => {
-                            tracing::warn!(
-                                schema = %schema_name,
-                                error = %e,
-                                "Failed to discover tables for schema, skipping schema"
-                            );
-                        }
+                SchemaRefreshOutcome::KeepPrevious => {
+                    // Only the (Err, Some) branch reaches here, so both are present.
+                    if let (Err(e), Some(previous)) = (&refresh_result, previous) {
+                        tracing::warn!(
+                            schema = %schema_name,
+                            error = %e,
+                            "Failed to discover tables for schema, keeping last-known-good state"
+                        );
+                        schemas.insert(schema_name.clone(), previous);
+                    }
+                }
+                SchemaRefreshOutcome::Skip => {
+                    if let Err(e) = &refresh_result {
+                        tracing::warn!(
+                            schema = %schema_name,
+                            error = %e,
+                            "Failed to discover tables for schema, skipping schema"
+                        );
                     }
                 }
             }
@@ -550,6 +551,35 @@ fn is_table_included(schema_name: &str, table_name: &str, include: Option<&GlobS
     include.is_none_or(|globset| globset.is_match(&schema_with_table))
 }
 
+/// What `refresh_schemas` does with a single schema after attempting to refresh
+/// its tables (#11724). Factored out as a pure decision so the
+/// (refresh succeeded / failed) × (previous entry present / absent) matrix can be
+/// unit-tested without live `PostgreSQL` I/O, guarding against a refactor
+/// reintroducing the all-or-nothing failure mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchemaRefreshOutcome {
+    /// Refresh succeeded — install the freshly discovered schema.
+    InsertNew,
+    /// Refresh failed but a last-known-good entry exists — keep it so a
+    /// transient error doesn't flap a previously healthy schema out of the catalog.
+    KeepPrevious,
+    /// Refresh failed and the schema has never refreshed successfully — drop it
+    /// for this cycle.
+    Skip,
+}
+
+/// Decide the outcome for a schema from whether its table refresh succeeded and
+/// whether a previously discovered entry exists. A successful refresh always
+/// installs the new schema; a failure keeps the last-known-good entry when one
+/// exists and otherwise skips the schema.
+fn schema_refresh_outcome(refresh_succeeded: bool, has_previous: bool) -> SchemaRefreshOutcome {
+    match (refresh_succeeded, has_previous) {
+        (true, _) => SchemaRefreshOutcome::InsertNew,
+        (false, true) => SchemaRefreshOutcome::KeepPrevious,
+        (false, false) => SchemaRefreshOutcome::Skip,
+    }
+}
+
 async fn build_table_providers_for_schema(
     schema_name: &str,
     table_names: Vec<String>,
@@ -698,8 +728,9 @@ impl SchemaProvider for PostgresSchemaProvider {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommentMap, ForeignKeyConstraint, ForeignKeyMap, TableComments,
+        CommentMap, ForeignKeyConstraint, ForeignKeyMap, SchemaRefreshOutcome, TableComments,
         build_table_providers_for_schema, foreign_key_target, is_table_included,
+        schema_refresh_outcome,
     };
     use crate::{
         DESCRIPTION_METADATA_KEY, FOREIGN_KEYS_METADATA_KEY, Read, SOURCE_TYPE_METADATA_KEY,
@@ -842,6 +873,33 @@ mod tests {
                 "table must round-trip (target = `{target}`)"
             );
         }
+    }
+
+    /// Regression coverage for #11724: the per-schema failure decision must keep
+    /// a previously healthy schema on a transient error and only drop a schema
+    /// that has never refreshed successfully — never abort the whole catalog.
+    #[test]
+    fn schema_refresh_outcome_covers_full_matrix() {
+        // A successful refresh always installs the freshly discovered schema,
+        // regardless of whether a previous entry existed.
+        assert_eq!(
+            schema_refresh_outcome(true, true),
+            SchemaRefreshOutcome::InsertNew
+        );
+        assert_eq!(
+            schema_refresh_outcome(true, false),
+            SchemaRefreshOutcome::InsertNew
+        );
+        // A failed refresh keeps the last-known-good entry when one exists...
+        assert_eq!(
+            schema_refresh_outcome(false, true),
+            SchemaRefreshOutcome::KeepPrevious
+        );
+        // ...and only drops the schema when it has never refreshed successfully.
+        assert_eq!(
+            schema_refresh_outcome(false, false),
+            SchemaRefreshOutcome::Skip
+        );
     }
 
     #[test]
