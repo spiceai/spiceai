@@ -124,7 +124,10 @@ test-bench:
 ## Example: make lint-rust-fix PACKAGES="runtime data_components" FEATURES="duckdb,postgres"
 PACKAGES ?=
 FEATURES ?=
-ifdef PACKAGES
+# Use strip non-empty checks (not bare ifdef): PACKAGES/FEATURES are always
+# assigned via ?=, and empty command-line overrides (PACKAGES= FEATURES=) must
+# fall through to workspace defaults — not emit `-p`/`--features` with no value.
+ifneq ($(strip $(PACKAGES)),)
 _LINT_PKG_FLAGS := $(foreach p,$(PACKAGES),-p $(p))
 _LINT_WORKSPACE_FLAGS := $(_LINT_PKG_FLAGS)
 _FMT_FLAGS := $(_LINT_PKG_FLAGS)
@@ -133,9 +136,9 @@ _LINT_WORKSPACE_FLAGS := --workspace --exclude libnfs --exclude lopdf --exclude 
 _FMT_FLAGS := --all
 endif
 # Apply FEATURES if provided, otherwise default to hardcoded features only for workspace-wide linting
-ifdef FEATURES
+ifneq ($(strip $(FEATURES)),)
 _FEATURES_FLAGS := --features $(FEATURES)
-else ifdef PACKAGES
+else ifneq ($(strip $(PACKAGES)),)
 _FEATURES_FLAGS :=
 else
 _FEATURES_FLAGS := --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control,spicebench
