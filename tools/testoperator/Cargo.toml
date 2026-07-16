@@ -12,7 +12,6 @@ version.workspace = true
 arrow.workspace = true
 arrow-json.workspace = true
 arrow_tools = { path = "../../crates/arrow_tools" }
-async-channel.workspace = true
 async-trait.workspace = true
 aws-config.workspace = true
 aws-credential-types.workspace = true

@@ -24,7 +24,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use futures::StreamExt;
 
 use super::super::spice::SpiceClients;
 use super::compare;
@@ -197,12 +197,12 @@ impl AnalyticalReport {
 /// Run every CH-benCH analytical query against both the source and Spice,
 /// comparing results.
 ///
-/// Queries are fanned out over an mpmc channel to `concurrency` worker futures
-/// (controllable, at least one and never more than the query count), so several
-/// queries run at once; each worker runs the source and Spice sides of its query
-/// *in parallel* (see [`evaluate_query`]). Results are written into per-index
-/// slots, so the returned report preserves the original query order regardless
-/// of completion order.
+/// Queries are streamed through [`StreamExt::buffered`] with a `concurrency`
+/// window (controllable, at least one and never more than the query count), so
+/// several queries run at once; each in-flight query runs the source and Spice
+/// sides *in parallel* (see [`evaluate_query`]). `buffered` yields results in
+/// submission order, so the returned report preserves the original query order
+/// regardless of completion order.
 pub async fn verify_analytical_results(
     driver: Arc<dyn ChBenchDriver>,
     spice: &SpiceClients,
@@ -219,55 +219,24 @@ pub async fn verify_analytical_results(
     // query artifact, not an engine divergence, so it is surfaced but not gated.
     let queries = get_chbench_test_queries(query_overrides);
     let n = queries.len();
-    // At least one worker, and never more workers than there are queries.
+    // At least one in-flight query, and never more than the query count.
     let workers = concurrency.clamp(1, n.max(1));
     println!(
-        "\nRunning analytical-query gate over {n} queries ({workers} worker(s), source+Spice in parallel per query)"
+        "\nRunning analytical-query gate over {n} queries ({workers} concurrent, source+Spice in parallel per query)"
     );
 
-    // Fan every query out over an mpmc channel. `bounded(n)` has room for all of
-    // them, so the enqueue loop never blocks; closing the sender lets each worker
-    // exit once the channel drains.
-    let (tx, rx) = async_channel::bounded(n.max(1));
-    for (idx, query) in queries.iter().enumerate() {
-        tx.send((idx, query))
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to enqueue analytical query: {e}"))?;
-    }
-    tx.close();
-
-    // Per-index result slots so completion order never reorders the report. The
-    // guard is held only for the slot write (no `.await` inside), so a plain
-    // mutex is correct and never stalls the runtime.
-    let slots: Mutex<Vec<Option<AnalyticalQueryResult>>> =
-        Mutex::new((0..n).map(|_| None).collect());
-
-    // Worker futures are joined (not spawned), so they borrow `driver`, `spice`
-    // and `slots` for the duration of this call — no `'static`/`Send` bound and
-    // no cloning of the clients. Each pulls `(index, query)` items until the
-    // channel is closed and drained.
-    let worker_futures = (0..workers).map(|_| {
-        let rx = rx.clone();
-        let driver = &driver;
-        let slots = &slots;
-        async move {
-            while let Ok((idx, query)) = rx.recv().await {
-                let result = evaluate_query(query, driver, spice).await;
-                slots.lock()[idx] = Some(result);
-            }
-        }
-    });
-    futures::future::join_all(worker_futures).await;
-
-    // Every index was enqueued exactly once and filled by the worker that
-    // dequeued it; treat a still-empty slot as an internal error rather than
-    // silently dropping a query from the gate.
-    let mut results = Vec::with_capacity(n);
-    for (idx, slot) in slots.into_inner().into_iter().enumerate() {
-        let query_result = slot
-            .ok_or_else(|| anyhow::anyhow!("analytical query at index {idx} produced no result"))?;
-        results.push(query_result);
-    }
+    // Stream the queries through a `buffered(workers)` window: up to `workers`
+    // `evaluate_query` futures run concurrently and results are yielded in
+    // submission order, so `collect` reconstructs the report in query order with
+    // no per-index bookkeeping. The futures are polled in place (not spawned), so
+    // they borrow `driver` and `spice` for the duration of this call — no
+    // `'static`/`Send` bound and no cloning of the clients.
+    let driver = &driver;
+    let results: Vec<AnalyticalQueryResult> = futures::stream::iter(queries.iter())
+        .map(|query| evaluate_query(query, driver, spice))
+        .buffered(workers)
+        .collect()
+        .await;
 
     Ok(AnalyticalReport { results })
 }
