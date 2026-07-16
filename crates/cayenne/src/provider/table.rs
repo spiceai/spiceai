@@ -1279,6 +1279,14 @@ pub struct CayenneTableProvider {
     /// across writer clones). Production never sets it.
     #[cfg(test)]
     force_checkpoint_spill_fault: Arc<AtomicBool>,
+    /// Test-only pause gate for the D>1 detached checkpoint drain (Stage 2b Step
+    /// 3b-b). When `Some`, a checkpoint drain parks right after it commits to the bake
+    /// (`GenState::Spilling`), letting a test deterministically hold drain N in flight
+    /// while it starts freeze N+1 — proving the drains OVERLAP and the publish is
+    /// ordered oldest-first. `None` (default / production) makes the pause a no-op.
+    /// Shared across writer clones so a detached drain on a clone observes it.
+    #[cfg(test)]
+    checkpoint_drain_gate: Arc<ParkingMutex<Option<CheckpointDrainGate>>>,
     /// Protected snapshot IDs that should skip deletion filtering.
     ///
     /// When data is inserted while pending deletions exist, the new data is written
@@ -1558,8 +1566,28 @@ pub struct CayenneTableProvider {
     /// operation drive the front generation through brief, await-free critical
     /// sections (the guard is NEVER held across an `.await`, the sync-substrate
     /// invariant). Shared across writer clones (one ledger per table); Stage 2b Step
-    /// 3 raises `max_depth` and hands `D > 1` spills to the pinned ingest pool.
+    /// 3b-b raises `max_depth` and hands `D > 1` checkpoint drains to detached
+    /// `tokio::spawn` tasks (NOT the pinned ingest pool — the drain is async I/O-bound;
+    /// see the Step 3 executor decision).
     drain_ledger: Arc<ParkingMutex<FrozenDrainLedger>>,
+    /// Depth-`D` drain ADMISSION (Stage 2b Step 3b-b): a permit is acquired before a
+    /// background-tick checkpoint captures+freezes and released when its (possibly
+    /// detached) drain reclaims the generation, so at most `max_depth` generations are
+    /// ever resident — the byte-budget-independent back-pressure that stalls a freeze
+    /// at capacity. Capacity equals the ledger's `max_depth`. Acquired ONLY at
+    /// `max_depth > 1`; at `D = 1` (config default) the drain runs inline under
+    /// `mem_checkpoint_lock` and this is never touched (byte-identical). Shared across
+    /// writer clones.
+    drain_admission: Arc<tokio::sync::Semaphore>,
+    /// Wakes drains waiting for their ORDERED-PUBLISH turn (Stage 2b Step 3b-b). At
+    /// `D > 1` encode/PUT fan out unordered, but the publish (metastore commit +
+    /// `listing_fence` swap + `retain_after` front-clear + slot ack) must be strictly
+    /// oldest-first — a later generation clearing the front `retain_after` before an
+    /// older one would drop the older generation's still-resident segments. A drain
+    /// waits until its generation is the ledger FRONT before publishing; every reclaim
+    /// advances the front and `notify_waiters()` here. Untouched at `D = 1` (the sole
+    /// generation is always the front). Shared across writer clones.
+    drain_publish_notify: Arc<tokio::sync::Notify>,
     /// Serializes the mem-tier *publish* (the `ArcSwap` swap + sequence
     /// reservation) across all writers — DECOUPLED from [`Self::listing_fence`]
     /// so an in-memory append no longer waits on scans (read-fence) or
@@ -2548,15 +2576,24 @@ impl std::fmt::Debug for CayenneTableProvider {
 /// order), leaving the ledger clear of this generation for the next freeze.
 struct DrainCleanup<'a> {
     ledger: &'a ParkingMutex<FrozenDrainLedger>,
+    /// Woken on a discard so a younger generation parked in the ordered-publish gate
+    /// ([`CayenneTableProvider::await_checkpoint_publish_turn`]) re-checks the front —
+    /// the failing generation left the ledger, so the front may have advanced.
+    publish_notify: &'a tokio::sync::Notify,
     id: u64,
     armed: bool,
 }
 
 impl DrainCleanup<'_> {
     /// Arm the guard for the operation that just froze the generation with `id`.
-    fn armed(ledger: &ParkingMutex<FrozenDrainLedger>, id: u64) -> DrainCleanup<'_> {
+    fn armed<'a>(
+        ledger: &'a ParkingMutex<FrozenDrainLedger>,
+        publish_notify: &'a tokio::sync::Notify,
+        id: u64,
+    ) -> DrainCleanup<'a> {
         DrainCleanup {
             ledger,
+            publish_notify,
             id,
             armed: true,
         }
@@ -2576,6 +2613,16 @@ impl Drop for DrainCleanup<'_> {
             // brief, await-free critical section (Drop is synchronous) removes this
             // drain's own stranded generation (by id) so the ledger does not fill.
             self.ledger.lock().discard_by_id(self.id);
+            // The discard advanced the ledger front, so wake any younger drain parked
+            // in the ordered-publish gate to re-check (else it would hang at D>1). A
+            // no-op at D=1 (no drain is ever parked). NOTE (Step 3d deliverable): a
+            // failing OLDER generation invalidates the window bases of the younger
+            // generations still resident behind it (their `window_base` counted this
+            // generation's now-un-cleared segments); waking them here prevents a hang,
+            // but the correct D>1 FAILURE semantics — cascade-discard / re-window the
+            // younger generations, or replay the whole pipeline — land with the D>1
+            // crash-injection work. This is unreachable at the config default (D=1).
+            self.publish_notify.notify_waiters();
         }
     }
 }
@@ -2629,6 +2676,21 @@ struct SealDrainClaim {
     /// The durable epoch this generation acks once sealed (MAX per-apply epoch over the
     /// full captured prefix).
     seal_epoch: u64,
+}
+
+/// Test-only deterministic pause gate for the D>1 detached checkpoint drain (Stage 2b
+/// Step 3b-b). Parks a drain right after it commits to the bake so a test can hold
+/// drain N in flight while it starts freeze N+1, then release both — proving the drains
+/// overlap and the publish is ordered oldest-first. Cloneable so the drain reads it out
+/// from under the `ParkingMutex` without holding the guard across the `.await`.
+#[cfg(test)]
+#[derive(Clone)]
+struct CheckpointDrainGate {
+    /// Incremented by each drain as it reaches the pause; the test waits until this
+    /// equals the number of drains it expects concurrently in flight (proving overlap).
+    parked: Arc<std::sync::atomic::AtomicUsize>,
+    /// Each parked drain awaits one permit here; the test adds permits to release them.
+    release: Arc<tokio::sync::Semaphore>,
 }
 
 impl CayenneTableProvider {
@@ -2961,6 +3023,57 @@ impl CayenneTableProvider {
     pub(crate) fn arm_checkpoint_spill_fault(&self) {
         self.force_checkpoint_spill_fault
             .store(true, Ordering::Relaxed);
+    }
+
+    /// Test-only: raise the drain-pipeline depth `D` so the D>1 DETACHED checkpoint
+    /// drain path becomes reachable (config keeps `D = 1` until Step 3c ships the
+    /// settable knob). Must be called before any checkpoint/seal freeze, on a provider
+    /// whose ledger is still empty. Raises BOTH the ledger's resident-generation bound
+    /// AND the admission-semaphore capacity to match, and both are shared across writer
+    /// clones (so a detached drain on a clone sees the raised depth). The mem-tier
+    /// append stays synchronous — only the checkpoint drain pipelines.
+    #[cfg(test)]
+    pub(crate) fn set_drain_pipeline_depth_for_test(&self, depth: usize) {
+        assert!(depth >= 1, "drain pipeline depth is at least 1");
+        self.drain_ledger.lock().set_max_depth_for_test(depth);
+        // The ledger started at capacity 1; add the extra permits so the admission
+        // budget equals `depth`.
+        if depth > 1 {
+            self.drain_admission.add_permits(depth - 1);
+        }
+    }
+
+    /// Test-only: install a pause gate so each subsequent detached checkpoint drain
+    /// parks (after committing to the bake) until the test releases it. Returns the
+    /// `parked` counter (drains reaching the pause) and the `release` semaphore (add
+    /// permits to let parked drains proceed), so a test can prove drains OVERLAP.
+    #[cfg(test)]
+    pub(crate) fn install_checkpoint_drain_gate_for_test(
+        &self,
+    ) -> (Arc<std::sync::atomic::AtomicUsize>, Arc<tokio::sync::Semaphore>) {
+        let parked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.checkpoint_drain_gate.lock() = Some(CheckpointDrainGate {
+            parked: Arc::clone(&parked),
+            release: Arc::clone(&release),
+        });
+        (parked, release)
+    }
+
+    /// Test-only pause point in the detached checkpoint drain: if a gate is installed,
+    /// record arrival and wait for a release permit. No-op (default / production) when
+    /// no gate is installed. Reads the gate out from under its `ParkingMutex` so no
+    /// guard is held across the `.await` (the sync-substrate invariant).
+    #[cfg(test)]
+    async fn checkpoint_drain_pause_point(&self) {
+        let gate = self.checkpoint_drain_gate.lock().clone();
+        if let Some(gate) = gate {
+            gate.parked.fetch_add(1, Ordering::Relaxed);
+            // `forget` the permit so `add_permits(k)` releases exactly `k` parked drains.
+            if let Ok(permit) = gate.release.acquire().await {
+                permit.forget();
+            }
+        }
     }
 
     /// Append a CDC upsert stream using Cayenne's native writer path.
@@ -6087,6 +6200,8 @@ impl CayenneTableProvider {
             force_apply_panic: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             force_checkpoint_spill_fault: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            checkpoint_drain_gate: Arc::new(ParkingMutex::new(None)),
             table_schema: Arc::new(ArcSwap::new(Arc::<arrow_schema::Schema>::clone(
                 &table_metadata.schema,
             ))),
@@ -6169,6 +6284,10 @@ impl CayenneTableProvider {
             // 3 raises the depth. Serialized against concurrent freezes by
             // `mem_checkpoint_lock`.
             drain_ledger: Arc::new(ParkingMutex::new(FrozenDrainLedger::new(1))),
+            // Stage 2b Step 3b-b: admission capacity == the ledger's `max_depth` (1 =
+            // config default). Only acquired at `max_depth > 1`.
+            drain_admission: Arc::new(tokio::sync::Semaphore::new(1)),
+            drain_publish_notify: Arc::new(tokio::sync::Notify::new()),
             mem_tier_publish_locks: (0..mem_tier_shards)
                 .map(|_| ParkingMutex::new(()))
                 .collect::<Vec<_>>()
@@ -7307,6 +7426,8 @@ impl CayenneTableProvider {
             force_apply_panic: Arc::clone(&self.force_apply_panic),
             #[cfg(test)]
             force_checkpoint_spill_fault: Arc::clone(&self.force_checkpoint_spill_fault),
+            #[cfg(test)]
+            checkpoint_drain_gate: Arc::clone(&self.checkpoint_drain_gate),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
             manifest_cache: Arc::clone(&self.manifest_cache),
             protected_snapshot_age_warning_keys: Arc::clone(
@@ -7343,6 +7464,10 @@ impl CayenneTableProvider {
             // Shared across clones so every writer/background task records + drains
             // generations through the SAME per-table drain ledger.
             drain_ledger: Arc::clone(&self.drain_ledger),
+            // Shared so a detached drain (spawned on its own writer clone) draws from
+            // and returns to the SAME admission budget + publish-turn notifier.
+            drain_admission: Arc::clone(&self.drain_admission),
+            drain_publish_notify: Arc::clone(&self.drain_publish_notify),
             // Shared across clones so EVERY writer serializes on the one publish
             // lock (the seq-ordering invariant requires a single lock per table).
             mem_tier_publish_locks: Arc::clone(&self.mem_tier_publish_locks),
@@ -22020,42 +22145,127 @@ impl CayenneTableProvider {
     /// (correctness item #4 — a failed checkpoint never advances).
     #[doc(hidden)]
     pub async fn checkpoint_mem_tier(&self) -> Result<u64> {
+        // At the config default (`D = 1`) the drain runs INLINE while `guards` holds
+        // `mem_checkpoint_lock` (byte-identical to pre-3b): freeze N is fully drained +
+        // reclaimed before freeze N+1 can acquire the lock. At `D > 1` (Step 3b-b) the
+        // drain DETACHES — freeze under the lock, release it, `tokio::spawn` the drain —
+        // so freeze N+1 overlaps drain N (the pipeline that lifts the drain ceiling).
+        if self.drain_pipeline_depth() == 1 {
+            let mut guards = self.acquire_capture_locks_blocking().await;
+            let write = guards.write.take();
+            let Some((claim, checkpoint_start)) = self.capture_and_freeze_checkpoint(write).await?
+            else {
+                return Ok(0);
+            };
+            return self.run_checkpoint_drain(claim, checkpoint_start).await;
+            // `guards` drops at scope end (after the inline drain), releasing the lock.
+        }
+        // `D > 1`: acquire a drain-admission permit BEFORE the capture so at most
+        // `max_depth` generations are ever resident (the back-pressure that stalls this
+        // freeze while the pipeline is full). The permit rides into the detached task
+        // and is released when its drain reclaims the generation.
+        let permit = self.acquire_drain_admission().await?;
         let mut guards = self.acquire_capture_locks_blocking().await;
-        // Keep `guards` alive so `mem_checkpoint_lock` spans the whole lifecycle;
-        // pass only the capture-scoped `write` guard to the capture.
         let write = guards.write.take();
-        // Capture + FREEZE the generation under `mem_checkpoint_lock` (the O(1),
-        // `M`-serialized portion), then run the off-lock drain. Splitting the two is
-        // the Stage 2b Step 3b-b seam: at `D = 1` (config default) the drain runs
-        // INLINE while `guards` still holds `mem_checkpoint_lock` (byte-identical to
-        // the pre-split interleaved body); a later step releases `guards` here and
-        // `tokio::spawn`s the drain at `D > 1` so freeze N+1 overlaps drain N.
-        let Some((claim, checkpoint_start)) = self.capture_and_freeze_checkpoint(write).await?
-        else {
+        let Some(claim) = self.capture_and_freeze_checkpoint(write).await? else {
             return Ok(0);
         };
-        self.run_checkpoint_drain(claim, checkpoint_start).await
-        // `guards` drops here (after the inline drain), releasing `mem_checkpoint_lock`
-        // exactly as before the split.
+        // Freeze recorded the generation in the shared ledger; release
+        // `mem_checkpoint_lock` so the NEXT freeze can start while this drain runs.
+        drop(guards);
+        self.spawn_detached_checkpoint_drain(claim, permit);
+        // The detached drain advances the source slot when it publishes (ordered,
+        // min-across-in-flight); the tick returns now having admitted the generation.
+        Ok(0)
     }
 
     /// BEST-EFFORT counterpart to [`Self::checkpoint_mem_tier`]: returns
-    /// [`CheckpointAttempt::Busy`] instead of blocking when the capture locks are
-    /// contended. `Busy` never advances the source slot and is never reported as a
-    /// completed checkpoint. (Adapted from PR #11907.)
+    /// [`CheckpointAttempt::Busy`] instead of blocking when the capture locks (or, at
+    /// `D > 1`, a drain-admission permit) are contended. `Busy` never advances the
+    /// source slot and is never reported as a completed checkpoint. (Adapted from
+    /// PR #11907.)
     async fn try_checkpoint_mem_tier(&self) -> Result<CheckpointAttempt> {
-        let Some(mut guards) = self.try_acquire_capture_locks() else {
+        if self.drain_pipeline_depth() == 1 {
+            let Some(mut guards) = self.try_acquire_capture_locks() else {
+                return Ok(CheckpointAttempt::Busy);
+            };
+            let write = guards.write.take();
+            let Some((claim, checkpoint_start)) = self.capture_and_freeze_checkpoint(write).await?
+            else {
+                return Ok(CheckpointAttempt::Completed(0));
+            };
+            let rows = self.run_checkpoint_drain(claim, checkpoint_start).await?;
+            return Ok(CheckpointAttempt::Completed(rows));
+        }
+        // `D > 1` best-effort: give up (`Busy`) the moment either a permit or a capture
+        // lock is contended — the deadline-driven `checkpoint_mem_tier` makes progress.
+        let Ok(permit) = Arc::clone(&self.drain_admission).try_acquire_owned() else {
             return Ok(CheckpointAttempt::Busy);
         };
-        // Keep `guards` alive across the capture + inline drain; pass only the `write`
-        // guard to the capture (see `checkpoint_mem_tier` for the freeze/drain seam).
+        let Some(mut guards) = self.try_acquire_capture_locks() else {
+            return Ok(CheckpointAttempt::Busy); // `permit` drops here, released
+        };
         let write = guards.write.take();
-        let Some((claim, checkpoint_start)) = self.capture_and_freeze_checkpoint(write).await?
-        else {
+        let Some(claim) = self.capture_and_freeze_checkpoint(write).await? else {
             return Ok(CheckpointAttempt::Completed(0));
         };
-        let rows = self.run_checkpoint_drain(claim, checkpoint_start).await?;
-        Ok(CheckpointAttempt::Completed(rows))
+        drop(guards);
+        self.spawn_detached_checkpoint_drain(claim, permit);
+        Ok(CheckpointAttempt::Completed(0))
+    }
+
+    /// The configured drain-pipeline depth `D` (`1` at the config default). Read once
+    /// per background-tick entry to choose the inline-vs-detached drain path.
+    fn drain_pipeline_depth(&self) -> usize {
+        self.drain_ledger.lock().max_depth()
+    }
+
+    /// Acquire a drain-admission permit (owned, `'static` so it rides into a detached
+    /// task). Blocks while `max_depth` generations are already resident — the depth
+    /// back-pressure. Only ever called at `D > 1`.
+    async fn acquire_drain_admission(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.drain_admission)
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: "mem-tier drain admission semaphore was closed".to_string(),
+            })
+    }
+
+    /// Detach a captured checkpoint generation's drain onto a background `tokio::spawn`
+    /// task (Stage 2b Step 3b-b), so the next freeze overlaps this drain. The task owns
+    /// a writer clone (`Arc::new(self.clone_for_write())` — the `IngestTask.provider`
+    /// pattern; `drain_ledger` / admission / publish-notify / mem-tier are all shared
+    /// Arc fields, so the clone drains the SAME ledger this freeze recorded into) and
+    /// the admission `permit`, which releases (≈ generation reclaim) when the task ends.
+    ///
+    /// DETACHED-ERROR CONTRACT: a detached drain error cannot propagate back to the
+    /// tick. It is safe because the drain advances the slot only AFTER it publishes
+    /// (ordered ack), and `DrainCleanup` discards the generation on the failing `?` —
+    /// so a failed drain simply does not advance the slot, and the source replays the
+    /// un-acked tail PK-idempotently on the next poll (mirroring the crash-in-the-gap
+    /// recovery the 2a suite proves). It is surfaced as a warning only.
+    fn spawn_detached_checkpoint_drain(
+        &self,
+        claim: (CheckpointDrainClaim, Instant),
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
+        let (claim, checkpoint_start) = claim;
+        let provider = Arc::new(self.clone_for_write());
+        let table = self.table_metadata.table_name.clone();
+        tokio::spawn(async move {
+            // Held for the whole task so the admission slot frees only once this drain
+            // has reclaimed its generation (its publish/ack completes just before).
+            let _permit = permit;
+            if let Err(e) = provider.run_checkpoint_drain(claim, checkpoint_start).await {
+                tracing::warn!(
+                    target: "cayenne::mem_tier",
+                    table = %table,
+                    "Detached mem-tier checkpoint drain failed (slot ack not advanced; source replays PK-idempotently): {e}"
+                );
+            }
+        });
     }
 
     /// Checkpoint for a caller that already holds `write_lock`, but does NOT hold
@@ -22196,8 +22406,49 @@ impl CayenneTableProvider {
             ledger.reclaim_terminal_prefix_ack()
         };
         cleanup.disarm();
+        // The reclaim above advanced the ledger front (this generation, and any
+        // contiguous already-terminal successors, left the ledger). Wake any drain
+        // parked in `await_checkpoint_publish_turn` waiting to become the front so it
+        // can take its ordered-publish turn (Step 3b-b). A no-op at `D = 1` (no drain
+        // is ever parked — the sole generation is already the front).
+        self.drain_publish_notify.notify_waiters();
         if let Some(epoch) = ack {
             self.fire_slot_advancer(epoch).await;
+        }
+    }
+
+    /// Wait until the generation identified by `id` is the FRONT (oldest in-flight) of
+    /// the drain ledger — its ordered-publish turn. Returns immediately when it is
+    /// already the front (ALWAYS the case at `D = 1`, where the sole resident
+    /// generation is the front — byte-identical, no suspension). At `D > 1` a drain
+    /// whose encode finished ahead of an older generation's parks here until every
+    /// older generation has published and reclaimed, so the publish section (metastore
+    /// commit → `listing_fence` swap → `retain_after` front-clear → slot ack) runs
+    /// strictly oldest-first. This is what makes the front-relative `retain_after`
+    /// clear safe: a later generation can only clear the tier front once it IS the
+    /// front, i.e. once every older generation's front prefix has already been cleared.
+    ///
+    /// The wait registers on [`Self::drain_publish_notify`] BEFORE re-checking the
+    /// front under the ledger lock, so a `notify_waiters()` fired by a concurrent
+    /// reclaim between the check and the await is not lost (the standard tokio
+    /// `Notified` idiom).
+    async fn await_checkpoint_publish_turn(&self, id: u64) {
+        loop {
+            let notified = self.drain_publish_notify.notified();
+            tokio::pin!(notified);
+            // Arm the waiter before the check so a reclaim's `notify_waiters()` that
+            // races this section still wakes us.
+            notified.as_mut().enable();
+            {
+                let ledger = self.drain_ledger.lock();
+                // Our turn once we are the front; also return if our generation is no
+                // longer resident (an abort/discard) — it will never become the front,
+                // and the caller's transition/cleanup handles the missing generation.
+                if ledger.front_id() == Some(id) || !ledger.is_resident(id) {
+                    return;
+                }
+            }
+            notified.await;
         }
     }
 
@@ -22408,7 +22659,7 @@ impl CayenneTableProvider {
         let claim = {
             let mut ledger = self.drain_ledger.lock();
             debug_assert!(
-                ledger.is_empty(),
+                ledger.max_depth() > 1 || ledger.is_empty(),
                 "D=1 drain ledger must be empty before a checkpoint freeze (freezes serialized by mem_checkpoint_lock)"
             );
             let window_base = ledger.resident_prefix_counts(n);
@@ -22461,7 +22712,8 @@ impl CayenneTableProvider {
         claim: CheckpointDrainClaim,
         checkpoint_start: Instant,
     ) -> Result<u64> {
-        let mut drain_cleanup = DrainCleanup::armed(&self.drain_ledger, claim.id);
+        let mut drain_cleanup =
+            DrainCleanup::armed(&self.drain_ledger, &self.drain_publish_notify, claim.id);
         self.drain_checkpoint_generation(claim, checkpoint_start, &mut drain_cleanup)
             .await
     }
@@ -22557,6 +22809,11 @@ impl CayenneTableProvider {
         }
         // Committed to draining this generation: claim it for the bake (by id).
         self.with_generation_by_id(id, |g| g.transition(GenState::Spilling));
+        // Test-only deterministic pause: hold this drain in flight (Spilling) so a D>1
+        // test can start freeze N+1 while drain N is here, proving overlap. No-op in
+        // production (no gate installed).
+        #[cfg(test)]
+        self.checkpoint_drain_pause_point().await;
         let inlined_view = self.cached_inlined_view().await?;
         // The inline removal map is the WHOLE-TIER tombstone union (carried on
         // `snapshot.tombstones` — shard 0's at N==1, the cross-shard union at N>1),
@@ -22621,6 +22878,10 @@ impl CayenneTableProvider {
             // moves past the deletes. All keys are pure deletes here (the
             // corpus is empty), so the commit writes delete-only entries and
             // registers no snapshot.
+            // ORDERED PUBLISH (Step 3b-b): this path commits DVs + clears the front
+            // prefix, so it must run after every older generation published. No-op at
+            // D=1 (this is the only, and therefore front, generation).
+            self.await_checkpoint_publish_turn(id).await;
             if let Some(sequence_number) = reserved_snapshot_sequence
                 && Self::mem_tier_has_tombstones(&snapshot)
             {
@@ -22720,6 +22981,12 @@ impl CayenneTableProvider {
         // ingest. The position-based strategy appends to the CURRENT snapshot and
         // therefore must keep encode+swap atomic under one held fence (unchanged).
         let stats = if self.pk_deletion_strategy.is_position_based() {
+            // ORDERED PUBLISH (Step 3b-b): the position-based path keeps encode+swap
+            // atomic under one held fence, so it cannot overlap encode across
+            // generations — take the publish turn up front. No-op at D=1 (and
+            // position-based tables never raise D above 1: they are single-shard and
+            // never engage the memory-mode mem-tier pipeline).
+            self.await_checkpoint_publish_turn(id).await;
             let _fence = self.listing_fence.write().await;
             let target_size_bytes = self.context.target_file_size_bytes();
             let current_snapshot = self.get_current_snapshot_id();
@@ -22817,6 +23084,15 @@ impl CayenneTableProvider {
                 let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
                 Self::sync_snapshot_dir(&snapshot_dir).await?;
             }
+
+            // ORDERED PUBLISH turn (Step 3b-b). The Vortex encode + fsync above (phase
+            // 1) ran OFF-lock and OFF-turn, so at D>1 generation N+1's encode overlaps
+            // generation N's whole drain (the pipeline win). But the metastore commit +
+            // fence swap + `retain_after` front-clear below (phase 2) must be strictly
+            // oldest-first: park here until this generation is the ledger front (every
+            // older generation published and reclaimed). No-op at D=1 (sole/front gen),
+            // so the pre-commit spill-fault crash boundary below is unchanged.
+            self.await_checkpoint_publish_turn(id).await;
 
             // Test-only Stage 2a spilling-crash injection: the generation is in
             // `GenState::Spilling` here — the Vortex file is durably encoded and
@@ -23193,7 +23469,7 @@ impl CayenneTableProvider {
         let claim = {
             let mut ledger = self.drain_ledger.lock();
             debug_assert!(
-                ledger.is_empty(),
+                ledger.max_depth() > 1 || ledger.is_empty(),
                 "D=1 drain ledger must be empty before a seal freeze (freezes serialized by mem_checkpoint_lock)"
             );
             let window_base = ledger.resident_prefix_counts(n);
@@ -23237,7 +23513,8 @@ impl CayenneTableProvider {
             sealed_through,
             seal_epoch,
         } = claim;
-        let mut drain_cleanup = DrainCleanup::armed(&self.drain_ledger, id);
+        let mut drain_cleanup =
+            DrainCleanup::armed(&self.drain_ledger, &self.drain_publish_notify, id);
         self.drain_seal_generation(id, shard_snapshots, sealed_through, seal_epoch, &mut drain_cleanup)
             .await
     }
@@ -31620,6 +31897,143 @@ mod tests {
             scan_sorted_ids(&provider).await,
             vec![1, 2, 3, 4, 5],
             "flushed rows are durable and visible after the periodic checkpoint"
+        );
+    }
+
+    /// Stage 2b Step 3b-b — the D>1 DETACHED checkpoint drain overlaps freeze N+1 with
+    /// drain N yet still publishes strictly oldest-first. Proven against a D=1 SERIAL
+    /// reference: the same two bursts + checkpoints must produce the SAME durable scan
+    /// and the SAME final ack watermark, while the D=2 run keeps BOTH drains
+    /// concurrently in flight (overlap — the pipeline win) and its ack watermark stays
+    /// monotone (ordered publish never acks past an unfinished older generation). The
+    /// config keeps `D = 1`; `D = 2` here is the test-only override, and the mem-tier
+    /// append stays synchronous — only the checkpoint drain pipelines.
+    #[tokio::test]
+    async fn stage2b_d2_detached_checkpoint_drains_overlap_and_publish_ordered() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        struct AckRecorder(Arc<ParkingMutex<Vec<u64>>>);
+        #[async_trait::async_trait]
+        impl crate::provider::mem_tier::SlotAdvancer for AckRecorder {
+            async fn on_checkpoint_durable(&self, durable_epoch: u64) {
+                self.0.lock().push(durable_epoch);
+            }
+        }
+
+        // Bounded condition-poll (NOT a fixed readiness sleep): 2ms interval, ~4s cap,
+        // with a failure message — the sanctioned readiness-wait shape.
+        async fn wait_until(label: &str, cond: impl Fn() -> bool) {
+            for _ in 0..2000 {
+                if cond() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            panic!("condition '{label}' not met within timeout");
+        }
+
+        let none = OnConflictDeletions::default();
+
+        // ---- D=1 SERIAL REFERENCE: identical workload, inline drain (no gate). ----
+        let ref_env = SessionContext::new().runtime_env();
+        let (reference, _ref_tmp) =
+            create_memory_mode_table_with_caps("d1_reference", ref_env, i64::MAX, 0, 0).await;
+        let ref_acks = Arc::new(ParkingMutex::new(Vec::<u64>::new()));
+        reference.install_slot_advancer(Arc::new(AckRecorder(Arc::clone(&ref_acks))));
+        let rb1 = int64_id_batch(&[1, 2, 3]);
+        let rb1_bytes = rb1.get_array_memory_size() as u64;
+        reference
+            .append_to_mem_tier(vec![rb1], &none, rb1_bytes, 0)
+            .await
+            .expect("ref append 1");
+        reference.checkpoint_mem_tier().await.expect("ref checkpoint 1");
+        let rb2 = int64_id_batch(&[4, 5]);
+        let rb2_bytes = rb2.get_array_memory_size() as u64;
+        reference
+            .append_to_mem_tier(vec![rb2], &none, rb2_bytes, 0)
+            .await
+            .expect("ref append 2");
+        reference.checkpoint_mem_tier().await.expect("ref checkpoint 2");
+        let ref_scan = scan_sorted_ids(&reference).await;
+        let ref_final_ack = ref_acks.lock().last().copied();
+        assert_eq!(ref_scan, vec![1, 2, 3, 4, 5], "reference durable scan");
+
+        // ---- D=2 PIPELINED: freeze N+1 overlaps drain N. ----
+        let env = SessionContext::new().runtime_env();
+        let (provider, _tmp) =
+            create_memory_mode_table_with_caps("d2_overlap", env, i64::MAX, 0, 0).await;
+        assert!(provider.is_cdc_memory_mode(), "memory mode active");
+        let acks = Arc::new(ParkingMutex::new(Vec::<u64>::new()));
+        provider.install_slot_advancer(Arc::new(AckRecorder(Arc::clone(&acks))));
+        provider.set_drain_pipeline_depth_for_test(2);
+        let (parked, release) = provider.install_checkpoint_drain_gate_for_test();
+
+        // Burst 1 → freeze gen0 → detach → drain0 parks in flight (Spilling).
+        let a1 = int64_id_batch(&[1, 2, 3]);
+        let a1_bytes = a1.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![a1], &none, a1_bytes, 0)
+            .await
+            .expect("append 1");
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("freeze + detach gen0");
+        wait_until("drain0 parked", || {
+            parked.load(AtomicOrdering::Relaxed) >= 1
+        })
+        .await;
+
+        // Burst 2 → freeze gen1 WHILE drain0 is parked (the OVERLAP) → detach → parks.
+        let a2 = int64_id_batch(&[4, 5]);
+        let a2_bytes = a2.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![a2], &none, a2_bytes, 0)
+            .await
+            .expect("append 2");
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("freeze + detach gen1");
+        wait_until("both drains parked", || {
+            parked.load(AtomicOrdering::Relaxed) >= 2
+        })
+        .await;
+        assert_eq!(
+            provider.drain_ledger.lock().depth(),
+            2,
+            "two generations concurrently resident — freeze N+1 overlapped drain N"
+        );
+
+        // Release both; the ordered-publish gate must sweep gen0 before gen1.
+        release.add_permits(2);
+        wait_until("ledger drained", || {
+            provider.drain_ledger.lock().is_empty()
+        })
+        .await;
+
+        // Ordered ack: monotone watermark, same FINAL value as the serial reference.
+        let recorded = acks.lock().clone();
+        assert!(!recorded.is_empty(), "at least one ack fired");
+        assert!(
+            recorded.windows(2).all(|w| w[0] <= w[1]),
+            "ack watermark monotone (ordered publish, never past an unfinished older gen): {recorded:?}"
+        );
+        assert_eq!(
+            recorded.last().copied(),
+            ref_final_ack,
+            "final ack equals the D=1 serial reference"
+        );
+
+        // Durable scan equals the serial reference — no resurrection, loss, or double-count.
+        assert!(
+            provider.mem_tier.tier().load().is_empty(),
+            "tier fully drained after both ordered publishes"
+        );
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            ref_scan,
+            "D=2 pipelined durable scan equals the D=1 serial reference"
         );
     }
 

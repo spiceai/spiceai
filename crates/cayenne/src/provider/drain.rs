@@ -411,11 +411,50 @@ impl FrozenDrainLedger {
     }
 
     /// Whether the ledger holds no in-flight generation. The entry points assert
-    /// this holds before they freeze (at `D = 1` every prior drain reclaimed or the
+    /// this holds before they freeze at `D = 1` (every prior drain reclaimed or the
     /// cleanup guard discarded its generation before releasing `mem_checkpoint_lock`).
     #[must_use]
     pub(crate) fn is_empty(&self) -> bool {
         self.generations.is_empty()
+    }
+
+    /// The configured maximum number of resident generations (`D`). `1` at the config
+    /// default; a `> 1` value (Stage 2b Step 3b-b) enables the detached pipelined
+    /// drain. Read by the entry points to decide inline-vs-detached and by the
+    /// admission back-pressure.
+    #[must_use]
+    pub(crate) fn max_depth(&self) -> usize {
+        self.max_depth
+    }
+
+    /// The id of the FRONT (oldest in-flight) generation, or `None` when empty. The
+    /// ordered-publish gate reads this: a drain may publish only once its generation is
+    /// the front (every older generation has published and been reclaimed ahead of it).
+    #[must_use]
+    pub(crate) fn front_id(&self) -> Option<u64> {
+        self.generations.front().map(|g| g.id)
+    }
+
+    /// Whether a generation with `id` is still resident. The ordered-publish gate uses
+    /// this to stop waiting if its own generation was discarded (aborted) while other
+    /// generations remain — it would otherwise never become the front.
+    #[must_use]
+    pub(crate) fn is_resident(&self, id: u64) -> bool {
+        self.generations.iter().any(|g| g.id == id)
+    }
+
+    /// Test-only: raise (or reset) the resident-generation bound `D` so the D>1
+    /// detached-drain path becomes reachable. The provider pairs this with a matching
+    /// admission-semaphore capacity. Must be called before any freeze (an empty ledger).
+    #[cfg(test)]
+    pub(crate) fn set_max_depth_for_test(&mut self, max_depth: usize) {
+        debug_assert!(max_depth >= 1, "a drain ledger admits at least one generation");
+        debug_assert!(
+            self.generations.is_empty(),
+            "set_max_depth_for_test must run before any freeze"
+        );
+        self.max_depth = max_depth;
+        self.generations.reserve(max_depth);
     }
 }
 
@@ -668,7 +707,7 @@ mod tests {
                 );
             }
 
-            let mut published = vec![false; K];
+            let mut published = [false; K];
             let mut last_fired: Option<u64> = None;
             for &gen_id in &publish_order {
                 let id = u64::try_from(gen_id).expect("small");
