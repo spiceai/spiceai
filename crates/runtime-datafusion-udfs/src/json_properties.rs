@@ -714,9 +714,9 @@ fn compute_type(spec: &Value) -> Cow<'static, str> {
         return Cow::Borrowed("map");
     }
     match spec.get("type") {
-        Some(Value::String(s)) => static_type_label(s)
-            .map(Cow::Borrowed)
-            .unwrap_or_else(|| Cow::Owned(s.clone())),
+        Some(Value::String(s)) => {
+            static_type_label(s).map_or_else(|| Cow::Owned(s.clone()), Cow::Borrowed)
+        }
         Some(Value::Array(arr)) => {
             // Type unions with `"null"` express optional/nullable in JSON
             // Schema; the "real" type is the first non-null entry. Only fall
@@ -725,11 +725,9 @@ fn compute_type(spec: &Value) -> Cow<'static, str> {
                 .iter()
                 .filter_map(Value::as_str)
                 .find(|&t| t != "null")
-                .or_else(|| arr.iter().filter_map(Value::as_str).next())
+                .or_else(|| arr.iter().find_map(Value::as_str))
                 .unwrap_or("unknown");
-            static_type_label(chosen)
-                .map(Cow::Borrowed)
-                .unwrap_or_else(|| Cow::Owned(chosen.to_owned()))
+            static_type_label(chosen).map_or_else(|| Cow::Owned(chosen.to_owned()), Cow::Borrowed)
         }
         _ => {
             if has_props {

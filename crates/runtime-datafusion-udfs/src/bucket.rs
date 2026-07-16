@@ -259,7 +259,12 @@ fn compute_bucket_array(
     // `hash % num_buckets` is always < num_buckets <= MAX_NUM_BUCKETS <= i32::MAX.
     let mut buckets = Vec::with_capacity(hashes.len());
     for hash in hashes {
-        buckets.push((hash % num_buckets_u64) as i32);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "modulo result is < num_buckets <= MAX_NUM_BUCKETS <= i32::MAX"
+        )]
+        let bucket = (hash % num_buckets_u64) as i32;
+        buckets.push(bucket);
     }
 
     let result = Int32Array::new(buckets.into(), array.nulls().cloned());

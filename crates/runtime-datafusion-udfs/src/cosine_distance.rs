@@ -486,6 +486,7 @@ fn cosine_distance_f32(x: &[f32], y: &[f32]) -> f64 {
 }
 
 /// Thin wrapper kept for unit tests that construct `Float64Array`s directly.
+#[cfg(test)]
 fn cosine_distance(x: &Float64Array, y: &Float64Array) -> f64 {
     cosine_distance_f64(x.values(), y.values())
 }
