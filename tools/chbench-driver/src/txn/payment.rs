@@ -211,7 +211,13 @@ pub async fn run(
     } else {
         tx.execute(
             &stmts.update_customer,
-            &[&h_amount, &h_amount_f64, &customer_wh, &customer_dist, &c_id],
+            &[
+                &h_amount,
+                &h_amount_f64,
+                &customer_wh,
+                &customer_dist,
+                &c_id,
+            ],
         )
         .await
         .map_err(|source| crate::Error::Sql {
