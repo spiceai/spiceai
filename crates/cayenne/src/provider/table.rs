@@ -3370,7 +3370,7 @@ impl CayenneTableProvider {
                         Self::invalidate_list_files_cache(&runtime_env, &url);
                         ledger.lock().remove(&id);
                         last_listed.lock().remove(&id);
-                        tracing::info!(
+                        tracing::debug!(
                             target: "cayenne::compaction",
                             table_id = %table_id,
                             snapshot_id = %id,
@@ -4741,7 +4741,7 @@ impl CayenneTableProvider {
             // manifest is populated, delete file-by-file so a file referenced
             // in place by a live/protected snapshot survives; otherwise (legacy
             // / unpopulated) the whole dir is dead and removed wholesale.
-            tracing::info!(
+            tracing::debug!(
                 "Deleting old snapshot directory for table {}: {}",
                 table_id,
                 snapshot_id
@@ -4758,7 +4758,7 @@ impl CayenneTableProvider {
                 if fully_removed {
                     deleted_count += 1;
                 } else {
-                    tracing::info!(
+                    tracing::debug!(
                         "Kept old snapshot directory for table {table_id}: {snapshot_id} \
                          (files still referenced in place by a live snapshot)"
                     );
@@ -4771,7 +4771,7 @@ impl CayenneTableProvider {
         }
 
         if deleted_count > 0 {
-            tracing::info!(
+            tracing::debug!(
                 "Cleaned up {} old snapshot(s) for table {}",
                 deleted_count,
                 table_id
@@ -5679,7 +5679,7 @@ impl CayenneTableProvider {
 
         // Log when starting S3 upload process
         if is_s3_storage {
-            tracing::info!(
+            tracing::debug!(
                 "Starting S3 upload to snapshot {} for table {} (writer target file size: {})",
                 snapshot_id,
                 self.table_metadata.table_name,
@@ -5737,7 +5737,7 @@ impl CayenneTableProvider {
                         } else {
                             "calculating...".to_string()
                         };
-                        tracing::info!(
+                        tracing::debug!(
                             "S3 upload for {}: streamed {} in {:.1}s, {}",
                             table_name,
                             format_bytes(bytes_so_far),
@@ -5792,7 +5792,7 @@ impl CayenneTableProvider {
             } else {
                 "N/A".to_string()
             };
-            tracing::info!(
+            tracing::debug!(
                 "Completed S3 upload for {} to snapshot {}: {} rows across {} writer operation(s) ({}) in {:.1}s, {}",
                 self.table_metadata.table_name,
                 snapshot_id,
@@ -7359,7 +7359,7 @@ impl CayenneTableProvider {
                 &mut row_id_base,
             )
             .await?;
-            tracing::info!(
+            tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 cold_keys_folded = keyset.len().saturating_sub(keys_before),
@@ -11393,7 +11393,7 @@ impl CayenneTableProvider {
             return Ok(());
         }
 
-        tracing::info!(
+        tracing::debug!(
             "Sorting and rewriting data for table {} by columns {:?}",
             self.table_metadata.table_name,
             self.context.sort_columns()
@@ -11565,7 +11565,7 @@ impl CayenneTableProvider {
         // Old snapshot directories are cleaned up in the background
         self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
 
-        tracing::info!(
+        tracing::debug!(
             "Rewrote {} rows in {} sorted chunk(s) for table {}",
             total_rows,
             chunk_count,
@@ -11949,7 +11949,7 @@ impl CayenneTableProvider {
         let mut orphaned_ids: Vec<String> = Vec::with_capacity(missing.len());
         for m in missing {
             if m.sequence_number <= floor {
-                tracing::info!(
+                tracing::warn!(
                     table_id,
                     path = %m.path,
                     sequence = m.sequence_number,
@@ -12552,7 +12552,7 @@ impl CayenneTableProvider {
             return Ok(false);
         };
 
-        tracing::info!(
+        tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             tier = candidate.tier.as_str(),
@@ -12569,7 +12569,7 @@ impl CayenneTableProvider {
         self.rewrite_current_snapshot_for_compaction_tracked()
             .await?;
 
-        tracing::info!(
+        tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             tier = candidate.tier.as_str(),
@@ -12647,7 +12647,7 @@ impl CayenneTableProvider {
             SnapshotMaintenanceTrigger::ProtectedSnapshotCount {
                 protected_snapshot_count,
                 trigger_count,
-            } => tracing::info!(
+            } => tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 protected_snapshot_count,
@@ -12658,7 +12658,7 @@ impl CayenneTableProvider {
                 protected_snapshot_count,
                 oldest_snapshot_age,
                 trigger_age,
-            } => tracing::info!(
+            } => tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 protected_snapshot_count,
@@ -12669,7 +12669,7 @@ impl CayenneTableProvider {
             SnapshotMaintenanceTrigger::SmallFileCount {
                 number_picker_candidate_files: files,
                 compaction_trigger_files: trigger,
-            } => tracing::info!(
+            } => tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 small_files = files,
@@ -13733,7 +13733,7 @@ impl CayenneTableProvider {
         };
 
         if self.context.has_sort_columns() {
-            tracing::info!(
+            tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 sort_columns = ?self.context.sort_columns(),
@@ -14056,7 +14056,7 @@ impl CayenneTableProvider {
         // so the at-risk window (plan-build → plan-execute) closes naturally.
         self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
 
-        tracing::info!(
+        tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             rows = total_rows,
@@ -15265,7 +15265,7 @@ impl CayenneTableProvider {
             PROTECTED_TIER_GROWTH,
         );
 
-        tracing::info!(
+        tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             input_count = inputs.len(),
@@ -15495,7 +15495,7 @@ impl CayenneTableProvider {
             // the Phase-1 capture detects every such interleaving.
             if self.get_current_snapshot_id() != snapshot_at_capture {
                 drop(fence);
-                tracing::info!(
+                tracing::debug!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
                     "Subset-merge in-memory publish skipped: the table snapshot was replaced mid-pass (overwrite or datalake move); discarding the merged output"
@@ -15536,7 +15536,7 @@ impl CayenneTableProvider {
             self.evict_compaction_input_pages(&old_ids).await;
         }
 
-        tracing::info!(
+        tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             merged_inputs = inputs.len(),
@@ -15831,7 +15831,7 @@ impl CayenneTableProvider {
         // one selected file, so it is a real sequence.
         let prefix_cutoff = cutoff;
 
-        tracing::info!(
+        tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             input_count = selected.len(),
@@ -16051,7 +16051,7 @@ impl CayenneTableProvider {
             // pre-overwrite row set, and pruning would gut the fresh index.
             if self.get_current_snapshot_id() != snapshot_at_capture {
                 drop(fence);
-                tracing::info!(
+                tracing::debug!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
                     "Seq-prefix bake in-memory publish skipped: the table snapshot was replaced mid-pass (overwrite or datalake move); discarding the merged output"
@@ -16074,7 +16074,7 @@ impl CayenneTableProvider {
         }
 
         if clean_prefix_holds {
-            tracing::info!(
+            tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 merged_inputs = selected.len(),
@@ -20751,7 +20751,7 @@ impl CayenneTableProvider {
             .map(|b| b.get_array_memory_size() as u64)
             .fold(0u64, u64::saturating_add);
         let estimated_bytes = Some(estimated_flushed_bytes);
-        tracing::info!(
+        tracing::debug!(
             table = %self.table_metadata.table_name,
             rows = flushed_mem_rows,
             inlined_rows = total_rows.saturating_sub(flushed_mem_rows),
@@ -21837,7 +21837,7 @@ impl CayenneTableProvider {
                 .store(stats.record_count, Ordering::Relaxed);
 
             if stats.entry_count > 0 {
-                tracing::info!(
+                tracing::debug!(
                     table = %self.table_metadata.table_name,
                     rows = stats.record_count,
                     segments = stats.entry_count,
@@ -21889,7 +21889,7 @@ impl CayenneTableProvider {
         } else {
             Vec::new()
         };
-        tracing::info!(
+        tracing::debug!(
             "Checkpointing {} inlined rows ({} batches) for table {}",
             total_rows,
             batches.len(),
@@ -22104,7 +22104,7 @@ impl CayenneTableProvider {
             return Ok(());
         };
 
-        tracing::info!(
+        tracing::debug!(
             table = %self.table_metadata.table_name,
             rows = stats.record_count,
             segments = stats.entry_count,
@@ -25231,7 +25231,7 @@ impl TableProvider for CayenneTableProvider {
         let is_s3 = self.table_metadata.path.starts_with("s3://");
 
         if is_s3 {
-            tracing::info!(
+            tracing::debug!(
                 "Cayenne insert_into called for S3 table {} (overwrite: {:?})",
                 self.table_metadata.table_name,
                 overwrite

@@ -1175,7 +1175,7 @@ impl CayenneCatalog {
                 ),
                 source: Box::new(e),
             })?;
-        tracing::info!(
+        tracing::debug!(
             table = stored.table_name.as_str(),
             "Reconciled datalake configuration from spicepod params on table reopen"
         );
