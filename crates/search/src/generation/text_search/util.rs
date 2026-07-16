@@ -56,9 +56,9 @@ pub fn with_json_subset_column(
     let json_data = writer.into_inner();
 
     let json_str = std::str::from_utf8(&json_data).boxed()?;
-    let json_array: ArrayRef = Arc::new(StringArray::from_iter_values(
-        json_str.lines().filter(|line| !line.is_empty()),
-    ));
+    // `lines().filter(...)` is not ExactSizeIterator; `from_iter_values` requires sized.
+    let lines: Vec<&str> = json_str.lines().filter(|line| !line.is_empty()).collect();
+    let json_array: ArrayRef = Arc::new(StringArray::from(lines));
 
     let mut new_fields: Vec<_> = batch.schema().fields().iter().cloned().collect();
     new_fields.push(Arc::new(ArrowField::new(
