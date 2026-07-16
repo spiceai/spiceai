@@ -6247,6 +6247,18 @@ impl CayenneTableProvider {
         // `.max(1)` keeps the unsharded path when unset/0; `ShardedMemTier::empty`
         // also clamps, but pin it here so the field decl and lock-slice sizing agree.
         let mem_tier_shards = table_metadata.vortex_config.cdc_mem_tier_shards.max(1);
+        // Stage 2b Step 3c: bounded CDC drain-pipeline depth `D`. Default 1 =
+        // today's serial inline drain (byte-identical); `D > 1` pipelines the
+        // checkpoint drain (freeze N+1 overlaps drain N's off-lock encode/PUT).
+        // Read + clamped once here, at table-open, before any freeze — the
+        // production twin of `set_drain_pipeline_depth_for_test`: it sizes BOTH
+        // the drain ledger's resident-generation bound AND the admission-semaphore
+        // capacity to `D`, and both are shared across writer clones (so a detached
+        // drain on a clone sees the configured depth). Resident RAM ≈
+        // `D × checkpoint-tier-bytes` (§4.5), capped by `MAX_INGEST_PIPELINE_DEPTH`.
+        let drain_pipeline_depth = table_metadata
+            .vortex_config
+            .resolved_ingest_pipeline_depth();
 
         // Advertise the primary key as an (unverified) DataFusion constraint so
         // `TableProvider::constraints()` reflects it — runtime features gate on
@@ -6352,13 +6364,15 @@ impl CayenneTableProvider {
             // a snapshot.
             current_sorted_snapshot: Arc::new(ArcSwap::from_pointee(None)),
             mem_checkpoint_lock: Arc::new(tokio::sync::Mutex::new(())),
-            // Stage 2b Step 2: one shared drain ledger per table, `D = 1` until Step
-            // 3 raises the depth. Serialized against concurrent freezes by
-            // `mem_checkpoint_lock`.
-            drain_ledger: Arc::new(ParkingMutex::new(FrozenDrainLedger::new(1))),
-            // Stage 2b Step 3b-b: admission capacity == the ledger's `max_depth` (1 =
-            // config default). Only acquired at `max_depth > 1`.
-            drain_admission: Arc::new(tokio::sync::Semaphore::new(1)),
+            // Stage 2b Step 2: one shared drain ledger per table, sized from config
+            // (`D = 1` = today's byte-identical serial path). Serialized against
+            // concurrent freezes by `mem_checkpoint_lock`.
+            drain_ledger: Arc::new(ParkingMutex::new(FrozenDrainLedger::new(
+                drain_pipeline_depth,
+            ))),
+            // Stage 2b Step 3b-b / 3c: admission capacity == the ledger's `max_depth`
+            // (`cayenne_ingest_pipeline_depth`, default 1). Only acquired at `D > 1`.
+            drain_admission: Arc::new(tokio::sync::Semaphore::new(drain_pipeline_depth)),
             drain_publish_notify: Arc::new(tokio::sync::Notify::new()),
             mem_tier_publish_locks: (0..mem_tier_shards)
                 .map(|_| ParkingMutex::new(()))
@@ -31706,6 +31720,50 @@ mod tests {
         (provider, temp_dir)
     }
 
+    /// Build a memory-mode provider whose CDC drain pipeline depth is set from
+    /// config (`cayenne_ingest_pipeline_depth`), NOT the test-only
+    /// `set_drain_pipeline_depth_for_test` override — so a test exercises the real
+    /// production actuator that sizes the ledger + admission budget at table-open.
+    /// Single `id: Int64` PK, caps large enough that appends never spill; checkpoints
+    /// are driven explicitly.
+    async fn create_memory_mode_table_with_pipeline_depth(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+        pipeline_depth: usize,
+    ) -> (CayenneTableProvider, tempfile::TempDir) {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("init catalog");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let vortex_config = VortexConfig {
+            cdc_durability: crate::metadata::CdcDurability::Memory,
+            cdc_mem_tier_max_bytes: i64::MAX,
+            ingest_pipeline_depth: pipeline_depth,
+            ..VortexConfig::default()
+        };
+        let options = CreateTableOptions {
+            table_name: table_name.to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config,
+        };
+        let provider = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .create(options)
+            .await
+            .expect("table created");
+        (provider, temp_dir)
+    }
+
     /// Build a memory-mode provider with a chosen ingest substrate (Stage 1 #3c).
     /// Single `id: Int64` PK, caps large enough that appends never spill — so the
     /// mem-tier apply interior runs directly (inline or on the pinned pool).
@@ -32185,6 +32243,144 @@ mod tests {
             scan_sorted_ids(&provider).await,
             ref_scan,
             "D=2 pipelined durable scan equals the D=1 serial reference"
+        );
+    }
+
+    /// Stage 2b Step 3c — the settable `cayenne_ingest_pipeline_depth` knob wires the
+    /// REAL detached D>1 drain path, without the test-only override. A provider built
+    /// with `ingest_pipeline_depth = 2` from config must (a) read back depth 2 through
+    /// the production `drain_pipeline_depth()` path and (b) actually pipeline: the same
+    /// two bursts + checkpoints keep BOTH drains concurrently resident (overlap) yet
+    /// publish strictly oldest-first, producing the SAME durable scan and final ack as a
+    /// D=1 serial reference. This is the production twin of
+    /// `stage2b_d2_detached_checkpoint_drains_overlap_and_publish_ordered`, proving the
+    /// config actuator (ledger `max_depth` + admission capacity sized at table-open)
+    /// enables the identical mechanism the test override does — the settable path is
+    /// only shipped now that the mechanism is proven, so the default (1) stays
+    /// byte-identical.
+    #[tokio::test]
+    async fn stage2b_3c_config_pipeline_depth_enables_detached_drain() {
+        struct AckRecorder(Arc<ParkingMutex<Vec<u64>>>);
+        #[async_trait::async_trait]
+        impl crate::provider::mem_tier::SlotAdvancer for AckRecorder {
+            async fn on_checkpoint_durable(&self, durable_epoch: u64) {
+                self.0.lock().push(durable_epoch);
+            }
+        }
+
+        // Bounded condition-poll (NOT a fixed readiness sleep): 2ms interval, ~4s cap.
+        async fn wait_until(label: &str, cond: impl Fn() -> bool) {
+            for _ in 0..2000 {
+                if cond() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            panic!("condition '{label}' not met within timeout");
+        }
+
+        let none = OnConflictDeletions::default();
+
+        // ---- D=1 SERIAL REFERENCE: identical workload, default-config inline drain. ----
+        let ref_env = SessionContext::new().runtime_env();
+        let (reference, _ref_tmp) =
+            create_memory_mode_table_with_pipeline_depth("d1_config_reference", ref_env, 1).await;
+        assert_eq!(
+            reference.drain_pipeline_depth(),
+            1,
+            "default config depth is 1 (byte-identical serial drain)"
+        );
+        let ref_acks = Arc::new(ParkingMutex::new(Vec::<u64>::new()));
+        reference.install_slot_advancer(Arc::new(AckRecorder(Arc::clone(&ref_acks))));
+        let rb1 = int64_id_batch(&[1, 2, 3]);
+        let rb1_bytes = rb1.get_array_memory_size() as u64;
+        reference
+            .append_to_mem_tier(vec![rb1], &none, rb1_bytes, 0)
+            .await
+            .expect("ref append 1");
+        reference.checkpoint_mem_tier().await.expect("ref checkpoint 1");
+        let rb2 = int64_id_batch(&[4, 5]);
+        let rb2_bytes = rb2.get_array_memory_size() as u64;
+        reference
+            .append_to_mem_tier(vec![rb2], &none, rb2_bytes, 0)
+            .await
+            .expect("ref append 2");
+        reference.checkpoint_mem_tier().await.expect("ref checkpoint 2");
+        let ref_scan = scan_sorted_ids(&reference).await;
+        let ref_final_ack = ref_acks.lock().last().copied();
+        assert_eq!(ref_scan, vec![1, 2, 3, 4, 5], "reference durable scan");
+
+        // ---- D=2 VIA CONFIG (no test override): freeze N+1 overlaps drain N. ----
+        let env = SessionContext::new().runtime_env();
+        let (provider, _tmp) =
+            create_memory_mode_table_with_pipeline_depth("d2_config", env, 2).await;
+        assert!(provider.is_cdc_memory_mode(), "memory mode active");
+        assert_eq!(
+            provider.drain_pipeline_depth(),
+            2,
+            "config `ingest_pipeline_depth = 2` sized the production drain pipeline"
+        );
+        let acks = Arc::new(ParkingMutex::new(Vec::<u64>::new()));
+        provider.install_slot_advancer(Arc::new(AckRecorder(Arc::clone(&acks))));
+        let gate = provider.install_checkpoint_drain_gate_for_test();
+
+        // Burst 1 → freeze gen0 → detach → drain0 parks in flight (Spilling).
+        let a1 = int64_id_batch(&[1, 2, 3]);
+        let a1_bytes = a1.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![a1], &none, a1_bytes, 0)
+            .await
+            .expect("append 1");
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("freeze + detach gen0");
+        wait_until("drain0 parked", || gate.arrived() >= 1).await;
+
+        // Burst 2 → freeze gen1 WHILE drain0 is parked (the OVERLAP) → detach → parks.
+        let a2 = int64_id_batch(&[4, 5]);
+        let a2_bytes = a2.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![a2], &none, a2_bytes, 0)
+            .await
+            .expect("append 2");
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("freeze + detach gen1");
+        wait_until("both drains parked", || gate.arrived() >= 2).await;
+        assert_eq!(
+            provider.drain_ledger.lock().depth(),
+            2,
+            "two generations concurrently resident — the config depth enabled the overlap"
+        );
+
+        // Release both; the ordered-publish gate must sweep gen0 before gen1.
+        gate.release_all_parked();
+        wait_until("ledger drained", || {
+            provider.drain_ledger.lock().is_empty()
+        })
+        .await;
+
+        let recorded = acks.lock().clone();
+        assert!(!recorded.is_empty(), "at least one ack fired");
+        assert!(
+            recorded.windows(2).all(|w| w[0] <= w[1]),
+            "ack watermark monotone (ordered publish, never past an unfinished older gen): {recorded:?}"
+        );
+        assert_eq!(
+            recorded.last().copied(),
+            ref_final_ack,
+            "final ack equals the D=1 serial reference"
+        );
+        assert!(
+            provider.mem_tier.tier().load().is_empty(),
+            "tier fully drained after both ordered publishes"
+        );
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            ref_scan,
+            "config-D=2 pipelined durable scan equals the D=1 serial reference"
         );
     }
 

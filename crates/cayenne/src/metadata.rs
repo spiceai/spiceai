@@ -791,6 +791,33 @@ impl IngestSubstrate {
     }
 }
 
+/// Upper bound on the CDC drain-pipeline depth `D` (`cayenne_ingest_pipeline_depth`,
+/// morsel pipeline Stage 2b). `D` bounds the number of frozen checkpoint generations
+/// that may be resident (encoding/uploading) at once, so peak RAM held by the drain
+/// pipeline is roughly `D × checkpoint-tier-bytes` (proposal §4.5). The overlap win
+/// saturates after a handful of concurrent drains (it hides encode + object-store PUT
+/// latency, not an unbounded fan-out), while resident RAM grows linearly with `D`, so
+/// the knob is capped here rather than left unbounded — a large `D` over large tiers
+/// is an OOM risk, not a throughput gain. Values above this clamp down to it.
+pub const MAX_INGEST_PIPELINE_DEPTH: usize = 8;
+
+/// Depth `1` by default — today's serial, byte-identical inline checkpoint drain
+/// (freeze → encode → publish → clear all under `mem_checkpoint_lock`). `>1` pipelines
+/// the drain so a later freeze overlaps an earlier generation's off-lock encode/PUT.
+fn default_ingest_pipeline_depth() -> usize {
+    1
+}
+
+/// Skip serializing the common default so an unset knob round-trips to byte-identical
+/// stored metadata.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde `skip_serializing_if` requires a `fn(&T) -> bool` signature"
+)]
+fn is_default_ingest_pipeline_depth(depth: &usize) -> bool {
+    *depth == default_ingest_pipeline_depth()
+}
+
 /// Which adaptive-tunable knobs the operator pinned with an explicit value. In
 /// `adaptive` mode the closed-loop controller must not move a pinned knob — its
 /// tuning bounds collapse to a single point so `decide()` naturally skips it and
@@ -1315,9 +1342,39 @@ pub struct VortexConfig {
     /// and skipped when serializing the common `Inline` case.
     #[serde(default, skip_serializing_if = "IngestSubstrate::is_inline")]
     pub ingest_substrate: IngestSubstrate,
+    /// Bounded depth `D` of the CDC checkpoint drain pipeline (morsel pipeline,
+    /// Stage 2b). Set from `cayenne_ingest_pipeline_depth`. Defaults to `1` —
+    /// today's serial inline drain, byte-identical: freeze, encode, publish, and
+    /// clear all run under `mem_checkpoint_lock`, so the next freeze waits for the
+    /// current drain. `>1` lets up to `D` frozen checkpoint generations be resident
+    /// at once: each freeze is O(1) under the lock, then the encode + object-store
+    /// PUT run off-lock on a detached task, so a later freeze overlaps an earlier
+    /// generation's upload (publish still commits strictly oldest-first — ordered
+    /// publish + min-across-in-flight ack). Applies to `cdc_durability: memory`
+    /// only. Runtime-only — never compared by `configuration_matches` (does not
+    /// affect data layout). Clamped to `[1, MAX_INGEST_PIPELINE_DEPTH]` by
+    /// [`VortexConfig::resolved_ingest_pipeline_depth`]; resident RAM is roughly
+    /// `D × checkpoint-tier-bytes` (proposal §4.5), which the upper bound caps.
+    #[serde(
+        default = "default_ingest_pipeline_depth",
+        skip_serializing_if = "is_default_ingest_pipeline_depth"
+    )]
+    pub ingest_pipeline_depth: usize,
 }
 
 impl VortexConfig {
+    /// Effective CDC drain-pipeline depth `D`, clamped to `[1, MAX_INGEST_PIPELINE_DEPTH]`.
+    /// The single derivation rule for every path that sizes the drain ledger / admission
+    /// budget from config. `0` (a nonsensical "no drains" value) clamps up to `1` so a
+    /// checkpoint always has at least one resident slot; an over-large value clamps down
+    /// to the memory-budget cap (see [`MAX_INGEST_PIPELINE_DEPTH`]). The runtime param
+    /// layer additionally warns on an out-of-range value; this is the defensive final
+    /// clamp so a stored/constructed config can never enable an out-of-range depth.
+    #[must_use]
+    pub fn resolved_ingest_pipeline_depth(&self) -> usize {
+        self.ingest_pipeline_depth.clamp(1, MAX_INGEST_PIPELINE_DEPTH)
+    }
+
     /// Whether the cold object-store tier is enabled (a non-empty location set).
     #[must_use]
     pub fn cold_tier_enabled(&self) -> bool {
@@ -1665,6 +1722,7 @@ impl Default for VortexConfig {
             cold_tier_gc_interval_ms: 300_000,
             ingest_cores: IngestCores::default(),
             ingest_substrate: IngestSubstrate::default(),
+            ingest_pipeline_depth: default_ingest_pipeline_depth(),
         }
     }
 }
@@ -1689,6 +1747,70 @@ mod tests {
     /// complete on every path. A regression flipping this default to `true`
     /// would silently make the manifest the authoritative scan source — guard
     /// both the struct default and the serde (empty-config) default.
+    /// `ingest_pipeline_depth` must default to 1 (today's byte-identical serial
+    /// drain), stay unserialized at the default (so stored metadata round-trips
+    /// unchanged), and clamp defensively to `[1, MAX_INGEST_PIPELINE_DEPTH]` — a
+    /// stored/constructed config can never enable an out-of-range depth (`0` would
+    /// leave a checkpoint with no resident slot; an over-large value blows the
+    /// `D × checkpoint-tier-bytes` memory budget).
+    #[test]
+    fn test_ingest_pipeline_depth_defaults_and_clamps() {
+        assert_eq!(
+            VortexConfig::default().ingest_pipeline_depth,
+            1,
+            "struct default depth is 1 (serial inline drain)"
+        );
+        let from_empty: VortexConfig = serde_json::from_str("{}").expect("valid empty config");
+        assert_eq!(
+            from_empty.ingest_pipeline_depth, 1,
+            "an empty config inherits depth 1 via serde default"
+        );
+        assert_eq!(from_empty.resolved_ingest_pipeline_depth(), 1);
+
+        let zero = VortexConfig {
+            ingest_pipeline_depth: 0,
+            ..VortexConfig::default()
+        };
+        assert_eq!(
+            zero.resolved_ingest_pipeline_depth(),
+            1,
+            "depth 0 clamps up to 1 (a checkpoint always needs one resident slot)"
+        );
+
+        let huge = VortexConfig {
+            ingest_pipeline_depth: 999,
+            ..VortexConfig::default()
+        };
+        assert_eq!(
+            huge.resolved_ingest_pipeline_depth(),
+            super::MAX_INGEST_PIPELINE_DEPTH,
+            "an over-large depth clamps down to the memory-budget cap"
+        );
+
+        let mid = VortexConfig {
+            ingest_pipeline_depth: 3,
+            ..VortexConfig::default()
+        };
+        assert_eq!(
+            mid.resolved_ingest_pipeline_depth(),
+            3,
+            "an in-range depth passes through unchanged"
+        );
+
+        let default_json =
+            serde_json::to_string(&VortexConfig::default()).expect("serialize default");
+        assert!(
+            !default_json.contains("ingest_pipeline_depth"),
+            "the default depth must not be serialized (byte-identical stored metadata)"
+        );
+        let opted: VortexConfig =
+            serde_json::from_str(r#"{"ingest_pipeline_depth": 4}"#).expect("valid opt-in");
+        assert_eq!(
+            opted.ingest_pipeline_depth, 4,
+            "a non-default depth deserializes as opt-in"
+        );
+    }
+
     #[test]
     fn test_scan_from_manifest_defaults_off() {
         assert!(
