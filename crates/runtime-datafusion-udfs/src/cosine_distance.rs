@@ -285,7 +285,7 @@ fn compute_cosine_distance(
         return exec_err!("Both arrays must have the same length");
     }
 
-    Ok(cosine_distance(&float_vals1, &float_vals2))
+    Ok(Some(cosine_distance(&float_vals1, &float_vals2)))
 }
 
 /// Computes the cosine distance between two equal-length vectors.
@@ -293,7 +293,7 @@ fn compute_cosine_distance(
 /// Zero-magnitude vectors have no defined direction; they are treated as
 /// orthogonal (cosine similarity = 0), returning distance `0.5`, consistent
 /// with the SIMD path.
-fn cosine_distance(x: &Float64Array, y: &Float64Array) -> Option<f64> {
+fn cosine_distance(x: &Float64Array, y: &Float64Array) -> f64 {
     let mut x_length: f64 = 0.0;
     let mut y_length: f64 = 0.0;
 
@@ -322,7 +322,7 @@ fn cosine_distance(x: &Float64Array, y: &Float64Array) -> Option<f64> {
     };
 
     // Convert cosine similarity [-1.0, 1.0] to cosine distance [0.0, 1.0]
-    Some((1.0 - similarity) / 2.0)
+    (1.0 - similarity) / 2.0
 }
 
 /// Converts an array of any numeric type to a `Float64Array`.
@@ -366,38 +366,37 @@ mod tests {
     #[test]
     fn test_cosine_distance() {
         // Identical vectors -> similarity 1 -> distance 0.
-        assert!(matches!(
+        assert!(
             cosine_distance(
                 &Float64Array::from(vec![1.0, 2.0, 3.0]),
                 &Float64Array::from(vec![1.0, 2.0, 3.0]),
-            ),
-            Some(d) if d.abs() < f64::EPSILON
-        ));
+            )
+            .abs()
+                < f64::EPSILON
+        );
 
         // Opposite vectors -> similarity -1 -> distance 1.
-        assert!(matches!(
-            cosine_distance(
+        assert!(
+            (cosine_distance(
                 &Float64Array::from(vec![1.0, 2.0, 3.0]),
                 &Float64Array::from(vec![-1.0, -2.0, -3.0]),
-            ),
-            Some(d) if (d - 1.0).abs() < f64::EPSILON
-        ));
+            ) - 1.0)
+                .abs()
+                < f64::EPSILON
+        );
 
         // Arbitrary vectors stay within the normalized [0, 1] range.
-        assert!(matches!(
-            cosine_distance(
-                &Float64Array::from(vec![1000.0, 2000.0, 30.0]),
-                &Float64Array::from(vec![-42.0, 123.0, -3.0]),
-            ),
-            Some(d) if (0.0..=1.0).contains(&d)
-        ));
+        assert!((0.0..=1.0).contains(&cosine_distance(
+            &Float64Array::from(vec![1000.0, 2000.0, 30.0]),
+            &Float64Array::from(vec![-42.0, 123.0, -3.0]),
+        )));
     }
 
     #[test]
     fn test_cosine_distance_zero_vector_yields_orthogonal_distance() {
         // Zero-magnitude vectors are treated as orthogonal → distance 0.5,
         // consistent with the SIMD path.
-        let half = |d: Option<f64>| matches!(d, Some(v) if (v - 0.5).abs() < 1e-10);
+        let half = |d: f64| (d - 0.5).abs() < 1e-10;
         assert!(half(cosine_distance(
             &Float64Array::from(vec![0.0, 0.0, 0.0]),
             &Float64Array::from(vec![1.0, 2.0, 3.0]),
