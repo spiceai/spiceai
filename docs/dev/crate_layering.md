@@ -175,9 +175,10 @@ python3 scripts/check_crate_layers.py --mermaid   # tier-level DAG
 Reads `layers.toml` + `cargo metadata --no-deps` (no compilation) and exits
 non-zero on the first upward *normal* dependency. Wired into `make lint-rust`
 (fail-fast, before clippy) so a PR that adds an upward edge fails before merge.
-`--dev`-dependencies are exempt — they never ship, so they cannot create a real
-cycle (this is why `runtime` may dev-depend on every `connector-*` for its
-integration tests).
+Only `kind = "normal"` edges are checked; dev- and build-dependencies are exempt
+— they never ship in the library graph, so they cannot create a real cycle (this
+is why `runtime` may dev-depend on every `connector-*` for its integration
+tests). Requires Python 3.11+ (stdlib `tomllib`).
 
 Because the manifest encodes *what is true today*, the check is a **ratchet**: it
 cannot force an improvement, but it prevents backsliding, and it tightens as crates

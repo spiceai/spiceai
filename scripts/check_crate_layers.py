@@ -26,8 +26,16 @@ import argparse
 import json
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
+
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:
+    sys.exit(
+        "error: this script needs Python 3.11+ for the stdlib `tomllib` module "
+        f"(found {sys.version_info.major}.{sys.version_info.minor}). "
+        "Install/select a newer python3 and re-run `make lint-rust`."
+    )
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -98,8 +106,8 @@ def main() -> int:
         for p in pkgs:
             src = p["name"]
             for d in p["dependencies"]:
-                if (d.get("kind") or "normal") == "dev":
-                    continue
+                if (d.get("kind") or "normal") != "normal":
+                    continue  # only normal edges layer the shipped graph (skip dev + build)
                 dep = d["name"]
                 if dep not in names or dep == src:
                     continue
@@ -113,8 +121,9 @@ def main() -> int:
     for p in pkgs:
         src = p["name"]
         for d in p["dependencies"]:
-            if (d.get("kind") or "normal") == "dev":
-                continue  # dev-deps may point anywhere (e.g. connector integration tests -> runtime)
+            if (d.get("kind") or "normal") != "normal":
+                continue  # only normal edges layer the shipped graph; dev + build deps
+                # may point anywhere (e.g. connector integration tests -> runtime)
             dep = d["name"]
             if dep not in names or dep == src:
                 continue

@@ -1,9 +1,10 @@
 # Crate layering manifest — see docs/dev/crate_layering.md
 #
 # `scripts/check_crate_layers.py` reads this file and the workspace dependency
-# graph, then fails if any *normal* (non-dev) dependency edge points to a crate
-# in a HIGHER tier. Tiers are listed low -> high; a crate may depend only on
-# crates in its own tier or a lower one.
+# graph, then fails if any *normal* dependency edge points to a crate in a
+# HIGHER tier. Only `kind = "normal"` edges are checked; dev- and
+# build-dependencies are exempt. Tiers are listed low -> high; a crate may
+# depend only on crates in its own tier or a lower one.
 #
 # This encodes the layering that ALREADY holds on the current tree so it cannot
 # regress. It is NOT the target architecture — notably, connectors currently sit
