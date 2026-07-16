@@ -315,7 +315,11 @@ fn cosine_distance(x: &Float64Array, y: &Float64Array) -> Option<f64> {
 
     // Zero-magnitude vectors produce NaN (0/0); treat as zero similarity
     // (orthogonal) so behavior matches the SIMD path → distance 0.5.
-    let similarity = if similarity.is_finite() { similarity } else { 0.0 };
+    let similarity = if similarity.is_finite() {
+        similarity
+    } else {
+        0.0
+    };
 
     // Convert cosine similarity [-1.0, 1.0] to cosine distance [0.0, 1.0]
     Some((1.0 - similarity) / 2.0)
