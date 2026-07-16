@@ -54,7 +54,7 @@ use crate::SEARCH_SCORE_COLUMN_NAME;
 use crate::index::memory::provider::{MemoryVectorListTable, MemoryVectorQueryTable};
 use crate::index::memory::store::MemoryVectorStore;
 use crate::index::{SearchIndex, VectorIndex, embedding_col, write_util};
-use crate::metadata::MetadataColumns;
+use crate::metadata::{MetadataColumn, MetadataColumns};
 
 mod provider;
 mod store;
