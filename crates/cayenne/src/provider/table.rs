@@ -38284,7 +38284,7 @@ mod tests {
         // This test owns the checkpoint guard directly (modelling an in-flight
         // background op), so it calls the lock-held body. Single-shard (default
         // `cdc_mem_tier_shards`) means the capture is atomic, so `None` is correct.
-        debug_assert_eq!(
+        assert_eq!(
             provider.mem_tier.shard_count(),
             1,
             "inner(None) here relies on the single-shard (no write_lock) capture path"
