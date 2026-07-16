@@ -184,7 +184,18 @@ impl DataSink for CayenneDataSink {
             // resident bytes, letting their combined footprint blow the RAM bound (and
             // OOM) before either appends. Reads use `ArcSwap` (lock-free), so this only
             // serializes writers.
+            //
+            // Stall diagnostics: a wedged cold promotion holds this table's
+            // `write_lock` across its whole graduation, so ingest parks here with
+            // no logging. Tracking the wait lets the watchdog attribute the stall
+            // to the blocked ingest (the victim), not just the promotion.
+            let ingest_stall = super::stall_watchdog::StallOp::begin(
+                self.table.table_name(),
+                "ingest-memory-write",
+            );
+            ingest_stall.phase("await-write-lock");
             let _write_guard = self.table.write_lock().lock().await;
+            ingest_stall.phase("buffer-and-write");
             while let Some(batch) = data.next().await {
                 let batch = batch?;
                 incoming_bytes =
@@ -227,7 +238,13 @@ impl DataSink for CayenneDataSink {
         } else {
             // Append path: `write_all_append` uses the existing-staging helpers
             // that assume the caller already holds the write lock.
+            let ingest_stall = super::stall_watchdog::StallOp::begin(
+                self.table.table_name(),
+                "ingest-append-write",
+            );
+            ingest_stall.phase("await-write-lock");
             let _write_guard = self.table.write_lock().lock().await;
+            ingest_stall.phase("write-append");
             self.write_all_append(normalized, context)
                 .await
                 .map_err(Into::into)

@@ -14690,10 +14690,21 @@ impl CayenneTableProvider {
         // lock prevents the stale work and keeps promotion's overwrite-clear from
         // racing bake/merge bookkeeping.
         //
+        // Stall diagnostics: promotion holds `write_lock` across the entire
+        // graduation below, so if any stage wedges the table's own ingest blocks
+        // behind it with no further logging. The watchdog thread reads the phase
+        // set here and warns once a phase stops advancing. Dropped (entry
+        // removed) on every early return / `?` via RAII.
+        let stall = super::stall_watchdog::StallOp::begin(
+            self.table_metadata.table_name.as_str(),
+            "cold-promotion",
+        );
+
         // Lock order matches compaction: `compaction_lock` before `write_lock`.
         // A position-delete compaction path may briefly try `write_lock` first, but
         // it uses `try_lock` on `compaction_lock`; if promotion owns the compaction
         // lock it skips and drops `write_lock`, so no cycle can form.
+        stall.phase("await-compaction-lock");
         let _compaction_guard = self.compaction_lock.lock().await;
 
         // Trigger: warm tier large/numerous enough to graduate.
@@ -14736,10 +14747,12 @@ impl CayenneTableProvider {
         );
 
         // Exclude writers for the whole graduation (mirrors begin_overwrite).
+        stall.phase("await-write-lock");
         let _write_guard = self.write_lock_arc().lock_owned().await;
 
         // Drain in-flight pipelined Stage-B publishes before capturing the
         // visible set.
+        stall.phase("drain-staged-writes");
         if !self
             .drain_inflight_staged_writes(STAGED_WRITE_DRAIN_TIMEOUT)
             .await
@@ -14754,9 +14767,11 @@ impl CayenneTableProvider {
         // Flush the in-RAM mem tier + inline into durable so the canonical visible
         // read below captures the whole live set.
         if self.cdc_durability().is_memory() {
+            stall.phase("checkpoint-mem-tier");
             self.checkpoint_mem_tier_holding_write_lock().await?;
         }
         if self.cached_inlined_row_count() > 0 {
+            stall.phase("checkpoint-inlined");
             self.checkpoint_inlined_data().await?;
         }
 
@@ -14768,6 +14783,7 @@ impl CayenneTableProvider {
         // untouched — carried forward by manifest reference, never re-read).
         // Promotion cost is thereby proportional to the changed data, not
         // total table size.
+        stall.phase("classify-cold-manifest");
         let prior_cold = self
             .catalog
             .list_cold_tier_files(&self.table_metadata.table_id)
@@ -14809,24 +14825,31 @@ impl CayenneTableProvider {
         // stream entirely.
         let dirty_urls: std::collections::HashSet<String> =
             dirty_cold.iter().map(|f| f.file_url.clone()).collect();
+        stall.phase("plan-visible-stream");
         let ctx = self.create_compaction_session_context_with_config(
             SessionConfig::default().with_extension(Arc::new(
                 super::cold_partition::ColdScanFileSubset(dirty_urls),
             )),
         );
         let (stream, _generation_before) = self.visible_file_stream_for_rewrite(&ctx).await?;
-        tracing::debug!(
+        tracing::info!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
-            "Datalake promotion: visible cross-tier stream planned"
+            elapsed_ms = u64::try_from(promotion_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "Datalake promotion: visible cross-tier stream planned; entering scan/sort/encode/upload"
         );
 
         // Z-order cluster for a read-optimized cold layout.
+        stall.phase("zorder-sort-plan");
         let clustering = self.resolve_cold_clustering_indices();
         let task_ctx = ctx.task_ctx();
         let stream = self.zorder_sort_stream(stream, clustering, &task_ctx);
 
         // Write the clustered, deletes-applied rows to the cold object store.
+        // This drives the whole scan → Z-order sort → encode → upload pipeline;
+        // it is the stage that wedged on the SF1000 cold chbench run (last log
+        // was its "splitting output" warning, then silence).
+        stall.phase("write-cold-store-scan-sort-encode-upload");
         let (cold_files, total_rows) = self
             .write_stream_to_cold(
                 &cold_location,
@@ -14835,11 +14858,12 @@ impl CayenneTableProvider {
                 max_sequence,
             )
             .await?;
-        tracing::debug!(
+        tracing::info!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             files = cold_files.len(),
             total_rows,
+            elapsed_ms = u64::try_from(promotion_start.elapsed().as_millis()).unwrap_or(u64::MAX),
             "Datalake promotion: cold store write complete"
         );
         if cold_files.is_empty() && dirty_cold.is_empty() {
@@ -14894,6 +14918,7 @@ impl CayenneTableProvider {
             table = self.table_metadata.table_name.as_str(),
             "Datalake promotion: committing cold manifest + snapshot flip under fence"
         );
+        stall.phase("commit-cold-manifest");
         {
             let _fence = self.listing_fence.write().await;
             self.catalog
@@ -14905,6 +14930,7 @@ impl CayenneTableProvider {
                 .await?;
             self.publish_overwrite_snapshot_fenced(&new_snapshot_id, new_listing_table);
         }
+        stall.phase("post-commit-cleanup");
         if let Err(error) = self.prune_snapshot_manifest_to(&new_snapshot_id).await {
             tracing::warn!(
                 target: "cayenne::compaction",

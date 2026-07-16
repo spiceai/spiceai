@@ -102,6 +102,7 @@ pub(crate) mod scan;
 pub(crate) mod sink;
 pub(crate) mod staged_upsert;
 pub(crate) mod staging_wal;
+pub(crate) mod stall_watchdog;
 pub(crate) mod streaming;
 pub(crate) mod table;
 pub(crate) mod transaction;
