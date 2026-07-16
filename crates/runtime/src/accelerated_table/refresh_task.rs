@@ -2231,8 +2231,7 @@ impl RefreshTask {
     async fn update_component_status(&self, status: status::ComponentStatus) {
         // main component status update
         if self.is_view_acceleration() {
-            self.runtime_status
-                .update_view(&self.dataset_name, &status);
+            self.runtime_status.update_view(&self.dataset_name, &status);
         } else {
             self.runtime_status
                 .update_dataset(&self.dataset_name, &status);
