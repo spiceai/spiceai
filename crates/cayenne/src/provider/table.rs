@@ -20332,7 +20332,7 @@ impl CayenneTableProvider {
     /// moment either is contended — never blocking, never stalling applies. Used by
     /// the size-triggered periodic checkpoint that still has age headroom; it
     /// retries next tick (and the write-path spill drains under sustained load).
-    async fn try_acquire_capture_locks(&self) -> Option<CaptureGuards> {
+    fn try_acquire_capture_locks(&self) -> Option<CaptureGuards> {
         let Ok(checkpoint) = self.mem_checkpoint_lock_for_writer().try_lock_owned() else {
             return None;
         };
@@ -20370,8 +20370,7 @@ impl CayenneTableProvider {
     /// contended. `Busy` never advances the source slot and is never reported as a
     /// completed checkpoint.
     async fn try_checkpoint_mem_tier(&self) -> Result<CheckpointAttempt> {
-        let Some(CaptureGuards { _checkpoint, write }) = self.try_acquire_capture_locks().await
-        else {
+        let Some(CaptureGuards { _checkpoint, write }) = self.try_acquire_capture_locks() else {
             return Ok(CheckpointAttempt::Busy);
         };
         let rows = self.checkpoint_mem_tier_inner(write).await?;
