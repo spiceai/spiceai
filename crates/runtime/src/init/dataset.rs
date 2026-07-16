@@ -130,7 +130,7 @@ impl Runtime {
             }
 
             self.status
-                .mark_initializing(status::ComponentKey::dataset(&ds.name));
+                .mark_initializing(&status::ComponentKey::dataset(&ds.name));
             let ds_clone = Arc::clone(ds);
             let cloned_self = Arc::clone(&self);
             let load_semaphore = Arc::clone(&semaphore);
@@ -146,7 +146,7 @@ impl Runtime {
         // For each localpod dataset, chain it after its parent's future
         for (ds, bootstrap_status) in localpod_datasets {
             self.status
-                .mark_initializing(status::ComponentKey::dataset(&ds.name));
+                .mark_initializing(&status::ComponentKey::dataset(&ds.name));
 
             // Get the parent dataset path from the localpod dataset
             let path = ds.path();
@@ -178,7 +178,7 @@ impl Runtime {
                 );
                 self.status.update_dataset(
                     &ds.name,
-                    status::ComponentStatus::error_with_message(format!(
+                    &status::ComponentStatus::error_with_message(format!(
                         "Parent dataset '{path_table_ref}' doesn't exist"
                     )),
                 );
@@ -324,7 +324,7 @@ impl Runtime {
                 let ds_name = &ds.name;
                 self.status.update_dataset(
                     ds_name,
-                    status::ComponentStatus::error_with_message(err.to_string()),
+                    &status::ComponentStatus::error_with_message(err.to_string()),
                 );
                 metrics::datasets::LOAD_ERROR.add(1, &[]);
                 warn_spaced!(
@@ -388,7 +388,7 @@ impl Runtime {
             error_spaced!(spaced_tracer, "{}{err}", "");
             self.status.update_dataset(
                 ds_name,
-                status::ComponentStatus::error_with_message(err.to_string()),
+                &status::ComponentStatus::error_with_message(err.to_string()),
             );
             return Err(err);
         }
@@ -456,7 +456,7 @@ impl Runtime {
                     let ds_name = &ds.name;
                     self.status.update_dataset(
                         ds_name,
-                        status::ComponentStatus::error_with_message(err.to_string()),
+                        &status::ComponentStatus::error_with_message(err.to_string()),
                     );
                     metrics::datasets::LOAD_ERROR.add(1, &[]);
                     warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
@@ -738,7 +738,7 @@ impl Runtime {
                 } else {
                     self.status.update_dataset(
                         &ds.name,
-                        status::ComponentStatus::error_with_message(err.to_string()),
+                        &status::ComponentStatus::error_with_message(err.to_string()),
                     );
                     metrics::datasets::LOAD_ERROR.add(1, &[]);
                     if !err.is_retriable() {
@@ -832,7 +832,7 @@ impl Runtime {
                 if let Some(message) = schema_change_failure {
                     self.status.update_dataset(
                         &ds.name,
-                        status::ComponentStatus::error_with_message(message),
+                        &status::ComponentStatus::error_with_message(message),
                     );
                 }
 
@@ -841,7 +841,7 @@ impl Runtime {
             Err(err) => {
                 self.status.update_dataset(
                     &ds.name,
-                    status::ComponentStatus::error_with_message(err.to_string()),
+                    &status::ComponentStatus::error_with_message(err.to_string()),
                 );
                 metrics::datasets::LOAD_ERROR.add(1, &[]);
                 if let Error::UnableToAttachDataConnector {
@@ -907,7 +907,7 @@ impl Runtime {
 
     async fn update_dataset(self: Arc<Self>, ds: Arc<Dataset>) {
         self.status
-            .mark_refreshing(status::ComponentKey::dataset(&ds.name));
+            .mark_refreshing(&status::ComponentKey::dataset(&ds.name));
 
         // Updating a dataset may cause the cached LogicalPlans to be
         // obsolete, so we remove them
@@ -928,7 +928,7 @@ impl Runtime {
                         Ok(())
                     ) {
                         self.status
-                            .mark_ready(status::ComponentKey::dataset(&ds.name));
+                            .mark_ready(&status::ComponentKey::dataset(&ds.name));
                         return;
                     }
                     tracing::debug!(
@@ -955,7 +955,7 @@ impl Runtime {
                 {
                     self.status.update_dataset(
                         &ds.name,
-                        status::ComponentStatus::error_with_message(e.to_string()),
+                        &status::ComponentStatus::error_with_message(e.to_string()),
                     );
                 }
             }
@@ -963,7 +963,7 @@ impl Runtime {
                 tracing::error!("Unable to update dataset {}: {e}", ds.name);
                 self.status.update_dataset(
                     &ds.name,
-                    status::ComponentStatus::error_with_message(e.to_string()),
+                    &status::ComponentStatus::error_with_message(e.to_string()),
                 );
             }
         }
@@ -1283,7 +1283,7 @@ impl Runtime {
                 })?;
 
             self.status
-                .mark_ready(status::ComponentKey::dataset(&ds_name));
+                .mark_ready(&status::ComponentKey::dataset(&ds_name));
 
             return Ok(());
         }
@@ -1353,7 +1353,7 @@ impl Runtime {
 
         // The accelerated refresh task will set the dataset status to `Ready` once it finishes loading.
         self.status
-            .mark_refreshing(status::ComponentKey::dataset(&ds.name));
+            .mark_refreshing(&status::ComponentKey::dataset(&ds.name));
         let notifier = self
             .df
             .register_table(
@@ -1487,7 +1487,7 @@ impl Runtime {
                 }
             } else {
                 self.status
-                    .mark_initializing(status::ComponentKey::dataset(&ds.name));
+                    .mark_initializing(&status::ComponentKey::dataset(&ds.name));
                 Arc::clone(&self)
                     .load_dataset(
                         Arc::clone(ds),
@@ -1527,7 +1527,7 @@ impl Runtime {
                 };
 
                 self.status
-                    .mark_disabled(status::ComponentKey::dataset(&ds_name));
+                    .mark_disabled(&status::ComponentKey::dataset(&ds_name));
                 Arc::clone(&self)
                     .remove_dataset(ds_name, ds_acceleration.as_ref())
                     .await;
@@ -1573,7 +1573,7 @@ impl Runtime {
                         let ds_name = &ds.name;
                         status.update_dataset(
                             ds_name,
-                            status::ComponentStatus::error_with_message(err.to_string()),
+                            &status::ComponentStatus::error_with_message(err.to_string()),
                         );
                         metrics::datasets::LOAD_ERROR.add(1, &[]);
                         warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
@@ -1597,7 +1597,7 @@ impl Runtime {
                         let ds_name = &ds.name;
                         status.update_dataset(
                             ds_name,
-                            status::ComponentStatus::error_with_message(err.to_string()),
+                            &status::ComponentStatus::error_with_message(err.to_string()),
                         );
                         metrics::datasets::LOAD_ERROR.add(1, &[]);
                         warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());

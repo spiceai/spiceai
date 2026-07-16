@@ -2232,16 +2232,16 @@ impl RefreshTask {
         // main component status update
         if self.is_view_acceleration() {
             self.runtime_status
-                .update_view(&self.dataset_name, status.clone());
+                .update_view(&self.dataset_name, &status);
         } else {
             self.runtime_status
-                .update_dataset(&self.dataset_name, status.clone());
+                .update_dataset(&self.dataset_name, &status);
         }
 
         // synchronized tables can be datasets only
         for synchronized_table in self.sink.read().await.synchronized_tables() {
             self.runtime_status
-                .update_dataset(&synchronized_table.child_dataset_name(), status.clone());
+                .update_dataset(&synchronized_table.child_dataset_name(), &status);
         }
     }
 

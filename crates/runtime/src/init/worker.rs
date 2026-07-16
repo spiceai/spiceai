@@ -29,7 +29,7 @@ impl Runtime {
                 let runtime = Arc::clone(&self);
                 runtime
                     .status
-                    .mark_initializing(status::ComponentKey::worker(&worker.name));
+                    .mark_initializing(&status::ComponentKey::worker(&worker.name));
                 runtime.load_worker(worker).await;
             }
         }
@@ -70,7 +70,7 @@ impl Runtime {
         tracing::info!("Worker [{}] loaded, ready for use", cfg.name);
         metrics::workers::COUNT.add(1, &[KeyValue::new("worker", cfg.name.clone())]);
         self.status
-            .mark_ready(status::ComponentKey::worker(&cfg.name));
+            .mark_ready(&status::ComponentKey::worker(&cfg.name));
 
         if let Err(e) = Arc::clone(&self)
             .create_worker_schedule(cloned_worker)
@@ -109,7 +109,7 @@ impl Runtime {
 
     async fn update_worker(self: Arc<Self>, worker_config: &spicepod::component::worker::Worker) {
         self.status
-            .mark_refreshing(status::ComponentKey::worker(&worker_config.name));
+            .mark_refreshing(&status::ComponentKey::worker(&worker_config.name));
         Arc::clone(&self).remove_worker(worker_config).await;
         Arc::clone(&self).load_worker(worker_config).await;
     }
@@ -125,7 +125,7 @@ impl Runtime {
                 let runtime = Arc::clone(&self);
                 runtime
                     .status
-                    .mark_disabled(status::ComponentKey::worker(&worker.name));
+                    .mark_disabled(&status::ComponentKey::worker(&worker.name));
                 runtime.remove_worker(worker).await;
             }
         }
@@ -140,7 +140,7 @@ impl Runtime {
                 let runtime = Arc::clone(&self);
                 runtime
                     .status
-                    .mark_initializing(status::ComponentKey::worker(&worker.name));
+                    .mark_initializing(&status::ComponentKey::worker(&worker.name));
                 runtime.load_worker(worker).await;
             }
         }

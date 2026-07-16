@@ -77,7 +77,7 @@ impl Runtime {
         tracing::trace!("Tool catalog {} ready to use", name.clone());
         metrics::tools::COUNT.add(1, &[KeyValue::new("tool_catalog", name.clone())]);
         self.status
-            .mark_ready(status::ComponentKey::tool_catalog(&name));
+            .mark_ready(&status::ComponentKey::tool_catalog(&name));
     }
 
     async fn insert_tool(&self, t: Tooling) {
@@ -87,7 +87,7 @@ impl Runtime {
         tools_map.insert(name.clone(), t);
         tracing::trace!("Tool {} ready to use", name.clone());
         metrics::tools::COUNT.add(1, &[KeyValue::new("tool", name.clone())]);
-        self.status.mark_ready(status::ComponentKey::tool(&name));
+        self.status.mark_ready(&status::ComponentKey::tool(&name));
     }
 
     /// When a spicepod `tools:` entry has `as_sql: true` + a `signature:`,
@@ -149,7 +149,7 @@ impl Runtime {
 
         let _ = retry(retry_strategy, || async {
             self.status
-                .mark_initializing(status::ComponentKey::tool(&tool.name));
+                .mark_initializing(&status::ComponentKey::tool(&tool.name));
             let params_with_secrets: HashMap<String, SecretString> =
                 get_params_with_secrets(self.secrets(), &tool.params).await;
 

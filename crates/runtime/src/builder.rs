@@ -799,7 +799,7 @@ impl RuntimeBuilder {
         // dataset-only status while task slots are still closed (#11758 Fix B).
         if is_cluster_executor {
             rt.status
-                .update_cluster("executor", status::ComponentStatus::Initializing);
+                .update_cluster("executor", &status::ComponentStatus::Initializing);
         }
 
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();

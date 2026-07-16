@@ -40,7 +40,7 @@ impl Runtime {
         let mut futures = vec![];
         for catalog in &valid_catalogs {
             self.status
-                .mark_initializing(status::ComponentKey::catalog(&catalog.name));
+                .mark_initializing(&status::ComponentKey::catalog(&catalog.name));
             futures.push(Arc::clone(&self).load_catalog(catalog));
         }
 
@@ -59,7 +59,7 @@ impl Runtime {
                     let catalog_name = &catalog.name;
                     self.status.update_catalog(
                         catalog_name,
-                        status::ComponentStatus::error_with_message(err.to_string()),
+                        &status::ComponentStatus::error_with_message(err.to_string()),
                     );
                     metrics::catalogs::LOAD_ERROR.add(1, &[]);
                     warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
@@ -78,7 +78,7 @@ impl Runtime {
                     let catalog_name = &catalog.name;
                     self.status.update_catalog(
                         catalog_name,
-                        status::ComponentStatus::error_with_message(err.to_string()),
+                        &status::ComponentStatus::error_with_message(err.to_string()),
                     );
                     metrics::catalogs::LOAD_ERROR.add(1, &[]);
                     return Err(RetryError::permanent(err));
@@ -87,7 +87,7 @@ impl Runtime {
             }
 
             self.status
-                .mark_ready(status::ComponentKey::catalog(&catalog.name));
+                .mark_ready(&status::ComponentKey::catalog(&catalog.name));
 
             Ok(())
         })
@@ -117,7 +117,7 @@ impl Runtime {
             };
             self.status.update_catalog(
                 catalog_name,
-                status::ComponentStatus::error_with_message(err.to_string()),
+                &status::ComponentStatus::error_with_message(err.to_string()),
             );
             warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
             return Err(err);
@@ -237,7 +237,7 @@ impl Runtime {
                 }
             } else {
                 self.status
-                    .mark_initializing(status::ComponentKey::catalog(&catalog.name));
+                    .mark_initializing(&status::ComponentKey::catalog(&catalog.name));
                 Arc::clone(&self).load_catalog(catalog).await;
             }
         }

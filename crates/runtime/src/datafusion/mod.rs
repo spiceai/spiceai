@@ -97,7 +97,7 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::collect;
 use datafusion::sql::parser::{DFParser, Statement};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
-use datafusion::sql::{ResolvedTableReference, TableReference};
+use datafusion::sql::TableReference;
 use datafusion_expr::Expr;
 use datafusion_federation::FederatedTableProviderAdaptor;
 use error::{find_datafusion_root, format_datafusion_error};
@@ -1117,7 +1117,7 @@ impl DataFusion {
                 } else if source.as_any().downcast_ref::<SinkConnector>().is_some() {
                     // Sink connectors don't know their schema until the first data is received. Park this registration until the schema is known via the first write.
                     self.runtime_status
-                        .update_dataset(&dataset_table_ref, status::ComponentStatus::Ready);
+                        .update_dataset(&dataset_table_ref, &status::ComponentStatus::Ready);
                     self.pending_sink_tables
                         .write()
                         .await
@@ -1146,7 +1146,7 @@ impl DataFusion {
                     data_connector.as_any().downcast_ref::<DeferredConnector>()
                 {
                     self.runtime_status
-                        .update_dataset(&dataset_table_ref, status::ComponentStatus::Ready);
+                        .update_dataset(&dataset_table_ref, &status::ComponentStatus::Ready);
 
                     self.deferred_tables.write().await.insert(
                         dataset.name.to_string(),
@@ -1780,7 +1780,7 @@ impl DataFusion {
             .fetch_add(1, std::sync::atomic::Ordering::Release);
 
         self.runtime_status
-            .update_dataset(&dataset.name, status::ComponentStatus::Ready);
+            .update_dataset(&dataset.name, &status::ComponentStatus::Ready);
 
         Ok(())
     }
@@ -2107,7 +2107,7 @@ impl DataFusion {
         }
 
         self.runtime_status
-            .update_dataset(table_reference, status::ComponentStatus::Ready);
+            .update_dataset(table_reference, &status::ComponentStatus::Ready);
 
         let broadcast_table_reference = self.normalize_table_reference(table_reference.clone());
         if self
@@ -2226,7 +2226,7 @@ impl DataFusion {
         }
 
         self.runtime_status
-            .update_dataset(table_reference, status::ComponentStatus::Ready);
+            .update_dataset(table_reference, &status::ComponentStatus::Ready);
 
         self.write_stats_notify.notify_one();
 
@@ -2545,7 +2545,7 @@ impl DataFusion {
         if initial_load_complete {
             // Caching mode datasets are always ready immediately
             self.runtime_status
-                .update_dataset(&dataset.name, status::ComponentStatus::Ready);
+                .update_dataset(&dataset.name, &status::ComponentStatus::Ready);
         } else if let Ok(checkpoint) = DatasetCheckpoint::try_new(
             dataset,
             self.accelerator_engine_registry(),
@@ -2565,7 +2565,7 @@ impl DataFusion {
 
             if !delay_initial_ready {
                 self.runtime_status
-                    .update_dataset(&dataset.name, status::ComponentStatus::Ready);
+                    .update_dataset(&dataset.name, &status::ComponentStatus::Ready);
                 initial_load_complete = true;
             }
         }
@@ -3889,7 +3889,7 @@ impl DataFusion {
                 );
                 status.update_view(
                     &table,
-                    status::ComponentStatus::error_with_message(format!(
+                    &status::ComponentStatus::error_with_message(format!(
                         "Dependent table {missing_table} does not exist"
                     )),
                 );
@@ -3907,7 +3907,7 @@ impl DataFusion {
                     tracing::error!("Failed to create view {table}: {e}");
                     status.update_view(
                         &table,
-                        status::ComponentStatus::error_with_message(e.to_string()),
+                        &status::ComponentStatus::error_with_message(e.to_string()),
                     );
                     return None;
                 }
@@ -3926,7 +3926,7 @@ impl DataFusion {
                         tracing::error!("Failed to create view {table}: {e}");
                         status.update_view(
                             &table,
-                            status::ComponentStatus::error_with_message(e.to_string()),
+                            &status::ComponentStatus::error_with_message(e.to_string()),
                         );
                         return None;
                     }
@@ -3940,12 +3940,12 @@ impl DataFusion {
                 tracing::error!("Failed to create view {table}: {e}");
                 status.update_view(
                     &table,
-                    status::ComponentStatus::error_with_message(e.to_string()),
+                    &status::ComponentStatus::error_with_message(e.to_string()),
                 );
                 return None;
             }
             tracing::info!("{}", view_registered_trace(&table, None));
-            status.update_view(&table, status::ComponentStatus::Ready);
+            status.update_view(&table, &status::ComponentStatus::Ready);
 
             None
         });
@@ -4110,7 +4110,7 @@ impl DataFusion {
             )
         {
             self.runtime_status
-                .update_view(&view.name, status::ComponentStatus::Ready);
+                .update_view(&view.name, &status::ComponentStatus::Ready);
         }
 
         Ok(is_ready)

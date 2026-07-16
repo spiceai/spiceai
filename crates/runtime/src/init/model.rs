@@ -59,7 +59,7 @@ impl Runtime {
         if let Some(app) = app_lock.as_ref() {
             for model in &app.models {
                 self.status
-                    .mark_initializing(status::ComponentKey::model(&model.name));
+                    .mark_initializing(&status::ComponentKey::model(&model.name));
                 self.load_model(model).await;
             }
         }
@@ -103,7 +103,7 @@ impl Runtime {
                 metrics::models::LOAD_ERROR.add(1, &[]);
                 self.status.update_model(
                     &model.name,
-                    status::ComponentStatus::error_with_message(err.to_string()),
+                    &status::ComponentStatus::error_with_message(err.to_string()),
                 );
                 tracing::warn!("{err}");
                 return;
@@ -152,13 +152,13 @@ impl Runtime {
                     ],
                 );
                 self.status
-                    .mark_ready(status::ComponentKey::model(&model.name));
+                    .mark_ready(&status::ComponentKey::model(&model.name));
             }
             Err(e) => {
                 metrics::models::LOAD_ERROR.add(1, &[]);
                 self.status.update_model(
                     &model.name,
-                    status::ComponentStatus::error_with_message(e.to_string()),
+                    &status::ComponentStatus::error_with_message(e.to_string()),
                 );
 
                 // Try to fetch available models to help user debug the issue
@@ -213,7 +213,7 @@ impl Runtime {
 
     async fn update_model(&self, m: &SpicepodModel) {
         self.status
-            .mark_refreshing(status::ComponentKey::model(&m.name));
+            .mark_refreshing(&status::ComponentKey::model(&m.name));
         self.remove_model(m).await;
         self.load_model(m).await;
     }
@@ -226,7 +226,7 @@ impl Runtime {
                 }
             } else {
                 self.status
-                    .mark_initializing(status::ComponentKey::model(&model.name));
+                    .mark_initializing(&status::ComponentKey::model(&model.name));
                 self.load_model(model).await;
             }
         }
@@ -235,7 +235,7 @@ impl Runtime {
         for model in &current_app.models {
             if !new_app.models.iter().any(|m| m.name == model.name) {
                 self.status
-                    .mark_disabled(status::ComponentKey::model(&model.name));
+                    .mark_disabled(&status::ComponentKey::model(&model.name));
                 self.remove_model(model).await;
             }
         }

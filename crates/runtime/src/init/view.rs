@@ -165,7 +165,7 @@ impl Runtime {
                             if log_errors.0 {
                                 metrics::views::LOAD_ERROR.add(1, &[]);
                                 tracing::error!("View '{}' has invalid SQL: {}", view.name, e);
-                                status.update_view(&view.name, status::ComponentStatus::error_with_message(e.to_string()));
+                                status.update_view(&view.name, &status::ComponentStatus::error_with_message(e.to_string()));
                             }
                             return None;
                         }
@@ -175,7 +175,7 @@ impl Runtime {
                         if log_errors.0 {
                             metrics::views::LOAD_ERROR.add(1, &[]);
                             tracing::error!("View '{}' has empty SQL statement", view.name);
-                            status.update_view(&view.name, status::ComponentStatus::error_with_message("Empty SQL statement".to_string()));
+                            status.update_view(&view.name, &status::ComponentStatus::error_with_message("Empty SQL statement".to_string()));
                         }
                         return None;
                     }
@@ -187,7 +187,7 @@ impl Runtime {
                                 "View '{}' contains multiple SQL statements. Only one SELECT statement is allowed per view",
                                 view.name
                             );
-                            status.update_view(&view.name, status::ComponentStatus::error_with_message("Multiple SQL statements".to_string()));
+                            status.update_view(&view.name, &status::ComponentStatus::error_with_message("Multiple SQL statements".to_string()));
                         }
                         return None;
                     }
@@ -210,7 +210,7 @@ impl Runtime {
                                 "View '{}' must contain a SELECT query",
                                 view.name
                             );
-                            status.update_view(&view.name, status::ComponentStatus::error_with_message("View must contain a SELECT query".to_string()));
+                            status.update_view(&view.name, &status::ComponentStatus::error_with_message("View must contain a SELECT query".to_string()));
                         }
                         return None;
                     }
@@ -291,7 +291,7 @@ impl Runtime {
                     let view_name = &view.name;
                     self.status.update_view(
                         view_name,
-                        status::ComponentStatus::error_with_message(err.to_string()),
+                        &status::ComponentStatus::error_with_message(err.to_string()),
                     );
                     metrics::views::LOAD_ERROR.add(1, &[]);
                     warn_spaced!(spaced_tracer, "{} {err}", view_name.table());
@@ -312,7 +312,7 @@ impl Runtime {
                     let view_name = &view.name;
                     self.status.update_view(
                         view_name,
-                        status::ComponentStatus::error_with_message(err.to_string()),
+                        &status::ComponentStatus::error_with_message(err.to_string()),
                     );
                     metrics::views::LOAD_ERROR.add(1, &[]);
                     warn_spaced!(spaced_tracer, "{} {err}", view_name.table());
@@ -330,7 +330,7 @@ impl Runtime {
             .inspect_err(|e| {
                 self.status.update_view(
                     &view.name,
-                    status::ComponentStatus::error_with_message(e.to_string()),
+                    &status::ComponentStatus::error_with_message(e.to_string()),
                 );
             })?;
 
@@ -389,7 +389,7 @@ impl Runtime {
 
     async fn update_view(self: Arc<Self>, view: &Arc<View>) {
         self.status
-            .mark_refreshing(status::ComponentKey::view(&view.name));
+            .mark_refreshing(&status::ComponentKey::view(&view.name));
         Arc::clone(&self).remove_view(&view.name).await;
         let secrets = self.secrets();
         let _ = self.load_view(view, secrets);
@@ -437,7 +437,7 @@ impl Runtime {
                     }
                 };
                 self.status
-                    .mark_disabled(status::ComponentKey::view(&view_builder.name));
+                    .mark_disabled(&status::ComponentKey::view(&view_builder.name));
                 Arc::clone(&self).remove_view(&view_builder.name).await;
             }
         }
@@ -488,7 +488,7 @@ impl Runtime {
                 } else {
                     runtime.status.update_view(
                         &validated_view.view.name,
-                        status::ComponentStatus::Initializing,
+                        &status::ComponentStatus::Initializing,
                     );
                     let secrets = runtime.secrets();
                     let _ = runtime.load_view(&validated_view.view, secrets);

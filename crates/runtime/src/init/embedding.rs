@@ -42,7 +42,7 @@ impl Runtime {
         if let Some(app) = app_opt.as_ref() {
             for in_embed in &app.embeddings {
                 self.status
-                    .mark_initializing(status::ComponentKey::embedding(&in_embed.name));
+                    .mark_initializing(&status::ComponentKey::embedding(&in_embed.name));
                 match self.load_embedding(in_embed).await {
                     Ok(e) => {
                         let mut embeds_map = self.embeds.write().await;
@@ -64,13 +64,13 @@ impl Runtime {
                             ],
                         );
                         self.status
-                            .mark_ready(status::ComponentKey::embedding(&in_embed.name));
+                            .mark_ready(&status::ComponentKey::embedding(&in_embed.name));
                     }
                     Err(e) => {
                         metrics::embeddings::LOAD_ERROR.add(1, &[]);
                         self.status.update_embedding(
                             &in_embed.name,
-                            status::ComponentStatus::error_with_message(e.to_string()),
+                            &status::ComponentStatus::error_with_message(e.to_string()),
                         );
                         tracing::warn!(
                             "Failed to load Embedding Model {}. {} Verify configuration and try again.\nFor details, visit https://spiceai.org/docs/components/embeddings",

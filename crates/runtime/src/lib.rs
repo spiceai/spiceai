@@ -71,7 +71,6 @@ use model::{EmbeddingModelStore, LLMChatCompletionsModelStore};
 use crate::tools::{Tooling, factory::default_available_catalogs};
 pub use notify::Error as NotifyError;
 use snafu::prelude::*;
-use status::ComponentStatus;
 use tls::TlsConfig;
 
 use tokio::sync::{RwLock, oneshot::error::RecvError};
@@ -1256,7 +1255,7 @@ impl Runtime {
         // status while task slots are still closed (Fix B for #11758).
         if self.df.cluster_config.effective_role() == Some(ClusterRole::Executor) {
             self.status
-                .update_cluster("executor", status::ComponentStatus::Initializing);
+                .update_cluster("executor", &status::ComponentStatus::Initializing);
         }
 
         Arc::clone(&self)
@@ -1564,46 +1563,46 @@ impl Runtime {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(&app, LogErrors(false));
         for ds in &valid_datasets {
             self.status
-                .mark_initializing(status::ComponentKey::dataset(&ds.name));
+                .mark_initializing(&status::ComponentKey::dataset(&ds.name));
         }
 
         if cfg!(feature = "models") {
             for embedding in &app.embeddings {
                 self.status
-                    .mark_initializing(status::ComponentKey::embedding(&embedding.name));
+                    .mark_initializing(&status::ComponentKey::embedding(&embedding.name));
             }
 
             for reranker in &app.rerankers {
                 self.status
-                    .mark_initializing(status::ComponentKey::reranker(&reranker.name));
+                    .mark_initializing(&status::ComponentKey::reranker(&reranker.name));
             }
 
             for model in &app.models {
                 self.status
-                    .mark_initializing(status::ComponentKey::model(&model.name));
+                    .mark_initializing(&status::ComponentKey::model(&model.name));
             }
 
             for tool in &app.tools {
                 self.status
-                    .mark_initializing(status::ComponentKey::tool(&tool.name));
+                    .mark_initializing(&status::ComponentKey::tool(&tool.name));
             }
 
             for catalog_name in default_catalog_names() {
                 self.status
-                    .mark_initializing(status::ComponentKey::tool_catalog(catalog_name));
+                    .mark_initializing(&status::ComponentKey::tool_catalog(catalog_name));
             }
         }
 
         let valid_catalogs = Arc::clone(&self).get_valid_catalogs(&app, LogErrors(false));
         for catalog in valid_catalogs {
             self.status
-                .mark_initializing(status::ComponentKey::catalog(&catalog.name));
+                .mark_initializing(&status::ComponentKey::catalog(&catalog.name));
         }
 
         let valid_views = Arc::clone(&self).get_valid_views(&app, LogErrors(false));
         for validated_view in valid_views {
             self.status
-                .mark_initializing(status::ComponentKey::view(&validated_view.view.name));
+                .mark_initializing(&status::ComponentKey::view(&validated_view.view.name));
         }
     }
 

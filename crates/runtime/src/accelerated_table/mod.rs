@@ -996,12 +996,12 @@ impl Builder {
         match self.ready_state {
             ReadyState::OnRegistration => {
                 self.runtime_status
-                    .update_dataset(&self.dataset_name, status::ComponentStatus::Ready);
+                    .update_dataset(&self.dataset_name, &status::ComponentStatus::Ready);
             }
             ReadyState::OnSchemaResolved => match &*self.federated {
                 FederatedTable::Immediate(_) => {
                     self.runtime_status
-                        .update_dataset(&self.dataset_name, status::ComponentStatus::Ready);
+                        .update_dataset(&self.dataset_name, &status::ComponentStatus::Ready);
                 }
                 FederatedTable::Deferred(_) => {
                     let runtime_status = Arc::clone(&self.runtime_status);
@@ -1039,7 +1039,7 @@ impl Builder {
                                 } else {
                                     runtime_status.update_dataset(
                                         &dataset_name,
-                                        status::ComponentStatus::Ready,
+                                        &status::ComponentStatus::Ready,
                                     );
                                 }
                             }
