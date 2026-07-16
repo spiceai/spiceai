@@ -6638,8 +6638,16 @@ impl CayenneTableProvider {
     /// shared Exact keyset with a stale or missing per-key sequence stamp (see
     /// [`Self::pk_keyset_occ_degraded`]). Idempotent; never a correctness risk —
     /// it can only turn a per-key check into an over-abort.
+    ///
+    /// `Release` (paired with the `Acquire` load in `transaction_has_conflict`):
+    /// the primary happens-before for this flag comes from the locks both the
+    /// setters and the reader hold (the `pk_keyset_cache` mutex at the drop site,
+    /// `write_lock` on the CDC-apply setters and the commit-time reader), but one
+    /// setter (`StagingReceipt::publish_validated_file_keys`'s no-sequence path)
+    /// runs outside those locks, so the flag carries its own release/acquire
+    /// ordering rather than relying on a lock being co-held in every case.
     pub(crate) fn mark_pk_keyset_occ_degraded(&self) {
-        self.pk_keyset_occ_degraded.store(true, Ordering::Relaxed);
+        self.pk_keyset_occ_degraded.store(true, Ordering::Release);
     }
 
     pub(crate) fn clear_cached_pk_keyset(&self) {
@@ -6648,8 +6656,9 @@ impl CayenneTableProvider {
         // already takes the per-table fallback, and the next rebuild floor-stamps
         // every key to the current high-water (`load_existing_keyset`) or returns
         // a Bloom (also per-table fallback). Either way the stale stamps that set
-        // the degraded flag cannot survive, so clear it here.
-        self.pk_keyset_occ_degraded.store(false, Ordering::Relaxed);
+        // the degraded flag cannot survive, so clear it here. `Release` pairs with
+        // the `Acquire` load in `transaction_has_conflict` (see the setter above).
+        self.pk_keyset_occ_degraded.store(false, Ordering::Release);
         // Invalidate the N>1 sharded cache in lockstep — every event that
         // invalidates the single keyset (delete, compaction, snapshot rewrite,
         // recovery) equally invalidates the sharded view. At N=1 the sharded cache
@@ -6837,7 +6846,7 @@ impl CayenneTableProvider {
             // dropped / stale / unstamped entry (see `pk_keyset_occ_degraded`)
             // would otherwise let this check miss a real conflict.
             Some(CachedPkIndex::Exact(keyset))
-                if footprint_complete && !self.pk_keyset_occ_degraded.load(Ordering::Relaxed) =>
+                if footprint_complete && !self.pk_keyset_occ_degraded.load(Ordering::Acquire) =>
             {
                 let write_digests = write_set.iter_with_digest().map(|(digest, _)| digest);
                 footprint
