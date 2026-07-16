@@ -22,7 +22,7 @@ limitations under the License.
 //! while query embedding is async (the embed happens inside `scan()`,
 //! mirroring `S3VectorsQueryTable`).
 
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, FixedSizeListBuilder, Float32Array, Float32Builder, Float64Array, RecordBatch,
@@ -65,10 +65,6 @@ impl MemoryVectorListTable {
 
 #[async_trait]
 impl TableProvider for MemoryVectorListTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         SchemaRef::clone(&self.schema)
     }
@@ -197,10 +193,6 @@ impl MemoryVectorQueryTable {
 
 #[async_trait]
 impl TableProvider for MemoryVectorQueryTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         SchemaRef::clone(&self.schema)
     }
