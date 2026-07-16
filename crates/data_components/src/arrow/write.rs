@@ -1398,7 +1398,10 @@ fn delete_primary_keys_from_snapshot(
 
 #[async_trait]
 impl DeletionSink for MemDeletionSink {
-    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    async fn delete_from(
+        &self,
+        _context: Arc<TaskContext>,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(primary_key) = &self.primary_key
             && let Some(primary_key_values) =
                 delete_primary_key_values(&self.filters, &self.schema, primary_key)

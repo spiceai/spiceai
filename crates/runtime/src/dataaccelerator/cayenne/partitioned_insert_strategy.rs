@@ -1216,10 +1216,16 @@ impl DataSink for CayennePartitionedAppendSink {
                 .zip(prepared_on_conflicts)
             {
                 receipt.publish_deferred_snapshot_under_held_fence(publish_state);
+                // Capture the on-conflict publish sequence before the value is
+                // consumed below; an on-conflict append has no `append_sequence`,
+                // so this is the sequence its validated keys must be stamped with.
+                let on_conflict_sequence = prepared_on_conflict
+                    .as_ref()
+                    .map(cayenne::provider::PreparedOnConflictDeletionPublish::snapshot_sequence);
                 if let Some(on_conflict) = prepared_on_conflict {
                     receipt.publish_on_conflict_under_held_fence(on_conflict);
                 }
-                receipt.publish_validated_file_keys();
+                receipt.publish_validated_file_keys(on_conflict_sequence);
             }
 
             // Publication is complete for every participant. Release all listing
