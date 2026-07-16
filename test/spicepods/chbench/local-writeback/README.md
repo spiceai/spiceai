@@ -80,8 +80,10 @@ echo "exit=$?"   # 0 = OCC + IVM invariants held
 kill "$SPICED_PID"; docker rm -f chbench-wb-pg
 ```
 
-`--skip-writeback-check` skips step 5's Postgres convergence probe (useful while
-the write-back echo-loss P0 is still open, to keep the run focused on OCC/IVM).
+`--skip-writeback-check` skips the driver's final Postgres-convergence probe (the
+write-back oracle inside `direct_write_bench.py`, not the teardown step above) —
+useful while the write-back echo-loss P0 is still open, to keep the run focused on
+the OCC/IVM invariants.
 
 ## Notes
 

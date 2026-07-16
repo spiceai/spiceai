@@ -83,12 +83,20 @@ def _parse(body):
 
 
 def spice_scalar(base_url, sql):
-    """Run a single-row single-column query and return the scalar value."""
+    """Run a single-row single-column query and return the scalar value.
+
+    Uses explicit raises (not `assert`) so the validation is NEVER compiled out
+    under `python -O` — a validation harness that silently skips its own checks
+    could report a false PASS.
+    """
     status, payload = spice_sql(base_url, sql)
-    assert status == 200, f"query failed ({status}): {sql}\n{payload}"
-    assert isinstance(payload, list) and payload, f"no rows for: {sql}\n{payload}"
+    if status != 200:
+        raise RuntimeError(f"query failed ({status}): {sql}\n{payload}")
+    if not isinstance(payload, list) or not payload:
+        raise RuntimeError(f"no rows for: {sql}\n{payload}")
     row = payload[0]
-    assert isinstance(row, dict) and len(row) == 1, f"want 1 column: {sql}\n{row}"
+    if not isinstance(row, dict) or len(row) != 1:
+        raise RuntimeError(f"want exactly 1 column: {sql}\n{row}")
     return next(iter(row.values()))
 
 
@@ -123,7 +131,10 @@ def wait_ready(base_url, pg_dsn, table, timeout_s):
             if int(spice_rows) == int(pg_rows):
                 print(f"  ready: {table} = {spice_rows} rows (Spice == Postgres)")
                 return
-        except (AssertionError, urllib.error.URLError):
+        except (RuntimeError, urllib.error.URLError, ValueError):
+            # Expected while the table is still bootstrapping: the query 5xx's,
+            # the connection is refused, or the row count is not yet an int.
+            # Swallow and retry until the bounded deadline below.
             pass
         time.sleep(1.0)
     raise TimeoutError(

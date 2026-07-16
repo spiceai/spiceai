@@ -6724,7 +6724,7 @@ impl CayenneTableProvider {
             // to the CONCURRENT writer's begin high-water, which is below this
             // write's sequence) — a silent lost update. Degrade to the per-table
             // fallback until the next rebuild floor-stamps past this sequence.
-            self.pk_keyset_occ_degraded.store(true, Ordering::Relaxed);
+            self.mark_pk_keyset_occ_degraded();
             return;
         };
 
