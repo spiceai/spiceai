@@ -24,6 +24,8 @@ use std::time::SystemTime;
 use ::rand::{Rng, RngExt};
 use tokio_postgres::Client;
 
+use rust_decimal::Decimal;
+
 use super::TerminalAssignment;
 use super::prepared::NewOrderStmts;
 use crate::Result;
@@ -47,7 +49,7 @@ pub async fn run(
         ol_i_id: i32,
         ol_supply_w_id: i32,
         ol_number: i32,
-        ol_amount: f64,
+        ol_amount: Decimal,
         ol_dist_info: String,
     }
 
@@ -103,8 +105,8 @@ pub async fn run(
             source,
         })?;
 
-    let c_discount: f64 = customer_row.get(0);
-    let w_tax: f64 = customer_row.get(3);
+    let c_discount: Decimal = customer_row.get(0);
+    let w_tax: Decimal = customer_row.get(3);
 
     // 2. SELECT district FOR UPDATE
     let district_row = tx
@@ -116,7 +118,7 @@ pub async fn run(
         })?;
 
     let d_next_o_id: i32 = district_row.get(0);
-    let d_tax: f64 = district_row.get(1);
+    let d_tax: Decimal = district_row.get(1);
 
     // 3. UPDATE district d_next_o_id
     tx.execute(&stmts.update_district, &[&d_next_o_id, &d_id, &w_id])
@@ -182,7 +184,7 @@ pub async fn run(
             source,
         })?;
 
-        let i_price: f64 = item_row.get(0);
+        let i_price: Decimal = item_row.get(0);
 
         let mut s_quantity: i32 = stock_row.get(0);
         let ol_dist_info: String = stock_row.get(2);
@@ -192,8 +194,11 @@ pub async fn run(
             s_quantity += 91;
         }
 
-        let ol_amount =
-            f64::from(ol_quantity) * i_price * (1.0 + w_tax + d_tax) * (1.0 - c_discount);
+        // Exact decimal arithmetic; Postgres rounds to NUMERIC(6,2) on store.
+        let ol_amount = Decimal::from(ol_quantity)
+            * i_price
+            * (Decimal::ONE + w_tax + d_tax)
+            * (Decimal::ONE - c_discount);
 
         writes.push(LineWrite {
             s_quantity,
