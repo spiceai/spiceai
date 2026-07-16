@@ -284,8 +284,10 @@ github_compare_files() {
   # GitHub caps the files list at 300; when truncated, skip targeted pre-lint
   # rather than linting an incomplete package set.
   # Emit: first line "true"/"false" (truncated), then one filename per line.
+  # Keep stderr so auth/rate-limit/network errors from `gh` are visible when
+  # the compare fallback fails (caller still degrades to full workspace lint).
   payload=$(gh api "repos/${repo}/compare/${LINT_BASE_BRANCH}...${head_sha}" \
-    --jq '(.truncated // false | tostring), (.files[]?.filename // empty)' 2>/dev/null) \
+    --jq '(.truncated // false | tostring), (.files[]?.filename // empty)') \
     || return 1
 
   local truncated rest
@@ -733,6 +735,52 @@ cmd_install() {
   echo "${OK} '${TARGET_BRANCH}' now requires developer sign-off + the full merge-queue suite."
 }
 
+# Dispatch .github/workflows/signoff.yml for the current branch (Git or JJ).
+# Branch names are validated to a safe charset so they cannot break shell
+# quoting or the workflow input parser.
+cmd_remote() {
+  require_tools
+
+  local branch
+  if [[ "$VCS" == "jj" ]]; then
+    # Prefer a local bookmark on @, then on the selected remote tip revision.
+    # Take the first line without `head` (SIGPIPE under pipefail).
+    local bookmarks
+    bookmarks=$(jj --color=never --no-pager log -r '@ & bookmarks()' --no-graph \
+      -T 'local_bookmarks.map(|b| b.name()).join("\n")' 2>/dev/null || true)
+    branch="${bookmarks%%$'\n'*}"
+    if [[ -z "$branch" ]]; then
+      local revision
+      revision=$(current_revision false)
+      bookmarks=$(jj --color=never --no-pager log -r "${revision} & bookmarks()" --no-graph \
+        -T 'local_bookmarks.map(|b| b.name()).join("\n")' 2>/dev/null || true)
+      branch="${bookmarks%%$'\n'*}"
+    fi
+    [[ -n "$branch" ]] \
+      || fail "no JJ bookmark on the working-copy tip — bookmark the change, or: gh workflow run signoff.yml -f branch=<name>"
+  else
+    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+    [[ -n "$branch" && "$branch" != "HEAD" ]] \
+      || fail "not on a named Git branch — check out a branch, or: gh workflow run signoff.yml -f branch=<name>"
+  fi
+
+  # Mirror the workflow input validation: allow feature/foo, reject whitespace,
+  # quotes, and path tricks so -f branch=… cannot be broken by the name.
+  if [[ "$branch" =~ [[:space:]] || "$branch" == -* || "$branch" == /* || "$branch" == *..* \
+      || "$branch" == *\"* || "$branch" == *\'* || "$branch" == *\$* || "$branch" == *\`* ]]; then
+    fail "refusing to dispatch Remote Sign-off for unsafe branch name: '${branch}'"
+  fi
+  if [[ ! "$branch" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+    fail "refusing to dispatch Remote Sign-off for invalid branch name: '${branch}'"
+  fi
+
+  info "Dispatching Remote Sign-off for ${branch}…"
+  # --raw-field avoids shell re-quoting pitfalls; the branch was validated above.
+  gh workflow run signoff.yml --raw-field "branch=${branch}" \
+    || fail "failed to dispatch signoff.yml"
+  echo "${OK} Dispatched. Watch with: gh run watch --workflow signoff.yml"
+}
+
 cmd_help() {
   cat >&2 <<EOF
 scripts/signoff ${VERSION} — local CI attestation for Spice.ai
@@ -740,6 +788,7 @@ scripts/signoff ${VERSION} — local CI attestation for Spice.ai
 Developers:
   make signoff                 Run lint + unit tests, then sign off on HEAD
   make signoff-remote          Dispatch Remote Sign-off for the current branch
+  scripts/signoff remote       Same as make signoff-remote (Git + JJ)
   scripts/signoff -f           Sign off even with a dirty/unpushed tree
   scripts/signoff --no-verify  Sign off without running checks (honor system)
   scripts/signoff status       Show the sign-off status of HEAD
@@ -770,6 +819,7 @@ main() {
   case "${1:-}" in
     ""|signoff) shift || true; cmd_signoff "$@" ;;
     -f|--force|--no-verify) cmd_signoff "$@" ;;
+    remote)   shift; cmd_remote "$@" ;;
     status)   shift; cmd_status "$@" ;;
     check)    shift; cmd_check "$@" ;;
     install)  shift; cmd_install "$@" ;;
