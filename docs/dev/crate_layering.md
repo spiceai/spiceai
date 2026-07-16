@@ -23,7 +23,7 @@ tracked separately (a working plan, not part of these rules).
   ┌──────────────────────────────────────────────────────────────────────┐
   │  binary        bin/spiced, bin/spice, tools/*                          │  stitch everything
   ├──────────────────────────────────────────────────────────────────────┤
-  │  extension     connector-* (33), spice-cloud, tpc-extension            │  plug-ins that
+  │  extension     connector-* (~30), spice-cloud, tpc-extension           │  plug-ins that
   │                                                                        │  register with the runtime
   ├──────────────────────────────────────────────────────────────────────┤
   │  runtime       runtime                                                 │  orchestration daemon
@@ -43,7 +43,7 @@ tracked separately (a working plan, not part of these rules).
 | **foundation** | Leaf utilities, wire formats, config parsing, primitives. Ideally reusable outside Spice. Little or no internal dependency. | foundation |
 | **domain** | The libraries the daemon is assembled from — data-plane building blocks (`data_components`), the accelerator (`cayenne`), inference (`llms`), search, the `runtime-*` feature crates. | foundation, domain |
 | **runtime** | The `runtime` crate: orchestration, component lifecycle, HTTP/Flight servers, and (today) the connector/accelerator/catalog trait definitions + registries. | foundation, domain |
-| **extension** | Plug-ins that *register with* the runtime: the 33 `connector-*` crates, `spice-cloud`, `tpc-extension`. Thin — a factory + wiring over a `domain` impl. | foundation, domain, runtime |
+| **extension** | Plug-ins that *register with* the runtime: the ~30 `connector-*` crates, `spice-cloud`, `tpc-extension`. Thin — a factory + wiring over a `domain` impl. | foundation, domain, runtime |
 | **binary** | The `spiced`/`spice` binaries and `tools/*` — link the whole graph. | anything |
 
 The **target** adds two lower tiers — `interface` (the `*-api` trait crates) and
@@ -286,7 +286,7 @@ Three moves, in order (the priority is set by the [measured
 baseline](#measured-compile-time-baseline)):
 
 1. **Extract the `-api` interface crates** below `runtime` (per the naming rule).
-   This inverts the ~33 `connector-* -> runtime` edges into `data-<source> -> *-api`.
+   This inverts the ~30 `connector-* -> runtime` edges into `data-<source> -> *-api`.
 2. **Split `runtime`** along its module seams into `runtime-*` impl crates that *use*
    the interfaces (`runtime-query`, `runtime-serving`, `runtime-acceleration`, …).
    This is where the compile-time win is.

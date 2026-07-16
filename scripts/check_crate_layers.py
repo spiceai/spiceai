@@ -47,7 +47,9 @@ def load_layers() -> dict:
 
 def load_metadata() -> dict:
     out = subprocess.run(
-        ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+        # --locked: this is a fast, side-effect-free lint guard; fail rather
+        # than let cargo mutate Cargo.lock, keeping CI/dev runs deterministic.
+        ["cargo", "metadata", "--format-version", "1", "--no-deps", "--locked"],
         cwd=REPO,
         capture_output=True,
         text=True,
