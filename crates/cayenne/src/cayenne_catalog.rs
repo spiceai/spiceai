@@ -3558,7 +3558,7 @@ impl MetadataCatalog for CayenneCatalog {
                 self.begin_transaction()
                     .await
                     .map_err(|e| CatalogError::InvalidOperation {
-                        message: "Failed to begin cold-tier promotion transaction.".to_string(),
+                        message: "Failed to begin the datalake data-move transaction.".to_string(),
                         source: Box::new(e),
                     })?;
 
@@ -3574,13 +3574,13 @@ impl MetadataCatalog for CayenneCatalog {
                             attempt,
                             max_attempts,
                             ?delay,
-                            "Retrying cold-tier promotion transaction after commit conflict"
+                            "Retrying the datalake data-move transaction after commit conflict"
                         );
                         tokio::time::sleep(delay).await;
                     }
                     Err(e) => {
                         return Err(CatalogError::InvalidOperation {
-                            message: "Failed to commit cold-tier promotion transaction."
+                            message: "Failed to commit the datalake data-move transaction."
                                 .to_string(),
                             source: Box::new(e),
                         });

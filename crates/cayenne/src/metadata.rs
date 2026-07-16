@@ -1137,8 +1137,8 @@ pub struct VortexConfig {
     pub cold_tier_warm_max_files: usize,
     /// How often (ms) the background loop evaluates the cold-promotion trigger.
     /// Cold tiering is not latency-critical, so this is much coarser than the
-    /// compaction interval. Set from `cayenne_datalake_promotion_interval_ms`.
-    /// Defaults to 60s.
+    /// compaction interval. Set from the user-facing
+    /// `cayenne_datalake_tiering_check_interval_ms`. Defaults to 60s.
     pub cold_tier_background_interval_ms: u64,
     /// Physical-GC cadence AND orphan grace (ms) for superseded cold objects:
     /// the sweep runs about this often, and an orphan (on the store, not in the

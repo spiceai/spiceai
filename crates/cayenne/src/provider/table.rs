@@ -14266,7 +14266,7 @@ impl CayenneTableProvider {
                         table = self.table_metadata.table_name.as_str(),
                         cold_file_row_cap = row_cap,
                         bloom_cap_bytes = COLD_PK_BLOOM_PER_FILE_MAX_BYTES,
-                        "Cold-tier promotion is splitting output into multiple row-bounded files to keep each file's PK bloom within the per-file cap"
+                        "Splitting the moved data into multiple row-bounded files to keep each file's PK bloom within the per-file cap"
                     );
                 }
                 let chunk_stream: SendableRecordBatchStream =
@@ -14275,7 +14275,7 @@ impl CayenneTableProvider {
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
                     chunk_idx,
-                    "Datalake promotion: cold chunk upload starting"
+                    "Datalake write: chunk upload starting"
                 );
                 let chunk_start = Instant::now();
                 self.insert_stream_into_cold_dir(
@@ -14290,7 +14290,7 @@ impl CayenneTableProvider {
                     table = self.table_metadata.table_name.as_str(),
                     chunk_idx,
                     duration_ms = chunk_start.elapsed().as_millis(),
-                    "Datalake promotion: cold chunk upload complete"
+                    "Datalake write: chunk upload complete"
                 );
                 chunk_idx = chunk_idx.saturating_add(1);
             }
@@ -14298,7 +14298,7 @@ impl CayenneTableProvider {
             tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
-                "Datalake promotion: cold upload starting (single stream)"
+                "Datalake write: upload starting (single stream)"
             );
             self.insert_stream_into_cold_dir(
                 session_state.as_ref(),
@@ -14721,7 +14721,7 @@ impl CayenneTableProvider {
                 warm_files,
                 max_bytes = vc.cold_tier_warm_max_bytes,
                 max_files = vc.cold_tier_warm_max_files,
-                "Datalake promotion skipped; warm tier below thresholds"
+                "Datalake tiering evaluation completed; no tier transition required"
             );
             return Ok(false);
         }
@@ -14730,9 +14730,12 @@ impl CayenneTableProvider {
         tracing::info!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
+            source_tier = "warm",
+            target_tier = "datalake",
+            clustering = "z_order",
             warm_bytes,
             warm_files,
-            "Promoting warm tier to datalake store (Z-order clustered graduation)"
+            "Moving warm-tier data to the datalake (Z-order clustered)"
         );
 
         // Exclude writers for the whole graduation (mirrors begin_overwrite).
@@ -14746,7 +14749,7 @@ impl CayenneTableProvider {
         {
             return Err(Error::Internal {
                 table: self.table_metadata.table_name.clone(),
-                message: "Timed out draining in-flight staged writes before datalake promotion; warm tier left intact (next tick retries)"
+                message: "Timed out draining in-flight staged writes before moving data to the datalake; warm tier left intact (next cycle retries)"
                     .to_string(),
             });
         }
@@ -14780,7 +14783,7 @@ impl CayenneTableProvider {
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
                     %error,
-                    "Carry-forward classification failed; skipping this promotion pass (next tick retries)"
+                    "Carry-forward classification failed; skipping this data move (next cycle retries)"
                 );
                 return Ok(false);
             }
@@ -14818,7 +14821,7 @@ impl CayenneTableProvider {
         tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
-            "Datalake promotion: visible cross-tier stream planned"
+            "Planned the cross-tier read stream for the data move"
         );
 
         // Z-order cluster for a read-optimized cold layout.
@@ -14840,7 +14843,7 @@ impl CayenneTableProvider {
             table = self.table_metadata.table_name.as_str(),
             files = cold_files.len(),
             total_rows,
-            "Datalake promotion: cold store write complete"
+            "Datalake write complete"
         );
         if cold_files.is_empty() && dirty_cold.is_empty() {
             // Nothing rewritten and nothing to drop. Gate on files-written, not
@@ -14892,7 +14895,7 @@ impl CayenneTableProvider {
         tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
-            "Datalake promotion: committing cold manifest + snapshot flip under fence"
+            "Committing the datalake manifest + snapshot flip under fence"
         );
         {
             let _fence = self.listing_fence.write().await;
@@ -14910,7 +14913,7 @@ impl CayenneTableProvider {
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 %error,
-                "Failed to prune stale manifest rows after cold-tier promotion"
+                "Failed to prune stale manifest rows after moving data to the datalake"
             );
         }
         self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
@@ -14937,7 +14940,7 @@ impl CayenneTableProvider {
         // files selected for rewrite — lower is better.
         let rewritten_datalake_files = dirty_cold.len();
         let datalake_rewrite_selectivity = if prior_cold_len == 0 {
-            "n/a (first promotion, no existing datalake files)".to_string()
+            "n/a (first move, no existing datalake files)".to_string()
         } else {
             #[expect(
                 clippy::cast_precision_loss,
@@ -14951,6 +14954,8 @@ impl CayenneTableProvider {
         tracing::info!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
+            source_tier = "warm",
+            target_tier = "datalake",
             datalake_rewrite_selectivity = %datalake_rewrite_selectivity,
             warm_files,
             warm_bytes,
@@ -14960,7 +14965,7 @@ impl CayenneTableProvider {
             written_bytes,
             total_rows,
             duration_ms = u64::try_from(promotion_start.elapsed().as_millis()).unwrap_or(u64::MAX),
-            "Datalake-tier promotion committed"
+            "Moved warm-tier data to the datalake"
         );
         Ok(true)
     }
@@ -15493,7 +15498,7 @@ impl CayenneTableProvider {
                 tracing::info!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
-                    "Subset-merge in-memory publish skipped: the table snapshot was replaced mid-pass (overwrite/promotion); discarding the merged output"
+                    "Subset-merge in-memory publish skipped: the table snapshot was replaced mid-pass (overwrite or datalake move); discarding the merged output"
                 );
                 self.retire_snapshot_dirs(std::iter::once(new_snapshot_id.as_str()));
                 self.sweep_retired_snapshot_dirs();
@@ -16049,7 +16054,7 @@ impl CayenneTableProvider {
                 tracing::info!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
-                    "Seq-prefix bake in-memory publish skipped: the table snapshot was replaced mid-pass (overwrite/promotion); discarding the merged output"
+                    "Seq-prefix bake in-memory publish skipped: the table snapshot was replaced mid-pass (overwrite or datalake move); discarding the merged output"
                 );
                 self.retire_snapshot_dirs(std::iter::once(new_snapshot_id.as_str()));
                 self.sweep_retired_snapshot_dirs();
@@ -26181,7 +26186,7 @@ impl super::compaction::ColdTierPromotionRunner for CayenneTableProvider {
                 tracing::debug!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
-                    "Cold-tier promotion tick graduated the warm tier to the cold object store"
+                    "Tiering tick moved warm-tier data to the datalake"
                 );
             }
             Ok(false) => {}
@@ -26189,7 +26194,7 @@ impl super::compaction::ColdTierPromotionRunner for CayenneTableProvider {
                 tracing::warn!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
-                    "Cold-tier promotion tick failed (warm tier left intact; retry next tick): {e}"
+                    "Tiering tick failed to move data to the datalake (warm tier left intact; next cycle retries): {e}"
                 );
             }
         }

@@ -118,7 +118,7 @@ datasets:
         # re-promotes per batch.
         cayenne_datalake_warm_max_bytes: '4294967296'
         # Background promoter cadence — re-checks the warm-size trigger every 30s.
-        cayenne_datalake_promotion_interval_ms: '30000'
+        cayenne_datalake_tiering_check_interval_ms: '30000'
         # cayenne_datalake_clustering_columns omitted -> Z-order falls back to the primary key
         # (sensible default for chbench point/range lookups); tune per-table if a scan dimension
         # dominates.
