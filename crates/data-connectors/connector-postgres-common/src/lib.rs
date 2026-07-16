@@ -45,14 +45,12 @@ pub enum Error {
     QueryFailed { source: tokio_postgres::Error },
 
     #[snafu(display(
-        "Cannot start CDC catalog acceleration: PostgreSQL `wal_level` is '{wal_level}', but 'logical' is required. \
-        Run `ALTER SYSTEM SET wal_level = 'logical';` and restart PostgreSQL. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
+        "Cannot start CDC catalog acceleration: PostgreSQL `wal_level` is '{wal_level}', but 'logical' is required. Run `ALTER SYSTEM SET wal_level = 'logical';` and restart PostgreSQL. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
     ))]
     WalLevelNotLogical { wal_level: String },
 
     #[snafu(display(
-        "Cannot start CDC catalog acceleration: PostgreSQL role '{role}' is not permitted to start replication. \
-        Grant it with `ALTER ROLE \"{role}\" REPLICATION;`, or connect as a superuser. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
+        "Cannot start CDC catalog acceleration: PostgreSQL role '{role}' is not permitted to start replication. Grant it with `ALTER ROLE \"{role}\" REPLICATION;`, or connect as a superuser. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
     ))]
     MissingReplicationPrivilege { role: String },
 }

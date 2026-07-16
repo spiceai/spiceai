@@ -292,9 +292,7 @@ impl AcceleratedCatalogProvider {
 
                 if primary_key.is_empty() {
                     return Err(format!(
-                        "Catalog '{}': table {table_path} has no primary key. Every table \
-                        included in an accelerated catalog must have a primary key -- add one, \
-                        or exclude the table via the catalog's `include`/`exclude` patterns.",
+                        "Catalog '{}': table {table_path} has no primary key. Every table included in an accelerated catalog must have a primary key -- add one, or exclude the table via the catalog's `include`/`exclude` patterns.",
                         self.catalog_name
                     )
                     .into());
