@@ -1688,7 +1688,10 @@ mod tests {
 
         match result {
             Err(cdc::StreamError::Arrow(msg)) => {
-                assert!(msg.contains("No record batch found"));
+                assert!(
+                    msg.contains("No Kafka message payload found"),
+                    "unexpected error: {msg}"
+                );
             }
             _ => panic!("Expected Arrow error"),
         }
