@@ -18,8 +18,7 @@ use std::num::TryFromIntError;
 use std::sync::LazyLock;
 
 use crate::vendored_hash::{RandomState, create_hashes};
-use arrow::array::{ArrayRef, UInt64Array};
-use arrow::compute::binary;
+use arrow::array::ArrayRef;
 use datafusion::arrow::array::{Array, Int32Array};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::DataFusionError;
@@ -250,26 +249,20 @@ fn compute_bucket_array(
     output_type: &DataType,
 ) -> Result<ArrayRef, DataFusionError> {
     let num_buckets = i32::try_from(num_buckets).context(BucketLargerThanTypeSnafu)?;
+    // Validated positive and <= MAX_NUM_BUCKETS (<= i32::MAX) by the caller.
+    let num_buckets_u64 = u64::try_from(num_buckets).context(BucketLargerThanTypeSnafu)?;
 
     let mut hashes = vec![0u64; array.len()];
     create_hashes(array.as_ref(), &RANDOM_STATE, &mut hashes)?;
 
-    let hash_array = UInt64Array::from(hashes);
+    // Compute bucket IDs directly from hashes — no intermediate Arrow arrays.
+    // `hash % num_buckets` is always < num_buckets <= MAX_NUM_BUCKETS <= i32::MAX.
+    let mut buckets = Vec::with_capacity(hashes.len());
+    for hash in hashes {
+        buckets.push((hash % num_buckets_u64) as i32);
+    }
 
-    let bucket_array: Int32Array = binary(
-        &hash_array,
-        &Int32Array::from_value(num_buckets, array.len()),
-        |hash, n| {
-            let Ok(n) = u64::try_from(n).and_then(|n| i32::try_from(hash % n)) else {
-                // MAX_NUM_BUCKETS is checked at compile-time to be less than i32::MAX
-                unreachable!("MAX_NUM_BUCKETS smaller than i32 positive maximum");
-            };
-
-            n
-        },
-    )?;
-
-    let result = Int32Array::new(bucket_array.values().clone(), array.nulls().cloned());
+    let result = Int32Array::new(buckets.into(), array.nulls().cloned());
 
     Ok(arrow::compute::cast(&result, output_type)?)
 }

@@ -181,9 +181,11 @@ impl ResponseMetadata {
     }
 }
 
-/// Gets all possible media types from a `Accept` header.
-pub(crate) fn accept_header_types(accept: &TypedHeader<Accept>) -> Vec<String> {
-    accept.0.media_types().map(ToString::to_string).collect()
+/// Gets all possible media types from a `Accept` header without allocating.
+pub(crate) fn accept_header_types(
+    accept: &TypedHeader<Accept>,
+) -> impl Iterator<Item = &str> + '_ {
+    accept.0.media_types().map(AsRef::<str>::as_ref)
 }
 
 impl ResponseMimeType {
@@ -203,8 +205,7 @@ impl ResponseMimeType {
     pub fn from_accept_header(accept: Option<&TypedHeader<Accept>>) -> ResponseMimeType {
         accept.map_or(ResponseMimeType::default(), |header| {
             accept_header_types(header)
-                .iter()
-                .find_map(|h| match h.as_str() {
+                .find_map(|h| match h {
                     "application/json" => Some(ResponseMimeType::Json),
                     "application/vnd.spiceai.nsql.v1+json" => Some(ResponseMimeType::VndNsqlJsonV1),
                     "application/vnd.spiceai.sql.v1+json" => Some(ResponseMimeType::VndSqlJsonV1),
@@ -569,11 +570,8 @@ fn attach_cache_headers(
         headers.insert("X-Cache", val);
     }
 
-    if let Some(val) = results_cache_status
-        .to_header_string()
-        .and_then(|v| v.parse().ok())
-    {
-        headers.insert("Results-Cache-Status", val);
+    if let Some(val) = results_cache_status.to_header_string() {
+        headers.insert("Results-Cache-Status", HeaderValue::from_static(val));
     }
 
     // Surface the cache scope so callers can tell whether a MISS came

@@ -48,6 +48,7 @@ use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use crate::metadata::{DeleteFile, DeletionType, TableMetadata};
+use crate::provider::utils::bytes_key;
 use crate::provider::{Error, Result};
 
 #[derive(Debug, Clone, Copy)]
@@ -698,7 +699,7 @@ pub fn detect_deletion_type_and_read(
 
                 for i in 0..row_key_array.len() {
                     if !row_key_array.is_null(i) {
-                        let key = row_key_array.value(i).to_vec().into_boxed_slice();
+                        let key = bytes_key(row_key_array.value(i));
                         let entry = key_row_state.entry(key).or_insert(KeyDeletionReadState {
                             delete_sequence: file_sequence,
                             reinsert_sequence: file_reinsert,

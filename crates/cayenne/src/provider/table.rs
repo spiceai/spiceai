@@ -150,6 +150,7 @@ use super::deletion_strategy::{
 };
 use super::memory_account::CayenneMemoryAccount;
 use super::staging_wal::PreparedStagedAppend;
+use super::utils::{bytes_key, i64_key};
 use super::vortex_format::PositionDeletionAccessPlanProvider;
 use arc_swap::ArcSwap;
 
@@ -644,10 +645,7 @@ fn deserialize_delete_keys_from_ipc(
                     rest.len()
                 )));
             }
-            Ok(rest
-                .chunks_exact(8)
-                .map(|chunk| chunk.to_vec().into_boxed_slice())
-                .collect())
+            Ok(rest.chunks_exact(8).map(bytes_key).collect())
         }
         // cycle-5 TASK 2a: LZ4-compressed Arrow IPC (composite keys).
         tombstone_format::COMPRESSED_IPC => deserialize_delete_keys_from_arrow_ipc(rest),
@@ -681,7 +679,7 @@ fn deserialize_delete_keys_from_arrow_ipc(
         row_keys.reserve(row_key_array.len());
         for row_index in 0..row_key_array.len() {
             if !row_key_array.is_null(row_index) {
-                row_keys.push(row_key_array.value(row_index).to_vec().into_boxed_slice());
+                row_keys.push(bytes_key(row_key_array.value(row_index)));
             }
         }
     }
@@ -8286,7 +8284,8 @@ impl CayenneTableProvider {
                     }
                     PkDeletionSnapshot::RowConverterBased { tombstones } => {
                         if tombstones.get(key.as_ref()).is_some() {
-                            let row_key = key.as_ref().to_vec().into_boxed_slice();
+                            // Box::from once, then clone for the dual-list push (file + inline).
+                            let row_key = bytes_key(key.as_ref());
                             deleted_row_keys.push(row_key.clone());
                             deleted_inlined_row_keys.push(row_key);
                             *reinserted_over_tombstone += 1;
@@ -8326,7 +8325,7 @@ impl CayenneTableProvider {
                         }
                     }
                     PkDeletionStrategyWithCache::RowConverterBased { .. } => {
-                        let row_key = key.as_ref().to_vec().into_boxed_slice();
+                        let row_key = bytes_key(key.as_ref());
                         deleted_row_keys.push(row_key.clone());
                         deleted_inlined_row_keys.push(row_key);
                     }
@@ -8430,7 +8429,7 @@ impl CayenneTableProvider {
                                         // `commit_on_conflict_deletions` catalog call without a second
                                         // re-encoding. This is one allocation per conflict row; the
                                         // arena-indexed key design discussed in iter 3 would amortize it.
-                                        let row_key = key.as_ref().to_vec().into_boxed_slice();
+                                        let row_key = bytes_key(key.as_ref());
                                         if is_inlined_conflict {
                                             deleted_inlined_row_keys.push(row_key);
                                         } else {
@@ -8523,7 +8522,7 @@ impl CayenneTableProvider {
                                 }
                             }
                             PkDeletionStrategyWithCache::RowConverterBased { .. } => {
-                                let row_key = key.as_ref().to_vec().into_boxed_slice();
+                                let row_key = bytes_key(key.as_ref());
                                 deleted_row_keys.push(row_key.clone());
                                 deleted_inlined_row_keys.push(row_key);
                             }
@@ -9715,7 +9714,7 @@ impl CayenneTableProvider {
             PkDeletionStrategyWithCache::Int64Pk { .. } => Cow::Owned(
                 deleted_pk_i64
                     .iter()
-                    .map(|&pk| pk.to_be_bytes().to_vec().into_boxed_slice())
+                    .map(|&pk| i64_key(pk))
                     .collect(),
             ),
             // RowConverter tables reuse the caller's keys verbatim: a borrowed
@@ -9846,10 +9845,7 @@ impl CayenneTableProvider {
                     // which replays this delta under `rcu` against the live index —
                     // so no `load_full` of the deletion snapshot here.
                     for (&delete_sequence, pks) in &pure_by_seq {
-                        let row_keys = pks
-                            .iter()
-                            .map(|pk| pk.to_be_bytes().to_vec().into_boxed_slice())
-                            .collect::<Vec<_>>();
+                        let row_keys = pks.iter().copied().map(i64_key).collect::<Vec<_>>();
                         if let Some(results) = self
                             .write_key_deletion_vectors(delete_sequence, row_keys)
                             .await?
@@ -9859,10 +9855,7 @@ impl CayenneTableProvider {
                         }
                     }
                     for (&delete_sequence, pks) in &reinsert_by_seq {
-                        let row_keys = pks
-                            .iter()
-                            .map(|pk| pk.to_be_bytes().to_vec().into_boxed_slice())
-                            .collect::<Vec<_>>();
+                        let row_keys = pks.iter().copied().map(i64_key).collect::<Vec<_>>();
                         if let Some(results) = self
                             .write_key_deletion_vectors(delete_sequence, row_keys)
                             .await?
@@ -22273,7 +22266,7 @@ impl CayenneTableProvider {
                             self.table_metadata.table_name
                         )));
                     }
-                    row_keys.push(rows.row(row_index).as_ref().to_vec().into_boxed_slice());
+                    row_keys.push(bytes_key(rows.row(row_index).as_ref()));
                 }
                 Ok(ExtractedPrimaryKeys {
                     int64_pk: Vec::new(),
@@ -26776,7 +26769,8 @@ mod tests {
     fn test_tombstone_packed_i64_roundtrip_and_compact() {
         let keys: Vec<Box<[u8]>> = [1_i64, -7, i64::MAX, 0, 42]
             .iter()
-            .map(|pk| pk.to_be_bytes().to_vec().into_boxed_slice())
+            .copied()
+            .map(i64_key)
             .collect();
         let blob = serialize_delete_keys_to_ipc(&keys, /* is_int64_pk */ true)
             .expect("serialize packed i64");
@@ -26817,7 +26811,8 @@ mod tests {
     fn test_tombstone_legacy_uncompressed_ipc_still_decodes() {
         let keys: Vec<Box<[u8]>> = [10_i64, 20, 30]
             .iter()
-            .map(|pk| pk.to_be_bytes().to_vec().into_boxed_slice())
+            .copied()
+            .map(i64_key)
             .collect();
         // Reproduce the exact pre-cycle-5 encoding: uncompressed Arrow IPC of a
         // single `row_key` BinaryArray, no prefix tag.

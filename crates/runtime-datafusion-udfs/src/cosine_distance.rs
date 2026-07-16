@@ -17,7 +17,10 @@ limitations under the License.
 //! [`ScalarUDFImpl`] definitions for cosine distance function.
 //! Keep implementation inline with `<https://github.com/apache/datafusion/blob/main/datafusion/functions-nested/src/distance.rs#L47>`
 
-use arrow::array::{Array, ArrayRef, Float64Array, LargeListArray, ListArray, OffsetSizeTrait};
+use arrow::array::{
+    Array, ArrayRef, Float64Array, Float64Builder, GenericListArray, LargeListArray, ListArray,
+    OffsetSizeTrait,
+};
 use arrow_schema::DataType;
 use arrow_schema::DataType::{FixedSizeList, Float64, LargeList, List};
 use core::any::type_name;
@@ -32,7 +35,9 @@ use datafusion::{
 };
 use std::sync::Arc;
 
-use crate::vector_simd::make_scalar_function;
+use crate::vector_simd::{
+    Kernel, compute_fsl_f32, make_scalar_function, matching_fixed_size_list_f32,
+};
 
 pub static COSINE_DISTANCE_UDF_NAME: &str = "cosine_distance";
 
@@ -87,7 +92,13 @@ impl ScalarUDFImpl for CosineDistance {
         if arg_types.len() != 2 {
             return exec_err!("{COSINE_DISTANCE_UDF_NAME} expects exactly two arguments");
         }
-        let mut result = Vec::new();
+
+        // Keep FixedSizeList<Float32, N> as-is so invoke can take the SIMD path.
+        if matching_fixed_size_list_f32(&arg_types[0], &arg_types[1]).is_some() {
+            return Ok(vec![arg_types[0].clone(), arg_types[1].clone()]);
+        }
+
+        let mut result = Vec::with_capacity(2);
         for arg_type in arg_types {
             match arg_type {
                 List(_) | LargeList(_) | FixedSizeList(_, _) => {
@@ -115,6 +126,11 @@ fn cosine_distance_inner(args: &[ArrayRef]) -> DataFusionResult<ArrayRef> {
     }
 
     match (&args[0].data_type(), &args[1].data_type()) {
+        (FixedSizeList(_, _), FixedSizeList(_, _))
+            if matching_fixed_size_list_f32(args[0].data_type(), args[1].data_type()).is_some() =>
+        {
+            compute_fsl_f32(args, Kernel::CosineDistance, |v| v)
+        }
         (List(_), List(_)) => general_cosine_distance::<i32>(args),
         (LargeList(_), LargeList(_)) => general_cosine_distance::<i64>(args),
         (array_type1, array_type2) => {
@@ -129,13 +145,129 @@ fn general_cosine_distance<O: OffsetSizeTrait>(arrays: &[ArrayRef]) -> DataFusio
     let list_array1 = as_generic_list_array::<O>(&arrays[0])?;
     let list_array2 = as_generic_list_array::<O>(&arrays[1])?;
 
-    let result = list_array1
-        .iter()
-        .zip(list_array2.iter())
-        .map(|(arr1, arr2)| compute_cosine_distance(arr1, arr2))
-        .collect::<DataFusionResult<Float64Array>>()?;
+    // Fast path: flat primitive values — walk offsets into the child buffers
+    // without allocating a per-row `ArrayRef` via `list.iter()` / `value(i)`.
+    match (list_array1.value_type(), list_array2.value_type()) {
+        (DataType::Float64, DataType::Float64) => {
+            return general_cosine_distance_f64(list_array1, list_array2);
+        }
+        (DataType::Float32, DataType::Float32) => {
+            return general_cosine_distance_f32(list_array1, list_array2);
+        }
+        _ => {}
+    }
 
-    Ok(Arc::new(result) as ArrayRef)
+    // Fallback: nested lists or non-float element types.
+    let n = list_array1.len();
+    let mut builder = Float64Builder::with_capacity(n);
+    for i in 0..n {
+        if list_array1.is_null(i) || list_array2.is_null(i) {
+            builder.append_null();
+            continue;
+        }
+        // `value(i)` still builds an ArrayRef, but this path is only for nested
+        // / uncommon element types; the Float32/Float64 hot path above avoids it.
+        match compute_cosine_distance(Some(list_array1.value(i)), Some(list_array2.value(i)))? {
+            Some(d) => builder.append_value(d),
+            None => builder.append_null(),
+        }
+    }
+
+    Ok(Arc::new(builder.finish()) as ArrayRef)
+}
+
+fn general_cosine_distance_f64<O: OffsetSizeTrait>(
+    list1: &GenericListArray<O>,
+    list2: &GenericListArray<O>,
+) -> DataFusionResult<ArrayRef> {
+    let values1 = as_float64_array(list1.values())?;
+    let values2 = as_float64_array(list2.values())?;
+    let raw1 = values1.values().as_ref();
+    let raw2 = values2.values().as_ref();
+    let offsets1 = list1.value_offsets();
+    let offsets2 = list2.value_offsets();
+    let nulls1 = values1.nulls();
+    let nulls2 = values2.nulls();
+    let check_inner1 = values1.null_count() > 0;
+    let check_inner2 = values2.null_count() > 0;
+
+    let n = list1.len();
+    let mut builder = Float64Builder::with_capacity(n);
+    for i in 0..n {
+        if list1.is_null(i) || list2.is_null(i) {
+            builder.append_null();
+            continue;
+        }
+        let start1 = offsets1[i].as_usize();
+        let end1 = offsets1[i + 1].as_usize();
+        let start2 = offsets2[i].as_usize();
+        let end2 = offsets2[i + 1].as_usize();
+
+        if check_inner1 && nulls1.is_some_and(|nb| (start1..end1).any(|j| nb.is_null(j))) {
+            builder.append_null();
+            continue;
+        }
+        if check_inner2 && nulls2.is_some_and(|nb| (start2..end2).any(|j| nb.is_null(j))) {
+            builder.append_null();
+            continue;
+        }
+        if end1 - start1 != end2 - start2 {
+            return exec_err!("Both arrays must have the same length");
+        }
+
+        match cosine_distance_f64(&raw1[start1..end1], &raw2[start2..end2]) {
+            Some(d) => builder.append_value(d),
+            None => builder.append_null(),
+        }
+    }
+    Ok(Arc::new(builder.finish()) as ArrayRef)
+}
+
+fn general_cosine_distance_f32<O: OffsetSizeTrait>(
+    list1: &GenericListArray<O>,
+    list2: &GenericListArray<O>,
+) -> DataFusionResult<ArrayRef> {
+    let values1 = as_float32_array(list1.values())?;
+    let values2 = as_float32_array(list2.values())?;
+    let raw1 = values1.values().as_ref();
+    let raw2 = values2.values().as_ref();
+    let offsets1 = list1.value_offsets();
+    let offsets2 = list2.value_offsets();
+    let nulls1 = values1.nulls();
+    let nulls2 = values2.nulls();
+    let check_inner1 = values1.null_count() > 0;
+    let check_inner2 = values2.null_count() > 0;
+
+    let n = list1.len();
+    let mut builder = Float64Builder::with_capacity(n);
+    for i in 0..n {
+        if list1.is_null(i) || list2.is_null(i) {
+            builder.append_null();
+            continue;
+        }
+        let start1 = offsets1[i].as_usize();
+        let end1 = offsets1[i + 1].as_usize();
+        let start2 = offsets2[i].as_usize();
+        let end2 = offsets2[i + 1].as_usize();
+
+        if check_inner1 && nulls1.is_some_and(|nb| (start1..end1).any(|j| nb.is_null(j))) {
+            builder.append_null();
+            continue;
+        }
+        if check_inner2 && nulls2.is_some_and(|nb| (start2..end2).any(|j| nb.is_null(j))) {
+            builder.append_null();
+            continue;
+        }
+        if end1 - start1 != end2 - start2 {
+            return exec_err!("Both arrays must have the same length");
+        }
+
+        match cosine_distance_f32(&raw1[start1..end1], &raw2[start2..end2]) {
+            Some(d) => builder.append_value(d),
+            None => builder.append_null(),
+        }
+    }
+    Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
 fn compute_cosine_distance(
@@ -189,6 +321,30 @@ fn compute_cosine_distance(
         return Ok(None);
     }
 
+    // Float64: operate on the value buffer without cloning the array.
+    if matches!(value1.data_type(), DataType::Float64)
+        && matches!(value2.data_type(), DataType::Float64)
+    {
+        let f1 = as_float64_array(&value1)?;
+        let f2 = as_float64_array(&value2)?;
+        if f1.len() != f2.len() {
+            return exec_err!("Both arrays must have the same length");
+        }
+        return Ok(cosine_distance_f64(f1.values(), f2.values()));
+    }
+
+    // Float32: same, promote while accumulating.
+    if matches!(value1.data_type(), DataType::Float32)
+        && matches!(value2.data_type(), DataType::Float32)
+    {
+        let f1 = as_float32_array(&value1)?;
+        let f2 = as_float32_array(&value2)?;
+        if f1.len() != f2.len() {
+            return exec_err!("Both arrays must have the same length");
+        }
+        return Ok(cosine_distance_f32(f1.values(), f2.values()));
+    }
+
     let float_vals1 = convert_to_f64_array(&value1)?;
     let float_vals2 = convert_to_f64_array(&value2)?;
 
@@ -196,32 +352,25 @@ fn compute_cosine_distance(
         return exec_err!("Both arrays must have the same length");
     }
 
-    Ok(cosine_distance(&float_vals1, &float_vals2))
+    Ok(cosine_distance_f64(float_vals1.values(), float_vals2.values()))
 }
 
-/// Computes the cosine distance between two equal-length vectors.
+/// Computes the cosine distance between two equal-length f64 vectors.
 ///
 /// Returns `None` when either vector has zero magnitude (e.g. an all-zero or
 /// failed embedding): cosine similarity is undefined there (`0.0 / 0.0` is
 /// `NaN`), and a `NaN` score sorts ahead of every real score in
 /// `ORDER BY _score DESC`, surfacing failed embeddings as top matches.
-fn cosine_distance(x: &Float64Array, y: &Float64Array) -> Option<f64> {
+fn cosine_distance_f64(x: &[f64], y: &[f64]) -> Option<f64> {
     let mut x_length: f64 = 0.0;
     let mut y_length: f64 = 0.0;
+    let mut sum_squares: f64 = 0.0;
 
-    let sum_squares: f64 = x
-        .iter()
-        .zip(y.iter())
-        .map(|(v1, v2)| {
-            let a = v1.unwrap_or(0.0);
-            let b = v2.unwrap_or(0.0);
-
-            x_length += a * a;
-            y_length += b * b;
-
-            a * b
-        })
-        .sum();
+    for (&a, &b) in x.iter().zip(y.iter()) {
+        x_length += a * a;
+        y_length += b * b;
+        sum_squares += a * b;
+    }
 
     let similarity = sum_squares / (x_length.sqrt() * y_length.sqrt());
 
@@ -236,11 +385,40 @@ fn cosine_distance(x: &Float64Array, y: &Float64Array) -> Option<f64> {
     Some((1.0 - similarity) / 2.0)
 }
 
+/// Float32 variant of [`cosine_distance_f64`]; accumulates in f64.
+fn cosine_distance_f32(x: &[f32], y: &[f32]) -> Option<f64> {
+    let mut x_length: f64 = 0.0;
+    let mut y_length: f64 = 0.0;
+    let mut sum_squares: f64 = 0.0;
+
+    for (&a, &b) in x.iter().zip(y.iter()) {
+        let a = f64::from(a);
+        let b = f64::from(b);
+        x_length += a * a;
+        y_length += b * b;
+        sum_squares += a * b;
+    }
+
+    let similarity = sum_squares / (x_length.sqrt() * y_length.sqrt());
+    if !similarity.is_finite() {
+        return None;
+    }
+    Some((1.0 - similarity) / 2.0)
+}
+
+/// Thin wrapper kept for unit tests that construct `Float64Array`s directly.
+#[cfg(test)]
+fn cosine_distance(x: &Float64Array, y: &Float64Array) -> Option<f64> {
+    cosine_distance_f64(x.values(), y.values())
+}
+
 /// Converts an array of any numeric type to a `Float64Array`.
+///
+/// Float64 inputs are not handled here — callers should use the zero-copy
+/// [`as_float64_array`] path instead of cloning.
 #[expect(clippy::cast_lossless, clippy::cast_precision_loss)]
 fn convert_to_f64_array(array: &ArrayRef) -> DataFusionResult<Float64Array> {
     match array.data_type() {
-        DataType::Float64 => Ok(as_float64_array(array)?.clone()),
         DataType::Float32 => {
             let array = as_float32_array(array)?;
             let converted: Float64Array = array.iter().map(|v| v.map(f64::from)).collect();
@@ -266,7 +444,10 @@ mod tests {
 
     use arrow::array::{ArrayRef, Float64Array};
 
-    use super::{compute_cosine_distance, cosine_distance};
+    use super::{compute_cosine_distance, cosine_distance, cosine_distance_inner};
+    use crate::vector_simd::testing::fsl_f32;
+    use arrow::array::{Array, AsArray};
+    use arrow::datatypes::Float64Type;
 
     #[test]
     fn test_cosine_distance() {
@@ -341,5 +522,32 @@ mod tests {
         let b: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0]));
         let result = compute_cosine_distance(Some(a), Some(b));
         assert!(matches!(result, Ok(Some(d)) if d.is_finite()));
+    }
+
+    #[test]
+    fn fsl_f32_identical_is_zero() {
+        let a = fsl_f32(&[&[1.0, 2.0, 3.0]]);
+        let b = fsl_f32(&[&[1.0, 2.0, 3.0]]);
+        let out = cosine_distance_inner(&[a, b]).expect("ok");
+        let out = out.as_primitive::<Float64Type>();
+        assert!(out.value(0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn fsl_f32_opposite_is_one() {
+        let a = fsl_f32(&[&[1.0, 2.0, 3.0]]);
+        let b = fsl_f32(&[&[-1.0, -2.0, -3.0]]);
+        let out = cosine_distance_inner(&[a, b]).expect("ok");
+        let out = out.as_primitive::<Float64Type>();
+        assert!((out.value(0) - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn fsl_f32_zero_vector_is_null() {
+        let a = fsl_f32(&[&[0.0, 0.0, 0.0]]);
+        let b = fsl_f32(&[&[1.0, 2.0, 3.0]]);
+        let out = cosine_distance_inner(&[a, b]).expect("ok");
+        let out = out.as_primitive::<Float64Type>();
+        assert!(out.is_null(0));
     }
 }

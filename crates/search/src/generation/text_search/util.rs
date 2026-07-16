@@ -13,7 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use serde_json::{Map, Value};
 use snafu::ResultExt;
 use std::sync::Arc;
 
@@ -29,8 +28,6 @@ use arrow::{
 };
 use arrow_schema::{Field as ArrowField, Schema, SchemaRef};
 use tantivy::{Term, schema::Field};
-
-use serde_json::to_string;
 
 /// Adds an additional [`StringArray`] column to a [`RecordBatch`] as a JSON-string representation
 /// from a subset of the columns present.
@@ -50,20 +47,18 @@ pub fn with_json_subset_column(
     let subset_schema: SchemaRef = Arc::new(Schema::new(subset_fields));
     let subset_batch = RecordBatch::try_new(Arc::clone(&subset_schema), subset_arrays).boxed()?;
 
+    // Line-delimited writer emits one JSON object per row (NDJSON). Use the raw line
+    // bytes as Utf8 values directly — no serde Map parse/re-serialize round-trip.
     let buf = Vec::new();
-    let mut writer = arrow_json::ArrayWriter::new(buf);
+    let mut writer = arrow_json::LineDelimitedWriter::new(buf);
     writer.write_batches(&[&subset_batch]).boxed()?;
     writer.finish().boxed()?;
     let json_data = writer.into_inner();
 
-    let json_strings: Vec<String> =
-        serde_json::from_reader::<_, Vec<Map<String, Value>>>(json_data.as_slice())
-            .boxed()?
-            .into_iter()
-            .map(|v| to_string(&v).boxed())
-            .collect::<Result<Vec<String>, _>>()?;
-
-    let json_array: ArrayRef = Arc::new(StringArray::from(json_strings));
+    let json_str = std::str::from_utf8(&json_data).boxed()?;
+    let json_array: ArrayRef = Arc::new(StringArray::from_iter_values(
+        json_str.lines().filter(|line| !line.is_empty()),
+    ));
 
     let mut new_fields: Vec<_> = batch.schema().fields().iter().cloned().collect();
     new_fields.push(Arc::new(ArrowField::new(

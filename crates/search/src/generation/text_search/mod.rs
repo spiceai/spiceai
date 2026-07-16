@@ -10,7 +10,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{cmp::min, collections::HashMap, sync::Arc};
+use std::{cmp::min, collections::{HashMap, HashSet}, sync::Arc};
 
 use crate::{
     SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME,
@@ -181,6 +181,9 @@ pub struct FullTextSearchFieldIndex {
     pub field: String,
     pub primary_key: Vec<String>,
 
+    /// Cached names of stored fields in the underlying index (for O(1) membership checks).
+    stored_columns: HashSet<String>,
+
     /// Provide hints to the final Arrow datatype for a given column. Keys are column names.
     /// Tantivy [`FieldType`]s are less specific than [`arrow::datatypes::DataType`]s and the Arrow type must be inferred from Tanitvy JSON results (via [`arrow_json::reader::infer_json_schema_from_iterator`]).
     /// For columns present, use the associated [`arrow::datatypes::Field`].
@@ -193,10 +196,17 @@ impl FullTextSearchFieldIndex {
         field: String,
         primary_key: Vec<String>,
     ) -> Result<Self> {
+        let stored_columns: HashSet<String> = index_search
+            .schema()
+            .fields()
+            .filter_map(|(_, f)| f.is_stored().then(|| f.name().to_string()))
+            .collect();
+
         let fts = Self {
             reader: index_search,
             field,
             primary_key,
+            stored_columns,
             type_hints: HashMap::from([(
                 SEARCH_SCORE_COLUMN_NAME.to_string(),
                 Arc::new(Field::new(
@@ -208,12 +218,11 @@ impl FullTextSearchFieldIndex {
         };
 
         // Ensure that the index has the required primary key columns.
-        let cols = fts.all_columns();
         for pk in &fts.primary_key {
-            if !cols.contains(pk) {
+            if !fts.stored_columns.contains(pk) {
                 return Err(Error::TextSearchIndexMissingColummn {
                     missing: pk.clone(),
-                    index_columns: cols,
+                    index_columns: fts.stored_columns.iter().cloned().collect(),
                 });
             }
         }
@@ -222,18 +231,20 @@ impl FullTextSearchFieldIndex {
     }
 
     ///  Schema is based on the [`tantivy::schema::Schema`] with `self.type_hints` applied.
+    /// Field order follows the underlying tantivy schema (not the `HashSet` cache).
     fn schema(&self) -> Arc<Schema> {
         let search_schema = self.reader.schema();
-        let fields = self
-            .all_columns()
-            .iter()
-            .filter_map(|field_name| {
-                let (data_type, nullable) = if let Some(f) = self.get_type_hint(field_name) {
-                    (f.data_type().clone(), f.is_nullable())
+        let fields = search_schema
+            .fields()
+            .filter_map(|(_, f)| {
+                if !f.is_stored() {
+                    return None;
+                }
+                let field_name = f.name();
+                let (data_type, nullable) = if let Some(hint) = self.get_type_hint(field_name) {
+                    (hint.data_type().clone(), hint.is_nullable())
                 } else {
-                    let f = search_schema.get_field(field_name).ok()?;
-                    let entry = search_schema.get_field_entry(f);
-                    (tantivy_to_arrow_type(entry.field_type())?, false)
+                    (tantivy_to_arrow_type(f.field_type())?, false)
                 };
                 Some(Field::new(field_name, data_type, nullable))
             })
@@ -256,23 +267,14 @@ impl FullTextSearchFieldIndex {
     }
 
     #[must_use]
-    pub fn get_type_hint(&self, name: &String) -> Option<&FieldRef> {
+    pub fn get_type_hint(&self, name: &str) -> Option<&FieldRef> {
         self.type_hints.get(name)
     }
 
+    /// Returns the cached set of stored column names in the underlying index.
     #[must_use]
-    pub fn all_columns(&self) -> Vec<String> {
-        self.reader
-            .schema()
-            .fields()
-            .filter_map(|(_, f)| {
-                if f.is_stored() {
-                    Some(f.name().to_string())
-                } else {
-                    None
-                }
-            })
-            .collect()
+    pub fn all_columns(&self) -> &HashSet<String> {
+        &self.stored_columns
     }
 
     fn query_parser(&self) -> QueryParser {
@@ -334,8 +336,6 @@ impl FullTextSearchFieldIndex {
                 })?,
         };
 
-        let all_cols = self.all_columns();
-
         let top_docs = self
             .reader
             .search(
@@ -353,12 +353,13 @@ impl FullTextSearchFieldIndex {
                 let mut doc_w_col_names = doc
                     .into_iter()
                     .map(|(f, v)| (self.reader.schema().get_field_name(f), v))
-                    .filter(|(name, _)| all_cols.contains(&(*name).to_string()))
+                    // `HashSet<String>::contains` accepts `&str` via `Borrow<str>`.
+                    .filter(|(name, _)| self.stored_columns.contains(*name))
                     .collect::<HashMap<_, _>>();
 
-                // Must rename `self.field` -> `SEARCH_VALUE_COLUMN_NAME` for final result.
-                if let Some(value) = doc_w_col_names.remove(self.field.as_str()) {
-                    doc_w_col_names.insert(self.field.as_str(), value.clone());
+                // Keep `self.field` and also expose it as `SEARCH_VALUE_COLUMN_NAME`.
+                // Both columns are required by the direct-search result schema.
+                if let Some(value) = doc_w_col_names.get(self.field.as_str()).cloned() {
                     doc_w_col_names.insert(SEARCH_VALUE_COLUMN_NAME, value);
                 }
 

@@ -66,6 +66,13 @@ pub(crate) enum Kernel {
     Dot,
     /// Squared L2 distance. Sqrt is left to the caller when true L2 is needed.
     L2Squared,
+    /// Spice cosine distance: `(1 - cos_sim) / 2` in `[0, 1]`.
+    ///
+    /// Zero-magnitude inputs yield a non-finite value so the caller can surface
+    /// SQL NULL (failed/empty embeddings must not rank first under
+    /// `ORDER BY _score DESC`). Computed from three dots rather than
+    /// [`f32::cos`], which maps zero vectors to `0`/`1` instead of NaN.
+    CosineDistance,
 }
 
 impl Kernel {
@@ -73,6 +80,13 @@ impl Kernel {
         match self {
             Self::Dot => f32::dot(a, b),
             Self::L2Squared => f32::l2sq(a, b),
+            Self::CosineDistance => {
+                let dot = f32::dot(a, b)?;
+                let aa = f32::dot(a, a)?;
+                let bb = f32::dot(b, b)?;
+                // NaN/Inf when either vector has zero magnitude (or overflows).
+                Some((1.0 - dot / (aa.sqrt() * bb.sqrt())) / 2.0)
+            }
         }
     }
 }
@@ -234,7 +248,14 @@ where
                 "vector_simd: simsimd returned None (length mismatch)".to_string(),
             )
         })?;
-        builder.append_value(post_process(raw));
+        let processed = post_process(raw);
+        // CosineDistance (and overflow edge cases) may produce non-finite
+        // values; surface those as SQL NULL rather than NaN scores.
+        if processed.is_finite() {
+            builder.append_value(processed);
+        } else {
+            builder.append_null();
+        }
     }
 
     Ok(Arc::new(builder.finish()) as ArrayRef)

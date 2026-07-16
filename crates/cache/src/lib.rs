@@ -151,14 +151,16 @@ pub fn resolved_table_match<S: std::hash::BuildHasher>(
     stored: &HashSet<TableReference, S>,
     target: &TableReference,
 ) -> bool {
-    let resolved_target = target
-        .clone()
-        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+    // Resolve the target once into a local (&str, &str, &str) triple so the
+    // O(cache_size) scan never clones TableReference or allocates via resolve().
+    let target_catalog = target.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
+    let target_schema = target.schema().unwrap_or(SPICE_DEFAULT_SCHEMA);
+    let target_table = target.table();
+
     stored.iter().any(|stored_ref| {
-        stored_ref
-            .clone()
-            .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
-            == resolved_target
+        stored_ref.catalog().unwrap_or(SPICE_DEFAULT_CATALOG) == target_catalog
+            && stored_ref.schema().unwrap_or(SPICE_DEFAULT_SCHEMA) == target_schema
+            && stored_ref.table() == target_table
     })
 }
 
@@ -651,6 +653,62 @@ mod tests {
     use utils::tests::parse_sql_to_logical_plan;
 
     use super::*;
+
+    #[test]
+    fn resolved_table_match_bare_vs_fully_qualified() {
+        let stored: HashSet<TableReference> =
+            HashSet::from([TableReference::bare("customer")]);
+        let target = TableReference::full(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, "customer");
+        assert!(resolved_table_match(&stored, &target));
+
+        // Reverse direction: stored fully-qualified, target bare.
+        let stored: HashSet<TableReference> = HashSet::from([TableReference::full(
+            SPICE_DEFAULT_CATALOG,
+            SPICE_DEFAULT_SCHEMA,
+            "customer",
+        )]);
+        let target = TableReference::bare("customer");
+        assert!(resolved_table_match(&stored, &target));
+    }
+
+    #[test]
+    fn resolved_table_match_bare_vs_partially_qualified() {
+        let stored: HashSet<TableReference> =
+            HashSet::from([TableReference::bare("customer")]);
+        let target = TableReference::partial(SPICE_DEFAULT_SCHEMA, "customer");
+        assert!(resolved_table_match(&stored, &target));
+
+        // Different schema must not match a bare name (defaults to public).
+        let target = TableReference::partial("other_schema", "customer");
+        assert!(!resolved_table_match(&stored, &target));
+    }
+
+    #[test]
+    fn resolved_table_match_partial_vs_fully_qualified() {
+        let stored: HashSet<TableReference> =
+            HashSet::from([TableReference::partial(SPICE_DEFAULT_SCHEMA, "customer")]);
+        let target = TableReference::full(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, "customer");
+        assert!(resolved_table_match(&stored, &target));
+
+        // Different catalog must not match.
+        let target = TableReference::full("other_catalog", SPICE_DEFAULT_SCHEMA, "customer");
+        assert!(!resolved_table_match(&stored, &target));
+    }
+
+    #[test]
+    fn resolved_table_match_different_table_names() {
+        let stored: HashSet<TableReference> =
+            HashSet::from([TableReference::bare("customer")]);
+        let target = TableReference::bare("orders");
+        assert!(!resolved_table_match(&stored, &target));
+    }
+
+    #[test]
+    fn resolved_table_match_empty_set() {
+        let stored: HashSet<TableReference> = HashSet::new();
+        let target = TableReference::bare("customer");
+        assert!(!resolved_table_match(&stored, &target));
+    }
 
     #[tokio::test]
     async fn test_cache_is_enabled_for_system_query_describe() {

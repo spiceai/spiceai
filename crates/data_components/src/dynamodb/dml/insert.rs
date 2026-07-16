@@ -16,8 +16,13 @@ limitations under the License.
 
 use super::streaming_batch_write;
 use crate::dynamodb::utils::scalar_to_attribute_value;
-use arrow::array::Array;
-use arrow::datatypes::SchemaRef;
+use arrow::array::{
+    Array, AsArray, BooleanArray, GenericByteArray, PrimitiveArray,
+};
+use arrow::datatypes::{
+    DataType, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, SchemaRef,
+    UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+};
 use async_trait::async_trait;
 use aws_sdk_dynamodb::{
     Client as DbClient,
@@ -56,17 +61,105 @@ impl DisplayAs for DynamoDBInsertSink {
     }
 }
 
+/// Fast path: convert common Arrow array cell types directly to `AttributeValue`
+/// without building an intermediate `ScalarValue`.
+///
+/// Returns `Ok(None)` when the type is not handled here (caller should fall back).
+fn try_array_value_to_attribute_value(
+    array: &dyn Array,
+    row_idx: usize,
+) -> DataFusionResult<Option<AttributeValue>> {
+    match array.data_type() {
+        DataType::Utf8 => {
+            let arr: &GenericByteArray<arrow::datatypes::GenericStringType<i32>> =
+                array.as_string::<i32>();
+            Ok(Some(AttributeValue::S(arr.value(row_idx).to_owned())))
+        }
+        DataType::LargeUtf8 => {
+            let arr: &GenericByteArray<arrow::datatypes::GenericStringType<i64>> =
+                array.as_string::<i64>();
+            Ok(Some(AttributeValue::S(arr.value(row_idx).to_owned())))
+        }
+        DataType::Boolean => {
+            let arr: &BooleanArray = array.as_boolean();
+            Ok(Some(AttributeValue::Bool(arr.value(row_idx))))
+        }
+        DataType::Int8 => {
+            let arr: &PrimitiveArray<Int8Type> = array.as_primitive();
+            Ok(Some(AttributeValue::N(arr.value(row_idx).to_string())))
+        }
+        DataType::Int16 => {
+            let arr: &PrimitiveArray<Int16Type> = array.as_primitive();
+            Ok(Some(AttributeValue::N(arr.value(row_idx).to_string())))
+        }
+        DataType::Int32 => {
+            let arr: &PrimitiveArray<Int32Type> = array.as_primitive();
+            Ok(Some(AttributeValue::N(arr.value(row_idx).to_string())))
+        }
+        DataType::Int64 => {
+            let arr: &PrimitiveArray<Int64Type> = array.as_primitive();
+            Ok(Some(AttributeValue::N(arr.value(row_idx).to_string())))
+        }
+        DataType::UInt8 => {
+            let arr: &PrimitiveArray<UInt8Type> = array.as_primitive();
+            Ok(Some(AttributeValue::N(arr.value(row_idx).to_string())))
+        }
+        DataType::UInt16 => {
+            let arr: &PrimitiveArray<UInt16Type> = array.as_primitive();
+            Ok(Some(AttributeValue::N(arr.value(row_idx).to_string())))
+        }
+        DataType::UInt32 => {
+            let arr: &PrimitiveArray<UInt32Type> = array.as_primitive();
+            Ok(Some(AttributeValue::N(arr.value(row_idx).to_string())))
+        }
+        DataType::UInt64 => {
+            let arr: &PrimitiveArray<UInt64Type> = array.as_primitive();
+            Ok(Some(AttributeValue::N(arr.value(row_idx).to_string())))
+        }
+        DataType::Float32 => {
+            let arr: &PrimitiveArray<Float32Type> = array.as_primitive();
+            let f = arr.value(row_idx);
+            if f.is_finite() {
+                Ok(Some(AttributeValue::N(f.to_string())))
+            } else {
+                Err(DataFusionError::Execution(format!(
+                    "Cannot write non-finite Float32 value ({f}) to DynamoDB"
+                )))
+            }
+        }
+        DataType::Float64 => {
+            let arr: &PrimitiveArray<Float64Type> = array.as_primitive();
+            let f = arr.value(row_idx);
+            if f.is_finite() {
+                Ok(Some(AttributeValue::N(f.to_string())))
+            } else {
+                Err(DataFusionError::Execution(format!(
+                    "Cannot write non-finite Float64 value ({f}) to DynamoDB"
+                )))
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Convert a single row from a `RecordBatch` to a `DynamoDB` item.
+///
+/// `field_names` is precomputed once per batch so `field.name()` is not re-resolved
+/// for every row.
 fn record_batch_row_to_dynamodb_item(
     batch: &arrow::array::RecordBatch,
     row_idx: usize,
-    schema: &SchemaRef,
+    field_names: &[&str],
     time_format: &str,
 ) -> DataFusionResult<HashMap<String, AttributeValue>> {
-    let mut item = HashMap::new();
-    for (col_idx, field) in schema.fields().iter().enumerate() {
+    let mut item = HashMap::with_capacity(field_names.len());
+    for (col_idx, &field_name) in field_names.iter().enumerate() {
         let col = batch.column(col_idx);
         if col.is_null(row_idx) {
+            continue;
+        }
+        if let Some(attr_value) = try_array_value_to_attribute_value(col.as_ref(), row_idx)? {
+            item.insert(field_name.to_owned(), attr_value);
             continue;
         }
         let scalar = ScalarValue::try_from_array(col, row_idx)?;
@@ -74,7 +167,7 @@ fn record_batch_row_to_dynamodb_item(
             continue;
         }
         let attr_value = scalar_to_attribute_value(&scalar, time_format)?;
-        item.insert(field.name().clone(), attr_value);
+        item.insert(field_name.to_owned(), attr_value);
     }
     Ok(item)
 }
@@ -105,11 +198,17 @@ impl DataSink for DynamoDBInsertSink {
                 Err(e) => futures::stream::iter(vec![Err(e)]).boxed(),
                 Ok(batch) => {
                     let rows = batch.num_rows();
+                    // Cache field names once per batch (not once per row).
+                    let field_names: Vec<&str> = schema
+                        .fields()
+                        .iter()
+                        .map(|f| f.name().as_str())
+                        .collect();
                     futures::stream::iter((0..rows).map(move |row_idx| {
                         let item = record_batch_row_to_dynamodb_item(
                             &batch,
                             row_idx,
-                            &schema,
+                            &field_names,
                             &time_format,
                         )?;
                         let put_request = PutRequest::builder()

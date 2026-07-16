@@ -22,11 +22,14 @@ pub fn unnest_dynamodb_rows(
     rows: Vec<DynamoDBRow>,
     unnest_depth: usize,
 ) -> Result<(Vec<DynamoDBRow>, HashSet<String>)> {
-    let mut unnested_rows = Vec::new();
+    let mut unnested_rows = Vec::with_capacity(rows.len());
     let mut all_flattened_fields = HashSet::new();
+    // Reused across rows to avoid per-key path allocations during construction.
+    let mut path_buf = String::new();
 
     for row in rows {
-        let (result, flattened_fields) = unnest_dynamodb_row(&row, unnest_depth)?;
+        let (result, flattened_fields) =
+            unnest_dynamodb_row_owned(row, unnest_depth, &mut path_buf)?;
         unnested_rows.push(result);
         all_flattened_fields.extend(flattened_fields);
     }
@@ -38,35 +41,69 @@ pub fn unnest_dynamodb_row(
     row: &DynamoDBRow,
     depth: usize,
 ) -> Result<(HashMap<String, AttributeValue>, HashSet<String>)> {
-    let mut new_row = HashMap::new();
+    let mut new_row = HashMap::with_capacity(row.len());
     let mut flattened_fields = HashSet::new();
-    flatten_row_recursive(row, "", &mut new_row, &mut flattened_fields, depth, 0)?;
+    let mut path_buf = String::new();
+    flatten_row_recursive(
+        row,
+        &mut path_buf,
+        &mut new_row,
+        &mut flattened_fields,
+        depth,
+        0,
+    )?;
     Ok((new_row, flattened_fields))
+}
+
+/// Owned variant: takes `AttributeValue`s by value so leaf values are not cloned.
+fn unnest_dynamodb_row_owned(
+    row: DynamoDBRow,
+    depth: usize,
+    path_buf: &mut String,
+) -> Result<(HashMap<String, AttributeValue>, HashSet<String>)> {
+    let mut new_row = HashMap::with_capacity(row.len());
+    let mut flattened_fields = HashSet::new();
+    path_buf.clear();
+    flatten_row_owned(
+        row,
+        path_buf,
+        &mut new_row,
+        &mut flattened_fields,
+        depth,
+        0,
+    )?;
+    Ok((new_row, flattened_fields))
+}
+
+fn append_path_segment(path_buf: &mut String, key: &str) {
+    if path_buf.is_empty() {
+        path_buf.push_str(key);
+    } else {
+        path_buf.push('.');
+        path_buf.push_str(key);
+    }
 }
 
 fn flatten_row_recursive(
     row: &DynamoDBRow,
-    current_path: &str,
+    path_buf: &mut String,
     flattened_row: &mut DynamoDBRow,
     flattened_fields: &mut HashSet<String>,
     max_depth: usize,
     current_depth: usize,
 ) -> Result<()> {
+    let path_len = path_buf.len();
     for (key, value) in row {
-        let new_path = if current_path.is_empty() {
-            key.clone()
-        } else {
-            format!("{current_path}.{key}")
-        };
+        append_path_segment(path_buf, key);
 
         match value {
             AttributeValue::M(inner_map) if current_depth < max_depth => {
                 // Track the parent field as completely flattened (removed)
-                flattened_fields.insert(new_path.clone());
+                flattened_fields.insert(path_buf.clone());
 
                 flatten_row_recursive(
                     inner_map,
-                    &new_path,
+                    path_buf,
                     flattened_row,
                     flattened_fields,
                     max_depth,
@@ -74,19 +111,67 @@ fn flatten_row_recursive(
                 )?;
             }
             _ => {
-                if flattened_row.contains_key(&new_path) {
+                if flattened_row.contains_key(path_buf.as_str()) {
                     return Err(Error::InvalidItemAccess {
                         message: format!("Column '{key}' already exists in the item."),
                     });
                 }
                 // Track only leaf (non-Map) fields that contain dots
                 // Don't track Maps that hit the depth limit
-                if new_path.contains('.') && !matches!(value, AttributeValue::M(_)) {
-                    flattened_fields.insert(new_path.clone());
+                if path_buf.contains('.') && !matches!(value, AttributeValue::M(_)) {
+                    flattened_fields.insert(path_buf.clone());
                 }
-                flattened_row.insert(new_path, value.clone());
+                flattened_row.insert(path_buf.clone(), value.clone());
             }
         }
+        path_buf.truncate(path_len);
+    }
+
+    Ok(())
+}
+
+fn flatten_row_owned(
+    row: DynamoDBRow,
+    path_buf: &mut String,
+    flattened_row: &mut DynamoDBRow,
+    flattened_fields: &mut HashSet<String>,
+    max_depth: usize,
+    current_depth: usize,
+) -> Result<()> {
+    let path_len = path_buf.len();
+    for (key, value) in row {
+        append_path_segment(path_buf, &key);
+
+        match value {
+            AttributeValue::M(inner_map) if current_depth < max_depth => {
+                // Track the parent field as completely flattened (removed)
+                flattened_fields.insert(path_buf.clone());
+
+                flatten_row_owned(
+                    inner_map,
+                    path_buf,
+                    flattened_row,
+                    flattened_fields,
+                    max_depth,
+                    current_depth + 1,
+                )?;
+            }
+            other => {
+                if flattened_row.contains_key(path_buf.as_str()) {
+                    return Err(Error::InvalidItemAccess {
+                        message: format!("Column '{key}' already exists in the item."),
+                    });
+                }
+                // Track only leaf (non-Map) fields that contain dots
+                // Don't track Maps that hit the depth limit
+                if path_buf.contains('.') && !matches!(other, AttributeValue::M(_)) {
+                    flattened_fields.insert(path_buf.clone());
+                }
+                // Take AttributeValue by value — no clone of the leaf payload.
+                flattened_row.insert(path_buf.clone(), other);
+            }
+        }
+        path_buf.truncate(path_len);
     }
 
     Ok(())
@@ -394,6 +479,6 @@ mod tests {
         assert!(flattened_fields.contains("complete")); // Map that was recursed into
         assert!(flattened_fields.contains("complete.field")); // Leaf field with dot
         assert!(flattened_fields.contains("partial")); // Map that was recursed into
-        // "partial.nested" is NOT in flattened_fields (Map that hit depth limit)
+                                                       // "partial.nested" is NOT in flattened_fields (Map that hit depth limit)
     }
 }
