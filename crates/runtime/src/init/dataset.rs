@@ -588,10 +588,13 @@ impl Runtime {
             Some(Ok(status)) => status,
             Some(Err(_)) => return, // error already logged in initialize_datasets_accelerators
             None => {
-                tracing::error!(
+                let message = format!(
                     "Dataset {} missing from accelerator initialization results",
                     ds.name
                 );
+                tracing::error!("{message}");
+                self.status
+                    .update_dataset(&ds.name, status::ComponentStatus::error_with_message(message));
                 return;
             }
         };

@@ -252,7 +252,11 @@ impl AcceleratedCatalogProvider {
         &self,
         schema_name: &str,
     ) -> Result<(AcceleratedSchemaProvider, usize), Box<dyn std::error::Error + Send + Sync>> {
-        let table_names = list_tables(&self.pool, schema_name)
+        // Views have no primary key and can't be CDC-accelerated -- exclude
+        // them at discovery so they never reach the per-table PK check below
+        // (which would otherwise reject every view with a misleading "has no
+        // primary key" error instead of simply not considering it).
+        let table_names = list_tables(&self.pool, schema_name, false)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 

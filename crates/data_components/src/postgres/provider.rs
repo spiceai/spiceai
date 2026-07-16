@@ -454,14 +454,18 @@ impl PostgresSchemaProvider {
     }
 
     async fn list_tables(&self) -> Result<Vec<String>> {
-        list_tables(&self.pool, &self.schema_name).await
+        list_tables(&self.pool, &self.schema_name, true).await
     }
 }
 
-/// Query `information_schema.tables` for base tables/views in `schema_name`.
+/// Query `information_schema.tables` for base tables (and, if `include_views`,
+/// views too) in `schema_name`.
 ///
-/// Shared between [`PostgresSchemaProvider`] and any other schema provider
-/// (e.g. an accelerated one) that needs the same discovery query.
+/// Shared between [`PostgresSchemaProvider`] (which passes `include_views:
+/// true` -- views are federated read-only tables like any other) and any
+/// other schema provider (e.g. an accelerated one, which passes
+/// `include_views: false` -- a view has no primary key and can't be
+/// CDC-accelerated, so it must never reach the per-table PK check at all).
 ///
 /// A declaratively-partitioned parent (relkind 'p') and every one of its leaf
 /// partitions (relkind 'r') all appear in `information_schema.tables` as `BASE
@@ -477,15 +481,25 @@ impl PostgresSchemaProvider {
 /// `pg_inherits` catalog exists on every supported `PostgreSQL` version and on
 /// Redshift (where it is empty), so this degrades to the prior behaviour on
 /// engines without partitioning.
-pub async fn list_tables(pool: &PostgresConnectionPool, schema_name: &str) -> Result<Vec<String>> {
+pub async fn list_tables(
+    pool: &PostgresConnectionPool,
+    schema_name: &str,
+    include_views: bool,
+) -> Result<Vec<String>> {
     let conn = pool.connect_direct().await.context(ConnectionFailedSnafu)?;
+
+    let table_types: &[&str] = if include_views {
+        &["BASE TABLE", "VIEW"]
+    } else {
+        &["BASE TABLE"]
+    };
 
     let rows = conn
         .conn
         .query(
             "SELECT t.table_name FROM information_schema.tables t \
              WHERE t.table_schema = $1 \
-             AND t.table_type IN ('BASE TABLE', 'VIEW') \
+             AND t.table_type = ANY($2) \
              AND NOT EXISTS ( \
                  SELECT 1 FROM pg_catalog.pg_inherits inh \
                  JOIN pg_catalog.pg_class child ON child.oid = inh.inhrelid \
@@ -494,7 +508,7 @@ pub async fn list_tables(pool: &PostgresConnectionPool, schema_name: &str) -> Re
                  AND child.relname = t.table_name \
              ) \
              ORDER BY t.table_name",
-            &[&schema_name],
+            &[&schema_name, &table_types],
         )
         .await
         .context(QueryFailedSnafu)?;
@@ -636,7 +650,12 @@ async fn build_table_providers_for_schema(
     for table_name in table_names {
         let schema_with_table = format!("{schema_name}.{table_name}");
         if !is_table_selected(schema_name, &table_name, include, exclude) {
-            tracing::debug!("Table {schema_with_table} is not included, skipping");
+            let reason = if include.is_some_and(|globset| !globset.is_match(&schema_with_table)) {
+                "does not match include patterns"
+            } else {
+                "matches exclude patterns"
+            };
+            tracing::debug!("Table {schema_with_table} is not selected ({reason}), skipping");
             continue;
         }
 
