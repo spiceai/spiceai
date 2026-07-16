@@ -688,9 +688,22 @@ mod tests {
             formatted.matches("| B  |").count() == 1,
             "expected document B exactly once, got:\n{formatted}"
         );
+        // B is absent from stream_0, rank 1 in stream_1 (score 9.0), rank 1 in stream_2 (score 7.0).
+        // Expected RRF score: 1/(1+60) + 1/(1+60) = 2/61 ≈ 0.032786885...
+        // Output schema: __spice_search_score | __spice_value_0 | __spice_value_1 | __spice_value_2 | id
+        // So B's id appears at the END of the row, not adjacent to the score.
+        let b_row = formatted
+            .lines()
+            .find(|l| l.contains("| B  |"))
+            .unwrap_or_else(|| panic!("expected B row in:\n{formatted}"));
         assert!(
-            formatted.contains("| B  | 0.03225806451612903"),
-            "expected fused B score to sum stream 2 and 3 contributions, got:\n{formatted}"
+            b_row.contains("B-from-s1") && b_row.contains("B-from-s2"),
+            "expected B row to carry values from both streams, got:\n{b_row}"
+        );
+        // Prefix covers stable significant digits of 2/61; avoids last-digit rounding variance.
+        assert!(
+            b_row.contains("0.032786885245901"),
+            "expected B's fused score ≈ 2/61, got:\n{b_row}"
         );
     }
 
