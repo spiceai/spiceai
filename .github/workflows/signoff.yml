@@ -65,9 +65,15 @@ jobs:
             echo "::error::branch input is required"
             exit 1
           fi
-          # Branch names may contain slashes (feature/foo) but not whitespace,
-          # leading dashes, absolute paths, or `..` segments.
-          if [[ "$BRANCH" =~ [[:space:]] || "$BRANCH" == -* || "$BRANCH" == /* || "$BRANCH" == *..* ]]; then
+          # Mirror scripts/signoff remote: allow feature/foo, reject whitespace,
+          # quotes, $, `, leading dashes, absolute paths, `..`, and any char
+          # outside [A-Za-z0-9._/-] so dispatch/checkout cannot be broken by the name.
+          if [[ "$BRANCH" =~ [[:space:]] || "$BRANCH" == -* || "$BRANCH" == /* || "$BRANCH" == *..* \
+              || "$BRANCH" == *\"* || "$BRANCH" == *\'* || "$BRANCH" == *\$* || "$BRANCH" == *\`* ]]; then
+            echo "::error::invalid branch name: '${BRANCH}'"
+            exit 1
+          fi
+          if [[ ! "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]]; then
             echo "::error::invalid branch name: '${BRANCH}'"
             exit 1
           fi
