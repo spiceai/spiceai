@@ -44,7 +44,7 @@ use datafusion::scalar::ScalarValue;
 use datafusion_table_providers::UnsupportedTypeAction;
 use runtime_table_partition::Partition;
 use runtime_table_partition::creator::filename::{
-    encode_key, parse_partition_value, to_hive_partition_dir,
+    encode_composite_key, encode_key, parse_partition_value, to_hive_partition_dir,
 };
 use runtime_table_partition::creator::{self, PartitionCreator};
 use runtime_table_partition::expression::PartitionedBy;
@@ -67,6 +67,7 @@ use runtime_acceleration::snapshot::{AccelerationEngine, AccelerationLayout};
 use runtime_datafusion_index::{Index, IndexedTableProvider};
 use search::index::native_vector::NativeVectorIndex;
 use spicepod::acceleration as spicepod_acceleration;
+use spicepod::acceleration::WriteMode;
 
 /// Metadata key to identify the accelerator type in the schema metadata.
 const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
@@ -125,6 +126,7 @@ static UNSUPPORTED_LOCAL_PARTITION_PATTERN: LazyLock<Regex> =
 fn maintained_aggregate_specs_for_cayenne(
     acceleration: Option<&Acceleration>,
     schema: &Schema,
+    primary_keys: &[String],
 ) -> Result<Vec<cayenne::maintained_aggregate::MaintainedAggregateSpec>> {
     let Some(acceleration) = acceleration else {
         return Ok(Vec::new());
@@ -139,6 +141,23 @@ fn maintained_aggregate_specs_for_cayenne(
         return Err(Error::InvalidConfiguration {
             detail: Arc::from(
                 "Cayenne maintained_aggregates is not yet supported on partitioned tables. Remove maintained_aggregates or remove partition_by from the acceleration configuration.",
+            ),
+        });
+    }
+
+    let has_min_or_max = maintained_aggregates.iter().any(|aggregate| {
+        aggregate.aggregates.iter().any(|expr| {
+            matches!(
+                expr.function,
+                spicepod_acceleration::MaintainedAggregateFunction::Min
+                    | spicepod_acceleration::MaintainedAggregateFunction::Max
+            )
+        })
+    });
+    if has_min_or_max && primary_keys.is_empty() {
+        return Err(Error::InvalidConfiguration {
+            detail: Arc::from(
+                "Cayenne maintained_aggregates MIN/MAX require a primary key so UPDATE and DELETE changes can retract prior extrema within the retained-index cap. Set acceleration.primary_key, enable extended schema inference for a source primary key, or remove MIN/MAX from maintained_aggregates.",
             ),
         });
     }
@@ -169,6 +188,12 @@ fn maintained_aggregate_specs_for_cayenne(
                         }
                         spicepod_acceleration::MaintainedAggregateFunction::Avg => {
                             cayenne::maintained_aggregate::MaintainedAggregateFunction::Avg
+                        }
+                        spicepod_acceleration::MaintainedAggregateFunction::Min => {
+                            cayenne::maintained_aggregate::MaintainedAggregateFunction::Min
+                        }
+                        spicepod_acceleration::MaintainedAggregateFunction::Max => {
+                            cayenne::maintained_aggregate::MaintainedAggregateFunction::Max
                         }
                     };
 
@@ -1971,7 +1996,7 @@ impl CayenneAccelerator {
         let acceleration = source.acceleration();
         let metadata_dir = Self::resolve_metadata_dir(acceleration);
         let maintained_aggregate_specs =
-            maintained_aggregate_specs_for_cayenne(acceleration, &schema)?;
+            maintained_aggregate_specs_for_cayenne(acceleration, &schema, &primary_keys)?;
         let metastore_type = acceleration
             .and_then(|a| a.params.get("cayenne_metastore"))
             .map_or("sqlite", String::as_str)
@@ -2055,11 +2080,23 @@ impl CayenneAccelerator {
             table_name,
         );
 
+        // Durable federated write-back (#11838): a write_back + on_conflict +
+        // refresh_mode:changes Cayenne dataset resolves to WriteMode::WriteBack
+        // (on_conflict with a non-`changes` refresh forces AcceleratorOnly). When
+        // so configured, every committed write durably marks its PKs so the
+        // delivery worker reconciles them to the federated source.
+        let durable_write_back = source.acceleration().is_some_and(|acceleration| {
+            acceleration.write_mode == WriteMode::WriteBack
+                && !acceleration.on_conflict.is_empty()
+                && acceleration.refresh_mode == Some(RefreshMode::Changes)
+        });
+
         // Create CayenneTableProvider with object store for S3 Express One Zone
         let mut builder = CayenneTableProviderBuilder::new(catalog, runtime_env)
             .with_context(context)
             .with_retention_filters(retention_filters)
-            .with_maintained_aggregates(maintained_aggregate_specs);
+            .with_maintained_aggregates(maintained_aggregate_specs)
+            .with_durable_write_back(durable_write_back);
         if let Some(retention_builder) = time_retention_filter_builder {
             builder = builder.with_time_retention_filter_builder(retention_builder);
         }
@@ -3092,6 +3129,8 @@ impl DataAccelerator for CayenneAccelerator {
                 vortex_config.schema_evolution = cayenne::metadata::SchemaEvolutionMode::Disabled;
             }
 
+            serialize_partition_child_writes(&mut vortex_config, &table_name);
+
             // Log S3 Express configuration for partitioned tables
             if is_s3_express {
                 tracing::info!(
@@ -3129,13 +3168,19 @@ impl DataAccelerator for CayenneAccelerator {
                     PathBuf::from(&dir_path),
                 ),
             );
-            let partition_provider = Arc::new(
+            let partition_provider =
                 PartitionTableProvider::new(creator, partition_by, Arc::clone(&arrow_schema))
                     .await
                     .boxed()
-                    .context(AccelerationCreationFailedSnafu)?
-                    .with_insert_strategy(insert_strategy),
-            );
+                    .context(AccelerationCreationFailedSnafu)?;
+            let partition_table_providers = partition_provider.partition_table_providers().await;
+            insert_strategy
+                .recover_partitioned_wals(&partition_table_providers)
+                .await
+                .boxed()
+                .context(AccelerationCreationFailedSnafu)?;
+            let partition_provider =
+                Arc::new(partition_provider.with_insert_strategy(insert_strategy));
 
             // Wrap with upsert deduplication if needed based on on_conflict settings
             let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
@@ -3373,6 +3418,45 @@ impl DataAccelerator for CayenneAccelerator {
     }
 }
 
+/// Force partition child tables to encode serially (one write shard).
+///
+/// Two reasons, both specific to partitioned datasets:
+///
+/// 1. **Parallelism already comes from the partition fan-out.** The insert
+///    path runs one concurrent insert task per partition
+///    (`runtime_table_partition::insert`), so intra-write encode sharding
+///    would multiply the aggregate encode-shard count by the partition count.
+/// 2. **Child writes bypass the global encode budget, so they must stay
+///    serial.** The per-partition insert tasks are coupled through one
+///    routing demux over bounded channels; a child write parked on the encode
+///    budget stalls the demux, starving the permit-holding sibling writes of
+///    input — a hold-and-wait cycle that left partitioned tables permanently
+///    unready (spiceai/spiceai#11818). Child tables are therefore created as
+///    coupled writers (`CayenneContext::new_for_partition_child`), exempt
+///    from the budget (see `cayenne::provider::write_budget`) — and an
+///    unmetered writer must contribute the minimum encode footprint, one
+///    shard, which this clamp guarantees.
+///
+/// An operator-pinned `cayenne_write_concurrency > 1` is IGNORED (clamped to
+/// 1, with a warning), like schema evolution above: there is no safe way to
+/// honor it — child writes are budget-exempt, so a multi-shard child would
+/// fan out unmetered, multiplied by a partition count that isn't statically
+/// bounded (time-based partitions grow indefinitely).
+fn serialize_partition_child_writes(
+    config: &mut cayenne::metadata::VortexConfig,
+    table_name: &str,
+) {
+    if config.pinned_tuning_actuators.write_concurrency && config.write_concurrency.unwrap_or(1) > 1
+    {
+        tracing::warn!(
+            dataset = table_name,
+            write_concurrency = ?config.write_concurrency,
+            "cayenne_write_concurrency is not supported for partitioned Cayenne tables (partition writes bypass the global encode budget, so intra-partition sharding would fan out unmetered); writing each partition serially instead"
+        );
+    }
+    config.write_concurrency = Some(1);
+}
+
 /// Partition creator for Cayenne accelerator.
 ///
 /// Supports single and composite partition keys (e.g., `partition_by: [year, month, day]`).
@@ -3448,7 +3532,11 @@ impl CayennePartitionCreator {
         // Create shared Cayenne context with cache once, to be shared across all partitions.
         // This ensures all partitions share the same footer/segment caches instead of
         // each partition creating its own cache.
-        let context = cayenne::CayenneContext::new(&vortex_config, runtime_env, &table_name);
+        let context = cayenne::CayenneContext::new_for_partition_child(
+            &vortex_config,
+            runtime_env,
+            &table_name,
+        );
 
         Self {
             table_name,
@@ -3482,9 +3570,15 @@ impl CayennePartitionCreator {
 
     /// Generate a unique table name for this partition based on composite key.
     fn partition_table_name(&self, partition_key: &str) -> String {
-        // Replace "/" with "_" to create a valid table name
-        let safe_key = partition_key.replace('/', "_");
-        format!("{}_{}", self.table_name, safe_key)
+        format!(
+            "{}_p{}",
+            self.table_name,
+            encode_identifier_hex(partition_key)
+        )
+    }
+
+    fn legacy_partition_table_name(&self, partition_values: &[String]) -> String {
+        format!("{}_{}", self.table_name, partition_values.join("_"))
     }
 
     /// Generate partition directory path from multiple partition values.
@@ -3559,14 +3653,17 @@ impl PartitionCreator for CayennePartitionCreator {
 
         tracing::debug!("creating Cayenne partition at {partition_path}");
 
-        // Create the partition directory (including nested directories for composite partitions)
-        std::fs::create_dir_all(&partition_dir)
+        // Create the partition directory (including nested directories for composite partitions).
+        // Use tokio's async variant so partition creation does not block the runtime thread.
+        tokio::fs::create_dir_all(&partition_dir)
+            .await
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
         let partition_column_names = self.partition_column_labels();
 
-        // Create composite key for table naming (slash-separated values)
-        let partition_key = partition_value_strings.join("/");
+        let partition_key = encode_composite_key(&partition_values)
+            .boxed()
+            .context(creator::CreatePartitionSnafu)?;
 
         // Create partition metadata with composite key support
         let partition_metadata = cayenne::PartitionMetadata::new_composite(
@@ -3661,8 +3758,7 @@ impl PartitionCreator for CayennePartitionCreator {
                 partition_values.push(partition_value);
             }
 
-            // Create composite key for table lookup
-            let partition_key = partition_meta.partition_values.join("/");
+            let partition_key = partition_meta.composite_key();
             let partition_table_name = self.partition_table_name(&partition_key);
 
             // Use builder pattern to pass object store config for S3 support.
@@ -3679,11 +3775,38 @@ impl PartitionCreator for CayennePartitionCreator {
             if let Some(ref object_store) = self.object_store_config {
                 builder = builder.with_object_store(object_store.clone());
             }
-            let cayenne_table = builder
-                .open(&partition_table_name)
-                .await
-                .boxed()
-                .context(creator::InferringPartitionsSnafu)?;
+            let cayenne_table = match builder.open(&partition_table_name).await {
+                Ok(table) => table,
+                Err(cayenne::provider::Error::Catalog {
+                    source: cayenne::CatalogError::TableNotFound { .. },
+                }) => {
+                    let legacy_name =
+                        self.legacy_partition_table_name(&partition_meta.partition_values);
+                    let mut legacy_builder = cayenne::CayenneTableProviderBuilder::new(
+                        Arc::clone(&self.catalog),
+                        Arc::clone(self.context.runtime_env()),
+                    )
+                    .with_context(Arc::clone(&self.context))
+                    .with_retention_filters(self.retention_filters.clone());
+                    if let Some(ref retention_builder) = self.time_retention_filter_builder {
+                        legacy_builder = legacy_builder
+                            .with_time_retention_filter_builder(retention_builder.clone());
+                    }
+                    if let Some(ref object_store) = self.object_store_config {
+                        legacy_builder = legacy_builder.with_object_store(object_store.clone());
+                    }
+                    legacy_builder
+                        .open(&legacy_name)
+                        .await
+                        .boxed()
+                        .context(creator::InferringPartitionsSnafu)?
+                }
+                Err(error) => {
+                    return Err(creator::Error::InferringPartitions {
+                        source: Box::new(error),
+                    });
+                }
+            };
 
             let partition_provider = Arc::new(cayenne_table);
             partition_provider.spawn_background_compaction(Arc::clone(&self.compaction_semaphore));
@@ -3737,6 +3860,16 @@ impl PartitionCreator for CayennePartitionCreator {
     }
 }
 
+fn encode_identifier_hex(value: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value.as_bytes() {
+        let _ = write!(encoded, "{byte:02X}");
+    }
+    encoded
+}
+
 register_data_accelerator!(Engine::Cayenne, CayenneAccelerator);
 
 #[cfg(test)]
@@ -3749,6 +3882,41 @@ mod tests {
     use datafusion_table_providers::UnsupportedTypeAction;
     use search::index::{SearchIndex, VectorIndex};
     use std::sync::Arc;
+
+    /// Partition child tables default to serial writes (`write_concurrency: 1`):
+    /// multi-shard child writes can deadlock the partition insert demux against
+    /// the global encode budget (spiceai/spiceai#11818).
+    #[test]
+    fn partition_child_writes_default_to_serial() {
+        let mut config = cayenne::metadata::VortexConfig {
+            write_concurrency: None,
+            ..Default::default()
+        };
+        serialize_partition_child_writes(&mut config, "t");
+        assert_eq!(config.write_concurrency, Some(1));
+
+        // Auto-tuned (unpinned) values are overridden too.
+        let mut config = cayenne::metadata::VortexConfig {
+            write_concurrency: Some(8),
+            ..Default::default()
+        };
+        serialize_partition_child_writes(&mut config, "t");
+        assert_eq!(config.write_concurrency, Some(1));
+    }
+
+    /// An operator-pinned `cayenne_write_concurrency > 1` is clamped to serial
+    /// for partition children — safety depends on the host-sized encode budget
+    /// and the (unbounded) partition count, so it cannot be honored safely.
+    #[test]
+    fn partition_child_writes_clamp_pinned_write_concurrency() {
+        let mut config = cayenne::metadata::VortexConfig {
+            write_concurrency: Some(4),
+            ..Default::default()
+        };
+        config.pinned_tuning_actuators.write_concurrency = true;
+        serialize_partition_child_writes(&mut config, "t");
+        assert_eq!(config.write_concurrency, Some(1));
+    }
 
     #[test]
     fn resolve_goal_raw_global_default_then_per_dataset_override() {
@@ -3846,6 +4014,7 @@ mod tests {
         let specs = maintained_aggregate_specs_for_cayenne(
             Some(&acceleration),
             &maintained_aggregate_test_schema(),
+            &[],
         )
         .expect("unpartitioned maintained aggregate config should convert");
 
@@ -3860,6 +4029,76 @@ mod tests {
     }
 
     #[test]
+    fn maintained_aggregate_specs_convert_min_max() {
+        let acceleration = Acceleration {
+            maintained_aggregates: vec![spicepod_acceleration::MaintainedAggregate {
+                group_by: vec!["customer_id".to_string()],
+                aggregates: vec![
+                    spicepod_acceleration::MaintainedAggregateExpr {
+                        function: spicepod_acceleration::MaintainedAggregateFunction::Min,
+                        column: Some("amount".to_string()),
+                    },
+                    spicepod_acceleration::MaintainedAggregateExpr {
+                        function: spicepod_acceleration::MaintainedAggregateFunction::Max,
+                        column: Some("amount".to_string()),
+                    },
+                ],
+                filter_sql: None,
+            }]
+            .into(),
+            ..Default::default()
+        };
+
+        let specs = maintained_aggregate_specs_for_cayenne(
+            Some(&acceleration),
+            &maintained_aggregate_test_schema(),
+            &["customer_id".to_string()],
+        )
+        .expect("min/max maintained aggregate config should convert");
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].aggregates.len(), 2);
+        assert_eq!(
+            specs[0].aggregates[0].function,
+            cayenne::maintained_aggregate::MaintainedAggregateFunction::Min
+        );
+        assert_eq!(
+            specs[0].aggregates[1].function,
+            cayenne::maintained_aggregate::MaintainedAggregateFunction::Max
+        );
+        assert_eq!(specs[0].aggregates[0].column.as_deref(), Some("amount"));
+    }
+
+    #[test]
+    fn maintained_aggregate_specs_reject_min_max_without_primary_key() {
+        let acceleration = Acceleration {
+            maintained_aggregates: vec![spicepod_acceleration::MaintainedAggregate {
+                group_by: Vec::new(),
+                aggregates: vec![spicepod_acceleration::MaintainedAggregateExpr {
+                    function: spicepod_acceleration::MaintainedAggregateFunction::Min,
+                    column: Some("amount".to_string()),
+                }],
+                filter_sql: None,
+            }]
+            .into(),
+            ..Default::default()
+        };
+
+        let error = maintained_aggregate_specs_for_cayenne(
+            Some(&acceleration),
+            &maintained_aggregate_test_schema(),
+            &[],
+        )
+        .expect_err("min/max without a primary key must be rejected");
+
+        let Error::InvalidConfiguration { detail } = error else {
+            panic!("expected InvalidConfiguration, got {error:?}");
+        };
+        assert!(detail.contains("MIN/MAX"));
+        assert!(detail.contains("primary key"));
+    }
+
+    #[test]
     fn maintained_aggregate_specs_empty_when_maintenance_disabled() {
         let mut acceleration = maintained_aggregate_acceleration();
         acceleration.maintained_aggregates = spicepod_acceleration::MaintainedAggregates::new(
@@ -3870,6 +4109,7 @@ mod tests {
         let specs = maintained_aggregate_specs_for_cayenne(
             Some(&acceleration),
             &maintained_aggregate_test_schema(),
+            &[],
         )
         .expect("disabled maintained aggregate config should parse");
 
@@ -3887,6 +4127,7 @@ mod tests {
         let error = maintained_aggregate_specs_for_cayenne(
             Some(&acceleration),
             &maintained_aggregate_test_schema(),
+            &[],
         )
         .expect_err("partitioned maintained aggregate config should be rejected");
 
@@ -3916,6 +4157,7 @@ mod tests {
         let specs = maintained_aggregate_specs_for_cayenne(
             Some(&acceleration),
             &maintained_aggregate_test_schema(),
+            &[],
         )
         .expect("a valid maintained aggregate filter should convert");
 
@@ -3933,6 +4175,7 @@ mod tests {
         let error = maintained_aggregate_specs_for_cayenne(
             Some(&acceleration),
             &maintained_aggregate_test_schema(),
+            &[],
         )
         .expect_err("a filter referencing an unknown column must be rejected");
 
@@ -3953,6 +4196,7 @@ mod tests {
         let error = maintained_aggregate_specs_for_cayenne(
             Some(&acceleration),
             &maintained_aggregate_test_schema(),
+            &[],
         )
         .expect_err("a non-Boolean filter must be rejected at config time");
 

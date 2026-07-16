@@ -476,34 +476,48 @@ impl PostgresSchemaProvider {
             .await
             .context(ConnectionFailedSnafu)?;
 
+        // Discover directly from `pg_catalog.pg_class` (the same `relkind`
+        // predicate `list_comments` already uses) rather than
+        // `information_schema.tables`. The prior query filtered on
+        // `table_type IN ('BASE TABLE', 'VIEW')`, which silently dropped
+        // materialized views (relkind 'm', absent from `information_schema`
+        // entirely) and foreign tables (relkind 'f', reported there as
+        // `table_type = 'FOREIGN'`). Both are otherwise ordinary, queryable
+        // relations (#11725).
+        //
+        // `pg_class` is broadly readable, whereas the discovered relations are
+        // registered to be queried. We therefore keep only relations the
+        // current role holds `SELECT` on (via `has_table_privilege`), so the
+        // catalog doesn't register relations that can't be read and then emit
+        // repeated warn logs when they're queried.
+        //
         // A declaratively-partitioned parent (relkind 'p') and every one of its
-        // leaf partitions (relkind 'r') all appear in `information_schema.tables`
-        // as `BASE TABLE`. Registering both the parent and its children would
-        // double-count the data (the parent is a union over its children) and
-        // clutter the catalog for tables with many partitions (#11726). It would
-        // also diverge from how the CDC path treats these tables: Spice publishes
-        // partitioned-table changes under the parent relation
-        // (`publish_via_partition_root = true`, see `postgres_replication::slot`),
-        // so the parent is the coherent unit either way. We therefore exclude any
-        // relation that is a child in `pg_inherits` (covering both declarative
-        // partitions and legacy table inheritance) and keep only the parent. The
-        // `pg_inherits` catalog exists on every supported PostgreSQL version and
-        // on Redshift (where it is empty), so this degrades to the prior
-        // behaviour on engines without partitioning.
+        // leaf partitions (relkind 'r') would otherwise both be discovered.
+        // Registering both the parent and its children would double-count the
+        // data (the parent is a union over its children) and clutter the catalog
+        // for tables with many partitions (#11726). It would also diverge from
+        // how the CDC path treats these tables: Spice publishes partitioned-table
+        // changes under the parent relation (`publish_via_partition_root = true`,
+        // see `postgres_replication::slot`), so the parent is the coherent unit
+        // either way. We therefore exclude any relation that is a child in
+        // `pg_inherits` (covering both declarative partitions and legacy table
+        // inheritance) and keep only the parent. The `pg_inherits` catalog exists
+        // on every supported PostgreSQL version and on Redshift (where it is
+        // empty), so this degrades to the prior behaviour on engines without
+        // partitioning.
         let rows = conn
             .conn
             .query(
-                "SELECT t.table_name FROM information_schema.tables t \
-                 WHERE t.table_schema = $1 \
-                 AND t.table_type IN ('BASE TABLE', 'VIEW') \
+                "SELECT c.relname FROM pg_catalog.pg_class c \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 \
+                 AND c.relkind IN ('r', 'p', 'v', 'm', 'f') \
+                 AND pg_catalog.has_table_privilege(c.oid, 'SELECT') \
                  AND NOT EXISTS ( \
                      SELECT 1 FROM pg_catalog.pg_inherits inh \
-                     JOIN pg_catalog.pg_class child ON child.oid = inh.inhrelid \
-                     JOIN pg_catalog.pg_namespace ns ON ns.oid = child.relnamespace \
-                     WHERE ns.nspname = t.table_schema \
-                     AND child.relname = t.table_name \
+                     WHERE inh.inhrelid = c.oid \
                  ) \
-                 ORDER BY t.table_name",
+                 ORDER BY c.relname",
                 &[&self.schema_name],
             )
             .await

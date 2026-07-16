@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 arrow = { workspace = true }
 async-trait = { workspace = true }
+bytes = { workspace = true }
 chrono = { workspace = true }
 datafusion-table-providers = { workspace = true, features = ["postgres", "mysql"] }
 futures = { workspace = true }
@@ -17,7 +18,8 @@ mysql_async = { workspace = true }
 rand = { workspace = true }
 secrecy = { workspace = true }
 snafu = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["fs", "macros", "rt", "time"] }
 tokio-postgres = { workspace = true }
 tokio-util = { workspace = true }
 

@@ -98,13 +98,61 @@ pg-load:
 	done
 	@echo "Benchmark dataset has been successfully loaded to $(DB_NAME) database"
 
+# tpch-kit's dbgen/dss.ddl (used by pg-init) creates bare tables with no
+# PRIMARY KEY, FOREIGN KEY, or index of any kind - unlike a hand-written TPC-H
+# DDL (e.g. the postgres cookbook's load-tpch.py), which declares real keys.
+# So this target must create the nominal TPC-H primary/unique-key indexes
+# itself, not assume dss.ddl already created them, plus the secondary
+# indexes covering join/filter columns the TPC-H queries in
+# crates/test-framework/src/queries/tpch actually use.
+# idx_lineitem_l_partkey_l_suppkey must be the composite (l_partkey, l_suppkey),
+# not a standalone l_partkey index: Q20's correlated subquery filters lineitem
+# on both columns together, and without the composite it falls back to a full
+# scan per outer row (observed ~1h49m vs ~0.1s with the composite).
+# Missing the supplier(s_suppkey) key index specifically starves Q2's
+# correlated MIN(ps_supplycost) subquery of an index-driven nested loop,
+# forcing Postgres to rebuild a full supplier/nation/region hash join on every
+# one of tens of thousands of correlated invocations instead of a cheap probe.
+# ANALYZE runs after index creation so the planner has fresh statistics on the
+# just-bulk-loaded tables; without it, correlated-subquery queries (Q2, Q20)
+# can get planned as per-row full/seq scans instead of index lookups.
+# statement_timeout is set on the database as a backstop: a cancelled CI run
+# only stops the GitHub runner, not the Postgres backend connection - we've
+# observed cancelled benchmark queries keep running server-side for hours,
+# competing for resources with every subsequent run. 90 minutes gives ample
+# headroom over the slowest known-good query (~52 min at SF100) while
+# bounding how long a leaked connection can hold resources.
 # Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpch make pg-create-index
 pg-create-index:
-	@echo "Creating indexes in $(DB_NAME) database"
-	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX idx_partsupp_ps_partkey ON partsupp (ps_partkey);";
-	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX idx_part_p_partkey ON part (p_partkey);";
-	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX idx_lineitem_l_partkey ON lineitem (l_partkey);";
+	@echo "Creating primary/unique-key indexes in $(DB_NAME) database"
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "DROP INDEX IF EXISTS idx_part_p_partkey;";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "DROP INDEX IF EXISTS idx_partsupp_ps_partkey;";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE UNIQUE INDEX IF NOT EXISTS idx_region_pk ON region (r_regionkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE UNIQUE INDEX IF NOT EXISTS idx_nation_pk ON nation (n_nationkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE UNIQUE INDEX IF NOT EXISTS idx_part_pk ON part (p_partkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE UNIQUE INDEX IF NOT EXISTS idx_supplier_pk ON supplier (s_suppkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE UNIQUE INDEX IF NOT EXISTS idx_customer_pk ON customer (c_custkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_pk ON orders (o_orderkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE UNIQUE INDEX IF NOT EXISTS idx_partsupp_pk ON partsupp (ps_partkey, ps_suppkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE UNIQUE INDEX IF NOT EXISTS idx_lineitem_pk ON lineitem (l_orderkey, l_linenumber);";
+	@echo "Creating secondary indexes in $(DB_NAME) database"
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "DROP INDEX IF EXISTS idx_lineitem_l_partkey;";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX IF NOT EXISTS idx_lineitem_l_partkey_l_suppkey ON lineitem (l_partkey, l_suppkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX IF NOT EXISTS idx_lineitem_l_suppkey ON lineitem (l_suppkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX IF NOT EXISTS idx_lineitem_l_shipdate ON lineitem (l_shipdate);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX IF NOT EXISTS idx_orders_o_custkey ON orders (o_custkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX IF NOT EXISTS idx_orders_o_orderdate ON orders (o_orderdate);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX IF NOT EXISTS idx_customer_c_nationkey ON customer (c_nationkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX IF NOT EXISTS idx_supplier_s_nationkey ON supplier (s_nationkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX IF NOT EXISTS idx_nation_n_regionkey ON nation (n_regionkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX IF NOT EXISTS idx_partsupp_ps_suppkey ON partsupp (ps_suppkey);";
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "CREATE INDEX IF NOT EXISTS idx_part_p_brand_p_container ON part (p_brand, p_container);";
 	@echo "Indexes have been successfully created to $(DB_NAME) database"
+	@echo "Analyzing $(DB_NAME) database"
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "ANALYZE;";
+	@echo "Statistics have been refreshed for $(DB_NAME) database"
+	@echo "Setting statement_timeout on $(DB_NAME) database"
+	@psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} $(DB_NAME) -c "ALTER DATABASE \"$(DB_NAME)\" SET statement_timeout = '5400000';";
 
 # Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpch make tpch-run-pq
 tpch-run-pq:
@@ -197,15 +245,24 @@ pg-tpcds-init:
 	@echo "Creating tables from tpcds.sql..."
 	@psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -f ./tpcds-kit/tools/tpcds.sql
 
-	@if [ "$(ADD_INDEXES)" = "true" ] || [ "$(ADD_INDEXES)" = "1" ]; then \
-		echo "Applying indexes from tpcds_index.sql..."; \
-		psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -f tpcds_index.sql; \
-		echo "Indexes applied successfully."; \
-	fi
-
 	@echo "Database '$(DB_NAME)' has been successfully created or updated."
 
-# Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpch make pg-tpcds-load
+# Indexes are built after pg-tpcds-load, not as part of pg-tpcds-init: building
+# them against empty tables means every bulk \copy in pg-tpcds-load has to
+# incrementally maintain each index row-by-row, instead of one efficient
+# sort-and-build pass over already-loaded data.
+# Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpcds make pg-tpcds-create-index
+pg-tpcds-create-index:
+	@echo "Applying indexes from tpcds_index.sql..."
+	@psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -f tpcds_index.sql
+	@echo "Indexes applied successfully."
+	@echo "Analyzing $(DB_NAME) database"
+	@psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -c "ANALYZE;";
+	@echo "Statistics have been refreshed for $(DB_NAME) database"
+	@echo "Setting statement_timeout on $(DB_NAME) database"
+	@psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -c "ALTER DATABASE \"$(DB_NAME)\" SET statement_timeout = '5400000';";
+
+# Example: DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_NAME=tpcds make pg-tpcds-load
 pg-tpcds-load:
 	@mkdir -p ./tmp
 	@for table in call_center catalog_page catalog_returns catalog_sales customer customer_address customer_demographics date_dim household_demographics income_band inventory item promotion reason ship_mode store store_returns store_sales time_dim warehouse web_page web_returns web_sales web_site; do \

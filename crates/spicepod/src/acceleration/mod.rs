@@ -326,6 +326,11 @@ pub enum MaintainedAggregateFunction {
     Count,
     Sum,
     Avg,
+    /// `MIN(column)` over integer / temporal / decimal families (engine-side).
+    /// Retraction-hard: requires a primary key so deletes can drop the extremum.
+    Min,
+    /// `MAX(column)` — mirror of [`Self::Min`].
+    Max,
 }
 
 /// Controls whether configured maintained aggregates are materialized and
@@ -750,6 +755,10 @@ mod tests {
                         column: amount
                       - function: avg
                         column: latency_ms
+                      - function: min
+                        column: amount
+                      - function: max
+                        column: amount
             ";
         let acceleration: Acceleration =
             yaml::from_str(yaml).expect("Failed to parse Acceleration");
@@ -771,6 +780,14 @@ mod tests {
                 MaintainedAggregateExpr {
                     function: MaintainedAggregateFunction::Avg,
                     column: Some("latency_ms".to_string()),
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Min,
+                    column: Some("amount".to_string()),
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Max,
+                    column: Some("amount".to_string()),
                 },
             ]
         );

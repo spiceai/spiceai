@@ -262,14 +262,17 @@ pub struct PartitionMetadata {
 impl PartitionMetadata {
     /// Returns a composite key string for this partition.
     ///
-    /// For single partitions: returns the single value (e.g., `"us-east-1"`).
-    /// For composite partitions: returns a slash-separated path (e.g., `"2025/10/15"`).
-    ///
-    /// This key uniquely identifies the partition within a table and is used
-    /// for `HashMap` lookups and Hive-style directory naming.
+    /// Components are length-prefixed so tuple boundaries are unambiguous even
+    /// for legacy values containing separators.
     #[must_use]
     pub fn composite_key(&self) -> String {
-        self.partition_values.join("/")
+        let mut composite = String::from("v1:");
+        for value in &self.partition_values {
+            composite.push_str(&value.len().to_string());
+            composite.push(':');
+            composite.push_str(value);
+        }
+        composite
     }
 
     /// Creates a new `PartitionMetadata` for a single partition column (legacy compatibility).
@@ -1117,6 +1120,13 @@ pub struct VortexConfig {
     /// objects and cold scans are range reads. Set from
     /// `cayenne_datalake_target_file_size_mb`. Defaults to 512.
     pub cold_target_file_size_mb: usize,
+    /// Max input bytes (in MB) fed to one bounded Z-order sort run during cold
+    /// promotion. `None` (the default) derives
+    /// [`Self::cold_clustering_run_size_bytes`] as `cold_target_file_size_mb *
+    /// 16` — 16 target files' worth of input gives enough locality for good
+    /// clustering (8 GiB with the default 512 MB target).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cold_clustering_run_size_mb: Option<usize>,
     /// Promotion fires only once the warm tier exceeds this many bytes
     /// (`<= 0` disables the byte trigger). Set from
     /// `cayenne_datalake_warm_max_bytes`.
@@ -1146,6 +1156,18 @@ impl VortexConfig {
         self.cold_tier_location
             .as_ref()
             .is_some_and(|s| !s.trim().is_empty())
+    }
+
+    /// Effective byte cap for one bounded Z-order sort run during cold
+    /// promotion: an explicit [`Self::cold_clustering_run_size_mb`], else
+    /// derived as `cold_target_file_size_mb * 16`. The single derivation rule
+    /// for standalone and runtime paths — never returns 0.
+    #[must_use]
+    pub fn cold_clustering_run_size_bytes(&self) -> usize {
+        self.cold_clustering_run_size_mb
+            .unwrap_or_else(|| self.cold_target_file_size_mb.saturating_mul(16))
+            .max(1)
+            .saturating_mul(1024 * 1024)
     }
 }
 
@@ -1468,6 +1490,7 @@ impl Default for VortexConfig {
             cold_tier_location: None,
             cold_clustering_columns: Vec::new(),
             cold_target_file_size_mb: 512,
+            cold_clustering_run_size_mb: None,
             cold_tier_warm_max_bytes: 0,
             cold_tier_warm_max_files: 0,
             cold_tier_background_interval_ms: 60_000,
