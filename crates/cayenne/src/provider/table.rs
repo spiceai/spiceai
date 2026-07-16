@@ -1268,6 +1268,17 @@ pub struct CayenneTableProvider {
     /// one. Production never sets it.
     #[cfg(test)]
     force_apply_panic: Arc<AtomicBool>,
+    /// Test-only fault injection for the Stage 2a crash-injection recovery suite:
+    /// when armed, `checkpoint_mem_tier_inner` aborts (one-shot, self-disarming)
+    /// in the `GenState::Spilling` state — AFTER the Vortex file is durably encoded
+    /// and fsynced but BEFORE `commit_mem_tier_checkpoint_metadata` publishes the
+    /// metastore pointer. This reproduces a crash mid-bake, leaving a
+    /// durable-but-unreferenced orphan snapshot file, so a recovery test can prove
+    /// the orphan never becomes visible on reopen (no dirty read of uncommitted
+    /// rows) and the un-acked tail replays PK-idempotently. Per-provider (shared
+    /// across writer clones). Production never sets it.
+    #[cfg(test)]
+    force_checkpoint_spill_fault: Arc<AtomicBool>,
     /// Protected snapshot IDs that should skip deletion filtering.
     ///
     /// When data is inserted while pending deletions exist, the new data is written
@@ -2784,6 +2795,16 @@ impl CayenneTableProvider {
     #[cfg(test)]
     pub(crate) fn set_force_apply_panic(&self, on: bool) {
         self.force_apply_panic.store(on, Ordering::Relaxed);
+    }
+
+    /// Test-only: arm the one-shot Stage 2a spilling-crash injection (per-provider).
+    /// The next `checkpoint_mem_tier` aborts in the `Spilling` state (durable file
+    /// encoded, metastore pointer NOT committed) and self-disarms, so a recovery
+    /// test can drop+reopen and assert the orphan file never surfaces.
+    #[cfg(test)]
+    pub(crate) fn arm_checkpoint_spill_fault(&self) {
+        self.force_checkpoint_spill_fault
+            .store(true, Ordering::Relaxed);
     }
 
     /// Append a CDC upsert stream using Cayenne's native writer path.
@@ -5908,6 +5929,8 @@ impl CayenneTableProvider {
             ingest_pool_override: None,
             #[cfg(test)]
             force_apply_panic: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            force_checkpoint_spill_fault: Arc::new(AtomicBool::new(false)),
             table_schema: Arc::new(ArcSwap::new(Arc::<arrow_schema::Schema>::clone(
                 &table_metadata.schema,
             ))),
@@ -7122,6 +7145,8 @@ impl CayenneTableProvider {
             ingest_pool_override: self.ingest_pool_override.clone(),
             #[cfg(test)]
             force_apply_panic: Arc::clone(&self.force_apply_panic),
+            #[cfg(test)]
+            force_checkpoint_spill_fault: Arc::clone(&self.force_checkpoint_spill_fault),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
             manifest_cache: Arc::clone(&self.manifest_cache),
             protected_snapshot_age_warning_keys: Arc::clone(
@@ -22303,6 +22328,25 @@ impl CayenneTableProvider {
                 Self::sync_snapshot_dir(&snapshot_dir).await?;
             }
 
+            // Test-only Stage 2a spilling-crash injection: the generation is in
+            // `GenState::Spilling` here — the Vortex file is durably encoded and
+            // fsynced above, but the metastore pointer (`commit_mem_tier_checkpoint_metadata`,
+            // just below) has NOT been written and the slot has NOT advanced.
+            // Aborting one-shot reproduces a crash mid-bake, leaving a
+            // durable-but-unreferenced orphan file; the recovery suite drops+reopens
+            // and asserts the orphan never surfaces (no dirty read) before replaying.
+            #[cfg(test)]
+            if self
+                .force_checkpoint_spill_fault
+                .swap(false, Ordering::Relaxed)
+            {
+                return Err(Error::DataValidation {
+                    table: self.table_name().to_string(),
+                    message: "injected spilling-state crash before checkpoint commit (test-only)"
+                        .to_string(),
+                });
+            }
+
             let update = self
                 .commit_mem_tier_checkpoint_metadata(
                     &snapshot,
@@ -32189,6 +32233,404 @@ mod tests {
                 got, want,
                 "schedule#{schedule_idx} {schedule:?}: reopen != durable reference (resurrection or loss across the durability boundary)"
             );
+        }
+    }
+
+    /// Stage 2a crash-injection — the `Spilling` boundary (§4.5). A checkpoint
+    /// that crashes AFTER durably encoding + fsyncing the Vortex file but BEFORE
+    /// committing the metastore pointer leaves a durable-but-unreferenced ORPHAN
+    /// file. On reopen that orphan MUST be invisible — surfacing it would be a
+    /// dirty read of never-committed rows (`CLAUDE.md`: query results can NEVER be
+    /// wrong) — and because the slot never advanced, the source re-streams the
+    /// un-acked tail and the replay converges PK-idempotently. The `Spilling`
+    /// state is reached deterministically with the one-shot
+    /// `arm_checkpoint_spill_fault` hook.
+    #[tokio::test]
+    async fn stage2a_crash_at_spilling_leaves_orphan_invisible_then_replays() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) =
+            create_memory_mode_upsert_table("s2a_spill_crash", Arc::clone(&runtime_env)).await;
+        let durable = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(std::sync::Arc::new(EpochRecorder(std::sync::Arc::clone(
+            &durable,
+        ))));
+
+        // Seed [1,2,3] and bake it durable — the recovery floor.
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(int64_id_batch(&[1, 2, 3])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed append");
+        provider.checkpoint_mem_tier().await.expect("seed checkpoint");
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 2, 3]);
+        let acked_after_seed = durable.load(std::sync::atomic::Ordering::SeqCst);
+
+        // Append [4,5] into the RAM tier (un-baked, un-acked).
+        let tail_epoch = provider
+            .write_cdc_append_stream(single_batch_stream(int64_id_batch(&[4, 5])), &ctx.task_ctx())
+            .await
+            .expect("tail append")
+            .in_memory_epoch()
+            .expect("the tail engaged the RAM tier");
+        assert!(tail_epoch > acked_after_seed, "the tail is a fresh un-acked epoch");
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 2, 3, 4, 5]);
+
+        // Arm the one-shot spilling crash: the checkpoint encodes [4,5] to a
+        // durable Vortex file, then aborts before committing the metastore pointer.
+        provider.arm_checkpoint_spill_fault();
+        let crashed = provider.checkpoint_mem_tier().await;
+        assert!(
+            crashed.is_err(),
+            "the injected spilling crash surfaces as a checkpoint error"
+        );
+        assert_eq!(
+            durable.load(std::sync::atomic::Ordering::SeqCst),
+            acked_after_seed,
+            "a checkpoint that crashed in Spilling must NOT advance the slot"
+        );
+
+        // CRASH: drop (RAM gone), reopen from the durable catalog. The orphan file
+        // for [4,5] is on disk but unreferenced by the metastore — it MUST NOT be
+        // visible.
+        drop(provider);
+        let reopened =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .open("s2a_spill_crash")
+                .await
+                .expect("reopen after spilling crash");
+        assert_eq!(
+            scan_sorted_ids(&reopened).await,
+            vec![1, 2, 3],
+            "the orphaned spill file must be invisible on reopen (no dirty read of uncommitted rows)"
+        );
+
+        // The source re-streams the un-acked tail; the replay converges (no loss,
+        // no duplicate) and a clean checkpoint now bakes it durable.
+        let durable2 = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        reopened.install_slot_advancer(std::sync::Arc::new(EpochRecorder(std::sync::Arc::clone(
+            &durable2,
+        ))));
+        let _ = reopened
+            .write_cdc_append_stream(single_batch_stream(int64_id_batch(&[4, 5])), &ctx.task_ctx())
+            .await
+            .expect("replay the un-acked tail");
+        assert_eq!(
+            scan_sorted_ids(&reopened).await,
+            vec![1, 2, 3, 4, 5],
+            "the replay converges with no loss"
+        );
+        reopened
+            .checkpoint_mem_tier()
+            .await
+            .expect("post-replay checkpoint");
+        assert_eq!(
+            scan_sorted_ids(&reopened).await,
+            vec![1, 2, 3, 4, 5],
+            "no resurrection or duplicate after the replay is baked durable"
+        );
+    }
+
+    /// Stage 2a crash-injection — the published-but-unacked boundary (the "crash
+    /// in the gap", `table.rs` two-phase checkpoint comment). A checkpoint commits
+    /// the durable file + metastore pointer and clears the tier, but the process
+    /// crashes before the source records the slot ack (`fire_slot_advancer` runs
+    /// post-fence). On restart the published rows are durable AND the source
+    /// re-streams the same epoch — so the replay of an already-published epoch MUST
+    /// be PK-idempotent (no duplicate, no resurrection). This is reachable via the
+    /// public API (a full checkpoint leaves the exact on-disk state of a crash in
+    /// the gap), so no fault hook is needed.
+    #[tokio::test]
+    async fn stage2a_crash_in_the_gap_published_replays_idempotently() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) =
+            create_memory_mode_upsert_table("s2a_gap_crash", Arc::clone(&runtime_env)).await;
+        let durable = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(std::sync::Arc::new(EpochRecorder(std::sync::Arc::clone(
+            &durable,
+        ))));
+
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(int64_id_batch(&[1, 2, 3])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed append");
+        provider.checkpoint_mem_tier().await.expect("seed checkpoint");
+        // The epoch whose rows are about to be published and whose ack is "lost".
+        // Key 3 overlaps the seed (exercises upsert supersede across the boundary).
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(int64_id_batch(&[3, 4, 5])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("gap-epoch append");
+        // Publish it fully — this IS the on-disk state at a crash in the gap
+        // (file + metastore pointer durable, tier cleared).
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("publish the gap epoch");
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 2, 3, 4, 5]);
+
+        // CRASH after the durable publish but (modeled) before the source recorded
+        // the ack. Reopen: the published rows are durable.
+        drop(provider);
+        let reopened =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .open("s2a_gap_crash")
+                .await
+                .expect("reopen after crash in the gap");
+        assert_eq!(
+            scan_sorted_ids(&reopened).await,
+            vec![1, 2, 3, 4, 5],
+            "the published checkpoint is durable across the crash"
+        );
+
+        // The source, having never seen the ack, RE-STREAMS the same epoch's rows
+        // over the already-published checkpoint. PK-idempotent apply must converge.
+        let durable2 = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        reopened.install_slot_advancer(std::sync::Arc::new(EpochRecorder(std::sync::Arc::clone(
+            &durable2,
+        ))));
+        let _ = reopened
+            .write_cdc_append_stream(
+                single_batch_stream(int64_id_batch(&[3, 4, 5])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("re-stream the un-acked (already-published) epoch");
+        let ids = scan_sorted_ids(&reopened).await;
+        assert_eq!(
+            ids,
+            vec![1, 2, 3, 4, 5],
+            "replaying an already-published epoch is idempotent (no duplicate, no resurrection)"
+        );
+        let mut deduped = ids.clone();
+        deduped.dedup();
+        assert_eq!(ids, deduped, "no primary key appears twice after the replay");
+        reopened
+            .checkpoint_mem_tier()
+            .await
+            .expect("bake the idempotent replay");
+        assert_eq!(
+            scan_sorted_ids(&reopened).await,
+            vec![1, 2, 3, 4, 5],
+            "baking the idempotent replay preserves the converged set"
+        );
+    }
+
+    /// Stage 2a crash-injection FUZZ — restart + replay convergence at every
+    /// transition boundary. For each schedule and each crash point, drop the
+    /// provider (RAM lost), reopen from the durable catalog, then REPLAY the ops
+    /// the source would re-deliver from the last durable ack forward, and assert
+    /// the live scan converges to the full single-tier reference with no duplicate
+    /// and no resurrection. Two crash flavors per point: a CLEAN crash (drop after
+    /// executing the prefix) and — at flushing checkpoint ops — a SPILLING crash
+    /// (durable file encoded, metastore pointer never committed) via the one-shot
+    /// `arm_checkpoint_spill_fault` hook. The existing
+    /// `stage2a_drain_ledger_model_matches_single_tier_reference` covers clean
+    /// end-of-schedule reopen; this adds the mid-flight crash + replay contract.
+    ///
+    /// The re-stream uses the upsert write path (`write_cdc_append_stream`) — the
+    /// faithful, PK-idempotent source-replay primitive — not the raw segment
+    /// append, so a replayed insert of an already-durable key supersedes instead
+    /// of duplicating.
+    #[tokio::test]
+    async fn stage2a_crash_injection_replay_converges() {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Op {
+            Insert(i64),
+            Delete(i64),
+            Seal,
+            Checkpoint,
+        }
+
+        async fn apply_op(ctx: &SessionContext, provider: &CayenneTableProvider, op: Op) {
+            match op {
+                Op::Insert(k) => {
+                    let _ = provider
+                        .write_cdc_append_stream(
+                            single_batch_stream(int64_id_batch(&[k])),
+                            &ctx.task_ctx(),
+                        )
+                        .await
+                        .expect("insert applies");
+                }
+                Op::Delete(k) => {
+                    provider
+                        .write_cdc_delete_keys_in_memory(&int64_id_batch(&[k]))
+                        .await
+                        .expect("delete applies");
+                }
+                Op::Seal => {
+                    provider.seal_mem_tier_durable().await.expect("seal applies");
+                }
+                Op::Checkpoint => {
+                    provider
+                        .checkpoint_mem_tier()
+                        .await
+                        .expect("checkpoint applies");
+                }
+            }
+        }
+
+        const DEPTH: u32 = 3;
+        // Two keys (cross-key supersede / delete-then-reinsert) plus both drains.
+        let alphabet = [
+            Op::Insert(1),
+            Op::Insert(2),
+            Op::Delete(1),
+            Op::Seal,
+            Op::Checkpoint,
+        ];
+
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let n = alphabet.len();
+        let total = n.pow(DEPTH);
+
+        for schedule_idx in 0..total {
+            let mut code = schedule_idx;
+            let schedule: Vec<Op> = (0..DEPTH)
+                .map(|_| {
+                    let op = alphabet[code % n];
+                    code /= n;
+                    op
+                })
+                .collect();
+            let len = schedule.len();
+
+            // Reference model: `prefix_live[k]` = the logical corpus after ops
+            // [0..=k]; `full_live` = the fully-converged corpus.
+            let mut prefix_live: Vec<std::collections::BTreeSet<i64>> = Vec::with_capacity(len);
+            {
+                let mut model: std::collections::BTreeSet<i64> =
+                    std::collections::BTreeSet::new();
+                for op in &schedule {
+                    match op {
+                        Op::Insert(k) => {
+                            model.insert(*k);
+                        }
+                        Op::Delete(k) => {
+                            model.remove(k);
+                        }
+                        Op::Seal | Op::Checkpoint => {}
+                    }
+                    prefix_live.push(model.clone());
+                }
+            }
+            let full_live: Vec<i64> = prefix_live
+                .last()
+                .map(|s| s.iter().copied().collect())
+                .unwrap_or_default();
+
+            // The last COMPLETED drain (Seal or Checkpoint) among indices [0..bound).
+            let last_drain_before = |bound: usize| -> Option<usize> {
+                (0..bound)
+                    .rev()
+                    .find(|&i| matches!(schedule[i], Op::Seal | Op::Checkpoint))
+            };
+
+            // Crash points. `crash_at` = number of prefix ops executed fully before
+            // the crash (0..=len). A `spill` crash additionally executes
+            // `schedule[crash_at]` as a checkpoint that crashes in Spilling — only
+            // when that op is a Checkpoint AND the tier is provably non-empty there
+            // (an empty-tier checkpoint early-returns before the fault site), which
+            // holds when at least one Insert occurred since the last Checkpoint
+            // (a Checkpoint clears the tier; a Seal does not).
+            let mut crash_points: Vec<(usize, bool)> = Vec::with_capacity(len + 1);
+            for c in 0..=len {
+                crash_points.push((c, false));
+            }
+            for (ci, op) in schedule.iter().enumerate() {
+                if !matches!(op, Op::Checkpoint) {
+                    continue;
+                }
+                let last_ckpt = (0..ci)
+                    .rev()
+                    .find(|&i| matches!(schedule[i], Op::Checkpoint));
+                let start = last_ckpt.map_or(0, |i| i + 1);
+                if schedule[start..ci]
+                    .iter()
+                    .any(|o| matches!(o, Op::Insert(_)))
+                {
+                    crash_points.push((ci, true));
+                }
+            }
+
+            for (variant, (crash_at, spill)) in crash_points.into_iter().enumerate() {
+                let table = format!("s2a_crash_{schedule_idx}_{variant}");
+                let (provider, catalog, _tmp) =
+                    create_memory_mode_upsert_table(&table, Arc::clone(&runtime_env)).await;
+                provider.install_slot_advancer(std::sync::Arc::new(EpochRecorder(
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                )));
+
+                // Execute the pre-crash prefix.
+                for &op in &schedule[..crash_at] {
+                    apply_op(&ctx, &provider, op).await;
+                }
+                // The last durable ack index. A crashed (Spilling) checkpoint never
+                // commits, so it does not count.
+                let mut drain_idx = last_drain_before(crash_at);
+                // At a spill crash, execute the crashing checkpoint (armed). If the
+                // tier has no rows to bake (empty, or a tombstones-only drain), the
+                // checkpoint COMMITS before reaching the Spilling injection site — a
+                // real completed drain at `crash_at` — so track it as such rather
+                // than asserting a crash that legitimately cannot happen there.
+                if spill {
+                    provider.arm_checkpoint_spill_fault();
+                    if provider.checkpoint_mem_tier().await.is_ok() {
+                        drain_idx = Some(crash_at);
+                    }
+                }
+                let durable_ref: Vec<i64> = match drain_idx {
+                    Some(d) => prefix_live[d].iter().copied().collect(),
+                    None => Vec::new(),
+                };
+
+                // CRASH + reopen: the durable corpus is exactly the last acked drain.
+                drop(provider);
+                let reopened = CayenneTableProviderBuilder::new(
+                    Arc::clone(&catalog),
+                    Arc::clone(&runtime_env),
+                )
+                .open(&table)
+                .await
+                .expect("reopen after crash");
+                assert_eq!(
+                    scan_sorted_ids(&reopened).await,
+                    durable_ref,
+                    "schedule#{schedule_idx} {schedule:?} v{variant} crash_at={crash_at} spill={spill}: reopen != durable reference (dirty read or loss)"
+                );
+
+                // Replay everything the source re-delivers from the last ack forward
+                // (idempotent upsert path); assert convergence to the full reference.
+                reopened.install_slot_advancer(std::sync::Arc::new(EpochRecorder(
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                )));
+                let replay_from = drain_idx.map_or(0, |d| d + 1);
+                for &op in &schedule[replay_from..] {
+                    apply_op(&ctx, &reopened, op).await;
+                }
+                let got = scan_sorted_ids(&reopened).await;
+                assert_eq!(
+                    got, full_live,
+                    "schedule#{schedule_idx} {schedule:?} v{variant} crash_at={crash_at} spill={spill}: replay did not converge to the full reference"
+                );
+                let mut deduped = got.clone();
+                deduped.dedup();
+                assert_eq!(
+                    got, deduped,
+                    "schedule#{schedule_idx} v{variant}: primary key duplicated after replay"
+                );
+            }
         }
     }
 
