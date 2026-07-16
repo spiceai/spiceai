@@ -37369,11 +37369,14 @@ mod tests {
         );
     }
 
-    /// Regression for the cold-promotion over-count observed in the SF100 CH-benCH
-    /// run: a background checkpoint had captured the mem tier and was encoding
-    /// off-lock while promotion acquired `write_lock` and checkpointed the same
-    /// corpus again. Promotion must wait for the first checkpoint's complete
-    /// publish-and-clear lifecycle before it may capture.
+    /// A cold-promotion mem-tier checkpoint serializes with any in-flight mem-tier
+    /// checkpoint. A checkpoint holds `mem_checkpoint_lock` across its whole
+    /// capture -> encode -> publish -> clear lifecycle, so while one is in flight a
+    /// promotion that has already taken `write_lock` must block on
+    /// `mem_checkpoint_lock` before it captures, rather than recapturing the same
+    /// not-yet-cleared corpus (which would publish a duplicate copy). Once the
+    /// in-flight checkpoint completes, promotion proceeds and captures the tier
+    /// exactly once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn promotion_checkpoint_waits_for_inflight_mem_checkpoint() {
         let ctx = SessionContext::new();
@@ -37449,6 +37452,186 @@ mod tests {
             query_count_star(&ctx, &provider, "promotion_checkpoint_serialization").await,
             3,
             "checkpoint serialization preserves exactly one copy of every key"
+        );
+    }
+
+    /// The GUARANTEED `checkpoint_mem_tier` fair-queues behind an ordinary writer
+    /// (one holding only `write_lock`, not `mem_checkpoint_lock`): its fast
+    /// `try_lock(write)` fails, so it falls back to a fair `write -> mem` wait and
+    /// BLOCKS until the writer releases, then acquires and flushes. Proves the
+    /// guaranteed path makes progress under contention without starving.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn guaranteed_checkpoint_waits_behind_ordinary_writer_then_flushes() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "guaranteed_ckpt_waits_writer",
+            ctx.runtime_env(),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                // N>1 so the capture actually takes `write_lock`.
+                cdc_mem_tier_shards: 4,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(schema, &[1, 2, 3], &[10, 20, 30])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed sharded RAM tier");
+        let provider = Arc::new(provider);
+
+        // An ORDINARY writer holds only `write_lock` (not `mem_checkpoint_lock`).
+        let write_guard = provider.write_lock_arc().lock_owned().await;
+
+        let ckpt_provider = Arc::clone(&provider);
+        let mut checkpoint = tokio::spawn(async move { ckpt_provider.checkpoint_mem_tier().await });
+
+        // Must block: `try_lock(write)` fails, so it fair-queues on `write_lock`.
+        let blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(250), &mut checkpoint).await;
+        assert!(
+            blocked.is_err(),
+            "guaranteed checkpoint must wait behind the writer's write_lock"
+        );
+
+        // Release the writer; the checkpoint acquires (fair) and flushes once.
+        drop(write_guard);
+        let flushed = tokio::time::timeout(std::time::Duration::from_secs(10), &mut checkpoint)
+            .await
+            .expect("checkpoint does not deadlock")
+            .expect("join checkpoint")
+            .expect("checkpoint succeeds");
+        assert_eq!(flushed, 3, "the checkpoint flushes the seeded rows once released");
+        assert_eq!(
+            query_count_star(&ctx, &provider, "guaranteed_ckpt_waits_writer").await,
+            3,
+            "exactly the three seeded keys are durable"
+        );
+    }
+
+    /// The BEST-EFFORT `try_checkpoint_mem_tier` returns `Busy` when `write_lock`
+    /// is contended and does NOT advance the source slot (the advancer never
+    /// fires). Proves a skip is not mistaken for a completed durable checkpoint.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn best_effort_checkpoint_returns_busy_without_advancing_slot() {
+        struct CountingAdvancer(Arc<std::sync::atomic::AtomicU64>);
+        #[async_trait::async_trait]
+        impl crate::provider::mem_tier::SlotAdvancer for CountingAdvancer {
+            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "best_effort_busy",
+            ctx.runtime_env(),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                cdc_mem_tier_shards: 4,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let advances = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(Arc::new(CountingAdvancer(Arc::clone(&advances))));
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(schema, &[1, 2, 3], &[10, 20, 30])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed sharded RAM tier");
+        let provider = Arc::new(provider);
+
+        // Contend `write_lock`, then the best-effort checkpoint must skip.
+        let write_guard = provider.write_lock_arc().lock_owned().await;
+        let attempt = provider
+            .try_checkpoint_mem_tier()
+            .await
+            .expect("try checkpoint returns Ok");
+        assert!(
+            matches!(attempt, super::CheckpointAttempt::Busy),
+            "contended write_lock must yield Busy, not a completed checkpoint"
+        );
+        assert_eq!(
+            advances.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a Busy skip must not advance the source slot"
+        );
+        drop(write_guard);
+    }
+
+    /// A due seal uses the GUARANTEED acquisition: it fair-queues behind an
+    /// ordinary writer, then completes and advances durability (fires the slot
+    /// advancer). Proves the seal cannot be starved and honors its durability
+    /// cadence under contention.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn seal_waits_behind_ordinary_writer_then_advances_durability() {
+        struct CountingAdvancer(Arc<std::sync::atomic::AtomicU64>);
+        #[async_trait::async_trait]
+        impl crate::provider::mem_tier::SlotAdvancer for CountingAdvancer {
+            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "seal_waits_writer",
+            ctx.runtime_env(),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                cdc_mem_tier_shards: 4,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let advances = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(Arc::new(CountingAdvancer(Arc::clone(&advances))));
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(schema, &[1, 2, 3], &[10, 20, 30])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed unsealed segments");
+        let provider = Arc::new(provider);
+
+        let write_guard = provider.write_lock_arc().lock_owned().await;
+        let seal_provider = Arc::clone(&provider);
+        let mut seal = tokio::spawn(async move { seal_provider.seal_mem_tier_durable().await });
+
+        // Must block: the guaranteed seal fair-queues behind the writer.
+        let blocked = tokio::time::timeout(std::time::Duration::from_millis(250), &mut seal).await;
+        assert!(
+            blocked.is_err(),
+            "due seal must fair-queue behind the writer's write_lock"
+        );
+
+        drop(write_guard);
+        let sealed = tokio::time::timeout(std::time::Duration::from_secs(10), &mut seal)
+            .await
+            .expect("seal does not deadlock")
+            .expect("join seal")
+            .expect("seal succeeds");
+        assert_eq!(sealed, 3, "the seal shadows the three seeded rows");
+        assert!(
+            advances.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the seal advances durability (fires the slot advancer)"
         );
     }
 
