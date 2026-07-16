@@ -886,6 +886,7 @@ mod tests {
 #[cfg(all(test, cayenne_loom))]
 mod loom_model {
     use super::{FrozenDrainLedger, FrozenGeneration, GenState};
+    use loom::sync::atomic::{AtomicU64, Ordering};
     use loom::sync::{Arc, Condvar, Mutex};
 
     /// A zero-shard frozen generation carrying only the `epoch` (and a dummy
@@ -907,7 +908,7 @@ mod loom_model {
 
     /// The shared drain state a set of racing drains operate over: the REAL
     /// ledger under a loom mutex, the condvar that models `drain_publish_notify`,
-    /// and two observation logs the assertions read.
+    /// and the observation logs the assertions read.
     struct DrainModel {
         ledger: Mutex<FrozenDrainLedger>,
         /// Faithful analog of `drain_publish_notify`: parks a drain until its
@@ -917,9 +918,17 @@ mod loom_model {
         /// Generation ids in the order they WON their publish turn — asserted to
         /// be strictly oldest-first (the ordered-publish invariant).
         publish_order: Mutex<Vec<u64>>,
-        /// Every non-`None` ack watermark, in the order it was fired — asserted
-        /// monotone non-decreasing (the min-across-in-flight ack invariant).
-        acks: Mutex<Vec<u64>>,
+        /// Every watermark returned by `reclaim_terminal_prefix_ack`, in the
+        /// order it was PRODUCED under the ledger lock — asserted monotone
+        /// non-decreasing (the min-across-in-flight ack invariant). This is the
+        /// sequence the ordered-publish contract actually guarantees; the
+        /// downstream FIRE order can differ (see [`Self::fire`]).
+        produced: Mutex<Vec<u64>>,
+        /// The effective durable watermark the SOURCE SLOT sees — the loom analog
+        /// of `last_fired_durable_epoch` (`fire_slot_advancer` advances it with a
+        /// `fetch_max` off the ledger lock). Modeled explicitly so loom explores
+        /// the fire reorder and checks it is monotone under every schedule.
+        effective_wm: AtomicU64,
     }
 
     impl DrainModel {
@@ -928,7 +937,8 @@ mod loom_model {
                 ledger: Mutex::new(ledger),
                 gate: Condvar::new(),
                 publish_order: Mutex::new(Vec::new()),
-                acks: Mutex::new(Vec::new()),
+                produced: Mutex::new(Vec::new()),
+                effective_wm: AtomicU64::new(0),
             })
         }
 
@@ -971,15 +981,41 @@ mod loom_model {
         /// separately (3d-ii); here we check the reclaim-order contract the ledger
         /// lock actually guarantees.
         fn publish_and_ack(&self, id: u64) {
-            let mut ledger = self.ledger.lock().expect("ledger lock");
-            match ledger.generation_mut_by_id(id) {
-                Some(g) => g.transition(GenState::Published),
-                None => panic!("published generation {id} was no longer resident"),
+            let ack = {
+                let mut ledger = self.ledger.lock().expect("ledger lock");
+                match ledger.generation_mut_by_id(id) {
+                    Some(g) => g.transition(GenState::Published),
+                    None => panic!("published generation {id} was no longer resident"),
+                }
+                let ack = ledger.reclaim_terminal_prefix_ack();
+                if let Some(epoch) = ack {
+                    self.produced.lock().expect("produced lock").push(epoch);
+                }
+                self.gate.notify_all();
+                ack
+            };
+            // Fire OUTSIDE the ledger lock, exactly as `publish_generation_and_ack`
+            // calls `fire_slot_advancer` after releasing it — so concurrent drains'
+            // fires can reorder, and loom explores that.
+            if let Some(epoch) = ack {
+                self.fire(epoch);
             }
-            if let Some(epoch) = ledger.reclaim_terminal_prefix_ack() {
-                self.acks.lock().expect("acks lock").push(epoch);
-            }
-            self.gate.notify_all();
+        }
+
+        /// The downstream slot ack (`fire_slot_advancer` analog), run OFF the
+        /// ledger lock. Advances the effective watermark with a `fetch_max`
+        /// (`last_fired_durable_epoch`), so it is monotone regardless of the order
+        /// two concurrent drains reach this. The safety of draining committers by
+        /// the absolute threshold `epoch <= w` rests on: when a watermark `w` is
+        /// fired, every epoch `<= w` was already PRODUCED by an earlier reclaim
+        /// (min-across-in-flight guarantees `w` is only produced once its whole
+        /// contiguous prefix is durable), which this asserts against `produced`.
+        fn fire(&self, w: u64) {
+            assert!(
+                self.produced.lock().expect("produced lock").contains(&w),
+                "fired watermark {w} must have been produced under the ledger lock first"
+            );
+            self.effective_wm.fetch_max(w, Ordering::SeqCst);
         }
 
         /// One detached CHECKPOINT drain: encode off-lock (a yield point, so loom
@@ -991,13 +1027,7 @@ mod loom_model {
             // order — the whole point of the pipeline. Model that as a scheduling
             // point before the gate.
             loom::thread::yield_now();
-            {
-                let mut ledger = self.ledger.lock().expect("ledger lock");
-                match ledger.generation_mut_by_id(id) {
-                    Some(g) => g.transition(GenState::Spilling),
-                    None => panic!("draining generation {id} was no longer resident"),
-                }
-            }
+            self.transition_to_spilling(id);
             match self.await_publish_turn(id) {
                 Turn::Ours => {
                     self.publish_order.lock().expect("publish_order lock").push(id);
@@ -1008,6 +1038,40 @@ mod loom_model {
                     // clear — the generation's rows stay live in the tier.
                 }
             }
+        }
+
+        /// One detached CHECKPOINT drain that FAILS mid-flight — the loom analog of
+        /// `arm_checkpoint_spill_fault` (which aborts in `Spilling`, after this
+        /// drain has claimed its own bake). On the `?`-error return, production's
+        /// `DrainCleanup::drop` runs the CASCADE: discard this generation AND every
+        /// younger one still resident behind it, then wake the gate so a
+        /// cascade-discarded younger drain re-checks and aborts. Models exactly
+        /// that: `discard_from_id(id)` + `notify_all`, under the ledger lock.
+        fn drain_checkpoint_failing(&self, id: u64) {
+            loom::thread::yield_now();
+            self.transition_to_spilling(id);
+            // FAULT at the Spilling boundary → DrainCleanup cascade.
+            let mut ledger = self.ledger.lock().expect("ledger lock");
+            ledger.discard_from_id(id);
+            self.gate.notify_all();
+        }
+
+        /// Claim this drain's own bake by driving its generation `Frozen ->
+        /// Spilling`, mirroring the production `with_generation_by_id(id, |g|
+        /// g.transition(Spilling))` at `table.rs:22955`. Production `debug_assert`s
+        /// the generation is still resident here; this MODELS RELEASE SEMANTICS —
+        /// a no-op when the generation was already cascade-discarded by an older
+        /// failure (see the D>1 finding recorded on `cascade_from_front_*` below).
+        fn transition_to_spilling(&self, id: u64) {
+            let mut ledger = self.ledger.lock().expect("ledger lock");
+            if let Some(g) = ledger.generation_mut_by_id(id) {
+                g.transition(GenState::Spilling);
+            }
+            // No-op when the generation was already cascade-discarded by an older
+            // failure — the release-correct behavior. A probe that instead mirrored
+            // production's `debug_assert!(result.is_some())` here FAILED under loom
+            // (a younger drain reached this after gen 0's cascade removed it), which
+            // is the D>1 finding recorded on the cascade test below.
         }
     }
 
@@ -1045,13 +1109,81 @@ mod loom_model {
                 "publish turns must be strictly oldest-first"
             );
             assert_eq!(
-                *model.acks.lock().expect("acks"),
+                *model.produced.lock().expect("produced"),
                 vec![10, 20],
                 "ack watermark must advance monotonically, one generation at a time"
+            );
+            assert_eq!(
+                model.effective_wm.load(Ordering::SeqCst),
+                20,
+                "the source slot ends at the newest durable epoch"
             );
             assert!(
                 model.ledger.lock().expect("ledger").is_empty(),
                 "both generations must be reclaimed"
+            );
+        });
+    }
+
+    /// CASCADE-DISCARD on failure (property 3) + min-ack never advances past a
+    /// FAILED older generation, two generations. Gen 0 (epoch 10) FAILS at its
+    /// Spilling boundary; gen 1 (epoch 20) is younger. loom explores every
+    /// interleaving and checks:
+    ///   * gen 0's failure CASCADE-discards gen 0 AND gen 1 (`discard_from_id`);
+    ///   * gen 1 (younger) ABORTS at the ordered-publish gate — it observes
+    ///     `!is_resident` (`Turn::Discarded`) and never publishes, so no metastore
+    ///     commit / fence swap / `retain_after` clear runs and its rows stay live
+    ///     for the source's PK-idempotent replay;
+    ///   * NOTHING is acked — the effective slot watermark never advances past the
+    ///     failure (stays 0), so a crash replays from the last durable epoch;
+    ///   * the ledger ends empty (no stranded generation blocks the next freeze).
+    ///
+    /// D>1 FINDING (loom-surfaced, recorded here). The production
+    /// `with_generation_by_id(id, |g| g.transition(Spilling))` at `table.rs:22955`
+    /// `debug_assert!`s the generation is still resident — but this model shows a
+    /// younger drain can reach that transition AFTER an older failure already
+    /// cascade-discarded it (gen 0 fails and discards gen 0+1 before gen 1's
+    /// detached task is polled to its own Spilling transition — the spawn-to-poll
+    /// gap). RELEASE builds handle it correctly (the transition is a no-op and the
+    /// drain then aborts at the gate), but DEBUG/test builds would trip that
+    /// `debug_assert`. It is unreachable at the config default (`D = 1`, no older
+    /// generation to fail-cascade) and the existing D>1 tests avoid the schedule
+    /// via the deterministic drain gate (which pauses AFTER the Spilling
+    /// transition). This model deliberately uses release semantics
+    /// ([`DrainModel::transition_to_spilling`] no-ops when the generation is gone)
+    /// so it verifies the SAFETY invariants; the too-strong `debug_assert` is
+    /// flagged for a separate (D>1-only, byte-identical at D=1) fix.
+    #[test]
+    fn cascade_from_front_failure_aborts_younger_and_pins_slot() {
+        loom::model(|| {
+            let mut ledger = FrozenDrainLedger::new(2);
+            ledger.freeze(model_gen(10)).ok().expect("freeze gen0");
+            ledger.freeze(model_gen(20)).ok().expect("freeze gen1");
+            let model = DrainModel::new(ledger);
+
+            let m0 = Arc::clone(&model);
+            let d0 = loom::thread::spawn(move || m0.drain_checkpoint_failing(0));
+            let m1 = Arc::clone(&model);
+            let d1 = loom::thread::spawn(move || m1.drain_checkpoint(1));
+            d0.join().expect("failing drain joins");
+            d1.join().expect("younger drain joins");
+
+            assert!(
+                model.publish_order.lock().expect("publish_order").is_empty(),
+                "no generation may publish: gen0 failed, gen1 was cascade-discarded"
+            );
+            assert!(
+                model.produced.lock().expect("produced").is_empty(),
+                "no watermark may be produced past the failure"
+            );
+            assert_eq!(
+                model.effective_wm.load(Ordering::SeqCst),
+                0,
+                "the slot never advances past a failed older generation"
+            );
+            assert!(
+                model.ledger.lock().expect("ledger").is_empty(),
+                "the cascade leaves no stranded generation"
             );
         });
     }
