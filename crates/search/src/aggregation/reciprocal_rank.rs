@@ -397,15 +397,12 @@ async fn reciprocal_rank_fusion_plan(
     // 3) FULL OUTER JOIN remaining tables on primary key columns
     for (table_name, plan) in ranked_plans.iter().skip(1) {
         let on_exprs = primary_key.iter().map(|pk| {
-            let left_key_parts = joined_table_names
+            let mut left_key_parts = joined_table_names
                 .iter()
                 .map(|joined_table| col(pk.clone().with_relation(joined_table.clone())))
                 .collect::<Vec<_>>();
             let left_key = if left_key_parts.len() == 1 {
-                left_key_parts
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| unreachable!("primary key expressions cannot be empty"))
+                left_key_parts.swap_remove(0)
             } else {
                 coalesce(left_key_parts)
             };

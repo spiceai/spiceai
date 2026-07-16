@@ -776,25 +776,14 @@ impl ReciprocalRankFusion {
             }
         }));
 
-        let mut join_err: Option<DataFusionError> = None;
-        let maybe_joined = subquery_dfs.into_iter().reduce(|a, b| {
-            let joined = Self::fold_join(a, b, join_key.qualified_name().1.as_str());
-
-            // No way to short circuit reduce, so we will surface the error at the end
-            match joined {
-                Ok(joined) => joined,
-                Err(e) => {
-                    join_err = Some(e);
-                    self.session_context
-                        .read_empty()
-                        .unwrap_or_else(|_| unreachable!("must be able to make an empty DataFrame"))
-                }
-            }
-        });
-
-        if let Some(error) = join_err {
-            return Err(error);
-        }
+        let join_key_name = join_key.qualified_name().1;
+        let mut subquery_iter = subquery_dfs.into_iter();
+        let maybe_joined = subquery_iter
+            .next()
+            .map(|first| {
+                subquery_iter.try_fold(first, |a, b| Self::fold_join(a, b, join_key_name.as_str()))
+            })
+            .transpose()?;
 
         if let Some(joined) = maybe_joined {
             tracing::trace!("{RRF_UDF_NAME} made reranked & fused DF for: {args:?}");
@@ -875,7 +864,9 @@ impl ReciprocalRankFusion {
             .iter()
             .map(|expr| {
                 let Expr::ScalarFunction(sf) = expr else {
-                    unreachable!("Must be a scalar function node")
+                    return exec_err!(
+                        "{RRF_UDF_NAME}: expected a scalar function expression, got {expr:?}"
+                    );
                 };
                 self.session_context
                     .table_function(sf.name())
@@ -1011,7 +1002,7 @@ impl ReciprocalRankFusion {
     }
 
     fn coalesced_qualified_field(df: &DataFrame, name: &str) -> Result<Expr> {
-        let qualified_fields = df
+        let mut qualified_fields = df
             .schema()
             .qualified_fields_with_unqualified_name(name)
             .iter()
@@ -1023,10 +1014,7 @@ impl ReciprocalRankFusion {
 
         match qualified_fields.len() {
             0 => exec_err!("{RRF_UDF_NAME}: Cannot resolve column {name} when fusing results"),
-            1 => Ok(qualified_fields
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| unreachable!("single-element vector cannot be empty"))),
+            1 => Ok(qualified_fields.swap_remove(0)),
             _ => Ok(coalesce(qualified_fields)),
         }
     }
