@@ -66,13 +66,9 @@ pub(crate) enum Kernel {
     Dot,
     /// Squared L2 distance. Sqrt is left to the caller when true L2 is needed.
     L2Squared,
-    /// Spice cosine distance: `(1 - cos_sim) / 2` in `[0, 1]`.
-    ///
-    /// Zero-magnitude inputs yield a non-finite value so the caller can surface
-    /// SQL NULL (failed/empty embeddings must not rank first under
-    /// `ORDER BY _score DESC`). Computed from three dots rather than
-    /// [`f32::cos`], which maps zero vectors to `0`/`1` instead of NaN.
-    CosineDistance,
+    /// Cosine distance via `simsimd`, which returns `1 - cosine_similarity` ∈ [0, 2].
+    /// The caller divides by 2 in `post_process` to map into the [0, 1] range.
+    Cosine,
 }
 
 impl Kernel {
@@ -80,13 +76,9 @@ impl Kernel {
         match self {
             Self::Dot => f32::dot(a, b),
             Self::L2Squared => f32::l2sq(a, b),
-            Self::CosineDistance => {
-                let dot = f32::dot(a, b)?;
-                let aa = f32::dot(a, a)?;
-                let bb = f32::dot(b, b)?;
-                // NaN/Inf when either vector has zero magnitude (or overflows).
-                Some((1.0 - dot / (aa.sqrt() * bb.sqrt())) / 2.0)
-            }
+            // `SpatialSimilarity::cos` returns `1 - cosine_similarity` ∈ [0, 2].
+            // The caller divides by 2 to map into the standard [0, 1] distance range.
+            Self::Cosine => <f32 as SpatialSimilarity>::cos(a, b),
         }
     }
 }
@@ -248,14 +240,7 @@ where
                 "vector_simd: simsimd returned None (length mismatch)".to_string(),
             )
         })?;
-        let processed = post_process(raw);
-        // CosineDistance (and overflow edge cases) may produce non-finite
-        // values; surface those as SQL NULL rather than NaN scores.
-        if processed.is_finite() {
-            builder.append_value(processed);
-        } else {
-            builder.append_null();
-        }
+        builder.append_value(post_process(raw));
     }
 
     Ok(Arc::new(builder.finish()) as ArrayRef)
@@ -391,5 +376,50 @@ mod tests {
             .expect_err("should error");
         let msg = err.to_string();
         assert!(msg.contains("dimensions differ"), "got: {msg}");
+    }
+
+    fn cosine_distance_via_simd(a_row: &[f32], b_row: &[f32]) -> Option<f64> {
+        let a = testing::fsl_f32(&[a_row]) as ArrayRef;
+        let b = testing::fsl_f32(&[b_row]) as ArrayRef;
+        // simsimd `cos` returns `1 - cosine_similarity`; divide by 2 to get [0, 1].
+        let out = compute_fsl_f32(&[a, b], Kernel::Cosine, |v| v / 2.0).expect("ok");
+        let out = out.as_primitive::<arrow::datatypes::Float64Type>();
+        if out.is_null(0) {
+            None
+        } else {
+            let v = out.value(0);
+            v.is_finite().then_some(v)
+        }
+    }
+
+    #[test]
+    fn cosine_identical_vectors() {
+        // identical vectors → similarity 1 → distance 0
+        let d = cosine_distance_via_simd(&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0]);
+        assert!(matches!(d, Some(v) if v.abs() < 1e-5), "got: {d:?}");
+    }
+
+    #[test]
+    fn cosine_orthogonal_vectors() {
+        // orthogonal vectors → similarity 0 → distance 0.5
+        let d = cosine_distance_via_simd(&[1.0, 0.0], &[0.0, 1.0]);
+        assert!(matches!(d, Some(v) if (v - 0.5).abs() < 1e-5), "got: {d:?}");
+    }
+
+    #[test]
+    fn cosine_opposite_vectors() {
+        // opposite vectors → similarity -1 → distance 1.0
+        let d = cosine_distance_via_simd(&[1.0, 2.0, 3.0], &[-1.0, -2.0, -3.0]);
+        assert!(matches!(d, Some(v) if (v - 1.0).abs() < 1e-5), "got: {d:?}");
+    }
+
+    #[test]
+    fn cosine_zero_magnitude_vector_yields_orthogonal_distance() {
+        // zero-magnitude vector → simsimd treats dot product as 0 (orthogonal) → distance 0.5
+        let d = cosine_distance_via_simd(&[0.0, 0.0, 0.0], &[1.0, 2.0, 3.0]);
+        assert!(
+            matches!(d, Some(v) if (v - 0.5).abs() < 1e-5),
+            "expected 0.5 for zero-magnitude input, got: {d:?}"
+        );
     }
 }
