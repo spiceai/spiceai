@@ -1269,7 +1269,7 @@ pub struct CayenneTableProvider {
     #[cfg(test)]
     force_apply_panic: Arc<AtomicBool>,
     /// Test-only fault injection for the Stage 2a crash-injection recovery suite:
-    /// when armed, `checkpoint_mem_tier_inner` aborts (one-shot, self-disarming)
+    /// when armed, `drain_checkpoint_generation` aborts (one-shot, self-disarming)
     /// in the `GenState::Spilling` state — AFTER the Vortex file is durably encoded
     /// and fsynced but BEFORE `commit_mem_tier_checkpoint_metadata` publishes the
     /// metastore pointer. This reproduces a crash mid-bake, leaving a
@@ -2303,13 +2303,13 @@ pub(crate) const BAKE_DELETION_INDEX_TRIGGER: usize = 50_000;
 /// lifecycle — capture, encode, publish, clear, slot advance — serializing
 /// checkpoints against each other, the seal, the write-path spill, and a cold
 /// promotion; `write` is only capture-scoped. Callers keep the struct alive and
-/// pass only `write.take()` to `checkpoint_mem_tier_inner`, so the checkpoint
+/// pass only `write.take()` to `capture_and_freeze_checkpoint`, so the checkpoint
 /// guard is not accidentally released early. (Adapted from PR #11907 —
 /// `sgrebnov/cayenne-promotion-checkpoint-serialization`.)
 struct MemTierCheckpointGuards {
     /// `mem_checkpoint_lock`, held for the whole checkpoint lifecycle (read only via `Drop`).
     _checkpoint: tokio::sync::OwnedMutexGuard<()>,
-    /// N>1 capture `write_lock`; `checkpoint_mem_tier_inner` releases it right after
+    /// N>1 capture `write_lock`; `capture_and_freeze_checkpoint` releases it right after
     /// capture so the encode runs off `write_lock`. `None` at N==1 (capture is atomic).
     write: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
@@ -2608,6 +2608,27 @@ struct CheckpointDrainClaim {
     /// The durable epoch this generation acks at publish (min-across-in-flight; the
     /// sole in-flight generation at `D = 1`).
     flushed_epoch: u64,
+}
+
+/// The claimed, immutable working copy of one frozen SEAL generation — the input to
+/// the off-lock seal drain ([`CayenneTableProvider::drain_seal_generation`]). The seal
+/// counterpart of [`CheckpointDrainClaim`]: owned (not borrowed from the ledger) so the
+/// drain reads it entirely off-lock and Stage 2b Step 3b-b can `tokio::spawn` a
+/// `'static` task that TAKES it. The seal marks per-shard boundaries rather than
+/// windowing an encode, so it carries no window base — `sealed_through` is the absolute
+/// per-shard boundary and the shadow reads `unsealed_view` (not a window).
+struct SealDrainClaim {
+    /// The ledger identity of the frozen generation this claim seals. The drain drives
+    /// its lifecycle (`Sealed`) and, on failure, discards it by this id — never by
+    /// ledger position (correct at `D > 1`).
+    id: u64,
+    /// The captured per-shard snapshots (whole live `segments` as of the seal freeze).
+    shard_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>>,
+    /// Per-shard absolute active→sealed boundary (the full prefix length at capture).
+    sealed_through: Vec<usize>,
+    /// The durable epoch this generation acks once sealed (MAX per-apply epoch over the
+    /// full captured prefix).
+    seal_epoch: u64,
 }
 
 impl CayenneTableProvider {
@@ -12684,7 +12705,7 @@ impl CayenneTableProvider {
         // falls back to the conservative `[0, current table sequence]` when no
         // input manifest is available. Unlike compaction, this path had no
         // manifest-authoring call at all until now — same gap, same fix as
-        // `write_new_snapshot_after_validation` and `checkpoint_mem_tier_inner`.
+        // `write_new_snapshot_after_validation` and `drain_checkpoint_generation`.
         // A `scan_from_manifest` table has no directory-LIST fallback, so a
         // failure here aborts the rewrite instead of publishing a snapshot
         // with zero manifest rows; a directory-listing table is unaffected
@@ -22001,9 +22022,21 @@ impl CayenneTableProvider {
     pub async fn checkpoint_mem_tier(&self) -> Result<u64> {
         let mut guards = self.acquire_capture_locks_blocking().await;
         // Keep `guards` alive so `mem_checkpoint_lock` spans the whole lifecycle;
-        // pass only the capture-scoped `write` guard to `inner`.
+        // pass only the capture-scoped `write` guard to the capture.
         let write = guards.write.take();
-        self.checkpoint_mem_tier_inner(write).await
+        // Capture + FREEZE the generation under `mem_checkpoint_lock` (the O(1),
+        // `M`-serialized portion), then run the off-lock drain. Splitting the two is
+        // the Stage 2b Step 3b-b seam: at `D = 1` (config default) the drain runs
+        // INLINE while `guards` still holds `mem_checkpoint_lock` (byte-identical to
+        // the pre-split interleaved body); a later step releases `guards` here and
+        // `tokio::spawn`s the drain at `D > 1` so freeze N+1 overlaps drain N.
+        let Some((claim, checkpoint_start)) = self.capture_and_freeze_checkpoint(write).await?
+        else {
+            return Ok(0);
+        };
+        self.run_checkpoint_drain(claim, checkpoint_start).await
+        // `guards` drops here (after the inline drain), releasing `mem_checkpoint_lock`
+        // exactly as before the split.
     }
 
     /// BEST-EFFORT counterpart to [`Self::checkpoint_mem_tier`]: returns
@@ -22014,9 +22047,14 @@ impl CayenneTableProvider {
         let Some(mut guards) = self.try_acquire_capture_locks() else {
             return Ok(CheckpointAttempt::Busy);
         };
-        // Keep `guards` alive across `inner`; pass only the `write` guard.
+        // Keep `guards` alive across the capture + inline drain; pass only the `write`
+        // guard to the capture (see `checkpoint_mem_tier` for the freeze/drain seam).
         let write = guards.write.take();
-        let rows = self.checkpoint_mem_tier_inner(write).await?;
+        let Some((claim, checkpoint_start)) = self.capture_and_freeze_checkpoint(write).await?
+        else {
+            return Ok(CheckpointAttempt::Completed(0));
+        };
+        let rows = self.run_checkpoint_drain(claim, checkpoint_start).await?;
         Ok(CheckpointAttempt::Completed(rows))
     }
 
@@ -22037,7 +22075,14 @@ impl CayenneTableProvider {
     /// capture is already atomic and `inner` re-acquiring `write_lock` would deadlock
     /// (tokio mutexes are not reentrant). `inner` gets `None` and touches neither lock.
     pub(crate) async fn checkpoint_mem_tier_holding_locks(&self) -> Result<u64> {
-        self.checkpoint_mem_tier_inner(None).await
+        // The caller holds BOTH locks for a larger operation, so the drain always runs
+        // INLINE here (it cannot release `mem_checkpoint_lock` — that is the caller's,
+        // held across the whole operation). Capture+freeze then drain, both under the
+        // caller's held lock — byte-identical to the pre-split combined method.
+        let Some((claim, checkpoint_start)) = self.capture_and_freeze_checkpoint(None).await? else {
+            return Ok(0);
+        };
+        self.run_checkpoint_drain(claim, checkpoint_start).await
     }
 
     /// The synchronous tail of the checkpoint capture, factored out so the capture
@@ -22173,15 +22218,25 @@ impl CayenneTableProvider {
     ///
     /// `mem_checkpoint_lock` is ALWAYS held by the caller across this method (via the
     /// guards struct or the `holding_*` wrappers), serializing the whole
-    /// capture → encode → publish → clear lifecycle. (Adapted from PR #11907.)
-    async fn checkpoint_mem_tier_inner(
+    /// capture → freeze lifecycle. (Adapted from PR #11907.)
+    ///
+    /// Stage 2b Step 3b-b split the former `checkpoint_mem_tier_inner` into this
+    /// capture+freeze half and [`Self::run_checkpoint_drain`]: this half is the O(1),
+    /// `M`-serialized capture + freeze; the drain half runs off-lock. Returns the
+    /// claimed immutable working copy plus the `checkpoint_start` instant (so the
+    /// drain's `mem_tier_checkpoint` phase metric spans the whole capture+drain exactly
+    /// as before), or `Ok(None)` in memory-resident mode (no durable checkpoint). The
+    /// caller decides whether to run the drain inline (holding `mem_checkpoint_lock`,
+    /// D=1) or via a detached task after releasing it (D>1) — splitting the capture
+    /// from the drain is what lets the caller release the lock between them.
+    async fn capture_and_freeze_checkpoint(
         &self,
         mut owned_capture_write_lock: Option<tokio::sync::OwnedMutexGuard<()>>,
-    ) -> Result<u64> {
+    ) -> Result<Option<(CheckpointDrainClaim, Instant)>> {
         // Memory mode (`mode: memory`) never checkpoints to Vortex — the mem-tier
         // is the permanent in-RAM store, so this is a no-op.
         if self.is_memory_resident_mode() {
-            return Ok(0);
+            return Ok(None);
         }
         let checkpoint_start = Instant::now();
         // Capture the corpus to flush AND reserve this checkpoint's
@@ -22387,17 +22442,26 @@ impl CayenneTableProvider {
                     .to_string(),
             });
         };
-        // Armed cleanup for this frozen generation, addressed BY ITS ID: the happy path
-        // reclaims + disarms explicitly below; an early `?`/panic drops this guard,
-        // discarding THIS generation (wherever it sits in the ledger) so the depth
-        // bound never blocks a later freeze.
+        Ok(Some((claim, checkpoint_start)))
+    }
+
+    /// Run the off-lock CHECKPOINT drain for a claimed frozen generation: arm the abort
+    /// guard (addressed BY ITS ID — the happy path reclaims + disarms explicitly; an
+    /// early `?`/panic drops the guard, discarding THIS generation wherever it sits in
+    /// the ledger so the depth bound never blocks a later freeze) and drive the drain
+    /// (encode → PUT → commit → publish → ack → reclaim) on the claimed immutable
+    /// working copy. At `D = 1` the caller invokes this INLINE while still holding
+    /// `mem_checkpoint_lock` (byte-identical to the pre-split interleaved body); Stage 2b
+    /// Step 3b-b invokes it as the body of a detached `tokio::spawn` after releasing the
+    /// lock, so the next freeze overlaps the drain (the pipelined drain that lifts the
+    /// `cdc_durability: memory` ceiling). `checkpoint_start` spans the
+    /// `mem_tier_checkpoint` phase metric across the whole capture+drain.
+    async fn run_checkpoint_drain(
+        &self,
+        claim: CheckpointDrainClaim,
+        checkpoint_start: Instant,
+    ) -> Result<u64> {
         let mut drain_cleanup = DrainCleanup::armed(&self.drain_ledger, claim.id);
-        // Drive the off-lock drain (encode → PUT → commit → publish → ack → reclaim)
-        // on the claimed immutable working copy. At D=1 this runs INLINE while the
-        // caller still holds `mem_checkpoint_lock` — byte-identical to the pre-3a
-        // interleaved body. Stage 2b Step 3b `tokio::spawn`s this exact method after
-        // releasing the lock, so the next freeze overlaps the drain (the pipelined
-        // drain that lifts the `cdc_durability: memory` ceiling).
         self.drain_checkpoint_generation(claim, checkpoint_start, &mut drain_cleanup)
             .await
     }
@@ -23011,7 +23075,6 @@ impl CayenneTableProvider {
         if !self.is_cdc_memory_mode() || self.is_memory_resident_mode() {
             return Ok(0);
         }
-        let n = self.mem_tier.shard_count();
         // A due seal must make progress even under sustained writes, so acquire the
         // capture locks with the GUARANTEED fair path (not a skip): fast try, then a
         // fair `write -> mem` queued fallback. Single-drainer w.r.t. the bake via
@@ -23022,9 +23085,37 @@ impl CayenneTableProvider {
         let mut guards = self.acquire_capture_locks_blocking().await;
         // Keep `guards` alive for the whole seal so `mem_checkpoint_lock` spans the
         // lifecycle; take only the capture-scoped `write` guard.
-        let mut owned_capture_write_lock = guards.write.take();
+        let write = guards.write.take();
+        // Capture + FREEZE the seal generation under `mem_checkpoint_lock` (the O(1),
+        // `M`-serialized portion), then run the off-lock seal drain. The freeze/drain
+        // seam mirrors `checkpoint_mem_tier`: at `D = 1` (config default) the drain runs
+        // INLINE while `guards` still holds `mem_checkpoint_lock` (byte-identical); Step
+        // 3b-b releases `guards` here and `tokio::spawn`s the drain at `D > 1`.
+        let Some(claim) = self.capture_and_freeze_seal(write)? else {
+            return Ok(0);
+        };
+        self.run_seal_drain(claim).await
+        // `guards` drops here (after the inline drain), releasing `mem_checkpoint_lock`.
+    }
 
-        // === ALL-SHARDS-ATOMIC CAPTURE (mirrors `checkpoint_mem_tier_inner`) ===
+    /// Capture the mem-tier active pieces atomically and FREEZE them as a seal drain
+    /// generation in the shared `drain_ledger` — the O(1), `M`-serialized portion of a
+    /// seal. Returns the claimed immutable working copy ([`SealDrainClaim`]), or
+    /// `Ok(None)` when nothing has an active ingestion piece to seal. Split from the
+    /// drain ([`Self::run_seal_drain`]) so the caller can release `mem_checkpoint_lock`
+    /// between the two at `D > 1` (Step 3b-b); the seal counterpart of
+    /// [`Self::capture_and_freeze_checkpoint`].
+    ///
+    /// Synchronous (unlike the checkpoint counterpart): the seal capture takes only
+    /// `parking_lot` publish locks and reserves its seal sequence off-lock inside the
+    /// drain, so there is no refill `.await` here.
+    fn capture_and_freeze_seal(
+        &self,
+        mut owned_capture_write_lock: Option<tokio::sync::OwnedMutexGuard<()>>,
+    ) -> Result<Option<SealDrainClaim>> {
+        let n = self.mem_tier.shard_count();
+
+        // === ALL-SHARDS-ATOMIC CAPTURE (mirrors `capture_and_freeze_checkpoint`) ===
         // At N>1 the coordinated helper above holds `write_lock` so an apply's N shard
         // appends are observed ALL-OR-NONE (§3.4 Fix 3): a torn capture would let the
         // MAX watermark ack an apply_epoch not yet durable in every shard it touched →
@@ -23051,7 +23142,7 @@ impl CayenneTableProvider {
             if shard_snapshots.iter().all(|s| !s.has_unsealed_segments()) {
                 drop(guards);
                 drop(owned_capture_write_lock.take());
-                return Ok(0);
+                return Ok(None);
             }
             // Seal each shard's FULL current prefix. After this all-shards-atomic
             // seal every shard's full prefix is durable (its prior-sealed segments by
@@ -23113,24 +23204,40 @@ impl CayenneTableProvider {
                 None,
                 seal_epoch,
             )) {
-                Ok(g) => Some((g.id, g.shard_snapshots.clone(), g.relative_counts.clone(), g.epoch)),
+                Ok(g) => Some(SealDrainClaim {
+                    id: g.id,
+                    shard_snapshots: g.shard_snapshots.clone(),
+                    sealed_through: g.relative_counts.clone(),
+                    seal_epoch: g.epoch,
+                }),
                 Err(_) => None,
             }
         };
-        let Some((id, shard_snapshots, sealed_through, seal_epoch)) = claim else {
+        let Some(claim) = claim else {
             return Err(Error::Internal {
                 table: self.table_metadata.table_name.clone(),
                 message: "mem-tier drain ledger rejected the initial seal freeze (depth bound broken)"
                     .to_string(),
             });
         };
-        // Armed cleanup for this frozen generation, addressed by its id (identity-aware
-        // at D>1).
+        Ok(Some(claim))
+    }
+
+    /// Run the off-lock SEAL drain for a claimed frozen generation: arm the abort guard
+    /// (addressed by its id, identity-aware at `D > 1`) and drive the seal (build union
+    /// delta → durable shadow → mark boundary → ack → reclaim) on the claimed immutable
+    /// working copy. At `D = 1` the caller invokes this INLINE while still holding
+    /// `mem_checkpoint_lock` (byte-identical to the pre-split body); Step 3b-b invokes it
+    /// as the body of a detached `tokio::spawn` after releasing the lock. The seal
+    /// counterpart of [`Self::run_checkpoint_drain`].
+    async fn run_seal_drain(&self, claim: SealDrainClaim) -> Result<u64> {
+        let SealDrainClaim {
+            id,
+            shard_snapshots,
+            sealed_through,
+            seal_epoch,
+        } = claim;
         let mut drain_cleanup = DrainCleanup::armed(&self.drain_ledger, id);
-        // Drive the off-lock seal drain (build union delta → durable shadow → mark
-        // boundary → ack → reclaim) on the claimed immutable working copy. At D=1 this
-        // runs INLINE under `mem_checkpoint_lock` (byte-identical to the pre-3a body);
-        // Step 3b spawns it after releasing the lock so the next freeze overlaps it.
         self.drain_seal_generation(id, shard_snapshots, sealed_through, seal_epoch, &mut drain_cleanup)
             .await
     }
@@ -23791,7 +23898,7 @@ impl CayenneTableProvider {
         // range `[sequence_number, sequence_number]` — every file here was
         // written by this one commit — BEFORE it becomes visible below. Same
         // gap and same fix as `write_new_snapshot_after_validation` and
-        // `checkpoint_mem_tier_inner`: this inline-checkpoint-flush path
+        // `drain_checkpoint_generation`: this inline-checkpoint-flush path
         // authored no manifest at all, so a `scan_from_manifest` table (no
         // directory-LIST fallback) would silently never see the flushed rows.
         // Only attempted (and only a hard failure) when the table actually
@@ -34007,7 +34114,7 @@ mod tests {
 
         // The checkpoint encodes one file per shard with a NON-EMPTY captured
         // prefix — mirrors the `shard.is_empty() || shard.segments.is_empty()`
-        // skip in `checkpoint_mem_tier_inner`.
+        // skip in `drain_checkpoint_generation`.
         let non_empty_shards = (0..n)
             .filter(|&s| {
                 let tier = provider.mem_tier.shard(s).load();
@@ -41397,16 +41504,17 @@ mod tests {
         // needlessly re-encode.
         // This test owns the checkpoint guard directly (modelling an in-flight
         // background op via `in_flight_guard`), so it calls the lock-held body
-        // `checkpoint_mem_tier_inner(None)` rather than the public entry (which would
-        // deadlock re-acquiring the held `mem_checkpoint_lock`). Single-shard (default
-        // `cdc_mem_tier_shards`) means the capture is atomic, so `None` is correct.
+        // `checkpoint_mem_tier_holding_locks()` (capture+freeze with `None` then the
+        // inline drain) rather than the public entry (which would deadlock re-acquiring
+        // the held `mem_checkpoint_lock`). Single-shard (default `cdc_mem_tier_shards`)
+        // means the capture is atomic, so the `None` write-guard path is correct.
         assert_eq!(
             provider.mem_tier.shard_count(),
             1,
-            "inner(None) here relies on the single-shard (no write_lock) capture path"
+            "holding_locks here relies on the single-shard (no write_lock) capture path"
         );
         let flushed = provider
-            .checkpoint_mem_tier_inner(None)
+            .checkpoint_mem_tier_holding_locks()
             .await
             .expect("in-flight checkpoint drains the seed");
         assert_eq!(flushed, 4096, "the in-flight flush drained the seed rows");
