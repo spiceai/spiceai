@@ -2572,6 +2572,31 @@ impl Drop for DrainCleanup<'_> {
     }
 }
 
+/// The claimed, immutable working copy of one frozen CHECKPOINT generation — the
+/// input to the off-lock drain ([`CayenneTableProvider::drain_checkpoint_generation`]).
+/// Owned (not borrowed from the ledger) so the drain reads it entirely off-lock and
+/// so Stage 2b Step 3b can `tokio::spawn` a `'static` task that TAKES it. Read from
+/// the front generation under one brief `drain_ledger` lock right after the freeze
+/// (never held across the encode `.await`s).
+struct CheckpointDrainClaim {
+    /// The captured per-shard snapshots (whole live `segments` as of freeze).
+    shard_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>>,
+    /// Per-shard freeze-time resident-prefix offset — the base of this generation's
+    /// encode window. `[0; n]` at `D = 1` (empty ledger at freeze), so the window is
+    /// the whole captured snapshot and the encode is byte-identical.
+    window_base: Vec<usize>,
+    /// Per-shard own window length `N_G` (= absolute segment count − `window_base`).
+    /// Drives BOTH the encode window (`window_view(base, N_G)`) and the publish
+    /// `retain_after` front-clear (ordered oldest-first, so the live tier's front at
+    /// publish IS this window).
+    relative_counts: Vec<usize>,
+    /// The reserved snapshot sequence (`None` for the empty / position-based capture).
+    reserved_snapshot_sequence: Option<i64>,
+    /// The durable epoch this generation acks at publish (min-across-in-flight; the
+    /// sole in-flight generation at `D = 1`).
+    flushed_epoch: u64,
+}
+
 impl CayenneTableProvider {
     pub(crate) fn metadata_catalog(&self) -> &Arc<dyn MetadataCatalog> {
         &self.catalog
@@ -22247,28 +22272,45 @@ impl CayenneTableProvider {
         // no second concurrent freeze can exist. `DrainCleanup` discards the generation
         // on any early `?`/panic before reclaim, so the next serialized freeze starts
         // on an empty ledger. Behavior is byte-identical to the pre-2b capture.
-        debug_assert!(
-            self.drain_ledger.lock().is_empty(),
-            "D=1 drain ledger must be empty before a checkpoint freeze (freezes serialized by mem_checkpoint_lock)"
-        );
-        if self
-            .drain_ledger
-            .lock()
-            .freeze(FrozenGeneration::freeze(
-                shard_snapshots,
-                flushed_counts,
-                reserved_snapshot_sequence,
-                flushed_epoch,
-            ))
-            .is_err()
-        {
+        // Compute the encode WINDOW GEOMETRY under the ledger lock: the window base
+        // is Σ of the older still-resident generations' relative counts
+        // (`resident_prefix_counts`), and this generation's own relative count is
+        // `absolute − base` per shard. At D=1 the ledger is empty ⇒ base = `[0; n]` ⇒
+        // relative = the absolute `flushed_counts` ⇒ `window_view(0, len)` is the
+        // whole snapshot ⇒ byte-identical. The base + relative are recorded on the
+        // generation so the drain windows its captured snapshot to ONLY its own rows
+        // (the D>1 double-count fix) and clears exactly its own front prefix.
+        let rejected = {
+            let mut ledger = self.drain_ledger.lock();
+            debug_assert!(
+                ledger.is_empty(),
+                "D=1 drain ledger must be empty before a checkpoint freeze (freezes serialized by mem_checkpoint_lock)"
+            );
+            let window_base = ledger.resident_prefix_counts(n);
+            let relative_counts: Vec<usize> = flushed_counts
+                .iter()
+                .zip(window_base.iter())
+                .map(|(&absolute, &base)| absolute.saturating_sub(base))
+                .collect();
+            let admitted = ledger
+                .freeze(FrozenGeneration::freeze(
+                    shard_snapshots,
+                    window_base,
+                    relative_counts,
+                    reserved_snapshot_sequence,
+                    flushed_epoch,
+                ))
+                .is_ok();
+            debug_assert!(!admitted || ledger.depth() == 1);
+            !admitted
+        };
+        if rejected {
             return Err(Error::Internal {
                 table: self.table_metadata.table_name.clone(),
                 message: "mem-tier drain ledger rejected the initial checkpoint freeze (D=1 invariant broken)"
                     .to_string(),
             });
         }
-        debug_assert_eq!(self.drain_ledger.lock().depth(), 1);
         // Armed cleanup for the frozen generation: the happy paths reclaim + disarm
         // explicitly below; an early `?`/panic drops this guard, discarding the
         // stranded generation so the D=1 depth bound never blocks the next freeze.
@@ -22279,16 +22321,13 @@ impl CayenneTableProvider {
         // — the inline D=1 drain uses the same seam so the shapes converge. The `else`
         // is unreachable (the freeze above admitted the generation and `mem_checkpoint_lock`
         // bars a concurrent drain), but return a typed error rather than panic.
-        let Some((shard_snapshots, flushed_counts, reserved_snapshot_sequence, flushed_epoch)) =
-            self.with_front_generation(|g| {
-                (
-                    g.shard_snapshots.clone(),
-                    g.relative_counts.clone(),
-                    g.reserved_seq,
-                    g.epoch,
-                )
-            })
-        else {
+        let Some(claim) = self.with_front_generation(|g| CheckpointDrainClaim {
+            shard_snapshots: g.shard_snapshots.clone(),
+            window_base: g.window_base.clone(),
+            relative_counts: g.relative_counts.clone(),
+            reserved_snapshot_sequence: g.reserved_seq,
+            flushed_epoch: g.epoch,
+        }) else {
             return Err(Error::Internal {
                 table: self.table_metadata.table_name.clone(),
                 message: "drain ledger empty immediately after a checkpoint freeze".to_string(),
@@ -22300,57 +22339,69 @@ impl CayenneTableProvider {
         // interleaved body. Stage 2b Step 3b `tokio::spawn`s this exact method after
         // releasing the lock, so the next freeze overlaps the drain (the pipelined
         // drain that lifts the `cdc_durability: memory` ceiling).
-        self.drain_checkpoint_generation(
-            shard_snapshots,
-            flushed_counts,
-            reserved_snapshot_sequence,
-            flushed_epoch,
-            checkpoint_start,
-            &mut drain_cleanup,
-        )
-        .await
+        self.drain_checkpoint_generation(claim, checkpoint_start, &mut drain_cleanup)
+            .await
     }
 
     /// The off-lock CHECKPOINT drain (Stage 2b Step 3a): encode the claimed frozen
     /// generation to a durable Vortex snapshot, publish it whole-unit under the
     /// listing fence, advance the source slot to its durable epoch, then reclaim the
     /// generation and disarm `cleanup`. Operates ONLY on the claimed immutable working
-    /// copy (`shard_snapshots` / `flushed_counts` / `reserved_snapshot_sequence` /
-    /// `flushed_epoch`) plus `self` and the shared `drain_ledger`'s front generation —
-    /// it holds NO capture lock. At `D = 1` the caller runs it inline under
-    /// `mem_checkpoint_lock` (byte-identical); Step 3b spawns it as a detached task
-    /// after releasing that lock. `checkpoint_start` is threaded in so the
-    /// `mem_tier_checkpoint` phase metric spans the whole capture+drain exactly as
+    /// copy ([`CheckpointDrainClaim`]) plus `self` and the shared `drain_ledger`'s
+    /// front generation — it holds NO capture lock. At `D = 1` the caller runs it
+    /// inline under `mem_checkpoint_lock` (byte-identical); Step 3b spawns it as a
+    /// detached task after releasing that lock. `checkpoint_start` is threaded in so
+    /// the `mem_tier_checkpoint` phase metric spans the whole capture+drain exactly as
     /// before the extraction.
     async fn drain_checkpoint_generation(
         &self,
-        shard_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>>,
-        flushed_counts: Vec<usize>,
-        reserved_snapshot_sequence: Option<i64>,
-        flushed_epoch: u64,
+        claim: CheckpointDrainClaim,
         checkpoint_start: Instant,
         drain_cleanup: &mut DrainCleanup<'_>,
     ) -> Result<u64> {
+        let CheckpointDrainClaim {
+            shard_snapshots,
+            window_base,
+            relative_counts,
+            reserved_snapshot_sequence,
+            flushed_epoch,
+        } = claim;
         let n = shard_snapshots.len();
-        // Recompute the (union / shard-0) snapshot view from the claimed immutable
-        // shard snapshots — identical to the value the capture computed, since the
-        // same `(shard_snapshots, flushed_counts)` yield the same view. The durable
+        // WINDOW the captured snapshots to ONLY this generation's own segments
+        // (`window_view(base, N_G)`). At D>1 a captured snapshot includes older
+        // still-resident generations' front prefixes, so encoding it whole would
+        // double-count their rows into this file; the window excludes them. At D=1
+        // `window_base = [0; n]` and `relative_counts` are the absolute counts, so
+        // each window is the whole captured snapshot via the full-window fast path —
+        // byte-identical to reading the tier directly. All downstream encode /
+        // snapshot / emptiness reads go through `windows`, and the publish clear drops
+        // exactly the front `relative_counts` (ordered oldest-first, so at publish the
+        // live tier's front IS this window).
+        let windows: Vec<Arc<crate::provider::mem_tier::MemTier>> = shard_snapshots
+            .iter()
+            .zip(window_base.iter())
+            .zip(relative_counts.iter())
+            .map(|((shard, &base), &count)| Arc::new(shard.window_view(base, count)))
+            .collect();
+        // Recompute the (union / shard-0) snapshot view from the windowed snapshots.
+        // Each window's segment count IS its `relative_counts` entry, so the prefix
+        // length for `max_source_position_in_prefix` is `relative_counts`. The durable
         // epoch is already claimed as `flushed_epoch`, so its recomputation is unused.
         let (_durable_epoch, snapshot) =
-            Self::checkpoint_durable_epoch_and_snapshot(n, &shard_snapshots, &flushed_counts);
-        // Emptiness must be judged on the REAL captured shard snapshots, not the
-        // synthetic union view: `union_snapshot_view` carries the cross-shard
-        // tombstone union + the summed byte/row counts but ALWAYS has empty
-        // `segments` (the row-bearing segments are iterated per shard below), so
-        // `snapshot.is_empty()` (segments ∧ tombstones empty) would spuriously
-        // report a pure-insert tier as empty and skip the flush. At N==1
-        // `snapshot` IS shard 0's snapshot, so `is_empty()` there is the
-        // byte-identical pre-shard check; at N>1 a tier is empty only when every
-        // shard is empty.
+            Self::checkpoint_durable_epoch_and_snapshot(n, &windows, &relative_counts);
+        // Emptiness must be judged on the WINDOWED snapshots, not the synthetic union
+        // view: `union_snapshot_view` carries the cross-shard tombstone union + the
+        // summed byte/row counts but ALWAYS has empty `segments` (the row-bearing
+        // segments are iterated per window below), so `snapshot.is_empty()` (segments
+        // ∧ tombstones empty) would spuriously report a pure-insert tier as empty and
+        // skip the flush. At N==1 `snapshot` IS window 0, so `is_empty()` there is the
+        // byte-identical pre-shard check; at N>1 a generation is empty only when every
+        // window is empty. (Judging on the raw captured snapshots would be wrong at
+        // D>1 — an empty window over a non-empty older prefix would report non-empty.)
         let nothing_to_flush = if n == 1 {
             snapshot.is_empty()
         } else {
-            shard_snapshots.iter().all(|s| s.is_empty())
+            windows.iter().all(|w| w.is_empty())
         };
         if nothing_to_flush {
             // The tier is fully empty — every epoch ever appended has already
@@ -22381,11 +22432,11 @@ impl CayenneTableProvider {
         // groups concatenate, each shard applying its OWN tombstones (§2.3e). At N==1
         // this is exactly `[visible_mem_tier_batches(shard 0)]`.
         let mut shard_groups: Vec<Vec<RecordBatch>> = Vec::new();
-        for shard in &shard_snapshots {
-            if shard.is_empty() || shard.segments.is_empty() {
+        for window in &windows {
+            if window.is_empty() || window.segments.is_empty() {
                 continue;
             }
-            let group = self.visible_mem_tier_batches(shard, None)?;
+            let group = self.visible_mem_tier_batches(window, None)?;
             if !group.is_empty() {
                 shard_groups.push(group);
             }
@@ -22455,7 +22506,7 @@ impl CayenneTableProvider {
                 self.commit_on_conflict_publish(update, None).await;
                 // All-shards clear (acquires each shard's publish lock itself).
                 self.clear_flushed_mem_tier_state_all_shards(
-                    &flushed_counts,
+                    &relative_counts,
                     !inlined_view.is_empty()
                         || self
                             .mem_tier_shadow_present
@@ -22470,7 +22521,7 @@ impl CayenneTableProvider {
                 // There is no durable state to publish here, so no listing fence is
                 // needed.
                 self.clear_flushed_mem_tier_state_all_shards(
-                    &flushed_counts,
+                    &relative_counts,
                     !inlined_view.is_empty()
                         || self
                             .mem_tier_shadow_present
@@ -22562,7 +22613,7 @@ impl CayenneTableProvider {
             // publish lock") unconditional. Lock order: fence (outer) → publish
             // (inner), same as phase 2.
             self.clear_flushed_mem_tier_state_all_shards(
-                &flushed_counts,
+                &relative_counts,
                 !inlined_view.is_empty()
                     || self
                         .mem_tier_shadow_present
@@ -22723,7 +22774,7 @@ impl CayenneTableProvider {
                         .await?;
                 }
                 self.clear_flushed_mem_tier_state_all_shards(
-                    &flushed_counts,
+                    &relative_counts,
                     !inlined_view.is_empty()
                         || self
                             .mem_tier_shadow_present
@@ -22967,28 +23018,38 @@ impl CayenneTableProvider {
         // below. The freeze is race-free (Step 1b serializes every freeze on
         // `mem_checkpoint_lock`); the `DrainCleanup` guard discards the generation on
         // any early `?`/panic before reclaim. Byte-identical to the pre-2b seal.
-        debug_assert!(
-            self.drain_ledger.lock().is_empty(),
-            "D=1 drain ledger must be empty before a seal freeze (freezes serialized by mem_checkpoint_lock)"
-        );
-        if self
-            .drain_ledger
-            .lock()
-            .freeze(FrozenGeneration::freeze(
-                shard_snapshots,
-                sealed_through,
-                None,
-                seal_epoch,
-            ))
-            .is_err()
-        {
+        // The seal records `sealed_through` (the absolute per-shard boundary) as its
+        // `relative_counts` — it marks the boundary rather than windowing an encode,
+        // so `window_base` is inert for the seal (the shadow reads `unsealed_view`,
+        // not a window). At D=1 `resident_prefix_counts` is `[0; n]` (empty ledger);
+        // D>1 seal composition is deferred to Step 3b (seal single-ordered per the
+        // drain-serialization audit).
+        let rejected = {
+            let mut ledger = self.drain_ledger.lock();
+            debug_assert!(
+                ledger.is_empty(),
+                "D=1 drain ledger must be empty before a seal freeze (freezes serialized by mem_checkpoint_lock)"
+            );
+            let window_base = ledger.resident_prefix_counts(n);
+            let admitted = ledger
+                .freeze(FrozenGeneration::freeze(
+                    shard_snapshots,
+                    window_base,
+                    sealed_through,
+                    None,
+                    seal_epoch,
+                ))
+                .is_ok();
+            debug_assert!(!admitted || ledger.depth() == 1);
+            !admitted
+        };
+        if rejected {
             return Err(Error::Internal {
                 table: self.table_metadata.table_name.clone(),
                 message: "mem-tier drain ledger rejected the initial seal freeze (D=1 invariant broken)"
                     .to_string(),
             });
         }
-        debug_assert_eq!(self.drain_ledger.lock().depth(), 1);
         let mut drain_cleanup = DrainCleanup::armed(&self.drain_ledger);
         // CLAIM a working copy of the captured immutable state for the off-lock shadow
         // write, read under a brief `drain_ledger` lock (never held across the durable

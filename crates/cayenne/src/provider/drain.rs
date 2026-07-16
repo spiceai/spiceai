@@ -126,9 +126,21 @@ pub(crate) struct FrozenGeneration {
     /// (never the live tier) for the off-lock encode/commit, so a post-freeze append
     /// to the live tier cannot tear this generation.
     pub(crate) shard_snapshots: Vec<Arc<MemTier>>,
-    /// The **relative** front segment-count `N_G` per shard (the checkpoint's
-    /// `flushed_counts` / the seal's `sealed_through`). Publish removes exactly this
-    /// many front segments per shard; seal marks the boundary at it.
+    /// The per-shard **window base**: the freeze-time resident-prefix offset into
+    /// the captured snapshot (Σ of the older still-resident generations' relative
+    /// counts, from [`FrozenDrainLedger::resident_prefix_counts`]). A checkpoint
+    /// encodes ONLY `segments[base..base + N_G)` of its captured snapshot, so a
+    /// newer generation never re-bakes an older still-resident generation's front
+    /// prefix (the D>1 double-count fix). `[0; n]` at `D = 1` (the ledger is empty at
+    /// freeze), so the window is the whole snapshot and the encode is byte-identical.
+    /// The seal path leaves this at the freeze-time base but does not window (it
+    /// shadows the active piece via [`MemTier::unsealed_view`]).
+    pub(crate) window_base: Vec<usize>,
+    /// The **relative** front segment-count `N_G` per shard (the checkpoint's window
+    /// length = absolute segment count − [`Self::window_base`]; the seal's
+    /// `sealed_through` boundary). Publish removes exactly this many front segments
+    /// per shard via `retain_after` (ordered oldest-first, so at publish the live
+    /// tier's front IS this generation's window); seal marks the boundary at it.
     pub(crate) relative_counts: Vec<usize>,
     /// The reserved snapshot/seal sequence. Known at freeze for the checkpoint
     /// (reserved under the capture locks); stamped after freeze for the seal
@@ -148,6 +160,7 @@ impl FrozenGeneration {
     #[must_use]
     pub(crate) fn freeze(
         shard_snapshots: Vec<Arc<MemTier>>,
+        window_base: Vec<usize>,
         relative_counts: Vec<usize>,
         reserved_seq: Option<i64>,
         epoch: u64,
@@ -157,8 +170,14 @@ impl FrozenGeneration {
             relative_counts.len(),
             "a frozen generation captures one relative front-count per shard snapshot"
         );
+        debug_assert_eq!(
+            shard_snapshots.len(),
+            window_base.len(),
+            "a frozen generation captures one window base per shard snapshot"
+        );
         Self {
             shard_snapshots,
+            window_base,
             relative_counts,
             reserved_seq,
             epoch,
@@ -216,6 +235,27 @@ impl FrozenDrainLedger {
             generations: VecDeque::with_capacity(max_depth),
             max_depth,
         }
+    }
+
+    /// The per-shard sum of the relative front-counts of every currently-resident
+    /// generation — the **window base** a newly frozen generation starts at. Freeze
+    /// captures the whole live `segments`, so the front `resident_prefix_counts`
+    /// segments already belong to older still-resident generations; the new freeze
+    /// owns `segments[base..]`, i.e. its own relative count is
+    /// `segments.len() − base[shard]`. An EMPTY ledger yields an all-zero base ⇒ the
+    /// freeze's relative counts equal its absolute segment counts (byte-identical at
+    /// `D = 1`, where every prior drain reclaimed before the next freeze). Returns a
+    /// `Vec` of length `n` (the shard count) because an empty ledger carries no
+    /// generation to infer the fan-out from.
+    #[must_use]
+    pub(crate) fn resident_prefix_counts(&self, n: usize) -> Vec<usize> {
+        let mut base = vec![0usize; n];
+        for generation in &self.generations {
+            for (b, c) in base.iter_mut().zip(generation.relative_counts.iter()) {
+                *b = b.saturating_add(*c);
+            }
+        }
+        base
     }
 
     /// Admit a frozen generation at the back and return a mutable handle to it (the
@@ -309,7 +349,13 @@ mod tests {
     use super::*;
 
     fn one_shard_gen(epoch: u64) -> FrozenGeneration {
-        FrozenGeneration::freeze(vec![Arc::new(MemTier::empty())], vec![0], Some(7), epoch)
+        FrozenGeneration::freeze(
+            vec![Arc::new(MemTier::empty())],
+            vec![0],
+            vec![0],
+            Some(7),
+            epoch,
+        )
     }
 
     #[test]
@@ -351,7 +397,7 @@ mod tests {
     #[test]
     fn set_reserved_seq_stamps_after_freeze() {
         let mut g =
-            FrozenGeneration::freeze(vec![Arc::new(MemTier::empty())], vec![0], None, 1);
+            FrozenGeneration::freeze(vec![Arc::new(MemTier::empty())], vec![0], vec![0], None, 1);
         assert_eq!(g.reserved_seq, None);
         g.set_reserved_seq(42);
         assert_eq!(g.reserved_seq, Some(42));
@@ -397,6 +443,39 @@ mod tests {
         assert!(ledger.is_empty());
         // Discarding an empty ledger is a no-op (the happy path already reclaimed).
         assert!(ledger.discard_front().is_none());
+    }
+
+    #[test]
+    fn resident_prefix_counts_sum_over_resident_generations() {
+        // Two-shard generations; base composes as the element-wise sum of the
+        // resident generations' relative counts. This is the window-base offset the
+        // NEXT freeze starts at, so its window never re-encodes an older resident
+        // generation's front prefix (the D>1 double-count fix, pure-logic form).
+        let mut ledger = FrozenDrainLedger::new(3);
+        // Empty ledger ⇒ all-zero base (byte-identical at D=1).
+        assert_eq!(ledger.resident_prefix_counts(2), vec![0, 0]);
+
+        let gen_a = FrozenGeneration::freeze(
+            vec![Arc::new(MemTier::empty()), Arc::new(MemTier::empty())],
+            vec![0, 0],
+            vec![2, 1],
+            Some(1),
+            10,
+        );
+        assert!(ledger.freeze(gen_a).is_ok());
+        // Next freeze's base = gen A's relative counts.
+        assert_eq!(ledger.resident_prefix_counts(2), vec![2, 1]);
+
+        let gen_b = FrozenGeneration::freeze(
+            vec![Arc::new(MemTier::empty()), Arc::new(MemTier::empty())],
+            vec![2, 1],
+            vec![3, 4],
+            Some(2),
+            20,
+        );
+        assert!(ledger.freeze(gen_b).is_ok());
+        // Now base = A + B, element-wise.
+        assert_eq!(ledger.resident_prefix_counts(2), vec![5, 5]);
     }
 
     #[test]
