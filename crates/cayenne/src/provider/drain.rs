@@ -836,3 +836,223 @@ mod tests {
         assert!(ledger.is_empty());
     }
 }
+
+// ---------------------------------------------------------------------------
+// loom model-check of the pipelined-drain concurrency invariants (Stage 2b
+// Step 3d). Compiled ONLY under `RUSTFLAGS="--cfg cayenne_loom"`; run with:
+//   RUSTFLAGS="--cfg cayenne_loom" cargo test -p cayenne --lib \
+//     provider::drain::loom_model --release
+//
+// WHY A REDUCED MODEL (not the production code compiled under loom): the
+// production drain orchestration (`table.rs`) is async and built on
+// `tokio::sync::{Semaphore, Notify}` + `tokio::spawn`, none of which loom
+// shims — loom instruments only `std`/`loom` sync primitives + `loom::thread`.
+// So this models the SAME happens-before structure with loom-shimmable
+// analogs, while driving the REAL `FrozenDrainLedger` logic
+// (`freeze` / `reclaim_terminal_prefix_ack` / `discard_from_id` / `front_id` /
+// `is_resident`) so the ordered-publish + min-across-in-flight ack + cascade
+// contracts under test carry NO transcription drift from production:
+//
+//   * `parking_lot::Mutex<FrozenDrainLedger>` (`drain_ledger`)
+//        -> `loom::sync::Mutex<FrozenDrainLedger>`
+//   * `tokio::sync::Notify` (`drain_publish_notify`, the arm-before-check
+//     ordered-publish gate + reclaim/discard `notify_waiters()`)
+//        -> `loom::sync::Condvar` on the ledger mutex — the textbook
+//           lost-wakeup-free "re-check the predicate under the lock in a loop,
+//           notify_all while holding the lock" pattern. This is a faithful and
+//           strictly MORE-conservative analog of the async arm-before-check
+//           idiom: the condvar wait atomically releases the lock and parks, and
+//           the notifier mutates the ledger + signals under that same lock, so
+//           no wakeup can be lost between a waiter's predicate check and its
+//           park (exactly the property `Notified::enable()`-before-check buys
+//           the async gate).
+//   * `tokio::spawn` detached drain            -> `loom::thread::spawn`
+//   * off-lock encode/PUT completing unordered -> a `loom::thread::yield_now()`
+//     scheduling point between freeze and the publish gate
+//
+// Generations carry EMPTY shard vectors: the ledger's ack / cascade / front
+// logic never reads `shard_snapshots` (only `id` / `epoch` / `state`), so a
+// zero-shard generation drives every interleaving under test without
+// constructing a (loom-hostile, Arrow-heavy, atomic-laden) `MemTier`. State
+// spaces are kept SMALL (2-3 generations, one yield point per drain) because
+// loom is exponential in the number of shared-memory operations.
+//
+// NOTE ON miri: the drain path contains NO `unsafe`, raw pointers, `UnsafeCell`,
+// or hand-rolled atomics (unlike the `task_queue` mailbox, whose `AtomicPtr` +
+// `NonNull` baton transit is why that module carries a miri target) — it is all
+// safe Rust over `VecDeque` + a mutex + tokio's `Notify`/`Semaphore`. There is
+// therefore no UB surface for miri to check here; loom fully covers the
+// happens-before invariants and miri is not warranted for Step 3d.
+#[cfg(all(test, cayenne_loom))]
+mod loom_model {
+    use super::{FrozenDrainLedger, FrozenGeneration, GenState};
+    use loom::sync::{Arc, Condvar, Mutex};
+
+    /// A zero-shard frozen generation carrying only the `epoch` (and a dummy
+    /// reserved sequence) — enough to drive the ledger's ack / cascade / front
+    /// logic, which never touches `shard_snapshots`. `id` is assigned by
+    /// `FrozenDrainLedger::freeze` on admission.
+    fn model_gen(epoch: u64) -> FrozenGeneration {
+        FrozenGeneration::freeze(Vec::new(), Vec::new(), Vec::new(), Some(1), epoch)
+    }
+
+    /// The outcome of the modeled ordered-publish gate — the loom analog of the
+    /// production `PublishTurn` enum (which lives in `table.rs` and cannot be
+    /// imported here).
+    #[derive(PartialEq, Eq, Debug)]
+    enum Turn {
+        Ours,
+        Discarded,
+    }
+
+    /// The shared drain state a set of racing drains operate over: the REAL
+    /// ledger under a loom mutex, the condvar that models `drain_publish_notify`,
+    /// and two observation logs the assertions read.
+    struct DrainModel {
+        ledger: Mutex<FrozenDrainLedger>,
+        /// Faithful analog of `drain_publish_notify`: parks a drain until its
+        /// generation is the ledger front (its ordered-publish turn) or it has
+        /// been cascade-discarded.
+        gate: Condvar,
+        /// Generation ids in the order they WON their publish turn — asserted to
+        /// be strictly oldest-first (the ordered-publish invariant).
+        publish_order: Mutex<Vec<u64>>,
+        /// Every non-`None` ack watermark, in the order it was fired — asserted
+        /// monotone non-decreasing (the min-across-in-flight ack invariant).
+        acks: Mutex<Vec<u64>>,
+    }
+
+    impl DrainModel {
+        fn new(ledger: FrozenDrainLedger) -> Arc<Self> {
+            Arc::new(Self {
+                ledger: Mutex::new(ledger),
+                gate: Condvar::new(),
+                publish_order: Mutex::new(Vec::new()),
+                acks: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// The ordered-publish gate (`await_checkpoint_publish_turn` analog):
+        /// park on the condvar until this generation is the front (its turn) or
+        /// no longer resident (cascade-discarded by an older failure). Re-checks
+        /// the predicate under the held ledger lock after every wakeup.
+        fn await_publish_turn(&self, id: u64) -> Turn {
+            let mut ledger = self.ledger.lock().expect("ledger lock");
+            loop {
+                if ledger.front_id() == Some(id) {
+                    return Turn::Ours;
+                }
+                if !ledger.is_resident(id) {
+                    return Turn::Discarded;
+                }
+                ledger = self.gate.wait(ledger).expect("condvar wait");
+            }
+        }
+
+        /// The publish + ordered ack (`publish_generation_and_ack` analog): under
+        /// ONE ledger lock, mark this generation terminal, reclaim the maximal
+        /// contiguous terminal prefix, RECORD the returned watermark, and wake
+        /// parked drains. Notifying under the lock is the lost-wakeup-free condvar
+        /// discipline.
+        ///
+        /// The watermark is recorded INSIDE the critical section, at the reclaim
+        /// point, because that is where the ordered-publish contract's ordering is
+        /// determined — the reclaim-returned sequence under the lock is what must
+        /// be monotone. Production fires the watermark (`fire_slot_advancer`)
+        /// AFTER releasing the ledger lock, so two concurrent drains' fire calls
+        /// can legitimately REORDER (loom surfaced exactly this — an initial model
+        /// that recorded the fire order saw `[20, 10]`). That reorder is benign in
+        /// production and NOT a bug: `fire_slot_advancer` advances
+        /// `last_fired_durable_epoch` with a `fetch_max` (monotone) and then calls
+        /// `SlotAdvancer::on_checkpoint_durable(w)`, which drains the deferred
+        /// committer queue by an ABSOLUTE threshold (`epoch <= w`, FIFO) — so a
+        /// higher watermark fired ahead of a lower one SUBSUMES it and the lower
+        /// fire becomes a no-op. The downstream fire's reorder-safety is modeled
+        /// separately (3d-ii); here we check the reclaim-order contract the ledger
+        /// lock actually guarantees.
+        fn publish_and_ack(&self, id: u64) {
+            let mut ledger = self.ledger.lock().expect("ledger lock");
+            match ledger.generation_mut_by_id(id) {
+                Some(g) => g.transition(GenState::Published),
+                None => panic!("published generation {id} was no longer resident"),
+            }
+            if let Some(epoch) = ledger.reclaim_terminal_prefix_ack() {
+                self.acks.lock().expect("acks lock").push(epoch);
+            }
+            self.gate.notify_all();
+        }
+
+        /// One detached CHECKPOINT drain: encode off-lock (a yield point, so loom
+        /// explores every completion order), claim the bake (`-> Spilling`), wait
+        /// for the ordered-publish turn, then publish + ack. On `Discarded` it
+        /// aborts without publishing (its rows stay live for replay).
+        fn drain_checkpoint(&self, id: u64) {
+            // Encode/PUT overlaps across drains and completes in an arbitrary
+            // order — the whole point of the pipeline. Model that as a scheduling
+            // point before the gate.
+            loom::thread::yield_now();
+            {
+                let mut ledger = self.ledger.lock().expect("ledger lock");
+                match ledger.generation_mut_by_id(id) {
+                    Some(g) => g.transition(GenState::Spilling),
+                    None => panic!("draining generation {id} was no longer resident"),
+                }
+            }
+            match self.await_publish_turn(id) {
+                Turn::Ours => {
+                    self.publish_order.lock().expect("publish_order lock").push(id);
+                    self.publish_and_ack(id);
+                }
+                Turn::Discarded => {
+                    // Abort: no metastore commit, no fence swap, no `retain_after`
+                    // clear — the generation's rows stay live in the tier.
+                }
+            }
+        }
+    }
+
+    /// ORDERED-PUBLISH happens-before (property 1), two generations. Two drains
+    /// race their encode + publish over a shared ledger holding gen 0 (epoch 10)
+    /// ahead of gen 1 (epoch 20). loom explores every interleaving of the two
+    /// drains' encode-completion order against the gate / publish / reclaim /
+    /// notify operations, and checks that NO interleaving lets gen 1 publish
+    /// before gen 0: the publish section (metastore commit → fence swap →
+    /// `retain_after` front-clear → slot ack) runs strictly oldest-first, so the
+    /// win order is [0, 1] and the ack watermark is monotone (10 then 20) in
+    /// EVERY schedule. Gen 1's `retain_after` front-clear is only ever safe once
+    /// it is the front — i.e. once gen 0's front prefix has already been cleared —
+    /// which is exactly what winning-Ours-only-when-front enforces here.
+    #[test]
+    fn ordered_publish_two_generations() {
+        loom::model(|| {
+            let mut ledger = FrozenDrainLedger::new(2);
+            // Freezes are serialized under `mem_checkpoint_lock` in production, so
+            // model them up-front + ordered (ids 0, 1); only the drains race.
+            ledger.freeze(model_gen(10)).ok().expect("freeze gen0");
+            ledger.freeze(model_gen(20)).ok().expect("freeze gen1");
+            let model = DrainModel::new(ledger);
+
+            let m0 = Arc::clone(&model);
+            let d0 = loom::thread::spawn(move || m0.drain_checkpoint(0));
+            let m1 = Arc::clone(&model);
+            let d1 = loom::thread::spawn(move || m1.drain_checkpoint(1));
+            d0.join().expect("drain 0 joins");
+            d1.join().expect("drain 1 joins");
+
+            assert_eq!(
+                *model.publish_order.lock().expect("publish_order"),
+                vec![0, 1],
+                "publish turns must be strictly oldest-first"
+            );
+            assert_eq!(
+                *model.acks.lock().expect("acks"),
+                vec![10, 20],
+                "ack watermark must advance monotonically, one generation at a time"
+            );
+            assert!(
+                model.ledger.lock().expect("ledger").is_empty(),
+                "both generations must be reclaimed"
+            );
+        });
+    }
+}
