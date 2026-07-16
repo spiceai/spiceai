@@ -706,6 +706,8 @@ fn is_vector_search_index(kind: &str) -> bool {
             | "duckdb_vector_index"
             | "elasticsearch_index"
             | "s3_vector_index"
+            | "memory_vector_index"
+            | "CompoundVectorIndex"
             | "ChunkedSearchIndex"
             | "ChunkedVectorIndex"
     )

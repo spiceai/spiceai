@@ -338,6 +338,7 @@ pub async fn try_from_table(
         primary_key,
         compute_query: model,
         dims,
+        similarity: mapping_opts.similarity.clone(),
         source_schema,
         metadata_columns,
         batch_write_rows,

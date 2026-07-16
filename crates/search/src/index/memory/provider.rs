@@ -25,17 +25,25 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, FixedSizeListBuilder, Float32Array, Float32Builder, Float64Array, RecordBatch,
+    Array, ArrayRef, BooleanArray, FixedSizeListBuilder, Float32Array, Float32Builder,
+    Float64Array, RecordBatch,
 };
-use arrow::compute::{SortOptions, concat_batches, sort_to_indices, take};
+use arrow::compute::{SortOptions, concat_batches, filter_record_batch, sort_to_indices, take};
 use arrow_schema::{DataType, Field, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     catalog::{MemTable, Session},
+    common::{
+        Column, DFSchema,
+        tree_node::{Transformed, TreeNode},
+    },
     config::ConfigOptions,
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
-    logical_expr::{ColumnarValue, Expr, ScalarFunctionArgs, ScalarUDFImpl},
+    execution::context::ExecutionProps,
+    logical_expr::{
+        ColumnarValue, Expr, ScalarFunctionArgs, ScalarUDFImpl, TableProviderFilterPushDown,
+    },
     physical_plan::ExecutionPlan,
     scalar::ScalarValue,
 };
@@ -189,6 +197,74 @@ impl MemoryVectorQueryTable {
         RecordBatch::try_new(self.schema(), columns)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
+
+    /// Best-effort application of pushed-down ([`TableProviderFilterPushDown::Inexact`])
+    /// filters, run *before* scoring and top-k truncation so the result is the top-k of
+    /// the filtered rows — matching the filter-aware search of the engine-backed indexes.
+    ///
+    /// A filter that cannot be planned or evaluated here is skipped: `Inexact` pushdown
+    /// keeps a `Filter` node above this scan, so skipping only loses prefiltering, never
+    /// correctness.
+    fn apply_filters(&self, filters: &[Expr], batch: RecordBatch) -> RecordBatch {
+        if filters.is_empty() || batch.num_rows() == 0 {
+            return batch;
+        }
+        let df_schema = match DFSchema::try_from(batch.schema()) {
+            Ok(df_schema) => df_schema,
+            Err(e) => {
+                tracing::trace!(
+                    "memory vector index '{}': not prefiltering pushed-down filters: {e}",
+                    self.index_name
+                );
+                return batch;
+            }
+        };
+        let execution_props = ExecutionProps::new();
+        let mut current = batch;
+        for filter in filters {
+            let mask = unqualify_columns(filter.clone())
+                .and_then(|filter| {
+                    datafusion::physical_expr::create_physical_expr(
+                        &filter,
+                        &df_schema,
+                        &execution_props,
+                    )
+                })
+                .and_then(|physical| physical.evaluate(&current))
+                .and_then(|value| value.into_array(current.num_rows()));
+            let filtered = mask.and_then(|mask| {
+                let mask = mask.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+                    DataFusionError::Internal("filter did not evaluate to a boolean".to_string())
+                })?;
+                filter_record_batch(&current, mask)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+            });
+            match filtered {
+                Ok(filtered) => current = filtered,
+                Err(e) => {
+                    tracing::trace!(
+                        "memory vector index '{}': skipping a pushed-down filter it cannot evaluate: {e}",
+                        self.index_name
+                    );
+                }
+            }
+        }
+        current
+    }
+}
+
+/// Rewrite every column reference in `expr` to be unqualified, so filters pushed down
+/// with a scan qualifier resolve against the store's (unqualified) schema.
+fn unqualify_columns(expr: Expr) -> DataFusionResult<Expr> {
+    expr.transform(|e| {
+        Ok(match e {
+            Expr::Column(column) => {
+                Transformed::yes(Expr::Column(Column::new_unqualified(column.name)))
+            }
+            other => Transformed::no(other),
+        })
+    })
+    .map(|t| t.data)
 }
 
 #[async_trait]
@@ -201,6 +277,32 @@ impl TableProvider for MemoryVectorQueryTable {
         TableType::View
     }
 
+    /// Filters over stored (primary-key / metadata) columns are applied inside [`Self::scan`]
+    /// *before* the top-k truncation, so a filtered search returns the top-k of the rows
+    /// matching the filter — not the filtered remainder of an unfiltered top-k. `Inexact`
+    /// keeps a `Filter` node above the scan, so a filter the scan fails to evaluate is
+    /// still enforced.
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        let stored_schema = self.store.read().stored_schema();
+        Ok(filters
+            .iter()
+            .map(|filter| {
+                let supported = filter.column_refs().iter().all(|column| {
+                    column.name != self.embedding_column_name
+                        && stored_schema.column_with_name(&column.name).is_some()
+                });
+                if supported {
+                    TableProviderFilterPushDown::Inexact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
+    }
+
     async fn scan(
         &self,
         state: &dyn Session,
@@ -211,15 +313,23 @@ impl TableProvider for MemoryVectorQueryTable {
         // Embed before touching the store: the lock is synchronous and must
         // never be held across an await.
         let query = self.query_vector().await?.clone();
-        let batches = self.store.read().batches();
+        let (stored_schema, batches) = {
+            let store = self.store.read();
+            (store.stored_schema(), store.batches())
+        };
 
-        let scored = batches
-            .iter()
-            .filter(|b| b.num_rows() > 0)
-            .map(|b| self.score_batch(b, &query))
-            .collect::<DataFusionResult<Vec<_>>>()?;
-        let combined = concat_batches(&self.schema(), &scored)
-            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        let stored = concat_batches(
+            &stored_schema,
+            batches.iter().filter(|b| b.num_rows() > 0),
+        )
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        // Prefilter before scoring and truncation (see `supports_filters_pushdown`).
+        let stored = self.apply_filters(filters, stored);
+        let combined = if stored.num_rows() == 0 {
+            RecordBatch::new_empty(self.schema())
+        } else {
+            self.score_batch(&stored, &query)?
+        };
 
         // Order by score descending; NULL scores (undefined similarity) last.
         let (score_idx, _) = combined
@@ -248,8 +358,10 @@ impl TableProvider for MemoryVectorQueryTable {
         let sorted = RecordBatch::try_new(self.schema(), sorted_columns)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
 
+        // Filters were already applied above (best-effort) and `Inexact` pushdown keeps a
+        // `Filter` above this scan — the inner `MemTable` ignores filters regardless.
         MemTable::try_new(self.schema(), vec![vec![sorted]])?
-            .scan(state, projection, filters, limit)
+            .scan(state, projection, &[], limit)
             .await
     }
 }
@@ -389,4 +501,158 @@ fn query_vector_scalar(query: &[f32]) -> DataFusionResult<ScalarValue> {
     builder.values().append_slice(query);
     builder.append(true);
     Ok(ScalarValue::FixedSizeList(Arc::new(builder.finish())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::SearchIndex;
+    use crate::index::memory::{MemoryDistanceMetric, MemoryVectorIndex};
+    use crate::metadata::MetadataColumns;
+    use arrow::array::{Int64Array, StringArray};
+    use arrow_schema::Schema;
+    use datafusion::prelude::{SessionContext, col, lit};
+    use llms::embeddings::{Embed, EmbeddingInput};
+
+    /// Maps known strings to fixed vectors so scores are deterministic under
+    /// [`MemoryDistanceMetric::Dot`]: "a" scores 1, "b" scores 2, "c" scores 3
+    /// against the query "q".
+    #[derive(Debug)]
+    struct MapEmbed;
+
+    fn vector_for(text: &str) -> Vec<f32> {
+        let magnitude = match text {
+            "a" => 1.0,
+            "b" => 2.0,
+            "c" => 3.0,
+            _ => 1.0, // the query "q"
+        };
+        vec![magnitude, 0.0, 0.0]
+    }
+
+    #[async_trait]
+    impl Embed for MapEmbed {
+        async fn embed(
+            &self,
+            input: EmbeddingInput,
+        ) -> llms::embeddings::Result<Vec<Vec<f32>>> {
+            match input {
+                EmbeddingInput::String(s) => Ok(vec![vector_for(&s)]),
+                EmbeddingInput::StringArray(v) => Ok(v.iter().map(|s| vector_for(s)).collect()),
+                _ => Ok(vec![]),
+            }
+        }
+    }
+
+    async fn populated_index() -> MemoryVectorIndex {
+        let index = MemoryVectorIndex::try_new(
+            "content".to_string(),
+            vec![Field::new("id", DataType::Int64, false)],
+            MetadataColumns::none(),
+            Arc::new(MapEmbed),
+            3,
+            MemoryDistanceMetric::Dot,
+        )
+        .expect("valid memory index");
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("content", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .expect("valid input batch");
+        index.write(batch).await.expect("write succeeds");
+        index
+    }
+
+    fn query_table(index: &MemoryVectorIndex) -> MemoryVectorQueryTable {
+        MemoryVectorQueryTable::new(
+            "memory_vector_index".to_string(),
+            Arc::clone(&index.store),
+            Arc::new(MapEmbed),
+            "q".to_string(),
+            MemoryDistanceMetric::Dot,
+            3,
+            "content_embedding".to_string(),
+        )
+    }
+
+    async fn scan_ids(
+        table: &MemoryVectorQueryTable,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Vec<i64> {
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let plan = table
+            .scan(&state, None, filters, limit)
+            .await
+            .expect("scan builds");
+        let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .expect("scan executes");
+        let mut ids = vec![];
+        for batch in &batches {
+            let id_col = batch
+                .column_by_name("id")
+                .expect("id column")
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int64 ids");
+            for i in 0..batch.num_rows() {
+                ids.push(id_col.value(i));
+            }
+        }
+        ids
+    }
+
+    #[tokio::test]
+    async fn pushed_filters_apply_before_top_k_truncation() {
+        let index = populated_index().await;
+        let table = query_table(&index);
+
+        // Unfiltered top-1 is the highest-scoring row.
+        assert_eq!(scan_ids(&table, &[], Some(1)).await, vec![3]);
+
+        // A pushed-down filter excludes the top row *before* truncation: the result is
+        // the best of the matching rows, not an empty remainder of an unfiltered top-1.
+        let filter = col("id").lt(lit(3_i64));
+        assert_eq!(scan_ids(&table, &[filter], Some(1)).await, vec![2]);
+    }
+
+    #[tokio::test]
+    async fn unevaluable_pushed_filters_are_skipped_not_fatal() {
+        let index = populated_index().await;
+        let table = query_table(&index);
+
+        // A filter over a column the store does not hold cannot be evaluated; the scan
+        // must skip it (DataFusion re-applies `Inexact` filters above) rather than fail.
+        let filter = col("not_a_column").eq(lit("x"));
+        assert_eq!(scan_ids(&table, &[filter], None).await, vec![3, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn filter_pushdown_supports_only_stored_non_embedding_columns() {
+        let index = populated_index().await;
+        let table = query_table(&index);
+
+        let on_pk = col("id").eq(lit(1_i64));
+        let on_embedding = col("content_embedding").is_not_null();
+        let on_unknown = col("elsewhere").eq(lit(1_i64));
+        let support = table
+            .supports_filters_pushdown(&[&on_pk, &on_embedding, &on_unknown])
+            .expect("pushdown probe succeeds");
+        assert_eq!(
+            support,
+            vec![
+                TableProviderFilterPushDown::Inexact,
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Unsupported,
+            ]
+        );
+    }
 }

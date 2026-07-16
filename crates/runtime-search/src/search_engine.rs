@@ -50,6 +50,7 @@ use runtime_query_engine::query_engine::QueryEngine;
 use runtime_request_context::{AsyncMarker, CacheControl, CacheKeyType, RequestContext};
 use search::index::SearchIndex;
 use search::index::chunking::ChunkedSearchIndex;
+use search::index::compound::CompoundVectorIndex;
 #[cfg(feature = "duckdb")]
 use search::index::duckdb::DuckDBVectorIndex;
 use search::index::native_vector::NativeVectorIndex;
@@ -157,6 +158,13 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
             embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
         }
 
+        if let Some((indexes, _)) = self
+            .explorer
+            .find_index::<CompoundVectorIndex>(&table_provider)
+        {
+            embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
+        }
+
         #[cfg(feature = "elasticsearch")]
         {
             use search::index::elasticsearch::ElasticsearchIndex;
@@ -253,6 +261,14 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
 
         #[cfg(feature = "duckdb")]
         if let Some((indexes, _)) = self.explorer.find_index::<DuckDBVectorIndex>(tbl)
+            && let Some(index) = indexes
+                .into_iter()
+                .find(|idx| idx.search_column() == embedding_column)
+        {
+            return Some(Arc::new(index.clone()) as Arc<dyn SearchIndex>);
+        }
+
+        if let Some((indexes, _)) = self.explorer.find_index::<CompoundVectorIndex>(tbl)
             && let Some(index) = indexes
                 .into_iter()
                 .find(|idx| idx.search_column() == embedding_column)
