@@ -2702,18 +2702,61 @@ enum PublishTurn {
 }
 
 /// Test-only deterministic pause gate for the D>1 detached checkpoint drain (Stage 2b
-/// Step 3b-b). Parks a drain right after it commits to the bake so a test can hold
-/// drain N in flight while it starts freeze N+1, then release both — proving the drains
-/// overlap and the publish is ordered oldest-first. Cloneable so the drain reads it out
-/// from under the `ParkingMutex` without holding the guard across the `.await`.
+/// Step 3b-b). Parks a drain right after it commits to the bake (by generation id) so a
+/// test can hold drain N in flight while it starts freeze N+1 — proving the drains
+/// overlap — and then release parked drains in a CHOSEN order (Step 3b-b-iii) to fuzz
+/// the concurrency against a serial reference. Cloneable so the drain reads it out from
+/// under the `ParkingMutex` without holding the guard across the `.await`.
 #[cfg(test)]
 #[derive(Clone)]
-struct CheckpointDrainGate {
-    /// Incremented by each drain as it reaches the pause; the test waits until this
-    /// equals the number of drains it expects concurrently in flight (proving overlap).
-    parked: Arc<std::sync::atomic::AtomicUsize>,
-    /// Each parked drain awaits one permit here; the test adds permits to release them.
-    release: Arc<tokio::sync::Semaphore>,
+pub(crate) struct CheckpointDrainGate {
+    /// Generation ids that reached the pause, in arrival order (never cleared) — the
+    /// test reads this to observe overlap and to pick a release order.
+    parked: Arc<ParkingMutex<Vec<u64>>>,
+    /// Generation ids the test has released; a parked drain proceeds once its id is in
+    /// this set. Releasing by id is what lets the fuzz choose the encode-start order
+    /// (the publish is always ordered oldest-first by the publish-turn gate regardless).
+    released: Arc<ParkingMutex<std::collections::HashSet<u64>>>,
+    /// Notified whenever `released` grows so parked drains re-check their id.
+    notify: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl CheckpointDrainGate {
+    /// How many drains have reached the pause so far (released or not).
+    fn arrived(&self) -> usize {
+        self.parked.lock().len()
+    }
+
+    /// The arrival-ordered ids of drains that have reached the pause but are not yet
+    /// released.
+    fn pending(&self) -> Vec<u64> {
+        let released = self.released.lock();
+        self.parked
+            .lock()
+            .iter()
+            .copied()
+            .filter(|id| !released.contains(id))
+            .collect()
+    }
+
+    /// Release the parked drain carrying `id` (idempotent).
+    fn release(&self, id: u64) {
+        self.released.lock().insert(id);
+        self.notify.notify_waiters();
+    }
+
+    /// Release every drain that has reached the pause so far.
+    fn release_all_parked(&self) {
+        let ids: Vec<u64> = self.parked.lock().clone();
+        {
+            let mut released = self.released.lock();
+            for id in ids {
+                released.insert(id);
+            }
+        }
+        self.notify.notify_waiters();
+    }
 }
 
 impl CayenneTableProvider {
@@ -3067,34 +3110,40 @@ impl CayenneTableProvider {
     }
 
     /// Test-only: install a pause gate so each subsequent detached checkpoint drain
-    /// parks (after committing to the bake) until the test releases it. Returns the
-    /// `parked` counter (drains reaching the pause) and the `release` semaphore (add
-    /// permits to let parked drains proceed), so a test can prove drains OVERLAP.
+    /// parks by generation id (after committing to the bake) until the test releases
+    /// that id. Returns the (cloneable) gate handle — `arrived`/`pending` observe the
+    /// parked drains, `release(id)`/`release_all_parked()` let them proceed — so a test
+    /// can prove drains OVERLAP and release them in a chosen order.
     #[cfg(test)]
-    pub(crate) fn install_checkpoint_drain_gate_for_test(
-        &self,
-    ) -> (Arc<std::sync::atomic::AtomicUsize>, Arc<tokio::sync::Semaphore>) {
-        let parked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let release = Arc::new(tokio::sync::Semaphore::new(0));
-        *self.checkpoint_drain_gate.lock() = Some(CheckpointDrainGate {
-            parked: Arc::clone(&parked),
-            release: Arc::clone(&release),
-        });
-        (parked, release)
+    pub(crate) fn install_checkpoint_drain_gate_for_test(&self) -> CheckpointDrainGate {
+        let gate = CheckpointDrainGate {
+            parked: Arc::new(ParkingMutex::new(Vec::new())),
+            released: Arc::new(ParkingMutex::new(std::collections::HashSet::new())),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        };
+        *self.checkpoint_drain_gate.lock() = Some(gate.clone());
+        gate
     }
 
     /// Test-only pause point in the detached checkpoint drain: if a gate is installed,
-    /// record arrival and wait for a release permit. No-op (default / production) when
-    /// no gate is installed. Reads the gate out from under its `ParkingMutex` so no
-    /// guard is held across the `.await` (the sync-substrate invariant).
+    /// record this generation's arrival (by id) and wait until the test releases that
+    /// id. No-op (default / production) when no gate is installed. Reads the gate out
+    /// from under its `ParkingMutex` so no guard is held across the `.await` (the
+    /// sync-substrate invariant); the wait arms the `Notified` before re-checking so a
+    /// release racing the check is not lost (the standard tokio idiom).
     #[cfg(test)]
-    async fn checkpoint_drain_pause_point(&self) {
+    async fn checkpoint_drain_pause_point(&self, id: u64) {
         let gate = self.checkpoint_drain_gate.lock().clone();
         if let Some(gate) = gate {
-            gate.parked.fetch_add(1, Ordering::Relaxed);
-            // `forget` the permit so `add_permits(k)` releases exactly `k` parked drains.
-            if let Ok(permit) = gate.release.acquire().await {
-                permit.forget();
+            gate.parked.lock().push(id);
+            loop {
+                let notified = gate.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if gate.released.lock().contains(&id) {
+                    return;
+                }
+                notified.await;
             }
         }
     }
@@ -22894,7 +22943,7 @@ impl CayenneTableProvider {
         // test can start freeze N+1 while drain N is here, proving overlap. No-op in
         // production (no gate installed).
         #[cfg(test)]
-        self.checkpoint_drain_pause_point().await;
+        self.checkpoint_drain_pause_point(id).await;
         let inlined_view = self.cached_inlined_view().await?;
         // The inline removal map is the WHOLE-TIER tombstone union (carried on
         // `snapshot.tombstones` — shard 0's at N==1, the cross-shard union at N>1),
@@ -32019,7 +32068,6 @@ mod tests {
     /// append stays synchronous — only the checkpoint drain pipelines.
     #[tokio::test]
     async fn stage2b_d2_detached_checkpoint_drains_overlap_and_publish_ordered() {
-        use std::sync::atomic::Ordering as AtomicOrdering;
 
         struct AckRecorder(Arc<ParkingMutex<Vec<u64>>>);
         #[async_trait::async_trait]
@@ -32075,7 +32123,7 @@ mod tests {
         let acks = Arc::new(ParkingMutex::new(Vec::<u64>::new()));
         provider.install_slot_advancer(Arc::new(AckRecorder(Arc::clone(&acks))));
         provider.set_drain_pipeline_depth_for_test(2);
-        let (parked, release) = provider.install_checkpoint_drain_gate_for_test();
+        let gate = provider.install_checkpoint_drain_gate_for_test();
 
         // Burst 1 → freeze gen0 → detach → drain0 parks in flight (Spilling).
         let a1 = int64_id_batch(&[1, 2, 3]);
@@ -32088,10 +32136,7 @@ mod tests {
             .checkpoint_mem_tier()
             .await
             .expect("freeze + detach gen0");
-        wait_until("drain0 parked", || {
-            parked.load(AtomicOrdering::Relaxed) >= 1
-        })
-        .await;
+        wait_until("drain0 parked", || gate.arrived() >= 1).await;
 
         // Burst 2 → freeze gen1 WHILE drain0 is parked (the OVERLAP) → detach → parks.
         let a2 = int64_id_batch(&[4, 5]);
@@ -32104,10 +32149,7 @@ mod tests {
             .checkpoint_mem_tier()
             .await
             .expect("freeze + detach gen1");
-        wait_until("both drains parked", || {
-            parked.load(AtomicOrdering::Relaxed) >= 2
-        })
-        .await;
+        wait_until("both drains parked", || gate.arrived() >= 2).await;
         assert_eq!(
             provider.drain_ledger.lock().depth(),
             2,
@@ -32115,7 +32157,7 @@ mod tests {
         );
 
         // Release both; the ordered-publish gate must sweep gen0 before gen1.
-        release.add_permits(2);
+        gate.release_all_parked();
         wait_until("ledger drained", || {
             provider.drain_ledger.lock().is_empty()
         })
@@ -33593,7 +33635,7 @@ mod tests {
         let acked_after_seed = durable.load(AtomicOrdering::SeqCst);
 
         provider.set_drain_pipeline_depth_for_test(2);
-        let (parked, release) = provider.install_checkpoint_drain_gate_for_test();
+        let gate = provider.install_checkpoint_drain_gate_for_test();
 
         // Freeze gen0 over [4,5] and gen1 over [6,7]; both detach and park at the pause
         // (in flight, overlapping). The mem-tier append stays synchronous.
@@ -33602,13 +33644,13 @@ mod tests {
             .await
             .expect("append [4,5]");
         provider.checkpoint_mem_tier().await.expect("freeze + detach gen0");
-        wait_until("gen0 parked", || parked.load(AtomicOrdering::Relaxed) >= 1).await;
+        wait_until("gen0 parked", || gate.arrived() >= 1).await;
         let _ = provider
             .write_cdc_append_stream(single_batch_stream(int64_id_batch(&[6, 7])), &ctx.task_ctx())
             .await
             .expect("append [6,7]");
         provider.checkpoint_mem_tier().await.expect("freeze + detach gen1");
-        wait_until("both parked", || parked.load(AtomicOrdering::Relaxed) >= 2).await;
+        wait_until("both parked", || gate.arrived() >= 2).await;
         assert_eq!(
             provider.drain_ledger.lock().depth(),
             2,
@@ -33619,7 +33661,7 @@ mod tests {
         // it after its encode, at its ordered-publish turn. Release both; gen0 faults
         // and cascade-discards gen1 (which aborts at the publish gate).
         provider.arm_checkpoint_spill_fault();
-        release.add_permits(2);
+        gate.release_all_parked();
         wait_until("ledger drained by the cascade", || {
             provider.drain_ledger.lock().is_empty()
         })
@@ -33639,11 +33681,12 @@ mod tests {
 
         // No strand: the next checkpoint's freeze admits into the (now empty) ledger and
         // drains the whole live tail. Release its single detached drain through the gate.
-        release.add_permits(1);
         provider
             .checkpoint_mem_tier()
             .await
             .expect("post-cascade checkpoint freezes + detaches");
+        wait_until("retry parked", || gate.arrived() >= 3).await;
+        gate.release_all_parked();
         wait_until("retry drained", || provider.drain_ledger.lock().is_empty()).await;
         assert_eq!(
             scan_sorted_ids(&provider).await,
@@ -33697,23 +33740,23 @@ mod tests {
         let acked_after_seed = durable.load(AtomicOrdering::SeqCst);
 
         provider.set_drain_pipeline_depth_for_test(2);
-        let (parked, release) = provider.install_checkpoint_drain_gate_for_test();
+        let gate = provider.install_checkpoint_drain_gate_for_test();
 
         let _ = provider
             .write_cdc_append_stream(single_batch_stream(int64_id_batch(&[4, 5])), &ctx.task_ctx())
             .await
             .expect("append [4,5]");
         provider.checkpoint_mem_tier().await.expect("freeze + detach gen0");
-        wait_until("gen0 parked", || parked.load(AtomicOrdering::Relaxed) >= 1).await;
+        wait_until("gen0 parked", || gate.arrived() >= 1).await;
         let _ = provider
             .write_cdc_append_stream(single_batch_stream(int64_id_batch(&[6, 7])), &ctx.task_ctx())
             .await
             .expect("append [6,7]");
         provider.checkpoint_mem_tier().await.expect("freeze + detach gen1");
-        wait_until("both parked", || parked.load(AtomicOrdering::Relaxed) >= 2).await;
+        wait_until("both parked", || gate.arrived() >= 2).await;
 
         provider.arm_checkpoint_spill_fault();
-        release.add_permits(2);
+        gate.release_all_parked();
         wait_until("ledger drained by the cascade", || {
             provider.drain_ledger.lock().is_empty()
         })
@@ -33777,7 +33820,6 @@ mod tests {
     /// the overlap. Config keeps `D = 1`; `D = 2` is the test-only override.
     #[tokio::test]
     async fn stage2b_d2_seal_quiesces_behind_a_resident_checkpoint() {
-        use std::sync::atomic::Ordering as AtomicOrdering;
 
         async fn wait_until(label: &str, cond: impl Fn() -> bool) {
             for _ in 0..2000 {
@@ -33808,7 +33850,7 @@ mod tests {
             .expect("seed append");
         provider.checkpoint_mem_tier().await.expect("seed checkpoint");
         provider.set_drain_pipeline_depth_for_test(2);
-        let (parked, release) = provider.install_checkpoint_drain_gate_for_test();
+        let gate = provider.install_checkpoint_drain_gate_for_test();
 
         // gen0 freezes over [4,5] and parks in flight (holding one of the two permits).
         let _ = provider
@@ -33816,7 +33858,7 @@ mod tests {
             .await
             .expect("append [4,5]");
         provider.checkpoint_mem_tier().await.expect("freeze + detach gen0");
-        wait_until("gen0 parked", || parked.load(AtomicOrdering::Relaxed) >= 1).await;
+        wait_until("gen0 parked", || gate.arrived() >= 1).await;
         // A LATER burst [6,7] lands in the tier while gen0 is still resident. gen0's
         // window is fixed at [4,5]; [6,7] is beyond it.
         let _ = provider
@@ -33842,7 +33884,7 @@ mod tests {
 
         // Release gen0: it publishes [4,5], clears the front, reclaims, frees its permit.
         // The seal's barrier then acquires both permits and captures ONLY [6,7].
-        release.add_permits(1);
+        gate.release_all_parked();
         let sealed_rows = seal
             .await
             .expect("seal task joins")
@@ -33875,6 +33917,225 @@ mod tests {
         let mut deduped = ids.clone();
         deduped.dedup();
         assert_eq!(ids, deduped, "no primary key recovered twice");
+    }
+
+    /// Stage 2b Step 3b-b-iii — EXHAUSTIVE D>1 concurrency fuzz. For each workload
+    /// (insert-only, cross-window deletes, delete-then-reinsert-across-windows) and
+    /// EVERY release order of its `K = 3` generations, the D>1 pipelined drain must
+    /// produce the SAME durable scan and the SAME final slot ack as a D=1 SERIAL
+    /// reference over the identical bursts, with a strictly monotone ack watermark and a
+    /// durable-across-reopen result (no resurrection, no loss, no double-count). This is
+    /// the live-concurrency analogue of the pure-ledger
+    /// `reclaim_terminal_prefix_ack_min_across_all_publish_orders` + the `window_view`
+    /// composition fuzz: the encode-start order varies (released in a chosen order via
+    /// the per-id gate), but the publish is always ordered oldest-first, so the durable
+    /// outcome is invariant. Cross-window tombstones (a delete in a younger generation
+    /// of a key a published older generation owns) are resolved by the tier-blind,
+    /// sequence-ordered deletion index committed oldest-first — the reason windowing the
+    /// encode never reintroduces the Model-A resurrection. Config keeps `D = 1`; `D = 3`
+    /// is the test-only override; the mem-tier append stays synchronous.
+    #[tokio::test]
+    async fn stage2b_d3_concurrent_drain_fuzz_matches_serial_reference() {
+        const K: usize = 3;
+
+        struct AckRecorder(Arc<ParkingMutex<Vec<u64>>>);
+        #[async_trait::async_trait]
+        impl crate::provider::mem_tier::SlotAdvancer for AckRecorder {
+            async fn on_checkpoint_durable(&self, durable_epoch: u64) {
+                self.0.lock().push(durable_epoch);
+            }
+        }
+
+        async fn wait_until(label: &str, cond: impl Fn() -> bool) {
+            for _ in 0..2000 {
+                if cond() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            panic!("condition '{label}' not met within timeout");
+        }
+
+        // Apply one burst (insert `inserts`, tombstone the already-live `deletes`) to
+        // the RAM tier — the SAME primitive for the reference and the pipeline, so the
+        // only variable is the drain concurrency. Inserts and deletes are disjoint per
+        // burst (a delete targets an EARLIER burst's key => a cross-window tombstone).
+        async fn apply_burst(p: &CayenneTableProvider, inserts: &[i64], deletes: &[i64]) {
+            let batch = int64_id_batch(inserts);
+            let bytes = batch.get_array_memory_size() as u64;
+            let deletions = OnConflictDeletions {
+                deleted_inlined_pk_i64: deletes.to_vec(),
+                ..OnConflictDeletions::default()
+            };
+            p.append_to_mem_tier(vec![batch], &deletions, bytes, deletes.len() as u64)
+                .await
+                .expect("apply burst");
+        }
+
+        // Factorial-indexed permutation of 0..n (same shape as the ledger fuzz).
+        fn permutation(mut rank: usize, n: usize) -> Vec<usize> {
+            let mut items: Vec<usize> = (0..n).collect();
+            let mut out = Vec::with_capacity(n);
+            let mut divisor: usize = (1..=n).product();
+            for k in (1..=n).rev() {
+                divisor /= k;
+                let idx = rank / divisor;
+                rank %= divisor;
+                out.push(items.remove(idx));
+            }
+            out
+        }
+
+        // A fuzz workload: `bursts` is K (inserts, deletes) pairs — one generation each.
+        // Inserts/deletes are disjoint per burst and a delete targets an earlier burst's
+        // key (a cross-window tombstone). `expected` is the hand-computed live set.
+        struct Workload {
+            name: &'static str,
+            bursts: Vec<(Vec<i64>, Vec<i64>)>,
+            expected: Vec<i64>,
+        }
+
+        let workloads = vec![
+            Workload {
+                name: "insert_only",
+                bursts: vec![
+                    (vec![1, 2], vec![]),
+                    (vec![3, 4], vec![]),
+                    (vec![5, 6], vec![]),
+                ],
+                expected: vec![1, 2, 3, 4, 5, 6],
+            },
+            Workload {
+                name: "cross_window_deletes",
+                bursts: vec![
+                    (vec![1, 2, 3], vec![]),
+                    (vec![4, 5], vec![1]),
+                    (vec![6], vec![4]),
+                ],
+                expected: vec![2, 3, 5, 6],
+            },
+            Workload {
+                name: "delete_then_reinsert",
+                bursts: vec![
+                    (vec![1, 2], vec![]),
+                    (vec![3], vec![1]),
+                    (vec![1, 4], vec![]),
+                ],
+                expected: vec![1, 2, 3, 4],
+            },
+        ];
+
+        let factorial: usize = (1..=K).product();
+
+        for Workload {
+            name,
+            bursts,
+            expected,
+        } in &workloads
+        {
+            assert_eq!(bursts.len(), K, "each fuzz workload has exactly K bursts");
+            // ---- D=1 SERIAL REFERENCE over the identical bursts. ----
+            let ref_env = SessionContext::new().runtime_env();
+            let (reference, _ref_cat, _ref_tmp) =
+                create_memory_mode_upsert_table(&format!("fuzz_ref_{name}"), ref_env).await;
+            let ref_acks = Arc::new(ParkingMutex::new(Vec::<u64>::new()));
+            reference.install_slot_advancer(Arc::new(AckRecorder(Arc::clone(&ref_acks))));
+            for (inserts, deletes) in bursts {
+                apply_burst(&reference, inserts, deletes).await;
+                reference.checkpoint_mem_tier().await.expect("reference checkpoint");
+            }
+            let ref_scan = scan_sorted_ids(&reference).await;
+            let ref_final_ack = ref_acks.lock().last().copied();
+            assert_eq!(
+                &ref_scan, expected,
+                "workload {name}: the D=1 serial reference matches the hand-computed live set"
+            );
+
+            // ---- D=3 PIPELINE for EVERY release order. ----
+            for rank in 0..factorial {
+                let order = permutation(rank, K);
+                let env = SessionContext::new().runtime_env();
+                let (provider, catalog, _tmp) = create_memory_mode_upsert_table(
+                    &format!("fuzz_d3_{name}_{rank}"),
+                    Arc::clone(&env),
+                )
+                .await;
+                let acks = Arc::new(ParkingMutex::new(Vec::<u64>::new()));
+                provider.install_slot_advancer(Arc::new(AckRecorder(Arc::clone(&acks))));
+                provider.set_drain_pipeline_depth_for_test(K);
+                let gate = provider.install_checkpoint_drain_gate_for_test();
+
+                // Freeze all K generations, each parking in flight (arrival = freeze
+                // order, oldest first) — the overlap.
+                for (i, (inserts, deletes)) in bursts.iter().enumerate() {
+                    apply_burst(&provider, inserts, deletes).await;
+                    provider.checkpoint_mem_tier().await.expect("freeze + detach");
+                    wait_until(&format!("{name} gen{i} parked"), || gate.arrived() > i).await;
+                }
+                assert_eq!(
+                    provider.drain_ledger.lock().depth(),
+                    K,
+                    "workload {name} rank#{rank}: all {K} generations concurrently resident"
+                );
+
+                // Release the parked drains in the CHOSEN order; the publish-turn gate
+                // still serializes their publishes oldest-first.
+                let parked_ids = gate.pending();
+                assert_eq!(parked_ids.len(), K, "all K generations parked");
+                for &idx in &order {
+                    gate.release(parked_ids[idx]);
+                }
+                wait_until(&format!("{name} rank#{rank} drained"), || {
+                    provider.drain_ledger.lock().is_empty()
+                })
+                .await;
+
+                // Ack watermark monotone + equal final coverage to the serial reference.
+                let recorded = acks.lock().clone();
+                assert!(
+                    recorded.windows(2).all(|w| w[0] <= w[1]),
+                    "workload {name} rank#{rank} order {order:?}: ack watermark not monotone: {recorded:?}"
+                );
+                assert_eq!(
+                    recorded.last().copied(),
+                    ref_final_ack,
+                    "workload {name} rank#{rank} order {order:?}: final ack differs from the serial reference"
+                );
+
+                // Durable scan equals the serial reference — no resurrection/loss/double-count.
+                assert_eq!(
+                    scan_sorted_ids(&provider).await,
+                    ref_scan,
+                    "workload {name} rank#{rank} order {order:?}: D=3 pipelined scan differs from the D=1 reference"
+                );
+                assert!(
+                    provider.mem_tier.tier().load().is_empty(),
+                    "workload {name} rank#{rank}: tier fully drained after all ordered publishes"
+                );
+
+                // Reopen-convergence on the reverse-order permutation of each workload:
+                // everything published + acked, so a restart recovers the full set with
+                // no re-stream needed (no resurrection, no loss, no duplicate).
+                if rank == factorial - 1 {
+                    drop(provider);
+                    let reopened = CayenneTableProviderBuilder::new(
+                        Arc::clone(&catalog),
+                        Arc::clone(&env),
+                    )
+                    .open(&format!("fuzz_d3_{name}_{rank}"))
+                    .await
+                    .expect("reopen after the pipelined drain");
+                    let ids = scan_sorted_ids(&reopened).await;
+                    assert_eq!(
+                        &ids, &ref_scan,
+                        "workload {name}: the pipelined durable state recovers the reference set across a restart"
+                    );
+                    let mut deduped = ids.clone();
+                    deduped.dedup();
+                    assert_eq!(ids, deduped, "workload {name}: no primary key recovered twice");
+                }
+            }
+        }
     }
 
     /// Stage 2a crash-injection — the published-but-unacked boundary (the "crash
