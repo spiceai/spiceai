@@ -1592,4 +1592,230 @@ mod tests {
         let oversized = tier.window_view(1, 999);
         assert_eq!(oversized.segments.len(), 1, "clamped to the 1 available segment");
     }
+
+    /// Stage 2b Step 3a-ii model fuzz — the D>1 window / relative-count COMPOSITION
+    /// over the PURE ledger + `window_view` logic (no concurrency, no provider). This
+    /// is the high-confidence correctness pass before Step 3b overlaps real threads:
+    /// it proves that with `D > 1` resident generations, the per-generation encode
+    /// windows compose EXACTLY back to the un-windowed drain — no double-count, no
+    /// gap, no dropped tombstone — and that ordered oldest-first publish reconstructs
+    /// each generation's front prefix.
+    ///
+    /// The alphabet builds a single-shard segment log (sharding is orthogonal — each
+    /// shard windows independently); `Freeze` captures the current tier as a
+    /// generation WITHOUT draining it, so multiple generations stay resident (the
+    /// `D > 1` residency the inline D=1 drain never reaches).
+    #[test]
+    fn stage2b_drain_windows_compose_over_d_gt_1_schedules() {
+        use crate::provider::drain::{FrozenDrainLedger, FrozenGeneration};
+
+        #[derive(Clone, Copy, Debug)]
+        enum Op {
+            Append(i64),
+            Delete(i64),
+            Freeze,
+        }
+
+        // Append segment `i` carrying source_position i+1; a Delete additionally
+        // stamps a tombstone for `key` at delete-sequence i+1. Distinct per-segment
+        // aggregates make a window's rebuilt aggregate unambiguous.
+        fn apply(tier: &MemTier, op_key: Option<i64>, seg_idx: i64) -> MemTier {
+            let seq = seg_idx + 1;
+            let mut ts = SegmentTombstones::default();
+            if let Some(k) = op_key {
+                ts = SegmentTombstones::from_int64_keys([k]);
+                ts.stamp(seq);
+            }
+            tier.append_segment_with_source_position(
+                Arc::new(vec![batch(&[seg_idx])]),
+                seq,
+                ts,
+                16,
+                1,
+                0,
+                Some(u64::try_from(seq).expect("small")),
+            )
+        }
+
+        const DEPTH: u32 = 5;
+
+        let alphabet = [Op::Append(1), Op::Append(2), Op::Delete(1), Op::Freeze];
+        let base_n = alphabet.len();
+        let exhaustive = base_n.pow(DEPTH);
+
+        let curated: Vec<Vec<Op>> = vec![
+            // Three resident generations before any publish (D=3): each owns a
+            // disjoint window; a delete lands in the middle generation.
+            vec![
+                Op::Append(1),
+                Op::Freeze,
+                Op::Append(2),
+                Op::Delete(1),
+                Op::Freeze,
+                Op::Append(1),
+                Op::Freeze,
+            ],
+            // A delete in a LATER generation over a key inserted in an EARLIER one —
+            // the tombstone must route to the later window (its own segment), and the
+            // union of window tombstones must still equal the whole prefix's.
+            vec![
+                Op::Append(1),
+                Op::Freeze,
+                Op::Append(2),
+                Op::Freeze,
+                Op::Delete(1),
+                Op::Freeze,
+            ],
+        ];
+
+        for schedule_idx in 0..(exhaustive + curated.len()) {
+            let schedule: Vec<Op> = if schedule_idx < exhaustive {
+                let mut code = schedule_idx;
+                (0..DEPTH)
+                    .map(|_| {
+                        let op = alphabet[code % base_n];
+                        code /= base_n;
+                        op
+                    })
+                    .collect()
+            } else {
+                curated[schedule_idx - exhaustive].clone()
+            };
+
+            let mut tier = MemTier::empty();
+            let mut seg_idx: i64 = 0;
+            // Bound the ledger generously so every freeze is admitted regardless of
+            // how many stay resident in this schedule.
+            let mut ledger = FrozenDrainLedger::new(DEPTH as usize + 2);
+            // Parallel record of each frozen generation's (base, N_G, captured
+            // snapshot) — the ledger exposes only its front, so the test keeps its
+            // own view to assert composition across ALL resident generations.
+            let mut gens: Vec<(usize, usize, Arc<MemTier>)> = Vec::new();
+
+            for op in &schedule {
+                match op {
+                    Op::Append(_k) => {
+                        // A pure insert segment: no tombstone. (The composition
+                        // assertions key on segment / tombstone geometry, not row
+                        // values, so the appended key itself is immaterial here.)
+                        tier = apply(&tier, None, seg_idx);
+                        seg_idx += 1;
+                    }
+                    Op::Delete(k) => {
+                        tier = apply(&tier, Some(*k), seg_idx);
+                        seg_idx += 1;
+                    }
+                    Op::Freeze => {
+                        let snapshot = Arc::new(tier.clone());
+                        let base = ledger.resident_prefix_counts(1);
+                        // P2 — resident_prefix_counts composes as Σ prior generations'
+                        // relative counts.
+                        let expected_base: usize = gens.iter().map(|(_, n, _)| *n).sum();
+                        assert_eq!(
+                            base[0], expected_base,
+                            "schedule#{schedule_idx} {schedule:?}: base != Σ prior N_G"
+                        );
+                        let n_g = snapshot.segments.len().saturating_sub(base[0]);
+                        gens.push((base[0], n_g, Arc::clone(&snapshot)));
+                        let admitted = ledger
+                            .freeze(FrozenGeneration::freeze(
+                                vec![snapshot],
+                                base,
+                                vec![n_g],
+                                None,
+                                u64::try_from(seg_idx).expect("small"),
+                            ))
+                            .is_ok();
+                        assert!(admitted, "schedule#{schedule_idx}: ledger rejected a freeze");
+                    }
+                }
+            }
+
+            // Nothing frozen ⇒ nothing to compose.
+            if gens.is_empty() {
+                continue;
+            }
+
+            let total_frozen: usize = gens.iter().map(|(_, n, _)| *n).sum();
+            let (last_base, last_n, _) = gens[gens.len() - 1];
+            // Σ N_G == base_last + N_last == the tier length at the last freeze.
+            assert_eq!(
+                total_frozen,
+                last_base + last_n,
+                "schedule#{schedule_idx} {schedule:?}: windows do not tile a contiguous prefix"
+            );
+
+            // Fold every generation's window tombstones + rows; compare against the
+            // whole frozen-prefix aggregate.
+            let mut union_tombstones = InMemTombstones::default();
+            let mut union_rows = 0u64;
+            let mut running_base = 0usize;
+            for (base, n_g, snapshot) in &gens {
+                // P1 — each generation's window is exactly its own contiguous slice
+                // [base, base+N_G) of the captured snapshot; bases are strictly
+                // non-decreasing and contiguous.
+                assert_eq!(
+                    *base, running_base,
+                    "schedule#{schedule_idx} {schedule:?}: window base is not contiguous with the prior window"
+                );
+                let window = snapshot.window_view(*base, *n_g);
+                assert_eq!(window.segments.len(), *n_g, "window segment count == N_G");
+                union_rows += window.rows;
+                // Merge with per-key MAX-sequence semantics: the SAME key may be
+                // deleted in more than one generation (at different sequences), which
+                // is not a double-count — the whole-prefix aggregate resolves it to
+                // the max, so the window union must too.
+                union_tombstones.merge_from(&window.tombstones);
+                running_base += *n_g;
+            }
+            // P5 — the union of the windows' tombstones equals the whole frozen
+            // prefix's aggregate (windowing the encode drops / duplicates NO
+            // tombstone → the tier-wide deletion index the ordered publish commits is
+            // complete → no resurrection).
+            let whole_prefix = tier.window_view(0, total_frozen);
+            assert_eq!(
+                union_tombstones.int64_pk.len(),
+                whole_prefix.tombstones.int64_pk.len(),
+                "schedule#{schedule_idx} {schedule:?}: union of window tombstones != whole-prefix tombstones"
+            );
+            for (k, seq) in whole_prefix.tombstones.int64_pk.iter() {
+                assert_eq!(
+                    union_tombstones.int64_pk.get(k),
+                    Some(seq),
+                    "schedule#{schedule_idx} {schedule:?}: window union missing/mismatched tombstone key {k}"
+                );
+            }
+            // Rows partition: Σ window rows == whole-prefix rows (each segment once).
+            assert_eq!(
+                union_rows, whole_prefix.rows,
+                "schedule#{schedule_idx} {schedule:?}: window rows do not sum to the whole prefix (double-count or gap)"
+            );
+
+            // P4 — ordered oldest-first publish: draining generation k drops exactly
+            // its front N_G from the live tier, and at that point the live front IS
+            // generation k's window (retain_after composes with the windows).
+            let mut live = tier.clone();
+            for (base, n_g, snapshot) in &gens {
+                let expected_window = snapshot.window_view(*base, *n_g);
+                let live_front = live.window_view(0, *n_g);
+                assert_eq!(
+                    live_front.rows, expected_window.rows,
+                    "schedule#{schedule_idx} {schedule:?}: live front rows != generation window rows at publish"
+                );
+                assert_eq!(
+                    live_front.tombstones.int64_pk.len(),
+                    expected_window.tombstones.int64_pk.len(),
+                    "schedule#{schedule_idx} {schedule:?}: live front tombstones != generation window at publish"
+                );
+                live = live.retain_after(*n_g);
+            }
+            // After publishing every frozen generation the live tier holds only the
+            // survivors appended after the last freeze.
+            assert_eq!(
+                live.segments.len(),
+                tier.segments.len() - total_frozen,
+                "schedule#{schedule_idx} {schedule:?}: residual after ordered publish != survivors"
+            );
+        }
+    }
 }
