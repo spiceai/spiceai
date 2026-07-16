@@ -43388,13 +43388,18 @@ mod tests {
              concurrent commit (high-water 7 != begin 5) — never miss it"
         );
 
-        // Clearing the keyset resets the flag; re-installing a fresh keyset
-        // restores per-key trust (a real rebuild floor-stamps, healing staleness).
+        // `clear_cached_pk_keyset` resets the flag. To isolate *that* effect,
+        // re-install a NON-degraded Exact keyset shaped like an incremental
+        // delta-update (which records only the incoming key's stamp and does NOT
+        // floor-stamp) — id=1 still at 5. With the flag now clear, the divergent
+        // scenario (stage 5, stamp 5, high-water 7) returns to the per-key answer
+        // (no conflict), proving per-key trust is restored — it was `true` (the
+        // fallback) only because the flag was set.
         provider.clear_cached_pk_keyset();
-        let mut rebuilt = CachedPkKeyset::with_capacity(1);
-        rebuilt.insert(key, RowLocation::FileUnlocated);
-        rebuilt.record_sequence(digest, 5);
-        provider.store_cached_pk_index(CachedPkIndex::Exact(rebuilt));
+        let mut delta_updated = CachedPkKeyset::with_capacity(1);
+        delta_updated.insert(key.clone(), RowLocation::FileUnlocated);
+        delta_updated.record_sequence(digest, 5);
+        provider.store_cached_pk_index(CachedPkIndex::Exact(delta_updated));
         assert!(
             !provider.transaction_has_conflict(
                 stage_seq,
@@ -43403,8 +43408,32 @@ mod tests {
                 &empty_write_set,
                 current_high_water,
             ),
-            "clear_cached_pk_keyset must reset the degraded flag so per-key OCC \
-             is trusted again after a rebuild"
+            "clear_cached_pk_keyset must reset the degraded flag so a non-degraded \
+             Exact keyset is trusted per-key again (id=1 unchanged at stamp 5)"
+        );
+
+        // Faithfulness check: a REAL `clear_cached_pk_keyset` rebuild goes through
+        // `load_existing_keyset`, which floor-stamps every key to the end-of-scan
+        // high-water (`stamp_all_sequences_min(sequence_high_water())`). Model that
+        // by floor-stamping id=1 to the high-water (7). The same transaction then
+        // correctly CONFLICTS via the per-key stamp (7 > begin 5) — the production
+        // rebuild is conservative (over-abort), so clearing the flag never lets a
+        // real post-rebuild commit miss a concurrent write.
+        let mut floor_stamped = CachedPkKeyset::with_capacity(1);
+        floor_stamped.insert(key, RowLocation::FileUnlocated);
+        floor_stamped.record_sequence(digest, 5);
+        floor_stamped.stamp_all_sequences_min(current_high_water);
+        provider.store_cached_pk_index(CachedPkIndex::Exact(floor_stamped));
+        assert!(
+            provider.transaction_has_conflict(
+                stage_seq,
+                &footprint,
+                true,
+                &empty_write_set,
+                current_high_water,
+            ),
+            "a floor-stamped rebuild (the production clear->load_existing_keyset \
+             path) must still conflict the stage_seq=5 txn against high-water 7"
         );
     }
 }
