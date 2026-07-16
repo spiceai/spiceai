@@ -61,12 +61,30 @@ ci:
 	make -C bin/spice
 	make -C bin/spiced
 
-# Local CI attestation ("developer sign-off"). Runs lint + unit tests, then
-# posts a `signoff` commit status on HEAD so the PR can enter the merge queue,
-# where the full suite runs. See scripts/signoff and docs/dev/ci_signoff.md.
+# Local CI attestation ("developer sign-off"). Target-lints changed crates,
+# then full lint + unit tests, then posts a `signoff` commit status on HEAD so
+# the PR can enter the merge queue. See scripts/signoff and docs/dev/ci_signoff.md.
 .PHONY: signoff
 signoff:
 	@./scripts/signoff
+
+# Dispatch the Remote Sign-off workflow for the current branch (self-hosted).
+# Optional: BASE=trunk make signoff-remote
+.PHONY: signoff-remote
+signoff-remote:
+	@branch=$$(git rev-parse --abbrev-ref HEAD); \
+	if [ -z "$$branch" ] || [ "$$branch" = "HEAD" ]; then \
+		echo "error: not on a named branch — check out a branch or pass one to gh workflow run" >&2; \
+		exit 1; \
+	fi; \
+	if [ -n "$(BASE)" ]; then \
+		echo "Dispatching Remote Sign-off for $$branch (base=$(BASE))…"; \
+		gh workflow run signoff.yml -f branch="$$branch" -f base="$(BASE)"; \
+	else \
+		echo "Dispatching Remote Sign-off for $$branch…"; \
+		gh workflow run signoff.yml -f branch="$$branch"; \
+	fi; \
+	echo "Watch with: gh run watch --workflow signoff.yml"
 
 .PHONY: test
 test:
@@ -108,47 +126,12 @@ test-integration-models-without-openai:
 test-bench:
 	@cargo bench -p runtime --features postgres,spark,mysql
 
-.PHONY: lint lint-rust
-lint: lint-rust
-
-lint-rust:
-	cargo fmt --all -- --check
-	## All except metal, cuda, nfs (nfs requires system libnfs library)
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going --lib --bins --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control,spicebench --workspace --exclude libnfs --exclude lopdf --exclude ttf-parser --exclude pdf-extract -- \
-		-Dwarnings \
-		-Dclippy::pedantic \
-		-Dclippy::unwrap_used \
-		-Dclippy::expect_used \
-		-Dclippy::clone_on_ref_ptr \
-		-Aclippy::module_name_repetitions \
-		-Aclippy::large_futures \
-		-Aclippy::too_many_lines \
-		-Dclippy::equatable_if_let \
-		-Dclippy::needless_collect \
-		-Dclippy::redundant_clone \
-		-Dclippy::todo \
-		-Dclippy::assertions_on_result_states \
-		-Dclippy::allow_attributes
-	cargo clippy $(CARGO_PROFILE) --keep-going --tests --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control,spicebench --workspace --exclude libnfs --exclude lopdf --exclude ttf-parser --exclude pdf-extract -- \
-		-Dwarnings \
-		-Dclippy::pedantic \
-		-Dclippy::unwrap_used \
-		-Aclippy::expect_used \
-		-Dclippy::clone_on_ref_ptr \
-		-Aclippy::module_name_repetitions \
-		-Aclippy::large_futures \
-		-Aclippy::too_many_lines \
-		-Dclippy::equatable_if_let \
-		-Dclippy::needless_collect \
-		-Dclippy::redundant_clone \
-		-Dclippy::todo \
-		-Dclippy::assertions_on_result_states \
-		-Dclippy::allow_attributes \
-		-Aunfulfilled_lint_expectations
-
 ## Optional: PACKAGES="pkg1 pkg2" to lint specific packages instead of the whole workspace
 ## Optional: FEATURES="feat1,feat2" to override features
-## Feature defaults: when FEATURES is unset, uses aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control for workspace (unless PACKAGES is set, then uses package defaults)
+## Feature defaults: when FEATURES is unset, uses the full release feature set for
+## workspace-wide linting (unless PACKAGES is set, then uses package defaults —
+## workspace features like `models` are not valid on every crate).
+## Example: make lint-rust PACKAGES="runtime data_components"
 ## Example: make lint-rust-fix PACKAGES="runtime data_components" FEATURES="duckdb,postgres"
 PACKAGES ?=
 FEATURES ?=
@@ -168,6 +151,45 @@ _FEATURES_FLAGS :=
 else
 _FEATURES_FLAGS := --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control,spicebench
 endif
+
+.PHONY: lint lint-rust
+lint: lint-rust
+
+# Full workspace lint (default), or scoped via PACKAGES=… for a fast fail-first pass.
+lint-rust:
+	cargo fmt $(_FMT_FLAGS) -- --check
+	## All except metal, cuda, nfs (nfs requires system libnfs library)
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going --lib --bins $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
+		-Dwarnings \
+		-Dclippy::pedantic \
+		-Dclippy::unwrap_used \
+		-Dclippy::expect_used \
+		-Dclippy::clone_on_ref_ptr \
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures \
+		-Aclippy::too_many_lines \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes
+	cargo clippy $(CARGO_PROFILE) --keep-going --tests $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
+		-Dwarnings \
+		-Dclippy::pedantic \
+		-Dclippy::unwrap_used \
+		-Aclippy::expect_used \
+		-Dclippy::clone_on_ref_ptr \
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures \
+		-Aclippy::too_many_lines \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes \
+		-Aunfulfilled_lint_expectations
 
 lint-rust-fix:
 	cargo fmt $(_FMT_FLAGS)
