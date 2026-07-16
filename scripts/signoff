@@ -326,7 +326,12 @@ changed_files_vs_trunk() {
   if base_ref=$(resolve_local_trunk_ref) \
     && base_sha=$(git merge-base HEAD "$base_ref" 2>/dev/null); then
     # No second revision → working tree vs trunk (covers committed + dirty -f).
-    git diff --name-only --diff-filter=ACDMRT "$base_sha"
+    # Untracked files are invisible to `git diff` but still need package mapping
+    # under `scripts/signoff -f` (dirty tree).
+    {
+      git diff --name-only --diff-filter=ACDMRT "$base_sha"
+      git ls-files --others --exclude-standard
+    } | sort -u
     return 0
   fi
 
@@ -348,7 +353,8 @@ packages_for_changed_files() {
   files=$(cat)
   [[ -n "${files//[$'\t\n\r ']/}" ]] || return 0
 
-  metadata=$(cargo metadata --no-deps --format-version 1 2>/dev/null) \
+  # Keep stderr so cargo's own error (missing rustc, bad manifest, …) is visible.
+  metadata=$(cargo metadata --no-deps --format-version 1) \
     || fail "cargo metadata failed — is this a Cargo workspace?"
 
   # Paths + metadata via env (heredoc is the program source, not stdin data).
@@ -470,7 +476,9 @@ run_checks() {
     append_step_summary "### Targeted pre-lint"$'\n'"Packages: \`${packages}\`"$'\n'
     # Package defaults only — workspace features (models, …) are not valid on
     # every crate. The full lint below still runs with the complete feature set.
-    make lint-rust PACKAGES="$packages"
+    # Explicit `|| return` so failures short-circuit even when the caller has
+    # temporarily disabled `set -e` to capture status (see cmd_signoff).
+    make lint-rust PACKAGES="$packages" || return $?
     info "Targeted pre-lint passed — running full workspace lint…"
   else
     info "No changed workspace packages detected (or targeted lint skipped) — running full workspace lint…"
@@ -478,10 +486,10 @@ run_checks() {
   fi
 
   info "Running Rust lint (make lint-rust)…"
-  make lint-rust
+  make lint-rust || return $?
 
   info "Building the CLI and running unit tests (make build-cli nextest)…"
-  make build-cli nextest
+  make build-cli nextest || return $?
 }
 
 # After a successful sign-off, the PR's `Attestation` job (pr.yml) only
@@ -567,8 +575,9 @@ cmd_signoff() {
         "Remote sign-off in progress (triggered by ${user})…" \
         || info "warning: could not post pending sign-off status"
     fi
-    # Do not wrap run_checks in `if`/`||` — that disables `set -e` inside the
-    # function and would let a failing make continue. Capture status explicitly.
+    # Capture status without wrapping in `if`/`||` (those also disable set -e
+    # for the LHS). run_checks uses explicit `|| return` so make failures still
+    # short-circuit under the temporary `set +e` used for status capture.
     set +e
     run_checks "$revision"
     check_status=$?
