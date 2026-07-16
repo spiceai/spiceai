@@ -26,13 +26,14 @@
 # Environment:
 #   SIGNOFF_BRANCH    Branch/ruleset to target for install/check (default: trunk)
 #   SIGNOFF_REMOTE    Git remote to use in a JJ workspace (default: origin)
-#   SIGNOFF_BASE      Override the base branch for targeted pre-lint (e.g. trunk)
 #   SIGNOFF_ACTOR     Attribution login (remote workflow sets this to the
 #                     human who dispatched the run; defaults to gh/git user)
 #   SIGNOFF_REMOTE_RUN  Set by .github/workflows/signoff.yml — pending/failure
 #                     statuses, "via remote" description, GitHub step summary
 #   SIGNOFF_DEBUG     Set to any value for verbose debug logging
 #   SIGNOFF_SKIP_TARGETED_LINT  Set to any value to skip the branch-scoped pre-lint
+#
+# Targeted pre-lint always diffs against trunk (not configurable).
 #
 # Remote (self-hosted runner) alternative to local `make signoff`:
 #   make signoff-remote                  # gh workflow run signoff.yml for HEAD branch
@@ -238,89 +239,33 @@ ensure_clean_and_pushed() {
 
 # --- branch → package mapping (targeted pre-lint) ----------------------------
 
-# Strip origin/ / refs/heads/ prefixes so we always work with a branch name.
-normalize_branch_name() {
-  local name="$1"
-  name="${name#refs/heads/}"
-  name="${name#refs/remotes/${TARGET_REMOTE}/}"
-  name="${name#${TARGET_REMOTE}/}"
-  echo "$name"
-}
+# Targeted pre-lint always diffs against trunk (fixed, not configurable).
+readonly LINT_BASE_BRANCH="trunk"
 
-# Prefer SIGNOFF_BASE, then the open PR's base, then trunk/main.
-# Prints a bare branch name (e.g. trunk), not a remote-qualified ref.
-detect_base_branch_name() {
-  local pr_base base
-
-  if [[ -n "${SIGNOFF_BASE:-}" ]]; then
-    normalize_branch_name "$SIGNOFF_BASE"
-    return 0
-  fi
-
-  # Open PR base is the most accurate (fork PRs, non-trunk bases, etc.).
-  if command -v gh >/dev/null 2>&1; then
-    pr_base=$(gh pr view --json baseRefName --jq .baseRefName 2>/dev/null || true)
-    if [[ -n "$pr_base" ]]; then
-      normalize_branch_name "$pr_base"
-      return 0
-    fi
-  fi
-
-  for base in trunk main; do
-    if [[ "$VCS" == "jj" ]]; then
-      if jj --color=never --no-pager log \
-        -r "remote_bookmarks(exact:\"${base}\", remote:exact:\"${TARGET_REMOTE}\")" \
-        --no-graph -T 'commit_id' -n 1 >/dev/null 2>&1 \
-        || jj --color=never --no-pager log -r "bookmarks(exact:\"${base}\")" \
-          --no-graph -T 'commit_id' -n 1 >/dev/null 2>&1; then
-        echo "$base"
-        return 0
-      fi
-    else
-      if git rev-parse --verify "${TARGET_REMOTE}/${base}" >/dev/null 2>&1 \
-        || git rev-parse --verify "$base" >/dev/null 2>&1; then
-        echo "$base"
-        return 0
-      fi
-    fi
-  done
-
-  # Last resort for remote runs / shallow clones where trunk isn't fetched yet
-  # but the GitHub compare API can still resolve it.
-  if is_remote_run || [[ -n "${GITHUB_ACTIONS:-}" ]]; then
-    echo "trunk"
-    return 0
-  fi
-  return 1
-}
-
-# Resolve a bare branch name to a local git/jj ref usable with merge-base / jj
-# diff. Fails if the ref isn't present locally (caller may fall back to API).
-resolve_local_base_ref() {
-  local name="$1"
-  name=$(normalize_branch_name "$name")
-
+# Resolve trunk to a local git/jj ref usable with merge-base / jj diff.
+# Fails if the ref isn't present locally (caller may fall back to API).
+resolve_local_trunk_ref() {
   if [[ "$VCS" == "jj" ]]; then
     if jj --color=never --no-pager log \
-      -r "remote_bookmarks(exact:\"${name}\", remote:exact:\"${TARGET_REMOTE}\")" \
+      -r "remote_bookmarks(exact:\"${LINT_BASE_BRANCH}\", remote:exact:\"${TARGET_REMOTE}\")" \
       --no-graph -T 'commit_id' -n 1 >/dev/null 2>&1; then
-      echo "${name}@${TARGET_REMOTE}"
+      echo "${LINT_BASE_BRANCH}@${TARGET_REMOTE}"
       return 0
     fi
-    if jj --color=never --no-pager log -r "bookmarks(exact:\"${name}\")" \
+    if jj --color=never --no-pager log -r "bookmarks(exact:\"${LINT_BASE_BRANCH}\")" \
       --no-graph -T 'commit_id' -n 1 >/dev/null 2>&1; then
-      echo "$name"
+      echo "$LINT_BASE_BRANCH"
       return 0
     fi
     return 1
   fi
 
-  if git rev-parse --verify "refs/remotes/${TARGET_REMOTE}/${name}" >/dev/null 2>&1; then
-    echo "${TARGET_REMOTE}/${name}"
+  if git rev-parse --verify "refs/remotes/${TARGET_REMOTE}/${LINT_BASE_BRANCH}" >/dev/null 2>&1; then
+    echo "${TARGET_REMOTE}/${LINT_BASE_BRANCH}"
     return 0
   fi
-  if git rev-parse --verify "refs/heads/${name}" >/dev/null 2>&1; then
-    echo "$name"
+  if git rev-parse --verify "refs/heads/${LINT_BASE_BRANCH}" >/dev/null 2>&1; then
+    echo "$LINT_BASE_BRANCH"
     return 0
   fi
   return 1
@@ -330,17 +275,16 @@ resolve_local_base_ref() {
 # Prints one filename per line. Returns non-zero if the API call fails or the
 # compare is truncated beyond usefulness (caller skips targeted lint).
 github_compare_files() {
-  local base_name="$1" head_sha="$2"
+  local head_sha="$1"
   local repo payload
 
   repo=$(repo_slug) || return 1
-  base_name=$(normalize_branch_name "$base_name")
 
-  # three-dot compare: merge-base of base...head → head (same as a PR diff).
+  # three-dot compare: merge-base of trunk...head → head (same as a PR diff).
   # GitHub caps the files list at 300; when truncated, skip targeted pre-lint
   # rather than linting an incomplete package set.
   # Emit: first line "true"/"false" (truncated), then one filename per line.
-  payload=$(gh api "repos/${repo}/compare/${base_name}...${head_sha}" \
+  payload=$(gh api "repos/${repo}/compare/${LINT_BASE_BRANCH}...${head_sha}" \
     --jq '(.truncated // false | tostring), (.files[]?.filename // empty)' 2>/dev/null) \
     || return 1
 
@@ -358,39 +302,37 @@ github_compare_files() {
   printf '%s\n' "$rest"
 }
 
-# List paths changed on this branch relative to the merge-base with base branch
-# name $1. With a dirty tree (signoff -f), includes uncommitted working-tree
-# changes when using local git. Falls back to the GitHub compare API on shallow
-# clones (remote sign-off).
-changed_files_vs_base() {
-  local base_name="$1" revision="$2"
+# List paths changed on this branch relative to the merge-base with trunk.
+# With a dirty tree (signoff -f), includes uncommitted working-tree changes when
+# using local git. Falls back to the GitHub compare API on shallow clones
+# (remote sign-off).
+changed_files_vs_trunk() {
+  local revision="$1"
   local base_ref base_sha head_sha files
 
-  base_name=$(normalize_branch_name "$base_name")
-
   if [[ "$VCS" == "jj" ]]; then
-    if base_ref=$(resolve_local_base_ref "$base_name"); then
+    if base_ref=$(resolve_local_trunk_ref); then
       # `jj diff --from A --to B` is the branch delta; working-copy edits on an
       # empty @ parent are already in `revision` when current_revision selected @.
       jj --color=never --no-pager diff --from "$base_ref" --to "$revision" --name-only
       return 0
     fi
-    debug "JJ base '${base_name}' not local — trying GitHub compare API"
+    debug "JJ trunk not local — trying GitHub compare API"
     head_sha=$(revision_sha "$revision") || return 1
-    github_compare_files "$base_name" "$head_sha"
+    github_compare_files "$head_sha"
     return
   fi
 
-  if base_ref=$(resolve_local_base_ref "$base_name") \
+  if base_ref=$(resolve_local_trunk_ref) \
     && base_sha=$(git merge-base HEAD "$base_ref" 2>/dev/null); then
-    # No second revision → working tree vs base (covers committed + dirty -f).
+    # No second revision → working tree vs trunk (covers committed + dirty -f).
     git diff --name-only --diff-filter=ACDMRT "$base_sha"
     return 0
   fi
 
-  debug "merge-base with '${base_name}' unavailable (shallow clone?) — trying GitHub compare API"
+  debug "merge-base with trunk unavailable (shallow clone?) — trying GitHub compare API"
   head_sha=$(git rev-parse HEAD) || return 1
-  files=$(github_compare_files "$base_name" "$head_sha") || return 1
+  files=$(github_compare_files "$head_sha") || return 1
   printf '%s\n' "$files"
 }
 
@@ -453,24 +395,20 @@ for name in sorted(found):
 PY
 }
 
-# Resolve workspace packages touched by the current branch. Prints a
-# space-separated list, or nothing if there is no base / no package changes.
+# Resolve workspace packages touched by the current branch vs trunk. Prints a
+# space-separated list, or nothing if there are no package changes.
 changed_workspace_packages() {
   local revision="$1"
-  local base_name files packages
+  local files packages
 
-  if ! base_name=$(detect_base_branch_name); then
-    debug "no base branch found — skipping targeted pre-lint"
-    return 0
-  fi
-  info "Diff base for targeted pre-lint: ${base_name}"
+  info "Diff base for targeted pre-lint: ${LINT_BASE_BRANCH}"
 
-  if ! files=$(changed_files_vs_base "$base_name" "$revision"); then
-    info "Could not list changed files vs ${base_name} — skipping targeted pre-lint"
+  if ! files=$(changed_files_vs_trunk "$revision"); then
+    info "Could not list changed files vs ${LINT_BASE_BRANCH} — skipping targeted pre-lint"
     return 0
   fi
   if [[ -z "${files//[$'\t\n\r ']/}" ]]; then
-    debug "no changed files vs ${base_name}"
+    debug "no changed files vs ${LINT_BASE_BRANCH}"
     return 0
   fi
   debug "changed files:"$'\n'"$files"
@@ -801,13 +739,12 @@ Maintainers:
   scripts/signoff install --yes  Apply it (needs admin on the repo)
 
 Checks (when verify is on):
-  1. Targeted lint of crates touched by this branch vs the PR base / trunk
+  1. Targeted lint of crates touched by this branch vs trunk
      (make lint-rust PACKAGES="…") — fail-fast feedback
   2. Full workspace lint (make lint-rust)
   3. CLI build + unit tests (make build-cli nextest)
 
   Set SIGNOFF_SKIP_TARGETED_LINT=1 to skip step 1.
-  Set SIGNOFF_BASE=<branch> to override the base used for step 1.
   Remote runs (.github/workflows/signoff.yml) set SIGNOFF_REMOTE_RUN and use
   the GitHub compare API when the clone is too shallow for merge-base.
 

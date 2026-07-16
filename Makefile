@@ -69,7 +69,7 @@ signoff:
 	@./scripts/signoff
 
 # Dispatch the Remote Sign-off workflow for the current branch (self-hosted).
-# Optional: BASE=trunk make signoff-remote
+# Targeted pre-lint always diffs against trunk.
 .PHONY: signoff-remote
 signoff-remote:
 	@branch=$$(git rev-parse --abbrev-ref HEAD); \
@@ -77,13 +77,8 @@ signoff-remote:
 		echo "error: not on a named branch — check out a branch or pass one to gh workflow run" >&2; \
 		exit 1; \
 	fi; \
-	if [ -n "$(BASE)" ]; then \
-		echo "Dispatching Remote Sign-off for $$branch (base=$(BASE))…"; \
-		gh workflow run signoff.yml -f branch="$$branch" -f base="$(BASE)"; \
-	else \
-		echo "Dispatching Remote Sign-off for $$branch…"; \
-		gh workflow run signoff.yml -f branch="$$branch"; \
-	fi; \
+	echo "Dispatching Remote Sign-off for $$branch…"; \
+	gh workflow run signoff.yml -f branch="$$branch"; \
 	echo "Watch with: gh run watch --workflow signoff.yml"
 
 .PHONY: test

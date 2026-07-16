@@ -6,7 +6,7 @@
 # so the PR's Attestation check turns green.
 #
 # Same fail-fast order as local sign-off:
-#   1. Targeted lint of crates touched by the branch (vs PR base / trunk)
+#   1. Targeted lint of crates touched by the branch vs trunk
 #   2. Full workspace lint (make lint-rust)
 #   3. CLI build + unit tests (make build-cli nextest)
 #   4. Post signoff status + re-run Attestation if needed
@@ -14,7 +14,6 @@
 # Use this when you can't (or don't want to) run the checks locally:
 #   make signoff-remote
 #   gh workflow run signoff.yml -f branch=<your-branch>
-#   gh workflow run signoff.yml -f branch=<your-branch> -f base=trunk
 name: Remote Sign-off
 
 on:
@@ -24,11 +23,6 @@ on:
         description: 'Branch to sign off (must be pushed to origin)'
         required: true
         type: string
-      base:
-        description: 'Base branch for targeted pre-lint (default: open PR base, else trunk)'
-        required: false
-        type: string
-        default: ''
 
 concurrency:
   group: signoff-${{ github.event.inputs.branch }}
@@ -58,14 +52,12 @@ jobs:
       # "via remote" description, GitHub compare fallback, step summary).
       SIGNOFF_REMOTE_RUN: '1'
       SIGNOFF_ACTOR: ${{ github.actor }}
-      SIGNOFF_BASE: ${{ github.event.inputs.base }}
       SIGNOFF_DEBUG: '1'
 
     steps:
       - name: Validate branch input
         env:
           BRANCH: ${{ github.event.inputs.branch }}
-          BASE_INPUT: ${{ github.event.inputs.base }}
         run: |
           set -euo pipefail
           if [[ -z "${BRANCH// }" ]]; then
@@ -78,48 +70,26 @@ jobs:
             echo "::error::invalid branch name: '${BRANCH}'"
             exit 1
           fi
-          if [[ -n "$BASE_INPUT" ]] && [[ "$BASE_INPUT" =~ [[:space:]] || "$BASE_INPUT" == -* || "$BASE_INPUT" == /* || "$BASE_INPUT" == *..* ]]; then
-            echo "::error::invalid base branch name: '${BASE_INPUT}'"
-            exit 1
-          fi
           echo "Signing off branch: ${BRANCH}"
           echo "Triggered by: ${{ github.actor }}"
-          if [[ -n "$BASE_INPUT" ]]; then
-            echo "Base override: ${BASE_INPUT}"
-          fi
+          echo "Targeted pre-lint base: trunk (fixed)"
 
       - name: Check out branch
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.event.inputs.branch }}
-          # Full history so local merge-base works when the base ref is present.
+          # Full history so local merge-base with trunk works when trunk is present.
           # scripts/signoff still falls back to the GitHub compare API if needed.
           fetch-depth: 0
 
-      - name: Fetch base ref for targeted pre-lint
-        env:
-          BASE_INPUT: ${{ github.event.inputs.base }}
+      - name: Fetch trunk for targeted pre-lint
         run: |
           set -euo pipefail
-          base="${BASE_INPUT}"
-          if [[ -z "$base" ]]; then
-            # Prefer the open PR's base when this branch has a PR.
-            base=$(gh pr view --json baseRefName --jq .baseRefName 2>/dev/null || true)
-          fi
-          if [[ -z "$base" ]]; then
-            base=trunk
-          fi
-          echo "Fetching origin/${base} for targeted pre-lint merge-base…"
-          git fetch --no-tags origin "${base}:refs/remotes/origin/${base}" \
-            || git fetch --no-tags origin "${base}"
-          # Always have trunk available as a fallback for scripts/signoff.
-          if [[ "$base" != "trunk" ]]; then
-            git fetch --no-tags origin "trunk:refs/remotes/origin/trunk" || true
-          fi
-          echo "SIGNOFF_BASE=${base}" >>"$GITHUB_ENV"
-          echo "Resolved base: ${base}"
+          echo "Fetching origin/trunk for targeted pre-lint merge-base…"
+          git fetch --no-tags origin "trunk:refs/remotes/origin/trunk" \
+            || git fetch --no-tags origin trunk
           echo "HEAD: $(git rev-parse --short HEAD)"
-          echo "merge-base with origin/${base}: $(git merge-base HEAD "origin/${base}" 2>/dev/null | cut -c1-12 || echo 'n/a (API fallback)')"
+          echo "merge-base with origin/trunk: $(git merge-base HEAD origin/trunk 2>/dev/null | cut -c1-12 || echo 'n/a (API fallback)')"
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust

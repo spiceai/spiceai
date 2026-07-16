@@ -55,9 +55,9 @@ and up to date:
 make signoff          # targeted crate lint → full lint + unit tests, then attests
 ```
 
-`make signoff` first diffs the branch against the PR base (or `trunk`), maps
-changed files to workspace crates, and runs `make lint-rust PACKAGES="…"` for
-fast fail-first feedback. It then always runs the full `make lint-rust` and
+`make signoff` first diffs the branch against `trunk`, maps changed files to
+workspace crates, and runs `make lint-rust PACKAGES="…"` for fast fail-first
+feedback. It then always runs the full `make lint-rust` and
 `make build-cli nextest` gate. Set `SIGNOFF_SKIP_TARGETED_LINT=1` to skip the
 scoped pre-lint.
 
@@ -88,7 +88,6 @@ scripts/signoff -f            # sign off even with an uncommitted/unpushed tree
 scripts/signoff --no-verify   # attest without running the checks (honor system)
 scripts/signoff status        # does HEAD have its own sign-off?
 scripts/signoff --help        # full usage
-SIGNOFF_BASE=trunk make signoff   # override the base used for targeted pre-lint
 ```
 
 ### Remote sign-off (self-hosted runner)
@@ -100,17 +99,15 @@ attributed to you:
 
 ```bash
 make signoff-remote                 # current branch
-BASE=trunk make signoff-remote      # override targeted-lint base
 gh workflow run signoff.yml -f branch=<your-branch>
-gh workflow run signoff.yml -f branch=<your-branch> -f base=trunk
 gh run watch --workflow signoff.yml
 ```
 
 The workflow:
 
-1. Checks out your branch (full history) and fetches the PR base / `trunk`
-2. Target-lints crates touched by the branch (GitHub compare API as a fallback
-   when merge-base isn't available)
+1. Checks out your branch (full history) and fetches `trunk`
+2. Target-lints crates touched by the branch vs `trunk` (GitHub compare API as a
+   fallback when merge-base isn't available)
 3. Runs full `make lint-rust` + `make build-cli nextest`
 4. Posts pending → success/failure `signoff` statuses, then re-runs
    **Attestation** if needed
