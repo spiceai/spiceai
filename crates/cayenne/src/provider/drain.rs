@@ -1073,6 +1073,56 @@ mod loom_model {
             // (a younger drain reached this after gen 0's cascade removed it), which
             // is the D>1 finding recorded on the cascade test below.
         }
+
+        /// The seal drain (`drain_seal_generation` analog): mark the sealed
+        /// generation terminal and reclaim it. The seal is single-ordered and runs
+        /// under the quiesce barrier (see [`seal_quiesces_over_an_empty_ledger`]),
+        /// so its generation is the only resident one — it is NOT windowed and gets
+        /// no ordered-publish gate.
+        fn seal_generation(&self, id: u64) {
+            let mut ledger = self.ledger.lock().expect("ledger lock");
+            match ledger.generation_mut_by_id(id) {
+                Some(g) => g.transition(GenState::Sealed),
+                None => panic!("sealing generation {id} was no longer resident"),
+            }
+            ledger.reclaim_terminal_prefix_ack();
+            self.gate.notify_all();
+        }
+    }
+
+    /// A counting semaphore modeled on loom primitives — the analog of the
+    /// `drain_admission` `tokio::sync::Semaphore`, which loom does not shim.
+    /// `acquire(n)` waits until `n` permits are available and then takes all `n`
+    /// ATOMICALLY under the lock, so a waiter NEVER holds partial permits while
+    /// blocked (the property tokio's `acquire_many` guarantees and the seal
+    /// quiesce barrier's deadlock-freedom argument relies on). `acquire(1)` is the
+    /// per-drain admission; `acquire(max_depth)` is the seal barrier.
+    struct ModelSemaphore {
+        permits: Mutex<usize>,
+        available: Condvar,
+    }
+
+    impl ModelSemaphore {
+        fn new(permits: usize) -> Arc<Self> {
+            Arc::new(Self {
+                permits: Mutex::new(permits),
+                available: Condvar::new(),
+            })
+        }
+
+        fn acquire(&self, n: usize) {
+            let mut permits = self.permits.lock().expect("permits lock");
+            while *permits < n {
+                permits = self.available.wait(permits).expect("permits wait");
+            }
+            *permits -= n;
+        }
+
+        fn release(&self, n: usize) {
+            let mut permits = self.permits.lock().expect("permits lock");
+            *permits += n;
+            self.available.notify_all();
+        }
     }
 
     /// ORDERED-PUBLISH happens-before (property 1), two generations. Two drains
@@ -1184,6 +1234,77 @@ mod loom_model {
             assert!(
                 model.ledger.lock().expect("ledger").is_empty(),
                 "the cascade leaves no stranded generation"
+            );
+        });
+    }
+
+    /// SEAL QUIESCE barrier deadlock-freedom (property 4), `max_depth = 2`. A
+    /// detached checkpoint drain (admission permit 1) races a seal. The seal's
+    /// `acquire_seal_quiesce_barrier` analog acquires ALL `max_depth` permits
+    /// before it captures, so it captures over an EMPTY ledger (no resident
+    /// checkpoint window for its un-windowed `unsealed_view` shadow to
+    /// doubly-persist). loom explores every interleaving and checks:
+    ///   * DEADLOCK-FREEDOM — both threads always terminate (loom flags any
+    ///     schedule that leaves all threads blocked). The checkpoint's drain
+    ///     (publish + reclaim) needs neither a permit nor anything the seal holds,
+    ///     so a checkpoint holding its admission permit always completes and
+    ///     releases it, letting the seal's `acquire(2)` make progress; the
+    ///     semaphore takes all permits atomically, so the seal never holds a
+    ///     partial set while waiting;
+    ///   * QUIESCE — the seal only ever captures over an empty ledger (asserted at
+    ///     its freeze), i.e. every resident checkpoint has published + reclaimed +
+    ///     released its permit before the barrier is satisfied, so no checkpoint
+    ///     window is doubly-persisted by the seal's whole-active shadow.
+    ///
+    /// The checkpoint drain provably takes no capture lock while off-lock (it
+    /// released `mem_checkpoint_lock` after its freeze), so the barrier's
+    /// `write`/`mem_checkpoint_lock` acquisition after it wins the permits cannot
+    /// deadlock against an in-flight checkpoint — that lock non-dependency is
+    /// structural in the production code and so is not re-modeled here; this model
+    /// isolates the semaphore barrier that the deadlock-freedom argument turns on.
+    #[test]
+    fn seal_quiesces_over_an_empty_ledger() {
+        loom::model(|| {
+            let model = DrainModel::new(FrozenDrainLedger::new(2));
+            let admission = ModelSemaphore::new(2);
+
+            // Detached checkpoint: admission permit -> freeze -> drain -> reclaim ->
+            // release (the permit rides the whole task, released after reclaim).
+            let m_ckpt = Arc::clone(&model);
+            let a_ckpt = Arc::clone(&admission);
+            let checkpoint = loom::thread::spawn(move || {
+                a_ckpt.acquire(1);
+                let id = {
+                    let mut ledger = m_ckpt.ledger.lock().expect("ledger lock");
+                    ledger.freeze(model_gen(10)).ok().expect("checkpoint freeze").id
+                };
+                m_ckpt.drain_checkpoint(id);
+                a_ckpt.release(1);
+            });
+
+            // Seal: quiesce barrier (ALL permits) -> capture over the empty ledger
+            // -> seal -> release.
+            let m_seal = Arc::clone(&model);
+            let a_seal = Arc::clone(&admission);
+            let seal = loom::thread::spawn(move || {
+                a_seal.acquire(2);
+                let id = {
+                    let mut ledger = m_seal.ledger.lock().expect("ledger lock");
+                    assert!(
+                        ledger.is_empty(),
+                        "seal must capture over an empty (quiesced) ledger — no resident checkpoint window"
+                    );
+                    ledger.freeze(model_gen(20)).ok().expect("seal freeze").id
+                };
+                m_seal.seal_generation(id);
+                a_seal.release(2);
+            });
+
+            checkpoint.join().expect("checkpoint drain joins (no deadlock)");
+            seal.join().expect("seal joins (no deadlock)");
+            assert!(
+                model.ledger.lock().expect("ledger").is_empty(),
+                "both the checkpoint and the seal reclaim their generations"
             );
         });
     }
