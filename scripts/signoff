@@ -476,13 +476,14 @@ run_checks() {
 
   if [[ -n "$packages" ]]; then
     info "Targeted pre-lint for changed packages: ${packages}"
-    info "  (make lint-rust PACKAGES=\"${packages}\")"
+    info "  (make lint-rust PACKAGES=\"${packages}\" FEATURES=)"
     append_step_summary "### Targeted pre-lint"$'\n'"Packages: \`${packages}\`"$'\n'
     # Package defaults only — workspace features (models, …) are not valid on
-    # every crate. The full lint below still runs with the complete feature set.
-    # Explicit `|| return` so failures short-circuit even when the caller has
-    # temporarily disabled `set -e` to capture status (see cmd_signoff).
-    make lint-rust PACKAGES="$packages" || return $?
+    # every crate. FEATURES= clears any user-exported FEATURES so the Makefile
+    # does not reintroduce a workspace-only set. Full lint below still uses the
+    # complete feature set. Explicit `|| return` so failures short-circuit even
+    # when the caller has temporarily disabled `set -e` (see cmd_signoff).
+    make lint-rust PACKAGES="$packages" FEATURES= || return $?
     info "Targeted pre-lint passed — running full workspace lint…"
   else
     info "No changed workspace packages detected (or targeted lint skipped) — running full workspace lint…"
@@ -490,7 +491,9 @@ run_checks() {
   fi
 
   info "Running Rust lint (make lint-rust)…"
-  make lint-rust || return $?
+  # Clear PACKAGES/FEATURES so a user-exported env cannot scope or re-feature
+  # the full gate; empty values leave the Makefile on its workspace defaults.
+  make lint-rust PACKAGES= FEATURES= || return $?
 
   info "Building the CLI and running unit tests (make build-cli nextest)…"
   make build-cli nextest || return $?
