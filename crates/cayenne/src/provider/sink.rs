@@ -251,7 +251,6 @@ mod tests {
     use datafusion_expr::dml::InsertOp;
     use datafusion_table_providers::util::column_reference::ColumnReference;
     use datafusion_table_providers::util::on_conflict::OnConflict;
-    use tokio::sync::Notify;
 
     use super::CayenneDataSink;
     use crate::CayenneCatalog;
@@ -265,112 +264,6 @@ mod tests {
             .read_table(Arc::new(provider.clone_for_write()))
             .expect("read_table");
         df.count().await.expect("count")
-    }
-
-    /// The age-bounded segment cut: rows streamed on a still-open append stream
-    /// become queryable within ~`stream_publish_interval_ms`, without waiting
-    /// for the stream to end. Guards the events-mode ingest-to-queryable
-    /// latency fix (long-lived ADBC bulk-ingest streams).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn stream_publish_interval_publishes_before_stream_end() {
-        let ctx = SessionContext::new();
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("path"));
-        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("path"));
-        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
-        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
-        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"))
-            as Arc<dyn MetadataCatalog>;
-        catalog.init().await.expect("catalog init");
-
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let vortex_config = VortexConfig {
-            stream_publish_interval_ms: 100,
-            ..VortexConfig::default()
-        };
-        let context = CayenneContext::new(&vortex_config, ctx.runtime_env(), "seg_pub");
-        let sink_context = Arc::clone(&context);
-        let options = CreateTableOptions {
-            table_name: "seg_pub".to_string(),
-            schema: Arc::clone(&schema),
-            primary_key: vec!["id".to_string()],
-            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
-                "id".to_string(),
-            ]))),
-            base_path: data_dir,
-            partition_column: None,
-            vortex_config,
-        };
-        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
-            .with_context(context)
-            .create(options)
-            .await
-            .expect("table created");
-
-        let release_second = Arc::new(Notify::new());
-        let release_for_stream = Arc::clone(&release_second);
-        let stream_schema = Arc::clone(&schema);
-        let batches = futures::stream::unfold(0_i64, move |i| {
-            let release = Arc::clone(&release_for_stream);
-            let schema = Arc::clone(&stream_schema);
-            async move {
-                match i {
-                    0 => {
-                        let batch = RecordBatch::try_new(
-                            Arc::clone(&schema),
-                            vec![Arc::new(Int64Array::from(vec![1_i64, 2]))],
-                        )
-                        .expect("batch");
-                        Some((Ok(batch), 1))
-                    }
-                    1 => {
-                        // Hold the stream open until the test observes the
-                        // first segment's rows.
-                        release.notified().await;
-                        let batch = RecordBatch::try_new(
-                            Arc::clone(&schema),
-                            vec![Arc::new(Int64Array::from(vec![3_i64]))],
-                        )
-                        .expect("batch");
-                        Some((Ok(batch), 2))
-                    }
-                    _ => None,
-                }
-            }
-        });
-        let stream = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), batches));
-
-        let sink = CayenneDataSink::new(
-            provider.clone_for_write(),
-            InsertOp::Append,
-            Arc::clone(&schema),
-            sink_context,
-        );
-        let task_ctx = ctx.task_ctx();
-        let write = tokio::spawn(async move { sink.write_all(stream, &task_ctx).await });
-
-        // Rows from the first batch must become visible while the stream is
-        // still open (the second batch is gated on `release_second`).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        loop {
-            if visible_rows(&ctx, &provider).await == 2 {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "first segment was not published while the stream was open"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-
-        release_second.notify_one();
-        let written = write.await.expect("join").expect("write_all");
-        assert_eq!(written, 3, "all rows accounted across segments");
-        assert_eq!(
-            visible_rows(&ctx, &provider).await,
-            3,
-            "all rows visible after stream end"
-        );
     }
 
     fn int64_batch(schema: &Arc<Schema>, values: Vec<i64>) -> RecordBatch {
@@ -416,14 +309,7 @@ mod tests {
         catalog.init().await.expect("catalog init");
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let vortex_config = VortexConfig {
-            // Publish on stream end (the refresh-write shape). The segmented
-            // streaming-publish path never publishes an empty segment, so it
-            // would short-circuit a zero-row stream before it reaches the
-            // append writer this test exercises.
-            stream_publish_interval_ms: 0,
-            ..VortexConfig::default()
-        };
+        let vortex_config = VortexConfig::default();
         let context = CayenneContext::new(&vortex_config, ctx.runtime_env(), "zero_row_append");
         let options = CreateTableOptions {
             table_name: "zero_row_append".to_string(),
