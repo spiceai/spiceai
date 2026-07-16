@@ -617,7 +617,10 @@ mod tests {
             "cosine",
         );
         assert!(
-            index.as_any().downcast_ref::<CompoundVectorIndex>().is_some(),
+            index
+                .as_any()
+                .downcast_ref::<CompoundVectorIndex>()
+                .is_some(),
             "the engine index should be wrapped in a CompoundVectorIndex"
         );
     }
@@ -632,7 +635,10 @@ mod tests {
             "hyperbolic",
         );
         assert!(
-            index.as_any().downcast_ref::<PretendVectorIndex>().is_some(),
+            index
+                .as_any()
+                .downcast_ref::<PretendVectorIndex>()
+                .is_some(),
             "an unknown metric must return the engine index unchanged"
         );
     }
@@ -648,7 +654,10 @@ mod tests {
             "cosine",
         );
         assert!(
-            index.as_any().downcast_ref::<PretendVectorIndex>().is_some(),
+            index
+                .as_any()
+                .downcast_ref::<PretendVectorIndex>()
+                .is_some(),
             "a memory index construction failure must return the engine index unchanged"
         );
     }

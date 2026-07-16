@@ -801,24 +801,25 @@ mod warm_memory {
     struct ByteEmbed;
 
     fn byte_vector(text: &str) -> Vec<f32> {
-        let mut vector = vec![0.0_f32; usize::try_from(DIM).expect("DIM is positive")];
+        let dim = usize::try_from(DIM).expect("DIM is positive");
+        let mut vector = vec![0.0_f32; dim];
         for (i, b) in text.bytes().enumerate() {
-            vector[i % vector.len()] += f32::from(b) / 255.0;
+            vector[i % dim] += f32::from(b) / 255.0;
         }
         vector
     }
 
     #[async_trait]
     impl Embed for ByteEmbed {
-        async fn embed(
-            &self,
-            input: EmbeddingInput,
-        ) -> llms::embeddings::Result<Vec<Vec<f32>>> {
+        async fn embed(&self, input: EmbeddingInput) -> llms::embeddings::Result<Vec<Vec<f32>>> {
             match input {
                 EmbeddingInput::String(s) => Ok(vec![byte_vector(&s)]),
                 EmbeddingInput::StringArray(v) => Ok(v.iter().map(|s| byte_vector(s)).collect()),
                 _ => Ok(vec![]),
             }
+        }
+        fn size(&self) -> i32 {
+            DIM
         }
     }
 
@@ -890,7 +891,10 @@ mod warm_memory {
                 embedding_field(),
                 Field::new("id", DataType::Int64, false),
             ])),
-            vec![embedding_array(rows), Arc::new(Int64Array::from(ids.to_vec()))],
+            vec![
+                embedding_array(rows),
+                Arc::new(Int64Array::from(ids.to_vec())),
+            ],
         )
         .expect("valid engine list batch")
     }

@@ -233,9 +233,14 @@ impl MemoryVectorQueryTable {
                 .and_then(|physical| physical.evaluate(&current))
                 .and_then(|value| value.into_array(current.num_rows()));
             let filtered = mask.and_then(|mask| {
-                let mask = mask.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
-                    DataFusionError::Internal("filter did not evaluate to a boolean".to_string())
-                })?;
+                let mask = mask
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(
+                            "filter did not evaluate to a boolean".to_string(),
+                        )
+                    })?;
                 filter_record_batch(&current, mask)
                     .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
             });
@@ -318,11 +323,8 @@ impl TableProvider for MemoryVectorQueryTable {
             (store.stored_schema(), store.batches())
         };
 
-        let stored = concat_batches(
-            &stored_schema,
-            batches.iter().filter(|b| b.num_rows() > 0),
-        )
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        let stored = concat_batches(&stored_schema, batches.iter().filter(|b| b.num_rows() > 0))
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
         // Prefilter before scoring and truncation (see `supports_filters_pushdown`).
         let stored = self.apply_filters(filters, stored);
         let combined = if stored.num_rows() == 0 {
@@ -522,7 +524,6 @@ mod tests {
 
     fn vector_for(text: &str) -> Vec<f32> {
         let magnitude = match text {
-            "a" => 1.0,
             "b" => 2.0,
             "c" => 3.0,
             _ => 1.0, // the query "q"
@@ -532,15 +533,16 @@ mod tests {
 
     #[async_trait]
     impl Embed for MapEmbed {
-        async fn embed(
-            &self,
-            input: EmbeddingInput,
-        ) -> llms::embeddings::Result<Vec<Vec<f32>>> {
+        async fn embed(&self, input: EmbeddingInput) -> llms::embeddings::Result<Vec<Vec<f32>>> {
             match input {
                 EmbeddingInput::String(s) => Ok(vec![vector_for(&s)]),
                 EmbeddingInput::StringArray(v) => Ok(v.iter().map(|s| vector_for(s)).collect()),
                 _ => Ok(vec![]),
             }
+        }
+
+        fn size(&self) -> i32 {
+            3
         }
     }
 
