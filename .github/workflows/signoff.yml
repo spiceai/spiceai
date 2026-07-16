@@ -16,6 +16,7 @@
 #   gh workflow run signoff.yml -f branch=<your-branch>
 name: Remote Sign-off
 
+run-name: Remote Sign-off (${{ inputs.branch }})
 on:
   workflow_dispatch:
     inputs:
