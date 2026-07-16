@@ -444,12 +444,11 @@ impl PostgresSchemaProvider {
         // `table_type = 'FOREIGN'`). Both are otherwise ordinary, queryable
         // relations (#11725).
         //
-        // `information_schema.tables` is privilege-aware — it only lists
-        // relations the current role can access — whereas `pg_class` is broadly
-        // readable. To preserve that behaviour (and avoid registering relations
-        // the configured user can't read, which would produce repeated warn
-        // logs on query), we keep only relations the current role holds `SELECT`
-        // on via `has_table_privilege`.
+        // `pg_class` is broadly readable, whereas the discovered relations are
+        // registered to be queried. We therefore keep only relations the
+        // current role holds `SELECT` on (via `has_table_privilege`), so the
+        // catalog doesn't register relations that can't be read and then emit
+        // repeated warn logs when they're queried.
         //
         // A declaratively-partitioned parent (relkind 'p') and every one of its
         // leaf partitions (relkind 'r') would otherwise both be discovered.

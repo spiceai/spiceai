@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use aws_sdk_dynamodb::Client as DbClient;
 use aws_sdk_dynamodb::types::{DeleteRequest, WriteRequest};
 use datafusion::error::DataFusionError;
+use datafusion::execution::TaskContext;
 use datafusion::prelude::Expr;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -39,6 +40,7 @@ pub struct DynamoDBDeletionSink {
 impl DeletionSink for DynamoDBDeletionSink {
     async fn delete_from(
         &self,
+        _context: Arc<TaskContext>,
     ) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let keys = extract_primary_keys(
             &self.filters,

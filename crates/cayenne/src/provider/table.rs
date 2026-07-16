@@ -5534,9 +5534,17 @@ impl CayenneTableProvider {
         // `cdc_apply_fixed_cost_ms{phase="write"}` in the runtime apply loop). The
         // `cayenne_encode_acquire_wait_ms{class}` histogram inside `acquire_from`
         // carries the same signal without the table label; this one keys by table.
+        // Coupled writers (partition child tables, fed by a shared routing
+        // demux) bypass the budget entirely — parking a coupled write here
+        // deadlocks the demux against the permit holders (see `write_budget`
+        // module docs; spiceai/spiceai#11818).
         let encode_permit_wait_start = Instant::now();
-        let _encode_permits =
-            super::write_budget::acquire_encode_permits(encode_shards, write_class).await;
+        let _encode_permits = super::write_budget::acquire_encode_permits(
+            encode_shards,
+            write_class,
+            self.context.is_coupled_writer(),
+        )
+        .await;
         record_cayenne_write_phase(
             self.table_name(),
             "encode_permit_wait",
@@ -14066,17 +14074,25 @@ impl CayenneTableProvider {
     }
 
     /// Z-order (Morton) cluster a stream by appending a transient interleaved-bits
-    /// key column, sorting on it via the proven external `SortExec` path
-    /// (`util::stream_utils::sort_stream`, disk-spilling), then stripping the key.
-    /// Empty `clustering_indices` returns the stream unchanged.
+    /// key column, sorting on it in byte-bounded runs via
+    /// [`super::streaming::bounded_sort_stream`] (per-run `SortExec`:
+    /// pool-accounted, disk-spilling), then stripping the key. Bounding the
+    /// sort caps per-run memory and first-batch latency; Z-order ranges may
+    /// overlap across runs, which only weakens per-file min/max pruning
+    /// slightly — cold files advertise no ordering, so this is a
+    /// clustering-quality trade-off, not a correctness change. The run cap is
+    /// [`crate::metadata::VortexConfig::cold_clustering_run_size_bytes`],
+    /// measured on the augmented batches (key included — what `SortExec`
+    /// actually buffers). Empty `clustering_indices` returns the stream
+    /// unchanged.
     fn zorder_sort_stream(
         &self,
         stream: SendableRecordBatchStream,
         clustering_indices: Vec<usize>,
         task_ctx: &Arc<datafusion_execution::TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
+    ) -> SendableRecordBatchStream {
         if clustering_indices.is_empty() {
-            return Ok(stream);
+            return stream;
         }
         let original_schema = stream.schema();
         let augmented_schema = super::zorder::zorder_augmented_schema(&original_schema);
@@ -14087,19 +14103,19 @@ impl CayenneTableProvider {
             Arc::clone(&augmented_schema),
             augmented,
         ));
-        let sort_cols = vec![super::zorder::ZORDER_COLUMN_NAME.to_string()];
-        let sorted = util::stream_utils::sort_stream(augmented_stream, &sort_cols, task_ctx)
-            .map_err(|e| Error::Internal {
-                table: self.table_metadata.table_name.clone(),
-                message: format!("cold-tier Z-order sort failed: {e}"),
-            })?;
+        let sorted = super::streaming::bounded_sort_stream(
+            &self.table_metadata.table_name,
+            augmented_stream,
+            vec![super::zorder::ZORDER_COLUMN_NAME.to_string()],
+            task_ctx,
+            self.table_metadata
+                .vortex_config
+                .cold_clustering_run_size_bytes(),
+        );
         let orig = Arc::clone(&original_schema);
         let stripped = sorted
             .map(move |res| res.and_then(|b| super::zorder::strip_zorder_key_column(&b, &orig)));
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            original_schema,
-            stripped,
-        )))
+        Box::pin(RecordBatchStreamAdapter::new(original_schema, stripped))
     }
 
     /// Per-file row cap so a file's PK bloom (~10 bits/key) stays within
@@ -14199,7 +14215,7 @@ impl CayenneTableProvider {
             // fresh per-write `write_id` UUID, so sequential writes never collide
             // (flat layout, identical to the single-write path).
             let row_cap = Self::cold_file_row_cap();
-            let source = super::streaming::RowChunkedSource::new(Arc::clone(&schema), stream);
+            let source = super::streaming::ChunkedSource::new(Arc::clone(&schema), stream);
             let mut chunk_idx: usize = 0;
             while !source.is_exhausted() {
                 if chunk_idx == 1 {
@@ -14212,7 +14228,8 @@ impl CayenneTableProvider {
                         "Cold-tier promotion is splitting output into multiple row-bounded files to keep each file's PK bloom within the per-file cap"
                     );
                 }
-                let chunk_stream: SendableRecordBatchStream = Box::pin(source.next_chunk(row_cap));
+                let chunk_stream: SendableRecordBatchStream =
+                    Box::pin(source.next_chunk(super::streaming::ChunkCap::Rows(row_cap)));
                 tracing::debug!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
@@ -14766,7 +14783,7 @@ impl CayenneTableProvider {
         // Z-order cluster for a read-optimized cold layout.
         let clustering = self.resolve_cold_clustering_indices();
         let task_ctx = ctx.task_ctx();
-        let stream = self.zorder_sort_stream(stream, clustering, &task_ctx)?;
+        let stream = self.zorder_sort_stream(stream, clustering, &task_ctx);
 
         // Write the clustered, deletes-applied rows to the cold object store.
         let (cold_files, total_rows) = self
@@ -16761,13 +16778,13 @@ impl CayenneTableProvider {
             Arc::clone(&self.seq_allocator),
         );
 
-        let deleted_count =
-            sink.delete_from()
-                .await
-                .map_err(|err| CatalogError::InvalidOperation {
-                    message: "Failed to execute retention filters.".to_string(),
-                    source: err,
-                })?;
+        let deleted_count = sink
+            .delete_from(Arc::new(datafusion_execution::TaskContext::default()))
+            .await
+            .map_err(|err| CatalogError::InvalidOperation {
+                message: "Failed to execute retention filters.".to_string(),
+                source: err,
+            })?;
 
         // Refresh deletion cache after applying retention filters
         if deleted_count > 0 {
@@ -25247,6 +25264,26 @@ impl TableProvider for CayenneTableProvider {
                     )));
                 }
             }
+            // Coalesce the read side to a single partition before staging. A
+            // `DataSinkExec` requires single-partition input, which the physical
+            // optimizer normally guarantees by inserting a `CoalescePartitionsExec`.
+            // The transaction-staging plan built here, however, is executed
+            // DIRECTLY (write-back sinks run it via `collect` without re-optimizing),
+            // so a multi-partition source — a union of the file branch and the
+            // in-memory CDC tier branch, as produced for CDC/`changes`-mode data —
+            // would otherwise have every partition but 0 silently dropped by the
+            // sink, staging zero rows (a lost update). Point-lookup file scans are
+            // already single-partition, so this is a no-op there.
+            let source_plan: Arc<dyn ExecutionPlan> = if source_plan
+                .properties()
+                .output_partitioning()
+                .partition_count()
+                > 1
+            {
+                Arc::new(CoalescePartitionsExec::new(source_plan))
+            } else {
+                source_plan
+            };
             return self.insert_into(state, source_plan, InsertOp::Append).await;
         }
 
@@ -25515,7 +25552,7 @@ impl CayenneTableProvider {
             filters: filters.to_vec(),
         };
         let deleted = sink
-            .delete_from()
+            .delete_from(Arc::new(datafusion_execution::TaskContext::default()))
             .await
             .map_err(datafusion_common::DataFusionError::External)?;
         Ok(Some(deleted))

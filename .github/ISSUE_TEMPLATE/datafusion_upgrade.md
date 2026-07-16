@@ -212,7 +212,6 @@ These forks may not require changes for every DataFusion upgrade but should be v
 
 - [ ] **[candle](https://github.com/spiceai/candle)**: ML framework (cudarc compatibility).
 - [ ] **[rusqlite](https://github.com/spiceai/rusqlite)**: SQLite bindings.
-- [ ] **[dotenvy](https://github.com/spiceai/dotenvy)**: Environment variable loading.
 - [ ] **arrow-odbc**: ODBC Arrow bridge (upstream, may need version bump).
 - [ ] **object_store**: Object store abstraction (apache/arrow-rs-object-store).
 
@@ -347,12 +346,6 @@ When upgrading, ensure all these tests pass. If adding a new patch to a fork, ad
 | ---------------- | ----------------------------------------- | -------------------------------------- |
 | Spark connector  | `crates/runtime/tests/spark/`             | Spark table provider via Spark Connect |
 | Databricks Spark | `crates/runtime/tests/databricks_spark*/` | Databricks-hosted Spark                |
-
-### Dotenvy (`spiceai/dotenvy`)
-
-| Patch/Feature                 | Test Location                                                                     | What It Verifies                                 |
-| ----------------------------- | --------------------------------------------------------------------------------- | ------------------------------------------------ |
-| Disable variable substitution | `crates/runtime-secrets/src/stores/env.rs::test_dotenvy_no_variable_substitution` | `.env` values with `$` chars preserved literally |
 
 ### Rusqlite (`spiceai/rusqlite`)
 

@@ -21,7 +21,8 @@ const HF_PARAM_LEN: usize = 3;
 pub const PARAMETERS: &[ParameterSpec] = &HF_PARAMETERS;
 
 pub(crate) const HF_PARAMETERS: [ParameterSpec; HF_PARAM_LEN] = [
-    ParameterSpec::component("hf_token")
+    // runtime (no prefix) to match docs and preserve backward compatibility.
+    ParameterSpec::runtime("hf_token")
         .secret()
         .description("The Hugging Face access token."),
     ParameterSpec::runtime("pooling")

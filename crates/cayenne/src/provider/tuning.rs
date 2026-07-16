@@ -2664,26 +2664,32 @@ fn decide_goal(
         }
     }
 
-    // (2.9) Freshness-shrink tier: a violated FRESHNESS SLO means data is taking
-    // too long to become queryable — the mem-tier checkpoint capture stalls behind a
-    // deep apply backlog and new rows queue behind it. SHRINK the mem-tier so
-    // checkpoints fire on smaller epochs: earlier backpressure keeps the apply
-    // backlog (and the capture stall) shallow, so PG-commit→queryable lag falls.
-    // This is a SAFE CONTROL RESPONSE to a violated freshness SLO, NOT a proven
-    // perf win. A SF-100 3-node A/B (1 GiB→256 MiB pin) coincided with a lower
-    // worst-table freshness tail, but a no-goal control run on the same binary
-    // reproduced the same tail — run-to-run variance dominated, so the magnitude is
-    // unestablished on that rig and wants a lower-variance venue to measure. What is
-    // sound: shrinking the tier checkpoints smaller epochs sooner, the correct
-    // direction for a visibility-lag violation, at no correctness/QPH cost. Ordered
-    // BEFORE the ingest grow tier, and that tier's buffer-grow branches are gated
-    // `!freshness_violated`, so freshness owns the mem-tier lever and never
-    // limit-cycles against the lag-grow. `clamp_move_i64(…, b.mem_tier_max_bytes)`
-    // supplies the `MEM_TIER_MIN_BYTES` floor AND free pin-respect: an operator
-    // `cayenne_cdc_mem_tier_max_bytes` collapses the bounds to a point, so this
-    // no-ops rather than fighting the pin. No `mem_ok` gate — a shrink never needs
-    // memory headroom (and a memory-pressure shrink already ran in an earlier tier).
+    // (2.9) Freshness-shrink tier: a violated FRESHNESS SLO *and* an apply that is
+    // actually behind offered load. SHRINK the mem-tier so checkpoints fire on
+    // smaller epochs: earlier backpressure keeps a *deep apply backlog* shallow.
+    //
+    // **Gates (ladder A/B, 2026-07-15 local SF10 RATE-capped HTAP):** when
+    // freshness is high but `apply_vs_arrival` is healthy (apply finishes well under
+    // the inter-batch gap), the lag is source-side / multi-table / coalesce — not a
+    // deep tier. Shrinking then collapses the absorb buffer (measured 1 GiB→67 MiB)
+    // and *raises* order_line p99 freshness (base 5–9s → 11.6s; +shards 41s). Also
+    // withhold shrink on mutation-heavy streams (`delete_fraction` above
+    // `MUTATION_HEAVY_FRACTION`): each spill/checkpoint multiplies key-churn
+    // cost the same way write-concurrency is withheld.
+    //
+    // When the gates block shrink, fall through to the ingest tier (write
+    // concurrency / compaction) which can still act on `ingest_violated`. Ordered
+    // BEFORE the ingest grow tier; buffer-grow branches stay gated
+    // `!freshness_violated` so freshness still owns the *direction* on the tier
+    // when shrink is eligible. `clamp_move_i64(…, b.mem_tier_max_bytes)` supplies
+    // the floor + pin-respect. No `mem_ok` gate — shrink never needs headroom.
+    // Match the rest of the controller: "behind" is strict `>` (see `behind` at
+    // the adaptive ingest gate), not `>=`, so the equality boundary is one
+    // definition across levers.
+    let apply_backlogged = s.apply_vs_arrival > BEHIND_RATIO;
     if freshness_violated
+        && apply_backlogged
+        && !mutation_heavy
         && let Some(v) = clamp_move_i64(
             cur.mem_tier_max_bytes,
             goal_shrink_i64(cur.mem_tier_max_bytes, b.mem_tier_max_bytes, fresh_v),
@@ -2693,7 +2699,7 @@ fn decide_goal(
         return Some(Adjustment {
             actuator: Actuator::MemTierMaxBytes,
             new_value: u64::try_from(v).unwrap_or(0),
-            reason: "freshness goal: shrink the in-memory CDC tier → checkpoint smaller epochs sooner (shallower apply backlog, lower visibility lag)",
+            reason: "freshness goal + apply behind: shrink the in-memory CDC tier → checkpoint smaller epochs sooner (shallower apply backlog, lower visibility lag)",
         });
     }
 
@@ -4122,14 +4128,16 @@ mod tests {
     }
 
     #[test]
-    fn freshness_goal_violated_shrinks_mem_tier_not_memtable() {
-        // A violated freshness SLO SHRINKS the in-memory CDC tier (checkpoint smaller
-        // epochs sooner) and WITHHOLDS the buffer-grow levers — the inversion of the
-        // pre-lever-3 "freshness grows the memtable" response, which pushed buffers in
-        // the wrong direction for a visibility-lag violation (the SF-100 A/B showed
-        // 1 GiB→256 MiB *cut* freshness P99 4.4s→2.7s).
+    fn freshness_goal_violated_behind_apply_shrinks_mem_tier_not_memtable() {
+        // A violated freshness SLO *with apply behind* SHRINKS the in-memory CDC
+        // tier and WITHHOLDS the buffer-grow levers. Healthy-apply freshness no
+        // longer shrinks (ladder A scar) — see
+        // `freshness_violation_healthy_apply_does_not_shrink`.
         let s = IngestSnapshot {
             freshness_secs: Some(30.0),
+            apply_ms: 150.0,
+            arrival_gap_ms: 100.0,
+            apply_vs_arrival: 1.5,
             ..snap()
         };
         let goals = Goals::from_targets(None, Some(5.0), None, None, Duration::from_mins(1));
@@ -4137,7 +4145,7 @@ mod tests {
         assert_eq!(adj.actuator, Actuator::MemTierMaxBytes);
         assert!(
             adj.new_value < actuators().mem_tier_max_bytes as u64,
-            "freshness violation shrinks the tier, never grows the memtable",
+            "freshness+behind shrinks the tier, never grows the memtable",
         );
     }
 
@@ -4726,23 +4734,72 @@ mod tests {
     }
 
     #[test]
-    fn freshness_violation_shrinks_mem_tier() {
-        // A violated freshness SLO (peak row freshness 5s past a 3s target) shrinks
-        // the in-memory CDC tier — the automated form of the validated 1 GiB→256 MiB
-        // pin (SF-100 3-node A/B: worst-table freshness P99 4.4s→2.7s).
+    fn freshness_violation_behind_apply_shrinks_mem_tier() {
+        // A violated freshness SLO *with apply behind offered load* shrinks the
+        // in-memory CDC tier (deep apply backlog → smaller epochs sooner).
+        // `apply_vs_arrival > BEHIND_RATIO` is required — see
+        // `freshness_violation_healthy_apply_does_not_shrink`.
         let s = IngestSnapshot {
             freshness_secs: Some(5.0),
+            apply_ms: 150.0,
+            arrival_gap_ms: 100.0,
+            apply_vs_arrival: 1.5, // behind
             ..snap()
         };
         let goals = Goals::from_targets(None, Some(3.0), None, None, Duration::from_mins(1));
         let a = actuators_1gib();
-        let adj = goal_decide(&s, &a, &bounds(), &goals).expect("freshness violation must act");
+        let adj = goal_decide(&s, &a, &bounds(), &goals).expect("freshness+behind must act");
         assert_eq!(adj.actuator, Actuator::MemTierMaxBytes);
         assert!(
             adj.new_value < a.mem_tier_max_bytes as u64,
-            "freshness violation must SHRINK the tier: got {} vs cur {}",
+            "freshness+behind must SHRINK the tier: got {} vs cur {}",
             adj.new_value,
             a.mem_tier_max_bytes,
+        );
+    }
+
+    #[test]
+    fn freshness_violation_healthy_apply_does_not_shrink() {
+        // Ladder A scar: freshness high but apply healthy (apply_vs_arrival ≪ 1)
+        // means source/coalesce lag, not a deep tier. Shrinking starves absorb
+        // (1 GiB→67 MiB) and raised order_line p99. Must not shrink.
+        let s = IngestSnapshot {
+            freshness_secs: Some(5.0),
+            apply_ms: 3.0,
+            arrival_gap_ms: 250.0,
+            apply_vs_arrival: 0.012, // healthy — matches cert soak EWMA
+            delete_fraction: 0.0,
+            ..snap()
+        };
+        let goals = Goals::from_targets(None, Some(3.0), None, None, Duration::from_mins(1));
+        let a = actuators_1gib();
+        let adj = goal_decide(&s, &a, &bounds(), &goals);
+        assert!(
+            adj.is_none_or(|a| a.actuator != Actuator::MemTierMaxBytes),
+            "healthy apply must not shrink the tier on freshness alone: got {:?}",
+            adj.map(|a| a.actuator),
+        );
+    }
+
+    #[test]
+    fn freshness_violation_mutation_heavy_does_not_shrink() {
+        // Even with apply behind, mutation-heavy streams pay more per spill/
+        // checkpoint on key churn — withhold shrink (same gate as write shards).
+        let s = IngestSnapshot {
+            freshness_secs: Some(5.0),
+            apply_ms: 150.0,
+            arrival_gap_ms: 100.0,
+            apply_vs_arrival: 1.5,
+            delete_fraction: 0.45, // delete-/mutation-heavy order_line shape
+            ..snap()
+        };
+        let goals = Goals::from_targets(None, Some(3.0), None, None, Duration::from_mins(1));
+        let a = actuators_1gib();
+        let adj = goal_decide(&s, &a, &bounds(), &goals);
+        assert!(
+            adj.is_none_or(|a| a.actuator != Actuator::MemTierMaxBytes),
+            "mutation-heavy must not shrink the tier: got {:?}",
+            adj.map(|a| a.actuator),
         );
     }
 
@@ -4768,12 +4825,15 @@ mod tests {
     }
 
     #[test]
-    fn freshness_and_lag_both_violated_shrinks_not_grows() {
-        // Both violated: freshness OWNS the tier — it shrinks, and the lag-grow is
-        // suppressed on the same tick (the no-limit-cycle invariant).
+    fn freshness_and_lag_both_violated_behind_apply_shrinks_not_grows() {
+        // Both violated *and apply behind*: freshness OWNS the tier — it shrinks,
+        // and the lag-grow is suppressed on the same tick (no-limit-cycle).
         let s = IngestSnapshot {
             replication_lag_secs: Some(30.0),
             freshness_secs: Some(5.0),
+            apply_ms: 150.0,
+            arrival_gap_ms: 100.0,
+            apply_vs_arrival: 1.5,
             ..snap()
         };
         let goals = Goals::from_targets(Some(5.0), Some(3.0), None, None, Duration::from_mins(1));
@@ -4782,16 +4842,21 @@ mod tests {
         assert_eq!(adj.actuator, Actuator::MemTierMaxBytes);
         assert!(
             adj.new_value < a.mem_tier_max_bytes as u64,
-            "with both violated, the freshness shrink must win over the lag grow",
+            "with both violated and apply behind, the freshness shrink must win over the lag grow",
         );
     }
 
     #[test]
     fn freshness_shrink_respects_operator_pin() {
         // An operator hard-pin collapses the mem-tier bounds to a point; the shrink
-        // must no-op rather than fight the pin.
+        // must no-op rather than fight the pin. Snapshot is apply-behind so the
+        // freshness-shrink tier is *eligible* — otherwise a healthy
+        // `apply_vs_arrival` from `snap()` would vacuous-pass this test.
         let s = IngestSnapshot {
             freshness_secs: Some(5.0),
+            apply_ms: 150.0,
+            arrival_gap_ms: 100.0,
+            apply_vs_arrival: 1.5,
             ..snap()
         };
         let goals = Goals::from_targets(None, Some(3.0), None, None, Duration::from_mins(1));
@@ -4800,6 +4865,9 @@ mod tests {
             mem_tier_max_bytes: (a.mem_tier_max_bytes, a.mem_tier_max_bytes),
             ..bounds()
         };
+        // Unpinned control: same snapshot must still shrink.
+        let unpinned = goal_decide(&s, &a, &bounds(), &goals).expect("eligible shrink");
+        assert_eq!(unpinned.actuator, Actuator::MemTierMaxBytes);
         let adj = decide_with_goals(&s, &a, &pinned, ms(60_000), ms(30_000), 0, &goals);
         assert!(
             adj.is_none_or(|adj| adj.actuator != Actuator::MemTierMaxBytes),
