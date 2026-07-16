@@ -158,7 +158,9 @@ impl PostgresCatalogProvider {
             // either. Look up (not clone) the last-known-good entry for just this
             // one schema — only reading `self.schemas` on the failure path avoids
             // cloning the whole map on every refresh cycle when nothing fails.
-            let refresh_result = schema_provider.refresh_tables(&foreign_keys, &comments).await;
+            let refresh_result = schema_provider
+                .refresh_tables(&foreign_keys, &comments)
+                .await;
             let previous = if refresh_result.is_ok() {
                 None
             } else {
