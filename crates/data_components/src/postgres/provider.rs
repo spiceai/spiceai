@@ -437,10 +437,19 @@ impl PostgresSchemaProvider {
 
         // Discover directly from `pg_catalog.pg_class` (the same `relkind`
         // predicate `list_comments` already uses) rather than
-        // `information_schema.tables`, which only recognizes `BASE TABLE` and
-        // `VIEW`: materialized views (relkind 'm') don't appear there at all,
-        // and foreign tables (relkind 'f') are excluded by the `table_type`
-        // filter. Both are otherwise ordinary, queryable relations (#11725).
+        // `information_schema.tables`. The prior query filtered on
+        // `table_type IN ('BASE TABLE', 'VIEW')`, which silently dropped
+        // materialized views (relkind 'm', absent from `information_schema`
+        // entirely) and foreign tables (relkind 'f', reported there as
+        // `table_type = 'FOREIGN'`). Both are otherwise ordinary, queryable
+        // relations (#11725).
+        //
+        // `information_schema.tables` is privilege-aware — it only lists
+        // relations the current role can access — whereas `pg_class` is broadly
+        // readable. To preserve that behaviour (and avoid registering relations
+        // the configured user can't read, which would produce repeated warn
+        // logs on query), we keep only relations the current role holds `SELECT`
+        // on via `has_table_privilege`.
         //
         // A declaratively-partitioned parent (relkind 'p') and every one of its
         // leaf partitions (relkind 'r') would otherwise both be discovered.
@@ -463,6 +472,7 @@ impl PostgresSchemaProvider {
                  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
                  WHERE n.nspname = $1 \
                  AND c.relkind IN ('r', 'p', 'v', 'm', 'f') \
+                 AND pg_catalog.has_table_privilege(c.oid, 'SELECT') \
                  AND NOT EXISTS ( \
                      SELECT 1 FROM pg_catalog.pg_inherits inh \
                      WHERE inh.inhrelid = c.oid \
