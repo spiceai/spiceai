@@ -22256,6 +22256,32 @@ impl CayenneTableProvider {
             })
     }
 
+    /// Acquire the D>1 seal QUIESCE barrier (Stage 2b Step 3b-b-iii): ALL `max_depth`
+    /// admission permits, so the seal captures over an empty drain ledger (no resident
+    /// detached checkpoint window for its un-windowed `unsealed_view` shadow to overlap)
+    /// and no checkpoint can freeze behind it while it is in flight. The returned permit
+    /// bundle is held for the whole seal and released on drop. Returns `Ok(None)` at
+    /// `D = 1` (the config default) — no barrier, byte-identical to the pre-3b-b-iii
+    /// seal. See [`Self::seal_mem_tier_durable`]'s call site for the full rationale and
+    /// the deadlock-freedom argument.
+    async fn acquire_seal_quiesce_barrier(
+        &self,
+    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+        let depth = self.drain_pipeline_depth();
+        if depth == 1 {
+            return Ok(None);
+        }
+        let permits = u32::try_from(depth).unwrap_or(u32::MAX);
+        Arc::clone(&self.drain_admission)
+            .acquire_many_owned(permits)
+            .await
+            .map(Some)
+            .map_err(|_| Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: "mem-tier drain admission semaphore was closed".to_string(),
+            })
+    }
+
     /// Detach a captured checkpoint generation's drain onto a background `tokio::spawn`
     /// task (Stage 2b Step 3b-b), so the next freeze overlaps this drain. The task owns
     /// a writer clone (`Arc::new(self.clone_for_write())` — the `IngestTask.provider`
@@ -23417,6 +23443,23 @@ impl CayenneTableProvider {
         if !self.is_cdc_memory_mode() || self.is_memory_resident_mode() {
             return Ok(0);
         }
+        // D>1 SEAL QUIESCE BARRIER (Stage 2b Step 3b-b-iii). A seal is SINGLE-ORDERED
+        // (the drain-serialization audit) and does NOT window its capture — it shadows
+        // `unsealed_view()` over the WHOLE active prefix. At `D > 1` a detached checkpoint
+        // releases `mem_checkpoint_lock` after its freeze and drains off-lock, so a seal
+        // could otherwise freeze BEHIND a still-resident checkpoint whose not-yet-cleared
+        // window overlaps the seal's active prefix — doubly-persisting those rows (the
+        // over-count class PR #11907 fixed). So before capturing, DRAIN THE PIPELINE:
+        // hold all `max_depth` admission permits for the whole seal, which blocks until
+        // every in-flight detached checkpoint published + reclaimed (releasing its permit)
+        // and prevents any new checkpoint freeze (none can get a permit). The seal then
+        // captures over an EMPTY ledger — `window_base = [0; n]`, no checkpoint window
+        // ahead of it — exactly as at `D = 1`. Deadlock-free: a checkpoint's publish path
+        // takes only the listing fence + shard publish locks (never `mem_checkpoint_lock`,
+        // never a seal-held permit), so it makes full progress while the seal waits; and
+        // `acquire_many` is fair, so a steady checkpoint stream cannot starve the seal.
+        // No-op at `D = 1` (the config default) — byte-identical to the pre-3b-b-iii seal.
+        let _quiesce = self.acquire_seal_quiesce_barrier().await?;
         // A due seal must make progress even under sustained writes, so acquire the
         // capture locks with the GUARANTEED fair path (not a skip): fast try, then a
         // fair `write -> mem` queued fallback. Single-drainer w.r.t. the bake via
@@ -23535,8 +23578,8 @@ impl CayenneTableProvider {
         let claim = {
             let mut ledger = self.drain_ledger.lock();
             debug_assert!(
-                ledger.max_depth() > 1 || ledger.is_empty(),
-                "D=1 drain ledger must be empty before a seal freeze (freezes serialized by mem_checkpoint_lock)"
+                ledger.is_empty(),
+                "seal must freeze over an empty drain ledger (D=1: mem_checkpoint_lock-serialized inline drains; D>1: the seal quiesce barrier drained the pipeline)"
             );
             let window_base = ledger.resident_prefix_counts(n);
             match ledger.freeze(FrozenGeneration::freeze(
@@ -33721,6 +33764,117 @@ mod tests {
             vec![1, 2, 3, 4, 5, 6, 7],
             "no resurrection or duplicate after the replay is baked durable"
         );
+    }
+
+    /// Stage 2b Step 3b-b-iii — the D>1 SEAL quiesce barrier. A seal is single-ordered
+    /// and shadows the WHOLE active prefix (`unsealed_view`, un-windowed), so it must not
+    /// freeze behind a still-resident detached checkpoint — it would doubly-persist that
+    /// checkpoint's rows. Here a checkpoint (gen0) is held in flight over [4,5] while a
+    /// LATER burst [6,7] lands, then a seal is issued: the barrier must BLOCK the seal
+    /// (it holds only `max_depth − 1` free permits) until gen0 publishes + reclaims, and
+    /// the seal must then capture ONLY the remaining [6,7] — NOT gen0's already-baked
+    /// [4,5]. The sealed-row count (2, not 4) is the direct proof the barrier prevented
+    /// the overlap. Config keeps `D = 1`; `D = 2` is the test-only override.
+    #[tokio::test]
+    async fn stage2b_d2_seal_quiesces_behind_a_resident_checkpoint() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        async fn wait_until(label: &str, cond: impl Fn() -> bool) {
+            for _ in 0..2000 {
+                if cond() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            panic!("condition '{label}' not met within timeout");
+        }
+
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) =
+            create_memory_mode_upsert_table("s2b_d2_seal_barrier", Arc::clone(&runtime_env)).await;
+        let durable = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(std::sync::Arc::new(EpochRecorder(std::sync::Arc::clone(
+            &durable,
+        ))));
+
+        // Seed [1,2,3] durable at D=1 (empty ledger afterward), then raise D and gate.
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(int64_id_batch(&[1, 2, 3])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed append");
+        provider.checkpoint_mem_tier().await.expect("seed checkpoint");
+        provider.set_drain_pipeline_depth_for_test(2);
+        let (parked, release) = provider.install_checkpoint_drain_gate_for_test();
+
+        // gen0 freezes over [4,5] and parks in flight (holding one of the two permits).
+        let _ = provider
+            .write_cdc_append_stream(single_batch_stream(int64_id_batch(&[4, 5])), &ctx.task_ctx())
+            .await
+            .expect("append [4,5]");
+        provider.checkpoint_mem_tier().await.expect("freeze + detach gen0");
+        wait_until("gen0 parked", || parked.load(AtomicOrdering::Relaxed) >= 1).await;
+        // A LATER burst [6,7] lands in the tier while gen0 is still resident. gen0's
+        // window is fixed at [4,5]; [6,7] is beyond it.
+        let _ = provider
+            .write_cdc_append_stream(single_batch_stream(int64_id_batch(&[6, 7])), &ctx.task_ctx())
+            .await
+            .expect("append [6,7]");
+
+        // Issue the seal on a detached clone (it would block the current task on the
+        // barrier otherwise). It must NOT make progress while gen0 holds a permit.
+        let seal_provider = Arc::new(provider.clone_for_write());
+        let seal = tokio::spawn(async move { seal_provider.seal_mem_tier_durable().await });
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            assert!(
+                !seal.is_finished(),
+                "the seal must block on the quiesce barrier while a checkpoint is resident"
+            );
+            assert!(
+                provider.drain_ledger.lock().depth() <= 1,
+                "the seal must not freeze a second generation while gen0 is resident"
+            );
+        }
+
+        // Release gen0: it publishes [4,5], clears the front, reclaims, frees its permit.
+        // The seal's barrier then acquires both permits and captures ONLY [6,7].
+        release.add_permits(1);
+        let sealed_rows = seal
+            .await
+            .expect("seal task joins")
+            .expect("seal succeeds after the pipeline quiesces");
+        assert_eq!(
+            sealed_rows, 2,
+            "the seal captured ONLY the post-checkpoint tail [6,7] (2 rows) — not gen0's already-baked [4,5]; the barrier prevented the overlap"
+        );
+        wait_until("ledger drained", || provider.drain_ledger.lock().is_empty()).await;
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1, 2, 3, 4, 5, 6, 7],
+            "checkpoint [4,5] + seal [6,7] compose with no loss or double-count"
+        );
+
+        // Durability: [1..5] baked (seed + gen0), [6,7] in the inline seal shadow. Reopen
+        // recovers the full set with no duplicate.
+        drop(provider);
+        let reopened =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .open("s2b_d2_seal_barrier")
+                .await
+                .expect("reopen after the seal");
+        let ids = scan_sorted_ids(&reopened).await;
+        assert_eq!(
+            ids,
+            vec![1, 2, 3, 4, 5, 6, 7],
+            "the seal shadow + the checkpoint file recover the full set across a restart"
+        );
+        let mut deduped = ids.clone();
+        deduped.dedup();
+        assert_eq!(ids, deduped, "no primary key recovered twice");
     }
 
     /// Stage 2a crash-injection — the published-but-unacked boundary (the "crash
