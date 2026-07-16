@@ -2561,19 +2561,21 @@ impl std::fmt::Debug for CayenneTableProvider {
 /// If the drain instead returns early on a `?` error or panics mid-flight, the
 /// generation would be stranded in the shared ledger and a later freeze would hit
 /// the depth bound and error the table permanently. On drop while still armed this
-/// guard discards that stranded generation BY ITS ID
-/// ([`FrozenDrainLedger::discard_by_id`]), which loses nothing — the mem-tier
+/// guard CASCADE-discards that stranded generation and every younger one behind it
+/// ([`FrozenDrainLedger::discard_from_id`]), which loses nothing — the mem-tier
 /// segments are removed only at publish, so the rows are still live in the tier and
 /// re-frozen by the next capture.
 ///
-/// IDENTITY-AWARE (Stage 2b Step 3b): the guard discards the generation with its
-/// recorded `id`, NOT the front. At `D > 1` a failing drain's generation may sit
-/// behind an older in-flight drain's generation, so discarding the front would drop
-/// the wrong one; addressing by id targets exactly this drain's generation wherever
-/// it sits. At `D = 1` the sole resident generation carries this id and is the front,
-/// so it is byte-identical to a front discard. The guard drops BEFORE the operation
-/// releases `mem_checkpoint_lock` (declared after the lock guard, so reverse drop
-/// order), leaving the ledger clear of this generation for the next freeze.
+/// IDENTITY-AWARE + CASCADING (Stage 2b Steps 3b + 3b-b-iii): the guard discards the
+/// generation with its recorded `id` (NOT the front) AND all younger generations still
+/// resident behind it — a failure invalidates their window bases (they summed this
+/// generation's un-cleared front into their own), so they must not publish a stale
+/// window. Addressing by id targets exactly this drain's generation wherever it sits at
+/// `D > 1`; the cascade then collapses the younger run. At `D = 1` the sole resident
+/// generation carries this id and is the front, so it is byte-identical to a single
+/// front discard. The guard drops BEFORE the operation releases `mem_checkpoint_lock`
+/// (declared after the lock guard, so reverse drop order), leaving the ledger clear of
+/// this generation for the next freeze.
 struct DrainCleanup<'a> {
     ledger: &'a ParkingMutex<FrozenDrainLedger>,
     /// Woken on a discard so a younger generation parked in the ordered-publish gate
@@ -2609,19 +2611,28 @@ impl DrainCleanup<'_> {
 impl Drop for DrainCleanup<'_> {
     fn drop(&mut self) {
         if self.armed {
-            // Error/panic path: the drain never reached its terminal reclaim. A
-            // brief, await-free critical section (Drop is synchronous) removes this
-            // drain's own stranded generation (by id) so the ledger does not fill.
-            self.ledger.lock().discard_by_id(self.id);
-            // The discard advanced the ledger front, so wake any younger drain parked
-            // in the ordered-publish gate to re-check (else it would hang at D>1). A
-            // no-op at D=1 (no drain is ever parked). NOTE (Step 3d deliverable): a
-            // failing OLDER generation invalidates the window bases of the younger
-            // generations still resident behind it (their `window_base` counted this
-            // generation's now-un-cleared segments); waking them here prevents a hang,
-            // but the correct D>1 FAILURE semantics — cascade-discard / re-window the
-            // younger generations, or replay the whole pipeline — land with the D>1
-            // crash-injection work. This is unreachable at the config default (D=1).
+            // Error/panic path: the drain never reached its terminal reclaim. A brief,
+            // await-free critical section (Drop is synchronous) CASCADE-discards this
+            // drain's own stranded generation AND every younger generation still
+            // resident behind it (Stage 2b Step 3b-b-iii). The cascade is the D>1
+            // FAILURE contract: a failing generation never clears its front prefix, but
+            // each younger generation summed this one's `relative_counts` into its
+            // `window_base` on the promise that the front WOULD be cleared oldest-first
+            // ahead of it — so a younger generation that published after this failure
+            // would `retain_after` the wrong (un-cleared) front and corrupt the tier.
+            // Discarding the whole younger run collapses the pipeline to a safe point:
+            // nothing was cleared (publish clears only from the front, oldest-first, and
+            // none of these ever became the front), so every discarded generation's rows
+            // stay live in the tier and the source replays their un-acked epochs
+            // PK-idempotently. Generations OLDER than this one (ahead of it) never
+            // counted it, so they are untouched and publish/clear their own fronts.
+            self.ledger.lock().discard_from_id(self.id);
+            // The cascade advanced the ledger front, so wake every drain parked in the
+            // ordered-publish gate to re-check: an older survivor may now be the front
+            // (its turn), and each cascade-discarded younger drain observes
+            // `!is_resident` and ABORTS its publish (see `await_checkpoint_publish_turn`)
+            // rather than clearing a stale window. A no-op at D=1 (no drain is ever
+            // parked — the sole generation is always the front).
             self.publish_notify.notify_waiters();
         }
     }
@@ -2676,6 +2687,18 @@ struct SealDrainClaim {
     /// The durable epoch this generation acks once sealed (MAX per-apply epoch over the
     /// full captured prefix).
     seal_epoch: u64,
+}
+
+/// The outcome of [`CayenneTableProvider::await_checkpoint_publish_turn`]: whether a
+/// parked drain won its ordered-publish turn or was cascade-discarded by an older
+/// failure (Stage 2b Step 3b-b-iii).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishTurn {
+    /// This generation is now the ledger front — proceed with the ordered publish.
+    Ours,
+    /// This generation left the ledger (an older drain failed and cascade-discarded it);
+    /// abort the publish without clearing/committing — its rows stay live for replay.
+    Discarded,
 }
 
 /// Test-only deterministic pause gate for the D>1 detached checkpoint drain (Stage 2b
@@ -22418,21 +22441,28 @@ impl CayenneTableProvider {
     }
 
     /// Wait until the generation identified by `id` is the FRONT (oldest in-flight) of
-    /// the drain ledger — its ordered-publish turn. Returns immediately when it is
-    /// already the front (ALWAYS the case at `D = 1`, where the sole resident
-    /// generation is the front — byte-identical, no suspension). At `D > 1` a drain
-    /// whose encode finished ahead of an older generation's parks here until every
-    /// older generation has published and reclaimed, so the publish section (metastore
-    /// commit → `listing_fence` swap → `retain_after` front-clear → slot ack) runs
-    /// strictly oldest-first. This is what makes the front-relative `retain_after`
+    /// the drain ledger — its ordered-publish turn. Returns [`PublishTurn::Ours`]
+    /// immediately when it is already the front (ALWAYS the case at `D = 1`, where the
+    /// sole resident generation is the front — byte-identical, no suspension). At
+    /// `D > 1` a drain whose encode finished ahead of an older generation's parks here
+    /// until every older generation has published and reclaimed, so the publish section
+    /// (metastore commit → `listing_fence` swap → `retain_after` front-clear → slot ack)
+    /// runs strictly oldest-first. This is what makes the front-relative `retain_after`
     /// clear safe: a later generation can only clear the tier front once it IS the
     /// front, i.e. once every older generation's front prefix has already been cleared.
     ///
+    /// Returns [`PublishTurn::Discarded`] when this generation is no longer resident: an
+    /// OLDER generation's drain failed and CASCADE-discarded this one (Step 3b-b-iii),
+    /// so it will never become the front and MUST NOT publish — its `window_base`
+    /// counted the failed older generation's now-un-cleared segments, so a
+    /// `retain_after` here would clear the wrong front. The caller aborts its publish;
+    /// the generation's rows stay live in the tier and the source replays PK-idempotently.
+    ///
     /// The wait registers on [`Self::drain_publish_notify`] BEFORE re-checking the
     /// front under the ledger lock, so a `notify_waiters()` fired by a concurrent
-    /// reclaim between the check and the await is not lost (the standard tokio
+    /// reclaim/cascade between the check and the await is not lost (the standard tokio
     /// `Notified` idiom).
-    async fn await_checkpoint_publish_turn(&self, id: u64) {
+    async fn await_checkpoint_publish_turn(&self, id: u64) -> PublishTurn {
         loop {
             let notified = self.drain_publish_notify.notified();
             tokio::pin!(notified);
@@ -22441,14 +22471,39 @@ impl CayenneTableProvider {
             notified.as_mut().enable();
             {
                 let ledger = self.drain_ledger.lock();
-                // Our turn once we are the front; also return if our generation is no
-                // longer resident (an abort/discard) — it will never become the front,
-                // and the caller's transition/cleanup handles the missing generation.
-                if ledger.front_id() == Some(id) || !ledger.is_resident(id) {
-                    return;
+                if ledger.front_id() == Some(id) {
+                    return PublishTurn::Ours;
+                }
+                // No longer resident ⇒ an older failure cascade-discarded us; abort.
+                if !ledger.is_resident(id) {
+                    return PublishTurn::Discarded;
                 }
             }
             notified.await;
+        }
+    }
+
+    /// Await the ordered-publish turn for generation `id`, returning `true` to proceed
+    /// with the publish (this generation is now the front) or `false` to ABORT it (an
+    /// older drain failed and cascade-discarded this generation — Step 3b-b-iii). On
+    /// abort it disarms `cleanup`: the generation already left the ledger, so there is
+    /// nothing to discard, and the caller returns early WITHOUT the commit / fence swap /
+    /// `retain_after` clear — its rows stay live in the tier and the source replays the
+    /// un-acked epoch PK-idempotently. Byte-identical at `D = 1` (always the front, no
+    /// suspension, never discarded — so always `true`).
+    async fn take_publish_turn_or_abort(&self, id: u64, cleanup: &mut DrainCleanup<'_>) -> bool {
+        match self.await_checkpoint_publish_turn(id).await {
+            PublishTurn::Ours => true,
+            PublishTurn::Discarded => {
+                cleanup.disarm();
+                tracing::debug!(
+                    target: "cayenne::mem_tier",
+                    table = %self.table_metadata.table_name,
+                    generation = id,
+                    "detached checkpoint drain cascade-discarded by an older drain failure; aborting publish (rows stay live, source replays PK-idempotently)"
+                );
+                false
+            }
         }
     }
 
@@ -22880,8 +22935,11 @@ impl CayenneTableProvider {
             // registers no snapshot.
             // ORDERED PUBLISH (Step 3b-b): this path commits DVs + clears the front
             // prefix, so it must run after every older generation published. No-op at
-            // D=1 (this is the only, and therefore front, generation).
-            self.await_checkpoint_publish_turn(id).await;
+            // D=1 (this is the only, and therefore front, generation). ABORT if an
+            // older failure cascade-discarded this generation (Step 3b-b-iii).
+            if !self.take_publish_turn_or_abort(id, drain_cleanup).await {
+                return Ok(0);
+            }
             if let Some(sequence_number) = reserved_snapshot_sequence
                 && Self::mem_tier_has_tombstones(&snapshot)
             {
@@ -22985,8 +23043,11 @@ impl CayenneTableProvider {
             // atomic under one held fence, so it cannot overlap encode across
             // generations — take the publish turn up front. No-op at D=1 (and
             // position-based tables never raise D above 1: they are single-shard and
-            // never engage the memory-mode mem-tier pipeline).
-            self.await_checkpoint_publish_turn(id).await;
+            // never engage the memory-mode mem-tier pipeline, so the abort branch is
+            // unreachable here — kept for uniformity with the other publish arms).
+            if !self.take_publish_turn_or_abort(id, drain_cleanup).await {
+                return Ok(0);
+            }
             let _fence = self.listing_fence.write().await;
             let target_size_bytes = self.context.target_file_size_bytes();
             let current_snapshot = self.get_current_snapshot_id();
@@ -23091,8 +23152,13 @@ impl CayenneTableProvider {
             // fence swap + `retain_after` front-clear below (phase 2) must be strictly
             // oldest-first: park here until this generation is the ledger front (every
             // older generation published and reclaimed). No-op at D=1 (sole/front gen),
-            // so the pre-commit spill-fault crash boundary below is unchanged.
-            self.await_checkpoint_publish_turn(id).await;
+            // so the pre-commit spill-fault crash boundary below is unchanged. ABORT if
+            // an older failure cascade-discarded this generation (Step 3b-b-iii): the
+            // orphan Vortex file just encoded stays unreferenced (invisible), and the
+            // rows stay live in the tier for PK-idempotent replay.
+            if !self.take_publish_turn_or_abort(id, drain_cleanup).await {
+                return Ok(0);
+            }
 
             // Test-only Stage 2a spilling-crash injection: the generation is in
             // `GenState::Spilling` here — the Vortex file is durably encoded and
@@ -33433,6 +33499,227 @@ mod tests {
         assert!(
             durable.load(std::sync::atomic::Ordering::SeqCst) > acked_after_seed,
             "the successful retry advances the slot past the seed"
+        );
+    }
+
+    /// Stage 2b Step 3b-b-iii — D>1 FAILURE cascade. When a detached checkpoint drain
+    /// fails at `Spilling`, its `DrainCleanup` must discard not only its own generation
+    /// but every YOUNGER generation still resident behind it: each younger freeze summed
+    /// the failing generation's front prefix into its own `window_base` on the promise
+    /// that the front would be cleared oldest-first ahead of it, so a younger generation
+    /// that published after the failure would `retain_after` the WRONG front and corrupt
+    /// the tier. Here two generations are held concurrently in flight (the overlap),
+    /// then the OLDER one is faulted; the cascade must collapse BOTH, advance no slot,
+    /// leave every row live in the tier, and never strand a generation (the next
+    /// checkpoint converges). Config keeps `D = 1`; `D = 2` is the test-only override.
+    #[tokio::test]
+    async fn stage2b_d2_older_drain_failure_cascade_discards_younger() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        // Bounded condition-poll (the sanctioned readiness-wait shape), not a sleep.
+        async fn wait_until(label: &str, cond: impl Fn() -> bool) {
+            for _ in 0..2000 {
+                if cond() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            panic!("condition '{label}' not met within timeout");
+        }
+
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) =
+            create_memory_mode_upsert_table("s2b_d2_cascade", Arc::clone(&runtime_env)).await;
+        let durable = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(std::sync::Arc::new(EpochRecorder(std::sync::Arc::clone(
+            &durable,
+        ))));
+
+        // Seed [1,2,3] and bake it durable at D=1 (inline, empty ledger afterward — the
+        // precondition for raising the depth).
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(int64_id_batch(&[1, 2, 3])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed append");
+        provider.checkpoint_mem_tier().await.expect("seed checkpoint");
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 2, 3]);
+        let acked_after_seed = durable.load(AtomicOrdering::SeqCst);
+
+        provider.set_drain_pipeline_depth_for_test(2);
+        let (parked, release) = provider.install_checkpoint_drain_gate_for_test();
+
+        // Freeze gen0 over [4,5] and gen1 over [6,7]; both detach and park at the pause
+        // (in flight, overlapping). The mem-tier append stays synchronous.
+        let _ = provider
+            .write_cdc_append_stream(single_batch_stream(int64_id_batch(&[4, 5])), &ctx.task_ctx())
+            .await
+            .expect("append [4,5]");
+        provider.checkpoint_mem_tier().await.expect("freeze + detach gen0");
+        wait_until("gen0 parked", || parked.load(AtomicOrdering::Relaxed) >= 1).await;
+        let _ = provider
+            .write_cdc_append_stream(single_batch_stream(int64_id_batch(&[6, 7])), &ctx.task_ctx())
+            .await
+            .expect("append [6,7]");
+        provider.checkpoint_mem_tier().await.expect("freeze + detach gen1");
+        wait_until("both parked", || parked.load(AtomicOrdering::Relaxed) >= 2).await;
+        assert_eq!(
+            provider.drain_ledger.lock().depth(),
+            2,
+            "two generations concurrently resident (overlap) before the fault"
+        );
+
+        // Arm the one-shot spilling fault: the OLDER generation (gen0, the front) trips
+        // it after its encode, at its ordered-publish turn. Release both; gen0 faults
+        // and cascade-discards gen1 (which aborts at the publish gate).
+        provider.arm_checkpoint_spill_fault();
+        release.add_permits(2);
+        wait_until("ledger drained by the cascade", || {
+            provider.drain_ledger.lock().is_empty()
+        })
+        .await;
+
+        assert_eq!(
+            durable.load(AtomicOrdering::SeqCst),
+            acked_after_seed,
+            "a cascade after an older-drain failure advances no slot"
+        );
+        // Nothing was cleared — every row stays live in the tier for replay.
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1, 2, 3, 4, 5, 6, 7],
+            "cascade-discarded generations leave all rows live in the tier"
+        );
+
+        // No strand: the next checkpoint's freeze admits into the (now empty) ledger and
+        // drains the whole live tail. Release its single detached drain through the gate.
+        release.add_permits(1);
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("post-cascade checkpoint freezes + detaches");
+        wait_until("retry drained", || provider.drain_ledger.lock().is_empty()).await;
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1, 2, 3, 4, 5, 6, 7],
+            "the retried checkpoint bakes the tail with no loss or duplicate"
+        );
+        assert!(
+            durable.load(AtomicOrdering::SeqCst) > acked_after_seed,
+            "the successful retry advances the slot past the seed"
+        );
+    }
+
+    /// Stage 2b Step 3b-b-iii — D>1 FAILURE cascade, REOPEN convergence. Same overlap +
+    /// older-drain fault as the in-process test, but here the process CRASHES (drop,
+    /// RAM lost) after the cascade. Both faulted generations left orphan Vortex files
+    /// (encoded before the fault / before the abort) but never committed a metastore
+    /// pointer, so on reopen only the seed is durable — the orphans MUST be invisible
+    /// (no dirty read). The source, having seen no ack past the seed, re-streams both
+    /// un-acked epochs and the PK-idempotent replay converges to the full set.
+    #[tokio::test]
+    async fn stage2b_d2_cascade_failure_reopen_converges() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        async fn wait_until(label: &str, cond: impl Fn() -> bool) {
+            for _ in 0..2000 {
+                if cond() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            panic!("condition '{label}' not met within timeout");
+        }
+
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) =
+            create_memory_mode_upsert_table("s2b_d2_cascade_reopen", Arc::clone(&runtime_env)).await;
+        let durable = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(std::sync::Arc::new(EpochRecorder(std::sync::Arc::clone(
+            &durable,
+        ))));
+
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(int64_id_batch(&[1, 2, 3])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed append");
+        provider.checkpoint_mem_tier().await.expect("seed checkpoint");
+        let acked_after_seed = durable.load(AtomicOrdering::SeqCst);
+
+        provider.set_drain_pipeline_depth_for_test(2);
+        let (parked, release) = provider.install_checkpoint_drain_gate_for_test();
+
+        let _ = provider
+            .write_cdc_append_stream(single_batch_stream(int64_id_batch(&[4, 5])), &ctx.task_ctx())
+            .await
+            .expect("append [4,5]");
+        provider.checkpoint_mem_tier().await.expect("freeze + detach gen0");
+        wait_until("gen0 parked", || parked.load(AtomicOrdering::Relaxed) >= 1).await;
+        let _ = provider
+            .write_cdc_append_stream(single_batch_stream(int64_id_batch(&[6, 7])), &ctx.task_ctx())
+            .await
+            .expect("append [6,7]");
+        provider.checkpoint_mem_tier().await.expect("freeze + detach gen1");
+        wait_until("both parked", || parked.load(AtomicOrdering::Relaxed) >= 2).await;
+
+        provider.arm_checkpoint_spill_fault();
+        release.add_permits(2);
+        wait_until("ledger drained by the cascade", || {
+            provider.drain_ledger.lock().is_empty()
+        })
+        .await;
+        assert_eq!(
+            durable.load(AtomicOrdering::SeqCst),
+            acked_after_seed,
+            "the cascade advanced no slot"
+        );
+
+        // CRASH: drop (RAM gone), reopen. Only the seed is durable; both generations'
+        // orphan spill files are unreferenced and MUST be invisible.
+        drop(provider);
+        let reopened =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .open("s2b_d2_cascade_reopen")
+                .await
+                .expect("reopen after the D>1 cascade crash");
+        assert_eq!(
+            scan_sorted_ids(&reopened).await,
+            vec![1, 2, 3],
+            "both cascade orphans are invisible on reopen (no dirty read of uncommitted rows)"
+        );
+
+        // The source re-streams both un-acked epochs; the replay converges with no loss
+        // or duplicate, and a clean checkpoint bakes it durable.
+        let durable2 = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        reopened.install_slot_advancer(std::sync::Arc::new(EpochRecorder(std::sync::Arc::clone(
+            &durable2,
+        ))));
+        for tail in [[4, 5], [6, 7]] {
+            let _ = reopened
+                .write_cdc_append_stream(single_batch_stream(int64_id_batch(&tail)), &ctx.task_ctx())
+                .await
+                .expect("replay an un-acked epoch");
+        }
+        let ids = scan_sorted_ids(&reopened).await;
+        assert_eq!(ids, vec![1, 2, 3, 4, 5, 6, 7], "the replay converges with no loss");
+        let mut deduped = ids.clone();
+        deduped.dedup();
+        assert_eq!(ids, deduped, "no primary key appears twice after the replay");
+        reopened
+            .checkpoint_mem_tier()
+            .await
+            .expect("post-replay checkpoint");
+        assert_eq!(
+            scan_sorted_ids(&reopened).await,
+            vec![1, 2, 3, 4, 5, 6, 7],
+            "no resurrection or duplicate after the replay is baked durable"
         );
     }
 

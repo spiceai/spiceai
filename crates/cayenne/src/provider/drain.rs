@@ -354,22 +354,43 @@ impl FrozenDrainLedger {
         watermark
     }
 
-    /// Remove the generation with `id` regardless of its lifecycle state or ledger
-    /// position, dropping its captured Arcs, WITHOUT the terminal-state assertion
-    /// [`Self::reclaim_front`] makes. This is the **abort** path: a drain that fails on
-    /// an early `?` return or panics mid-flight — before it published or sealed — must
-    /// discard ITS OWN frozen generation, or the next freeze eventually hits the depth
-    /// bound and errors the table permanently. Addressing by id (not by front) is what
-    /// makes this safe at depth `D > 1`, where the failing drain's generation may not
-    /// be the front (an older drain is still in flight ahead of it) — discarding the
-    /// front would drop the wrong generation. Discarding a not-yet-published generation
-    /// loses nothing: the mem-tier segments are removed only at publish
-    /// (`retain_after`), so the rows are still live in the tier and the next capture
-    /// re-freezes them. Returns the discarded generation, or `None` if no resident
-    /// generation carries `id` (the happy path, where the drain reclaimed it already).
-    pub(crate) fn discard_by_id(&mut self, id: u64) -> Option<FrozenGeneration> {
-        let pos = self.generations.iter().position(|g| g.id == id)?;
-        self.generations.remove(pos)
+    /// CASCADE-discard: remove the generation with `id` AND every generation frozen
+    /// AFTER it (younger, positioned behind it), dropping all their captured Arcs,
+    /// WITHOUT the terminal-state assertion [`Self::reclaim_front`] makes. Returns the
+    /// discarded run oldest-first (the generation with `id` first), or an empty `Vec`
+    /// if no resident generation carries `id` (the happy path, where the drain already
+    /// reclaimed it).
+    ///
+    /// This is the **abort / D>1 failure** contract (Stage 2b Steps 2 + 3b-b-iii). A
+    /// drain that fails on an early `?` return or panics mid-flight — before it
+    /// published or sealed — must discard its OWN frozen generation, or the next freeze
+    /// eventually hits the depth bound and errors the table permanently. But a failure
+    /// invalidates not just its own generation: it also breaks the
+    /// [`window_base`](FrozenGeneration::window_base) of every YOUNGER resident
+    /// generation, because each younger freeze summed this generation's
+    /// `relative_counts` into its own base ([`Self::resident_prefix_counts`]) on the
+    /// promise that this generation's front prefix would be cleared (`retain_after`)
+    /// ahead of it. A failing generation never clears, so a younger generation that then
+    /// published would `retain_after` the WRONG front prefix (this generation's
+    /// un-cleared segments) — corrupting the tier. Discarding the whole younger run
+    /// collapses the pipeline back to a safe point: nothing was cleared (publish clears
+    /// the front only oldest-first, and none of these ever became the front), so every
+    /// discarded generation's rows are still live in the tier, and the source replays
+    /// their un-acked epochs PK-idempotently. The younger drains' own tasks abort at the
+    /// ordered-publish gate (they observe `!is_resident`) rather than publishing a stale
+    /// window. Addressing by id (not by front) is what makes this safe at depth `D > 1`,
+    /// where the failing drain's generation may not be the front. Generations OLDER than
+    /// `id` (ahead of it) are untouched — they froze before it, so their bases never
+    /// counted it, and they publish/clear their own fronts correctly.
+    ///
+    /// At `D = 1` the sole resident generation is the only one at or behind `id`, so
+    /// this reclaims exactly it (or nothing, if already reclaimed) — byte-identical to
+    /// the pre-3b-b-iii single-generation discard.
+    pub(crate) fn discard_from_id(&mut self, id: u64) -> Vec<FrozenGeneration> {
+        let Some(pos) = self.generations.iter().position(|g| g.id == id) else {
+            return Vec::new();
+        };
+        self.generations.drain(pos..).collect()
     }
 
     /// Mutable handle to the resident generation with `id`, or `None` if none carries
@@ -559,34 +580,61 @@ mod tests {
     }
 
     #[test]
-    fn discard_by_id_removes_a_non_terminal_generation() {
+    fn discard_from_id_removes_a_non_terminal_generation() {
         // The abort path: a generation frozen but not driven to a terminal state
         // (an error mid-drain) must still be removable, WITHOUT the terminal-state
         // assertion `reclaim_front` makes, so a failed drain never strands it.
         let mut ledger = FrozenDrainLedger::new(1);
         let id = ledger.freeze(one_shard_gen(9)).map(|g| g.id).ok().expect("admitted");
-        // Still Frozen — reclaim_front would assert; discard_by_id must not.
+        // Still Frozen — reclaim_front would assert; discard_from_id must not.
         assert_eq!(ledger.front().expect("front").state(), GenState::Frozen);
-        let discarded = ledger.discard_by_id(id).expect("discard by id");
-        assert_eq!(discarded.epoch, 9);
+        let discarded = ledger.discard_from_id(id);
+        assert_eq!(discarded.iter().map(|g| g.epoch).collect::<Vec<_>>(), vec![9]);
         assert!(ledger.is_empty());
         // Discarding an unknown id is a no-op (the happy path already reclaimed it).
-        assert!(ledger.discard_by_id(id).is_none());
+        assert!(ledger.discard_from_id(id).is_empty());
     }
 
     #[test]
-    fn discard_by_id_removes_a_non_front_generation() {
-        // At D>1 a failing drain's generation may be behind an older in-flight one;
-        // discarding must target IT by id, not the front (which belongs to the older
-        // drain). Freeze two, discard the SECOND (back) — the first (front) survives.
-        let mut ledger = FrozenDrainLedger::new(2);
-        let id_front = ledger.freeze(one_shard_gen(10)).map(|g| g.id).ok().expect("front");
-        let id_back = ledger.freeze(one_shard_gen(20)).map(|g| g.id).ok().expect("back");
-        let discarded = ledger.discard_by_id(id_back).expect("discard back");
-        assert_eq!(discarded.epoch, 20);
-        assert_eq!(ledger.depth(), 1);
-        assert_eq!(ledger.front().expect("front").id, id_front);
-        assert_eq!(ledger.front().expect("front").epoch, 10);
+    fn discard_from_id_cascades_the_failing_generation_and_all_younger() {
+        // The D>1 FAILURE contract: discarding an OLDER generation invalidates every
+        // YOUNGER generation's window base, so the cascade removes the failing one AND
+        // all behind it, leaving the older ones intact. Freeze A,B,C,D; fail B → the
+        // cascade discards [B,C,D] and leaves [A].
+        let mut ledger = FrozenDrainLedger::new(4);
+        let id_a = ledger.freeze(one_shard_gen(10)).map(|g| g.id).ok().expect("A");
+        let id_b = ledger.freeze(one_shard_gen(20)).map(|g| g.id).ok().expect("B");
+        let _id_c = ledger.freeze(one_shard_gen(30)).map(|g| g.id).ok().expect("C");
+        let _id_d = ledger.freeze(one_shard_gen(40)).map(|g| g.id).ok().expect("D");
+        assert_eq!(ledger.depth(), 4);
+
+        let discarded = ledger.discard_from_id(id_b);
+        // Oldest-first, the failing generation first.
+        assert_eq!(
+            discarded.iter().map(|g| g.epoch).collect::<Vec<_>>(),
+            vec![20, 30, 40],
+            "cascade returns the failing generation and all younger, oldest-first"
+        );
+        assert_eq!(ledger.depth(), 1, "only the older survivor remains");
+        assert_eq!(ledger.front().expect("front").id, id_a);
+        // The survivor still publishes normally.
+        ledger.front_mut().expect("front").transition(GenState::Spilling);
+        ledger.front_mut().expect("front").transition(GenState::Published);
+        assert_eq!(ledger.reclaim_terminal_prefix_ack(), Some(10));
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn discard_from_id_of_the_front_drains_the_whole_ledger() {
+        // Failing the FRONT (oldest) generation cascades the entire resident run —
+        // every younger generation counted the front in its base.
+        let mut ledger = FrozenDrainLedger::new(3);
+        let id_a = ledger.freeze(one_shard_gen(10)).map(|g| g.id).ok().expect("A");
+        ledger.freeze(one_shard_gen(20)).ok().expect("B");
+        ledger.freeze(one_shard_gen(30)).ok().expect("C");
+        let discarded = ledger.discard_from_id(id_a);
+        assert_eq!(discarded.len(), 3, "the whole ledger cascades");
+        assert!(ledger.is_empty());
     }
 
     #[test]
