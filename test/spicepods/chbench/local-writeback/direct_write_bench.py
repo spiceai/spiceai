@@ -216,19 +216,21 @@ def check_no_lost_updates(base_url, w_id, before_sum, applied_delta):
 
 def check_ivm_fresh(base_url, w_id):
     """Maintained aggregate (served from the IVM registry) must equal a base scan
-    that bypasses it. Both go through the same SQL; the maintained one is the
-    GROUP BY the pod declares, the base one forces a scan via a non-declared shape
-    (COUNT(*)-style wrapper) so a stale registry would diverge."""
+    that bypasses it. The maintained query uses the exact `GROUP BY s_w_id` shape
+    the pod declares (served from the IVM registry); the base query is a scalar
+    `SUM` with NO `GROUP BY`, whose empty group-by set can never match the view's
+    `group_by: [s_w_id]` (`MaintainedAggregateView::matches_query` requires an
+    exact group-by + aggregate match), so it is forced to a base scan. If the
+    registry is stale, the two diverge."""
     maintained = int(spice_scalar(
         base_url,
         f"SELECT SUM(s_quantity) AS s FROM stock WHERE s_w_id={w_id} GROUP BY s_w_id",
     ))
     base = int(spice_scalar(
         base_url,
-        # Wrap in a subquery + HAVING to steer the planner off the exact
-        # maintained-aggregate serve shape, forcing a base scan for comparison.
-        f"SELECT s FROM (SELECT s_w_id, SUM(s_quantity) AS s FROM stock "
-        f"WHERE s_w_id={w_id} GROUP BY s_w_id HAVING COUNT(*) >= 0) t",
+        # Scalar SUM, no GROUP BY: group_by set is [] != the view's [s_w_id], so
+        # this cannot be served from the maintained aggregate — a true base scan.
+        f"SELECT SUM(s_quantity) AS s FROM stock WHERE s_w_id={w_id}",
     ))
     ok = maintained == base
     print(

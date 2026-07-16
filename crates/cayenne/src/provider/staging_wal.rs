@@ -521,14 +521,19 @@ impl PreparedStagedAppend {
             if let Some(sequence) = on_conflict_sequence.or(self.append_sequence) {
                 self.table.record_file_pk_keys(keys, sequence);
             } else {
-                // Neither sequence is available. Stamping the old fallback `0`
-                // would fail OPEN for per-key OCC — a transaction that read these
-                // keys would see stamp 0 <= its begin token and MISS the conflict
-                // (silent lost update). Record existence (needed for upsert
-                // supersede) but degrade per-key OCC to the per-table fallback
-                // until the next keyset rebuild.
-                self.table.record_file_pk_keys(keys, 0);
+                // Neither sequence is available. Stamping the fallback `0` would
+                // fail OPEN for per-key OCC — a transaction that read these keys
+                // would see stamp 0 <= its begin token and MISS the conflict
+                // (silent lost update). Degrade per-key OCC to the per-table
+                // fallback, and do it BEFORE publishing the stamp-0 keys: a reader
+                // observes the keys only after acquiring the pk_keyset_cache lock
+                // that `record_file_pk_keys` releases, and that lock's
+                // release/acquire chains after this `Release` store, so any reader
+                // that sees a stamp-0 entry is guaranteed to also see degraded and
+                // take the per-table fallback (setting the flag after the publish
+                // would leave a window where the untrustworthy stamp is trusted).
                 self.table.mark_pk_keyset_occ_degraded();
+                self.table.record_file_pk_keys(keys, 0);
             }
         }
     }
