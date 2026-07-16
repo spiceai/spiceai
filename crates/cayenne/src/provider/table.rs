@@ -37515,7 +37515,10 @@ mod tests {
             .expect("checkpoint does not deadlock")
             .expect("join checkpoint")
             .expect("checkpoint succeeds");
-        assert_eq!(flushed, 3, "the checkpoint flushes the seeded rows once released");
+        assert_eq!(
+            flushed, 3,
+            "the checkpoint flushes the seeded rows once released"
+        );
         assert_eq!(
             query_count_star(&ctx, &provider, "guaranteed_ckpt_waits_writer").await,
             3,
