@@ -191,7 +191,11 @@ Every new crate must:
 - add `[lints]\nworkspace = true` (else it is silently **under-linted** — scoped
   clippy and rust-analyzer won't apply the pedantic/`unwrap_used` levels);
 - carry the copyright header (`Copyright 2024-2026 The Spice.ai OSS Authors`);
-- be added to workspace `members` in the root `Cargo.toml` **and** to `layers.toml`;
+- be added to workspace `members` in the root `Cargo.toml`, and be **covered by
+  `layers.toml`** — either it falls under an existing `[[rules]]` path prefix (or
+  the `default_tier`) and you've confirmed that tier is right, or you add an
+  explicit `[override]` entry. The guard rejects `[override]` keys that don't
+  name a real crate, so a typo fails rather than silently defaulting;
 - use a hyphenated name (and the `-api` suffix if it is an interface crate);
 - inherit shared deps via `dep.workspace = true`.
 

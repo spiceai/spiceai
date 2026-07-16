@@ -101,6 +101,29 @@ def main() -> int:
     for p in pkgs:
         tier_of[p["name"]] = assign_tier(p["name"], path_of[p["name"]], cfg)
 
+    # Validate the manifest itself: a typo can't be allowed to silently weaken
+    # the guard (e.g. a misspelled [override] key falls through to default_tier).
+    config_errors = []
+    for crate in cfg.get("override", {}):
+        if crate not in names:
+            config_errors.append(
+                f"[override] assigns unknown crate '{crate}' — typo or renamed crate? "
+                "It has no effect, so that crate silently uses its rule/default tier."
+            )
+    referenced_tiers = (
+        [cfg["default_tier"]]
+        + list(cfg.get("override", {}).values())
+        + [r["tier"] for r in cfg.get("rules", []) if "tier" in r]
+    )
+    for t in referenced_tiers:
+        if t not in rank:
+            config_errors.append(f"layers.toml references tier '{t}' not present in `order`.")
+    if config_errors:
+        print("layers.toml configuration error(s):\n", file=sys.stderr)
+        for e in config_errors:
+            print(f"  {e}", file=sys.stderr)
+        return 2
+
     unknown = {t for t in tier_of.values() if t not in rank}
     if unknown:
         print(f"error: crates assigned to unknown tier(s): {sorted(unknown)}", file=sys.stderr)
