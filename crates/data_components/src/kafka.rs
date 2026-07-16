@@ -1354,12 +1354,11 @@ fn max_kafka_offsets<'a>(
     let mut topic_names: Vec<&str> = Vec::new();
     let mut max_offsets: HashMap<(usize, i32), i64> = HashMap::new();
     for (topic, partition, offset) in &messages {
-        let topic_idx = match topic_names.iter().position(|t| t == topic) {
-            Some(idx) => idx,
-            None => {
-                topic_names.push(*topic);
-                topic_names.len() - 1
-            }
+        let topic_idx = if let Some(idx) = topic_names.iter().position(|t| t == topic) {
+            idx
+        } else {
+            topic_names.push(*topic);
+            topic_names.len() - 1
         };
         max_offsets
             .entry((topic_idx, *partition))

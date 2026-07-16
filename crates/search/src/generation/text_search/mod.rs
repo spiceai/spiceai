@@ -203,7 +203,8 @@ impl FullTextSearchFieldIndex {
         let stored_columns: HashSet<String> = index_search
             .schema()
             .fields()
-            .filter_map(|(_, f)| f.is_stored().then(|| f.name().to_string()))
+            .filter(|&(_, f)| f.is_stored())
+            .map(|(_, f)| f.name().to_string())
             .collect();
 
         let fts = Self {

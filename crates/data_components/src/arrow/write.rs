@@ -794,7 +794,7 @@ fn u64_to_key_string(mut n: u64) -> String {
 #[inline]
 fn i64_to_key_string(n: i64) -> String {
     if n >= 0 {
-        return u64_to_key_string(n as u64);
+        return u64_to_key_string(n.cast_unsigned());
     }
     let mut buf = [0u8; 20];
     let mut i = buf.len();
