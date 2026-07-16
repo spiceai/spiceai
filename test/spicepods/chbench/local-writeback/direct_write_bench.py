@@ -173,6 +173,7 @@ def worker(base_url, w_id, key_lo, key_hi, delta, rounds, max_retries):
     applied = 0
     conflicts = 0
     gate_aborts = 0
+    exhausted = 0
     key_span = key_hi - key_lo + 1
     for r in range(rounds):
         i_id = key_lo + (r % key_span)
@@ -188,7 +189,13 @@ def worker(base_url, w_id, key_lo, key_hi, delta, rounds, max_retries):
             if outcome == "gate":
                 gate_aborts += 1
                 break  # gate failed (stock exhausted) — expected terminal
-    return committed, applied, conflicts, gate_aborts
+        else:
+            # Every retry hit WriteConflict without committing (no `break`). This
+            # is a no-progress condition — surface it explicitly rather than
+            # silently under-driving the round, since it can mask a stuck-degraded
+            # / per-table-OCC-starvation scenario the harness is meant to catch.
+            exhausted += 1
+    return committed, applied, conflicts, gate_aborts, exhausted
 
 
 # ------------------------------- oracles -------------------------------------
@@ -291,9 +298,10 @@ def main():
     ))
     print(f"[2/5] baseline SUM(s_quantity) w_id={args.w_id}: {before_sum}")
 
-    # Disjoint key ranges per worker + a shared overlap band that forces conflicts.
+    # Disjoint key ranges per worker + an optional shared overlap band that
+    # forces conflicts (gated on --overlap-keys > 0 so it can be disabled).
     print(f"[3/5] driving {args.workers} concurrent gated transaction workers...")
-    total_committed = total_applied = total_conflicts = total_gate = 0
+    total_committed = total_applied = total_conflicts = total_gate = total_exhausted = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = []
         for wkr in range(args.workers):
@@ -303,20 +311,27 @@ def main():
                 worker, args.spice_url, args.w_id, key_lo, key_hi,
                 args.delta, args.rounds, args.max_retries,
             ))
-        # A couple of workers also hammer the shared overlap band (conflict path).
-        for wkr in range(min(2, args.workers)):
-            futures.append(pool.submit(
-                worker, args.spice_url, args.w_id, 1, max(1, args.overlap_keys),
-                args.delta, args.rounds, args.max_retries,
-            ))
+        # A couple of workers also hammer the shared overlap band (conflict path),
+        # unless the contended band is disabled with --overlap-keys 0.
+        if args.overlap_keys > 0:
+            for wkr in range(min(2, args.workers)):
+                futures.append(pool.submit(
+                    worker, args.spice_url, args.w_id, 1, args.overlap_keys,
+                    args.delta, args.rounds, args.max_retries,
+                ))
         for f in concurrent.futures.as_completed(futures):
-            committed, applied, conflicts, gate = f.result()
+            committed, applied, conflicts, gate, exhausted = f.result()
             total_committed += committed
             total_applied += applied
             total_conflicts += conflicts
             total_gate += gate
+            total_exhausted += exhausted
     print(f"  committed={total_committed} applied_delta=-{total_applied} "
-          f"conflicts(retried)={total_conflicts} gate_aborts={total_gate}")
+          f"conflicts(retried)={total_conflicts} gate_aborts={total_gate} "
+          f"retry_exhausted={total_exhausted}")
+    if total_exhausted > 0:
+        print(f"  WARNING: {total_exhausted} round(s) exhausted {args.max_retries} "
+              f"retries without committing — possible OCC starvation / stuck-degraded")
 
     print("[4/5] interleaved upsert filter-DELETE (exercises P0-3 degraded-flag path)...")
     del_status, _ = spice_sql(
@@ -328,6 +343,9 @@ def main():
     print("[5/5] checking invariants...")
     ok_lost = check_no_lost_updates(args.spice_url, args.w_id, before_sum, total_applied)
     ok_ivm = check_ivm_fresh(args.spice_url, args.w_id)
+    ok_progress = total_exhausted == 0
+    print(f"  [no-progress] retry_exhausted={total_exhausted} "
+          f"-> {'PASS' if ok_progress else 'FAIL'}")
     ok_wb = True
     if not args.skip_writeback_check:
         ok_wb = check_writeback_converges(
@@ -337,13 +355,16 @@ def main():
     print("\n== RESULT ==")
     print(f"  no-lost-updates (OCC): {'PASS' if ok_lost else 'FAIL'}")
     print(f"  ivm-fresh (P1):        {'PASS' if ok_ivm else 'FAIL'}")
+    print(f"  no-progress (OCC):     {'PASS' if ok_progress else 'FAIL'}")
     print(f"  write-back converge:   "
           f"{'PASS' if ok_wb else 'DIVERGED (see deferred P0 note above)'}")
 
-    # OCC and IVM are what THIS PR fixes — they gate the exit code. Write-back
+    # OCC and IVM are what THIS PR fixes — they gate the exit code, including a
+    # no-progress guard (any round that exhausted its retries without committing
+    # signals OCC starvation / stuck-degraded and fails the run). Write-back
     # convergence is reported but does NOT fail the run (the write-back echo-loss
     # P0 is deferred to its own PR).
-    critical_ok = ok_lost and ok_ivm
+    critical_ok = ok_lost and ok_ivm and ok_progress
     sys.exit(0 if critical_ok else 1)
 
 
