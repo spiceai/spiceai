@@ -1952,22 +1952,24 @@ const BAKE_KEEP_RECENT_SNAPSHOTS: usize = 3;
 /// value is read per-trigger via `self.context.bake_deletion_index_trigger()`.
 pub(crate) const BAKE_DELETION_INDEX_TRIGGER: usize = 50_000;
 
-/// The lock guards a mem-tier capture holds: `mem_checkpoint_lock` for the whole
-/// checkpoint lifecycle, plus (at N>1) the `write_lock` used for the atomic
-/// capture. Produced by the acquisition helpers and consumed by the checkpoint
-/// entry points.
-struct CaptureGuards {
-    /// Held across the entire capture -> encode -> publish -> clear lifecycle so no
-    /// other checkpoint runs concurrently. Read only via its `Drop` (held to scope
-    /// end by the caller).
+/// The two lock guards a mem-tier checkpoint holds. Their lifetimes differ — which
+/// is the whole reason this is a struct, not a tuple: `_checkpoint` lives across
+/// the ENTIRE lifecycle (capture -> encode -> publish -> clear -> slot advance) so
+/// no other checkpoint can run concurrently, while `write` is only capture-scoped.
+/// Callers keep the struct alive and hand only `write.take()` to
+/// `checkpoint_mem_tier_inner`, so the checkpoint guard's full-lifecycle ownership
+/// is hard to accidentally shorten in a future refactor.
+struct MemTierCheckpointGuards {
+    /// `mem_checkpoint_lock`, held across the whole checkpoint lifecycle. Read only
+    /// via its `Drop` (kept alive by the caller until the lifecycle completes).
     _checkpoint: tokio::sync::OwnedMutexGuard<()>,
-    /// The N>1 capture `write_lock`, handed to `checkpoint_mem_tier_inner`, which
-    /// releases it right after capture so the encode runs off `write_lock`. `None`
-    /// at N==1 (the single-shard capture is atomic).
+    /// The N>1 capture `write_lock`, taken out and handed to
+    /// `checkpoint_mem_tier_inner`, which releases it right after the atomic capture
+    /// so the encode runs off `write_lock`. `None` at N==1 (capture is atomic).
     write: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
-impl CaptureGuards {
+impl MemTierCheckpointGuards {
     fn new(
         checkpoint: tokio::sync::OwnedMutexGuard<()>,
         write: Option<tokio::sync::OwnedMutexGuard<()>>,
@@ -20308,15 +20310,15 @@ impl CayenneTableProvider {
     /// then a fair queued `write -> mem` fallback so it can never starve under
     /// sustained writers and never deadlocks the write-path spill / cold promotion
     /// (which hold `write_lock` first, then await `mem_checkpoint_lock`).
-    async fn acquire_capture_locks_blocking(&self) -> CaptureGuards {
+    async fn acquire_capture_locks_blocking(&self) -> MemTierCheckpointGuards {
         let checkpoint = self.mem_checkpoint_lock_for_writer().lock_owned().await;
         if self.mem_tier.shard_count() == 1 {
-            return CaptureGuards::new(checkpoint, None);
+            return MemTierCheckpointGuards::new(checkpoint, None);
         }
         // Fast path: no writer active, so take both without queueing — and without
         // ever holding `mem_checkpoint_lock` while BLOCKING on `write_lock`.
         if let Ok(write) = self.write_lock_arc().try_lock_owned() {
-            return CaptureGuards::new(checkpoint, Some(write));
+            return MemTierCheckpointGuards::new(checkpoint, Some(write));
         }
         // Contended: drop `mem_checkpoint_lock` to avoid the mem -> blocking-write
         // inversion, then acquire in the established `write -> mem` order. The
@@ -20325,22 +20327,22 @@ impl CayenneTableProvider {
         drop(checkpoint);
         let write = self.write_lock_arc().lock_owned().await;
         let checkpoint = self.mem_checkpoint_lock_for_writer().lock_owned().await;
-        CaptureGuards::new(checkpoint, Some(write))
+        MemTierCheckpointGuards::new(checkpoint, Some(write))
     }
 
     /// BEST-EFFORT acquisition: `try_lock` both locks and give up (`None`) the
     /// moment either is contended — never blocking, never stalling applies. Used by
     /// the size-triggered periodic checkpoint that still has age headroom; it
     /// retries next tick (and the write-path spill drains under sustained load).
-    fn try_acquire_capture_locks(&self) -> Option<CaptureGuards> {
+    fn try_acquire_capture_locks(&self) -> Option<MemTierCheckpointGuards> {
         let Ok(checkpoint) = self.mem_checkpoint_lock_for_writer().try_lock_owned() else {
             return None;
         };
         if self.mem_tier.shard_count() == 1 {
-            return Some(CaptureGuards::new(checkpoint, None));
+            return Some(MemTierCheckpointGuards::new(checkpoint, None));
         }
         match self.write_lock_arc().try_lock_owned() {
-            Ok(write) => Some(CaptureGuards::new(checkpoint, Some(write))),
+            Ok(write) => Some(MemTierCheckpointGuards::new(checkpoint, Some(write))),
             // `checkpoint` drops here — never held while blocking on `write_lock`.
             Err(_) => None,
         }
@@ -20358,11 +20360,13 @@ impl CayenneTableProvider {
     /// or tier clearing fails. The source slot is not advanced on failure.
     #[doc(hidden)]
     pub async fn checkpoint_mem_tier(&self) -> Result<u64> {
-        let CaptureGuards { _checkpoint, write } = self.acquire_capture_locks_blocking().await;
-        // `_checkpoint` is held across the whole lifecycle below (dropped at scope
-        // end); `write` is handed to `inner`, which releases it after capture so the
-        // encode runs off `write_lock`.
+        let mut guards = self.acquire_capture_locks_blocking().await;
+        // Hand only the capture-scoped `write` guard to `inner`; keep `guards`
+        // (holding `mem_checkpoint_lock`) alive until scope end so the checkpoint
+        // guard spans the whole capture -> encode -> publish -> clear lifecycle.
+        let write = guards.write.take();
         self.checkpoint_mem_tier_inner(write).await
+        // guards._checkpoint drops here, after the complete lifecycle.
     }
 
     /// BEST-EFFORT counterpart to [`Self::checkpoint_mem_tier`]: returns
@@ -20370,9 +20374,12 @@ impl CayenneTableProvider {
     /// contended. `Busy` never advances the source slot and is never reported as a
     /// completed checkpoint.
     async fn try_checkpoint_mem_tier(&self) -> Result<CheckpointAttempt> {
-        let Some(CaptureGuards { _checkpoint, write }) = self.try_acquire_capture_locks() else {
+        let Some(mut guards) = self.try_acquire_capture_locks() else {
             return Ok(CheckpointAttempt::Busy);
         };
+        // Keep `guards` alive across `inner` (the checkpoint guard spans the whole
+        // lifecycle); hand it only the capture-scoped `write` guard.
+        let write = guards.write.take();
         let rows = self.checkpoint_mem_tier_inner(write).await?;
         Ok(CheckpointAttempt::Completed(rows))
     }
@@ -21079,10 +21086,11 @@ impl CayenneTableProvider {
         // capture locks with the GUARANTEED fair path (not a skip): fast try, then a
         // fair `write -> mem` queued fallback. Single-drainer w.r.t. the bake via
         // `mem_checkpoint_lock`; the capture `write_lock` is released after capture.
-        let CaptureGuards {
-            _checkpoint,
-            write: mut owned_capture_write_lock,
-        } = self.acquire_capture_locks_blocking().await;
+        let mut guards = self.acquire_capture_locks_blocking().await;
+        // Keep `guards` alive for the whole seal so `mem_checkpoint_lock` spans the
+        // entire lifecycle; take only the capture-scoped `write` guard for the
+        // all-shards-atomic capture below.
+        let mut owned_capture_write_lock = guards.write.take();
 
         // === ALL-SHARDS-ATOMIC CAPTURE (mirrors `checkpoint_mem_tier_inner`) ===
         // At N>1 take `write_lock` so an apply's N shard appends are observed
