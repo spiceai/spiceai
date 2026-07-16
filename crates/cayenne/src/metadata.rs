@@ -740,6 +740,57 @@ impl IngestCores {
     }
 }
 
+/// Where the memory-mode CDC apply's synchronous interior runs (morsel pipeline,
+/// Stage 1 #3c). A rollout flag — the Stage-1 analogue of `pipeline_depth: 1` —
+/// that lets the pinned-pool substrate ship behind a byte-identical fallback.
+///
+/// Runtime-only: it never affects data layout, so it is not compared by
+/// `configuration_matches`, and it is skipped when serializing the default
+/// (`Inline`) case. The `inline`/`pool` split is the `snake_case` enum
+/// `CLAUDE.md` requires (no user-facing booleans); each variant names the
+/// behavior, not an on/off state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestSubstrate {
+    /// Run `apply_memory_burst_locked` inline on the tokio refresh task — today's
+    /// path, byte-identical. The conservative, back-compat-preserving default.
+    #[default]
+    Inline,
+    /// Route the apply's synchronous interior through the process-global pinned
+    /// [`crate::ingest_pool::IngestPool`]: the edge packages a descriptor,
+    /// submits it, and awaits the reply while holding `write_guard` (so applies
+    /// stay serial at Stage 1 depth = 1 — the pool is *where* the apply runs, not
+    /// *how many* run). No overlap win yet; overlap is Stage 2's payoff.
+    Pool,
+}
+
+impl IngestSubstrate {
+    /// Parse a spicepod parameter value: `inline` or `pool`. Returns `None` for
+    /// anything else so the caller can warn and fall back to the default.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "inline" => Some(Self::Inline),
+            "pool" => Some(Self::Pool),
+            _ => None,
+        }
+    }
+
+    /// Whether this is the default `Inline` substrate (used to skip serializing
+    /// the common case). Takes `&self` so serde's `skip_serializing_if` can call
+    /// it directly.
+    #[must_use]
+    pub const fn is_inline(&self) -> bool {
+        matches!(self, Self::Inline)
+    }
+
+    /// Whether the apply should route through the pinned pool.
+    #[must_use]
+    pub const fn is_pool(&self) -> bool {
+        matches!(self, Self::Pool)
+    }
+}
+
 /// Which adaptive-tunable knobs the operator pinned with an explicit value. In
 /// `adaptive` mode the closed-loop controller must not move a pinned knob — its
 /// tuning bounds collapse to a single point so `decide()` naturally skips it and
@@ -1256,6 +1307,14 @@ pub struct VortexConfig {
     /// data layout), and skipped when serializing the common `Auto` case.
     #[serde(default, skip_serializing_if = "IngestCores::is_auto")]
     pub ingest_cores: IngestCores,
+    /// Where the memory-mode CDC apply's synchronous interior runs (morsel
+    /// pipeline, Stage 1 #3c). Set from `cayenne_ingest_substrate`. Defaults to
+    /// [`IngestSubstrate::Inline`] (today's byte-identical path); `pool` routes
+    /// the apply through the process-global pinned ingest pool. Runtime-only —
+    /// never compared by `configuration_matches` (does not affect data layout),
+    /// and skipped when serializing the common `Inline` case.
+    #[serde(default, skip_serializing_if = "IngestSubstrate::is_inline")]
+    pub ingest_substrate: IngestSubstrate,
 }
 
 impl VortexConfig {
@@ -1605,6 +1664,7 @@ impl Default for VortexConfig {
             cold_tier_background_interval_ms: 60_000,
             cold_tier_gc_interval_ms: 300_000,
             ingest_cores: IngestCores::default(),
+            ingest_substrate: IngestSubstrate::default(),
         }
     }
 }

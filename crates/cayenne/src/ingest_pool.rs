@@ -65,9 +65,15 @@ use std::time::Duration;
 use core_affinity::CoreId;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use parking_lot::RwLock;
+// Only the test-only `Task::Probe` (and the tests) carry a `oneshot`; the
+// production `MemoryApply` reply channel lives on the descriptor (in `table.rs`).
+#[cfg(test)]
 use tokio::sync::oneshot;
 
 use crate::metadata::IngestCores;
+use crate::provider::table::{
+    ApplyInterrupt, MemoryApplyDescriptor, MemoryApplyError, MemoryApplyReply,
+};
 
 /// How long a parked worker blocks in `recv_timeout` before re-checking its
 /// `retire` flag. A submitted task wakes a parked receiver immediately (the
@@ -100,19 +106,47 @@ pub struct ProbeReport {
 /// A unit of work submitted to the pinned ingest pool.
 ///
 /// A concrete enum — never `Box<dyn FnOnce>` — so the hot path allocates no
-/// per-task trait object (proposal §10). Stage 1 #3a defines only the test-only
+/// per-task trait object (proposal §10). Stage 1 #3a defined only the test-only
 /// `Probe`; #3c adds `MemoryApply(Box<MemoryApplyDescriptor>)` carrying the
 /// factored-out synchronous memory apply.
-#[derive(Debug)]
-pub enum Task {
+///
+/// `pub(crate)`: it carries the crate-internal [`MemoryApplyDescriptor`] and has
+/// no cross-crate consumer — the runtime installs/uninstalls the pool but never
+/// builds tasks (it drives apply through the provider). Keeping it crate-visible
+/// avoids leaking the descriptor's provider internals into the public API.
+pub(crate) enum Task {
     /// Trivial diagnostic task: the executing worker reports its own core
     /// assignment over `report`, isolating the channel + oneshot + wake hand-off
-    /// cost. Exercised only by tests; production apply routing arrives in #3c.
+    /// cost. Test-only (`#[cfg(test)]`) — the production apply path uses
+    /// `MemoryApply`; keeping `Probe` out of release builds avoids a dead-code
+    /// variant now that `Task` is crate-private.
+    #[cfg(test)]
     Probe {
         /// Pool -> edge reply channel (a `tokio::sync::oneshot`, matching the
         /// design's completion carrier — sendable from the sync worker).
         report: oneshot::Sender<ProbeReport>,
     },
+    /// The memory-mode CDC apply (Stage 1 #3c). The worker runs the descriptor's
+    /// synchronous interior under `catch_unwind` and replies over the
+    /// descriptor's own `oneshot`: `Done(Ok)` on success, `NeedsRefill` (handing
+    /// the descriptor back) on a cold sequence-block bounce, `Done(Err)` on a
+    /// panic (never a torn tier — see [`MemoryApplyDescriptor`]). Boxed so the
+    /// enum stays small (a `Probe` costs one pointer, not the whole apply
+    /// payload).
+    MemoryApply(Box<MemoryApplyDescriptor>),
+}
+
+impl std::fmt::Debug for Task {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            #[cfg(test)]
+            Self::Probe { .. } => f.write_str("Task::Probe"),
+            Self::MemoryApply(descriptor) => f
+                .debug_struct("Task::MemoryApply")
+                .field("table", &descriptor.table_name())
+                .finish(),
+        }
+    }
 }
 
 /// Handle to one pinned worker thread.
@@ -184,7 +218,7 @@ impl IngestPool {
     /// # Errors
     ///
     /// Returns the un-submitted `task` when the channel has no live receiver.
-    pub fn submit(&self, task: Task) -> Result<(), Task> {
+    pub(crate) fn submit(&self, task: Task) -> Result<(), Task> {
         self.tx.send(task).map_err(crossbeam_channel::SendError::into_inner)
     }
 
@@ -332,13 +366,55 @@ fn run_worker(
     }
 }
 
-/// Execute one task on the worker. Stage 1 #3a handles only the diagnostic
-/// probe; the memory-apply arm (in `catch_unwind`) arrives in #3c.
+/// Execute one task on the worker. The `MemoryApply` arm wraps the descriptor's
+/// synchronous interior in `catch_unwind` so a panic mid-apply becomes a
+/// structured `Done(Err)` reply — the `parking_lot` publish lock releases on
+/// unwind (no poison) and the interior's "compute → single `store`" ordering
+/// means the tier `ArcSwap` is never left half-updated (proposal §10 / Stage 1
+/// #3b panic-safety), so the edge fails the apply cleanly, never a torn tier.
 fn run_task(task: Task, report: ProbeReport) {
+    // `report` is consumed only by the test-only `Probe` arm; discard it in
+    // release builds so it is not an unused parameter.
+    #[cfg(not(test))]
+    let _ = report;
     match task {
+        #[cfg(test)]
         Task::Probe { report: reply } => {
             // The receiver may have been dropped (test cancelled); ignore.
             let _ = reply.send(report);
+        }
+        Task::MemoryApply(mut descriptor) => {
+            // Run the interior isolated from the worker thread: a panic must not
+            // unwind past the run loop and kill the pinned worker.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                descriptor.run_interior()
+            }));
+            match result {
+                Ok(Ok(outcome)) => {
+                    // Success: hand the epoch + prepared IVM deltas to the edge
+                    // tail. A dropped receiver (edge cancelled) is ignored.
+                    if let Some(reply) = descriptor.take_reply() {
+                        let _ = reply.send(MemoryApplyReply::Done(Ok(outcome)));
+                    }
+                }
+                Ok(Err(ApplyInterrupt::NeedsRefill { count })) => {
+                    // Cold bounce: nothing stamped/stored; hand the descriptor
+                    // back so the edge grows the durable block and re-submits.
+                    if let Some(reply) = descriptor.take_reply() {
+                        let _ = reply.send(MemoryApplyReply::NeedsRefill { count, descriptor });
+                    }
+                }
+                Err(_panic) => {
+                    tracing::error!(
+                        target: "cayenne::ingest_pool",
+                        table = descriptor.table_name(),
+                        "Ingest worker panicked applying a memory burst; failing the apply (no torn tier)"
+                    );
+                    if let Some(reply) = descriptor.take_reply() {
+                        let _ = reply.send(MemoryApplyReply::Done(Err(MemoryApplyError)));
+                    }
+                }
+            }
         }
     }
 }
@@ -405,7 +481,7 @@ pub fn install_global_ingest_pool(cores: IngestCores) {
 ///
 /// Returns the un-submitted `task` when no global pool is installed or its send
 /// fails.
-pub fn submit_to_global_ingest_pool(task: Task) -> Result<(), Task> {
+pub(crate) fn submit_to_global_ingest_pool(task: Task) -> Result<(), Task> {
     let guard = GLOBAL_INGEST_POOL.read();
     match guard.as_ref() {
         Some(pool) => pool.submit(task),
@@ -420,6 +496,13 @@ pub fn uninstall_global_ingest_pool() {
     let mut guard = GLOBAL_INGEST_POOL.write();
     *guard = None;
 }
+
+/// Serializes tests that touch the *process-global* ingest pool (install / submit
+/// / uninstall) or the test-only apply-panic injection, so parallel test threads
+/// (cargo's default) never stomp the shared static or bleed the injected panic
+/// into another test's apply. Held for the whole body of each such test.
+#[cfg(test)]
+pub(crate) static POOL_TEST_MUTEX: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -540,6 +623,10 @@ mod tests {
     /// The process-global install/submit path: install resizes in place (bumping
     /// the generation, not rebuilding), and a submitted probe round-trips.
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the test-serialization guard intentionally spans the test's awaits (parking_lot, no poisoning); it is not on any production path"
+    )]
     async fn global_pool_install_and_submit() {
         // Leave no pinned threads behind regardless of assertion outcome.
         struct Cleanup;
@@ -548,6 +635,8 @@ mod tests {
                 uninstall_global_ingest_pool();
             }
         }
+        // Serialize against other global-pool tests (the pool is a shared static).
+        let _serial = super::POOL_TEST_MUTEX.lock();
         let _cleanup = Cleanup;
 
         let gen_before = global_ingest_pool_generation();

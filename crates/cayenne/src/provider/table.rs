@@ -1250,6 +1250,23 @@ pub struct CayenneTableProvider {
     /// window the mid-pass overwrite guard defends. Consumed on first fire.
     #[cfg(test)]
     test_pre_publish_hook: Arc<ParkingMutex<Option<TestPrePublishHook>>>,
+    /// Test-only override for the `cayenne_ingest_substrate: pool` routing target
+    /// (Stage 1 #3c). When `Some`, `apply_memory_burst_via_pool` submits to THIS
+    /// private [`crate::ingest_pool::IngestPool`] instead of the process-global
+    /// one — so end-to-end apply-through-pool tests each drive an isolated pool
+    /// (no shared static, no cross-test serialization). Production always leaves
+    /// this `None` (the §8 core partition is machine-wide, one global pool).
+    /// Shared across writer clones so the descriptor's clone routes to the same
+    /// pool as the edge.
+    #[cfg(test)]
+    ingest_pool_override: Option<Arc<crate::ingest_pool::IngestPool>>,
+    /// Test-only fault injection: when set, the memory-apply interior panics at
+    /// its top (before any lock/mutation), so the worker-panic chaos test can
+    /// assert isolation + structured error + no torn tier. Per-provider (shared
+    /// across writer clones) so a panicking test never bleeds into a concurrent
+    /// one. Production never sets it.
+    #[cfg(test)]
+    force_apply_panic: Arc<AtomicBool>,
     /// Protected snapshot IDs that should skip deletion filtering.
     ///
     /// When data is inserted while pending deletions exist, the new data is written
@@ -1842,7 +1859,7 @@ struct PendingMaintainedAggregateDelete {
 /// APPLIED on the async edge AFTER the lock is dropped — they are the only edge
 /// work the interior can't do itself. This is the exact shape 3c hands to the
 /// pinned pool worker (interior sync, tail on the edge).
-struct MemApplyOutcome {
+pub(crate) struct MemApplyOutcome {
     epoch: u64,
     maintained_aggregate_insert: Option<PendingMaintainedAggregateInsert>,
     maintained_aggregate_delete: Option<PendingMaintainedAggregateDelete>,
@@ -1856,7 +1873,7 @@ struct MemApplyOutcome {
 /// surfaces to a mutation caller. This makes the interior a pure sync function
 /// (no `.await`, no I/O) so its critical section is safe under a `parking_lot`
 /// publish lock, and is what 3c routes through the pool unchanged.
-enum ApplyInterrupt {
+pub(crate) enum ApplyInterrupt {
     /// The lock-free `try_reserve` found the durable sequence block exhausted.
     /// The edge must durably grow the block by at least `count`
     /// (`refill_sequence_block`), then re-invoke the interior, which re-acquires
@@ -1865,6 +1882,122 @@ enum ApplyInterrupt {
     /// only thing serializing it against the checkpoint's snapshot-sequence
     /// reservation). Cold: ~once per `SEQ_RESERVE_BLOCK` reservations.
     NeedsRefill { count: u32 },
+}
+
+/// An owned, `Send` package of everything [`CayenneTableProvider::apply_memory_burst_locked`]
+/// needs to run its synchronous interior on a pinned [`crate::ingest_pool`]
+/// worker (morsel pipeline, Stage 1 #3c). It is the concrete payload of
+/// [`crate::ingest_pool::Task::MemoryApply`] — a struct, not a `Box<dyn Fn>`, so
+/// the hot path allocates no per-task trait object (proposal §10).
+///
+/// The interior's working set (the tombstone HAMT, the memo delta) is born and
+/// dies on the worker, so it crosses no boundary and needs no `Sync`; only the
+/// `Send` *inputs* travel here. The `provider` is a `clone_for_write_operations`
+/// clone (all `Arc` shares — the writer state is shared across clones), so the
+/// worker mutates the SAME mem-tier / publish locks / allocator as the edge.
+///
+/// PANIC-SAFETY: the worker wraps [`Self::run_interior`] in `catch_unwind` and,
+/// on a panic, replies with [`MemoryApplyReply::Done(Err(..))`] — the
+/// `parking_lot` publish lock is released by unwinding (no poison) and the
+/// interior's "compute → single `store`" ordering means a panic cannot leave the
+/// tier `ArcSwap` half-updated, so the edge fails the apply cleanly, never a
+/// silent torn tier.
+pub(crate) struct MemoryApplyDescriptor {
+    /// Writer clone whose `apply_memory_burst_locked` the worker calls.
+    provider: Arc<CayenneTableProvider>,
+    shard_id: usize,
+    arc_batches: Arc<Vec<RecordBatch>>,
+    /// Owned; the interior takes `&mut` to `stamp` it under the publish lock.
+    /// Untouched on a `NeedsRefill` bounce (the interior returns before `stamp`),
+    /// so a re-submit re-stamps exactly once — matching the inline loop.
+    tombstones: crate::provider::mem_tier::SegmentTombstones,
+    incoming_rows: u64,
+    incoming_bytes: u64,
+    superseded: u64,
+    source_position: Option<u64>,
+    /// Owned clone of the shard's kept keys (EMPTY at N=1, so the clone is free
+    /// on the primary path; the shard's key set at N>1).
+    record_keys: PkDigestSet,
+    maintained_aggregate_delete_rows: Option<RecordBatch>,
+    reserved_sequences: Option<(i64, i64)>,
+    defer_maintained_aggregate: bool,
+    /// Pool → edge completion carrier. `Option` so the worker can `take` it to
+    /// reply while still owning the descriptor (needed on the `NeedsRefill`
+    /// bounce, which sends the descriptor back for a re-submit).
+    reply: Option<tokio::sync::oneshot::Sender<MemoryApplyReply>>,
+}
+
+/// The pool → edge reply for a submitted [`MemoryApplyDescriptor`] (Stage 1 #3c).
+pub(crate) enum MemoryApplyReply {
+    /// The interior ran to completion: `Ok` carries the applied epoch + prepared
+    /// maintained-aggregate deltas for the edge tail; `Err` signals the worker
+    /// panicked mid-apply (the edge fails the apply — no torn tier).
+    Done(std::result::Result<MemApplyOutcome, MemoryApplyError>),
+    /// The lock-free `try_reserve` found the durable block exhausted. The
+    /// descriptor is handed BACK so the edge can durably grow the block off-lock
+    /// and re-submit it (run-to-completion; cold, ~once per `SEQ_RESERVE_BLOCK`).
+    NeedsRefill {
+        count: u32,
+        descriptor: Box<MemoryApplyDescriptor>,
+    },
+}
+
+/// The worker panicked while applying a [`MemoryApplyDescriptor`]. Carried back
+/// so the edge returns a structured apply error rather than a torn tier.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MemoryApplyError;
+
+impl MemoryApplyDescriptor {
+    /// Run the synchronous, await-free interior. Called by the pinned worker
+    /// INSIDE its `catch_unwind`. Takes `&mut self` because the interior stamps
+    /// `tombstones` in place; on `NeedsRefill` `tombstones` is left untouched so
+    /// the edge can re-submit `self` unchanged.
+    pub(crate) fn run_interior(
+        &mut self,
+    ) -> std::result::Result<MemApplyOutcome, ApplyInterrupt> {
+        // Fault injection (tests only): panic at the TOP of the interior, before
+        // any lock is taken or tier state mutated, so the worker-panic chaos test
+        // can assert the `catch_unwind` in `run_task` converts it to a structured
+        // apply error, the worker survives, and the tier is uncorrupted. The flag
+        // is per-provider (shared across writer clones), so a panicking test never
+        // bleeds into a concurrent one.
+        #[cfg(test)]
+        assert!(
+            !self.provider.force_apply_panic.load(Ordering::Relaxed),
+            "cayenne test: injected memory-apply panic"
+        );
+        self.provider.apply_memory_burst_locked(
+            self.shard_id,
+            &self.arc_batches,
+            &mut self.tombstones,
+            self.incoming_rows,
+            self.incoming_bytes,
+            self.superseded,
+            self.source_position,
+            &self.record_keys,
+            self.maintained_aggregate_delete_rows.as_ref(),
+            self.reserved_sequences,
+            self.defer_maintained_aggregate,
+        )
+    }
+
+    /// Take the reply sender out (so the worker can reply while still owning the
+    /// descriptor for a `NeedsRefill` re-submit).
+    pub(crate) fn take_reply(
+        &mut self,
+    ) -> Option<tokio::sync::oneshot::Sender<MemoryApplyReply>> {
+        self.reply.take()
+    }
+
+    /// Install a fresh reply sender before a (re-)submit.
+    pub(crate) fn set_reply(&mut self, reply: tokio::sync::oneshot::Sender<MemoryApplyReply>) {
+        self.reply = Some(reply);
+    }
+
+    /// The table this descriptor applies to (for diagnostics / panic logging).
+    pub(crate) fn table_name(&self) -> &str {
+        self.provider.table_name()
+    }
 }
 
 /// RAII writer side of the maintained-aggregate scan seqlock. Construction
@@ -2630,6 +2763,26 @@ impl CayenneTableProvider {
     #[must_use]
     pub fn clone_for_write_operations(&self) -> Self {
         self.clone_for_write()
+    }
+
+    /// Test-only: route `cayenne_ingest_substrate: pool` applies to a PRIVATE
+    /// [`crate::ingest_pool::IngestPool`] instead of the process-global one, so an
+    /// end-to-end apply-through-pool test drives an isolated pool (no shared
+    /// static, no cross-test serialization). Shared across writer clones via
+    /// `clone_for_write`.
+    #[cfg(test)]
+    pub(crate) fn set_ingest_pool_override(
+        &mut self,
+        pool: Arc<crate::ingest_pool::IngestPool>,
+    ) {
+        self.ingest_pool_override = Some(pool);
+    }
+
+    /// Test-only: toggle the memory-apply panic injection (per-provider — never
+    /// bleeds into a concurrent test).
+    #[cfg(test)]
+    pub(crate) fn set_force_apply_panic(&self, on: bool) {
+        self.force_apply_panic.store(on, Ordering::Relaxed);
     }
 
     /// Append a CDC upsert stream using Cayenne's native writer path.
@@ -5750,6 +5903,10 @@ impl CayenneTableProvider {
             current_snapshot_id: Arc::new(RwLock::new(table_metadata.current_snapshot_id.clone())),
             #[cfg(test)]
             test_pre_publish_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            ingest_pool_override: None,
+            #[cfg(test)]
+            force_apply_panic: Arc::new(AtomicBool::new(false)),
             table_schema: Arc::new(ArcSwap::new(Arc::<arrow_schema::Schema>::clone(
                 &table_metadata.schema,
             ))),
@@ -6960,6 +7117,10 @@ impl CayenneTableProvider {
             current_snapshot_id: Arc::clone(&self.current_snapshot_id),
             #[cfg(test)]
             test_pre_publish_hook: Arc::clone(&self.test_pre_publish_hook),
+            #[cfg(test)]
+            ingest_pool_override: self.ingest_pool_override.clone(),
+            #[cfg(test)]
+            force_apply_panic: Arc::clone(&self.force_apply_panic),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
             manifest_cache: Arc::clone(&self.manifest_cache),
             protected_snapshot_age_warning_keys: Arc::clone(
@@ -21038,32 +21199,64 @@ impl CayenneTableProvider {
         // durable block OFF the lock and retries, and the retry re-acquires the
         // publish lock and re-reserves UNDER it (§2.3d). `tombstones` is stamped
         // and consumed only on a successful pass — a bounce returns BEFORE `stamp`,
-        // so a retry re-stamps with the final reserved sequence exactly once. This
-        // is the exact locking/refill shape 3c routes through the pinned pool, so
-        // 3c changes only the executor, not this logic.
-        let outcome = loop {
-            match self.apply_memory_burst_locked(
-                shard_id,
-                &arc_batches,
-                &mut tombstones,
-                incoming_rows,
-                incoming_bytes,
-                superseded,
-                source_position,
-                record_keys,
-                maintained_aggregate_delete_rows,
-                reserved_sequences,
-                defer_maintained_aggregate,
-            ) {
-                Ok(outcome) => break outcome,
-                Err(ApplyInterrupt::NeedsRefill { count }) => {
-                    // Cold path (~once per `SEQ_RESERVE_BLOCK` reservations):
-                    // durably grow the block OFF the publish lock, then retry under
-                    // it. No sequence is claimed off-lock, so the N=1 reserve stays
-                    // serialized against the checkpoint's snapshot-sequence
-                    // reservation by the publish lock exactly as before.
-                    self.refill_sequence_block(count).await?;
+        // so a retry re-stamps with the final reserved sequence exactly once.
+        //
+        // `cayenne_ingest_substrate` (Stage 1 #3c) selects the EXECUTOR without
+        // changing this locking/refill logic: `Inline` (default) runs the interior
+        // on this tokio refresh task, byte-identical to before; `Pool` packages a
+        // `MemoryApplyDescriptor` and runs the SAME interior on a pinned
+        // `IngestPool` worker, awaiting the reply. Depth stays 1 — the caller holds
+        // `write_guard` across this whole call — so applies remain serial either
+        // way; the pool is *where* the apply runs, not *how many* run.
+        let outcome = match self.table_metadata.vortex_config.ingest_substrate {
+            crate::metadata::IngestSubstrate::Inline => loop {
+                match self.apply_memory_burst_locked(
+                    shard_id,
+                    &arc_batches,
+                    &mut tombstones,
+                    incoming_rows,
+                    incoming_bytes,
+                    superseded,
+                    source_position,
+                    record_keys,
+                    maintained_aggregate_delete_rows,
+                    reserved_sequences,
+                    defer_maintained_aggregate,
+                ) {
+                    Ok(outcome) => break outcome,
+                    Err(ApplyInterrupt::NeedsRefill { count }) => {
+                        // Cold path (~once per `SEQ_RESERVE_BLOCK` reservations):
+                        // durably grow the block OFF the publish lock, then retry
+                        // under it. No sequence is claimed off-lock, so the N=1
+                        // reserve stays serialized against the checkpoint's
+                        // snapshot-sequence reservation by the publish lock exactly
+                        // as before. Timed as `seq_refill_bounce` for the Stage-2
+                        // adaptive `SEQ_RESERVE_BLOCK` tuner (bounce rate × cost).
+                        let bounce_start = Instant::now();
+                        self.refill_sequence_block(count).await?;
+                        record_cayenne_write_phase(
+                            &self.table_metadata.table_name,
+                            "seq_refill_bounce",
+                            bounce_start,
+                        );
+                    }
                 }
+            },
+            crate::metadata::IngestSubstrate::Pool => {
+                self.apply_memory_burst_via_pool(
+                    shard_id,
+                    &arc_batches,
+                    tombstones,
+                    incoming_rows,
+                    incoming_bytes,
+                    superseded,
+                    source_position,
+                    record_keys,
+                    maintained_aggregate_delete_rows,
+                    reserved_sequences,
+                    defer_maintained_aggregate,
+                )
+                .await?
             }
         };
 
@@ -21100,6 +21293,165 @@ impl CayenneTableProvider {
             .await;
 
         Ok(outcome.epoch)
+    }
+
+    /// Run the memory apply's synchronous interior on the process-global pinned
+    /// [`crate::ingest_pool::IngestPool`] instead of inline (Stage 1 #3c, active
+    /// only under `cayenne_ingest_substrate: pool`). Packages a
+    /// [`MemoryApplyDescriptor`], submits it, and awaits the reply — running the
+    /// SAME `apply_memory_burst_locked` interior and the SAME refill-bounce loop
+    /// as the inline path, just on a pinned worker. Returns the [`MemApplyOutcome`]
+    /// for [`Self::append_to_shard`]'s shared edge tail.
+    ///
+    /// Depth = 1: the caller holds `write_guard` across this whole call, so applies
+    /// stay serial — the pool is *where* the apply runs, not *how many* (overlap is
+    /// Stage 2). `write_guard` (a `tokio::sync` guard, safe across `.await`) never
+    /// crosses to the worker; the `parking_lot` publish lock is taken and dropped
+    /// entirely inside the sync interior on the worker (never across an `.await`).
+    ///
+    /// Fallbacks preserve correctness identically: if no pool is installed, or it
+    /// is torn down before submit, the SAME interior runs inline on this edge; a
+    /// worker panic or a dropped reply surfaces as a structured apply error (never
+    /// a torn tier — see [`MemoryApplyDescriptor`]).
+    #[expect(clippy::too_many_arguments)]
+    async fn apply_memory_burst_via_pool(
+        &self,
+        shard_id: usize,
+        arc_batches: &Arc<Vec<RecordBatch>>,
+        tombstones: crate::provider::mem_tier::SegmentTombstones,
+        incoming_rows: u64,
+        incoming_bytes: u64,
+        superseded: u64,
+        source_position: Option<u64>,
+        record_keys: &PkDigestSet,
+        maintained_aggregate_delete_rows: Option<&RecordBatch>,
+        reserved_sequences: Option<(i64, i64)>,
+        defer_maintained_aggregate: bool,
+    ) -> Result<MemApplyOutcome> {
+        use crate::ingest_pool::{Task as IngestTask, submit_to_global_ingest_pool};
+
+        // Build the descriptor once; a `NeedsRefill` bounce hands it back for a
+        // re-submit, so it is reused across the loop (no per-bounce rebuild).
+        // `record_keys` is EMPTY at N=1 (the clone is free on the primary path);
+        // the `RecordBatch` clones below are Arc-buffer refcount bumps.
+        let mut descriptor = Box::new(MemoryApplyDescriptor {
+            provider: Arc::new(self.clone_for_write_operations()),
+            shard_id,
+            arc_batches: Arc::clone(arc_batches),
+            tombstones,
+            incoming_rows,
+            incoming_bytes,
+            superseded,
+            source_position,
+            record_keys: record_keys.clone(),
+            maintained_aggregate_delete_rows: maintained_aggregate_delete_rows.cloned(),
+            reserved_sequences,
+            defer_maintained_aggregate,
+            reply: None,
+        });
+
+        loop {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<MemoryApplyReply>();
+            descriptor.set_reply(reply_tx);
+            let handoff_start = Instant::now();
+
+            // Submit to the test-only private pool override when set (isolated
+            // end-to-end tests), else the process-global pool (production).
+            let submit_result = {
+                #[cfg(test)]
+                {
+                    match &self.ingest_pool_override {
+                        Some(pool) => pool.submit(IngestTask::MemoryApply(descriptor)),
+                        None => submit_to_global_ingest_pool(IngestTask::MemoryApply(descriptor)),
+                    }
+                }
+                #[cfg(not(test))]
+                {
+                    submit_to_global_ingest_pool(IngestTask::MemoryApply(descriptor))
+                }
+            };
+            if let Err(returned) = submit_result {
+                // No pool installed / torn down: run the SAME interior inline.
+                // The pattern's refutability differs by cfg — `Task` has a
+                // test-only `Probe` variant — so the extraction is cfg-split: an
+                // irrefutable destructure in release (only `MemoryApply` exists), a
+                // match with a `Probe` guard under `#[cfg(test)]`.
+                #[cfg(not(test))]
+                let IngestTask::MemoryApply(mut fallback) = returned;
+                #[cfg(test)]
+                let mut fallback = match returned {
+                    IngestTask::MemoryApply(descriptor) => descriptor,
+                    IngestTask::Probe { .. } => {
+                        unreachable!("submit returns the MemoryApply task it was handed")
+                    }
+                };
+                tracing::warn!(
+                    target: "cayenne::ingest_pool",
+                    table = %self.table_metadata.table_name,
+                    "cayenne_ingest_substrate: pool set but no global ingest pool is installed; applying inline"
+                );
+                match fallback.run_interior() {
+                    Ok(outcome) => return Ok(outcome),
+                    Err(ApplyInterrupt::NeedsRefill { count }) => {
+                        let bounce_start = Instant::now();
+                        self.refill_sequence_block(count).await?;
+                        record_cayenne_write_phase(
+                            &self.table_metadata.table_name,
+                            "seq_refill_bounce",
+                            bounce_start,
+                        );
+                        descriptor = fallback;
+                        continue;
+                    }
+                }
+            }
+
+            match reply_rx.await {
+                Ok(MemoryApplyReply::Done(Ok(outcome))) => {
+                    // Total submit→reply wall time (edge→pool channel + apply CPU +
+                    // oneshot + wake). The apply CPU itself is separately recorded
+                    // inside the interior (`inmemory_fence_wait`/`inmemory_fence_work`),
+                    // so `ingest_pool_handoff − (fence_wait + fence_work)` is the pure
+                    // hand-off overhead the §11.2 "hand-off must be small vs apply"
+                    // gate watches.
+                    record_cayenne_write_phase(
+                        &self.table_metadata.table_name,
+                        "ingest_pool_handoff",
+                        handoff_start,
+                    );
+                    return Ok(outcome);
+                }
+                Ok(MemoryApplyReply::Done(Err(MemoryApplyError))) => {
+                    return Err(Error::Internal {
+                        table: self.table_metadata.table_name.clone(),
+                        message: "ingest pool worker panicked applying a memory burst".to_string(),
+                    });
+                }
+                Ok(MemoryApplyReply::NeedsRefill {
+                    count,
+                    descriptor: bounced,
+                }) => {
+                    // Cold bounce (~once per `SEQ_RESERVE_BLOCK`): grow the durable
+                    // block off-lock, then re-submit the handed-back descriptor.
+                    descriptor = bounced;
+                    let bounce_start = Instant::now();
+                    self.refill_sequence_block(count).await?;
+                    record_cayenne_write_phase(
+                        &self.table_metadata.table_name,
+                        "seq_refill_bounce",
+                        bounce_start,
+                    );
+                }
+                Err(_recv) => {
+                    return Err(Error::Internal {
+                        table: self.table_metadata.table_name.clone(),
+                        message:
+                            "ingest pool worker dropped the memory-apply reply (pool torn down mid-apply)"
+                                .to_string(),
+                    });
+                }
+            }
+        }
     }
 
     /// The synchronous, await-free INTERIOR of a memory-mode mem-tier append —
@@ -30180,6 +30532,278 @@ mod tests {
             .await
             .expect("table created");
         (provider, temp_dir)
+    }
+
+    /// Build a memory-mode provider with a chosen ingest substrate (Stage 1 #3c).
+    /// Single `id: Int64` PK, caps large enough that appends never spill — so the
+    /// mem-tier apply interior runs directly (inline or on the pinned pool).
+    async fn create_memory_mode_table_with_substrate(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+        substrate: crate::metadata::IngestSubstrate,
+    ) -> (CayenneTableProvider, tempfile::TempDir) {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("init catalog");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let vortex_config = VortexConfig {
+            cdc_durability: crate::metadata::CdcDurability::Memory,
+            cdc_mem_tier_max_bytes: i64::MAX,
+            ingest_substrate: substrate,
+            ..VortexConfig::default()
+        };
+        let options = CreateTableOptions {
+            table_name: table_name.to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config,
+        };
+        let provider = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .create(options)
+            .await
+            .expect("table created");
+        (provider, temp_dir)
+    }
+
+    /// A local pinned pool + a memory-mode provider whose `pool` substrate routes
+    /// to THAT pool (not the process-global one) — so each end-to-end test drives
+    /// an isolated pool with no shared static and no cross-test serialization. The
+    /// returned `Arc<IngestPool>` is kept alive by the caller; dropping it joins
+    /// the pinned worker (shutdown/join coverage).
+    async fn create_pooled_memory_mode_table(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> (
+        CayenneTableProvider,
+        Arc<crate::ingest_pool::IngestPool>,
+        tempfile::TempDir,
+    ) {
+        let (mut provider, tmp) = create_memory_mode_table_with_substrate(
+            table_name,
+            runtime_env,
+            crate::metadata::IngestSubstrate::Pool,
+        )
+        .await;
+        let pool = Arc::new(crate::ingest_pool::IngestPool::new(1));
+        provider.set_ingest_pool_override(Arc::clone(&pool));
+        (provider, pool, tmp)
+    }
+
+    /// Stage 1 #3c — routing the memory apply through the pinned pool
+    /// (`cayenne_ingest_substrate: pool`) is BYTE-IDENTICAL to inline: the same
+    /// append sequence yields the same epoch progression, the same visible scan,
+    /// and the same live row count. The pool is *where* the apply runs, not *what*
+    /// it computes. Uses a private local pool (no global static).
+    #[tokio::test]
+    async fn stage1_3c_pool_substrate_matches_inline() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let (inline, _t1) = create_memory_mode_table_with_substrate(
+            "s3c_inline",
+            Arc::clone(&runtime_env),
+            crate::metadata::IngestSubstrate::Inline,
+        )
+        .await;
+        let (pool, _local_pool, _t2) =
+            create_pooled_memory_mode_table("s3c_pool", Arc::clone(&runtime_env)).await;
+        assert!(inline.is_cdc_memory_mode() && pool.is_cdc_memory_mode());
+
+        let no_deletions = OnConflictDeletions::default();
+        let sequences: [&[i64]; 4] = [&[1, 2, 3], &[4, 5], &[6, 7, 8, 9], &[10]];
+        let mut inline_epochs = Vec::new();
+        let mut pool_epochs = Vec::new();
+        for ids in sequences {
+            let batch = int64_id_batch(ids);
+            let bytes = batch.get_array_memory_size() as u64;
+            let inline_epoch = inline
+                .append_to_mem_tier(vec![batch.clone()], &no_deletions, bytes, 0)
+                .await
+                .expect("inline append");
+            let pool_epoch = pool
+                .append_to_mem_tier(vec![batch], &no_deletions, bytes, 0)
+                .await
+                .expect("pool append");
+            inline_epochs.push(inline_epoch);
+            pool_epochs.push(pool_epoch);
+        }
+
+        assert_eq!(
+            inline_epochs, pool_epochs,
+            "pool substrate produces the same epoch progression as inline"
+        );
+        assert_eq!(
+            scan_sorted_ids(&inline).await,
+            scan_sorted_ids(&pool).await,
+            "pool substrate produces the same visible scan as inline"
+        );
+        assert_eq!(
+            inline.cached_inlined_row_count(),
+            pool.cached_inlined_row_count(),
+            "pool substrate produces the same live row count as inline"
+        );
+        assert_eq!(scan_sorted_ids(&pool).await, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    }
+
+    /// Stage 1 #3c — a worker panic mid-apply surfaces as a structured apply error
+    /// (never a torn tier), the pinned worker SURVIVES (`catch_unwind` isolates
+    /// it), and a subsequent apply succeeds. The injected panic fires at the top
+    /// of the interior (before any lock/mutation), so the tier is provably
+    /// uncorrupted — the pre-panic scan state is intact. Per-provider panic flag +
+    /// private pool ⇒ no cross-test bleed, no serialization.
+    #[tokio::test]
+    async fn stage1_3c_pool_worker_panic_surfaces_error_and_survives() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let (pool, _local_pool, _t) =
+            create_pooled_memory_mode_table("s3c_panic", Arc::clone(&runtime_env)).await;
+        let no_deletions = OnConflictDeletions::default();
+
+        // Seed a good apply so there is prior visible state to prove uncorrupted.
+        let seed = int64_id_batch(&[1, 2, 3]);
+        let seed_bytes = seed.get_array_memory_size() as u64;
+        pool.append_to_mem_tier(vec![seed], &no_deletions, seed_bytes, 0)
+            .await
+            .expect("seed append");
+        assert_eq!(scan_sorted_ids(&pool).await, vec![1, 2, 3]);
+
+        // Inject a panic into the next apply's interior.
+        pool.set_force_apply_panic(true);
+        let boom = int64_id_batch(&[4, 5]);
+        let boom_bytes = boom.get_array_memory_size() as u64;
+        let err = pool
+            .append_to_mem_tier(vec![boom], &no_deletions, boom_bytes, 0)
+            .await
+            .expect_err("a panicking apply surfaces a structured error");
+        assert!(
+            matches!(err, Error::Internal { .. }),
+            "worker panic → structured apply error, got {err:?}"
+        );
+        // Tier uncorrupted: the pre-panic state is intact (nothing from the boom).
+        assert_eq!(
+            scan_sorted_ids(&pool).await,
+            vec![1, 2, 3],
+            "the panicking apply left no partial state"
+        );
+
+        // The worker survived: a subsequent (non-panicking) apply succeeds.
+        pool.set_force_apply_panic(false);
+        let recover = int64_id_batch(&[6, 7]);
+        let recover_bytes = recover.get_array_memory_size() as u64;
+        pool.append_to_mem_tier(vec![recover], &no_deletions, recover_bytes, 0)
+            .await
+            .expect("apply after a worker panic succeeds (worker survived)");
+        assert_eq!(scan_sorted_ids(&pool).await, vec![1, 2, 3, 6, 7]);
+    }
+
+    /// Stage 1 #3c — with `cayenne_ingest_substrate: pool` set but NO pool
+    /// available (no private override, no global pool installed), the apply falls
+    /// back to running the SAME interior inline on the edge (correctness
+    /// preserved), rather than erroring. This is the ONLY end-to-end pool test
+    /// that touches the process-global static (to prove it is uninstalled), so it
+    /// is serialized with the global-pool lifecycle tests.
+    #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the test-serialization guard intentionally spans the test's awaits (parking_lot, no poisoning); it is not on any production path"
+    )]
+    async fn stage1_3c_pool_substrate_falls_back_inline_when_unavailable() {
+        let _serial = crate::ingest_pool::POOL_TEST_MUTEX.lock();
+        // Ensure no global pool is installed (and none is set as an override).
+        crate::ingest_pool::uninstall_global_ingest_pool();
+
+        let runtime_env = SessionContext::new().runtime_env();
+        let (pool, _t) = create_memory_mode_table_with_substrate(
+            "s3c_fallback",
+            Arc::clone(&runtime_env),
+            crate::metadata::IngestSubstrate::Pool,
+        )
+        .await;
+        let no_deletions = OnConflictDeletions::default();
+        let batch = int64_id_batch(&[1, 2, 3]);
+        let bytes = batch.get_array_memory_size() as u64;
+        pool.append_to_mem_tier(vec![batch], &no_deletions, bytes, 0)
+            .await
+            .expect("apply falls back to inline with no pool available");
+        assert_eq!(scan_sorted_ids(&pool).await, vec![1, 2, 3]);
+    }
+
+    /// Stage 1 #3c microbench (measurement aid, not a CI gate — `#[ignore]`, run
+    /// with `cargo test -p cayenne stage1_3c_microbench -- --ignored --nocapture`).
+    /// Prints per-apply latency for inline vs pool so the "hand-off must be small
+    /// vs apply" gate (§11.2) is observable. Depth = 1, so no overlap win is
+    /// expected — this isolates the channel + oneshot + wake cost. Uses a private
+    /// local pool.
+    #[tokio::test]
+    #[ignore = "manual microbench; run with --ignored --nocapture"]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "microbench per-apply latency print; precision loss is irrelevant to a human-read µs figure"
+    )]
+    async fn stage1_3c_microbench_inline_vs_pool_handoff() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let no_deletions = OnConflictDeletions::default();
+
+        // Sweep batch size so the "hand-off small vs apply" gate is read against
+        // the regime that matters: the hand-off is a ~fixed per-apply cost, so a
+        // degenerate 1-row apply shows a ~1:1 ratio, but a production-sized
+        // coalesced burst (§8.1: ~30k rows at 10k txn/s) dwarfs it. Distinct id
+        // ranges per apply (no supersede); caps are `i64::MAX` (no spill) and
+        // there is no periodic tick, so this isolates the pure apply interior.
+        // `(rows_per_apply, iters)` — fewer iters for bigger bursts to bound RAM.
+        let regimes: [(i64, i64); 3] = [(1, 2000), (1_000, 1_000), (10_000, 300)];
+
+        for (rows, iters) in regimes {
+            let mut per_apply_us = [0.0f64; 2];
+            // Fresh tables per regime so a growing tier never leaks across sizes.
+            let (inline, _ti) = create_memory_mode_table_with_substrate(
+                &format!("s3c_bench_inline_{rows}"),
+                Arc::clone(&runtime_env),
+                crate::metadata::IngestSubstrate::Inline,
+            )
+            .await;
+            let (pooled, _local_pool, _tp) = create_pooled_memory_mode_table(
+                &format!("s3c_bench_pool_{rows}"),
+                Arc::clone(&runtime_env),
+            )
+            .await;
+
+            for (idx, (label, provider)) in
+                [("inline", &inline), ("pool", &pooled)].into_iter().enumerate()
+            {
+                let start = Instant::now();
+                for i in 0..iters {
+                    // Disjoint id window per apply so nothing is superseded.
+                    let base = i * rows;
+                    let ids: Vec<i64> = (base..base + rows).collect();
+                    let batch = int64_id_batch(&ids);
+                    let bytes = batch.get_array_memory_size() as u64;
+                    provider
+                        .append_to_mem_tier(vec![batch], &no_deletions, bytes, 0)
+                        .await
+                        .expect("append");
+                }
+                let elapsed = start.elapsed();
+                let us = elapsed.as_micros() as f64 / iters as f64;
+                per_apply_us[idx] = us;
+                eprintln!(
+                    "[stage1_3c microbench] rows={rows:>6} {label:>6}: {iters} applies in {elapsed:?} = {us:.2} µs/apply"
+                );
+            }
+            let handoff = per_apply_us[1] - per_apply_us[0];
+            let ratio = handoff / per_apply_us[0];
+            eprintln!(
+                "[stage1_3c microbench] rows={rows:>6} HAND-OFF = {handoff:.2} µs/apply ({:.0}% of apply)",
+                ratio * 100.0
+            );
+        }
     }
 
     /// A1-T2 — idle/pure-upsert source: the PERIODIC checkpoint tick advances the

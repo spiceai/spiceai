@@ -85,6 +85,7 @@ pub mod row_converter;
 pub(crate) mod schema;
 pub mod stats;
 pub mod stats_aggregate;
+pub mod task_queue;
 
 pub use catalog::MetadataCatalog;
 pub use catalog::{CatalogError, CatalogResult};
@@ -93,13 +94,12 @@ pub use catalog_provider::{
 };
 pub use cayenne_catalog::{CayenneCatalog, is_retryable_write_conflict};
 pub use ingest_pool::{
-    IngestPool, ProbeReport, Task as IngestTask, install_global_ingest_pool,
-    submit_to_global_ingest_pool, uninstall_global_ingest_pool,
+    IngestPool, ProbeReport, install_global_ingest_pool, uninstall_global_ingest_pool,
 };
 pub use metadata::{
-    CdcDurability, DataFile, DeleteFile, IngestCores, InlinedData, InlinedDataStats, InlinedDelete,
-    ObjectStoreConfig, PartitionMetadata, StageBPublishMode, StorageClass, TableMetadata,
-    TableStatistics,
+    CdcDurability, DataFile, DeleteFile, IngestCores, IngestSubstrate, InlinedData,
+    InlinedDataStats, InlinedDelete, ObjectStoreConfig, PartitionMetadata, StageBPublishMode,
+    StorageClass, TableMetadata, TableStatistics,
 };
 pub use metastore::sqlite::{SqliteAutoVacuum, SqliteMetastoreConfig, set_sqlite_metastore_config};
 pub use provider::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};

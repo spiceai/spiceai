@@ -1304,6 +1304,18 @@ impl CayenneAccelerator {
                     );
                 }
             }
+            if let Some((key, value)) = ["cayenne_ingest_substrate", "ingest_substrate"]
+                .iter()
+                .find_map(|key| acceleration.params.get(*key).map(|value| (*key, value)))
+            {
+                if let Some(substrate) = cayenne::metadata::IngestSubstrate::parse(value) {
+                    config.ingest_substrate = substrate;
+                } else {
+                    tracing::warn!(
+                        "Dataset '{table_name}' contains an invalid `{key}` value: '{value}'. Expected `inline` or `pool`. Using the default (inline)."
+                    );
+                }
+            }
             config.cdc_mem_tier_max_bytes = parse_usize_aliases_as_i64(
                 acceleration,
                 &["cayenne_cdc_mem_tier_max_bytes", "cdc_mem_tier_max_bytes"],
@@ -2076,6 +2088,20 @@ impl CayenneAccelerator {
             Self::apply_memory_mode_overrides(&mut vortex_config, acceleration);
         }
 
+        // Stage 1 #3c: when this memory-mode table opts into the pinned ingest
+        // substrate (`cayenne_ingest_substrate: pool`), install — or resize in
+        // place — the process-global pinned ingest pool for the configured core
+        // policy. Idempotent and machine-wide (shared across every memory-mode
+        // table, like the mem-tier byte budget), so registering multiple pooled
+        // tables never thrashes workers. Inline tables never spin up the pool.
+        if memory_mode && vortex_config.ingest_substrate.is_pool() {
+            cayenne::install_global_ingest_pool(vortex_config.ingest_cores);
+            tracing::info!(
+                "Cayenne acceleration for {table_name} using pinned ingest substrate (cayenne_ingest_substrate: pool, cores: {:?})",
+                vortex_config.ingest_cores
+            );
+        }
+
         // Build S3 object store if using S3 Express One Zone storage. Memory mode
         // has no data directory or object store (and `cayenne_data_dir` errors for
         // it), so skip this entirely — memory-mode data lives only in RAM.
@@ -2420,8 +2446,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    64,
-    { S3_PARAMS_LEN + 64 },
+    65,
+    { S3_PARAMS_LEN + 65 },
 >(
     S3_PARAMETERS,
     [
@@ -2563,6 +2589,10 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("ingest_cores")
             .description("How many CPU cores the process-global CDC ingest pool reserves, pinning one worker thread per core (morsel pipeline). Machine-wide, not per-table — the pool is shared across every memory-mode table. 'auto' (default) reserves 1 core (apply is serial, so one worker saturates it while the rest stay available for queries); a positive integer reserves exactly that many. The ingest reservation is hard for ingest workers and advisory (OS-scheduled) for the unpinned query runtime.")
             .default("auto"),
+        ParameterSpec::component("ingest_substrate")
+            .description("Where the memory-mode CDC apply runs (morsel pipeline, Stage 1). 'inline' (default) runs the apply on the tokio refresh task — today's byte-identical path. 'pool' routes the apply's synchronous interior through the process-global pinned ingest pool (cayenne_ingest_cores workers): the apply runs on a pinned worker while the refresh task holds back-pressure. At Stage 1 depth is 1 (applies stay serial), so 'pool' proves the substrate carries the real apply with no throughput change; pipeline overlap arrives in a later stage. Applies to cdc_durability: memory only.")
+            .one_of(&["inline", "pool"])
+            .default("inline"),
         ParameterSpec::component("tuning")
             .description("Auto-tuning mode. 'auto': derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate, delete fraction, and arrival burstiness AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adapts the inline-memtable flush caps, the in-memory CDC tier byte cap, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. DEFAULT: when this is unset, the mode is 'adaptive' if extended schema inference produced metadata (the dataset set 'schema_inference: extended' and the source emitted it) — opting into extended schema enables self-tuning, and that metadata is the adaptive warm-start — otherwise 'auto'. Set 'cayenne_tuning: auto' explicitly to opt out of the closed loop even with extended schema. 'schema_inference: extended' also sharpens the 'adaptive' warm-start (inferred cardinality/size) but is not required for an explicit 'adaptive' — without it the controller relearns the row width from observed ingest and converges from the hardware-derived warm-start. In BOTH modes an explicit per-parameter value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set actuator is pinned (the loop will not move it).")
             .one_of(&["auto", "adaptive"]),

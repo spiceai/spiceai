@@ -113,10 +113,13 @@ version = "2.2.0-unstable"
 # Test-context exemptions (allow-expect-in-tests, thresholds) live in `clippy.toml`.
 [workspace.lints.rust]
 # `tokio_unstable` is enabled via `RUSTFLAGS="--cfg tokio_unstable"` to expose the
-# per-worker tokio RuntimeMetrics (busy/park/steal). Declare it so the otherwise-unknown
-# cfg name doesn't trip the `unexpected_cfgs` lint on builds without the flag. Declared
-# workspace-wide (via each crate's `lints.workspace = true`) rather than per-crate.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
+# per-worker tokio RuntimeMetrics (busy/park/steal). `loom` is enabled via
+# `RUSTFLAGS="--cfg cayenne_loom"` to model-check the cayenne §10.1 `PriorityMailbox`
+# atomic orderings (crates/cayenne/src/task_queue.rs). Declare both so the
+# otherwise-unknown cfg names don't trip the `unexpected_cfgs` lint on builds
+# without the flag. Declared workspace-wide (via each crate's
+# `lints.workspace = true`) rather than per-crate.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)', 'cfg(cayenne_loom)'] }
 
 [workspace.lints.clippy]
 # Deny the pedantic group with a lower priority so the specific opt-outs below win.
@@ -210,8 +213,19 @@ clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0
 # ingest pool over an MPMC channel. `core_affinity` pins ingest workers to
 # reserved cores; `crossbeam-channel` is the edge→pool descriptor channel. Both
 # were already in the lock transitively — naming them here makes them direct.
+# `st3` is the lock-free bounded LIFO work-stealing deque under the §10.1
+# three-queue `TaskQueue` (Stage 1 #3c); `crossbeam-utils` supplies `CachePadded`
+# for the `PriorityMailbox` gate atomics (false-sharing would re-serialize the
+# pool). Both were already in the lock transitively — naming them makes them
+# direct.
 core_affinity = "0.8"
 crossbeam-channel = "0.5"
+crossbeam-utils = "0.8"
+st3 = "0.4.1"
+# `loom` model-checks the §10.1 `PriorityMailbox` atomic orderings under
+# `RUSTFLAGS="--cfg cayenne_loom"` only (a `cfg(cayenne_loom)`-gated dev-dependency), so it never
+# enters normal test/CI builds. Already in the lock transitively.
+loom = "0.7"
 datafusion = "54.0.0"
 datafusion-catalog = "54.0.0"
 datafusion-common = "54.0.0"
