@@ -4555,6 +4555,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "connector-postgres-common"
+version = "2.2.0-unstable"
+dependencies = [
+ "datafusion-common",
+ "datafusion-table-providers",
+ "snafu",
+ "tokio-postgres",
+]
+
+[[package]]
 name = "connector-scylladb"
 version = "2.2.0-unstable"
 dependencies = [
@@ -5709,6 +5719,7 @@ dependencies = [
  "charset",
  "chrono",
  "clickhouse-rs",
+ "connector-postgres-common",
  "criterion 0.7.0",
  "ctor 0.8.0",
  "dashmap",

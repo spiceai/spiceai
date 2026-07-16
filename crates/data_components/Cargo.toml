@@ -41,6 +41,7 @@ bytes.workspace = true
 charset = { workspace = true, optional = true }
 chrono.workspace = true
 clickhouse-rs = { workspace = true, optional = true }
+connector-postgres-common = { path = "../data-connectors/connector-postgres-common", optional = true }
 dashmap = "6.1"
 dataformat-json = { path = "../dataformat-json" }
 datafusion.workspace = true
@@ -179,6 +180,7 @@ postgres = [
     "dep:native-tls",
     "dep:postgres-native-tls",
     "dep:postgres-protocol",
+    "dep:connector-postgres-common",
     "federation",
     "datafusion-table-providers/postgres",
     "datafusion-table-providers/postgres-federation",

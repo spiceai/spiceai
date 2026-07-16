@@ -260,6 +260,20 @@ impl TryFrom<spicepod_catalog::Catalog> for CatalogBuilder {
             });
         }
 
+        // Catalog-level acceleration is only implemented for the `pg`
+        // provider (see `catalogconnector::postgres_accelerated`) -- every
+        // other provider's connector ignores `catalog.acceleration`
+        // entirely, which would otherwise silently no-op a user's config.
+        if catalog.acceleration.is_some() && provider != crate::catalogconnector::postgres::PREFIX
+        {
+            return Err(crate::Error::ComponentError {
+                source: super::Error::CatalogAccelerationUnsupportedProvider {
+                    name: catalog.name.clone(),
+                    provider: provider.to_string(),
+                },
+            });
+        }
+
         Ok(CatalogBuilder {
             provider: provider.to_string(),
             catalog_id,
@@ -426,6 +440,22 @@ mod tests {
         let mapped = builder.acceleration.expect("acceleration should be mapped");
         assert_eq!(mapped.engine, CatalogAccelerationEngine::Cayenne);
         assert_eq!(mapped.refresh_mode, CatalogRefreshMode::Changes);
+    }
+
+    #[test]
+    fn test_try_from_rejects_acceleration_for_unsupported_provider() {
+        let acceleration = spicepod_catalog::CatalogAcceleration {
+            engine: spicepod_catalog::CatalogAccelerationEngine::Cayenne,
+            refresh_mode: spicepod_catalog::CatalogRefreshMode::Changes,
+        };
+        let mut catalog = spicepod_catalog(&[], &[], Some(acceleration));
+        catalog.from = "mysql".to_string();
+
+        let result = CatalogBuilder::try_from(catalog);
+        assert!(
+            result.is_err(),
+            "acceleration on a provider other than 'pg' should be rejected, not silently ignored"
+        );
     }
 
     #[test]

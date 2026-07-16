@@ -51,23 +51,18 @@ pub enum Error {
     ))]
     QueryFailed { source: tokio_postgres::Error },
 
-    #[snafu(display(
-        "Cannot start CDC catalog acceleration: PostgreSQL `wal_level` is '{wal_level}', but 'logical' is required. \
-        Run `ALTER SYSTEM SET wal_level = 'logical';` and restart PostgreSQL. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
-    ))]
-    WalLevelNotLogical { wal_level: String },
-
-    #[snafu(display(
-        "Cannot start CDC catalog acceleration: PostgreSQL role '{role}' is not permitted to start replication. \
-        Grant it with `ALTER ROLE \"{role}\" REPLICATION;`, or connect as a superuser. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
-    ))]
-    MissingReplicationPrivilege { role: String },
+    /// Wraps errors from the shared `connector-postgres-common` queries
+    /// (`list_schemas`/`list_tables`, re-exported below) so this crate's own
+    /// callers can still propagate them with `?`.
+    #[snafu(display("{source}"), context(false))]
+    Common { source: connector_postgres_common::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// System schemas to exclude from discovery.
-const SYSTEM_SCHEMAS: &[&str] = &["information_schema", "pg_catalog", "pg_toast"];
+pub use connector_postgres_common::{
+    check_cdc_prerequisites, list_schemas, list_tables, primary_key_columns,
+};
 
 /// A single foreign key constraint discovered from `information_schema`.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -323,40 +318,8 @@ impl PostgresCatalogProvider {
     }
 
     async fn list_schemas(&self) -> Result<Vec<String>> {
-        list_schemas(&self.pool).await
+        Ok(list_schemas(&self.pool).await?)
     }
-}
-
-/// Query `information_schema.schemata` for all user schemas, excluding system
-/// schemas (`information_schema`, `pg_catalog`, `pg_toast`, `pg_temp*`).
-///
-/// Shared between [`PostgresCatalogProvider`] and any other catalog/schema
-/// provider (e.g. an accelerated one) that needs the same discovery query.
-pub async fn list_schemas(pool: &PostgresConnectionPool) -> Result<Vec<String>> {
-    let conn = pool.connect_direct().await.context(ConnectionFailedSnafu)?;
-
-    let rows = conn
-        .conn
-        .query(
-            "SELECT schema_name FROM information_schema.schemata ORDER BY schema_name",
-            &[],
-        )
-        .await
-        .context(QueryFailedSnafu)?;
-
-    let names: Vec<String> = rows
-        .iter()
-        .filter_map(|row| {
-            let name: String = row.get(0);
-            if SYSTEM_SCHEMAS.contains(&name.as_str()) || name.starts_with("pg_temp") {
-                None
-            } else {
-                Some(name)
-            }
-        })
-        .collect();
-
-    Ok(names)
 }
 
 impl CatalogProvider for PostgresCatalogProvider {
@@ -454,157 +417,8 @@ impl PostgresSchemaProvider {
     }
 
     async fn list_tables(&self) -> Result<Vec<String>> {
-        list_tables(&self.pool, &self.schema_name, true).await
+        Ok(list_tables(&self.pool, &self.schema_name, true).await?)
     }
-}
-
-/// Query `information_schema.tables` for base tables (and, if `include_views`,
-/// views too) in `schema_name`.
-///
-/// Shared between [`PostgresSchemaProvider`] (which passes `include_views:
-/// true` -- views are federated read-only tables like any other) and any
-/// other schema provider (e.g. an accelerated one, which passes
-/// `include_views: false` -- a view has no primary key and can't be
-/// CDC-accelerated, so it must never reach the per-table PK check at all).
-///
-/// A declaratively-partitioned parent (relkind 'p') and every one of its leaf
-/// partitions (relkind 'r') all appear in `information_schema.tables` as `BASE
-/// TABLE`. Registering both the parent and its children would double-count
-/// the data (the parent is a union over its children) and clutter the
-/// catalog for tables with many partitions (#11726). It would also diverge
-/// from how the CDC path treats these tables: Spice publishes
-/// partitioned-table changes under the parent relation
-/// (`publish_via_partition_root = true`, see `postgres_replication::slot`),
-/// so the parent is the coherent unit either way. We therefore exclude any
-/// relation that is a child in `pg_inherits` (covering both declarative
-/// partitions and legacy table inheritance) and keep only the parent. The
-/// `pg_inherits` catalog exists on every supported `PostgreSQL` version and on
-/// Redshift (where it is empty), so this degrades to the prior behaviour on
-/// engines without partitioning.
-pub async fn list_tables(
-    pool: &PostgresConnectionPool,
-    schema_name: &str,
-    include_views: bool,
-) -> Result<Vec<String>> {
-    let conn = pool.connect_direct().await.context(ConnectionFailedSnafu)?;
-
-    let table_types: &[&str] = if include_views {
-        &["BASE TABLE", "VIEW"]
-    } else {
-        &["BASE TABLE"]
-    };
-
-    let rows = conn
-        .conn
-        .query(
-            "SELECT t.table_name FROM information_schema.tables t \
-             WHERE t.table_schema = $1 \
-             AND t.table_type = ANY($2) \
-             AND NOT EXISTS ( \
-                 SELECT 1 FROM pg_catalog.pg_inherits inh \
-                 JOIN pg_catalog.pg_class child ON child.oid = inh.inhrelid \
-                 JOIN pg_catalog.pg_namespace ns ON ns.oid = child.relnamespace \
-                 WHERE ns.nspname = t.table_schema \
-                 AND child.relname = t.table_name \
-             ) \
-             ORDER BY t.table_name",
-            &[&schema_name, &table_types],
-        )
-        .await
-        .context(QueryFailedSnafu)?;
-
-    let names: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
-    Ok(names)
-}
-
-/// Query `pg_catalog` for the primary-key columns of `schema_name.table_name`,
-/// in key order. Empty when the table has no primary key.
-///
-/// This is deliberately a minimal, self-contained lookup (primary key only) —
-/// not the fuller index/sort/statistics inference `connector-postgres` does
-/// for a dataset's own schema-inference pipeline — so catalog-level table
-/// classification (accelerate vs. skip vs. query-through) doesn't need a
-/// dependency on that crate.
-pub async fn primary_key_columns(
-    pool: &PostgresConnectionPool,
-    schema_name: &str,
-    table_name: &str,
-) -> Result<Vec<String>> {
-    let conn = pool.connect_direct().await.context(ConnectionFailedSnafu)?;
-    // `to_regclass` parses its argument as a (possibly qualified, possibly
-    // quoted) SQL identifier, not a literal string match -- an unquoted
-    // mixed-case or special-character name would resolve to the wrong
-    // relation (or nothing), so each component is quoted the same way
-    // `foreign_key_target` quotes identifiers for `TableReference` round-trips.
-    let table_path = format!(
-        "{}.{}",
-        quote_identifier(schema_name),
-        quote_identifier(table_name)
-    );
-
-    // `indkey` is an `int2vector`, not a plain array, so it's converted via
-    // `string_to_array(...)::int2[]` before unnesting `WITH ORDINALITY` to
-    // preserve key-column order — the same technique used by
-    // `connector-postgres`'s fuller schema-inference query.
-    let rows = conn
-        .conn
-        .query(
-            "SELECT a.attname AS column_name \
-             FROM pg_catalog.pg_index ix \
-             JOIN LATERAL unnest(string_to_array(ix.indkey::text, ' ')::int2[]) \
-                 WITH ORDINALITY AS k(attnum, ord) ON true \
-             JOIN pg_catalog.pg_attribute a \
-                 ON a.attrelid = ix.indrelid \
-                 AND a.attnum = k.attnum \
-             WHERE ix.indrelid = to_regclass($1) \
-             AND ix.indisprimary \
-             ORDER BY k.ord",
-            &[&table_path],
-        )
-        .await
-        .context(QueryFailedSnafu)?;
-
-    let columns: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
-    Ok(columns)
-}
-
-/// Validate the `PostgreSQL` prerequisites CDC catalog acceleration needs
-/// before discovering or accelerating any tables, returning a specific,
-/// actionable error naming the exact fix: `wal_level = logical`, and the
-/// connecting role can start replication (either `REPLICATION` directly, or
-/// transitively via superuser).
-///
-/// Deliberately just a clear pass/fail at the connection level -- not a
-/// per-table CDC-readiness report (e.g. `REPLICA IDENTITY`), which is out
-/// of scope for now.
-pub async fn check_cdc_prerequisites(pool: &PostgresConnectionPool) -> Result<()> {
-    let conn = pool.connect_direct().await.context(ConnectionFailedSnafu)?;
-
-    let wal_level: String = conn
-        .conn
-        .query_one("SHOW wal_level", &[])
-        .await
-        .context(QueryFailedSnafu)?
-        .get(0);
-    ensure!(
-        wal_level == "logical",
-        WalLevelNotLogicalSnafu { wal_level }
-    );
-
-    let row = conn
-        .conn
-        .query_one(
-            "SELECT current_user::text, (rolreplication OR rolsuper) \
-             FROM pg_roles WHERE rolname = current_user",
-            &[],
-        )
-        .await
-        .context(QueryFailedSnafu)?;
-    let role: String = row.get(0);
-    let can_replicate: bool = row.get(1);
-    ensure!(can_replicate, MissingReplicationPrivilegeSnafu { role });
-
-    Ok(())
 }
 
 /// Build the fully-qualified name of a foreign-key target table
