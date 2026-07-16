@@ -421,7 +421,15 @@ impl DeletionSink for PkKeysetInvalidatingDeletionSink {
             // ~6105), and their keys are not enumerable on this filter path, so
             // they keep the conservative full clear and rebuild next batch.
             // `upsert_bloom_eligible()` is precisely "is this an `Upsert` table".
-            if !self.table.upsert_bloom_eligible() {
+            if self.table.upsert_bloom_eligible() {
+                // Upsert: the keyset is kept as a stale superset (skipping the
+                // O(live-rows) rebuild), so the retained deleted keys keep their
+                // PRE-DELETE per-key OCC sequence stamps. A transaction that
+                // gate-read a now-deleted key would otherwise pass per-key
+                // validation and resurrect it. Degrade per-key OCC to the
+                // per-table high-water fallback until the next rebuild heals it.
+                self.table.mark_pk_keyset_occ_degraded();
+            } else {
                 self.table.clear_cached_pk_keyset();
             }
             // Drop the per-file stats `CayenneTableProvider::collect_scan_file_statistics`
@@ -498,7 +506,13 @@ impl DeletionSink for InlineAwareDeletionSink {
             // the clear and avoid the O(live-rows) `load_existing_keyset` rebuild
             // the next insert batch would pay. `DoNothing` tables need exactness
             // (a stale entry would wrongly drop a new row) and keep the full clear.
-            if !self.table.upsert_bloom_eligible() {
+            if self.table.upsert_bloom_eligible() {
+                // Upsert stale-superset keyset: retained deleted keys keep their
+                // pre-delete per-key OCC stamps — degrade to the per-table
+                // fallback until rebuild (see the twin site in
+                // `PkKeysetInvalidatingDeletionSink::delete_from`).
+                self.table.mark_pk_keyset_occ_degraded();
+            } else {
                 self.table.clear_cached_pk_keyset();
             }
             if file_deleted > 0 && self.table.pk_deletion_strategy.is_position_based() {
