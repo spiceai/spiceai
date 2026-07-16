@@ -94,23 +94,36 @@ pub async fn list_schemas(pool: &PostgresConnectionPool) -> Result<Vec<String>> 
     Ok(names)
 }
 
-/// Query `information_schema.tables` for base tables (and, if `include_views`,
-/// views too) in `schema_name`.
+/// Query `pg_catalog.pg_class` for the relations in `schema_name`.
+///
+/// When `include_views` is true, view-like relations (views, materialized
+/// views, foreign tables) are returned alongside ordinary and partitioned
+/// tables -- the set a read-only schema provider can serve as federated
+/// tables. When false, only CDC-able base tables (ordinary `r` and
+/// partitioned-parent `p`) are returned, since views, materialized views, and
+/// foreign tables can't be primary-keyed or CDC-accelerated.
+///
+/// Discovery goes through `pg_catalog.pg_class` rather than
+/// `information_schema.tables` (#11725): `information_schema` omits
+/// materialized views (relkind 'm') entirely and reports foreign tables under
+/// a separate `table_type`, so an `information_schema`-based query silently
+/// dropped both. Only relations the current role holds `SELECT` on
+/// (`has_table_privilege`) are returned, so a schema provider never registers
+/// a relation it can't actually read.
 ///
 /// A declaratively-partitioned parent (relkind 'p') and every one of its leaf
-/// partitions (relkind 'r') all appear in `information_schema.tables` as `BASE
-/// TABLE`. Registering both the parent and its children would double-count
-/// the data (the parent is a union over its children) and clutter the
-/// catalog for tables with many partitions (#11726). It would also diverge
-/// from how the CDC path treats these tables: Spice publishes
-/// partitioned-table changes under the parent relation
-/// (`publish_via_partition_root = true`, see `postgres_replication::slot`),
-/// so the parent is the coherent unit either way. We therefore exclude any
-/// relation that is a child in `pg_inherits` (covering both declarative
-/// partitions and legacy table inheritance) and keep only the parent. The
-/// `pg_inherits` catalog exists on every supported `PostgreSQL` version and on
-/// Redshift (where it is empty), so this degrades to the prior behaviour on
-/// engines without partitioning.
+/// partitions (relkind 'r') would otherwise both be discovered. Registering
+/// both the parent and its children would double-count the data (the parent is
+/// a union over its children) and clutter the catalog for tables with many
+/// partitions (#11726). It would also diverge from how the CDC path treats
+/// these tables: Spice publishes partitioned-table changes under the parent
+/// relation (`publish_via_partition_root = true`, see
+/// `postgres_replication::slot`), so the parent is the coherent unit either
+/// way. We therefore exclude any relation that is a child in `pg_inherits`
+/// (covering both declarative partitions and legacy table inheritance) and
+/// keep only the parent. The `pg_inherits` catalog exists on every supported
+/// `PostgreSQL` version and on Redshift (where it is empty), so this degrades
+/// to the prior behaviour on engines without partitioning.
 ///
 /// # Errors
 ///
@@ -123,27 +136,29 @@ pub async fn list_tables(
 ) -> Result<Vec<String>> {
     let conn = pool.connect_direct().await.context(ConnectionFailedSnafu)?;
 
-    let table_types: &[&str] = if include_views {
-        &["BASE TABLE", "VIEW"]
+    // 'r' = ordinary table, 'p' = partitioned-table parent (both CDC-able);
+    // 'v' = view, 'm' = materialized view, 'f' = foreign table (view-like,
+    // read-only, not CDC-able).
+    let relkinds: &[&str] = if include_views {
+        &["r", "p", "v", "m", "f"]
     } else {
-        &["BASE TABLE"]
+        &["r", "p"]
     };
 
     let rows = conn
         .conn
         .query(
-            "SELECT t.table_name FROM information_schema.tables t \
-             WHERE t.table_schema = $1 \
-             AND t.table_type = ANY($2) \
+            "SELECT c.relname FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 \
+             AND c.relkind::text = ANY($2) \
+             AND pg_catalog.has_table_privilege(c.oid, 'SELECT') \
              AND NOT EXISTS ( \
                  SELECT 1 FROM pg_catalog.pg_inherits inh \
-                 JOIN pg_catalog.pg_class child ON child.oid = inh.inhrelid \
-                 JOIN pg_catalog.pg_namespace ns ON ns.oid = child.relnamespace \
-                 WHERE ns.nspname = t.table_schema \
-                 AND child.relname = t.table_name \
+                 WHERE inh.inhrelid = c.oid \
              ) \
-             ORDER BY t.table_name",
-            &[&schema_name, &table_types],
+             ORDER BY c.relname",
+            &[&schema_name, &relkinds],
         )
         .await
         .context(QueryFailedSnafu)?;

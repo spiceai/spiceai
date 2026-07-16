@@ -68,6 +68,7 @@ use crate::row_converter::RowConverter;
 use async_trait::async_trait;
 use data_components::delete::DeletionSink;
 use datafusion::datasource::listing::ListingTable;
+use datafusion::execution::TaskContext;
 use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -1162,7 +1163,10 @@ impl CayenneDeletionSink {
 
 #[async_trait]
 impl DeletionSink for CayenneDeletionSink {
-    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    async fn delete_from(
+        &self,
+        _context: Arc<TaskContext>,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         // Acquire write lock (if provided) to prevent racing with concurrent inserts or catalog refreshes.
         // When called from within write_all_append (e.g. retention filters), the caller already
         // holds the lock, so write_lock is None to avoid deadlocking the non-reentrant mutex.

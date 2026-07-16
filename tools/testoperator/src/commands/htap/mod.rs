@@ -49,6 +49,10 @@ use crate::{
     spiced_metrics::MetricsScraper,
 };
 
+/// Cap on the *default* terminal count (when `--terminals` is not passed
+/// explicitly) — see the comment at its use site below.
+const DEFAULT_TERMINALS_CAP: usize = 100;
+
 pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     let test_args = &args.test_args;
     // spiced names replication metrics per source connector; select the prefix
@@ -76,8 +80,18 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     // 1. Prepare the source: seed schema + data — or, with --skip-prepare,
     //    connect to an already-prepared source and verify it matches the SF.
     let scale_factor = test_args.scale_factor.unwrap_or(1.0);
+    // Each OLTP terminal opens its own dedicated source-DB connection, and the
+    // benchmark source containers run with max-connections=200 (see
+    // setup-chbench-mysql/postgres). An unbounded default here can exhaust
+    // that well before the scale factor gets large — a manual SF1000 dispatch
+    // that omitted --terminals hit exactly this ("Too many connections"),
+    // since scale_factor * 10 = 10,000 terminals. Scheduled dispatch configs
+    // already avoid it by hardcoding `terminals: 100`; cap the *default* the
+    // same way so an omitted --terminals doesn't reproduce the failure.
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let terminals = args.terminals.unwrap_or((scale_factor * 10.0) as usize);
+    let terminals = args
+        .terminals
+        .unwrap_or_else(|| ((scale_factor * 10.0) as usize).min(DEFAULT_TERMINALS_CAP));
     let duration = Duration::from_secs(test_args.common.duration);
     let driver: Arc<dyn chbench_driver::ChBenchDriver> = prepare_chbench_source(
         scale_factor,

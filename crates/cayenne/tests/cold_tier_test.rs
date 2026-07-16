@@ -1584,3 +1584,116 @@ async fn test_cold_tier_promotion_racing_stage_b_finalize_impl(
 
     Ok(())
 }
+
+test_with_backends!(test_cold_tier_bounded_zorder_multi_run_promotion_impl);
+
+/// Promotion with `cold_clustering_run_size_mb: Some(1)` — small enough that
+/// the Z-order sort splits into several byte-bounded runs (the inserted raw
+/// bytes alone exceed 3 run caps, and the sorted stream is the *augmented*
+/// batches, which are strictly larger). Verifies the bounded sort is invisible
+/// to correctness: the commit succeeds, every inserted row lands in the cold
+/// manifest exactly once (row conservation across runs), and cross-tier scans
+/// return the exact row set.
+async fn test_cold_tier_bounded_zorder_multi_run_promotion_impl(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    let cold_dir = fixture.temp_dir.path().join("cold");
+    std::fs::create_dir_all(&cold_dir)?;
+    let cold_url = format!("file://{}", cold_dir.to_string_lossy());
+
+    let run_size_mb = 1usize;
+    let table_options = CreateTableOptions {
+        table_name: "cold_runs_t".to_string(),
+        schema: Arc::clone(&schema),
+        primary_key: vec!["id".to_string()],
+        on_conflict: None,
+        base_path: fixture.data_path.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: VortexConfig {
+            cold_tier_location: Some(cold_url),
+            // Multi-column key exercises real bit-interleaving across runs.
+            cold_clustering_columns: vec!["id".to_string(), "value".to_string()],
+            cold_tier_warm_max_files: 1,
+            cold_target_file_size_mb: 16,
+            cold_clustering_run_size_mb: Some(run_size_mb),
+            deletion_mode: DeletionMode::Key,
+            ..VortexConfig::default()
+        },
+    };
+
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
+    ctx.register_table("cold_runs_t", Arc::clone(&table) as Arc<dyn TableProvider>)?;
+
+    // 240k rows (value = id * 2) in 8 batches — enough raw bytes to force
+    // multiple 1 MB sort runs by construction.
+    let total_rows: i64 = 240_000;
+    let batch_rows: i64 = 30_000;
+    let mut raw_bytes = 0usize;
+    for chunk_start in (0..total_rows).step_by(usize::try_from(batch_rows).expect("fits usize")) {
+        let ids: Vec<i64> = (chunk_start..chunk_start + batch_rows).collect();
+        let values: Vec<i64> = ids.iter().map(|i| i * 2).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(Int64Array::from(values)),
+            ],
+        )?;
+        raw_bytes += batch.get_array_memory_size();
+        common::insert_batch(table.as_ref(), batch).await?;
+    }
+    assert!(
+        raw_bytes > 3 * run_size_mb * 1024 * 1024,
+        "test must feed enough input to force >= 3 sort runs (raw input {raw_bytes} bytes)"
+    );
+
+    let _ = table.checkpoint_inlined_data().await;
+    let _ = table.checkpoint_mem_tier().await;
+    assert!(
+        table.promote_warm_to_cold().await?,
+        "promotion should fire with cold_tier_warm_max_files = 1"
+    );
+
+    // Row conservation through the bounded multi-run sort: the manifest holds
+    // every inserted row exactly once.
+    let cold = fixture
+        .catalog
+        .list_cold_tier_files(table.table_id())
+        .await?;
+    assert!(!cold.is_empty(), "cold files registered after promotion");
+    let cold_rows: i64 = cold.iter().map(|f| f.row_count).sum();
+    assert_eq!(
+        cold_rows, total_rows,
+        "all rows graduated to cold exactly once despite multiple sort runs"
+    );
+
+    // Cross-tier scan correctness over the multi-run layout.
+    assert_eq!(row_count(&ctx, "cold_runs_t").await?, total_rows);
+    assert_eq!(
+        collect_pairs(&ctx, "SELECT id, value FROM cold_runs_t WHERE id = 54321").await?,
+        vec![(54_321, 108_642)],
+        "point lookup lands on the right row"
+    );
+    assert_eq!(
+        collect_pairs(
+            &ctx,
+            "SELECT id, value FROM cold_runs_t ORDER BY id DESC LIMIT 2"
+        )
+        .await?,
+        // `collect_pairs` sorts ascending for deterministic comparison.
+        vec![(239_998, 479_996), (239_999, 479_998)],
+        "ordered scan over run-overlapping files returns correct rows"
+    );
+
+    Ok(())
+}

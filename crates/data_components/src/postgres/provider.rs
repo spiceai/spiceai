@@ -417,6 +417,11 @@ impl PostgresSchemaProvider {
     }
 
     async fn list_tables(&self) -> Result<Vec<String>> {
+        // Include view-like relations (views, materialized views, foreign
+        // tables) here -- the non-accelerated schema provider serves them as
+        // ordinary read-only federated tables. The accelerated catalog path
+        // passes `include_views: false` so only CDC-able base tables are
+        // discovered. See `connector_postgres_common::list_tables`.
         Ok(list_tables(&self.pool, &self.schema_name, true).await?)
     }
 }

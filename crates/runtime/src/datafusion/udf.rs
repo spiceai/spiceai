@@ -52,6 +52,7 @@ use runtime_secrets::{ExposeSecret, get_params_with_secrets};
 const EMBED_UDF_NAME: &str = "embed";
 use runtime_datafusion_udfs::{
     alias::ScalarUDFAlias,
+    assert::Assert,
     bucket::{BUCKET_SCALAR_UDF_NAME, Bucket},
     cosine_distance::{COSINE_DISTANCE_UDF_NAME, CosineDistance},
     digest_many::{DIGEST_UDF_NAME, INSTANCE},
@@ -79,6 +80,7 @@ pub fn register_core_scalar_udfs(ctx: &SessionContext) {
     ctx.register_udf(L2SquaredDistance::new().into());
     ctx.register_udf(L2Norm::new().into());
     ctx.register_udf(Truncate::new().into());
+    ctx.register_udf(Assert::new().into());
     ctx.register_udf(INSTANCE.clone());
     register_postgres_comment_udfs(ctx);
 }
