@@ -122,6 +122,14 @@ impl GenState {
 /// the captured shard snapshots (`Σ_shards tier.bytes`), pinned via the `Arc`s until
 /// the generation is reclaimed. Everything else here is `O(shards)` or `O(1)`.
 pub(crate) struct FrozenGeneration {
+    /// The ledger-assigned identity of this generation, monotone in freeze order
+    /// (oldest = lowest). Assigned by [`FrozenDrainLedger::freeze`], `0` until then.
+    /// A drain drives / discards ITS OWN generation by this id rather than by ledger
+    /// position, because at depth `D > 1` a drain's generation is NOT necessarily the
+    /// front — the front may belong to an older still-in-flight drain. At `D = 1` the
+    /// sole resident generation always carries the current id, so id-addressing is
+    /// byte-identical to front-addressing.
+    pub(crate) id: u64,
     /// The captured shard snapshots — the dominant pinned RAM. Model B reads these
     /// (never the live tier) for the off-lock encode/commit, so a post-freeze append
     /// to the live tier cannot tear this generation.
@@ -176,6 +184,8 @@ impl FrozenGeneration {
             "a frozen generation captures one window base per shard snapshot"
         );
         Self {
+            // Assigned by `FrozenDrainLedger::freeze` on admission; a placeholder here.
+            id: 0,
             shard_snapshots,
             window_base,
             relative_counts,
@@ -223,6 +233,11 @@ impl FrozenGeneration {
 pub(crate) struct FrozenDrainLedger {
     generations: VecDeque<FrozenGeneration>,
     max_depth: usize,
+    /// The next generation id to assign, monotone in freeze order. Never reset, so an
+    /// id is unique for the life of the ledger — a reclaimed/discarded generation's id
+    /// is never reused, so a stale id addresses nothing (returns `None`) rather than a
+    /// later generation.
+    next_id: u64,
 }
 
 impl FrozenDrainLedger {
@@ -234,6 +249,7 @@ impl FrozenDrainLedger {
         Self {
             generations: VecDeque::with_capacity(max_depth),
             max_depth,
+            next_id: 0,
         }
     }
 
@@ -266,11 +282,17 @@ impl FrozenDrainLedger {
     /// `mem_checkpoint_lock`-held operation.
     pub(crate) fn freeze(
         &mut self,
-        generation: FrozenGeneration,
+        mut generation: FrozenGeneration,
     ) -> Result<&mut FrozenGeneration, FrozenGeneration> {
         if self.generations.len() >= self.max_depth {
             return Err(generation);
         }
+        // Assign the identity on admission (monotone in freeze order). The caller reads
+        // it off the returned handle and addresses this generation by id thereafter, so
+        // a drain drives ITS OWN generation even when a newer freeze has since made it a
+        // non-front element (depth `D > 1`).
+        generation.id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
         self.generations.push_back(generation);
         match self.generations.back_mut() {
             Some(generation) => Ok(generation),
@@ -296,18 +318,68 @@ impl FrozenDrainLedger {
         self.generations.pop_front()
     }
 
-    /// Remove the front generation regardless of its lifecycle state, dropping its
-    /// captured Arcs, WITHOUT the terminal-state assertion [`Self::reclaim_front`]
-    /// makes. This is the **abort** path: a drain that fails on an early `?` return
-    /// or panics mid-flight — before it published or sealed — must not strand its
-    /// frozen generation in the shared ledger, or the next freeze would hit the
-    /// depth bound and error the table permanently. Discarding a not-yet-published
-    /// generation loses nothing: the mem-tier segments are removed only at publish
+    /// Reclaim the maximal contiguous prefix of TERMINAL (`Published` / `Sealed`)
+    /// generations from the front (strictly oldest-first) and return the max ack epoch
+    /// over that prefix — the slot watermark to fire — or `None` when the front is not
+    /// yet terminal (an older generation is still in flight).
+    ///
+    /// This is the **ordered-publish + min-across-in-flight ack** contract. Encode/PUT
+    /// fan out unordered across the `D` in-flight generations, but the durable
+    /// watermark may only advance over a CONTIGUOUS terminal prefix from the oldest: a
+    /// still-encoding or failed older generation `G` pins the ack at `G − 1`. So this
+    /// walks the front, reclaiming each generation while it is terminal and stops at
+    /// the first non-terminal one, returning the MAX epoch of the reclaimed run. It is
+    /// NEVER a `fetch_max` over an arbitrary generation's epoch: a later generation
+    /// that publishes first does NOT advance the watermark past an unfinished earlier
+    /// one — its epoch is only acked once every older generation has published and been
+    /// reclaimed ahead of it. Because segment (and therefore source-position) order is
+    /// monotone with freeze order, the epochs of a contiguous prefix are
+    /// non-decreasing, so the returned max is the newest reclaimed generation's epoch
+    /// and successive calls yield a monotone watermark.
+    ///
+    /// At `D = 1` the sole resident generation is the front, so publishing it makes the
+    /// front terminal and this reclaims exactly it and returns its epoch —
+    /// byte-identical to the pre-3b `fire(epoch); reclaim_front()` pair.
+    pub(crate) fn reclaim_terminal_prefix_ack(&mut self) -> Option<u64> {
+        let mut watermark: Option<u64> = None;
+        while let Some(front) = self.generations.front() {
+            if !matches!(front.state, GenState::Published | GenState::Sealed) {
+                break;
+            }
+            let epoch = front.epoch;
+            // Front is terminal, so `reclaim_front`'s terminal-state assertion holds.
+            self.reclaim_front();
+            watermark = Some(watermark.map_or(epoch, |w: u64| w.max(epoch)));
+        }
+        watermark
+    }
+
+    /// Remove the generation with `id` regardless of its lifecycle state or ledger
+    /// position, dropping its captured Arcs, WITHOUT the terminal-state assertion
+    /// [`Self::reclaim_front`] makes. This is the **abort** path: a drain that fails on
+    /// an early `?` return or panics mid-flight — before it published or sealed — must
+    /// discard ITS OWN frozen generation, or the next freeze eventually hits the depth
+    /// bound and errors the table permanently. Addressing by id (not by front) is what
+    /// makes this safe at depth `D > 1`, where the failing drain's generation may not
+    /// be the front (an older drain is still in flight ahead of it) — discarding the
+    /// front would drop the wrong generation. Discarding a not-yet-published generation
+    /// loses nothing: the mem-tier segments are removed only at publish
     /// (`retain_after`), so the rows are still live in the tier and the next capture
-    /// re-freezes them. Returns the discarded generation, or `None` if the ledger is
-    /// already empty (the happy path, where the drain reclaimed it explicitly).
-    pub(crate) fn discard_front(&mut self) -> Option<FrozenGeneration> {
-        self.generations.pop_front()
+    /// re-freezes them. Returns the discarded generation, or `None` if no resident
+    /// generation carries `id` (the happy path, where the drain reclaimed it already).
+    pub(crate) fn discard_by_id(&mut self, id: u64) -> Option<FrozenGeneration> {
+        let pos = self.generations.iter().position(|g| g.id == id)?;
+        self.generations.remove(pos)
+    }
+
+    /// Mutable handle to the resident generation with `id`, or `None` if none carries
+    /// it. A drain drives its own generation's lifecycle transitions
+    /// (`Spilling` / `Published` / `Sealed`) and stamps its reserved seal sequence
+    /// through this under a brief, await-free `drain_ledger` lock. At `D = 1` this is
+    /// the front; at `D > 1` it may be a non-front element.
+    #[must_use]
+    pub(crate) fn generation_mut_by_id(&mut self, id: u64) -> Option<&mut FrozenGeneration> {
+        self.generations.iter_mut().find(|g| g.id == id)
     }
 
     /// The front generation (oldest in-flight). Exercised by the ledger unit tests;
@@ -320,16 +392,19 @@ impl FrozenDrainLedger {
         self.generations.front()
     }
 
-    /// Mutable handle to the front generation. The shared-field drain (Stage 2b)
-    /// drives the front generation's lifecycle transitions through this under a
-    /// brief, await-free `drain_ledger` lock.
+    /// Mutable handle to the front generation. Exercised by the ledger unit tests;
+    /// the shared-field drain drives its OWN generation by id
+    /// ([`Self::generation_mut_by_id`]), not by front, so it is correct at `D > 1`.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn front_mut(&mut self) -> Option<&mut FrozenGeneration> {
         self.generations.front_mut()
     }
 
-    /// The number of resident (in-flight) generations. At `D = 1` this is `0` before
-    /// a freeze and `1` after, asserted by the entry points to guard the invariant.
+    /// The number of resident (in-flight) generations. Exercised by the ledger unit
+    /// tests; Stage 2b Step 3b's depth-`D` admission / back-pressure will read this in
+    /// production (freeze stalls at `max_depth`), at which point it is un-`cfg`'d.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn depth(&self) -> usize {
         self.generations.len()
@@ -430,19 +505,201 @@ mod tests {
     }
 
     #[test]
-    fn discard_front_removes_a_non_terminal_generation() {
+    fn freeze_assigns_monotone_ids() {
+        let mut ledger = FrozenDrainLedger::new(4);
+        let id_a = ledger.freeze(one_shard_gen(1)).map(|g| g.id).ok();
+        let id_b = ledger.freeze(one_shard_gen(2)).map(|g| g.id).ok();
+        assert_eq!(id_a, Some(0));
+        assert_eq!(id_b, Some(1));
+        // Ids are never reused: reclaim the front, freeze again, the new id keeps
+        // climbing (a stale id addresses nothing rather than a later generation).
+        ledger.front_mut().expect("front").transition(GenState::Sealed);
+        ledger.reclaim_front();
+        let id_c = ledger.freeze(one_shard_gen(3)).map(|g| g.id).ok();
+        assert_eq!(id_c, Some(2));
+    }
+
+    #[test]
+    fn discard_by_id_removes_a_non_terminal_generation() {
         // The abort path: a generation frozen but not driven to a terminal state
         // (an error mid-drain) must still be removable, WITHOUT the terminal-state
         // assertion `reclaim_front` makes, so a failed drain never strands it.
         let mut ledger = FrozenDrainLedger::new(1);
-        assert!(ledger.freeze(one_shard_gen(9)).is_ok());
-        // Still Frozen — reclaim_front would assert; discard_front must not.
+        let id = ledger.freeze(one_shard_gen(9)).map(|g| g.id).ok().expect("admitted");
+        // Still Frozen — reclaim_front would assert; discard_by_id must not.
         assert_eq!(ledger.front().expect("front").state(), GenState::Frozen);
-        let discarded = ledger.discard_front().expect("discard front");
+        let discarded = ledger.discard_by_id(id).expect("discard by id");
         assert_eq!(discarded.epoch, 9);
         assert!(ledger.is_empty());
-        // Discarding an empty ledger is a no-op (the happy path already reclaimed).
-        assert!(ledger.discard_front().is_none());
+        // Discarding an unknown id is a no-op (the happy path already reclaimed it).
+        assert!(ledger.discard_by_id(id).is_none());
+    }
+
+    #[test]
+    fn discard_by_id_removes_a_non_front_generation() {
+        // At D>1 a failing drain's generation may be behind an older in-flight one;
+        // discarding must target IT by id, not the front (which belongs to the older
+        // drain). Freeze two, discard the SECOND (back) — the first (front) survives.
+        let mut ledger = FrozenDrainLedger::new(2);
+        let id_front = ledger.freeze(one_shard_gen(10)).map(|g| g.id).ok().expect("front");
+        let id_back = ledger.freeze(one_shard_gen(20)).map(|g| g.id).ok().expect("back");
+        let discarded = ledger.discard_by_id(id_back).expect("discard back");
+        assert_eq!(discarded.epoch, 20);
+        assert_eq!(ledger.depth(), 1);
+        assert_eq!(ledger.front().expect("front").id, id_front);
+        assert_eq!(ledger.front().expect("front").epoch, 10);
+    }
+
+    #[test]
+    fn reclaim_terminal_prefix_ack_single_generation_returns_its_epoch() {
+        // D=1: publishing the sole generation makes the front terminal, so the sweep
+        // reclaims exactly it and returns its epoch (byte-identical to the pre-3b
+        // `fire(epoch); reclaim_front()` pair).
+        let mut ledger = FrozenDrainLedger::new(1);
+        assert!(ledger.freeze(one_shard_gen(42)).is_ok());
+        ledger.front_mut().expect("front").transition(GenState::Spilling);
+        ledger.front_mut().expect("front").transition(GenState::Published);
+        assert_eq!(ledger.reclaim_terminal_prefix_ack(), Some(42));
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn reclaim_terminal_prefix_ack_pins_at_unfinished_older_generation() {
+        // The min-across-in-flight rule: a LATER generation publishing FIRST must NOT
+        // advance the watermark past an unfinished earlier one. Freeze A (front) then
+        // B; publish B while A is still Frozen → the sweep returns None and reclaims
+        // nothing (A pins the ack). Then publish A → the sweep reclaims A AND the
+        // already-published B in one contiguous run, returning the max (B's epoch).
+        let mut ledger = FrozenDrainLedger::new(2);
+        let id_a = ledger.freeze(one_shard_gen(10)).map(|g| g.id).ok().expect("A");
+        let id_b = ledger.freeze(one_shard_gen(20)).map(|g| g.id).ok().expect("B");
+
+        // B finishes encoding first and publishes — but A (the front) is not terminal.
+        ledger.generation_mut_by_id(id_b).expect("B").transition(GenState::Spilling);
+        ledger.generation_mut_by_id(id_b).expect("B").transition(GenState::Published);
+        assert_eq!(
+            ledger.reclaim_terminal_prefix_ack(),
+            None,
+            "B publishing first must not ack past the unfinished A"
+        );
+        assert_eq!(ledger.depth(), 2, "nothing reclaimed while A is in flight");
+
+        // A publishes — now the contiguous terminal prefix is [A, B].
+        ledger.generation_mut_by_id(id_a).expect("A").transition(GenState::Spilling);
+        ledger.generation_mut_by_id(id_a).expect("A").transition(GenState::Published);
+        assert_eq!(
+            ledger.reclaim_terminal_prefix_ack(),
+            Some(20),
+            "reclaiming [A,B] fires the monotone max epoch once"
+        );
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn reclaim_terminal_prefix_ack_stops_at_a_gap() {
+        // A gap in the middle stops the sweep: front A published, B still in flight,
+        // C published. The sweep reclaims only A (returns A's epoch); B and C stay.
+        // When B publishes, the next sweep reclaims [B, C].
+        let mut ledger = FrozenDrainLedger::new(3);
+        let id_a = ledger.freeze(one_shard_gen(10)).map(|g| g.id).ok().expect("A");
+        let id_b = ledger.freeze(one_shard_gen(20)).map(|g| g.id).ok().expect("B");
+        let id_c = ledger.freeze(one_shard_gen(30)).map(|g| g.id).ok().expect("C");
+
+        for id in [id_a, id_c] {
+            ledger.generation_mut_by_id(id).expect("gen").transition(GenState::Spilling);
+            ledger.generation_mut_by_id(id).expect("gen").transition(GenState::Published);
+        }
+        assert_eq!(
+            ledger.reclaim_terminal_prefix_ack(),
+            Some(10),
+            "the sweep stops at the still-in-flight B"
+        );
+        assert_eq!(ledger.depth(), 2);
+
+        ledger.generation_mut_by_id(id_b).expect("B").transition(GenState::Spilling);
+        ledger.generation_mut_by_id(id_b).expect("B").transition(GenState::Published);
+        assert_eq!(ledger.reclaim_terminal_prefix_ack(), Some(30));
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn reclaim_terminal_prefix_ack_min_across_all_publish_orders() {
+        // Fuzz the ordered-publish + min-ack contract over EVERY order in which K
+        // generations can finish encoding (publish). Invariants for each permutation:
+        //  * the sequence of fired watermarks is strictly monotone increasing;
+        //  * a watermark W is only ever fired once every generation with epoch <= W has
+        //    been published (never acks past an unfinished older generation);
+        //  * after all K publish, every generation is reclaimed and the final coverage
+        //    is exactly the newest generation's epoch.
+        // Epoch == freeze index so "epoch <= W" is "index <= W" (monotone by freeze).
+        const K: usize = 5;
+
+        // Heap's algorithm would do; a simple factorial-indexed permutation is enough.
+        fn permutation(mut rank: usize, n: usize) -> Vec<usize> {
+            let mut items: Vec<usize> = (0..n).collect();
+            let mut out = Vec::with_capacity(n);
+            let mut divisor = 1usize;
+            for k in 2..=n {
+                divisor *= k;
+            }
+            for k in (1..=n).rev() {
+                divisor /= k;
+                let idx = rank / divisor;
+                rank %= divisor;
+                out.push(items.remove(idx));
+            }
+            out
+        }
+
+        let mut factorial = 1usize;
+        for k in 2..=K {
+            factorial *= k;
+        }
+
+        for rank in 0..factorial {
+            let publish_order = permutation(rank, K);
+            let mut ledger = FrozenDrainLedger::new(K);
+            for i in 0..K {
+                // epoch = freeze index; ids are 0..K in freeze order.
+                assert!(
+                    ledger
+                        .freeze(one_shard_gen(u64::try_from(i).expect("small")))
+                        .is_ok()
+                );
+            }
+
+            let mut published = vec![false; K];
+            let mut last_fired: Option<u64> = None;
+            for &gen_id in &publish_order {
+                let id = u64::try_from(gen_id).expect("small");
+                ledger.generation_mut_by_id(id).expect("gen").transition(GenState::Spilling);
+                ledger.generation_mut_by_id(id).expect("gen").transition(GenState::Published);
+                published[gen_id] = true;
+                if let Some(w) = ledger.reclaim_terminal_prefix_ack() {
+                    // Monotone strictly increasing across the whole schedule.
+                    assert!(
+                        last_fired.is_none_or(|prev| w > prev),
+                        "rank#{rank} order {publish_order:?}: watermark {w} not > previous {last_fired:?}"
+                    );
+                    last_fired = Some(w);
+                    // Safety: every generation with epoch <= W is durable (published).
+                    for (idx, &done) in published.iter().enumerate() {
+                        if u64::try_from(idx).expect("small") <= w {
+                            assert!(
+                                done,
+                                "rank#{rank} order {publish_order:?}: acked {w} while gen {idx} unfinished"
+                            );
+                        }
+                    }
+                }
+            }
+            assert!(ledger.is_empty(), "rank#{rank}: not fully reclaimed");
+            assert_eq!(
+                last_fired,
+                Some(u64::try_from(K - 1).expect("small")),
+                "rank#{rank}: final watermark != newest generation epoch"
+            );
+        }
     }
 
     #[test]
