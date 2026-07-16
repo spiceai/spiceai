@@ -2490,7 +2490,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("compaction_trigger_snapshot_age_ms")
             .description("Maximum age in milliseconds of the oldest protected snapshot before snapshot-maintenance compaction runs. Set to 0 to disable the age trigger. Default: 60000 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 300000 otherwise."),
         ParameterSpec::component("compaction_max_levels")
-            .description("Maximum number of consecutive compaction passes per trigger. Bounds write amplification when tiering keeps producing new candidates. Default: 3.")
+            .description("Maximum number of consecutive compaction passes per trigger. Bounds write amplification when tiered compaction keeps producing new candidates. Default: 3.")
             .default("3"),
         ParameterSpec::component("compaction_max_files_per_pick")
             .description("Maximum number of eligible file paths retained in one compaction candidate for trigger selection and observability. The current compactor rewrites the whole current snapshot once triggered, so this does not bound rewrite IO or memory. Default: 32.")
