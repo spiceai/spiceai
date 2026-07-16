@@ -529,10 +529,7 @@ impl CayenneDeletionSink {
                         };
                         pending_pk_values.extend(projected_sink.extract_int64_pk_values(&batch)?);
                         if pending_pk_values.len() >= PK_DELETE_FLUSH_BATCH_SIZE {
-                            let row_keys = pending_pk_values
-                                .drain()
-                                .map(i64_key)
-                                .collect();
+                            let row_keys = pending_pk_values.drain().map(i64_key).collect();
                             let results = self
                                 .write_key_based_chunk_with_shared_sequence(
                                     row_keys,
@@ -548,10 +545,7 @@ impl CayenneDeletionSink {
                     }
                 }
                 if !pending_pk_values.is_empty() {
-                    let row_keys = pending_pk_values
-                        .into_iter()
-                        .map(i64_key)
-                        .collect();
+                    let row_keys = pending_pk_values.into_iter().map(i64_key).collect();
                     let results = self
                         .write_key_based_chunk_with_shared_sequence(row_keys, &mut delete_sequence)
                         .await?;
@@ -596,10 +590,7 @@ impl CayenneDeletionSink {
                             });
                         }
                         let rows = row_converter.convert_columns(&pk_columns)?;
-                        pending_row_keys.extend(
-                            rows.iter()
-                                .map(|row| bytes_key(row.as_ref())),
-                        );
+                        pending_row_keys.extend(rows.iter().map(|row| bytes_key(row.as_ref())));
                         if pending_row_keys.len() >= PK_DELETE_FLUSH_BATCH_SIZE {
                             let results = self
                                 .write_key_based_chunk_with_shared_sequence(
@@ -701,10 +692,7 @@ impl CayenneDeletionSink {
 
         let rows = row_converter.convert_columns(&pk_columns)?;
 
-        let row_keys: Vec<Box<[u8]>> = rows
-            .iter()
-            .map(|row| bytes_key(row.as_ref()))
-            .collect();
+        let row_keys: Vec<Box<[u8]>> = rows.iter().map(|row| bytes_key(row.as_ref())).collect();
 
         Ok(row_keys)
     }
@@ -754,10 +742,7 @@ impl CayenneDeletionSink {
                     }
                     let mut delete_sequence = None;
                     let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
-                    let row_keys = pk_values
-                        .into_iter()
-                        .map(i64_key)
-                        .collect();
+                    let row_keys = pk_values.into_iter().map(i64_key).collect();
                     let results = self
                         .write_key_based_chunk_with_shared_sequence(row_keys, &mut delete_sequence)
                         .await?;
@@ -821,10 +806,7 @@ impl CayenneDeletionSink {
 
                         if pending_pk_values.len() >= PK_DELETE_FLUSH_BATCH_SIZE {
                             let chunk_values = std::mem::take(&mut pending_pk_values);
-                            let row_keys = chunk_values
-                                .into_iter()
-                                .map(i64_key)
-                                .collect();
+                            let row_keys = chunk_values.into_iter().map(i64_key).collect();
                             let results = self
                                 .write_key_based_chunk_with_shared_sequence(
                                     row_keys,
@@ -842,10 +824,7 @@ impl CayenneDeletionSink {
 
                 if !pending_pk_values.is_empty() {
                     let chunk_values = std::mem::take(&mut pending_pk_values);
-                    let row_keys = chunk_values
-                        .into_iter()
-                        .map(i64_key)
-                        .collect();
+                    let row_keys = chunk_values.into_iter().map(i64_key).collect();
                     let results = self
                         .write_key_based_chunk_with_shared_sequence(row_keys, &mut delete_sequence)
                         .await?;

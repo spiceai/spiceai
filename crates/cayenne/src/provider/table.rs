@@ -9711,12 +9711,9 @@ impl CayenneTableProvider {
         match &self.pk_deletion_strategy {
             // Int64 PK tables re-derive keys from the i64 PKs and ignore the
             // encoded row keys, so this allocates only when it must.
-            PkDeletionStrategyWithCache::Int64Pk { .. } => Cow::Owned(
-                deleted_pk_i64
-                    .iter()
-                    .map(|&pk| i64_key(pk))
-                    .collect(),
-            ),
+            PkDeletionStrategyWithCache::Int64Pk { .. } => {
+                Cow::Owned(deleted_pk_i64.iter().map(|&pk| i64_key(pk)).collect())
+            }
             // RowConverter tables reuse the caller's keys verbatim: a borrowed
             // slice stays borrowed (no clone), an owned Vec is moved through.
             PkDeletionStrategyWithCache::RowConverterBased { .. } => deleted_row_keys,
@@ -26809,11 +26806,7 @@ mod tests {
     /// reader (never colliding with the `0x00`/`0x01` tags).
     #[test]
     fn test_tombstone_legacy_uncompressed_ipc_still_decodes() {
-        let keys: Vec<Box<[u8]>> = [10_i64, 20, 30]
-            .iter()
-            .copied()
-            .map(i64_key)
-            .collect();
+        let keys: Vec<Box<[u8]>> = [10_i64, 20, 30].iter().copied().map(i64_key).collect();
         // Reproduce the exact pre-cycle-5 encoding: uncompressed Arrow IPC of a
         // single `row_key` BinaryArray, no prefix tag.
         let array = BinaryArray::from_iter_values(keys.iter().map(std::convert::AsRef::as_ref));

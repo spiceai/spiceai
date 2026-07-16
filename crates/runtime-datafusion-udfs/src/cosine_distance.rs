@@ -352,7 +352,10 @@ fn compute_cosine_distance(
         return exec_err!("Both arrays must have the same length");
     }
 
-    Ok(cosine_distance_f64(float_vals1.values(), float_vals2.values()))
+    Ok(cosine_distance_f64(
+        float_vals1.values(),
+        float_vals2.values(),
+    ))
 }
 
 /// Computes the cosine distance between two equal-length f64 vectors.

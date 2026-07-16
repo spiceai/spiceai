@@ -16,12 +16,10 @@ limitations under the License.
 
 use super::streaming_batch_write;
 use crate::dynamodb::utils::scalar_to_attribute_value;
-use arrow::array::{
-    Array, AsArray, BooleanArray, GenericByteArray, PrimitiveArray,
-};
+use arrow::array::{Array, AsArray, BooleanArray, GenericByteArray, PrimitiveArray};
 use arrow::datatypes::{
-    DataType, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, SchemaRef,
-    UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    DataType, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, SchemaRef,
+    UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 use async_trait::async_trait;
 use aws_sdk_dynamodb::{
@@ -199,11 +197,8 @@ impl DataSink for DynamoDBInsertSink {
                 Ok(batch) => {
                     let rows = batch.num_rows();
                     // Cache field names once per batch (not once per row).
-                    let field_names: Vec<&str> = schema
-                        .fields()
-                        .iter()
-                        .map(|f| f.name().as_str())
-                        .collect();
+                    let field_names: Vec<&str> =
+                        schema.fields().iter().map(|f| f.name().as_str()).collect();
                     futures::stream::iter((0..rows).map(move |row_idx| {
                         let item = record_batch_row_to_dynamodb_item(
                             &batch,

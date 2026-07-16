@@ -64,14 +64,7 @@ fn unnest_dynamodb_row_owned(
     let mut new_row = HashMap::with_capacity(row.len());
     let mut flattened_fields = HashSet::new();
     path_buf.clear();
-    flatten_row_owned(
-        row,
-        path_buf,
-        &mut new_row,
-        &mut flattened_fields,
-        depth,
-        0,
-    )?;
+    flatten_row_owned(row, path_buf, &mut new_row, &mut flattened_fields, depth, 0)?;
     Ok((new_row, flattened_fields))
 }
 
@@ -479,6 +472,6 @@ mod tests {
         assert!(flattened_fields.contains("complete")); // Map that was recursed into
         assert!(flattened_fields.contains("complete.field")); // Leaf field with dot
         assert!(flattened_fields.contains("partial")); // Map that was recursed into
-                                                       // "partial.nested" is NOT in flattened_fields (Map that hit depth limit)
+        // "partial.nested" is NOT in flattened_fields (Map that hit depth limit)
     }
 }

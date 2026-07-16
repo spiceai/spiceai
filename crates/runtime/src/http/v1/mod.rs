@@ -182,9 +182,7 @@ impl ResponseMetadata {
 }
 
 /// Gets all possible media types from a `Accept` header without allocating.
-pub(crate) fn accept_header_types(
-    accept: &TypedHeader<Accept>,
-) -> impl Iterator<Item = &str> + '_ {
+pub(crate) fn accept_header_types(accept: &TypedHeader<Accept>) -> impl Iterator<Item = &str> + '_ {
     accept.0.media_types().map(AsRef::<str>::as_ref)
 }
 

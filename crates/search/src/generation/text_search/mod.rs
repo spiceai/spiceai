@@ -10,7 +10,11 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{cmp::min, collections::{HashMap, HashSet}, sync::Arc};
+use std::{
+    cmp::min,
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use crate::{
     SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME,

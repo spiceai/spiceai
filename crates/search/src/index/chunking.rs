@@ -246,8 +246,7 @@ impl ChunkedSearchIndex {
             .enumerate()
             .filter_map(|(i, arr)| {
                 let field = schema.field(i).clone();
-                if field.name() == &self.embedding_col_name
-                    || field.name() == &self.offset_col_name
+                if field.name() == &self.embedding_col_name || field.name() == &self.offset_col_name
                 {
                     return None;
                 }

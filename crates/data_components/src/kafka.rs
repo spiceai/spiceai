@@ -1117,9 +1117,11 @@ impl MessageBatchCommitter {
         consumer: &'static KafkaConsumer,
         messages: &[KafkaMessage<'_, K, V>],
     ) -> Self {
-        let offsets = max_kafka_offsets(messages.iter().map(|msg| {
-            (msg.topic(), msg.partition(), msg.offset())
-        }));
+        let offsets = max_kafka_offsets(
+            messages
+                .iter()
+                .map(|msg| (msg.topic(), msg.partition(), msg.offset())),
+        );
 
         Self {
             consumer,
@@ -1133,9 +1135,11 @@ impl MessageBatchCommitter {
         consumer: &'static KafkaConsumer,
         messages: &[BorrowedMessage<'_>],
     ) -> Self {
-        let offsets = max_kafka_offsets(messages.iter().map(|msg| {
-            (msg.topic(), msg.partition(), msg.offset())
-        }));
+        let offsets = max_kafka_offsets(
+            messages
+                .iter()
+                .map(|msg| (msg.topic(), msg.partition(), msg.offset())),
+        );
 
         Self {
             consumer,
@@ -1669,8 +1673,7 @@ mod tests {
             "name": "bob"
         }"#;
 
-        let result =
-            payloads_to_change_batch(&[first.as_slice(), second.as_slice()], &schema);
+        let result = payloads_to_change_batch(&[first.as_slice(), second.as_slice()], &schema);
 
         assert!(result.is_ok());
         let batch = result.expect("batch");
@@ -1720,14 +1723,14 @@ mod tests {
         };
 
         // direct (this PR's fast path), number form
-        let direct_num = payloads_to_change_batch(&[raw_num.as_slice()], &schema)
-            .expect("direct num");
+        let direct_num =
+            payloads_to_change_batch(&[raw_num.as_slice()], &schema).expect("direct num");
         // current round-trip path, number form
         let v_num = serde_json::from_slice::<Value>(raw_num).expect("parse num");
         let rt_num = values_to_change_batch([v_num].iter(), None, &schema).expect("roundtrip num");
         // direct, string form (decimal-as-string control)
-        let direct_str = payloads_to_change_batch(&[raw_str.as_slice()], &schema)
-            .expect("direct str");
+        let direct_str =
+            payloads_to_change_batch(&[raw_str.as_slice()], &schema).expect("direct str");
 
         eprintln!("[decimal-precision] exact          = {exact}");
         eprintln!("[decimal-precision] direct(num)     = {}", amt(&direct_num));

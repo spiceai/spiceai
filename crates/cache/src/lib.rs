@@ -656,8 +656,7 @@ mod tests {
 
     #[test]
     fn resolved_table_match_bare_vs_fully_qualified() {
-        let stored: HashSet<TableReference> =
-            HashSet::from([TableReference::bare("customer")]);
+        let stored: HashSet<TableReference> = HashSet::from([TableReference::bare("customer")]);
         let target = TableReference::full(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, "customer");
         assert!(resolved_table_match(&stored, &target));
 
@@ -673,8 +672,7 @@ mod tests {
 
     #[test]
     fn resolved_table_match_bare_vs_partially_qualified() {
-        let stored: HashSet<TableReference> =
-            HashSet::from([TableReference::bare("customer")]);
+        let stored: HashSet<TableReference> = HashSet::from([TableReference::bare("customer")]);
         let target = TableReference::partial(SPICE_DEFAULT_SCHEMA, "customer");
         assert!(resolved_table_match(&stored, &target));
 
@@ -697,8 +695,7 @@ mod tests {
 
     #[test]
     fn resolved_table_match_different_table_names() {
-        let stored: HashSet<TableReference> =
-            HashSet::from([TableReference::bare("customer")]);
+        let stored: HashSet<TableReference> = HashSet::from([TableReference::bare("customer")]);
         let target = TableReference::bare("orders");
         assert!(!resolved_table_match(&stored, &target));
     }

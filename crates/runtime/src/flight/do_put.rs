@@ -194,11 +194,9 @@ pub(crate) async fn handle(
 
     // Allocate path label once for request + per-batch metrics (avoids re-stringifying per batch).
     let path_label: Arc<str> = Arc::from(path.to_string());
-    let start = metrics::track_flight_request_value(
-        "do_put",
-        Some(Value::from(Arc::clone(&path_label))),
-    )
-    .await;
+    let start =
+        metrics::track_flight_request_value("do_put", Some(Value::from(Arc::clone(&path_label))))
+            .await;
 
     if !datafusion.is_writable(&path) && !datafusion.is_path_catalog_writable(&path) {
         return Err(Status::invalid_argument(format!(
