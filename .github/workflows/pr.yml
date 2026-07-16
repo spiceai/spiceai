@@ -86,6 +86,10 @@ jobs:
       - name: Fast-track pure reverts
         id: revert
         if: ${{ github.event_name == 'pull_request' }}
+        # Best-effort: any unexpected script failure must fall through to the
+        # normal developer sign-off path, not fail required Attestation for
+        # every PR. listCommits/compare errors are also try/caught inside.
+        continue-on-error: true
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
