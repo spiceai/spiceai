@@ -84,9 +84,7 @@ pub enum Error {
         primary_key_rows: usize,
     },
 
-    #[snafu(display(
-        "Cannot write to '{index}' index, data does not have column '{column}'."
-    ))]
+    #[snafu(display("Cannot write to '{index}' index, data does not have column '{column}'."))]
     ColumnNotFound { index: String, column: String },
 
     #[snafu(display(
