@@ -147,17 +147,17 @@ fn try_array_value_to_attribute_value(
 fn record_batch_row_to_dynamodb_item(
     batch: &arrow::array::RecordBatch,
     row_idx: usize,
-    field_names: &[&str],
+    field_names: &[String],
     time_format: &str,
 ) -> DataFusionResult<HashMap<String, AttributeValue>> {
     let mut item = HashMap::with_capacity(field_names.len());
-    for (col_idx, &field_name) in field_names.iter().enumerate() {
+    for (col_idx, field_name) in field_names.iter().enumerate() {
         let col = batch.column(col_idx);
         if col.is_null(row_idx) {
             continue;
         }
         if let Some(attr_value) = try_array_value_to_attribute_value(col.as_ref(), row_idx)? {
-            item.insert(field_name.to_owned(), attr_value);
+            item.insert(field_name.clone(), attr_value);
             continue;
         }
         let scalar = ScalarValue::try_from_array(col, row_idx)?;
@@ -197,8 +197,8 @@ impl DataSink for DynamoDBInsertSink {
                 Ok(batch) => {
                     let rows = batch.num_rows();
                     // Cache field names once per batch (not once per row).
-                    let field_names: Vec<&str> =
-                        schema.fields().iter().map(|f| f.name().as_str()).collect();
+                    let field_names: Vec<String> =
+                        schema.fields().iter().map(|f| f.name().clone()).collect();
                     futures::stream::iter((0..rows).map(move |row_idx| {
                         let item = record_batch_row_to_dynamodb_item(
                             &batch,
