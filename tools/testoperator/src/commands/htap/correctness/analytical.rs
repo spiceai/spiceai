@@ -23,6 +23,7 @@ limitations under the License.
 //! numeric tolerance).
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures::StreamExt;
 
@@ -232,11 +233,31 @@ pub async fn verify_analytical_results(
     // they borrow `driver` and `spice` for the duration of this call — no
     // `'static`/`Send` bound and no cloning of the clients.
     let driver = &driver;
+    let overall = Instant::now();
     let results: Vec<AnalyticalQueryResult> = futures::stream::iter(queries.iter())
-        .map(|query| evaluate_query(query, driver, spice))
+        .map(|query| async move {
+            // Logged when the query is admitted into the `buffered` window (only
+            // `workers` are in flight at once), so CI output shows exactly which
+            // queries started before a cancellation/timeout and which are still
+            // waiting for a slot.
+            println!("  [{}] dispatching (source + Spice)", query.name);
+            let started = Instant::now();
+            let result = evaluate_query(query, driver, spice).await;
+            println!(
+                "  [{}] done in {:.1}s — {}",
+                query.name,
+                started.elapsed().as_secs_f64(),
+                result.outcome.label()
+            );
+            result
+        })
         .buffered(workers)
         .collect()
         .await;
+    println!(
+        "Analytical-query gate finished all {n} queries in {:.1}s",
+        overall.elapsed().as_secs_f64()
+    );
 
     Ok(AnalyticalReport { results })
 }
@@ -254,12 +275,33 @@ async fn evaluate_query(
     let sql = query.to_sql_with_inlined_params();
 
     // Run both engines concurrently — the two are independent and each pulls its
-    // own pooled connection, so there is no reason to serialize them. If both
-    // error, the source error is reported (matching the previous sequential
-    // precedence, which checked the source first).
+    // own pooled connection, so there is no reason to serialize them. Each side
+    // is timed and its completion logged, so a hang (e.g. the CI job is canceled
+    // mid-gate with no report emitted) can be attributed to the source or the
+    // Spice side of a named query rather than the whole gate. If both error, the
+    // source error is reported (matching the previous sequential precedence,
+    // which checked the source first).
     let (expected_res, actual_res) = tokio::join!(
-        driver.query_arrow(sql.as_ref()),
-        spice.query_arrow(sql.as_ref())
+        async {
+            let t = Instant::now();
+            let r = driver.query_arrow(sql.as_ref()).await;
+            println!(
+                "  [{name}] source {} in {:.1}s",
+                if r.is_ok() { "ok" } else { "ERROR" },
+                t.elapsed().as_secs_f64()
+            );
+            r
+        },
+        async {
+            let t = Instant::now();
+            let r = spice.query_arrow(sql.as_ref()).await;
+            println!(
+                "  [{name}] Spice {} in {:.1}s",
+                if r.is_ok() { "ok" } else { "ERROR" },
+                t.elapsed().as_secs_f64()
+            );
+            r
+        }
     );
 
     let expected = match expected_res {
