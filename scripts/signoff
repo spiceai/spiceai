@@ -777,11 +777,15 @@ cmd_remote() {
     fail "refusing to dispatch Remote Sign-off for invalid branch name: '${branch}'"
   fi
 
-  info "Dispatching Remote Sign-off for ${branch}…"
+  local repo
+  repo=$(repo_slug) || fail "could not resolve GitHub repo for workflow dispatch"
+
+  info "Dispatching Remote Sign-off for ${branch} on ${repo}…"
+  # --repo so non-colocated JJ workspaces (no .git) still resolve the remote;
   # --raw-field avoids shell re-quoting pitfalls; the branch was validated above.
-  gh workflow run signoff.yml --raw-field "branch=${branch}" \
+  gh workflow run signoff.yml --repo "$repo" --raw-field "branch=${branch}" \
     || fail "failed to dispatch signoff.yml"
-  echo "${OK} Dispatched. Watch with: gh run watch --workflow signoff.yml"
+  echo "${OK} Dispatched. Watch with: gh run watch --repo ${repo} --workflow signoff.yml"
 }
 
 cmd_help() {
