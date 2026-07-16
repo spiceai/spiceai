@@ -138,6 +138,10 @@ impl CloudConnectConfig {
     ///
     /// Endpoint defaults to [`DEFAULT_ENDPOINT`]; override via the
     /// `SPICE_CLOUD_ENDPOINT` env var.
+    ///
+    /// TLS overrides for self-hosted / local control planes:
+    /// - `SPICE_CLOUD_CA_CERT_PATH` — PEM CA file pinned as the server root.
+    /// - `SPICE_CLOUD_INSECURE=true` — disable TLS entirely (plaintext h2c).
     #[must_use]
     pub fn from_env(runtime_version: impl Into<String>) -> Self {
         let config_dir = Self::default_config_dir();
@@ -178,10 +182,26 @@ impl CloudConnectConfig {
             (None, None)
         };
 
+        let ca_cert_pem = std::env::var("SPICE_CLOUD_CA_CERT_PATH")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .and_then(|path| match std::fs::read_to_string(&path) {
+                Ok(pem) => Some(pem),
+                Err(err) => {
+                    tracing::warn!(
+                        "Cloud Connect: failed to read SPICE_CLOUD_CA_CERT_PATH ({path}): {err}"
+                    );
+                    None
+                }
+            });
+        let insecure = std::env::var("SPICE_CLOUD_INSECURE").is_ok_and(|v| {
+            matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+        });
+
         Self {
             endpoint,
-            ca_cert_pem: None,
-            insecure: false,
+            ca_cert_pem,
+            insecure,
             identity_path,
             config_dir,
             adoption_code,
