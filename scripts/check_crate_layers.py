@@ -57,7 +57,16 @@ def load_metadata() -> dict:
 
 
 def rel(manifest_path: str) -> str:
-    return manifest_path.replace(str(REPO) + "/", "").replace("/Cargo.toml", "")
+    # Workspace-relative crate dir, always forward-slashed so the layers.toml
+    # `path_prefix` rules match on every platform (Windows included) rather than
+    # relying on string-substituting a hard-coded separator.
+    crate_dir = Path(manifest_path).parent
+    try:
+        return crate_dir.relative_to(REPO).as_posix()
+    except ValueError:
+        # Not under the repo root — shouldn't happen for `--no-deps` workspace
+        # members, but degrade to the full posix path rather than misassign.
+        return crate_dir.as_posix()
 
 
 def assign_tier(name: str, path: str, cfg: dict) -> str:
