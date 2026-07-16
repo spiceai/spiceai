@@ -1547,6 +1547,19 @@ pub struct CayenneTableProvider {
     /// checkpoint to finish rather than racing it — natural backpressure, not
     /// a try-lock-with-fallback. Shared across writer clones.
     mem_checkpoint_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The shared in-flight mem-tier drain ledger (proposal §4.5, Model B — Stage
+    /// 2b Step 2). Every freeze/clear path (checkpoint, seal, spill, schema-
+    /// evolution flush, cold-tier promotion) records the front prefix it captured as
+    /// a [`FrozenGeneration`] here, then drives it through its lifecycle
+    /// ([`GenState`]) and reclaims it. Because Step 1b serializes ALL of those paths
+    /// on [`Self::mem_checkpoint_lock`], at most one `freeze()` exists at a time, so
+    /// this `D = 1` ledger is provably race-free and the [`ParkingMutex`] is
+    /// uncontended — it guards interior mutability behind `&self` and lets an
+    /// operation drive the front generation through brief, await-free critical
+    /// sections (the guard is NEVER held across an `.await`, the sync-substrate
+    /// invariant). Shared across writer clones (one ledger per table); Stage 2b Step
+    /// 3 raises `max_depth` and hands `D > 1` spills to the pinned ingest pool.
+    drain_ledger: Arc<ParkingMutex<FrozenDrainLedger>>,
     /// Serializes the mem-tier *publish* (the `ArcSwap` swap + sequence
     /// reservation) across all writers — DECOUPLED from [`Self::listing_fence`]
     /// so an in-memory append no longer waits on scans (read-fence) or
@@ -2511,6 +2524,51 @@ impl std::fmt::Debug for CayenneTableProvider {
         f.debug_struct("CayenneTableProvider")
             .field("table_metadata", &self.table_metadata)
             .finish_non_exhaustive()
+    }
+}
+
+/// RAII cleanup for the shared drain ledger (Stage 2b Step 2). A drain freezes a
+/// generation into [`CayenneTableProvider::drain_ledger`] and, on the happy path,
+/// drives it to a terminal state and reclaims it explicitly (disarming this guard).
+/// If the drain instead returns early on a `?` error or panics mid-flight, the
+/// generation would be stranded in the shared ledger and the NEXT freeze would hit
+/// the `D = 1` depth bound and error the table permanently. On drop while still
+/// armed this guard discards that stranded generation ([`FrozenDrainLedger::discard_front`]),
+/// which loses nothing — the mem-tier segments are removed only at publish, so the
+/// rows are still live in the tier and re-frozen by the next capture.
+///
+/// At `D = 1` the ledger holds only this operation's generation between its freeze
+/// and reclaim (freezes are serialized by `mem_checkpoint_lock`), so discarding the
+/// front is exactly it. The guard drops BEFORE the operation releases
+/// `mem_checkpoint_lock` (declared after the lock guard, so reverse drop order),
+/// leaving the ledger empty for the next serialized freeze. Stage 2b Step 3 (`D > 1`)
+/// must make this identity-aware (the front may belong to another in-flight drain).
+struct DrainCleanup<'a> {
+    ledger: &'a ParkingMutex<FrozenDrainLedger>,
+    armed: bool,
+}
+
+impl DrainCleanup<'_> {
+    /// Arm the guard for the operation that just froze a generation.
+    fn armed(ledger: &ParkingMutex<FrozenDrainLedger>) -> DrainCleanup<'_> {
+        DrainCleanup { ledger, armed: true }
+    }
+
+    /// The drain reached its terminal reclaim; the ledger is already empty, so the
+    /// guard must not discard anything on drop.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DrainCleanup<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            // Error/panic path: the drain never reached its terminal reclaim. A
+            // brief, await-free critical section (Drop is synchronous) removes the
+            // stranded generation so the next serialized freeze starts clean.
+            self.ledger.lock().discard_front();
+        }
     }
 }
 
@@ -6048,6 +6106,10 @@ impl CayenneTableProvider {
             // a snapshot.
             current_sorted_snapshot: Arc::new(ArcSwap::from_pointee(None)),
             mem_checkpoint_lock: Arc::new(tokio::sync::Mutex::new(())),
+            // Stage 2b Step 2: one shared drain ledger per table, `D = 1` until Step
+            // 3 raises the depth. Serialized against concurrent freezes by
+            // `mem_checkpoint_lock`.
+            drain_ledger: Arc::new(ParkingMutex::new(FrozenDrainLedger::new(1))),
             mem_tier_publish_locks: (0..mem_tier_shards)
                 .map(|_| ParkingMutex::new(()))
                 .collect::<Vec<_>>()
@@ -7219,6 +7281,9 @@ impl CayenneTableProvider {
             // clone is observed by scanning clones, and cleared for all on a write.
             current_sorted_snapshot: Arc::clone(&self.current_sorted_snapshot),
             mem_checkpoint_lock: Arc::clone(&self.mem_checkpoint_lock),
+            // Shared across clones so every writer/background task records + drains
+            // generations through the SAME per-table drain ledger.
+            drain_ledger: Arc::clone(&self.drain_ledger),
             // Shared across clones so EVERY writer serializes on the one publish
             // lock (the seq-ordering invariant requires a single lock per table).
             mem_tier_publish_locks: Arc::clone(&self.mem_tier_publish_locks),
@@ -21983,6 +22048,25 @@ impl CayenneTableProvider {
         (durable_epoch, snapshot)
     }
 
+    /// Drive the shared drain ledger's front generation under a brief, await-free
+    /// `drain_ledger` lock (Stage 2b Step 2), returning `f`'s result (or `None` if
+    /// the ledger is unexpectedly empty). The closure runs while the lock is held, so
+    /// it must not `.await` — it only records a lifecycle transition or stamps the
+    /// reserved sequence, both synchronous. At `D = 1` the front is this operation's
+    /// sole in-flight generation (freezes serialized by `mem_checkpoint_lock`).
+    fn with_front_generation<R>(
+        &self,
+        f: impl FnOnce(&mut FrozenGeneration) -> R,
+    ) -> Option<R> {
+        let mut ledger = self.drain_ledger.lock();
+        let result = ledger.front_mut().map(f);
+        debug_assert!(
+            result.is_some(),
+            "drove the drain ledger's front generation while the ledger was empty"
+        );
+        result
+    }
+
     /// `owned_capture_write_lock` decides who releases `write_lock` after the
     /// all-shards-atomic capture — it is NOT a request to hold it longer:
     ///
@@ -22151,31 +22235,65 @@ impl CayenneTableProvider {
         // (no `source_position` stamped), byte-identical to the pre-shard path. At
         // N>1 it is the shared per-apply `durable_epoch` MAX computed above.
         let flushed_epoch = durable_epoch.unwrap_or(snapshot.epoch);
-        // FREEZE (Model B, proposal §4.5): hoist the captured prefix into a depth-1
-        // drain ledger. The live tier is UNTOUCHED — the durable encode/commit below
-        // read only these captured immutable snapshots, and publish removes the front
-        // `flushed_counts` segments per shard via `retain_after`. At D=1 the ledger
-        // holds exactly this one generation for the duration of the
-        // (`mem_checkpoint_lock`-serialized) flush; the checkpoint bakes an un-sealed
-        // frozen tier directly, so it walks `Frozen → Spilling → Published → Reclaimed`
-        // and acks at publish (the un-decoupled §4.5 edge). Stage 2b promotes the
-        // ledger to a shared field once the seal-single / spill-multi
-        // drain-serialization audit lands; `flushed_epoch` / `reserved_snapshot_sequence`
-        // stay Copy locals so the durable-ack fires unchanged. This is a pure
-        // refactor: behavior is byte-identical to the pre-2a capture.
-        let mut drain = FrozenDrainLedger::new(1);
-        let generation = drain
+        // FREEZE (Model B, proposal §4.5): record the captured prefix as a drain
+        // generation in the SHARED `drain_ledger` (Stage 2b Step 2), MOVING the
+        // captured state into it — the generation is the single source of truth. The
+        // live tier is UNTOUCHED — publish removes the front `flushed_counts` segments
+        // per shard via `retain_after`. The checkpoint bakes an un-sealed frozen tier
+        // directly, so it walks `Frozen → Spilling → Published → Reclaimed` and acks at
+        // publish (the un-decoupled §4.5 edge). At D=1 the ledger holds exactly this one
+        // generation for the (`mem_checkpoint_lock`-serialized) flush — the freeze is
+        // race-free because Step 1b serializes every freeze/clear path on that lock, so
+        // no second concurrent freeze can exist. `DrainCleanup` discards the generation
+        // on any early `?`/panic before reclaim, so the next serialized freeze starts
+        // on an empty ledger. Behavior is byte-identical to the pre-2b capture.
+        debug_assert!(
+            self.drain_ledger.lock().is_empty(),
+            "D=1 drain ledger must be empty before a checkpoint freeze (freezes serialized by mem_checkpoint_lock)"
+        );
+        if self
+            .drain_ledger
+            .lock()
             .freeze(FrozenGeneration::freeze(
                 shard_snapshots,
                 flushed_counts,
                 reserved_snapshot_sequence,
                 flushed_epoch,
             ))
-            .map_err(|_| Error::Internal {
+            .is_err()
+        {
+            return Err(Error::Internal {
                 table: self.table_metadata.table_name.clone(),
                 message: "mem-tier drain ledger rejected the initial checkpoint freeze (D=1 invariant broken)"
                     .to_string(),
-            })?;
+            });
+        }
+        debug_assert_eq!(self.drain_ledger.lock().depth(), 1);
+        // Armed cleanup for the frozen generation: the happy paths reclaim + disarm
+        // explicitly below; an early `?`/panic drops this guard, discarding the
+        // stranded generation so the D=1 depth bound never blocks the next freeze.
+        let mut drain_cleanup = DrainCleanup::armed(&self.drain_ledger);
+        // CLAIM a working copy of the captured immutable state for the off-lock drain,
+        // read under a brief `drain_ledger` lock (NEVER held across the encode/commit
+        // `.await`s below). A D>1 pool worker (Step 3) claims a generation identically
+        // — the inline D=1 drain uses the same seam so the shapes converge. The `else`
+        // is unreachable (the freeze above admitted the generation and `mem_checkpoint_lock`
+        // bars a concurrent drain), but return a typed error rather than panic.
+        let Some((shard_snapshots, flushed_counts, reserved_snapshot_sequence, flushed_epoch)) =
+            self.with_front_generation(|g| {
+                (
+                    g.shard_snapshots.clone(),
+                    g.relative_counts.clone(),
+                    g.reserved_seq,
+                    g.epoch,
+                )
+            })
+        else {
+            return Err(Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: "drain ledger empty immediately after a checkpoint freeze".to_string(),
+            });
+        };
         // Emptiness must be judged on the REAL captured shard snapshots, not the
         // synthetic union view: `union_snapshot_view` carries the cross-shard
         // tombstone union + the summed byte/row counts but ALWAYS has empty
@@ -22188,7 +22306,7 @@ impl CayenneTableProvider {
         let nothing_to_flush = if n == 1 {
             snapshot.is_empty()
         } else {
-            generation.shard_snapshots.iter().all(|s| s.is_empty())
+            shard_snapshots.iter().all(|s| s.is_empty())
         };
         if nothing_to_flush {
             // The tier is fully empty — every epoch ever appended has already
@@ -22207,7 +22325,7 @@ impl CayenneTableProvider {
             return Ok(0);
         }
         // Committed to draining this generation: claim it for the bake.
-        generation.transition(GenState::Spilling);
+        self.with_front_generation(|g| g.transition(GenState::Spilling));
         let inlined_view = self.cached_inlined_view().await?;
         // The inline removal map is the WHOLE-TIER tombstone union (carried on
         // `snapshot.tombstones` — shard 0's at N==1, the cross-shard union at N>1),
@@ -22219,7 +22337,7 @@ impl CayenneTableProvider {
         // groups concatenate, each shard applying its OWN tombstones (§2.3e). At N==1
         // this is exactly `[visible_mem_tier_batches(shard 0)]`.
         let mut shard_groups: Vec<Vec<RecordBatch>> = Vec::new();
-        for shard in &generation.shard_snapshots {
+        for shard in &shard_snapshots {
             if shard.is_empty() || shard.segments.is_empty() {
                 continue;
             }
@@ -22272,7 +22390,7 @@ impl CayenneTableProvider {
             // moves past the deletes. All keys are pure deletes here (the
             // corpus is empty), so the commit writes delete-only entries and
             // registers no snapshot.
-            if let Some(sequence_number) = generation.reserved_seq
+            if let Some(sequence_number) = reserved_snapshot_sequence
                 && Self::mem_tier_has_tombstones(&snapshot)
             {
                 let update = self
@@ -22293,7 +22411,7 @@ impl CayenneTableProvider {
                 self.commit_on_conflict_publish(update, None).await;
                 // All-shards clear (acquires each shard's publish lock itself).
                 self.clear_flushed_mem_tier_state_all_shards(
-                    &generation.relative_counts,
+                    &flushed_counts,
                     !inlined_view.is_empty()
                         || self
                             .mem_tier_shadow_present
@@ -22308,7 +22426,7 @@ impl CayenneTableProvider {
                 // There is no durable state to publish here, so no listing fence is
                 // needed.
                 self.clear_flushed_mem_tier_state_all_shards(
-                    &generation.relative_counts,
+                    &flushed_counts,
                     !inlined_view.is_empty()
                         || self
                             .mem_tier_shadow_present
@@ -22322,11 +22440,13 @@ impl CayenneTableProvider {
                 checkpoint_start,
             );
             // Tombstones-only drain: the durable DVs are committed and the front
-            // prefix cleared — the generation's whole-unit publish is complete. The
-            // generation is the ack authority; fire off its durable epoch, then reclaim.
-            generation.transition(GenState::Published);
-            self.fire_slot_advancer(generation.epoch).await;
-            drain.reclaim_front();
+            // prefix cleared — the generation's whole-unit publish is complete. Drive
+            // it to `Published`, fire off its durable epoch (`flushed_epoch`, the
+            // generation's ack currency), then reclaim + disarm the cleanup guard.
+            self.with_front_generation(|g| g.transition(GenState::Published));
+            self.fire_slot_advancer(flushed_epoch).await;
+            self.drain_ledger.lock().reclaim_front();
+            drain_cleanup.disarm();
             return Ok(0);
         }
 
@@ -22398,7 +22518,7 @@ impl CayenneTableProvider {
             // publish lock") unconditional. Lock order: fence (outer) → publish
             // (inner), same as phase 2.
             self.clear_flushed_mem_tier_state_all_shards(
-                &generation.relative_counts,
+                &flushed_counts,
                 !inlined_view.is_empty()
                     || self
                         .mem_tier_shadow_present
@@ -22413,7 +22533,7 @@ impl CayenneTableProvider {
             // concurrent scan sees the RAM rows (correct) and never the file yet.
             // snapshot_sequence was reserved under the fence at capture time —
             // see the capture block for the ordering invariant.
-            let Some(sequence_number) = generation.reserved_seq else {
+            let Some(sequence_number) = reserved_snapshot_sequence else {
                 return Err(Error::DataValidation {
                     table: self.table_name().to_string(),
                     message: "non-position checkpoint reserved its snapshot_sequence at capture"
@@ -22559,7 +22679,7 @@ impl CayenneTableProvider {
                         .await?;
                 }
                 self.clear_flushed_mem_tier_state_all_shards(
-                    &generation.relative_counts,
+                    &flushed_counts,
                     !inlined_view.is_empty()
                         || self
                             .mem_tier_shadow_present
@@ -22601,7 +22721,7 @@ impl CayenneTableProvider {
         // listing fence) has completed for both the position-based and two-phase
         // arms — the generation is published. Its captured Arcs are reclaimed after
         // the post-fence slot ack fires off its durable epoch (below).
-        generation.transition(GenState::Published);
+        self.with_front_generation(|g| g.transition(GenState::Published));
 
         // Seed the persisted live `num_rows` from the mem-tier rows that just
         // became durable. Unlike the inline/staged path — which persists
@@ -22660,10 +22780,12 @@ impl CayenneTableProvider {
             "Mem-tier checkpoint flushed a durable snapshot"
         );
         // ONLY NOW — after the Vortex file + metastore pointer are durable — tell
-        // the runtime it may advance the source slot to cover this epoch (the
-        // generation is the ack authority). Reclaim its captured Arcs afterward.
-        self.fire_slot_advancer(generation.epoch).await;
-        drain.reclaim_front();
+        // the runtime it may advance the source slot to cover this epoch
+        // (`flushed_epoch`, the generation's ack currency). Reclaim its captured Arcs
+        // afterward and disarm the cleanup guard.
+        self.fire_slot_advancer(flushed_epoch).await;
+        self.drain_ledger.lock().reclaim_front();
+        drain_cleanup.disarm();
 
         Ok(u64::try_from(flushed_mem_rows).unwrap_or(u64::MAX))
     }
@@ -22790,28 +22912,54 @@ impl CayenneTableProvider {
         drop(owned_capture_write_lock.take());
 
         // FREEZE (Model B, proposal §4.5): record the captured active prefix as a
-        // drain generation in a depth-1 ledger. The live tier is UNTOUCHED — the seal
-        // marks the per-shard boundary (`active → sealed`) without removing segments,
-        // so the rows stay in the read union; the durable shadow below reads only
-        // these captured immutable snapshots. The seal walks `Frozen → Sealed` (the
-        // lightweight durability + slot-ack cadence; no Vortex bake) and its
-        // generation leaves the ledger after `Sealed`. `seal_epoch` stays a Copy local
-        // (the ack fires off it); the reserved seal sequence is stamped after the
-        // off-lock reservation below. Stage 2b promotes the ledger to the shared drain
-        // field. Byte-identical to the pre-2a seal.
-        let mut drain = FrozenDrainLedger::new(1);
-        let generation = drain
+        // drain generation in the SHARED `drain_ledger` (Stage 2b Step 2), MOVING the
+        // captured state into it — the generation is the single source of truth. The
+        // live tier is UNTOUCHED — the seal marks the per-shard boundary
+        // (`active → sealed`) without removing segments, so the rows stay in the read
+        // union; the durable shadow below reads only the captured immutable snapshots.
+        // The seal walks `Frozen → Sealed` (the lightweight durability + slot-ack
+        // cadence; no Vortex bake) and leaves the ledger after `Sealed`. The reserved
+        // seal sequence is stamped onto the generation after the off-lock reservation
+        // below. The freeze is race-free (Step 1b serializes every freeze on
+        // `mem_checkpoint_lock`); the `DrainCleanup` guard discards the generation on
+        // any early `?`/panic before reclaim. Byte-identical to the pre-2b seal.
+        debug_assert!(
+            self.drain_ledger.lock().is_empty(),
+            "D=1 drain ledger must be empty before a seal freeze (freezes serialized by mem_checkpoint_lock)"
+        );
+        if self
+            .drain_ledger
+            .lock()
             .freeze(FrozenGeneration::freeze(
                 shard_snapshots,
                 sealed_through,
                 None,
                 seal_epoch,
             ))
-            .map_err(|_| Error::Internal {
+            .is_err()
+        {
+            return Err(Error::Internal {
                 table: self.table_metadata.table_name.clone(),
                 message: "mem-tier drain ledger rejected the initial seal freeze (D=1 invariant broken)"
                     .to_string(),
-            })?;
+            });
+        }
+        debug_assert_eq!(self.drain_ledger.lock().depth(), 1);
+        let mut drain_cleanup = DrainCleanup::armed(&self.drain_ledger);
+        // CLAIM a working copy of the captured immutable state for the off-lock shadow
+        // write, read under a brief `drain_ledger` lock (never held across the durable
+        // commit `.await`s). The reserved seal sequence is not claimed here — it is
+        // reserved off-lock below and stamped back onto the generation. The `else` is
+        // unreachable (the freeze above admitted the generation), but returns a typed
+        // error rather than panic.
+        let Some((shard_snapshots, sealed_through, seal_epoch)) = self
+            .with_front_generation(|g| (g.shard_snapshots.clone(), g.relative_counts.clone(), g.epoch))
+        else {
+            return Err(Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: "drain ledger empty immediately after a seal freeze".to_string(),
+            });
+        };
 
         // === BUILD the union delta from the captured snapshots (off-lock) ===
         // Each shard's active piece as a delta view (tombstone/byte aggregates
@@ -22820,8 +22968,7 @@ impl CayenneTableProvider {
         // ⇒ the visible rows CONCATENATE and the tombstones UNION with no cross-shard
         // collision (the §2.3e argument the sharded checkpoint relies on). At N==1
         // this is exactly shard 0's delta — byte-identical to the pre-sharding seal.
-        let deltas: Vec<Arc<crate::provider::mem_tier::MemTier>> = generation
-            .shard_snapshots
+        let deltas: Vec<Arc<crate::provider::mem_tier::MemTier>> = shard_snapshots
             .iter()
             .map(|s| Arc::new(s.unsealed_view()))
             .collect();
@@ -22839,12 +22986,13 @@ impl CayenneTableProvider {
             // Every active row was superseded within the delta and no tombstone hides
             // a durable row: the epoch is vacuously durable. Advance the per-shard
             // boundary + the slot so the active pieces are not re-scanned next seal.
-            for (shard_id, &through) in generation.relative_counts.iter().enumerate() {
+            for (shard_id, &through) in sealed_through.iter().enumerate() {
                 self.mark_shard_sealed_through(shard_id, through);
             }
             // Vacuously durable: the boundary is marked, so the generation is sealed.
-            generation.transition(GenState::Sealed);
-            drain.reclaim_front();
+            self.with_front_generation(|g| g.transition(GenState::Sealed));
+            self.drain_ledger.lock().reclaim_front();
+            drain_cleanup.disarm();
             self.fire_slot_advancer(seal_epoch).await;
             return Ok(0);
         }
@@ -22865,7 +23013,7 @@ impl CayenneTableProvider {
             .await
             .map_err(|source| Error::Catalog { source })?;
         // Stamp the off-lock reservation onto the generation (freeze recorded `None`).
-        generation.set_reserved_seq(seal_sequence);
+        self.with_front_generation(|g| g.set_reserved_seq(seal_sequence));
 
         // (a) Durable INSERTS → ONE unpublished inline-corpus BLOB over the
         // concatenated cross-shard visible rows. Durable commit only — NO
@@ -22923,13 +23071,14 @@ impl CayenneTableProvider {
         // Advance each shard's ingestion/immutable split (active → sealed) under that
         // shard's publish lock so the boundary store is atomic w.r.t. a concurrent
         // append's tier swap.
-        for (shard_id, &through) in generation.relative_counts.iter().enumerate() {
+        for (shard_id, &through) in sealed_through.iter().enumerate() {
             self.mark_shard_sealed_through(shard_id, through);
         }
         // The active prefix is durable (inserts + tombstones) and the boundary marked
-        // — the generation is sealed and leaves the ledger.
-        generation.transition(GenState::Sealed);
-        drain.reclaim_front();
+        // — the generation is sealed and leaves the ledger. Reclaim + disarm the guard.
+        self.with_front_generation(|g| g.transition(GenState::Sealed));
+        self.drain_ledger.lock().reclaim_front();
+        drain_cleanup.disarm();
 
         // ONLY NOW — after every shard's active delta is durable — may the runtime
         // advance the source slot to cover `seal_epoch`. A crash before this point
@@ -32502,6 +32651,76 @@ mod tests {
             scan_sorted_ids(&reopened).await,
             vec![1, 2, 3, 4, 5],
             "no resurrection or duplicate after the replay is baked durable"
+        );
+    }
+
+    /// Stage 2b Step 2 — the shared drain ledger's error-path cleanup. A checkpoint
+    /// that fails mid-drain (here the one-shot spilling fault, an in-process `Err`
+    /// raised while the generation is `Spilling`) must NOT strand its frozen
+    /// generation in the shared `drain_ledger`: the `DrainCleanup` guard discards it
+    /// on the early `?` return, so the NEXT checkpoint's freeze admits its generation
+    /// into an empty `D = 1` ledger and drains successfully. Without the guard the
+    /// stranded generation would trip the depth bound and every subsequent checkpoint
+    /// would error the table PERMANENTLY. No reopen — this is the same-process
+    /// recovery the crash-injection suite (which drops + reopens) does not cover.
+    #[tokio::test]
+    async fn stage2b_failed_drain_does_not_strand_generation_in_shared_ledger() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) =
+            create_memory_mode_upsert_table("s2b_ledger_cleanup", Arc::clone(&runtime_env)).await;
+        let durable = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(std::sync::Arc::new(EpochRecorder(std::sync::Arc::clone(
+            &durable,
+        ))));
+
+        // Seed [1,2,3] and bake it durable.
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(int64_id_batch(&[1, 2, 3])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed append");
+        provider.checkpoint_mem_tier().await.expect("seed checkpoint");
+        let acked_after_seed = durable.load(std::sync::atomic::Ordering::SeqCst);
+
+        // Append [4,5], then FAIL the checkpoint in `Spilling`: the fault returns an
+        // error after the encode but before the metastore commit + tier clear, so the
+        // generation is frozen-then-spilling and NEVER reclaimed on the happy path.
+        let _ = provider
+            .write_cdc_append_stream(single_batch_stream(int64_id_batch(&[4, 5])), &ctx.task_ctx())
+            .await
+            .expect("tail append");
+        provider.arm_checkpoint_spill_fault();
+        assert!(
+            provider.checkpoint_mem_tier().await.is_err(),
+            "the injected spilling fault surfaces as a checkpoint error"
+        );
+        assert_eq!(
+            durable.load(std::sync::atomic::Ordering::SeqCst),
+            acked_after_seed,
+            "a checkpoint that failed in Spilling must not advance the slot"
+        );
+        // The front prefix was never cleared, so the tail is still live in the tier.
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 2, 3, 4, 5]);
+
+        // THE ASSERTION: the next checkpoint's freeze must admit its generation into
+        // an empty ledger and drain successfully — proving the guard discarded the
+        // stranded generation. If it had leaked, this would return the D=1 "rejected
+        // the initial checkpoint freeze" internal error.
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("the checkpoint after a failed drain must succeed (guard cleaned the ledger)");
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1, 2, 3, 4, 5],
+            "the retried checkpoint bakes the tail durable with no loss or duplicate"
+        );
+        assert!(
+            durable.load(std::sync::atomic::Ordering::SeqCst) > acked_after_seed,
+            "the successful retry advances the slot past the seed"
         );
     }
 

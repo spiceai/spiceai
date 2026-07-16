@@ -34,19 +34,26 @@ limitations under the License.
 //! front `N_G`; publishing `G` drops `N_G` from the front, so `G+1` becomes the new
 //! front with its own `N_{G+1}`.
 //!
-//! ## Depth at Stage 2a
+//! ## Depth at Stage 2b (`D = 1`)
 //!
 //! At `D = 1` the ledger holds at most one in-flight generation, so both entry
 //! points stay byte-identical to the pre-2a code: a generation is always drained
 //! (published or sealed) and reclaimed before the next freeze within one
-//! `mem_checkpoint_lock`-held operation. The ledger is therefore instantiated as a
-//! **per-operation local** in 2a — it is NOT yet a shared provider field. Promoting
-//! it to a `ParkingMutex`-guarded field that persists across calls is Stage 2b's
-//! job, and is gated on the drain-path serialization audit (the seal is
-//! single-drained/ordered; spills are multi-drained/unordered — proposal §4.5), so
-//! we do not add a cross-call shared-mutation surface on this correctness-critical
-//! path before that audit exists. `max_depth` is carried now so 2b flips only the
-//! ownership, not the shape.
+//! `mem_checkpoint_lock`-held operation.
+//!
+//! Stage 2b Step 2 promotes the ledger from a per-operation local to a **shared
+//! provider field** (`Arc<ParkingMutex<FrozenDrainLedger>>` on
+//! [`crate::provider::CayenneTableProvider`]) that persists across calls. This is
+//! now race-free because Step 1b serializes EVERY freeze/clear path (checkpoint,
+//! seal, spill, schema-evolution flush, cold-tier promotion) on
+//! `mem_checkpoint_lock` — a second concurrent `freeze()` can no longer exist, so
+//! the shared `D = 1` ledger observes exactly one generation at a time. The
+//! [`ParkingMutex`](parking_lot::Mutex) that guards it is therefore uncontended
+//! today; it exists so an operation can drive the front generation's lifecycle
+//! through brief, await-free critical sections (never holding the guard across an
+//! `.await`), and so Stage 2b Step 3 can hand `D > 1` spills to the pinned ingest
+//! pool where a worker drains a generation concurrently with the next freeze.
+//! `max_depth` stays `1` until that step raises it.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -249,30 +256,48 @@ impl FrozenDrainLedger {
         self.generations.pop_front()
     }
 
+    /// Remove the front generation regardless of its lifecycle state, dropping its
+    /// captured Arcs, WITHOUT the terminal-state assertion [`Self::reclaim_front`]
+    /// makes. This is the **abort** path: a drain that fails on an early `?` return
+    /// or panics mid-flight — before it published or sealed — must not strand its
+    /// frozen generation in the shared ledger, or the next freeze would hit the
+    /// depth bound and error the table permanently. Discarding a not-yet-published
+    /// generation loses nothing: the mem-tier segments are removed only at publish
+    /// (`retain_after`), so the rows are still live in the tier and the next capture
+    /// re-freezes them. Returns the discarded generation, or `None` if the ledger is
+    /// already empty (the happy path, where the drain reclaimed it explicitly).
+    pub(crate) fn discard_front(&mut self) -> Option<FrozenGeneration> {
+        self.generations.pop_front()
+    }
+
     /// The front generation (oldest in-flight). Exercised by the ledger unit tests;
-    /// Stage 2b's shared-field drain consumes it directly.
+    /// the shared-field drain reads the captured fields it needs into operation
+    /// locals at freeze time rather than through this borrow (the guard cannot be
+    /// held across the off-lock encode).
     #[cfg(test)]
     #[must_use]
     pub(crate) fn front(&self) -> Option<&FrozenGeneration> {
         self.generations.front()
     }
 
-    /// Mutable handle to the front generation. Test-only in Stage 2a (the entry
-    /// points drive the handle returned by [`FrozenDrainLedger::freeze`]); Stage 2b's
-    /// shared field drives transitions through this.
-    #[cfg(test)]
+    /// Mutable handle to the front generation. The shared-field drain (Stage 2b)
+    /// drives the front generation's lifecycle transitions through this under a
+    /// brief, await-free `drain_ledger` lock.
     #[must_use]
     pub(crate) fn front_mut(&mut self) -> Option<&mut FrozenGeneration> {
         self.generations.front_mut()
     }
 
-    #[cfg(test)]
+    /// The number of resident (in-flight) generations. At `D = 1` this is `0` before
+    /// a freeze and `1` after, asserted by the entry points to guard the invariant.
     #[must_use]
     pub(crate) fn depth(&self) -> usize {
         self.generations.len()
     }
 
-    #[cfg(test)]
+    /// Whether the ledger holds no in-flight generation. The entry points assert
+    /// this holds before they freeze (at `D = 1` every prior drain reclaimed or the
+    /// cleanup guard discarded its generation before releasing `mem_checkpoint_lock`).
     #[must_use]
     pub(crate) fn is_empty(&self) -> bool {
         self.generations.is_empty()
@@ -356,6 +381,22 @@ mod tests {
         assert_eq!(reclaimed.epoch, 10);
         assert_eq!(ledger.depth(), 1);
         assert_eq!(ledger.front().expect("remaining front").epoch, 20);
+    }
+
+    #[test]
+    fn discard_front_removes_a_non_terminal_generation() {
+        // The abort path: a generation frozen but not driven to a terminal state
+        // (an error mid-drain) must still be removable, WITHOUT the terminal-state
+        // assertion `reclaim_front` makes, so a failed drain never strands it.
+        let mut ledger = FrozenDrainLedger::new(1);
+        assert!(ledger.freeze(one_shard_gen(9)).is_ok());
+        // Still Frozen — reclaim_front would assert; discard_front must not.
+        assert_eq!(ledger.front().expect("front").state(), GenState::Frozen);
+        let discarded = ledger.discard_front().expect("discard front");
+        assert_eq!(discarded.epoch, 9);
+        assert!(ledger.is_empty());
+        // Discarding an empty ledger is a no-op (the happy path already reclaimed).
+        assert!(ledger.discard_front().is_none());
     }
 
     #[test]
