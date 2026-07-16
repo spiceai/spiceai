@@ -281,7 +281,7 @@ fn stored_schema(
             metadata_columns
                 .iter()
                 .filter(|c| c.name() != embedding_column_name)
-                .map(|c| c.field()),
+                .map(MetadataColumn::field),
         )
         .chain(std::iter::once(Arc::new(Field::new(
             &embedding_column_name,
