@@ -22294,6 +22294,50 @@ impl CayenneTableProvider {
                 message: "drain ledger empty immediately after a checkpoint freeze".to_string(),
             });
         };
+        // Drive the off-lock drain (encode → PUT → commit → publish → ack → reclaim)
+        // on the claimed immutable working copy. At D=1 this runs INLINE while the
+        // caller still holds `mem_checkpoint_lock` — byte-identical to the pre-3a
+        // interleaved body. Stage 2b Step 3b `tokio::spawn`s this exact method after
+        // releasing the lock, so the next freeze overlaps the drain (the pipelined
+        // drain that lifts the `cdc_durability: memory` ceiling).
+        self.drain_checkpoint_generation(
+            shard_snapshots,
+            flushed_counts,
+            reserved_snapshot_sequence,
+            flushed_epoch,
+            checkpoint_start,
+            &mut drain_cleanup,
+        )
+        .await
+    }
+
+    /// The off-lock CHECKPOINT drain (Stage 2b Step 3a): encode the claimed frozen
+    /// generation to a durable Vortex snapshot, publish it whole-unit under the
+    /// listing fence, advance the source slot to its durable epoch, then reclaim the
+    /// generation and disarm `cleanup`. Operates ONLY on the claimed immutable working
+    /// copy (`shard_snapshots` / `flushed_counts` / `reserved_snapshot_sequence` /
+    /// `flushed_epoch`) plus `self` and the shared `drain_ledger`'s front generation —
+    /// it holds NO capture lock. At `D = 1` the caller runs it inline under
+    /// `mem_checkpoint_lock` (byte-identical); Step 3b spawns it as a detached task
+    /// after releasing that lock. `checkpoint_start` is threaded in so the
+    /// `mem_tier_checkpoint` phase metric spans the whole capture+drain exactly as
+    /// before the extraction.
+    async fn drain_checkpoint_generation(
+        &self,
+        shard_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>>,
+        flushed_counts: Vec<usize>,
+        reserved_snapshot_sequence: Option<i64>,
+        flushed_epoch: u64,
+        checkpoint_start: Instant,
+        drain_cleanup: &mut DrainCleanup<'_>,
+    ) -> Result<u64> {
+        let n = shard_snapshots.len();
+        // Recompute the (union / shard-0) snapshot view from the claimed immutable
+        // shard snapshots — identical to the value the capture computed, since the
+        // same `(shard_snapshots, flushed_counts)` yield the same view. The durable
+        // epoch is already claimed as `flushed_epoch`, so its recomputation is unused.
+        let (_durable_epoch, snapshot) =
+            Self::checkpoint_durable_epoch_and_snapshot(n, &shard_snapshots, &flushed_counts);
         // Emptiness must be judged on the REAL captured shard snapshots, not the
         // synthetic union view: `union_snapshot_view` carries the cross-shard
         // tombstone union + the summed byte/row counts but ALWAYS has empty
@@ -22960,6 +23004,31 @@ impl CayenneTableProvider {
                 message: "drain ledger empty immediately after a seal freeze".to_string(),
             });
         };
+        // Drive the off-lock seal drain (build union delta → durable shadow → mark
+        // boundary → ack → reclaim) on the claimed immutable working copy. At D=1 this
+        // runs INLINE under `mem_checkpoint_lock` (byte-identical to the pre-3a body);
+        // Step 3b spawns it after releasing the lock so the next freeze overlaps it.
+        self.drain_seal_generation(shard_snapshots, sealed_through, seal_epoch, &mut drain_cleanup)
+            .await
+    }
+
+    /// The off-lock SEAL drain (Stage 2b Step 3a): durably shadow the claimed frozen
+    /// active-piece generation into the unpublished inline corpus, mark each shard's
+    /// active→sealed boundary, advance the source slot to `seal_epoch`, then reclaim
+    /// the generation and disarm `cleanup`. Operates ONLY on the claimed immutable
+    /// working copy (`shard_snapshots` / `sealed_through` / `seal_epoch`) plus `self`
+    /// and the shared `drain_ledger`'s front generation — it holds NO capture lock, so
+    /// at `D = 1` the caller runs it inline under `mem_checkpoint_lock` (byte-identical)
+    /// and Step 3b spawns it as a detached task. The seal sequence is reserved off-lock
+    /// inside here and stamped back onto the generation (the freeze recorded `None`).
+    async fn drain_seal_generation(
+        &self,
+        shard_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>>,
+        sealed_through: Vec<usize>,
+        seal_epoch: u64,
+        drain_cleanup: &mut DrainCleanup<'_>,
+    ) -> Result<u64> {
+        let n = shard_snapshots.len();
 
         // === BUILD the union delta from the captured snapshots (off-lock) ===
         // Each shard's active piece as a delta view (tombstone/byte aggregates
