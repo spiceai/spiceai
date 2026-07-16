@@ -244,6 +244,8 @@ fn config_with(
         adoption_code: None,
         pending_adopt_code_path: None,
         runtime_version: "v0.0.0-test".to_string(),
+        heartbeat_interval: Duration::from_secs(30),
+        telemetry_interval: Duration::from_mins(1),
     }
 }
 
@@ -253,6 +255,7 @@ fn preseed_identity(path: &std::path::Path) {
         identity_cert_pem: "UNIT-TEST-CERT".to_string(),
         private_key_pem: "UNIT-TEST-KEY".to_string(),
         public_key_pem: "UNIT-TEST-PUB".to_string(),
+        ca_bundle_pem: String::new(),
         not_after_unix: 0,
     };
     IdentityStore::store(path, &identity).unwrap();

@@ -17,6 +17,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow_schema::{Field, Schema};
+use chrono::{Datelike as _, TimeZone as _, Utc};
 
 // Constants for bucket enumeration limits
 const MAX_BUCKET_ENUMERATION_I32: i32 = 10_000;
@@ -28,8 +29,6 @@ const NANOS_PER_MINUTE: i64 = 60 * NANOS_PER_SECOND;
 const NANOS_PER_HOUR: i64 = 60 * NANOS_PER_MINUTE;
 const NANOS_PER_DAY: i64 = 24 * NANOS_PER_HOUR;
 const NANOS_PER_WEEK: i64 = 7 * NANOS_PER_DAY;
-const NANOS_PER_MONTH: i64 = 30 * NANOS_PER_DAY; // Approximate
-const NANOS_PER_YEAR: i64 = 365 * NANOS_PER_DAY; // Approximate
 use datafusion::{
     common::{
         Column, ToDFSchema as _,
@@ -663,71 +662,79 @@ fn evaluate_bucket_inequality(
 }
 
 /// Evaluates inequality for modulo partitions using statistics-based pruning.
-/// For col % divisor = `partition_value`, the values that map to this partition form
-/// an arithmetic sequence: `partition_value`, `partition_value` + divisor, `partition_value` + 2*divisor, ...
-/// We can prune if we know the filter range doesn't contain any values from this sequence.
+///
+/// `DataFusion` uses truncation-toward-zero remainder (Rust `%` semantics), so the
+/// sign of the partition key determines which half of the number line that partition
+/// occupies — the partition key is the remainder value stored for that partition:
+///
+/// - key > 0: all values in this partition are ≥ key  (e.g. key=5, divisor=10 → {5,15,25,…})
+/// - key < 0: all values in this partition are ≤ key  (e.g. key=-5, divisor=10 → {-5,-15,-25,…})
+/// - key = 0: partition contains multiples of divisor in both directions → cannot prune
+///
+/// This holds for any non-zero divisor regardless of its sign.
 fn evaluate_modulo_inequality(
     divisor: &ScalarValue,
     partition_value: &ScalarValue,
     filter_value: &ScalarValue,
     op: Operator,
 ) -> Result<bool, DataFusionError> {
-    // Fast path for integer types with direct arithmetic
-    match (divisor, partition_value, filter_value) {
-        (
-            ScalarValue::Int32(Some(d)),
-            ScalarValue::Int32(Some(pv)),
-            ScalarValue::Int32(Some(fv)),
-        ) => {
-            // Partition represents: pv, pv + d, pv + 2d, pv + 3d, ...
-            // For negative values: ..., pv - 3d, pv - 2d, pv - d, pv, pv + d, ...
-
-            // Check if any value in the arithmetic sequence satisfies the inequality
-            let can_satisfy = match op {
-                Operator::Gt => {
-                    // col > fv: Need pv + k*d > fv for some integer k
-                    // If pv > fv, satisfied immediately (k=0)
-                    // Otherwise, need k > (fv - pv) / d, which means k >= ceil((fv - pv + 1) / d)
-                    // Since sequence is infinite in positive direction, always satisfiable if d > 0
-                    *pv > *fv || *d > 0
-                }
-                Operator::GtEq => {
-                    // col >= fv: Need pv + k*d >= fv
-                    *pv >= *fv || *d > 0
-                }
-                Operator::Lt => {
-                    // col < fv: Need pv + k*d < fv
-                    *pv < *fv || *d < 0
-                }
-                Operator::LtEq => {
-                    // col <= fv: Need pv + k*d <= fv
-                    *pv <= *fv || *d < 0
-                }
-                _ => return Err(DataFusionError::Plan("Unsupported operator".to_string())),
-            };
-
-            return Ok(!can_satisfy); // Prune if no value can satisfy
-        }
-        (
-            ScalarValue::Int64(Some(d)),
-            ScalarValue::Int64(Some(pv)),
-            ScalarValue::Int64(Some(fv)),
-        ) => {
-            let can_satisfy = match op {
-                Operator::Gt => *pv > *fv || *d > 0,
-                Operator::GtEq => *pv >= *fv || *d > 0,
-                Operator::Lt => *pv < *fv || *d < 0,
-                Operator::LtEq => *pv <= *fv || *d < 0,
-                _ => return Err(DataFusionError::Plan("Unsupported operator".to_string())),
-            };
-
-            return Ok(!can_satisfy);
-        }
-        _ => {}
+    if !matches!(
+        op,
+        Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq
+    ) {
+        return Err(DataFusionError::Plan("Unsupported operator".to_string()));
     }
 
-    // Conservative fallback for unsupported types
-    Ok(false)
+    match (divisor, partition_value, filter_value) {
+        (
+            ScalarValue::Int32(Some(divisor)),
+            ScalarValue::Int32(Some(key)),
+            ScalarValue::Int32(Some(threshold)),
+        ) => {
+            if *divisor == 0 {
+                return Ok(false);
+            }
+            Ok(match key.cmp(&0) {
+                // partition ⊆ [key, +∞): prune if the filter's upper bound is at or below key
+                std::cmp::Ordering::Greater => match op {
+                    Operator::Lt => threshold <= key,
+                    Operator::LtEq => threshold < key,
+                    _ => false,
+                },
+                // partition ⊆ (−∞, key]: prune if the filter's lower bound is at or above key
+                std::cmp::Ordering::Less => match op {
+                    Operator::Gt => threshold >= key,
+                    Operator::GtEq => threshold > key,
+                    _ => false,
+                },
+                // key = 0: multiples of divisor span both directions, cannot prune
+                std::cmp::Ordering::Equal => false,
+            })
+        }
+        (
+            ScalarValue::Int64(Some(divisor)),
+            ScalarValue::Int64(Some(key)),
+            ScalarValue::Int64(Some(threshold)),
+        ) => {
+            if *divisor == 0 {
+                return Ok(false);
+            }
+            Ok(match key.cmp(&0) {
+                std::cmp::Ordering::Greater => match op {
+                    Operator::Lt => threshold <= key,
+                    Operator::LtEq => threshold < key,
+                    _ => false,
+                },
+                std::cmp::Ordering::Less => match op {
+                    Operator::Gt => threshold >= key,
+                    Operator::GtEq => threshold > key,
+                    _ => false,
+                },
+                std::cmp::Ordering::Equal => false,
+            })
+        }
+        _ => Ok(false),
+    }
 }
 
 /// Evaluates inequality for truncate(step, col) partitions.
@@ -745,7 +752,9 @@ fn evaluate_truncate_inequality(
             ScalarValue::Int32(Some(s)),
             ScalarValue::Int32(Some(fv)),
         ) => {
-            let partition_upper = pv + s;
+            let Some(partition_upper) = pv.checked_add(*s) else {
+                return Ok(false);
+            };
             let overlaps = match op {
                 Operator::Gt | Operator::GtEq => partition_upper > *fv,
                 Operator::Lt => *pv < *fv,
@@ -759,7 +768,9 @@ fn evaluate_truncate_inequality(
             ScalarValue::Int64(Some(s)),
             ScalarValue::Int64(Some(fv)),
         ) => {
-            let partition_upper = pv + s;
+            let Some(partition_upper) = pv.checked_add(*s) else {
+                return Ok(false);
+            };
             let overlaps = match op {
                 Operator::Gt | Operator::GtEq => partition_upper > *fv,
                 Operator::Lt => *pv < *fv,
@@ -822,20 +833,32 @@ fn evaluate_date_trunc_inequality(
         return Ok(false); // Overflow: don't prune
     };
 
-    // Compute the upper bound based on granularity
-    let nanos_in_granularity = match gran.as_str() {
-        "second" => NANOS_PER_SECOND,
-        "minute" => NANOS_PER_MINUTE,
-        "hour" => NANOS_PER_HOUR,
-        "day" => NANOS_PER_DAY,
-        "week" => NANOS_PER_WEEK,
-        "month" => NANOS_PER_MONTH,
-        "year" => NANOS_PER_YEAR,
-        _ => return Ok(false), // Unknown granularity, be conservative
+    let partition_upper_ts = match gran.as_str() {
+        "second" => partition_ts.checked_add(NANOS_PER_SECOND),
+        "minute" => partition_ts.checked_add(NANOS_PER_MINUTE),
+        "hour" => partition_ts.checked_add(NANOS_PER_HOUR),
+        "day" => partition_ts.checked_add(NANOS_PER_DAY),
+        "week" => partition_ts.checked_add(NANOS_PER_WEEK),
+        "month" | "year" => {
+            // Calendar boundaries depend on the timezone. DataFusion's date_trunc
+            // uses the timestamp timezone when one is present; without a timezone
+            // database here, only UTC/no-timezone values can be pruned soundly.
+            let timezone = match partition_value {
+                ScalarValue::TimestampNanosecond(_, tz)
+                | ScalarValue::TimestampMicrosecond(_, tz)
+                | ScalarValue::TimestampMillisecond(_, tz)
+                | ScalarValue::TimestampSecond(_, tz) => tz.as_deref(),
+                _ => None,
+            };
+            if timezone.is_some_and(|tz| tz != "UTC" && tz != "+00:00") {
+                return Ok(false);
+            }
+            next_calendar_boundary_nanos(partition_ts, gran)
+        }
+        _ => return Ok(false),
     };
-
-    let Some(partition_upper_ts) = partition_ts.checked_add(nanos_in_granularity) else {
-        return Ok(false); // Overflow: don't prune
+    let Some(partition_upper_ts) = partition_upper_ts else {
+        return Ok(false);
     };
 
     // Create upper bound ScalarValue matching the partition_value type
@@ -877,6 +900,22 @@ fn evaluate_date_trunc_inequality(
     };
 
     Ok(!overlaps) // Prune if no overlap
+}
+
+fn next_calendar_boundary_nanos(partition_ts: i64, granularity: &str) -> Option<i64> {
+    let seconds = partition_ts.div_euclid(NANOS_PER_SECOND);
+    let nanos = u32::try_from(partition_ts.rem_euclid(NANOS_PER_SECOND)).ok()?;
+    let timestamp = Utc.timestamp_opt(seconds, nanos).single()?;
+
+    let (year, month) = match granularity {
+        "month" if timestamp.month() == 12 => (timestamp.year().checked_add(1)?, 1),
+        "month" => (timestamp.year(), timestamp.month().checked_add(1)?),
+        "year" => (timestamp.year().checked_add(1)?, 1),
+        _ => return None,
+    };
+    Utc.with_ymd_and_hms(year, month, 1, 0, 0, 0)
+        .single()?
+        .timestamp_nanos_opt()
 }
 
 /// Evaluates a function-based filter (e.g., `date_trunc`, truncate).
@@ -928,7 +967,7 @@ fn call(f: &ScalarUDF, args: Vec<ScalarValue>) -> Result<ScalarValue, DataFusion
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, TimeUnit};
-    use chrono::{NaiveDateTime, TimeZone as _, Utc};
+    use chrono::{NaiveDateTime, Utc};
     use datafusion::{
         functions::regex::regexp_match,
         prelude::{case, col, date_trunc, in_list, lit},
@@ -1557,6 +1596,19 @@ mod tests {
             Int32,
             [(0, false), (5, false), (6, false)]
         );
+
+        // Filter: a < -5
+        // Partition 0: contains multiples of 10 (…,-10, 0, 10,…) — unbounded, cannot prune
+        // Partition 5: contains {5, 15, 25,…} — all ≥ 5 > -5, so can prune
+        // Partition 9: contains {9, 19, 29,…} — all ≥ 9 > -5, so can prune
+        let negative_filters = &[col("a").lt(lit(-5))];
+        assert_prune_partition!(
+            negative_filters,
+            &partition_by,
+            schema,
+            Int32,
+            [(0, false), (5, true), (9, true)]
+        );
         Ok(())
     }
 
@@ -1666,6 +1718,38 @@ mod tests {
     }
 
     #[test]
+    fn test_prune_partition_date_trunc_uses_exact_calendar_boundaries()
+    -> Result<(), DataFusionError> {
+        let schema = Schema::new(vec![Field::new(
+            "date",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        )]);
+
+        let month_partition = date_trunc(lit("month"), col("date"));
+        let march_31 =
+            ScalarValue::TimestampNanosecond(Some(timestamp_nanos("2025-03-31 12:00:00")), None);
+        assert!(!prune_partition(
+            &[col("date").gt(lit(march_31))],
+            &month_partition,
+            &ScalarValue::TimestampNanosecond(Some(timestamp_nanos("2025-03-01 00:00:00")), None,),
+            &schema,
+        )?);
+
+        let year_partition = date_trunc(lit("year"), col("date"));
+        let leap_day =
+            ScalarValue::TimestampNanosecond(Some(timestamp_nanos("2024-02-29 12:00:00")), None);
+        assert!(!prune_partition(
+            &[col("date").gt(lit(leap_day))],
+            &year_partition,
+            &ScalarValue::TimestampNanosecond(Some(timestamp_nanos("2024-01-01 00:00:00")), None,),
+            &schema,
+        )?);
+
+        Ok(())
+    }
+
+    #[test]
     fn test_prune_partition_simple_column_with_multiple_inequalities() -> Result<(), DataFusionError>
     {
         // Test that simple column partitions correctly handle multiple inequality filters
@@ -1739,6 +1823,23 @@ mod tests {
                 (3000, true)   // All values 3000-3999 >= 3000
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_truncate_inequality_overflow_is_conservative() -> Result<(), DataFusionError> {
+        assert!(!evaluate_truncate_inequality(
+            &ScalarValue::Int32(Some(10)),
+            &ScalarValue::Int32(Some(i32::MAX - 5)),
+            &ScalarValue::Int32(Some(i32::MAX)),
+            Operator::Gt,
+        )?);
+        assert!(!evaluate_truncate_inequality(
+            &ScalarValue::Int64(Some(10)),
+            &ScalarValue::Int64(Some(i64::MAX - 5)),
+            &ScalarValue::Int64(Some(i64::MAX)),
+            Operator::Gt,
+        )?);
         Ok(())
     }
 

@@ -103,7 +103,11 @@ impl HyperLogLog {
     pub fn add_i128(&mut self, value: i128) {
         // Explicit byte hashing (not `Hash`) so the mapping is stable across
         // runs and builds — the sketch is persisted and merged over time.
-        let hash = hash_index::hash_key_bytes(&[&value.to_le_bytes()]);
+        // One-shot XXH3 (not the streaming hasher) since every value is a
+        // single 16-byte part — byte-identical, but skips constructing a
+        // fresh streaming hasher per value on this hot fold loop; pinned by
+        // `hash_key_bytes_oneshot_matches_streaming` in `hash-index`.
+        let hash = hash_index::hash_key_bytes_oneshot(&value.to_le_bytes());
         self.add_hash(hash);
     }
 
@@ -111,7 +115,7 @@ impl HyperLogLog {
     /// stable, explicit byte hashing as [`add_i128`](Self::add_i128) so the
     /// mapping is consistent across runs and builds for the persisted sketch.
     pub fn add_bytes(&mut self, value: &[u8]) {
-        let hash = hash_index::hash_key_bytes(&[value]);
+        let hash = hash_index::hash_key_bytes_oneshot(value);
         self.add_hash(hash);
     }
 

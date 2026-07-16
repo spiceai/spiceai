@@ -107,7 +107,9 @@ impl DataConnectorFactory for IcebergDataConnectorFactory {
 /// table on remote executors during distributed (Ballista) execution.
 struct IcebergTableParts {
     provider: Arc<dyn TableProvider>,
+    #[cfg(feature = "iceberg-write")]
     catalog: Arc<dyn Catalog>,
+    #[cfg(feature = "iceberg-write")]
     table_identifier: TableIdent,
 }
 
@@ -260,7 +262,9 @@ impl IcebergDataConnector {
 
         Ok(IcebergTableParts {
             provider: Arc::new(table_provider),
+            #[cfg(feature = "iceberg-write")]
             catalog: catalog_client,
+            #[cfg(feature = "iceberg-write")]
             table_identifier,
         })
     }
@@ -335,7 +339,9 @@ impl IcebergDataConnector {
 
         Ok(IcebergTableParts {
             provider: Arc::new(table_provider),
+            #[cfg(feature = "iceberg-write")]
             catalog: catalog_client,
+            #[cfg(feature = "iceberg-write")]
             table_identifier,
         })
     }

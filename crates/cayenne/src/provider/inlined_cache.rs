@@ -50,7 +50,7 @@ pub(crate) struct InlinedViewEntry {
 /// [`CayenneTableProvider::cached_inlined_view`].
 ///
 /// The cache is keyed by an `inlined_generation` counter that is incremented
-/// (with `Release` ordering) by every `commit_inlined_data_mutation` and
+/// (with `Release` ordering) by every inline mutation publication and
 /// `clear_inlined_metadata_after_checkpoint` call. A cache entry is valid only
 /// when its stored `generation` equals the live counter — guaranteeing that any
 /// write or checkpoint immediately invalidates the cache without a lock.
