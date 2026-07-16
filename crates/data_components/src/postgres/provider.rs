@@ -148,7 +148,10 @@ impl PostgresCatalogProvider {
                 Arc::clone(&self.table_creator),
                 self.include.clone(),
             );
-            match schema_provider.refresh_tables(&foreign_keys, &comments).await {
+            match schema_provider
+                .refresh_tables(&foreign_keys, &comments)
+                .await
+            {
                 Ok(()) => {
                     schemas.insert(schema_name.clone(), Arc::new(schema_provider));
                 }
