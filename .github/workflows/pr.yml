@@ -70,6 +70,8 @@ jobs:
     permissions:
       contents: read
       statuses: read
+      # pulls.listCommits for pure-revert fast-track detection
+      pull-requests: read
     steps:
       # Pure reverts are fast-tracked: undoing a commit that already landed on
       # (and so passed the full suite through) the base branch is low-risk, and
@@ -99,21 +101,32 @@ jobs:
               return;
             }
 
-            const commits = await github.paginate(github.rest.pulls.listCommits, {
-              owner,
-              repo,
-              pull_number,
-              per_page: 100,
-            });
+            // Failures here must fall through to the normal sign-off path — never
+            // fail Attestation for the whole PR because we couldn't prove purity.
+            let commits;
+            try {
+              commits = await github.paginate(github.rest.pulls.listCommits, {
+                owner,
+                repo,
+                pull_number,
+                per_page: 100,
+              });
+            } catch (error) {
+              core.info(
+                `Could not list PR commits for revert fast-track (${error.message}); ` +
+                `falling back to developer sign-off.`
+              );
+              return;
+            }
             if (commits.length === 0) {
               core.info('PR introduces no commits; revert fast-track does not apply.');
               return;
             }
 
-            // The footer Git writes for each reverted commit. `git revert`
-            // creates one commit per reverted commit; a single --no-commit batch
-            // can carry several footers, so collect every match.
-            const revertFooter = /^This reverts commit ([0-9a-f]{7,40})\.$/gm;
+            // The footer Git writes for each reverted commit (full 40-char SHA).
+            // `git revert` creates one commit per reverted commit; a single
+            // --no-commit batch can carry several footers, so collect every match.
+            const revertFooter = /^This reverts commit ([0-9a-f]{40})\.$/gm;
             const revertedShas = new Set();
             for (const c of commits) {
               const message = c.commit?.message ?? '';
