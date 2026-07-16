@@ -6796,8 +6796,7 @@ impl CayenneTableProvider {
             // dropped / stale / unstamped entry (see `pk_keyset_occ_degraded`)
             // would otherwise let this check miss a real conflict.
             Some(CachedPkIndex::Exact(keyset))
-                if footprint_complete
-                    && !self.pk_keyset_occ_degraded.load(Ordering::Relaxed) =>
+                if footprint_complete && !self.pk_keyset_occ_degraded.load(Ordering::Relaxed) =>
             {
                 let write_digests = write_set.iter_with_digest().map(|(digest, _)| digest);
                 footprint
