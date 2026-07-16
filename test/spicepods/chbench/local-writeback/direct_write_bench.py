@@ -121,10 +121,10 @@ def pg_scalar(pg_dsn, sql):
 def wait_ready(base_url, pg_dsn, table, timeout_s):
     """Poll until Spice serves the write-back table and its row count matches PG
     (CDC bootstrap complete). Bounded; raises on timeout."""
-    deadline = time.time() + timeout_s
+    deadline = time.monotonic() + timeout_s
     pg_rows = pg_scalar(pg_dsn, f"SELECT COUNT(*) FROM {table}")
     last = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             spice_rows = spice_scalar(base_url, f"SELECT COUNT(*) AS c FROM {table}")
             last = spice_rows
@@ -243,12 +243,12 @@ def check_writeback_converges(base_url, pg_dsn, w_id, timeout_s):
     NOTE: a divergence here that does not self-heal may be the *separate*,
     deferred P0 write-back echo-loss bug (tracked in its own issue), not an OCC
     regression — the driver flags it distinctly."""
-    deadline = time.time() + timeout_s
+    deadline = time.monotonic() + timeout_s
     spice_sum = int(spice_scalar(
         base_url, f"SELECT SUM(s_quantity) AS s FROM stock WHERE s_w_id={w_id}"
     ))
     last_pg = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         last_pg = pg_scalar(pg_dsn, f"SELECT SUM(s_quantity) FROM stock WHERE s_w_id={w_id}")
         if int(last_pg) == spice_sum:
             print(f"  [write-back] Postgres SUM converged to Spice ({spice_sum}) -> PASS")

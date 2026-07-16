@@ -6621,6 +6621,12 @@ impl CayenneTableProvider {
                         "Skipping primary-key keyset cache because it exceeds the configured byte budget"
                     );
                     *self.pk_keyset_cache.lock() = None;
+                    // Full invalidation: the next access rebuilds a trustworthy
+                    // keyset (floor-stamped, or a Bloom that takes the per-table
+                    // fallback), so clear any degraded flag or it would stay stuck
+                    // `true` and force per-table OCC forever (over-abort). Same
+                    // reasoning as `clear_cached_pk_keyset`.
+                    self.pk_keyset_occ_degraded.store(false, Ordering::Release);
                     self.table_memory.set_keyset_bytes(0);
                     return;
                 }
@@ -6790,7 +6796,11 @@ impl CayenneTableProvider {
                     max_bytes,
                     "Clearing primary-key keyset cache because the write would exceed the byte budget"
                 );
-                // `guard` already holds None from the take() above.
+                // `guard` already holds None from the take() above. Full
+                // invalidation → the next rebuild is trustworthy (floor-stamped or
+                // Bloom), so clear any degraded flag rather than leave it stuck
+                // `true` across the rebuild (see `clear_cached_pk_keyset`).
+                self.pk_keyset_occ_degraded.store(false, Ordering::Release);
                 self.table_memory.set_keyset_bytes(0);
                 return;
             }
