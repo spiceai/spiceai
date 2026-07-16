@@ -37498,7 +37498,15 @@ mod tests {
         let write_guard = provider.write_lock_arc().lock_owned().await;
 
         let ckpt_provider = Arc::clone(&provider);
-        let mut checkpoint = tokio::spawn(async move { ckpt_provider.checkpoint_mem_tier().await });
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut checkpoint = tokio::spawn(async move {
+            // Signal the task is scheduled and about to attempt the capture locks,
+            // so the "blocked" assertion below cannot pass vacuously (a task that
+            // never started would also time out).
+            let _ = started_tx.send(());
+            ckpt_provider.checkpoint_mem_tier().await
+        });
+        started_rx.await.expect("checkpoint task started");
 
         // Must block: `try_lock(write)` fails, so it fair-queues on `write_lock`.
         let blocked =
@@ -37623,7 +37631,14 @@ mod tests {
 
         let write_guard = provider.write_lock_arc().lock_owned().await;
         let seal_provider = Arc::clone(&provider);
-        let mut seal = tokio::spawn(async move { seal_provider.seal_mem_tier_durable().await });
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut seal = tokio::spawn(async move {
+            // Signal the task is scheduled and about to attempt the capture locks,
+            // so the "blocked" assertion below cannot pass vacuously.
+            let _ = started_tx.send(());
+            seal_provider.seal_mem_tier_durable().await
+        });
+        started_rx.await.expect("seal task started");
 
         // Must block: the guaranteed seal fair-queues behind the writer.
         let blocked = tokio::time::timeout(std::time::Duration::from_millis(250), &mut seal).await;
@@ -38270,9 +38285,16 @@ mod tests {
         // then a fresh tiny segment lands, leaving a NON-empty tier far below
         // the cap — exactly the state a redundant writer-side checkpoint would
         // needlessly re-encode.
+        // This test manually owns the checkpoint guard to model the in-flight
+        // background operation, so it calls the lock-held body directly. The table
+        // is single-shard (default `cdc_mem_tier_shards`), so the capture is atomic
+        // without `write_lock` and `None` is the correct capture-guard argument.
+        debug_assert_eq!(
+            provider.mem_tier.shard_count(),
+            1,
+            "inner(None) here relies on the single-shard (no write_lock) capture path"
+        );
         let flushed = provider
-            // This test manually owns the checkpoint guard to model the in-flight
-            // background operation, so call the lock-held body directly.
             .checkpoint_mem_tier_inner(None)
             .await
             .expect("in-flight checkpoint drains the seed");
