@@ -358,13 +358,15 @@ packages_for_changed_files() {
     || fail "cargo metadata failed — is this a Cargo workspace?"
 
   # Paths + metadata via env (heredoc is the program source, not stdin data).
+  # Use a different env name than the readonly shell constant — bash rejects
+  # VAR=value command when VAR is readonly, even if the value is unchanged.
   CHANGED_FILES="$files" PACKAGES_METADATA="$metadata" \
-    LINT_EXCLUDED_PACKAGES="$LINT_EXCLUDED_PACKAGES" python3 <<'PY'
+    SIGNOFF_LINT_EXCLUDED="$LINT_EXCLUDED_PACKAGES" python3 <<'PY'
 import json, os
 from pathlib import Path
 
 meta = json.loads(os.environ["PACKAGES_METADATA"])
-excluded = set(os.environ.get("LINT_EXCLUDED_PACKAGES", "").split())
+excluded = set(os.environ.get("SIGNOFF_LINT_EXCLUDED", "").split())
 workspace_root = Path(meta["workspace_root"]).resolve()
 
 # Longest package root first so nested members (connector-postgres) win over
