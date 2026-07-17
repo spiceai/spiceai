@@ -1145,6 +1145,19 @@ pub struct CayenneTableProvider {
     /// `build_sharded_pk_index` / the sharded validate path; routed by
     /// `shard_of_pk` so a key co-locates with its tier segments + tombstones.
     sharded_pk_keyset_cache: Arc<ParkingMutex<Option<ShardedPkIndex>>>,
+    /// Per-key transaction OCC (`transaction_has_conflict`) trusts the Exact
+    /// keyset's per-key `sequence` stamps ONLY when this is `false`. Set `true`
+    /// whenever an event leaves the shared Exact keyset with a stale or missing
+    /// stamp that per-key validation would then wrongly trust — a dropped stamp
+    /// (`record_pk_keys_with_location`'s checked-out keyset), a stale-present key
+    /// after an upsert filter-DELETE (`PkKeysetInvalidatingDeletionSink`), or a
+    /// keys-published-with-no-sequence fallback (`publish_validated_file_keys`).
+    /// While `true`, `transaction_has_conflict` degrades to the conservative
+    /// per-table high-water check (over-abort, never a missed conflict). Cleared
+    /// only by `clear_cached_pk_keyset`, whose next rebuild floor-stamps every
+    /// key to the current high-water (or returns a Bloom, which also takes the
+    /// per-table fallback) — so a cleared flag can never uncover a stale keyset.
+    pk_keyset_occ_degraded: Arc<AtomicBool>,
     /// Table-global cold-tier (datalake) PK existence view: one bloom per live
     /// cold file, from the manifest's per-file `pk_bloom` blobs. Lets the
     /// CDC-upsert keyset rebuild fold cold-resident keys WITHOUT the O(cold-rows)
@@ -5082,6 +5095,7 @@ impl CayenneTableProvider {
             )),
             pk_keyset_cache: Arc::new(ParkingMutex::new(None)),
             sharded_pk_keyset_cache: Arc::new(ParkingMutex::new(None)),
+            pk_keyset_occ_degraded: Arc::new(AtomicBool::new(false)),
             cold_pk_existence: Arc::new(ParkingMutex::new(None)),
             table_memory,
             inline_checkpoint_scheduled: Arc::new(AtomicBool::new(false)),
@@ -6172,6 +6186,7 @@ impl CayenneTableProvider {
             ),
             pk_keyset_cache: Arc::clone(&self.pk_keyset_cache),
             sharded_pk_keyset_cache: Arc::clone(&self.sharded_pk_keyset_cache),
+            pk_keyset_occ_degraded: Arc::clone(&self.pk_keyset_occ_degraded),
             cold_pk_existence: Arc::clone(&self.cold_pk_existence),
             table_memory: Arc::clone(&self.table_memory),
             inline_checkpoint_scheduled: Arc::clone(&self.inline_checkpoint_scheduled),
@@ -6606,6 +6621,12 @@ impl CayenneTableProvider {
                         "Skipping primary-key keyset cache because it exceeds the configured byte budget"
                     );
                     *self.pk_keyset_cache.lock() = None;
+                    // Full invalidation: the next access rebuilds a trustworthy
+                    // keyset (floor-stamped, or a Bloom that takes the per-table
+                    // fallback), so clear any degraded flag or it would stay stuck
+                    // `true` and force per-table OCC forever (over-abort). Same
+                    // reasoning as `clear_cached_pk_keyset`.
+                    self.pk_keyset_occ_degraded.store(false, Ordering::Release);
                     self.table_memory.set_keyset_bytes(0);
                     return;
                 }
@@ -6618,8 +6639,32 @@ impl CayenneTableProvider {
         self.table_memory.set_keyset_bytes(bytes);
     }
 
+    /// Degrade per-key transaction OCC to the conservative per-table high-water
+    /// check until the next keyset rebuild. Called when an event leaves the
+    /// shared Exact keyset with a stale or missing per-key sequence stamp (see
+    /// [`Self::pk_keyset_occ_degraded`]). Idempotent; never a correctness risk —
+    /// it can only turn a per-key check into an over-abort.
+    ///
+    /// `Release` (paired with the `Acquire` load in `transaction_has_conflict`):
+    /// the primary happens-before for this flag comes from the locks both the
+    /// setters and the reader hold (the `pk_keyset_cache` mutex at the drop site,
+    /// `write_lock` on the CDC-apply setters and the commit-time reader), but one
+    /// setter (`StagingReceipt::publish_validated_file_keys`'s no-sequence path)
+    /// runs outside those locks, so the flag carries its own release/acquire
+    /// ordering rather than relying on a lock being co-held in every case.
+    pub(crate) fn mark_pk_keyset_occ_degraded(&self) {
+        self.pk_keyset_occ_degraded.store(true, Ordering::Release);
+    }
+
     pub(crate) fn clear_cached_pk_keyset(&self) {
         *self.pk_keyset_cache.lock() = None;
+        // The keyset is gone: while it is `None`, `transaction_has_conflict`
+        // already takes the per-table fallback, and the next rebuild floor-stamps
+        // every key to the current high-water (`load_existing_keyset`) or returns
+        // a Bloom (also per-table fallback). Either way the stale stamps that set
+        // the degraded flag cannot survive, so clear it here. `Release` pairs with
+        // the `Acquire` load in `transaction_has_conflict` (see the setter above).
+        self.pk_keyset_occ_degraded.store(false, Ordering::Release);
         // Invalidate the N>1 sharded cache in lockstep — every event that
         // invalidates the single keyset (delete, compaction, snapshot rewrite,
         // recovery) equally invalidates the sharded view. At N=1 the sharded cache
@@ -6687,6 +6732,14 @@ impl CayenneTableProvider {
         // Take ownership so an over-budget Exact keyset can be replaced by a
         // bloom without a borrow conflict; the index is restored before return.
         let Some(mut index) = guard.take() else {
+            // The shared keyset is checked out by a concurrent writer, so this
+            // committed write's key stamps (and existence entries) are dropped on
+            // the floor. A later per-key OCC check against the eventually
+            // stored-back keyset would then miss this write (it is floor-stamped
+            // to the CONCURRENT writer's begin high-water, which is below this
+            // write's sequence) — a silent lost update. Degrade to the per-table
+            // fallback until the next rebuild floor-stamps past this sequence.
+            self.mark_pk_keyset_occ_degraded();
             return;
         };
 
@@ -6743,7 +6796,11 @@ impl CayenneTableProvider {
                     max_bytes,
                     "Clearing primary-key keyset cache because the write would exceed the byte budget"
                 );
-                // `guard` already holds None from the take() above.
+                // `guard` already holds None from the take() above. Full
+                // invalidation → the next rebuild is trustworthy (floor-stamped or
+                // Bloom), so clear any degraded flag rather than leave it stuck
+                // `true` across the rebuild (see `clear_cached_pk_keyset`).
+                self.pk_keyset_occ_degraded.store(false, Ordering::Release);
                 self.table_memory.set_keyset_bytes(0);
                 return;
             }
@@ -6794,7 +6851,13 @@ impl CayenneTableProvider {
     ) -> bool {
         let guard = self.pk_keyset_cache.lock();
         match guard.as_ref() {
-            Some(CachedPkIndex::Exact(keyset)) if footprint_complete => {
+            // Trust the per-key stamps ONLY when the keyset is Exact, the
+            // footprint is fully bounded, AND the keyset is not degraded — a
+            // dropped / stale / unstamped entry (see `pk_keyset_occ_degraded`)
+            // would otherwise let this check miss a real conflict.
+            Some(CachedPkIndex::Exact(keyset))
+                if footprint_complete && !self.pk_keyset_occ_degraded.load(Ordering::Acquire) =>
+            {
                 let write_digests = write_set.iter_with_digest().map(|(digest, _)| digest);
                 footprint
                     .iter()
@@ -6806,8 +6869,8 @@ impl CayenneTableProvider {
                             .is_some_and(|seq| seq > stage_seq)
                     })
             }
-            // Bloom / cleared keyset, or an incomplete footprint: conservative
-            // per-table fallback.
+            // Bloom / cleared / degraded keyset, or an incomplete footprint:
+            // conservative per-table fallback.
             _ => current_high_water != stage_seq,
         }
     }
@@ -43255,5 +43318,132 @@ mod tests {
         // Empty input is handled defensively (callers early-return, but stay safe).
         let empty = CayenneTableProvider::partition_memory_batches(Vec::new(), 8);
         assert_eq!(total(&empty), 0);
+    }
+
+    /// Regression (cluster α — P0-2 / P0-3 / P2-2): a stale, dropped, or
+    /// unstamped per-key OCC entry must never let `transaction_has_conflict`
+    /// miss a concurrent commit. When the keyset is marked degraded
+    /// (`mark_pk_keyset_occ_degraded` — set by a checked-out-keyset stamp drop,
+    /// an upsert filter-DELETE stale-present entry, or a no-sequence publish),
+    /// the check MUST fall back to the conservative per-table high-water
+    /// comparison (over-abort, never a missed conflict). `clear_cached_pk_keyset`
+    /// resets the flag because its next rebuild floor-stamps the keyset.
+    #[tokio::test]
+    async fn transaction_has_conflict_degraded_keyset_falls_back_to_per_table() {
+        use arrow::array::{ArrayRef, Int64Array};
+        use arrow::datatypes::DataType;
+        use std::collections::HashSet;
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "occ_degraded_fallback",
+            ctx.runtime_env(),
+            VortexConfig::default(),
+        )
+        .await;
+
+        // One PK row (id = 1) and its digest via a standalone Int64 RowConverter.
+        // `transaction_has_conflict` only compares digests, so the encoding path
+        // is irrelevant as long as the keyset entry and the footprint share the
+        // SAME digest (guaranteed here by using one `pk_digest` for both).
+        let converter =
+            RowConverter::new(vec![SortField::new(DataType::Int64)]).expect("valid converter");
+        let key_column: ArrayRef = Arc::new(Int64Array::from(vec![1_i64]));
+        let rows = converter
+            .convert_columns(&[key_column])
+            .expect("convert key column");
+        let key = rows.row(0).owned();
+        let digest = crate::provider::pk_index::pk_digest(&key);
+
+        // Install an Exact keyset stamping id=1 at sequence 5. A concurrent
+        // commit to a DIFFERENT key then advances the table high-water to 7
+        // WITHOUT touching id=1's stamp — the stale-stamp shape that a dropped /
+        // stale-present / unstamped entry leaves behind.
+        let mut keyset = CachedPkKeyset::with_capacity(1);
+        keyset.insert(key.clone(), RowLocation::FileUnlocated);
+        keyset.record_sequence(digest, 5);
+        provider.store_cached_pk_index(CachedPkIndex::Exact(keyset));
+
+        let footprint: HashSet<u128> = HashSet::from([digest]);
+        let empty_write_set = crate::provider::pk_index::PkDigestSet::with_capacity(0);
+        let stage_seq = 5_i64;
+        let current_high_water = 7_i64; // a concurrent commit advanced it
+
+        // Consistent keyset (not degraded): per-key OCC correctly sees id=1
+        // unchanged (stamp 5 <= begin token 5) and admits the commit — the
+        // per-key win over a per-table token that would abort on ANY commit.
+        assert!(
+            !provider.transaction_has_conflict(
+                stage_seq,
+                &footprint,
+                true,
+                &empty_write_set,
+                current_high_water,
+            ),
+            "a consistent Exact keyset must trust the per-key stamp (id=1 unchanged)"
+        );
+
+        // Degrade the keyset: the per-key stamp is now untrustworthy, so the
+        // check MUST fall back to per-table OCC and abort (high-water 7 != 5).
+        provider.mark_pk_keyset_occ_degraded();
+        assert!(
+            provider.transaction_has_conflict(
+                stage_seq,
+                &footprint,
+                true,
+                &empty_write_set,
+                current_high_water,
+            ),
+            "a degraded keyset must fall back to per-table OCC and detect the \
+             concurrent commit (high-water 7 != begin 5) — never miss it"
+        );
+
+        // `clear_cached_pk_keyset` resets the flag. To isolate *that* effect,
+        // re-install a NON-degraded Exact keyset shaped like an incremental
+        // delta-update (which records only the incoming key's stamp and does NOT
+        // floor-stamp) — id=1 still at 5. With the flag now clear, the divergent
+        // scenario (stage 5, stamp 5, high-water 7) returns to the per-key answer
+        // (no conflict), proving per-key trust is restored — it was `true` (the
+        // fallback) only because the flag was set.
+        provider.clear_cached_pk_keyset();
+        let mut delta_updated = CachedPkKeyset::with_capacity(1);
+        delta_updated.insert(key.clone(), RowLocation::FileUnlocated);
+        delta_updated.record_sequence(digest, 5);
+        provider.store_cached_pk_index(CachedPkIndex::Exact(delta_updated));
+        assert!(
+            !provider.transaction_has_conflict(
+                stage_seq,
+                &footprint,
+                true,
+                &empty_write_set,
+                current_high_water,
+            ),
+            "clear_cached_pk_keyset must reset the degraded flag so a non-degraded \
+             Exact keyset is trusted per-key again (id=1 unchanged at stamp 5)"
+        );
+
+        // Faithfulness check: a REAL `clear_cached_pk_keyset` rebuild goes through
+        // `load_existing_keyset`, which floor-stamps every key to the end-of-scan
+        // high-water (`stamp_all_sequences_min(sequence_high_water())`). Model that
+        // by floor-stamping id=1 to the high-water (7). The same transaction then
+        // correctly CONFLICTS via the per-key stamp (7 > begin 5) — the production
+        // rebuild is conservative (over-abort), so clearing the flag never lets a
+        // real post-rebuild commit miss a concurrent write.
+        let mut floor_stamped = CachedPkKeyset::with_capacity(1);
+        floor_stamped.insert(key, RowLocation::FileUnlocated);
+        floor_stamped.record_sequence(digest, 5);
+        floor_stamped.stamp_all_sequences_min(current_high_water);
+        provider.store_cached_pk_index(CachedPkIndex::Exact(floor_stamped));
+        assert!(
+            provider.transaction_has_conflict(
+                stage_seq,
+                &footprint,
+                true,
+                &empty_write_set,
+                current_high_water,
+            ),
+            "a floor-stamped rebuild (the production clear->load_existing_keyset \
+             path) must still conflict the stage_seq=5 txn against high-water 7"
+        );
     }
 }
