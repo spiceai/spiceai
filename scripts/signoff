@@ -8,6 +8,11 @@
 # your sign-off and lets the PR into the merge queue, where the *full* suite of
 # tests and checks runs as the real gate.
 #
+# Pure reverts skip this entirely: a PR that only reverts commits already on the
+# base branch passes the Attestation check automatically (validated in pr.yml),
+# since the merge queue still re-runs the full suite on the merged result. See
+# docs/dev/ci_signoff.md ("Reverts are fast-tracked").
+#
 # This is Spice's take on 37signals' approach of moving CI back to developer
 # machines (https://world.hey.com/dhh/we-re-moving-continuous-integration-back-to-developer-machines-3ac6c611),
 # modeled on their open-source tool basecamp/gh-signoff. The twist: local

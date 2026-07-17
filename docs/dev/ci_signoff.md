@@ -81,6 +81,30 @@ sign-off.
 `scripts/signoff status` reports only a commit's own status; the inheritance
 check runs in the PR's **Attestation** workflow.
 
+### Reverts are fast-tracked
+
+A pull request that only reverts commits already on the base branch passes
+**Attestation** automatically — no local `make signoff` needed. Undoing a change
+that already landed (and so already passed the full suite on its way in) is
+low-risk, and the merge queue still re-runs the whole suite on the merged
+result before it can reach `trunk`.
+
+The **Attestation** workflow fast-tracks a PR when **all** of the following hold:
+
+- Every commit the PR introduces is a Git revert — it carries the
+  `This reverts commit <sha>.` footer that `git revert` writes. A single
+  non-revert commit disqualifies the PR and it needs a normal sign-off.
+- Each reverted commit is already on the base branch (an ancestor of the base
+  tip). You can't fast-track "reverting" something that never merged.
+- The PR is from the same repository, not a fork. Fork contributors can't
+  self-sign-off anyway (posting a status needs write access), so a fork revert
+  still takes a maintainer sign-off — this keeps the trusted-committer boundary.
+
+To fast-track, just open the revert PR the normal way (e.g. `git revert <sha>`
+keeps the footer intact); the check passes on its own. If you amend a revert
+with extra changes, or squash the footer out of the message, it falls back to
+requiring a sign-off.
+
 Options:
 
 ```bash
@@ -162,7 +186,7 @@ merge queue is still the real gate.
 | --- | --- | --- |
 | Local | `make signoff` | targeted `make lint-rust PACKAGES=…` (changed crates), then full `make lint-rust`, `make build-cli nextest` |
 | Remote | `make signoff-remote` / `signoff.yml` | same checks as local on a self-hosted runner; posts `signoff` as the dispatcher |
-| Pull request | `pull_request` | **Attestation** + PR hygiene; merge-queue check names report lightweight skipped/passthrough results |
+| Pull request | `pull_request` | **Attestation** (validates the sign-off, or auto-passes a pure revert) + PR hygiene; merge-queue check names report lightweight skipped/passthrough results |
 | Merge queue | `merge_group` | the full required suite (below) + advisory niche checks |
 
 Required checks in the merge queue (the `trunk` ruleset):
