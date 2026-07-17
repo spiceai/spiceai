@@ -26,7 +26,7 @@ use crate::dataaccelerator::spice_sys::dynamodb::{DynamoDBCheckpointMetadata, Dy
 use crate::dataconnector::schema_projection::{ProjectionPolicy, parse_schema_projection};
 use crate::federated_table::FederatedTable;
 use async_trait::async_trait;
-use data_components::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError, StreamError};
+use data_components::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError};
 use data_components::dynamodb::Error;
 use data_components::dynamodb::provider::DynamoDBTableProvider;
 use data_components::dynamodb::stream::StreamError as DynamoDBStreamError;
@@ -650,11 +650,10 @@ fn resume_from_checkpoint_stream(
                         );
                         return Some(
                             stream::once(async move {
-                                Err(StreamError::DynamoDB(
-                                    DynamoDBStreamError::FailedToReceiveMessage {
-                                        source: dynamodb_streams::Error::ShardNotFound,
-                                    },
-                                ))
+                                Err(DynamoDBStreamError::FailedToReceiveMessage {
+                                    source: dynamodb_streams::Error::ShardNotFound,
+                                }
+                                .into())
                             })
                             .boxed(),
                         );
@@ -670,11 +669,10 @@ fn resume_from_checkpoint_stream(
                         );
                         Some(
                             stream::once(async move {
-                                Err(StreamError::DynamoDB(
-                                    DynamoDBStreamError::FailedToReceiveMessage {
-                                        source: dynamodb_streams::Error::ShardNotFound,
-                                    },
-                                ))
+                                Err(DynamoDBStreamError::FailedToReceiveMessage {
+                                    source: dynamodb_streams::Error::ShardNotFound,
+                                }
+                                .into())
                             })
                             .boxed(),
                         )
@@ -711,11 +709,10 @@ fn resume_from_checkpoint_stream(
                         );
                         Some(
                             stream::once(async move {
-                                Err(StreamError::DynamoDB(
-                                    DynamoDBStreamError::FailedToReceiveMessage {
-                                        source: dynamodb_streams::Error::StreamBeyondRetention,
-                                    },
-                                ))
+                                Err(DynamoDBStreamError::StreamBeyondRetention {
+                                    source: dynamodb_streams::Error::StreamBeyondRetention,
+                                }
+                                .into())
                             })
                             .boxed(),
                         )

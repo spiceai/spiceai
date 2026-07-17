@@ -42,6 +42,11 @@ pub enum StreamError {
     #[snafu(display("Failed to receive DynamoDB Stream record: {source}"))]
     FailedToReceiveMessage { source: dynamodb_streams::Error },
 
+    #[snafu(display(
+        "DynamoDB Stream is beyond its 24-hour retention window; delete the acceleration to re-bootstrap the table: {source}"
+    ))]
+    StreamBeyondRetention { source: dynamodb_streams::Error },
+
     #[snafu(display("Unable to downcast ArrayBuilder"))]
     DowncastBuilder,
 
@@ -59,6 +64,15 @@ pub enum StreamError {
 
     #[snafu(display("Failed to read RecordBatch: {}", format_datafusion_error(source)))]
     FailedToReadRecordBatch { source: DataFusionError },
+}
+
+/// The `DynamoDB` connector owns the mapping from its concrete stream error to the
+/// connector-agnostic CDC contract error: it boxes itself as the cause so the CDC
+/// contract (and the runtime) never names `DynamoDB`-specific types.
+impl From<StreamError> for crate::cdc::StreamError {
+    fn from(e: StreamError) -> Self {
+        crate::cdc::StreamError::Connector(Box::new(e))
+    }
 }
 
 // This function is used for bootstrapping stream which doesn't have checkpoints.

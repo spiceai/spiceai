@@ -513,7 +513,7 @@ impl DynamoDBTableProvider {
                     &time_format,
                     projection.as_ref(),
                 )
-                .map_err(crate::cdc::StreamError::DynamoDB)
+                .map_err(crate::cdc::StreamError::from)
             });
 
         Ok(Box::pin(stream))
@@ -561,11 +561,9 @@ impl DynamoDBTableProvider {
                         record_batch.num_rows()
                     );
                     record_batch_to_change_batch(record_batch, &schema, &primary_keys)
-                        .map_err(crate::cdc::StreamError::DynamoDB)
+                        .map_err(crate::cdc::StreamError::from)
                 }
-                Err(e) => Err(crate::cdc::StreamError::DynamoDB(
-                    StreamError::FailedToReadRecordBatch { source: e },
-                )),
+                Err(e) => Err(StreamError::FailedToReadRecordBatch { source: e }.into()),
             });
 
         Ok(stream.boxed())

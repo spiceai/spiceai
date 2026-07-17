@@ -119,9 +119,10 @@ pub enum StreamError {
     Arrow(String),
     /// External error not originating from `ChangesStream` core logic, such as index processing failure.
     External(String),
-    #[cfg(feature = "dynamodb")]
-    /// Error from `DynamoDB`, such as failure during streaming or subscription.
-    DynamoDB(crate::dynamodb::stream::StreamError),
+    /// Error surfaced by a data-source connector's change stream: the connector maps
+    /// its own concrete error into this variant and attaches it as the boxed cause,
+    /// keeping this CDC contract connector-agnostic.
+    Connector(Box<dyn std::error::Error + Send + Sync>),
     #[cfg(feature = "mongodb")]
     /// Error from `MongoDB`, such as failure during change stream processing.
     MongoDB(crate::mongodb::stream::StreamError),
@@ -148,8 +149,7 @@ impl std::fmt::Display for StreamError {
             StreamError::Flight(e) => write!(f, "Arrow Flight error: {e}"),
             StreamError::Arrow(e) => write!(f, "Arrow error: {e}"),
             StreamError::External(e) => write!(f, "External error: {e}"),
-            #[cfg(feature = "dynamodb")]
-            StreamError::DynamoDB(e) => write!(f, "DynamoDB error: {e}"),
+            StreamError::Connector(e) => write!(f, "{e}"),
             #[cfg(feature = "mongodb")]
             StreamError::MongoDB(e) => write!(f, "MongoDB error: {e}"),
         }
