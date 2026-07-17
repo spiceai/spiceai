@@ -237,7 +237,35 @@ vortex read (`crates/vortex/src/persistent`: opener/source/format `buffer_unorde
 segment read) parking mid-stream on a later run's data. Matches the historical "wedge in the
 scan/sort drain."
 
+## Localized to the vortex segment-read driver (FileSegmentSource), 2026-07-17
+
+The frozen scan (run 3's SortExec input) parks in vortex-file's per-file segment reader
+`FileSegmentSource` (`/Users/sg/spice/other/vortex/vortex-file/src/segments/source.rs`):
+- A spawned driver fetches segments via **`buffer_unordered(concurrency)`** (`concurrency =
+  reader.concurrency()`) — a bounded read-concurrency pipeline.
+- Lazy + coalesced + `Polled`-gated: `request()` registers a segment (eager) but the actual fetch
+  only fires after the `ReadFuture`'s first poll sends a `ReadEvent::Polled(id)`; the
+  `IoRequestStream` state machine (`vortex-file/src/read/driver.rs`) coalesces polled requests
+  (`State.requests` vs `polled_requests`, `next_uncoalesced`/`next_coalesced`) and feeds
+  `buffer_unordered`; results come back via `oneshot` (`req.resolve`).
+- A segment request that never gets fetched ⇒ its `oneshot` never resolves ⇒ the scan parks (input
+  frozen) ⇒ promotion holds write_lock ⇒ never ready. Matches all evidence (input frozen mid-run,
+  workers idle-parked, racy, pool not exhausted).
+
+Ruled out for the freeze: shared read/write mutex (none), write holding a permit (encode budget
+FREE 48/48 during the freeze), the SortExec/sort/pool (runs 0-2 completed). `poll_next` wakeup
+registration reads as correct on inspection, so the bug is a subtle race in this driver's
+coalescing/`Polled`-gating/`buffer_unordered` interplay (a 817-line driver; not obvious statically).
+NOTE: vortex core lives at `/Users/sg/spice/other/vortex` (checkout); confirm it matches the
+`vortex` workspace pin spiceai builds before asserting line-level.
+
 ## Next step
+
+Write the reproducing unit test at the vortex-file `FileSegmentSource` layer (not DataFusion scan,
+not bounded_sort — both exonerated): construct a `FileSegmentSource` with a mock `VortexReadAt`
+(controllable `concurrency()` + `read_at` latency), register many segments, poll them concurrently
+in adversarial orders under a timeout; a hang reproduces the segment-read stall and lets us bisect
+the exact race. (Confirm the local vortex checkout == the built pin first.)
 
 Exact vortex frame needs finer scan-read tracing (ptrace backtraces are unavailable on the runner):
 add a rebuild that logs the scan's last in-flight read op / a per-poll heartbeat so the last line
