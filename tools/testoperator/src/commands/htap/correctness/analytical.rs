@@ -289,100 +289,97 @@ pub async fn verify_analytical_results(
             }
         };
 
-        let (outcome, max_rel_delta) =
-            if total_rows(&expected_sorted) == 0 && total_rows(&actual_sorted) == 0 {
-                (Outcome::Pass, None)
-            } else {
-                match validate_with_expected_batches(
-                    query.name.as_ref(),
-                    &actual_sorted,
-                    &expected_sorted,
-                ) {
-                    Ok(QueryValidationResult::Pass) => {
-                        // Structure, schema and row set agree within the string
-                        // comparator's tolerance. Now apply the tight, type-aware
-                        // numeric check (exact for integer/decimal, 0.1% for
-                        // float — including avg() that alignment cast to decimal)
-                        // and surface the magnitude either way.
-                        match (expected_sorted.first(), actual_sorted.first()) {
-                            (Some(e0), Some(a0)) => {
-                                let delta = compare::numeric_delta(e0, a0, &actual_source_floats);
-                                if delta.exceeded {
-                                    if let Some(row) = delta.worst_row {
-                                        let column = delta
-                                            .worst_col
-                                            .and_then(|c| e0.schema().fields().get(c).cloned())
-                                            .map(|f| f.name().clone());
-                                        print_mismatch_context(
-                                            query.name.as_ref(),
-                                            e0,
-                                            a0,
-                                            row,
-                                            column.as_deref(),
-                                        );
-                                    }
-                                    (
-                                        Outcome::Divergence(format!(
-                                            "numeric drift exceeds tolerance — {}",
-                                            delta.worst.as_deref().unwrap_or("(unknown cell)")
-                                        )),
-                                        Some(delta.max_rel_delta),
-                                    )
-                                } else {
-                                    (Outcome::Pass, Some(delta.max_rel_delta))
-                                }
-                            }
-                            _ => (Outcome::Pass, None),
-                        }
-                    }
-                    Ok(QueryValidationResult::Fail(reason)) => {
-                        // Print the surrounding rows from both sides so a
-                        // divergence can be inspected in context rather than as a
-                        // lone cell. A `DataMismatch` carries the exact 1-based row
-                        // and column of the first disagreement; a `RowCountMismatch`
-                        // has no single cell, so center the window on the boundary
-                        // where the shorter (lex-sorted) side ends — the first row
-                        // index present on only one side. Other reasons (schema, no
-                        // answer) have no meaningful row to center on.
-                        if let (Some(e0), Some(a0)) =
-                            (expected_sorted.first(), actual_sorted.first())
-                        {
-                            match &reason {
-                                QueryValidationFailReason::DataMismatch {
-                                    row_number,
-                                    column,
-                                    ..
-                                } => print_mismatch_context(
-                                    query.name.as_ref(),
-                                    e0,
-                                    a0,
-                                    row_number.saturating_sub(1),
-                                    Some(column),
-                                ),
-                                QueryValidationFailReason::RowCountMismatch { .. } => {
+        let (outcome, max_rel_delta) = if total_rows(&expected_sorted) == 0
+            && total_rows(&actual_sorted) == 0
+        {
+            (Outcome::Pass, None)
+        } else {
+            match validate_with_expected_batches(
+                query.name.as_ref(),
+                &actual_sorted,
+                &expected_sorted,
+            ) {
+                Ok(QueryValidationResult::Pass) => {
+                    // Structure, schema and row set agree within the string
+                    // comparator's tolerance. Now apply the tight, type-aware
+                    // numeric check (exact for integer/decimal, 0.1% for
+                    // float — including avg() that alignment cast to decimal)
+                    // and surface the magnitude either way.
+                    match (expected_sorted.first(), actual_sorted.first()) {
+                        (Some(e0), Some(a0)) => {
+                            let delta = compare::numeric_delta(e0, a0, &actual_source_floats);
+                            if delta.exceeded {
+                                if let Some(row) = delta.worst_row {
+                                    let column = delta
+                                        .worst_col
+                                        .and_then(|c| e0.schema().fields().get(c).cloned())
+                                        .map(|f| f.name().clone());
                                     print_mismatch_context(
                                         query.name.as_ref(),
                                         e0,
                                         a0,
-                                        e0.num_rows().min(a0.num_rows()),
-                                        None,
+                                        row,
+                                        column.as_deref(),
                                     );
                                 }
-                                _ => {}
+                                (
+                                    Outcome::Divergence(format!(
+                                        "numeric drift exceeds tolerance — {}",
+                                        delta.worst.as_deref().unwrap_or("(unknown cell)")
+                                    )),
+                                    Some(delta.max_rel_delta),
+                                )
+                            } else {
+                                (Outcome::Pass, Some(delta.max_rel_delta))
                             }
                         }
-                        (
-                            Outcome::Divergence(format!(
-                                "{reason:?} (source rows={}, spice rows={})",
-                                total_rows(&expected_sorted),
-                                total_rows(&actual_sorted),
-                            )),
-                            None,
-                        )
+                        _ => (Outcome::Pass, None),
                     }
-                    Err(e) => (Outcome::Fail(e.to_string()), None),
                 }
-            };
+                Ok(QueryValidationResult::Fail(reason)) => {
+                    // Print the surrounding rows from both sides so a
+                    // divergence can be inspected in context rather than as a
+                    // lone cell. A `DataMismatch` carries the exact 1-based row
+                    // and column of the first disagreement; a `RowCountMismatch`
+                    // has no single cell, so center the window on the boundary
+                    // where the shorter (lex-sorted) side ends — the first row
+                    // index present on only one side. Other reasons (schema, no
+                    // answer) have no meaningful row to center on.
+                    if let (Some(e0), Some(a0)) = (expected_sorted.first(), actual_sorted.first()) {
+                        match &reason {
+                            QueryValidationFailReason::DataMismatch {
+                                row_number, column, ..
+                            } => print_mismatch_context(
+                                query.name.as_ref(),
+                                e0,
+                                a0,
+                                row_number.saturating_sub(1),
+                                Some(column),
+                            ),
+                            QueryValidationFailReason::RowCountMismatch { .. } => {
+                                print_mismatch_context(
+                                    query.name.as_ref(),
+                                    e0,
+                                    a0,
+                                    e0.num_rows().min(a0.num_rows()),
+                                    None,
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                    (
+                        Outcome::Divergence(format!(
+                            "{reason:?} (source rows={}, spice rows={})",
+                            total_rows(&expected_sorted),
+                            total_rows(&actual_sorted),
+                        )),
+                        None,
+                    )
+                }
+                Err(e) => (Outcome::Fail(e.to_string()), None),
+            }
+        };
 
         results.push(AnalyticalQueryResult {
             name: query.name.to_string(),
