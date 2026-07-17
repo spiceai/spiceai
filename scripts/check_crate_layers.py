@@ -159,6 +159,23 @@ def main() -> int:
     for t in referenced_tiers:
         if t not in tiers:
             config_errors.append(f"layers.toml references tier '{t}' not present in `order`.")
+    # `restricted_deps`: {dep_name: [allowed crate, ...]}. The dep KEY may be an
+    # external crate (a driver/format lib not in the workspace), but every ALLOWED
+    # crate must be a real member — a typo would silently disable the rule.
+    restricted = cfg.get("restricted_deps", {})
+    if not isinstance(restricted, dict):
+        config_errors.append("`restricted_deps` must be a table: dep = [allowed crates].")
+        restricted = {}
+    else:
+        for dep, allowed in restricted.items():
+            if not isinstance(allowed, list):
+                config_errors.append(f"`restricted_deps.{dep}` must be a list of crate names.")
+                continue
+            for c in allowed:
+                if c not in names:
+                    config_errors.append(
+                        f"`restricted_deps.{dep}` lists unknown crate '{c}' — typo or renamed crate?"
+                    )
     if config_errors:
         print("layers.toml configuration error(s):\n", file=sys.stderr)
         for e in config_errors:
@@ -199,14 +216,28 @@ def main() -> int:
     violations = []
     for p in pkgs:
         src = p["name"]
+        st = tier_of[src]
         for d in p["dependencies"]:
             if (d.get("kind") or "normal") != "normal":
                 continue  # only normal edges layer the shipped graph; dev + build deps
                 # may point anywhere (e.g. connector integration tests -> runtime)
             dep = d["name"]
-            if dep not in names or dep == src:
+            if dep == src:
                 continue
-            st, dt = tier_of[src], tier_of[dep]
+            # Restricted-dep ownership runs BEFORE the workspace-member filter: a
+            # restricted crate is usually an EXTERNAL driver (clickhouse-rs, ...), and
+            # the tier rule structurally can't catch it — a leaf driver sits at/below
+            # foundation, so a dep on it is a legal downward edge from anywhere.
+            if dep in restricted and src not in restricted[dep]:
+                allowed = ", ".join(restricted[dep])
+                violations.append(
+                    (src, st, dep, tier_of.get(dep, "external"),
+                     f"restricted dep — only [{allowed}] may depend on {dep}")
+                )
+            # Tier/forbid rules apply only to workspace-member deps.
+            if dep not in names:
+                continue
+            dt = tier_of[dep]
             if rank[dt] > rank[st]:
                 violations.append((src, st, dep, dt, "depends on a HIGHER tier"))
             elif (st, dt) in forbidden:

@@ -45,6 +45,19 @@ default_tier = "shared-utility"
 # orchestrator (they may still use the low runtime-*-api interface crates).
 forbid = [["extension-utility", "runtime"]]
 
+# Dependency-ownership rules, checked IN ADDITION to the tier rule. The tier check
+# only catches UPWARD edges; a driver/format crate sits at/below `foundation`, so a
+# normal-dependency on it from ANYWHERE is a legal *downward* edge the tier check
+# cannot flag. This table confines such a crate to its owning connector(s): a normal
+# dep on a restricted crate from any crate NOT listed is a violation. The key may be
+# an external crate; every listed crate must be a real workspace member. Dev/build
+# deps are exempt. Ratchet: add one entry per source as its driver is fully evacuated
+# into the corresponding connector crate (see docs/dev/crate_layering.md).
+[restricted_deps]
+# clickhouse-rs now lives only in connector-clickhouse (provider + pool + block
+# decoder all moved out of data_components / db_connection_pool / arrow_sql_gen).
+clickhouse-rs = ["connector-clickhouse"]
+
 # Path-prefix rules (checked after per-crate overrides, in order).
 [[rules]]
 path_prefix = "bin/"
