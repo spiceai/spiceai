@@ -396,6 +396,22 @@ impl DeletionSink for PkKeysetInvalidatingDeletionSink {
         context: Arc<TaskContext>,
     ) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         self.table.mark_maintained_aggregates_stale();
+        // Degrade per-key OCC BEFORE the inner delete runs. `self.inner.delete_from`
+        // draws the delete sequence and (for an upsert table) leaves the deleted
+        // keys stale-present in the Exact keyset with their pre-delete stamps, and
+        // it acquires + releases the table `write_lock` INTERNALLY. If the flag were
+        // set only afterward, a transaction commit could acquire `write_lock` in the
+        // window between the inner delete releasing it and this flag write, run
+        // `transaction_has_conflict` against a non-degraded keyset, trust a
+        // stale-present stamp, and resurrect a just-deleted key (a missed conflict).
+        // Setting the flag first (a `Release` store) orders it ahead of any commit
+        // that can observe the delete's effects. It is set unconditionally here
+        // (before we know the deleted count): degrading on a zero-row delete only
+        // costs a conservative per-table fallback until the next rebuild, never a
+        // missed conflict. A `DoNothing` table's post-delete `clear_cached_pk_keyset`
+        // below resets the flag and rebuilds exact; an upsert table keeps the
+        // stale-superset keyset and stays degraded until its next rebuild.
+        self.table.mark_pk_keyset_occ_degraded();
         let deleted = self.inner.delete_from(context).await?;
         if deleted > 0 {
             // Keyset clear-on-delete avoidance (cycle-4 incremental lever).
@@ -421,6 +437,10 @@ impl DeletionSink for PkKeysetInvalidatingDeletionSink {
             // ~6105), and their keys are not enumerable on this filter path, so
             // they keep the conservative full clear and rebuild next batch.
             // `upsert_bloom_eligible()` is precisely "is this an `Upsert` table".
+            // Upsert tables keep the stale-superset keyset (already degraded before
+            // the delete above, so its stale stamps are never trusted until the
+            // next rebuild); `DoNothing` tables need exactness, so clear and rebuild
+            // next batch (which also resets the degraded flag).
             if !self.table.upsert_bloom_eligible() {
                 self.table.clear_cached_pk_keyset();
             }
@@ -498,7 +518,13 @@ impl DeletionSink for InlineAwareDeletionSink {
             // the clear and avoid the O(live-rows) `load_existing_keyset` rebuild
             // the next insert batch would pay. `DoNothing` tables need exactness
             // (a stale entry would wrongly drop a new row) and keep the full clear.
-            if !self.table.upsert_bloom_eligible() {
+            if self.table.upsert_bloom_eligible() {
+                // Upsert stale-superset keyset: retained deleted keys keep their
+                // pre-delete per-key OCC stamps — degrade to the per-table
+                // fallback until rebuild (see the twin site in
+                // `PkKeysetInvalidatingDeletionSink::delete_from`).
+                self.table.mark_pk_keyset_occ_degraded();
+            } else {
                 self.table.clear_cached_pk_keyset();
             }
             if file_deleted > 0 && self.table.pk_deletion_strategy.is_position_based() {
