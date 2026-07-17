@@ -207,6 +207,23 @@ mod tests {
         drop(sv.begin_mutation());
         assert_eq!(sv.current(), 4);
     }
+
+    #[tokio::test]
+    async fn read_validated_async_publishes_when_stable() {
+        let sv = StructuralVersion::new();
+        let published = sv.read_validated_async(|| async { 42 }).await;
+        assert_eq!(published, Some((0, 42)), "a stable async read must publish");
+    }
+
+    #[tokio::test]
+    async fn read_validated_async_discards_during_forced_mutation() {
+        let sv = StructuralVersion::new();
+        let _g = sv.begin_mutation(); // odd: forced mutation in flight
+        assert!(
+            sv.read_validated_async(|| async { 1 }).await.is_none(),
+            "the async seqlock read must refuse to publish during a forced mutation"
+        );
+    }
 }
 
 // LOOM model. Run with:
