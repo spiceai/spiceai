@@ -1061,6 +1061,35 @@ impl RawScanInput {
     }
 }
 
+/// A scan-ready, internally-consistent view of the table: a [`RawScanInput`]
+/// capture PLUS the computed KDI merge + visible mem-tier segments derived from
+/// it. This is the whole unit a scan runs on; every field descends from the SAME
+/// fence-held capture, so stale-deletions-against-fresh-data (or the reverse) is
+/// impossible by construction.
+///
+/// [`CayenneTableProvider::build_scan_view`] computes it. Today the scan builds it
+/// inline; a later commit moves that computation onto a background scan-view
+/// maintainer that publishes an `Arc<ScanView>` per version change and lets every
+/// concurrent scan borrow the same bundle instead of each recomputing the merge.
+struct ScanView {
+    /// The consistent capture the merge + segments were computed from. Also holds
+    /// the `scan_guard` that pins the snapshot dirs for the scan lifetime.
+    raw: RawScanInput,
+    /// Merged (file ∪ mem-tier) PK deletion snapshot — `merged_deletion_snapshot_sharded`
+    /// over `raw`. What the scan's deletion filter is applied against.
+    merged_deletions: PkDeletionSnapshot,
+    /// Per-segment deletion-filtered visible mem-tier batches, UNPRUNED (the
+    /// version-invariant core of the mem-tier scan). The per-query statistics
+    /// pruning predicate is applied at serve time by
+    /// `build_mem_tier_scan_plan_from_segments`. `Arc<[_]>` so borrowing the view
+    /// is an O(1) pointer clone, never an O(segments) copy.
+    visible_segments: Arc<[VisibleMemTierSegment]>,
+    /// Whole-tier tombstone UNION over the captured shards — the global inline
+    /// corpus is hidden by EVERY shard's tombstones. Computed once here and reused
+    /// for the inline pruning. At N==1 this is shard 0's tombstone clone (O(1)).
+    union_tombstones: crate::provider::mem_tier::InMemTombstones,
+}
+
 /// Test-only mid-pass hook: an async callback fired between a compaction
 /// pass's catalog CAS commit and its fenced in-memory publish. See
 /// `CayenneTableProvider::test_pre_publish_hook`.
@@ -19249,6 +19278,31 @@ impl CayenneTableProvider {
         })
     }
 
+    /// Compute the scan-ready [`ScanView`] from a [`RawScanInput`] capture: the KDI
+    /// merge (`merged_deletion_snapshot_sharded`) + the per-segment visible mem-tier
+    /// batches (`visible_mem_tier_segments_unpruned`, memoized) + the whole-tier
+    /// tombstone union — all over the SAME capture, so the bundle is internally
+    /// consistent by construction.
+    ///
+    /// Pure, synchronous CPU (no `.await`); O(tier tombstones + segments). Today the
+    /// scan calls it inline; a later commit runs it in `spawn_blocking` on the
+    /// scan-view maintainer so it never stalls a tokio worker or the query cores.
+    fn build_scan_view(&self, raw: RawScanInput) -> datafusion_common::Result<ScanView> {
+        // Clone the file-side snapshot for the merge (an `Arc` clone); `raw` keeps
+        // its own copy so the view carries the file-side source for reference.
+        let merged_deletions =
+            self.merged_deletion_snapshot_sharded(raw.deletion_snapshot.clone(), &raw.mem_tier_shards);
+        let visible_segments = self.memoized_visible_mem_tier_segments(&raw.mem_tier_shards)?;
+        let union_tombstones =
+            crate::provider::mem_tier::ShardedMemTier::union_tombstones(&raw.mem_tier_shards);
+        Ok(ScanView {
+            raw,
+            merged_deletions,
+            visible_segments,
+            union_tombstones,
+        })
+    }
+
     fn mem_tier_deletion_maps(
         snapshot: &crate::provider::mem_tier::MemTier,
     ) -> InlinedDeletionMaps {
@@ -21783,65 +21837,74 @@ impl CayenneTableProvider {
     /// The disjoint min/max gate (`int64_deleted_key_range`) runs per shard
     /// inside `filter_inlined_batch_for_deletions`. At N==1 this is exactly
     /// `build_mem_tier_scan_plan(shards[0])`.
-    fn build_mem_tier_scan_plan_sharded(
+    /// The memoized per-shard, deletion-filtered visible mem-tier segments (the
+    /// version-invariant core of the mem-tier scan). This is the pure computation
+    /// [`Self::build_scan_view`] captures into a [`ScanView`]; the per-query pruning
+    /// predicate + plan build stays in [`Self::build_mem_tier_scan_plan_from_segments`].
+    ///
+    /// Memo key — same three-part discipline as `merged_scan_deletions`: the
+    /// file-side index identity, the per-shard content-version hash, and the
+    /// structural epoch. A hit requires all three, so any concurrent
+    /// append/clear/publish forces a rebuild; a mid-build advance bumps one part, so
+    /// a possibly-inconsistent memo is invalidated on the NEXT scan and is never
+    /// served. `file_index_ptr` is read from the SAME source
+    /// `filter_inlined_batch_for_deletions` reads live (`pk_deletion_strategy` via
+    /// `pk_deletion_snapshot`), so the key reflects what the memoized batches were
+    /// filtered against. The file-side source snapshot is RETAINED in the memo
+    /// (pins its index `Arc` so the `file_index_ptr` identity stays ABA-safe —
+    /// #11303).
+    fn memoized_visible_mem_tier_segments(
         &self,
         shards: &[Arc<crate::provider::mem_tier::MemTier>],
-        effective_projection: Option<&Vec<usize>>,
-        pruning_predicate: Option<&Arc<dyn PhysicalExpr>>,
-        target_partitions: usize,
-    ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
-        // Memo key — same three-part discipline as `merged_scan_deletions`: the
-        // file-side index identity, the per-shard content-version hash, and the
-        // structural epoch. A hit requires all three, so any concurrent
-        // append/clear/publish forces a rebuild; a mid-build advance bumps one
-        // part, so a possibly-inconsistent memo is invalidated on the NEXT scan
-        // and is never served. `file_index_ptr` is read from the SAME source
-        // `filter_inlined_batch_for_deletions` reads live (`pk_deletion_strategy`
-        // via `pk_deletion_snapshot`), so the key reflects what the memoized
-        // batches were filtered against.
-        // Retain the file-side source snapshot in the memo (pins its index `Arc`
-        // so the `file_index_ptr` identity stays ABA-safe — #11303).
+    ) -> datafusion_common::Result<Arc<[VisibleMemTierSegment]>> {
         let file_index = self.pk_deletion_snapshot();
         let file_index_ptr = file_index.index_ptr();
         let tier_version = crate::provider::mem_tier::ShardedMemTier::version_hash_of(shards);
         let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
 
-        let segments = if let Some(memo) = self.mem_tier_visible_memo.load_full()
+        if let Some(memo) = self.mem_tier_visible_memo.load_full()
             && memo.file_index_ptr() == file_index_ptr
             && memo.tier_version == tier_version
             && memo.structural_epoch == structural_epoch
         {
-            Arc::clone(&memo.segments)
-        } else {
-            let built: Arc<[VisibleMemTierSegment]> = Arc::from(
-                self.visible_mem_tier_segments_unpruned(shards)
-                    .map_err(|e| {
-                        datafusion_common::DataFusionError::Execution(format!(
-                            "Failed to apply in-memory CDC tier deletion visibility for table {}: {e}",
-                            self.table_metadata.table_name
-                        ))
-                    })?,
-            );
-            self.mem_tier_visible_memo
-                .store(Some(Arc::new(MemTierVisibleMemo {
-                    file_index: Some(file_index),
-                    tier_version,
-                    structural_epoch,
-                    segments: Arc::clone(&built),
-                })));
-            built
-        };
+            return Ok(Arc::clone(&memo.segments));
+        }
+        let built: Arc<[VisibleMemTierSegment]> = Arc::from(
+            self.visible_mem_tier_segments_unpruned(shards)
+                .map_err(|e| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Failed to apply in-memory CDC tier deletion visibility for table {}: {e}",
+                        self.table_metadata.table_name
+                    ))
+                })?,
+        );
+        self.mem_tier_visible_memo
+            .store(Some(Arc::new(MemTierVisibleMemo {
+                file_index: Some(file_index),
+                tier_version,
+                structural_epoch,
+                segments: Arc::clone(&built),
+            })));
+        Ok(built)
+    }
 
+    /// Serve a mem-tier scan plan from precomputed visible segments (from a
+    /// [`ScanView`]): apply the per-query statistics-only pruning predicate to each
+    /// segment, concatenate the surviving visible batches (disjoint keys across
+    /// shards ⇒ concatenation, not merge — §2.3e), and wrap them in a memory exec.
+    fn build_mem_tier_scan_plan_from_segments(
+        &self,
+        segments: &[VisibleMemTierSegment],
+        effective_projection: Option<&Vec<usize>>,
+        pruning_predicate: Option<&Arc<dyn PhysicalExpr>>,
+        target_partitions: usize,
+    ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
         if segments.is_empty() {
             return Ok(None);
         }
-
-        // Serve: apply the per-query (statistics-only) pruning predicate to each
-        // memoized segment, then concatenate the surviving visible batches.
-        // Disjoint keys across shards ⇒ concatenation, not merge (§2.3e).
         let schema = Arc::clone(&self.table_metadata.schema);
         let mut visible_batches: Vec<RecordBatch> = Vec::new();
-        for segment in segments.iter() {
+        for segment in segments {
             if let Some(predicate) = pruning_predicate
                 && super::file_pruning::should_prune_statistics(
                     segment.statistics.as_ref(),
@@ -24848,39 +24911,38 @@ impl TableProvider for CayenneTableProvider {
         // or once every file has been verified this process.
         self.verify_data_file_integrity().await?;
 
-        // Capture the consistent per-scan input (mem-tier shards + IVM epoch,
-        // file-side deletion snapshot, protected map, inline view, current snapshot
-        // id, GC guard) under one `listing_fence.read()` — see
-        // [`Self::capture_raw_scan_input`]. The `scan_guard` pins the captured
-        // snapshot dirs against a concurrent-compaction GC for the FULL scan
-        // lifetime, so plan-build below runs WITHOUT holding the listing fence (a
-        // contention win): the fence is released when the capture returns.
-        let RawScanInput {
-            mem_tier_shards,
-            maintained_aggregate_epoch,
-            deletion_snapshot,
-            protected_map,
-            inlined_view,
-            current_snapshot_id,
-            structural_epoch: _,
-            scan_guard,
-        } = self.capture_raw_scan_input().await?;
+        // Capture the consistent per-scan input under one `listing_fence.read()`,
+        // then compute the scan-ready view (KDI merge + visible mem-tier segments +
+        // tombstone union) from it — see [`Self::capture_raw_scan_input`] and
+        // [`Self::build_scan_view`]. Everything the scan reads descends from ONE
+        // capture, so it is internally consistent (the merged deletions hide the old
+        // copies of the exact rows this scan sees). The `scan_guard` pins the
+        // captured snapshot dirs for the FULL scan lifetime, so plan-build below
+        // runs WITHOUT holding the listing fence (a contention win): the fence is
+        // released when the capture returns.
+        let ScanView {
+            raw:
+                RawScanInput {
+                    mem_tier_shards,
+                    maintained_aggregate_epoch,
+                    // Superseded by `merged_deletions` (bound as `deletion_snapshot`).
+                    deletion_snapshot: _,
+                    protected_map,
+                    inlined_view,
+                    current_snapshot_id,
+                    structural_epoch: _,
+                    scan_guard,
+                },
+            merged_deletions: deletion_snapshot,
+            visible_segments,
+            union_tombstones: mem_tier_union_tombstones,
+        } = self.build_scan_view(self.capture_raw_scan_input().await?)?;
         let mem_tier_any_rows = mem_tier_shards.iter().any(|s| !s.is_empty());
-
-        // Merge the file-side deletion snapshot with the UNION of the captured
-        // shards' tombstones (the KDI merge). Internally consistent: the merged
-        // deletions and the rows they hide come from the same fence-held capture.
-        let deletion_snapshot =
-            self.merged_deletion_snapshot_sharded(deletion_snapshot, &mem_tier_shards);
         let need_pk_deletion = deletion_snapshot.has_deletions();
 
-        // Whole-tier tombstone UNION over the captured shard snapshots — the
-        // global inline corpus is hidden by EVERY shard's tombstones (a delete of
+        // The whole-tier tombstone union hides the global inline corpus (a delete of
         // key `k` lives in shard `h(k)`, but the inline rows it hides are not
-        // sharded). Computed once and reused for the inline pruning below. At
-        // N==1 this is shard 0's tombstone clone (O(1)).
-        let mem_tier_union_tombstones =
-            crate::provider::mem_tier::ShardedMemTier::union_tombstones(&mem_tier_shards);
+        // sharded). Reused for the inline pruning below.
         let mem_tier_removal = if mem_tier_union_tombstones.is_empty() {
             None
         } else {
@@ -25190,14 +25252,13 @@ impl TableProvider for CayenneTableProvider {
             }
         };
 
-        // Build a MemoryExec for the in-memory CDC tier captured under the read
-        // fence, applying the tier's own tombstones merge-on-read (the same
-        // `filter_inlined_batch_for_deletions` path the durable inline corpus
-        // uses; only the tombstone SOURCE differs — the in-RAM map vs the
-        // metastore). `None` (and skipped) in file mode, where the tier is empty.
+        // Build a MemoryExec for the in-memory CDC tier from the view's precomputed
+        // visible segments, applying the tier's tombstones merge-on-read (already
+        // baked into the segments) plus the per-query pruning predicate. `None` (and
+        // skipped) in file mode, where the tier is empty.
         let mem_plan: Option<Arc<dyn ExecutionPlan>> = self
-            .build_mem_tier_scan_plan_sharded(
-                &mem_tier_shards,
+            .build_mem_tier_scan_plan_from_segments(
+                &visible_segments,
                 effective_projection.as_ref(),
                 mem_tier_pruning_predicate.as_ref(),
                 // Scan-resolved (1 for PK point lookups) — see the inline branch.
