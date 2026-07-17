@@ -9987,6 +9987,23 @@ impl CayenneTableProvider {
         self.inlined_structural_epoch
             .fetch_add(1, Ordering::Release);
         self.inlined_generation.fetch_add(1, Ordering::Release);
+        // A structural bump changes what a scan sees (a retired-memo invalidation
+        // point), so wake the scan-view maintainer. This is the single funnel for
+        // inline mutations, checkpoint clears, overwrite, recovery, on-conflict, and
+        // deferred-snapshot publishes.
+        self.notify_scan_input_change();
+    }
+
+    /// Wake the scan-view maintainer: a cheap signal (NO lock, NO capture, NO clone)
+    /// that scan-visible state may have changed, so the builder re-captures and, if
+    /// [`RawScanInput::changed`], rebuilds the published bundle. `notify_one` stores a
+    /// permit if the builder is not currently parked, so a signal racing the park is
+    /// never lost. Spurious calls are harmless — the builder re-captures, finds
+    /// nothing moved, and parks again — so callers may notify LIBERALLY. This is
+    /// wired at every mutation that changes a scan input (the sites that invalidated
+    /// the retired memos, direct or indirect).
+    fn notify_scan_input_change(&self) {
+        self.scan_input_change.notify_one();
     }
 
     /// Convert typed PK values into raw key bytes for deletion vector writing.
@@ -17510,6 +17527,10 @@ impl CayenneTableProvider {
             self.table_metadata.table_name,
             new_snapshot_id
         );
+        // The snapshot the scan reads (and the dirs the scan-view bundle pins)
+        // changed — wake the maintainer to re-capture over the new snapshot. Single
+        // funnel for compaction / overwrite / restore / catalog-refresh id flips.
+        self.notify_scan_input_change();
     }
 
     /// Refresh in-memory query state by reloading from the catalog (source of truth).
@@ -19865,6 +19886,9 @@ impl CayenneTableProvider {
             // tombstone/visibility memo — drop them so the next scan rebuilds.
             self.mem_tier_visible_memo.store(None);
             self.merged_scan_deletions.store(None);
+            // Memory-mode overwrite swaps the tier without a structural-epoch bump,
+            // so signal the scan-view maintainer here.
+            self.notify_scan_input_change();
         }
         Ok(incoming_rows)
     }
@@ -20770,6 +20794,11 @@ impl CayenneTableProvider {
                         merged: memo.merged.extended_by_delta(&tombstones),
                     })));
             }
+            // Wake the scan-view maintainer: a mem-tier append changes the visible
+            // set + tier version but deliberately does NOT bump the structural epoch
+            // (see the invariant above), so it is NOT covered by the
+            // `bump_inlined_structural_epoch` funnel and must signal here.
+            self.notify_scan_input_change();
             record_cayenne_write_phase(
                 &self.table_metadata.table_name,
                 "inmemory_fence_work",
@@ -39142,6 +39171,79 @@ mod tests {
         assert!(
             matched,
             "the background builder must publish a bundle matching the inline build"
+        );
+    }
+
+    /// The mutation sites must WAKE a PARKED builder via the wired
+    /// `notify_scan_input_change` (no manual notify here — this exercises the real
+    /// wiring). After the builder publishes and parks on the first append, a SECOND
+    /// append must wake it and drive the published bundle to reflect both — proving
+    /// the park -> notify -> re-capture -> rebuild cycle works across a mutation
+    /// stream, not just the first build.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_builder_wakes_on_wired_mutation_notify() {
+        // Wait (bounded) for the published bundle's visible segments to reach an
+        // expected set of (id, value) pairs, driven ONLY by the wired notify.
+        async fn wait_for_pairs(
+            provider: &Arc<CayenneTableProvider>,
+            expected: &[(i64, i64)],
+        ) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                if let Some(view) = provider.scan_view.load_full()
+                    && collect_segment_pairs(&view.visible_segments) == expected
+                {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            false
+        }
+
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "scan_view_builder_notify",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        let provider = Arc::new(provider);
+        assert!(provider.spawn_scan_view_builder(), "builder task spawned");
+
+        let write1 = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("first RAM append");
+        assert!(write1.in_memory_epoch().is_some(), "first append engaged RAM");
+        assert!(
+            wait_for_pairs(&provider, &[(1, 10), (2, 20)]).await,
+            "the wired append notify must wake the builder to publish the first append"
+        );
+
+        // The builder is now parked (quiesced). A second append's wired notify must
+        // wake it and drive the bundle to reflect BOTH appends.
+        let write2 = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[3], &[30])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("second RAM append");
+        assert!(write2.in_memory_epoch().is_some(), "second append engaged RAM");
+        assert!(
+            wait_for_pairs(&provider, &[(1, 10), (2, 20), (3, 30)]).await,
+            "the wired notify must wake the PARKED builder for a subsequent mutation"
         );
     }
 
