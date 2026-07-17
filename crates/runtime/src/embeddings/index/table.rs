@@ -583,6 +583,10 @@ mod tests {
         async fn embed(&self, _input: EmbeddingInput) -> llms::embeddings::Result<Vec<Vec<f32>>> {
             Ok(vec![])
         }
+
+        fn size(&self) -> i32 {
+            3
+        }
     }
 
     /// A [`PretendVectorIndex`] whose embedded column carries `dimension`-sized vectors
