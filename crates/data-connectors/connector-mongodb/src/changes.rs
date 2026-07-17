@@ -1011,20 +1011,15 @@ mod tests {
             ("disabled", InitialSnapshotMode::Disabled),
         ] {
             assert_eq!(
-                snapshot_mode_from_params(&params(&[(
-                    "mongodb_replication_initial_snapshot",
-                    raw
-                )]))
-                .expect("valid value parses"),
+                snapshot_mode_from_params(&params(&[("replication_initial_snapshot", raw)]))
+                    .expect("valid value parses"),
                 expected,
                 "raw: {raw}"
             );
         }
-        let err = snapshot_mode_from_params(&params(&[(
-            "mongodb_replication_initial_snapshot",
-            "sometimes",
-        )]))
-        .expect_err("typo must error");
+        let err =
+            snapshot_mode_from_params(&params(&[("replication_initial_snapshot", "sometimes")]))
+                .expect_err("typo must error");
         assert!(
             format!("{err}").contains("mongodb_replication_initial_snapshot"),
             "got: {err}"
@@ -1041,7 +1036,7 @@ mod tests {
         // Canonical key + value.
         assert_eq!(
             invalid_checkpoint_behavior_from_params(&params(&[(
-                "mongodb_replication_invalid_checkpoint_behavior",
+                "replication_invalid_checkpoint_behavior",
                 "restart"
             )]))
             .expect("canonical parses"),
@@ -1059,15 +1054,15 @@ mod tests {
         // Canonical wins when both are set.
         assert_eq!(
             invalid_checkpoint_behavior_from_params(&params(&[
-                ("mongodb_replication_invalid_checkpoint_behavior", "error"),
-                ("mongodb_resume_token_invalid_behavior", "rebootstrap"),
+                ("replication_invalid_checkpoint_behavior", "error"),
+                ("resume_token_invalid_behavior", "rebootstrap"),
             ]))
             .expect("both set parses"),
             InvalidCheckpointBehavior::Error
         );
         // Canonical key rejects the deprecated value vocabulary.
         let err = invalid_checkpoint_behavior_from_params(&params(&[(
-            "mongodb_replication_invalid_checkpoint_behavior",
+            "replication_invalid_checkpoint_behavior",
             "rebootstrap",
         )]))
         .expect_err("deprecated value on canonical key must error");
@@ -1084,11 +1079,11 @@ mod tests {
             DEFAULT_READY_LAG
         );
         assert_eq!(
-            ready_lag_from_params(&params(&[("mongodb_replication_ready_lag", "5s")]))
+            ready_lag_from_params(&params(&[("replication_ready_lag", "5s")]))
                 .expect("valid duration parses"),
             Duration::from_secs(5)
         );
-        let err = ready_lag_from_params(&params(&[("mongodb_replication_ready_lag", "nope")]))
+        let err = ready_lag_from_params(&params(&[("replication_ready_lag", "nope")]))
             .expect_err("invalid duration must error");
         assert!(
             format!("{err}").contains("mongodb_replication_ready_lag"),
