@@ -113,6 +113,29 @@ impl StructuralVersion {
         let v1 = self.version.load(Ordering::Acquire);
         (v0 == v1).then_some((v0, out))
     }
+
+    /// Open a seqlock read whose critical section is ASYNC (the scan-view builder's
+    /// capture awaits `listing_fence`, so it cannot live inside a synchronous
+    /// [`Self::read_validated`] closure). Returns the even baseline version `v0`, or
+    /// `None` if a forced mutation is in flight (the caller waits + retries). Pair
+    /// with [`Self::read_still_stable`] AFTER the async capture: publish the captured
+    /// state only if it returns `true`.
+    ///
+    /// This is [`Self::read_validated`] split across an await; the loom model of
+    /// `read_validated` covers the identical load ordering (`v0` Acquire before the
+    /// reads, `v1` Acquire after the fence).
+    pub(crate) fn read_begin(&self) -> Option<u64> {
+        let v0 = self.version.load(Ordering::Acquire);
+        (v0 & 1 == 0).then_some(v0)
+    }
+
+    /// Close a [`Self::read_begin`] seqlock read: `true` iff no forced mutation raced
+    /// the capture (the version is still the even `v0`). The `Acquire` fence orders
+    /// the capture's reads before the `v1` load.
+    pub(crate) fn read_still_stable(&self, v0: u64) -> bool {
+        fence(Ordering::Acquire);
+        self.version.load(Ordering::Acquire) == v0
+    }
 }
 
 impl Default for StructuralVersion {
