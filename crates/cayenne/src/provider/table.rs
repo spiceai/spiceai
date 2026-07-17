@@ -48,7 +48,7 @@ use super::manifest::{ManifestSequenceTag, SeqPrefixPlan};
 use super::mutation_writer::AppendMutationWriter;
 use super::on_conflict::{
     BatchValidationResult, CheckpointCorpusKeys, ExtractedPrimaryKeys, InlineAwareDeletionSink,
-    InlinedDataRewrite, Int64DeletionDelta, MergedScanDeletions, OnConflictContext,
+    InlinedDataRewrite, Int64DeletionDelta, OnConflictContext,
     OnConflictDeletionUpdate, OnConflictDeletions, OnConflictUpdate, OnConflictValidationStream,
     PendingTombstoneDeltas, PkDeletionSnapshot, PkKeysetInvalidatingDeletionSink,
     PreparedInsertStream, PreparedOnConflictDeletionPublish, PreparedOnConflictDurablePayload,
@@ -918,59 +918,14 @@ pub(crate) async fn reserve_sequences_in(
     Ok(first)
 }
 
-/// One memoized, deletion-filtered mem-tier visible set for the scan path.
-///
-/// Keyed the SAME way as [`MergedScanDeletions`] — (file-index `Arc` ptr, the
-/// per-shard content `version` hash, structural epoch) — so any concurrent
-/// append/clear/publish forces a rebuild and a stale pairing can never be
-/// served. Like `MergedScanDeletions`, the file-index `Arc` is RETAINED here
-/// (`file_index`) so its address cannot be freed and reused by a later index
-/// generation, keeping the ptr comparison ABA-safe (#11303). Where
-/// `merged_scan_deletions` memoizes the merged tombstone
-/// *snapshot*, this memoizes the merge-on-read *output*: the visible batches
-/// after `filter_inlined_batch_for_deletions` has already run.
-///
-/// Stored PER SEGMENT (each with its statistics), not as one flat batch list,
-/// because the deletion filtering is version-invariant but a query's pruning
-/// predicate is per-query: the memo serves the deletion-filtered batches and
-/// the caller re-applies the (cheap, statistics-only) pruning at serve time.
-/// This kills the per-table-reference re-filtering a multi-reference query
-/// (q20/q21 semi-/anti-joins reference the CDC table 2-3×) paid on every
-/// reference, and lets repeated same-version queries skip merge-on-read
-/// entirely.
-struct MemTierVisibleMemo {
-    /// The file-side deletion snapshot the visibility was filtered against,
-    /// RETAINED for the lifetime of the memo (`None` for position-based, which
-    /// does not filter here). Retaining the `Arc` — not merely its address —
-    /// pins the index generation so its address cannot be freed and reused by a
-    /// later generation, making the [`Self::file_index_ptr`] identity ABA-safe;
-    /// see [`MergedScanDeletions::file_index`] and #11303.
-    file_index: Option<PkDeletionSnapshot>,
-    /// [`crate::provider::mem_tier::ShardedMemTier::version_hash_of`] of the
-    /// shards the batches were built from.
-    tier_version: u64,
-    /// Structural epoch observed when the memo was built.
-    structural_epoch: u64,
-    /// Per-segment deletion-filtered visible batches, unpruned. `Arc<[_]>` so a
-    /// memo hit is an `Arc`-pointer clone, never an O(segments) copy.
-    segments: Arc<[VisibleMemTierSegment]>,
-}
-
-impl MemTierVisibleMemo {
-    /// `Arc::as_ptr` identity of the retained file-side index — the memo key's
-    /// file-side component (`None` for position-based). Read from
-    /// [`Self::file_index`] so the compared pointer and the pinned allocation
-    /// can never diverge.
-    fn file_index_ptr(&self) -> Option<usize> {
-        self.file_index
-            .as_ref()
-            .and_then(PkDeletionSnapshot::index_ptr)
-    }
-}
-
 /// One retained mem-tier segment's deletion-filtered visible batches plus the
 /// segment statistics a query's pruning predicate is evaluated against at serve
-/// time. See [`MemTierVisibleMemo`].
+/// time. Held per-segment (not one flat batch list) because the deletion
+/// filtering is version-invariant but a query's pruning predicate is per-query:
+/// the [`ScanView`] carries the deletion-filtered batches and the scan re-applies
+/// the (cheap, statistics-only) pruning at serve time. `Arc<[_]>` in the
+/// `ScanView` so borrowing the bundle is a pointer clone, never an O(segments)
+/// copy.
 struct VisibleMemTierSegment {
     statistics: Arc<Statistics>,
     batches: Vec<RecordBatch>,
@@ -1093,6 +1048,12 @@ struct ScanView {
     /// corpus is hidden by EVERY shard's tombstones. Computed once here and reused
     /// for the inline pruning. At N==1 this is shard 0's tombstone clone (O(1)).
     union_tombstones: crate::provider::mem_tier::InMemTombstones,
+    /// The monotonic `scan_input_version` this bundle's capture reflects (a
+    /// conservative LOWER BOUND — read before the capture, so the bundle is
+    /// at-least-this-fresh). A scan runs on this bundle only when
+    /// `input_version >= scan_input_version` at scan start, giving linearizable
+    /// visibility. See [`CayenneTableProvider::scan_input_version`].
+    input_version: u64,
 }
 
 /// Abort-on-drop handle for a table's background scan-view maintainer.
@@ -1361,22 +1322,6 @@ pub struct CayenneTableProvider {
     /// cached view with just the new rows instead of rebuilding it from the
     /// whole corpus. See the [`InlinedCache`] "Incremental maintenance contract".
     inlined_structural_epoch: Arc<AtomicU64>,
-    /// Memo for the per-scan merged (file ∪ mem-tier) deletion snapshot. Keyed
-    /// by (file-index `Arc` ptr, tier content `version`, structural epoch) — a
-    /// hit requires all three, so any concurrent append/clear/publish forces a
-    /// rebuild and a stale pairing can never be served. The file-index `Arc` is
-    /// RETAINED in the memo (`MergedScanDeletions::file_index`) so its address
-    /// cannot be freed and reused by a later index generation, keeping the ptr
-    /// comparison ABA-safe (#11303). Kills the per-scan
-    /// O(tier-tombstones) `with_mem_tier_tombstones` extend that correlated
-    /// plans (q20: 322ms -> 74s) paid per outer-group rescan.
-    merged_scan_deletions: Arc<arc_swap::ArcSwapOption<MergedScanDeletions>>,
-    /// Memo for the per-scan mem-tier visible batch set (the merge-on-read
-    /// OUTPUT), keyed identically to `merged_scan_deletions`. See
-    /// [`MemTierVisibleMemo`]. Eliminates the per-table-reference re-filtering a
-    /// multi-reference query paid, and serves repeated same-version queries
-    /// without re-running `filter_inlined_batch_for_deletions`.
-    mem_tier_visible_memo: Arc<arc_swap::ArcSwapOption<MemTierVisibleMemo>>,
     /// The background scan-view maintainer's published bundle (see
     /// [`Self::run_scan_view_builder_loop`]). Seeded synchronously at construction
     /// (cold start) and refreshed on every version change; scans borrow it via an
@@ -1390,6 +1335,25 @@ pub struct CayenneTableProvider {
     /// builder is not currently parked, so a signal is never lost. Wired at every
     /// memo-invalidation site in a later commit. Shared across clones.
     scan_input_change: Arc<tokio::sync::Notify>,
+    /// Monotonic scan-input version, bumped by [`Self::notify_scan_input_change`] on
+    /// EVERY mutation (ordinary or forced). The published bundle carries the value it
+    /// was captured at ([`ScanView::input_version`]); a scan reads this at start and
+    /// runs only on a bundle stamped `>=` it — so a scan observes every write
+    /// committed before it began (LINEARIZABLE), the same guarantee the retired
+    /// per-scan inline capture gave. A single `Acquire` atomic load on the scan path
+    /// (no hashing). Shared across `clone_for_write` clones.
+    scan_input_version: Arc<AtomicU64>,
+    /// Wakes scans parked on the freshness gate. The builder calls `notify_waiters`
+    /// after each publish; a scan waiting for a fresher bundle registers a
+    /// `notified()` BEFORE re-checking the published version, so a publish that races
+    /// the park is not missed. Shared across clones.
+    scan_view_published: Arc<tokio::sync::Notify>,
+    /// Forced-structural-event seqlock (truncate / full-delete / overwrite /
+    /// schema-evolve / reopen). The builder brackets its capture with this
+    /// (`read_begin`/`read_still_stable`) so it never PUBLISHES a bundle whose capture
+    /// straddled a forced event that mutates both fence-protected and fence-decoupled
+    /// (mem-tier) state. Ordinary churn never touches it. Shared across clones.
+    structural_version: Arc<crate::provider::structural_version::StructuralVersion>,
     /// Abort-on-drop handle for this table's scan-view maintainer task. Shared across
     /// clones; the task aborts when the last provider reference drops (the task holds
     /// only a `Weak<Self>`). `Arc<OnceLock<_>>` exactly like [`Self::background_compactor`].
@@ -5262,10 +5226,13 @@ impl CayenneTableProvider {
             mem_tier_pending_superseded: Arc::new(AtomicI64::new(0)),
             inlined_generation: Arc::new(AtomicU64::new(0)),
             inlined_structural_epoch: Arc::new(AtomicU64::new(0)),
-            merged_scan_deletions: Arc::new(arc_swap::ArcSwapOption::const_empty()),
-            mem_tier_visible_memo: Arc::new(arc_swap::ArcSwapOption::const_empty()),
             scan_view: Arc::new(arc_swap::ArcSwapOption::const_empty()),
             scan_input_change: Arc::new(tokio::sync::Notify::new()),
+            scan_input_version: Arc::new(AtomicU64::new(0)),
+            scan_view_published: Arc::new(tokio::sync::Notify::new()),
+            structural_version: Arc::new(
+                crate::provider::structural_version::StructuralVersion::new(),
+            ),
             scan_view_builder: Arc::new(std::sync::OnceLock::new()),
             pending_inline_tombstones: Arc::new(AtomicU64::new(0)),
             published_inlined_seq: Arc::new(AtomicI64::new(initial_inlined_seq)),
@@ -5404,8 +5371,9 @@ impl CayenneTableProvider {
         // refreshes this on every version change. Best-effort — a failure here leaves
         // the bundle empty (the maintainer fills it on its first tick) and must NOT
         // fail construction.
+        let seed_input_version = provider.scan_input_version.load(Ordering::Acquire);
         match provider.capture_raw_scan_input().await {
-            Ok(raw) => match provider.build_scan_view(raw) {
+            Ok(raw) => match provider.build_scan_view(raw, seed_input_version) {
                 Ok(view) => provider.scan_view.store(Some(Arc::new(view))),
                 Err(error) => tracing::warn!(
                     target: "cayenne::scan_view",
@@ -6379,10 +6347,11 @@ impl CayenneTableProvider {
             mem_tier_pending_superseded: Arc::clone(&self.mem_tier_pending_superseded),
             inlined_generation: Arc::clone(&self.inlined_generation),
             inlined_structural_epoch: Arc::clone(&self.inlined_structural_epoch),
-            merged_scan_deletions: Arc::clone(&self.merged_scan_deletions),
-            mem_tier_visible_memo: Arc::clone(&self.mem_tier_visible_memo),
             scan_view: Arc::clone(&self.scan_view),
             scan_input_change: Arc::clone(&self.scan_input_change),
+            scan_input_version: Arc::clone(&self.scan_input_version),
+            scan_view_published: Arc::clone(&self.scan_view_published),
+            structural_version: Arc::clone(&self.structural_version),
             scan_view_builder: Arc::clone(&self.scan_view_builder),
             pending_inline_tombstones: Arc::clone(&self.pending_inline_tombstones),
             published_inlined_seq: Arc::clone(&self.published_inlined_seq),
@@ -10004,6 +9973,12 @@ impl CayenneTableProvider {
     /// wired at every mutation that changes a scan input (the sites that invalidated
     /// the retired memos, direct or indirect).
     fn notify_scan_input_change(&self) {
+        // Advance the monotonic freshness version FIRST (Release), then wake the
+        // builder. A scan that starts after this mutation reads a version >= this
+        // one and waits for a bundle stamped at least that high (linearizable). The
+        // builder reads the version BEFORE its capture and stamps the bundle with it,
+        // so the stamp is a conservative lower bound on the bundle's freshness.
+        self.scan_input_version.fetch_add(1, Ordering::Release);
         self.scan_input_change.notify_one();
     }
 
@@ -17757,6 +17732,11 @@ impl CayenneTableProvider {
             self.table_metadata.table_name
         );
 
+        // The file set the scan reads changed — wake the scan-view maintainer so it
+        // recomputes the bundle (and advances the freshness version) over the new
+        // files. Covers file-mode appends / compaction / overwrite listing rebuilds.
+        self.notify_scan_input_change();
+
         Ok(())
     }
 
@@ -17793,6 +17773,11 @@ impl CayenneTableProvider {
         // under its own commit fence observes every publish that landed during
         // its off-fence re-encode. See [`Self::current_dir_generation`].
         self.current_dir_generation.fetch_add(1, Ordering::Relaxed);
+
+        // Fence-held chokepoint where appended files become scan-visible — wake the
+        // scan-view maintainer (the delta-apply publish path that does not go through
+        // `refresh_listing_table_under_held_fence`).
+        self.notify_scan_input_change();
 
         // [sound output_ordering] This delta-applies newly-added (UNSORTED) files
         // onto the current snapshot's cached listing in place — invalidate the
@@ -19162,63 +19147,29 @@ impl CayenneTableProvider {
         Ok(Some(arrow::compute::filter_record_batch(&batch, &filter)?))
     }
 
-    /// Merge the mem-tier tombstones into the file-side deletion index for one
-    /// scan, memoized. The raw `with_mem_tier_tombstones` extend is
-    /// O(tier-tombstones) (plus bloom inserts) and a correlated plan re-scans —
-    /// and would re-merge — per outer group. The memo key is (file-index `Arc`
-    /// ptr, per-shard version VECTOR collapsed to one `u64`, structural epoch): a
-    /// hit requires all three, so any append/clear/publish on ANY shard forces a
-    /// rebuild and a stale pairing can never be served; quiescent re-scans pay
-    /// one `ArcSwap` load per shard. When there is no file-side index
-    /// (position-based) or no tier tombstones the merge is the identity and the
-    /// memo is skipped.
-    ///
-    /// N-way `merged_deletion_snapshot`: merge the file-side `PkDeletionSnapshot`
-    /// (global, NOT sharded — it filters file rows, which have no shard
-    /// structure) with the UNION of every captured shard's tombstones. The memo
-    /// key's `tier_version` becomes the per-shard version VECTOR collapsed to one
-    /// `u64` (`version_hash`), so the memo invalidates when ANY shard's version
-    /// moves. At N==1 `version_hash` == shard 0's raw `version` and
-    /// `union_tombstones` == shard 0's tombstone clone, so the memo key AND the
-    /// merged snapshot are byte-identical to `merged_deletion_snapshot`.
+    /// Merge the file-side `PkDeletionSnapshot` with the UNION of every captured
+    /// shard's mem-tier tombstones (the KDI merge, `extend_max_deletes`). The
+    /// identity when there is no file-side index (position-based) or no tier
+    /// tombstones. The scan-view maintainer computes this ONCE per version and
+    /// publishes it (it is now the single owner of the result), so — unlike the
+    /// retired per-scan `merged_scan_deletions` `ArcSwapOption` memo — it does not
+    /// memoize; the builder's `.changed()` gate is the reuse mechanism.
     fn merged_deletion_snapshot_sharded(
-        &self,
         deletion_snapshot: PkDeletionSnapshot,
         shards: &[Arc<crate::provider::mem_tier::MemTier>],
     ) -> PkDeletionSnapshot {
-        let Some(file_index_ptr) = deletion_snapshot.index_ptr() else {
+        if deletion_snapshot.index_ptr().is_none() {
             return deletion_snapshot;
-        };
+        }
         // Whole-tier union over the captured shard snapshots. Skip the merge (the
-        // identity) when no shard carries tombstones.
+        // identity) when no shard carries tombstones. At N==1 `union_tombstones` is
+        // shard 0's tombstone clone (O(1)), so the merge is byte-identical to the
+        // single-shard `merged_deletion_snapshot`.
         let union = crate::provider::mem_tier::ShardedMemTier::union_tombstones(shards);
         if union.is_empty() {
             return deletion_snapshot;
         }
-        // Per-shard version VECTOR collapsed to one key (changes when any shard
-        // moves). Hash the CAPTURED snapshots (not the live `ArcSwap`s) so the
-        // memo key matches the tombstones it was built from.
-        let tier_version = crate::provider::mem_tier::ShardedMemTier::version_hash_of(shards);
-        let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
-        if let Some(memo) = self.merged_scan_deletions.load_full()
-            && memo.file_index_ptr() == Some(file_index_ptr)
-            && memo.tier_version == tier_version
-            && memo.structural_epoch == structural_epoch
-        {
-            return memo.merged.clone();
-        }
-        let merged = deletion_snapshot.with_mem_tier_tombstones_map(&union);
-        self.merged_scan_deletions
-            .store(Some(Arc::new(MergedScanDeletions {
-                // Retain the file-side source snapshot (pins its index `Arc` so
-                // the `file_index_ptr` identity above stays ABA-safe — #11303);
-                // `deletion_snapshot` is unused past this point.
-                file_index: deletion_snapshot,
-                tier_version,
-                structural_epoch,
-                merged: merged.clone(),
-            })));
-        merged
+        deletion_snapshot.with_mem_tier_tombstones_map(&union)
     }
 
     /// Bound on the inline-view capture retry (see [`Self::capture_raw_scan_input`]).
@@ -19378,15 +19329,22 @@ impl CayenneTableProvider {
     /// tombstone union — all over the SAME capture, so the bundle is internally
     /// consistent by construction.
     ///
-    /// Pure, synchronous CPU (no `.await`); O(tier tombstones + segments). Today the
-    /// scan calls it inline; a later commit runs it in `spawn_blocking` on the
-    /// scan-view maintainer so it never stalls a tokio worker or the query cores.
-    fn build_scan_view(&self, raw: RawScanInput) -> datafusion_common::Result<ScanView> {
+    /// Pure, synchronous CPU (no `.await`); O(tier tombstones + segments). Runs in
+    /// `spawn_blocking` on the scan-view maintainer so it never stalls a tokio worker
+    /// or the query cores. `input_version` is the monotonic freshness stamp the
+    /// caller captured BEFORE the capture (a conservative lower bound).
+    fn build_scan_view(
+        &self,
+        raw: RawScanInput,
+        input_version: u64,
+    ) -> datafusion_common::Result<ScanView> {
         // Clone the file-side snapshot for the merge (an `Arc` clone); `raw` keeps
         // its own copy so the view carries the file-side source for reference.
-        let merged_deletions =
-            self.merged_deletion_snapshot_sharded(raw.deletion_snapshot.clone(), &raw.mem_tier_shards);
-        let visible_segments = self.memoized_visible_mem_tier_segments(&raw.mem_tier_shards)?;
+        let merged_deletions = Self::merged_deletion_snapshot_sharded(
+            raw.deletion_snapshot.clone(),
+            &raw.mem_tier_shards,
+        );
+        let visible_segments = self.visible_mem_tier_segments(&raw.mem_tier_shards)?;
         let union_tombstones =
             crate::provider::mem_tier::ShardedMemTier::union_tombstones(&raw.mem_tier_shards);
         Ok(ScanView {
@@ -19394,6 +19352,7 @@ impl CayenneTableProvider {
             merged_deletions,
             visible_segments,
             union_tombstones,
+            input_version,
         })
     }
 
@@ -19409,14 +19368,8 @@ impl CayenneTableProvider {
     ///
     /// The initial bundle is seeded synchronously at construction (cold start), so a
     /// scan never waits for the first build even before this is called.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "called from the runtime accelerator at the scan-path switch commit"
-        )
-    )]
-    pub(crate) fn spawn_scan_view_builder(self: &Arc<Self>) -> bool {
+    #[must_use]
+    pub fn spawn_scan_view_builder(self: &Arc<Self>) -> bool {
         if self.scan_view_builder.get().is_some() {
             return false;
         }
@@ -19464,6 +19417,20 @@ impl CayenneTableProvider {
             // whole (capture + build) period to `floor`, not `floor` ON TOP of it.
             let compute_start = Instant::now();
 
+            // Forced-event seqlock, open side: skip while a forced structural event
+            // (truncate / full-delete / overwrite / schema-evolve / reopen) is in
+            // flight (odd version). The event's notify wakes us to retry once it
+            // completes.
+            let Some(structural_v0) = provider.structural_version.read_begin() else {
+                let notify = Arc::clone(&provider.scan_input_change);
+                drop(provider);
+                notify.notified().await;
+                continue;
+            };
+            // Freshness stamp: read the monotonic input version BEFORE the capture,
+            // so the bundle's stamp is a conservative lower bound on its freshness.
+            let input_version = provider.scan_input_version.load(Ordering::Acquire);
+
             let raw = match provider.capture_raw_scan_input().await {
                 Ok(raw) => raw,
                 Err(error) => {
@@ -19480,6 +19447,16 @@ impl CayenneTableProvider {
                 }
             };
 
+            // Forced-event seqlock, close side: if a forced event raced the capture,
+            // the captured state may straddle it (a forced event mutates both
+            // fence-protected AND fence-decoupled mem-tier state) — DISCARD and
+            // re-capture at the new generation (no publish, no `prev` advance, no
+            // floor). This is what stops the maintainer publishing a torn bundle.
+            if !provider.structural_version.read_still_stable(structural_v0) {
+                drop(provider);
+                continue;
+            }
+
             let should_build = prev.as_ref().is_none_or(|prev_raw| raw.changed(prev_raw));
             if should_build {
                 // Run the CPU-bound merge + visible-segment build off the tokio
@@ -19487,8 +19464,16 @@ impl CayenneTableProvider {
                 // every task on that worker (including /health).
                 let build_provider = Arc::clone(&provider);
                 let raw_for_prev = raw.clone();
-                match task::spawn_blocking(move || build_provider.build_scan_view(raw)).await {
-                    Ok(Ok(view)) => provider.scan_view.store(Some(Arc::new(view))),
+                match task::spawn_blocking(move || {
+                    build_provider.build_scan_view(raw, input_version)
+                })
+                .await
+                {
+                    Ok(Ok(view)) => {
+                        provider.scan_view.store(Some(Arc::new(view)));
+                        // Wake scans parked on the freshness gate.
+                        provider.scan_view_published.notify_waiters();
+                    }
                     Ok(Err(error)) => tracing::warn!(
                         target: "cayenne::scan_view",
                         table = %provider.table_metadata.table_name,
@@ -19516,7 +19501,6 @@ impl CayenneTableProvider {
                 // effective rebuild period is `max(floor, compute)` — bounding
                 // staleness to ~`floor` rather than `compute + floor`. Skip the math
                 // entirely when the floor is zero (rebuild as fast as input changes).
-                // (The compute duration becomes a metric in a later commit.)
                 if !floor.is_zero() {
                     let remaining = floor.saturating_sub(compute_elapsed);
                     if !remaining.is_zero() {
@@ -19532,6 +19516,58 @@ impl CayenneTableProvider {
                 drop(provider);
                 notify.notified().await;
             }
+        }
+    }
+
+    /// Borrow the published scan-view bundle for a scan, at a freshness at least the
+    /// current [`Self::scan_input_version`] (LINEARIZABLE: the scan observes every
+    /// write committed before it began). Reads the required version once, then
+    /// returns the published bundle if it is fresh enough; otherwise it waits for the
+    /// maintainer's next publish and re-checks. Registering the `notified()` BEFORE
+    /// re-checking means a publish that races the park is not missed.
+    ///
+    /// Under no in-flight mutation the published bundle already satisfies the
+    /// required version, so this returns immediately (no wait on the fast path). Only
+    /// a scan that started after a not-yet-built mutation waits — bounded by ~one
+    /// build.
+    ///
+    /// There is no inline fallback under builder LAG (D6): while a maintainer is
+    /// registered, a stale-bundle scan WAITS for its next publish. The ONE inline
+    /// build is under builder ABSENCE — a provider whose maintainer has not been
+    /// spawned (a unit-test provider, or the brief window before the runtime spawns
+    /// it): it builds one bundle inline so the provider is always self-sufficient and
+    /// linearizable. In production the maintainer is spawned at provider creation, so
+    /// this never runs in steady state (hence no thundering-herd fallback); builder
+    /// DEATH after spawn is a loud circuit-break, not a silent inline fallback (a
+    /// later commit).
+    async fn scan_view_at_current_input(&self) -> datafusion_common::Result<Arc<ScanView>> {
+        // Builder ABSENCE — a unit-test provider, or the brief window before the
+        // runtime spawns the maintainer: always build fresh inline. The published
+        // bundle is only kept current by a RUNNING maintainer, so without one we must
+        // not trust it; capturing fresh keeps such a provider correct + linearizable
+        // regardless of which write paths advance the freshness version.
+        if self.scan_view_builder.get().is_none() {
+            let input_version = self.scan_input_version.load(Ordering::Acquire);
+            let raw = self.capture_raw_scan_input().await?;
+            let view = Arc::new(self.build_scan_view(raw, input_version)?);
+            self.scan_view.store(Some(Arc::clone(&view)));
+            return Ok(view);
+        }
+        // Builder REGISTERED: serve the published bundle at a freshness >= this scan's
+        // start. The loop's first iteration is the fast path — a fresh-enough bundle
+        // returns immediately (no wait); only a scan that started after a not-yet-built
+        // mutation waits for the next publish (D6 — no inline fallback under lag).
+        // Registering the `notified()` BEFORE the re-check means a publish that races
+        // the park is not missed.
+        let required = self.scan_input_version.load(Ordering::Acquire);
+        loop {
+            let published = self.scan_view_published.notified();
+            if let Some(view) = self.scan_view.load_full()
+                && view.input_version >= required
+            {
+                return Ok(view);
+            }
+            published.await;
         }
     }
 
@@ -19887,12 +19923,8 @@ impl CayenneTableProvider {
                     None,
                 );
             self.mem_tier.shard(0).store(Arc::new(next));
-            // Overwrite changes the entire visible set and invalidates every prior
-            // tombstone/visibility memo — drop them so the next scan rebuilds.
-            self.mem_tier_visible_memo.store(None);
-            self.merged_scan_deletions.store(None);
-            // Memory-mode overwrite swaps the tier without a structural-epoch bump,
-            // so signal the scan-view maintainer here.
+            // Memory-mode overwrite swaps the entire tier without a structural-epoch
+            // bump, so signal the scan-view maintainer to recompute the bundle.
             self.notify_scan_input_change();
         }
         Ok(incoming_rows)
@@ -20694,7 +20726,6 @@ impl CayenneTableProvider {
                 source_position,
             );
             let epoch = next.epoch;
-            let next_version = next.version;
             // N=1 publishes the tier swap and IVM epoch under this shard lock. Use
             // the same scan seqlock as N>1 so a reader cannot capture the new tier
             // and then attach the old aggregate epoch (or the reverse).
@@ -20713,15 +20744,6 @@ impl CayenneTableProvider {
             // throughput bottleneck (an eager lock-held O(tier) re-filter
             // measured ~72% of `cdc_path_inmemory`).
             self.mem_tier.shard(shard_id).store(Arc::new(next));
-            // Drop the visible-batch memo (it holds full-tier `RecordBatch`
-            // clones for the PRE-append version): an append changes the visible
-            // set, so — unlike the extend-in-place merged-scan-deletions memo
-            // below — it cannot be cheaply updated, and leaving it stored would
-            // pin the old batches' RAM until the next scan. store(None) releases
-            // them now; the next scan rebuilds. (Under sustained CDC the memo
-            // rarely hits anyway — every append re-keys the tier version — so
-            // this loses no hit-rate while it does reclaim the RAM.)
-            self.mem_tier_visible_memo.store(None);
             // §5 Phase 6: record this shard's kept keys into the cached sharded
             // existence index for THIS shard, still UNDER `locks[shard_id]`, so the
             // bloom INSERT is atomic with the segment swap above (a later HIT-path
@@ -20753,52 +20775,11 @@ impl CayenneTableProvider {
             // capture-retry loop until a checkpoint zeroed the row count.
             // Durable-path mutations (inline rewrite/insert, tombstone publish,
             // checkpoint clears, overwrite, open-time recovery) still bump —
-            // only the RAM-tier append is exempt.
+            // only the RAM-tier append is exempt. (The old N==1 lockstep that
+            // delta-extended the `merged_scan_deletions` memo here is retired with
+            // that memo: the scan-view maintainer now recomputes the merged view once
+            // per version off the query path, keyed by its `.changed()` gate.)
             //
-            // Keep the merged-scan-deletions memo CURRENT in lockstep: extend it
-            // by this append's tombstone delta (O(delta)) and re-key it to the
-            // post-append tier version (the structural epoch is unchanged by a
-            // tier append — see the invariant above — so the stored key matches
-            // what a scan-time `merged_deletion_snapshot` lookup computes; a
-            // concurrent durable structural bump simply misses the memo and
-            // rebuilds, exactly as before). Without this the memo can
-            // never hit under sustained CDC (every append re-keys the tier) and
-            // each scan pays an O(tier) merged-index rebuild — the churn-coupled
-            // 175-247x collapse the `mem_tier_join_shapes` live lanes measure.
-            // Only valid while the memo still matches the live file-side index
-            // (`cur.version` pre-append + the current strategy snapshot ptr);
-            // any mismatch leaves the memo stale-keyed and the next scan
-            // rebuilds, exactly as before.
-            //
-            // N>1 GATE: the memo key is the cross-shard version VECTOR
-            // (`version_hash`), and this append knows only ITS shard's
-            // `cur.version`/`next_version` — not the combined key — so the
-            // single-version comparison/re-key here cannot maintain it. Worse,
-            // an apply's N shard appends run CONCURRENTLY under disjoint locks,
-            // so two of them racing the single `merged_scan_deletions` `ArcSwap`
-            // store would lose updates. So at N>1 we skip the lockstep extend and
-            // let the scan-side `merged_deletion_snapshot_sharded` rebuild the
-            // memo (and re-hit on quiescent re-scans, version_hash stable until
-            // the next apply) — correct, since the lockstep extend is purely an
-            // optimization. Byte-identical at N==1 (`version_hash` == raw
-            // `version`, single shard, no concurrency).
-            if self.mem_tier_shard_count() == 1
-                && let Some(memo) = self.merged_scan_deletions.load_full()
-                && memo.tier_version == cur.version
-                && memo.file_index_ptr() == self.pk_deletion_snapshot().index_ptr()
-            {
-                let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
-                self.merged_scan_deletions
-                    .store(Some(Arc::new(MergedScanDeletions {
-                        // The file-side index is unchanged by a tier append —
-                        // carry the retained source snapshot forward (keeps its
-                        // `Arc` pinned so the ptr identity stays ABA-safe, #11303).
-                        file_index: memo.file_index.clone(),
-                        tier_version: next_version,
-                        structural_epoch,
-                        merged: memo.merged.extended_by_delta(&tombstones),
-                    })));
-            }
             // Wake the scan-view maintainer: a mem-tier append changes the visible
             // set + tier version but deliberately does NOT bump the structural epoch
             // (see the invariant above), so it is NOT covered by the
@@ -21927,13 +21908,10 @@ impl CayenneTableProvider {
         let survivors = cur.retain_after(flushed_segment_count);
         let released = cur.bytes.saturating_sub(survivors.bytes);
         self.mem_tier.shard(shard_id).store(Arc::new(survivors));
-        // Drop the visible-batch memo: it may pin `RecordBatch`es (Arc refs to
-        // the tier buffers) from the pre-clear tier version, which would keep the
-        // just-flushed prefix's RAM alive until the next scan rebuilds the memo —
-        // defeating this clear's purpose (releasing RAM at checkpoint, especially
-        // under memory pressure or when the table goes idle afterward). Rebuilt
-        // lazily on the next scan; a store(None) is a single atomic publish.
-        self.mem_tier_visible_memo.store(None);
+        // The scan-view maintainer holds the pre-clear visible segments only until it
+        // republishes (its `.changed()` gate fires on this tier swap, via the
+        // checkpoint's structural-epoch bump), so the just-flushed prefix's RAM is
+        // released when the next bundle publishes — no per-scan memo to drop here.
         released
     }
 
@@ -22066,66 +22044,30 @@ impl CayenneTableProvider {
     /// [`Self::filter_inlined_batch_for_deletions`] — the SAME merge-on-read keep
     /// rule (and the same disjoint-skip fast path) as the durable inline corpus,
     /// with the tombstones supplied from the in-RAM map instead of the metastore.
+    /// Each shard applies its OWN tombstones to its OWN segments, correct precisely
+    /// because shard `s`'s tombstones only reference shard `s`'s keys (disjoint key
+    /// spaces — §2.3e); the flat result concatenates every shard's retained
+    /// segments. At N==1 this is exactly the single shard's visible segments.
     ///
-    /// N-way mem-tier scan plan: CONCATENATE every shard's visible batches into
-    /// one `MemorySourceConfig` exec. Disjoint keys across shards ⇒ a
-    /// concatenation, not a merge (a key's whole version history + its max
-    /// `delete_sequence` live in exactly ONE shard, so no cross-shard "which
-    /// version wins" decision exists — §2.3e). Each shard applies its OWN
-    /// tombstones to its OWN segments via `visible_mem_tier_batches`, correct
-    /// precisely because shard `s`'s tombstones only reference shard `s`'s keys.
-    /// The disjoint min/max gate (`int64_deleted_key_range`) runs per shard
-    /// inside `filter_inlined_batch_for_deletions`. At N==1 this is exactly
-    /// `build_mem_tier_scan_plan(shards[0])`.
-    /// The memoized per-shard, deletion-filtered visible mem-tier segments (the
+    /// The per-shard, deletion-filtered visible mem-tier segments (the
     /// version-invariant core of the mem-tier scan). This is the pure computation
     /// [`Self::build_scan_view`] captures into a [`ScanView`]; the per-query pruning
     /// predicate + plan build stays in [`Self::build_mem_tier_scan_plan_from_segments`].
-    ///
-    /// Memo key — same three-part discipline as `merged_scan_deletions`: the
-    /// file-side index identity, the per-shard content-version hash, and the
-    /// structural epoch. A hit requires all three, so any concurrent
-    /// append/clear/publish forces a rebuild; a mid-build advance bumps one part, so
-    /// a possibly-inconsistent memo is invalidated on the NEXT scan and is never
-    /// served. `file_index_ptr` is read from the SAME source
-    /// `filter_inlined_batch_for_deletions` reads live (`pk_deletion_strategy` via
-    /// `pk_deletion_snapshot`), so the key reflects what the memoized batches were
-    /// filtered against. The file-side source snapshot is RETAINED in the memo
-    /// (pins its index `Arc` so the `file_index_ptr` identity stays ABA-safe —
-    /// #11303).
-    fn memoized_visible_mem_tier_segments(
+    /// The scan-view maintainer computes this ONCE per version (it is the single
+    /// owner), so — unlike the retired per-scan `mem_tier_visible_memo`
+    /// `ArcSwapOption` — it does not memoize.
+    fn visible_mem_tier_segments(
         &self,
         shards: &[Arc<crate::provider::mem_tier::MemTier>],
     ) -> datafusion_common::Result<Arc<[VisibleMemTierSegment]>> {
-        let file_index = self.pk_deletion_snapshot();
-        let file_index_ptr = file_index.index_ptr();
-        let tier_version = crate::provider::mem_tier::ShardedMemTier::version_hash_of(shards);
-        let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
-
-        if let Some(memo) = self.mem_tier_visible_memo.load_full()
-            && memo.file_index_ptr() == file_index_ptr
-            && memo.tier_version == tier_version
-            && memo.structural_epoch == structural_epoch
-        {
-            return Ok(Arc::clone(&memo.segments));
-        }
-        let built: Arc<[VisibleMemTierSegment]> = Arc::from(
-            self.visible_mem_tier_segments_unpruned(shards)
-                .map_err(|e| {
-                    datafusion_common::DataFusionError::Execution(format!(
-                        "Failed to apply in-memory CDC tier deletion visibility for table {}: {e}",
-                        self.table_metadata.table_name
-                    ))
-                })?,
-        );
-        self.mem_tier_visible_memo
-            .store(Some(Arc::new(MemTierVisibleMemo {
-                file_index: Some(file_index),
-                tier_version,
-                structural_epoch,
-                segments: Arc::clone(&built),
-            })));
-        Ok(built)
+        Ok(Arc::from(
+            self.visible_mem_tier_segments_unpruned(shards).map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to apply in-memory CDC tier deletion visibility for table {}: {e}",
+                    self.table_metadata.table_name
+                ))
+            })?,
+        ))
     }
 
     /// Serve a mem-tier scan plan from precomputed visible segments (from a
@@ -22164,8 +22106,8 @@ impl CayenneTableProvider {
     }
 
     /// Build the per-segment, deletion-filtered visible batches for every shard,
-    /// WITHOUT applying any pruning predicate — the memoizable, version-invariant
-    /// core of the sharded mem-tier scan (see [`MemTierVisibleMemo`]). Each shard
+    /// WITHOUT applying any pruning predicate — the version-invariant core of the
+    /// sharded mem-tier scan (captured into a [`ScanView`]). Each shard
     /// applies its OWN tombstones to its OWN segments (correct because shard
     /// `s`'s tombstones only reference shard `s`'s keys); the flat result
     /// concatenates every shard's retained segments. The per-query pruning
@@ -25151,33 +25093,28 @@ impl TableProvider for CayenneTableProvider {
         // or once every file has been verified this process.
         self.verify_data_file_integrity().await?;
 
-        // Capture the consistent per-scan input under one `listing_fence.read()`,
-        // then compute the scan-ready view (KDI merge + visible mem-tier segments +
-        // tombstone union) from it — see [`Self::capture_raw_scan_input`] and
-        // [`Self::build_scan_view`]. Everything the scan reads descends from ONE
-        // capture, so it is internally consistent (the merged deletions hide the old
-        // copies of the exact rows this scan sees). The `scan_guard` pins the
-        // captured snapshot dirs for the FULL scan lifetime, so plan-build below
-        // runs WITHOUT holding the listing fence (a contention win): the fence is
-        // released when the capture returns.
-        let ScanView {
-            raw:
-                RawScanInput {
-                    mem_tier_shards,
-                    maintained_aggregate_epoch,
-                    // Superseded by `merged_deletions` (bound as `deletion_snapshot`).
-                    deletion_snapshot: _,
-                    protected_map,
-                    inlined_view,
-                    current_snapshot_id,
-                    structural_epoch: _,
-                    scan_guard,
-                },
-            merged_deletions: deletion_snapshot,
-            visible_segments,
-            union_tombstones: mem_tier_union_tombstones,
-        } = self.build_scan_view(self.capture_raw_scan_input().await?)?;
-        let mem_tier_any_rows = mem_tier_shards.iter().any(|s| !s.is_empty());
+        // Borrow the published scan-view bundle at a freshness >= this scan's start
+        // (linearizable — see [`Self::scan_view_at_current_input`]). The scan-view
+        // maintainer computed the KDI merge + visible mem-tier segments OFF the query
+        // path, so the scan no longer recomputes them per-scan (the retired memos'
+        // job). Everything below descends from that ONE capture, so it is internally
+        // consistent (the merged deletions hide the old copies of the exact rows this
+        // scan sees), and the bundle's `scan_guard` pins the captured snapshot dirs
+        // for the full scan lifetime, so plan-build runs WITHOUT the listing fence.
+        //
+        // The fields are cloned out (cheap `Arc` / short-`String` / `im`-HAMT clones)
+        // so downstream plan-build owns them exactly as when it captured inline.
+        let scan_view = self.scan_view_at_current_input().await?;
+        let mem_tier_any_rows = scan_view.raw.mem_tier_shards.iter().any(|s| !s.is_empty());
+        let maintained_aggregate_epoch = scan_view.raw.maintained_aggregate_epoch;
+        let protected_map = Arc::clone(&scan_view.raw.protected_map);
+        let inlined_view = Arc::clone(&scan_view.raw.inlined_view);
+        let current_snapshot_id = scan_view.raw.current_snapshot_id.clone();
+        let scan_guard = Arc::clone(&scan_view.raw.scan_guard);
+        let deletion_snapshot = scan_view.merged_deletions.clone();
+        let visible_segments = Arc::clone(&scan_view.visible_segments);
+        let mem_tier_union_tombstones = scan_view.union_tombstones.clone();
+        drop(scan_view);
         let need_pk_deletion = deletion_snapshot.has_deletions();
 
         // The whole-tier tombstone union hides the global inline corpus (a delete of
@@ -32580,14 +32517,6 @@ mod tests {
             expected,
             "initial scan builds the correct file+RAM merge view"
         );
-        let merged_before = provider
-            .merged_scan_deletions
-            .load_full()
-            .expect("initial scan stored the merged-deletions memo");
-        let visible_before = provider
-            .mem_tier_visible_memo
-            .load_full()
-            .expect("initial scan stored the visible-batch memo");
         let shards_before: Vec<_> = provider
             .mem_tier
             .shards()
@@ -32613,29 +32542,13 @@ mod tests {
             crate::provider::mem_tier::ShardedMemTier::version_hash_of(&shards_after);
         assert_eq!(
             version_after, version_before,
-            "the seal pipeline must not perturb the scan memo version key"
+            "the seal pipeline must not perturb the scan-view version key"
         );
 
         assert_eq!(
             collect_id_value_pairs(&ctx, &provider, "seal_memo_stable").await,
             expected,
             "scan results stay unchanged after the seal"
-        );
-        let merged_after = provider
-            .merged_scan_deletions
-            .load_full()
-            .expect("merged-deletions memo still present");
-        let visible_after = provider
-            .mem_tier_visible_memo
-            .load_full()
-            .expect("visible-batch memo still present");
-        assert!(
-            Arc::ptr_eq(&merged_before, &merged_after),
-            "a seal must not force the merged-deletions memo to rebuild"
-        );
-        assert!(
-            Arc::ptr_eq(&visible_before, &visible_after),
-            "a seal must not force the visible-batch memo to rebuild"
         );
     }
 
@@ -38814,189 +38727,6 @@ mod tests {
         );
     }
 
-    /// Merged-scan-deletions memo: repeated scans in a quiescent window reuse
-    /// ONE merged (file ∪ mem-tier) deletion snapshot (the q20 correlated-rescan
-    /// fix), and any append invalidates it (new tier version ⇒ rebuild). Also
-    /// re-asserts visibility correctness across the memoized path.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn merged_scan_deletions_memo_reuses_and_invalidates() {
-        let ctx = SessionContext::new();
-        let runtime_env = ctx.runtime_env();
-        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
-            "merge_memo",
-            Arc::clone(&runtime_env),
-            VortexConfig {
-                cdc_durability: crate::metadata::CdcDurability::Memory,
-                deletion_mode: crate::metadata::DeletionMode::Key,
-                inline_max_rows: 1024,
-                ..VortexConfig::default()
-            },
-        )
-        .await;
-        let schema = Arc::clone(&provider.table_metadata.schema);
-        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
-
-        // Durable rows first (a file-side index exists), then a RAM upsert that
-        // tombstones one of them — the scan must merge file ∪ tier deletions.
-        insert_batch(
-            &provider,
-            id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20]),
-        )
-        .await;
-        provider
-            .checkpoint_inlined_data()
-            .await
-            .expect("flush inline rows to the file tier");
-        let write = provider
-            .write_cdc_append_stream(
-                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[100])),
-                &ctx.task_ctx(),
-            )
-            .await
-            .expect("RAM upsert");
-        assert!(
-            write.in_memory_epoch().is_some(),
-            "upsert engaged the RAM tier"
-        );
-
-        // First scan builds + stores the memo; the result must be merge-correct.
-        assert_eq!(
-            collect_id_value_pairs(&ctx, &provider, "merge_memo").await,
-            vec![(1, 100), (2, 20)],
-            "tier tombstone must hide the durable copy of PK 1"
-        );
-        let first = provider
-            .merged_scan_deletions
-            .load_full()
-            .expect("first scan stored the merged-deletions memo");
-
-        // Second scan (no writes in between) must REUSE the same memo entry.
-        assert_eq!(
-            collect_id_value_pairs(&ctx, &provider, "merge_memo").await,
-            vec![(1, 100), (2, 20)],
-            "memoized merge returns identical visibility"
-        );
-        let second = provider
-            .merged_scan_deletions
-            .load_full()
-            .expect("memo still present");
-        assert!(
-            Arc::ptr_eq(&first, &second),
-            "a quiescent re-scan must HIT the memo (same entry), not rebuild it"
-        );
-
-        // An append invalidates: the next scan rebuilds (a different entry).
-        let write2 = provider
-            .write_cdc_append_stream(
-                single_batch_stream(id_value_batch(Arc::clone(&schema), &[2], &[200])),
-                &ctx.task_ctx(),
-            )
-            .await
-            .expect("second RAM upsert");
-        assert!(
-            write2.in_memory_epoch().is_some(),
-            "second upsert engaged RAM"
-        );
-        assert_eq!(
-            collect_id_value_pairs(&ctx, &provider, "merge_memo").await,
-            vec![(1, 100), (2, 200)],
-            "post-append scan reflects the new tombstone"
-        );
-        let third = provider
-            .merged_scan_deletions
-            .load_full()
-            .expect("memo rebuilt after append");
-        assert!(
-            !Arc::ptr_eq(&first, &third),
-            "an append must invalidate the memo (tier version changed)"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn mem_tier_visible_memo_reuses_and_invalidates() {
-        let ctx = SessionContext::new();
-        let runtime_env = ctx.runtime_env();
-        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
-            "visible_memo",
-            Arc::clone(&runtime_env),
-            VortexConfig {
-                cdc_durability: crate::metadata::CdcDurability::Memory,
-                deletion_mode: crate::metadata::DeletionMode::Key,
-                inline_max_rows: 1024,
-                ..VortexConfig::default()
-            },
-        )
-        .await;
-        let schema = Arc::clone(&provider.table_metadata.schema);
-        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
-
-        // A resident RAM tier (no checkpoint) so the scan takes the mem-tier
-        // visible-batch path that the memo covers.
-        let write = provider
-            .write_cdc_append_stream(
-                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])),
-                &ctx.task_ctx(),
-            )
-            .await
-            .expect("RAM append");
-        assert!(
-            write.in_memory_epoch().is_some(),
-            "append engaged the RAM tier"
-        );
-
-        // First scan builds + stores the visible-batch memo.
-        assert_eq!(
-            collect_id_value_pairs(&ctx, &provider, "visible_memo").await,
-            vec![(1, 10), (2, 20)],
-        );
-        let first = provider
-            .mem_tier_visible_memo
-            .load_full()
-            .expect("first scan stored the visible-batch memo");
-
-        // A quiescent re-scan (no writes) must HIT the same memo entry, not
-        // rebuild it — the per-reference re-filtering this fix removes.
-        assert_eq!(
-            collect_id_value_pairs(&ctx, &provider, "visible_memo").await,
-            vec![(1, 10), (2, 20)],
-        );
-        let second = provider
-            .mem_tier_visible_memo
-            .load_full()
-            .expect("memo still present");
-        assert!(
-            Arc::ptr_eq(&first, &second),
-            "a quiescent re-scan must HIT the visible-batch memo, not rebuild it"
-        );
-
-        // An append bumps the tier version → the next scan rebuilds a DIFFERENT
-        // entry AND reflects the new row (no stale visibility served).
-        let write2 = provider
-            .write_cdc_append_stream(
-                single_batch_stream(id_value_batch(Arc::clone(&schema), &[3], &[30])),
-                &ctx.task_ctx(),
-            )
-            .await
-            .expect("second RAM append");
-        assert!(
-            write2.in_memory_epoch().is_some(),
-            "second append engaged RAM"
-        );
-        assert_eq!(
-            collect_id_value_pairs(&ctx, &provider, "visible_memo").await,
-            vec![(1, 10), (2, 20), (3, 30)],
-            "post-append scan reflects the new row"
-        );
-        let third = provider
-            .mem_tier_visible_memo
-            .load_full()
-            .expect("memo rebuilt after append");
-        assert!(
-            !Arc::ptr_eq(&first, &third),
-            "an append must invalidate the visible-batch memo (tier version changed)"
-        );
-    }
-
     /// The scan-view builder (a later commit in this stack) decides whether to
     /// recompute a `ScanView` by comparing consecutive [`RawScanInput`] captures
     /// with [`RawScanInput::changed`]. This asserts both directions:
@@ -39143,10 +38873,11 @@ mod tests {
             "append engaged the RAM tier"
         );
 
-        // Inline reference: exactly what the scan path computes today.
+        // Inline reference: exactly what the maintainer computes for this state.
         let reference = {
+            let input_version = provider.scan_input_version.load(Ordering::Acquire);
             let raw = provider.capture_raw_scan_input().await.expect("capture");
-            provider.build_scan_view(raw).expect("build")
+            provider.build_scan_view(raw, input_version).expect("build")
         };
         let expected = collect_segment_pairs(&reference.visible_segments);
         assert_eq!(
@@ -39254,40 +38985,19 @@ mod tests {
         );
     }
 
-    /// Strong count of the file-side deletion index held inside a
-    /// `PkDeletionSnapshot` (the allocation the scan memos key on by
-    /// `Arc::as_ptr`). `0` for position-based (no index).
-    fn file_index_strong_count(snapshot: &PkDeletionSnapshot) -> usize {
-        match snapshot {
-            PkDeletionSnapshot::Int64Pk { tombstones } => Arc::strong_count(tombstones),
-            PkDeletionSnapshot::RowConverterBased { tombstones } => Arc::strong_count(tombstones),
-            PkDeletionSnapshot::PositionBased => 0,
-        }
-    }
-
-    /// #11303 regression: the per-scan deletion memos must RETAIN (pin) the
-    /// file-side deletion index they key on, not merely cache its raw
-    /// `Arc::as_ptr`.
-    ///
-    /// The memo key compares `Arc::as_ptr(file_index)`. If the memo does not
-    /// keep that `Arc` alive, a deletion publish can free the index and a later
-    /// publish can reuse its freed address for a new generation — a false
-    /// pointer match (ABA) that serves a stale merged deletion view and
-    /// resurrects deleted rows. Pinning the source `Arc` makes the address
-    /// non-reusable while the memo is live, so a pointer match can only mean
-    /// "same generation".
-    ///
-    /// The ABA itself is allocator-dependent and non-deterministic to trigger,
-    /// so this asserts the retention INVARIANT that eliminates it: after a scan
-    /// builds the memos, clearing them must drop the file-side index's strong
-    /// count (the memos were holding references to it). On the pre-fix code the
-    /// memos held no reference, so clearing them would not move the count.
+    /// With a RUNNING maintainer, `scan()` takes the builder-registered freshness
+    /// gate (the production path — the no-builder unit-test providers build inline
+    /// instead). It must be LINEARIZABLE: a query sees every write committed before
+    /// it began, waiting ~one build for the maintainer to publish rather than
+    /// serving a stale bundle. This is the switch's core correctness guarantee — the
+    /// scan-view maintainer is a performance optimization, never a visibility
+    /// regression versus the retired per-scan inline capture.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn deletion_memos_pin_file_index_against_aba() {
+    async fn scan_is_linearizable_with_a_running_maintainer() {
         let ctx = SessionContext::new();
         let runtime_env = ctx.runtime_env();
         let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
-            "aba_pin",
+            "linearizable_maintainer",
             Arc::clone(&runtime_env),
             VortexConfig {
                 cdc_durability: crate::metadata::CdcDurability::Memory,
@@ -39299,59 +39009,37 @@ mod tests {
         .await;
         let schema = Arc::clone(&provider.table_metadata.schema);
         provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        let provider = Arc::new(provider);
+        assert!(provider.spawn_scan_view_builder(), "builder task spawned");
 
-        // Durable rows + checkpoint (a file-side deletion index exists), then a
-        // RAM upsert tombstoning a durable key so a scan builds BOTH the merged
-        // and the visible-batch deletion memos.
-        insert_batch(
-            &provider,
-            id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20]),
-        )
-        .await;
-        provider
-            .checkpoint_inlined_data()
-            .await
-            .expect("flush inline rows to the file tier");
-        let write = provider
+        let write1 = provider
             .write_cdc_append_stream(
-                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[100])),
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])),
                 &ctx.task_ctx(),
             )
             .await
-            .expect("RAM upsert");
-        assert!(
-            write.in_memory_epoch().is_some(),
-            "upsert engaged the RAM tier"
-        );
-
-        // Build the memos and re-assert visibility over the memoized path.
+            .expect("first RAM append");
+        assert!(write1.in_memory_epoch().is_some(), "first append engaged RAM");
+        // With the maintainer running, the query-path scan must wait for the bundle
+        // that reflects this write — never serve the stale cold-start seed.
         assert_eq!(
-            collect_id_value_pairs(&ctx, &provider, "aba_pin").await,
-            vec![(1, 100), (2, 20)],
-            "tier tombstone must hide the durable copy of PK 1"
-        );
-        assert!(
-            provider.merged_scan_deletions.load_full().is_some(),
-            "the scan must have stored the merged-deletions memo"
+            collect_id_value_pairs(&ctx, &provider, "linearizable_maintainer").await,
+            vec![(1, 10), (2, 20)],
+            "scan must reflect the first write (linearizable via the freshness gate)"
         );
 
-        // The live file-side deletion index. `pk_deletion_snapshot()` clones its
-        // inner `Arc`, giving the test exactly one reference to count against;
-        // no write happens after this, so the live cell still holds the same
-        // generation the memos keyed on.
-        let live = provider.pk_deletion_snapshot();
-        let count_with_memos = file_index_strong_count(&live);
-        // Clearing the memos must release the reference(s) they were PINNING.
-        provider.merged_scan_deletions.store(None);
-        provider.mem_tier_visible_memo.store(None);
-        let count_without_memos = file_index_strong_count(&live);
-
-        assert!(
-            count_with_memos > count_without_memos,
-            "the scan deletion memos must PIN the file-side index (ABA guard, #11303): \
-             strong count was {count_with_memos} with the memos present and \
-             {count_without_memos} after clearing them — a pre-fix memo that cached only \
-             the raw pointer would leave the count unchanged"
+        let write2 = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[3], &[30])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("second RAM append");
+        assert!(write2.in_memory_epoch().is_some(), "second append engaged RAM");
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "linearizable_maintainer").await,
+            vec![(1, 10), (2, 20), (3, 30)],
+            "scan must reflect the second write too (the gate waits for the rebuild)"
         );
     }
 

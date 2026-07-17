@@ -2200,6 +2200,14 @@ impl CayenneAccelerator {
 
         tracing::debug!("create_cayenne_table_provider: table {table_name} created successfully");
         let provider = Arc::new(cayenne_table);
+        // Always spawn the scan-view maintainer: the scan path reads its published
+        // bundle behind the linearizable freshness gate, so it must run in every mode
+        // (memory mode included — that is the hot HTAP path whose KDI merge this
+        // offloads off the query cores). The task holds a `Weak<Self>` and aborts when
+        // the last provider reference drops.
+        if provider.spawn_scan_view_builder() {
+            tracing::debug!("Scan-view maintainer spawned for Cayenne table {table_name}");
+        }
         // Publish the real, in-use compaction semaphore for the occupancy gauges
         // (idempotent across the fleet — every table shares this one semaphore).
         publish_compaction_semaphore_for_metrics(
@@ -3713,6 +3721,7 @@ impl PartitionCreator for CayennePartitionCreator {
 
         let partition_provider = Arc::new(cayenne_table);
         partition_provider.spawn_background_compaction(Arc::clone(&self.compaction_semaphore));
+        let _ = partition_provider.spawn_scan_view_builder();
         Ok(Partition {
             partition_values,
             table_provider: partition_provider,
@@ -3810,6 +3819,7 @@ impl PartitionCreator for CayennePartitionCreator {
 
             let partition_provider = Arc::new(cayenne_table);
             partition_provider.spawn_background_compaction(Arc::clone(&self.compaction_semaphore));
+            let _ = partition_provider.spawn_scan_view_builder();
             result.push(Partition {
                 partition_values,
                 table_provider: partition_provider,
