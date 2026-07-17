@@ -453,7 +453,8 @@ async fn mongodb_json_nesting_folds_into_catch_all() -> Result<(), anyhow::Error
 /// Non-CDC counterpart to `mongodb_change_streams_infer_primary_key`: a `DuckDB`
 /// full-refresh dataset loads end-to-end against a real `MongoDB` with always-on
 /// schema inference. The catalog query (`listIndexes`/`collStats`) runs on the server
-/// and the inferred `_id` primary key, secondary indexes, and `_id` sort order are all
+/// and the inferred settings applied for `DuckDB` + full refresh (the `_id` sort
+/// order; physical constraints are intentionally skipped for this engine/mode) are
 /// accepted by the accelerator — a correct row count proves none of those steps
 /// errored. (Precise value-level mapping is covered by unit tests.)
 #[cfg(feature = "duckdb")]

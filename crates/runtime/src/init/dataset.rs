@@ -578,11 +578,15 @@ impl Runtime {
     /// columns) and returns a rebuilt `Dataset`. Applying it here — before the
     /// `FederatedTable` and registration are created — ensures every refresh mode,
     /// including CDC (`refresh_mode: changes`), observes the inferred values.
-    /// Schema inference is always attempted; this returns `ds` unchanged when the
-    /// dataset is not accelerated or the source emitted no usable metadata.
+    /// `resolved_refresh_mode` (the connector-resolved mode, not the raw Spicepod
+    /// value) gates which inferred settings are safe to apply — see
+    /// `apply_inferred_schema`. Schema inference is always attempted; this returns
+    /// `ds` unchanged when the dataset is not accelerated or the source emitted no
+    /// usable metadata.
     fn apply_inferred_acceleration(
         ds: Arc<Dataset>,
         provider: &Arc<dyn datafusion::datasource::TableProvider>,
+        resolved_refresh_mode: RefreshMode,
     ) -> Arc<Dataset> {
         use crate::component::dataset::schema_inference::apply_inferred_schema;
         use data_components::inferred_schema::InferredSchema;
@@ -647,7 +651,13 @@ impl Runtime {
 
         let mut new_ds = (*ds).clone();
         if let Some(acceleration) = new_ds.acceleration.as_mut() {
-            apply_inferred_schema(acceleration, &inferred, &effective_schema, ds.name.table());
+            apply_inferred_schema(
+                acceleration,
+                &inferred,
+                &effective_schema,
+                ds.name.table(),
+                resolved_refresh_mode,
+            );
         }
         Arc::new(new_ds)
     }
@@ -707,7 +717,9 @@ impl Runtime {
                 // Gap-fill acceleration settings from schema inference (a no-op when
                 // the connector emitted no inferred metadata) before the dataset
                 // flows into registration and any changes stream.
-                ds = Self::apply_inferred_acceleration(ds, &provider);
+                let resolved_refresh_mode = data_connector
+                    .resolve_refresh_mode(ds.acceleration.as_ref().and_then(|a| a.refresh_mode));
+                ds = Self::apply_inferred_acceleration(ds, &provider, resolved_refresh_mode);
                 FederatedTable::new(
                     Arc::clone(&ds),
                     provider,

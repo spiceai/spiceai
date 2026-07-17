@@ -17,18 +17,45 @@ datasets:
     name: orders
     # No primary_key / indexes / sort needed — schema inference fills them.
     acceleration:
-      engine: duckdb
-      refresh_mode: full
+      engine: cayenne
+      refresh_mode: changes
 ```
 
 Inference is strictly **gap-filling**: a value you configure explicitly always wins.
-It applies to **all refresh modes** (`full`, `append`, `changes`, `snapshot`,
-`caching`), and is applied before registration so change-data-capture
-(`refresh_mode: changes`) sees the inferred primary key too. The one exception is
-inferred **sort** order, which is *not* applied for `refresh_mode: changes`: CDC is
-driven by the upsert (primary) key rather than a refresh-time sort, and applying a
-sort can perturb the initial snapshot. Primary key, `on_conflict`, and indexes are
-still inferred for CDC.
+It is applied before registration so change-data-capture (`refresh_mode: changes`)
+sees the inferred primary key too.
+
+Not every inferred setting is applied to every engine + refresh mode — each is
+applied only where it is provably safe across the table's whole lifecycle, not just
+the first load:
+
+- **Physical constraints (primary key, indexes)** are applied for
+  `refresh_mode: full` and `refresh_mode: changes` — except:
+  - **`refresh_mode: append` never gets inferred constraints** (any engine): appends
+    incrementally re-read the source, an engine cannot retrofit a constraint onto
+    rows already appended, and an overlapping re-read window would violate a
+    just-added key.
+  - **DuckDB does not get inferred constraints for `full`** (it does for `changes`):
+    DuckDB's refresh machinery rebuilds versioned internal tables and verifies
+    declared constraints across refreshes — a lifecycle its write path does not yet
+    provably preserve for auto-applied constraints — so DuckDB keeps its
+    pre-inference behavior. Explicitly-configured `primary_key` / `indexes` behave
+    exactly as before.
+- **Inferred sort is never applied to DuckDB when the acceleration carries a
+  primary key, indexes, or `on_conflict`** (whether user-declared or inferred):
+  DuckDB applies its on-refresh sort by rewriting the table
+  (`CREATE OR REPLACE … ORDER BY …`), which does not preserve constraints — a
+  seeded sort would silently strip them and break every subsequent upsert.
+- **`on_conflict` (upsert on the inferred primary key) is seeded only for
+  `refresh_mode: changes`**, where the CDC path requires it to apply `UPDATE` events.
+  It is never inferred for other refresh modes because a configured `on_conflict`
+  redirects writes to the accelerator only — inferring one would silently reroute
+  `write_mode: write_through` DML away from the federated source.
+- **Sort** order is *not* applied for `refresh_mode: changes` on refresh-time-sorted
+  engines (DuckDB, Arrow): CDC is driven by the upsert (primary) key rather than a
+  refresh-time sort, and applying one can perturb the initial snapshot. Cayenne is
+  the exception — its `cayenne_sort_columns` orders the background compaction
+  rewrite, not the change stream, so it applies in every refresh mode.
 
 ## Supported connectors
 
@@ -49,8 +76,9 @@ Inferred from `pg_catalog` with a few read-only catalog queries
 key, table sizing via `pg_class.reltuples`/`pg_relation_size`, and per-column
 statistics from `pg_stats`):
 
-- **Primary key** → `acceleration.primary_key` (plus an `upsert` `on_conflict`
-  on that key, so the accelerator upserts by primary key).
+- **Primary key** → `acceleration.primary_key`. For `refresh_mode: changes` an
+  `upsert` `on_conflict` on that key is also seeded, so the CDC path upserts by
+  primary key.
 - **Indexes** → `acceleration.indexes` (a unique index becomes a `unique`
   index; others become `enabled`). The primary key's own index is not
   duplicated. **Partial** and **expression** indexes are skipped (a partial
@@ -67,9 +95,9 @@ statistics from `pg_stats`):
 
 Inferred from `information_schema` (read-only):
 
-- **Primary key** → `acceleration.primary_key` (plus an `upsert` `on_conflict`
-  on that key). This makes `refresh_mode: changes` (binlog replication) work
-  without a hand-declared `primary_key`.
+- **Primary key** → `acceleration.primary_key` (for `refresh_mode: changes`,
+  plus an `upsert` `on_conflict` on that key). This makes `refresh_mode: changes`
+  (binlog replication) work without a hand-declared `primary_key`.
 - **Table size** → an estimated row count and data byte size from
   `information_schema.tables`.
 
@@ -149,15 +177,19 @@ Sort columns map to the engine's existing sort parameter, only when you have not
 set one yourself:
 
 - **DuckDB** → `on_refresh_sort_columns` (direction-qualified, e.g.
-  `"created_at DESC, id ASC"`). DuckDB on-refresh sorting is experimental.
+  `"created_at DESC, id ASC"`). DuckDB on-refresh sorting is experimental, and it
+  is only inferred when the acceleration has no primary key, indexes, or
+  `on_conflict` — the sort rewrite does not preserve constraints.
 - **Arrow** → `sort_columns` (direction-qualified).
 - **Cayenne** → `cayenne_sort_columns` (bare column names; Cayenne sorts by
   column and ignores direction).
 - **SQLite / Turso / PostgreSQL accelerators** have no sort parameter, so sort
   inference is skipped.
-- **`refresh_mode: changes` (CDC)** — sort inference is skipped regardless of
-  engine; the change-stream accelerator is driven by the upsert key, not a
-  refresh-time sort.
+- **`refresh_mode: changes` (CDC)** — sort inference is skipped for the
+  refresh-time-sorted engines (DuckDB, Arrow); the change-stream accelerator is
+  driven by the upsert key, not a refresh-time sort. Cayenne's
+  `cayenne_sort_columns` orders the background compaction rewrite instead, so it
+  still applies for CDC.
 
 ## Notes & limitations
 

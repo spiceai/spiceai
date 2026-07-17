@@ -20,12 +20,17 @@ limitations under the License.
 //! secondary indexes — unique, non-unique, partial, expression, and a clustered
 //! (DESC) index. The dataset is then accelerated with `DuckDB`, exercising the full
 //! always-on pipeline end-to-end: the `pg_catalog` inference query (the riskiest
-//! SQL) must run on the real server, and the inferred primary key / indexes / sort
-//! order must be accepted by the accelerator without error.
+//! SQL) must run on the real server, and the inferred settings must be accepted by
+//! the accelerator without error. For `DuckDB` + full refresh, inferred physical
+//! constraints (primary key / indexes) are intentionally *not* applied (its
+//! versioned internal-table rebuild rejects them on the second refresh); only the
+//! inferred sort order flows through — so the test also triggers a second refresh,
+//! which is exactly where an inferred constraint would blow up.
 //!
 //! Precise value-level checks of the inference mapping live in fast unit tests:
 //! `data_components::inferred_schema` (the wire contract) and
-//! `runtime::component::dataset::schema_inference` (the apply logic per engine).
+//! `runtime::component::dataset::schema_inference` (the apply logic per engine +
+//! refresh mode).
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -157,9 +162,29 @@ async fn start_runtime(dataset: Dataset) -> Result<Arc<runtime::Runtime>, anyhow
     Ok(rt)
 }
 
+/// Trigger a refresh and wait for it to complete via the completion notifier.
+async fn refresh_dataset(rt: &runtime::Runtime, name: &str) -> Result<(), anyhow::Error> {
+    let notifier = rt
+        .datafusion()
+        .refresh_table(&datafusion::common::TableReference::from(name), None)
+        .await?;
+    notifier
+        .ok_or_else(|| anyhow::anyhow!("no completion notifier for {name}"))?
+        .notified()
+        .await;
+    Ok(())
+}
+
 /// The rich-index table loads end-to-end and returns correct data — proving the
 /// always-on `pg_catalog` inference query runs on the real server and the inferred
-/// primary key, indexes, and sort order are accepted by `DuckDB`.
+/// settings that apply to `DuckDB` + full refresh (the sort order; physical
+/// constraints are intentionally skipped for this engine/mode) are accepted.
+///
+/// A second, manually-triggered refresh is part of the test: `DuckDB` verifies
+/// declared constraints against the internal table left by the previous load, so a
+/// wrongly-applied inferred primary key or index only fails on the SECOND refresh —
+/// the initial load alone cannot catch it (this is the merge-queue regression from
+/// #11880).
 #[tokio::test]
 async fn test_schema_inference_loads_and_queries() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -174,8 +199,8 @@ async fn test_schema_inference_loads_and_queries() -> Result<(), anyhow::Error> 
             let rt = start_runtime(inventory_dataset(port)).await?;
 
             // The whole inference pipeline must succeed end-to-end: the pg_catalog
-            // inference query runs on the real server, and the inferred primary key,
-            // indexes, and sort order are all accepted by the DuckDB accelerator. A
+            // inference query runs on the real server, and the inferred settings
+            // applied for DuckDB + full refresh are accepted by the accelerator. A
             // correct row count proves the dataset loaded without any of those steps
             // erroring. (Precise value-level mapping is covered by unit tests.)
             let results = run_query(&rt, "SELECT COUNT(*) AS n FROM inventory").await?;
@@ -202,6 +227,24 @@ async fn test_schema_inference_loads_and_queries() -> Result<(), anyhow::Error> 
                     "+---+", //
                 ],
                 &active
+            );
+
+            // Second refresh: DuckDB rebuilds its internal table and verifies the
+            // declared constraints against the previous one — this is the step that
+            // rejects wrongly-inferred physical constraints, so it must succeed and
+            // still return correct data.
+            refresh_dataset(&rt, "inventory").await?;
+
+            let after_refresh = run_query(&rt, "SELECT COUNT(*) AS n FROM inventory").await?;
+            assert_batches_eq!(
+                &[
+                    "+---+", //
+                    "| n |", //
+                    "+---+", //
+                    "| 3 |", //
+                    "+---+", //
+                ],
+                &after_refresh
             );
 
             Ok(())
