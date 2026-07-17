@@ -16855,7 +16855,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-parameters-derive"
-version = "2.1.0-unstable"
+version = "2.2.0-unstable"
 dependencies = [
  "proc-macro2",
  "quote",
