@@ -21,7 +21,7 @@ name: postgres-cayenne[file]-adaptive-cold-sf1000
 #   - cayenne_datalake_target_file_size_mb         750 — read-optimized cold files, larger than the warm
 #                                              target so cold scans open fewer footers; kept under the
 #                                              per-file PK-bloom cap so cold files stay bloom-backed.
-#   - cayenne_datalake_promotion_interval_ms 30s promoter cadence.
+#   - cayenne_datalake_tiering_check_interval_ms 30s tiering-check cadence.
 # NOTE: `cayenne_target_file_size_mb` (the WARM/hot file size) is deliberately NOT set — it is an
 # adaptive actuator, and pinning it would collapse its tuning bounds to a point. Only the COLD file
 # size is set here; they are different knobs.
@@ -94,7 +94,7 @@ datasets:
 
         cayenne_datalake_warm_max_bytes: '4294967296' # 4 GiB warm->cold promotion trigger
         cayenne_datalake_target_file_size_mb: '750'
-        cayenne_datalake_promotion_interval_ms: '30000'
+        cayenne_datalake_tiering_check_interval_ms: '30000'
 
   - from: postgres:customer
     name: customer
