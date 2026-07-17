@@ -514,6 +514,89 @@ pub fn validate_batches_as_strings(
     Ok(QueryValidationResult::Pass)
 }
 
+/// Render a ±`radius`-row window around a diverging row from both the expected
+/// and actual result sets, stacked and labelled, for divergence diagnostics.
+///
+/// A single [`QueryValidationFailReason::DataMismatch`] reports one scalar cell
+/// with no surrounding context, so it can't distinguish a genuinely wrong value
+/// from a row-alignment/sort-tie shift (where every row from the divergence
+/// onward is off-by-one). Printing the neighbouring rows — full row, all columns,
+/// so key columns are visible — from both sides makes the failure mode obvious at
+/// a glance.
+///
+/// `row_number` is the 1-based row index carried by `DataMismatch` (indexing the
+/// concatenated result). Both sides are assumed to share a schema and row order
+/// (as the HTAP analytical gate guarantees by sorting before comparison), so the
+/// same global index addresses the corresponding logical row on each side.
+pub fn format_row_window(
+    expected: &[RecordBatch],
+    actual: &[RecordBatch],
+    row_number: usize,
+    column: &str,
+    radius: usize,
+) -> Result<String> {
+    use std::fmt::Write as _;
+
+    let Some(schema) = expected
+        .first()
+        .map(arrow::array::RecordBatch::schema)
+        .or_else(|| actual.first().map(arrow::array::RecordBatch::schema))
+    else {
+        return Ok(String::new());
+    };
+
+    let expected = arrow::compute::concat_batches(&schema, expected)?;
+    let actual_schema = actual
+        .first()
+        .map_or_else(|| Arc::clone(&schema), arrow::array::RecordBatch::schema);
+    let actual = arrow::compute::concat_batches(&actual_schema, actual)?;
+
+    // `row_number` is 1-based; clamp the window to each side's own length so a
+    // row-count mismatch can't slice out of bounds.
+    let idx = row_number.saturating_sub(1);
+    let window = |batch: &RecordBatch| -> Option<(usize, RecordBatch)> {
+        let len = batch.num_rows();
+        if len == 0 {
+            return None;
+        }
+        let start = idx.saturating_sub(radius);
+        let end = idx.saturating_add(radius).saturating_add(1).min(len);
+        if start >= end {
+            return None;
+        }
+        Some((start, batch.slice(start, end - start)))
+    };
+
+    let mut out = String::new();
+    writeln!(
+        out,
+        "\u{21b3} divergence at global row {row_number}, column '{column}' (\u{00b1}{radius}-row window)"
+    )?;
+
+    for (label, batch) in [
+        ("EXPECTED (source)", &expected),
+        ("ACTUAL (spice)", &actual),
+    ] {
+        match window(batch) {
+            Some((start, slice)) => {
+                writeln!(
+                    out,
+                    "  {label} — rows {}..={}:",
+                    start + 1,
+                    start + slice.num_rows()
+                )?;
+                match arrow::util::pretty::pretty_format_batches(&[slice]) {
+                    Ok(pretty) => writeln!(out, "{pretty}")?,
+                    Err(e) => writeln!(out, "  (failed to format window: {e})")?,
+                }
+            }
+            None => writeln!(out, "  {label}: (no rows at this offset)")?,
+        }
+    }
+
+    Ok(out)
+}
+
 pub fn validate_tpch_query(
     query: &Query,
     batches: &[RecordBatch],
@@ -736,6 +819,60 @@ mod test {
             .clone();
         let schema = batches[0].schema();
         assert_eq!(schema.fields().len(), 10);
+    }
+
+    #[test]
+    fn test_format_row_window() {
+        // 30 rows; expected/actual differ only at row 15 (1-based).
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("city", DataType::Utf8, false),
+            Field::new("state", DataType::Utf8, false),
+        ]));
+        let ids: Vec<i64> = (0..30).collect();
+        let states: Vec<String> = (0..30).map(|i| format!("state_{i}")).collect();
+        let expected_cities: Vec<String> = (0..30).map(|i| format!("city_{i}")).collect();
+        let mut actual_cities = expected_cities.clone();
+        actual_cities[14] = "WRONG".to_string();
+
+        let mk = |cities: &[String]| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids.clone())),
+                    Arc::new(StringArray::from(cities.to_vec())),
+                    Arc::new(StringArray::from(states.clone())),
+                ],
+            )
+            .expect("build batch")
+        };
+        let expected = vec![mk(&expected_cities)];
+        let actual = vec![mk(&actual_cities)];
+
+        let window =
+            format_row_window(&expected, &actual, 15, "city", 3).expect("should render window");
+
+        // Snapshot the exact end-to-end rendering: header naming the diverging
+        // row/column, both labelled ±3 windows (rows 12..=18), the neighbouring
+        // context, and the diverging `city_14` vs `WRONG` cell.
+        insta::assert_snapshot!("format_row_window", window);
+    }
+
+    #[test]
+    fn test_format_row_window_clamps_at_end() {
+        // Window near the last row must clamp instead of slicing out of bounds.
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let mk = || {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from((0..5).collect::<Vec<i64>>()))],
+            )
+            .expect("build batch")
+        };
+        let batches = vec![mk()];
+        let window =
+            format_row_window(&batches, &batches, 5, "v", 10).expect("should render window");
+        assert!(window.contains("rows 1..=5"), "window: {window}");
     }
 
     #[test]

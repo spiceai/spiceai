@@ -32,7 +32,10 @@ use arrow::datatypes::{Field, Schema};
 use arrow_tools::record_batch::try_cast_to;
 use chbench_driver::ChBenchDriver;
 use test_framework::anyhow;
-use test_framework::queries::validation::{QueryValidationResult, validate_with_expected_batches};
+use test_framework::queries::validation::{
+    QueryValidationFailReason, QueryValidationResult, format_row_window,
+    validate_with_expected_batches,
+};
 use test_framework::queries::{QueryOverrides, get_chbench_test_queries};
 
 /// Analytical queries that are executed and reported but do **not** gate the
@@ -53,6 +56,16 @@ const ADVISORY_QUERIES: &[&str] = &["chbench_q15"];
 fn is_advisory(name: &str) -> bool {
     ADVISORY_QUERIES.contains(&name)
 }
+
+/// Number of rows on each side of a diverging row to print for diagnostics.
+/// A radius of 10 yields a 21-row window (10 before + the row + 10 after).
+/// Overridable via `SPICE_HTAP_DIVERGENCE_WINDOW` for deeper context.
+static DIVERGENCE_WINDOW_RADIUS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("SPICE_HTAP_DIVERGENCE_WINDOW")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(10)
+});
 
 /// Whether a result should fail the gate: any non-`Pass` outcome, except a
 /// value/row [`Outcome::Divergence`] on an advisory query (reported but
@@ -315,14 +328,42 @@ pub async fn verify_analytical_results(
                             _ => (Outcome::Pass, None),
                         }
                     }
-                    Ok(QueryValidationResult::Fail(reason)) => (
-                        Outcome::Divergence(format!(
-                            "{reason:?} (source rows={}, spice rows={})",
-                            total_rows(&expected_sorted),
-                            total_rows(&actual_sorted),
-                        )),
-                        None,
-                    ),
+                    Ok(QueryValidationResult::Fail(reason)) => {
+                        // A `DataMismatch` reports a single diverging cell with no
+                        // surrounding context, which can't distinguish a wrong
+                        // value from a sort-tie row shift. Print a windowed slice
+                        // around the failing row from both sides so the failure
+                        // mode is obvious in the log; the tree keeps the compact
+                        // one-line detail below.
+                        if let QueryValidationFailReason::DataMismatch {
+                            row_number, column, ..
+                        } = &reason
+                        {
+                            match format_row_window(
+                                &expected_sorted,
+                                &actual_sorted,
+                                *row_number,
+                                column,
+                                *DIVERGENCE_WINDOW_RADIUS,
+                            ) {
+                                Ok(window) => eprintln!("\n{}: {window}", query.name),
+                                Err(e) => {
+                                    eprintln!(
+                                        "{}: failed to render divergence window: {e}",
+                                        query.name
+                                    );
+                                }
+                            }
+                        }
+                        (
+                            Outcome::Divergence(format!(
+                                "{reason:?} (source rows={}, spice rows={})",
+                                total_rows(&expected_sorted),
+                                total_rows(&actual_sorted),
+                            )),
+                            None,
+                        )
+                    }
                     Err(e) => (Outcome::Fail(e.to_string()), None),
                 }
             };

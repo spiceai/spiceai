@@ -1,0 +1,29 @@
+---
+source: crates/test-framework/src/queries/validation/mod.rs
+expression: window
+---
+↳ divergence at global row 15, column 'city' (±3-row window)
+  EXPECTED (source) — rows 12..=18:
++----+---------+----------+
+| id | city    | state    |
++----+---------+----------+
+| 11 | city_11 | state_11 |
+| 12 | city_12 | state_12 |
+| 13 | city_13 | state_13 |
+| 14 | city_14 | state_14 |
+| 15 | city_15 | state_15 |
+| 16 | city_16 | state_16 |
+| 17 | city_17 | state_17 |
++----+---------+----------+
+  ACTUAL (spice) — rows 12..=18:
++----+---------+----------+
+| id | city    | state    |
++----+---------+----------+
+| 11 | city_11 | state_11 |
+| 12 | city_12 | state_12 |
+| 13 | city_13 | state_13 |
+| 14 | WRONG   | state_14 |
+| 15 | city_15 | state_15 |
+| 16 | city_16 | state_16 |
+| 17 | city_17 | state_17 |
++----+---------+----------+
