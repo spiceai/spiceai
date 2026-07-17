@@ -1352,11 +1352,17 @@ pub struct CayenneTableProvider {
     /// `notified()` BEFORE re-checking the published version, so a publish that races
     /// the park is not missed. Shared across clones.
     scan_view_published: Arc<tokio::sync::Notify>,
-    /// Forced-structural-event seqlock (truncate / full-delete / overwrite /
-    /// schema-evolve / reopen). The builder brackets its capture with this
-    /// (`read_validated_async`) so it never PUBLISHES a bundle whose capture
-    /// straddled a forced event that mutates both fence-protected and fence-decoupled
-    /// (mem-tier) state. Ordinary churn never touches it. Shared across clones.
+    /// Seqlock the maintainer brackets its capture with (`read_validated_async`) so it
+    /// never PUBLISHES a bundle whose capture straddled a mutation that changes the
+    /// per-shard mem-tier visibility NON-ATOMICALLY across shards OFF the listing fence
+    /// — a tear the fence cannot serialize (the capture loads each shard's `ArcSwap`
+    /// separately, so at `cdc_mem_tier_shards > 1` a partial mix is observable). Only
+    /// `evolve_schema_live`'s all-shards flush qualifies today. Ordinary + overwrite
+    /// snapshot publishing does NOT bump it — those run under `listing_fence.write()`,
+    /// so a capture (holding `listing_fence.read()`) sees them all-or-nothing and they
+    /// advance only the additive `scan_input_version`. INERT at `cdc_mem_tier_shards ==
+    /// 1` (single-shard capture is atomic), which memory mode enforces. Shared across
+    /// clones.
     structural_version: Arc<crate::provider::structural_version::StructuralVersion>,
     /// Abort-on-drop handle for this table's scan-view maintainer task. Shared across
     /// clones; the task aborts when the last provider reference drops (the task holds
@@ -2422,6 +2428,15 @@ impl CayenneTableProvider {
         let started = Instant::now();
         let _write_guard = self.write_lock.lock().await;
 
+        // Bracket the widen in the scan-view seqlock: unlike a fenced snapshot
+        // publish, the all-shards mem-tier FLUSH below runs OFF the listing fence
+        // (under `write_lock` + `mem_checkpoint_lock`), so at `cdc_mem_tier_shards > 1`
+        // a maintainer capture could observe some shards flushed and others not — a
+        // tear the fence cannot serialize. The seqlock makes the maintainer discard
+        // such a straddling capture. Held under `write_lock`, so no two forced events
+        // overlap; dropped at fn end. Inert at N == 1 (single-shard capture is atomic).
+        let _structural_guard = self.structural_version.begin_mutation();
+
         // Step 2: drain Stage-B publishes. They complete without `write_lock`
         // (visibility lock + listing fence only), and no new ones can start.
         if !self
@@ -2818,6 +2833,13 @@ impl CayenneTableProvider {
         new_snapshot_id: &str,
         new_listing_table: Arc<ListingTable>,
     ) {
+        // No scan-view seqlock bracket needed: the caller holds `listing_fence.write()`
+        // and every step here is synchronous, while a maintainer capture holds
+        // `listing_fence.read()` across its WHOLE capture — so the capture observes
+        // this overwrite fully-before or fully-after, never a partial mix. Snapshot
+        // publishing is additive: the monotonic `scan_input_version` bumps below
+        // (via `update_current_snapshot_id` + `invalidate_inlined_cache`) advance the
+        // freshness gate; no torn-capture discard is possible.
         self.update_current_snapshot_id(new_snapshot_id);
         self.clear_all_deletion_caches();
         // `commit_overwrite_in_txn` already cleared the inlined data/deletes in the
@@ -39121,6 +39143,66 @@ mod tests {
             collect_id_value_pairs(&ctx, &provider, "linearizable_maintainer").await,
             vec![(1, 10), (2, 20), (3, 30)],
             "scan must reflect the second write too (the gate waits for the rebuild)"
+        );
+    }
+
+    /// A `ScanView` a scan is holding must stay valid across a concurrent mem-tier
+    /// checkpoint + CLEAR (D2 — GC/clear-during-scan): the bundle's captured mem-tier
+    /// `Arc`s keep the deletion-filtered batches alive by refcount even after the live
+    /// tier is flushed to a file and cleared, so an in-flight scan sees no
+    /// use-after-clear, no lost rows, and no resurrection — it returns the consistent
+    /// pinned view it captured.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn held_scan_view_survives_checkpoint_and_clear() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "held_view_gc",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        let write = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("RAM append");
+        assert!(write.in_memory_epoch().is_some(), "append engaged the RAM tier");
+
+        // Capture + build the bundle a scan would borrow, and HOLD the Arc for the
+        // rest of the test (as an in-flight scan's plan would).
+        let held: Arc<ScanView> = {
+            let raw = provider.capture_raw_scan_input().await.expect("capture");
+            Arc::new(provider.build_scan_view(raw, 0).expect("build"))
+        };
+        assert_eq!(
+            collect_segment_pairs(&held.visible_segments),
+            vec![(1, 10), (2, 20)],
+            "the held bundle carries the mem-tier rows"
+        );
+
+        // Flush the RAM tier to a durable file and CLEAR the live tier out from under
+        // the held bundle.
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("checkpoint flushes + clears the mem tier");
+
+        // The held bundle must STILL return the same rows: its captured mem-tier Arcs
+        // pin the batches by refcount independent of the (now-cleared) live tier.
+        assert_eq!(
+            collect_segment_pairs(&held.visible_segments),
+            vec![(1, 10), (2, 20)],
+            "the held bundle survives the checkpoint + clear (no use-after-clear / loss)"
         );
     }
 
