@@ -49,6 +49,7 @@ tokio-rusqlite = { workspace = true }
 serde_json = { workspace = true }
 snafu = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 turso = { workspace = true, optional = true }
 turso-shared = { workspace = true }

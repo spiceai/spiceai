@@ -1066,10 +1066,14 @@ struct ScanView {
 #[derive(Debug)]
 pub(crate) struct ScanViewBuilder {
     handle: Option<task::JoinHandle<()>>,
+    shutdown: tokio_util::sync::CancellationToken,
 }
 
 impl Drop for ScanViewBuilder {
     fn drop(&mut self) {
+        // Cancel FIRST so a scan parked on the freshness gate wakes and returns a
+        // shutting-down error instead of hanging, then abort the maintainer task.
+        self.shutdown.cancel();
         if let Some(handle) = self.handle.take() {
             handle.abort();
         }
@@ -1358,6 +1362,12 @@ pub struct CayenneTableProvider {
     /// clones; the task aborts when the last provider reference drops (the task holds
     /// only a `Weak<Self>`). `Arc<OnceLock<_>>` exactly like [`Self::background_compactor`].
     scan_view_builder: Arc<std::sync::OnceLock<ScanViewBuilder>>,
+    /// Cooperative shutdown for the scan-view maintainer + any scan parked on the
+    /// freshness gate. Cancelled by [`ScanViewBuilder`]'s drop (last provider
+    /// reference gone) or an explicit teardown: the maintainer loop exits and a
+    /// parked scan returns a shutting-down error rather than hanging. Shared across
+    /// clones (`CancellationToken` clones share one cancellation state).
+    scan_view_shutdown: tokio_util::sync::CancellationToken,
     /// Count of staged inline-conflict tombstones written with `published =
     /// false` whose owning snapshot has not yet finalized (flipped the flag).
     ///
@@ -5234,6 +5244,7 @@ impl CayenneTableProvider {
                 crate::provider::structural_version::StructuralVersion::new(),
             ),
             scan_view_builder: Arc::new(std::sync::OnceLock::new()),
+            scan_view_shutdown: tokio_util::sync::CancellationToken::new(),
             pending_inline_tombstones: Arc::new(AtomicU64::new(0)),
             published_inlined_seq: Arc::new(AtomicI64::new(initial_inlined_seq)),
             seq_allocator,
@@ -6353,6 +6364,7 @@ impl CayenneTableProvider {
             scan_view_published: Arc::clone(&self.scan_view_published),
             structural_version: Arc::clone(&self.structural_version),
             scan_view_builder: Arc::clone(&self.scan_view_builder),
+            scan_view_shutdown: self.scan_view_shutdown.clone(),
             pending_inline_tombstones: Arc::clone(&self.pending_inline_tombstones),
             published_inlined_seq: Arc::clone(&self.published_inlined_seq),
             // Shared so every writer clone of the same table allocates from one
@@ -19356,15 +19368,30 @@ impl CayenneTableProvider {
         })
     }
 
-    /// Default floor between builder rebuilds; the configurable knob
-    /// (`cayenne_scan_view_refresh_floor_ms`) is added in a later commit.
-    const DEFAULT_SCAN_VIEW_REFRESH_FLOOR: Duration = Duration::from_millis(250);
+    /// Default floor between scan-view maintainer rebuilds (250 ms), overridable via
+    /// the `CAYENNE_SCAN_VIEW_REFRESH_FLOOR_MS` environment variable (`0` = rebuild as
+    /// fast as the input changes). Env-var rather than a Spicepod param: it is a
+    /// process-wide operational tuning knob, not per-table data configuration, so it
+    /// stays out of `configuration_matches`.
+    const DEFAULT_SCAN_VIEW_REFRESH_FLOOR_MS: u64 = 250;
+
+    /// The configured refresh floor, read once per spawn from
+    /// `CAYENNE_SCAN_VIEW_REFRESH_FLOOR_MS` (falling back to the default on an unset
+    /// or unparseable value).
+    fn scan_view_refresh_floor() -> Duration {
+        let ms = std::env::var("CAYENNE_SCAN_VIEW_REFRESH_FLOOR_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(Self::DEFAULT_SCAN_VIEW_REFRESH_FLOOR_MS);
+        Duration::from_millis(ms)
+    }
 
     /// Spawn the background scan-view maintainer for this provider, if not already
     /// spawned. Must be called after the provider is wrapped in an `Arc` — the task
     /// holds a `Weak<Self>` so it never pins the provider; the returned handle is
     /// owned by the provider (`scan_view_builder`) and aborts the task when the last
-    /// provider reference drops. Returns `true` iff this call spawned the task.
+    /// provider reference drops (and cancels `scan_view_shutdown`, waking any parked
+    /// scan). Returns `true` iff this call spawned the task.
     ///
     /// The initial bundle is seeded synchronously at construction (cold start), so a
     /// scan never waits for the first build even before this is called.
@@ -19375,13 +19402,15 @@ impl CayenneTableProvider {
         }
         let handle = task::spawn(Self::run_scan_view_builder_loop(
             Arc::downgrade(self),
-            Self::DEFAULT_SCAN_VIEW_REFRESH_FLOOR,
+            Self::scan_view_refresh_floor(),
+            self.scan_view_shutdown.clone(),
         ));
         // `OnceLock::set` fails only if already initialized — a lost race just drops
         // the extra handle, aborting its own task.
         self.scan_view_builder
             .set(ScanViewBuilder {
                 handle: Some(handle),
+                shutdown: self.scan_view_shutdown.clone(),
             })
             .is_ok()
     }
@@ -19397,11 +19426,19 @@ impl CayenneTableProvider {
     ///
     /// Holds only a `Weak<Self>`, re-upgraded each iteration and dropped across every
     /// `.await`, so it never pins the provider and exits once the table is torn down
-    /// (the [`ScanViewBuilder`] handle also aborts it on drop). On a transient
-    /// capture/build failure it logs and retries after a short backoff, keeping the
-    /// loop alive; a later commit escalates a PERSISTENT failure to a loud circuit
-    /// break (never a silent fallback to the retired per-scan path).
-    async fn run_scan_view_builder_loop(weak: std::sync::Weak<Self>, floor: Duration) {
+    /// (the [`ScanViewBuilder`] handle also aborts it on drop). Exits promptly on
+    /// `shutdown` cancellation (waking any scan parked on the freshness gate).
+    ///
+    /// Failure handling is FAIL-SAFE-KEEP-ALIVE for now: a transient capture/build
+    /// error is logged and retried after a short backoff so the maintainer survives
+    /// (its death would hang scans behind the freshness gate). The loud
+    /// circuit-breaker on PERSISTENT failure — and any loop-restart machinery — is
+    /// deliberately deferred.
+    async fn run_scan_view_builder_loop(
+        weak: std::sync::Weak<Self>,
+        floor: Duration,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) {
         // Seed the change-detector from the cold-start bundle so the first iteration
         // does not redundantly rebuild an unchanged view.
         let mut prev: Option<RawScanInput> = weak
@@ -19409,6 +19446,9 @@ impl CayenneTableProvider {
             .and_then(|p| p.scan_view.load_full().map(|v| v.raw.clone()));
 
         loop {
+            if shutdown.is_cancelled() {
+                return;
+            }
             let Some(provider) = weak.upgrade() else {
                 return; // provider torn down
             };
@@ -19424,7 +19464,10 @@ impl CayenneTableProvider {
             let Some(structural_v0) = provider.structural_version.read_begin() else {
                 let notify = Arc::clone(&provider.scan_input_change);
                 drop(provider);
-                notify.notified().await;
+                tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    () = notify.notified() => {}
+                }
                 continue;
             };
             // Freshness stamp: read the monotonic input version BEFORE the capture,
@@ -19442,7 +19485,10 @@ impl CayenneTableProvider {
                     );
                     drop(provider);
                     // Brief backoff so a persistent failure cannot hot-spin a core.
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tokio::select! {
+                        () = shutdown.cancelled() => return,
+                        () = tokio::time::sleep(Duration::from_millis(50)) => {}
+                    }
                     continue;
                 }
             };
@@ -19489,11 +19535,15 @@ impl CayenneTableProvider {
                 }
                 prev = Some(raw_for_prev);
                 let compute_elapsed = compute_start.elapsed();
-                tracing::trace!(
-                    target: "cayenne::scan_view",
-                    table = %provider.table_metadata.table_name,
-                    compute_ms = u64::try_from(compute_elapsed.as_millis()).unwrap_or(u64::MAX),
-                    "published a fresh scan-view bundle"
+                // Metric: one build+publish, off the query path. Count ≪ scan count,
+                // and the duration is the capture+build cost the query path no longer
+                // pays (the 1c measurement signals).
+                telemetry::cayenne::track_scan_view_build(
+                    compute_elapsed,
+                    &[telemetry::KeyValue::new(
+                        "dataset",
+                        provider.table_metadata.table_name.clone(),
+                    )],
                 );
                 drop(provider);
                 // Throttle to at most one build per `floor` window: sleep only the
@@ -19504,7 +19554,10 @@ impl CayenneTableProvider {
                 if !floor.is_zero() {
                     let remaining = floor.saturating_sub(compute_elapsed);
                     if !remaining.is_zero() {
-                        tokio::time::sleep(remaining).await;
+                        tokio::select! {
+                            () = shutdown.cancelled() => return,
+                            () = tokio::time::sleep(remaining) => {}
+                        }
                     }
                 }
             } else {
@@ -19514,7 +19567,10 @@ impl CayenneTableProvider {
                 // so a signal that races this park is not lost.
                 let notify = Arc::clone(&provider.scan_input_change);
                 drop(provider);
-                notify.notified().await;
+                tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    () = notify.notified() => {}
+                }
             }
         }
     }
@@ -19560,14 +19616,39 @@ impl CayenneTableProvider {
         // Registering the `notified()` BEFORE the re-check means a publish that races
         // the park is not missed.
         let required = self.scan_input_version.load(Ordering::Acquire);
+        let wait_start = Instant::now();
+        let mut waited = false;
         loop {
             let published = self.scan_view_published.notified();
             if let Some(view) = self.scan_view.load_full()
                 && view.input_version >= required
             {
+                if waited {
+                    // Metric: this scan sat idle on the gate (maintainer lagging query
+                    // demand) rather than recomputing on a query core. ~0 in steady state.
+                    telemetry::cayenne::track_scan_view_wait(
+                        wait_start.elapsed(),
+                        &[telemetry::KeyValue::new(
+                            "dataset",
+                            self.table_metadata.table_name.clone(),
+                        )],
+                    );
+                }
                 return Ok(view);
             }
-            published.await;
+            waited = true;
+            // Wait for the next publish, or bail out if the maintainer is shutting
+            // down (cancellation), so a parked scan never hangs on a dead maintainer.
+            tokio::select! {
+                () = self.scan_view_shutdown.cancelled() => {
+                    return Err(datafusion_common::DataFusionError::Execution(format!(
+                        "Scan aborted: table {} is shutting down while waiting for a \
+                         fresh scan-view bundle",
+                        self.table_metadata.table_name
+                    )));
+                }
+                () = published => {}
+            }
         }
     }
 

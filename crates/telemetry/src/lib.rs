@@ -768,6 +768,76 @@ pub mod cayenne {
         .record(duration.as_secs_f64() * 1000.0, dimensions);
     }
 
+    static SCAN_VIEW_BUILDS: OnceLock<Counter<u64>> = OnceLock::new();
+    static SCAN_VIEW_BUILD_DURATION_MS: OnceLock<Histogram<f64>> = OnceLock::new();
+
+    /// Records one scan-view maintainer build+publish: bumps the build counter and
+    /// the build-duration histogram. Expect this COUNT to be far below the scan
+    /// count — the maintainer computes the merged deletion snapshot + visible
+    /// mem-tier segments ONCE per table version, off the query cores, instead of
+    /// every concurrent scan recomputing it (the retired per-scan memos). The
+    /// duration is the capture + build time paid on the background task, not the
+    /// query path. `dimensions` should carry `dataset`.
+    pub fn track_scan_view_build(duration: Duration, dimensions: &[KeyValue]) {
+        SCAN_VIEW_BUILDS
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_counter("cayenne_scan_view_builds_total")
+                    .with_description(
+                        "Scan-view maintainer builds — one merged bundle published per table version, off the query path.",
+                    )
+                    .with_unit("builds")
+                    .build()
+            })
+            .add(1, dimensions);
+        SCAN_VIEW_BUILD_DURATION_MS
+            .get_or_init(|| {
+                operational_meter()
+                    .f64_histogram("cayenne_scan_view_build_duration_ms")
+                    .with_description(
+                        "Time the scan-view maintainer spends capturing + building one merged scan-view bundle (off the query cores).",
+                    )
+                    .with_unit("ms")
+                    .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
+                    .build()
+            })
+            .record(duration.as_secs_f64() * 1000.0, dimensions);
+    }
+
+    static SCAN_VIEW_WAITS: OnceLock<Counter<u64>> = OnceLock::new();
+    static SCAN_VIEW_WAIT_DURATION_MS: OnceLock<Histogram<f64>> = OnceLock::new();
+
+    /// Records a scan that had to WAIT for the maintainer to publish a bundle fresh
+    /// enough for its linearizable freshness gate (rather than finding one already
+    /// published). Expect ~0 in steady state; a rising count / duration means the
+    /// maintainer is lagging query demand (the scan sits idle on the gate rather than
+    /// recomputing on a query core). `dimensions` should carry `dataset`.
+    pub fn track_scan_view_wait(duration: Duration, dimensions: &[KeyValue]) {
+        SCAN_VIEW_WAITS
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_counter("cayenne_scan_view_waits_total")
+                    .with_description(
+                        "Scans that waited for the scan-view maintainer to publish a bundle fresh enough for the linearizable freshness gate.",
+                    )
+                    .with_unit("scans")
+                    .build()
+            })
+            .add(1, dimensions);
+        SCAN_VIEW_WAIT_DURATION_MS
+            .get_or_init(|| {
+                operational_meter()
+                    .f64_histogram("cayenne_scan_view_wait_duration_ms")
+                    .with_description(
+                        "Time a scan spent waiting on the scan-view freshness gate for a fresh-enough published bundle.",
+                    )
+                    .with_unit("ms")
+                    .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
+                    .build()
+            })
+            .record(duration.as_secs_f64() * 1000.0, dimensions);
+    }
+
     static WRITE_PHASE_DURATION_MS: OnceLock<Histogram<f64>> = OnceLock::new();
 
     pub fn track_write_phase_duration(duration: Duration, dimensions: &[KeyValue]) {

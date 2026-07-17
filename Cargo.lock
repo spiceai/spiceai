@@ -3575,6 +3575,7 @@ dependencies = [
  "tokio",
  "tokio-rusqlite",
  "tokio-stream",
+ "tokio-util",
  "tracing",
  "turso",
  "turso-shared",
