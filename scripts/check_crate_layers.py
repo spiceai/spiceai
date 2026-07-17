@@ -47,8 +47,17 @@ REPO = Path(__file__).resolve().parent.parent
 
 
 def load_layers() -> dict:
-    with (REPO / "layers.toml").open("rb") as f:
-        return tomllib.load(f)
+    path = REPO / "layers.toml"
+    try:
+        with path.open("rb") as f:
+            return tomllib.load(f)
+    except FileNotFoundError:
+        print(f"error: layers.toml not found at {path}.", file=sys.stderr)
+        raise SystemExit(2)
+    except tomllib.TOMLDecodeError as e:
+        # Malformed manifest is a config error (exit 2), not a layering violation.
+        print(f"error: layers.toml is not valid TOML: {e}", file=sys.stderr)
+        raise SystemExit(2)
 
 
 def load_metadata() -> dict:
