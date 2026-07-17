@@ -47788,4 +47788,156 @@ mod tests {
         let empty = CayenneTableProvider::partition_memory_batches(Vec::new(), 8);
         assert_eq!(total(&empty), 0);
     }
+
+    /// MANUAL PERF MICRO-BENCH (`#[ignore]`d — never runs in CI). Isolates the D>1
+    /// CDC drain-pipeline win from the OLTP-generation ceiling that dominates the
+    /// local HTAP path (SF100-on-18-cores is source-throughput-bound at ~430 txn/s,
+    /// so the mem-tier never fills and the checkpoint drain never contends — see the
+    /// `morsel_proposal` plan). Here there is NO Postgres and NO analytical query load:
+    /// it drives `append_to_mem_tier` + `checkpoint_mem_tier` back-to-back at full
+    /// rate so the checkpoint DRAIN (Vortex encode + metastore commit + fence publish)
+    /// is the throughput ceiling, then measures ingest-to-durable wall time at
+    /// `D = 1 / 2 / 4 / 8`.
+    ///
+    /// At `D=1` each `checkpoint_mem_tier` runs the drain INLINE — serial, so the next
+    /// freeze waits out the whole encode+commit+publish. At `D>1` it freezes + detaches
+    /// (`tokio::spawn`) and only blocks on the admission semaphore once `D` drains are
+    /// in flight, so freeze `N+1` overlaps drain `N`'s off-lock encode. The measured win
+    /// is higher sustained drain throughput (rows/s) as `D` rises — bounded by the global
+    /// encode-permit budget and available cores. Every `D` must land an identical durable
+    /// row set (correctness guard) — the pipeline only reorders WORK, never data.
+    ///
+    /// Run (release is essential — dev-profile encode is meaningless):
+    /// `cargo test -p cayenne --lib --release bench_drain_pipeline_depth -- --ignored --nocapture`
+    /// Tunable via env: `BENCH_BATCHES` (default 100), `BENCH_ROWS` per batch (default 100000).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    #[ignore = "manual perf micro-bench; run with --release --ignored --nocapture"]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "bench throughput display only; row counts are well under 2^52"
+    )]
+    async fn bench_drain_pipeline_depth() {
+        struct AckCounter(Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait::async_trait]
+        impl crate::provider::mem_tier::SlotAdvancer for AckCounter {
+            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        let batches: usize = std::env::var("BENCH_BATCHES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+        let rows_per_batch: usize = std::env::var("BENCH_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000);
+        let total_rows = batches * rows_per_batch;
+        let none = OnConflictDeletions::default();
+
+        eprintln!(
+            "\n=== CDC drain-pipeline micro-bench: {batches} batches x {rows_per_batch} rows = {total_rows} total (no PG, no OLAP) ==="
+        );
+        eprintln!(
+            "{:>4} {:>11} {:>11} {:>11} {:>13} {:>10} {:>7} {:>7}",
+            "D", "loop_ms", "drain_ms", "total_ms", "rows/s", "max_depth", "acks", "speedup"
+        );
+
+        let mut baseline_total_ms = 0.0_f64;
+        for depth in [1usize, 2, 4, 8] {
+            let env = SessionContext::new().runtime_env();
+            let (provider, _tmp) =
+                create_memory_mode_table_with_pipeline_depth("bench_drain", env, depth).await;
+            assert_eq!(
+                provider.drain_pipeline_depth(),
+                depth,
+                "config depth {depth} applied"
+            );
+            let ack_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            provider.install_slot_advancer(Arc::new(AckCounter(Arc::clone(&ack_count))));
+            let provider = Arc::new(provider);
+
+            // Sampler: record the max resident ledger depth (proves D>1 actually keeps
+            // multiple generations in flight — an overlap that never happens would read 1).
+            let max_depth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let sampler = {
+                let p = Arc::clone(&provider);
+                let md = Arc::clone(&max_depth);
+                let st = Arc::clone(&stop);
+                tokio::spawn(async move {
+                    while !st.load(std::sync::atomic::Ordering::Relaxed) {
+                        let d = p.drain_ledger.lock().depth();
+                        md.fetch_max(d, std::sync::atomic::Ordering::Relaxed);
+                        tokio::time::sleep(Duration::from_micros(200)).await;
+                    }
+                })
+            };
+
+            let loop_start = Instant::now();
+            let span = i64::try_from(rows_per_batch).expect("batch size fits i64");
+            for i in 0..batches {
+                let lo = i64::try_from(i * rows_per_batch).expect("batch offset fits i64");
+                let ids: Vec<i64> = (lo..lo + span).collect();
+                let rb = int64_id_batch(&ids);
+                let bytes = rb.get_array_memory_size() as u64;
+                provider
+                    .append_to_mem_tier(vec![rb], &none, bytes, 0)
+                    .await
+                    .expect("append");
+                // D=1: inline drain (blocks full encode+commit+publish). D>1: freeze +
+                // detach, blocking only on the admission semaphore when D drains fly.
+                provider.checkpoint_mem_tier().await.expect("checkpoint");
+            }
+            let loop_ms = loop_start.elapsed().as_secs_f64() * 1000.0;
+
+            // Tail: wait for the last detached drains to publish + clear the ledger.
+            let drain_start = Instant::now();
+            while !provider.drain_ledger.lock().is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            let drain_ms = drain_start.elapsed().as_secs_f64() * 1000.0;
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            sampler.await.expect("sampler join");
+
+            let total_ms = loop_ms + drain_ms;
+            let rows_per_s = (total_rows as f64) / (total_ms / 1000.0);
+            if depth == 1 {
+                baseline_total_ms = total_ms;
+            }
+            let speedup = if total_ms > 0.0 {
+                baseline_total_ms / total_ms
+            } else {
+                0.0
+            };
+
+            // Correctness guard: every D must land the identical durable row set.
+            let scanned = scan_sorted_ids(&provider).await;
+            assert_eq!(
+                scanned.len(),
+                total_rows,
+                "D={depth}: all {total_rows} rows durable after drain"
+            );
+            assert_eq!(scanned.first().copied(), Some(0), "D={depth}: min id 0");
+            assert_eq!(
+                scanned.last().copied(),
+                Some(i64::try_from(total_rows).expect("total fits i64") - 1),
+                "D={depth}: max id {}",
+                total_rows - 1
+            );
+
+            eprintln!(
+                "{:>4} {:>11.1} {:>11.1} {:>11.1} {:>13.0} {:>10} {:>7} {:>6.2}x",
+                depth,
+                loop_ms,
+                drain_ms,
+                total_ms,
+                rows_per_s,
+                max_depth.load(std::sync::atomic::Ordering::Relaxed),
+                ack_count.load(std::sync::atomic::Ordering::Relaxed),
+                speedup
+            );
+        }
+    }
 }
