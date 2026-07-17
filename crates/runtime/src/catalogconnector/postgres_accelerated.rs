@@ -55,6 +55,7 @@ use data_components::postgres::provider::{
 };
 use data_components::postgres_replication::config::default_slot_name;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
+use datafusion::common::TableReference;
 use datafusion::common::utils::quote_identifier;
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
@@ -428,8 +429,28 @@ impl SchemaProvider for AcceleratedSchemaProvider {
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        let guard = self.tables.read();
-        guard.contains_key(name)
+        let dataset_name = {
+            let guard = self.tables.read();
+            match guard.get(name) {
+                Some(dataset_name) => dataset_name.clone(),
+                None => return false,
+            }
+        };
+
+        // Mirror `table()`: report the table as existing only once its
+        // synthesized dataset is actually registered and queryable, not
+        // merely discovered. Returning `true` on discovery alone would let a
+        // still-bootstrapping table (whose `table()` returns `Ok(None)`) be
+        // resolved by `DataFusion::normalize_table_reference` and then fail
+        // as "not found" at query time -- and could shadow a ready same-named
+        // table in another schema/catalog during that window.
+        // `get_table_sync` resolves the synthesized dataset in the default
+        // catalog synchronously and flips to `Some` at the same registration
+        // point `get_accelerated_table_provider` begins succeeding.
+        self.runtime
+            .df
+            .get_table_sync(&TableReference::bare(dataset_name))
+            .is_some()
     }
 }
 
