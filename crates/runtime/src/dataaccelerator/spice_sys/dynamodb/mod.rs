@@ -16,6 +16,8 @@ limitations under the License.
 
 use super::{AccelerationConnection, Error, Result, acceleration_connection};
 use crate::{component::dataset::Dataset, dataaccelerator::spice_sys::OpenOption};
+use async_trait::async_trait;
+use runtime_checkpoint_api::{CheckpointError, CheckpointRecord, CheckpointStore};
 use serde::{Deserialize, Serialize};
 
 const DYNAMODB_STREAMS_TABLE_NAME: &str = "spice_sys_dynamodb_streams";
@@ -51,9 +53,15 @@ impl DynamoDBSys {
                 .await?,
         })
     }
+}
 
-    pub async fn get(&self) -> Option<DynamoDBCheckpointMetadata> {
-        match &self.acceleration_connection {
+#[async_trait]
+impl CheckpointStore for DynamoDBSys {
+    async fn get(&self) -> Option<CheckpointRecord> {
+        // Annotate the type explicitly: with no accelerator backend feature
+        // compiled in, only the `_ => None` arm survives and the type can't be
+        // inferred from the arms alone.
+        let metadata: Option<DynamoDBCheckpointMetadata> = match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.get_duckdb(pool),
             #[cfg(feature = "postgres-accel")]
@@ -71,21 +79,40 @@ impl DynamoDBSys {
                 feature = "turso"
             )))]
             _ => None,
-        }
+        };
+        metadata.map(|m| CheckpointRecord {
+            data: m.checkpoint_data,
+            updated_at: m.updated_at,
+        })
     }
 
-    pub async fn upsert(&self, metadata: &DynamoDBCheckpointMetadata) -> Result<()> {
-        match &self.acceleration_connection {
+    async fn upsert(&self, data: &str) -> Result<(), CheckpointError> {
+        // Consumed only by the accelerator-backed arms below; with no backend
+        // feature compiled in, the `_ => Err` arm leaves it unused.
+        #[cfg_attr(
+            not(any(
+                feature = "duckdb",
+                feature = "sqlite",
+                feature = "postgres-accel",
+                feature = "turso"
+            )),
+            expect(unused_variables, reason = "no accelerator backend compiled in")
+        )]
+        let metadata = DynamoDBCheckpointMetadata {
+            checkpoint_data: data.to_string(),
+            updated_at: None,
+        };
+        let result = match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.upsert_duckdb(pool, metadata),
+            AccelerationConnection::DuckDB(pool) => self.upsert_duckdb(pool, &metadata),
             #[cfg(feature = "postgres-accel")]
-            AccelerationConnection::Postgres(pool) => self.upsert_postgres(pool, metadata).await,
+            AccelerationConnection::Postgres(pool) => self.upsert_postgres(pool, &metadata).await,
             #[cfg(feature = "sqlite")]
-            AccelerationConnection::SQLite(conn) => self.upsert_sqlite(conn, metadata).await,
+            AccelerationConnection::SQLite(conn) => self.upsert_sqlite(conn, &metadata).await,
             #[cfg(feature = "turso")]
-            AccelerationConnection::Turso(pool) => self.upsert_turso(pool, metadata).await,
+            AccelerationConnection::Turso(pool) => self.upsert_turso(pool, &metadata).await,
             #[cfg(all(not(windows), feature = "sqlite"))]
-            AccelerationConnection::Cayenne(conn) => self.upsert_sqlite(conn, metadata).await,
+            AccelerationConnection::Cayenne(conn) => self.upsert_sqlite(conn, &metadata).await,
             #[cfg(not(any(
                 feature = "sqlite",
                 feature = "duckdb",
@@ -93,6 +120,9 @@ impl DynamoDBSys {
                 feature = "turso"
             )))]
             _ => Err(Error::NoAccelerationConnection),
-        }
+        };
+        result.map_err(|e| CheckpointError::Store {
+            source: Box::new(e),
+        })
     }
 }

@@ -22,7 +22,7 @@ use crate::accelerated_table::sink::table::TableSink;
 use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::dataaccelerator::spice_sys::OpenOption;
-use crate::dataaccelerator::spice_sys::dynamodb::{DynamoDBCheckpointMetadata, DynamoDBSys};
+use crate::dataaccelerator::spice_sys::dynamodb::DynamoDBSys;
 use crate::dataconnector::schema_projection::{ProjectionPolicy, parse_schema_projection};
 use crate::federated_table::FederatedTable;
 use async_trait::async_trait;
@@ -39,6 +39,7 @@ use dynamodb_streams::{Checkpoint, Metrics, MetricsCollector};
 use futures::stream::{self, StreamExt};
 use opentelemetry::KeyValue;
 use runtime_api_types::v1::ComponentType;
+use runtime_checkpoint_api::CheckpointStore;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_parameters::ExposedParamLookup;
 use snafu::ResultExt;
@@ -482,7 +483,7 @@ async fn load_or_initialize_checkpoint(
 ) -> Option<(bool, Checkpoint, Option<SystemTime>)> {
     if let Some(ref dynamodb_sys) = **dynamodb_sys {
         if let Some(metadata) = dynamodb_sys.get().await {
-            match serde_json::from_str::<Checkpoint>(&metadata.checkpoint_data) {
+            match serde_json::from_str::<Checkpoint>(&metadata.data) {
                 Ok(checkpoint) => Some((false, checkpoint, metadata.updated_at)),
                 Err(err) => {
                     tracing::warn!(
@@ -1243,13 +1244,8 @@ impl CommitChange for DynamoDBStreamCommitter {
             }
         })?;
 
-        let metadata = DynamoDBCheckpointMetadata {
-            checkpoint_data: checkpoint_json,
-            updated_at: None, // Set by the database layer on upsert
-        };
-
         match self.dynamodb_sys.as_ref() {
-            Some(dynamodb_sys) => dynamodb_sys.upsert(&metadata).await.map_err(|e| {
+            Some(dynamodb_sys) => dynamodb_sys.upsert(&checkpoint_json).await.map_err(|e| {
                 CommitError::UnableToCommitChange {
                     source: Box::new(e),
                 }
