@@ -1048,12 +1048,15 @@ struct ScanView {
     /// corpus is hidden by EVERY shard's tombstones. Computed once here and reused
     /// for the inline pruning. At N==1 this is shard 0's tombstone clone (O(1)).
     union_tombstones: crate::provider::mem_tier::InMemTombstones,
-    /// The monotonic `scan_input_version` this bundle's capture reflects (a
-    /// conservative LOWER BOUND — read before the capture, so the bundle is
-    /// at-least-this-fresh). A scan runs on this bundle only when
-    /// `input_version >= scan_input_version` at scan start, giving linearizable
-    /// visibility. See [`CayenneTableProvider::scan_input_version`].
-    input_version: u64,
+    /// The forced-structural generation ([`super::structural_version::StructuralVersion`])
+    /// this bundle was built at (EVEN — a validated, non-torn capture). The scan gate
+    /// serves a bundle NON-BLOCKING for ordinary CDC churn — freshness is bounded by
+    /// the maintainer's refresh cadence (the floor), well within the freshness SLO —
+    /// and only WAITS when a forced structural event (truncate / full-delete /
+    /// `INSERT OVERWRITE` / schema-evolve / reopen) has advanced the generation past
+    /// the published bundle, so a post-event scan never runs on a pre-event structure.
+    /// See [`CayenneTableProvider::structural_version`].
+    structural_version: u64,
 }
 
 /// Abort-on-drop handle for a table's background scan-view maintainer.
@@ -1340,12 +1343,11 @@ pub struct CayenneTableProvider {
     /// memo-invalidation site in a later commit. Shared across clones.
     scan_input_change: Arc<tokio::sync::Notify>,
     /// Monotonic scan-input version, bumped by [`Self::notify_scan_input_change`] on
-    /// EVERY mutation (ordinary or forced). The published bundle carries the value it
-    /// was captured at ([`ScanView::input_version`]); a scan reads this at start and
-    /// runs only on a bundle stamped `>=` it — so a scan observes every write
-    /// committed before it began (LINEARIZABLE), the same guarantee the retired
-    /// per-scan inline capture gave. A single `Acquire` atomic load on the scan path
-    /// (no hashing). Shared across `clone_for_write` clones.
+    /// EVERY mutation (ordinary or forced). It drives the maintainer's wake + is a
+    /// cheap freshness signal; it is NOT the scan gate. Scans serve the latest
+    /// published bundle non-blocking (bounded-stale by the refresh floor) and gate only
+    /// on the forced-structural generation ([`Self::structural_version`]), so ordinary
+    /// churn never blocks a query. Shared across `clone_for_write` clones.
     scan_input_version: Arc<AtomicU64>,
     /// Wakes scans parked on the freshness gate. The builder calls `notify_waiters`
     /// after each publish; a scan waiting for a fresher bundle registers a
@@ -5404,9 +5406,9 @@ impl CayenneTableProvider {
         // refreshes this on every version change. Best-effort — a failure here leaves
         // the bundle empty (the maintainer fills it on its first tick) and must NOT
         // fail construction.
-        let seed_input_version = provider.scan_input_version.load(Ordering::Acquire);
+        let seed_structural = provider.structural_version.current();
         match provider.capture_raw_scan_input().await {
-            Ok(raw) => match provider.build_scan_view(raw, seed_input_version) {
+            Ok(raw) => match provider.build_scan_view(raw, seed_structural) {
                 Ok(view) => provider.scan_view.store(Some(Arc::new(view))),
                 Err(error) => tracing::warn!(
                     target: "cayenne::scan_view",
@@ -10008,10 +10010,11 @@ impl CayenneTableProvider {
     /// the retired memos, direct or indirect).
     fn notify_scan_input_change(&self) {
         // Advance the monotonic freshness version FIRST (Release), then wake the
-        // builder. A scan that starts after this mutation reads a version >= this
-        // one and waits for a bundle stamped at least that high (linearizable). The
-        // builder reads the version BEFORE its capture and stamps the bundle with it,
-        // so the stamp is a conservative lower bound on the bundle's freshness.
+        // builder so it re-captures and republishes the latest view. Scans do NOT gate
+        // on this version — they serve the latest published bundle non-blocking
+        // (bounded-stale by the refresh floor); the version only wakes/paces the
+        // maintainer. Forced structural events additionally advance
+        // `structural_version`, which IS the scan gate (see `scan_view_at_current_input`).
         self.scan_input_version.fetch_add(1, Ordering::Release);
         self.scan_input_change.notify_one();
     }
@@ -19365,12 +19368,14 @@ impl CayenneTableProvider {
     ///
     /// Pure, synchronous CPU (no `.await`); O(tier tombstones + segments). Runs in
     /// `spawn_blocking` on the scan-view maintainer so it never stalls a tokio worker
-    /// or the query cores. `input_version` is the monotonic freshness stamp the
-    /// caller captured BEFORE the capture (a conservative lower bound).
+    /// or the query cores. `structural_version` is the forced-structural generation the
+    /// capture was validated at (the builder passes its seqlock `v0`; inline/cold-start
+    /// callers pass the current generation, which is stable in those single-writer
+    /// contexts) — the scan gate compares it to decide whether to serve or wait.
     fn build_scan_view(
         &self,
         raw: RawScanInput,
-        input_version: u64,
+        structural_version: u64,
     ) -> datafusion_common::Result<ScanView> {
         // Clone the file-side snapshot for the merge (an `Arc` clone); `raw` keeps
         // its own copy so the view carries the file-side source for reference.
@@ -19386,16 +19391,43 @@ impl CayenneTableProvider {
             merged_deletions,
             visible_segments,
             union_tombstones,
-            input_version,
+            structural_version,
         })
     }
 
-    /// Default floor between scan-view maintainer rebuilds (250 ms), overridable via
+    /// Default floor between scan-view maintainer rebuilds (1000 ms), overridable via
     /// the `CAYENNE_SCAN_VIEW_REFRESH_FLOOR_MS` environment variable (`0` = rebuild as
     /// fast as the input changes). Env-var rather than a Spicepod param: it is a
     /// process-wide operational tuning knob, not per-table data configuration, so it
     /// stays out of `configuration_matches`.
-    const DEFAULT_SCAN_VIEW_REFRESH_FLOOR_MS: u64 = 250;
+    ///
+    /// Since scans are served NON-BLOCKING off the latest published bundle (they never
+    /// wait on the builder except across a forced structural event), this floor sets
+    /// the freshness/CPU trade: it bounds how stale a served bundle can be (~floor +
+    /// build time) AND caps the maintainer's rebuild rate so it does not starve the CDC
+    /// apply on a CPU-bound host. 1000 ms keeps staleness far inside the freshness SLO
+    /// (default 30 s) while cutting the rebuild CPU of the churniest tables severalfold.
+    const DEFAULT_SCAN_VIEW_REFRESH_FLOOR_MS: u64 = 1000;
+
+    /// Jitter a base floor by ±25% from a cheap seed, so the per-table maintainers do
+    /// not re-synchronize into a lockstep rebuild herd (which would spike CPU
+    /// contention against the apply). A `SplitMix64` finalizer on the seed → fraction
+    /// in `[0, 1)` → multiplier in `[0.75, 1.25)`. No randomness quality needed beyond
+    /// phase spread, so this is dependency-free and deterministic per (table, build).
+    fn jitter_floor(floor: Duration, seed: u64) -> Duration {
+        let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        // `z >> 11` (a 53-bit value) and `1 << 53` are both <= 2^53, so the f64 casts
+        // are exact — cast_precision_loss is a false positive here.
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "operands are <= 2^53, exactly representable in f64"
+        )]
+        let frac = (z >> 11) as f64 / (1u64 << 53) as f64;
+        floor.mul_f64(0.75 + 0.5 * frac)
+    }
 
     /// The configured refresh floor, read once per spawn from
     /// `CAYENNE_SCAN_VIEW_REFRESH_FLOOR_MS` (falling back to the default on an unset
@@ -19467,6 +19499,20 @@ impl CayenneTableProvider {
             .upgrade()
             .and_then(|p| p.scan_view.load_full().map(|v| v.raw.clone()));
 
+        // Stable per-table phase seed for the rebuild-floor JITTER: a cheap FNV-1a over
+        // the table name (no rand dependency). Combined with each build's duration nanos
+        // below, it decorrelates the per-table maintainers so they don't rebuild in
+        // lockstep — a thundering herd on the shared encode/compaction pools + query
+        // cores that would spike CPU contention against the CDC apply.
+        let jitter_seed: u64 = weak.upgrade().map_or(0, |p| {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for b in p.table_metadata.table_name.as_bytes() {
+                h ^= u64::from(*b);
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            h
+        });
+
         loop {
             if shutdown.is_cancelled() {
                 return;
@@ -19479,10 +19525,6 @@ impl CayenneTableProvider {
             // whole (capture + build) period to `floor`, not `floor` ON TOP of it.
             let compute_start = Instant::now();
 
-            // Freshness stamp: read the monotonic input version BEFORE the capture,
-            // so the bundle's stamp is a conservative lower bound on its freshness.
-            let input_version = provider.scan_input_version.load(Ordering::Acquire);
-
             // Capture the scan input INSIDE the forced-event seqlock: the closure runs
             // between the version reads, so a capture that straddled a forced
             // structural event (truncate / full-delete / overwrite / schema-evolve /
@@ -19490,12 +19532,12 @@ impl CayenneTableProvider {
             // state — is DISCARDED (`None`) rather than published as a torn bundle. The
             // closure encapsulates the pairing (the maintainer cannot forget the
             // re-check); the loom model of `read_validated` covers the load ordering.
-            let raw = match provider
+            let (structural_version, raw) = match provider
                 .structural_version
                 .read_validated_async(|| provider.capture_raw_scan_input())
                 .await
             {
-                Some((_v0, Ok(raw))) => raw,
+                Some((v0, Ok(raw))) => (v0, raw),
                 Some((_v0, Err(error))) => {
                     tracing::warn!(
                         target: "cayenne::scan_view",
@@ -19533,7 +19575,7 @@ impl CayenneTableProvider {
                 let build_provider = Arc::clone(&provider);
                 let raw_for_prev = raw.clone();
                 match task::spawn_blocking(move || {
-                    build_provider.build_scan_view(raw, input_version)
+                    build_provider.build_scan_view(raw, structural_version)
                 })
                 .await
                 {
@@ -19568,13 +19610,17 @@ impl CayenneTableProvider {
                     )],
                 );
                 drop(provider);
-                // Throttle to at most one build per `floor` window: sleep only the
-                // REMAINDER of the floor after subtracting the compute time, so the
-                // effective rebuild period is `max(floor, compute)` — bounding
-                // staleness to ~`floor` rather than `compute + floor`. Skip the math
-                // entirely when the floor is zero (rebuild as fast as input changes).
+                // Throttle to at most one build per (jittered) `floor` window: sleep
+                // only the REMAINDER of the floor after subtracting the compute time, so
+                // the effective rebuild period is `max(floor, compute)` — bounding
+                // staleness to ~`floor` rather than `compute + floor`. The floor is
+                // jittered ±25% (seeded per-table + per-build) so the maintainers do not
+                // re-synchronize into a lockstep rebuild herd. Skip the math entirely
+                // when the floor is zero (rebuild as fast as input changes).
                 if !floor.is_zero() {
-                    let remaining = floor.saturating_sub(compute_elapsed);
+                    let jittered =
+                        Self::jitter_floor(floor, jitter_seed ^ u64::from(compute_elapsed.subsec_nanos()));
+                    let remaining = jittered.saturating_sub(compute_elapsed);
                     if !remaining.is_zero() {
                         tokio::select! {
                             () = shutdown.cancelled() => return,
@@ -19597,57 +19643,57 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Borrow the published scan-view bundle for a scan, at a freshness at least the
-    /// current [`Self::scan_input_version`] (LINEARIZABLE: the scan observes every
-    /// write committed before it began). Reads the required version once, then
-    /// returns the published bundle if it is fresh enough; otherwise it waits for the
-    /// maintainer's next publish and re-checks. Registering the `notified()` BEFORE
-    /// re-checking means a publish that races the park is not missed.
+    /// Borrow the published scan-view bundle for a scan. NON-BLOCKING for ordinary CDC
+    /// churn: the scan takes the latest published bundle and never waits on the
+    /// maintainer to catch up to the newest mutation. Freshness is BOUNDED-STALE by the
+    /// maintainer's refresh cadence (the floor) — well inside the freshness SLO — which
+    /// matches the async-accelerator contract and, critically, keeps analytical scans
+    /// off the maintainer's critical path (blocking here starves query throughput and,
+    /// on a CPU-bound host, the apply too).
     ///
-    /// Under no in-flight mutation the published bundle already satisfies the
-    /// required version, so this returns immediately (no wait on the fast path). Only
-    /// a scan that started after a not-yet-built mutation waits — bounded by ~one
-    /// build.
+    /// It WAITS in exactly one case: a forced STRUCTURAL event (truncate / full-delete
+    /// / `INSERT OVERWRITE` / schema-evolve / reopen) has advanced the structural
+    /// generation past the published bundle. Then the scan must see a view of the NEW
+    /// structure, so it waits for the maintainer's post-event publish (bounded by ~one
+    /// build; these events are rare). Ordinary appends/deletes/upserts do NOT advance
+    /// the structural generation, so they never make a scan wait. Registering the
+    /// `notified()` BEFORE the re-check means a publish that races the park is not
+    /// missed.
     ///
-    /// There is no inline fallback under builder LAG (D6): while a maintainer is
-    /// registered, a stale-bundle scan WAITS for its next publish. The ONE inline
-    /// build is under builder ABSENCE — a provider whose maintainer has not been
-    /// spawned (a unit-test provider, or the brief window before the runtime spawns
-    /// it): it builds one bundle inline so the provider is always self-sufficient and
-    /// linearizable. In production the maintainer is spawned at provider creation, so
-    /// this never runs in steady state (hence no thundering-herd fallback); builder
-    /// DEATH after spawn is a loud circuit-break, not a silent inline fallback (a
-    /// later commit).
+    /// The ONE inline build is under builder ABSENCE — a provider whose maintainer has
+    /// not been spawned (a unit-test provider, or the brief window before the runtime
+    /// spawns it): it builds one bundle inline so the provider is always self-sufficient.
+    /// In production the maintainer is spawned at provider creation. Builder DEATH after
+    /// spawn is a loud circuit-break, not a silent inline fallback (a later commit).
     async fn scan_view_at_current_input(&self) -> datafusion_common::Result<Arc<ScanView>> {
         // Builder ABSENCE — a unit-test provider, or the brief window before the
         // runtime spawns the maintainer: always build fresh inline. The published
         // bundle is only kept current by a RUNNING maintainer, so without one we must
-        // not trust it; capturing fresh keeps such a provider correct + linearizable
-        // regardless of which write paths advance the freshness version.
+        // not trust it; capturing fresh keeps such a provider correct regardless of
+        // which write paths advance state.
         if self.scan_view_builder.get().is_none() {
-            let input_version = self.scan_input_version.load(Ordering::Acquire);
+            let structural = self.structural_version.current();
             let raw = self.capture_raw_scan_input().await?;
-            let view = Arc::new(self.build_scan_view(raw, input_version)?);
+            let view = Arc::new(self.build_scan_view(raw, structural)?);
             self.scan_view.store(Some(Arc::clone(&view)));
             return Ok(view);
         }
-        // Builder REGISTERED: serve the published bundle at a freshness >= this scan's
-        // start. The loop's first iteration is the fast path — a fresh-enough bundle
-        // returns immediately (no wait); only a scan that started after a not-yet-built
-        // mutation waits for the next publish (D6 — no inline fallback under lag).
-        // Registering the `notified()` BEFORE the re-check means a publish that races
-        // the park is not missed.
-        let required = self.scan_input_version.load(Ordering::Acquire);
+        // Builder REGISTERED: serve the latest published bundle immediately UNLESS a
+        // forced structural event has advanced the generation past it (then wait for the
+        // post-event publish so the scan sees the new structure). `current()` may be ODD
+        // (a forced mutation in flight); the builder only publishes EVEN generations, so
+        // a bundle stamped `>= required` is always a stable, post-(or pre-)event view.
+        let required = self.structural_version.current();
         let wait_start = Instant::now();
         let mut waited = false;
         loop {
             let published = self.scan_view_published.notified();
             if let Some(view) = self.scan_view.load_full()
-                && view.input_version >= required
+                && view.structural_version >= required
             {
                 if waited {
-                    // Metric: this scan sat idle on the gate (maintainer lagging query
-                    // demand) rather than recomputing on a query core. ~0 in steady state.
+                    // Metric: this scan waited for a post-structural-event publish (rare)
+                    // rather than serving a pre-event view. ~0 for ordinary churn.
                     telemetry::cayenne::track_scan_view_wait(
                         wait_start.elapsed(),
                         &[telemetry::KeyValue::new(
@@ -25196,10 +25242,11 @@ impl TableProvider for CayenneTableProvider {
         // or once every file has been verified this process.
         self.verify_data_file_integrity().await?;
 
-        // Borrow the published scan-view bundle at a freshness >= this scan's start
-        // (linearizable — see [`Self::scan_view_at_current_input`]). The scan-view
-        // maintainer computed the KDI merge + visible mem-tier segments OFF the query
-        // path, so the scan no longer recomputes them per-scan (the retired memos'
+        // Borrow the latest published scan-view bundle NON-BLOCKING (bounded-stale by
+        // the refresh floor; blocks only across a forced structural event — see
+        // [`Self::scan_view_at_current_input`]). The scan-view maintainer computed the
+        // KDI merge + visible mem-tier segments OFF the query path, so the scan no
+        // longer recomputes them per-scan (the retired memos'
         // job). Everything below descends from that ONE capture, so it is internally
         // consistent (the merged deletions hide the old copies of the exact rows this
         // scan sees), and the bundle's `scan_guard` pins the captured snapshot dirs
@@ -38967,6 +39014,23 @@ mod tests {
         pairs
     }
 
+    /// Wait (bounded, 10s) for the PUBLISHED scan-view bundle's visible segments to
+    /// reach an expected set of `(id, value)` pairs. Polls the published bundle (not a
+    /// query) — the direct signal that the maintainer has caught up to a write under
+    /// the non-blocking, bounded-stale gate. Shared by the maintainer tests.
+    async fn wait_for_pairs(provider: &Arc<CayenneTableProvider>, expected: &[(i64, i64)]) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if let Some(view) = provider.scan_view.load_full()
+                && collect_segment_pairs(&view.visible_segments) == expected
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
     /// The background scan-view maintainer must publish a bundle whose computed KDI
     /// merge + visible segments MATCH what the inline scan path computes for the same
     /// state — the parity that lets the switch commit serve scans from the bundle
@@ -39003,9 +39067,9 @@ mod tests {
 
         // Inline reference: exactly what the maintainer computes for this state.
         let reference = {
-            let input_version = provider.scan_input_version.load(Ordering::Acquire);
+            let structural = provider.structural_version.current();
             let raw = provider.capture_raw_scan_input().await.expect("capture");
-            provider.build_scan_view(raw, input_version).expect("build")
+            provider.build_scan_view(raw, structural).expect("build")
         };
         let expected = collect_segment_pairs(&reference.visible_segments);
         assert_eq!(
@@ -39048,24 +39112,6 @@ mod tests {
     /// stream, not just the first build.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scan_view_builder_wakes_on_wired_mutation_notify() {
-        // Wait (bounded) for the published bundle's visible segments to reach an
-        // expected set of (id, value) pairs, driven ONLY by the wired notify.
-        async fn wait_for_pairs(
-            provider: &Arc<CayenneTableProvider>,
-            expected: &[(i64, i64)],
-        ) -> bool {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while Instant::now() < deadline {
-                if let Some(view) = provider.scan_view.load_full()
-                    && collect_segment_pairs(&view.visible_segments) == expected
-                {
-                    return true;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            false
-        }
-
         let ctx = SessionContext::new();
         let runtime_env = ctx.runtime_env();
         let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
@@ -39113,15 +39159,16 @@ mod tests {
         );
     }
 
-    /// With a RUNNING maintainer, `scan()` takes the builder-registered freshness
-    /// gate (the production path — the no-builder unit-test providers build inline
-    /// instead). It must be LINEARIZABLE: a query sees every write committed before
-    /// it began, waiting ~one build for the maintainer to publish rather than
-    /// serving a stale bundle. This is the switch's core correctness guarantee — the
-    /// scan-view maintainer is a performance optimization, never a visibility
-    /// regression versus the retired per-scan inline capture.
+    /// With a RUNNING maintainer, `scan()` takes the builder-registered gate (the
+    /// production path — the no-builder unit-test providers build inline instead). For
+    /// ordinary CDC churn the gate is NON-BLOCKING and BOUNDED-STALE: a scan serves the
+    /// latest published bundle and never blocks the query on the maintainer, so a write
+    /// becomes visible once the maintainer publishes (within the refresh floor) — not
+    /// necessarily on the first scan after the write. This asserts eventual visibility
+    /// (poll), which is the contract for ordinary writes; forced structural events use
+    /// the blocking path instead (see the gate doc + the seqlock loom model).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn scan_is_linearizable_with_a_running_maintainer() {
+    async fn scan_reflects_writes_within_bounded_staleness_with_a_running_maintainer() {
         let ctx = SessionContext::new();
         let runtime_env = ctx.runtime_env();
         let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
@@ -39148,12 +39195,12 @@ mod tests {
             .await
             .expect("first RAM append");
         assert!(write1.in_memory_epoch().is_some(), "first append engaged RAM");
-        // With the maintainer running, the query-path scan must wait for the bundle
-        // that reflects this write — never serve the stale cold-start seed.
-        assert_eq!(
-            collect_id_value_pairs(&ctx, &provider, "linearizable_maintainer").await,
-            vec![(1, 10), (2, 20)],
-            "scan must reflect the first write (linearizable via the freshness gate)"
+        // Ordinary churn is bounded-stale: the scan serves the latest published bundle
+        // (non-blocking), so this write becomes visible once the maintainer publishes —
+        // poll for it rather than asserting immediate visibility.
+        assert!(
+            wait_for_pairs(&provider, &[(1, 10), (2, 20)]).await,
+            "scan must reflect the first write once the maintainer publishes (bounded-stale)"
         );
 
         let write2 = provider
@@ -39164,10 +39211,9 @@ mod tests {
             .await
             .expect("second RAM append");
         assert!(write2.in_memory_epoch().is_some(), "second append engaged RAM");
-        assert_eq!(
-            collect_id_value_pairs(&ctx, &provider, "linearizable_maintainer").await,
-            vec![(1, 10), (2, 20), (3, 30)],
-            "scan must reflect the second write too (the gate waits for the rebuild)"
+        assert!(
+            wait_for_pairs(&provider, &[(1, 10), (2, 20), (3, 30)]).await,
+            "scan must reflect the second write too once the maintainer publishes (bounded-stale)"
         );
     }
 
