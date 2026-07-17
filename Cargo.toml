@@ -334,6 +334,7 @@ rmcp = { version = "1.5.0", default-features = false }
 rayon = "1.11.0"
 roaring = "0.11"
 rusqlite = { version = "0.40", features = ["bundled-decimal", "chrono"] }
+rust_decimal = "1.42"
 rustls = "0.23"
 schemars = "1.2.1"
 scylla = "1.4.1"
