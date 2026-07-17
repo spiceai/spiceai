@@ -335,35 +335,42 @@ pub async fn verify_analytical_results(
                     }
                 }
                 Ok(QueryValidationResult::Fail(reason)) => {
-                    // Print the surrounding rows from both sides so a
-                    // divergence can be inspected in context rather than as a
-                    // lone cell. A `DataMismatch` carries the exact 1-based row
-                    // and column of the first disagreement; a `RowCountMismatch`
-                    // has no single cell, so center the window on the boundary
-                    // where the shorter (lex-sorted) side ends — the first row
-                    // index present on only one side. Other reasons (schema, no
-                    // answer) have no meaningful row to center on.
-                    if let (Some(e0), Some(a0)) = (expected_sorted.first(), actual_sorted.first()) {
+                    // Print the surrounding rows from both sides so a divergence
+                    // can be inspected in context rather than as a lone cell. A
+                    // `DataMismatch` carries the exact 1-based row and column of
+                    // the first disagreement; a count-type divergence (differing
+                    // row counts, or one engine returning no rows at all) has no
+                    // single cell, so center the window on the boundary where the
+                    // shorter (lex-sorted) side ends. `context_pair` synthesizes
+                    // an empty batch from the present side's schema when one side
+                    // has no batches, so a "source has rows, Spice has none" (or
+                    // vice-versa) divergence still shows the rows that *are*
+                    // there. `SchemaMismatch` has no comparable rows to show.
+                    if let Some((e0, a0)) = context_pair(&expected_sorted, &actual_sorted) {
                         match &reason {
                             QueryValidationFailReason::DataMismatch {
                                 row_number, column, ..
                             } => print_mismatch_context(
                                 query.name.as_ref(),
-                                e0,
-                                a0,
+                                &e0,
+                                &a0,
                                 row_number.saturating_sub(1),
                                 Some(column),
                             ),
-                            QueryValidationFailReason::RowCountMismatch { .. } => {
+                            QueryValidationFailReason::RowCountMismatch { .. }
+                            | QueryValidationFailReason::NoAnswer
+                            | QueryValidationFailReason::NoExpectedAnswer
+                            | QueryValidationFailReason::NoExpectedAnswerAtScaleFactor => {
                                 print_mismatch_context(
                                     query.name.as_ref(),
-                                    e0,
-                                    a0,
+                                    &e0,
+                                    &a0,
                                     e0.num_rows().min(a0.num_rows()),
                                     None,
                                 );
                             }
-                            _ => {}
+                            QueryValidationFailReason::SchemaMismatch
+                            | QueryValidationFailReason::ColumnLengthMismatch { .. } => {}
                         }
                     }
                     (
@@ -478,6 +485,25 @@ fn sort_all_columns(batches: &[RecordBatch]) -> anyhow::Result<Vec<RecordBatch>>
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(vec![RecordBatch::try_new(schema, new_columns)?])
+}
+
+/// The `(expected, actual)` first-batch pair to print context from, tolerating
+/// a side that produced no batches at all (an engine returned zero rows —
+/// `query_arrow` collects to an empty `Vec`). The empty side is synthesized as
+/// a zero-row batch cloned from the present side's schema, so a "one side has
+/// rows, the other has none" divergence still shows the rows that *are* there
+/// (the empty side renders as `<no rows in window>`). `None` only when both
+/// sides are empty, which the caller already treats as a pass.
+fn context_pair(
+    expected: &[RecordBatch],
+    actual: &[RecordBatch],
+) -> Option<(RecordBatch, RecordBatch)> {
+    match (expected.first(), actual.first()) {
+        (Some(e), Some(a)) => Some((e.clone(), a.clone())),
+        (Some(e), None) => Some((e.clone(), RecordBatch::new_empty(e.schema()))),
+        (None, Some(a)) => Some((RecordBatch::new_empty(a.schema()), a.clone())),
+        (None, None) => None,
+    }
 }
 
 /// Print up to [`MISMATCH_CONTEXT_ROWS`] rows on either side of `mismatch_row`
@@ -693,5 +719,32 @@ mod tests {
         print_windowed_table(&full, 0, 4);
         print_windowed_table(&short, 0, 4); // hi clamped to row 1
         print_windowed_table(&short, 3, 4); // lo past end → no rows
+    }
+
+    #[test]
+    fn context_pair_synthesizes_empty_side_when_one_engine_returns_no_rows() {
+        let full = ctx_batch(); // 5 rows
+        let full_vec = vec![full.clone()];
+        let empty_vec: Vec<RecordBatch> = vec![];
+
+        // Both present: batches pass through unchanged.
+        let (e, a) = context_pair(&full_vec, &full_vec).expect("both present");
+        assert_eq!((e.num_rows(), a.num_rows()), (5, 5));
+
+        // Actual empty: synthesized 0-row batch on the actual side, expected kept.
+        let (e, a) = context_pair(&full_vec, &empty_vec).expect("expected present");
+        assert_eq!((e.num_rows(), a.num_rows()), (5, 0));
+        assert_eq!(a.schema(), full.schema());
+
+        // Expected empty: mirror of the above.
+        let (e, a) = context_pair(&empty_vec, &full_vec).expect("actual present");
+        assert_eq!((e.num_rows(), a.num_rows()), (0, 5));
+
+        // Neither present: nothing to show.
+        assert!(context_pair(&empty_vec, &empty_vec).is_none());
+
+        // The synthesized pair drives print_mismatch_context without panicking.
+        let (e, a) = context_pair(&full_vec, &empty_vec).expect("expected present");
+        print_mismatch_context("chbench_q10", &e, &a, e.num_rows().min(a.num_rows()), None);
     }
 }
