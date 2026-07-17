@@ -34638,6 +34638,16 @@ mod tests {
             "precondition: re-insert hides the old copy, only value 999 visible"
         );
 
+        // Quiesce the detached post-write maintenance the inserts above scheduled
+        // (the manifest rebuild grabs `compaction_lock` — see the post-write path)
+        // BEFORE we pin manifests, so it cannot (a) hold the lock out from under the
+        // bake's best-effort `try_lock` nor (b) run a listing rebuild that overwrites
+        // the pins we set below. Drain must precede pinning — never inside the retry.
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain in-flight maintenance before pinning manifests");
+
         // Populate manifests, then PIN them: older prefix (oldest 3) at `T = D`,
         // kept snapshots (newest 3, incl. the SURVIVOR) strictly above `D`, so the
         // SURVIVOR is referenced in place and the OLD-100 snapshot is baked.
@@ -34683,11 +34693,26 @@ mod tests {
             }
         }
 
-        let baked = provider
-            .bake_seq_prefix_protected_snapshots()
-            .await
-            .expect("bake should not error");
-        assert!(baked, "older prefix must bake");
+        // Best-effort bake, driven the way the production maintenance tick drives
+        // it: `bake_seq_prefix_protected_snapshots` `try_lock`s `compaction_lock` and
+        // returns `Ok(false)` when it loses (a straggler pass still releasing after
+        // the drain), which the tick simply retries next time. Mirror that with a
+        // bounded retry — yielding (not sleeping) so any lock holder makes progress —
+        // rather than asserting a single call wins the race. We do NOT re-drain in
+        // the loop: a second drain would run a listing rebuild that clobbers the pins.
+        let mut baked = false;
+        for _ in 0..5 {
+            if provider
+                .bake_seq_prefix_protected_snapshots()
+                .await
+                .expect("bake should not error")
+            {
+                baked = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(baked, "older prefix must bake within the bounded retry");
 
         // The <= T (= D) delete of key 100 is pruned from the index.
         let tombstones = int64_tombstones(&provider);
