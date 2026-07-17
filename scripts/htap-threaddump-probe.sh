@@ -22,6 +22,13 @@ if ! have eu-stack && ! have gdb; then
   (sudo apt-get update -qq && sudo apt-get install -y -qq elfutils gdb) >/dev/null 2>&1 || true
 fi
 
+# eu-stack/gdb attach via ptrace, which yama blocks by default on the runners
+# ("Operation not permitted"). Relax the scope and prefer running the unwinder
+# as root — both best-effort; the /proc wchan fallback still works without ptrace.
+sudo -n sysctl -w kernel.yama.ptrace_scope=0 >/dev/null 2>&1 || true
+SUDO=""
+if sudo -n true >/dev/null 2>&1; then SUDO="sudo -n"; fi
+
 sleep "$START_AFTER"
 
 while true; do
@@ -32,12 +39,15 @@ while true; do
     {
       echo "=== spiced pid=${pid} ${ts} ==="
       if have eu-stack; then
-        echo "--- eu-stack -p ${pid} ---"
-        eu-stack -p "$pid" 2>&1 || echo "(eu-stack failed)"
-      elif have gdb; then
-        echo "--- gdb thread apply all bt ---"
-        gdb -p "$pid" -batch -ex "set pagination off" -ex "thread apply all bt" 2>&1 || echo "(gdb failed)"
-      else
+        echo "--- ${SUDO} eu-stack -p ${pid} ---"
+        $SUDO eu-stack -p "$pid" 2>&1 || echo "(eu-stack failed)"
+      fi
+      if have gdb; then
+        echo "--- ${SUDO} gdb thread apply all bt ---"
+        $SUDO gdb -p "$pid" -batch -ex "set pagination off" -ex "thread apply all bt" 2>&1 \
+          | grep -vE "^\[New LWP|^\[Thread|Reading symbols|no debugging symbols" || echo "(gdb failed)"
+      fi
+      if ! have eu-stack && ! have gdb; then
         echo "(no eu-stack/gdb available)"
       fi
       echo "--- /proc/${pid}/task comm + wchan (blocked-on symbol; no ptrace needed) ---"
