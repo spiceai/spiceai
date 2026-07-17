@@ -101,10 +101,11 @@ fn table_is_selected(
 /// SQL identifier word, regardless of what characters `s` itself contains.
 fn hex_encode(s: &str) -> String {
     use std::fmt::Write;
-    s.bytes().fold(String::with_capacity(s.len() * 2), |mut out, b| {
-        let _ = write!(out, "{b:02x}");
-        out
-    })
+    s.bytes()
+        .fold(String::with_capacity(s.len() * 2), |mut out, b| {
+            let _ = write!(out, "{b:02x}");
+            out
+        })
 }
 
 /// A sanitized, collision-safe internal name for the per-table dataset

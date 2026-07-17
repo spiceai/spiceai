@@ -264,8 +264,7 @@ impl TryFrom<spicepod_catalog::Catalog> for CatalogBuilder {
         // provider (see `catalogconnector::postgres_accelerated`) -- every
         // other provider's connector ignores `catalog.acceleration`
         // entirely, which would otherwise silently no-op a user's config.
-        if catalog.acceleration.is_some() && provider != crate::catalogconnector::postgres::PREFIX
-        {
+        if catalog.acceleration.is_some() && provider != crate::catalogconnector::postgres::PREFIX {
             return Err(crate::Error::ComponentError {
                 source: super::Error::CatalogAccelerationUnsupportedProvider {
                     name: catalog.name.clone(),

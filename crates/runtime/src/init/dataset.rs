@@ -593,8 +593,10 @@ impl Runtime {
                     ds.name
                 );
                 tracing::error!("{message}");
-                self.status
-                    .update_dataset(&ds.name, status::ComponentStatus::error_with_message(message));
+                self.status.update_dataset(
+                    &ds.name,
+                    status::ComponentStatus::error_with_message(message),
+                );
                 return;
             }
         };

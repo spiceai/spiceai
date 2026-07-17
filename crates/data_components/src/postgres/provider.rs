@@ -55,7 +55,9 @@ pub enum Error {
     /// (`list_schemas`/`list_tables`, re-exported below) so this crate's own
     /// callers can still propagate them with `?`.
     #[snafu(display("{source}"), context(false))]
-    Common { source: connector_postgres_common::Error },
+    Common {
+        source: connector_postgres_common::Error,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -759,14 +761,24 @@ mod tests {
     fn test_is_table_selected_with_glob_filter() {
         let include = make_globset(&["public.orders"]);
         assert!(is_table_selected("public", "orders", Some(&include), None));
-        assert!(!is_table_selected("public", "lineitem", Some(&include), None));
+        assert!(!is_table_selected(
+            "public",
+            "lineitem",
+            Some(&include),
+            None
+        ));
     }
 
     #[test]
     fn test_is_table_selected_with_exclude_filter() {
         let exclude = make_globset(&["public.secrets"]);
         assert!(is_table_selected("public", "orders", None, Some(&exclude)));
-        assert!(!is_table_selected("public", "secrets", None, Some(&exclude)));
+        assert!(!is_table_selected(
+            "public",
+            "secrets",
+            None,
+            Some(&exclude)
+        ));
     }
 
     #[tokio::test]
