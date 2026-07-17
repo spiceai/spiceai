@@ -21,19 +21,21 @@ tracked separately (a working plan, not part of these rules).
 
 ```
   ┌──────────────────────────────────────────────────────────────────────┐
-  │  binary        bin/spiced, bin/spice, tools/*                          │  stitch everything
+  │  binary            bin/spiced, bin/spice, tools/*                      │  stitch everything
   ├──────────────────────────────────────────────────────────────────────┤
-  │  extension     connector-* (~30), spice-cloud, tpc-extension           │  plug-ins that
+  │  extension         connector-* (~30), spice-cloud, tpc-extension       │  plug-ins that
   │                                                                        │  register with the runtime
   ├──────────────────────────────────────────────────────────────────────┤
-  │  runtime       runtime                                                 │  orchestration daemon
+  │  extension-utility (target slot; empty today)                          │  connector-only building
+  │                                                                        │  blocks — runtime can't use
   ├──────────────────────────────────────────────────────────────────────┤
-  │  domain        data_components, cayenne, llms, search, app, cache,     │  composable libraries
-  │                runtime-datafusion, runtime-search, runtime-cluster,    │  the runtime is built from
-  │                runtime-acceleration, runtime-auth, workers…            │
+  │  runtime           runtime                                             │  orchestration daemon
   ├──────────────────────────────────────────────────────────────────────┤
-  │  foundation    util, arrow_tools, arrow_sql_gen, spicepod, telemetry,  │  near-dependency-free
-  │                db_connection_pool, token_provider, flight_client …     │  utilities + primitives
+  │  shared-utility    data_components, cayenne, llms, search, app, cache, │  always-shipped libraries
+  │                    runtime-datafusion, runtime-cluster, workers…       │  runtime is built from
+  ├──────────────────────────────────────────────────────────────────────┤
+  │  foundation        util, arrow_tools, arrow_sql_gen, spicepod,         │  near-dependency-free
+  │                    db_connection_pool, token_provider, flight_client … │  utilities + primitives
   └──────────────────────────────────────────────────────────────────────┘
          ▲ every arrow points DOWN — no crate depends on a higher tier ▲
 ```
@@ -41,15 +43,21 @@ tracked separately (a working plan, not part of these rules).
 | Tier | Purpose | May depend on |
 |------|---------|---------------|
 | **foundation** | Leaf utilities, wire formats, config parsing, primitives. Ideally reusable outside Spice. Little or no internal dependency. | foundation |
-| **domain** | The **always-shipped** shared libraries the runtime is built on — the accelerator (`cayenne`), inference (`llms`), search, the `runtime-*` support crates. *Optional* or connector-specific building blocks do **not** belong here (see [Shared building blocks vs. extension-only code](#shared-building-blocks-vs-extension-only-code)); `data_components` sits here today only because it is still an undivided monolith. | foundation, domain |
-| **runtime** | The `runtime` crate: orchestration, component lifecycle, HTTP/Flight servers, and (today) the connector/accelerator/catalog trait definitions + registries. | foundation, domain |
-| **extension** | **Everything optional** — plug-ins that *register with* the runtime: the ~30 `connector-*` crates, `spice-cloud`, `tpc-extension`, **plus the connector-specific building blocks only they use.** Thin wiring over a `domain` impl today; the target folds each source's utilities in alongside it. | foundation, domain, runtime |
+| **shared-utility** | The **always-shipped** shared libraries the runtime is built on — the accelerator (`cayenne`), inference (`llms`), search, the `runtime-*` support crates. Sits *below* `runtime`, so `runtime` may build on it. *Optional* / connector-specific building blocks do **not** belong here (see [Shared building blocks vs. extension-only code](#shared-building-blocks-vs-extension-only-code)); `data_components` sits here today only because it is still an undivided monolith. | foundation, shared-utility |
+| **runtime** | The `runtime` crate: orchestration, component lifecycle, HTTP/Flight servers, and (today) the connector/accelerator/catalog trait definitions + registries. May **not** depend on `extension-utility`. | foundation, shared-utility |
+| **extension-utility** | Connector-specific building blocks that only *extensions* depend on — never `runtime`. Sits *above* `runtime` so an accidental `runtime → connector-utility` edge is caught as upward. **Empty today** (a target slot): every such crate — `pgwire-replication`, the `elasticsearch`/`dynamodb-streams`/`smb`/`libnfs` clients, `s3_vectors` — is still pulled in by the `data_components` monolith or `runtime` itself, so it can't move up yet. Populates as the monolith dissolves. | foundation, shared-utility |
+| **extension** | **Everything optional** — plug-ins that *register with* the runtime: the ~30 `connector-*` crates, `spice-cloud`, `tpc-extension`, **plus the connector-specific building blocks only they use** (`extension-utility`). Thin wiring over a `shared-utility` impl today; the target folds each source's utilities in alongside it. | foundation, shared-utility, runtime, extension-utility |
 | **binary** | The `spiced`/`spice` binaries and `tools/*` — link the whole graph. | anything |
 
-The **target** adds two lower tiers — `interface` (the `*-api` trait crates) and
-`data` (the `data-<source>` crates, below `runtime`) — as the migration proceeds;
-see [Target layering](#target-layering-and-how-we-get-there). `layers.toml`'s
-`order` grows to match.
+The two utility tiers encode a single rule: **`runtime-*` may depend only on
+`shared-utility`, while extensions may depend on both.** `shared-utility` is what
+we always ship and the runtime builds on; `extension-utility` is connector-only
+code the runtime must never pull in.
+
+The **target** also adds two lower tiers — `interface` (the `*-api` trait crates)
+and `data` (the `data-<source>` crates, below `runtime`) — as the migration
+proceeds; see [Target layering](#target-layering-and-how-we-get-there).
+`layers.toml`'s `order` grows to match.
 
 The authoritative, machine-readable assignment is [`layers.toml`](../../layers.toml);
 `scripts/check_crate_layers.py` validates the whole workspace against it (see
@@ -57,36 +65,44 @@ The authoritative, machine-readable assignment is [`layers.toml`](../../layers.t
 
 ### Shared building blocks vs. extension-only code
 
-The dividing line for the shared lower tiers (`foundation`, `domain`) is **"does
-the always-shipped runtime actually build on this?"** — not "is it a library?".
-Two kinds of building block look similar but belong in different places:
+This is exactly what the **`shared-utility`** and **`extension-utility`** tiers
+encode. The dividing line is **"does the always-shipped runtime actually build on
+this?"** — not "is it a library?". Two kinds of building block look similar but
+belong in different tiers:
 
-- **Shared utility** — used by `runtime` itself and/or many crates: `util`,
+- **`shared-utility`** — used by `runtime` itself and/or many crates: `util`,
   `arrow_tools`, `db_connection_pool`, `spicepod`, the `datafusion-*` extensions,
-  `cayenne`. These are pieces we *always* ship; they stay in `foundation`/`domain`,
-  below `runtime`.
-- **Connector / data-plane utility** — a building block only one (or a few)
-  *extensions* ever use, never `runtime` itself: e.g. `pgwire-replication` (the
-  PostgreSQL logical-replication wire protocol), the `elasticsearch` /
-  `dynamodb-streams` / `smb` / `libnfs` clients, `s3_vectors`, and the per-source
-  halves of `data_components`. "Optional" ⇒ it belongs on the **extension** side,
-  not in a shared tier that inflates the always-shipped graph (and the `runtime`
-  build) with code only a plug-in touches.
+  `cayenne`. These are pieces we *always* ship; they sit below `runtime` so it can
+  build on them. (`foundation` is the same idea, one level lower: near-leaf.)
+- **`extension-utility`** — a building block only one (or a few) *extensions* ever
+  use, never `runtime` itself: e.g. `pgwire-replication` (the PostgreSQL
+  logical-replication wire protocol), the `elasticsearch` / `dynamodb-streams` /
+  `smb` / `libnfs` clients, `s3_vectors`, and the per-source halves of
+  `data_components`. "Optional" ⇒ it sits *above* `runtime` (which therefore
+  cannot depend on it) and *below* `extension`, rather than inflating the
+  always-shipped graph with code only a plug-in touches.
 
 > **Litmus:** if the only crates that depend on X are connectors/extensions, X is
-> extension-tier code — even when it looks like a generic utility. Keep it in, or
-> fold it into, the extension that needs it.
+> `extension-utility` — even when it looks like a generic utility. Keep it there,
+> or fold it into the extension that needs it.
 
 **Target direction — push connector-specific code UP toward its extension.** This
 is the mirror image of the guiding principle (push *shared* types *down*): a
-building block used by a single connector should live *in* that connector's crate
-(or a sibling only it depends on), not in `foundation`/`domain`. For example,
-`pgwire-replication` folds into the `data-postgres` crate rather than sitting in
-`crates/vendor` as a foundation dependency. Doing so shrinks what `runtime`
-transitively pulls in, sharpens the always-shipped-vs-optional line, and — once the
-[connector inversion](#target-layering-and-how-we-get-there) lands — lets a source
-and its private utilities compile as one parallel unit. Only building blocks used
-by *two or more unrelated* extensions (or by `runtime`) stay shared.
+building block used by a single connector should live in `extension-utility` (or
+*inside* that connector's crate), not in `foundation`/`shared-utility`. For
+example, `pgwire-replication` folds into the `data-postgres` crate rather than
+sitting in `crates/vendor` as a foundation dependency. Doing so shrinks what
+`runtime` transitively pulls in, sharpens the always-shipped-vs-optional line,
+and — once the [connector inversion](#target-layering-and-how-we-get-there) lands
+— lets a source and its private utilities compile as one parallel unit. Only
+building blocks used by *two or more unrelated* extensions (or by `runtime`) stay
+shared.
+
+**`extension-utility` is empty today.** Every candidate above is still a
+dependency of the `data_components` monolith or of `runtime` directly, so moving
+it up would be an upward edge the guard rejects. The tier is a defined,
+enforced *slot* that populates as the monolith dissolves and connector-only code
+is lifted out of `foundation` — it does not force any move now.
 
 ---
 
@@ -111,7 +127,7 @@ case:
   - concrete/impl: `runtime-query`, `runtime-serving`, `runtime-acceleration`,
     `runtime-cluster`, … and runtime-owned shared *types* like
     `runtime-component-api` (`Dataset`/`Catalog`/`RefreshMode`).
-- **`datafusion-*`** — existing domain prefix for DataFusion extensions
+- **`datafusion-*`** — existing subsystem prefix for DataFusion extensions
   (`datafusion-ddl`, `datafusion-dml`, …). Keep it.
 - **foundation utilities — no capability prefix** (`util`, `arrow_tools`,
   `spicepod`). They are generic; a prefix would over-claim ownership.
@@ -297,7 +313,7 @@ today. The target **inverts** that edge:
     │        depends on ▼                 ┌────┴─────────────┐
   runtime  ◄── the monolith            runtime-* impl      data-<source>
     │                                  (runtime-query,      (data-postgres, …;
-  domain                                runtime-serving,     absorb data_components/<src>)
+  shared-utility                        runtime-serving,     absorb data_components/<src>)
     │                                   runtime-accel, …)        │ implement / use
   foundation                                 │ use / implement   │
                                              └──► interface ◄─────┘
