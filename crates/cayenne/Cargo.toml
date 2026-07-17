@@ -95,6 +95,14 @@ libc = "0.2"
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
+# TEMP diag (cold-stall branch): the stall watchdog's tokio task dump needs the
+# `taskdump` feature, which tokio only supports on Linux x86_64/aarch64. Scoped
+# here so macOS/Windows/other builds are unaffected. The dump call is also gated
+# on `--cfg tokio_unstable` (set only in the branch's build_and_release step).
+# Revert before merge.
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+tokio = { workspace = true, features = ["taskdump"] }
+
 [features]
 default = []
 turso = ["dep:turso"]

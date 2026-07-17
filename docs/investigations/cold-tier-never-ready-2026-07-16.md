@@ -276,3 +276,86 @@ the vortex read layer.)
 Wait for the `3ec6368` build → dispatch one SF1000 `testoperator_run_htap.yml` run on the branch →
 read `progress`/sort-run/spill/compaction-pool telemetry → classify stuck-vs-slow → apply the
 matching fix and verify (re-run until ready 10×).
+
+## Concurrent-operation patterns EXAMINED and ELIMINATED (2026-07-17, full re-read of run 29599553490)
+
+Re-read the frozen run's full 1628-line log to test whether a *concurrent* cayenne operation
+(parallel deletion of protected snapshots, another table's compaction, a shared IO limit) causes
+the scan to park — not just the intrinsic vortex race.
+
+Verified chronology (`order_line`, the frozen table):
+- Many `Fast protected-snapshot subset compaction` + `Seq-prefix bake` on `order_line` complete
+  **before** promotion (last at 18:05:29), each minting a `new_snapshot_id` and retiring inputs.
+- Promotion starts **18:05:44** (`warm_files=33`, holds `write_lock`). **No `order_line` compaction
+  runs again** until after the freeze — promotion ⟂ compaction per table via `write_lock`.
+- runs 0,1,2 complete (37.1M rows each; run 1 spilled 4.37 GB). **run_idx=3 "starting" @18:08 →
+  never "input consumed".** Meanwhile `stock`/`customer` promotions keep completing (18:08:09,
+  18:10:43, 18:13:43) — freeze is **per-`order_line`, not global**.
+
+Eliminated patterns, each with independent evidence:
+1. **Parallel deletion of protected snapshots.** (a) `write_lock` serializes promotion vs compaction
+   for `order_line` (no concurrent compaction during its promotion). (b) `[file]` local store ⇒ a
+   deleted file is `ENOENT`, an *error* that `RunInputStream`/`bounded_sort` surface as `Some(Err)`
+   (streaming.rs:451/533) and end the stream — but there is **not a single ERROR / `NotFound` /
+   `ENOENT` / retry line in the whole 40-min log**; the hang is a silent `Poll::Pending`. (c) freeze
+   is confined to one table.
+2. **Another table's compaction starving a shared resource.** During the stall `compaction_pool_used`
+   *drops* 13.8→6.8 GB (22 GB free), `encode 48/48 free`, `mem_tier 0`; concurrent tables complete.
+3. **Global vortex IO-executor saturation.** /proc wchan showed **all tokio workers `futex_wait`
+   (no runnable task)** — the lost-wakeup signature, not saturation (which leaves workers busy).
+4. **cayenne run-boundary / EOF bug in `bounded_sort_stream`.** Traced the state machine: run 2 ends
+   on its **byte cap** (streaming.rs:257, not EOF) ⇒ `is_exhausted()` correctly false ⇒ run 3 minted
+   (499–510); run 3's `SortExec` pulls `RunInputStream → ChunkStream → inner.poll_next` and faithfully
+   propagates the inner's `Pending` (265/275/349). "input consumed" logs only on `Ready(None)` (334)
+   and never fires ⇒ the **inner vortex scan returns `Pending` forever**. cayenne is a correct conduit.
+
+**Surviving cause (unchanged):** a lost wakeup inside the vortex `FileSegmentSource` segment-read
+pipeline feeding run 3. None of the concurrent-operation patterns are contributing.
+
+## Reproduction unit test (written 2026-07-17)
+
+`vortex-file/src/segments/source.rs` → `mod stall_repro_tests` →
+`file_segment_source_concurrent_requests_do_not_stall` (local checkout `729249dd3`; the pinned build
+is `spiceai/vortex@409505dfd0` — same `FileSegmentSource` Polled/coalescing/`buffer_unordered`
+protocol; final test + fix land at the pin). Mock `VortexReadAt` with bounded `concurrency`,
+coalescing enabled, offset-dependent `read_at` latency; drives batched schedules (batch ∈ {1,2,3,8,64})
+that **drain the driver to idle between batches** — the idle→re-wake transition where a lost wakeup
+wedges — looped, under a 10s timeout. Three schedules, all **compiled + passed** (no repro):
+(a) all-registered burst + `try_join_all` (200 iters, 5.3s) — perpetual backlog hides the idle→wake
+transition; (b) batched-drain `batch ∈ {1,2,3,8,64}` (80 iters, 403s) — drains to idle between
+batches; (c) drop-churn at the run boundary (300 iters, 10.3s) — models a `ChunkStream` dropped
+mid-prefetch (`ReadEvent::Dropped`) racing the coalescer + `buffer_unordered` slot accounting.
+
+Driver audit (read/driver.rs `poll_next` L73–104 + `State::next`/`next_coalesced` L172–301): the drain
+loop registers the events-channel waker on its final `Pending` poll (no basic mpsc lost-wake), and
+`next_uncoalesced` always returns a live polled request (pop_first, skip closed-callback), so `next()`
+returns `None` only when `polled_requests` is empty — i.e. `Pending`-waiting-for-an-event is correct.
+The obvious lost-wake axes are clean; the race is subtle and does not surface under a fast in-memory
+mock. Most likely it needs conditions the mock doesn't model: **remote-storage (S3/MinIO) latency +
+the high `concurrency()` an object-store reader advertises**, where many coalesced reads are in flight.
+
+A fourth attempt made the mock **prod-faithful** — matched `ObjectStoreReadAt` exactly: `concurrency
+= 192` (`DEFAULT_CONCURRENCY`), `coalesce = object_storage()` (1 MB / 16 MB), `read_at` completing
+across two spawned tasks (`spawn_io` → `spawn_blocking`), and a clustered segment layout so coalescing
+and 192-wide concurrency both engage. **Both schedules still passed** (83s). Mock approach exhausted
+(5 attempts across burst / batched-drain / drop-churn / prod-faithful; driver code byte-identical to
+the pin `409505d`, audited clean).
+
+**Decisive finding (why no local mock can reproduce it):** the promotion's cross-tier scan
+(`visible_file_stream_for_rewrite` → `TableProvider::scan`, table.rs:14092/14841) reads **all tiers**:
+mem-tier + warm (local `[file]`) + **cold (S3/MinIO)** — the cold branch restricted to the *dirty*
+cold files by the `ColdScanFileSubset` extension (table.rs:14830–14839). So run 3's stuck read very
+likely targets a **cold file on S3/MinIO**, whose `ObjectStoreReadAt::read_at` takes the object-store
+**byte-stream** path (`store.get_opts().await` + streaming, read_at.rs:152–163) — real network
+latency / connection-pool limits / retries, driven `buffer_unordered(192)`-wide. A fast in-process
+mock structurally cannot replicate that; the lost wakeup most probably lives in that S3-read ×
+coalescing-pipeline interaction.
+
+**Recommended next step (mock is a dead end):** pin the frame with per-read tracing *inside* the
+vortex driver against a real S3-backed repro — log each `read_at` start (offset/len/id, tier), each
+completion, and a per-poll driver heartbeat (in-flight count / `polled_requests` / registered), then
+run one CI SF1000 repro; the last line before silence pinpoints the parked read (and whether it's a
+cold/S3 read). This needs the tracing in the CI binary → push a `spiceai/vortex` branch off the pin
+`409505dfd0`, bump the `Cargo.toml` rev, rebuild spiced, dispatch CI. With the frame known, write the
+reproducing test at that layer and land the fix at the pin. (Awaiting user go-ahead — this touches
+the vortex pin + an org push, beyond the diagnostics-only branch scope so far.)

@@ -108,6 +108,13 @@ struct OpEntry {
     /// advancing while `progress` frozen ⇒ the sort/sink is parked downstream.
     input_progress: Arc<AtomicU64>,
     last_input_progress: u64,
+    /// Tokio runtime the op was registered on (captured at `begin`), so the
+    /// watchdog can request an async task dump of the exact runtime the parked
+    /// scan runs on. `None` if `begin` ran outside a runtime.
+    runtime: Option<tokio::runtime::Handle>,
+    /// Set once a task dump has been emitted for this op, so a sustained stall
+    /// dumps only once (dumps re-poll every task and are expensive).
+    dumped: bool,
 }
 
 /// A stuck operation snapshot, collected under the registry lock and logged
@@ -122,6 +129,11 @@ struct StuckOp {
     progress_delta: u64,
     input_progress: u64,
     input_delta: u64,
+    /// When set, the watchdog emits a one-time tokio task dump for this op after
+    /// logging the stall WARN (only when genuinely parked: no input/output
+    /// progress this tick).
+    runtime: Option<tokio::runtime::Handle>,
+    should_dump: bool,
 }
 
 /// RAII handle for a long-running Cayenne operation tracked by the stall
@@ -154,6 +166,8 @@ impl StallOp {
                 last_progress: 0,
                 input_progress: Arc::clone(&input_progress),
                 last_input_progress: 0,
+                runtime: tokio::runtime::Handle::try_current().ok(),
+                dumped: false,
             },
         );
         Self {
@@ -264,6 +278,14 @@ fn watchdog_loop(interval: Duration, warn_after: Duration) {
                     let input_progress = entry.input_progress.load(Ordering::Relaxed);
                     let input_delta = input_progress.saturating_sub(entry.last_input_progress);
                     entry.last_input_progress = input_progress;
+                    // Dump once, only when genuinely parked (no forward progress
+                    // on either side this tick) — that's the deadlock signature and
+                    // the case whose await backtraces we need.
+                    let parked = delta == 0 && input_delta == 0;
+                    let should_dump = parked && !entry.dumped;
+                    if should_dump {
+                        entry.dumped = true;
+                    }
                     Some(StuckOp {
                         table: entry.table.clone(),
                         kind: entry.kind,
@@ -274,6 +296,8 @@ fn watchdog_loop(interval: Duration, warn_after: Duration) {
                         progress_delta: delta,
                         input_progress,
                         input_delta,
+                        runtime: entry.runtime.clone(),
+                        should_dump,
                     })
                 })
                 .collect()
@@ -313,6 +337,70 @@ fn watchdog_loop(interval: Duration, warn_after: Duration) {
                 compaction_pool_total = ?compaction_pool_total,
                 "Cayenne operation has not advanced its phase — possible stall/deadlock (write_lock likely held; ingest for this table is blocked behind it). input_delta_tick=0 ⇒ scan/upstream parked (no rows into the sort); input advancing while progress_delta_tick=0 ⇒ sort/sink parked downstream; compaction_pool_used near total ⇒ spilling sort"
             );
+            if op.should_dump {
+                if let Some(handle) = op.runtime.as_ref() {
+                    dump_runtime_tasks(handle, &op.table, op.phase);
+                }
+            }
         }
+    }
+}
+
+/// Emit a one-time async task dump of `handle`'s runtime when an op is parked,
+/// so the parked scan task's exact await backtrace is captured in-process
+/// (ptrace is blocked on CI runners). Requires the build to enable
+/// `--cfg tokio_unstable`; otherwise this is a no-op that says so. Runs on the
+/// watchdog OS thread (never a runtime worker), so `block_on` is safe; the dump
+/// is bounded by a timeout because it re-polls every task and could otherwise
+/// hang behind a truly wedged worker.
+fn dump_runtime_tasks(handle: &tokio::runtime::Handle, table: &str, phase: &'static str) {
+    // Tokio task dumps exist only under `--cfg tokio_unstable` + the `taskdump`
+    // feature on Linux x86_64/aarch64 (tokio's `cfg_taskdump!`). Match those
+    // conditions exactly so every other target compiles the no-op branch.
+    #[cfg(all(
+        tokio_unstable,
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    {
+        tracing::warn!(
+            target: "cayenne::stall",
+            %table, phase,
+            "Cayenne stall: capturing tokio task dump (await backtraces of all tasks on this runtime)"
+        );
+        let dump = handle.block_on(async {
+            tokio::time::timeout(Duration::from_secs(25), handle.dump()).await
+        });
+        match dump {
+            Ok(dump) => {
+                for (idx, task) in dump.tasks().iter().enumerate() {
+                    // Flatten the multi-line async backtrace to one log line.
+                    let trace = format!("{}", task.trace()).replace('\n', " ⏎ ");
+                    tracing::warn!(
+                        target: "cayenne::stall",
+                        %table, phase, task_idx = idx, task_id = ?task.id(),
+                        "STALL TASK DUMP: {trace}"
+                    );
+                }
+            }
+            Err(_elapsed) => tracing::warn!(
+                target: "cayenne::stall",
+                %table, phase,
+                "Cayenne stall: tokio task dump timed out after 25s (a worker may be blocked outside an await point)"
+            ),
+        }
+    }
+    #[cfg(not(all(
+        tokio_unstable,
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
+    {
+        let _ = (handle, phase);
+        tracing::warn!(
+            target: "cayenne::stall",
+            %table,
+            "Cayenne stall: task dump unavailable — rebuild spiced (Linux x86_64/aarch64) with the tokio `taskdump` feature and RUSTFLAGS=\"--cfg tokio_unstable\" to capture await backtraces"
+        );
     }
 }

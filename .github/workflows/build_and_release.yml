@@ -235,6 +235,9 @@ jobs:
       - name: Build spiced and spice CLI
         if: contains(matrix.target.tags, 'default') && matrix.target.target_os != 'windows' && !matrix.target.is_tagged_release
         working-directory: bin/spiced
+        # TEMP diag (cold-stall branch): tokio_unstable enables the watchdog task dump. Revert before merge.
+        env:
+          RUSTFLAGS: "${{ env.RUSTFLAGS }} --cfg tokio_unstable"
         run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models,postgres-accel -p spiced -p spice --target-dir ../../target
 
       # Release builds exclude optional accelerators from the distributed binary
