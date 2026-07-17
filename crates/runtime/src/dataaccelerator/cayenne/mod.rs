@@ -1408,7 +1408,7 @@ impl CayenneAccelerator {
             );
             config.cold_tier_background_interval_ms = autotune::auto_or_u64(
                 acceleration,
-                &["cayenne_datalake_promotion_interval_ms"],
+                &["cayenne_datalake_tiering_check_interval_ms"],
                 config.cold_tier_background_interval_ms,
             );
             config.cold_tier_gc_interval_ms = autotune::auto_or_u64(
@@ -1433,7 +1433,7 @@ impl CayenneAccelerator {
                 )
                 .unwrap_or(i64::MAX);
                 tracing::info!(
-                    "Dataset '{table_name}': datalake promotion trigger defaulted to {} bytes. Set 'cayenne_datalake_warm_max_bytes' to override.",
+                    "Dataset '{table_name}': warm-tier data will move to the datalake once it reaches {} bytes (default). Set 'cayenne_datalake_warm_max_bytes' to override.",
                     config.cold_tier_warm_max_bytes
                 );
             }
@@ -2231,7 +2231,7 @@ impl CayenneAccelerator {
             // cadence — no spicepod `workers:` section, nothing user-facing.
             if provider.spawn_background_cold_tier_promotion() {
                 tracing::debug!(
-                    "Background cold-tier promotion task spawned for Cayenne table {table_name}",
+                    "Background datalake tiering task spawned for Cayenne table {table_name}",
                 );
             }
         }
@@ -2265,7 +2265,7 @@ fn validate_datalake_table_options(
         // early-returns for PK-less tables — the tier is configured but
         // inactive. Warn loudly instead of failing registration.
         warnings.push(format!(
-            "Dataset '{table_name}': 'cayenne_datalake_location' is set but the dataset has no primary key, so the datalake tier stays INACTIVE (data is never promoted and remains in the warm tier). Add 'primary_key' to the acceleration to activate it, or remove 'cayenne_datalake_location'."
+            "Dataset '{table_name}': 'cayenne_datalake_location' is set but the dataset has no primary key, so the datalake tier stays INACTIVE (data never moves to the datalake and stays in the warm tier). Add 'primary_key' to the acceleration to activate it, or remove 'cayenne_datalake_location'."
         ));
     }
     // Position deletes are file-path scoped and cannot survive the warm→cold
@@ -2280,12 +2280,12 @@ fn validate_datalake_table_options(
     // Default values quoted in the error hints, derived so they can never
     // drift from the actual `VortexConfig` defaults.
     let defaults = cayenne::metadata::VortexConfig::default();
-    // The promotion interval drives BOTH the promotion trigger and the
-    // physical GC loop; 0 means the background task is never spawned, so the
-    // tier never promotes and never reclaims superseded objects.
+    // The tiering-check interval drives BOTH the data-move evaluation and the
+    // physical GC loop; 0 means the background task is never spawned, so warm
+    // data never moves to the datalake and superseded objects are never reclaimed.
     if vc.cold_tier_background_interval_ms == 0 {
         return Err(format!(
-            "Failed to register dataset {table_name} (cayenne): 'cayenne_datalake_promotion_interval_ms' is 0, which disables the background promotion and garbage-collection loop — the datalake tier would never promote or reclaim objects. \
+            "Failed to register dataset {table_name} (cayenne): 'cayenne_datalake_tiering_check_interval_ms' is 0, which disables the datalake tiering loop — warm-tier data would never move to the datalake and superseded objects would never be reclaimed. \
             Set a positive interval (default {}), or remove 'cayenne_datalake_location'.",
             defaults.cold_tier_background_interval_ms
         ));
@@ -2418,7 +2418,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .one_of(&["true", "false"])
             .default("true"),
         ParameterSpec::component("datalake_location")
-            .description("Object-store URL prefix for the datalake tier, e.g. 's3://bucket/prefix' — the storage-cascade bottom tier. When set, a background promotion stage graduates the warm local-disk tier to read-optimized, Z-order-clustered Vortex files on this store, and queries span warm + cold with per-tier pushdown. Unset (default) disables the tier. Requires key-based deletes and a primary key (auto-resolved). Partitioned and position-delete tables are not supported."),
+            .description("Object-store URL prefix for the datalake tier, e.g. 's3://bucket/prefix' — the storage-cascade bottom tier. When set, a background tiering loop moves warm local-disk data to read-optimized, Z-order-clustered Vortex files on this store, and queries span warm + datalake with per-tier pushdown. Unset (default) disables the tier. Requires key-based deletes and a primary key (auto-resolved). Partitioned and position-delete tables are not supported."),
         ParameterSpec::component("datalake_clustering_columns")
             .description("Comma-separated liquid-clustering key columns for datalake files (multi-column Z-order), e.g. 'tenant_id,ts'. When unset, falls back to cayenne_sort_columns, then the primary key. Clustering tightens each cold file's per-column zone maps so selective queries on any clustering dimension prune at the storage layer."),
         ParameterSpec::component("datalake_s3_auth")
@@ -2451,11 +2451,11 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("datalake_target_file_size_mb")
             .description("Target size for datalake (cold) tier Vortex files in MB. Larger than the warm cayenne_target_file_size_mb because object stores favor fewer, larger objects and cold scans are range reads. Default: 512."),
         ParameterSpec::component("datalake_warm_max_bytes")
-            .description("The warm tier graduates to the datalake once its total Vortex bytes reach this threshold. Pairs with cayenne_datalake_warm_max_files; 0 disables the byte trigger, but when BOTH triggers are 0/unset this one defaults to 16 x cayenne_datalake_target_file_size_mb."),
+            .description("Warm-tier data moves to the datalake once the warm tier's total Vortex bytes reach this threshold. Pairs with cayenne_datalake_warm_max_files; 0 disables the byte trigger, but when BOTH triggers are 0/unset this one defaults to 16 x cayenne_datalake_target_file_size_mb."),
         ParameterSpec::component("datalake_warm_max_files")
-            .description("The warm tier graduates to the datalake once its Vortex file count reaches this threshold. 0 (default) disables the file-count trigger; when cayenne_datalake_warm_max_bytes is also 0/unset, the byte trigger defaults to 16 x cayenne_datalake_target_file_size_mb."),
-        ParameterSpec::component("datalake_promotion_interval_ms")
-            .description("How often the background loop evaluates the warm-to-datalake promotion trigger. Default: 60000 (60s)."),
+            .description("Warm-tier data moves to the datalake once the warm tier's Vortex file count reaches this threshold. 0 (default) disables the file-count trigger; when cayenne_datalake_warm_max_bytes is also 0/unset, the byte trigger defaults to 16 x cayenne_datalake_target_file_size_mb."),
+        ParameterSpec::component("datalake_tiering_check_interval_ms")
+            .description("How often the background loop checks whether warm-tier data should move to the datalake (a check does not guarantee a move). Normally auto-tuned; override for testing. Default: 60000 (60s)."),
         ParameterSpec::component("datalake_gc_interval_ms")
             .description("Physical-GC cadence and orphan grace for superseded datalake objects: the background sweep runs about this often and deletes an object no longer referenced by the manifest only once it has been observed orphaned for at least this long (so an in-flight scan has a full interval to finish). Default: 300000 (5min)."),
         ParameterSpec::component("sort_columns")
@@ -2490,7 +2490,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("compaction_trigger_snapshot_age_ms")
             .description("Maximum age in milliseconds of the oldest protected snapshot before snapshot-maintenance compaction runs. Set to 0 to disable the age trigger. Default: 60000 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 300000 otherwise."),
         ParameterSpec::component("compaction_max_levels")
-            .description("Maximum number of consecutive compaction passes per trigger. Bounds write amplification when promotion keeps producing new candidates. Default: 3.")
+            .description("Maximum number of consecutive compaction passes per trigger. Bounds write amplification when tiered compaction keeps producing new candidates. Default: 3.")
             .default("3"),
         ParameterSpec::component("compaction_max_files_per_pick")
             .description("Maximum number of eligible file paths retained in one compaction candidate for trigger selection and observability. The current compactor rewrites the whole current snapshot once triggered, so this does not bound rewrite IO or memory. Default: 32.")
@@ -5082,16 +5082,16 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_datalake_rejects_zero_promotion_interval() {
+    fn test_validate_datalake_rejects_zero_tiering_check_interval() {
         let config = cayenne::metadata::VortexConfig {
             cold_tier_background_interval_ms: 0,
             ..datalake_enabled_config()
         };
         let options = datalake_test_options(vec!["id".to_string()], config);
         let error = validate_datalake_table_options("dl_t", &options)
-            .expect_err("promotion interval 0 must fail registration");
+            .expect_err("tiering-check interval 0 must fail registration");
         assert!(
-            error.contains("cayenne_datalake_promotion_interval_ms"),
+            error.contains("cayenne_datalake_tiering_check_interval_ms"),
             "unexpected error: {error}"
         );
     }

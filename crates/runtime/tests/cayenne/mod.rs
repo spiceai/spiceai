@@ -2017,7 +2017,7 @@ fn make_datalake_nation_dataset(
             warm_max_bytes.to_string(),
         ),
         (
-            "cayenne_datalake_promotion_interval_ms".to_string(),
+            "cayenne_datalake_tiering_check_interval_ms".to_string(),
             "500".to_string(),
         ),
     ]);

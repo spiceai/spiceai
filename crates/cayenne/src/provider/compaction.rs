@@ -908,7 +908,7 @@ impl BackgroundColdTierPromoter {
                 tracing::trace!(
                     target: "cayenne::compaction",
                     table = runner.cold_tier_promotion_target_name(),
-                    "Periodic cold-tier promotion wake",
+                    "Datalake background tiering check: wake",
                 );
 
                 let Some(_pass) = try_track_compaction_pass() else {
