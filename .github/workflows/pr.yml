@@ -70,10 +70,123 @@ jobs:
     permissions:
       contents: read
       statuses: read
+      # pulls.listCommits for pure-revert fast-track detection
+      pull-requests: read
     steps:
+      # Pure reverts are fast-tracked: undoing a commit that already landed on
+      # (and so passed the full suite through) the base branch is low-risk, and
+      # the merge queue re-runs the whole suite on the merged result anyway. A
+      # revert PR passes Attestation with no local sign-off. Every commit the PR
+      # introduces must be a Git revert (carry the "This reverts commit <sha>."
+      # footer), and each reverted commit must already be on the base branch.
+      # Same-repo only: fork contributors already can't self-sign-off (posting a
+      # status needs write access), so auto-passing a fork here would sidestep
+      # the trusted-committer boundary — a fork revert still takes a maintainer
+      # sign-off. Anything not matching falls through to the sign-off check below.
+      - name: Fast-track pure reverts
+        id: revert
+        if: ${{ github.event_name == 'pull_request' }}
+        # Best-effort: any unexpected script failure must fall through to the
+        # normal developer sign-off path, not fail required Attestation for
+        # every PR. listCommits/compare errors are also try/caught inside.
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pull_number = context.payload.pull_request.number;
+            const baseSha = context.payload.pull_request.base.sha;
+
+            const headRepo = context.payload.pull_request.head.repo?.full_name;
+            const baseRepo = context.payload.pull_request.base.repo?.full_name;
+            if (!headRepo || headRepo !== baseRepo) {
+              core.info('PR is from a fork; revert fast-track does not apply.');
+              return;
+            }
+
+            // Failures here must fall through to the normal sign-off path — never
+            // fail Attestation for the whole PR because we couldn't prove purity.
+            let commits;
+            try {
+              commits = await github.paginate(github.rest.pulls.listCommits, {
+                owner,
+                repo,
+                pull_number,
+                per_page: 100,
+              });
+            } catch (error) {
+              core.info(
+                `Could not list PR commits for revert fast-track (${error.message}); ` +
+                `falling back to developer sign-off.`
+              );
+              return;
+            }
+            if (commits.length === 0) {
+              core.info('PR introduces no commits; revert fast-track does not apply.');
+              return;
+            }
+
+            // The footer Git writes for each reverted commit (full 40-char SHA).
+            // `git revert` creates one commit per reverted commit; a single
+            // --no-commit batch can carry several footers, so collect every match.
+            const revertFooter = /^This reverts commit ([0-9a-f]{40})\.$/gm;
+            const revertedShas = new Set();
+            for (const c of commits) {
+              const message = c.commit?.message ?? '';
+              const matches = [...message.matchAll(revertFooter)];
+              if (matches.length === 0) {
+                core.info(
+                  `Commit ${c.sha} is not a Git revert (no "This reverts commit ..." ` +
+                  `footer); revert fast-track does not apply.`
+                );
+                return;
+              }
+              for (const m of matches) {
+                revertedShas.add(m[1]);
+              }
+            }
+
+            // Each reverted commit must already be on the base branch — you can
+            // only fast-track undoing something that actually landed. compare
+            // base...sha reports ahead_by === 0 exactly when sha carries no
+            // commits the base lacks, i.e. sha is an ancestor of (or equal to)
+            // the base tip.
+            for (const sha of revertedShas) {
+              let ancestor = false;
+              try {
+                const { data } = await github.rest.repos.compareCommitsWithBasehead({
+                  owner,
+                  repo,
+                  basehead: `${baseSha}...${sha}`,
+                });
+                ancestor = data.ahead_by === 0;
+              } catch (error) {
+                core.info(
+                  `Could not confirm reverted commit ${sha} is on the base branch ` +
+                  `(${error.message}); revert fast-track does not apply.`
+                );
+                return;
+              }
+              if (!ancestor) {
+                core.info(
+                  `Reverted commit ${sha} is not on the base branch; revert ` +
+                  `fast-track does not apply.`
+                );
+                return;
+              }
+            }
+
+            core.setOutput('fast_track', 'true');
+            core.notice(
+              `Fast-tracked ${commits.length} revert commit(s) reverting ` +
+              `${[...revertedShas].map((s) => s.slice(0, 12)).join(', ')}; ` +
+              `the full suite still runs in the merge queue.`
+            );
+
       - name: Inspect developer sign-off
         id: signoff
-        if: ${{ github.event_name == 'pull_request' }}
+        if: ${{ github.event_name == 'pull_request' && steps.revert.outputs.fast_track != 'true' }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
@@ -241,6 +354,10 @@ jobs:
               `Inherited developer sign-off from ${signedSha} across ${merges.length} ` +
               `clean base merge(s).`
             );
+      - name: Revert fast-track passthrough
+        if: ${{ github.event_name == 'pull_request' && steps.revert.outputs.fast_track == 'true' }}
+        run: echo "Pure revert fast-tracked past sign-off; the full suite runs on the merged result in the merge queue."
+
       - name: Merge queue passthrough
         if: ${{ github.event_name != 'pull_request' }}
         run: echo "Sign-off was validated at queue entry; the full suite runs in this merge_group run."
