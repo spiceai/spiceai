@@ -326,30 +326,8 @@ impl SpiceTestQueryWorker {
                             .is_some_and(|predicate| predicate(&query.name))
                             && self.id == 0; // only one worker should snapshot results
 
-                        // Additional round of query run before recording results.
-                        // To discard the abnormal results caused by: establishing initial connection / spark cluster startup time
-
-                        let QueryRunResult {
-                            connection_failed, ..
-                        } = self
-                            .run_single_query(
-                                query,
-                                Arc::new(DashMap::new()),
-                                &mut BTreeMap::new(),
-                                snapshot_results,
-                                false,
-                            )
-                            .await?;
-                        if connection_failed {
-                            return Ok(SpiceTestQueryWorkerResult::new(
-                                &query_durations,
-                                query_iteration_durations,
-                                query_statuses,
-                                true,
-                                row_counts,
-                            ));
-                        }
-
+                        // Record the explain plan before the warmup run so the plan is visible
+                        // in logs even if the warmup query itself hangs.
                         if self.explain_plan_snapshot
                             && self.id == 0
                             && let Some(client) = self.executor.as_spice_client()
@@ -372,6 +350,43 @@ impl SpiceTestQueryWorker {
                                     "Explain plan snapshot assertion failed".into(),
                                 ));
                             }
+                        }
+
+                        // Additional round of query run before recording results.
+                        // To discard the abnormal results caused by: establishing initial connection / spark cluster startup time
+                        println!(
+                            "Worker {} - Query '{}' - Running warmup query",
+                            self.id, query.name
+                        );
+                        let warmup_start = std::time::Instant::now();
+
+                        let QueryRunResult {
+                            connection_failed, ..
+                        } = self
+                            .run_single_query(
+                                query,
+                                Arc::new(DashMap::new()),
+                                &mut BTreeMap::new(),
+                                snapshot_results,
+                                false,
+                            )
+                            .await?;
+
+                        println!(
+                            "Worker {} - Query '{}' - Warmup query completed in {:?}",
+                            self.id,
+                            query.name,
+                            warmup_start.elapsed()
+                        );
+
+                        if connection_failed {
+                            return Ok(SpiceTestQueryWorkerResult::new(
+                                &query_durations,
+                                query_iteration_durations,
+                                query_statuses,
+                                true,
+                                row_counts,
+                            ));
                         }
 
                         while current_query_count < target_count {

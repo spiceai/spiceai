@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::Runtime;
 use crate::auth::EndpointAuth;
 use crate::datafusion::DataFusion;
 use crate::datafusion::app_context_extension::AppContextExtension;
@@ -21,9 +22,9 @@ use crate::datafusion::error::{SpiceExternalError, find_datafusion_root};
 use crate::datafusion::query::{self, QueryBuilder};
 use crate::datafusion::sql_validator::validate_sql_query_read_only;
 use crate::dataupdate::DataUpdateBroadcaster;
+use crate::egress::EgressAccount;
 use crate::opentelemetry::create_metrics_service;
 use crate::tls::TlsConfig;
-use crate::{Runtime, metrics as runtime_metrics};
 use app::{App, spicepod::component::runtime::FlightIpcCompression};
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Schema};
@@ -37,11 +38,11 @@ use arrow_flight::{
     Ticket, flight_service_server::FlightServiceServer,
 };
 use arrow_ipc::{CompressionType, writer::IpcWriteOptions};
-use async_stream::try_stream;
 use bytes::Bytes;
 use cache::result::{CacheStatus, query::QueryResult};
 use datafusion::common::ParamValues;
 use datafusion::error::DataFusionError;
+use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::sql::sqlparser::parser::ParserError;
 use flight_client::Error as FlightClientError;
@@ -53,12 +54,20 @@ use middleware::{RequestContextLayer, WriteRateLimitLayer};
 use runtime_auth::{AuthRequestContext, FlightBasicAuth, layer::flight::BasicAuthLayer};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use snafu::prelude::*;
+use std::future::Future;
 use std::num::NonZeroU32;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::Poll;
+use tokio::runtime::Handle;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
+use tracing::{Instrument, Span};
 
 mod actions;
 mod async_actions;
@@ -69,7 +78,7 @@ mod flightsql;
 mod get_flight_info;
 mod get_schema;
 mod handshake;
-mod metrics;
+pub(crate) mod metrics;
 pub mod middleware;
 mod mtls;
 mod session;
@@ -278,6 +287,9 @@ impl Service {
         Ok(Self::query_result_to_flight_stream(
             query_result,
             ipc_write_options,
+            datafusion.cpu_runtime().cloned(),
+            &datafusion.ctx.runtime_env().memory_pool,
+            context,
         ))
     }
 
@@ -313,6 +325,9 @@ impl Service {
     fn query_result_to_flight_stream(
         query_result: QueryResult,
         ipc_write_options: IpcWriteOptions,
+        cpu_runtime: Option<Handle>,
+        memory_pool: &Arc<dyn MemoryPool>,
+        request_context: Arc<RequestContext>,
     ) -> (BoxStream<'static, Result<FlightData, Status>>, CacheStatus) {
         // Reuse the same options for all messages.
         let options = ipc_write_options;
@@ -353,41 +368,84 @@ impl Service {
         let data_stream = query_result.data;
         let cache_status = query_result.cache_status;
 
-        let flights_stream = try_stream! {
-            yield schema_flight_data;
+        // Charge the encoded FlightData buffered for send against the query
+        // memory pool so egress memory is visible to `runtime.query.memory_limit`
+        // and applies back-pressure under real pressure.
+        let account = EgressAccount::register(memory_pool, "flight_egress");
 
-            // Use fused stream for better performance
-            let mut data_stream = data_stream.fuse();
+        // Encode on the dedicated CPU runtime when one is configured, otherwise on
+        // the current (IO) runtime — the fallback when
+        // `runtime.params.dedicated_thread_pool=disabled`. Either way encoding runs
+        // as a task feeding a small bounded channel: it never blocks the tonic
+        // response writer inline, the channel back-pressures so egress memory stays
+        // bounded (and a slow client stalls execution), and the encode of batch N
+        // overlaps the socket write of batch N-1, reducing transfer time. With a
+        // dedicated CPU runtime that overlap is free; on the shared IO-runtime
+        // fallback the spawn costs one scheduling hop before the first byte.
+        let encode_runtime = cpu_runtime.unwrap_or_else(Handle::current);
+        let (tx, rx) = mpsc::channel::<Result<FlightData, Status>>(FLIGHT_ENCODE_CHANNEL_CAPACITY);
+        let span = Span::current();
 
-            while let Some(batch_result) = data_stream.next().await {
-                match batch_result {
-                    Ok(batch) => {
-                        // Cast view columns to match the expanded schema we advertised.
-                        let batch = if needs_view_cast {
-                            arrow_tools::schema::cast_view_columns(batch, &schema)
-                                .map_err(|e| Status::internal(e.to_string()))?
-                        } else {
-                            batch
-                        };
-                        let (dicts, batch_data) = encoder
-                            .encode(&batch, &mut dict_tracker, &options, &mut compression_context)
-                            .map_err(|e| Status::internal(e.to_string()))?;
+        let encode_task = {
+            let account = Arc::clone(&account);
+            async move {
+                // Reserve when a message enters the channel; the consumer
+                // (`FlightEncodeStream`) releases it once handed to tonic.
+                account.reserve(flight_data_size(&schema_flight_data)).await;
+                if tx.send(Ok(schema_flight_data)).await.is_err() {
+                    return;
+                }
 
-                        // Yield dictionaries first
-                        for dict in dicts {
-                            yield dict.into();
+                let mut data_stream = data_stream.fuse();
+
+                while let Some(batch_result) = data_stream.next().await {
+                    match batch_result {
+                        Ok(batch) => match encode_flight_batch(
+                            batch,
+                            needs_view_cast,
+                            &schema,
+                            &encoder,
+                            &mut dict_tracker,
+                            &options,
+                            &mut compression_context,
+                        ) {
+                            Ok((dicts, batch_data)) => {
+                                for dict in dicts {
+                                    account.reserve(flight_data_size(&dict)).await;
+                                    if tx.send(Ok(dict)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                account.reserve(flight_data_size(&batch_data)).await;
+                                if tx.send(Ok(batch_data)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Err(status) => {
+                                let _ = tx.send(Err(status)).await;
+                                return;
+                            }
+                        },
+                        Err(e) => {
+                            let e = find_datafusion_root(e);
+                            let _ = tx.send(Err(handle_datafusion_error(e))).await;
+                            return;
                         }
-                        yield batch_data.into();
-                    }
-                    Err(e) => {
-                        let e = find_datafusion_root(e);
-                        Err(handle_datafusion_error(e))?;
                     }
                 }
             }
         };
 
-        (flights_stream.boxed(), cache_status)
+        let encode_handle =
+            encode_runtime.spawn(request_context.scope(encode_task).instrument(span));
+
+        let stream = FlightEncodeStream {
+            receiver: ReceiverStream::new(rx),
+            encode_handle: Some(encode_handle),
+            account,
+        };
+
+        (stream.boxed(), cache_status)
     }
 
     async fn wrap_response_stream_with_scope<S>(
@@ -402,6 +460,127 @@ impl Service {
         let (metadata, stream, extensions) = response.into_parts();
         let scoped_stream = request_context.scope_stream(stream);
         Response::from_parts(metadata, scoped_stream.boxed(), extensions)
+    }
+}
+
+/// Number of already-encoded `FlightData` messages buffered between the encode
+/// task and the tonic response writer. Kept small so per-stream egress memory
+/// stays bounded, while still letting the encode of batch N overlap the socket
+/// write of batch N-1.
+const FLIGHT_ENCODE_CHANNEL_CAPACITY: usize = 2;
+
+/// Encode one [`RecordBatch`] into its Flight dictionary + record-batch
+/// messages, applying the `Utf8View`/`BinaryView` → `Large*` cast when the
+/// advertised schema was expanded.
+fn encode_flight_batch(
+    batch: RecordBatch,
+    needs_view_cast: bool,
+    schema: &Arc<Schema>,
+    encoder: &IpcDataGenerator,
+    dict_tracker: &mut DictionaryTracker,
+    options: &IpcWriteOptions,
+    compression_context: &mut CompressionContext,
+) -> Result<(Vec<FlightData>, FlightData), Status> {
+    // Cast view columns to match the expanded schema we advertised.
+    let batch = if needs_view_cast {
+        arrow_tools::schema::cast_view_columns(batch, schema)
+            .map_err(|e| Status::internal(e.to_string()))?
+    } else {
+        batch
+    };
+
+    let (dicts, batch_data) = encoder
+        .encode(&batch, dict_tracker, options, compression_context)
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    Ok((
+        dicts.into_iter().map(Into::into).collect(),
+        batch_data.into(),
+    ))
+}
+
+/// Heap/wire bytes a single [`FlightData`] message occupies while buffered for
+/// send — used to charge egress against the query memory pool.
+fn flight_data_size(flight_data: &FlightData) -> usize {
+    flight_data.data_header.len() + flight_data.data_body.len() + flight_data.app_metadata.len()
+}
+
+/// Response stream for the Flight encode pipeline. Wraps the receiver of
+/// already-encoded [`FlightData`] and owns the encode task's [`JoinHandle`] so
+/// that:
+///   1. buffered messages are drained first, then a panic — or an unexpected
+///      cancellation (e.g. runtime shutdown) — of the encode task surfaces as a
+///      stream error instead of a silent truncation (which would look like a
+///      successful short result), and
+///   2. dropping the response stream (client disconnect) aborts the encode task,
+///      which in turn drops the upstream execution stream.
+///
+/// Uses the same join-handle-backed approach as `RuntimeDriverStream` (execution
+/// offload); unlike that stream it polls drain-first (point 1 above) rather than
+/// observing the handle first.
+struct FlightEncodeStream {
+    receiver: ReceiverStream<Result<FlightData, Status>>,
+    encode_handle: Option<JoinHandle<()>>,
+    /// Egress reservation shared with the encode task. The encode task reserves
+    /// each message's bytes before it enters the channel; we release them here
+    /// as each message is handed to tonic. Dropping this (client disconnect)
+    /// frees any still-buffered bytes via the reservation's `Drop`.
+    account: Arc<EgressAccount>,
+}
+
+impl Stream for FlightEncodeStream {
+    type Item = Result<FlightData, Status>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
+        // Drain already-encoded messages first, so a panic/cancellation surfaces
+        // only after the client has received everything the encode task sent.
+        if let Some(item) = std::task::ready!(Pin::new(&mut this.receiver).poll_next(cx)) {
+            if let Ok(flight_data) = &item {
+                // Message handed to tonic — release its egress reservation.
+                this.account.release(flight_data_size(flight_data));
+            }
+            return Poll::Ready(Some(item));
+        }
+
+        // Channel closed: the encode task has ended. Surface a panic — or an
+        // unexpected cancellation that we did not trigger via `Drop::abort` (e.g.
+        // runtime shutdown) — as a stream error rather than a silent end-of-stream
+        // that would look like a successful short result. While the channel is
+        // closed but the handle has not resolved yet, `ready!` yields `Pending` so
+        // a panic is still reported instead of ending silently.
+        let Some(handle) = this.encode_handle.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let result = std::task::ready!(Future::poll(Pin::new(handle), cx));
+        this.encode_handle = None;
+        match result {
+            Ok(()) => Poll::Ready(None),
+            Err(err) if err.is_panic() => Poll::Ready(Some(Err(Status::internal(format!(
+                "Flight encode task panicked: {err}"
+            ))))),
+            Err(_) => Poll::Ready(Some(Err(Status::internal(
+                "Flight encode task was cancelled before completing",
+            )))),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.receiver.size_hint()
+    }
+}
+
+impl Drop for FlightEncodeStream {
+    fn drop(&mut self) {
+        if let Some(handle) = self.encode_handle.take()
+            && !handle.is_finished()
+        {
+            handle.abort();
+        }
     }
 }
 
@@ -491,13 +670,35 @@ fn handle_query_error(e: query::Error) -> Status {
         query::Error::BindingParameters { source }
         | query::Error::UnableToExecuteQuery { source } => handle_datafusion_error(source),
         query::Error::QueryCancelled { .. } => Status::cancelled(e.to_string()),
+        query::Error::QueryTimedOut { .. } => Status::deadline_exceeded(e.to_string()),
         _ => to_tonic_err(e),
+    }
+}
+
+/// Map a shared-orchestrator [`TransactionError`](query::TransactionError) to the
+/// gRPC `Status` the `FlightSQL` transaction path returns. A `Conflict` is a
+/// retryable optimistic-concurrency loss (`Aborted`).
+pub(crate) fn transaction_error_to_status(error: query::TransactionError) -> Status {
+    use query::TransactionError;
+    match error {
+        TransactionError::Rejected(message) => Status::invalid_argument(message),
+        TransactionError::Plan(e) | TransactionError::Stream(e) => handle_datafusion_error(e),
+        TransactionError::Query(e) => handle_query_error(e),
+        TransactionError::Conflict { table } => Status::aborted(format!(
+            "transaction write conflict on '{table}': a participant table changed since the transaction started; retry"
+        )),
+        TransactionError::Publish(message) => {
+            Status::internal(format!("transaction publish failed: {message}"))
+        }
     }
 }
 
 pub(crate) fn handle_datafusion_error(e: DataFusionError) -> Status {
     if query::is_cancellation_error(&e) {
         return Status::cancelled(e.to_string());
+    }
+    if query::is_timeout_error(&e) {
+        return Status::deadline_exceeded(e.to_string());
     }
     match e {
         DataFusionError::Plan(err_msg) | DataFusionError::Execution(err_msg) => {

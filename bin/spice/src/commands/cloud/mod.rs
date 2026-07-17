@@ -974,7 +974,12 @@ async fn execute_login_device_flow(open_browser: bool) -> Result<()> {
     println!("\n  {auth_url}\n");
 
     if open_browser {
-        let _ = open::that(&auth_url);
+        // Fire-and-forget: open in spawn_blocking so Command::status does not
+        // block a Tokio worker or delay the device-flow poll loop.
+        let auth_url_for_open = auth_url.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = system_open::that(auth_url_for_open);
+        });
     }
 
     println!("Waiting for authentication...");
@@ -1153,12 +1158,20 @@ fn execute_unlink() -> Result<()> {
 async fn execute_apps(args: &AppsArgs) -> Result<()> {
     let client = CloudClient::new()?;
     let context = client.optional_user_auth_context().await?;
-    let apps = client.list_apps().await?;
+    let mut apps = client.list_apps().await?;
 
     if apps.is_empty() {
         println!("No apps found. Create one with: spice cloud create app <name>");
         return Ok(());
     }
+
+    let context_org = context.as_ref().map_or("", |c| c.org_name.as_str());
+    // The Spice Cloud `/v1/apps` endpoint does not populate `org` per app, so
+    // backfill it from the auth-context org — the same fallback the table
+    // rendering applies via `display_app_name`. Without this, `--output json`
+    // emitted `"org": ""` while the table showed `<org>/<name>`, breaking
+    // format parity and machine-readable scripting (see #11041).
+    backfill_app_orgs(&mut apps, context_org);
 
     if args.output == OutputFormat::Json {
         return write_json(&apps);
@@ -1172,7 +1185,6 @@ async fn execute_apps(args: &AppsArgs) -> Result<()> {
         "CREATED",
     ]);
     for app in &apps {
-        let context_org = context.as_ref().map_or("", |c| c.org_name.as_str());
         let display_name = display_app_name(app, context_org);
         table.add_row(vec![
             display_name,
@@ -1197,10 +1209,26 @@ fn is_cloud_unauthorized_error(err: &crate::error::Error) -> bool {
     )
 }
 
+/// Backfill each app's empty `org` from the auth-context org so machine-readable
+/// (`--output json`) output matches the human-readable table, which already
+/// applies this fallback when rendering via [`display_app_name`]. The Spice
+/// Cloud `/v1/apps` endpoint does not populate `org` on each app, so the auth
+/// context is the only source of truth for the user's org. A no-op when
+/// `context_org` is empty (nothing to fall back to) or the app already carries
+/// an org.
+fn backfill_app_orgs(apps: &mut [spice_cloud_client::types::App], context_org: &str) {
+    if context_org.is_empty() {
+        return;
+    }
+    for app in apps.iter_mut() {
+        if app.org.is_empty() {
+            app.org = context_org.to_string();
+        }
+    }
+}
+
 /// Format an app's display name as `org/name`, falling back to the auth
-/// context org when the app payload does not include one. The Spice Cloud
-/// `/v1/apps` endpoint does not currently populate `org` on each app, so the
-/// auth context provides the only source of truth for the user's org.
+/// context org when the app payload does not include one.
 fn display_app_name(app: &spice_cloud_client::types::App, context_org: &str) -> String {
     let org = if app.org.is_empty() {
         context_org
@@ -2163,5 +2191,49 @@ mod tests {
     fn display_app_name_omits_leading_slash_when_org_unavailable() {
         let app = test_app("", "dashboard");
         assert_eq!(display_app_name(&app, ""), "dashboard");
+    }
+
+    #[test]
+    fn backfill_app_orgs_fills_empty_org_from_context() {
+        let mut apps = vec![test_app("", "ltd-mint"), test_app("", "zippy-cayenne")];
+        backfill_app_orgs(&mut apps, "Jeadie");
+        assert_eq!(apps[0].org, "Jeadie");
+        assert_eq!(apps[1].org, "Jeadie");
+    }
+
+    #[test]
+    fn backfill_app_orgs_preserves_existing_org() {
+        let mut apps = vec![test_app("analytics", "dashboard"), test_app("", "ltd-mint")];
+        backfill_app_orgs(&mut apps, "Jeadie");
+        // An app that already carries an org keeps it; only empty orgs are filled.
+        assert_eq!(apps[0].org, "analytics");
+        assert_eq!(apps[1].org, "Jeadie");
+    }
+
+    #[test]
+    fn backfill_app_orgs_noop_when_context_empty() {
+        let mut apps = vec![test_app("", "ltd-mint")];
+        backfill_app_orgs(&mut apps, "");
+        assert_eq!(apps[0].org, "");
+    }
+
+    #[test]
+    fn json_output_populates_org_after_backfill() {
+        // Regression for #11041: the `/v1/apps` payload omits `org`, so
+        // `--output json` serialized `"org": ""`. After the backfill the
+        // serialized JSON must carry the context org, matching the table's
+        // `<org>/<name>` display.
+        let mut apps = vec![test_app("", "ltd-mint")];
+        backfill_app_orgs(&mut apps, "Jeadie");
+        let value = serde_json::to_value(&apps[0]).expect("app should serialize to JSON");
+        assert_eq!(
+            value.get("org").and_then(serde_json::Value::as_str),
+            Some("Jeadie"),
+            "JSON output must populate `org` to match the table output"
+        );
+        assert_eq!(
+            value.get("name").and_then(serde_json::Value::as_str),
+            Some("ltd-mint")
+        );
     }
 }

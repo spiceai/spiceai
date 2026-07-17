@@ -57,29 +57,40 @@ env:
   INTEGRATION_DATA_COMPONENTS_TEST_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/integration-data-components-test-archive/data_components_hadoop.tar.zst
 
 jobs:
-  # `pr` is a required check for pull requests. Therefore we cannot skip the workflow via
-  # `on.pull_requests.paths-ignore`. Instead, we conditionally run the jobs (which report
-  # a success when skipped).
+  # Required merge-queue checks must also report on the PR head before GitHub
+  # will enqueue it. On pull requests these jobs run lightweight passthrough
+  # steps on GitHub-hosted runners; the full suite runs only on non-PR events.
   check_changes:
-    runs-on: spiceai-dev-runners
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
     outputs:
-      relevant_changes: ${{ steps.check.outputs.relevant_changes }}
+      # Always treat a manual workflow_dispatch run as having relevant changes so the
+      # tests run even when no relevant files changed.
+      relevant_changes: ${{ steps.check.outputs.relevant_changes == 'true' || github.event_name == 'workflow_dispatch' }}
     steps:
+      - name: Pull request passthrough
+        if: ${{ github.event_name == 'pull_request' }}
+        run: echo "Integration tests run on the merge-group commit"
+
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        if: ${{ github.event_name != 'pull_request' }}
         with:
           persist-credentials: false
-          # Use fetch-depth 2 for PR change detection (dorny/paths-filter only needs base + head)
-          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
+          fetch-depth: 0
 
       - name: Check for code changes
+        if: ${{ github.event_name != 'pull_request' }}
         id: check
         uses: ./.github/actions/check-code-changes
 
   build:
     name: Build Test Binary
     needs: check_changes
-    runs-on: spiceai-dev-runners
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
     steps:
+      - name: Pull request passthrough
+        if: ${{ github.event_name == 'pull_request' }}
+        run: echo "Integration test binaries build on the merge-group commit"
+
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
@@ -244,7 +255,7 @@ jobs:
     needs: [build, check_changes]
     permissions:
       contents: write
-    runs-on: spiceai-dev-runners
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
     strategy:
       fail-fast: false
       matrix:
@@ -256,6 +267,10 @@ jobs:
           - label: 3
             partition: 'count:3/3'
     steps:
+      - name: Pull request passthrough
+        if: ${{ github.event_name == 'pull_request' }}
+        run: echo "Integration test part ${{ matrix.label }} runs on the merge-group commit"
+
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
@@ -318,7 +333,7 @@ jobs:
 
       - name: Login to DockerHub
         if: needs.check_changes.outputs.relevant_changes == 'true' && github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -363,6 +378,7 @@ jobs:
           TEST_DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
           TEST_DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
           TEST_DATABRICKS_CLUSTER_ID: ${{ vars.DATABRICKS_CLUSTER_ID }}
+          TEST_DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.DATABRICKS_SQL_WAREHOUSE_ID }}
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
           # new dbc instance
@@ -518,7 +534,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         if: github.repository == 'spiceai/spiceai'
         with:
           registry: spiceaitestimages.azurecr.io
@@ -578,7 +594,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         if: github.repository == 'spiceai/spiceai'
         with:
           registry: spiceaitestimages.azurecr.io
@@ -641,7 +657,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         if: github.repository == 'spiceai/spiceai'
         with:
           registry: spiceaitestimages.azurecr.io
@@ -749,7 +765,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         if: github.repository == 'spiceai/spiceai'
         with:
           registry: spiceaitestimages.azurecr.io

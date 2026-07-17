@@ -2,24 +2,24 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: tpch_simple_q2"
 ---
-+---------------+-----------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                              |
-+---------------+-----------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Projection: lineitem.L_LINENUMBER                                                                                                 |
-|               |   Inner Join: lineitem.L_LINENUMBER = __scalar_sq_1.max(lineitem.L_LINENUMBER)                                                    |
-|               |     TableScan: lineitem projection=[L_LINENUMBER]                                                                                 |
-|               |     SubqueryAlias: __scalar_sq_1                                                                                                  |
-|               |       Aggregate: groupBy=[[]], aggr=[[max(lineitem.L_LINENUMBER)]]                                                                |
-|               |         TableScan: lineitem projection=[L_LINENUMBER]                                                                             |
-| physical_plan | HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(max(lineitem.L_LINENUMBER)@0, L_LINENUMBER@0)], projection=[L_LINENUMBER@1] |
-|               |   AggregateExec: mode=Final, gby=[], aggr=[max(lineitem.L_LINENUMBER)]                                                            |
-|               |     CoalescePartitionsExec                                                                                                        |
-|               |       AggregateExec: mode=Partial, gby=[], aggr=[max(lineitem.L_LINENUMBER)]                                                      |
-|               |         RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                     |
-|               |           BytesProcessedExec                                                                                                      |
-|               |             OracleExec sql=SELECT "L_LINENUMBER" FROM "TPCH_SF1"."LINEITEM"                                                       |
-|               |   RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                           |
-|               |     BytesProcessedExec                                                                                                            |
-|               |       OracleExec sql=SELECT "L_LINENUMBER" FROM "TPCH_SF1"."LINEITEM"                                                             |
-|               |                                                                                                                                   |
-+---------------+-----------------------------------------------------------------------------------------------------------------------------------+
++---------------+-------------------------------------------------------------------------------+
+| plan_type     | plan                                                                          |
++---------------+-------------------------------------------------------------------------------+
+| logical_plan  | Filter: lineitem.L_LINENUMBER = (<subquery>)                                  |
+|               |   Subquery:                                                                   |
+|               |     Aggregate: groupBy=[[]], aggr=[[max(lineitem.L_LINENUMBER)]]              |
+|               |       TableScan: lineitem projection=[L_LINENUMBER]                           |
+|               |   TableScan: lineitem projection=[L_LINENUMBER]                               |
+| physical_plan | ScalarSubqueryExec: subqueries=1                                              |
+|               |   FilterExec: L_LINENUMBER@0 = scalar_subquery(<pending>)                     |
+|               |     RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1     |
+|               |       BytesProcessedExec                                                      |
+|               |         OracleExec sql=SELECT "L_LINENUMBER" FROM "TPCH_SF1"."LINEITEM"       |
+|               |   AggregateExec: mode=Final, gby=[], aggr=[max(lineitem.L_LINENUMBER)]        |
+|               |     CoalescePartitionsExec                                                    |
+|               |       AggregateExec: mode=Partial, gby=[], aggr=[max(lineitem.L_LINENUMBER)]  |
+|               |         RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1 |
+|               |           BytesProcessedExec                                                  |
+|               |             OracleExec sql=SELECT "L_LINENUMBER" FROM "TPCH_SF1"."LINEITEM"   |
+|               |                                                                               |
++---------------+-------------------------------------------------------------------------------+

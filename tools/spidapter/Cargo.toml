@@ -17,6 +17,7 @@ aws-config.workspace = true
 aws-sdk-dynamodb.workspace = true
 aws-sdk-ec2.workspace = true
 base64.workspace = true
+chrono.workspace = true
 clap.workspace = true
 dirs = "6"
 mongodb.workspace = true
@@ -40,3 +41,6 @@ url.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros"] }
+
+[lints]
+workspace = true

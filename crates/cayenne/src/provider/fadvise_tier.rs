@@ -64,11 +64,11 @@ use std::path::PathBuf;
 /// `address_space` (the kernel's `ksys_sync_file_range` does NO `FMODE_WRITE`
 /// check; `EBADF` is raised only for an *invalid* fd, not a read-only one) — but
 /// we open `O_RDWR` as zero-cost defense-in-depth: it matches `RocksDB`'s
-/// writable-fd `RangeSync` posture and retires the recurring "sync_file_range
+/// writable-fd `RangeSync` posture and retires the recurring "`sync_file_range`
 /// needs a writable fd" objection. (The real failure axes are filesystem-level
 /// — ZFS no-ops, ext4-on-WSL `ENOSYS` — not fd mode.) The file is a
 /// process-owned, durable, not-yet-published compaction output, so it is always
-/// on a writable mount; Cayenne holds no fd for it (object_store closed the
+/// on a writable mount; Cayenne holds no fd for it (`object_store` closed the
 /// writer), so we re-open.
 #[cfg(target_os = "linux")]
 pub(crate) fn flush_and_evict(path: &std::path::Path) -> io::Result<()> {
@@ -153,6 +153,76 @@ pub(crate) async fn evict_files(paths: Vec<PathBuf>) {
     }
 }
 
+/// Drop `path`'s already-clean pages from the page cache, WITHOUT a preceding
+/// `sync_file_range`. For a file that was only ever READ — a compaction *input*
+/// consumed by a merge — every page is already clean, so the writeback step
+/// [`flush_and_evict`] performs would be wasted work; a bare
+/// `POSIX_FADV_DONTNEED` drops them. Best-effort: callers log and ignore.
+///
+/// `O_RDONLY` is sufficient (and correct): `posix_fadvise` acts on the inode's
+/// page-cache `address_space` and needs no write access, and the input is a
+/// read-only, soon-to-be-retired file we hold no fd for — so we re-open it
+/// read-only rather than `O_RDWR` (the [`flush_and_evict`] writeback posture
+/// does not apply when there is nothing to write back).
+#[cfg(target_os = "linux")]
+pub(crate) fn drop_clean(path: &std::path::Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let file = std::fs::File::open(path)?;
+    let fd = file.as_raw_fd();
+
+    // `posix_fadvise` returns the errno DIRECTLY (0 = ok, >0 = errno) — map with
+    // `from_raw_os_error`, not `last_os_error`. `POSIX_FADV_DONTNEED` is 6 on
+    // s390x/musl, 4 elsewhere, so use the symbol.
+    // SAFETY: `fd` is valid for the borrow of `file`.
+    let ret = unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED) };
+    if ret != 0 {
+        return Err(io::Error::from_raw_os_error(ret));
+    }
+    Ok(())
+}
+
+/// Non-Linux hosts: no portable post-hoc page-drop exists. No-op.
+#[cfg(not(target_os = "linux"))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "signature must match the fallible Linux variant so callers are platform-agnostic"
+)]
+pub(crate) fn drop_clean(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Drop the page cache for a batch of clean, read-only files — compaction
+/// *inputs* the merge has finished consuming — off the reactor. Best-effort and
+/// self-logging: a failed hint can never fail a compaction. A no-op when `paths`
+/// is empty or on a non-Linux host. The clean-input counterpart to
+/// [`evict_files`] (which first flushes dirty output pages).
+pub(crate) async fn evict_clean_files(paths: Vec<PathBuf>) {
+    if paths.is_empty() {
+        return;
+    }
+    if let Err(join_error) = tokio::task::spawn_blocking(move || {
+        for path in &paths {
+            if let Err(error) = drop_clean(path) {
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    path = %path.display(),
+                    %error,
+                    "compaction input page-cache evict hint failed (best-effort, ignored)"
+                );
+            }
+        }
+    })
+    .await
+    {
+        tracing::debug!(
+            target: "cayenne::compaction",
+            %join_error,
+            "compaction input page-cache evict task did not run to completion (best-effort, ignored)"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +258,40 @@ mod tests {
         // Must complete (and log, not panic) even though one path is missing.
         evict_files(vec![present.clone(), missing]).await;
         assert!(present.exists(), "evict must not delete the file it hints");
+    }
+
+    /// `drop_clean` succeeds on a freshly written + synced (clean) file — the
+    /// compaction-input case (no dirty pages, hence no `sync_file_range`). A
+    /// no-op elsewhere; it must never error on a valid, clean file.
+    #[test]
+    fn drop_clean_succeeds_on_clean_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("input.vortex");
+        {
+            let mut file = std::fs::File::create(&path).expect("create input file");
+            file.write_all(&vec![0x5A_u8; 1 << 20])
+                .expect("write 1 MiB input");
+            file.sync_all().expect("sync input file");
+        }
+        drop_clean(&path).expect("drop_clean must succeed on a clean file");
+    }
+
+    /// The clean-input batch wrapper drains a mixed list without panicking and is
+    /// a no-op on the empty list; a missing path is swallowed (best-effort) and
+    /// the present file is never deleted by the hint.
+    #[tokio::test]
+    async fn evict_clean_files_is_best_effort_and_bounded() {
+        evict_clean_files(Vec::new()).await; // empty: no-op
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let present = dir.path().join("present.vortex");
+        std::fs::write(&present, b"data").expect("write present file");
+        let missing = dir.path().join("does_not_exist.vortex");
+
+        evict_clean_files(vec![present.clone(), missing]).await;
+        assert!(
+            present.exists(),
+            "clean-evict must not delete the file it hints"
+        );
     }
 }

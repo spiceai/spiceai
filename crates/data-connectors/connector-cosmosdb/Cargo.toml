@@ -1,0 +1,23 @@
+[package]
+name = "connector-cosmosdb"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+description = "Azure Cosmos DB data connector for Spice.ai runtime"
+
+[dependencies]
+async-trait.workspace = true
+data_components = { path = "../../data_components", features = ["cosmosdb"] }
+datafusion.workspace = true
+datafusion-table-providers = { workspace = true }
+opentelemetry.workspace = true
+runtime = { path = "../../runtime" }
+runtime-api-types = { path = "../../runtime-api-types" }
+runtime-metrics = { path = "../../runtime-metrics" }
+snafu.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

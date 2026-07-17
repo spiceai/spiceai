@@ -37,10 +37,8 @@ use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use super::{
     AccelerationConnection, Error, Result, acceleration_connection, offsets::OffsetSchemaState,
 };
-use crate::{
-    component::dataset::Dataset, dataaccelerator::spice_sys::OpenOption,
-    dataconnector::kafka::KafkaMetadata,
-};
+use crate::{component::dataset::Dataset, dataaccelerator::spice_sys::OpenOption};
+pub(super) use data_components::kafka::KafkaMetadata;
 use data_components::kafka::KafkaOffset;
 
 const KAFKA_TABLE_NAME: &str = "spice_sys_kafka";
@@ -63,14 +61,16 @@ pub struct KafkaSys {
 
 impl KafkaSys {
     pub async fn try_new(dataset: &Dataset, open_option: OpenOption) -> Result<Self> {
+        let registry = dataset.runtime.accelerator_engine_registry();
         Ok(Self {
             dataset_name: dataset.name.to_string(),
-            acceleration_connection: acceleration_connection(dataset, open_option).await?,
+            acceleration_connection: acceleration_connection(dataset, registry, open_option)
+                .await?,
             schema_ensured: OffsetSchemaState::default(),
         })
     }
 
-    pub(crate) async fn get(&self) -> Result<Option<KafkaMetadata>> {
+    pub async fn get(&self) -> Result<Option<KafkaMetadata>> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.get_duckdb(pool),
@@ -92,7 +92,7 @@ impl KafkaSys {
         }
     }
 
-    pub(crate) async fn upsert(&self, metadata: &KafkaMetadata) -> Result<()> {
+    pub async fn upsert(&self, metadata: &KafkaMetadata) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.upsert_duckdb(pool, metadata),
@@ -114,7 +114,7 @@ impl KafkaSys {
         }
     }
 
-    pub(crate) async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> Result<()> {
+    pub async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.upsert_offsets_duckdb(pool, offsets),

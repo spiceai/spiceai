@@ -38,11 +38,12 @@ use crate::{
     datasets_health_monitor::DatasetsHealthMonitor,
     extension::{Extension, ExtensionFactory},
     flight::RateLimits,
-    metrics, podswatcher,
+    podswatcher,
     secrets::{self, Secrets},
     status, tracers,
 };
 use app::App;
+use runtime_metrics as metrics;
 use spicepod::component::runtime::Runtime as SpicepodRuntime;
 use spicepod::component::runtime::RuntimeReadyState as SpicepodRuntimeReadyState;
 use spicepod::component::runtime::SourceRateControl as SpicepodSourceRateControl;
@@ -124,7 +125,8 @@ const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
 /// Recognized `runtime.params` keys that don't belong to a larger prefix
 /// family (the family lists live next to the code that consumes them:
 /// `KNOWN_CAYENNE_RUNTIME_PARAMS`, `changes::CDC_RUNTIME_PARAMS`,
-/// `http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS`).
+/// `http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS`,
+/// `cluster::CLUSTER_GRPC_RUNTIME_PARAMS`).
 const MISC_RUNTIME_PARAMS: &[&str] = &[
     "url_tables",
     "geo",
@@ -148,11 +150,13 @@ fn known_runtime_params() -> Vec<&'static str> {
         KNOWN_CAYENNE_RUNTIME_PARAMS.len()
             + crate::accelerated_table::refresh_task::changes::CDC_RUNTIME_PARAMS.len()
             + dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS.len()
+            + crate::cluster::CLUSTER_GRPC_RUNTIME_PARAMS.len()
             + MISC_RUNTIME_PARAMS.len(),
     );
     known.extend_from_slice(KNOWN_CAYENNE_RUNTIME_PARAMS);
     known.extend_from_slice(crate::accelerated_table::refresh_task::changes::CDC_RUNTIME_PARAMS);
     known.extend_from_slice(dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS);
+    known.extend_from_slice(crate::cluster::CLUSTER_GRPC_RUNTIME_PARAMS);
     known.extend_from_slice(MISC_RUNTIME_PARAMS);
     known
 }
@@ -178,6 +182,7 @@ pub struct RuntimeBuilder {
 }
 
 impl RuntimeBuilder {
+    #[must_use]
     pub fn new() -> Self {
         RuntimeBuilder {
             app: None,
@@ -200,27 +205,32 @@ impl RuntimeBuilder {
         }
     }
 
+    #[must_use]
     pub fn with_app(mut self, app: app::App) -> Self {
         self.app = Some(Arc::new(app));
         self
     }
 
+    #[must_use]
     pub fn with_app_opt(mut self, app: Option<Arc<app::App>>) -> Self {
         self.app = app;
         self
     }
 
+    #[must_use]
     pub fn with_runtime_config(mut self, config: Config) -> Self {
         self.runtime_config = Arc::new(config);
         self
     }
 
+    #[must_use]
     pub fn with_extensions(mut self, extensions: Vec<Box<dyn ExtensionFactory>>) -> Self {
         self.extensions = extensions;
         self
     }
 
     /// Extensions that will be automatically loaded if a component requests them and the user hasn't explicitly loaded it.
+    #[must_use]
     pub fn with_autoload_extensions(
         mut self,
         extensions: HashMap<String, Box<dyn ExtensionFactory>>,
@@ -229,16 +239,19 @@ impl RuntimeBuilder {
         self
     }
 
+    #[must_use]
     pub fn with_pods_watcher(mut self, pods_watcher: podswatcher::PodsWatcher) -> Self {
         self.pods_watcher = Some(pods_watcher);
         self
     }
 
+    #[must_use]
     pub fn with_datasets_health_monitor(mut self) -> Self {
         self.datasets_health_monitor_enabled = true;
         self
     }
 
+    #[must_use]
     pub fn with_metrics_server(
         mut self,
         metrics_endpoint: SocketAddr,
@@ -249,6 +262,7 @@ impl RuntimeBuilder {
         self
     }
 
+    #[must_use]
     pub fn with_metrics_server_opt(
         mut self,
         metrics_endpoint: Option<SocketAddr>,
@@ -259,16 +273,19 @@ impl RuntimeBuilder {
         self
     }
 
+    #[must_use]
     pub fn with_rate_limits(mut self, rate_limits: RateLimits) -> Self {
         self.rate_limits = Some(Arc::new(rate_limits));
         self
     }
 
+    #[must_use]
     pub fn with_io_runtime(mut self, io_runtime: Handle) -> Self {
         self.io_runtime = Some(io_runtime);
         self
     }
 
+    #[must_use]
     pub fn with_resolved_cluster_config(
         mut self,
         resolved_cluster_config: ResolvedClusterConfig,
@@ -280,6 +297,7 @@ impl RuntimeBuilder {
     /// Sets a `SetOnce` handle that will be resolved with the spicepod
     /// `TelemetryConfig` once it is available.  For executors, this is set
     /// after the app definition is fetched from the scheduler.
+    #[must_use]
     pub fn with_telemetry_config(
         mut self,
         telemetry_config: Arc<tokio::sync::SetOnce<TelemetryConfig>>,
@@ -293,6 +311,7 @@ impl RuntimeBuilder {
     /// This reader is used by:
     /// - `GetMetrics` RPC to return local metrics to peer schedulers
     /// - Executors responding to metrics requests from schedulers via control stream
+    #[must_use]
     pub fn with_metrics_reader(mut self, metrics_reader: MetricsReader) -> Self {
         self.metrics_reader = Some(metrics_reader);
         self
@@ -305,6 +324,12 @@ impl RuntimeBuilder {
                 "Failed to initialize DataFusion tracer: {e}. Span context may not propagate correctly across async boundaries."
             );
         }
+
+        // Cayenne compaction shutdown state is process-global. Reset it when a
+        // fresh Runtime is built so embedded/test runtimes created after a prior
+        // shutdown can start maintenance passes again, including when dedicated
+        // thread pools are disabled and no compaction runtime handle is injected.
+        cayenne::reset_compaction_shutdown();
 
         self.accelerator_engine_registry.register_all().await;
         dataconnector::register_all().await;
@@ -323,6 +348,13 @@ impl RuntimeBuilder {
         let memory_limit = parse_memory_limit(query.memory_limit.clone());
         let target_partitions = query.target_partitions;
         let max_concurrent_queries = query.max_concurrent_queries;
+
+        // The effective timeout is resolved per request by
+        // `RequestContextBuilder::build` from the app's `runtime.query.timeout`;
+        // validate here so a misconfigured value is warned about once at startup
+        if let Err(e) = query.timeout() {
+            tracing::warn!("{e} No query timeout will be applied.");
+        }
 
         let metrics = spicepod_rt.metrics.clone();
 
@@ -468,6 +500,15 @@ impl RuntimeBuilder {
                 .unwrap_or(DEFAULT_COMPACTION_MEMORY_FRACTION);
                 clamp_cayenne_compaction_memory_fraction(requested)
             });
+
+        // Estimate the off-pool per-table Cayenne CDC cache reservation (keyset /
+        // segment / coalesce / inline, summed over enabled changes-mode Cayenne
+        // tables). The DataFusion builder reduces the query-memory default by the
+        // amount this exceeds the base host/8 headroom, so the query pool + the
+        // in-memory tier + the per-table caches stay within host RAM as the table
+        // count grows.
+        let cayenne_cdc_reservation_bytes =
+            estimate_cayenne_cdc_reservation_bytes(self.app.as_ref(), &spicepod_rt.params);
 
         #[cfg(not(windows))]
         if cayenne_footer_cache_mb.is_some() {
@@ -660,6 +701,9 @@ impl RuntimeBuilder {
         .target_partitions(target_partitions)
         .max_concurrent_queries(max_concurrent_queries)
         .prefer_hash_join(query.prefer_hash_join)
+        .eager_aggregation(query.eager_aggregation)
+        .eager_aggregation_min_reduction_factor(query.eager_aggregation_min_reduction_factor)
+        .eager_aggregation_max_pushed_groups(query.eager_aggregation_max_pushed_groups)
         .temp_directory(query.temp_directory)
         .spill_compression(query.spill_compression)
         .with_task_history(task_history)
@@ -671,6 +715,7 @@ impl RuntimeBuilder {
         .cayenne_sort_merge_memory_pool_fraction(cayenne_sort_merge_memory_pool_fraction)
         .cayenne_footer_cache_mb(cayenne_footer_cache_mb)
         .compaction_memory_fraction(compaction_memory_fraction)
+        .cayenne_cdc_reservation_bytes(cayenne_cdc_reservation_bytes)
         .cayenne_optimizer_rules(cayenne_optimizer_rules);
 
         if let Some(DistributedNode::Scheduler {
@@ -715,8 +760,8 @@ impl RuntimeBuilder {
 
         let mut rt = Runtime {
             app: shared_app,
+            apply_app_lock: Arc::new(tokio::sync::Mutex::new(())),
             df,
-            models: Arc::new(RwLock::new(HashMap::new())),
             llm_runtime_stores: Arc::new(crate::model::LlmRuntimeStores::default()),
             http_rate_control_registry,
             workers: Arc::new(RwLock::new(HashMap::new())),
@@ -748,6 +793,14 @@ impl RuntimeBuilder {
             )),
             telemetry_config: self.telemetry_config,
         };
+
+        // Executors: register cluster status before any concurrent
+        // `load_components` / `start_servers` race so readiness cannot pass on
+        // dataset-only status while task slots are still closed (#11758 Fix B).
+        if is_cluster_executor {
+            rt.status
+                .update_cluster("executor", status::ComponentStatus::Initializing);
+        }
 
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();
         for factory in self.extensions {
@@ -794,76 +847,77 @@ impl Default for RuntimeBuilder {
     }
 }
 
+#[cfg(not(feature = "rate-control"))]
 async fn build_http_rate_control_registry(
     source_rate_control: Option<&SpicepodSourceRateControl>,
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
 ) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
-    #[cfg(not(feature = "rate-control"))]
+    let _ = (&secrets, &io_runtime);
+    if source_rate_control
+        .and_then(|config| config.state_location.as_ref())
+        .is_some()
     {
-        let _ = (&secrets, &io_runtime);
-        if source_rate_control
-            .and_then(|config| config.state_location.as_ref())
-            .is_some()
-        {
-            tracing::warn!(
-                "Persisted HTTP governor rate-control state requires a Spice.ai Enterprise build. Falling back to in-memory HTTP rate-control state."
-            );
-        }
-        return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
+        tracing::warn!(
+            "Persisted HTTP governor rate-control state requires a Spice.ai Enterprise build. Falling back to in-memory HTTP rate-control state."
+        );
     }
+    Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default())
+}
 
-    #[cfg(feature = "rate-control")]
-    {
-        let Some((state_location, params, refresh_interval, config_path)) = source_rate_control
-            .and_then(|config| {
-                config.state_location.as_deref().map(|state_location| {
-                    (
-                        state_location,
-                        config.params.as_ref(),
-                        config.refresh_interval.as_str(),
-                        "runtime.source_rate_control",
-                    )
-                })
+#[cfg(feature = "rate-control")]
+async fn build_http_rate_control_registry(
+    source_rate_control: Option<&SpicepodSourceRateControl>,
+    secrets: Arc<RwLock<Secrets>>,
+    io_runtime: Handle,
+) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
+    let Some((state_location, params, refresh_interval, config_path)) = source_rate_control
+        .and_then(|config| {
+            config.state_location.as_deref().map(|state_location| {
+                (
+                    state_location,
+                    config.params.as_ref(),
+                    config.refresh_interval.as_str(),
+                    "runtime.source_rate_control",
+                )
             })
-        else {
-            return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
-        };
+        })
+    else {
+        return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
+    };
 
-        let Some(refresh_interval) =
-            parse_rate_control_refresh_interval(refresh_interval, config_path)
-        else {
-            return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
-        };
+    let Some(refresh_interval) = parse_rate_control_refresh_interval(refresh_interval, config_path)
+    else {
+        return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
+    };
 
-        match crate::object_store_state::build_object_store(
-            secrets,
-            io_runtime,
-            state_location,
-            params,
-            "rate-control state",
-        )
-        .await
-        {
-            Ok((store, base_prefix)) => {
-                tracing::info!(
-                    "Initialized persisted HTTP governor rate-control state with location: {}",
-                    state_location
-                );
-                let registry = Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::with_persisted_governor_state(
-                    store,
-                    base_prefix,
-                    refresh_interval,
-                ));
-                registry.start_persistence_task();
-                registry
-            }
-            Err(error) => {
-                tracing::error!(
-                    "Failed to initialize persisted HTTP governor rate-control state: {error}"
-                );
-                Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default())
-            }
+    match crate::object_store_state::build_object_store(
+        secrets,
+        io_runtime,
+        state_location,
+        params,
+        "rate-control state",
+    )
+    .await
+    {
+        Ok((store, base_prefix)) => {
+            tracing::info!(
+                "Initialized persisted HTTP governor rate-control state with location: {}",
+                state_location
+            );
+            let registry = Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::with_persisted_governor_state(
+                store,
+                base_prefix,
+                refresh_interval,
+            ));
+            registry.start_persistence_task();
+            registry
+        }
+        Err(error) => {
+            tracing::error!(
+                "Failed to initialize persisted HTTP governor rate-control state: {error}"
+            );
+            Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default())
         }
     }
 }
@@ -966,6 +1020,102 @@ fn parse_usize_runtime_param(params: &HashMap<String, String>, key: &str) -> Opt
             None
         }
     }
+}
+
+/// Estimate the aggregate bytes that enabled `refresh_mode: changes` Cayenne tables
+/// reserve OUTSIDE the `DataFusion` query pool: per table, the PK keyset cache +
+/// segment cache + CDC coalesce buffer + inline memtable. Each uses the explicit
+/// per-table param (matching the accelerator's key lists, incl. `cayenne_`-prefixed
+/// aliases) when set, else the accelerator's auto-derived cap (mirroring
+/// `dataaccelerator::cayenne::autotune::HardwareProfile` — keep the fractions in
+/// sync). The globally coordinated in-memory tier and the virtual (non-resident)
+/// metastore mmap are intentionally excluded: the tier is already capped at host/5
+/// and the mmap is page-cache-backed. Returns 0 when no changes-mode Cayenne table
+/// is configured, which disables the query-pool reduction.
+fn estimate_cayenne_cdc_reservation_bytes(
+    app: Option<&Arc<app::App>>,
+    runtime_params: &HashMap<String, String>,
+) -> u64 {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    // Auto-derived per-table cap fractions (mirror of the accelerator's autotune).
+    const KEYSET_CACHE_HOST_FRACTION: u64 = 32; // ~1/32 host, clamped [256 MiB, 8 GiB]
+    const SEGMENT_CACHE_HOST_FRACTION: u64 = 128; // ~1/128 host, clamped [256 MiB, 1 GiB]
+    const DEFAULT_COALESCE_BYTES: u64 = 128 * MIB;
+    const DEFAULT_INLINE_BYTES: u64 = 8 * MIB;
+
+    // Parse the first matching key as a trimmed u64 (params may carry whitespace,
+    // matching the rest of the runtime/dataset param parsing).
+    fn parse_u64(map: &HashMap<String, String>, keys: &[&str]) -> Option<u64> {
+        keys.iter()
+            .find_map(|k| map.get(*k))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    }
+
+    let Some(app) = app else {
+        return 0;
+    };
+    let total_memory = crate::resource_monitor::get_total_memory();
+    // Global CDC coalesce-buffer size (default 128 MiB); a per-dataset
+    // `cdc_max_coalesced_bytes` overlays it per table (see `cdc_config_overlay`).
+    let global_coalesce_bytes =
+        parse_u64(runtime_params, &["cdc_max_coalesced_bytes"]).unwrap_or(DEFAULT_COALESCE_BYTES);
+
+    let mut total: u64 = 0;
+    for dataset in &app.datasets {
+        let Some(accel) = dataset.acceleration.as_ref() else {
+            continue;
+        };
+        if !accel.enabled
+            || !accel
+                .engine
+                .as_deref()
+                .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
+            || accel.refresh_mode != Some(spicepod::acceleration::RefreshMode::Changes)
+        {
+            continue;
+        }
+        let params = accel
+            .params
+            .as_ref()
+            .map(spicepod::param::Params::as_string_map)
+            .unwrap_or_default();
+        // MB-valued cache params -> bytes; else the accelerator's auto host-fraction cap.
+        let keyset = parse_u64(
+            &params,
+            &["cayenne_pk_keyset_cache_mb", "pk_keyset_cache_mb"],
+        )
+        .map_or_else(
+            || (total_memory / KEYSET_CACHE_HOST_FRACTION).clamp(256 * MIB, 8 * GIB),
+            |mb| mb.saturating_mul(MIB),
+        );
+        let segment = parse_u64(&params, &["cayenne_segment_cache_mb", "segment_cache_mb"])
+            .map_or_else(
+                || (total_memory / SEGMENT_CACHE_HOST_FRACTION).clamp(256 * MIB, GIB),
+                |mb| mb.saturating_mul(MIB),
+            );
+        // Inline memtable is byte-valued; match the accelerator's key list including
+        // the `cayenne_`-prefixed aliases (see dataaccelerator::cayenne mod.rs).
+        let inline = parse_u64(
+            &params,
+            &[
+                "cayenne_inline_flush_max_bytes",
+                "inline_flush_max_bytes",
+                "cayenne_inline_memtable_max_bytes",
+                "inline_memtable_max_bytes",
+            ],
+        )
+        .unwrap_or(DEFAULT_INLINE_BYTES);
+        // Per-dataset coalesce override wins over the global (mirrors cdc_config_overlay).
+        let coalesce =
+            parse_u64(&params, &["cdc_max_coalesced_bytes"]).unwrap_or(global_coalesce_bytes);
+        total = total
+            .saturating_add(keyset)
+            .saturating_add(segment)
+            .saturating_add(coalesce)
+            .saturating_add(inline);
+    }
+    total
 }
 
 fn parse_f64_runtime_param(params: &HashMap<String, String>, key: &str) -> Option<f64> {

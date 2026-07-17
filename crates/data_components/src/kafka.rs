@@ -158,6 +158,19 @@ impl KafkaOffset {
     }
 }
 
+/// Metadata stored in the `spice_sys` sidecar for a Kafka-backed accelerated dataset.
+///
+/// This type is shared between the Kafka data connector and the `spice_sys` persistence
+/// layer so that neither needs to depend on the other.
+#[derive(Serialize, Deserialize)]
+pub struct KafkaMetadata {
+    pub consumer_group_id: String,
+    pub topic: String,
+    pub schema: SchemaRef,
+    #[serde(default)]
+    pub offsets: Vec<KafkaOffset>,
+}
+
 #[async_trait]
 pub trait KafkaOffsetCommitHook: Send + Sync {
     /// Runs after the refresh task has written a batch but before Kafka offsets are committed.
@@ -1843,9 +1856,8 @@ mod tests {
             .expect("item is Ok");
 
         assert!(next.is_dataset_ready(), "envelope must flag dataset ready");
-        assert_eq!(
-            next.change_batch.record.num_rows(),
-            0,
+        assert!(
+            next.is_empty(),
             "ready signal envelope must carry zero rows"
         );
     }

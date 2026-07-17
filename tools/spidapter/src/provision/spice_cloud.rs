@@ -40,7 +40,7 @@ pub(crate) async fn provision_scp_app(
     cayenne: Option<&CayenneConfig>,
 ) -> anyhow::Result<RunState> {
     let api_url = args.spice_cloud_api_url.trim_end_matches('/');
-    let cloud = commands::build_cloud_client(Some(api_url), args.api_key.as_deref())?;
+    let cloud = commands::build_cloud_client(Some(api_url), args.api_key.as_deref()).await?;
 
     let cname = commands::resolve_default_cname(&cloud).await?;
     let flight_url = scp
@@ -73,6 +73,7 @@ pub(crate) async fn provision_scp_app(
         executor_storage_size_gb: res.executor_storage_size_gb,
         ephemeral_storage_limit_gb: res.ephemeral_storage_gb.clone(),
         organization_tag: scp.organization_tag.clone(),
+        cluster_name: scp.cluster_name.clone(),
     };
     eprintln!(
         "[stdio] App resource config: \

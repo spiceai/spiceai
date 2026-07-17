@@ -556,9 +556,7 @@ fn validate_distributed_engine(
 fn engine_to_acceleration_engine(engine: Engine) -> Option<AccelerationEngine> {
     match engine {
         #[cfg(feature = "duckdb")]
-        Engine::DuckDB | Engine::PartitionedDuckDB | Engine::TableModePartitionedDuckDB => {
-            Some(AccelerationEngine::DuckDB)
-        }
+        Engine::DuckDB => Some(AccelerationEngine::DuckDB),
         #[cfg(feature = "sqlite")]
         Engine::Sqlite => Some(AccelerationEngine::Sqlite),
         #[cfg(feature = "turso")]
@@ -639,7 +637,11 @@ pub enum Table {
         /// Initial partition filter expressions to apply before the refresher starts.
         /// These are set on the `Refresh` during table registration to avoid a race
         /// where the first refresh runs before partition filters are applied.
-        initial_partition_filters: Vec<datafusion_expr::Expr>,
+        ///
+        /// Uses the `RefreshSQL` three-state partition-filter semantics: `None`
+        /// (not partition-scoped), `Some(filters)` (assigned partitions), or
+        /// `Some(empty)` (executor owns no partition — load no rows).
+        initial_partition_filters: Option<Vec<datafusion_expr::Expr>>,
     },
     Federated {
         data_connector: Arc<dyn DataConnector>,
@@ -728,6 +730,16 @@ pub struct DataFusion {
     /// `Acquire`-ordered atomic load and skip the lookup entirely.
     pending_initializations_count: std::sync::atomic::AtomicUsize,
     query_cancel_registry: Arc<QueryCancelRegistry>,
+    /// When set (from task-history tracing init), local/distributed query
+    /// completion hooks emit `plan` child rows with metrics from the executed
+    /// plan instead of re-running `EXPLAIN ANALYZE`. Default (unset) behaves
+    /// as `TaskHistoryCapturedPlan::None`.
+    plan_capture: OnceLock<query::plan_capture::PlanCaptureConfig>,
+
+    /// Signalled after each completed streaming write; the cluster executor
+    /// statistics reporter listens so scheduler-side stats (and the COUNT(*)
+    /// folds derived from them) track publishes instead of a fixed interval.
+    write_stats_notify: tokio::sync::Notify,
 
     pub(crate) accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     // Controls the parallelism of accelerated table refreshes
@@ -926,6 +938,21 @@ impl DataFusion {
     #[must_use]
     pub fn query_cancel_registry(&self) -> Arc<QueryCancelRegistry> {
         Arc::clone(&self.query_cancel_registry)
+    }
+
+    /// Install plan-capture config used by local/distributed query completion
+    /// hooks. Idempotent-tolerant: a second call is ignored with a warning.
+    pub fn set_plan_capture_config(&self, cfg: query::plan_capture::PlanCaptureConfig) {
+        if self.plan_capture.set(cfg).is_err() {
+            tracing::warn!(
+                "plan_capture config already set on DataFusion; ignoring duplicate set_plan_capture_config"
+            );
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn plan_capture_config(&self) -> Option<&query::plan_capture::PlanCaptureConfig> {
+        self.plan_capture.get()
     }
 
     pub async fn get_table(
@@ -1462,6 +1489,25 @@ impl DataFusion {
             "Cayenne global encode-concurrency budget active (caps aggregate write-encode shards across all tables)"
         );
 
+        // Install the process-global query-admission governor so the per-table
+        // adaptive CDC controller can SHED concurrent analytical queries when a
+        // memory-mode table is behind its freshness/lag SLO AND CPU is the
+        // contended resource — handing cores back to the CDC apply — then restore
+        // them when it catches up. Reuses the SAME count-based admission semaphore
+        // the query path acquires from (deadlock-safe: it admits whole queries, not
+        // partitions). A no-op when admission is unbounded
+        // (`runtime.query.max_concurrent_queries` unset → no semaphore).
+        if let Some(semaphore) = self.query_admission_semaphore.as_ref() {
+            // No queries run at install time, so `available_permits()` is the pool's
+            // full capacity (`max_concurrent_queries`).
+            let max = semaphore.available_permits();
+            cayenne::set_query_admission_governor(Arc::clone(semaphore), max);
+            tracing::info!(
+                max_concurrent_queries = max,
+                "Cayenne adaptive query-admission throttle active (controller sheds concurrent queries when CDC is behind its freshness/lag SLO under CPU contention)"
+            );
+        }
+
         // Install the process-global in-memory CDC tier byte budget: the hard
         // aggregate RAM ceiling for `cdc_durability: memory` across ALL Cayenne
         // tables. Per-table `cayenne_cdc_mem_tier_max_bytes` is sized in
@@ -1539,7 +1585,7 @@ impl DataFusion {
         if let Some(bytes) = self.compaction_memory_bytes {
             // The compaction metrics (incl. the pool-size gauge) are registered by
             // the binary AFTER metrics init via
-            // `telemetry::register_cayenne_compaction_metrics`. This runs before the
+            // `telemetry::cayenne::register_compaction_metrics`. This runs before the
             // Prometheus meter exists, so emitting the gauge here would bind it to
             // the noop meter and it would never reach `/metrics`.
             tracing::info!(
@@ -1783,23 +1829,66 @@ impl DataFusion {
                 DataFusionError::External(Box::new(std::io::Error::other(e.to_string())))
             })?;
 
-            // Swap the placeholder out of the catalog with the real
-            // provider so federation analysis on the eventual logical
-            // plan downcasts to the underlying
-            // `FederatedTableProviderAdaptor`.
-            if let Some(real_provider) = ready.table_provider.clone() {
-                self.replace_table(&table_ref, real_provider).map_err(|e| {
-                    DataFusionError::External(Box::new(std::io::Error::other(e.to_string())))
-                })?;
+            // Atomically claim this placeholder before swapping: the resolver
+            // that removes it from the pending registry owns the swap, and any
+            // concurrent resolver that finds it already gone skips its own
+            // swap. This is the global serialization point that stops two
+            // callers from both swapping the same table — a redundant swap is
+            // wasted work and, historically, reopened the deregister/register
+            // window this fix closes. The lock is released before touching the
+            // catalog, so we never hold `pending_initializations` across a
+            // `ctx` table operation (avoiding any lock-order coupling with the
+            // registration paths that take the catalog lock first).
+            {
+                let mut pending = self.pending_initializations.write().await;
+                match pending.remove(&table_ref) {
+                    // Our placeholder is still the pending one — claim it.
+                    Some(current) if Arc::ptr_eq(&current, &placeholder) => {
+                        self.pending_initializations_count
+                            .fetch_sub(1, std::sync::atomic::Ordering::Release);
+                    }
+                    // A concurrent re-registration (e.g. a schema-change
+                    // recreate) replaced the placeholder after we snapshotted it
+                    // and ran `ensure_ready`. The entry we removed belongs to
+                    // that newer registration and carries its own fresh pending
+                    // initialization; put it back untouched and skip our
+                    // now-stale swap so we don't drop it or register stale data.
+                    Some(current) => {
+                        pending.insert(table_ref.clone(), current);
+                        continue;
+                    }
+                    // Already drained by a concurrent resolver.
+                    None => continue,
+                }
             }
 
-            // Drop from the pending registry. Decrement only if the
-            // entry was still present (concurrent resolvers may have
-            // already removed it).
-            let mut pending = self.pending_initializations.write().await;
-            if pending.remove(&table_ref).is_some() {
-                self.pending_initializations_count
-                    .fetch_sub(1, std::sync::atomic::Ordering::Release);
+            // Swap the placeholder out of the catalog with the real provider
+            // so federation analysis on the eventual logical plan downcasts to
+            // the underlying `FederatedTableProviderAdaptor`. `replace_table`
+            // is an atomic overwrite (a single map insert), so even though the
+            // pending lock is no longer held there is no window where the table
+            // is absent from the catalog: the placeholder — itself a fully
+            // functional provider — stays registered until the real provider
+            // atomically replaces it.
+            if let Some(real_provider) = ready.table_provider.clone()
+                && let Err(e) = self.replace_table(&table_ref, real_provider)
+            {
+                // The swap failed after we claimed the placeholder. Restore
+                // it so a later query retries the initialization instead of
+                // leaving the table stuck as a placeholder that is no longer
+                // tracked — but only if nothing has been registered under
+                // this reference since we claimed it, so we can't clobber a
+                // newer placeholder from a concurrent re-registration with
+                // our stale one.
+                let mut pending = self.pending_initializations.write().await;
+                if !pending.contains_key(&table_ref) {
+                    pending.insert(table_ref.clone(), placeholder);
+                    self.pending_initializations_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Release);
+                }
+                return Err(DataFusionError::External(Box::new(std::io::Error::other(
+                    e.to_string(),
+                ))));
             }
         }
 
@@ -1813,9 +1902,13 @@ impl DataFusion {
         name: &TableReference,
         provider: Arc<dyn TableProvider>,
     ) -> Result<()> {
-        // DataFusion has no atomic replace; deregister + register is
-        // the documented pattern.
-        let _ = self.ctx.deregister_table(name.clone());
+        // Register the real provider directly, without a preceding
+        // `deregister_table`. The underlying schema provider registers via an
+        // atomic map insert that overwrites (and returns) the previous
+        // provider, so this replaces the placeholder in a single step with no
+        // window where the table is absent from the catalog. The earlier
+        // deregister-then-register opened exactly such a gap, which a
+        // concurrent query planner could observe as "table not found".
         self.ctx
             .register_table(name.clone(), provider)
             .map_err(find_datafusion_root)
@@ -1909,7 +2002,7 @@ impl DataFusion {
             federated_table,
             Arc::clone(&pending_registration.secrets),
             BootstrapStatus::none(), // Sink datasets don't bootstrap from snapshots
-            vec![],
+            None,                    // Sink datasets are not partition-scoped
         )
         .await?;
 
@@ -2040,6 +2133,11 @@ impl DataFusion {
         Ok(())
     }
 
+    /// Resolves when a streaming write has completed since the previous call.
+    pub async fn write_completed_notified(&self) {
+        self.write_stats_notify.notified().await;
+    }
+
     pub async fn write_streaming_data(
         &self,
         table_reference: &TableReference,
@@ -2131,6 +2229,8 @@ impl DataFusion {
 
         self.runtime_status
             .update_dataset(table_reference, status::ComponentStatus::Ready);
+
+        self.write_stats_notify.notify_one();
 
         if let Some(broadcast_batches) = broadcast_batches
             && self
@@ -2243,7 +2343,7 @@ impl DataFusion {
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
         bootstrap_status: BootstrapStatus,
-        initial_partition_filters: Vec<datafusion_expr::Expr>,
+        initial_partition_filters: Option<Vec<datafusion_expr::Expr>>,
     ) -> Result<AcceleratedTable> {
         tracing::trace!("Creating accelerated table {dataset:?}");
 
@@ -2448,8 +2548,12 @@ impl DataFusion {
             // Caching mode datasets are always ready immediately
             self.runtime_status
                 .update_dataset(&dataset.name, status::ComponentStatus::Ready);
-        } else if let Ok(checkpoint) =
-            DatasetCheckpoint::try_new(dataset, OpenOption::OpenExisting).await
+        } else if let Ok(checkpoint) = DatasetCheckpoint::try_new(
+            dataset,
+            self.accelerator_engine_registry(),
+            OpenOption::OpenExisting,
+        )
+        .await
             && checkpoint.exists().await
         {
             // For append refreshes that rely on a time column (i.e. file-based appends) that have
@@ -2521,15 +2625,17 @@ impl DataFusion {
             .context(InvalidTimeColumnTimeFormatSnafu)?;
 
         // Apply initial partition filters before the refresher starts to avoid a race
-        // where the first refresh runs without partition filters.
-        if !initial_partition_filters.is_empty() {
+        // where the first refresh runs without partition filters. `Some(empty)`
+        // (executor owns no partition of this table) is preserved so the refresh
+        // loads no rows rather than the entire source table.
+        if let Some(filters) = initial_partition_filters {
             use crate::accelerated_table::refresh::{RefreshSQL, RefreshSQLColumns};
             if let Some(ref mut sql) = refresh.sql {
-                sql.set_partition_filters(initial_partition_filters);
+                sql.set_partition_filters(Some(filters));
             } else {
                 let mut sql =
                     RefreshSQL::new(dataset.name.clone(), RefreshSQLColumns::All, vec![], None);
-                sql.set_partition_filters(initial_partition_filters);
+                sql.set_partition_filters(Some(filters));
                 refresh = refresh.refresh_sql(sql);
             }
         }
@@ -2683,7 +2789,10 @@ impl DataFusion {
         }
 
         // Get the acceleration layout (used for snapshots and size metrics)
-        let acceleration_layout = get_acceleration_layout(dataset).await.ok();
+        let acceleration_layout =
+            get_acceleration_layout(dataset, &self.accelerator_engine_registry)
+                .await
+                .ok();
 
         if acceleration_settings.snapshot_behavior.create_enabled() {
             if let Some(ref layout) = acceleration_layout {
@@ -2732,14 +2841,18 @@ impl DataFusion {
         }
 
         accelerated_table_builder.checkpointer_opt(
-            DatasetCheckpoint::try_new(dataset, OpenOption::CreateIfNotExists)
-                .await
-                .map(|checkpoint| {
-                    checkpoint
-                        .with_snapshot_behavior(acceleration_settings.snapshot_behavior)
-                        .to_arc()
-                })
-                .ok(),
+            DatasetCheckpoint::try_new(
+                dataset,
+                self.accelerator_engine_registry(),
+                OpenOption::CreateIfNotExists,
+            )
+            .await
+            .map(|checkpoint| {
+                checkpoint
+                    .with_snapshot_behavior(acceleration_settings.snapshot_behavior)
+                    .to_arc()
+            })
+            .ok(),
         );
 
         accelerated_table_builder.initial_load_complete(initial_load_complete);
@@ -2917,7 +3030,13 @@ impl DataFusion {
             return Ok(None);
         }
 
-        let Ok(cp) = DatasetCheckpoint::try_new(dataset, OpenOption::OpenExisting).await else {
+        let Ok(cp) = DatasetCheckpoint::try_new(
+            dataset,
+            self.accelerator_engine_registry(),
+            OpenOption::OpenExisting,
+        )
+        .await
+        else {
             return Ok(None);
         };
         let Some(existing_schema) = cp.get_schema().await.ok().flatten() else {
@@ -3170,7 +3289,8 @@ impl DataFusion {
             );
 
             // Snapshot before recreating (best-effort)
-            if let Ok(layout) = get_acceleration_layout(dataset).await
+            if let Ok(layout) =
+                get_acceleration_layout(dataset, &self.accelerator_engine_registry).await
                 && let Some(accel_engine) =
                     engine_to_acceleration_engine(acceleration_settings.engine)
             {
@@ -3356,7 +3476,7 @@ impl DataFusion {
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
         bootstrap_status: BootstrapStatus,
-        initial_partition_filters: Vec<datafusion_expr::Expr>,
+        initial_partition_filters: Option<Vec<datafusion_expr::Expr>>,
     ) -> Result<Option<Arc<Notify>>> {
         let mut accelerated_table = self
             .create_accelerated_table(
@@ -3563,10 +3683,14 @@ impl DataFusion {
     }
 
     /// Update only the partition filters on an accelerated table's refresh.
+    ///
+    /// `filters` carries the `RefreshSQL` three-state partition-filter semantics:
+    /// `None` (not partition-scoped), `Some(filters)` (assigned partitions), or
+    /// `Some(empty)` (no partitions assigned — load no rows).
     pub async fn update_partition_filters(
         &self,
         dataset_name: TableReference,
-        filters: Vec<datafusion_expr::Expr>,
+        filters: Option<Vec<datafusion_expr::Expr>>,
     ) -> Result<()> {
         let table = self
             .get_accelerated_table_provider(&dataset_name.to_string())
@@ -3873,7 +3997,12 @@ impl DataFusion {
 
         // Detect if data for view was already loaded so we don't need to wait for the first refresh to complete to mark it as ready.
         let mut initial_load_complete = false;
-        if let Ok(checkpoint) = DatasetCheckpoint::try_new(view, OpenOption::OpenExisting).await
+        if let Ok(checkpoint) = DatasetCheckpoint::try_new(
+            view,
+            self.accelerator_engine_registry(),
+            OpenOption::OpenExisting,
+        )
+        .await
             && checkpoint.exists().await
         {
             initial_load_complete = true;
@@ -3905,14 +4034,18 @@ impl DataFusion {
         builder.initial_load_complete(initial_load_complete);
         builder.caching(Some(Arc::clone(&self.caching)));
         builder.checkpointer_opt(
-            DatasetCheckpoint::try_new(view, OpenOption::CreateIfNotExists)
-                .await
-                .map(|checkpoint| {
-                    checkpoint
-                        .with_snapshot_behavior(acceleration.snapshot_behavior.clone())
-                        .to_arc()
-                })
-                .ok(),
+            DatasetCheckpoint::try_new(
+                view,
+                self.accelerator_engine_registry(),
+                OpenOption::CreateIfNotExists,
+            )
+            .await
+            .map(|checkpoint| {
+                checkpoint
+                    .with_snapshot_behavior(acceleration.snapshot_behavior.clone())
+                    .to_arc()
+            })
+            .ok(),
         );
         builder.refresh_on_startup(acceleration.refresh_on_startup);
         builder.ready_state(view.ready_state);
@@ -4046,7 +4179,7 @@ impl DataFusion {
             .table_names())
     }
 
-    pub fn query_builder<'a>(self: &Arc<Self>, sql: &'a str) -> QueryBuilder<'a> {
+    pub fn query_builder(self: &Arc<Self>, sql: &str) -> QueryBuilder {
         QueryBuilder::new(sql, Arc::clone(self))
     }
 
@@ -4708,9 +4841,7 @@ async fn build_snapshot_creation_config(
     ))]
     let acceleration_engine = match acceleration_settings.engine {
         #[cfg(feature = "duckdb")]
-        Engine::DuckDB | Engine::PartitionedDuckDB | Engine::TableModePartitionedDuckDB => {
-            AccelerationEngine::DuckDB
-        }
+        Engine::DuckDB => AccelerationEngine::DuckDB,
         #[cfg(feature = "sqlite")]
         Engine::Sqlite => AccelerationEngine::Sqlite,
         #[cfg(feature = "turso")]
@@ -4805,7 +4936,7 @@ async fn build_snapshot_refresh_state(
     }
 
     // 4. obtain (or warn) a SnapshotManager for this dataset.
-    let acceleration_layout = get_acceleration_layout(dataset)
+    let acceleration_layout = get_acceleration_layout(dataset, &df.accelerator_engine_registry)
         .await
         .context(SnapshotRefreshModeLayoutUnavailableSnafu)?;
     if !acceleration_layout.is_enabled() {
@@ -4831,15 +4962,17 @@ async fn build_snapshot_refresh_state(
     let source_for_checkpointer: Arc<dyn crate::dataaccelerator::AccelerationSource> =
         Arc::new(dataset.clone());
     let snapshot_behavior_for_checkpointer = acceleration_settings.snapshot_behavior.clone();
+    let registry_for_checkpointer = Arc::clone(&df.accelerator_engine_registry);
     let checkpoint_factory =
         runtime_acceleration::dataset_checkpoint::make_checkpointer_factory(move || {
             let source = Arc::clone(&source_for_checkpointer);
             let snapshot_behavior = snapshot_behavior_for_checkpointer.clone();
+            let registry = Arc::clone(&registry_for_checkpointer);
             async move {
                 use crate::dataaccelerator::spice_sys::OpenOption;
                 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
                 use snafu::ResultExt;
-                DatasetCheckpoint::try_new(source.as_ref(), OpenOption::OpenExisting)
+                DatasetCheckpoint::try_new(source.as_ref(), registry, OpenOption::OpenExisting)
                     .await
                     .boxed()
                     .map(|checkpoint| {
@@ -5103,7 +5236,7 @@ mod tests {
             .expect("should resolve the accelerated table provider");
 
         assert!(
-            resolved.downcast_ref::<MemTable>().is_some(),
+            resolved.is::<MemTable>(),
             "get_accelerated_table_provider must peel MetadataEnrichedTableProvider to reach the inner provider"
         );
     }
@@ -5707,37 +5840,6 @@ mod tests {
         }
 
         #[test]
-        fn partitioned_duckdb_rejected_in_distributed_mode() {
-            let config = make_cluster_config(ClusterRole::Scheduler);
-            let result =
-                validate_distributed_engine(&config, Engine::PartitionedDuckDB, "my_dataset");
-            assert!(
-                matches!(
-                    result,
-                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
-                ),
-                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
-            );
-        }
-
-        #[test]
-        fn table_mode_partitioned_duckdb_rejected_in_distributed_mode() {
-            let config = make_cluster_config(ClusterRole::Scheduler);
-            let result = validate_distributed_engine(
-                &config,
-                Engine::TableModePartitionedDuckDB,
-                "my_dataset",
-            );
-            assert!(
-                matches!(
-                    result,
-                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
-                ),
-                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
-            );
-        }
-
-        #[test]
         fn any_engine_allowed_in_non_distributed_mode() {
             let config = make_non_distributed_config();
             validate_distributed_engine(&config, Engine::DuckDB, "ds")
@@ -5748,11 +5850,6 @@ mod tests {
                 .expect("postgresql should be allowed when not in distributed mode");
             validate_distributed_engine(&config, Engine::Turso, "ds")
                 .expect("turso should be allowed when not in distributed mode");
-            validate_distributed_engine(&config, Engine::PartitionedDuckDB, "ds")
-                .expect("partitioned_duckdb should be allowed when not in distributed mode");
-            validate_distributed_engine(&config, Engine::TableModePartitionedDuckDB, "ds").expect(
-                "table_mode_partitioned_duckdb should be allowed when not in distributed mode",
-            );
             validate_distributed_engine(&config, Engine::Arrow, "ds")
                 .expect("arrow should be allowed when not in distributed mode");
             validate_distributed_engine(&config, Engine::Cayenne, "ds")

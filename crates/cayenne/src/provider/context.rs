@@ -26,7 +26,9 @@ use vortex_datafusion::{ProjectionPushdown, VortexFormat, VortexTableOptions, Wr
 use vortex_session::VortexSession;
 
 use super::tuning::{self, ActuatorValues, IngestStats, LiveActuators, TuningBounds};
-use crate::metadata::{DeletionMode, DeltaEncoding, PkConflictDetection, VortexConfig};
+use crate::metadata::{
+    DeletionMode, DeltaEncoding, PkConflictDetection, StorageClass, VortexConfig,
+};
 
 /// Shared context for Cayenne table operations.
 ///
@@ -111,6 +113,23 @@ pub struct CayenneContext {
     /// inter-batch arrival interval (the offered-load signal). `None` until the
     /// first write.
     last_write: parking_lot::Mutex<Option<std::time::Instant>>,
+    /// Whether this table's writes are COUPLED to sibling writers through a
+    /// shared input demux — true for the partition child tables of a
+    /// partitioned dataset, whose per-partition writes are all fed by one
+    /// router over bounded channels. Coupled writes must never park on the
+    /// global encode budget: a parked child stalls the router, which starves
+    /// the permit-holding siblings of input — a hold-and-wait deadlock that
+    /// left partitioned tables permanently unready (spiceai/spiceai#11818).
+    /// Set only at construction ([`Self::new_for_partition_child`]); read by
+    /// the write path to bypass `write_budget` permit acquisition. Runtime-only
+    /// state — never persisted.
+    coupled_writer: std::sync::atomic::AtomicBool,
+    /// Set of data files whose integrity digest has already been verified this
+    /// process, keyed by `"<snapshot_id>/<file_path>"`. Used only when
+    /// `integrity_checksums` is enabled, to bound verification to one whole-file
+    /// read per file per process ("verify on first read"). Data files are
+    /// immutable once published, so a verified file never needs re-checking.
+    verified_data_files: parking_lot::Mutex<std::collections::HashSet<String>>,
 }
 
 /// Default byte budget for the in-memory PK keyset cache when
@@ -169,6 +188,9 @@ impl CayenneContext {
             write_concurrency: wc_init,
             mem_tier_max_bytes: config.cdc_mem_tier_max_bytes,
             target_vortex_file_size_bytes: target_file_size_bytes_init,
+            // Starts at 0 (no queries shed). Only a violated lag/freshness goal
+            // under CPU contention drives it up — inert otherwise.
+            query_admission_reserve: 0,
         }));
         // Bounds keep the controller within sane, memory-/cpu-safe ranges. The
         // memtable and mem-tier ceilings are derived from the runtime-installed
@@ -233,6 +255,11 @@ impl CayenneContext {
             } else {
                 tuning::adaptive_target_file_size_bounds(target_file_size_bytes_init)
             },
+            // Reserve up to `cores` query-admission slots for CDC apply under
+            // contention; the process-global governor re-clamps the reported demand
+            // to the real admission pool's `max - 1`, so this cores-scale ceiling is
+            // a safe upper bound regardless of `runtime.query.max_concurrent_queries`.
+            query_admission_reserve: (0, cores),
         };
         // Register (idempotently) this table's query-observations handle in the
         // process-global registry so the runtime's query tracker can push p99
@@ -270,7 +297,37 @@ impl CayenneContext {
             bake_gate_last_samples: std::sync::atomic::AtomicU64::new(0),
             goal_stuck_ticks: std::sync::atomic::AtomicU64::new(0),
             last_write: parking_lot::Mutex::new(None),
+            coupled_writer: std::sync::atomic::AtomicBool::new(false),
+            verified_data_files: parking_lot::Mutex::new(std::collections::HashSet::new()),
         })
+    }
+
+    /// Create the shared context for the partition CHILD tables of a
+    /// partitioned dataset. Identical to [`Self::new`] except the tables are
+    /// marked as coupled writers (see [`Self::is_coupled_writer`]): their
+    /// writes are all fed by one routing demux over bounded channels, so they
+    /// must never park on the global encode budget.
+    #[must_use]
+    pub fn new_for_partition_child(
+        config: &VortexConfig,
+        runtime_env: Arc<RuntimeEnv>,
+        dataset: &str,
+    ) -> Arc<Self> {
+        let context = Self::new(config, runtime_env, dataset);
+        context
+            .coupled_writer
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        context
+    }
+
+    /// Whether this table's writes are coupled to sibling writers through a
+    /// shared input demux (partition child tables). Coupled writes bypass the
+    /// global encode budget — parking there deadlocks the demux
+    /// (spiceai/spiceai#11818).
+    #[must_use]
+    pub fn is_coupled_writer(&self) -> bool {
+        self.coupled_writer
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Encoding effort configured for delta writes (`cayenne_delta_encoding`).
@@ -299,6 +356,36 @@ impl CayenneContext {
         let format =
             VortexFormat::new_with_options(session, Self::vortex_table_options(&self.config))
                 .with_dataset_label(self.dataset.as_str());
+        let format = match shard {
+            Some(config) => format.with_write_shard(config),
+            None => format,
+        };
+        Arc::new(format)
+    }
+
+    /// Build a write-only `VortexFormat` for the cold (datalake) tier whose
+    /// file-rolling target is `cold_target_file_size_mb` rather than the warm
+    /// `target_vortex_file_size_mb`.
+    #[must_use]
+    pub(crate) fn cold_write_format(
+        &self,
+        cold_target_file_size_mb: usize,
+        shard: Option<WriteShardConfig>,
+    ) -> Arc<VortexFormat> {
+        let mut session = VortexSession::default();
+        if let Some(full_strategy) =
+            super::delta_encoding::full_strategy_builder_for(&self.config.compression_strategy)
+        {
+            session = session.set(full_strategy);
+        }
+        let mut options = Self::vortex_table_options(&self.config);
+        options.target_file_size_mb = cold_target_file_size_mb;
+        // Write-only format: it never scans, so drop the read-path segment cache
+        // and avoid constructing a `SharedSegmentCache` (moka + metrics) per
+        // promotion.
+        options.segment_cache_size_bytes = None;
+        let format = VortexFormat::new_with_options(session, options)
+            .with_dataset_label(self.dataset.as_str());
         let format = match shard {
             Some(config) => format.with_write_shard(config),
             None => format,
@@ -528,6 +615,27 @@ impl CayenneContext {
         self.config.force_view_read_schema
     }
 
+    /// Whether end-to-end integrity checksums are enabled for the staging WAL
+    /// and Vortex data files. See
+    /// [`crate::metadata::VortexConfig::integrity_checksums`].
+    #[must_use]
+    pub(crate) fn integrity_checksums(&self) -> bool {
+        self.config.integrity_checksums
+    }
+
+    /// Whether the data file keyed by `"<snapshot_id>/<file_path>"` has already
+    /// had its integrity digest verified in this process.
+    #[must_use]
+    pub(crate) fn is_data_file_verified(&self, key: &str) -> bool {
+        self.verified_data_files.lock().contains(key)
+    }
+
+    /// Record that the data file keyed by `"<snapshot_id>/<file_path>"` passed
+    /// integrity verification, so it is not re-read on later scans.
+    pub(crate) fn mark_data_file_verified(&self, key: String) {
+        self.verified_data_files.lock().insert(key);
+    }
+
     /// Maximum number of consecutive compaction passes per trigger.
     #[must_use]
     pub(crate) fn compaction_max_levels(&self) -> usize {
@@ -566,6 +674,34 @@ impl CayenneContext {
     #[must_use]
     pub(crate) fn mem_tier_checkpoint_interval(&self) -> Option<std::time::Duration> {
         let ms = self.config.cdc_mem_tier_checkpoint_interval_ms;
+        if ms == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(ms))
+        }
+    }
+
+    /// Max age of the ACTIVE ingestion piece before a **seal** durably shadows it
+    /// and advances the source slot (`cdc_durability: memory`). Returns `None` when
+    /// sealing is disabled (`cdc_mem_tier_seal_age_ms == 0`), in which case the
+    /// slot ack reverts to the checkpoint cadence. Like the checkpoint interval
+    /// this is a fixed time-domain durability-policy bound, not a tuned actuator.
+    #[must_use]
+    pub(crate) fn mem_tier_seal_age(&self) -> Option<std::time::Duration> {
+        let ms = self.config.cdc_mem_tier_seal_age_ms;
+        if ms == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(ms))
+        }
+    }
+
+    /// Maximum age of buffered streaming-append data before the sink cuts the
+    /// segment and publishes it. Returns `None` when disabled (interval = 0):
+    /// the sink then publishes only when the input stream ends.
+    #[must_use]
+    pub(crate) fn stream_publish_interval(&self) -> Option<std::time::Duration> {
+        let ms = self.config.stream_publish_interval_ms;
         if ms == 0 {
             None
         } else {
@@ -612,6 +748,14 @@ impl CayenneContext {
         if let Some(ts_ms) = source_commit_ts_ms {
             self.ingest_stats.observe_source_commit_ts_ms(ts_ms);
         }
+        // Fold this batch's end-to-end row freshness (apply wall-clock − the batch's
+        // source-commit ts) into the rolling windowed PEAK — the worst-case
+        // PG-commit→queryable lag the freshness SLO is stated against, and what the
+        // freshness-goal shrink lever controls on. No-op when the source carries no
+        // commit ts. Idle-immune (a post-idle batch measures its own small lag), so
+        // it must be folded here on the apply path, before the visibility stamp.
+        self.ingest_stats
+            .fold_row_freshness(now_ms, source_commit_ts_ms);
         // Stamp freshness at apply time. Exact for the synchronous publish path;
         // for the backgrounded staged-CDC publish this trails true visibility by
         // the finalize latency, so it is a lower bound on staleness.
@@ -640,6 +784,22 @@ impl CayenneContext {
         self.ingest_stats.mem_pressure()
     }
 
+    /// Test hook: inject a memory-pressure sample directly (production writes it
+    /// via the controller's `observe_environment`).
+    #[cfg(test)]
+    pub(crate) fn set_mem_pressure_for_test(&self, fraction: f64) {
+        self.ingest_stats.set_mem_pressure(fraction);
+    }
+
+    /// The detected storage medium backing this table's data files (from the
+    /// runtime's acceleration-storage detection at registration, or the operator's
+    /// `storage` param). A cheap field read — the compaction writer's tier gate
+    /// uses it without building a full [`Self::ingest_snapshot`].
+    #[must_use]
+    pub(crate) fn data_storage_class(&self) -> StorageClass {
+        self.config.data_storage_class
+    }
+
     /// A snapshot of the current ingest accounting (rate + response), enriched with
     /// the now-relative CDC goal signals (replication lag, freshness) and the
     /// query-side goal signals (p99 latency, QPH) — the wall clock and the
@@ -650,7 +810,19 @@ impl CayenneContext {
         let mut snap = self.ingest_stats.snapshot();
         let now_ms = chrono::Utc::now().timestamp_millis();
         snap.replication_lag_secs = self.ingest_stats.replication_lag_secs(now_ms);
-        snap.freshness_secs = self.ingest_stats.freshness_secs(now_ms);
+        // `freshness_secs` carries the windowed-PEAK per-apply row freshness (worst
+        // PG-commit→queryable lag over the last ~60s) rather than the instantaneous
+        // `now − last_visible` age. The peak is the SLO signal — the instantaneous
+        // value is sampled at a random phase (so it misses transient stalls the
+        // freshness-goal shrink lever must react to) and ramps unbounded on an idle
+        // table (so it reads as a false violation post-load). Both the freshness goal
+        // and the `cayenne_ingest_freshness_seconds` gauge read this field, so they
+        // share the robust signal. Falls back to the instantaneous age until the
+        // first apply carrying a source-commit ts seeds the peak.
+        snap.freshness_secs = self
+            .ingest_stats
+            .peak_row_freshness_secs(now_ms)
+            .or_else(|| self.ingest_stats.freshness_secs(now_ms));
         snap.query_latency_p99_ms = self.query_observations.p99_latency_ms();
         // QPH is system-wide (a query spanning datasets counts once), so every
         // table's controller reads the process-global aggregate — NOT this table's
@@ -670,6 +842,14 @@ impl CayenneContext {
     #[must_use]
     pub(crate) fn live_actuator_values(&self) -> tuning::ActuatorValues {
         self.live_actuators.values()
+    }
+
+    /// Whether closed-loop dynamic tuning is active for this table (an SLO goal is
+    /// set / `cayenne_tuning: adaptive`). Gates the per-tick query-admission reserve
+    /// report so it is a strict no-op for non-adaptive tables.
+    #[must_use]
+    pub(crate) fn dynamic_tuning_enabled(&self) -> bool {
+        self.dynamic_tuning
     }
 
     /// The operator-configured tuning goals (for telemetry/observability — the
@@ -869,6 +1049,56 @@ mod tests {
         assert_eq!(
             context.file_format().options().projection_pushdown,
             ProjectionPushdown::On
+        );
+    }
+
+    /// Partition child contexts are marked as coupled writers (their writes
+    /// share one routing demux and must bypass the global encode budget —
+    /// spiceai/spiceai#11818); ordinary contexts are not.
+    #[test]
+    fn partition_child_context_is_coupled_writer() {
+        let runtime_env = Arc::new(RuntimeEnv::default());
+        let ordinary =
+            CayenneContext::new(&VortexConfig::default(), Arc::clone(&runtime_env), "test");
+        assert!(!ordinary.is_coupled_writer());
+
+        let child =
+            CayenneContext::new_for_partition_child(&VortexConfig::default(), runtime_env, "test");
+        assert!(child.is_coupled_writer());
+    }
+
+    /// Regression: the cold (datalake) promotion write must roll files at
+    /// `cayenne_datalake_target_file_size_mb`, not the warm `target_vortex_file_size_mb`.
+    ///
+    /// Every sorted / PK-upsert table earns a single write shard, so the warm
+    /// `write_shard_format` path returns the base format unchanged — whose
+    /// `target_file_size_mb` is the warm size. Cold promotion therefore silently
+    /// rolled files at the warm size, leaving `cayenne_datalake_target_file_size_mb`
+    /// inert. `cold_write_format` must build a format carrying the cold size.
+    #[test]
+    fn cold_write_format_rolls_files_at_cold_target_size() {
+        let runtime_env = Arc::new(RuntimeEnv::default());
+        let config = VortexConfig {
+            target_vortex_file_size_mb: 256,
+            cold_target_file_size_mb: 1024,
+            ..VortexConfig::default()
+        };
+        let context = CayenneContext::new(&config, runtime_env, "test");
+
+        // Baseline: the warm/base format rolls at the warm target size.
+        assert_eq!(
+            context.file_format().options().target_file_size_mb,
+            256,
+            "base (warm) format must use target_vortex_file_size_mb"
+        );
+
+        // Datalake: the cold format rolls at the cold target size, independent of the warm size;
+        // previously this file size was silently 256 (the warm size).
+        let cold = context.cold_write_format(config.cold_target_file_size_mb, None);
+        assert_eq!(
+            cold.options().target_file_size_mb,
+            1024,
+            "cold format must use cayenne_datalake_target_file_size_mb, not the warm size"
         );
     }
 

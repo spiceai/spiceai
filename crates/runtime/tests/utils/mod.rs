@@ -164,6 +164,27 @@ pub(crate) fn init_tracing_with_task_history_captured_context(
     rt: &Runtime,
     captured_context: TaskHistoryCapturedContext,
 ) -> (DefaultGuard, SdkTracerProvider) {
+    init_tracing_with_task_history_plan_capture(
+        default_level,
+        rt,
+        captured_context,
+        spicepod::component::runtime::TaskHistoryCapturedPlan::None,
+        None,
+        None,
+    )
+}
+
+/// Like [`init_tracing_with_task_history_captured_context`], but also configures
+/// plan capture mode/thresholds on both the exporter and `DataFusion` (for the
+/// execution-time `ExplainAnalyze` path).
+pub(crate) fn init_tracing_with_task_history_plan_capture(
+    default_level: Option<&str>,
+    rt: &Runtime,
+    captured_context: TaskHistoryCapturedContext,
+    captured_plan: spicepod::component::runtime::TaskHistoryCapturedPlan,
+    min_plan_duration_ms: Option<f64>,
+    min_sql_duration_ms: Option<f64>,
+) -> (DefaultGuard, SdkTracerProvider) {
     let filter = match (default_level, std::env::var("SPICED_LOG").ok()) {
         (_, Some(log)) => EnvFilter::new(log),
         (Some(level), None) => EnvFilter::new(level),
@@ -171,6 +192,14 @@ pub(crate) fn init_tracing_with_task_history_captured_context(
     };
 
     let fmt_layer = fmt::layer().with_ansi(true).with_filter(filter);
+
+    rt.datafusion().set_plan_capture_config(
+        runtime::datafusion::query::plan_capture::PlanCaptureConfig {
+            captured_plan: captured_plan.clone(),
+            min_plan_duration_ms,
+            min_sql_duration_ms,
+        },
+    );
 
     let (ballista_transform, ballista_retention) =
         runtime::datafusion::query::stage_history::BallistaStageMiddleware::pair();
@@ -180,9 +209,9 @@ pub(crate) fn init_tracing_with_task_history_captured_context(
         query_engine,
         TaskHistoryCapturedOutput::Truncated,
         captured_context,
-        None, // min_sql_duration_ms
-        spicepod::component::runtime::TaskHistoryCapturedPlan::None,
-        None, // min_plan_duration_ms
+        min_sql_duration_ms,
+        captured_plan,
+        min_plan_duration_ms,
         None, // scheduler_id - not in cluster mode for tests
     )
     .with_transform(ballista_transform)
@@ -731,6 +760,44 @@ async fn do_register_test_connectors() {
     )
     .await;
     register_connector_factory(connector_spark::CONNECTOR_NAME, connector_spark::factory()).await;
+
+    // Connectors extracted into dedicated crates (registered the same way as in `bin/spiced`).
+    register_connector_factory(connector_abfs::CONNECTOR_NAME, connector_abfs::factory()).await;
+    // Also register the "abfss" prefix (secure variant uses the same factory)
+    register_connector_factory("abfss", connector_abfs::factory()).await;
+    register_connector_factory(connector_adbc::CONNECTOR_NAME, connector_adbc::factory()).await;
+    register_connector_factory(
+        connector_cosmosdb::CONNECTOR_NAME,
+        connector_cosmosdb::factory(),
+    )
+    .await;
+    register_connector_factory(
+        connector_ducklake::CONNECTOR_NAME,
+        connector_ducklake::factory(),
+    )
+    .await;
+    register_connector_factory(connector_gcs::CONNECTOR_NAME, connector_gcs::factory()).await;
+    // Also register the "gs" prefix alias for GCS
+    register_connector_factory("gs", connector_gcs::factory()).await;
+    register_connector_factory(connector_git::CONNECTOR_NAME, connector_git::factory()).await;
+    register_connector_factory(
+        connector_github::CONNECTOR_NAME,
+        connector_github::factory(),
+    )
+    .await;
+    register_connector_factory(connector_glue::CONNECTOR_NAME, connector_glue::factory()).await;
+    register_connector_factory(connector_kafka::CONNECTOR_NAME, connector_kafka::factory()).await;
+    register_connector_factory(
+        connector_spiceai::CONNECTOR_NAME,
+        connector_spiceai::factory(),
+    )
+    .await;
+    // Also register the legacy "spiceai" prefix
+    register_connector_factory(
+        connector_spiceai::LEGACY_CONNECTOR_NAME,
+        connector_spiceai::legacy_factory(),
+    )
+    .await;
 
     tracing::debug!("Completed connector registration for tests");
 }

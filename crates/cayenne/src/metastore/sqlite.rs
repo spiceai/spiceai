@@ -220,8 +220,21 @@ fn is_sqlite_lock_error(error: &tokio_rusqlite::Error<rusqlite::Error>) -> bool 
     )
 }
 
+/// Returns true if the connection string targets an in-memory `SQLite` database
+/// (Cayenne memory mode). Memory mode always uses the memdb VFS
+/// (`file:<name>?vfs=memdb`) — the only form under which multiple pooled
+/// connections share ONE in-memory database. (`:memory:` / `mode=memory` would
+/// instead give each pooled connection its own private database.)
+///
+/// In-memory databases have no backing file, so the pool skips parent-directory
+/// creation and uses the `MEMORY` rollback journal (WAL is unsupported).
+fn is_memory_db_path(db_path: &str) -> bool {
+    db_path.contains("vfs=memdb")
+}
+
 async fn configure_sqlite_connection(
     conn: &tokio_rusqlite::Connection,
+    in_memory: bool,
 ) -> Result<(), tokio_rusqlite::Error<rusqlite::Error>> {
     // Resolve the tunable pragmas once. Defaults and rationale live on
     // `SqliteMetastoreConfig`; the runtime overrides them via
@@ -239,13 +252,24 @@ async fn configure_sqlite_connection(
                 if let Some(mode) = cfg.auto_vacuum.pragma_value() {
                     conn.pragma_update(None, "auto_vacuum", mode)?;
                 }
-                conn.pragma_update(None, "journal_mode", "WAL")?;
-                conn.pragma_update(None, "synchronous", "NORMAL")?;
+                if in_memory {
+                    // In-memory databases don't support WAL — use the MEMORY
+                    // rollback journal and set synchronous OFF (no backing file to
+                    // fsync). mmap_size / wal_autocheckpoint are meaningless without
+                    // a file and are skipped below.
+                    conn.pragma_update(None, "journal_mode", "MEMORY")?;
+                    conn.pragma_update(None, "synchronous", "OFF")?;
+                } else {
+                    conn.pragma_update(None, "journal_mode", "WAL")?;
+                    conn.pragma_update(None, "synchronous", "NORMAL")?;
+                }
                 conn.pragma_update(None, "cache_size", -cache_size_kib)?;
                 conn.pragma_update(None, "foreign_keys", true)?;
                 conn.pragma_update(None, "temp_store", "memory")?;
-                conn.pragma_update(None, "mmap_size", cfg.mmap_size_bytes)?;
-                conn.pragma_update(None, "wal_autocheckpoint", cfg.wal_autocheckpoint_pages)?;
+                if !in_memory {
+                    conn.pragma_update(None, "mmap_size", cfg.mmap_size_bytes)?;
+                    conn.pragma_update(None, "wal_autocheckpoint", cfg.wal_autocheckpoint_pages)?;
+                }
 
                 Ok::<_, rusqlite::Error>(())
             })
@@ -396,49 +420,71 @@ impl SqliteMetastore {
     ///
     async fn open_connection(&self) -> CatalogResult<tokio_rusqlite::Connection> {
         let db_path = self.db_path();
-        let db_dir =
-            Path::new(db_path)
-                .parent()
-                .ok_or_else(|| CatalogError::InvalidDatabasePath {
-                    path: db_path.to_string(),
-                })?;
+        let in_memory = is_memory_db_path(db_path);
 
-        if !db_dir.exists() {
-            tokio::fs::create_dir_all(db_dir).await?;
+        // In-memory databases (Cayenne memory mode) have no backing file, so
+        // there is no parent directory to create or fsync — skip straight to the
+        // open. File-mode DBs create and sync the parent dir as before.
+        if !in_memory {
+            let db_dir =
+                Path::new(db_path)
+                    .parent()
+                    .ok_or_else(|| CatalogError::InvalidDatabasePath {
+                        path: db_path.to_string(),
+                    })?;
 
-            // Best-effort parent directory sync (defense-in-depth with the sync
-            // already performed in CayenneCatalog::init).
-            if let Some(parent) = db_dir.parent() {
-                let parent_for_sync = parent.to_path_buf();
-                let parent_display = parent_for_sync.display().to_string();
-                let db_dir_display = db_dir.display().to_string();
-                match tokio::task::spawn_blocking(move || {
-                    std::fs::File::open(&parent_for_sync).and_then(|f| f.sync_all())
-                })
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => tracing::warn!(
-                        "Failed to sync parent directory {parent_display} after creating SQLite catalog DB directory {db_dir_display} (subsequent DB writes will still be durable): {error}"
-                    ),
-                    Err(error) => tracing::warn!(
-                        "Failed to join SQLite catalog DB parent directory sync task for {parent_display}: {error}"
-                    ),
+            if !db_dir.exists() {
+                tokio::fs::create_dir_all(db_dir).await?;
+
+                // Best-effort parent directory sync (defense-in-depth with the sync
+                // already performed in CayenneCatalog::init).
+                if let Some(parent) = db_dir.parent() {
+                    let parent_for_sync = parent.to_path_buf();
+                    let parent_display = parent_for_sync.display().to_string();
+                    let db_dir_display = db_dir.display().to_string();
+                    match tokio::task::spawn_blocking(move || {
+                        std::fs::File::open(&parent_for_sync).and_then(|f| f.sync_all())
+                    })
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => tracing::warn!(
+                            "Failed to sync parent directory {parent_display} after creating SQLite catalog DB directory {db_dir_display} (subsequent DB writes will still be durable): {error}"
+                        ),
+                        Err(error) => tracing::warn!(
+                            "Failed to join SQLite catalog DB parent directory sync task for {parent_display}: {error}"
+                        ),
+                    }
                 }
             }
         }
 
-        let conn = tokio_rusqlite::Connection::open(db_path)
+        // In-memory DSNs are URI filenames (e.g. `file:...?vfs=memdb`) that let
+        // every pooled connection attach to the SAME shared database;
+        // SQLITE_OPEN_URI is required to interpret them. It is part of
+        // OpenFlags::default(), but we pass flags explicitly so the URI
+        // dependency is not silently lost if that default ever changes. File
+        // mode keeps the plain open.
+        let open_result = if in_memory {
+            tokio_rusqlite::Connection::open_with_flags(
+                db_path.to_string(),
+                rusqlite::OpenFlags::default() | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+            )
             .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to open SQLite database: {e}"),
-            })?;
+        } else {
+            tokio_rusqlite::Connection::open(db_path).await
+        };
+        let conn = open_result.map_err(|e| CatalogError::Database {
+            message: format!("Failed to open SQLite database: {e}"),
+        })?;
 
-        configure_sqlite_connection(&conn).await.map_err(
-            |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-                message: format!("Failed to configure SQLite pragmas: {e}"),
-            },
-        )?;
+        configure_sqlite_connection(&conn, in_memory)
+            .await
+            .map_err(
+                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                    message: format!("Failed to configure SQLite pragmas: {e}"),
+                },
+            )?;
 
         Ok(conn)
     }
@@ -583,6 +629,38 @@ impl SqliteMetastore {
         ) WITHOUT ROWID
     ";
 
+    /// Schema for the `cayenne_pending_write_back` table (durable federated
+    /// write-back, #11838).
+    ///
+    /// Tracks the primary keys that a durable-write-back table has committed to
+    /// the accelerator but not yet reconciled to the federated source. One row
+    /// per undelivered key; the delivery worker claims rows, reconciles the
+    /// key's current committed value to the source, then clears the row.
+    ///
+    /// `table_id` is the 16 raw UUID bytes (as in `cayenne_insert_record`);
+    /// `pk_bytes` is the `RowConverter` `OwnedRow` encoding of the full primary
+    /// key (bit-identical to the keyset/footprint `pk_digest` input) so the
+    /// worker can rebuild both the accelerator point-scan filter and the source
+    /// key. `sequence_number` is the table commit sequence that last dirtied the
+    /// key; the marker upsert is **monotone** (keeps `MAX`) and the worker's
+    /// compare-and-clear is `<= claimed_seq`, so a newer commit landing during
+    /// delivery leaves the marker above the claimed sequence and the stale clear
+    /// no-ops. `first_marked_at` is the oldest-undelivered timestamp (lag metric)
+    /// and is never overwritten on re-mark.
+    ///
+    /// Unlike `cayenne_insert_record`, this table is **never** cleared at
+    /// checkpoint/overwrite (that would drop acked-but-undelivered writes);
+    /// `drop_table` deletes its rows explicitly.
+    const PENDING_WRITE_BACK_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_pending_write_back (
+            table_id BLOB NOT NULL,
+            pk_bytes BLOB NOT NULL,
+            sequence_number BIGINT NOT NULL,
+            first_marked_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            PRIMARY KEY (table_id, pk_bytes)
+        ) WITHOUT ROWID
+    ";
+
     /// Schema for the `cayenne_snapshot_sequence` table.
     ///
     /// Tracks the sequence number for each snapshot. This enables Iceberg-style
@@ -611,6 +689,7 @@ impl SqliteMetastore {
             statistics_blob BLOB NOT NULL,
             num_rows BIGINT NOT NULL DEFAULT 0,
             ndv_sketches BLOB,
+            num_rows_exact INTEGER NOT NULL DEFAULT 1,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
         )
     ";
@@ -649,8 +728,33 @@ impl SqliteMetastore {
             file_size_bytes BIGINT NOT NULL DEFAULT 0,
             min_sequence BIGINT NOT NULL DEFAULT 0,
             max_sequence BIGINT NOT NULL DEFAULT 0,
+            digest TEXT,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
             PRIMARY KEY (table_id, snapshot_id, file_path)
+        )
+    ";
+
+    /// Cold-tier object-store manifest (storage-cascade bottom tier). One row
+    /// per Vortex file promoted to the cold object store. Table-scoped (no
+    /// `snapshot_id`) and append-only: a promoted file is referenced only here,
+    /// never from `cayenne_snapshot_file`. `file_url` is the absolute
+    /// object-store URL (the cold location may differ from the warm table path).
+    /// `statistics_blob` is the file's serialized Vortex `FileStatistics`
+    /// (NOT NULL — always captured at promotion) so the scan prunes cold files
+    /// at listing time without re-reading any footer. Captured in metastore
+    /// snapshots via `EXPECTED_TABLES`.
+    const COLD_TIER_FILE_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_cold_tier_file (
+            table_id TEXT NOT NULL,
+            file_url TEXT NOT NULL,
+            row_count BIGINT NOT NULL DEFAULT 0,
+            file_size_bytes BIGINT NOT NULL DEFAULT 0,
+            min_sequence BIGINT NOT NULL DEFAULT 0,
+            max_sequence BIGINT NOT NULL DEFAULT 0,
+            statistics_blob BLOB NOT NULL,
+            pk_bloom_blob BLOB,
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
+            PRIMARY KEY (table_id, file_url)
         )
     ";
 
@@ -839,20 +943,34 @@ impl MetastoreBackend for SqliteMetastore {
     async fn init_schema(&self) -> CatalogResult<()> {
         let guard = self.pool().await?.acquire().await;
 
+        // Refuse to open a catalog written by a newer, incompatible Spice build
+        // BEFORE running any migration against it (a fresh/legacy DB reads 0).
+        let stored_version = guard
+            .call(|conn| conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)))
+            .await
+            .map_err(
+                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                    message: format!("Failed to read metastore schema version: {e}"),
+                },
+            )?;
+        super::ensure_supported_schema_version(stored_version)?;
+
         guard
             .call(|conn| {
                 // Create tables in a transaction
                 conn.execute_batch(&format!(
-                    "{}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
+                    "{}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
                     Self::TABLE_TABLE_DDL,
                     Self::TABLE_NAME_UNIQUE_INDEX_DDL,
                     Self::DELETE_FILE_TABLE_DDL,
                     Self::PARTITION_TABLE_DDL,
                     Self::INSERT_RECORD_TABLE_DDL,
+                    Self::PENDING_WRITE_BACK_TABLE_DDL,
                     Self::SNAPSHOT_SEQUENCE_TABLE_DDL,
                     Self::TABLE_STATISTICS_DDL,
                     Self::SNAPSHOT_FILE_STATISTICS_TABLE_DDL,
                     Self::SNAPSHOT_FILE_TABLE_DDL,
+                    Self::COLD_TIER_FILE_TABLE_DDL,
                     Self::INLINED_DATA_TABLE_DDL,
                     Self::INLINED_DELETE_TABLE_DDL,
                     Self::PK_INDEX_TABLE_DDL
@@ -868,6 +986,14 @@ impl MetastoreBackend for SqliteMetastore {
                     "ALTER TABLE cayenne_table_statistics ADD COLUMN ndv_sketches BLOB",
                     [],
                 );
+                // Whether the maintained `num_rows` is a provably-exact live count.
+                // Legacy rows predate the mem-tier drift fix; DEFAULT 1 trusts their
+                // count once (the next mem-tier checkpoint delta taints a drifted
+                // one to 0, after which only a full-rewrite `Set` restores exactness).
+                let _ = conn.execute(
+                    "ALTER TABLE cayenne_table_statistics ADD COLUMN num_rows_exact INTEGER NOT NULL DEFAULT 1",
+                    [],
+                );
 
                 // Metadata-only publish: per-commit reinsert sequence on delete-file
                 // rows replaces the per-key cayenne_insert_record chunks. NULL on
@@ -875,10 +1001,33 @@ impl MetastoreBackend for SqliteMetastore {
                 // cayenne_insert_record, so adding the column is forward-upgrade safe.
                 // (DOWNGRADE is NOT safe: an older binary on a catalog with this
                 // column reads an empty insert-record table for new commits and would
-                // drop the re-inserts — rebuild the catalog before downgrading. A
-                // user_version gate is the productionization follow-up.)
+                // drop the re-inserts — rebuild the catalog before downgrading. The
+                // `user_version` gate at the top/bottom of this fn — bumped to
+                // CAYENNE_METASTORE_SCHEMA_VERSION here — turns that into a loud
+                // failure on any downgrade to a build with a lower max version.)
                 let _ = conn.execute(
                     "ALTER TABLE cayenne_delete_file ADD COLUMN reinsert_sequence BIGINT",
+                    [],
+                );
+
+                // End-to-end data-file integrity digest (opt-in
+                // `cayenne_integrity_checksums`). NULL on legacy rows and on rows
+                // written with the feature off → verification is skipped for
+                // those files, so adding the column is forward- and
+                // downgrade-safe (an older binary simply ignores the extra
+                // column). Appended last to match the CREATE TABLE and
+                // EXPECTED_TABLES column order.
+                let _ = conn.execute(
+                    "ALTER TABLE cayenne_snapshot_file ADD COLUMN digest TEXT",
+                    [],
+                );
+
+                // Per-cold-file PK existence bloom. NULL (legacy / non-upsert /
+                // over-cap) makes the keyset rebuild fall back to the exact cold
+                // scan, so the column is forward- and downgrade-safe. Appended
+                // last to match CREATE TABLE and EXPECTED_TABLES column order.
+                let _ = conn.execute(
+                    "ALTER TABLE cayenne_cold_tier_file ADD COLUMN pk_bloom_blob BLOB",
                     [],
                 );
 
@@ -998,6 +1147,24 @@ impl MetastoreBackend for SqliteMetastore {
                 },
             )?;
 
+        // Stamp the current schema version now that all migrations have succeeded,
+        // so a later downgrade to a build with a lower max version fails loudly at
+        // the gate above instead of returning silently wrong results.
+        guard
+            .call(|conn| {
+                conn.pragma_update(
+                    None,
+                    "user_version",
+                    super::CAYENNE_METASTORE_SCHEMA_VERSION,
+                )
+            })
+            .await
+            .map_err(
+                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                    message: format!("Failed to stamp metastore schema version: {e}"),
+                },
+            )?;
+
         // Validate that existing tables match the expected schema.
         // This catches incompatible metadata databases from previous versions.
         // Drop the guard before validation — the callback acquires it per-table.
@@ -1034,7 +1201,7 @@ impl MetastoreBackend for SqliteMetastore {
         // cheaply know the originating catalog stage.
         let wait_start = std::time::Instant::now();
         let guard = self.pool().await?.acquire().await;
-        telemetry::track_cayenne_metastore_writer_wait(
+        telemetry::cayenne::track_metastore_writer_wait(
             wait_start.elapsed(),
             &[telemetry::KeyValue::new("txn", "other")],
         );
@@ -1054,7 +1221,7 @@ impl MetastoreBackend for SqliteMetastore {
             })
             .await
             .map_err(|e| convert_tokio_rusqlite_error(e, "Failed to execute statement"))?;
-        telemetry::track_cayenne_metastore_writer_held(
+        telemetry::cayenne::track_metastore_writer_held(
             held_start.elapsed(),
             &[telemetry::KeyValue::new("txn", "other")],
         );
@@ -1236,7 +1403,7 @@ impl MetastoreBackend for SqliteMetastore {
                     message: format!("Failed to begin transaction: {e}"),
                 },
             )?;
-        telemetry::track_cayenne_metastore_writer_wait(
+        telemetry::cayenne::track_metastore_writer_wait(
             wait_start.elapsed(),
             &[telemetry::KeyValue::new("txn", "other")],
         );
@@ -1364,7 +1531,7 @@ impl MetastoreBackend for SqliteMetastore {
                     message: format!("Failed to checkpoint catalog WAL: {e}"),
                 },
             )?;
-        telemetry::track_cayenne_metastore_checkpoint(
+        telemetry::cayenne::track_metastore_checkpoint(
             checkpoint_start.elapsed(),
             &[telemetry::KeyValue::new("mode", mode_label)],
         );
@@ -1393,7 +1560,7 @@ impl SqliteMetastore {
     /// `cayenne_metastore_wal_bytes` gauge.
     async fn sample_wal_bytes(&self) {
         let bytes = self.read_wal_bytes().await;
-        telemetry::track_cayenne_metastore_wal_bytes(bytes, &[]);
+        telemetry::cayenne::track_metastore_wal_bytes(bytes, &[]);
     }
 }
 
@@ -1426,7 +1593,7 @@ impl Drop for SqliteTransaction {
             // bg connection thread): this Drop returns immediately and the
             // synchronous writer-held window genuinely ends now, not when the
             // detached rollback later completes.
-            telemetry::track_cayenne_metastore_writer_held(
+            telemetry::cayenne::track_metastore_writer_held(
                 self.held_start.elapsed(),
                 &[telemetry::KeyValue::new("txn", "other")],
             );
@@ -1434,14 +1601,35 @@ impl Drop for SqliteTransaction {
             // tokio_rusqlite::Connection::call sends a closure to the bg
             // thread; it will execute even after this Drop returns.
             // We spawn a task to await the future properly.
-            tokio::spawn(async move {
+            let rollback = async move {
                 let _ = conn
                     .call(|conn| {
                         let _ = conn.execute_batch("ROLLBACK");
                         Ok::<_, rusqlite::Error>(())
                     })
                     .await;
-            });
+            };
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(rollback);
+            } else {
+                // No ambient Tokio runtime (dropped from a non-Tokio thread).
+                // `tokio_rusqlite::Connection::call` awaits the background
+                // connection thread over a Tokio channel, so drive the
+                // best-effort rollback on a small current-thread runtime instead
+                // of a bare `futures::executor::block_on` (mirrors the Turso
+                // metastore transaction Drop). Log if the runtime cannot be built.
+                std::thread::spawn(move || {
+                    match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt.block_on(rollback),
+                        Err(err) => tracing::error!(
+                            "Failed to build fallback Tokio runtime to auto-rollback SqliteTransaction on drop: {err}"
+                        ),
+                    }
+                });
+            }
         }
     }
 }
@@ -1551,7 +1739,7 @@ impl MetastoreTransaction for SqliteTransaction {
         // window the next writer queues behind (PR #11206 review).
         match commit_result {
             Ok(()) => {
-                telemetry::track_cayenne_metastore_writer_held(
+                telemetry::cayenne::track_metastore_writer_held(
                     self.held_start.elapsed(),
                     &[telemetry::KeyValue::new("txn", "other")],
                 );
@@ -1566,7 +1754,7 @@ impl MetastoreTransaction for SqliteTransaction {
                     })
                     .await;
 
-                telemetry::track_cayenne_metastore_writer_held(
+                telemetry::cayenne::track_metastore_writer_held(
                     self.held_start.elapsed(),
                     &[telemetry::KeyValue::new("txn", "other")],
                 );
@@ -1592,7 +1780,7 @@ impl MetastoreTransaction for SqliteTransaction {
 
         // METRIC 1 (writer held): record AFTER ROLLBACK — the write lock is held
         // through the rollback statement, so include its duration (PR #11206).
-        telemetry::track_cayenne_metastore_writer_held(
+        telemetry::cayenne::track_metastore_writer_held(
             self.held_start.elapsed(),
             &[telemetry::KeyValue::new("txn", "other")],
         );
@@ -1631,6 +1819,75 @@ mod tests {
         let db_path = dir.path().join("cayenne_test.db");
         let metastore = SqliteMetastore::new(format!("sqlite://{}", db_path.display()));
         (dir, metastore)
+    }
+
+    /// Build an in-memory (memdb) metastore for memory-mode tests. Each caller
+    /// MUST pass a unique `name` — memdb shares one in-memory database per name
+    /// across the whole process, so a shared name would leak state between tests.
+    fn in_memory_metastore(name: &str) -> SqliteMetastore {
+        SqliteMetastore::new(format!("sqlite://file:/{name}?vfs=memdb"))
+    }
+
+    /// Cayenne memory mode: an in-memory (memdb) metastore must be usable and,
+    /// crucially, SHARED across every pooled connection — a table created via one
+    /// pooled connection must be visible when a read round-robins to another.
+    /// This is the core memdb-sharing invariant; a private `:memory:` per
+    /// connection would fail the cross-connection read.
+    #[tokio::test]
+    async fn test_in_memory_metastore_shared_across_pool() {
+        let _guard = CONFIG_LOCK.lock().await;
+        set_sqlite_metastore_config(SqliteMetastoreConfig::default());
+
+        let metastore = in_memory_metastore("cayenne-mem-shared-pool");
+        assert!(is_memory_db_path(metastore.db_path()));
+
+        // Create the table via a pooled connection.
+        metastore
+            .execute_batch("CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY)")
+            .await
+            .expect("create table on a pooled connection");
+
+        // Every pooled connection must report the MEMORY journal (WAL is
+        // unsupported in-memory) — read it off a real pooled connection.
+        let pool = metastore.pool().await.expect("pool");
+        let journal_mode: String = pool.conns[0]
+            .lock()
+            .await
+            .call(|conn| conn.query_row("PRAGMA journal_mode", [], |row| row.get(0)))
+            .await
+            .expect("read journal_mode");
+        assert_eq!(
+            journal_mode.to_lowercase(),
+            "memory",
+            "in-memory metastore must use the MEMORY journal, got {journal_mode}"
+        );
+
+        // Insert enough rows that the round-robin pool spreads writes across
+        // multiple connections, then read the full count back — proving all
+        // connections share ONE database (memdb), not a private DB each.
+        for i in 0..64i64 {
+            metastore
+                .execute(ExecuteParams {
+                    sql: "INSERT INTO t (id) VALUES (?1)",
+                    params: vec![MetastoreValue::Integer(i)],
+                })
+                .await
+                .expect("insert row");
+        }
+        let count: i64 = metastore
+            .query_row(
+                QueryRowParams {
+                    sql: "SELECT COUNT(*) FROM t",
+                    params: vec![],
+                },
+                |row| row.get_i64(0),
+            )
+            .await
+            .expect("count rows");
+        assert_eq!(
+            count, 64,
+            "all inserts must be visible across the shared in-memory pool"
+        );
     }
 
     /// Create a tiny table and append `n` rows each carrying a ~`blob_kib` KiB
@@ -2162,5 +2419,107 @@ mod tests {
             false,
         )
         .await;
+    }
+
+    async fn read_user_version(metastore: &SqliteMetastore) -> i64 {
+        metastore
+            .query_row(
+                QueryRowParams {
+                    sql: "PRAGMA user_version",
+                    params: vec![],
+                },
+                |row| row.get_i64(0),
+            )
+            .await
+            .expect("read user_version")
+    }
+
+    /// A fresh catalog is stamped with the current schema version, and re-running
+    /// `init_schema` on it is idempotent (no downgrade, no error).
+    #[tokio::test]
+    async fn test_init_schema_stamps_and_preserves_user_version() {
+        let (_dir, metastore) = temp_metastore();
+        metastore.init_schema().await.expect("first init schema");
+        assert_eq!(
+            read_user_version(&metastore).await,
+            crate::metastore::CAYENNE_METASTORE_SCHEMA_VERSION,
+            "fresh catalog must be stamped with the current schema version"
+        );
+
+        metastore
+            .init_schema()
+            .await
+            .expect("re-running init schema is idempotent");
+        assert_eq!(
+            read_user_version(&metastore).await,
+            crate::metastore::CAYENNE_METASTORE_SCHEMA_VERSION,
+            "re-init must leave the stamp at the current version"
+        );
+    }
+
+    /// A legacy catalog (`user_version` 0, written before this gate existed) opens
+    /// cleanly and is migrated forward to the current stamp.
+    #[tokio::test]
+    async fn test_init_schema_upgrades_legacy_zero_version() {
+        let (_dir, metastore) = temp_metastore();
+        metastore.init_schema().await.expect("init schema");
+        // Simulate a pre-gate catalog by resetting the stamp to 0.
+        metastore
+            .execute(ExecuteParams {
+                sql: "PRAGMA user_version = 0",
+                params: vec![],
+            })
+            .await
+            .expect("reset user_version to legacy 0");
+        assert_eq!(read_user_version(&metastore).await, 0, "precondition");
+
+        metastore
+            .init_schema()
+            .await
+            .expect("legacy (v0) catalog must open and migrate");
+        assert_eq!(
+            read_user_version(&metastore).await,
+            crate::metastore::CAYENNE_METASTORE_SCHEMA_VERSION,
+            "legacy catalog must be re-stamped to the current version"
+        );
+    }
+
+    /// A catalog stamped by a NEWER build must be refused loudly rather than
+    /// opened and read with silently-wrong (dropped-row) results (#11291).
+    #[tokio::test]
+    async fn test_init_schema_rejects_newer_user_version() {
+        let (_dir, metastore) = temp_metastore();
+        metastore.init_schema().await.expect("first init schema");
+        // Simulate a catalog written by a future, incompatible build.
+        let newer = crate::metastore::CAYENNE_METASTORE_SCHEMA_VERSION + 1;
+        metastore
+            .execute(ExecuteParams {
+                sql: &format!("PRAGMA user_version = {newer}"),
+                params: vec![],
+            })
+            .await
+            .expect("bump user_version to a future version");
+
+        let err = metastore
+            .init_schema()
+            .await
+            .expect_err("a newer catalog must be rejected");
+        match err {
+            CatalogError::IncompatibleSchemaVersion { found, supported } => {
+                assert_eq!(found, newer);
+                assert_eq!(
+                    supported,
+                    crate::metastore::CAYENNE_METASTORE_SCHEMA_VERSION
+                );
+            }
+            other => panic!("expected IncompatibleSchemaVersion, got: {other}"),
+        }
+
+        // The rejected open must NOT have mutated the stamp (no silent downgrade).
+        assert_eq!(
+            read_user_version(&metastore).await,
+            newer,
+            "a refused open must leave the newer stamp untouched"
+        );
     }
 }

@@ -1,0 +1,54 @@
+[package]
+name = "runtime-cloud-connect"
+description = "Outbound control-plane client for Spice Cloud Connect (adoption flow for standalone spiced)"
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+arrow = { workspace = true }
+async-trait = { workspace = true }
+dirs = "6"
+gethostname = { workspace = true }
+prost = { workspace = true }
+rand = { workspace = true }
+# Client-side keypair + PKCS#10 CSR generation for the enrollment handshake.
+# Default features (ring backend + pem) are all we need; cert *parsing* /
+# signing (x509-parser) is only pulled in for the integration test server.
+rcgen = { version = "0.14", features = ["pem"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+snafu = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = "0.14"
+tracing = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "test-util"] }
+# `tokio_stream::wrappers::TcpListenerStream` requires the `net` feature.
+# The workspace dependency only enables `sync`, so opt-in explicitly here
+# for the integration tests.
+tokio-stream = { workspace = true, features = ["net"] }
+# The standalone-adoption e2e test stands up a real TLS control server that
+# signs client CSRs, so it needs rcgen's CSR/CA parsing (x509-parser) plus a
+# rustls crypto provider to install as the process default before the tonic
+# server builds its `ServerConfig`.
+rcgen = { version = "0.14", features = ["x509-parser"] }
+rustls = { workspace = true }
+
+[lints]
+workspace = true

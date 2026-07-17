@@ -292,8 +292,6 @@ impl DataConnector for GlueDataConnector {
     }
 }
 
-register_data_connector!("glue", GlueDataConnectorFactory);
-
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum InputFormat {
     // Avro,

@@ -14,11 +14,9 @@ description: "SELECT subject FROM vector_search(qs_view, 'second', answer) order
 |               |     HashJoinExec: mode=CollectLeft, join_type=Left, accumulator=MinMaxLeftAccumulator, on=[(id@0, id@0), (question@1, question@1)], projection=[id@0, question@1, _score@2, subject@5] |
 |               |       CoalescePartitionsExec                                                                                                                                                           |
 |               |         ProjectionExec: expr=[union_extract(json_get(key@0, id), int) as id, union_extract(json_get(key@0, question), str) as question, 1 - distance@1 as _score]                      |
-|               |           CooperativeExec                                                                                                                                                              |
-|               |             BytesProcessedExec                                                                                                                                                         |
-|               |               RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                     |
-|               |                 CooperativeExec                                                                                                                                                        |
-|               |                   S3VectorsQueryExec (INDEX_NAME_1): limit=100                                                                                                                         |
+|               |           BytesProcessedExec                                                                                                                                                           |
+|               |             RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                       |
+|               |               S3VectorsQueryExec (INDEX_NAME_1): limit=100                                                                                                                             |
 |               |       SchemaCastScanExec                                                                                                                                                               |
 |               |         BytesProcessedExec                                                                                                                                                             |
 |               |           DataSourceExec: partitions=1, partition_sizes=[2]                                                                                                                            |

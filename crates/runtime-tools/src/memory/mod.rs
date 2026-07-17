@@ -74,15 +74,40 @@ pub fn try_from(data: &[MemoryTableElement]) -> Result<RecordBatch, ArrowError> 
     )
 }
 
-/// Check that `identifier` is a single valid SQL identifier (no injection).
+/// Check that `identifier` is a valid (optionally dotted) SQL identifier (no injection).
 fn is_valid_identifier(identifier: &str) -> bool {
     let dialect: Box<dyn datafusion::sql::sqlparser::dialect::Dialect> = Box::new(GenericDialect);
     let mut tokenizer = Tokenizer::new(dialect.as_ref(), identifier);
     let Ok(tokens) = tokenizer.tokenize() else {
         return false;
     };
-    // Exactly one Word token + EOF
-    matches!(tokens.as_slice(), [Token::Word(_), Token::EOF])
+
+    if tokens.is_empty() {
+        return false;
+    }
+
+    let mut expect_period = false;
+    for token in tokens {
+        if expect_period && matches!(token, Token::Period) {
+            expect_period = false;
+            continue;
+        } else if expect_period {
+            return false;
+        }
+
+        let Token::Word(word) = token else {
+            return false;
+        };
+
+        if word.value.is_empty() {
+            return false;
+        }
+
+        expect_period = true;
+    }
+
+    // Ensure the last token was a word, not a trailing period
+    expect_period
 }
 
 /// Determine the name of the table to use to store/load memories.

@@ -1,19 +1,31 @@
 [package]
-name = "document_parse"
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
 license-file.workspace = true
+name = "document_parse"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-calamine = "0.28"
-docx-rs = { git = "https://github.com/spiceai/docx-rs", rev="2a85dce57d0128e2cd7c369545516c347cb8c529"}
-pdf-extract = "0.12"
-quick-xml = "0.38"
-snafu.workspace = true
+async-trait.workspace = true
 bytes.workspace = true
+calamine = "0.28"
+docx-rs = { git = "https://github.com/spiceai/docx-rs", rev = "2a85dce57d0128e2cd7c369545516c347cb8c529" }
+flate2 = "1"
+liteparse = { version = "2.3", default-features = false }
+# Preload PDFium through liteparse's own runtime loader (shared `dynamic` OnceLock).
+# Keep in lockstep with the `liteparse-pdfium-sys` version `liteparse` depends on;
+# a mismatch is a hard build error (duplicate `links = "pdfium"`), not a silent bug.
+liteparse-pdfium-sys = "1.3"
+quick-xml = "0.38"
+sha2 = "0.10"
+snafu.workspace = true
+tar = "0.4"
 tokio = { workspace = true, features = ["sync"] }
+ureq = "2"
 zip = "7.2"
+
+[lints]
+workspace = true

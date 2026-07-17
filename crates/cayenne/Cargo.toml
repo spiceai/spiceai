@@ -16,7 +16,6 @@ datafusion-dml = { path = "../datafusion-dml" }
 regex = "1.12.3"
 arrow-flight = { workspace = true }
 arrow-ipc = { workspace = true }
-arrow-row = { workspace = true }
 arrow-schema = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
@@ -41,6 +40,7 @@ object_store = { workspace = true }
 parking_lot = { workspace = true }
 roaring = { workspace = true }
 runtime-datafusion = { path = "../runtime-datafusion" }
+runtime-request-context = { path = "../runtime-request-context" }
 runtime-table-partition = { path = "../runtime-table-partition", optional = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
@@ -103,6 +103,9 @@ duckdb-bench = ["dep:duckdb"]
 chdb-bench = ["dep:chdb-rust"]
 
 [dev-dependencies]
+# Kept only for the `row_converter` byte-identity equivalence test; Cayenne's runtime no
+# longer depends on arrow-row's (unstable) row format.
+arrow-row = { workspace = true }
 criterion = { version = "0.7", features = ["html_reports", "async_tokio"] }
 datafusion-federation.workspace = true
 datafusion-functions-aggregate = { workspace = true }
@@ -110,11 +113,25 @@ datafusion-functions = { workspace = true }
 insta = { workspace = true, features = ["json"] }
 paste.workspace = true
 rstest = "0.26.1"
+# For the `pk_key_hashing` bench (FxHash for native integer PK keys) and the
+# `hll_ndv_hashing` bench (FxHash vs XXH3 for NDV sketch value hashing).
+rustc-hash = "2.1.2"
 tempfile = { workspace = true }
 test-framework = { path = "../test-framework" }
 test-log = { version = "0.2", features = ["trace"] }
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "fs"] }
 tokio-stream = { workspace = true }
+
+# The `compaction_io_hygiene` bench reproduces the Linux-only fadvise/fsync
+# primitives (`sync_file_range`, `posix_fadvise`, `mincore`) directly. cayenne
+# already depends on libc for `target_os = "linux"`, but a bench is a separate
+# crate and must name the dep itself.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
+
+[[bench]]
+harness = false
+name = "zorder_clustering"
 
 [[bench]]
 harness = false
@@ -123,6 +140,18 @@ name = "metastore_operations"
 [[bench]]
 harness = false
 name = "ivm_retraction_anchor"
+
+[[bench]]
+harness = false
+name = "mem_tier_shard_split_converter"
+
+[[bench]]
+harness = false
+name = "sharded_validation_inline"
+
+[[bench]]
+harness = false
+name = "maintained_minmax_anchor"
 
 [[bench]]
 harness = false
@@ -330,6 +359,10 @@ name = "int64_pk_filter_keep_mask_alloc"
 
 [[bench]]
 harness = false
+name = "key_based_filter_scratch_reuse_alloc"
+
+[[bench]]
+harness = false
 name = "position_delete_redundant_walks"
 
 [[bench]]
@@ -362,6 +395,10 @@ name = "apply_on_conflict_keys_double_clone"
 [[bench]]
 harness = false
 name = "delta_encoding_sweep"
+
+[[bench]]
+harness = false
+name = "compaction_write_amplification"
 
 [[bench]]
 harness = false
@@ -401,8 +438,31 @@ name = "mem_tier_join_shapes"
 
 [[bench]]
 harness = false
+name = "mem_tier_seal_cadence"
+
+[[bench]]
+harness = false
 name = "publish_metadata_wall"
 
 [[bench]]
 harness = false
 name = "cdc_apply_simd"
+
+[[bench]]
+harness = false
+name = "compaction_io_hygiene"
+
+[[bench]]
+harness = false
+name = "pk_key_hashing"
+
+[[bench]]
+harness = false
+name = "hll_ndv_hashing"
+
+[[bench]]
+harness = false
+name = "pk_keyset_present_path"
+
+[lints]
+workspace = true

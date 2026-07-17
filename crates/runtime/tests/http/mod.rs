@@ -62,6 +62,14 @@ const SHOWS_JSON: &str = r#"[
     {"id": 3, "name": "Better Call Saul", "rating": 8.9}
 ]"#;
 
+/// A JSON array whose objects carry, beyond `id`/`name`, extra scalar (`email`,
+/// `age`), nested-document (`address`), and array (`tags`) fields — everything a
+/// `json_object` catch-all must fold in.
+const PEOPLE_JSON: &str = r#"[
+    {"id": 1, "name": "Alice", "email": "alice@example.com", "age": 30, "address": {"city": "NYC", "zip": "10001"}},
+    {"id": 2, "name": "Bob", "email": "bob@example.com", "tags": ["x", "y"]}
+]"#;
+
 const ITEMS_CSV: &str = "id,name,price\n1,Widget,9.99\n2,Gadget,19.99\n3,Doohickey,4.99\n";
 
 const HTTP_JSON_EDGE_CASES: &str = r#"[
@@ -130,6 +138,19 @@ WHERE request_path = '/edge'
 ORDER BY id
 ";
 
+/// Same source/path as [`HTTP_JSON_EDGE_QUERY`] (so the connector still fetches
+/// `/edge` exactly once), but an extra predicate filters out every row, leaving
+/// an empty (zero-row) result set. Used to verify empty results are cached.
+const HTTP_JSON_EDGE_EMPTY_QUERY: &str = r"
+SELECT
+    CAST(json_get(content, 'id') AS BIGINT) AS id,
+    CAST(json_get(content, 'name') AS VARCHAR) AS name
+FROM http_json_edges
+WHERE request_path = '/edge'
+  AND CAST(json_get(content, 'id') AS BIGINT) = 999
+ORDER BY id
+";
+
 fn expected_http_json_edge_rows() -> Value {
     json!([
         {
@@ -193,6 +214,10 @@ async fn start_http_server() -> Result<
         .route(
             "/api/shows",
             get(|| async { ([("content-type", "application/json")], SHOWS_JSON) }),
+        )
+        .route(
+            "/api/people",
+            get(|| async { ([("content-type", "application/json")], PEOPLE_JSON) }),
         )
         .route(
             "/api/shows/{id}",
@@ -374,6 +399,30 @@ async fn run_http_json_edge_query(rt: &Runtime) -> Result<(CacheStatus, Vec<Reco
         .try_collect::<Vec<RecordBatch>>()
         .await
         .map_err(|e| format!("Failed to collect HTTP JSON edge query results: {e}"))?;
+
+    Ok((cache_status, batches))
+}
+
+/// Run an arbitrary SQL query against the HTTP JSON edge runtime, returning the
+/// cache status and collected batches.
+async fn run_http_json_query(
+    rt: &Runtime,
+    sql: &str,
+) -> Result<(CacheStatus, Vec<RecordBatch>), String> {
+    let query_result = rt
+        .datafusion()
+        .query_builder(sql)
+        .build()
+        .run()
+        .await
+        .map_err(|e| format!("Failed to run HTTP JSON query: {e}"))?;
+
+    let cache_status = query_result.cache_status;
+    let batches = query_result
+        .data
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .map_err(|e| format!("Failed to collect HTTP JSON query results: {e}"))?;
 
     Ok((cache_status, batches))
 }
@@ -564,6 +613,116 @@ async fn test_http_json_api_dynamic() -> Result<(), String> {
                 )
                 .await?;
             }
+
+            tx.send(())
+                .map_err(|()| "Failed to send shutdown signal".to_string())?;
+            Ok(())
+        })
+        .await
+}
+
+/// JSON nesting (`json_object: "*"`) on the HTTP connector: declared static
+/// columns (`id`, `name`) stay top-level while every other field of each JSON
+/// row folds into one sorted-key JSON catch-all `Utf8` column (`data`),
+/// exercised end-to-end against a live endpoint returning a JSON array.
+#[tokio::test]
+async fn http_json_object_decomposition() -> Result<(), String> {
+    use arrow::array::{Array, StringArray};
+    use spicepod::semantic::Column;
+
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let (tx, addr, _) = start_http_server().await?;
+            tracing::debug!("HTTP test server started at {addr}");
+
+            // Declaring a `json_object` catch-all column switches the HTTP provider
+            // into decomposition mode; no `file_format` is needed (the extensionless
+            // URL takes the dynamic HTTP path).
+            let mut dataset = Dataset::new(format!("http://{addr}/api/people"), "people");
+            let mut catch_all_meta = HashMap::new();
+            catch_all_meta.insert("json_object".to_string(), json!("*"));
+            dataset.columns = vec![
+                Column::new("id"),
+                Column::new("name"),
+                Column::new("data").with_metadata(catch_all_meta),
+            ];
+
+            let app = AppBuilder::new("http_json_object_test")
+                .with_dataset(dataset)
+                .build();
+            let rt = load_runtime(app).await?;
+
+            let query_result = rt
+                .datafusion()
+                .query_builder("SELECT name, data FROM people ORDER BY id")
+                .build()
+                .run()
+                .await
+                .map_err(|e| format!("json_object query failed: {e}"))?;
+            let batches: Vec<RecordBatch> = query_result
+                .data
+                .try_collect()
+                .await
+                .map_err(|e| format!("failed to collect json_object results: {e}"))?;
+
+            let mut rows: Vec<(String, Value)> = Vec::new();
+            for batch in &batches {
+                let names = batch
+                    .column_by_name("name")
+                    .ok_or("missing `name` column")?
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or("`name` should be a static Utf8 column")?;
+                let data = batch
+                    .column_by_name("data")
+                    .ok_or("missing catch-all `data` column")?
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or("catch-all `data` should be a Utf8 JSON string")?;
+                for row in 0..batch.num_rows() {
+                    let catch_all: Value = serde_json::from_str(data.value(row))
+                        .map_err(|e| format!("catch-all must be valid JSON: {e}"))?;
+                    rows.push((names.value(row).to_string(), catch_all));
+                }
+            }
+
+            assert_eq!(rows.len(), 2, "expected two rows, got {}", rows.len());
+
+            // Row 0 (Alice): declared statics stay top-level; every other field
+            // (scalar, nested object) folds into the catch-all, and no static key
+            // leaks into it.
+            let (name0, data0) = &rows[0];
+            assert_eq!(name0, "Alice");
+            assert_eq!(data0["email"], json!("alice@example.com"));
+            assert!(
+                data0.get("age").is_some(),
+                "scalar `age` must be in the catch-all"
+            );
+            assert!(
+                data0["address"].is_object(),
+                "nested `address` must be preserved as JSON in the catch-all"
+            );
+            assert!(
+                data0.get("name").is_none(),
+                "static `name` must not leak into the catch-all"
+            );
+            assert!(
+                data0.get("id").is_none(),
+                "static `id` must not leak into the catch-all"
+            );
+
+            // Row 1 (Bob): an array field folds in as well.
+            let (name1, data1) = &rows[1];
+            assert_eq!(name1, "Bob");
+            assert_eq!(data1["email"], json!("bob@example.com"));
+            assert!(
+                data1["tags"].is_array(),
+                "array `tags` must be preserved in the catch-all"
+            );
+            assert!(data1.get("name").is_none());
 
             tx.send(())
                 .map_err(|()| "Failed to send shutdown signal".to_string())?;
@@ -1114,6 +1273,74 @@ async fn test_http_json_edge_cases_results_cache() -> Result<(), String> {
             assert_eq!(
                 second_http_cache_header.as_deref(),
                 Some("Hit from spiceai")
+            );
+
+            rt.shutdown().await;
+
+            tx.send(())
+                .map_err(|()| "Failed to send shutdown signal".to_string())?;
+            Ok(())
+        })
+        .await
+}
+
+/// Regression test: an empty (zero-row) result set from a live source must be
+/// cached, and the second identical request must be served from cache WITHOUT
+/// re-fetching the upstream source.
+///
+/// This is the strongest form of the empty-result caching regression test:
+/// `edge_request_count` proves the source was hit exactly once across both
+/// requests. Before the fix, the empty result was never cached, so the second
+/// request re-executed (cache miss) and re-fetched the source (count == 2).
+#[tokio::test]
+async fn test_http_json_edge_cases_empty_result_cache() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let (tx, addr, edge_request_count) = start_http_server().await?;
+            let rt = setup_http_json_edge_runtime(
+                "http_json_edge_cases_empty_result_cache",
+                &format!("http://{addr}/api"),
+                false,
+                Some(SQLResultsCacheConfig {
+                    item_ttl: Some("60s".to_string()),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+
+            // First request: cache miss, empty result, source fetched once.
+            let (first_cache_status, first_batches) =
+                run_http_json_query(rt.as_ref(), HTTP_JSON_EDGE_EMPTY_QUERY).await?;
+            assert_eq!(first_cache_status, CacheStatus::CacheMiss);
+            assert_eq!(
+                first_batches
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum::<usize>(),
+                0,
+                "query should return zero rows"
+            );
+            assert_eq!(edge_request_count.load(Ordering::SeqCst), 1);
+
+            // Second request: cache hit, still empty, and NO second fetch.
+            let (second_cache_status, second_batches) =
+                run_http_json_query(rt.as_ref(), HTTP_JSON_EDGE_EMPTY_QUERY).await?;
+            assert_eq!(second_cache_status, CacheStatus::CacheHit);
+            assert_eq!(
+                second_batches
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum::<usize>(),
+                0,
+                "cached query should still return zero rows"
+            );
+            assert_eq!(
+                edge_request_count.load(Ordering::SeqCst),
+                1,
+                "results-cache hit on an empty result should avoid a second HTTP fetch"
             );
 
             rt.shutdown().await;

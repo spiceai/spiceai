@@ -57,6 +57,7 @@ use yaml::Value;
 #[cfg(feature = "anonymous_telemetry")]
 const TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE: &str = "Usage telemetry is anonymous and aggregated. In Spice.ai Open Source, setting runtime.telemetry.enabled: false in a Spicepod or passing --telemetry-enabled=false does not disable anonymous usage telemetry. To remove anonymous telemetry from an Open Source build, build from source without the anonymous_telemetry feature, or consider using Spice.ai Enterprise. Learn more at https://docs.spice.ai/docs/enterprise";
 
+mod cloud_connect;
 #[path = "tracing.rs"]
 mod spiced_tracing;
 mod tls;
@@ -77,13 +78,60 @@ pub async fn register_external_connectors() {
     )
     .await;
 
+    register_connector_factory(connector_abfs::CONNECTOR_NAME, connector_abfs::factory()).await;
+    // Also register the "abfss" prefix (secure variant uses the same factory)
+    register_connector_factory("abfss", connector_abfs::factory()).await;
+
+    register_connector_factory(connector_gcs::CONNECTOR_NAME, connector_gcs::factory()).await;
+    // Also register the "gs" prefix alias for GCS
+    register_connector_factory("gs", connector_gcs::factory()).await;
+
+    register_connector_factory(connector_glue::CONNECTOR_NAME, connector_glue::factory()).await;
+
+    register_connector_factory(
+        connector_ducklake::CONNECTOR_NAME,
+        connector_ducklake::factory(),
+    )
+    .await;
+    register_connector_factory(connector_git::CONNECTOR_NAME, connector_git::factory()).await;
+    register_connector_factory(
+        connector_github::CONNECTOR_NAME,
+        connector_github::factory(),
+    )
+    .await;
+    register_connector_factory(
+        connector_spiceai::CONNECTOR_NAME,
+        connector_spiceai::factory(),
+    )
+    .await;
+    // Also register the legacy "spiceai" prefix
+    register_connector_factory(
+        connector_spiceai::LEGACY_CONNECTOR_NAME,
+        connector_spiceai::legacy_factory(),
+    )
+    .await;
+
     // Feature-gated connectors
+
     #[cfg(feature = "clickhouse")]
     register_connector_factory(
         connector_clickhouse::CONNECTOR_NAME,
         connector_clickhouse::factory(),
     )
     .await;
+
+    #[cfg(feature = "cosmosdb")]
+    register_connector_factory(
+        connector_cosmosdb::CONNECTOR_NAME,
+        connector_cosmosdb::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "adbc")]
+    register_connector_factory(connector_adbc::CONNECTOR_NAME, connector_adbc::factory()).await;
+
+    #[cfg(feature = "kafka")]
+    register_connector_factory(connector_kafka::CONNECTOR_NAME, connector_kafka::factory()).await;
 
     #[cfg(feature = "databricks")]
     register_connector_factory(
@@ -765,7 +813,7 @@ pub async fn run(args: Args) -> Result<()> {
         // instruments must be (re)bound to the real meter here rather than at carve
         // time — otherwise they'd bind to the early noop meter and never export.
         if let Some(bytes) = rt.datafusion().compaction_memory_pool_bytes() {
-            telemetry::register_cayenne_compaction_metrics(bytes);
+            telemetry::cayenne::register_compaction_metrics(bytes);
         }
 
         // Per-runtime tokio thread/task gauges (alive tasks, workers, global-queue depth;
@@ -788,6 +836,14 @@ pub async fn run(args: Args) -> Result<()> {
         }
         tokio_handles.push(("main", Handle::current()));
         telemetry::register_tokio_runtime_metrics(tokio_handles);
+
+        // Cayenne write-path backpressure occupancy gauges (encode budget, in-memory
+        // CDC tier byte budget, compaction semaphore). Pull-based observable gauges on
+        // the global `cayenne` meter; registered here — after `init_metrics` — for the
+        // same reason as the compaction metrics above (bind to the real Prometheus
+        // meter, not the early noop one). Localizes *which* valve is stalling the CDC
+        // apply path when ingest falls behind.
+        runtime::dataaccelerator::cayenne::register_cayenne_telemetry();
     }
 
     let (tls_config, client_auth_mode) = tls::load_tls_config(
@@ -875,12 +931,25 @@ pub async fn run(args: Args) -> Result<()> {
         Box::pin(cloned_rt.start_servers(args.runtime, tls_config, endpoint_auth)).await
     });
 
+    let mut components_loaded = false;
     tokio::select! {
-        () = Arc::clone(&rt).load_components() => {},
+        () = Arc::clone(&rt).load_components() => { components_loaded = true; },
         () = runtime::shutdown_signal() => {
             tracing::debug!("Cancelling runtime initializing!");
         },
     }
+
+    // Spice Cloud Connect. Default off — only activates when an identity is
+    // on disk or an adoption code is available. Failures here are non-fatal:
+    // spiced keeps running. Started only after `load_components()` completes
+    // so an adopted control plane can't issue RunQuery / GetRuntimeInfo
+    // against a half-loaded runtime (datasets/models still registering).
+    let cloud_connect_handle = if components_loaded {
+        cloud_connect::maybe_start(env!("CARGO_PKG_VERSION"), Arc::clone(&rt)).await
+    } else {
+        // Shutting down before components finished loading — don't start.
+        None
+    };
 
     let result = match server_thread.await {
         // Don't treat force terminated as an error
@@ -893,6 +962,9 @@ pub async fn run(args: Args) -> Result<()> {
         }),
     };
 
+    if let Some(cc) = cloud_connect_handle {
+        cc.shutdown().await;
+    }
     rt.shutdown().await;
 
     result

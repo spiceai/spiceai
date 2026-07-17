@@ -16,7 +16,6 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::RefreshMode;
-use crate::component::metrics::MetricsProvider;
 use crate::component::{ComponentInitialization, DatasetHealthMonitor, StartupOptions};
 use crate::dataconnector::client_identity::{
     ClientIdentityConfig, ClientIdentityConfigError, TLS_CLIENT_CERTIFICATE,
@@ -31,6 +30,7 @@ use crate::dataconnector::listing::{
     LISTING_TABLE_PARAMETERS, ListingTableConnector, build_fragments,
     detect_file_extension_from_url_or_path, parse_file_extension_param,
 };
+use runtime_metrics::component::MetricsProvider;
 
 use data_components::http::auth::{
     ClientAuthMethod, HttpAuthenticator, RefreshTokenAuth, RefreshTokenConfig,
@@ -2871,14 +2871,14 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         let nesting = parse_http_json_nesting(&dataset)
             .expect("parse should succeed")
             .expect("expected Some(nesting) when marker is present");
-        assert_eq!(nesting.json_field_name, "data");
+        assert_eq!(nesting.json_field_name(), "data");
         assert_eq!(
             nesting.column_order,
             vec!["id", "name", "data", "_fetched_at"]
         );
-        assert!(nesting.static_fields.contains("id"));
-        assert!(nesting.static_fields.contains("name"));
-        assert!(!nesting.static_fields.contains("data"));
+        assert!(nesting.static_fields().contains("id"));
+        assert!(nesting.static_fields().contains("name"));
+        assert!(!nesting.static_fields().contains("data"));
         assert!(
             nesting.metadata_fields.contains("_fetched_at"),
             "_fetched_at should be auto-injected into metadata_fields"
@@ -2964,7 +2964,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         let nesting = parse_http_json_nesting(&dataset)
             .expect("parse should succeed")
             .expect("expected Some(nesting) when marker is present");
-        assert_eq!(nesting.json_field_name, "data");
+        assert_eq!(nesting.json_field_name(), "data");
         assert_eq!(
             nesting.column_order,
             vec![
@@ -2987,10 +2987,10 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         );
         // Reserved-name columns must not also be treated as static body
         // fields, otherwise the body would shadow the HTTP metadata.
-        assert!(!nesting.static_fields.contains("request_path"));
-        assert!(!nesting.static_fields.contains("response_status"));
-        assert!(!nesting.static_fields.contains("_fetched_at"));
-        assert!(nesting.static_fields.contains("id"));
+        assert!(!nesting.static_fields().contains("request_path"));
+        assert!(!nesting.static_fields().contains("response_status"));
+        assert!(!nesting.static_fields().contains("_fetched_at"));
+        assert!(nesting.static_fields().contains("id"));
     }
 
     #[tokio::test]
@@ -3178,7 +3178,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
             "_fetched_at should be in metadata_fields"
         );
         assert!(
-            !nesting.static_fields.contains("_fetched_at"),
+            !nesting.static_fields().contains("_fetched_at"),
             "_fetched_at must not be a static body field"
         );
         // Auto-injected at the end, after user-declared columns.

@@ -1,0 +1,169 @@
+version: v1
+kind: Spicepod
+name: postgres-cayenne[file]-adaptive-1slot
+
+# SINGLE-SHARED-SLOT variant of the default `postgres-cayenne[file]-adaptive` (which is 4-slot +
+# deep prefetch). IDENTICAL to that pod — adaptive self-tuning (`cayenne_tuning: adaptive` +
+# `schema_inference: extended`), the global `cayenne_goal_*` SLOs, and the SAME deep CDC prefetch
+# (16384) — EXCEPT every changes-mode table shares ONE replication slot instead of the default
+# four. Kept as a SEPARATE pod to A/B the slot-count effect against the 4-slot default with
+# everything else (adaptive tuning + prefetch depth) held constant.
+#
+# This is the TARGET topology we are driving toward: ONE shared slot (`spice_all`) spawns ONE
+# walsender that decodes the FULL WAL stream exactly once (server decode at 1x — the minimum), and
+# the whole merged change stream is drained by a SINGLE shared client pump. It maximizes source
+# decode savings but concentrates ALL apply pressure on one pump. At SF1000 it is currently
+# apply-bound and fails the data-correctness convergence gate; the shared-pump / deferred-parsing /
+# ack-path work aims to make it viable. Trade-off: confirmed_flush_lsn is the min across ALL
+# members, so any one table stalling pins WAL retention for the whole stream (acceptable for the
+# bench).
+#
+# As in `-adaptive`, no primary_key / on_conflict / indexes are declared: `schema_inference:
+# extended` detects them from the PostgreSQL source and seeds the upsert on_conflict the CDC
+# (changes) path requires. sql_results / task_history stay off to match the baseline.
+
+postgres_connection_params: &postgres_params
+  pg_host: ${env:CHBENCH_PG_HOST}
+  pg_port: 5432
+  pg_db: chbench
+  pg_user: bench
+  pg_pass: bench
+  pg_sslmode: disable
+
+runtime:
+  flight:
+    ipc_compression: lz4_frame
+  caching:
+    sql_results:
+      enabled: false
+  task_history:
+    enabled: false
+  # Goal-driven adaptive SLOs, set GLOBALLY once here and inherited by every Cayenne
+  # dataset. These are the high-level targets the closed loop converges toward — NOT
+  # actuator knobs. QPH is GLOBAL-ONLY (measured across all datasets).
+  params:
+    # Deep prefetch, matching the default `-adaptive` pod so this 1-slot config differs from it
+    # ONLY in slot count (isolating the slot-count effect at the standard prefetch depth).
+    cdc_prefetch_buffer: '16384'
+    cdc_max_coalesced_envelopes: '16384'
+    cayenne_goal_replication_lag: '5s'
+    cayenne_goal_freshness: '30s'
+    cayenne_goal_query_latency: '10s'
+    cayenne_goal_qph: '5000'
+
+datasets:
+  # ---- TPC-C core tables (mutated by OLTP workload) ----
+  # No primary_key / on_conflict / indexes: `schema_inference: extended` detects them from the
+  # PostgreSQL source and seeds the upsert on_conflict the CDC (changes) path requires.
+  # All changes tables share the single slot `spice_all`.
+
+  - from: postgres:warehouse
+    name: warehouse
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_all
+      pg_replication_initial_snapshot: 'true'
+    acceleration: &cayenne_accel
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      params: &cayenne_params
+        cayenne_tuning: adaptive
+        # In-memory CDC intra-apply sharding: 4 PK-hash shards validate+append in
+        # parallel within one apply on the memory-tier (changes) tables. Inert on the
+        # full-refresh reference tables that share this anchor (not CDC memory mode).
+        cayenne_cdc_mem_tier_shards: '4'
+        # Goal-driven SLOs are set globally under `runtime.params` (above) and
+        # inherited by every dataset, so they are intentionally not repeated here.
+
+  - from: postgres:district
+    name: district
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_all
+      pg_replication_initial_snapshot: 'true'
+    acceleration: *cayenne_accel
+
+  - from: postgres:customer
+    name: customer
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_all
+      pg_replication_initial_snapshot: 'true'
+    acceleration: *cayenne_accel
+
+  - from: postgres:new_order
+    name: new_order
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_all
+      pg_replication_initial_snapshot: 'true'
+    acceleration: *cayenne_accel
+
+  - from: postgres:oorder
+    name: oorder
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_all
+      pg_replication_initial_snapshot: 'true'
+    acceleration: *cayenne_accel
+
+  - from: postgres:order_line
+    name: order_line
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_all
+      pg_replication_initial_snapshot: 'true'
+    acceleration: *cayenne_accel
+
+  - from: postgres:stock
+    name: stock
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_all
+      pg_replication_initial_snapshot: 'true'
+    acceleration: *cayenne_accel
+
+  # ---- Static reference tables (no OLTP mutations, full refresh) ----
+  # Same: PK / on_conflict / indexes come from extended inference.
+
+  - from: postgres:item
+    name: item
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration: &cayenne_accel_full
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      params: *cayenne_params
+
+  - from: postgres:region
+    name: region
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration: *cayenne_accel_full
+
+  - from: postgres:nation
+    name: nation
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration: *cayenne_accel_full
+
+  - from: postgres:supplier
+    name: supplier
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration: *cayenne_accel_full

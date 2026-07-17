@@ -61,6 +61,13 @@ ci:
 	make -C bin/spice
 	make -C bin/spiced
 
+# Local CI attestation ("developer sign-off"). Runs lint + unit tests, then
+# posts a `signoff` commit status on HEAD so the PR can enter the merge queue,
+# where the full suite runs. See scripts/signoff and docs/dev/ci_signoff.md.
+.PHONY: signoff
+signoff:
+	@./scripts/signoff
+
 .PHONY: test
 test:
 	@cargo test --all --lib
@@ -107,7 +114,7 @@ lint: lint-rust
 lint-rust:
 	cargo fmt --all -- --check
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going --lib --bins --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control,spicebench --workspace --exclude libnfs -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going --lib --bins --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control,spicebench --workspace --exclude libnfs --exclude lopdf --exclude ttf-parser --exclude pdf-extract -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -122,7 +129,7 @@ lint-rust:
 		-Dclippy::todo \
 		-Dclippy::assertions_on_result_states \
 		-Dclippy::allow_attributes
-	cargo clippy $(CARGO_PROFILE) --keep-going --tests --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control,spicebench --workspace --exclude libnfs -- \
+	cargo clippy $(CARGO_PROFILE) --keep-going --tests --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control,spicebench --workspace --exclude libnfs --exclude lopdf --exclude ttf-parser --exclude pdf-extract -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -150,7 +157,7 @@ _LINT_PKG_FLAGS := $(foreach p,$(PACKAGES),-p $(p))
 _LINT_WORKSPACE_FLAGS := $(_LINT_PKG_FLAGS)
 _FMT_FLAGS := $(_LINT_PKG_FLAGS)
 else
-_LINT_WORKSPACE_FLAGS := --workspace --exclude libnfs
+_LINT_WORKSPACE_FLAGS := --workspace --exclude libnfs --exclude lopdf --exclude ttf-parser --exclude pdf-extract
 _FMT_FLAGS := --all
 endif
 # Apply FEATURES if provided, otherwise default to hardcoded features only for workspace-wide linting

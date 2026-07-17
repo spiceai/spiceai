@@ -1,0 +1,169 @@
+version: v1
+kind: Spicepod
+name: mysql-cayenne[file]
+
+# Non-tuned baseline: NO Cayenne/CDC performance tuning — the runtime auto-derives every knob
+# (write concurrency, segment/footer/keyset/metastore caches, compaction triggers, CDC
+# coalescing, file path, metastore backend) from the host. This is the out-of-box reference for
+# the postgres-cayenne[file]-cdc-tuned-* configs. The only non-defaults are the sql_results /
+# task_history toggles below, kept off to match the tuned configs so the comparison isolates the
+# effect of tuning, not caching/history overhead.
+
+mysql_connection_params: &mysql_params
+  mysql_host: ${env:CHBENCH_MYSQL_HOST}
+  mysql_tcp_port: 3306
+  mysql_db: chbench
+  mysql_user: bench
+  mysql_pass: bench
+  mysql_sslmode: disabled
+
+runtime:
+  caching:
+    sql_results:
+      enabled: false
+  task_history:
+    enabled: false
+
+datasets:
+  # ---- TPC-C core tables (mutated by OLTP workload) ----
+
+  - from: mysql:warehouse
+    name: warehouse
+    params:
+      <<: *mysql_params
+      mysql_replication_snapshot_mode: auto
+      mysql_replication_server_id: '1001'
+    acceleration: &cayenne_accel
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: w_id
+      on_conflict:
+        w_id: upsert
+
+  - from: mysql:district
+    name: district
+    params:
+      <<: *mysql_params
+      mysql_replication_snapshot_mode: auto
+      mysql_replication_server_id: '1002'
+    acceleration:
+      <<: *cayenne_accel
+      primary_key: (d_w_id, d_id)
+      on_conflict:
+        (d_w_id, d_id): upsert
+
+  - from: mysql:customer
+    name: customer
+    params:
+      <<: *mysql_params
+      mysql_replication_snapshot_mode: auto
+      mysql_replication_server_id: '1003'
+    acceleration:
+      <<: *cayenne_accel
+      primary_key: (c_w_id, c_d_id, c_id)
+      on_conflict:
+        (c_w_id, c_d_id, c_id): upsert
+
+  - from: mysql:new_order
+    name: new_order
+    params:
+      <<: *mysql_params
+      mysql_replication_snapshot_mode: auto
+      mysql_replication_server_id: '1004'
+    acceleration:
+      <<: *cayenne_accel
+      primary_key: (no_w_id, no_d_id, no_o_id)
+      on_conflict:
+        (no_w_id, no_d_id, no_o_id): upsert
+
+  - from: mysql:oorder
+    name: oorder
+    params:
+      <<: *mysql_params
+      mysql_replication_snapshot_mode: auto
+      mysql_replication_server_id: '1005'
+    acceleration:
+      <<: *cayenne_accel
+      primary_key: (o_w_id, o_d_id, o_id)
+      on_conflict:
+        (o_w_id, o_d_id, o_id): upsert
+
+  - from: mysql:order_line
+    name: order_line
+    params:
+      <<: *mysql_params
+      mysql_replication_snapshot_mode: auto
+      mysql_replication_server_id: '1006'
+    acceleration:
+      <<: *cayenne_accel
+      primary_key: (ol_w_id, ol_d_id, ol_o_id, ol_number)
+      on_conflict:
+        (ol_w_id, ol_d_id, ol_o_id, ol_number): upsert
+
+  - from: mysql:stock
+    name: stock
+    params:
+      <<: *mysql_params
+      mysql_replication_snapshot_mode: auto
+      mysql_replication_server_id: '1007'
+    acceleration:
+      <<: *cayenne_accel
+      primary_key: (s_w_id, s_i_id)
+      on_conflict:
+        (s_w_id, s_i_id): upsert
+
+  # ---- Static reference tables (no OLTP mutations, full refresh) ----
+
+  - from: mysql:item
+    name: item
+    params:
+      <<: *mysql_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: i_id
+      on_conflict:
+        i_id: upsert
+
+  - from: mysql:region
+    name: region
+    params:
+      <<: *mysql_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: r_regionkey
+      on_conflict:
+        r_regionkey: upsert
+
+  - from: mysql:nation
+    name: nation
+    params:
+      <<: *mysql_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: n_nationkey
+      on_conflict:
+        n_nationkey: upsert
+
+  - from: mysql:supplier
+    name: supplier
+    params:
+      <<: *mysql_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: su_suppkey
+      on_conflict:
+        su_suppkey: upsert

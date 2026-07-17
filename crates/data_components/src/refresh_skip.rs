@@ -38,6 +38,17 @@ pub trait RefreshSkipTableProvider: TableProvider {
     /// and proceed with the refresh to ensure data consistency.
     async fn should_skip_refresh(&self) -> datafusion::error::Result<bool>;
 
+    /// Invalidates any cached state used to decide whether a refresh can be skipped.
+    ///
+    /// The skip decision assumes the currently-materialized data is a faithful, complete read
+    /// of the source. A one-off refresh override (e.g. a manual refresh with a different
+    /// `refresh_sql`) breaks that assumption: it materializes a *subset* of the source even
+    /// though the source itself is unchanged. After such a refresh the cached version must be
+    /// reset, otherwise the next plain refresh would compare an unchanged source against the
+    /// cached version, skip, and leave the narrowed data in place. Providers cache their
+    /// skip state so this defaults to a no-op only for providers that keep none.
+    async fn reset_skip_state(&self) {}
+
     /// Returns a reference to self as a `RefreshSkipTableProvider` trait object.
     /// This enables dynamic dispatch without requiring knowledge of the concrete type.
     fn as_refresh_skip_provider(&self) -> &dyn RefreshSkipTableProvider
@@ -107,4 +118,37 @@ pub async fn should_skip_refresh_for_table_provider(
     }
 
     Ok(None)
+}
+
+/// Resets the refresh-skip cached state of the provided table provider if it implements
+/// [`RefreshSkipTableProvider`], peeling the same wrapper providers as
+/// [`should_skip_refresh_for_table_provider`] so the inner provider is reached. A no-op for
+/// providers that do not support refresh skipping.
+///
+/// Call this after a refresh that materialized a subset of the source (e.g. an override
+/// `refresh_sql`) so the next plain refresh re-materializes the full source instead of skipping
+/// against the now-narrowed accelerated data.
+pub async fn reset_refresh_skip_state_for_table_provider(
+    table_provider: &(dyn TableProvider + Send + Sync),
+) {
+    let any = table_provider as &dyn std::any::Any;
+
+    if let Some(provider) = any.downcast_ref::<crate::s3_single_file_cached::S3SingleFileCached>() {
+        provider.reset_skip_state().await;
+        return;
+    }
+
+    if let Some(enriched) = any.downcast_ref::<crate::MetadataEnrichedTableProvider>() {
+        Box::pin(reset_refresh_skip_state_for_table_provider(
+            enriched.get_inner_ref().as_ref(),
+        ))
+        .await;
+        return;
+    }
+
+    if let Some(adaptor) = any.downcast_ref::<FederatedTableProviderAdaptor>()
+        && let Some(inner) = adaptor.table_provider.as_ref()
+    {
+        Box::pin(reset_refresh_skip_state_for_table_provider(inner.as_ref())).await;
+    }
 }

@@ -1,0 +1,227 @@
+# CI Sign-off (developer attestation)
+
+Spice runs the fast quality checks on the **developer's machine**, not on every
+pull-request push. You run one command locally to attest your change, and a
+single lightweight check — **Attestation** — validates it on the PR (only the
+`enforce-pull-with-spice` PR-hygiene check runs alongside it). The heavy, full
+test suite then runs **once in the merge queue**, on the actual merged result,
+as the required gate.
+
+This is our take on 37signals' [move of CI back to developer
+machines](https://world.hey.com/dhh/we-re-moving-continuous-integration-back-to-developer-machines-3ac6c611),
+built on the same mechanism as their open-source
+[`basecamp/gh-signoff`](https://github.com/basecamp/gh-signoff). The difference:
+their sign-off is the whole gate; ours only gates *entry* to the merge queue, so
+the full suite still runs on the merged code before it can reach `trunk`.
+
+## Why
+
+Previously every PR push ran the whole suite — lint, build, unit tests,
+integration tests, E2E — and then the merge queue ran much of it *again* on
+merge. That is slow feedback and a lot of duplicated CI. With sign-off:
+
+- **Fast local feedback.** `make signoff` runs lint + unit tests on your
+  hardware, which is typically faster than waiting for a remote runner.
+- **No duplicated CI.** The full suite runs once, in the queue, on the merged
+  commit — not on every push and again on merge.
+- **Same safety.** Nothing reaches `trunk` without the full suite passing on the
+  exact commit that will be merged.
+
+## The flow
+
+```
+        ┌── you ───────────────┐      ┌── GitHub ──────────────────────────────┐
+        │                      │      │                                        │
+  edit → commit → push → make signoff │→ Attestation check ─(green + review)─┐  │
+        │        (lint+test, posts    │  (validates the sign-off on the PR)  │  │
+        │         a `signoff` status) │                                      ▼  │
+        │                      │      │                              merge queue │
+        │                      │      │                  full suite runs on the  │
+        │                      │      │                  merged result (required)│
+        │                      │      │                                      │   │
+        │                      │      │                          all green → merge to trunk
+        └──────────────────────┘      └────────────────────────────────────────┘
+```
+
+## For contributors
+
+### Sign off on your change
+
+From a clean Git checkout or JJ workspace, with your branch/bookmark pushed
+and up to date:
+
+```bash
+make signoff          # runs `make lint-rust` + `make build-cli nextest`, then attests
+```
+
+On success it posts a `signoff` commit status on your current `HEAD`. If the
+**Attestation** check already ran and failed before the sign-off existed, the
+script re-runs that job via the `gh` CLI so it turns green without you having
+to open or refresh the PR. (If no run is found yet — e.g. before the PR's
+first CI run — or the rerun call fails, it falls back to prompting you to
+open/refresh the PR yourself.) That, together with a review, lets a
+maintainer add the PR to the merge queue.
+
+The sign-off is normally bound to the **exact commit** you pushed. If you push a
+code change, the old sign-off no longer applies and you must run `make signoff`
+again. The only exception is merging the PR's base branch. **Attestation** walks
+up to 100 successive merge commits on the first-parent chain to find a sign-off.
+`HEAD` must merge the current base commit, each older merged base must appear in
+order on the current base branch's first-parent history, and every merge tree
+must exactly match Git's conflict-free automatic result. A conflict resolution,
+amended merge, octopus merge, or merge from another branch still requires a new
+sign-off.
+`scripts/signoff status` reports only a commit's own status; the inheritance
+check runs in the PR's **Attestation** workflow.
+
+### Reverts are fast-tracked
+
+A pull request that only reverts commits already on the base branch passes
+**Attestation** automatically — no local `make signoff` needed. Undoing a change
+that already landed (and so already passed the full suite on its way in) is
+low-risk, and the merge queue still re-runs the whole suite on the merged
+result before it can reach `trunk`.
+
+The **Attestation** workflow fast-tracks a PR when **all** of the following hold:
+
+- Every commit the PR introduces is a Git revert — it carries the
+  `This reverts commit <sha>.` footer that `git revert` writes. A single
+  non-revert commit disqualifies the PR and it needs a normal sign-off.
+- Each reverted commit is already on the base branch (an ancestor of the base
+  tip). You can't fast-track "reverting" something that never merged.
+- The PR is from the same repository, not a fork. Fork contributors can't
+  self-sign-off anyway (posting a status needs write access), so a fork revert
+  still takes a maintainer sign-off — this keeps the trusted-committer boundary.
+
+To fast-track, just open the revert PR the normal way (e.g. `git revert <sha>`
+keeps the footer intact); the check passes on its own. If you amend a revert
+with extra changes, or squash the footer out of the message, it falls back to
+requiring a sign-off.
+
+Options:
+
+```bash
+scripts/signoff -f            # sign off even with an uncommitted/unpushed tree
+scripts/signoff --no-verify   # attest without running the checks (honor system)
+scripts/signoff status        # does HEAD have its own sign-off?
+scripts/signoff --help        # full usage
+```
+
+### Jujutsu workspaces
+
+`make signoff` also works in non-colocated JJ workspaces (where there is a
+`.jj` directory but no `.git` directory). Commit/bookmark your change and push
+it normally before signing off:
+
+```bash
+jj commit -m "describe the change"
+jj bookmark set my-branch -r @-
+jj git push --bookmark my-branch
+make signoff
+```
+
+After `jj commit`, JJ normally leaves an empty working-copy commit (`@`) on top
+of the bookmarked commit. The sign-off tool recognizes that layout and attests
+the pushed parent (`@-`). If `@` itself is bookmarked and pushed, it attests `@`
+instead. In either case, the selected commit must exactly match a bookmark tip
+on the configured remote.
+
+The JJ remote defaults to `origin`. Set `SIGNOFF_REMOTE=<remote>` when the PR
+branch is pushed elsewhere. Colocated JJ repositories continue to use the Git
+path, so existing Git behavior is unchanged.
+
+### "No developer sign-off found for &lt;sha&gt;"
+
+The Attestation check couldn't find an applicable green `signoff` status. It
+checks the PR's head commit first, then walks backward through clean, unmodified
+base merges on the first-parent chain. Make sure the commit under review is
+pushed, then run `make signoff` again. Any new code or manual merge resolution
+needs a fresh sign-off.
+
+### External contributors (forks)
+
+Posting a commit status requires write access to this repository, so
+contributors working from a fork can't sign off on their own PR. A maintainer
+reviews the change and signs off on your behalf (or pushes a small follow-up and
+signs off). This mirrors the trusted-committer model — the full suite in the
+merge queue is still the real gate.
+
+## For maintainers
+
+### What runs where
+
+| Stage | Trigger | Checks |
+| --- | --- | --- |
+| Local | `make signoff` | `make lint-rust`, `make build-cli nextest` |
+| Pull request | `pull_request` | **Attestation** (validates the sign-off, or auto-passes a pure revert) + PR hygiene; merge-queue check names report lightweight skipped/passthrough results |
+| Merge queue | `merge_group` | the full required suite (below) + advisory niche checks |
+
+Required checks in the merge queue (the `trunk` ruleset):
+
+- `Attestation`
+- `enforce-pull-with-spice`
+- `Rust Lint`
+- `Build and Test`
+- `Build (release profile)`
+- `Integration Tests (part 1/2/3)`
+- `ADBC Integration Tests`
+- `Features Check`
+- `Check Rust Licenses`
+- `E2E Test CI` (a summary "gate" job over the whole E2E matrix)
+
+Advisory checks that also run on `merge_group` but don't block (they can be
+promoted to required with a gate job later): `integration tests (llms)`,
+`Elasticsearch Integration Tests`, `Helm Lint`.
+
+GitHub uses one required-checks list both before queue entry and on the merge
+queue commit. Therefore every required workflow triggers on both `pull_request`
+and `merge_group`. On a pull request, `Attestation` is the only *quality* work
+(the `enforce-pull-with-spice` hygiene check also runs); the expensive required
+jobs report skipped or lightweight passthrough results under their stable check
+names. On `merge_group`, those same names run the real suite, so any failure
+blocks the merge. `check_changes` still lets docs-only merge groups skip work
+and report success.
+
+### Enabling it (one-time rollout)
+
+Because this changes the checks that gate `trunk`, roll it out deliberately:
+
+1. Review and merge the PR that adds `scripts/signoff`. Its pull-request
+   workflows still report every currently required check name, allowing it to
+   enter the merge queue normally; the queue runs the real suite.
+2. Immediately run `scripts/signoff install --yes` so `trunk` requires
+   `Attestation` plus the full merge-queue suite.
+3. From then on, contributors run `make signoff`, the PR gates on `Attestation`,
+   and the queue runs the full suite.
+
+### Configure the ruleset
+
+The required-checks list lives in the `trunk` ruleset and is applied with the
+same script developers use:
+
+```bash
+scripts/signoff check          # show what trunk currently requires
+scripts/signoff install        # dry run: preview the required-checks change
+scripts/signoff install --yes  # apply it (needs admin on the repo)
+```
+
+`install` reads the current ruleset and swaps only the required-status-checks
+list — the merge-queue settings, required approvals, and other rules are left
+untouched. The single source of truth for the required list is the
+`REQUIRED_CHECKS` array in [`scripts/signoff`](/scripts/signoff); if you add a
+required merge-queue check, add its (stable) job name there and re-run `install`.
+
+> **Every required check must be produced under the same stable name on both
+> the PR head (`pull_request` or `pull_request_target`) and `merge_group`.** A
+> missing PR check blocks queue entry; a missing merge-group check stalls the
+> queue. Matrix workflows use a summary
+> "gate" job with a stable name so one ruleset entry can require the whole matrix.
+
+### Rollback
+
+Sign-off is enabled by the ruleset, not the workflows, so you can revert the gate
+without touching code: edit the `trunk` ruleset's required status checks back to
+the previous list (drop `Attestation` and re-add the heavy checks), then restore
+the heavy jobs on `pull_request` by removing their PR-only skip conditions.
+Because the jobs continue to run on `merge_group`, the queue keeps working
+throughout.

@@ -44,6 +44,9 @@ pub(crate) struct AppCreateConfig {
     pub executor_storage_size_gb: Option<f64>,
     pub ephemeral_storage_limit_gb: Option<String>,
     pub organization_tag: Option<String>,
+    /// Dedicated-cluster / nodegroup name from `GET /v1/clusters`. When set,
+    /// cloud injects scheduling tags; mutually exclusive with sending `cname`.
+    pub cluster_name: Option<String>,
 }
 
 pub(crate) fn spice_cloud_base_url(api_url_override: Option<&str>) -> String {
@@ -74,16 +77,62 @@ pub(crate) fn spice_cloud_token(api_key_override: Option<&str>) -> anyhow::Resul
 }
 
 /// Build a [`CloudClient`] from an optional API URL override, optional API key
-/// override, and environment token fallback.
-pub(crate) fn build_cloud_client(
+/// override, and environment fallbacks.
+///
+/// Bearer-token resolution order:
+/// 1. `api_key_override` (an explicit `--api-key`) — used verbatim.
+/// 2. `SPICE_CLOUD_CLIENT_ID` + `SPICE_CLOUD_CLIENT_SECRET` — exchanged for a
+///    freshly-minted OAuth access token (client-credentials grant), so a long
+///    provisioning run starts with a fresh token instead of a possibly-expired
+///    static key.
+/// 3. Static token env vars (see [`spice_cloud_token`]).
+pub(crate) async fn build_cloud_client(
     api_url_override: Option<&str>,
     api_key_override: Option<&str>,
 ) -> anyhow::Result<CloudClient> {
     let base_url = spice_cloud_base_url(api_url_override);
-    let token = spice_cloud_token(api_key_override)?;
+    let token = resolve_cloud_token(&base_url, api_key_override).await?;
     Ok(CloudClient::new(&base_url)?
         .with_token(token)
         .with_timeout(Duration::from_mins(10))?)
+}
+
+/// Resolve the Spice Cloud bearer token following [`build_cloud_client`]'s order:
+/// explicit override, else a client-credentials exchange, else a static env token.
+async fn resolve_cloud_token(
+    base_url: &str,
+    api_key_override: Option<&str>,
+) -> anyhow::Result<String> {
+    if let Some(key) = api_key_override {
+        return Ok(key.to_string());
+    }
+
+    // Service-account client credentials → freshly-minted OAuth token. Preferred
+    // over a static env token so long-running provisioning doesn't fail on an
+    // expired key. Both halves must be present; a partial pair is a config error.
+    let client_id = std::env::var("SPICE_CLOUD_CLIENT_ID")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let client_secret = std::env::var("SPICE_CLOUD_CLIENT_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty());
+    match (client_id, client_secret) {
+        (Some(client_id), Some(client_secret)) => {
+            let token = CloudClient::new(base_url)?
+                .exchange_client_credentials(&client_id, &client_secret)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to exchange SPICE_CLOUD_CLIENT_ID/SPICE_CLOUD_CLIENT_SECRET for an access token: {e}"
+                    )
+                })?;
+            Ok(token.access_token)
+        }
+        (Some(_), None) | (None, Some(_)) => Err(anyhow::anyhow!(
+            "SPICE_CLOUD_CLIENT_ID and SPICE_CLOUD_CLIENT_SECRET must both be set to use client-credentials auth"
+        )),
+        (None, None) => spice_cloud_token(None),
+    }
 }
 
 /// Default resource allocation shared by scheduler and executor when no overrides are provided.
@@ -151,7 +200,19 @@ pub(crate) async fn ensure_spice_cloud_app(
         return Ok(app.id);
     }
 
-    let cname = resolve_default_cname(cloud).await?;
+    // When assigning to a dedicated-cluster nodegroup, `cluster_name` is the
+    // region source and must not be combined with the deprecated `cname`.
+    // Otherwise keep today's regional `cname` path.
+    let (cname, cluster_name) = if let Some(cluster) = &config.cluster_name {
+        let cluster = cluster.trim();
+        if cluster.is_empty() {
+            (Some(resolve_default_cname(cloud).await?), None)
+        } else {
+            (None, Some(cluster.to_string()))
+        }
+    } else {
+        (Some(resolve_default_cname(cloud).await?), None)
+    };
 
     // App (scheduler) resources — start from defaults, then apply any overrides.
     let resources = resources_over(
@@ -185,14 +246,25 @@ pub(crate) async fn ensure_spice_cloud_app(
         name: app_name.to_string(),
         description: None,
         visibility: "private".to_string(),
-        cname: Some(cname),
+        cname,
+        cluster_name,
         tags: {
             let mut tags = BTreeMap::new();
             if matches!(deployment_mode, DeploymentMode::Cluster) {
                 tags.insert("kind".to_string(), "cluster".to_string());
             }
-            if let Some(org) = &config.organization_tag {
-                tags.insert("organization".to_string(), org.clone());
+            // Skip when `cluster_name` is set — cloud injects organization/_cluster
+            // from the nodegroup row; client-set `_cluster` is restricted.
+            if config
+                .cluster_name
+                .as_ref()
+                .is_none_or(|name| name.trim().is_empty())
+                && let Some(org) = &config.organization_tag
+            {
+                let org = org.trim();
+                if !org.is_empty() {
+                    tags.insert("organization".to_string(), org.to_string());
+                }
             }
             Some(tags)
         },

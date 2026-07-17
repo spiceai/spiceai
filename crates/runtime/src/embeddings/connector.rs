@@ -20,7 +20,6 @@ use crate::component::ComponentInitialization;
 use crate::component::dataset::Dataset;
 #[cfg(feature = "duckdb")]
 use crate::component::dataset::acceleration::Engine;
-use crate::component::metrics::MetricsProvider;
 #[cfg(feature = "duckdb")]
 use crate::component::view::View;
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
@@ -38,6 +37,7 @@ use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use itertools::Itertools;
 use runtime_datafusion_index::IndexedTableProvider;
+use runtime_metrics::component::MetricsProvider;
 use search::generation::text_search::index::FullTextDatabaseIndex;
 use search::index::VectorScanTableProvider;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
@@ -185,7 +185,11 @@ impl EmbeddingConnector {
             e
         })?;
 
-        let (change_committer, batch, is_dataset_ready) = envelope.into_parts();
+        // Materializes a deferred batch here, on the embedding wrapper's task —
+        // this wrapper sits between a (possibly multiplexed) source and the
+        // accelerator, so it must build the deferred rows before augmenting them.
+        // Offload the synchronous build so a large burst can't stall this worker.
+        let (change_committer, batch, is_dataset_ready) = envelope.into_parts_offloaded().await?;
         let data_batch = batch.data_batch();
 
         let embeddings = compute_additional_embedding_columns(

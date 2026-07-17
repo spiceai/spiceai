@@ -60,6 +60,10 @@ pub(crate) struct ScpConfig {
     pub scheduler_state_location: Option<String>,
     /// Organization tag to apply to the created app.
     pub organization_tag: Option<String>,
+    /// Dedicated-cluster / nodegroup name (`GET /v1/clusters`). When set, cloud
+    /// injects scheduling tags from the nodegroup; do not also set
+    /// `organization_tag` for the same create.
+    pub cluster_name: Option<String>,
     /// Query memory limit (e.g. `150Gi`).
     pub query_memory_limit: Option<String>,
     /// Pod resource allocations.
@@ -80,6 +84,13 @@ pub(crate) struct ScenarioConfig {
     pub compute: Option<ComputeConfig>,
     pub acceleration: Option<AccelerationEngine>,
     pub source: SourceConfig,
+    /// Optional path to a full spicepod to deploy verbatim instead of generating
+    /// one from the source + inferred schema. Used to select the hand-tuned /
+    /// adaptive Mongo CDC pods. Env-substituted at scenario load (e.g.
+    /// `spicepod: ${MONGO_SPICEPOD_PATH:-}`); an empty/unset value falls through
+    /// to generation. A `spicepod_path` in the setup metadata takes precedence.
+    #[serde(default)]
+    pub spicepod: Option<String>,
 }
 
 /// Cayenne-specific configuration nested under `source: direct: cayenne:`.

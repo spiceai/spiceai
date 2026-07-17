@@ -149,6 +149,96 @@ async fn get_ids(ctx: &SessionContext, table_name: &str) -> TestResult<Vec<i64>>
     Ok(ids)
 }
 
+/// Insert `n` sequential Int64-PK rows (id `0..n`, name `"n{i}"`, value `i*100`)
+/// and checkpoint them into listing-table files, so a subsequent delete
+/// exercises the file-resident `pk IN (...)` path rather than the inline
+/// memtable (an inline-resident delete takes a different, already-correct path).
+/// Asserts the full row count landed.
+async fn seed_int64_rows_to_files(
+    table: &Arc<CayenneTableProvider>,
+    ctx: &SessionContext,
+    schema: &Arc<Schema>,
+    name: &str,
+    n: i64,
+) -> TestResult<()> {
+    let batch = RecordBatch::try_new(
+        Arc::clone(schema),
+        vec![
+            Arc::new(Int64Array::from((0..n).collect::<Vec<i64>>())),
+            Arc::new(StringArray::from(
+                (0..n).map(|i| format!("n{i}")).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                (0..n).map(|i| i * 100).collect::<Vec<i64>>(),
+            )),
+        ],
+    )?;
+    insert_batch(table, batch).await?;
+    table.checkpoint_inlined_data().await?;
+    assert_eq!(get_row_count(ctx, name).await?, n);
+    Ok(())
+}
+
+/// Issue an unfiltered `DELETE` (delete-all) and return the reported count.
+async fn delete_all(table: &Arc<CayenneTableProvider>) -> TestResult<u64> {
+    let ctx = SessionContext::new();
+    let plan = table.delete_from(&ctx.state(), vec![]).await?;
+    let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
+    Ok(results
+        .first()
+        .and_then(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+        })
+        .and_then(|a| a.values().first())
+        .copied()
+        .unwrap_or(0))
+}
+
+// =============================================================================
+// Regression: delete-all (unfiltered DELETE) over file-resident rows
+// =============================================================================
+
+/// An unfiltered `DELETE` over file-resident Int64-PK rows must remove every
+/// row and report the exact count. Guards the streaming delete-all scan path.
+async fn test_int64_pk_delete_all_empty_filter_impl(fixture: TestFixture) -> TestResult<()> {
+    let (table, ctx, schema) = setup_int64_pk_table(&fixture, "int64_delete_all").await?;
+    seed_int64_rows_to_files(&table, &ctx, &schema, "int64_delete_all", 10).await?;
+
+    let deleted = delete_all(&table).await?;
+    assert_eq!(
+        deleted, 10,
+        "delete-all must report every file-resident row"
+    );
+    assert_eq!(get_row_count(&ctx, "int64_delete_all").await?, 0);
+    assert!(
+        get_ids(&ctx, "int64_delete_all").await?.is_empty(),
+        "no rows may remain after delete-all"
+    );
+    Ok(())
+}
+test_with_backends!(test_int64_pk_delete_all_empty_filter_impl);
+
+/// A delete-all larger than `PK_DELETE_FLUSH_BATCH_SIZE` (`50_000`) spans multiple
+/// deletion-vector flush chunks in one logical delete. Every chunk's vector file
+/// must be committed in a single metastore transaction and the tombstone cache
+/// published, so all rows are removed with no partial or lost deletions.
+async fn test_int64_pk_delete_all_multichunk_atomic_impl(fixture: TestFixture) -> TestResult<()> {
+    let (table, ctx, schema) = setup_int64_pk_table(&fixture, "int64_delete_multichunk").await?;
+    // 55_000 > 50_000 forces at least two flush chunks in one logical delete.
+    seed_int64_rows_to_files(&table, &ctx, &schema, "int64_delete_multichunk", 55_000).await?;
+
+    let deleted = delete_all(&table).await?;
+    assert_eq!(
+        deleted, 55_000,
+        "every row across all chunks must be deleted"
+    );
+    assert_eq!(get_row_count(&ctx, "int64_delete_multichunk").await?, 0);
+    Ok(())
+}
+test_with_backends!(test_int64_pk_delete_all_multichunk_atomic_impl);
+
 // =============================================================================
 // Edge Case 1: Empty deletion set (no matching rows)
 // =============================================================================
@@ -178,6 +268,94 @@ async fn test_int64_pk_delete_no_matches_impl(fixture: TestFixture) -> TestResul
 }
 
 test_with_backends!(test_int64_pk_delete_no_matches_impl);
+
+// =============================================================================
+// User-visible `DELETE ... WHERE id IN (...)` reports the exact number of live
+// rows removed.
+//
+// A single-Int64-PK `DELETE WHERE id IN (...)` is extracted straight from the
+// filter and applied via deletion vectors. The CDC count-skipping path
+// intentionally skips the scan and returns 0 for that shape; a user-visible
+// DELETE surfaces "rows affected" to the SQL client, so it must instead return
+// the verified count (the fix routes user DELETEs through the scan-based count
+// path). The count must also be EXACT: IN-list ids that don't exist must not
+// inflate it past the rows actually removed.
+// =============================================================================
+
+async fn test_int64_pk_delete_in_list_reports_exact_count_impl(
+    fixture: TestFixture,
+) -> TestResult<()> {
+    let (table, ctx, schema) = setup_int64_pk_table(&fixture, "in_list_count_test").await?;
+    // File-resident seed: the file deletion path's `pk IN (...)` fast path is
+    // separate from the inline-resident delete count path.
+    seed_int64_rows_to_files(&table, &ctx, &schema, "in_list_count_test", 10).await?;
+
+    // DELETE WHERE id IN (0,1,2,3,4) — all five exist.
+    let in_list = col("id").in_list((0i64..5).map(lit).collect::<Vec<_>>(), false);
+    let deleted = delete_records(&table, in_list).await?;
+    assert_eq!(
+        deleted, 5,
+        "user DELETE WHERE id IN (...) must report the exact live-row count, not the \
+         CDC fast-path 0"
+    );
+    assert_eq!(get_row_count(&ctx, "in_list_count_test").await?, 5);
+
+    // EXACTNESS: an IN-list mixing live (5,6) and non-existent (999,1000) ids must
+    // count only the rows actually removed, not the IN-list's upper bound.
+    let mixed = col("id").in_list(vec![lit(5i64), lit(6i64), lit(999i64), lit(1000i64)], false);
+    let deleted_mixed = delete_records(&table, mixed).await?;
+    assert_eq!(
+        deleted_mixed, 2,
+        "count must be the EXACT number of live rows removed (2), not the IN-list size (4)"
+    );
+    assert_eq!(get_row_count(&ctx, "in_list_count_test").await?, 3);
+
+    Ok(())
+}
+
+test_with_backends!(test_int64_pk_delete_in_list_reports_exact_count_impl);
+
+/// The durable CDC delete path (`CayenneTableProvider::delete_from_cdc_fast`)
+/// must stay on the count-skipping `pk IN (...)` fast path, not the scan-to-count
+/// path used by user-visible DELETEs. CDC counterpart to
+/// `test_int64_pk_delete_in_list_reports_exact_count` above (same file-resident
+/// seed): it asserts the fast-path witness (`Some(0)`, not a scanned count) and
+/// that the rows are actually removed.
+async fn test_int64_pk_cdc_fast_delete_keeps_fast_path_impl(
+    fixture: TestFixture,
+) -> TestResult<()> {
+    let (table, ctx, schema) = setup_int64_pk_table(&fixture, "cdc_fast_delete_test").await?;
+    seed_int64_rows_to_files(&table, &ctx, &schema, "cdc_fast_delete_test", 10).await?;
+
+    // The durable CDC apply loop's delete: `id IN (2,4,6)`, all live.
+    let in_list = col("id").in_list(vec![lit(2i64), lit(4i64), lit(6i64)], false);
+    let handled = table
+        .delete_from_cdc_fast(std::slice::from_ref(&in_list))
+        .await?;
+    // The count-skipping fast path returns the deliberate non-authoritative
+    // sentinel 0 (the CDC caller discards it). `Some(3)` would mean the
+    // scan-to-count path ran instead, and `None` would mean the shape was
+    // declined back to the exact-count `delete_from`.
+    assert_eq!(
+        handled,
+        Some(0),
+        "a key-based `pk IN (...)` CDC delete must stay on the count-skipping fast path \
+         (sentinel 0), not the scan-to-count path (exact count 3) or a decline to \
+         `delete_from` (`None`)"
+    );
+
+    // The deletion must be correct even though the (non-authoritative) count is
+    // discarded by the CDC caller.
+    assert_eq!(get_row_count(&ctx, "cdc_fast_delete_test").await?, 7);
+    assert_eq!(
+        get_ids(&ctx, "cdc_fast_delete_test").await?,
+        vec![0, 1, 3, 5, 7, 8, 9]
+    );
+
+    Ok(())
+}
+
+test_with_backends!(test_int64_pk_cdc_fast_delete_keeps_fast_path_impl);
 
 // =============================================================================
 // Edge Case 2: Delete all rows

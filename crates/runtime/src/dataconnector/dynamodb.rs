@@ -19,18 +19,17 @@ use super::{
     ParameterSpec, Parameters, parameters::aws::initiate_config_with_auth_method,
 };
 use crate::accelerated_table::sink::table::TableSink;
-use crate::component::ComponentType;
 use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::RefreshMode;
-use crate::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::dynamodb::{DynamoDBCheckpointMetadata, DynamoDBSys};
+use crate::dataconnector::schema_projection::{ProjectionPolicy, parse_schema_projection};
 use crate::federated_table::FederatedTable;
 use async_trait::async_trait;
 use data_components::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError, StreamError};
+use data_components::dynamodb::Error;
 use data_components::dynamodb::provider::DynamoDBTableProvider;
 use data_components::dynamodb::stream::StreamError as DynamoDBStreamError;
-use data_components::dynamodb::{Error, JsonNesting};
 use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -39,11 +38,10 @@ use datafusion::sql::TableReference;
 use dynamodb_streams::{Checkpoint, Metrics, MetricsCollector};
 use futures::stream::{self, StreamExt};
 use opentelemetry::KeyValue;
+use runtime_api_types::v1::ComponentType;
+use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_parameters::ExposedParamLookup;
-use serde_json::Value;
 use snafu::ResultExt;
-use spicepod::semantic::Column;
-use std::collections::HashSet;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
@@ -180,73 +178,6 @@ impl DataConnectorFactory for DynamoDBFactory {
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
     }
-}
-
-fn parse_json_nesting_static_fields(
-    dataset: &Dataset,
-) -> Result<Option<JsonNesting>, DataConnectorError> {
-    // Find all columns that have json_object metadata defined
-    let json_object_columns: Vec<&Column> = dataset
-        .columns
-        .iter()
-        .filter(|col| col.metadata.contains_key("json_object"))
-        .collect();
-
-    // No json_object columns means no JSON nesting configuration
-    if json_object_columns.is_empty() {
-        return Ok(None);
-    }
-
-    // Error if multiple columns have json_object defined
-    if json_object_columns.len() > 1 {
-        let column_names: Vec<&str> = json_object_columns
-            .iter()
-            .map(|c| c.name.as_str())
-            .collect();
-        return Err(DataConnectorError::InvalidConfigurationNoSource {
-            dataconnector: "dynamodb".to_string(),
-            message: format!(
-                "Multiple columns have 'json_object' metadata defined: {}. Only one column can be configured as a JSON object column.",
-                column_names.join(", ")
-            ),
-            connector_component: ConnectorComponent::from(dataset),
-        });
-    }
-
-    let json_column = json_object_columns[0];
-    let Some(json_object_value) = json_column.metadata.get("json_object") else {
-        unreachable!("json_object key existence was checked above")
-    };
-
-    // Validate that json_object value is "*"
-    let is_wildcard = match json_object_value {
-        Value::String(s) => s == "*",
-        _ => false,
-    };
-
-    if !is_wildcard {
-        return Err(DataConnectorError::InvalidConfigurationNoSource {
-            dataconnector: "dynamodb".to_string(),
-            message: format!(
-                "Column '{}' has invalid 'json_object' value: {:?}. Only '*' is supported.",
-                json_column.name, json_object_value
-            ),
-            connector_component: ConnectorComponent::from(dataset),
-        });
-    }
-
-    // Collect all other columns as static fields
-    let static_fields: HashSet<String> = dataset
-        .columns
-        .iter()
-        .filter(|col| col.name != json_column.name)
-        .map(|col| col.name.clone())
-        .collect();
-
-    Ok(Some(JsonNesting {
-        static_fields,
-        json_field_name: json_column.name.clone(),
-    }))
 }
 
 #[async_trait]
@@ -400,7 +331,7 @@ impl DataConnector for DynamoDB {
             time_format.to_string(),
             ready_lag,
             Arc::clone(&self.metrics_collector),
-            parse_json_nesting_static_fields(dataset)?.as_ref(),
+            parse_schema_projection(dataset, &ProjectionPolicy::new("dynamodb"))?.as_ref(),
             write_parallelism,
             dataset.schema.clone(),
         )
@@ -1338,6 +1269,7 @@ mod tests {
     use super::*;
     use crate::component::dataset::builder::DatasetBuilder;
     use serde_json::json;
+    use spicepod::semantic::Column;
     use std::collections::HashMap;
 
     async fn test_dataset(columns: Vec<Column>) -> Dataset {
@@ -1354,7 +1286,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_no_json_object_columns_returns_none() {
+    async fn test_no_json_object_columns_is_identity() {
         let dataset = test_dataset(vec![
             Column::new("PK"),
             Column::new("SK"),
@@ -1362,8 +1294,13 @@ mod tests {
         ])
         .await;
 
-        let result = parse_json_nesting_static_fields(&dataset).expect("should return Ok");
-        assert!(result.is_none());
+        // Columns with no `json_object` marker yield an identity projection
+        // (no catch-all): rows pass through unchanged.
+        let result = parse_schema_projection(&dataset, &ProjectionPolicy::new("dynamodb"))
+            .expect("should return Ok")
+            .expect("columns present → Some");
+        assert!(!result.has_catch_all());
+        assert!(result.is_identity());
     }
 
     #[tokio::test]
@@ -1379,15 +1316,15 @@ mod tests {
         ])
         .await;
 
-        let result = parse_json_nesting_static_fields(&dataset)
+        let result = parse_schema_projection(&dataset, &ProjectionPolicy::new("dynamodb"))
             .expect("should return Ok")
             .expect("should return Some");
 
-        assert_eq!(result.json_field_name, "data_json");
-        assert_eq!(result.static_fields.len(), 3);
-        assert!(result.static_fields.contains("PK"));
-        assert!(result.static_fields.contains("SK"));
-        assert!(result.static_fields.contains("Baz"));
+        assert_eq!(result.catch_all_name(), Some("data_json"));
+        assert_eq!(result.static_fields().len(), 3);
+        assert!(result.static_fields().contains("PK"));
+        assert!(result.static_fields().contains("SK"));
+        assert!(result.static_fields().contains("Baz"));
     }
 
     #[tokio::test]
@@ -1405,13 +1342,9 @@ mod tests {
         ])
         .await;
 
-        let result = parse_json_nesting_static_fields(&dataset);
-        assert!(result.is_err());
-
-        let err = result
+        let err = parse_schema_projection(&dataset, &ProjectionPolicy::new("dynamodb"))
             .expect_err("should fail when multiple json_object columns defined")
             .to_string();
-        assert!(err.contains("Multiple columns"));
         assert!(err.contains("data1"));
         assert!(err.contains("data2"));
     }
@@ -1427,10 +1360,7 @@ mod tests {
         ])
         .await;
 
-        let result = parse_json_nesting_static_fields(&dataset);
-        assert!(result.is_err());
-
-        let err = result
+        let err = parse_schema_projection(&dataset, &ProjectionPolicy::new("dynamodb"))
             .expect_err("should fail when invalid value")
             .to_string();
         assert!(err.contains("invalid 'json_object' value"));

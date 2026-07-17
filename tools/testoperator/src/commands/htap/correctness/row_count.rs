@@ -27,7 +27,7 @@ use super::compare;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use chbench_driver::ChBenchDriver;
-use datafusion::functions_aggregate::expr_fn::{count, max, min};
+use datafusion::functions_aggregate::expr_fn::{count, max, min, sum};
 use datafusion::logical_expr::{
     Expr, LogicalPlanBuilder, TableSource, builder::LogicalTableSource,
 };
@@ -280,7 +280,9 @@ pub async fn verify_after_drain(
 /// Compute and compare a per-column content fingerprint for `table`.
 ///
 /// The fingerprint is engine-agnostic: `COUNT(*)`, a non-null `COUNT(col)` for
-/// every column, and `MIN(col)`/`MAX(col)` for numeric columns. `SUM` is
+/// every column, `MIN(col)`/`MAX(col)` for numeric columns, and `SUM(col)` for
+/// exact (integer/decimal) numeric columns — the `SUM` catches interior value
+/// corruption that COUNT/MIN/MAX miss. `SUM` over a *float* column is
 /// deliberately excluded (floating sums are order-dependent and legitimately
 /// differ across engines); text/temporal `MIN`/`MAX` are excluded (collation
 /// and timestamp precision differ across engines). The identical SQL runs
@@ -389,9 +391,10 @@ fn first_non_empty(batches: &[RecordBatch]) -> Option<&RecordBatch> {
 /// SQL is well-formed on both the source and Spice.
 ///
 /// A `COUNT(*)`, a non-null `COUNT` for every column (catches column swaps /
-/// nulled values) and `MIN`/`MAX` for numeric columns. Each aggregate is aliased
-/// (`count_<col>`, `min_<col>`, `max_<col>`) so a divergence reported by
-/// [`compare::numeric_delta`] names the offending column.
+/// nulled values), `MIN`/`MAX` for numeric columns, and `SUM` for exact
+/// (integer/decimal) numeric columns. Each aggregate is aliased
+/// (`count_<col>`, `min_<col>`, `max_<col>`, `sum_<col>`) so a divergence
+/// reported by [`compare::numeric_delta`] names the offending column.
 fn build_fingerprint_sql(table: &str, schema: &SchemaRef) -> anyhow::Result<String> {
     // The table source only carries the schema — the plan is unparsed, never run.
     let source = Arc::new(LogicalTableSource::new(Arc::clone(schema))) as Arc<dyn TableSource>;
@@ -403,6 +406,17 @@ fn build_fingerprint_sql(table: &str, schema: &SchemaRef) -> anyhow::Result<Stri
         if compare::is_numeric(field.data_type()) {
             aggs.push(min(col(name.as_str())).alias(format!("min_{name}")));
             aggs.push(max(col(name.as_str())).alias(format!("max_{name}")));
+            // SUM only for exact (integer/decimal) columns. It catches interior
+            // value corruption — a wrong upsert value, a stale/missed update —
+            // that COUNT/MIN/MAX miss (the wrong value need not be a new
+            // extreme). A floating SUM is order-dependent and legitimately
+            // drifts across engines, so it is never summed; an exact SUM is
+            // bit-identical on both sides and compared with zero tolerance. The
+            // sum relies on the f64-exactness bound documented in `compare`
+            // (magnitudes below 2^53), which holds at the scale factors we run.
+            if compare::is_exact_numeric(field.data_type()) {
+                aggs.push(sum(col(name.as_str())).alias(format!("sum_{name}")));
+            }
         }
     }
 
@@ -419,10 +433,12 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
     #[test]
-    fn fingerprint_sql_counts_all_columns_minmax_only_numerics() {
+    fn fingerprint_sql_counts_all_columns_minmax_numerics_sum_exact_only() {
         let schema: SchemaRef = Arc::new(Schema::new(vec![
             Field::new("ol_amount", DataType::Decimal128(38, 2), true),
             Field::new("ol_quantity", DataType::Int32, true),
+            // A genuine float column: MIN/MAX yes, but never SUM (drifts).
+            Field::new("ol_ratio", DataType::Float64, true),
             Field::new("ol_dist_info", DataType::Utf8, true),
             Field::new(
                 "ol_delivery_d",
@@ -436,21 +452,25 @@ mod tests {
 
         // COUNT(*) and a non-null COUNT alias for every column.
         assert!(sql.contains("count_star"), "missing COUNT(*): {sql}");
-        for col in ["ol_amount", "ol_quantity", "ol_dist_info", "ol_delivery_d"] {
+        for col in [
+            "ol_amount",
+            "ol_quantity",
+            "ol_ratio",
+            "ol_dist_info",
+            "ol_delivery_d",
+        ] {
             assert!(
                 sql.contains(&format!("count_{col}")),
                 "missing COUNT for {col}: {sql}"
             );
         }
-        // MIN/MAX only for numeric columns.
-        assert!(
-            sql.contains("min_ol_amount") && sql.contains("max_ol_amount"),
-            "{sql}"
-        );
-        assert!(
-            sql.contains("min_ol_quantity") && sql.contains("max_ol_quantity"),
-            "{sql}"
-        );
+        // MIN/MAX for every numeric column, including the float.
+        for col in ["ol_amount", "ol_quantity", "ol_ratio"] {
+            assert!(
+                sql.contains(&format!("min_{col}")) && sql.contains(&format!("max_{col}")),
+                "missing MIN/MAX for numeric {col}: {sql}"
+            );
+        }
         // Not for text or temporal (cross-engine collation / precision differ).
         assert!(
             !sql.contains("min_ol_dist_info") && !sql.contains("max_ol_dist_info"),
@@ -460,6 +480,19 @@ mod tests {
             !sql.contains("min_ol_delivery_d") && !sql.contains("max_ol_delivery_d"),
             "{sql}"
         );
+        // SUM only for exact (integer/decimal) numerics — catches interior
+        // value corruption without the order-dependent drift of a float sum.
+        assert!(
+            sql.contains("sum_ol_amount") && sql.contains("sum_ol_quantity"),
+            "missing SUM for exact numeric columns: {sql}"
+        );
+        // Never SUM the float, text, or temporal columns.
+        for col in ["ol_ratio", "ol_dist_info", "ol_delivery_d"] {
+            assert!(
+                !sql.contains(&format!("sum_{col}")),
+                "unexpected SUM for {col}: {sql}"
+            );
+        }
         // The source table is referenced.
         assert!(sql.contains("order_line"), "{sql}");
     }

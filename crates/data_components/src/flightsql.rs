@@ -129,12 +129,13 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub type FlightSqlClient = FlightSqlServiceClient<CookieService<Channel>>;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FlightSQLFactory {
     client: FlightSqlClient,
     endpoint: String,
     cookie_store: Arc<CookieStore>,
     function_support: Option<FunctionSupport>,
+    token: Option<String>,
 }
 
 impl FlightSQLFactory {
@@ -145,6 +146,7 @@ impl FlightSQLFactory {
             endpoint,
             cookie_store,
             function_support: None,
+            token: None,
         }
     }
 
@@ -155,6 +157,21 @@ impl FlightSQLFactory {
         self.function_support = Some(function_support);
         self
     }
+
+    #[must_use]
+    pub fn with_token(mut self, token: String) -> Self {
+        self.token = Some(token);
+        self
+    }
+}
+
+impl std::fmt::Debug for FlightSQLFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlightSQLFactory")
+            .field("endpoint", &self.endpoint)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish_non_exhaustive()
+    }
 }
 
 #[async_trait]
@@ -163,17 +180,19 @@ impl Read for FlightSQLFactory {
         &self,
         table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        let table_provider = Arc::new(
-            FlightSQLTable::create(
-                "flightsql",
-                &self.endpoint,
-                self.client.clone(),
-                table_reference,
-                Arc::clone(&self.cookie_store),
-            )
-            .await?
-            .with_function_support(self.function_support.clone()),
-        );
+        let mut table = FlightSQLTable::create(
+            "flightsql",
+            &self.endpoint,
+            self.client.clone(),
+            table_reference,
+            Arc::clone(&self.cookie_store),
+        )
+        .await?
+        .with_function_support(self.function_support.clone());
+        if let Some(token) = &self.token {
+            table = table.with_token(token.clone());
+        }
+        let table_provider = Arc::new(table);
 
         let table_provider = Arc::new(table_provider.create_federated_table_provider());
 
@@ -181,7 +200,16 @@ impl Read for FlightSQLFactory {
     }
 }
 
-#[derive(Debug)]
+impl std::fmt::Debug for FlightSQLTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlightSQLTable")
+            .field("name", &self.name)
+            .field("table_reference", &self.table_reference)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish_non_exhaustive()
+    }
+}
+
 pub struct FlightSQLTable {
     name: &'static str,
     join_push_down_context: String,
@@ -195,6 +223,7 @@ pub struct FlightSQLTable {
     /// as `json_get_str`) are evaluated locally instead of pushed into the SQL
     /// sent to the Flight SQL server. See issue #10703.
     function_support: Option<FunctionSupport>,
+    token: Option<String>,
 }
 
 #[expect(clippy::needless_pass_by_value)]
@@ -217,6 +246,7 @@ impl FlightSQLTable {
             cookie_store,
             statistics: None,
             function_support: None,
+            token: None,
         })
     }
 
@@ -238,6 +268,7 @@ impl FlightSQLTable {
             cookie_store,
             statistics: None,
             function_support: None,
+            token: None,
         }
     }
 
@@ -252,6 +283,13 @@ impl FlightSQLTable {
     #[must_use]
     pub fn with_function_support(mut self, function_support: Option<FunctionSupport>) -> Self {
         self.function_support = function_support;
+        self
+    }
+
+    /// Set the bearer token to propagate to per-endpoint `DoGet` clients.
+    #[must_use]
+    pub fn with_token(mut self, token: String) -> Self {
+        self.token = Some(token);
         self
     }
 
@@ -444,10 +482,31 @@ impl FlightSQLTable {
             limit,
             Arc::clone(&self.cookie_store),
         )?;
+        let exec = exec.with_token(self.token.clone());
         // Project the table-level statistics onto the scan's (projected) output
         // schema so the column-statistics list lines up with the output columns.
+        //
+        // When filters are pushed down to the remote scan, the stamped statistics
+        // still describe the *unfiltered* slice the executor reported (they are the
+        // whole-table row count / column bounds, not the filtered subset). Every
+        // pushdown-eligible filter is reported `Exact` (see
+        // `supports_filters_pushdown`), so DataFusion drops the coordinator-side
+        // `FilterExec` — and if the stamped `num_rows`/bounds stay `Exact`, the
+        // `aggregate_statistics` optimizer rule folds `COUNT(*)`/`MIN`/`MAX` to
+        // those unfiltered values, silently ignoring the predicate (e.g. a filtered
+        // `COUNT(*)` returns the full table count — issue #11599). Marking the
+        // statistics inexact when any filter is applied disables that fold while
+        // keeping the bounds usable for join sizing.
         let exec = match &self.statistics {
-            Some(stats) => exec.with_statistics(stats.clone().project(projections)),
+            Some(stats) => {
+                let stats = stats.clone().project(projections);
+                let stats = if filters.is_empty() {
+                    stats
+                } else {
+                    stats.to_inexact()
+                };
+                exec.with_statistics(stats)
+            }
             None => exec,
         };
         Ok(Arc::new(exec))
@@ -515,6 +574,7 @@ pub struct FlightSqlExec {
     /// [`FlightSqlExec::with_statistics`] so downstream optimizer rules such as
     /// hash-join build-side selection can use them.
     statistics: Statistics,
+    token: Option<String>,
 }
 
 impl FlightSqlExec {
@@ -546,6 +606,7 @@ impl FlightSqlExec {
             metrics: ExecutionPlanMetricsSet::new(),
             trace_parent: None,
             statistics,
+            token: None,
         })
     }
 
@@ -567,6 +628,12 @@ impl FlightSqlExec {
     #[must_use]
     pub fn with_trace_parent(mut self, trace_parent: Option<String>) -> Self {
         self.trace_parent = trace_parent;
+        self
+    }
+
+    #[must_use]
+    pub fn with_token(mut self, token: Option<String>) -> Self {
+        self.token = token;
         self
     }
 
@@ -766,6 +833,7 @@ impl ExecutionPlan for FlightSqlExec {
             metrics: ExecutionPlanMetricsSet::new(),
             trace_parent: self.trace_parent.clone(),
             statistics: self.statistics.clone(),
+            token: self.token.clone(),
         };
 
         Ok(SortOrderPushdownResult::Exact {
@@ -794,6 +862,9 @@ impl ExecutionPlan for FlightSqlExec {
             .or_else(|| trace_parent_from_task_context(&context));
         if let Some(value) = trace_parent {
             client.set_header("traceparent", value);
+        }
+        if let Some(token) = &self.token {
+            client.set_token(token.clone());
         }
 
         let inner =
@@ -859,6 +930,7 @@ impl ExecutionPlan for FlightSqlExec {
             metrics: ExecutionPlanMetricsSet::new(),
             trace_parent: self.trace_parent.clone(),
             statistics: self.statistics.clone(),
+            token: self.token.clone(),
         };
 
         Some(Arc::new(new_plan))
@@ -971,7 +1043,12 @@ pub fn query_to_stream(
 
         for ep in flight_info.endpoint {
             if let Some(tkt) = ep.clone().ticket {
-                match get_client_for_flight_endpoint(&client, ep, &cookie_store).await
+                match get_client_for_flight_endpoint(
+                    &client,
+                    ep,
+                    &cookie_store,
+                )
+                .await
                     .map_err(to_execution_error)?
                     .do_get(tkt.clone()).await {
                         Ok(mut flight_stream) => {
@@ -1009,7 +1086,13 @@ pub async fn get_client_for_flight_endpoint(
         match new_tls_flight_channel(&ep.location[0].uri, None).await {
             Ok(channel) => {
                 let channel = CookieService::new(channel, Arc::clone(cookie_store));
-                Ok(FlightSqlServiceClient::new(channel))
+                let mut new_client = FlightSqlServiceClient::new(channel);
+                // Propagate auth token to avoid "invalid authentication credentials" on DoGet.
+                // Per-endpoint clients don't inherit the handshake session of the original client.
+                if let Some(t) = client.token().cloned() {
+                    new_client.set_token(t);
+                }
+                Ok(new_client)
             }
             Err(_) => Ok(client.clone()),
         }
@@ -1266,6 +1349,97 @@ mod tests {
         metrics.sum_by_name(name).is_some()
     }
 
+    /// A `FlightSqlClient` connected lazily to a non-routable address: enough to
+    /// build a `FlightSQLTable`/scan plan without ever attempting a connection.
+    fn lazy_client() -> FlightSqlClient {
+        use arrow_flight::flight_service_client::FlightServiceClient;
+        use arrow_flight::sql::client::FlightSqlServiceClient;
+        use tonic::transport::Endpoint;
+
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let cookie_channel = CookieService::new(channel, Arc::new(CookieStore::new()));
+        FlightSqlServiceClient::new_from_inner(FlightServiceClient::new(cookie_channel))
+    }
+
+    /// Regression test for #11599: a cluster leaf scan carries the executor's
+    /// *unfiltered* row-count/bounds as stamped statistics. Because pushed-down
+    /// filters are reported `Exact` (dropping the `FilterExec`), leaving those
+    /// statistics `Exact` lets `aggregate_statistics` fold a filtered `COUNT(*)`
+    /// to the unfiltered total. The scan must therefore mark its statistics
+    /// inexact whenever a filter is pushed to it, while leaving them exact for an
+    /// unfiltered scan.
+    #[tokio::test]
+    async fn scan_marks_stamped_statistics_inexact_when_filter_pushed() {
+        use super::FlightSQLTable;
+        use datafusion::catalog::TableProvider;
+        use datafusion::common::stats::Precision;
+        use datafusion::common::{ColumnStatistics, ScalarValue, Statistics};
+        use datafusion::prelude::{SessionContext, col, lit};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let stats = Statistics {
+            num_rows: Precision::Exact(150_000),
+            total_byte_size: Precision::Exact(1_200_000),
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Exact(0),
+                max_value: Precision::Exact(ScalarValue::Int64(Some(149_999))),
+                min_value: Precision::Exact(ScalarValue::Int64(Some(0))),
+                sum_value: Precision::Absent,
+                distinct_count: Precision::Absent,
+                byte_size: Precision::Exact(1_200_000),
+            }],
+        };
+
+        let table = FlightSQLTable::create_with_schema(
+            "flightsql",
+            "executor-1",
+            lazy_client(),
+            TableReference::bare("customer"),
+            Arc::clone(&schema),
+            Arc::new(CookieStore::new()),
+        )
+        .with_statistics(Some(stats));
+
+        let session = SessionContext::new().state();
+
+        // No filter → stamped statistics stay exact (folding a bare COUNT(*) is correct).
+        let plan = table
+            .scan(&session, None, &[], None)
+            .await
+            .expect("unfiltered scan should build");
+        let unfiltered = plan
+            .partition_statistics(None)
+            .expect("statistics should be available");
+        assert_eq!(
+            unfiltered.num_rows,
+            Precision::Exact(150_000),
+            "unfiltered scan must keep exact num_rows"
+        );
+
+        // With a pushed-down filter → statistics must be inexact so the
+        // aggregate-statistics rule cannot fold the (now filtered) COUNT(*).
+        let filter = col("v").eq(lit(0_i64));
+        let plan = table
+            .scan(&session, None, std::slice::from_ref(&filter), None)
+            .await
+            .expect("filtered scan should build");
+        let filtered = plan
+            .partition_statistics(None)
+            .expect("statistics should be available");
+        assert_eq!(
+            filtered.num_rows,
+            Precision::Inexact(150_000),
+            "filtered scan must degrade num_rows to inexact (issue #11599)"
+        );
+        assert!(
+            matches!(
+                filtered.column_statistics[0].max_value,
+                Precision::Inexact(_)
+            ),
+            "filtered scan must degrade column bounds to inexact so MIN/MAX are not folded"
+        );
+    }
+
     fn build_exec(client: FlightSqlClient, cookie_store: Arc<CookieStore>) -> FlightSqlExec {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
         FlightSqlExec::new(
@@ -1485,5 +1659,188 @@ mod tests {
         );
 
         server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn query_to_stream_propagates_token_to_endpoint_client() {
+        // Verify that a bearer token set on the main client is propagated to the
+        // per-endpoint client created when following FlightEndpoint.location.
+        // Servers like StarRocks enforce authentication on every connection.
+        const TOKEN_VALUE: &str = "test-bearer-token";
+        let cookie_seen = Arc::new(AtomicBool::new(false));
+        let token_seen = Arc::new(AtomicBool::new(false));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should have addr");
+        let location = format!("http://{addr}");
+        let service = {
+            let token_seen = Arc::clone(&token_seen);
+            TokenFlightSqlService {
+                cookie_seen: Arc::clone(&cookie_seen),
+                token_seen,
+                location: location.clone(),
+                expected_token: TOKEN_VALUE.to_string(),
+            }
+        };
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(FlightServiceServer::new(service))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let cookie_store = Arc::new(CookieStore::new());
+        let channel = Channel::from_shared(format!("http://{addr}"))
+            .expect("channel should parse")
+            .connect()
+            .await
+            .expect("channel should connect");
+        let channel = CookieService::new(channel, Arc::clone(&cookie_store));
+        let mut client: FlightSqlClient =
+            arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
+        client.set_token(TOKEN_VALUE.to_string());
+
+        let _batches = query_to_stream(client, "SELECT 1".to_string(), Arc::clone(&cookie_store))
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("query should succeed");
+
+        assert!(
+            token_seen.load(Ordering::SeqCst),
+            "bearer token should have been forwarded to the per-endpoint DoGet client"
+        );
+
+        let _ = shutdown_tx.send(());
+        handle
+            .await
+            .expect("server should finish")
+            .expect("server should exit cleanly");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test server that enforces bearer-token auth on DoGet.
+    // Used by `query_to_stream_propagates_token_to_endpoint_client`.
+    // -----------------------------------------------------------------------
+    struct TokenFlightSqlService {
+        cookie_seen: Arc<AtomicBool>,
+        token_seen: Arc<AtomicBool>,
+        location: String,
+        expected_token: String,
+    }
+    #[async_trait]
+    impl FlightService for TokenFlightSqlService {
+        type HandshakeStream = EmptyResponseStream<arrow_flight::HandshakeResponse>;
+        type ListFlightsStream = EmptyResponseStream<FlightInfo>;
+        type DoGetStream = EmptyResponseStream<FlightData>;
+        type DoPutStream = EmptyResponseStream<PutResult>;
+        type DoExchangeStream = EmptyResponseStream<FlightData>;
+        type DoActionStream = EmptyResponseStream<arrow_flight::Result>;
+        type ListActionsStream = EmptyResponseStream<ActionType>;
+
+        async fn handshake(
+            &self,
+            _request: Request<tonic::Streaming<arrow_flight::HandshakeRequest>>,
+        ) -> Result<Response<Self::HandshakeStream>, Status> {
+            Err(Status::unimplemented("handshake"))
+        }
+
+        async fn list_flights(
+            &self,
+            _request: Request<Criteria>,
+        ) -> Result<Response<Self::ListFlightsStream>, Status> {
+            Err(Status::unimplemented("list_flights"))
+        }
+
+        async fn get_flight_info(
+            &self,
+            _request: Request<FlightDescriptor>,
+        ) -> Result<Response<FlightInfo>, Status> {
+            // Return an endpoint pointing back at this server so the client
+            // must create a per-endpoint FlightSqlServiceClient and call DoGet on it.
+            let endpoint = FlightEndpoint {
+                ticket: Some(Ticket {
+                    ticket: Bytes::from_static(b"tok-ticket"),
+                }),
+                location: vec![Location {
+                    uri: self.location.clone(),
+                }],
+                expiration_time: None,
+                app_metadata: Bytes::new(),
+            };
+            Ok(Response::new(FlightInfo {
+                schema: Bytes::new(),
+                flight_descriptor: None,
+                endpoint: vec![endpoint],
+                total_records: -1,
+                total_bytes: -1,
+                ordered: false,
+                app_metadata: Bytes::new(),
+            }))
+        }
+
+        async fn poll_flight_info(
+            &self,
+            _request: Request<FlightDescriptor>,
+        ) -> Result<Response<PollInfo>, Status> {
+            Err(Status::unimplemented("poll_flight_info"))
+        }
+
+        async fn get_schema(
+            &self,
+            _request: Request<FlightDescriptor>,
+        ) -> Result<Response<SchemaResult>, Status> {
+            Err(Status::unimplemented("get_schema"))
+        }
+
+        async fn do_get(
+            &self,
+            request: Request<Ticket>,
+        ) -> Result<Response<Self::DoGetStream>, Status> {
+            // Enforce bearer-token auth: reject if the token is missing or wrong.
+            let auth = request
+                .metadata()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| Status::unauthenticated("missing authorization header"))?;
+            if auth != format!("Bearer {}", self.expected_token) {
+                return Err(Status::unauthenticated("invalid bearer token"));
+            }
+            self.cookie_seen.store(true, Ordering::SeqCst);
+            self.token_seen.store(true, Ordering::SeqCst);
+            Ok(Response::new(tokio_stream::empty()))
+        }
+
+        async fn do_put(
+            &self,
+            _request: Request<tonic::Streaming<FlightData>>,
+        ) -> Result<Response<Self::DoPutStream>, Status> {
+            Err(Status::unimplemented("do_put"))
+        }
+
+        async fn do_exchange(
+            &self,
+            _request: Request<tonic::Streaming<FlightData>>,
+        ) -> Result<Response<Self::DoExchangeStream>, Status> {
+            Err(Status::unimplemented("do_exchange"))
+        }
+
+        async fn do_action(
+            &self,
+            _request: Request<Action>,
+        ) -> Result<Response<Self::DoActionStream>, Status> {
+            Err(Status::unimplemented("do_action"))
+        }
+
+        async fn list_actions(
+            &self,
+            _request: Request<Empty>,
+        ) -> Result<Response<Self::ListActionsStream>, Status> {
+            Err(Status::unimplemented("list_actions"))
+        }
     }
 }
