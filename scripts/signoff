@@ -353,7 +353,12 @@ changed_files_vs_trunk() {
 # nested members under crates/data-connectors/*).
 packages_for_changed_files() {
   command -v cargo >/dev/null 2>&1 || fail "cargo not found — required for sign-off checks"
-  command -v python3 >/dev/null 2>&1 || fail "python3 not found — required to map changed files to crates"
+  # Targeted pre-lint is an optional fail-fast step: without python3, skip it
+  # (return non-zero, caller tolerates) — the full workspace lint still runs.
+  if ! command -v python3 >/dev/null 2>&1; then
+    info "python3 not found — skipping targeted pre-lint (full workspace lint still runs)"
+    return 1
+  fi
 
   local metadata files
   # Read paths first — a heredoc would otherwise consume stdin for the program.
