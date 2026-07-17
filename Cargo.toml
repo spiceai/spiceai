@@ -49,6 +49,7 @@ members = [
     "crates/runtime-proto",
     "crates/runtime-parameter-spec",
     "crates/runtime-parameters",
+    "crates/runtime-parameters-derive",
     "crates/runtime-secrets",
     "crates/runtime-table-partition",
     "crates/runtime-rate-control",
@@ -324,6 +325,8 @@ prometheus = "0.14"
 prost = { version = "0.14.1", default-features = false, features = [
     "derive",
 ] }
+proc-macro2 = "1"
+quote = "1"
 r2d2 = "0.8.10"
 rand = "0.10.1"
 rdkafka = { version = "0.39.0" }
@@ -349,6 +352,7 @@ snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "74
 sqlparser = "0.59.0"
 ssh2 = { version = "0.9.5" }
 suppaftp = { version = "6.3.0", features = ["async"] }
+syn = { version = "2", features = ["full", "extra-traits"] }
 sysinfo = "0.38.4"
 system-adapter-protocol = { git = "https://github.com/spiceai/spicebench.git", rev = "4624f1ec96c519d0bde4fee8c4e75b0498a2181d", features = ["client", "server"] }
 tantivy = "0.26.0"
