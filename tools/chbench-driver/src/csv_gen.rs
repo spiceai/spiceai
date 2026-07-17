@@ -328,7 +328,7 @@ fn generate_warehouse_range(
             let w_zip = tpcc_rand::rand_zip(&mut wh_rng);
             let w_tax = tpcc_rand::rand_tax(&mut wh_rng);
             tw_warehouse.write_line(&format!(
-                "{w_id},{},{},{},{},{},{},{w_tax},300000.00",
+                "{w_id},{},{},{},{},{},{},{w_tax:.4},300000.00",
                 csv_str(&w_name),
                 csv_str(&w_street_1),
                 csv_str(&w_street_2),
@@ -347,7 +347,7 @@ fn generate_warehouse_range(
             let d_zip = tpcc_rand::rand_zip(&mut wh_rng);
             let d_tax = tpcc_rand::rand_tax(&mut wh_rng);
             tw_district.write_line(&format!(
-                "{d},{w_id},{},{},{},{},{},{},{d_tax},30000.00,3001",
+                "{d},{w_id},{},{},{},{},{},{},{d_tax:.4},30000.00,3001",
                 csv_str(&d_name),
                 csv_str(&d_street_1),
                 csv_str(&d_street_2),
@@ -409,7 +409,7 @@ fn generate_warehouse_range(
                 let c_discount: f64 = f64::from(wh_rng.random_range(0..=5_000)) / 10_000.0;
                 let c_data = tpcc_rand::rand_chars(&mut wh_rng, 300, 500);
                 tw_customer.write_line(&format!(
-                    "{i},{d},{w_id},{},OE,{},{},{},{},{},{},{},{},{},50000.00,{c_discount},-10.00,10.00,1,0,{}",
+                    "{i},{d},{w_id},{},OE,{},{},{},{},{},{},{},{},{},50000.00,{c_discount:.4},-10.00,10.00,1,0,{}",
                     csv_str(&c_first),
                     csv_str(&c_last),
                     csv_str(&c_street_1),
@@ -469,7 +469,7 @@ fn generate_warehouse_range(
                         let ol_amount: f64 = 0.00;
                         let ol_dist_info = tpcc_rand::rand_chars(&mut wh_rng, 24, 24);
                         tw_order_line.write_line(&format!(
-                            "{o_id},{d},{w_id},{j},{ol_i_id},{w_id},{ol_delivery_d},5,{ol_amount},{}",
+                            "{o_id},{d},{w_id},{j},{ol_i_id},{w_id},{ol_delivery_d},5,{ol_amount:.2},{}",
                             csv_str(&ol_dist_info),
                         ))?;
                     } else {
@@ -477,7 +477,7 @@ fn generate_warehouse_range(
                         let ol_amount = f64::from(wh_rng.random_range(1..=999_999)) / 100.0;
                         let ol_dist_info = tpcc_rand::rand_chars(&mut wh_rng, 24, 24);
                         tw_order_line.write_line(&format!(
-                            "{o_id},{d},{w_id},{j},{ol_i_id},{w_id},{ol_delivery_d},5,{ol_amount},{}",
+                            "{o_id},{d},{w_id},{j},{ol_i_id},{w_id},{ol_delivery_d},5,{ol_amount:.2},{}",
                             csv_str(&ol_dist_info),
                         ))?;
                     }
@@ -528,7 +528,7 @@ pub fn generate(dir: &Path, warehouses: usize, seed: Option<u64>) -> Result<Vec<
             let i_name = tpcc_rand::rand_chars(&mut rng, 14, 24);
             let i_data = tpcc_rand::rand_original_string(&mut rng);
             tw.write_line(&format!(
-                "{i},{i_im_id},{},{i_price},{}",
+                "{i},{i_im_id},{},{i_price:.2},{}",
                 csv_str(&i_name),
                 csv_str(&i_data)
             ))?;
@@ -566,7 +566,7 @@ pub fn generate(dir: &Path, warehouses: usize, seed: Option<u64>) -> Result<Vec<
             let s_acctbal: f64 = f64::from(rng.random_range(10_000i32..=1_000_000_000i32)) / 100.0;
             let s_comment = tpcc_rand::rand_chars(&mut rng, 25, 63);
             tw.write_line(&format!(
-                "{i},{},{},{s_nationkey},{},{s_acctbal},{}",
+                "{i},{},{},{s_nationkey},{},{s_acctbal:.2},{}",
                 csv_str(&s_name),
                 csv_str(&s_address),
                 csv_str(&s_phone),
