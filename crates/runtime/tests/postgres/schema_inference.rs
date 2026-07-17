@@ -173,7 +173,9 @@ async fn refresh_dataset(rt: &runtime::Runtime, name: &str) -> Result<(), anyhow
     let notify = notifier.ok_or_else(|| anyhow::anyhow!("no completion notifier for {name}"))?;
     tokio::time::timeout(Duration::from_secs(60), notify.notified())
         .await
-        .map_err(|_| anyhow::anyhow!("timed out after 60s waiting for {name} refresh to complete"))?;
+        .map_err(|_| {
+            anyhow::anyhow!("timed out after 60s waiting for {name} refresh to complete")
+        })?;
     Ok(())
 }
 
