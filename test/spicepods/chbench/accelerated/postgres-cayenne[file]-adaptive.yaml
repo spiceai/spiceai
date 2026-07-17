@@ -32,13 +32,10 @@ name: postgres-cayenne[file]-adaptive
 #     warm-start. Adaptive is set explicitly, so it runs regardless; without inferred metadata
 #     the loop just relearns the row width from observed ingest.
 # Background compaction stays at the auto-derived (non-zero) default — the controller rides its
-# tick. The pinned CDC knobs under `runtime.params` below are the deep prefetch buffers
-# (`cdc_prefetch_buffer` / `cdc_max_coalesced_envelopes` = 16384, the runtime max) plus the
-# higher-coalescing byte budget + linger window (`cdc_max_coalesced_bytes` = 512 MB /
-# `cdc_max_coalesce_age_ms` = 2000): the sweep showed deep prefetch is a clear, stable win and
-# that coalescing is the strongest convergence lever at SF1000, so we fix both here (this
-# collapses those knobs' adaptive bounds to a point; adaptive still moves every other per-actuator
-# knob freely).
+# tick. The ONLY pinned knobs are the two CDC prefetch buffers (`cdc_prefetch_buffer` /
+# `cdc_max_coalesced_envelopes` = 16384, the runtime max) under `runtime.params` below: the sweep
+# showed deep prefetch is a clear, stable win, so we fix it here (this collapses those two knobs'
+# adaptive bounds to a point; adaptive still moves every other per-actuator knob freely).
 # The `cayenne_goal_*` SLOs (set globally under `runtime.params`) are NOT actuator knobs — they
 # are the high-level targets the closed loop converges toward (it still moves the un-pinned
 # actuators freely to hit them).
@@ -75,15 +72,6 @@ runtime:
     # replication lag ~435s at default buffers → ~320s deep).
     cdc_prefetch_buffer: '16384'
     cdc_max_coalesced_envelopes: '16384'
-    # Higher-coalescing default: raise the byte budget and add a linger window so the
-    # apply loop forms big bursts (fewer, larger applies amortize per-burst
-    # stats/checkpoint/publish over more rows). In the SF1000 sweep this was the
-    # strongest single convergence lever — 4-slot converged fastest (~801s) with
-    # coalescing on, where the no-coalesce default failed to converge. The linger
-    # deadline is anchored at the previous apply's start, so apply-bound tables barely
-    # wait; 2000ms bounds the added freshness latency for lighter tables.
-    cdc_max_coalesced_bytes: '536870912' # 512 MB
-    cdc_max_coalesce_age_ms: '2000'
     cayenne_goal_replication_lag: '5s'
     cayenne_goal_freshness: '30s'
     cayenne_goal_query_latency: '10s'
