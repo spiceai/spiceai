@@ -1,0 +1,134 @@
+# Crate layering manifest — see docs/dev/crate_layering.md
+#
+# `scripts/check_crate_layers.py` reads this file and the workspace dependency
+# graph, then fails if any *normal* dependency edge points to a crate in a
+# HIGHER tier. Only `kind = "normal"` edges are checked; dev- and
+# build-dependencies are exempt. Tiers are listed low -> high; a crate may
+# depend only on crates in its own tier or a lower one.
+#
+# This encodes the layering that ALREADY holds on the current tree so it cannot
+# regress. It is NOT the target architecture — notably, connectors currently sit
+# in `extension` (ABOVE `runtime`) because the `DataConnector` trait/registry
+# live in the `runtime` crate. The target is to invert that so connectors live
+# in a `data` tier BELOW `runtime`. See docs/dev/crate_layering.md for the plan
+# and for how to tighten these rules as crates move.
+
+# Tiers, lowest first. A dependency edge must go to this tier or lower.
+#
+# The two "utility" tiers split what used to be one `domain` tier by *who is
+# allowed to build on the crate*:
+#   - shared-utility   — below `runtime`, so `runtime` (and everything under it)
+#                        may depend on it. The always-shipped building blocks.
+#   - extension-utility — above `runtime`, below `extension`. Only extensions may
+#                        depend on it; `runtime` cannot. Connector-specific
+#                        building blocks that no runtime code touches live here.
+#                        These should themselves depend ONLY on foundation/
+#                        shared-utility (at most the runtime-*-api interface
+#                        crates) — NOT on the `runtime` crate. The linear order
+#                        enforces runtime->extension-utility (rejected as
+#                        upward); the reverse is enforced by `forbid` below.
+# Extensions may therefore depend on BOTH utility tiers; `runtime-*` may depend
+# only on shared-utility. See docs/dev/crate_layering.md.
+order = ["foundation", "shared-utility", "runtime", "extension-utility", "extension", "binary"]
+
+# Crates not matched by a rule or override land here. shared-utility is the
+# conservative default: it sits below `runtime`, so runtime may build on it. A
+# connector-specific utility must be deliberately placed in extension-utility.
+default_tier = "shared-utility"
+
+# Explicit forbidden tier edges, checked IN ADDITION to the upward-edge rule —
+# for constraints the linear tier order can't express. Each entry is a
+# [from_tier, to_tier] pair; an edge whose endpoints match is a violation even
+# when it points "downward". extension-utility sits ABOVE runtime, so
+# runtime->extension-utility is already caught as upward; this forbids the
+# REVERSE, keeping connector-only building blocks from pulling in the
+# orchestrator (they may still use the low runtime-*-api interface crates).
+forbid = [["extension-utility", "runtime"]]
+
+# Path-prefix rules (checked after per-crate overrides, in order).
+[[rules]]
+path_prefix = "bin/"
+tier = "binary"
+
+[[rules]]
+path_prefix = "tools/"
+tier = "binary"
+
+[[rules]]
+path_prefix = "crates/data-connectors/"
+tier = "extension"
+
+[[rules]]
+path_prefix = "crates/vendor/"
+tier = "foundation"
+
+# Per-crate overrides win over rules.
+[override]
+runtime = "runtime"
+# Extensions that sit above the runtime crate (depend on `runtime`).
+spice-cloud = "extension"
+tpc-extension = "extension"
+
+# --- foundation: near-dependency-free utilities + config/platform primitives.
+# (crates/ libraries whose full normal-dep closure stays within foundation.)
+ansi_colors = "foundation"
+arrow_sql_gen = "foundation"
+arrow_tools = "foundation"
+aws-sdk-credential-bridge = "foundation"
+chunking = "foundation"
+dataformat-json = "foundation"
+datafusion-dml = "foundation"
+datafusion-flightsql = "foundation"
+db_connection_pool = "foundation"
+document_parse = "foundation"
+dotenv = "foundation"
+duration-parse = "foundation"
+dynamodb-streams = "foundation"
+elasticsearch = "foundation"
+event_stream = "foundation"
+flight_client = "foundation"
+google-genai = "foundation"
+hash-index = "foundation"
+libnfs = "foundation"
+ns_lookup = "foundation"
+object_store_occ = "foundation"
+otel-arrow = "foundation"
+repl = "foundation"
+runtime-api-types = "foundation"
+runtime-async = "foundation"
+runtime-cloud-connect = "foundation"
+runtime-datafusion-index = "foundation"
+runtime-metrics = "foundation"
+runtime-object-store = "foundation"
+runtime-parameter-spec = "foundation"
+runtime-proto = "foundation"
+runtime-query-engine = "foundation"
+runtime-rate-control = "foundation"
+s3_vectors = "foundation"
+s3_vectors_metadata_filter = "foundation"
+scheduler = "foundation"
+smb = "foundation"
+spice-cloud-client = "foundation"
+spicepod = "foundation"
+system-open = "foundation"
+telemetry = "foundation"
+token_provider = "foundation"
+tools = "foundation"
+turso-shared = "foundation"
+util = "foundation"
+vortex-datafusion = "foundation"
+yaml = "foundation"
+
+# --- shared-utility: composable libraries the runtime is built from (default
+# tier, but listed here for clarity / auditability). Everything else defaults to
+# `shared-utility`:
+#   app, cache, cayenne, data_components, datafusion-ddl,
+#   datafusion-optimizer-rules, llms, package, runtime-acceleration,
+#   runtime-auth, runtime-cluster, runtime-datafusion, runtime-datafusion-udfs,
+#   runtime-parameters, runtime-request-context, runtime-search, runtime-secrets,
+#   runtime-table-partition, runtime-tools, search, test-framework, workers
+#
+# --- extension-utility: connector-specific building blocks that only extensions
+# depend on (never `runtime`). Populated as the data_components monolith is
+# dissolved and connector-only deps are lifted out of `foundation`; a crate can
+# move here only once nothing at or below `runtime` still depends on it.

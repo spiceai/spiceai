@@ -113,6 +113,8 @@ lint: lint-rust
 
 lint-rust:
 	cargo fmt --all -- --check
+	## Crate-layering guard (fast, no compile): no crate may depend on a higher tier. See docs/dev/crate_layering.md
+	python3 scripts/check_crate_layers.py
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
 	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going --lib --bins --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control,spicebench --workspace --exclude libnfs --exclude lopdf --exclude ttf-parser --exclude pdf-extract -- \
 		-Dwarnings \
