@@ -33,11 +33,15 @@ from pathlib import Path
 try:
     import tomllib  # Python 3.11+
 except ModuleNotFoundError:
-    sys.exit(
+    # Exit 2 (tooling/config error), matching cargo-missing and layers.toml
+    # validation failures — never 1, which signals an actual layering violation.
+    print(
         "error: this script needs Python 3.11+ for the stdlib `tomllib` module "
         f"(found {sys.version_info.major}.{sys.version_info.minor}). "
-        "Install/select a newer python3 and re-run `make lint-rust`."
+        "Install/select a newer python3 and re-run `make lint-rust`.",
+        file=sys.stderr,
     )
+    raise SystemExit(2)
 
 REPO = Path(__file__).resolve().parent.parent
 
