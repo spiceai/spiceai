@@ -336,25 +336,40 @@ pub async fn verify_analytical_results(
                         }
                     }
                     Ok(QueryValidationResult::Fail(reason)) => {
-                        // A located cell divergence (`DataMismatch`) carries the
-                        // 1-based row and column of the first disagreement; print
-                        // the surrounding rows from both sides so the mismatch can
-                        // be inspected in context rather than as a lone cell.
-                        if let (
-                            Some(e0),
-                            Some(a0),
-                            QueryValidationFailReason::DataMismatch {
-                                row_number, column, ..
-                            },
-                        ) = (expected_sorted.first(), actual_sorted.first(), &reason)
+                        // Print the surrounding rows from both sides so a
+                        // divergence can be inspected in context rather than as a
+                        // lone cell. A `DataMismatch` carries the exact 1-based row
+                        // and column of the first disagreement; a `RowCountMismatch`
+                        // has no single cell, so center the window on the boundary
+                        // where the shorter (lex-sorted) side ends — the first row
+                        // index present on only one side. Other reasons (schema, no
+                        // answer) have no meaningful row to center on.
+                        if let (Some(e0), Some(a0)) =
+                            (expected_sorted.first(), actual_sorted.first())
                         {
-                            print_mismatch_context(
-                                query.name.as_ref(),
-                                e0,
-                                a0,
-                                row_number.saturating_sub(1),
-                                Some(column),
-                            );
+                            match &reason {
+                                QueryValidationFailReason::DataMismatch {
+                                    row_number,
+                                    column,
+                                    ..
+                                } => print_mismatch_context(
+                                    query.name.as_ref(),
+                                    e0,
+                                    a0,
+                                    row_number.saturating_sub(1),
+                                    Some(column),
+                                ),
+                                QueryValidationFailReason::RowCountMismatch { .. } => {
+                                    print_mismatch_context(
+                                        query.name.as_ref(),
+                                        e0,
+                                        a0,
+                                        e0.num_rows().min(a0.num_rows()),
+                                        None,
+                                    );
+                                }
+                                _ => {}
+                            }
                         }
                         (
                             Outcome::Divergence(format!(
@@ -494,9 +509,7 @@ fn print_mismatch_context(
     }
     let last = total - 1;
     let lo = mismatch_row.saturating_sub(MISMATCH_CONTEXT_ROWS);
-    let hi = mismatch_row
-        .saturating_add(MISMATCH_CONTEXT_ROWS)
-        .min(last);
+    let hi = mismatch_row.saturating_add(MISMATCH_CONTEXT_ROWS).min(last);
 
     let column_note = column.map_or_else(String::new, |c| format!(", diverging column '{c}'"));
     println!(
@@ -527,9 +540,8 @@ fn print_windowed_table(batch: &RecordBatch, lo: usize, hi: usize) {
 
     // Prepend the absolute row index so the mismatch row can be identified in
     // the rendered table and the two sides lined up row-for-row.
-    let row_index = Int64Array::from_iter_values(
-        (lo..lo + len).map(|r| i64::try_from(r).unwrap_or(i64::MAX)),
-    );
+    let row_index =
+        Int64Array::from_iter_values((lo..lo + len).map(|r| i64::try_from(r).unwrap_or(i64::MAX)));
     let mut fields = Vec::with_capacity(sliced.num_columns() + 1);
     fields.push(Field::new("row", DataType::Int64, false));
     fields.extend(sliced.schema().fields().iter().map(|f| f.as_ref().clone()));
@@ -663,6 +675,18 @@ mod tests {
         // Empty batches print nothing rather than underflowing `total - 1`.
         let empty = RecordBatch::new_empty(batch.schema());
         print_mismatch_context("chbench_q10", &empty, &empty, 0, None);
+    }
+
+    #[test]
+    fn mismatch_context_handles_row_count_divergence() {
+        // The RowCountMismatch path centers on min(expected, actual) rows, which
+        // sits at (or past) the shorter side's end — must not panic and must
+        // clamp each side to its own length.
+        let full = ctx_batch(); // 5 rows
+        let short = full.slice(0, 2); // 2 rows
+        let boundary = full.num_rows().min(short.num_rows()); // 2
+        print_mismatch_context("chbench_q10", &full, &short, boundary, None);
+        print_mismatch_context("chbench_q10", &short, &full, boundary, None);
     }
 
     #[test]
