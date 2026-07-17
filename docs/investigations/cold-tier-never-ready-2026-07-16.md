@@ -170,6 +170,50 @@ Discriminators (all from traces):
 
 Fix target therefore shifts: the deferral-until-initial-load gate would hide the readiness symptom but the lost-wake could still wedge post-load under CDC (holding write_lock, stalling ingest). The real fix must address the stall in `bounded_sort_stream`'s multi-run path (candidate: the `RunInputStream`/`ChunkedSource` handoff or the per-run `SortExec.execute` on the compaction runtime). Investigate before implementing.
 
+## Iteration 3 diagnostics (commit 12e96e7b, to pin the exact deadlock frame)
+
+Static analysis narrowed but did not pin it: NOT kanal (gone from trunk vortex), NOT moka
+load-coalescing (segment_cache uses plain `get`/`insert`), NOT DataFusion memory-pool blocking
+(pool `try_grow` errors, never blocks — and the CI pool had room + was shrinking). The scan is a
+standard `TableProvider::scan`→`execute_stream` driven single-task (one `collect` waker), so no
+waker-identity change at the cayenne layer. Remaining candidates: (a) scan/vortex-read park, (b)
+`SortExec` spill I/O, (c) compaction-runtime worker/blocking-thread starvation under concurrent
+promotions.
+
+Shipped two signals to disambiguate on the next SF1000 run (default terminals, ready-wait 2400,
+`collect_diagnostics=true`, spiced 12e96e7b):
+1. **Scan-vs-sort input counter**: `bounded_sort_stream` threads a rows-fed-INTO-sort counter,
+   surfaced by the watchdog as `input_rows`/`input_delta_tick` next to sink `progress`.
+   `input_delta=0` ⇒ scan/upstream parked; `input` advancing while `progress` frozen ⇒ sort/sink
+   parked. Also bumped "Bounded sort run input consumed" DEBUG→INFO.
+2. **Native thread-dump probe** (`scripts/htap-threaddump-probe.sh`, wired into
+   `collect_diagnostics`): periodic all-thread backtraces of stalled spiced via eu-stack/gdb +
+   `/proc/<pid>/task/*/{comm,wchan}` fallback — captures the exact parked frame / thread-pool
+   starvation the async watchdog can't see. This is the artifact that yields "specific mechanism".
+
+Once the thread-dump + input counter identify the exact frame, write a targeted unit test
+(location depends on the frame: `bounded_sort_stream` multi-run harness in `streaming.rs`, or a
+vortex read/spill test).
+
+## Local repro attempt result (2026-07-17) — sort machinery EXONERATED
+
+Added `bounded_sort_concurrent_multi_run_spilling_does_not_deadlock` (streaming.rs tests): two
+concurrent `bounded_sort_stream`s sharing one 32 MiB `GreedyMemoryPool`, ~64 MiB/stream (forces
+real disk spilling), multi-run, over an async input that returns `Pending` before every batch
+(exercises task parking/waking across run boundaries). **Result: both sorted 8,192,000 rows,
+errored=false, completed in 2.63s — NO deadlock.**
+
+⇒ The deadlock is NOT in `bounded_sort_stream` / `SortExec` / memory pool / spilling / concurrency /
+generic async parking. Combined with earlier eliminations (kanal gone, moka plain get/insert, pool
+try_grow errors-not-blocks), the hang is in the **real vortex scan read path** (warm vortex files
+through the vortex reader at scale) feeding run-1 — which a synthetic in-memory Int64 stream can't
+reproduce. The test is kept as a regression guard proving the sort path is clean, but it is NOT the
+repro of the actual bug.
+
+Next: the CI thread-dump (`scripts/htap-threaddump-probe.sh`, on the pending 12e96e7b repro run)
+will show the exact parked frame in the vortex read path → then write the targeted unit test there
+(a vortex read test / the scan primitive), which is where the reproducing test belongs.
+
 ## Next step
 
 Wait for the `3ec6368` build → dispatch one SF1000 `testoperator_run_htap.yml` run on the branch →

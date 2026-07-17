@@ -894,4 +894,100 @@ mod tests {
             "the stream must end after the error (no further runs)"
         );
     }
+
+    /// Reproduction guard for the cold-promotion multi-run deadlock observed in
+    /// CI (a `run_idx>=1` `SortExec` starts but never emits; the promotion holds
+    /// `write_lock` and the runtime never becomes ready). Recreates the
+    /// distinguishing conditions the other tests lack: MANY spilling sort runs
+    /// over an ASYNC input (returns `Pending` before every batch, like a real
+    /// scan), with TWO sorts running CONCURRENTLY against one small SHARED memory
+    /// pool (mirrors order_line + stock promotions contending on the compaction
+    /// pool). Must finish within the timeout — a hang here is the CI deadlock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bounded_sort_concurrent_multi_run_spilling_does_not_deadlock() {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+        use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+        use datafusion::prelude::SessionConfig;
+        use std::time::Duration;
+
+        let schema = id_schema();
+        let batch_rows = 8192i64;
+        let n_batches = 1000usize; // ~64 MiB/stream so a 32 MiB pool genuinely spills
+        let batch_bytes = id_batch(&schema, 0, batch_rows).get_array_memory_size();
+
+        // One SHARED pool sized to force real disk spilling (not an immediate
+        // ResourcesExhausted) across both concurrent sorts — the disk-spill path
+        // is what differs run-0 (works) from run-1 (hung) at scale.
+        let rtenv = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(GreedyMemoryPool::new(32 * 1024 * 1024)))
+            .build_arc()
+            .expect("build runtime env");
+        let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), rtenv).task_ctx();
+
+        // Async input: `yield_now` (returns Pending once) before each batch to
+        // exercise real task parking/waking across run boundaries.
+        let async_input = |schema: SchemaRef| -> DFStream {
+            let batches: Vec<datafusion_common::Result<RecordBatch>> = (0..n_batches)
+                .map(|i| {
+                    #[expect(clippy::cast_possible_wrap, reason = "test indices are tiny")]
+                    let start = i as i64 * batch_rows;
+                    Ok(id_batch(&schema, start, batch_rows))
+                })
+                .collect();
+            Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                stream::iter(batches).then(|b| async move {
+                    tokio::task::yield_now().await;
+                    b
+                }),
+            ))
+        };
+
+        let run_size = batch_bytes * 8; // many spilling runs per stream
+        let s1 = bounded_sort_stream(
+            "t1",
+            async_input(Arc::clone(&schema)),
+            vec!["id".to_string()],
+            &ctx,
+            run_size,
+            None,
+        );
+        let s2 = bounded_sort_stream(
+            "t2",
+            async_input(Arc::clone(&schema)),
+            vec!["id".to_string()],
+            &ctx,
+            run_size,
+            None,
+        );
+
+        // Errors (e.g. ResourcesExhausted) are NOT the deadlock — the test only
+        // guards against a hang. Returns (rows, errored) so we can confirm the
+        // run actually sorted/spilled rather than erroring out immediately.
+        async fn drain(mut s: DFStream) -> (usize, bool) {
+            let mut rows = 0usize;
+            let mut errored = false;
+            while let Some(item) = s.next().await {
+                match item {
+                    Ok(b) => rows += b.num_rows(),
+                    Err(_) => {
+                        errored = true;
+                        break;
+                    }
+                }
+            }
+            (rows, errored)
+        }
+
+        let res = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(drain(s1), drain(s2))
+        })
+        .await;
+        // eprintln (not tracing) so it survives the test harness's thread-local subscriber.
+        eprintln!("bounded_sort concurrent repro result: {res:?}");
+        assert!(
+            res.is_ok(),
+            "concurrent multi-run spilling bounded sort timed out — reproduces the cold-promotion deadlock"
+        );
+    }
 }
