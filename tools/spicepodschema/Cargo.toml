@@ -19,7 +19,6 @@ spicepod = { path = "../../crates/spicepod", features = ["schemars"] }
 # Enable all data connector features for complete schema generation
 runtime = { path = "../../crates/runtime", features = [
     # All data connectors
-    "clickhouse",
     "databricks",
     "debezium",
     "delta_lake",

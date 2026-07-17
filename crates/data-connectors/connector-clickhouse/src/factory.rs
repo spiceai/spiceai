@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,9 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::function_support::FunctionSupport;
 use async_trait::async_trait;
 use clickhouse_rs::ClientHandle;
+use data_components::Read;
+use data_components::federation::create_spice_federated_table_provider;
+use data_components::function_support::FunctionSupport;
 use datafusion::{datasource::TableProvider, sql::TableReference};
 use datafusion_table_providers::sql::{
     db_connection_pool::DbConnectionPool,
@@ -24,9 +26,6 @@ use datafusion_table_providers::sql::{
 };
 use snafu::prelude::*;
 use std::sync::Arc;
-
-use crate::Read;
-use crate::federation::create_spice_federated_table_provider;
 
 pub type ClickhouseConnectionPool =
     dyn DbConnectionPool<ClientHandle, &'static dyn Sync> + Send + Sync;

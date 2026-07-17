@@ -25,7 +25,7 @@ description = "ClickHouse data connector for Spice.ai runtime"
 [dependencies]
 async-trait.workspace = true
 clickhouse-rs.workspace = true
-data_components = { path = "../../data_components", features = ["clickhouse"] }
+data_components = { path = "../../data_components", features = ["federation"] }
 datafusion.workspace = true
 datafusion-table-providers.workspace = true
 db_connection_pool = { path = "../../db_connection_pool", features = ["clickhouse"] }

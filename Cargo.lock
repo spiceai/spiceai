@@ -5728,7 +5728,6 @@ dependencies = [
  "bytes",
  "charset",
  "chrono",
- "clickhouse-rs",
  "criterion 0.7.0",
  "ctor 0.8.0",
  "dashmap",
