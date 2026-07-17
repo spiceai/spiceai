@@ -245,6 +245,15 @@ fn apply_inferred_sort(
         return false;
     }
 
+    // Respect any user-configured sort param (Cayenne also accepts `sort_columns`).
+    // Checked before the DuckDB constraint guard below so an explicitly-sorted
+    // dataset is reported as user-configured, not as a constraint-preservation skip.
+    let user_configured = acceleration.params.contains_key(key)
+        || (engine == Engine::Cayenne && acceleration.params.contains_key("sort_columns"));
+    if user_configured {
+        return false;
+    }
+
     // DuckDB's on-refresh sort is applied by rewriting the freshly-written table
     // (`CREATE OR REPLACE TABLE … AS SELECT … ORDER BY …`), which does NOT
     // preserve primary keys or indexes — an inferred sort would silently strip
@@ -261,13 +270,6 @@ fn apply_inferred_sort(
         tracing::debug!(
             "Skipping inferred sort; DuckDB's on-refresh sort rewrite would not preserve the configured primary key/indexes/on_conflict target"
         );
-        return false;
-    }
-
-    // Respect any user-configured sort param (Cayenne also accepts `sort_columns`).
-    let user_configured = acceleration.params.contains_key(key)
-        || (engine == Engine::Cayenne && acceleration.params.contains_key("sort_columns"));
-    if user_configured {
         return false;
     }
 
