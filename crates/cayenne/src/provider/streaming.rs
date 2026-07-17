@@ -302,6 +302,12 @@ struct RunInputStream {
     run_idx: usize,
     started: Instant,
     ended: bool,
+    /// Optional shared counter (rows the scan has fed to ALL runs so far),
+    /// surfaced to the stall watchdog. Comparing this against the sink-side
+    /// `progress` counter pinpoints a stalled promotion as scan-side (input
+    /// frozen ⇒ the scan feeding this run is parked) vs sort-internal (input
+    /// advancing/complete but no sorted output). Diagnostics only.
+    input_rows_total: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl Stream for RunInputStream {
@@ -317,12 +323,18 @@ impl Stream for RunInputStream {
                 this.counters
                     .bytes
                     .fetch_add(batch.get_array_memory_size(), Ordering::Relaxed);
+                if let Some(total) = this.input_rows_total.as_ref() {
+                    total.fetch_add(
+                        u64::try_from(batch.num_rows()).unwrap_or(0),
+                        Ordering::Relaxed,
+                    );
+                }
                 Poll::Ready(Some(Ok(batch)))
             }
             Poll::Ready(None) => {
                 if !this.ended {
                     this.ended = true;
-                    tracing::debug!(
+                    tracing::info!(
                         target: "cayenne::compaction",
                         table = this.table_name.as_ref(),
                         run_idx = this.run_idx,
@@ -392,6 +404,7 @@ pub(crate) fn bounded_sort_stream(
     sort_columns: Vec<String>,
     task_ctx: &Arc<TaskContext>,
     run_size_bytes: usize,
+    input_rows_total: Option<Arc<std::sync::atomic::AtomicU64>>,
 ) -> DFStream {
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 
@@ -416,6 +429,7 @@ pub(crate) fn bounded_sort_stream(
         let sort_columns = sort_columns.clone();
         let task_ctx = Arc::clone(&task_ctx);
         let table_name = Arc::clone(&table_name);
+        let input_rows_total = input_rows_total.clone();
         async move {
             loop {
                 if let Some(run) = state.current.as_mut() {
@@ -502,6 +516,7 @@ pub(crate) fn bounded_sort_stream(
                     run_idx,
                     started: Instant::now(),
                     ended: false,
+                    input_rows_total: input_rows_total.clone(),
                 });
                 match util::stream_utils::sort_stream_with_plan(input, &sort_columns, &task_ctx) {
                     Ok((sorted, plan)) => {
@@ -760,6 +775,7 @@ mod tests {
             vec!["id".to_string()],
             &test_task_ctx(),
             batch_bytes * 2,
+            None,
         );
         let got = drain_ids(sorted).await;
         let expected: Vec<i64> = (8..16).chain(0..8).collect();
@@ -792,6 +808,7 @@ mod tests {
             vec!["id".to_string()],
             &test_task_ctx(),
             usize::MAX,
+            None,
         );
         let mut rows = 0usize;
         let mut nulls = 0usize;
@@ -816,6 +833,7 @@ mod tests {
             vec!["id".to_string()],
             &test_task_ctx(),
             1024,
+            None,
         );
         let got = drain_ids(sorted).await;
         assert!(got.is_empty());
@@ -830,7 +848,7 @@ mod tests {
             id_batch_of(&schema, &[2, 0, 1]),
         ];
         let input = source_stream(&schema, batches);
-        let sorted = bounded_sort_stream("test_table", input, Vec::new(), &test_task_ctx(), 1);
+        let sorted = bounded_sort_stream("test_table", input, Vec::new(), &test_task_ctx(), 1, None);
         let got = drain_ids(sorted).await;
         assert_eq!(got, vec![5, 3, 4, 2, 0, 1], "passthrough preserves order");
     }
@@ -857,6 +875,7 @@ mod tests {
             vec!["id".to_string()],
             &test_task_ctx(),
             usize::MAX,
+            None,
         );
         let mut saw_error = false;
         while let Some(item) = sorted.next().await {

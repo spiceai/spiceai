@@ -14131,6 +14131,7 @@ impl CayenneTableProvider {
         stream: SendableRecordBatchStream,
         clustering_indices: Vec<usize>,
         task_ctx: &Arc<datafusion_execution::TaskContext>,
+        input_rows_total: Option<Arc<std::sync::atomic::AtomicU64>>,
     ) -> SendableRecordBatchStream {
         if clustering_indices.is_empty() {
             return stream;
@@ -14152,6 +14153,7 @@ impl CayenneTableProvider {
             self.table_metadata
                 .vortex_config
                 .cold_clustering_run_size_bytes(),
+            input_rows_total,
         );
         let orig = Arc::clone(&original_schema);
         let stripped = sorted
@@ -14844,11 +14846,15 @@ impl CayenneTableProvider {
             "Datalake promotion: visible cross-tier stream planned; entering scan/sort/encode/upload"
         );
 
-        // Z-order cluster for a read-optimized cold layout.
+        // Z-order cluster for a read-optimized cold layout. The input-rows
+        // counter (rows the scan feeds INTO the bounded sort) goes to the stall
+        // watchdog: comparing it against the sink-side `progress` counter below
+        // localizes a freeze as scan-side (input frozen) vs sort/sink-side.
         stall.phase("zorder-sort-plan");
         let clustering = self.resolve_cold_clustering_indices();
         let task_ctx = ctx.task_ctx();
-        let stream = self.zorder_sort_stream(stream, clustering, &task_ctx);
+        let stream =
+            self.zorder_sort_stream(stream, clustering, &task_ctx, Some(stall.input_progress_counter()));
 
         // Count rows as the cold sink pulls them from the sorted stream. The
         // watchdog reports this per tick: frozen at 0 => scan/sort produced

@@ -325,6 +325,12 @@ jobs:
               EXPLAIN_QUERIES=all EXPLAIN_INTERVAL=30 READY_TIMEOUT=3600 \
               bash scripts/htap-explain-probe.sh > "$DIAG_DIR/explain-probe.log" 2>&1 &
             DIAG_PIDS="$DIAG_PIDS $!"
+            # Native all-thread stack dumps of spiced — captures the exact parked
+            # frame (channel recv / spill I/O / decompress / futex) during a
+            # cold-promotion deadlock, which the async watchdog can't see.
+            OUTDIR="$DIAG_DIR" THREADDUMP_INTERVAL=60 THREADDUMP_START_AFTER=240 \
+              bash scripts/htap-threaddump-probe.sh > "$DIAG_DIR/threaddump-probe.log" 2>&1 &
+            DIAG_PIDS="$DIAG_PIDS $!"
             echo "diagnostics probes backgrounded (pids$DIAG_PIDS) -> $DIAG_DIR"
           fi
 

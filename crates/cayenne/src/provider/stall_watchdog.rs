@@ -102,6 +102,12 @@ struct OpEntry {
     progress: Arc<AtomicU64>,
     /// Progress value observed on the previous watchdog tick, for delta logging.
     last_progress: u64,
+    /// Optional monotonic INPUT-side counter (e.g. rows the scan has fed into the
+    /// promotion's bounded sort). Compared against `progress` (sink side) to
+    /// localize a stall: `input` frozen ⇒ scan/upstream parked; `input`
+    /// advancing while `progress` frozen ⇒ the sort/sink is parked downstream.
+    input_progress: Arc<AtomicU64>,
+    last_input_progress: u64,
 }
 
 /// A stuck operation snapshot, collected under the registry lock and logged
@@ -114,6 +120,8 @@ struct StuckOp {
     total_s: u64,
     progress: u64,
     progress_delta: u64,
+    input_progress: u64,
+    input_delta: u64,
 }
 
 /// RAII handle for a long-running Cayenne operation tracked by the stall
@@ -122,6 +130,7 @@ struct StuckOp {
 pub(crate) struct StallOp {
     id: u64,
     progress: Arc<AtomicU64>,
+    input_progress: Arc<AtomicU64>,
 }
 
 impl StallOp {
@@ -132,6 +141,7 @@ impl StallOp {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
         let progress = Arc::new(AtomicU64::new(0));
+        let input_progress = Arc::new(AtomicU64::new(0));
         REGISTRY.lock().insert(
             id,
             OpEntry {
@@ -142,9 +152,15 @@ impl StallOp {
                 phase_since: now,
                 progress: Arc::clone(&progress),
                 last_progress: 0,
+                input_progress: Arc::clone(&input_progress),
+                last_input_progress: 0,
             },
         );
-        Self { id, progress }
+        Self {
+            id,
+            progress,
+            input_progress,
+        }
     }
 
     /// Advance to a new phase, resetting the stall timer for this operation.
@@ -160,6 +176,13 @@ impl StallOp {
     /// apart from a slow-but-advancing one. Cheap `Relaxed` atomic adds.
     pub(crate) fn progress_counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.progress)
+    }
+
+    /// Shared INPUT-side counter (rows fed into the op's sort). Compared against
+    /// [`Self::progress_counter`] by the watchdog to localize a stall as
+    /// upstream (scan) vs downstream (sort/sink).
+    pub(crate) fn input_progress_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.input_progress)
     }
 }
 
@@ -238,6 +261,9 @@ fn watchdog_loop(interval: Duration, warn_after: Duration) {
                     let progress = entry.progress.load(Ordering::Relaxed);
                     let delta = progress.saturating_sub(entry.last_progress);
                     entry.last_progress = progress;
+                    let input_progress = entry.input_progress.load(Ordering::Relaxed);
+                    let input_delta = input_progress.saturating_sub(entry.last_input_progress);
+                    entry.last_input_progress = input_progress;
                     Some(StuckOp {
                         table: entry.table.clone(),
                         kind: entry.kind,
@@ -246,6 +272,8 @@ fn watchdog_loop(interval: Duration, warn_after: Duration) {
                         total_s: now.saturating_duration_since(entry.started).as_secs(),
                         progress,
                         progress_delta: delta,
+                        input_progress,
+                        input_delta,
                     })
                 })
                 .collect()
@@ -275,13 +303,15 @@ fn watchdog_loop(interval: Duration, warn_after: Duration) {
                 total_s = op.total_s,
                 progress = op.progress,
                 progress_delta_tick = op.progress_delta,
+                input_rows = op.input_progress,
+                input_delta_tick = op.input_delta,
                 mem_tier_used = ?mem_used,
                 mem_tier_total = ?mem_total,
                 encode_permits_available = ?encode_avail,
                 encode_permits_total = ?encode_total,
                 compaction_pool_used = ?compaction_pool_used,
                 compaction_pool_total = ?compaction_pool_total,
-                "Cayenne operation has not advanced its phase — possible stall/deadlock (write_lock likely held; ingest for this table is blocked behind it). progress_delta_tick=0 with progress=0 means nothing produced (scan/sort parked); >0 then frozen means the sink/upload is parked; compaction_pool_used near total points at a spilling sort"
+                "Cayenne operation has not advanced its phase — possible stall/deadlock (write_lock likely held; ingest for this table is blocked behind it). input_delta_tick=0 ⇒ scan/upstream parked (no rows into the sort); input advancing while progress_delta_tick=0 ⇒ sort/sink parked downstream; compaction_pool_used near total ⇒ spilling sort"
             );
         }
     }
