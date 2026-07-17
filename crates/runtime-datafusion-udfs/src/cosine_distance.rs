@@ -493,11 +493,13 @@ fn cosine_distance(x: &Float64Array, y: &Float64Array) -> f64 {
 
 /// Converts an array of any numeric type to a `Float64Array`.
 ///
-/// Float64 inputs are not handled here — callers should use the zero-copy
-/// [`as_float64_array`] path instead of cloning.
+/// Same-type Float64/Float32 pairs use the zero-copy paths in
+/// [`compute_cosine_distance`]; this helper still accepts `Float64` so mixed
+/// numeric pairs (e.g. `Float64` + `Int32`) keep working.
 #[expect(clippy::cast_lossless, clippy::cast_precision_loss)]
 fn convert_to_f64_array(array: &ArrayRef) -> DataFusionResult<Float64Array> {
     match array.data_type() {
+        DataType::Float64 => Ok(as_float64_array(array)?.clone()),
         DataType::Float32 => {
             let array = as_float32_array(array)?;
             let converted: Float64Array = array.iter().map(|v| v.map(f64::from)).collect();
@@ -521,7 +523,7 @@ fn convert_to_f64_array(array: &ArrayRef) -> DataFusionResult<Float64Array> {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{Array, ArrayRef, Float64Array};
+    use arrow::array::{Array, ArrayRef, Float64Array, Int32Array};
     use arrow_schema::Field;
 
     use super::{CosineDistance, compute_cosine_distance, cosine_distance, cosine_distance_inner};
@@ -593,6 +595,22 @@ mod tests {
         let b: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0]));
         let result = compute_cosine_distance(Some(a), Some(b));
         assert!(matches!(result, Ok(Some(d)) if d.is_finite()));
+    }
+
+    #[test]
+    fn test_compute_cosine_distance_mixed_float64_int32() {
+        // Mixed numeric element types fall through to `convert_to_f64_array`,
+        // which must still accept Float64 (same behavior as trunk).
+        let f64_side: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 0.0]));
+        let i32_side: ArrayRef = Arc::new(Int32Array::from(vec![0, 1]));
+
+        let result = compute_cosine_distance(Some(f64_side), Some(i32_side))
+            .expect("mixed Float64/Int32 must convert");
+        let distance = result.expect("non-null distance");
+        assert!(
+            (distance - 0.5).abs() < 1e-10,
+            "orthogonal mixed-type vectors should yield 0.5, got {distance}"
+        );
     }
 
     // --- SIMD (FixedSizeList<Float32>) path tests ---
