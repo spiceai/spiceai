@@ -662,11 +662,11 @@ mod tests {
 
     #[test]
     fn mismatch_context_clamps_window_to_bounds() {
-        // Must not panic when the mismatch sits at row 0 (lo underflow) or past
-        // the end (hi overflow); the window is clamped to the rows present.
+        // Must not panic when the mismatch sits at row 0 (lo underflow) or beyond
+        // the end; the window is clamped to the rows present.
         let batch = ctx_batch();
         print_mismatch_context("chbench_q10", &batch, &batch, 0, Some("city"));
-        print_mismatch_context("chbench_q10", &batch, &batch, 4, Some("city"));
+        print_mismatch_context("chbench_q10", &batch, &batch, 999, Some("city"));
         // Empty batches print nothing rather than underflowing `total - 1`.
         let empty = RecordBatch::new_empty(batch.schema());
         print_mismatch_context("chbench_q10", &empty, &empty, 0, None);
