@@ -252,7 +252,7 @@ readonly LINT_BASE_BRANCH="trunk"
 resolve_local_trunk_ref() {
   if [[ "$VCS" == "jj" ]]; then
     if jj --color=never --no-pager log \
-      -r "remote_bookmarks(exact:\"${LINT_BASE_BRANCH}\", remote:exact:\"${TARGET_REMOTE}\")" \
+      -r "remote_bookmarks(exact:\"${LINT_BASE_BRANCH}\", remote=exact:\"${TARGET_REMOTE}\")" \
       --no-graph -T 'commit_id' -n 1 >/dev/null 2>&1; then
       echo "${LINT_BASE_BRANCH}@${TARGET_REMOTE}"
       return 0
