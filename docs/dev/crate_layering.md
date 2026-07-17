@@ -45,7 +45,7 @@ tracked separately (a working plan, not part of these rules).
 | **foundation** | Leaf utilities, wire formats, config parsing, primitives. Ideally reusable outside Spice. Little or no internal dependency. | foundation |
 | **shared-utility** | The **always-shipped** shared libraries the runtime is built on — the accelerator (`cayenne`), inference (`llms`), search, the `runtime-*` support crates. Sits *below* `runtime`, so `runtime` may build on it. *Optional* / connector-specific building blocks do **not** belong here (see [Shared building blocks vs. extension-only code](#shared-building-blocks-vs-extension-only-code)); `data_components` sits here today only because it is still an undivided monolith. | foundation, shared-utility |
 | **runtime** | The `runtime` crate: orchestration, component lifecycle, HTTP/Flight servers, and (today) the connector/accelerator/catalog trait definitions + registries. May **not** depend on `extension-utility`. | foundation, shared-utility |
-| **extension-utility** | Connector-specific building blocks that only *extensions* depend on — never `runtime`. Sits *above* `runtime` so an accidental `runtime → connector-utility` edge is caught as upward. **Empty today** (a target slot): every such crate — `pgwire-replication`, the `elasticsearch`/`dynamodb-streams`/`smb`/`libnfs` clients, `s3_vectors` — is still pulled in by the `data_components` monolith or `runtime` itself, so it can't move up yet. Populates as the monolith dissolves. | foundation, shared-utility |
+| **extension-utility** | Connector-specific building blocks that only *extensions* depend on — never `runtime`. It is a low-level *building block*, so it must itself depend **only** on `foundation`/`shared-utility` (at most the `runtime-*-api` interface crates, which sit low) — **not on the `runtime` crate**; pulling in the orchestrator would defeat the point. Sits *above* `runtime` so an accidental `runtime → connector-utility` edge is caught as upward. **Empty today** (a target slot): every such crate — `pgwire-replication`, the `elasticsearch`/`dynamodb-streams`/`smb`/`libnfs` clients, `s3_vectors` — is still pulled in by the `data_components` monolith or `runtime` itself, so it can't move up yet. Populates as the monolith dissolves. | foundation, shared-utility (+ `runtime-*-api`) |
 | **extension** | **Everything optional** — plug-ins that *register with* the runtime: the ~30 `connector-*` crates, `spice-cloud`, `tpc-extension`, **plus the connector-specific building blocks only they use** (`extension-utility`). Thin wiring over a `shared-utility` impl today; the target folds each source's utilities in alongside it. | foundation, shared-utility, runtime, extension-utility |
 | **binary** | The `spiced`/`spice` binaries and `tools/*` — link the whole graph. | anything |
 
@@ -53,6 +53,19 @@ The two utility tiers encode a single rule: **`runtime-*` may depend only on
 `shared-utility`, while extensions may depend on both.** `shared-utility` is what
 we always ship and the runtime builds on; `extension-utility` is connector-only
 code the runtime must never pull in.
+
+**`extension-utility` must not depend on `runtime` either.** It is a low-level
+building block for extensions, not a consumer of the orchestrator: its only
+dependencies should be `foundation`/`shared-utility` and — at most — the
+`runtime-*-api` *interface* crates (which live low, below `runtime`, not the
+`runtime` crate itself). Note the linear tier order can only enforce *one*
+direction of this mutual "no edge between `runtime` and `extension-utility`": the
+guard catches `runtime → extension-utility` (the critical one — it would drag a
+connector-only crate into the always-shipped graph), while `extension-utility →
+runtime` stays a documented convention for now. It becomes structural in the
+[target](#target-layering-and-how-we-get-there) anyway: once `runtime` is split,
+there is no monolithic `runtime` crate for a building block to depend on — only
+the low `runtime-*-api` crates remain.
 
 The **target** also adds two lower tiers — `interface` (the `*-api` trait crates)
 and `data` (the `data-<source>` crates, below `runtime`) — as the migration

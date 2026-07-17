@@ -22,6 +22,11 @@
 #   - extension-utility — above `runtime`, below `extension`. Only extensions may
 #                        depend on it; `runtime` cannot. Connector-specific
 #                        building blocks that no runtime code touches live here.
+#                        These should themselves depend ONLY on foundation/
+#                        shared-utility (at most the runtime-*-api interface
+#                        crates) — NOT on the `runtime` crate. The linear order
+#                        enforces runtime->extension-utility (rejected); the
+#                        reverse is a convention (see docs/dev/crate_layering.md).
 # Extensions may therefore depend on BOTH utility tiers; `runtime-*` may depend
 # only on shared-utility. See docs/dev/crate_layering.md.
 order = ["foundation", "shared-utility", "runtime", "extension-utility", "extension", "binary"]
