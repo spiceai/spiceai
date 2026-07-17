@@ -132,7 +132,8 @@ datasets:
     acceleration: *cayenne_accel
 
   # ---- Static reference tables (no OLTP mutations, full refresh) ----
-  # Same: PK / on_conflict come from schema inference (always on).
+  # Same: the PK comes from schema inference (always on); on_conflict is seeded only
+  # for CDC (changes) datasets — a full refresh replaces the table and needs no upsert.
 
   - from: mysql:item
     name: item

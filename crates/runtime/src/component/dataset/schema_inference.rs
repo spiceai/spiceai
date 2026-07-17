@@ -259,7 +259,7 @@ fn apply_inferred_sort(
             || !acceleration.on_conflict.is_empty())
     {
         tracing::debug!(
-            "Skipping inferred sort; DuckDB's on-refresh sort rewrite would not preserve the configured primary key/indexes"
+            "Skipping inferred sort; DuckDB's on-refresh sort rewrite would not preserve the configured primary key/indexes/on_conflict target"
         );
         return false;
     }

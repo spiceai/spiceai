@@ -156,7 +156,8 @@ datasets:
 
   # ------------------------------------------------------------------
   # Static reference tables (no OLTP mutations, full refresh) — adaptive, no cold tier.
-  # PK / on_conflict / indexes come from schema inference (always on).
+  # PK / indexes come from schema inference (always on); on_conflict is seeded only
+  # for CDC (changes) datasets — a full refresh replaces the table and needs no upsert.
   # ------------------------------------------------------------------
   - from: postgres:item
     name: item

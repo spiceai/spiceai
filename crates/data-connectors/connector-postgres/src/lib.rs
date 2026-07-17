@@ -621,15 +621,20 @@ async fn postgres_inferred_schema_metadata(
     // are resolved against the row estimate.
     let mut row_count: Option<u64> = None;
     let mut table_bytes: Option<u64> = None;
-    if let Ok(size_rows) = conn.conn.query(TABLE_SIZE_SQL, &[&table_path]).await
-        && let Some(row) = size_rows.first()
-    {
-        row_count = row
-            .get::<_, Option<i64>>("row_estimate")
-            .and_then(|rows| u64::try_from(rows).ok());
-        table_bytes = row
-            .get::<_, Option<i64>>("table_bytes")
-            .and_then(|bytes| u64::try_from(bytes).ok());
+    match conn.conn.query(TABLE_SIZE_SQL, &[&table_path]).await {
+        Ok(size_rows) => {
+            if let Some(row) = size_rows.first() {
+                row_count = row
+                    .get::<_, Option<i64>>("row_estimate")
+                    .and_then(|rows| u64::try_from(rows).ok());
+                table_bytes = row
+                    .get::<_, Option<i64>>("table_bytes")
+                    .and_then(|bytes| u64::try_from(bytes).ok());
+            }
+        }
+        Err(error) => {
+            tracing::debug!(%error, "Failed to query PostgreSQL table sizing; continuing without it");
+        }
     }
 
     // Per-column statistics (best-effort; empty when the table was never
