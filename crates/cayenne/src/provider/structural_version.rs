@@ -114,27 +114,32 @@ impl StructuralVersion {
         (v0 == v1).then_some((v0, out))
     }
 
-    /// Open a seqlock read whose critical section is ASYNC (the scan-view builder's
-    /// capture awaits `listing_fence`, so it cannot live inside a synchronous
-    /// [`Self::read_validated`] closure). Returns the even baseline version `v0`, or
-    /// `None` if a forced mutation is in flight (the caller waits + retries). Pair
-    /// with [`Self::read_still_stable`] AFTER the async capture: publish the captured
-    /// state only if it returns `true`.
+    /// [`Self::read_validated`] for an ASYNC critical section: the scan-view builder's
+    /// capture awaits `listing_fence`, so it cannot live inside a synchronous closure.
+    /// This encapsulates the exact same seqlock protocol around an `.await` — so the
+    /// caller cannot forget the after-check — with the identical load ordering the
+    /// loom model of [`Self::read_validated`] verifies (`v0` Acquire before the
+    /// captured `ArcSwap` loads, an Acquire fence + `v1` Acquire after them).
     ///
-    /// This is [`Self::read_validated`] split across an await; the loom model of
-    /// `read_validated` covers the identical load ordering (`v0` Acquire before the
-    /// reads, `v1` Acquire after the fence).
-    pub(crate) fn read_begin(&self) -> Option<u64> {
+    /// Returns `Some((v0, output))` iff no forced mutation was in flight at the start
+    /// AND none raced the awaited capture; `None` => discard and retry (never publish
+    /// a torn or pre-event capture). Rejecting an odd `v0` up front is load-bearing:
+    /// without it a capture that runs entirely within ONE forced mutation's odd
+    /// window would see `v0 == v1` (both the same odd value) and wrongly validate a
+    /// torn read.
+    pub(crate) async fn read_validated_async<F, Fut, T>(&self, build: F) -> Option<(u64, T)>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
         let v0 = self.version.load(Ordering::Acquire);
-        (v0 & 1 == 0).then_some(v0)
-    }
-
-    /// Close a [`Self::read_begin`] seqlock read: `true` iff no forced mutation raced
-    /// the capture (the version is still the even `v0`). The `Acquire` fence orders
-    /// the capture's reads before the `v1` load.
-    pub(crate) fn read_still_stable(&self, v0: u64) -> bool {
+        if v0 & 1 != 0 {
+            return None; // a forced mutation is in flight
+        }
+        let out = build().await;
         fence(Ordering::Acquire);
-        self.version.load(Ordering::Acquire) == v0
+        let v1 = self.version.load(Ordering::Acquire);
+        (v0 == v1).then_some((v0, out))
     }
 }
 

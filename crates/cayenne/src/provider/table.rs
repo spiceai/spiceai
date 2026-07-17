@@ -1352,7 +1352,7 @@ pub struct CayenneTableProvider {
     scan_view_published: Arc<tokio::sync::Notify>,
     /// Forced-structural-event seqlock (truncate / full-delete / overwrite /
     /// schema-evolve / reopen). The builder brackets its capture with this
-    /// (`read_begin`/`read_still_stable`) so it never PUBLISHES a bundle whose capture
+    /// (`read_validated_async`) so it never PUBLISHES a bundle whose capture
     /// straddled a forced event that mutates both fence-protected and fence-decoupled
     /// (mem-tier) state. Ordinary churn never touches it. Shared across clones.
     structural_version: Arc<crate::provider::structural_version::StructuralVersion>,
@@ -19452,26 +19452,24 @@ impl CayenneTableProvider {
             // whole (capture + build) period to `floor`, not `floor` ON TOP of it.
             let compute_start = Instant::now();
 
-            // Forced-event seqlock, open side: skip while a forced structural event
-            // (truncate / full-delete / overwrite / schema-evolve / reopen) is in
-            // flight (odd version). The event's notify wakes us to retry once it
-            // completes.
-            let Some(structural_v0) = provider.structural_version.read_begin() else {
-                let notify = Arc::clone(&provider.scan_input_change);
-                drop(provider);
-                tokio::select! {
-                    () = shutdown.cancelled() => return,
-                    () = notify.notified() => {}
-                }
-                continue;
-            };
             // Freshness stamp: read the monotonic input version BEFORE the capture,
             // so the bundle's stamp is a conservative lower bound on its freshness.
             let input_version = provider.scan_input_version.load(Ordering::Acquire);
 
-            let raw = match provider.capture_raw_scan_input().await {
-                Ok(raw) => raw,
-                Err(error) => {
+            // Capture the scan input INSIDE the forced-event seqlock: the closure runs
+            // between the version reads, so a capture that straddled a forced
+            // structural event (truncate / full-delete / overwrite / schema-evolve /
+            // reopen) — which mutates both fence-protected AND fence-decoupled mem-tier
+            // state — is DISCARDED (`None`) rather than published as a torn bundle. The
+            // closure encapsulates the pairing (the maintainer cannot forget the
+            // re-check); the loom model of `read_validated` covers the load ordering.
+            let raw = match provider
+                .structural_version
+                .read_validated_async(|| provider.capture_raw_scan_input())
+                .await
+            {
+                Some((_v0, Ok(raw))) => raw,
+                Some((_v0, Err(error))) => {
                     tracing::warn!(
                         target: "cayenne::scan_view",
                         table = %provider.table_metadata.table_name,
@@ -19486,17 +19484,19 @@ impl CayenneTableProvider {
                     }
                     continue;
                 }
+                None => {
+                    // A forced structural event was in flight or raced the capture —
+                    // park briefly on the notify so we don't hot-spin, then re-capture
+                    // at the new generation (no publish, no `prev` advance, no floor).
+                    let notify = Arc::clone(&provider.scan_input_change);
+                    drop(provider);
+                    tokio::select! {
+                        () = shutdown.cancelled() => return,
+                        () = notify.notified() => {}
+                    }
+                    continue;
+                }
             };
-
-            // Forced-event seqlock, close side: if a forced event raced the capture,
-            // the captured state may straddle it (a forced event mutates both
-            // fence-protected AND fence-decoupled mem-tier state) — DISCARD and
-            // re-capture at the new generation (no publish, no `prev` advance, no
-            // floor). This is what stops the maintainer publishing a torn bundle.
-            if !provider.structural_version.read_still_stable(structural_v0) {
-                drop(provider);
-                continue;
-            }
 
             let should_build = prev.as_ref().is_none_or(|prev_raw| raw.changed(prev_raw));
             if should_build {
