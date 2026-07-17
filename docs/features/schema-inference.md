@@ -29,8 +29,9 @@ Not every inferred setting is applied to every engine + refresh mode — each is
 applied only where it is provably safe across the table's whole lifecycle, not just
 the first load:
 
-- **Physical constraints (primary key, indexes)** are applied for
-  `refresh_mode: full` and `refresh_mode: changes` — except:
+- **Physical constraints (primary key, indexes)** are applied for every refresh
+  mode except `append` (`full` and `changes` are the common cases; `caching` and
+  `snapshot` follow the `full` rule) — with two carve-outs:
   - **`refresh_mode: append` never gets inferred constraints** (any engine): appends
     incrementally re-read the source, an engine cannot retrofit a constraint onto
     rows already appended, and an overlapping re-read window would violate a

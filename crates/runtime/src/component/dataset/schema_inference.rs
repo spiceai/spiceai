@@ -89,6 +89,9 @@ pub fn apply_inferred_schema(
     // - `changes` (CDC) always gets them: the change stream requires the primary
     //   key, and the physical base table is created with it up front (no versioned
     //   rebuild), matching what an explicit `primary_key` would do.
+    // The remaining modes (`disabled`, `caching`, `snapshot`) follow the `full`
+    // rule via the `_` arm: their loads replace whole tables rather than
+    // incrementally appending, so the append hazard does not apply.
     // The inferred *sort* is not a physical constraint (it is a refresh-time ORDER
     // BY / compaction order) and is gated separately in `apply_inferred_sort`.
     let constraints_applicable = match resolved_refresh_mode {
