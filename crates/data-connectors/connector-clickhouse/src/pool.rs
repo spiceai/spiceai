@@ -23,17 +23,10 @@ use datafusion_table_providers::sql::db_connection_pool::{
 };
 use snafu::Snafu;
 
-use crate::dbconnection::clickhouseconn::ClickhouseConnection;
-
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+use crate::conn::ClickhouseConnection;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to connect to ClickHouse: {source}"))]
-    ConnectionPoolError {
-        source: clickhouse_rs::errors::ConnectionError,
-    },
-
     #[snafu(display("Failed to establish TLS connection to ClickHouse: {source}"))]
     ConnectionTlsError {
         source: clickhouse_rs::errors::ConnectionError,
@@ -69,11 +62,6 @@ impl ClickhouseConnectionPool {
             join_push_down: JoinPushDown::AllowedFor(compute_context),
             db,
         }
-    }
-
-    #[must_use]
-    pub fn db(&self) -> Arc<str> {
-        Arc::clone(&self.db)
     }
 }
 

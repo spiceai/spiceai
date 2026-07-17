@@ -37,7 +37,7 @@ use snafu::{ResultExt, Snafu};
 use datafusion_table_providers::sql::arrow_sql_gen::arrow::map_data_type_to_array_builder;
 
 #[derive(Debug, Snafu)]
-pub enum Error {
+pub(crate) enum Error {
     #[snafu(display("Failed to process ClickHouse query result: {source}"))]
     FailedToBuildRecordBatch { source: arrow::error::ArrowError },
 
@@ -53,12 +53,6 @@ pub enum Error {
     FailedToGetRowValue {
         clickhouse_type: SqlType,
         source: clickhouse_rs::errors::Error,
-    },
-
-    #[snafu(display("Failed to append a row value for {}: {}", clickhouse_type, source))]
-    FailedToAppendRowValue {
-        clickhouse_type: SqlType,
-        source: arrow::error::ArrowError,
     },
 
     #[snafu(display("No column definition found at index {index} in the ClickHouse result"))]
@@ -80,7 +74,7 @@ pub enum Error {
     UnsupportedColumnType { column_type: SqlType },
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 
 macro_rules! handle_primitive_type {
     ($builder:expr, $type:expr, $builder_ty:ty, $value_ty:ty, $row:expr, $index:expr) => {{
@@ -133,7 +127,7 @@ macro_rules! handle_primitive_nullable_type {
 /// # Errors
 ///
 /// Returns an error if there is a failure in converting the rows to a `RecordBatch`.
-pub fn block_to_arrow<T: ColumnType>(block: &Block<T>) -> Result<RecordBatch> {
+pub(crate) fn block_to_arrow<T: ColumnType>(block: &Block<T>) -> Result<RecordBatch> {
     let mut arrow_fields: Vec<Option<Field>> = Vec::new();
     let mut arrow_columns_builders: Vec<Option<Box<dyn ArrayBuilder>>> = Vec::new();
     let mut clickhouse_types: Vec<SqlType> = Vec::new();

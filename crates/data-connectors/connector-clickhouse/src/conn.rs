@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
-use arrow_sql_gen::clickhouse::block_to_arrow;
+use crate::block_to_arrow::block_to_arrow;
 use async_stream::stream;
 use clickhouse_rs::{Block, ClientHandle, Pool};
 use datafusion::error::DataFusionError;
@@ -46,7 +46,7 @@ pub enum Error {
     },
     #[snafu(display("Failed to convert query result to Arrow: {source}"))]
     ConversionError {
-        source: arrow_sql_gen::clickhouse::Error,
+        source: crate::block_to_arrow::Error,
     },
 }
 

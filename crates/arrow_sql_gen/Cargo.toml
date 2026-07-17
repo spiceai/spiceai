@@ -14,14 +14,8 @@ version.workspace = true
 arrow.workspace = true
 bigdecimal.workspace = true
 chrono.workspace = true
-chrono-tz = "0.8.6"
 datafusion-table-providers.workspace = true
 snafu.workspace = true
-clickhouse-rs = { workspace = true, optional = true }
-uuid = { workspace = true, optional = true }
-
-[features]
-clickhouse = ["dep:clickhouse-rs", "dep:uuid"]
 
 [lints]
 workspace = true
