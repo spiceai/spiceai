@@ -214,7 +214,36 @@ Next: the CI thread-dump (`scripts/htap-threaddump-probe.sh`, on the pending 12e
 will show the exact parked frame in the vortex read path → then write the targeted unit test there
 (a vortex read test / the scan primitive), which is where the reproducing test belongs.
 
+## DEFINITIVE: the freeze is a lost-wakeup in the SCAN (input to SortExec), not the SortExec (run 29599553490, 12e96e7b, 2026-07-17)
+
+Reproduced "not ready within 2400s" with the `input_rows` counter. Frozen table `order_line`:
+- Bounded-sort `run_idx=0,1,2` **completed** (~37M rows each; run 1 spilled 4.4 GB).
+- `run_idx=3` logged **"starting" but never "input consumed"** → its input chunk never ended.
+- Watchdog, flat for ~30 min (in_phase 1339→2209s): `input_rows=124,395,520 (+0)`,
+  `progress=111,311,295 (+0)`. `input − progress = 13.1M` = rows run 3 consumed before the scan
+  stopped (111.3M = runs 0-2 output). Compaction pool constant 6.4 GB (NOT exhausted).
+- Thread-dump (ptrace blocked on runner even with sudo — no user backtraces): ALL `tokio-rt-worker`
+  threads in `wchan=futex_wait_queue` (no runnable task) = **lost-wakeup signature** (not CPU-spin,
+  not lock contention, not memory).
+
+⇒ **It is the INPUT to the SortExec that parks — the visible cross-tier vortex read scan feeding
+`bounded_sort_stream` stops producing (~13M rows into run 3) and never wakes / signals EOF.** run 3's
+`SortExec` waits forever for input; the promotion holds `order_line`'s `write_lock`; the initial
+snapshot can't complete → spiced never ready. Racy (~50%; 3ec6368 also became ready once, so the
+input_rows atomic is NOT a Heisenbug — just a timing-sensitive race).
+
+Scope narrowed to: the scan stream `visible_file_stream_for_rewrite` → `TableProvider::scan` →
+vortex read (`crates/vortex/src/persistent`: opener/source/format `buffer_unordered` meta-fetch /
+segment read) parking mid-stream on a later run's data. Matches the historical "wedge in the
+scan/sort drain."
+
 ## Next step
+
+Exact vortex frame needs finer scan-read tracing (ptrace backtraces are unavailable on the runner):
+add a rebuild that logs the scan's last in-flight read op / a per-poll heartbeat so the last line
+before silence pinpoints the vortex read primitive; then write a unit test reproducing that read
+parking. (The `bounded_sort` machinery is exonerated — runs 0-2 completed; the repro test must be at
+the vortex read layer.)
 
 Wait for the `3ec6368` build → dispatch one SF1000 `testoperator_run_htap.yml` run on the branch →
 read `progress`/sort-run/spill/compaction-pool telemetry → classify stuck-vs-slow → apply the
