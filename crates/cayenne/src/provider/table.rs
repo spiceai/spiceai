@@ -993,6 +993,14 @@ struct VisibleMemTierSegment {
 /// [`Self::scan_guard`] pins the snapshot dirs for the whole scan lifetime (D2),
 /// so the fence can be released after the capture without a compaction GC'ing a
 /// file the scan still reads.
+///
+/// `Clone` is a cheap shallow clone (Arc / atom / String copies; the
+/// `PkDeletionSnapshot` is itself an `Arc` clone) — used by the builder to retain
+/// the prior capture for the next [`Self::changed`] comparison while the current
+/// one moves into the published [`ScanView`]. Cloning the `scan_guard` `Arc` SHARES
+/// the same in-flight lease (it does NOT re-increment the snapshot ref-count), so a
+/// clone never double-pins.
+#[derive(Clone)]
 struct RawScanInput {
     /// Per-shard immutable mem-tier snapshots (`ArcSwap::load_full` per shard).
     /// Empty in file mode. At N==1 this is the single shard, matching the prior
@@ -1031,31 +1039,28 @@ struct RawScanInput {
 impl RawScanInput {
     /// `true` iff some scan-visible component moved since `prev`, so the builder
     /// must recompute the [`ScanView`]. Mirrors the memo key the builder replaces
-    /// (file-index `Arc` ptr + per-shard version hash + structural epoch) plus the
-    /// remaining scan inputs (protected map, inline view, current snapshot, IVM
-    /// epoch). Cheap: `Arc::ptr_eq` / `index_ptr` / a shard-version hash — never a
+    /// (file-index `Arc` ptr + the per-shard mem-tier identity + structural epoch)
+    /// plus the remaining scan inputs (protected map, inline view, current
+    /// snapshot, IVM epoch).
+    ///
+    /// Deliberately HASH-FREE on the builder's hot loop: a `MemTier` is immutable
+    /// once published (an append/checkpoint SWAPS the shard's `ArcSwap` to a new
+    /// `Arc`, never mutates in place), so `Arc::ptr_eq` per shard is an exact
+    /// change test — no `version_hash_of` (which hashes every shard's version).
+    /// Every other field compares by `Arc::ptr_eq` / `index_ptr` / an int — never a
     /// deep compare of tombstones or batches. The `scan_guard` is deliberately NOT
     /// compared: it is a per-capture lease, not scan-visible state.
-    // The production caller is the scan-view builder loop, added in a later commit
-    // of this stack; here it is exercised only by unit tests. The `expect` is
-    // fulfilled in the (builder-less) non-test build and removed once the builder
-    // lands.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "consumed by the scan-view builder loop in a later commit"
-        )
-    )]
     fn changed(&self, prev: &RawScanInput) -> bool {
         self.current_snapshot_id != prev.current_snapshot_id
             || self.structural_epoch != prev.structural_epoch
             || self.maintained_aggregate_epoch != prev.maintained_aggregate_epoch
             || self.deletion_snapshot.index_ptr() != prev.deletion_snapshot.index_ptr()
-            || crate::provider::mem_tier::ShardedMemTier::version_hash_of(&self.mem_tier_shards)
-                != crate::provider::mem_tier::ShardedMemTier::version_hash_of(
-                    &prev.mem_tier_shards,
-                )
+            || self.mem_tier_shards.len() != prev.mem_tier_shards.len()
+            || self
+                .mem_tier_shards
+                .iter()
+                .zip(&prev.mem_tier_shards)
+                .any(|(a, b)| !Arc::ptr_eq(a, b))
             || !Arc::ptr_eq(&self.protected_map, &prev.protected_map)
             || !Arc::ptr_eq(&self.inlined_view, &prev.inlined_view)
     }
@@ -1088,6 +1093,26 @@ struct ScanView {
     /// corpus is hidden by EVERY shard's tombstones. Computed once here and reused
     /// for the inline pruning. At N==1 this is shard 0's tombstone clone (O(1)).
     union_tombstones: crate::provider::mem_tier::InMemTombstones,
+}
+
+/// Abort-on-drop handle for a table's background scan-view maintainer.
+///
+/// Mirrors [`super::compaction::BackgroundCompactor`]: the spawned task holds a
+/// `Weak<CayenneTableProvider>` so it never pins the provider, and this handle —
+/// owned by the provider itself ([`CayenneTableProvider::scan_view_builder`], shared
+/// across `clone_for_write` clones) — aborts the task when the last provider
+/// reference drops, so a deregistered table's maintainer stops promptly.
+#[derive(Debug)]
+pub(crate) struct ScanViewBuilder {
+    handle: Option<task::JoinHandle<()>>,
+}
+
+impl Drop for ScanViewBuilder {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
 }
 
 /// Test-only mid-pass hook: an async callback fired between a compaction
@@ -1352,6 +1377,23 @@ pub struct CayenneTableProvider {
     /// multi-reference query paid, and serves repeated same-version queries
     /// without re-running `filter_inlined_batch_for_deletions`.
     mem_tier_visible_memo: Arc<arc_swap::ArcSwapOption<MemTierVisibleMemo>>,
+    /// The background scan-view maintainer's published bundle (see
+    /// [`Self::run_scan_view_builder_loop`]). Seeded synchronously at construction
+    /// (cold start) and refreshed on every version change; scans borrow it via an
+    /// O(1) `Arc` load (no lock held across `.await`). Shared across
+    /// `clone_for_write` clones. `None` only in the instant before the cold-start
+    /// seed. Retires the two `ArcSwapOption` memos above at the switch commit.
+    scan_view: Arc<arc_swap::ArcSwapOption<ScanView>>,
+    /// Cheap wakeup from a mutation to the scan-view builder: the mutation path calls
+    /// `notify_one` (NO lock, NO capture, NO clone — just a signal) and the builder
+    /// re-captures at its own throttled rate. `notify_one` stores a permit if the
+    /// builder is not currently parked, so a signal is never lost. Wired at every
+    /// memo-invalidation site in a later commit. Shared across clones.
+    scan_input_change: Arc<tokio::sync::Notify>,
+    /// Abort-on-drop handle for this table's scan-view maintainer task. Shared across
+    /// clones; the task aborts when the last provider reference drops (the task holds
+    /// only a `Weak<Self>`). `Arc<OnceLock<_>>` exactly like [`Self::background_compactor`].
+    scan_view_builder: Arc<std::sync::OnceLock<ScanViewBuilder>>,
     /// Count of staged inline-conflict tombstones written with `published =
     /// false` whose owning snapshot has not yet finalized (flipped the flag).
     ///
@@ -5222,6 +5264,9 @@ impl CayenneTableProvider {
             inlined_structural_epoch: Arc::new(AtomicU64::new(0)),
             merged_scan_deletions: Arc::new(arc_swap::ArcSwapOption::const_empty()),
             mem_tier_visible_memo: Arc::new(arc_swap::ArcSwapOption::const_empty()),
+            scan_view: Arc::new(arc_swap::ArcSwapOption::const_empty()),
+            scan_input_change: Arc::new(tokio::sync::Notify::new()),
+            scan_view_builder: Arc::new(std::sync::OnceLock::new()),
             pending_inline_tombstones: Arc::new(AtomicU64::new(0)),
             published_inlined_seq: Arc::new(AtomicI64::new(initial_inlined_seq)),
             seq_allocator,
@@ -5350,6 +5395,31 @@ impl CayenneTableProvider {
                 error = %error,
                 "Failed to initialize maintained aggregate state; queries will fall back to base table scans"
             );
+        }
+
+        // Cold-start (D3): seed the scan-view bundle synchronously against the fully
+        // initialized (post-recovery, post-backfill) state, so the first scan borrows
+        // a ready bundle instead of waiting for the maintainer's first publish. The
+        // maintainer is spawned separately once the provider is `Arc`-wrapped; it
+        // refreshes this on every version change. Best-effort — a failure here leaves
+        // the bundle empty (the maintainer fills it on its first tick) and must NOT
+        // fail construction.
+        match provider.capture_raw_scan_input().await {
+            Ok(raw) => match provider.build_scan_view(raw) {
+                Ok(view) => provider.scan_view.store(Some(Arc::new(view))),
+                Err(error) => tracing::warn!(
+                    target: "cayenne::scan_view",
+                    table = %provider.table_metadata.table_name,
+                    %error,
+                    "cold-start scan-view build failed; the maintainer will seed it on its first tick"
+                ),
+            },
+            Err(error) => tracing::warn!(
+                target: "cayenne::scan_view",
+                table = %provider.table_metadata.table_name,
+                %error,
+                "cold-start scan-view capture failed; the maintainer will seed it on its first tick"
+            ),
         }
 
         Ok(provider)
@@ -6311,6 +6381,9 @@ impl CayenneTableProvider {
             inlined_structural_epoch: Arc::clone(&self.inlined_structural_epoch),
             merged_scan_deletions: Arc::clone(&self.merged_scan_deletions),
             mem_tier_visible_memo: Arc::clone(&self.mem_tier_visible_memo),
+            scan_view: Arc::clone(&self.scan_view),
+            scan_input_change: Arc::clone(&self.scan_input_change),
+            scan_view_builder: Arc::clone(&self.scan_view_builder),
             pending_inline_tombstones: Arc::clone(&self.pending_inline_tombstones),
             published_inlined_seq: Arc::clone(&self.published_inlined_seq),
             // Shared so every writer clone of the same table allocates from one
@@ -19301,6 +19374,144 @@ impl CayenneTableProvider {
             visible_segments,
             union_tombstones,
         })
+    }
+
+    /// Default floor between builder rebuilds; the configurable knob
+    /// (`cayenne_scan_view_refresh_floor_ms`) is added in a later commit.
+    const DEFAULT_SCAN_VIEW_REFRESH_FLOOR: Duration = Duration::from_millis(250);
+
+    /// Spawn the background scan-view maintainer for this provider, if not already
+    /// spawned. Must be called after the provider is wrapped in an `Arc` — the task
+    /// holds a `Weak<Self>` so it never pins the provider; the returned handle is
+    /// owned by the provider (`scan_view_builder`) and aborts the task when the last
+    /// provider reference drops. Returns `true` iff this call spawned the task.
+    ///
+    /// The initial bundle is seeded synchronously at construction (cold start), so a
+    /// scan never waits for the first build even before this is called.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "called from the runtime accelerator at the scan-path switch commit"
+        )
+    )]
+    pub(crate) fn spawn_scan_view_builder(self: &Arc<Self>) -> bool {
+        if self.scan_view_builder.get().is_some() {
+            return false;
+        }
+        let handle = task::spawn(Self::run_scan_view_builder_loop(
+            Arc::downgrade(self),
+            Self::DEFAULT_SCAN_VIEW_REFRESH_FLOOR,
+        ));
+        // `OnceLock::set` fails only if already initialized — a lost race just drops
+        // the extra handle, aborting its own task.
+        self.scan_view_builder
+            .set(ScanViewBuilder {
+                handle: Some(handle),
+            })
+            .is_ok()
+    }
+
+    /// The background scan-view maintainer loop. Captures the live scan input and,
+    /// when it has changed since the last published bundle, recomputes the
+    /// [`ScanView`] (in `spawn_blocking`, D3) and publishes it to `scan_view` for
+    /// scans to borrow — moving the KDI merge + visible-segment computation OFF the
+    /// query cores and collapsing the thundering herd to one build per version. When
+    /// the input has quiesced it parks on `scan_input_change` until a mutation
+    /// signals, so it self-throttles to at most one build per (build + floor) window
+    /// and spins no core when idle.
+    ///
+    /// Holds only a `Weak<Self>`, re-upgraded each iteration and dropped across every
+    /// `.await`, so it never pins the provider and exits once the table is torn down
+    /// (the [`ScanViewBuilder`] handle also aborts it on drop). On a transient
+    /// capture/build failure it logs and retries after a short backoff, keeping the
+    /// loop alive; a later commit escalates a PERSISTENT failure to a loud circuit
+    /// break (never a silent fallback to the retired per-scan path).
+    async fn run_scan_view_builder_loop(weak: std::sync::Weak<Self>, floor: Duration) {
+        // Seed the change-detector from the cold-start bundle so the first iteration
+        // does not redundantly rebuild an unchanged view.
+        let mut prev: Option<RawScanInput> = weak
+            .upgrade()
+            .and_then(|p| p.scan_view.load_full().map(|v| v.raw.clone()));
+
+        loop {
+            let Some(provider) = weak.upgrade() else {
+                return; // provider torn down
+            };
+
+            // Start the compute clock BEFORE the capture: the throttle bounds the
+            // whole (capture + build) period to `floor`, not `floor` ON TOP of it.
+            let compute_start = Instant::now();
+
+            let raw = match provider.capture_raw_scan_input().await {
+                Ok(raw) => raw,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "cayenne::scan_view",
+                        table = %provider.table_metadata.table_name,
+                        %error,
+                        "scan-view capture failed; keeping the builder alive and retrying"
+                    );
+                    drop(provider);
+                    // Brief backoff so a persistent failure cannot hot-spin a core.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+            };
+
+            let should_build = prev.as_ref().is_none_or(|prev_raw| raw.changed(prev_raw));
+            if should_build {
+                // Run the CPU-bound merge + visible-segment build off the tokio
+                // worker (D3): a large tier can take tens of ms, which would stall
+                // every task on that worker (including /health).
+                let build_provider = Arc::clone(&provider);
+                let raw_for_prev = raw.clone();
+                match task::spawn_blocking(move || build_provider.build_scan_view(raw)).await {
+                    Ok(Ok(view)) => provider.scan_view.store(Some(Arc::new(view))),
+                    Ok(Err(error)) => tracing::warn!(
+                        target: "cayenne::scan_view",
+                        table = %provider.table_metadata.table_name,
+                        %error,
+                        "scan-view build failed; keeping the builder alive and retrying"
+                    ),
+                    Err(join_error) => tracing::warn!(
+                        target: "cayenne::scan_view",
+                        table = %provider.table_metadata.table_name,
+                        %join_error,
+                        "scan-view build task did not complete; keeping the builder alive"
+                    ),
+                }
+                prev = Some(raw_for_prev);
+                let compute_elapsed = compute_start.elapsed();
+                tracing::trace!(
+                    target: "cayenne::scan_view",
+                    table = %provider.table_metadata.table_name,
+                    compute_ms = u64::try_from(compute_elapsed.as_millis()).unwrap_or(u64::MAX),
+                    "published a fresh scan-view bundle"
+                );
+                drop(provider);
+                // Throttle to at most one build per `floor` window: sleep only the
+                // REMAINDER of the floor after subtracting the compute time, so the
+                // effective rebuild period is `max(floor, compute)` — bounding
+                // staleness to ~`floor` rather than `compute + floor`. Skip the math
+                // entirely when the floor is zero (rebuild as fast as input changes).
+                // (The compute duration becomes a metric in a later commit.)
+                if !floor.is_zero() {
+                    let remaining = floor.saturating_sub(compute_elapsed);
+                    if !remaining.is_zero() {
+                        tokio::time::sleep(remaining).await;
+                    }
+                }
+            } else {
+                // Quiesced: park until a mutation signals, then re-capture. Clone the
+                // `Notify` `Arc` so the future does not borrow the dropped provider.
+                // A mutation's `notify_one` stores a permit if no waiter is parked,
+                // so a signal that races this park is not lost.
+                let notify = Arc::clone(&provider.scan_input_change);
+                drop(provider);
+                notify.notified().await;
+            }
+        }
     }
 
     fn mem_tier_deletion_maps(
@@ -38840,6 +39051,104 @@ mod tests {
         assert!(
             third.changed(&first),
             "a capture after a RAM append must be `changed` (tier version moved)"
+        );
+    }
+
+    /// Flatten a bundle's visible mem-tier segments into sorted `(id, value)` pairs
+    /// (the `id_value_batch` test schema is `id: Int64, value: Int64`). Used to
+    /// compare the background builder's published bundle against an inline build.
+    fn collect_segment_pairs(segments: &[VisibleMemTierSegment]) -> Vec<(i64, i64)> {
+        let mut pairs = Vec::new();
+        for segment in segments {
+            for batch in &segment.batches {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id column is Int64");
+                let vals = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("value column is Int64");
+                for i in 0..batch.num_rows() {
+                    pairs.push((ids.value(i), vals.value(i)));
+                }
+            }
+        }
+        pairs.sort_unstable();
+        pairs
+    }
+
+    /// The background scan-view maintainer must publish a bundle whose computed KDI
+    /// merge + visible segments MATCH what the inline scan path computes for the same
+    /// state — the parity that lets the switch commit serve scans from the bundle
+    /// instead of recomputing per-scan. Exercises the spawned loop end-to-end:
+    /// append, signal, and assert the published bundle converges to the inline build.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_view_builder_publishes_bundle_matching_inline_build() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "scan_view_builder_parity",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        let write = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("RAM append");
+        assert!(
+            write.in_memory_epoch().is_some(),
+            "append engaged the RAM tier"
+        );
+
+        // Inline reference: exactly what the scan path computes today.
+        let reference = {
+            let raw = provider.capture_raw_scan_input().await.expect("capture");
+            provider.build_scan_view(raw).expect("build")
+        };
+        let expected = collect_segment_pairs(&reference.visible_segments);
+        assert_eq!(
+            expected,
+            vec![(1, 10), (2, 20)],
+            "reference bundle must reflect the append"
+        );
+
+        // Spawn the maintainer and signal it; it must publish a bundle whose computed
+        // visible segments + merged-deletion state MATCH the inline build — off the
+        // query path.
+        let provider = Arc::new(provider);
+        assert!(provider.spawn_scan_view_builder(), "builder task spawned");
+        provider.scan_input_change.notify_one();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut matched = false;
+        while Instant::now() < deadline {
+            if let Some(view) = provider.scan_view.load_full()
+                && collect_segment_pairs(&view.visible_segments) == expected
+                && view.merged_deletions.has_deletions()
+                    == reference.merged_deletions.has_deletions()
+            {
+                matched = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            matched,
+            "the background builder must publish a bundle matching the inline build"
         );
     }
 
