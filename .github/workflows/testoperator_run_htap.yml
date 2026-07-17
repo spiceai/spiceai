@@ -343,6 +343,7 @@ jobs:
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && '--skip-prepare' || '' }} \
             ${{ github.event.inputs.skip_analytic_gate == 'true' && '--skip-analytic-gate' || '' }} \
+            ${{ steps.set_spicepod_path.outputs.SOURCE_TYPE == 'mysql' && '--analytic-gate-concurrency 16' || '' }} \
             --disable-progress-bars \
             --metrics \
             --metrics-dump "${GITHUB_WORKSPACE}/htap-metrics.json" \
