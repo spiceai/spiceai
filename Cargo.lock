@@ -16845,14 +16845,25 @@ version = "2.2.0-unstable"
 name = "runtime-parameters"
 version = "2.2.0-unstable"
 dependencies = [
+ "async-trait",
  "itertools 0.14.0",
  "runtime-parameter-spec",
+ "runtime-parameters-derive",
  "runtime-secrets",
  "secrecy",
  "snafu",
  "tokio",
  "tracing",
  "util",
+]
+
+[[package]]
+name = "runtime-parameters-derive"
+version = "2.2.0-unstable"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
