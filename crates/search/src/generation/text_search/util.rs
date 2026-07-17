@@ -265,3 +265,56 @@ pub fn array_to_terms(field: Field, arr: &ArrayRef) -> Result<Vec<Term>, ArrowEr
 
     Ok(terms)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::{
+        array::{Array, Int32Array, RecordBatch, StringArray},
+        datatypes::{DataType, Field, Schema},
+    };
+
+    use super::with_json_subset_column;
+
+    /// Locks the exact NDJSON string format written into tantivy as the composite
+    /// primary-key unique field. Format drift breaks update/delete term matching
+    /// against existing on-disk indexes.
+    #[test]
+    fn json_subset_column_utf8_int32_golden_format() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("seq", DataType::Int32, false),
+            Field::new("content", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["apple", "banana"])),
+            ],
+        )
+        .expect("test batch");
+
+        let with_pk = with_json_subset_column(
+            &batch,
+            &["id".to_string(), "seq".to_string()],
+            "__spice.unique_field",
+        )
+        .expect("json subset column");
+
+        let col_idx = with_pk
+            .schema()
+            .index_of("__spice.unique_field")
+            .expect("unique field present");
+        let json_col = with_pk
+            .column(col_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Utf8 unique field");
+
+        let lines: Vec<&str> = (0..json_col.len()).map(|i| json_col.value(i)).collect();
+        insta::assert_snapshot!("json_subset_column_utf8_int32", lines.join("\n"));
+    }
+}
