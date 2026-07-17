@@ -503,9 +503,9 @@ fn print_mismatch_context(
         return;
     }
     let last = total - 1;
+    let mismatch_row = mismatch_row.min(last);
     let lo = mismatch_row.saturating_sub(MISMATCH_CONTEXT_ROWS);
     let hi = mismatch_row.saturating_add(MISMATCH_CONTEXT_ROWS).min(last);
-
     let column_note = column.map_or_else(String::new, |c| format!(", diverging column '{c}'"));
     println!(
         "    ── {query_name} mismatch context: rows {lo}..={hi} of {total} (0-based, lex-sorted), mismatch at row {mismatch_row}{column_note} ──"
