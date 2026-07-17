@@ -74,35 +74,47 @@ belong in different tiers:
   `arrow_tools`, `db_connection_pool`, `spicepod`, the `datafusion-*` extensions,
   `cayenne`. These are pieces we *always* ship; they sit below `runtime` so it can
   build on them. (`foundation` is the same idea, one level lower: near-leaf.)
-- **`extension-utility`** — a building block only one (or a few) *extensions* ever
-  use, never `runtime` itself: e.g. `pgwire-replication` (the PostgreSQL
-  logical-replication wire protocol), the `elasticsearch` / `dynamodb-streams` /
-  `smb` / `libnfs` clients, `s3_vectors`, and the per-source halves of
-  `data_components`. "Optional" ⇒ it sits *above* `runtime` (which therefore
-  cannot depend on it) and *below* `extension`, rather than inflating the
-  always-shipped graph with code only a plug-in touches.
+- **`extension-utility`** — a building block a few *extensions* share but
+  `runtime` itself never uses (a single-connector building block should instead
+  live *inside* that connector — see the preference order below). Candidates:
+  `pgwire-replication` (the PostgreSQL logical-replication wire protocol), the
+  `elasticsearch` / `dynamodb-streams` / `smb` / `libnfs` clients, `s3_vectors`,
+  the per-source halves of `data_components`. "Optional" ⇒ it sits *above*
+  `runtime` (which therefore cannot depend on it) and *below* `extension`, rather
+  than inflating the always-shipped graph with code only plug-ins touch.
 
 > **Litmus:** if the only crates that depend on X are connectors/extensions, X is
-> `extension-utility` — even when it looks like a generic utility. Keep it there,
-> or fold it into the extension that needs it.
+> extension-tier code — even when it looks like a generic utility. **Prefer
+> folding it *into* the one extension that needs it** (`extension`); reach for
+> `extension-utility` only when *two or more* extensions genuinely share it.
 
 **Target direction — push connector-specific code UP toward its extension.** This
-is the mirror image of the guiding principle (push *shared* types *down*): a
-building block used by a single connector should live in `extension-utility` (or
-*inside* that connector's crate), not in `foundation`/`shared-utility`. For
-example, `pgwire-replication` folds into the `data-postgres` crate rather than
-sitting in `crates/vendor` as a foundation dependency. Doing so shrinks what
-`runtime` transitively pulls in, sharpens the always-shipped-vs-optional line,
-and — once the [connector inversion](#target-layering-and-how-we-get-there) lands
-— lets a source and its private utilities compile as one parallel unit. Only
-building blocks used by *two or more unrelated* extensions (or by `runtime`) stay
-shared.
+is the mirror image of the guiding principle (push *shared* types *down*). The
+preference order, most-common first:
+
+1. **Into the extension crate itself** (`extension`) — a building block a single
+   connector uses belongs *inside* that connector. E.g. `pgwire-replication` folds
+   into the `data-postgres` crate rather than sitting in `crates/vendor` as a
+   foundation dependency. This is the common case.
+2. **Into `extension-utility`** — only the *limited* case where a few unrelated
+   extensions share a building block that `runtime` must never touch. Shared, but
+   still above `runtime`.
+3. **Stays in `shared-utility`/`foundation`** — only if `runtime` (or something
+   `runtime` always links) actually uses it.
+
+Both **`data_components` and `runtime`** feed this over time: as the monolith is
+dissolved and `runtime` is split, connector-specific pieces move out to the
+extension crates (mostly), or to `extension-utility` (occasionally) — never left
+in the always-shipped graph. Doing so shrinks what `runtime` transitively pulls
+in, sharpens the always-shipped-vs-optional line, and — once the [connector
+inversion](#target-layering-and-how-we-get-there) lands — lets a source and its
+private utilities compile as one parallel unit.
 
 **`extension-utility` is empty today.** Every candidate above is still a
 dependency of the `data_components` monolith or of `runtime` directly, so moving
 it up would be an upward edge the guard rejects. The tier is a defined,
-enforced *slot* that populates as the monolith dissolves and connector-only code
-is lifted out of `foundation` — it does not force any move now.
+enforced *slot* that populates as the monolith and `runtime` are split — it does
+not force any move now.
 
 ---
 
