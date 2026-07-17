@@ -359,7 +359,9 @@ jobs:
           [ -n "$DIAG_PIDS" ] && kill $DIAG_PIDS 2>/dev/null || true
           exit $testop_exit
         env:
-          SPICED_LOG: "info"
+          # Trace cayenne at INFO (otherwise WARN-only) for the cold-tier promotion phase
+          # timeline + cayenne::stall watchdog; keeps datafusion at WARN to avoid query-plan noise.
+          SPICED_LOG: "app=info,spiced=info,runtime=info,data_components=info,search=info,cayenne=info,warn"
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           # Dedicated in-cluster PG pod on xlarge; per-run docker container (loopback) elsewhere.
