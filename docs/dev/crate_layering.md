@@ -58,11 +58,12 @@ code the runtime must never pull in.
 building block for extensions, not a consumer of the orchestrator: its only
 dependencies should be `foundation`/`shared-utility` and — at most — the
 `runtime-*-api` *interface* crates (which live low, below `runtime`, not the
-`runtime` crate itself). Note the linear tier order can only enforce *one*
-direction of this mutual "no edge between `runtime` and `extension-utility`": the
-guard catches `runtime → extension-utility` (the critical one — it would drag a
-connector-only crate into the always-shipped graph), while `extension-utility →
-runtime` stays a documented convention for now. It becomes structural in the
+`runtime` crate itself). The linear tier order enforces only one direction of
+this mutual "no edge between `runtime` and `extension-utility`" — `runtime →
+extension-utility` is caught as upward — so the reverse is enforced explicitly by
+a **`forbid`** rule in [`layers.toml`](../../layers.toml)
+(`forbid = [["extension-utility", "runtime"]]`), which rejects that edge even
+though it points "downward". It becomes structural in the
 [target](#target-layering-and-how-we-get-there) anyway: once `runtime` is split,
 there is no monolithic `runtime` crate for a building block to depend on — only
 the low `runtime-*-api` crates remain.
@@ -247,12 +248,14 @@ python3 scripts/check_crate_layers.py --mermaid   # tier-level DAG
 ```
 
 Reads `layers.toml` + `cargo metadata --no-deps` (no compilation) and exits
-non-zero on the first upward *normal* dependency. Wired into `make lint-rust`
-(fail-fast, before clippy) so a PR that adds an upward edge fails before merge.
-Only `kind = "normal"` edges are checked; dev- and build-dependencies are exempt
-— they never ship in the library graph, so they cannot create a real cycle (this
-is why `runtime` may dev-depend on every `connector-*` for its integration
-tests). Requires Python 3.11+ (stdlib `tomllib`).
+non-zero on any upward *normal* dependency, plus any edge listed in `layers.toml`'s
+`forbid` (specific `[from_tier, to_tier]` pairs the linear order can't express,
+e.g. `extension-utility -> runtime` — rejected even though it points down). Wired
+into `make lint-rust` (fail-fast, before clippy) so a PR that adds a bad edge fails
+before merge. Only `kind = "normal"` edges are checked; dev- and build-dependencies
+are exempt — they never ship in the library graph, so they cannot create a real
+cycle (this is why `runtime` may dev-depend on every `connector-*` for its
+integration tests). Requires Python 3.11+ (stdlib `tomllib`).
 
 Because the manifest encodes *what is true today*, the check is a **ratchet**: it
 cannot force an improvement, but it prevents backsliding, and it tightens as crates
@@ -282,7 +285,11 @@ Every new crate must:
    just above `foundation` (the `*-api` crates), and `data` just above it (the
    `data-<source>` crates, which drop below `runtime` once their `runtime` dep is
    gone). Move crates one at a time; the check flags the moment an edge points up.
-4. **Stricter same-tier policy?** The check allows same-tier edges; to forbid them,
+4. **Forbidding a specific edge the linear order can't express?** Add a
+   `[from_tier, to_tier]` pair to `forbid` in `layers.toml` (e.g.
+   `["extension-utility", "runtime"]`). It is rejected even when it points
+   downward — use this for sibling tiers that must not cross-depend.
+5. **Stricter same-tier policy?** The check allows same-tier edges; to forbid them,
    extend the script to reject `rank(dep) == rank(src)` for chosen tiers, or split
    the tier.
 

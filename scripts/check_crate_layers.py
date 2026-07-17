@@ -7,7 +7,9 @@
 # dependency graph from `cargo metadata`, then verifies that every *normal*
 # (non-dev, non-build) dependency edge points to a crate in the same tier or a
 # lower one. An edge that points "up" the stack is a layering regression and
-# fails the check.
+# fails the check. `layers.toml`'s optional `forbid` list also rejects specific
+# [from_tier, to_tier] edges the linear order can't express (e.g.
+# extension-utility -> runtime), even when they point "down".
 #
 # This codifies the layering that ALREADY holds today so it cannot regress; it
 # does not attempt to move the tree toward the target architecture (see
@@ -123,6 +125,13 @@ def main() -> int:
         for key in ("path_prefix", "tier"):
             if key not in rule:
                 config_errors.append(f"[[rules]] entry #{i + 1} is missing required key '{key}'.")
+    for i, pair in enumerate(cfg.get("forbid", [])):
+        if not isinstance(pair, list) or len(pair) != 2:
+            config_errors.append(f"`forbid` entry #{i + 1} must be a [from_tier, to_tier] pair.")
+            continue
+        for t in pair:
+            if t not in tiers:
+                config_errors.append(f"`forbid` entry #{i + 1} references tier '{t}' not present in `order`.")
     for crate in cfg.get("override", {}):
         if crate not in names:
             config_errors.append(
@@ -144,6 +153,7 @@ def main() -> int:
         return 2
 
     rank = {tier: i for i, tier in enumerate(order)}
+    forbidden = {tuple(pair) for pair in cfg.get("forbid", [])}
     tier_of = {p["name"]: assign_tier(p["name"], path_of[p["name"]], cfg) for p in pkgs}
 
     if args.list:
@@ -183,13 +193,16 @@ def main() -> int:
             dep = d["name"]
             if dep not in names or dep == src:
                 continue
-            if rank[tier_of[dep]] > rank[tier_of[src]]:
-                violations.append((src, tier_of[src], dep, tier_of[dep]))
+            st, dt = tier_of[src], tier_of[dep]
+            if rank[dt] > rank[st]:
+                violations.append((src, st, dep, dt, "depends on a HIGHER tier"))
+            elif (st, dt) in forbidden:
+                violations.append((src, st, dep, dt, f"forbidden edge {st} -> {dt}"))
 
     if violations:
-        print("Crate-layering violations (a crate depends on a HIGHER tier):\n")
-        for src, st, dep, dt in sorted(violations):
-            print(f"  {src} [{st}] -> {dep} [{dt}]")
+        print("Crate-layering violations:\n")
+        for src, st, dep, dt, reason in sorted(violations):
+            print(f"  {src} [{st}] -> {dep} [{dt}]  — {reason}")
         print(
             f"\n{len(violations)} violation(s). Either fix the dependency direction, "
             "or (if this is an intentional, documented layering change) update layers.toml.\n"

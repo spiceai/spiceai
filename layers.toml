@@ -25,8 +25,8 @@
 #                        These should themselves depend ONLY on foundation/
 #                        shared-utility (at most the runtime-*-api interface
 #                        crates) — NOT on the `runtime` crate. The linear order
-#                        enforces runtime->extension-utility (rejected); the
-#                        reverse is a convention (see docs/dev/crate_layering.md).
+#                        enforces runtime->extension-utility (rejected as
+#                        upward); the reverse is enforced by `forbid` below.
 # Extensions may therefore depend on BOTH utility tiers; `runtime-*` may depend
 # only on shared-utility. See docs/dev/crate_layering.md.
 order = ["foundation", "shared-utility", "runtime", "extension-utility", "extension", "binary"]
@@ -35,6 +35,15 @@ order = ["foundation", "shared-utility", "runtime", "extension-utility", "extens
 # conservative default: it sits below `runtime`, so runtime may build on it. A
 # connector-specific utility must be deliberately placed in extension-utility.
 default_tier = "shared-utility"
+
+# Explicit forbidden tier edges, checked IN ADDITION to the upward-edge rule —
+# for constraints the linear tier order can't express. Each entry is a
+# [from_tier, to_tier] pair; an edge whose endpoints match is a violation even
+# when it points "downward". extension-utility sits ABOVE runtime, so
+# runtime->extension-utility is already caught as upward; this forbids the
+# REVERSE, keeping connector-only building blocks from pulling in the
+# orchestrator (they may still use the low runtime-*-api interface crates).
+forbid = [["extension-utility", "runtime"]]
 
 # Path-prefix rules (checked after per-crate overrides, in order).
 [[rules]]
