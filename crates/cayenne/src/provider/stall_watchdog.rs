@@ -43,6 +43,7 @@ limitations under the License.
 //! by default; set `CAYENNE_STALL_WATCHDOG_SECS=0` to disable.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, Instant};
@@ -78,6 +79,24 @@ struct OpEntry {
     /// When the CURRENT phase began — resets on every [`StallOp::phase`] so a
     /// long op that keeps making progress (advancing phases) never warns.
     phase_since: Instant,
+    /// Optional monotonic progress counter (e.g. rows delivered to the cold
+    /// sink). Lets the watchdog distinguish a truly-parked op from one that is
+    /// slow-but-advancing even while its phase label is unchanged.
+    progress: Arc<AtomicU64>,
+    /// Progress value observed on the previous watchdog tick, for delta logging.
+    last_progress: u64,
+}
+
+/// A stuck operation snapshot, collected under the registry lock and logged
+/// outside it.
+struct StuckOp {
+    table: String,
+    kind: &'static str,
+    phase: &'static str,
+    in_phase_s: u64,
+    total_s: u64,
+    progress: u64,
+    progress_delta: u64,
 }
 
 /// RAII handle for a long-running Cayenne operation tracked by the stall
@@ -85,6 +104,7 @@ struct OpEntry {
 /// entry (covering `?`, early return, and panic unwinding).
 pub(crate) struct StallOp {
     id: u64,
+    progress: Arc<AtomicU64>,
 }
 
 impl StallOp {
@@ -94,6 +114,7 @@ impl StallOp {
         ensure_watchdog();
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
+        let progress = Arc::new(AtomicU64::new(0));
         REGISTRY.lock().insert(
             id,
             OpEntry {
@@ -102,9 +123,11 @@ impl StallOp {
                 phase: "start",
                 started: now,
                 phase_since: now,
+                progress: Arc::clone(&progress),
+                last_progress: 0,
             },
         );
-        Self { id }
+        Self { id, progress }
     }
 
     /// Advance to a new phase, resetting the stall timer for this operation.
@@ -113,6 +136,13 @@ impl StallOp {
             entry.phase = phase;
             entry.phase_since = Instant::now();
         }
+    }
+
+    /// Shared monotonic progress counter for this op. Bump it (e.g. by rows
+    /// delivered) so the watchdog can report throughput and tell a parked op
+    /// apart from a slow-but-advancing one. Cheap `Relaxed` atomic adds.
+    pub(crate) fn progress_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.progress)
     }
 }
 
@@ -177,24 +207,29 @@ fn watchdog_loop(interval: Duration, warn_after: Duration) {
         let now = Instant::now();
 
         // Snapshot the stuck entries under the lock, then log outside it so a
-        // slow subscriber never extends the hot-path critical section.
-        let stuck: Vec<(String, &'static str, &'static str, u64, u64)> = {
-            let registry = REGISTRY.lock();
+        // slow subscriber never extends the hot-path critical section. Updates
+        // `last_progress` in place, so this needs a mutable borrow.
+        let stuck: Vec<StuckOp> = {
+            let mut registry = REGISTRY.lock();
             registry
-                .values()
+                .values_mut()
                 .filter_map(|entry| {
                     let in_phase = now.saturating_duration_since(entry.phase_since);
-                    if in_phase >= warn_after {
-                        Some((
-                            entry.table.clone(),
-                            entry.kind,
-                            entry.phase,
-                            in_phase.as_secs(),
-                            now.saturating_duration_since(entry.started).as_secs(),
-                        ))
-                    } else {
-                        None
+                    if in_phase < warn_after {
+                        return None;
                     }
+                    let progress = entry.progress.load(Ordering::Relaxed);
+                    let delta = progress.saturating_sub(entry.last_progress);
+                    entry.last_progress = progress;
+                    Some(StuckOp {
+                        table: entry.table.clone(),
+                        kind: entry.kind,
+                        phase: entry.phase,
+                        in_phase_s: in_phase.as_secs(),
+                        total_s: now.saturating_duration_since(entry.started).as_secs(),
+                        progress,
+                        progress_delta: delta,
+                    })
                 })
                 .collect()
         };
@@ -212,19 +247,21 @@ fn watchdog_loop(interval: Duration, warn_after: Duration) {
             .as_ref()
             .map_or((None, None), |s| (Some(s.available), Some(s.total)));
 
-        for (table, kind, phase, in_phase_s, total_s) in stuck {
+        for op in stuck {
             tracing::warn!(
                 target: "cayenne::stall",
-                table = %table,
-                kind,
-                phase,
-                in_phase_s,
-                total_s,
+                table = %op.table,
+                kind = op.kind,
+                phase = op.phase,
+                in_phase_s = op.in_phase_s,
+                total_s = op.total_s,
+                progress = op.progress,
+                progress_delta_tick = op.progress_delta,
                 mem_tier_used = ?mem_used,
                 mem_tier_total = ?mem_total,
                 encode_permits_available = ?encode_avail,
                 encode_permits_total = ?encode_total,
-                "Cayenne operation has not advanced its phase — possible stall/deadlock (write_lock likely held; ingest for this table is blocked behind it)"
+                "Cayenne operation has not advanced its phase — possible stall/deadlock (write_lock likely held; ingest for this table is blocked behind it). progress_delta_tick=0 with progress=0 means nothing produced (scan/sort parked); >0 then frozen means the sink/upload is parked"
             );
         }
     }

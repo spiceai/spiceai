@@ -14271,7 +14271,7 @@ impl CayenneTableProvider {
                 }
                 let chunk_stream: SendableRecordBatchStream =
                     Box::pin(source.next_chunk(super::streaming::ChunkCap::Rows(row_cap)));
-                tracing::debug!(
+                tracing::info!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
                     chunk_idx,
@@ -14285,7 +14285,7 @@ impl CayenneTableProvider {
                     chunk_stream,
                 )
                 .await?;
-                tracing::debug!(
+                tracing::info!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
                     chunk_idx,
@@ -14295,7 +14295,7 @@ impl CayenneTableProvider {
                 chunk_idx = chunk_idx.saturating_add(1);
             }
         } else {
-            tracing::debug!(
+            tracing::info!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 "Datalake promotion: cold upload starting (single stream)"
@@ -14329,6 +14329,11 @@ impl CayenneTableProvider {
             None
         };
 
+        tracing::info!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            "Datalake promotion: cold files written; listing + building per-file PK blooms"
+        );
         let mut listing = store.list(Some(&prefix));
         let mut cold_files = Vec::new();
         let mut total_rows = 0u64;
@@ -14844,6 +14849,25 @@ impl CayenneTableProvider {
         let clustering = self.resolve_cold_clustering_indices();
         let task_ctx = ctx.task_ctx();
         let stream = self.zorder_sort_stream(stream, clustering, &task_ctx);
+
+        // Count rows as the cold sink pulls them from the sorted stream. The
+        // watchdog reports this per tick: frozen at 0 => scan/sort produced
+        // nothing (parked upstream); frozen at N>0 => the vortex encode/upload
+        // sink is parked after N rows. A pipeline-breaking SortExec buffers all
+        // input before emitting, so any nonzero value means the sort completed.
+        let progress = stall.progress_counter();
+        let counted_schema = stream.schema();
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            counted_schema,
+            stream.inspect(move |item| {
+                if let Ok(batch) = item {
+                    progress.fetch_add(
+                        u64::try_from(batch.num_rows()).unwrap_or(0),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+            }),
+        ));
 
         // Write the clustered, deletes-applied rows to the cold object store.
         // This drives the whole scan → Z-order sort → encode → upload pipeline;
