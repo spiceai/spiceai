@@ -33,7 +33,7 @@ use snafu::prelude::*;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to get connection from PostgreSQL pool: {source}. Check `pg_host`/`pg_port`/`pg_user`/`pg_pass`/`pg_sslmode` in the dataset params and that the server is reachable. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
+        "Failed to get connection from PostgreSQL pool: {source}. Check `pg_host`/`pg_port`/`pg_user`/`pg_pass`/`pg_sslmode` in the catalog or dataset params and that the server is reachable. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
     ))]
     ConnectionFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
