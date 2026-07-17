@@ -28,6 +28,7 @@ use datafusion_execution::TaskContext;
 use datafusion_physical_plan::DisplayAs;
 use datafusion_physical_plan::DisplayFormatType;
 use datafusion_physical_plan::ExecutionPlan;
+use datafusion_physical_plan::metrics::MetricsSet;
 use datafusion_physical_plan::PlanProperties;
 use datafusion_physical_plan::RecordBatchStream;
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType, Partitioning};
@@ -352,6 +353,9 @@ struct BoundedSortRun {
     started: Instant,
     output_rows: usize,
     output_batches: usize,
+    /// The run's `SortExec` plan, kept so its spill metrics can be read once the
+    /// run's output stream is fully drained.
+    plan: Option<Arc<dyn ExecutionPlan>>,
 }
 
 /// Driver state for [`bounded_sort_stream`]'s `unfold` loop.
@@ -418,7 +422,7 @@ pub(crate) fn bounded_sort_stream(
                     match run.stream.next().await {
                         Some(Ok(batch)) => {
                             if run.output_batches == 0 {
-                                tracing::debug!(
+                                tracing::info!(
                                     target: "cayenne::compaction",
                                     table = table_name.as_ref(),
                                     run_idx = run.run_idx,
@@ -443,6 +447,15 @@ pub(crate) fn bounded_sort_stream(
                             let (run_idx, output_rows, output_batches) =
                                 (run.run_idx, run.output_rows, run.output_batches);
                             let total_ms = run.started.elapsed().as_millis();
+                            // Spill metrics for this run's SortExec are final now
+                            // that its output stream has ended — the direct signal
+                            // for "slow because the sort spilled under memory
+                            // pressure" vs "slow for another reason". Read before
+                            // clearing `state.current` (which drops `run`).
+                            let metrics = run.plan.as_ref().and_then(|p| p.metrics());
+                            let spill_count = metrics.as_ref().and_then(MetricsSet::spill_count);
+                            let spilled_bytes =
+                                metrics.as_ref().and_then(MetricsSet::spilled_bytes);
                             state.current = None;
                             if input_rows != output_rows {
                                 // Data-correctness backstop: a sort must never
@@ -454,13 +467,15 @@ pub(crate) fn bounded_sort_stream(
                                 ));
                                 return Some((Err(error), state));
                             }
-                            tracing::debug!(
+                            tracing::info!(
                                 target: "cayenne::compaction",
                                 table = table_name.as_ref(),
                                 run_idx,
                                 output_rows,
                                 output_batches,
                                 total_ms,
+                                spill_count = ?spill_count,
+                                spilled_bytes = ?spilled_bytes,
                                 "Bounded sort run complete"
                             );
                             continue;
@@ -472,7 +487,7 @@ pub(crate) fn bounded_sort_stream(
                 }
                 let run_idx = state.next_run_idx;
                 state.next_run_idx = state.next_run_idx.saturating_add(1);
-                tracing::debug!(
+                tracing::info!(
                     target: "cayenne::compaction",
                     table = table_name.as_ref(),
                     run_idx,
@@ -488,8 +503,8 @@ pub(crate) fn bounded_sort_stream(
                     started: Instant::now(),
                     ended: false,
                 });
-                match util::stream_utils::sort_stream(input, &sort_columns, &task_ctx) {
-                    Ok(sorted) => {
+                match util::stream_utils::sort_stream_with_plan(input, &sort_columns, &task_ctx) {
+                    Ok((sorted, plan)) => {
                         state.current = Some(BoundedSortRun {
                             stream: sorted,
                             counters,
@@ -497,6 +512,7 @@ pub(crate) fn bounded_sort_stream(
                             started: Instant::now(),
                             output_rows: 0,
                             output_batches: 0,
+                            plan,
                         });
                     }
                     Err(error) => {

@@ -73,8 +73,28 @@ pub fn sort_stream(
     sort_columns: &[String],
     context: &Arc<TaskContext>,
 ) -> Result<SendableRecordBatchStream> {
+    Ok(sort_stream_with_plan(stream, sort_columns, context)?.0)
+}
+
+/// Like [`sort_stream`], but also returns the [`SortExec`] plan when a sort was
+/// actually applied, so the caller can read its
+/// [`MetricsSet`](datafusion::physical_plan::metrics::MetricsSet) — e.g.
+/// `spill_count` / `spilled_bytes` — after the returned stream is fully drained.
+///
+/// The plan is `None` when no sort was applied (empty or invalid `sort_columns`);
+/// the input stream is then returned unchanged. Reading metrics before the stream
+/// is drained yields partial counts.
+///
+/// # Errors
+///
+/// Returns an error if the sort execution fails.
+pub fn sort_stream_with_plan(
+    stream: SendableRecordBatchStream,
+    sort_columns: &[String],
+    context: &Arc<TaskContext>,
+) -> Result<(SendableRecordBatchStream, Option<Arc<dyn ExecutionPlan>>)> {
     if sort_columns.is_empty() {
-        return Ok(stream);
+        return Ok((stream, None));
     }
 
     let schema = stream.schema();
@@ -100,7 +120,7 @@ pub fn sort_stream(
                 "Invalid sort column specification '{}', expected 'column [ASC|DESC] [NULLS FIRST|LAST]'. Skipping sort.",
                 entry
             );
-            return Ok(stream);
+            return Ok((stream, None));
         };
 
         // Validate column exists in schema and get its index
@@ -109,7 +129,7 @@ pub fn sort_stream(
                 "Sort column '{}' not found in schema. Skipping sort.",
                 col_name
             );
-            return Ok(stream);
+            return Ok((stream, None));
         };
 
         sort_exprs.push(PhysicalSortExpr {
@@ -138,7 +158,7 @@ pub fn sort_stream(
     // Execute the sort
     let sorted_stream = sort_exec.execute(0, Arc::clone(context))?;
 
-    Ok(sorted_stream)
+    Ok((sorted_stream, Some(sort_exec as Arc<dyn ExecutionPlan>)))
 }
 
 /// Parse one sort specification of the form

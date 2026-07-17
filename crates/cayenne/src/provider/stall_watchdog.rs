@@ -48,10 +48,27 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
+use datafusion_execution::memory_pool::MemoryLimit;
 use parking_lot::Mutex;
 
 use super::mem_tier_budget::{global_mem_tier_total, global_mem_tier_used};
 use super::write_budget::encode_budget_snapshot;
+
+/// Reserved / limit bytes of the dedicated compaction memory pool (the pool the
+/// cold-promotion Z-order `SortExec` draws from), or `(None, None)` when no
+/// compaction runtime is installed. Reserved approaching the limit is the direct
+/// signal that promotion sorts are spilling under memory pressure.
+fn compaction_pool_usage() -> (Option<u64>, Option<u64>) {
+    let Some(env) = super::compaction::compaction_runtime_env() else {
+        return (None, None);
+    };
+    let used = u64::try_from(env.memory_pool.reserved()).ok();
+    let total = match env.memory_pool.memory_limit() {
+        MemoryLimit::Finite(limit) => u64::try_from(limit).ok(),
+        MemoryLimit::Infinite | MemoryLimit::Unknown => None,
+    };
+    (used, total)
+}
 
 /// Monotonic id source for registry entries (avoids `Instant`/random keys).
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -246,6 +263,7 @@ fn watchdog_loop(interval: Duration, warn_after: Duration) {
         let (encode_avail, encode_total) = encode
             .as_ref()
             .map_or((None, None), |s| (Some(s.available), Some(s.total)));
+        let (compaction_pool_used, compaction_pool_total) = compaction_pool_usage();
 
         for op in stuck {
             tracing::warn!(
@@ -261,7 +279,9 @@ fn watchdog_loop(interval: Duration, warn_after: Duration) {
                 mem_tier_total = ?mem_total,
                 encode_permits_available = ?encode_avail,
                 encode_permits_total = ?encode_total,
-                "Cayenne operation has not advanced its phase — possible stall/deadlock (write_lock likely held; ingest for this table is blocked behind it). progress_delta_tick=0 with progress=0 means nothing produced (scan/sort parked); >0 then frozen means the sink/upload is parked"
+                compaction_pool_used = ?compaction_pool_used,
+                compaction_pool_total = ?compaction_pool_total,
+                "Cayenne operation has not advanced its phase — possible stall/deadlock (write_lock likely held; ingest for this table is blocked behind it). progress_delta_tick=0 with progress=0 means nothing produced (scan/sort parked); >0 then frozen means the sink/upload is parked; compaction_pool_used near total points at a spilling sort"
             );
         }
     }
