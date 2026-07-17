@@ -255,7 +255,9 @@ mod tests {
     #[test]
     fn accepts_canonical_adoption_code() {
         // The portal mints four 5-char base32 segments.
-        assert!(is_valid_adoption_code("SPICE-ADOPT-7K2PX-9XYZ2-A1B2C-D3E4F"));
+        assert!(is_valid_adoption_code(
+            "SPICE-ADOPT-7K2PX-9XYZ2-A1B2C-D3E4F"
+        ));
         assert!(is_valid_adoption_code("SPICE-ADOPT-AAAAA-BBBBB"));
         assert!(is_valid_adoption_code(
             "SPICE-ADOPT-11111-22222-33333-44444-55555"

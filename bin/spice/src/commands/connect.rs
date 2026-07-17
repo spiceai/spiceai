@@ -422,7 +422,9 @@ mod tests {
     #[test]
     fn looks_like_adoption_code_matches_prefix() {
         // Well-formed and malformed adoption codes both look like codes.
-        assert!(looks_like_adoption_code("SPICE-ADOPT-7K2PX-9XYZ2-A1B2C-D3E4F"));
+        assert!(looks_like_adoption_code(
+            "SPICE-ADOPT-7K2PX-9XYZ2-A1B2C-D3E4F"
+        ));
         assert!(looks_like_adoption_code("SPICE-ADOPT-AAA-BBBB"));
         assert!(looks_like_adoption_code("SPICE-ADOPT-aaaa-BBBB"));
         assert!(looks_like_adoption_code("SPICE-ADOPT"));
