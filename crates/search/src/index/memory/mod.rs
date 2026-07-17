@@ -23,11 +23,6 @@ limitations under the License.
 //! [`crate::index::SearchIndex::query_table_provider`] expose the store
 //! contents as `LogicalPlan`s. Nearest-neighbor search is brute-force exact
 //! k-NN over the SIMD distance kernels in `runtime-datafusion-udfs`.
-//!
-//! The index is a programmatic building block (e.g. for composite type
-//! indexes); it is intentionally not wired into spicepod `vectors.engine`
-//! dispatch. Memory growth is unbounded by design — eviction policy belongs
-//! to the caller.
 
 use std::{any::Any, sync::Arc};
 
@@ -36,13 +31,11 @@ use arrow::compute::filter;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
-    common::Column,
     datasource::{DefaultTableSource, TableProvider},
     error::DataFusionError,
     logical_expr::LogicalPlan,
-    prelude::Expr,
 };
-use datafusion_expr::LogicalPlanBuilder;
+use datafusion_expr::{LogicalPlanBuilder, ScalarUDF};
 use futures::future::try_join_all;
 use itertools::Itertools;
 use llms::embeddings::Embed;
@@ -50,10 +43,14 @@ use parking_lot::RwLock;
 use runtime_datafusion_index::Index;
 use snafu::{ResultExt, Snafu, ensure};
 
-use crate::SEARCH_SCORE_COLUMN_NAME;
-use crate::index::memory::provider::{MemoryVectorListTable, MemoryVectorQueryTable};
-use crate::index::memory::store::MemoryVectorStore;
-use crate::index::{SearchIndex, VectorIndex, embedding_col, write_util};
+use crate::index::{
+    SearchIndex, VectorIndex, embedding_col,
+    memory::{
+        provider::{MemoryVectorListTable, MemoryVectorQueryTable},
+        store::MemoryVectorStore,
+    },
+    write_util,
+};
 use crate::metadata::{MetadataColumn, MetadataColumns};
 
 mod provider;
@@ -141,6 +138,8 @@ pub struct MemoryVectorIndex {
     primary_key: Vec<Field>,
     metadata_columns: MetadataColumns,
     embedder: Arc<dyn Embed>,
+    embed_udf: Arc<ScalarUDF>,
+    model_name: String,
     dimension: i32,
     metric: MemoryDistanceMetric,
     store: Arc<RwLock<MemoryVectorStore>>,
@@ -149,27 +148,32 @@ pub struct MemoryVectorIndex {
 impl MemoryVectorIndex {
     /// Create an empty index.
     ///
-    /// `dimension` must match the vectors produced by `embedder`. Any
-    /// metadata column named like the embedding column is ignored (the
-    /// embedding column is always stored).
+    /// `dimension` must match the vectors produced by `embedder`.
+    /// `query_scoring` is used to build query-time scoring plans.
+    /// Any metadata column named like the embedding column is ignored
+    /// (the embedding column is always stored).
     pub fn try_new(
         embedded_column: String,
         primary_key: Vec<Field>,
         metadata_columns: MetadataColumns,
         embedder: Arc<dyn Embed>,
-        dimension: i32,
+        embed_udf: Arc<ScalarUDF>,
+        model_name: String,
         metric: MemoryDistanceMetric,
     ) -> Result<Self, Error> {
+        let dimension = embedder.size();
         ensure!(
             dimension > 0,
             InvalidDimensionSnafu {
-                index: INDEX_NAME,
+                index: INDEX_NAME.to_string(),
                 dimension,
             }
         );
         ensure!(
             !primary_key.is_empty(),
-            NoPrimaryKeyFieldSnafu { index: INDEX_NAME }
+            NoPrimaryKeyFieldSnafu {
+                index: INDEX_NAME.to_string(),
+            }
         );
         let stored_schema =
             stored_schema(&embedded_column, &primary_key, &metadata_columns, dimension);
@@ -178,27 +182,12 @@ impl MemoryVectorIndex {
             primary_key,
             metadata_columns,
             embedder,
+            embed_udf,
+            model_name,
             dimension,
             metric,
             store: Arc::new(RwLock::new(MemoryVectorStore::new(stored_schema))),
         })
-    }
-
-    /// Number of rows currently stored in the index.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.store.read().len()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.store.read().is_empty()
-    }
-
-    /// The exact schema of the store: primary keys + metadata + embedding
-    /// column, alphabetically sorted.
-    fn stored_schema(&self) -> SchemaRef {
-        self.store.read().stored_schema()
     }
 
     /// Project the write-output batch down to the stored schema, dropping
@@ -242,22 +231,27 @@ impl MemoryVectorIndex {
             .collect();
 
         let output_schema = output.schema();
-        let target_schema = self.stored_schema();
+        let target_schema = Arc::clone(&self.store.read().stored_schema);
         let mut columns = Vec::with_capacity(target_schema.fields().len());
         for field in target_schema.fields() {
             let Some((idx, _)) = output_schema.column_with_name(field.name()) else {
                 return ColumnNotFoundSnafu {
-                    index: INDEX_NAME,
+                    index: INDEX_NAME.to_string(),
                     column: field.name().clone(),
                 }
                 .fail();
             };
-            let filtered: ArrayRef = filter(output.column(idx), &mask)
-                .context(IssueWithArrowProcessingSnafu { index: INDEX_NAME })?;
+            let filtered: ArrayRef =
+                filter(output.column(idx), &mask).context(IssueWithArrowProcessingSnafu {
+                    index: INDEX_NAME.to_string(),
+                })?;
             columns.push(filtered);
         }
-        let batch = RecordBatch::try_new(target_schema, columns)
-            .context(IssueWithArrowProcessingSnafu { index: INDEX_NAME })?;
+        let batch = RecordBatch::try_new(target_schema, columns).context(
+            IssueWithArrowProcessingSnafu {
+                index: INDEX_NAME.to_string(),
+            },
+        )?;
         Ok((batch, keys))
     }
 }
@@ -317,7 +311,7 @@ impl Index for MemoryVectorIndex {
         columns.extend(
             self.metadata_columns
                 .iter()
-                .filter(|c| *c.name() != embedding_col(&self.embedded_column))
+                .filter(|c| c.name() != embedding_col(&self.embedded_column))
                 .map(|c| c.name().to_string()),
         );
         columns
@@ -372,7 +366,7 @@ impl SearchIndex for MemoryVectorIndex {
         ensure!(
             primary_keys.len() == embedding_vectors.len(),
             LengthMismatchSnafu {
-                index: INDEX_NAME,
+                index: INDEX_NAME.to_string(),
                 column: self.embedded_column.clone(),
                 embedding_rows: embedding_vectors.len(),
                 primary_key_rows: primary_keys.len(),
@@ -405,39 +399,23 @@ impl SearchIndex for MemoryVectorIndex {
     }
 
     fn query_table_provider(&self, query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
-        let table = Arc::new(MemoryVectorQueryTable::new(
-            INDEX_NAME.to_string(),
-            Arc::clone(&self.store),
-            Arc::clone(&self.embedder),
-            query.to_string(),
-            self.metric,
-            self.dimension,
-            embedding_col(&self.embedded_column),
-        )) as Arc<dyn TableProvider>;
-
-        let projection = self
-            .primary_key
-            .iter()
-            .map(|f| f.name().clone())
-            .chain(
-                self.metadata_columns
-                    .iter()
-                    .filter(|c| *c.name() != embedding_col(&self.embedded_column))
-                    .map(|c| c.name().to_string()),
-            )
-            .chain([
-                embedding_col(&self.embedded_column),
-                SEARCH_SCORE_COLUMN_NAME.to_string(),
-            ])
-            .map(|name| Expr::Column(Column::new_unqualified(name)))
-            .collect::<Vec<_>>();
-
-        Ok(
-            LogicalPlanBuilder::scan("tbl", Arc::new(DefaultTableSource::new(table)), None)?
-                .project(projection)?
-                .build()?
-                .into(),
-        )
+        Ok(LogicalPlanBuilder::scan(
+            "tbl",
+            Arc::new(DefaultTableSource::new(
+                Arc::new(MemoryVectorQueryTable::new(
+                    INDEX_NAME.to_string(),
+                    Arc::clone(&self.store),
+                    Arc::clone(&self.embed_udf),
+                    self.model_name.clone(),
+                    query.to_string(),
+                    self.metric,
+                    embedding_col(&self.embedded_column),
+                )) as Arc<dyn TableProvider>,
+            )),
+            None,
+        )?
+        .build()?
+        .into())
     }
 }
 
@@ -447,8 +425,14 @@ impl VectorIndex for MemoryVectorIndex {
     }
 
     fn list_table_provider(&self) -> Result<LogicalPlan, DataFusionError> {
-        let table =
-            Arc::new(MemoryVectorListTable::new(Arc::clone(&self.store))) as Arc<dyn TableProvider>;
-        LogicalPlanBuilder::scan("tbl", Arc::new(DefaultTableSource::new(table)), None)?.build()
+        LogicalPlanBuilder::scan(
+            "tbl",
+            Arc::new(DefaultTableSource::new(
+                Arc::new(MemoryVectorListTable::new(Arc::clone(&self.store)))
+                    as Arc<dyn TableProvider>,
+            )),
+            None,
+        )?
+        .build()
     }
 }
