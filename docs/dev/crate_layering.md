@@ -41,9 +41,9 @@ tracked separately (a working plan, not part of these rules).
 | Tier | Purpose | May depend on |
 |------|---------|---------------|
 | **foundation** | Leaf utilities, wire formats, config parsing, primitives. Ideally reusable outside Spice. Little or no internal dependency. | foundation |
-| **domain** | The libraries the daemon is assembled from — data-plane building blocks (`data_components`), the accelerator (`cayenne`), inference (`llms`), search, the `runtime-*` feature crates. | foundation, domain |
+| **domain** | The **always-shipped** shared libraries the runtime is built on — the accelerator (`cayenne`), inference (`llms`), search, the `runtime-*` support crates. *Optional* or connector-specific building blocks do **not** belong here (see [Shared building blocks vs. extension-only code](#shared-building-blocks-vs-extension-only-code)); `data_components` sits here today only because it is still an undivided monolith. | foundation, domain |
 | **runtime** | The `runtime` crate: orchestration, component lifecycle, HTTP/Flight servers, and (today) the connector/accelerator/catalog trait definitions + registries. | foundation, domain |
-| **extension** | Plug-ins that *register with* the runtime: the ~30 `connector-*` crates, `spice-cloud`, `tpc-extension`. Thin — a factory + wiring over a `domain` impl. | foundation, domain, runtime |
+| **extension** | **Everything optional** — plug-ins that *register with* the runtime: the ~30 `connector-*` crates, `spice-cloud`, `tpc-extension`, **plus the connector-specific building blocks only they use.** Thin wiring over a `domain` impl today; the target folds each source's utilities in alongside it. | foundation, domain, runtime |
 | **binary** | The `spiced`/`spice` binaries and `tools/*` — link the whole graph. | anything |
 
 The **target** adds two lower tiers — `interface` (the `*-api` trait crates) and
@@ -54,6 +54,39 @@ see [Target layering](#target-layering-and-how-we-get-there). `layers.toml`'s
 The authoritative, machine-readable assignment is [`layers.toml`](../../layers.toml);
 `scripts/check_crate_layers.py` validates the whole workspace against it (see
 [Enforcement](#enforcement)).
+
+### Shared building blocks vs. extension-only code
+
+The dividing line for the shared lower tiers (`foundation`, `domain`) is **"does
+the always-shipped runtime actually build on this?"** — not "is it a library?".
+Two kinds of building block look similar but belong in different places:
+
+- **Shared utility** — used by `runtime` itself and/or many crates: `util`,
+  `arrow_tools`, `db_connection_pool`, `spicepod`, the `datafusion-*` extensions,
+  `cayenne`. These are pieces we *always* ship; they stay in `foundation`/`domain`,
+  below `runtime`.
+- **Connector / data-plane utility** — a building block only one (or a few)
+  *extensions* ever use, never `runtime` itself: e.g. `pgwire-replication` (the
+  PostgreSQL logical-replication wire protocol), the `elasticsearch` /
+  `dynamodb-streams` / `smb` / `libnfs` clients, `s3_vectors`, and the per-source
+  halves of `data_components`. "Optional" ⇒ it belongs on the **extension** side,
+  not in a shared tier that inflates the always-shipped graph (and the `runtime`
+  build) with code only a plug-in touches.
+
+> **Litmus:** if the only crates that depend on X are connectors/extensions, X is
+> extension-tier code — even when it looks like a generic utility. Keep it in, or
+> fold it into, the extension that needs it.
+
+**Target direction — push connector-specific code UP toward its extension.** This
+is the mirror image of the guiding principle (push *shared* types *down*): a
+building block used by a single connector should live *in* that connector's crate
+(or a sibling only it depends on), not in `foundation`/`domain`. For example,
+`pgwire-replication` folds into the `data-postgres` crate rather than sitting in
+`crates/vendor` as a foundation dependency. Doing so shrinks what `runtime`
+transitively pulls in, sharpens the always-shipped-vs-optional line, and — once the
+[connector inversion](#target-layering-and-how-we-get-there) lands — lets a source
+and its private utilities compile as one parallel unit. Only building blocks used
+by *two or more unrelated* extensions (or by `runtime`) stay shared.
 
 ---
 
@@ -298,7 +331,11 @@ baseline](#measured-compile-time-baseline)):
    `connector-<source>` + `data_components/<source>` + any `<source>-utils`,
    implements the shapes it supports, depends on the `-api` crates). Only genuinely
    cross-source glue moves *down* into an `-api` or foundation crate — never sideways
-   between sources.
+   between sources. The complement (see [Shared building blocks vs.
+   extension-only code](#shared-building-blocks-vs-extension-only-code)): a
+   building block only this source uses moves *up* into it — e.g.
+   `pgwire-replication` folds into `data-postgres` rather than staying a foundation
+   dependency.
 
 ### Method: inverting one seam
 
