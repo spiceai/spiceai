@@ -3370,7 +3370,7 @@ impl CayenneTableProvider {
                         Self::invalidate_list_files_cache(&runtime_env, &url);
                         ledger.lock().remove(&id);
                         last_listed.lock().remove(&id);
-                        tracing::info!(
+                        tracing::debug!(
                             target: "cayenne::compaction",
                             table_id = %table_id,
                             snapshot_id = %id,
@@ -4741,7 +4741,7 @@ impl CayenneTableProvider {
             // manifest is populated, delete file-by-file so a file referenced
             // in place by a live/protected snapshot survives; otherwise (legacy
             // / unpopulated) the whole dir is dead and removed wholesale.
-            tracing::info!(
+            tracing::debug!(
                 "Deleting old snapshot directory for table {}: {}",
                 table_id,
                 snapshot_id
