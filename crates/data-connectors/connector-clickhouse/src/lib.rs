@@ -34,8 +34,8 @@ use data_components::Read;
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::sql::db_connection_pool::Error as DbConnectionPoolError;
 use factory::ClickhouseTableFactory;
-use pool::ClickhouseConnectionPool;
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
+use pool::ClickhouseConnectionPool;
 use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,

@@ -18,9 +18,9 @@ use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::block_to_arrow::block_to_arrow;
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
-use crate::block_to_arrow::block_to_arrow;
 use async_stream::stream;
 use clickhouse_rs::{Block, ClientHandle, Pool};
 use datafusion::error::DataFusionError;
