@@ -760,17 +760,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arrow_sql_gen"
-version = "2.2.0-unstable"
-dependencies = [
- "arrow",
- "bigdecimal",
- "chrono",
- "datafusion-table-providers",
- "snafu",
-]
-
-[[package]]
 name = "arrow_tools"
 version = "2.2.0-unstable"
 dependencies = [

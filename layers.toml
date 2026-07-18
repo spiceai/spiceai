@@ -85,7 +85,6 @@ tpc-extension = "extension"
 # --- foundation: near-dependency-free utilities + config/platform primitives.
 # (crates/ libraries whose full normal-dep closure stays within foundation.)
 ansi_colors = "foundation"
-arrow_sql_gen = "foundation"
 arrow_tools = "foundation"
 aws-sdk-credential-bridge = "foundation"
 chunking = "foundation"
