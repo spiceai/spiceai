@@ -26,14 +26,21 @@ use std::sync::Arc;
 
 use super::super::spice::SpiceClients;
 use super::compare;
-use arrow::array::RecordBatch;
+use arrow::array::{ArrayRef, Int64Array, RecordBatch};
 use arrow::compute::{SortColumn, concat_batches, lexsort_to_indices, take};
-use arrow::datatypes::{Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::util::pretty::pretty_format_batches;
 use arrow_tools::record_batch::try_cast_to;
 use chbench_driver::ChBenchDriver;
 use test_framework::anyhow;
-use test_framework::queries::validation::{QueryValidationResult, validate_with_expected_batches};
+use test_framework::queries::validation::{
+    QueryValidationFailReason, QueryValidationResult, validate_with_expected_batches,
+};
 use test_framework::queries::{QueryOverrides, get_chbench_test_queries};
+
+/// Number of rows of context printed on either side of an analytical-gate
+/// mismatch, from both the reference (source) and Spice result sets.
+const MISMATCH_CONTEXT_ROWS: usize = 10;
 
 /// Analytical queries that are executed and reported but do **not** gate the
 /// build, because their result is sensitive to floating-point summation order
@@ -280,50 +287,104 @@ pub async fn verify_analytical_results(
             }
         };
 
-        let (outcome, max_rel_delta) =
-            if total_rows(&expected_sorted) == 0 && total_rows(&actual_sorted) == 0 {
-                (Outcome::Pass, None)
-            } else {
-                match validate_with_expected_batches(
-                    query.name.as_ref(),
-                    &actual_sorted,
-                    &expected_sorted,
-                ) {
-                    Ok(QueryValidationResult::Pass) => {
-                        // Structure, schema and row set agree within the string
-                        // comparator's tolerance. Now apply the tight, type-aware
-                        // numeric check (exact for integer/decimal, 0.1% for
-                        // float — including avg() that alignment cast to decimal)
-                        // and surface the magnitude either way.
-                        match (expected_sorted.first(), actual_sorted.first()) {
-                            (Some(e0), Some(a0)) => {
-                                let delta = compare::numeric_delta(e0, a0, &approximate_cols);
-                                if delta.exceeded {
-                                    (
-                                        Outcome::Divergence(format!(
-                                            "numeric drift exceeds tolerance — {}",
-                                            delta.worst.as_deref().unwrap_or("(unknown cell)")
-                                        )),
-                                        Some(delta.max_rel_delta),
-                                    )
-                                } else {
-                                    (Outcome::Pass, Some(delta.max_rel_delta))
+        let (outcome, max_rel_delta) = if total_rows(&expected_sorted) == 0
+            && total_rows(&actual_sorted) == 0
+        {
+            (Outcome::Pass, None)
+        } else {
+            match validate_with_expected_batches(
+                query.name.as_ref(),
+                &actual_sorted,
+                &expected_sorted,
+            ) {
+                Ok(QueryValidationResult::Pass) => {
+                    // Structure, schema and row set agree within the string
+                    // comparator's tolerance. Now apply the tight, type-aware
+                    // numeric check (exact for integer/decimal, 0.1% for
+                    // float — including avg() that alignment cast to decimal)
+                    // and surface the magnitude either way.
+                    match (expected_sorted.first(), actual_sorted.first()) {
+                        (Some(e0), Some(a0)) => {
+                            let delta = compare::numeric_delta(e0, a0, &approximate_cols);
+                            if delta.exceeded {
+                                if let Some(row) = delta.worst_row {
+                                    let column = delta
+                                        .worst_col
+                                        .and_then(|c| e0.schema().fields().get(c).cloned())
+                                        .map(|f| f.name().clone());
+                                    print_mismatch_context(
+                                        query.name.as_ref(),
+                                        e0,
+                                        a0,
+                                        row,
+                                        column.as_deref(),
+                                    );
                                 }
+                                (
+                                    Outcome::Divergence(format!(
+                                        "numeric drift exceeds tolerance — {}",
+                                        delta.worst.as_deref().unwrap_or("(unknown cell)")
+                                    )),
+                                    Some(delta.max_rel_delta),
+                                )
+                            } else {
+                                (Outcome::Pass, Some(delta.max_rel_delta))
                             }
-                            _ => (Outcome::Pass, None),
+                        }
+                        _ => (Outcome::Pass, None),
+                    }
+                }
+                Ok(QueryValidationResult::Fail(reason)) => {
+                    // Print the surrounding rows from both sides so a divergence
+                    // can be inspected in context rather than as a lone cell. A
+                    // `DataMismatch` carries the exact 1-based row and column of
+                    // the first disagreement; a count-type divergence (differing
+                    // row counts, or one engine returning no rows at all) has no
+                    // single cell, so center the window on the boundary where the
+                    // shorter (lex-sorted) side ends. `context_pair` synthesizes
+                    // an empty batch from the present side's schema when one side
+                    // has no batches, so a "source has rows, Spice has none" (or
+                    // vice-versa) divergence still shows the rows that *are*
+                    // there. `SchemaMismatch` has no comparable rows to show.
+                    if let Some((e0, a0)) = context_pair(&expected_sorted, &actual_sorted) {
+                        match &reason {
+                            QueryValidationFailReason::DataMismatch {
+                                row_number, column, ..
+                            } => print_mismatch_context(
+                                query.name.as_ref(),
+                                &e0,
+                                &a0,
+                                row_number.saturating_sub(1),
+                                Some(column),
+                            ),
+                            QueryValidationFailReason::RowCountMismatch { .. }
+                            | QueryValidationFailReason::NoAnswer
+                            | QueryValidationFailReason::NoExpectedAnswer
+                            | QueryValidationFailReason::NoExpectedAnswerAtScaleFactor => {
+                                print_mismatch_context(
+                                    query.name.as_ref(),
+                                    &e0,
+                                    &a0,
+                                    e0.num_rows().min(a0.num_rows()),
+                                    None,
+                                );
+                            }
+                            QueryValidationFailReason::SchemaMismatch
+                            | QueryValidationFailReason::ColumnLengthMismatch { .. } => {}
                         }
                     }
-                    Ok(QueryValidationResult::Fail(reason)) => (
+                    (
                         Outcome::Divergence(format!(
                             "{reason:?} (source rows={}, spice rows={})",
                             total_rows(&expected_sorted),
                             total_rows(&actual_sorted),
                         )),
                         None,
-                    ),
-                    Err(e) => (Outcome::Fail(e.to_string()), None),
+                    )
                 }
-            };
+                Err(e) => (Outcome::Fail(e.to_string()), None),
+            }
+        };
 
         results.push(AnalyticalQueryResult {
             name: query.name.to_string(),
@@ -426,9 +487,111 @@ fn sort_all_columns(batches: &[RecordBatch]) -> anyhow::Result<Vec<RecordBatch>>
     Ok(vec![RecordBatch::try_new(schema, new_columns)?])
 }
 
+/// The `(expected, actual)` first-batch pair to print context from, tolerating
+/// a side that produced no batches at all (an engine returned zero rows —
+/// `query_arrow` collects to an empty `Vec`). The empty side is synthesized as
+/// a zero-row batch cloned from the present side's schema, so a "one side has
+/// rows, the other has none" divergence still shows the rows that *are* there
+/// (the empty side renders as `<no rows in window>`). `None` only when both
+/// sides are empty, which the caller already treats as a pass.
+fn context_pair(
+    expected: &[RecordBatch],
+    actual: &[RecordBatch],
+) -> Option<(RecordBatch, RecordBatch)> {
+    match (expected.first(), actual.first()) {
+        (Some(e), Some(a)) => Some((e.clone(), a.clone())),
+        (Some(e), None) => Some((e.clone(), RecordBatch::new_empty(e.schema()))),
+        (None, Some(a)) => Some((RecordBatch::new_empty(a.schema()), a.clone())),
+        (None, None) => None,
+    }
+}
+
+/// Print up to [`MISMATCH_CONTEXT_ROWS`] rows on either side of `mismatch_row`
+/// (0-based, into the shared lex-sorted row order) from both the reference
+/// (source) and Spice result sets, so a divergence can be inspected in context
+/// rather than from a single offending cell. `column` names the diverging
+/// column when known.
+///
+/// Each side is rendered as its own table via Arrow's `pretty_format_batches`,
+/// with a prepended absolute `row` index column so the mismatch row (called out
+/// in the header) can be located and the two tables lined up. The window is
+/// clamped to the rows each side actually has; the shorter side of a row-count
+/// divergence simply prints fewer rows.
+fn print_mismatch_context(
+    query_name: &str,
+    expected: &RecordBatch,
+    actual: &RecordBatch,
+    mismatch_row: usize,
+    column: Option<&str>,
+) {
+    let total = expected.num_rows().max(actual.num_rows());
+    if total == 0 {
+        return;
+    }
+    let last = total - 1;
+    let mismatch_row = mismatch_row.min(last);
+    let lo = mismatch_row.saturating_sub(MISMATCH_CONTEXT_ROWS);
+    let hi = mismatch_row.saturating_add(MISMATCH_CONTEXT_ROWS).min(last);
+    let column_note = column.map_or_else(String::new, |c| format!(", diverging column '{c}'"));
+    println!(
+        "    ── {query_name} mismatch context: rows {lo}..={hi} of {total} (0-based, lex-sorted), mismatch at row {mismatch_row}{column_note} ──"
+    );
+
+    for (label, batch) in [
+        ("reference (source of truth, Postgres)", expected),
+        ("spice (Spice)", actual),
+    ] {
+        println!("    {label}:");
+        print_windowed_table(batch, lo, hi);
+    }
+}
+
+/// Slice `batch` to the inclusive absolute row range `[lo, hi]` (clamped to the
+/// rows this side actually has), prepend an absolute `row` index column, and
+/// print it as a table via Arrow's `pretty_format_batches`, indented under the
+/// caller's label.
+fn print_windowed_table(batch: &RecordBatch, lo: usize, hi: usize) {
+    let n = batch.num_rows();
+    if lo >= n {
+        println!("      <no rows in window>");
+        return;
+    }
+    let len = hi.min(n - 1) - lo + 1;
+    let sliced = batch.slice(lo, len);
+
+    // Prepend the absolute row index so the mismatch row can be identified in
+    // the rendered table and the two sides lined up row-for-row.
+    let row_index =
+        Int64Array::from_iter_values((lo..lo + len).map(|r| i64::try_from(r).unwrap_or(i64::MAX)));
+    let mut fields = Vec::with_capacity(sliced.num_columns() + 1);
+    fields.push(Field::new("row", DataType::Int64, false));
+    fields.extend(sliced.schema().fields().iter().map(|f| f.as_ref().clone()));
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(sliced.num_columns() + 1);
+    columns.push(Arc::new(row_index) as ArrayRef);
+    columns.extend(sliced.columns().iter().map(Arc::clone));
+
+    let windowed = match RecordBatch::try_new(Arc::new(Schema::new(fields)), columns) {
+        Ok(b) => b,
+        Err(e) => {
+            println!("      <failed to build context window: {e}>");
+            return;
+        }
+    };
+
+    match pretty_format_batches(std::slice::from_ref(&windowed)) {
+        Ok(table) => {
+            for line in table.to_string().lines() {
+                println!("      {line}");
+            }
+        }
+        Err(e) => println!("      <failed to render context window: {e}>"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::StringArray;
 
     fn result(name: &str, outcome: Outcome) -> AnalyticalQueryResult {
         AnalyticalQueryResult {
@@ -502,5 +665,86 @@ mod tests {
             .failure_message()
             .expect("a harness error on an advisory query must still gate");
         assert!(msg.contains("chbench_q15"));
+    }
+
+    fn ctx_batch() -> RecordBatch {
+        let ids: ArrayRef = Arc::new(Int64Array::from((0..5).collect::<Vec<_>>()));
+        let cities: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("Berlin"),
+            None,
+            Some("Munich"),
+            Some("Hamburg"),
+            Some("Cologne"),
+        ]));
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("city", DataType::Utf8, true),
+            ])),
+            vec![ids, cities],
+        )
+        .expect("valid batch")
+    }
+
+    #[test]
+    fn mismatch_context_clamps_window_to_bounds() {
+        // Must not panic when the mismatch sits at row 0 (lo underflow) or beyond
+        // the end; the window is clamped to the rows present.
+        let batch = ctx_batch();
+        print_mismatch_context("chbench_q10", &batch, &batch, 0, Some("city"));
+        print_mismatch_context("chbench_q10", &batch, &batch, 999, Some("city"));
+        // Empty batches print nothing rather than underflowing `total - 1`.
+        let empty = RecordBatch::new_empty(batch.schema());
+        print_mismatch_context("chbench_q10", &empty, &empty, 0, None);
+    }
+
+    #[test]
+    fn mismatch_context_handles_row_count_divergence() {
+        // The RowCountMismatch path centers on min(expected, actual) rows, which
+        // sits at (or past) the shorter side's end — must not panic and must
+        // clamp each side to its own length.
+        let full = ctx_batch(); // 5 rows
+        let short = full.slice(0, 2); // 2 rows
+        let boundary = full.num_rows().min(short.num_rows()); // 2
+        print_mismatch_context("chbench_q10", &full, &short, boundary, None);
+        print_mismatch_context("chbench_q10", &short, &full, boundary, None);
+    }
+
+    #[test]
+    fn windowed_table_handles_unequal_side_lengths() {
+        // The shorter side of a row-count divergence must not panic: a window
+        // past its end prints "<no rows in window>", a partial window is clamped.
+        let full = ctx_batch(); // 5 rows
+        let short = full.slice(0, 2); // 2 rows
+        print_windowed_table(&full, 0, 4);
+        print_windowed_table(&short, 0, 4); // hi clamped to row 1
+        print_windowed_table(&short, 3, 4); // lo past end → no rows
+    }
+
+    #[test]
+    fn context_pair_synthesizes_empty_side_when_one_engine_returns_no_rows() {
+        let full = ctx_batch(); // 5 rows
+        let full_vec = vec![full.clone()];
+        let empty_vec: Vec<RecordBatch> = vec![];
+
+        // Both present: batches pass through unchanged.
+        let (e, a) = context_pair(&full_vec, &full_vec).expect("both present");
+        assert_eq!((e.num_rows(), a.num_rows()), (5, 5));
+
+        // Actual empty: synthesized 0-row batch on the actual side, expected kept.
+        let (e, a) = context_pair(&full_vec, &empty_vec).expect("expected present");
+        assert_eq!((e.num_rows(), a.num_rows()), (5, 0));
+        assert_eq!(a.schema(), full.schema());
+
+        // Expected empty: mirror of the above.
+        let (e, a) = context_pair(&empty_vec, &full_vec).expect("actual present");
+        assert_eq!((e.num_rows(), a.num_rows()), (0, 5));
+
+        // Neither present: nothing to show.
+        assert!(context_pair(&empty_vec, &empty_vec).is_none());
+
+        // The synthesized pair drives print_mismatch_context without panicking.
+        let (e, a) = context_pair(&full_vec, &empty_vec).expect("expected present");
+        print_mismatch_context("chbench_q10", &e, &a, e.num_rows().min(a.num_rows()), None);
     }
 }
