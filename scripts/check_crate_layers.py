@@ -181,6 +181,11 @@ def main() -> int:
             if not isinstance(allowed, list):
                 config_errors.append(f"`restricted_deps.{dep}` must be a list of crate names.")
                 continue
+            if not allowed:
+                config_errors.append(
+                    f"`restricted_deps.{dep}` has an empty allowed-crates list; list at least one "
+                    "crate (an empty list would forbid the dependency everywhere — likely a mistake)."
+                )
             for c in allowed:
                 if not isinstance(c, str):
                     config_errors.append(
