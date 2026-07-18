@@ -4166,7 +4166,6 @@ dependencies = [
  "data_components",
  "datafusion",
  "datafusion-table-providers",
- "db_connection_pool",
  "futures",
  "linkme",
  "ns_lookup",
