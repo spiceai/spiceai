@@ -212,10 +212,10 @@ impl CloudConnect {
 
 /// Validate an adoption code shape.
 ///
-/// Format: `SPICE-ADOPT-XXXX-XXXX-...` where each `XXXX` segment is 4
-/// uppercase ASCII alphanumeric characters, and there are between 2 and 5
-/// segments. The actual code may be looser server-side; this is the
-/// client-side sanity check.
+/// Format: `SPICE-ADOPT-XXXXX-XXXXX-...` where each `XXXXX` segment is 5
+/// uppercase ASCII alphanumeric characters (the portal mints RFC4648 base32,
+/// A-Z2-7), and there are between 2 and 5 segments (the portal mints 4). The
+/// actual code may be looser server-side; this is the client-side sanity check.
 #[must_use]
 pub fn is_valid_adoption_code(code: &str) -> bool {
     let mut parts = code.split('-');
@@ -227,7 +227,7 @@ pub fn is_valid_adoption_code(code: &str) -> bool {
     }
     let mut segments = 0_usize;
     for part in parts {
-        if part.len() != 4
+        if part.len() != 5
             || !part
                 .chars()
                 .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
@@ -248,28 +248,31 @@ mod tests {
 
     #[test]
     fn rejects_codes_with_wrong_prefix() {
-        assert!(!is_valid_adoption_code("FOO-BAR-AAAA-BBBB"));
-        assert!(!is_valid_adoption_code("SPICE-CONNECT-AAAA-BBBB"));
+        assert!(!is_valid_adoption_code("FOO-BAR-AAAAA-BBBBB"));
+        assert!(!is_valid_adoption_code("SPICE-CONNECT-AAAAA-BBBBB"));
     }
 
     #[test]
     fn accepts_canonical_adoption_code() {
-        assert!(is_valid_adoption_code("SPICE-ADOPT-7K2P-9XYZ-A1B2"));
-        assert!(is_valid_adoption_code("SPICE-ADOPT-AAAA-BBBB"));
+        // The portal mints four 5-char base32 segments.
         assert!(is_valid_adoption_code(
-            "SPICE-ADOPT-1111-2222-3333-4444-5555"
+            "SPICE-ADOPT-7K2PX-9XYZ2-A1B2C-D3E4F"
+        ));
+        assert!(is_valid_adoption_code("SPICE-ADOPT-AAAAA-BBBBB"));
+        assert!(is_valid_adoption_code(
+            "SPICE-ADOPT-11111-22222-33333-44444-55555"
         ));
     }
 
     #[test]
     fn rejects_codes_with_lowercase_or_wrong_length() {
-        assert!(!is_valid_adoption_code("SPICE-ADOPT-aaaa-BBBB"));
-        assert!(!is_valid_adoption_code("SPICE-ADOPT-AAA-BBBB"));
-        assert!(!is_valid_adoption_code("SPICE-ADOPT-AAAAA-BBBB"));
+        assert!(!is_valid_adoption_code("SPICE-ADOPT-aaaaa-BBBBB"));
+        assert!(!is_valid_adoption_code("SPICE-ADOPT-AAAA-BBBBB")); // 4-char segment
+        assert!(!is_valid_adoption_code("SPICE-ADOPT-AAAAAA-BBBBB")); // 6-char segment
         assert!(!is_valid_adoption_code("SPICE-ADOPT"));
         // 6 segments — too many.
         assert!(!is_valid_adoption_code(
-            "SPICE-ADOPT-1111-2222-3333-4444-5555-6666"
+            "SPICE-ADOPT-11111-22222-33333-44444-55555-66666"
         ));
     }
 }

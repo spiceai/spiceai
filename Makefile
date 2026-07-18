@@ -150,6 +150,8 @@ lint: lint-rust
 # Full workspace lint (default), or scoped via PACKAGES=… for a fast fail-first pass.
 lint-rust:
 	cargo fmt $(_FMT_FLAGS) -- --check
+	## Crate-layering guard (fast, no compile): no crate may depend on a higher tier. See docs/dev/crate_layering.md
+	python3 scripts/check_crate_layers.py
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
 	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going --lib --bins $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
 		-Dwarnings \
