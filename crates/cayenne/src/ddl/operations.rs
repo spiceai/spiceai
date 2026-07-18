@@ -409,7 +409,7 @@ async fn build_partitioned_provider(
     let partition_expr_for_error =
         partition_expr_sql.map_or_else(|| partition_expr.to_string(), String::clone);
 
-    tracing::info!(
+    tracing::debug!(
         table = %table_name,
         partition_expr = %partition_expr_for_error,
         "CayenneCreateTableExec: validating partition expression"

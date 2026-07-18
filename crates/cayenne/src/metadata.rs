@@ -1120,25 +1120,25 @@ pub struct VortexConfig {
     /// objects and cold scans are range reads. Set from
     /// `cayenne_datalake_target_file_size_mb`. Defaults to 512.
     pub cold_target_file_size_mb: usize,
-    /// Max input bytes (in MB) fed to one bounded Z-order sort run during cold
-    /// promotion. `None` (the default) derives
+    /// Max input bytes (in MB) fed to one bounded Z-order sort run during a
+    /// warm-to-datalake move. `None` (the default) derives
     /// [`Self::cold_clustering_run_size_bytes`] as `cold_target_file_size_mb *
     /// 16` — 16 target files' worth of input gives enough locality for good
     /// clustering (8 GiB with the default 512 MB target).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cold_clustering_run_size_mb: Option<usize>,
-    /// Promotion fires only once the warm tier exceeds this many bytes
+    /// The warm tier moves to the datalake only once it exceeds this many bytes
     /// (`<= 0` disables the byte trigger). Set from
     /// `cayenne_datalake_warm_max_bytes`.
     pub cold_tier_warm_max_bytes: i64,
-    /// Promotion fires only once the warm tier exceeds this many files
+    /// The warm tier moves to the datalake only once it exceeds this many files
     /// (`0` disables the file-count trigger). Set from
     /// `cayenne_datalake_warm_max_files`.
     pub cold_tier_warm_max_files: usize,
-    /// How often (ms) the background loop evaluates the cold-promotion trigger.
-    /// Cold tiering is not latency-critical, so this is much coarser than the
-    /// compaction interval. Set from `cayenne_datalake_promotion_interval_ms`.
-    /// Defaults to 60s.
+    /// How often (ms) the background loop checks whether to move warm-tier data
+    /// to the datalake. Datalake tiering is not latency-critical, so this is much coarser than the
+    /// compaction interval. Set from the user-facing
+    /// `cayenne_datalake_tiering_check_interval_ms`. Defaults to 60s.
     pub cold_tier_background_interval_ms: u64,
     /// Physical-GC cadence AND orphan grace (ms) for superseded cold objects:
     /// the sweep runs about this often, and an orphan (on the store, not in the

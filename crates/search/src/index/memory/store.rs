@@ -48,7 +48,7 @@ pub(crate) struct MemoryVectorStore {
     /// Primary-key fields + metadata fields + `{search_column}_embedding`,
     /// alphabetically sorted by name (the same order the index's `write()`
     /// output uses, as required by `VectorScanTableProvider`).
-    stored_schema: SchemaRef,
+    pub(crate) stored_schema: SchemaRef,
     batches: Vec<StoredBatch>,
 }
 
@@ -58,10 +58,6 @@ impl MemoryVectorStore {
             stored_schema,
             batches: Vec::new(),
         }
-    }
-
-    pub(crate) fn stored_schema(&self) -> SchemaRef {
-        SchemaRef::clone(&self.stored_schema)
     }
 
     /// Replace-on-rewrite insert: drops any stored row whose formatted primary
@@ -113,14 +109,5 @@ impl MemoryVectorStore {
     /// Cheap: Arrow buffers are shared, not copied.
     pub(crate) fn batches(&self) -> Vec<RecordBatch> {
         self.batches.iter().map(|s| s.batch.clone()).collect()
-    }
-
-    /// Total number of stored rows.
-    pub(crate) fn len(&self) -> usize {
-        self.batches.iter().map(|s| s.batch.num_rows()).sum()
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.batches.iter().all(|s| s.batch.num_rows() == 0)
     }
 }

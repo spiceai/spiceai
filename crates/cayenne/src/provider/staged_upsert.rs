@@ -415,6 +415,16 @@ impl PreparedTxnCommit {
         let sequence = self.publish.snapshot_sequence;
         self.table
             .publish_prepared_on_conflict_deletions(self.publish);
+        // The fused transaction publish just made this transaction's staged rows
+        // visible; mark maintained aggregates stale under the same held listing
+        // fence so an IVM query cannot serve a Fresh aggregate that omits them.
+        // The non-fused `commit_on_conflict_publish` path already does this; the
+        // fused path (the only live transaction commit path) previously did not,
+        // so aggregate queries served pre-transaction state as Fresh until an
+        // unrelated CDC event re-fed the registry. `None` marks stale
+        // (conservative base-scan fallback); feeding the staged batches as
+        // retraction+insert deltas for incremental maintenance is a follow-up.
+        self.table.feed_staged_ivm_under_fence(None);
         let retention_requested = self.table.has_retention_delete_filters();
         let live_rows_delta = i64::try_from(self.row_count)
             .unwrap_or(i64::MAX)

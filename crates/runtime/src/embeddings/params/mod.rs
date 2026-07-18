@@ -14,7 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! Typed parameter structs for each embedding provider, deserialized from
+//! spicepod `params` via `#[derive(TypedParams)]`.
+
 pub mod azure;
+#[cfg(feature = "bedrock")]
 pub mod bedrock;
 pub mod databricks;
 pub mod file;
@@ -23,192 +27,267 @@ pub mod huggingface;
 pub mod model2vec;
 pub mod openai;
 
-pub use crate::parameters::ParameterSpec;
-use spicepod::component::embeddings::EmbeddingPrefix;
+use std::str::FromStr;
 
-/// Returns the parameter specifications for a given embedding source.
-#[must_use]
-pub fn get_params_spec(source: &EmbeddingPrefix) -> &'static [ParameterSpec] {
-    match source {
-        EmbeddingPrefix::OpenAi => openai::PARAMETERS,
-        EmbeddingPrefix::Azure => azure::PARAMETERS,
-        EmbeddingPrefix::Google => google::PARAMETERS,
-        EmbeddingPrefix::HuggingFace => huggingface::PARAMETERS,
-        EmbeddingPrefix::Databricks => databricks::PARAMETERS,
-        EmbeddingPrefix::Bedrock => bedrock::PARAMETERS,
-        EmbeddingPrefix::File => file::PARAMETERS,
-        EmbeddingPrefix::Model2Vec => model2vec::PARAMETERS,
+/// Pooling strategy for local (TEI-based) embedding models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pooling {
+    Cls,
+    Mean,
+    Splade,
+}
+
+impl Pooling {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Pooling::Cls => "cls",
+            Pooling::Mean => "mean",
+            Pooling::Splade => "splade",
+        }
+    }
+}
+
+impl FromStr for Pooling {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "cls" => Ok(Pooling::Cls),
+            "mean" => Ok(Pooling::Mean),
+            "splade" => Ok(Pooling::Splade),
+            other => Err(format!("must be one of: cls, mean, splade. Found {other}")),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parameters::Parameters;
-    use runtime_secrets::Secrets;
-    use spicepod::component::embeddings::EmbeddingPrefix;
-    use spicepod::param::Params;
+    use runtime_parameters::typed::TypedParams;
+    use secrecy::{ExposeSecret, SecretString};
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
-    /// Parse YAML into a string map, construct `Parameters`, then exercise every
-    /// `params.get(key)` the provider function calls. A panic here means a key
-    /// is missing from the `ParameterSpec`.
-    async fn build_params(prefix: &EmbeddingPrefix, yaml: &str) -> Parameters {
-        let string_map: std::collections::HashMap<String, String> = yaml::from_str::<Params>(yaml)
-            .expect("YAML must parse")
-            .as_string_map();
-        let secrets = Arc::new(RwLock::new(Secrets::default()));
-        let params_with_secrets =
-            runtime_secrets::get_params_with_secrets(Arc::clone(&secrets), &string_map)
-                .await
-                .into_iter()
-                .collect::<Vec<_>>();
-        Parameters::try_new(
-            &format!("embedding test_{prefix}"),
-            params_with_secrets,
-            prefix.to_string().leak(),
-            Arc::clone(&secrets),
-            get_params_spec(prefix),
+    fn params(entries: &[(&str, &str)]) -> HashMap<String, SecretString> {
+        entries
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), SecretString::from((*v).to_string())))
+            .collect()
+    }
+
+    fn empty_secrets() -> Arc<RwLock<runtime_secrets::Secrets>> {
+        Arc::new(RwLock::new(runtime_secrets::Secrets::new()))
+    }
+
+    #[tokio::test]
+    async fn openai_params_default_endpoint_and_tier() {
+        let typed = openai::OpenAiEmbeddingParams::try_from_params(
+            "embedding test",
+            params(&[("openai_api_key", "sk-1")]),
+            &empty_secrets(),
         )
         .await
-        .expect("Parameters::try_new must not fail")
-    }
-
-    #[tokio::test]
-    async fn test_openai_params_roundtrip() {
-        let params = build_params(
-            &EmbeddingPrefix::OpenAi,
-            "openai_api_key: sk-test\nopenai_org_id: org-1\nopenai_project_id: proj-1\nendpoint: https://api.openai.com\nopenai_usage_tier: tier1\n",
-        )
-        .await;
-        // Every key that embed.rs accesses for openai
-        let _ = params.get("api_key");
-        let _ = params.get("endpoint");
-        let _ = params.get("org_id");
-        let _ = params.get("project_id");
-        let _ = params.get("usage_tier");
-    }
-
-    #[tokio::test]
-    async fn test_azure_params_roundtrip() {
-        let params = build_params(
-            &EmbeddingPrefix::Azure,
-            "azure_api_key: key\nazure_api_version: 2024-02-01\nazure_deployment_name: my-deploy\nendpoint: https://my.azure.com\nazure_entra_token: tok\n",
-        )
-        .await;
-        let _ = params.get("api_key");
-        let _ = params.get("api_version");
-        let _ = params.get("deployment_name");
-        let _ = params.get("endpoint");
-        let _ = params.get("entra_token");
-    }
-
-    #[tokio::test]
-    async fn test_google_params_roundtrip() {
-        let params = build_params(
-            &EmbeddingPrefix::Google,
-            "google_api_key: key\ndimensions: 768\n",
-        )
-        .await;
-        let _ = params.get("api_key");
-        let _ = params.get("dimensions");
-    }
-
-    #[tokio::test]
-    async fn test_huggingface_params_roundtrip() {
-        let params = build_params(
-            &EmbeddingPrefix::HuggingFace,
-            "hf_token: hf_abc\npooling: mean\nmax_seq_length: 512\n",
-        )
-        .await;
-        let _ = params.get("hf_token");
-        let _ = params.get("pooling");
-        let _ = params.get("max_seq_length");
-    }
-
-    #[tokio::test]
-    async fn test_databricks_params_roundtrip() {
-        let params = build_params(
-            &EmbeddingPrefix::Databricks,
-            "databricks_endpoint: https://my.databricks.com\ndatabricks_token: dapi-abc\ndatabricks_client_id: cid\ndatabricks_client_secret: csec\n",
-        )
-        .await;
-        let _ = params.get("endpoint");
-        let _ = params.get("token");
-        let _ = params.get("client_id");
-        let _ = params.get("client_secret");
-    }
-
-    #[tokio::test]
-    async fn test_bedrock_params_roundtrip() {
-        let params = build_params(
-            &EmbeddingPrefix::Bedrock,
-            // AWS params (no prefix — runtime type)
-            "aws_region: us-east-1\naws_access_key_id: AKIA\naws_secret_access_key: secret\naws_session_token: token\naws_iam_role_source: auto\n\
-             # Titan/Nova model params\ndimensions: 256\nnormalize: true\n\
-             # Cohere/Nova truncation params\ntruncate_mode: END\ntruncate: END\ninput_type: classification\nembedding_purpose: GENERIC_INDEX\n\
-             # Rate-limit and profile overrides\naws_profile: default\nrequests_per_min_limit: 1500\nmax_concurrent_invocations: 10\n",
-        )
-        .await;
-        // AWS params consumed via get_runtime_params()
-        let runtime = params.get_runtime_params();
-        assert!(
-            runtime.contains_key("aws_region"),
-            "aws_region missing from runtime params"
+        .expect("openai params should deserialize");
+        assert_eq!(typed.endpoint, "https://api.openai.com/v1");
+        assert_eq!(
+            typed.api_key.as_ref().map(ExposeSecret::expose_secret),
+            Some("sk-1")
         );
-        assert!(
-            runtime.contains_key("aws_access_key_id"),
-            "aws_access_key_id missing from runtime params"
-        );
-        assert!(
-            runtime.contains_key("aws_secret_access_key"),
-            "aws_secret_access_key missing from runtime params"
-        );
-        assert!(
-            runtime.contains_key("aws_profile"),
-            "aws_profile missing from runtime params"
-        );
-        assert!(
-            runtime.contains_key("requests_per_min_limit"),
-            "requests_per_min_limit missing from runtime params"
-        );
-        assert!(
-            runtime.contains_key("max_concurrent_invocations"),
-            "max_concurrent_invocations missing from runtime params"
-        );
-        // Model-specific params accessed directly in embed.rs
-        let _ = params.get("dimensions");
-        let _ = params.get("normalize");
-        let _ = params.get("truncate_mode");
-        let _ = params.get("truncate"); // alias — must not panic
-        let _ = params.get("input_type");
-        let _ = params.get("embedding_purpose");
+        assert_eq!(typed.usage_tier, llms::openai::UsageTier::Tier1);
     }
 
     #[tokio::test]
-    async fn test_file_params_roundtrip() {
-        let params = build_params(
-            &EmbeddingPrefix::File,
-            "pooling: cls\nmax_seq_length: 256\n",
+    async fn azure_params_accept_prefixed_keys() {
+        let typed = azure::AzureEmbeddingParams::try_from_params(
+            "embedding test",
+            params(&[
+                ("endpoint", "https://r.openai.azure.com"),
+                ("azure_api_version", "2024-02-01"),
+                ("azure_deployment_name", "embed"),
+                ("azure_api_key", "key"),
+            ]),
+            &empty_secrets(),
         )
-        .await;
-        let _ = params.get("pooling");
-        let _ = params.get("max_seq_length");
+        .await
+        .expect("azure params should deserialize");
+        assert_eq!(
+            typed.endpoint.as_deref(),
+            Some("https://r.openai.azure.com")
+        );
+        assert_eq!(typed.api_version.as_deref(), Some("2024-02-01"));
+        assert_eq!(typed.deployment_name.as_deref(), Some("embed"));
+        assert!(typed.api_key.is_some());
+        assert!(typed.entra_token.is_none());
     }
 
     #[tokio::test]
-    async fn test_model2vec_params_roundtrip() {
-        let params = build_params(
-            &EmbeddingPrefix::Model2Vec,
-            "hf_token: hf_abc\nsubfolder: onnx\nnormalize: true\nparallelism: 4\nembed_max_token_length: 512\nembed_custom_batch_size: 32\n",
+    async fn google_params_require_api_key() {
+        let Err(err) = google::GoogleEmbeddingParams::try_from_params(
+            "embedding test",
+            params(&[]),
+            &empty_secrets(),
         )
-        .await;
-        let _ = params.get("hf_token");
-        let _ = params.get("subfolder");
-        let _ = params.get("normalize");
-        let _ = params.get("parallelism");
-        let _ = params.get("embed_max_token_length");
-        let _ = params.get("embed_custom_batch_size");
+        .await
+        else {
+            panic!("google api_key is required")
+        };
+        assert!(
+            err.to_string()
+                .contains("Missing required parameter: google_api_key"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn google_params_accept_runtime_dimensions() {
+        let typed = google::GoogleEmbeddingParams::try_from_params(
+            "embedding test",
+            params(&[("google_api_key", "key"), ("dimensions", "768")]),
+            &empty_secrets(),
+        )
+        .await
+        .expect("google params should deserialize");
+        assert_eq!(typed.dimensions, Some(768));
+    }
+
+    #[tokio::test]
+    async fn huggingface_params_parse_pooling_enum() {
+        let typed = huggingface::HuggingFaceEmbeddingParams::try_from_params(
+            "embedding test",
+            params(&[
+                ("hf_token", "hf_abc"),
+                ("pooling", "mean"),
+                ("max_seq_length", "512"),
+            ]),
+            &empty_secrets(),
+        )
+        .await
+        .expect("huggingface params should deserialize");
+        assert_eq!(
+            typed.hf_token.as_ref().map(ExposeSecret::expose_secret),
+            Some("hf_abc")
+        );
+        assert_eq!(typed.pooling, Some(Pooling::Mean));
+        assert_eq!(typed.max_seq_length, Some(512));
+    }
+
+    #[tokio::test]
+    async fn databricks_params_require_endpoint() {
+        let Err(err) = databricks::DatabricksEmbeddingParams::try_from_params(
+            "embedding test",
+            params(&[("databricks_token", "t")]),
+            &empty_secrets(),
+        )
+        .await
+        else {
+            panic!("databricks endpoint is required")
+        };
+        assert!(
+            err.to_string()
+                .contains("Missing required parameter: databricks_endpoint"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn model2vec_params_reject_malformed_numbers() {
+        let Err(err) = model2vec::Model2VecEmbeddingParams::try_from_params(
+            "embedding test",
+            params(&[("parallelism", "many")]),
+            &empty_secrets(),
+        )
+        .await
+        else {
+            panic!("malformed parallelism should error")
+        };
+        assert!(
+            err.to_string()
+                .contains("Invalid value for parameter 'parallelism'"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn model2vec_params_accept_runtime_keys() {
+        let typed = model2vec::Model2VecEmbeddingParams::try_from_params(
+            "embedding test",
+            params(&[
+                ("hf_token", "hf_abc"),
+                ("subfolder", "onnx"),
+                ("normalize", "true"),
+                ("parallelism", "4"),
+                ("embed_max_token_length", "512"),
+                ("embed_custom_batch_size", "32"),
+            ]),
+            &empty_secrets(),
+        )
+        .await
+        .expect("model2vec params should deserialize");
+        assert_eq!(
+            typed.hf_token.as_ref().map(ExposeSecret::expose_secret),
+            Some("hf_abc")
+        );
+        assert_eq!(typed.subfolder.as_deref(), Some("onnx"));
+        assert_eq!(typed.normalize, Some(true));
+        assert_eq!(typed.parallelism, Some(4));
+        assert_eq!(typed.embed_max_token_length, Some(512));
+        assert_eq!(typed.embed_custom_batch_size, Some(32));
+    }
+
+    #[cfg(feature = "bedrock")]
+    #[tokio::test]
+    async fn bedrock_params_accept_runtime_keys_and_legacy_truncate_alias() {
+        let typed = bedrock::BedrockEmbeddingParams::try_from_params(
+            "embedding test",
+            params(&[
+                ("aws_access_key_id", "AKIA"),
+                ("aws_secret_access_key", "secret"),
+                ("aws_session_token", "token"),
+                ("aws_region", "us-east-1"),
+                ("aws_iam_role_source", "auto"),
+                ("aws_profile", "default"),
+                ("requests_per_min_limit", "1500"),
+                ("max_concurrent_invocations", "10"),
+                ("dimensions", "1024"),
+                ("normalize", "true"),
+                ("truncate", "END"),
+                ("input_type", "search_document"),
+            ]),
+            &empty_secrets(),
+        )
+        .await
+        .expect("bedrock params should deserialize");
+        assert_eq!(
+            typed
+                .aws_access_key_id
+                .as_ref()
+                .map(ExposeSecret::expose_secret),
+            Some("AKIA")
+        );
+        assert_eq!(
+            typed
+                .aws_secret_access_key
+                .as_ref()
+                .map(ExposeSecret::expose_secret),
+            Some("secret")
+        );
+        assert_eq!(
+            typed
+                .aws_session_token
+                .as_ref()
+                .map(ExposeSecret::expose_secret),
+            Some("token")
+        );
+        assert_eq!(typed.aws_region.as_deref(), Some("us-east-1"));
+        assert_eq!(typed.aws_iam_role_source.as_deref(), Some("auto"));
+        assert_eq!(typed.aws_profile.as_deref(), Some("default"));
+        assert_eq!(typed.requests_per_min_limit, 1500);
+        assert_eq!(typed.max_concurrent_invocations, 10);
+        assert_eq!(typed.dimensions, Some(1024));
+        assert_eq!(typed.normalize, Some(true));
+        assert_eq!(typed.truncate_mode.as_deref(), Some("END"));
+        assert!(typed.input_type.is_some());
     }
 }
