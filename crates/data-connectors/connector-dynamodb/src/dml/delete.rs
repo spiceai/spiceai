@@ -16,10 +16,10 @@ limitations under the License.
 
 use super::keys::extract_primary_keys;
 use super::streaming_batch_write;
-use crate::delete::DeletionSink;
 use async_trait::async_trait;
 use aws_sdk_dynamodb::Client as DbClient;
 use aws_sdk_dynamodb::types::{DeleteRequest, WriteRequest};
+use data_components::delete::DeletionSink;
 use datafusion::error::DataFusionError;
 use datafusion::execution::TaskContext;
 use datafusion::prelude::Expr;

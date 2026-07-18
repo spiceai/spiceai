@@ -4277,6 +4277,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "connector-dynamodb"
+version = "2.2.0-unstable"
+dependencies = [
+ "app",
+ "arrow",
+ "arrow-array",
+ "async-trait",
+ "aws-config",
+ "aws-sdk-credential-bridge",
+ "aws-sdk-dynamodb",
+ "aws-sdk-dynamodbstreams",
+ "aws-smithy-async",
+ "aws-smithy-types",
+ "base64 0.22.1",
+ "chrono",
+ "data_components",
+ "datafusion",
+ "dynamodb-streams",
+ "fundu",
+ "futures",
+ "humantime",
+ "opentelemetry",
+ "runtime",
+ "runtime-api-types",
+ "runtime-checkpoint-api",
+ "runtime-metrics",
+ "runtime-parameters",
+ "serde_json",
+ "snafu",
+ "spicepod",
+ "tokio",
+ "tracing",
+ "util",
+]
+
+[[package]]
 name = "connector-elasticsearch"
 version = "2.2.0-unstable"
 dependencies = [
@@ -5713,12 +5749,8 @@ dependencies = [
  "arrow_tools",
  "async-stream",
  "async-trait",
- "aws-config",
  "aws-credential-types",
  "aws-sdk-credential-bridge",
- "aws-sdk-dynamodb",
- "aws-sdk-dynamodbstreams",
- "aws-smithy-async",
  "aws-smithy-types",
  "azure_core 0.31.0",
  "azure_data_cosmos",
@@ -5743,7 +5775,6 @@ dependencies = [
  "delta_kernel",
  "document_parse",
  "duckdb",
- "dynamodb-streams",
  "elasticsearch",
  "flate2",
  "flight_client",
@@ -16363,6 +16394,7 @@ dependencies = [
  "connector-dremio",
  "connector-duckdb",
  "connector-ducklake",
+ "connector-dynamodb",
  "connector-flightsql",
  "connector-ftp",
  "connector-gcs",
@@ -16405,7 +16437,6 @@ dependencies = [
  "document_parse",
  "duckdb",
  "duration-parse",
- "dynamodb-streams",
  "elasticsearch",
  "event_stream",
  "flight_client",
@@ -16420,7 +16451,6 @@ dependencies = [
  "http 1.4.1",
  "http-body 1.0.1",
  "http-body-util",
- "humantime",
  "hyper 1.10.1",
  "hyper-util",
  "iceberg",
@@ -18768,6 +18798,7 @@ dependencies = [
  "connector-dremio",
  "connector-duckdb",
  "connector-ducklake",
+ "connector-dynamodb",
  "connector-elasticsearch",
  "connector-flightsql",
  "connector-ftp",
@@ -18869,6 +18900,7 @@ dependencies = [
  "connector-delta-lake",
  "connector-dremio",
  "connector-duckdb",
+ "connector-dynamodb",
  "connector-flightsql",
  "connector-ftp",
  "connector-graphql",

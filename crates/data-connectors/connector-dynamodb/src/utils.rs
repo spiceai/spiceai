@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::dynamodb::table_schema::DynamoDBTableSchema;
+use crate::table_schema::DynamoDBTableSchema;
 use aws_sdk_dynamodb::types::AttributeValue;
 use chrono::{DateTime, FixedOffset, NaiveDate};
 use datafusion::common::tree_node::{TreeNodeRecursion, TreeNodeVisitor};

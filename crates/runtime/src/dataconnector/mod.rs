@@ -156,8 +156,6 @@ macro_rules! register_data_connector {
 // #[cfg(feature = "cosmosdb")] pub mod cosmosdb;
 #[cfg(feature = "debezium")]
 pub mod debezium;
-#[cfg(feature = "dynamodb")]
-pub mod dynamodb;
 pub mod file;
 
 // git: moved to crates/data-connectors/connector-git

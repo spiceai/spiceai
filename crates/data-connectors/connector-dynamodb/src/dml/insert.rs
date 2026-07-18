@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use super::streaming_batch_write;
-use crate::dynamodb::utils::scalar_to_attribute_value;
+use crate::utils::scalar_to_attribute_value;
 use arrow::array::{Array, AsArray, BooleanArray, GenericByteArray, PrimitiveArray};
 use arrow::datatypes::{
     DataType, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, SchemaRef,

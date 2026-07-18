@@ -127,6 +127,13 @@ pub async fn register_external_connectors() {
     )
     .await;
 
+    #[cfg(feature = "dynamodb")]
+    register_connector_factory(
+        connector_dynamodb::CONNECTOR_NAME,
+        connector_dynamodb::factory(),
+    )
+    .await;
+
     #[cfg(feature = "adbc")]
     register_connector_factory(connector_adbc::CONNECTOR_NAME, connector_adbc::factory()).await;
 

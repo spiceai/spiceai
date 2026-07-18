@@ -14,25 +14,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    ParameterSpec, Parameters, parameters::aws::initiate_config_with_auth_method,
-};
-use crate::component::dataset::Dataset;
-use crate::component::dataset::acceleration::RefreshMode;
-use crate::dataaccelerator::spice_sys::checkpoint_store;
-use crate::dataconnector::schema_projection::{ProjectionPolicy, parse_schema_projection};
-use crate::federated_table::FederatedTable;
+use crate::Error;
+use crate::provider::DynamoDBTableProvider;
+use crate::stream::StreamError as DynamoDBStreamError;
 use async_trait::async_trait;
 use data_components::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError};
-use data_components::dynamodb::Error;
-use data_components::dynamodb::provider::DynamoDBTableProvider;
-use data_components::dynamodb::stream::StreamError as DynamoDBStreamError;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use dynamodb_streams::{Checkpoint, Metrics, MetricsCollector};
 use futures::stream::{self, StreamExt};
 use opentelemetry::KeyValue;
+use runtime::component::dataset::Dataset;
+use runtime::component::dataset::acceleration::RefreshMode;
+use runtime::dataaccelerator::spice_sys::dynamodb::init_checkpoint_store;
+use runtime::dataconnector::schema_projection::{ProjectionPolicy, parse_schema_projection};
+use runtime::dataconnector::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    ParameterSpec, Parameters, parameters::aws::initiate_config_with_auth_method,
+};
+use runtime::federated_table::FederatedTable;
 use runtime_api_types::v1::ComponentType;
 use runtime_checkpoint_api::BlobCheckpointStore;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
@@ -156,7 +156,7 @@ impl DataConnectorFactory for DynamoDBFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let dynamodb = DynamoDB {
                 params: params.parameters,
@@ -245,7 +245,7 @@ impl DataConnector for DynamoDB {
             .unwrap_or(Duration::from_secs(0));
 
         let unnest_depth = match self.params.get("unnest_depth").expose() {
-            ExposedParamLookup::Present(unnest_depth_str) => Some(usize::from_str(unnest_depth_str).boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
+            ExposedParamLookup::Present(unnest_depth_str) => Some(usize::from_str(unnest_depth_str).boxed().context(runtime::dataconnector::InvalidConfigurationSnafu {
                 dataconnector: "dynamodb".to_string(),
                 message: format!(
                     "DynamoDB parameter 'unnest_depth' must be an integer, not {unnest_depth_str}"),
@@ -264,7 +264,7 @@ impl DataConnector for DynamoDB {
         {
             SEGMENTS_AUTO_STR => None,
             config_segments_str => {
-                let config_segments = usize::from_str(config_segments_str).boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
+                let config_segments = usize::from_str(config_segments_str).boxed().context(runtime::dataconnector::InvalidConfigurationSnafu {
                     dataconnector: "dynamodb".to_string(),
                     message: format!(
                         "DynamoDB parameter 'scan_segments' must be either an integer > 0 or 'auto', not {config_segments_str}"),
@@ -314,7 +314,7 @@ impl DataConnector for DynamoDB {
             .expose()
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(data_components::dynamodb::dml::DEFAULT_WRITE_PARALLELISM);
+            .unwrap_or(crate::dml::DEFAULT_WRITE_PARALLELISM);
 
         let provider = DynamoDBTableProvider::try_new(
             config,
@@ -346,7 +346,7 @@ impl DataConnector for DynamoDB {
             return Err(DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "dynamodb".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
-                source: Box::new(data_components::dynamodb::Error::StreamsNotEnabled {
+                source: Box::new(crate::Error::StreamsNotEnabled {
                     table_name: table_name.to_string(),
                 }),
             });
@@ -444,20 +444,6 @@ impl DataConnector for DynamoDB {
             .flat_map(|opt| opt.unwrap_or_else(|| stream::empty().boxed())),
         ))
     }
-}
-
-/// Sidecar table (in the dataset's own accelerator) holding this connector's
-/// serialized stream checkpoint.
-const DYNAMODB_STREAMS_CHECKPOINT_TABLE: &str = "spice_sys_dynamodb_streams";
-
-/// Resolves the dataset's accelerator into a blob checkpoint store for the `DynamoDB`
-/// Streams sidecar table. `None` means no usable accelerator connection, so the
-/// connector state is ephemeral and the stream restarts on every runtime restart.
-async fn init_checkpoint_store(dataset: &Dataset) -> Option<Arc<dyn BlobCheckpointStore>> {
-    // `None` (no usable accelerator connection) is a graceful "checkpointing
-    // unavailable" degradation; `checkpoint_store` already logs the underlying
-    // reason, so don't double-log it here.
-    checkpoint_store(dataset, DYNAMODB_STREAMS_CHECKPOINT_TABLE).await
 }
 
 /// Loads the checkpoint from the sidecar [`BlobCheckpointStore`]. Falls back to
@@ -1113,12 +1099,10 @@ impl CommitChange for DynamoDBStreamCommitter {
     }
 }
 
-register_data_connector!("dynamodb", DynamoDBFactory);
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::component::dataset::builder::DatasetBuilder;
+    use runtime::component::dataset::builder::DatasetBuilder;
     use serde_json::json;
     use spicepod::semantic::Column;
     use std::collections::HashMap;
@@ -1127,7 +1111,7 @@ mod tests {
         let mut dataset = DatasetBuilder::try_new("test:test_dataset".to_string(), "test_dataset")
             .expect("Failed to create builder")
             .with_app(Arc::new(app::AppBuilder::new("test_app").build()))
-            .with_runtime(Arc::new(crate::Runtime::builder().build().await))
+            .with_runtime(Arc::new(runtime::Runtime::builder().build().await))
             .build()
             .expect("Failed to build dataset");
 

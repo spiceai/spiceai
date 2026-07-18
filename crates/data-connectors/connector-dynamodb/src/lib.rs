@@ -21,6 +21,7 @@ use std::sync::Arc;
 use util::format_datafusion_error;
 
 mod arrow;
+mod connector;
 pub mod dml;
 mod json_nest;
 pub mod provider;
@@ -32,7 +33,18 @@ mod table_schema;
 mod unnest;
 mod utils;
 
+pub use connector::{DynamoDB, DynamoDBFactory};
 pub use json_nest::project_dynamodb_row;
+
+/// The connector name used in Spicepod `from:` strings and for factory registration.
+pub const CONNECTOR_NAME: &str = "dynamodb";
+
+/// Returns the `DynamoDB` [`DataConnectorFactory`](runtime::dataconnector::DataConnectorFactory)
+/// for explicit registration in the binary via `register_connector_factory`.
+#[must_use]
+pub fn factory() -> Arc<dyn runtime::dataconnector::DataConnectorFactory> {
+    DynamoDBFactory::new_arc()
+}
 
 type DynamoDBRow = HashMap<String, AttributeValue>;
 
