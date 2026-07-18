@@ -23,31 +23,24 @@ use datafusion_table_providers::sql::db_connection_pool::{
 };
 use snafu::Snafu;
 
-use crate::dbconnection::clickhouseconn::ClickhouseConnection;
-
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+use crate::conn::ClickhouseConnection;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to connect to ClickHouse: {source}"))]
-    ConnectionPoolError {
-        source: clickhouse_rs::errors::ConnectionError,
-    },
-
     #[snafu(display("Failed to establish TLS connection to ClickHouse: {source}"))]
-    ConnectionTlsError {
+    ConnectionTls {
         source: clickhouse_rs::errors::ConnectionError,
     },
 
     #[snafu(display("ClickHouse connection failed: {source}"))]
-    ConnectionPoolRunError {
+    ConnectionFailed {
         source: clickhouse_rs::errors::Error,
     },
 
     #[snafu(display(
         "Authentication failed. Ensure that the username and password are correctly configured."
     ))]
-    InvalidUsernameOrPasswordError {
+    InvalidUsernameOrPassword {
         source: clickhouse_rs::errors::Error,
     },
 }
@@ -70,11 +63,6 @@ impl ClickhouseConnectionPool {
             db,
         }
     }
-
-    #[must_use]
-    pub fn db(&self) -> Arc<str> {
-        Arc::clone(&self.db)
-    }
 }
 
 #[async_trait]
@@ -94,7 +82,7 @@ impl DbConnectionPool<ClientHandle, &'static dyn Sync> for ClickhouseConnectionP
                 | clickhouse_rs::errors::Error::Other(_)
                 | clickhouse_rs::errors::Error::Url(_)
                 | clickhouse_rs::errors::Error::FromSql(_) => {
-                    Err(Error::ConnectionPoolRunError { source: e })
+                    Err(Error::ConnectionFailed { source: e })
                 }
                 clickhouse_rs::errors::Error::Connection(connection_error) => {
                     match connection_error {
@@ -103,24 +91,22 @@ impl DbConnectionPool<ClientHandle, &'static dyn Sync> for ClickhouseConnectionP
                         | clickhouse_rs::ConnectionError::IoError(_)
                         | clickhouse_rs::ConnectionError::Broken
                         | clickhouse_rs::ConnectionError::NoPacketReceived => {
-                            Err(Error::ConnectionPoolRunError {
+                            Err(Error::ConnectionFailed {
                                 source: connection_error.into(),
                             })
                         }
-                        clickhouse_rs::ConnectionError::TlsError(_) => {
-                            Err(Error::ConnectionTlsError {
-                                source: connection_error,
-                            })
-                        }
+                        clickhouse_rs::ConnectionError::TlsError(_) => Err(Error::ConnectionTls {
+                            source: connection_error,
+                        }),
                     }
                 }
                 clickhouse_rs::errors::Error::Server(server_error) => {
                     if server_error.code == 516 {
-                        Err(Error::InvalidUsernameOrPasswordError {
+                        Err(Error::InvalidUsernameOrPassword {
                             source: server_error.into(),
                         })
                     } else {
-                        Err(Error::ConnectionPoolRunError {
+                        Err(Error::ConnectionFailed {
                             source: server_error.into(),
                         })
                     }
