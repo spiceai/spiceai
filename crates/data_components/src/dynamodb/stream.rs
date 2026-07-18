@@ -108,6 +108,50 @@ pub fn record_batch_to_change_batch(
     Ok(change_batch)
 }
 
+/// Builds a single-row `op="t"` (Truncate) change batch.
+///
+/// Emitted ahead of a bootstrap snapshot, the accelerator applies it as a
+/// delete-all barrier (`process_truncate` → `DELETE FROM <table> WHERE TRUE`) so
+/// a re-bootstrap over a persistent accelerator drops rows deleted at the source
+/// — the same overwrite semantics the old direct `InsertOp::Overwrite` gave,
+/// expressed entirely through the CDC change contract.
+///
+/// The row payload is all-null (Truncate ignores it) and uses the same
+/// [`changes_schema`] as [`record_batch_to_change_batch`], so the truncate and
+/// snapshot batches coalesce. `DynamoDB` infers an all-nullable schema, so the
+/// null payload validates against every field.
+pub fn truncate_change_batch(
+    table_schema: &Arc<Schema>,
+    primary_keys: &[String],
+) -> Result<ChangeBatch, StreamError> {
+    // "t" stands for ChangeOperation::Truncate
+    let op_array = StringArray::from(vec!["t"]);
+
+    let primary_keys_array = get_primary_keys_array(primary_keys, 1);
+
+    // Truncate carries no data; a single all-null row keeps the data struct's
+    // type identical to the snapshot/live batches so the apply path can coalesce.
+    let data_columns: Vec<arrow_array::ArrayRef> = table_schema
+        .fields()
+        .iter()
+        .map(|f| arrow::array::new_null_array(f.data_type(), 1))
+        .collect();
+    let data_array = StructArray::new(table_schema.fields().clone(), data_columns, None);
+
+    let new_schema = Arc::new(changes_schema(table_schema.as_ref()));
+    let new_record_batch = RecordBatch::try_new(
+        new_schema,
+        vec![
+            Arc::new(op_array),
+            Arc::new(primary_keys_array),
+            Arc::new(data_array),
+        ],
+    )
+    .context(FailedToCreateRecordBatchSnafu)?;
+
+    ChangeBatch::try_new(new_record_batch).context(FailedToCreateChangeBatchSnafu)
+}
+
 fn get_primary_keys_array(primary_keys: &[String], row_count: usize) -> ListArray {
     let mut list_builder_generic = make_builder(
         &DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
@@ -323,6 +367,36 @@ mod tests {
             },
             watermark: None,
         }
+    }
+
+    #[test]
+    fn truncate_change_batch_is_single_truncate_row() {
+        let table_schema = create_test_table_schema();
+        let primary_keys = vec!["id".to_string()];
+
+        let batch = truncate_change_batch(&table_schema, &primary_keys)
+            .expect("should build truncate batch");
+
+        // Exactly one row, op = "t" (Truncate) — the delete-all barrier.
+        assert_eq!(batch.record.num_rows(), 1);
+        assert!(matches!(batch.op(0), ChangeOperation::Truncate));
+    }
+
+    #[test]
+    fn truncate_and_insert_batches_share_a_schema() {
+        // The truncate barrier and the snapshot inserts must carry the same
+        // `changes_schema` so the accelerator's apply path can coalesce them
+        // into one write; a mismatch would fail the Arrow concat at apply time.
+        let table_schema = create_test_table_schema();
+        let primary_keys = vec!["id".to_string()];
+
+        let insert_rows = RecordBatch::new_empty(Arc::clone(&table_schema));
+        let insert = record_batch_to_change_batch(insert_rows, &table_schema, &primary_keys)
+            .expect("should build insert batch");
+        let truncate = truncate_change_batch(&table_schema, &primary_keys)
+            .expect("should build truncate batch");
+
+        assert_eq!(insert.record.schema(), truncate.record.schema());
     }
 
     mod process_batch {
