@@ -37,15 +37,15 @@ use snafu::prelude::*;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to connect to ClickHouse: {source}"))]
-    ConnectionPoolError {
+    ConnectionPool {
         source: clickhouse_rs::errors::Error,
     },
     #[snafu(display("Failed to execute ClickHouse query: {source}"))]
-    QueryError {
+    Query {
         source: clickhouse_rs::errors::Error,
     },
     #[snafu(display("Failed to convert query result to Arrow: {source}"))]
-    ConversionError {
+    Conversion {
         source: crate::block_to_arrow::Error,
     },
 }
