@@ -218,9 +218,10 @@ def main() -> int:
         src = p["name"]
         st = tier_of[src]
         for d in p["dependencies"]:
+            # Only normal edges layer the shipped graph; dev + build deps may point
+            # anywhere (e.g. connector integration tests -> runtime).
             if (d.get("kind") or "normal") != "normal":
-                continue  # only normal edges layer the shipped graph; dev + build deps
-                # may point anywhere (e.g. connector integration tests -> runtime)
+                continue
             dep = d["name"]
             if dep == src:
                 continue
