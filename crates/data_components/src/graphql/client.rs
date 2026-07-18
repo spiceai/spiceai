@@ -613,104 +613,101 @@ impl PaginationParameters {
 
 fn unnest_json_object_duplicate_columns(
     new_object: &mut Map<String, Value>,
-    key: &str,
+    key: String,
     duplicate_behavior: &DuplicateBehavior,
 ) -> Result<String> {
     match duplicate_behavior {
         DuplicateBehavior::Error => {
-            if new_object.contains_key(key) {
+            if new_object.contains_key(&key) {
                 return Err(Error::InvalidObjectAccess {
                     message: format!("Column '{key}' already exists in the object."),
                 });
             }
 
-            Ok(key.to_string())
+            Ok(key)
         }
     }
 }
 
 pub fn unnest_json_object_to_depth(
-    object: &Value,
+    object: Value,
     depth: usize,
     duplicate_behavior: &DuplicateBehavior,
 ) -> Result<Vec<Value>> {
-    let mut new_objects = Vec::new();
-    if let Value::Object(obj) = object {
-        let mut new_object = obj.clone();
+    match object {
+        Value::Object(mut new_object) => {
+            // setup some loop controls
+            let mut depth_counter = 0;
 
-        // setup some loop controls
-        let mut depth_counter = 0;
-
-        loop {
-            if depth_counter >= depth {
-                break; // break if we've hit the unnest depth limit
-            }
-
-            // store additions and deletions
-            let mut additions = vec![];
-
-            new_object.retain(|_, value| {
-                match value {
-                    Value::Object(inner_obj) => {
-                        inner_obj.retain(|inner_key, inner_value| {
-                            additions.push((inner_key.clone(), inner_value.clone())); // add the inner key to the additions list
-                            false
-                        });
-
-                        // don't retain the inner object, because we're about to bump it up to the root object
-                        false
-                    }
-                    _ => true, // we don't need to do anything for non-object inner types
+            loop {
+                if depth_counter >= depth {
+                    break; // break if we've hit the unnest depth limit
                 }
-            });
 
-            if additions.is_empty() {
-                break; // break if there's nothing else to do
+                // Move nested object entries up into the root; drop the parent keys.
+                let mut additions = Vec::new();
+                let mut remaining = Map::with_capacity(new_object.len());
+
+                for (key, value) in new_object {
+                    match value {
+                        Value::Object(inner_obj) => {
+                            additions.reserve(inner_obj.len());
+                            for (inner_key, inner_value) in inner_obj {
+                                additions.push((inner_key, inner_value));
+                            }
+                        }
+                        other => {
+                            remaining.insert(key, other);
+                        }
+                    }
+                }
+
+                new_object = remaining;
+
+                if additions.is_empty() {
+                    break; // break if there's nothing else to do
+                }
+
+                // add the staged additions back to the root object
+                for (key, value) in additions {
+                    let new_key = unnest_json_object_duplicate_columns(
+                        &mut new_object,
+                        key,
+                        duplicate_behavior,
+                    )?;
+
+                    new_object.insert(new_key, value);
+                }
+
+                // increment the depth counter
+                depth_counter += 1;
             }
 
-            // add the staged additions back to the root object
-            for (key, value) in additions {
-                let new_key = unnest_json_object_duplicate_columns(
-                    &mut new_object,
-                    &key,
-                    duplicate_behavior,
-                )?;
-
-                new_object.insert(new_key, value);
-            }
-
-            // increment the depth counter
-            depth_counter += 1;
+            Ok(vec![Value::Object(new_object)])
         }
-
-        new_objects.push(Value::Object(new_object));
-    } else if let Value::Array(arr) = object {
-        new_objects.extend(arr.clone());
-    } else {
-        return Err(Error::InvalidObjectAccess {
+        Value::Array(arr) => Ok(arr),
+        other => Err(Error::InvalidObjectAccess {
             // unnesting any other type is invalid
-            message: format!("Unsupported unnest type: {object}"),
-        });
+            message: format!("Unsupported unnest type: {other}"),
+        }),
     }
-
-    Ok(new_objects)
 }
 
-fn unnest_json_object(unnest_parameters: &UnnestParameters, object: &Value) -> Result<Vec<Value>> {
+fn unnest_json_object(unnest_parameters: &UnnestParameters, object: Value) -> Result<Vec<Value>> {
     match unnest_parameters.behavior {
         UnnestBehavior::Depth(depth) => {
             unnest_json_object_to_depth(object, depth, &unnest_parameters.duplicate_behavior)
         }
-        UnnestBehavior::Custom(ref func) => func(object),
+        UnnestBehavior::Custom(ref func) => func(&object),
     }
 }
 
 fn unnest_json_objects(
     unnest_parameters: &UnnestParameters,
-    objects: &[Value],
+    objects: Vec<Value>,
 ) -> Result<Vec<Value>> {
     Ok(objects
-        .iter()
+        .into_iter()
         .map(|obj| unnest_json_object(unnest_parameters, obj))
         .collect::<Result<Vec<Vec<_>>>>()?
         .into_iter()
@@ -1209,7 +1206,7 @@ impl GraphQLClient {
         unwrapped = match self.unnest_parameters.behavior {
             UnnestBehavior::Depth(0) => unwrapped,
             UnnestBehavior::Depth(_) | UnnestBehavior::Custom(_) => {
-                unnest_json_objects(&self.unnest_parameters, &unwrapped)?
+                unnest_json_objects(&self.unnest_parameters, unwrapped)?
             }
         };
 
@@ -2220,7 +2217,7 @@ mod tests {
         };
         let object = serde_json::from_str(r#"{"a": {"b": 1}}"#).expect("Valid json");
         let result =
-            super::unnest_json_object(&unnest_parameters, &object).expect("To unnest JSON object");
+            super::unnest_json_object(&unnest_parameters, object).expect("To unnest JSON object");
         assert_eq!(result.len(), 1);
 
         let obj = result.first().expect("To get first unnested object");
@@ -2239,7 +2236,7 @@ mod tests {
         let object =
             serde_json::from_str(r#"{"a": {"b": {"c": {"d": "1"}}}}"#).expect("Valid json");
         let result =
-            super::unnest_json_object(&unnest_parameters, &object).expect("To unnest JSON object");
+            super::unnest_json_object(&unnest_parameters, object).expect("To unnest JSON object");
         assert_eq!(result.len(), 1);
 
         let obj = result.first().expect("To get first unnested object");
@@ -2260,7 +2257,7 @@ mod tests {
         };
         let object = serde_json::from_str(r#"{"a": {"b": 1}}"#).expect("Valid json");
         let result =
-            super::unnest_json_object(&unnest_parameters, &object).expect("To unnest JSON object");
+            super::unnest_json_object(&unnest_parameters, object).expect("To unnest JSON object");
         assert_eq!(result.len(), 1);
 
         let obj = result.first().expect("To get first unnested object");
@@ -2282,7 +2279,7 @@ mod tests {
         let object =
             serde_json::from_str(r#"{"a": {"b": {"c": {"d": "1"}}}}"#).expect("Valid json");
         let result =
-            super::unnest_json_object(&unnest_parameters, &object).expect("To unnest JSON object");
+            super::unnest_json_object(&unnest_parameters, object).expect("To unnest JSON object");
         assert_eq!(result.len(), 1);
 
         let obj = result.first().expect("To get first unnested object");
@@ -2309,7 +2306,7 @@ mod tests {
         };
         let object = serde_json::from_str("[1, 2, 3]").expect("Valid json");
         let result =
-            super::unnest_json_object(&unnest_parameters, &object).expect("To unnest json array");
+            super::unnest_json_object(&unnest_parameters, object).expect("To unnest json array");
         assert_eq!(result.len(), 3);
 
         let obj = result.first().expect("To get first unnested object");
@@ -2329,7 +2326,7 @@ mod tests {
             duplicate_behavior: DuplicateBehavior::Error,
         };
         let object = serde_json::from_str(r#"{"a": 1, "c": {"b": {"a": 2}}}"#).expect("Valid json");
-        let result = super::unnest_json_object(&unnest_parameters, &object);
+        let result = super::unnest_json_object(&unnest_parameters, object);
 
         assert!(result.is_err());
 
@@ -2374,7 +2371,7 @@ mod tests {
         let object: Value =
             serde_json::from_str(r#"{"a": [1, 2], "b": {"c": [3, 4]}}"#).expect("Valid json");
 
-        let result = super::unnest_json_object(&unnest_parameters, &object)
+        let result = super::unnest_json_object(&unnest_parameters, object)
             .expect("To unnest JSON object with custom behavior");
 
         assert_eq!(result.len(), 1);

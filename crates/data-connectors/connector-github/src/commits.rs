@@ -824,7 +824,7 @@ fn custom_unnestter(object: &Value) -> Result<Vec<Value>> {
         }
 
         let flattened =
-            unnest_json_object_to_depth(&Value::Object(commit), 1, &DuplicateBehavior::Error)?;
+            unnest_json_object_to_depth(Value::Object(commit), 1, &DuplicateBehavior::Error)?;
         commits.extend(flattened);
     }
 

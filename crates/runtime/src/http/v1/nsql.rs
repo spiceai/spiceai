@@ -47,7 +47,6 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use tracing_futures::Instrument;
 
-use super::accept_header_types;
 use crate::datafusion::query::QueryBuilder;
 
 // Default number of retries for NSQL queries if the generated query fails to execute
@@ -193,7 +192,7 @@ fn default_sample_data_enabled() -> bool {
 
 /// Checks if the request is asking to only generate SQL.
 fn return_sql_only(accept: Option<&TypedHeader<Accept>>) -> bool {
-    accept.is_some_and(|a| accept_header_types(a).contains(&"application/sql".to_string()))
+    accept.is_some_and(|a| a.0.media_types().any(|mt| mt.as_ref() == "application/sql"))
 }
 
 fn context_response_format(

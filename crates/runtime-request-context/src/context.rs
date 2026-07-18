@@ -229,7 +229,8 @@ impl RequestContext {
 
     #[must_use]
     pub fn to_dimensions(&self) -> Vec<KeyValue> {
-        let mut dimensions = vec![KeyValue::new("protocol", self.protocol().as_str())];
+        let mut dimensions = Vec::with_capacity(self.dimensions.len() + 2);
+        dimensions.push(KeyValue::new("protocol", self.protocol().as_str()));
         dimensions.extend(self.dimensions.iter().cloned());
         // Low-cardinality scope dimension: `public` / `principal` / `system`.
         // Never includes the principal id.
@@ -596,13 +597,15 @@ impl RequestContextBuilder {
             dimensions.push(KeyValue::new("runtime_version", super::RUNTIME_VERSION));
             dimensions.push(KeyValue::new(
                 "runtime_system",
-                super::RUNTIME_SYSTEM.to_string(),
+                Arc::clone(&*super::RUNTIME_SYSTEM),
             ));
         };
 
         match self.user_agent {
             UserAgent::Absent => (),
             UserAgent::Raw(raw) => {
+                // Display appends runtime identity; keep that combined value for metric
+                // continuity (runtime is also recorded separately below).
                 dimensions.push(KeyValue::new("user_agent", UserAgent::Raw(raw).to_string()));
                 add_runtime_dimensions(&mut dimensions);
             }
@@ -616,6 +619,8 @@ impl RequestContextBuilder {
                 if let Some(client_system) = &parsed.client_system {
                     dimensions.push(KeyValue::new("client_system", Arc::clone(client_system)));
                 }
+                // Display appends runtime identity; keep that combined value for metric
+                // continuity (runtime is also recorded separately below).
                 dimensions.push(KeyValue::new(
                     "user_agent",
                     UserAgent::Parsed(parsed).to_string(),

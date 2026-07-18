@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::{
+    fmt::Write as _,
     num::ParseIntError,
     path::{Path, PathBuf},
     str::ParseBoolError,
@@ -34,6 +35,10 @@ use crate::expression::PartitionedBy;
 const PARTITION_KEY_CODEC_PREFIX: &str = "v1";
 const NULL_COMPONENT: &str = "n";
 const VALUE_COMPONENT_PREFIX: &str = "v";
+/// Uppercase hex digits — must match the on-disk `v1` codec (e.g. `42` → `3432`).
+const HEX_CHARS: &[u8; 16] = b"0123456789ABCDEF";
+/// Enough for the decimal Display form of any supported integer/timestamp payload.
+const DECIMAL_BUF_LEN: usize = 24;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -98,39 +103,84 @@ fn validate_partition_name(name: &str) -> Result<(), Error> {
 /// Returns [`Error::UnsupportedPartitionKey`] if the scalar value type is not supported
 /// for partitioning.
 pub fn encode_key(key: &ScalarValue) -> Result<String, Error> {
-    let (type_tag, value) = match key {
-        ScalarValue::Boolean(v) => ("bool", v.map(|v| v.to_string())),
-        ScalarValue::Int8(v) => ("i8", v.map(|v| v.to_string())),
-        ScalarValue::Int16(v) => ("i16", v.map(|v| v.to_string())),
-        ScalarValue::Int32(v) => ("i32", v.map(|v| v.to_string())),
-        ScalarValue::Int64(v) => ("i64", v.map(|v| v.to_string())),
-        ScalarValue::UInt8(v) => ("u8", v.map(|v| v.to_string())),
-        ScalarValue::UInt16(v) => ("u16", v.map(|v| v.to_string())),
-        ScalarValue::UInt32(v) => ("u32", v.map(|v| v.to_string())),
-        ScalarValue::UInt64(v) => ("u64", v.map(|v| v.to_string())),
-        ScalarValue::TimestampSecond(v, _) => ("ts_s", v.map(|v| v.to_string())),
-        ScalarValue::TimestampMillisecond(v, _) => ("ts_ms", v.map(|v| v.to_string())),
-        ScalarValue::TimestampMicrosecond(v, _) => ("ts_us", v.map(|v| v.to_string())),
-        ScalarValue::TimestampNanosecond(v, _) => ("ts_ns", v.map(|v| v.to_string())),
-        ScalarValue::Utf8(v) => ("utf8", v.clone()),
-        ScalarValue::LargeUtf8(v) => ("large_utf8", v.clone()),
-        ScalarValue::Utf8View(v) => ("utf8_view", v.clone()),
+    // Wire format: hex of the UTF-8 Display/decimal form (e.g. Int32(42) → "3432"),
+    // not raw endian bytes. Changing that would break existing partition directories.
+    Ok(match key {
+        ScalarValue::Boolean(None) => encode_null_key("bool"),
+        ScalarValue::Boolean(Some(true)) => encode_bytes_key("bool", b"true"),
+        ScalarValue::Boolean(Some(false)) => encode_bytes_key("bool", b"false"),
+        ScalarValue::Int8(None) => encode_null_key("i8"),
+        ScalarValue::Int8(Some(v)) => encode_display_key("i8", v),
+        ScalarValue::Int16(None) => encode_null_key("i16"),
+        ScalarValue::Int16(Some(v)) => encode_display_key("i16", v),
+        ScalarValue::Int32(None) => encode_null_key("i32"),
+        ScalarValue::Int32(Some(v)) => encode_display_key("i32", v),
+        ScalarValue::Int64(None) => encode_null_key("i64"),
+        ScalarValue::Int64(Some(v)) => encode_display_key("i64", v),
+        ScalarValue::UInt8(None) => encode_null_key("u8"),
+        ScalarValue::UInt8(Some(v)) => encode_display_key("u8", v),
+        ScalarValue::UInt16(None) => encode_null_key("u16"),
+        ScalarValue::UInt16(Some(v)) => encode_display_key("u16", v),
+        ScalarValue::UInt32(None) => encode_null_key("u32"),
+        ScalarValue::UInt32(Some(v)) => encode_display_key("u32", v),
+        ScalarValue::UInt64(None) => encode_null_key("u64"),
+        ScalarValue::UInt64(Some(v)) => encode_display_key("u64", v),
+        ScalarValue::TimestampSecond(None, _) => encode_null_key("ts_s"),
+        ScalarValue::TimestampSecond(Some(v), _) => encode_display_key("ts_s", v),
+        ScalarValue::TimestampMillisecond(None, _) => encode_null_key("ts_ms"),
+        ScalarValue::TimestampMillisecond(Some(v), _) => encode_display_key("ts_ms", v),
+        ScalarValue::TimestampMicrosecond(None, _) => encode_null_key("ts_us"),
+        ScalarValue::TimestampMicrosecond(Some(v), _) => encode_display_key("ts_us", v),
+        ScalarValue::TimestampNanosecond(None, _) => encode_null_key("ts_ns"),
+        ScalarValue::TimestampNanosecond(Some(v), _) => encode_display_key("ts_ns", v),
+        ScalarValue::Utf8(None) => encode_null_key("utf8"),
+        ScalarValue::Utf8(Some(v)) => encode_bytes_key("utf8", v.as_bytes()),
+        ScalarValue::LargeUtf8(None) => encode_null_key("large_utf8"),
+        ScalarValue::LargeUtf8(Some(v)) => encode_bytes_key("large_utf8", v.as_bytes()),
+        ScalarValue::Utf8View(None) => encode_null_key("utf8_view"),
+        ScalarValue::Utf8View(Some(v)) => encode_bytes_key("utf8_view", v.as_bytes()),
         value => {
             return Err(Error::UnsupportedPartitionKey {
                 value: value.clone(),
             });
         }
-    };
+    })
+}
 
-    Ok(value.map_or_else(
-        || format!("{PARTITION_KEY_CODEC_PREFIX}.{type_tag}.{NULL_COMPONENT}"),
-        |value| {
-            format!(
-                "{PARTITION_KEY_CODEC_PREFIX}.{type_tag}.{VALUE_COMPONENT_PREFIX}{}",
-                encode_hex(value.as_bytes())
-            )
-        },
-    ))
+fn encode_null_key(type_tag: &str) -> String {
+    let mut encoded = String::with_capacity(
+        PARTITION_KEY_CODEC_PREFIX.len() + 1 + type_tag.len() + 1 + NULL_COMPONENT.len(),
+    );
+    encoded.push_str(PARTITION_KEY_CODEC_PREFIX);
+    encoded.push('.');
+    encoded.push_str(type_tag);
+    encoded.push('.');
+    encoded.push_str(NULL_COMPONENT);
+    encoded
+}
+
+fn encode_bytes_key(type_tag: &str, bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(
+        PARTITION_KEY_CODEC_PREFIX.len()
+            + 1
+            + type_tag.len()
+            + 1
+            + VALUE_COMPONENT_PREFIX.len()
+            + bytes.len() * 2,
+    );
+    encoded.push_str(PARTITION_KEY_CODEC_PREFIX);
+    encoded.push('.');
+    encoded.push_str(type_tag);
+    encoded.push('.');
+    encoded.push_str(VALUE_COMPONENT_PREFIX);
+    encode_hex_into(&mut encoded, bytes);
+    encoded
+}
+
+fn encode_display_key(type_tag: &str, value: impl std::fmt::Display) -> String {
+    let mut decimal = String::with_capacity(DECIMAL_BUF_LEN);
+    let _ = write!(decimal, "{value}");
+    encode_bytes_key(type_tag, decimal.as_bytes())
 }
 
 /// Encodes multiple [`ScalarValue`] partition keys into a composite key string.
@@ -148,24 +198,25 @@ pub fn encode_key(key: &ScalarValue) -> Result<String, Error> {
 /// # Errors
 /// Returns [`Error::UnsupportedPartitionKey`] if any scalar value type is not supported.
 pub fn encode_composite_key(keys: &[ScalarValue]) -> Result<String, Error> {
-    let mut composite = format!("{PARTITION_KEY_CODEC_PREFIX}:");
+    // Rough per-key budget: length digits + ':' + a typical versioned component.
+    let mut composite =
+        String::with_capacity(PARTITION_KEY_CODEC_PREFIX.len() + 1 + keys.len() * 48);
+    composite.push_str(PARTITION_KEY_CODEC_PREFIX);
+    composite.push(':');
     for key in keys {
         let encoded = encode_key(key)?;
-        composite.push_str(&encoded.len().to_string());
+        let _ = write!(composite, "{}", encoded.len());
         composite.push(':');
         composite.push_str(&encoded);
     }
     Ok(composite)
 }
 
-fn encode_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(encoded, "{byte:02X}");
+fn encode_hex_into(out: &mut String, bytes: &[u8]) {
+    for &byte in bytes {
+        out.push(char::from(HEX_CHARS[(byte >> 4) as usize]));
+        out.push(char::from(HEX_CHARS[(byte & 0x0f) as usize]));
     }
-    encoded
 }
 
 fn decode_hex(encoded: &str) -> Result<String, Error> {
