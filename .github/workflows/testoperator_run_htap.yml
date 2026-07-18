@@ -222,13 +222,14 @@ jobs:
           CHBENCH_PG_USER: bench
           CHBENCH_PG_PASS: bench
 
-      # MySQL counterpart: the long-lived pod runs a file-agent sidecar
-      # (chbench-mysql chart, sidecar.enabled) that keeps a pristine tablespace
-      # snapshot and restores it with a fast local file copy. This step only
-      # drives it over the MySQL connection: on a hit it issues a `restore`, on a
-      # miss it seeds once via `testoperator --prepare-only` then issues a
-      # `snapshot`. After this the run below uses `--skip-prepare`. Ephemeral
-      # docker-MySQL runners have no sidecar, so they skip this and seed normally.
+      # MySQL counterpart: the long-lived pod runs a supervisor (chbench-mysql
+      # chart) that keeps a pristine whole-data-dir snapshot and restores it with a
+      # fast local file copy, done COLD while mysqld is stopped so a reset can't
+      # corrupt InnoDB. This step only drives it over the MySQL connection: on a
+      # hit it issues a `restore`, on a miss it seeds once via `testoperator
+      # --prepare-only` then issues a `snapshot`. After this the run below uses
+      # `--skip-prepare`. Ephemeral docker-MySQL runners have no supervisor, so
+      # they skip this and seed normally.
       - name: Restore or seed CH-benCH MySQL from template
         if: steps.set_spicepod_path.outputs.SOURCE_TYPE == 'mysql' && github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners'
         run: bash .github/scripts/chbench_template_mysql.sh
