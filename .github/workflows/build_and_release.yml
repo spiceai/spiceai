@@ -57,6 +57,14 @@ on:
           - 'release'
           - 'release-lto'
         default: 'release'
+      build_option:
+        description: 'What to build? "all" (default) or "spiced_only" (Linux x64 release spiced only, for htap benchmarks — skips the spice CLI, odbc, metal, and all other platforms)'
+        required: false
+        type: choice
+        options:
+          - 'all'
+          - 'spiced_only'
+        default: 'all'
 
 env:
   # CI performance optimizations
@@ -145,6 +153,17 @@ jobs:
             if (isManualDispatch) {
               const platform_option = context.payload.inputs.platform_option;
               const tag_option = context.payload.inputs.tag_option;
+              const build_option = context.payload.inputs.build_option || 'all';
+
+              // Benchmark builds only need the Linux x64 release spiced binary uploaded to
+              // MinIO (consumed by testoperator_run_htap.yml via the setup-spiced action).
+              // Skip odbc, metal, the spice CLI, and every other platform to avoid wasted
+              // build time. This overrides platform_option / tag_option.
+              if (build_option === 'spiced_only') {
+                return matrix
+                  .filter(m => m.name === 'Linux x64')
+                  .map(m => ({ ...m, tags: ['default'], spiced_only: true }));
+              }
 
               // Filter by platform
               let filtered = matrix;
@@ -233,9 +252,15 @@ jobs:
       # Default flavor - build both spiced and spice CLI together (runtime not built on Windows - use WSL)
       # Non-release builds include postgres-accel for benchmark testing
       - name: Build spiced and spice CLI
-        if: contains(matrix.target.tags, 'default') && matrix.target.target_os != 'windows' && !matrix.target.is_tagged_release
+        if: contains(matrix.target.tags, 'default') && matrix.target.target_os != 'windows' && !matrix.target.is_tagged_release && !matrix.target.spiced_only
         working-directory: bin/spiced
         run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models,postgres-accel -p spiced -p spice --target-dir ../../target
+
+      # Benchmark flavor - build only spiced (skip the spice CLI) for htap benchmark uploads
+      - name: Build spiced only (benchmark)
+        if: contains(matrix.target.tags, 'default') && matrix.target.target_os != 'windows' && matrix.target.spiced_only
+        working-directory: bin/spiced
+        run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models,postgres-accel -p spiced --target-dir ../../target
 
       # Release builds exclude optional accelerators from the distributed binary
       - name: Build spiced and spice CLI (release)
@@ -328,7 +353,7 @@ jobs:
 
       ## CLI - package the CLI binary that was built above
       - name: tar CLI binary
-        if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default')
+        if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default') && !matrix.target.spiced_only
         run: |
           mv target/release/spice spice
           chmod +x spice
@@ -346,7 +371,7 @@ jobs:
           tar czf spice.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz spice.exe
 
       - name: Print CLI version
-        if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default')
+        if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default') && !matrix.target.spiced_only
         run: ./spice version
 
       - name: Print CLI version (Windows)
@@ -354,7 +379,7 @@ jobs:
         run: ./spice.exe version
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default')
+        if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default') && !matrix.target.spiced_only
         with:
           name: spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
@@ -366,7 +391,7 @@ jobs:
           path: spice.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
       - name: Upload spice CLI to Minio
-        if: matrix.target.use_minio && matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'default')
+        if: matrix.target.use_minio && matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'default') && !matrix.target.spiced_only
         uses: ./.github/actions/upload-to-minio
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
