@@ -52,6 +52,13 @@ pub struct NumericDelta {
     /// Column / row / values of the worst *offending* cell, for the failure
     /// message. `None` when nothing exceeded tolerance.
     pub worst: Option<String>,
+    /// Row index (0-based) of the worst offending cell, so callers can print
+    /// the surrounding rows for context. `None` when nothing exceeded tolerance
+    /// (or the divergence was a whole-column cast failure with no single row).
+    pub worst_row: Option<usize>,
+    /// Column index of the worst offending cell, matching `worst_row`. `None`
+    /// under the same conditions.
+    pub worst_col: Option<usize>,
 }
 
 /// Whether a column's values are compared numerically by [`numeric_delta`]
@@ -84,6 +91,23 @@ fn is_float(dt: &DataType) -> bool {
     )
 }
 
+/// Decimal scale of a numeric type, or `None` for non-decimals.
+fn decimal_scale(dt: &DataType) -> Option<i8> {
+    match dt {
+        DataType::Decimal128(_, s) | DataType::Decimal256(_, s) => Some(*s),
+        _ => None,
+    }
+}
+
+/// Whether a column is numeric *and* exact — integers and decimals, never
+/// floats. `SUM` over such a column is bit-identical across engines (no
+/// order-dependent rounding), so the fingerprint gate can compare it with zero
+/// tolerance; a floating `SUM` legitimately drifts and must not be summed.
+#[must_use]
+pub fn is_exact_numeric(dt: &DataType) -> bool {
+    is_numeric(dt) && !is_float(dt)
+}
+
 /// Per-column float-ness of a batch's schema, for the `actual_source_floats`
 /// argument of [`numeric_delta`].
 ///
@@ -102,6 +126,37 @@ pub fn float_columns(batch: &RecordBatch) -> Vec<bool> {
         .fields()
         .iter()
         .map(|f| is_float(f.data_type()))
+        .collect()
+}
+
+/// Analytical-gate generalization of [`float_columns`]: flags a column for
+/// relative float tolerance when either side is float, or both are decimals of
+/// *different scale*. Exact reproductions (`SUM`/`MIN`/`MAX`/`COUNT`) keep the
+/// operand scale and stay exact; `AVG`/division inflate it per-engine (Postgres
+/// ~13 digits, `DataFusion` operand scale + 4), so their low digits legitimately
+/// differ. Must run pre-alignment (alignment casts actual to the source scale,
+/// erasing the signal); columns match by position.
+#[must_use]
+pub fn approximate_columns(expected: &RecordBatch, actual: &RecordBatch) -> Vec<bool> {
+    let a_schema = actual.schema();
+    let a_fields = a_schema.fields();
+    expected
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let Some(a) = a_fields.get(i) else {
+                return is_float(e.data_type());
+            };
+            let (e_dt, a_dt) = (e.data_type(), a.data_type());
+            is_float(e_dt)
+                || is_float(a_dt)
+                || matches!(
+                    (decimal_scale(e_dt), decimal_scale(a_dt)),
+                    (Some(es), Some(a_s)) if es != a_s
+                )
+        })
         .collect()
 }
 
@@ -129,18 +184,14 @@ fn cast_pair_to_f64(e_col: &dyn Array, a_col: &dyn Array) -> Option<(Float64Arra
 /// cross-engine text collation / timestamp precision make their MIN/MAX
 /// unreliable to compare directly.
 ///
-/// `actual_source_floats[i]` flags columns the actual engine produced as
-/// floating point *before* any schema alignment (see [`float_columns`]). A
-/// column is compared with the relative float tolerance when either side's
-/// compared type is float *or* its pre-alignment actual type was — so an
-/// `avg()` that Spice computed in `Float64` but the gate cast to the source's
-/// `Decimal128` keeps its tolerance, while money sums and counts (decimal /
-/// integer on both sides, and never float pre-alignment) stay exact.
+/// `approximate[i]` flags columns to compare with relative float tolerance
+/// instead of exactly: the fingerprint gate passes [`float_columns`], the
+/// analytical gate [`approximate_columns`]. Sums and counts stay exact.
 #[must_use]
 pub fn numeric_delta(
     expected: &RecordBatch,
     actual: &RecordBatch,
-    actual_source_floats: &[bool],
+    approximate: &[bool],
 ) -> NumericDelta {
     let mut out = NumericDelta::default();
     let mut worst_rel = 0.0_f64;
@@ -161,7 +212,7 @@ pub fn numeric_delta(
         }
         let float_col = is_float(e_col.data_type())
             || is_float(a_col.data_type())
-            || actual_source_floats.get(c).copied().unwrap_or(false);
+            || approximate.get(c).copied().unwrap_or(false);
         let col_name = field.name();
 
         // Both columns are numeric, so casting to f64 should always succeed.
@@ -209,6 +260,8 @@ pub fn numeric_delta(
                         "{col_name}[row {r}]: expected {ev}, actual {av} (rel {:.6}%)",
                         rel * 100.0
                     ));
+                    out.worst_row = Some(r);
+                    out.worst_col = Some(c);
                 }
             }
         }
@@ -258,6 +311,10 @@ mod tests {
         let d = numeric_delta(&e, &a, &float_columns(&a));
         assert!(d.exceeded, "any integer diff must exceed (exact tolerance)");
         assert!(d.worst.is_some());
+        // The offending cell's coordinates are surfaced so the gate can print
+        // the surrounding rows for context.
+        assert_eq!(d.worst_row, Some(0));
+        assert_eq!(d.worst_col, Some(0));
     }
 
     #[test]
@@ -338,6 +395,29 @@ mod tests {
                 Decimal128Array::from(raw).with_data_type(DataType::Decimal128(precision, scale)),
             ) as ArrayRef,
         )
+    }
+
+    #[test]
+    fn approximate_columns_flags_scale_mismatched_decimals() {
+        // avg(): both decimal but different scale (Postgres ~13, DataFusion 6) ->
+        // approximate. sum() (money, scale 2 both) and count (integer) stay
+        // exact; a genuinely float column is always approximate.
+        let expected = batch(vec![
+            decimal_col("avg_amount", vec![1_i128], 38, 13),
+            decimal_col("sum_amount", vec![1_i128], 38, 2),
+            int_col("cnt", vec![1]),
+            float_col("ratio", vec![1.0]),
+        ]);
+        let actual = batch(vec![
+            decimal_col("avg_amount", vec![1_i128], 38, 6),
+            decimal_col("sum_amount", vec![1_i128], 38, 2),
+            int_col("cnt", vec![1]),
+            float_col("ratio", vec![1.0]),
+        ]);
+        assert_eq!(
+            approximate_columns(&expected, &actual),
+            vec![true, false, false, true]
+        );
     }
 
     #[test]

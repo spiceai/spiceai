@@ -14,8 +14,9 @@ chrono = { workspace = true }
 datafusion-table-providers = { workspace = true, features = ["postgres", "mysql"] }
 futures = { workspace = true }
 governor = { workspace = true, features = ["std"] }
-mysql_async = { workspace = true }
+mysql_async = { workspace = true, features = ["rust_decimal"] }
 rand = { workspace = true }
+rust_decimal = { workspace = true, features = ["db-tokio-postgres"] }
 secrecy = { workspace = true }
 snafu = { workspace = true }
 tempfile = { workspace = true }

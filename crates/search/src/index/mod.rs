@@ -23,6 +23,7 @@ use datafusion::{error::DataFusionError, logical_expr::LogicalPlan};
 use runtime_datafusion_index::Index;
 
 pub mod chunking;
+pub mod compound;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 #[cfg(feature = "elasticsearch")]
@@ -105,6 +106,12 @@ pub fn derived_columns_from_vector_index(
         return Some(vec.derived_columns());
     }
     if let Some(vec) = index.as_any().downcast_ref::<ChunkedVectorIndex>() {
+        return Some(vec.derived_columns());
+    }
+    if let Some(vec) = index
+        .as_any()
+        .downcast_ref::<crate::index::compound::CompoundVectorIndex>()
+    {
         return Some(vec.derived_columns());
     }
     None

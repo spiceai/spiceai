@@ -49,6 +49,7 @@ members = [
     "crates/runtime-proto",
     "crates/runtime-parameter-spec",
     "crates/runtime-parameters",
+    "crates/runtime-parameters-derive",
     "crates/runtime-secrets",
     "crates/runtime-table-partition",
     "crates/runtime-rate-control",
@@ -217,6 +218,7 @@ datafusion-expr = "54.0.0"
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "0cb3781608b89f40c6585618ec3071f83345671a", features = ["sql"] } # spiceai-54
 datafusion-functions = "54.0.0"
 datafusion-functions-aggregate = "54.0.0"
+datafusion-functions-nested = "54.0.0"
 datafusion-functions-json = "0.54"
 datafusion-physical-expr = "54.0.0"
 datafusion-physical-expr-adapter = "54.0.0"
@@ -227,8 +229,7 @@ datafusion-proto-common = "54.0.0"
 datafusion-pruning = "54.0.0"
 datafusion-spark = "54.0.0"
 datafusion-substrait = "54.0.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "12321c06d7919b04acf6ce05b969536b2e7ccbbb" } # spiceai-54
-
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "ccdc1aaae359b9b4066fd4fbad19638b9176d5fa" } # spiceai-54
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
     "arrow-58",
@@ -323,6 +324,8 @@ prometheus = "0.14"
 prost = { version = "0.14.1", default-features = false, features = [
     "derive",
 ] }
+proc-macro2 = "1"
+quote = "1"
 r2d2 = "0.8.10"
 rand = "0.10.1"
 rdkafka = { version = "0.39.0" }
@@ -333,6 +336,7 @@ rmcp = { version = "1.5.0", default-features = false }
 rayon = "1.11.0"
 roaring = "0.11"
 rusqlite = { version = "0.40", features = ["bundled-decimal", "chrono"] }
+rust_decimal = "1.42"
 rustls = "0.23"
 schemars = "1.2.1"
 scylla = "1.4.1"
@@ -347,6 +351,7 @@ snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "74
 sqlparser = "0.59.0"
 ssh2 = { version = "0.9.5" }
 suppaftp = { version = "6.3.0", features = ["async"] }
+syn = { version = "2", features = ["full", "extra-traits"] }
 sysinfo = "0.38.4"
 system-adapter-protocol = { git = "https://github.com/spiceai/spicebench.git", rev = "4624f1ec96c519d0bde4fee8c4e75b0498a2181d", features = ["client", "server"] }
 tantivy = "0.26.0"
