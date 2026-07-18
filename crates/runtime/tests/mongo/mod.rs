@@ -23,7 +23,7 @@ use common::{get_mongodb_client, make_mongodb_dataset, start_mongodb_docker_cont
 #[cfg(feature = "duckdb")]
 use common::{
     get_mongodb_replica_set_client, make_mongodb_change_stream_dataset,
-    make_mongodb_change_stream_dataset_inferred, make_mongodb_extended_inference_dataset,
+    make_mongodb_change_stream_dataset_inferred, make_mongodb_inference_dataset,
     make_mongodb_widen_dataset, start_mongodb_replica_set_docker_container,
 };
 #[cfg(feature = "duckdb")]
@@ -451,14 +451,15 @@ async fn mongodb_json_nesting_folds_into_catch_all() -> Result<(), anyhow::Error
 }
 
 /// Non-CDC counterpart to `mongodb_change_streams_infer_primary_key`: a `DuckDB`
-/// full-refresh dataset with `schema_inference: extended` loads end-to-end against a
-/// real `MongoDB`. The catalog query (`listIndexes`/`collStats`) runs on the server and
-/// the inferred `_id` primary key, secondary indexes, and `_id` sort order are all
+/// full-refresh dataset loads end-to-end against a real `MongoDB` with always-on
+/// schema inference. The catalog query (`listIndexes`/`collStats`) runs on the server
+/// and the inferred settings applied for `DuckDB` + full refresh (the `_id` sort
+/// order; physical constraints are intentionally skipped for this engine/mode) are
 /// accepted by the accelerator — a correct row count proves none of those steps
 /// errored. (Precise value-level mapping is covered by unit tests.)
 #[cfg(feature = "duckdb")]
 #[tokio::test]
-async fn mongodb_extended_schema_inference_loads_and_queries() -> Result<(), anyhow::Error> {
+async fn mongodb_schema_inference_loads_and_queries() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,connector_mongodb=debug,info"));
     register_test_connectors().await;
 
@@ -473,8 +474,8 @@ async fn mongodb_extended_schema_inference_loads_and_queries() -> Result<(), any
             })
             .await?;
 
-            let app = AppBuilder::new("mongodb_extended_schema_inference")
-                .with_dataset(make_mongodb_extended_inference_dataset(
+            let app = AppBuilder::new("mongodb_schema_inference")
+                .with_dataset(make_mongodb_inference_dataset(
                     "inventory",
                     "inventory",
                     MONGODB_INFERENCE_PORT,
@@ -613,7 +614,7 @@ async fn mongodb_change_streams_apply_insert_update_delete() -> Result<(), anyho
         .await
 }
 
-/// `MongoDB` Streams (`refresh_mode: changes`) work with `schema_inference: extended`
+/// `MongoDB` Streams (`refresh_mode: changes`) work with always-on schema inference
 /// and no explicit `primary_key`/`on_conflict`: inference supplies `_id` as the
 /// primary key plus the matching upsert, which the change-stream path requires.
 #[cfg(feature = "duckdb")]
