@@ -159,6 +159,43 @@ def main() -> int:
     for t in referenced_tiers:
         if t not in tiers:
             config_errors.append(f"layers.toml references tier '{t}' not present in `order`.")
+    # `restricted_deps`: {dep_name: [allowed crate, ...]}. The dep KEY may be an
+    # external crate (a driver/format lib not in the workspace), but it must be a real
+    # dependency of SOME crate, and every ALLOWED crate must be a real member — either
+    # kind of typo would silently disable the rule (it would just never match),
+    # defeating the ratchet, so both are validated as config errors.
+    restricted = cfg.get("restricted_deps", {})
+    if not isinstance(restricted, dict):
+        config_errors.append("`restricted_deps` must be a table: dep = [allowed crates].")
+        restricted = {}
+    else:
+        # Every dependency name declared anywhere in the workspace (includes external
+        # crates like `clickhouse-rs`, which are not workspace members).
+        all_dep_names = {d["name"] for p in pkgs for d in p["dependencies"]}
+        for dep, allowed in restricted.items():
+            if dep not in all_dep_names:
+                config_errors.append(
+                    f"`restricted_deps` key '{dep}' is not a dependency of any workspace crate "
+                    "— typo or unused crate? As written the rule would silently never fire."
+                )
+            if not isinstance(allowed, list):
+                config_errors.append(f"`restricted_deps.{dep}` must be a list of crate names.")
+                continue
+            if not allowed:
+                config_errors.append(
+                    f"`restricted_deps.{dep}` has an empty allowed-crates list; list at least one "
+                    "crate (an empty list would forbid the dependency everywhere — likely a mistake)."
+                )
+            for c in allowed:
+                if not isinstance(c, str):
+                    config_errors.append(
+                        f"`restricted_deps.{dep}` must list crate-name strings, got {c!r}."
+                    )
+                    continue
+                if c not in names:
+                    config_errors.append(
+                        f"`restricted_deps.{dep}` lists unknown crate '{c}' — typo or renamed crate?"
+                    )
     if config_errors:
         print("layers.toml configuration error(s):\n", file=sys.stderr)
         for e in config_errors:
@@ -199,14 +236,29 @@ def main() -> int:
     violations = []
     for p in pkgs:
         src = p["name"]
+        st = tier_of[src]
         for d in p["dependencies"]:
+            # Only normal edges layer the shipped graph; dev + build deps may point
+            # anywhere (e.g. connector integration tests -> runtime).
             if (d.get("kind") or "normal") != "normal":
-                continue  # only normal edges layer the shipped graph; dev + build deps
-                # may point anywhere (e.g. connector integration tests -> runtime)
-            dep = d["name"]
-            if dep not in names or dep == src:
                 continue
-            st, dt = tier_of[src], tier_of[dep]
+            dep = d["name"]
+            if dep == src:
+                continue
+            # Restricted-dep ownership runs BEFORE the workspace-member filter: a
+            # restricted crate is usually an EXTERNAL driver (clickhouse-rs, ...), and
+            # the tier rule structurally can't catch it — a leaf driver sits at/below
+            # foundation, so a dep on it is a legal downward edge from anywhere.
+            if dep in restricted and src not in restricted[dep]:
+                allowed = ", ".join(restricted[dep])
+                violations.append(
+                    (src, st, dep, tier_of.get(dep, "external"),
+                     f"restricted dep — only [{allowed}] may depend on {dep}")
+                )
+            # Tier/forbid rules apply only to workspace-member deps.
+            if dep not in names:
+                continue
+            dt = tier_of[dep]
             if rank[dt] > rank[st]:
                 violations.append((src, st, dep, dt, "depends on a HIGHER tier"))
             elif (st, dt) in forbidden:

@@ -760,20 +760,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arrow_sql_gen"
-version = "2.2.0-unstable"
-dependencies = [
- "arrow",
- "bigdecimal",
- "chrono",
- "chrono-tz 0.8.6",
- "clickhouse-rs",
- "datafusion-table-providers",
- "snafu",
- "uuid 1.23.2",
-]
-
-[[package]]
 name = "arrow_tools"
 version = "2.2.0-unstable"
 dependencies = [
@@ -4159,12 +4145,17 @@ dependencies = [
 name = "connector-clickhouse"
 version = "2.2.0-unstable"
 dependencies = [
+ "arrow",
+ "async-stream",
  "async-trait",
+ "bigdecimal",
+ "chrono",
+ "chrono-tz 0.8.6",
  "clickhouse-rs",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
- "db_connection_pool",
+ "futures",
  "linkme",
  "ns_lookup",
  "paste",
@@ -4172,6 +4163,7 @@ dependencies = [
  "secrecy",
  "snafu",
  "url",
+ "uuid 1.23.2",
 ]
 
 [[package]]
@@ -5728,7 +5720,6 @@ dependencies = [
  "bytes",
  "charset",
  "chrono",
- "clickhouse-rs",
  "criterion 0.7.0",
  "ctor 0.8.0",
  "dashmap",
@@ -6729,10 +6720,8 @@ version = "2.2.0-unstable"
 dependencies = [
  "arrow",
  "arrow-odbc",
- "arrow_sql_gen",
  "async-stream",
  "async-trait",
- "clickhouse-rs",
  "datafusion",
  "datafusion-table-providers",
  "dyn-clone",
