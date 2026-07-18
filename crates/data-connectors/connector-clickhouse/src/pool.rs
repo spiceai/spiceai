@@ -95,11 +95,9 @@ impl DbConnectionPool<ClientHandle, &'static dyn Sync> for ClickhouseConnectionP
                                 source: connection_error.into(),
                             })
                         }
-                        clickhouse_rs::ConnectionError::TlsError(_) => {
-                            Err(Error::ConnectionTls {
-                                source: connection_error,
-                            })
-                        }
+                        clickhouse_rs::ConnectionError::TlsError(_) => Err(Error::ConnectionTls {
+                            source: connection_error,
+                        }),
                     }
                 }
                 clickhouse_rs::errors::Error::Server(server_error) => {
