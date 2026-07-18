@@ -6651,7 +6651,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=12321c06d7919b04acf6ce05b969536b2e7ccbbb#12321c06d7919b04acf6ce05b969536b2e7ccbbb"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=ccdc1aaae359b9b4066fd4fbad19638b9176d5fa#ccdc1aaae359b9b4066fd4fbad19638b9176d5fa"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -16834,14 +16834,25 @@ version = "2.2.0-unstable"
 name = "runtime-parameters"
 version = "2.2.0-unstable"
 dependencies = [
+ "async-trait",
  "itertools 0.14.0",
  "runtime-parameter-spec",
+ "runtime-parameters-derive",
  "runtime-secrets",
  "secrecy",
  "snafu",
  "tokio",
  "tracing",
  "util",
+]
+
+[[package]]
+name = "runtime-parameters-derive"
+version = "2.2.0-unstable"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
