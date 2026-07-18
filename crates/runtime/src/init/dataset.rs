@@ -571,29 +571,31 @@ impl Runtime {
         }
     }
 
-    /// Apply extended schema inference to a freshly-resolved dataset.
+    /// Apply schema inference to a freshly-resolved dataset.
     ///
-    /// When the dataset opts into `schema_inference: extended` and the source
-    /// connector emitted inferred-schema metadata, this fills any acceleration
-    /// settings the user left unset (primary key, indexes, sort columns) and
-    /// returns a rebuilt `Dataset`. Applying it here — before the `FederatedTable`
-    /// and registration are created — ensures every refresh mode, including CDC
-    /// (`refresh_mode: changes`), observes the inferred values. Returns `ds`
-    /// unchanged when inference is disabled, the dataset is not accelerated, or no
-    /// usable metadata was emitted.
+    /// When the source connector emitted inferred-schema metadata, this fills any
+    /// acceleration settings the user left unset (primary key, indexes, sort
+    /// columns) and returns a rebuilt `Dataset`. Applying it here — before the
+    /// `FederatedTable` and registration are created — ensures every refresh mode,
+    /// including CDC (`refresh_mode: changes`), observes the inferred values.
+    /// `resolved_refresh_mode` (the connector-resolved mode, not the raw Spicepod
+    /// value) gates which inferred settings are safe to apply — see
+    /// `apply_inferred_schema`. Schema inference is always attempted; this returns
+    /// `ds` unchanged when the dataset is not accelerated or the source emitted no
+    /// usable metadata.
     fn apply_inferred_acceleration(
         ds: Arc<Dataset>,
         provider: &Arc<dyn datafusion::datasource::TableProvider>,
+        resolved_refresh_mode: RefreshMode,
     ) -> Arc<Dataset> {
         use crate::component::dataset::schema_inference::apply_inferred_schema;
         use data_components::inferred_schema::InferredSchema;
 
-        // Skip when extended inference is off, or the dataset is not accelerated —
-        // including an `acceleration` block that is present but `enabled: false`,
-        // which the rest of the runtime treats as non-accelerated.
-        if !ds.schema_inference.is_extended()
-            || !ds.acceleration.as_ref().is_some_and(|a| a.enabled)
-        {
+        // Skip when the dataset is not accelerated — including an `acceleration`
+        // block that is present but `enabled: false`, which the rest of the runtime
+        // treats as non-accelerated. Schema inference is always attempted, so a
+        // source that exposed no inferred metadata simply yields an empty set below.
+        if !ds.acceleration.as_ref().is_some_and(|a| a.enabled) {
             return ds;
         }
 
@@ -639,7 +641,7 @@ impl Runtime {
                     tracing::debug!(
                         dataset = %ds.name,
                         %error,
-                        "Skipping extended schema inference; could not parse refresh_sql to validate inferred columns"
+                        "Skipping schema inference; could not parse refresh_sql to validate inferred columns"
                     );
                     return ds;
                 }
@@ -649,7 +651,13 @@ impl Runtime {
 
         let mut new_ds = (*ds).clone();
         if let Some(acceleration) = new_ds.acceleration.as_mut() {
-            apply_inferred_schema(acceleration, &inferred, &effective_schema, ds.name.table());
+            apply_inferred_schema(
+                acceleration,
+                &inferred,
+                &effective_schema,
+                ds.name.table(),
+                resolved_refresh_mode,
+            );
         }
         Arc::new(new_ds)
     }
@@ -663,7 +671,7 @@ impl Runtime {
         load_semaphore: Option<Arc<Semaphore>>,
     ) -> Result<()> {
         // Owned (not borrowed from `ds`) so the dataset can be rebuilt below by
-        // extended schema inference without holding a borrow across the reassignment.
+        // schema inference without holding a borrow across the reassignment.
         let source = ds.source().to_string();
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
         if let Some(acceleration) = &ds.acceleration
@@ -706,10 +714,12 @@ impl Runtime {
         let schema_start = Instant::now();
         let federated_table = match data_connector.read_provider(&ds).await {
             Ok(provider) => {
-                // Gap-fill acceleration settings from extended schema inference (no-op
-                // unless `schema_inference: extended` and the connector emitted metadata)
-                // before the dataset flows into registration and any changes stream.
-                ds = Self::apply_inferred_acceleration(ds, &provider);
+                // Gap-fill acceleration settings from schema inference (a no-op when
+                // the connector emitted no inferred metadata) before the dataset
+                // flows into registration and any changes stream.
+                let resolved_refresh_mode = data_connector
+                    .resolve_refresh_mode(ds.acceleration.as_ref().and_then(|a| a.refresh_mode));
+                ds = Self::apply_inferred_acceleration(ds, &provider, resolved_refresh_mode);
                 FederatedTable::new(
                     Arc::clone(&ds),
                     provider,
