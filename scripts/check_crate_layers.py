@@ -160,14 +160,24 @@ def main() -> int:
         if t not in tiers:
             config_errors.append(f"layers.toml references tier '{t}' not present in `order`.")
     # `restricted_deps`: {dep_name: [allowed crate, ...]}. The dep KEY may be an
-    # external crate (a driver/format lib not in the workspace), but every ALLOWED
-    # crate must be a real member — a typo would silently disable the rule.
+    # external crate (a driver/format lib not in the workspace), but it must be a real
+    # dependency of SOME crate, and every ALLOWED crate must be a real member — either
+    # kind of typo would silently disable the rule (it would just never match),
+    # defeating the ratchet, so both are validated as config errors.
     restricted = cfg.get("restricted_deps", {})
     if not isinstance(restricted, dict):
         config_errors.append("`restricted_deps` must be a table: dep = [allowed crates].")
         restricted = {}
     else:
+        # Every dependency name declared anywhere in the workspace (includes external
+        # crates like `clickhouse-rs`, which are not workspace members).
+        all_dep_names = {d["name"] for p in pkgs for d in p["dependencies"]}
         for dep, allowed in restricted.items():
+            if dep not in all_dep_names:
+                config_errors.append(
+                    f"`restricted_deps` key '{dep}' is not a dependency of any workspace crate "
+                    "— typo or unused crate? As written the rule would silently never fire."
+                )
             if not isinstance(allowed, list):
                 config_errors.append(f"`restricted_deps.{dep}` must be a list of crate names.")
                 continue
