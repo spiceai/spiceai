@@ -182,6 +182,11 @@ def main() -> int:
                 config_errors.append(f"`restricted_deps.{dep}` must be a list of crate names.")
                 continue
             for c in allowed:
+                if not isinstance(c, str):
+                    config_errors.append(
+                        f"`restricted_deps.{dep}` must list crate-name strings, got {c!r}."
+                    )
+                    continue
                 if c not in names:
                     config_errors.append(
                         f"`restricted_deps.{dep}` lists unknown crate '{c}' — typo or renamed crate?"
