@@ -44,9 +44,33 @@ limitations under the License.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, Instant};
+
+/// Poll-boundary state for a bounded-sort run's input tap (`RunInputStream`),
+/// shared with the watchdog. Distinguishes, when `input_rows` is frozen, WHY:
+/// - `inflight > 0` ⇒ a `poll_next` call is stuck INSIDE (synchronous block —
+///   the `ChunkStream` mutex or the sync `execute_arrow` decode).
+/// - `inflight == 0` && `last_return == PENDING` ⇒ the SortExec polled, got
+///   `Pending`, and is parked waiting for a wake that never comes (scan
+///   lost-wakeup / scan not producing).
+/// - `inflight == 0` && `last_return == READY/EOF` && `entered` frozen ⇒ the
+///   SortExec is NOT polling its input (parked downstream / not requesting).
+#[derive(Default)]
+pub(crate) struct InputPollProbe {
+    /// `poll_next` calls started (a row was requested by the SortExec).
+    pub entered: AtomicU64,
+    /// `entered - returned`: > 0 means a poll is stuck inside (synchronous).
+    pub inflight: AtomicU64,
+    /// Outcome of the most recent completed poll: 0=none, 1=pending, 2=batch, 3=eof.
+    pub last_return: AtomicU8,
+}
+
+/// `last_return` codes for [`InputPollProbe`].
+pub(crate) const POLL_RET_PENDING: u8 = 1;
+pub(crate) const POLL_RET_BATCH: u8 = 2;
+pub(crate) const POLL_RET_EOF: u8 = 3;
 
 use datafusion_execution::memory_pool::MemoryLimit;
 use parking_lot::Mutex;
@@ -108,6 +132,10 @@ struct OpEntry {
     /// advancing while `progress` frozen ⇒ the sort/sink is parked downstream.
     input_progress: Arc<AtomicU64>,
     last_input_progress: u64,
+    /// Poll-boundary state for the sort's input tap; distinguishes SortExec
+    /// not-polling vs polled-Pending vs stuck-inside-poll when `input` is frozen.
+    input_poll: Arc<InputPollProbe>,
+    last_poll_entered: u64,
     /// Tokio runtime the op was registered on (captured at `begin`), so the
     /// watchdog can request an async task dump of the exact runtime the parked
     /// scan runs on. `None` if `begin` ran outside a runtime.
@@ -129,6 +157,12 @@ struct StuckOp {
     progress_delta: u64,
     input_progress: u64,
     input_delta: u64,
+    /// Sort input-tap poll state (see [`InputPollProbe`]): distinguishes the
+    /// three frozen-input causes.
+    poll_entered: u64,
+    poll_entered_delta: u64,
+    poll_inflight: u64,
+    last_return: u8,
     /// When set, the watchdog emits a one-time tokio task dump for this op after
     /// logging the stall WARN (only when genuinely parked: no input/output
     /// progress this tick).
@@ -143,6 +177,7 @@ pub(crate) struct StallOp {
     id: u64,
     progress: Arc<AtomicU64>,
     input_progress: Arc<AtomicU64>,
+    input_poll: Arc<InputPollProbe>,
 }
 
 impl StallOp {
@@ -154,6 +189,7 @@ impl StallOp {
         let now = Instant::now();
         let progress = Arc::new(AtomicU64::new(0));
         let input_progress = Arc::new(AtomicU64::new(0));
+        let input_poll = Arc::new(InputPollProbe::default());
         REGISTRY.lock().insert(
             id,
             OpEntry {
@@ -166,6 +202,8 @@ impl StallOp {
                 last_progress: 0,
                 input_progress: Arc::clone(&input_progress),
                 last_input_progress: 0,
+                input_poll: Arc::clone(&input_poll),
+                last_poll_entered: 0,
                 runtime: tokio::runtime::Handle::try_current().ok(),
                 dumped: false,
             },
@@ -174,6 +212,7 @@ impl StallOp {
             id,
             progress,
             input_progress,
+            input_poll,
         }
     }
 
@@ -197,6 +236,14 @@ impl StallOp {
     /// upstream (scan) vs downstream (sort/sink).
     pub(crate) fn input_progress_counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.input_progress)
+    }
+
+    /// Shared poll-boundary probe for the sort's input tap. The input tap
+    /// increments `entered`/`inflight` and records `last_return`, letting the
+    /// watchdog separate "SortExec not polling" vs "polled → Pending → waiting"
+    /// vs "stuck inside the poll" when `input_progress` is frozen.
+    pub(crate) fn input_poll_probe(&self) -> Arc<InputPollProbe> {
+        Arc::clone(&self.input_poll)
     }
 }
 
@@ -278,6 +325,11 @@ fn watchdog_loop(interval: Duration, warn_after: Duration) {
                     let input_progress = entry.input_progress.load(Ordering::Relaxed);
                     let input_delta = input_progress.saturating_sub(entry.last_input_progress);
                     entry.last_input_progress = input_progress;
+                    let poll_entered = entry.input_poll.entered.load(Ordering::Relaxed);
+                    let poll_entered_delta = poll_entered.saturating_sub(entry.last_poll_entered);
+                    entry.last_poll_entered = poll_entered;
+                    let poll_inflight = entry.input_poll.inflight.load(Ordering::Relaxed);
+                    let last_return = entry.input_poll.last_return.load(Ordering::Relaxed);
                     // Dump once, only when genuinely parked (no forward progress
                     // on either side this tick) — that's the deadlock signature and
                     // the case whose await backtraces we need.
@@ -296,6 +348,10 @@ fn watchdog_loop(interval: Duration, warn_after: Duration) {
                         progress_delta: delta,
                         input_progress,
                         input_delta,
+                        poll_entered,
+                        poll_entered_delta,
+                        poll_inflight,
+                        last_return,
                         runtime: entry.runtime.clone(),
                         should_dump,
                     })
@@ -318,6 +374,17 @@ fn watchdog_loop(interval: Duration, warn_after: Duration) {
         let (compaction_pool_used, compaction_pool_total) = compaction_pool_usage();
 
         for op in stuck {
+            // Interpret the sort-input poll boundary: when input_rows is frozen,
+            // this separates the three causes the row counter alone can't.
+            let sort_input_diag = if op.poll_inflight > 0 {
+                "STUCK-INSIDE-POLL: a RunInputStream::poll_next is blocked synchronously (ChunkStream mutex or sync execute_arrow decode)"
+            } else if op.last_return == POLL_RET_PENDING && op.input_delta == 0 {
+                "POLLED-THEN-PENDING: SortExec polled, scan returned Pending, parked waiting for a wake (scan lost-wakeup / not producing)"
+            } else if op.input_delta == 0 && op.poll_entered_delta == 0 {
+                "SORTEXEC-NOT-POLLING: input not being requested (SortExec parked downstream / not pulling)"
+            } else {
+                "advancing-or-mixed"
+            };
             tracing::warn!(
                 target: "cayenne::stall",
                 table = %op.table,
@@ -329,13 +396,18 @@ fn watchdog_loop(interval: Duration, warn_after: Duration) {
                 progress_delta_tick = op.progress_delta,
                 input_rows = op.input_progress,
                 input_delta_tick = op.input_delta,
+                input_poll_entered = op.poll_entered,
+                input_poll_entered_delta = op.poll_entered_delta,
+                input_poll_inflight = op.poll_inflight,
+                input_last_return = op.last_return,
+                sort_input_diag,
                 mem_tier_used = ?mem_used,
                 mem_tier_total = ?mem_total,
                 encode_permits_available = ?encode_avail,
                 encode_permits_total = ?encode_total,
                 compaction_pool_used = ?compaction_pool_used,
                 compaction_pool_total = ?compaction_pool_total,
-                "Cayenne operation has not advanced its phase — possible stall/deadlock (write_lock likely held; ingest for this table is blocked behind it). input_delta_tick=0 ⇒ scan/upstream parked (no rows into the sort); input advancing while progress_delta_tick=0 ⇒ sort/sink parked downstream; compaction_pool_used near total ⇒ spilling sort"
+                "Cayenne operation has not advanced its phase — possible stall/deadlock (write_lock likely held; ingest for this table is blocked behind it). See sort_input_diag for the frozen-input cause. input_delta_tick=0 ⇒ scan/upstream parked; input advancing while progress_delta_tick=0 ⇒ sort/sink parked downstream; compaction_pool_used near total ⇒ spilling sort"
             );
             if op.should_dump {
                 if let Some(handle) = op.runtime.as_ref() {

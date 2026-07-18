@@ -42,6 +42,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
+use super::stall_watchdog::{InputPollProbe, POLL_RET_BATCH, POLL_RET_EOF, POLL_RET_PENDING};
+
 /// A streaming execution plan that forwards batches without buffering.
 ///
 /// This is used during chunk writes to efficiently stream data to the Vortex writer
@@ -339,6 +341,10 @@ struct RunInputStream {
     /// frozen ⇒ the scan feeding this run is parked) vs sort-internal (input
     /// advancing/complete but no sorted output). Diagnostics only.
     input_rows_total: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// Poll-boundary probe (entered/inflight/last_return) surfaced to the stall
+    /// watchdog to separate SortExec-not-polling vs polled-Pending vs
+    /// stuck-inside-poll when `input_rows_total` is frozen. Diagnostics only.
+    input_poll: Option<Arc<InputPollProbe>>,
 }
 
 impl Stream for RunInputStream {
@@ -346,7 +352,28 @@ impl Stream for RunInputStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        match Pin::new(&mut this.chunk).poll_next(cx) {
+        // Poll-boundary probe: mark a poll in flight BEFORE delegating to the
+        // inner (scan) stream. If the inner poll blocks synchronously (stuck in
+        // the ChunkStream mutex or the sync execute_arrow decode), `inflight`
+        // stays > 0 — the "stuck inside the poll" signal. On return we record the
+        // outcome so the watchdog can tell Pending-then-parked from not-polling.
+        if let Some(p) = this.input_poll.as_ref() {
+            p.entered.fetch_add(1, Ordering::Relaxed);
+            p.inflight.fetch_add(1, Ordering::Relaxed);
+        }
+        let polled = Pin::new(&mut this.chunk).poll_next(cx);
+        if let Some(p) = this.input_poll.as_ref() {
+            p.inflight.fetch_sub(1, Ordering::Relaxed);
+            p.last_return.store(
+                match &polled {
+                    Poll::Pending => POLL_RET_PENDING,
+                    Poll::Ready(None) => POLL_RET_EOF,
+                    Poll::Ready(Some(_)) => POLL_RET_BATCH,
+                },
+                Ordering::Relaxed,
+            );
+        }
+        match polled {
             Poll::Ready(Some(Ok(batch))) => {
                 this.counters
                     .rows
@@ -436,6 +463,7 @@ pub(crate) fn bounded_sort_stream(
     task_ctx: &Arc<TaskContext>,
     run_size_bytes: usize,
     input_rows_total: Option<Arc<std::sync::atomic::AtomicU64>>,
+    input_poll: Option<Arc<InputPollProbe>>,
 ) -> DFStream {
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 
@@ -461,6 +489,7 @@ pub(crate) fn bounded_sort_stream(
         let task_ctx = Arc::clone(&task_ctx);
         let table_name = Arc::clone(&table_name);
         let input_rows_total = input_rows_total.clone();
+        let input_poll = input_poll.clone();
         async move {
             loop {
                 if let Some(run) = state.current.as_mut() {
@@ -548,6 +577,7 @@ pub(crate) fn bounded_sort_stream(
                     started: Instant::now(),
                     ended: false,
                     input_rows_total: input_rows_total.clone(),
+                    input_poll: input_poll.clone(),
                 });
                 match util::stream_utils::sort_stream_with_plan(input, &sort_columns, &task_ctx) {
                     Ok((sorted, plan)) => {
@@ -807,6 +837,7 @@ mod tests {
             &test_task_ctx(),
             batch_bytes * 2,
             None,
+            None,
         );
         let got = drain_ids(sorted).await;
         let expected: Vec<i64> = (8..16).chain(0..8).collect();
@@ -840,6 +871,7 @@ mod tests {
             &test_task_ctx(),
             usize::MAX,
             None,
+            None,
         );
         let mut rows = 0usize;
         let mut nulls = 0usize;
@@ -865,6 +897,7 @@ mod tests {
             &test_task_ctx(),
             1024,
             None,
+            None,
         );
         let got = drain_ids(sorted).await;
         assert!(got.is_empty());
@@ -879,7 +912,8 @@ mod tests {
             id_batch_of(&schema, &[2, 0, 1]),
         ];
         let input = source_stream(&schema, batches);
-        let sorted = bounded_sort_stream("test_table", input, Vec::new(), &test_task_ctx(), 1, None);
+        let sorted =
+            bounded_sort_stream("test_table", input, Vec::new(), &test_task_ctx(), 1, None, None);
         let got = drain_ids(sorted).await;
         assert_eq!(got, vec![5, 3, 4, 2, 0, 1], "passthrough preserves order");
     }
@@ -906,6 +940,7 @@ mod tests {
             vec!["id".to_string()],
             &test_task_ctx(),
             usize::MAX,
+            None,
             None,
         );
         let mut saw_error = false;
@@ -982,6 +1017,7 @@ mod tests {
             &ctx,
             run_size,
             None,
+            None,
         );
         let s2 = bounded_sort_stream(
             "t2",
@@ -989,6 +1025,7 @@ mod tests {
             vec!["id".to_string()],
             &ctx,
             run_size,
+            None,
             None,
         );
 
@@ -1098,6 +1135,7 @@ mod tests {
                 &ctx,
                 run_size,
                 None,
+                None,
             )
         };
         let (s1, s2, s3) = (mk("customer"), mk("order_line"), mk("stock"));
@@ -1115,6 +1153,68 @@ mod tests {
         assert!(
             res.is_ok(),
             "GreedyMemoryPool contention unexpectedly hung; it should surface ResourcesExhausted, not deadlock"
+        );
+    }
+
+    /// Reproduction attempt for the DEFINITIVE freeze signature (frozen instrumented
+    /// CI run 29627694719): with every vortex read completing, the scan `DFStream`
+    /// returns `Pending` forever at a `bounded_sort` run≥1 boundary, starving the
+    /// run's `SortExec`. Leading suspect: `RepartitionExec` backpressure across the
+    /// inter-run polling pause (run N's `SortExec` sorts/emits while run N+1 isn't
+    /// pulling, so the scan plan's bounded channels fill and its producer tasks
+    /// block). This drives `bounded_sort` over a scan-shaped plan (memory source →
+    /// RoundRobin `RepartitionExec` → `CoalescePartitionsExec`) with a small run
+    /// size so there are MANY run boundaries. A hang (timeout) reproduces the freeze.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bounded_sort_over_repartitioned_scan_no_run_boundary_deadlock() {
+        use std::time::Duration;
+
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::datasource::source::DataSourceExec;
+        use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+        use datafusion::physical_plan::repartition::RepartitionExec;
+        use datafusion::physical_plan::{ExecutionPlan, execute_stream};
+
+        let schema = id_schema();
+        let batch_rows = 8192i64;
+        let n_batches = 400usize;
+        let batch_bytes = id_batch(&schema, 0, batch_rows).get_array_memory_size();
+        let batches: Vec<RecordBatch> = (0..n_batches)
+            .map(|i| {
+                #[expect(clippy::cast_possible_wrap, reason = "test indices are tiny")]
+                let start = i as i64 * batch_rows;
+                id_batch(&schema, start, batch_rows)
+            })
+            .collect();
+
+        let ctx = test_task_ctx();
+        // Scan-shaped plan: memory source → RoundRobin repartition → coalesce to 1.
+        let src: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(
+            MemorySourceConfig::try_new(&[batches], Arc::clone(&schema), None)
+                .expect("memory source"),
+        )));
+        let repart: Arc<dyn ExecutionPlan> = Arc::new(
+            RepartitionExec::try_new(src, Partitioning::RoundRobinBatch(4)).expect("repartition"),
+        );
+        let coalesced: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(repart));
+        let stream = execute_stream(coalesced, Arc::clone(&ctx)).expect("execute_stream");
+
+        // Small run size ⇒ many runs ⇒ many inter-run polling pauses of the scan stream.
+        let run_size = batch_bytes.saturating_mul(4);
+        let sorted =
+            bounded_sort_stream("t", stream, vec!["id".to_string()], &ctx, run_size, None, None);
+
+        let res = tokio::time::timeout(Duration::from_secs(30), drain_ids(sorted)).await;
+        eprintln!("repartitioned-scan repro: n_batches={n_batches} run_size={run_size} ok={}", res.is_ok());
+        assert!(
+            res.is_ok(),
+            "bounded_sort over a repartitioned scan hung at a run boundary — reproduces the scan-DFStream Pending-at-run-boundary freeze"
+        );
+        let out = res.expect("no timeout");
+        assert_eq!(
+            out.len(),
+            n_batches * batch_rows as usize,
+            "row count preserved across runs"
         );
     }
 }

@@ -14132,6 +14132,7 @@ impl CayenneTableProvider {
         clustering_indices: Vec<usize>,
         task_ctx: &Arc<datafusion_execution::TaskContext>,
         input_rows_total: Option<Arc<std::sync::atomic::AtomicU64>>,
+        input_poll: Option<Arc<super::stall_watchdog::InputPollProbe>>,
     ) -> SendableRecordBatchStream {
         if clustering_indices.is_empty() {
             return stream;
@@ -14154,6 +14155,7 @@ impl CayenneTableProvider {
                 .vortex_config
                 .cold_clustering_run_size_bytes(),
             input_rows_total,
+            input_poll,
         );
         let orig = Arc::clone(&original_schema);
         let stripped = sorted
@@ -14853,8 +14855,13 @@ impl CayenneTableProvider {
         stall.phase("zorder-sort-plan");
         let clustering = self.resolve_cold_clustering_indices();
         let task_ctx = ctx.task_ctx();
-        let stream =
-            self.zorder_sort_stream(stream, clustering, &task_ctx, Some(stall.input_progress_counter()));
+        let stream = self.zorder_sort_stream(
+            stream,
+            clustering,
+            &task_ctx,
+            Some(stall.input_progress_counter()),
+            Some(stall.input_poll_probe()),
+        );
 
         // Count rows as the cold sink pulls them from the sorted stream. The
         // watchdog reports this per tick: frozen at 0 => scan/sort produced
