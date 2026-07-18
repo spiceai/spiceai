@@ -261,6 +261,30 @@ Because the manifest encodes *what is true today*, the check is a **ratchet**: i
 cannot force an improvement, but it prevents backsliding, and it tightens as crates
 move down.
 
+### Restricted dependencies (`restricted_deps`)
+
+The tier rule only catches **upward** edges. A driver/format crate (`clickhouse-rs`,
+`tokio-postgres`, `aws-sdk-dynamodb`, …) sits at or below `foundation`, so a
+normal-dependency on it from *anywhere* is a legal **downward** edge — the tier check
+structurally cannot enforce "only `connector-clickhouse` may depend on `clickhouse-rs`".
+The optional `[restricted_deps]` table in `layers.toml` closes that gap with an
+orthogonal, ownership-based rule:
+
+```toml
+[restricted_deps]
+clickhouse-rs = ["connector-clickhouse"]   # only this crate may normal-dep clickhouse-rs
+```
+
+A normal-dependency edge to a restricted crate from any crate **not** in its list is a
+violation (dev/build deps exempt, like the tier rule). The key may be an external crate;
+every listed crate must be a real workspace member (a typo fails as a config error rather
+than silently disabling the rule). This is the machine-checkable form of "a feature is a
+crate" + "connector-specific code lives in its extension": it makes each source
+extraction a **ratchet** — add one entry per source once its driver is fully evacuated
+into the corresponding connector (adding an entry before the evacuation is complete
+fails, which is the point). The entry count tracks migration progress alongside the
+shrinking `runtime`/`data_components` feature counts.
+
 ### New-crate checklist
 
 Every new crate must:

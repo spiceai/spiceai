@@ -118,8 +118,6 @@ pub type FieldMetadata = HashMap<String, HashMap<String, String>>;
 #[cfg(feature = "adbc")]
 pub mod adbc_helpers;
 pub mod arrow;
-#[cfg(feature = "clickhouse")]
-pub mod clickhouse;
 #[cfg(feature = "cosmosdb")]
 pub mod cosmosdb;
 #[cfg(feature = "databricks")]
