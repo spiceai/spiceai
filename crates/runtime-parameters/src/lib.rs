@@ -504,6 +504,9 @@ impl<'a> ExposedParamLookup<'a> {
 
 pub use runtime_parameter_spec::{ParameterSpec, ParameterType};
 
+pub mod typed;
+pub use runtime_parameters_derive::TypedParams;
+
 /// Suggest the closest valid parameter name for a user-typo'd key.
 ///
 /// Compares against the user-facing form of every non-deprecated spec

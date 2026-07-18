@@ -577,9 +577,20 @@ cmd_signoff() {
   revision=$(current_revision "$force")
   $force || ensure_clean_and_pushed "$revision"
   sha=$(revision_sha "$revision") || fail "could not resolve ${revision}"
-  # Remote workflow passes the human who dispatched the run; fall back to the
-  # authenticated gh user / local git name.
-  user="${SIGNOFF_ACTOR:-$(gh api user --jq .login 2>/dev/null || local_user_name || echo "unknown")}"
+  # Remote workflow passes the human who dispatched the run (SIGNOFF_ACTOR).
+  # Otherwise: `gh api user` needs a user-scoped token; under a CI GITHUB_TOKEN
+  # it 403s and can echo the error body to stdout, so accept its result only if
+  # it looks like a GitHub login. Then fall back to the CI actor (set in
+  # Actions) or the VCS-configured name (which may contain spaces — fine for a
+  # description).
+  user="${SIGNOFF_ACTOR:-}"
+  if [[ -z "$user" ]]; then
+    user=$(gh api user --jq .login 2>/dev/null || true)
+    if [[ ! "$user" =~ ^[A-Za-z0-9-]{1,39}$ ]]; then
+      user="${GITHUB_ACTOR:-$(local_user_name 2>/dev/null || true)}"
+    fi
+  fi
+  [[ -n "$user" ]] || user="unknown"
   repo=$(repo_slug)
   via=""
   is_remote_run && via=" via remote"

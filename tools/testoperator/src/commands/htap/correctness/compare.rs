@@ -52,6 +52,13 @@ pub struct NumericDelta {
     /// Column / row / values of the worst *offending* cell, for the failure
     /// message. `None` when nothing exceeded tolerance.
     pub worst: Option<String>,
+    /// Row index (0-based) of the worst offending cell, so callers can print
+    /// the surrounding rows for context. `None` when nothing exceeded tolerance
+    /// (or the divergence was a whole-column cast failure with no single row).
+    pub worst_row: Option<usize>,
+    /// Column index of the worst offending cell, matching `worst_row`. `None`
+    /// under the same conditions.
+    pub worst_col: Option<usize>,
 }
 
 /// Whether a column's values are compared numerically by [`numeric_delta`]
@@ -253,6 +260,8 @@ pub fn numeric_delta(
                         "{col_name}[row {r}]: expected {ev}, actual {av} (rel {:.6}%)",
                         rel * 100.0
                     ));
+                    out.worst_row = Some(r);
+                    out.worst_col = Some(c);
                 }
             }
         }
@@ -302,6 +311,10 @@ mod tests {
         let d = numeric_delta(&e, &a, &float_columns(&a));
         assert!(d.exceeded, "any integer diff must exceed (exact tolerance)");
         assert!(d.worst.is_some());
+        // The offending cell's coordinates are surfaced so the gate can print
+        // the surrounding rows for context.
+        assert_eq!(d.worst_row, Some(0));
+        assert_eq!(d.worst_col, Some(0));
     }
 
     #[test]

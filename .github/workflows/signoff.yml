@@ -43,8 +43,12 @@ jobs:
     permissions:
       contents: read
       statuses: write
-      # Needed so scripts/signoff can list/re-run the Attestation job on the PR.
+      # scripts/signoff re-runs the PR's completed pr.yml run so the
+      # 'Attestation' check re-evaluates the sign-off status it just posted;
+      # the "re-run a workflow" API needs actions: write. Without it the
+      # refresh 403s and Attestation stays stuck on its pre-sign-off failure.
       actions: write
+      # Needed so scripts/signoff can find the PR and its Attestation run.
       pull-requests: read
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
