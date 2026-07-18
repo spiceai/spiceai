@@ -40,6 +40,8 @@ postgres_connection_params: &postgres_params
   pg_sslmode: disable
 
 runtime:
+  query:
+    memory_limit: 24GiB
   flight:
     ipc_compression: lz4_frame
   caching:
@@ -92,6 +94,8 @@ datasets:
         cayenne_datalake_s3_secret: ${secrets:S3_SECRET}
         cayenne_datalake_s3_allow_http: 'true'
 
+        # Optional (expert mode)
+        # cayenne_datalake_warm_max_files: '5'
         cayenne_datalake_warm_max_bytes: '4294967296' # 4 GiB warm->cold promotion trigger
         cayenne_datalake_target_file_size_mb: '750'
         cayenne_datalake_promotion_interval_ms: '30000'
