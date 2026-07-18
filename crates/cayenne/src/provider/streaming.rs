@@ -224,14 +224,28 @@ impl ChunkedSource {
     /// this one stopped — provided chunks are consumed sequentially (CONTRACT).
     pub(crate) fn next_chunk(self: &Arc<Self>, cap: ChunkCap) -> ChunkStream {
         let was_active = self.chunk_active.swap(true, Ordering::AcqRel);
+        // Dev/test: fail loud (panic) so violations are caught in CI.
         debug_assert!(
             !was_active,
             "ChunkedSource contract violation: minted a new chunk while the previous chunk is still live — chunks must be consumed sequentially"
         );
+        // Release: a `debug_assert` is compiled out, so without this a violation
+        // would degrade to a concurrent chunk racing the inner stream's single
+        // stored waker — the losing task parks forever (a SILENT hang, exactly the
+        // cold-promotion freeze signature). Instead, poison the offending chunk so
+        // it yields a typed error on first poll: the promotion aborts loudly and
+        // retries next tick rather than hanging with `write_lock` held.
+        if was_active {
+            tracing::error!(
+                target: "cayenne::compaction",
+                "ChunkedSource contract violation: minted a chunk while another is still live — poisoning it (yields an error, not a silent hang). Chunks MUST be consumed sequentially."
+            );
+        }
         ChunkStream {
             source: Arc::clone(self),
             consumed: 0,
             cap,
+            poisoned: was_active,
         }
     }
 }
@@ -241,11 +255,20 @@ pub(crate) struct ChunkStream {
     source: Arc<ChunkedSource>,
     consumed: usize,
     cap: ChunkCap,
+    /// Set when this chunk was minted while another was still live (a CONTRACT
+    /// violation). It yields a typed error on first poll instead of racing the
+    /// shared inner-stream waker and hanging. It also never owned `chunk_active`,
+    /// so its `Drop` must not clear that flag (which the live chunk still holds).
+    poisoned: bool,
 }
 
 impl Drop for ChunkStream {
     fn drop(&mut self) {
-        self.source.chunk_active.store(false, Ordering::Release);
+        // A poisoned chunk never legitimately held the active flag — leave it so
+        // the still-live chunk keeps ownership.
+        if !self.poisoned {
+            self.source.chunk_active.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -254,6 +277,14 @@ impl Stream for ChunkStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        if this.poisoned {
+            // Contract violation (concurrent chunk) — abort instead of hanging.
+            return Poll::Ready(Some(Err(datafusion_common::DataFusionError::Execution(
+                "ChunkedSource contract violation: a chunk was minted before the previous one \
+                 was drained; aborting to avoid a silent hang (chunks must be consumed sequentially)"
+                    .to_string(),
+            ))));
+        }
         if this.consumed >= this.cap.limit() {
             // Budget reached — end without pulling, so the next chunk resumes here.
             return Poll::Ready(None);
@@ -988,6 +1019,102 @@ mod tests {
         assert!(
             res.is_ok(),
             "concurrent multi-run spilling bounded sort timed out — reproduces the cold-promotion deadlock"
+        );
+    }
+
+    /// Characterizes what pure sort-side compaction-pool contention does — and
+    /// crucially what it does NOT do. The CI cold-promotion freeze (dump-enabled
+    /// run 29615122014) showed three concurrent promotions pinning the shared
+    /// `GreedyMemoryPool` at ~95% and HANGING with no error. This test recreates
+    /// the ratio (3 concurrent sorts, each run's working set ~42% of the pool,
+    /// like CI's 12.58 GB run vs 30 GB pool) and shows that in ISOLATION the pool
+    /// does NOT deadlock: the losing sort gets `ResourcesExhausted` and the others
+    /// complete (observed: two finish, one errors, none hang). So `GreedyMemoryPool`
+    /// errors on exhaustion — the CI HANG must involve a component that WAITS
+    /// rather than errors (the parked cross-tier scan holding pool memory while the
+    /// sort waits for its input — a circular wait), not sort-side contention alone.
+    /// This guards that regression while documenting where the real deadlock lives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_promotions_pool_contention_errors_does_not_deadlock() {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+        use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+        use datafusion::prelude::SessionConfig;
+        use std::time::Duration;
+
+        let schema = id_schema();
+        let batch_rows = 8192i64;
+        let batch_bytes = id_batch(&schema, 0, batch_rows).get_array_memory_size();
+
+        // Shared pool mirroring the compaction pool. run_size ~42% of it, so one
+        // promotion's run fits but three concurrent cannot coexist.
+        let pool_bytes = 32 * 1024 * 1024usize;
+        let run_size = (pool_bytes * 42) / 100; // ~13.4 MiB, like CI's 12.58GB/30GB
+        // Each stream feeds several runs' worth so the sorts spill and stay
+        // resident long enough to contend (≈4 runs/stream).
+        let n_batches = (run_size * 4) / batch_bytes.max(1);
+
+        let rtenv = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(GreedyMemoryPool::new(pool_bytes)))
+            .build_arc()
+            .expect("build runtime env");
+        let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), rtenv).task_ctx();
+
+        let async_input = |schema: SchemaRef, n: usize| -> DFStream {
+            let batches: Vec<datafusion_common::Result<RecordBatch>> = (0..n)
+                .map(|i| {
+                    #[expect(clippy::cast_possible_wrap, reason = "test indices are tiny")]
+                    let start = i as i64 * batch_rows;
+                    Ok(id_batch(&schema, start, batch_rows))
+                })
+                .collect();
+            Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                stream::iter(batches).then(|b| async move {
+                    tokio::task::yield_now().await;
+                    b
+                }),
+            ))
+        };
+
+        async fn drain(mut s: DFStream) -> (usize, bool) {
+            let (mut rows, mut errored) = (0usize, false);
+            while let Some(item) = s.next().await {
+                match item {
+                    Ok(b) => rows += b.num_rows(),
+                    Err(_) => {
+                        errored = true;
+                        break;
+                    }
+                }
+            }
+            (rows, errored)
+        }
+
+        let mk = |name: &'static str| {
+            bounded_sort_stream(
+                name,
+                async_input(Arc::clone(&schema), n_batches),
+                vec!["id".to_string()],
+                &ctx,
+                run_size,
+                None,
+            )
+        };
+        let (s1, s2, s3) = (mk("customer"), mk("order_line"), mk("stock"));
+
+        let res = tokio::time::timeout(Duration::from_secs(40), async {
+            tokio::join!(drain(s1), drain(s2), drain(s3))
+        })
+        .await;
+        eprintln!(
+            "3-concurrent pool-contention: pool={pool_bytes} run_size={run_size} n_batches={n_batches} result={res:?}"
+        );
+        // Key finding: sort-side pool contention does NOT hang — it errors. So
+        // this must NOT time out (a timeout would mean the pool itself deadlocks,
+        // which it does not; the CI hang comes from the waiting scan, elsewhere).
+        assert!(
+            res.is_ok(),
+            "GreedyMemoryPool contention unexpectedly hung; it should surface ResourcesExhausted, not deadlock"
         );
     }
 }
