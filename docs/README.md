@@ -21,6 +21,7 @@ The project docs for contributors and community. For user documentation of the S
 ## Developer Notes
 
 - [Cosmos DB](dev/cosmosdb.md)
+- [Crate Layering](dev/crate_layering.md)
 - [Error Handling](dev/error_handling.md)
 - [LLM Prompt Caching](dev/llm-prompt-caching.md)
 - [Metrics](dev/metrics.md)
