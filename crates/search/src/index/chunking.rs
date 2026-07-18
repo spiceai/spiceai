@@ -55,6 +55,10 @@ pub static CHUNKED_INDEX_FULL_SEARCH_FIELD: &str = "_spice.search_field";
 pub struct ChunkedSearchIndex {
     inner: Arc<dyn SearchIndex>,
     chunker: Arc<dyn Chunker>,
+    /// Cached `{search_column}_embedding` — avoids reallocating the name on every write.
+    embedding_col_name: String,
+    /// Cached `{search_column}_offset` — avoids reallocating the name on every write.
+    offset_col_name: String,
 }
 
 #[async_trait]
@@ -191,7 +195,13 @@ impl ChunkedSearchIndex {
     }
 
     pub fn new(inner: Arc<dyn SearchIndex>, chunker: Arc<dyn Chunker>) -> Self {
-        Self { inner, chunker }
+        let search_column = inner.search_column();
+        Self {
+            embedding_col_name: embedding_col(search_column.as_str()),
+            offset_col_name: Self::chunking_offset_col(search_column.as_str()),
+            inner,
+            chunker,
+        }
     }
 
     /// Build the intermediate "chunked" [`RecordBatch`] for a contiguous group of input rows
@@ -230,37 +240,26 @@ impl ChunkedSearchIndex {
         // intermediate chunked batch — they are recomputed by the inner index and re-attached
         // as list columns on the final output. Filtering them out *before* `repeat()` avoids
         // expensive `take()` work on nested list columns that would be discarded immediately.
-        let embedding_col_name = embedding_col(self.search_column().as_str());
-        let offset_col_name = Self::chunking_offset_col(self.search_column().as_str());
-
         let (mut fields, mut arrays): (Vec<Field>, Vec<ArrayRef>) = group_record
             .columns()
             .iter()
             .enumerate()
             .filter_map(|(i, arr)| {
                 let field = schema.field(i).clone();
-                if field.name() == &embedding_col_name || field.name() == &offset_col_name {
+                if field.name() == &self.embedding_col_name || field.name() == &self.offset_col_name
+                {
                     return None;
                 }
                 let result = if i == search_field_idx {
+                    // Build string arrays from `&str` slices rather than an intermediate `Vec<String>`.
                     let chunked_array: ArrayRef = match field.data_type() {
                         DataType::LargeUtf8 => {
-                            let values: Vec<String> = group_flatten_chunks
-                                .iter()
-                                .map(|s| (*s).to_string())
-                                .collect();
-                            Arc::new(LargeStringArray::from(values))
+                            Arc::new(LargeStringArray::from(group_flatten_chunks.clone()))
                         }
                         DataType::Utf8View => {
                             Arc::new(StringViewArray::from(group_flatten_chunks.clone()))
                         }
-                        _ => {
-                            let values: Vec<String> = group_flatten_chunks
-                                .iter()
-                                .map(|s| (*s).to_string())
-                                .collect();
-                            Arc::new(StringArray::from(values))
-                        }
+                        _ => Arc::new(StringArray::from(group_flatten_chunks.clone())),
                     };
                     Ok((field, chunked_array))
                 } else if schema
@@ -286,7 +285,7 @@ impl ChunkedSearchIndex {
         arrays.push(Arc::new(UInt64Array::from(group_chunk_index)) as ArrayRef);
 
         fields.push(Field::new(
-            Self::chunking_offset_col(self.search_column().as_str()),
+            self.offset_col_name.clone(),
             DataType::new_fixed_size_list(DataType::Int32, 2, false),
             false,
         ));
@@ -472,9 +471,6 @@ impl SearchIndex for ChunkedSearchIndex {
         // recover the same flat value buffer the single-call path would have produced, and wrap
         // it with an OffsetBuffer over the full `repeats` vector to produce the per-document
         // list columns.
-        let offsets_col_name = Self::chunking_offset_col(self.search_column().as_str());
-        let embeddings_col_name = embedding_col(self.search_column().as_str());
-
         let mut group_offset_arrays: Vec<ArrayRef> = Vec::with_capacity(row_groups.len());
         let mut group_embedding_arrays: Vec<ArrayRef> = Vec::with_capacity(row_groups.len());
 
@@ -497,10 +493,10 @@ impl SearchIndex for ChunkedSearchIndex {
                 .context(InnerIndexWriteSnafu)
                 .boxed()?;
 
-            if let Some(arr) = inner_rb.column_by_name(&offsets_col_name) {
+            if let Some(arr) = inner_rb.column_by_name(&self.offset_col_name) {
                 group_offset_arrays.push(Arc::clone(arr));
             }
-            if let Some(arr) = inner_rb.column_by_name(&embeddings_col_name) {
+            if let Some(arr) = inner_rb.column_by_name(&self.embedding_col_name) {
                 group_embedding_arrays.push(Arc::clone(arr));
             }
         }
@@ -514,7 +510,7 @@ impl SearchIndex for ChunkedSearchIndex {
 
         attach_list_column(
             &group_offset_arrays,
-            &offsets_col_name,
+            &self.offset_col_name,
             &repeats,
             &schema,
             &mut arrs,
@@ -522,7 +518,7 @@ impl SearchIndex for ChunkedSearchIndex {
         )?;
         attach_list_column(
             &group_embedding_arrays,
-            &embeddings_col_name,
+            &self.embedding_col_name,
             &repeats,
             &schema,
             &mut arrs,
@@ -736,10 +732,10 @@ impl Index for ChunkedVectorIndex {
 
     /// Columns that are required for the index to be computed.
     fn required_columns(&self) -> Vec<String> {
-        ChunkedSearchIndex {
-            inner: Arc::clone(&self.inner) as Arc<dyn SearchIndex>,
-            chunker: Arc::clone(&self.chunker),
-        }
+        ChunkedSearchIndex::new(
+            Arc::clone(&self.inner) as Arc<dyn SearchIndex>,
+            Arc::clone(&self.chunker),
+        )
         .required_columns()
     }
 
@@ -749,10 +745,10 @@ impl Index for ChunkedVectorIndex {
         &self,
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
-        ChunkedSearchIndex {
-            inner: Arc::clone(&self.inner) as Arc<dyn SearchIndex>,
-            chunker: Arc::clone(&self.chunker),
-        }
+        ChunkedSearchIndex::new(
+            Arc::clone(&self.inner) as Arc<dyn SearchIndex>,
+            Arc::clone(&self.chunker),
+        )
         .compute_index(batches)
         .await
     }
@@ -782,10 +778,10 @@ impl SearchIndex for ChunkedVectorIndex {
 
     /// All [`Field`]s that define a primary key between the underlying table and the [`SearchIndex`].
     fn primary_fields(&self) -> Vec<Field> {
-        ChunkedSearchIndex {
-            inner: Arc::clone(&self.inner) as Arc<dyn SearchIndex>,
-            chunker: Arc::clone(&self.chunker),
-        }
+        ChunkedSearchIndex::new(
+            Arc::clone(&self.inner) as Arc<dyn SearchIndex>,
+            Arc::clone(&self.chunker),
+        )
         .primary_fields()
     }
 
@@ -794,10 +790,10 @@ impl SearchIndex for ChunkedVectorIndex {
         &self,
         record: RecordBatch,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
-        ChunkedSearchIndex {
-            inner: Arc::clone(&self.inner) as Arc<dyn SearchIndex>,
-            chunker: Arc::clone(&self.chunker),
-        }
+        ChunkedSearchIndex::new(
+            Arc::clone(&self.inner) as Arc<dyn SearchIndex>,
+            Arc::clone(&self.chunker),
+        )
         .write(record)
         .await
     }
@@ -806,10 +802,10 @@ impl SearchIndex for ChunkedVectorIndex {
     /// columns, the associated vectors/indexed content of the [`SearchIndex::search_column`] and the
     ///  search score between `query` and the [`SearchIndex::search_column`].
     fn query_table_provider(&self, query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
-        ChunkedSearchIndex {
-            inner: Arc::clone(&self.inner) as Arc<dyn SearchIndex>,
-            chunker: Arc::clone(&self.chunker),
-        }
+        ChunkedSearchIndex::new(
+            Arc::clone(&self.inner) as Arc<dyn SearchIndex>,
+            Arc::clone(&self.chunker),
+        )
         .query_table_provider(query)
     }
 
