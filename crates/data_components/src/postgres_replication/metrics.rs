@@ -159,7 +159,7 @@ impl MetricsCollector {
         self.bootstrap_complete.store(1, Ordering::Relaxed);
     }
 
-    /// Set the estimated total rows to bootstrap (from extended schema inference).
+    /// Set the estimated total rows to bootstrap (from schema inference).
     /// Marks the estimate as known, so a count of `0` is a valid value (a known-empty
     /// source table) rather than being conflated with "no estimate available".
     pub fn set_bootstrap_rows_expected(&self, n: u64) {
@@ -171,7 +171,7 @@ impl MetricsCollector {
             .store(true, Ordering::Release);
     }
     /// The estimated bootstrap row total, or `None` when no estimate is available
-    /// (extended schema inference is off or surfaced no row count). `Some(0)` is a
+    /// (schema inference surfaced no row count for the source). `Some(0)` is a
     /// known-empty source table — deliberately distinct from `None`.
     #[must_use]
     pub fn bootstrap_rows_expected(&self) -> Option<u64> {
