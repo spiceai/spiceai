@@ -27,7 +27,10 @@ use serde::{Deserialize, Serialize};
         feature = "postgres-accel",
         feature = "turso"
     )),
-    expect(dead_code, reason = "only referenced by the accelerator backend modules")
+    expect(
+        dead_code,
+        reason = "only referenced by the accelerator backend modules"
+    )
 )]
 const DYNAMODB_STREAMS_TABLE_NAME: &str = "spice_sys_dynamodb_streams";
 
