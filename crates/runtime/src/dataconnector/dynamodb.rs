@@ -592,7 +592,13 @@ async fn emit_overwrite_then_live(
     // Zero-row barrier carrying the pre-scan checkpoint. Its committer runs only
     // after the truncate + snapshot are durably applied (the `CommitChange`
     // ordering contract), mirroring the MySQL bootstrap's `InitialPositionCommitter`.
-    let checkpoint_batch = empty_change_batch(&table_schema)?;
+    let Some(checkpoint_batch) = empty_change_batch(&table_schema) else {
+        tracing::error!(
+            dataset = %dataset_name,
+            "Failed to build DynamoDB bootstrap checkpoint barrier batch; dataset will not start streaming or commit checkpoints"
+        );
+        return None;
+    };
     let checkpoint_envelope = ChangeEnvelope::from_parts(
         Box::new(DynamoDBStreamCommitter::new(
             Arc::clone(&dynamodb_sys),
