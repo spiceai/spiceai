@@ -1432,7 +1432,7 @@ impl MetastoreBackend for SqliteMetastore {
                         conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
 
                     if journal_mode.eq_ignore_ascii_case("wal") {
-                        tracing::info!("Truncating Cayenne catalog WAL log");
+                        tracing::debug!("Truncating Cayenne catalog WAL log");
                         // Truncate the WAL log to persist changes and reduce file size
                         // wal_checkpoint returns results (busy, log, checkpointed), so we use query_row
                         let _: (i32, i32, i32) =
@@ -1443,7 +1443,7 @@ impl MetastoreBackend for SqliteMetastore {
 
                     // Run optimize to improve query performance for future connections
                     // PRAGMA optimize may return rows indicating what was optimized
-                    tracing::info!("Running optimize on Cayenne catalog");
+                    tracing::debug!("Running optimize on Cayenne catalog");
                     let mut stmt = conn.prepare("PRAGMA optimize")?;
                     let mut rows = stmt.query([])?;
                     while rows.next()?.is_some() {} // Consume all results to ensure PRAGMA completes

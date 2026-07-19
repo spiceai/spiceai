@@ -760,20 +760,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arrow_sql_gen"
-version = "2.2.0-unstable"
-dependencies = [
- "arrow",
- "bigdecimal",
- "chrono",
- "chrono-tz 0.8.6",
- "clickhouse-rs",
- "datafusion-table-providers",
- "snafu",
- "uuid 1.23.2",
-]
-
-[[package]]
 name = "arrow_tools"
 version = "2.2.0-unstable"
 dependencies = [
@@ -3724,6 +3710,7 @@ dependencies = [
  "governor",
  "mysql_async",
  "rand 0.10.1",
+ "rust_decimal",
  "secrecy",
  "snafu",
  "tempfile",
@@ -4158,12 +4145,17 @@ dependencies = [
 name = "connector-clickhouse"
 version = "2.2.0-unstable"
 dependencies = [
+ "arrow",
+ "async-stream",
  "async-trait",
+ "bigdecimal",
+ "chrono",
+ "chrono-tz 0.8.6",
  "clickhouse-rs",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
- "db_connection_pool",
+ "futures",
  "linkme",
  "ns_lookup",
  "paste",
@@ -4171,6 +4163,7 @@ dependencies = [
  "secrecy",
  "snafu",
  "url",
+ "uuid 1.23.2",
 ]
 
 [[package]]
@@ -5737,7 +5730,6 @@ dependencies = [
  "bytes",
  "charset",
  "chrono",
- "clickhouse-rs",
  "connector-postgres-common",
  "criterion 0.7.0",
  "ctor 0.8.0",
@@ -6670,7 +6662,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=12321c06d7919b04acf6ce05b969536b2e7ccbbb#12321c06d7919b04acf6ce05b969536b2e7ccbbb"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=ccdc1aaae359b9b4066fd4fbad19638b9176d5fa#ccdc1aaae359b9b4066fd4fbad19638b9176d5fa"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -6739,10 +6731,8 @@ version = "2.2.0-unstable"
 dependencies = [
  "arrow",
  "arrow-odbc",
- "arrow_sql_gen",
  "async-stream",
  "async-trait",
- "clickhouse-rs",
  "datafusion",
  "datafusion-table-providers",
  "dyn-clone",
@@ -12271,6 +12261,7 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "regex",
+ "rust_decimal",
  "saturating",
  "serde",
  "serde_json",
@@ -16854,14 +16845,25 @@ version = "2.2.0-unstable"
 name = "runtime-parameters"
 version = "2.2.0-unstable"
 dependencies = [
+ "async-trait",
  "itertools 0.14.0",
  "runtime-parameter-spec",
+ "runtime-parameters-derive",
  "runtime-secrets",
  "secrecy",
  "snafu",
  "tokio",
  "tracing",
  "util",
+]
+
+[[package]]
+name = "runtime-parameters-derive"
+version = "2.2.0-unstable"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
