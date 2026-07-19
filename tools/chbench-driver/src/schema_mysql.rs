@@ -21,6 +21,8 @@ limitations under the License.
 //! dialect DDL. Postgres-WAL-specific replication cleanup has no `MySQL`
 //! equivalent and is omitted.
 
+use std::time::Instant;
+
 use mysql_async::prelude::Queryable;
 
 use crate::Result;
@@ -37,6 +39,44 @@ use crate::Result;
 pub async fn drop_tables(conn: &mut mysql_async::Conn) -> Result<()> {
     println!("  dropping {} tables", crate::schema::ALL_TABLES.len());
 
+    // Bound metadata-lock waits. A `DROP TABLE` blocked by another session holding
+    // a lock otherwise waits up to the server default `lock_wait_timeout`
+    // (31536000s ≈ 1 year), so a single stuck drop silently consumes the whole CI
+    // job budget. 60s makes a blocked drop fail fast with a clear
+    // "Lock wait timeout exceeded" error instead of hanging.
+    conn.query_drop("SET SESSION lock_wait_timeout = 60")
+        .await
+        .map_err(|source| crate::Error::MySql {
+            action: "set lock_wait_timeout".into(),
+            source,
+        })?;
+
+    // A prior run killed abruptly (e.g. the CI runner was terminated mid-run) can
+    // leave sessions still holding metadata locks on the tables we are about to
+    // drop, which is exactly what blocks the drop above. Terminate any other
+    // sessions before dropping. Without PROCESS/CONNECTION_ADMIN this account sees
+    // and can KILL only its own threads — precisely the CDC/loader connections a
+    // previous run may have leaked. Best-effort: a session may already be gone
+    // (killed/timed out) between the SELECT and the KILL, which is fine.
+    let stale: Vec<u64> = conn
+        .query("SELECT ID FROM information_schema.PROCESSLIST WHERE ID <> CONNECTION_ID()")
+        .await
+        .map_err(|source| crate::Error::MySql {
+            action: "list stale sessions".into(),
+            source,
+        })?;
+    if !stale.is_empty() {
+        println!(
+            "  terminating {} stale MySQL session(s) before drop",
+            stale.len()
+        );
+        for id in stale {
+            if let Err(e) = conn.query_drop(format!("KILL {id}")).await {
+                eprintln!("  KILL {id} skipped (session likely already gone): {e}");
+            }
+        }
+    }
+
     conn.query_drop("SET FOREIGN_KEY_CHECKS=0")
         .await
         .map_err(|source| crate::Error::MySql {
@@ -45,6 +85,7 @@ pub async fn drop_tables(conn: &mut mysql_async::Conn) -> Result<()> {
         })?;
 
     for table in crate::schema::ALL_TABLES.iter().rev() {
+        let started = Instant::now();
         let sql = format!("DROP TABLE IF EXISTS {table}");
         conn.query_drop(&sql)
             .await
@@ -52,6 +93,12 @@ pub async fn drop_tables(conn: &mut mysql_async::Conn) -> Result<()> {
                 action: format!("drop table {table}"),
                 source,
             })?;
+        // Per-table timing so a future hang is immediately attributable to the
+        // exact table (and therefore the lock) it stuck on.
+        println!(
+            "    dropped {table} ({:.1}s)",
+            started.elapsed().as_secs_f64()
+        );
     }
 
     conn.query_drop("SET FOREIGN_KEY_CHECKS=1")

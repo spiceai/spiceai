@@ -232,6 +232,12 @@ jobs:
       # they skip this and seed normally.
       - name: Restore or seed CH-benCH MySQL from template
         if: steps.set_spicepod_path.outputs.SOURCE_TYPE == 'mysql' && github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners'
+        # Backstop so a wedged seed/restore (e.g. a DROP blocked on a stale lock)
+        # fails THIS step fast and attributably, instead of silently consuming the
+        # whole 120-min job budget and reporting a confusing "cancelled". A cold
+        # SF1000 CSV seed finishes comfortably under this; exceeding it means the
+        # seed is stuck.
+        timeout-minutes: 90
         run: bash .github/scripts/chbench_template_mysql.sh
         env:
           SCALE_FACTOR: ${{ github.event.inputs.scale_factor }}
