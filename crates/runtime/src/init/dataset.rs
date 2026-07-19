@@ -580,24 +580,37 @@ impl Runtime {
     /// Used for datasets synthesized at runtime (e.g. by catalog-level
     /// acceleration) rather than declared in the Spicepod `datasets:` list.
     pub(crate) async fn load_synthesized_dataset(self: Arc<Self>, ds: Arc<Dataset>) {
-        let bootstrap_status = match self
-            .initialize_datasets_accelerators(std::slice::from_ref(&ds))
-            .await
-            .remove(&ds.name)
-        {
-            Some(Ok(status)) => status,
-            Some(Err(_)) => return, // error already logged in initialize_datasets_accelerators
-            None => {
-                let message = format!(
-                    "Dataset {} missing from accelerator initialization results",
-                    ds.name
-                );
-                tracing::error!("{message}");
-                self.status.update_dataset(
-                    &ds.name,
-                    status::ComponentStatus::error_with_message(message),
-                );
-                return;
+        // Throttle accelerator init to the same `dataset_load_parallelism` budget
+        // `load_dataset` enforces. Catalog-level acceleration spawns one
+        // `load_synthesized_dataset` task per table (potentially hundreds), and
+        // `initialize_datasets_accelerators` does real init work/IO; without a
+        // permit here every table would initialize its accelerator at once, ahead
+        // of any throttling. The permit is held ONLY around init and dropped before
+        // `load_dataset` (which acquires its own permit) -- holding both at once
+        // would deadlock once `dataset_load_parallelism` tasks each await a second.
+        let bootstrap_status = {
+            let Ok(_init_permit) = self.dataset_load_semaphore.acquire().await else {
+                unreachable!("Semaphore is never closed.");
+            };
+            match self
+                .initialize_datasets_accelerators(std::slice::from_ref(&ds))
+                .await
+                .remove(&ds.name)
+            {
+                Some(Ok(status)) => status,
+                Some(Err(_)) => return, // error already logged in initialize_datasets_accelerators
+                None => {
+                    let message = format!(
+                        "Dataset {} missing from accelerator initialization results",
+                        ds.name
+                    );
+                    tracing::error!("{message}");
+                    self.status.update_dataset(
+                        &ds.name,
+                        status::ComponentStatus::error_with_message(message),
+                    );
+                    return;
+                }
             }
         };
 
