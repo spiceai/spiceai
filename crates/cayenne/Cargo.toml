@@ -487,5 +487,9 @@ name = "validate_shard_keyset_presize_rehash"
 harness = false
 name = "flip_inlined_keyset_pending_list"
 
+[[bench]]
+harness = false
+name = "mem_tier_append_freeze_on_read"
+
 [lints]
 workspace = true
