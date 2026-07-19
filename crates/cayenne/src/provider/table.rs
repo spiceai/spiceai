@@ -10404,15 +10404,30 @@ impl CayenneTableProvider {
         // Table-global (not sharded): every shard consults the same view for its
         // own keys so a cold-resident key never fast-paths as brand-new.
         let cold_existence = self.cold_pk_existence.lock().clone();
-        let mut incoming_keys: PkDigestSet = PkDigestSet::default();
+        // Pre-size the per-shard accumulators to the shard's total incoming rows so
+        // the `incoming_keys`/`kept_keys` digest maps fill without repeated
+        // `RawTable::reserve_rehash` doublings (both accumulate ~every distinct
+        // incoming key of the shard — misses via `absorb`/`extend_ref` plus
+        // validated keeps). Only when conflict detection is on (`sharded_index`
+        // is Some); with it off both sets stay empty, so sizing them would just
+        // allocate two large empty maps for nothing. Mirrors the per-batch
+        // `PkDigestSet::with_capacity(batch.num_rows())` sizing at the sibling
+        // sites (`bloom_split_shard_batch`, the non-sharded validate path).
+        let total_shard_rows: usize = shard_batches.iter().map(RecordBatch::num_rows).sum();
+        let key_set_capacity = if sharded_index.is_some() {
+            total_shard_rows
+        } else {
+            0
+        };
+        let mut incoming_keys: PkDigestSet = PkDigestSet::with_capacity(key_set_capacity);
         let mut delete_specs: HashMap<Arc<str>, Vec<u64>> = HashMap::new();
         let mut deleted_pk_i64: Vec<i64> = Vec::new();
         let mut deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
         let mut deleted_inlined_pk_i64: Vec<i64> = Vec::new();
         let mut deleted_inlined_row_keys: Vec<Box<[u8]>> = Vec::new();
         let mut reinserted_over_tombstone: usize = 0;
-        let mut kept_keys: PkDigestSet = PkDigestSet::default();
-        let mut filtered_batches: Vec<RecordBatch> = Vec::new();
+        let mut kept_keys: PkDigestSet = PkDigestSet::with_capacity(key_set_capacity);
+        let mut filtered_batches: Vec<RecordBatch> = Vec::with_capacity(shard_batches.len());
 
         for batch in shard_batches {
             if batch.num_rows() == 0 {

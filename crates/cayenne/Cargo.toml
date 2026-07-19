@@ -479,5 +479,9 @@ name = "hll_ndv_hashing"
 harness = false
 name = "pk_keyset_present_path"
 
+[[bench]]
+harness = false
+name = "validate_shard_keyset_presize_rehash"
+
 [lints]
 workspace = true
