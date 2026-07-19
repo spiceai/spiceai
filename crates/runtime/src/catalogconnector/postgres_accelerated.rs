@@ -66,7 +66,7 @@ use snafu::prelude::*;
 use spicepod::acceleration::{
     Acceleration as SpicepodAcceleration, RefreshMode as SpicepodRefreshMode,
 };
-use spicepod::component::dataset::{Dataset as SpicepodDataset, SchemaInference};
+use spicepod::component::dataset::Dataset as SpicepodDataset;
 use spicepod::param::Params;
 
 use crate::Runtime;
@@ -226,7 +226,11 @@ impl AcceleratedCatalogProvider {
             dataset_name.clone(),
         )
         .with_params(Params::from_string_map(params));
-        spicepod_ds.schema_inference = SchemaInference::Extended;
+        // Schema inference is always attempted now (the `schema_inference` opt-in
+        // was removed upstream). For `refresh_mode: changes` the inferred primary
+        // key and its CDC upsert `on_conflict` are always applied
+        // (`apply_inferred_schema`), which is exactly what this synthesized CDC
+        // dataset relies on — so no explicit opt-in is needed here.
         spicepod_ds.acceleration = Some(SpicepodAcceleration {
             engine: Some(CAYENNE_ENGINE.to_string()),
             refresh_mode: Some(SpicepodRefreshMode::Changes),
