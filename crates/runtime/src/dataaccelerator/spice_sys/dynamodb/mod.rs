@@ -20,6 +20,15 @@ use async_trait::async_trait;
 use runtime_checkpoint_api::{CheckpointError, CheckpointRecord, CheckpointStore};
 use serde::{Deserialize, Serialize};
 
+#[cfg_attr(
+    not(any(
+        feature = "duckdb",
+        feature = "sqlite",
+        feature = "postgres-accel",
+        feature = "turso"
+    )),
+    expect(dead_code, reason = "only referenced by the accelerator backend modules")
+)]
 const DYNAMODB_STREAMS_TABLE_NAME: &str = "spice_sys_dynamodb_streams";
 
 #[cfg(feature = "duckdb")]
@@ -40,6 +49,15 @@ pub struct DynamoDBCheckpointMetadata {
 }
 
 pub struct DynamoDBSys {
+    #[cfg_attr(
+        not(any(
+            feature = "duckdb",
+            feature = "sqlite",
+            feature = "postgres-accel",
+            feature = "turso"
+        )),
+        expect(dead_code, reason = "only read by the accelerator backend modules")
+    )]
     dataset_name: String,
     acceleration_connection: AccelerationConnection,
 }
