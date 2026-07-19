@@ -40,8 +40,8 @@ postgres_connection_params: &postgres_params
   pg_sslmode: disable
 
 runtime:
-  query:
-    memory_limit: 24GiB
+  # query:
+  #   memory_limit: 24GiB
   flight:
     ipc_compression: lz4_frame
   caching:
