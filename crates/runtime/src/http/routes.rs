@@ -45,6 +45,7 @@ use runtime_tools::mcp::server::RuntimeServer;
 use spicepod::component::runtime::CorsConfig;
 #[cfg(feature = "mcp")]
 use spicepod::component::runtime::McpConfig;
+use std::borrow::Cow;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -557,12 +558,12 @@ async fn track_metrics(
     let request_dimensions = request_context.to_dimensions();
 
     let start = Instant::now();
-    let path = if let Some(matched_path) = req.extensions().get::<MatchedPath>() {
-        matched_path.as_str().to_owned()
+    let path: Arc<str> = if let Some(matched_path) = req.extensions().get::<MatchedPath>() {
+        Arc::from(matched_path.as_str())
     } else {
-        req.uri().path().to_owned()
+        Arc::from(req.uri().path())
     };
-    let method = req.method().clone();
+    let method = http_method_label(req.method());
 
     let response = Arc::clone(&request_context)
         .scope(async move {
@@ -589,10 +590,10 @@ async fn track_metrics(
         .await;
 
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let status = response.status().as_u16().to_string();
+    let status = http_status_label(response.status().as_u16());
 
     let mut labels = vec![
-        KeyValue::new("method", method.to_string()),
+        KeyValue::new("method", method),
         KeyValue::new("path", path),
         KeyValue::new("status", status),
     ];
@@ -631,7 +632,7 @@ fn cors_layer(cors_config: &CorsConfig) -> CorsLayer {
         return cors;
     }
 
-    let allowed_origins: AllowOrigin = if cors_config.allowed_origins.contains(&"*".to_string()) {
+    let allowed_origins: AllowOrigin = if cors_config.allowed_origins.iter().any(|o| o == "*") {
         Any.into()
     } else {
         cors_config
@@ -651,6 +652,40 @@ fn cors_layer(cors_config: &CorsConfig) -> CorsLayer {
     cors.allow_methods([Method::GET, Method::POST, Method::PATCH, Method::OPTIONS])
         .allow_headers([ACCEPT, CONTENT_TYPE, AUTHORIZATION])
         .allow_origin(allowed_origins)
+}
+
+/// Map common HTTP methods to static metric labels (avoids per-request allocation).
+fn http_method_label(method: &Method) -> &'static str {
+    match method.as_str() {
+        "GET" => "GET",
+        "POST" => "POST",
+        "PUT" => "PUT",
+        "PATCH" => "PATCH",
+        "DELETE" => "DELETE",
+        "HEAD" => "HEAD",
+        "OPTIONS" => "OPTIONS",
+        "CONNECT" => "CONNECT",
+        "TRACE" => "TRACE",
+        _ => "OTHER",
+    }
+}
+
+/// Map common HTTP status codes to static metric labels; rare codes allocate.
+fn http_status_label(code: u16) -> Cow<'static, str> {
+    match code {
+        200 => Cow::Borrowed("200"),
+        201 => Cow::Borrowed("201"),
+        204 => Cow::Borrowed("204"),
+        400 => Cow::Borrowed("400"),
+        401 => Cow::Borrowed("401"),
+        403 => Cow::Borrowed("403"),
+        404 => Cow::Borrowed("404"),
+        429 => Cow::Borrowed("429"),
+        500 => Cow::Borrowed("500"),
+        502 => Cow::Borrowed("502"),
+        503 => Cow::Borrowed("503"),
+        other => Cow::Owned(other.to_string()),
+    }
 }
 
 async fn check_shutdown(

@@ -13,7 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use serde_json::{Map, Value};
 use snafu::ResultExt;
 use std::sync::Arc;
 
@@ -29,8 +28,6 @@ use arrow::{
 };
 use arrow_schema::{Field as ArrowField, Schema, SchemaRef};
 use tantivy::{Term, schema::Field};
-
-use serde_json::to_string;
 
 /// Adds an additional [`StringArray`] column to a [`RecordBatch`] as a JSON-string representation
 /// from a subset of the columns present.
@@ -50,20 +47,18 @@ pub fn with_json_subset_column(
     let subset_schema: SchemaRef = Arc::new(Schema::new(subset_fields));
     let subset_batch = RecordBatch::try_new(Arc::clone(&subset_schema), subset_arrays).boxed()?;
 
+    // Line-delimited writer emits one JSON object per row (NDJSON). Use the raw line
+    // bytes as Utf8 values directly — no serde Map parse/re-serialize round-trip.
     let buf = Vec::new();
-    let mut writer = arrow_json::ArrayWriter::new(buf);
+    let mut writer = arrow_json::LineDelimitedWriter::new(buf);
     writer.write_batches(&[&subset_batch]).boxed()?;
     writer.finish().boxed()?;
     let json_data = writer.into_inner();
 
-    let json_strings: Vec<String> =
-        serde_json::from_reader::<_, Vec<Map<String, Value>>>(json_data.as_slice())
-            .boxed()?
-            .into_iter()
-            .map(|v| to_string(&v).boxed())
-            .collect::<Result<Vec<String>, _>>()?;
-
-    let json_array: ArrayRef = Arc::new(StringArray::from(json_strings));
+    let json_str = std::str::from_utf8(&json_data).boxed()?;
+    // `lines().filter(...)` is not ExactSizeIterator; `from_iter_values` requires sized.
+    let lines: Vec<&str> = json_str.lines().filter(|line| !line.is_empty()).collect();
+    let json_array: ArrayRef = Arc::new(StringArray::from(lines));
 
     let mut new_fields: Vec<_> = batch.schema().fields().iter().cloned().collect();
     new_fields.push(Arc::new(ArrowField::new(
@@ -269,4 +264,57 @@ pub fn array_to_terms(field: Field, arr: &ArrayRef) -> Result<Vec<Term>, ArrowEr
     }
 
     Ok(terms)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::{
+        array::{Array, Int32Array, RecordBatch, StringArray},
+        datatypes::{DataType, Field, Schema},
+    };
+
+    use super::with_json_subset_column;
+
+    /// Locks the exact NDJSON string format written into tantivy as the composite
+    /// primary-key unique field. Format drift breaks update/delete term matching
+    /// against existing on-disk indexes.
+    #[test]
+    fn json_subset_column_utf8_int32_golden_format() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("seq", DataType::Int32, false),
+            Field::new("content", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["apple", "banana"])),
+            ],
+        )
+        .expect("test batch");
+
+        let with_pk = with_json_subset_column(
+            &batch,
+            &["id".to_string(), "seq".to_string()],
+            "__spice.unique_field",
+        )
+        .expect("json subset column");
+
+        let col_idx = with_pk
+            .schema()
+            .index_of("__spice.unique_field")
+            .expect("unique field present");
+        let json_col = with_pk
+            .column(col_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Utf8 unique field");
+
+        let lines: Vec<&str> = (0..json_col.len()).map(|i| json_col.value(i)).collect();
+        insta::assert_snapshot!("json_subset_column_utf8_int32", lines.join("\n"));
+    }
 }

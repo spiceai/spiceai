@@ -901,7 +901,7 @@ impl TableProvider for EmbeddingTable {
             filters,
             limit,
             base_plan,
-            scan_embed_columns,
+            Arc::new(scan_embed_columns),
             Arc::clone(&self.embedding_models),
         )) as Arc<dyn ExecutionPlan>)
     }

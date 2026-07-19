@@ -110,16 +110,23 @@ pub enum Op {
     Message,
 }
 
+impl Op {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Op::Create => "c",
+            Op::Update => "u",
+            Op::Delete => "d",
+            Op::Read => "r",
+            Op::Truncate => "t",
+            Op::Message => "m",
+        }
+    }
+}
+
 impl Display for Op {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        match self {
-            Op::Create => write!(f, "c"),
-            Op::Update => write!(f, "u"),
-            Op::Delete => write!(f, "d"),
-            Op::Read => write!(f, "r"),
-            Op::Truncate => write!(f, "t"),
-            Op::Message => write!(f, "m"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
