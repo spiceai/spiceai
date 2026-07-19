@@ -67,11 +67,15 @@ pub enum StreamError {
 }
 
 /// The `DynamoDB` connector owns the mapping from its concrete stream error to the
-/// connector-agnostic CDC contract error: it boxes itself as the cause so the CDC
-/// contract (and the runtime) never names `DynamoDB`-specific types.
+/// connector-agnostic CDC contract error: it tags the `"DynamoDB"` connector name and
+/// boxes itself as the cause, so the CDC contract (and the runtime) never names
+/// `DynamoDB`-specific types while logs still identify the source connector.
 impl From<StreamError> for crate::cdc::StreamError {
     fn from(e: StreamError) -> Self {
-        crate::cdc::StreamError::Connector(Box::new(e))
+        crate::cdc::StreamError::Connector {
+            connector: "DynamoDB",
+            source: Box::new(e),
+        }
     }
 }
 

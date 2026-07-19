@@ -119,10 +119,16 @@ pub enum StreamError {
     Arrow(String),
     /// External error not originating from `ChangesStream` core logic, such as index processing failure.
     External(String),
-    /// Error surfaced by a data-source connector's change stream: the connector maps
-    /// its own concrete error into this variant and attaches it as the boxed cause,
-    /// keeping this CDC contract connector-agnostic.
-    Connector(Box<dyn std::error::Error + Send + Sync>),
+    /// Error surfaced by a data-source connector's change stream: the connector
+    /// names itself (`connector`) and attaches its own concrete error as the boxed
+    /// `source` cause, keeping this CDC contract connector-agnostic.
+    Connector {
+        /// Static name of the connector that produced the error (e.g. `"DynamoDB"`),
+        /// so logs that print only `{err}` still identify the source connector.
+        connector: &'static str,
+        /// The connector's concrete error, preserved as the chained cause.
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[cfg(feature = "mongodb")]
     /// Error from `MongoDB`, such as failure during change stream processing.
     MongoDB(crate::mongodb::stream::StreamError),
@@ -133,7 +139,7 @@ impl std::error::Error for StreamError {
         match self {
             #[cfg(any(feature = "debezium", feature = "kafka"))]
             StreamError::Kafka(e) => Some(e),
-            StreamError::Connector(e) => Some(&**e),
+            StreamError::Connector { source, .. } => Some(&**source),
             #[cfg(feature = "mongodb")]
             StreamError::MongoDB(e) => Some(e),
             // String-carrying variants have no underlying `Error` source.
@@ -161,7 +167,9 @@ impl std::fmt::Display for StreamError {
             StreamError::Flight(e) => write!(f, "Arrow Flight error: {e}"),
             StreamError::Arrow(e) => write!(f, "Arrow error: {e}"),
             StreamError::External(e) => write!(f, "External error: {e}"),
-            StreamError::Connector(e) => write!(f, "{e}"),
+            StreamError::Connector { connector, source } => {
+                write!(f, "{connector} error: {source}")
+            }
             #[cfg(feature = "mongodb")]
             StreamError::MongoDB(e) => write!(f, "MongoDB error: {e}"),
         }
