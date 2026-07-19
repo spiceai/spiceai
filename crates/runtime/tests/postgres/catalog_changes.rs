@@ -144,20 +144,27 @@ async fn start_runtime(catalog: Catalog) -> Result<Arc<Runtime>, anyhow::Error> 
     Ok(rt)
 }
 
-/// Poll until `SELECT COUNT(*) FROM {CATALOG_NAME}.public.{table}` returns
-/// at least one row -- the synthesized dataset bootstraps in the background
+/// Poll until `SELECT COUNT(*) FROM {CATALOG_NAME}.public.{table}` returns a
+/// non-zero count -- the synthesized dataset bootstraps in the background
 /// (fire-and-forget, same as any spicepod-declared dataset), so this can't
 /// be assumed ready the instant catalog registration returns.
+///
+/// The readiness signal must be the count *value*, not the row count: a
+/// `COUNT(*)` query returns exactly one row as soon as it succeeds -- which
+/// happens the moment the table is registered, before the background refresh
+/// has loaded any data -- so `num_rows() > 0` is always true and would let the
+/// exact-count assertions downstream race the bootstrap. Every table this waits
+/// on is seeded non-empty, so `n > 0` is the correct "data present" condition.
 async fn wait_for_table_ready(rt: &Arc<Runtime>, table: &str) -> Result<(), anyhow::Error> {
     let ready = wait_until_true(Duration::from_mins(2), || {
         let rt = Arc::clone(rt);
         async move {
-            run_query(
+            query_i64(
                 &rt,
                 &format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.{table}"),
             )
             .await
-            .is_ok_and(|batches| batches.first().is_some_and(|b| b.num_rows() > 0))
+            .is_some_and(|n| n > 0)
         }
     })
     .await;
