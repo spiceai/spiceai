@@ -549,6 +549,11 @@ async fn test_wal_persists_on_move_failure_impl(
 // ============================================================================
 
 test_with_backends!(test_prepared_lifecycle_matches_commit_impl);
+test_with_backends!(test_manifest_publish_preplaces_then_atomically_exposes_files_impl);
+test_with_backends!(test_manifest_publish_rollback_removes_preplaced_files_impl);
+test_with_backends!(test_manifest_publish_recovers_durable_intent_impl);
+test_with_backends!(test_manifest_publish_reclaims_old_unowned_file_impl);
+test_with_backends!(test_manifest_offfence_publish_accumulates_impl);
 test_with_backends!(test_prepared_apply_under_barrier_waits_for_write_lock_impl);
 test_with_backends!(test_held_barrier_current_snapshot_requires_write_lock_impl);
 
@@ -610,6 +615,245 @@ async fn test_prepared_lifecycle_matches_commit_impl(
     );
     assert_staging_empty(&staging);
 
+    Ok(())
+}
+
+async fn test_manifest_publish_preplaces_then_atomically_exposes_files_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let vortex_config = cayenne::metadata::VortexConfig {
+        scan_from_manifest: true,
+        stage_b_publish_mode: cayenne::StageBPublishMode::Manifest,
+        inline_max_rows: 0,
+        compaction_background_interval_ms: 0,
+        ..Default::default()
+    };
+    let (table, ctx) =
+        setup_table_with_vortex_config(&fixture, "manifest_preplacement", vortex_config).await;
+    let staged = begin_staged_append_with_rows(&table, &[(1, "Alice"), (2, "Bob")]).await?;
+
+    let meta = table.metadata();
+    let snapshot_dir = PathBuf::from(&meta.path)
+        .join(&meta.table_id)
+        .join(&meta.current_snapshot_id);
+    let preplaced_files = vortex_file_names(&snapshot_dir)?;
+    assert!(
+        !preplaced_files.is_empty(),
+        "Stage A must write data files directly into the target snapshot"
+    );
+    assert_eq!(
+        row_count(&ctx, "manifest_preplacement").await,
+        0,
+        "a physically pre-placed file must remain invisible before manifest publication"
+    );
+    assert!(
+        table
+            .catalog()
+            .get_snapshot_files(&meta.table_id, &meta.current_snapshot_id)
+            .await?
+            .is_empty(),
+        "Stage A must not publish manifest rows"
+    );
+
+    let prepared = staged.prepare().await?;
+    let staging_data_files = vortex_file_names(&staging_dir(&table))?;
+    assert!(
+        staging_data_files.is_empty(),
+        "manifest mode must not write data files under _staging"
+    );
+    prepared.apply_under_barrier().await?;
+
+    let manifest = table
+        .catalog()
+        .get_snapshot_files(&meta.table_id, &meta.current_snapshot_id)
+        .await?;
+    assert_eq!(manifest.len(), preplaced_files.len());
+    assert_eq!(row_count(&ctx, "manifest_preplacement").await, 2);
+    prepared.finish().await?;
+    Ok(())
+}
+
+/// Stage 0c — pointer-only publish. An append-only, pre-placed, manifest-scan
+/// generation now commits the durable catalog rows and removes the WAL OFF the
+/// reader-blocking `listing_fence`, holding it only for the synchronous
+/// in-memory cache flip. The observable end-state must be byte-for-byte
+/// equivalent to the all-under-fence path across repeated publishes: rows become
+/// visible, the manifest stays consistent with the physical files, staging stays
+/// clean, and nothing is lost or duplicated.
+async fn test_manifest_offfence_publish_accumulates_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let vortex_config = cayenne::metadata::VortexConfig {
+        scan_from_manifest: true,
+        stage_b_publish_mode: cayenne::StageBPublishMode::Manifest,
+        inline_max_rows: 0,
+        compaction_background_interval_ms: 0,
+        ..Default::default()
+    };
+    let (table, ctx) =
+        setup_table_with_vortex_config(&fixture, "manifest_offfence_accumulate", vortex_config).await;
+    let staging = staging_dir(&table);
+
+    let batches: [&[(i64, &str)]; 3] = [&[(1, "A"), (2, "B")], &[(3, "C"), (4, "D")], &[(5, "E"), (6, "F")]];
+    for (batch_idx, rows) in batches.iter().enumerate() {
+        // commit() drives prepare -> apply_under_barrier -> finish; for this
+        // config apply_under_barrier takes the Stage 0c off-fence path.
+        begin_staged_append_with_rows(&table, rows)
+            .await?
+            .commit()
+            .await?;
+
+        let expected = (batch_idx + 1) * 2;
+        assert_eq!(
+            row_count(&ctx, "manifest_offfence_accumulate").await,
+            expected,
+            "off-fence publish #{batch_idx} must make its rows visible"
+        );
+        assert_staging_empty(&staging);
+
+        // After each off-fence publish the durable manifest must exactly match
+        // the physical files pre-placed in the current snapshot directory.
+        let meta = table.metadata();
+        let manifest = table
+            .catalog()
+            .get_snapshot_files(&meta.table_id, &meta.current_snapshot_id)
+            .await?;
+        let snapshot_dir = PathBuf::from(&meta.path)
+            .join(&meta.table_id)
+            .join(&meta.current_snapshot_id);
+        let files = vortex_file_names(&snapshot_dir)?;
+        assert_eq!(
+            manifest.len(),
+            files.len(),
+            "manifest rows must match physical file count after off-fence publish #{batch_idx}"
+        );
+    }
+
+    let all = query_all(&ctx, "manifest_offfence_accumulate").await;
+    assert_eq!(all.len(), 6);
+    assert_eq!(all.first(), Some(&(1, "A".to_string())));
+    assert_eq!(all.last(), Some(&(6, "F".to_string())));
+    Ok(())
+}
+
+async fn test_manifest_publish_rollback_removes_preplaced_files_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let vortex_config = cayenne::metadata::VortexConfig {
+        scan_from_manifest: true,
+        stage_b_publish_mode: cayenne::StageBPublishMode::Manifest,
+        inline_max_rows: 0,
+        compaction_background_interval_ms: 0,
+        ..Default::default()
+    };
+    let (table, ctx) =
+        setup_table_with_vortex_config(&fixture, "manifest_rollback", vortex_config).await;
+    let prepared = begin_staged_append_with_rows(&table, &[(1, "Alice")])
+        .await?
+        .prepare()
+        .await?;
+    let meta = table.metadata();
+    let snapshot_dir = PathBuf::from(&meta.path)
+        .join(&meta.table_id)
+        .join(&meta.current_snapshot_id);
+    assert!(!vortex_file_names(&snapshot_dir)?.is_empty());
+
+    prepared.rollback().await?;
+
+    assert!(vortex_file_names(&snapshot_dir)?.is_empty());
+    assert_eq!(row_count(&ctx, "manifest_rollback").await, 0);
+    assert_staging_empty(&staging_dir(&table));
+    Ok(())
+}
+
+async fn test_manifest_publish_recovers_durable_intent_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let vortex_config = cayenne::metadata::VortexConfig {
+        scan_from_manifest: true,
+        stage_b_publish_mode: cayenne::StageBPublishMode::Manifest,
+        inline_max_rows: 0,
+        compaction_background_interval_ms: 0,
+        ..Default::default()
+    };
+    let (table, ctx) =
+        setup_table_with_vortex_config(&fixture, "manifest_recovery", vortex_config).await;
+
+    let prepared = begin_staged_append_with_rows(&table, &[(1, "Alice")])
+        .await?
+        .prepare()
+        .await?;
+    let abandoned_wal = prepared.staging_wal_path();
+    assert!(abandoned_wal.exists());
+    drop(prepared);
+    assert_eq!(row_count(&ctx, "manifest_recovery").await, 0);
+
+    // Starting the next append invokes incomplete-write recovery. The durable
+    // exact intent must publish idempotently without moving the already-final
+    // file. Roll back the second append so only the recovered generation remains.
+    let next = begin_staged_append_with_rows(&table, &[(2, "Bob")]).await?;
+    next.rollback().await?;
+
+    assert!(!abandoned_wal.exists());
+    assert_eq!(
+        query_all(&ctx, "manifest_recovery").await,
+        vec![(1, "Alice".to_string())]
+    );
+    Ok(())
+}
+
+async fn test_manifest_publish_reclaims_old_unowned_file_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let vortex_config = cayenne::metadata::VortexConfig {
+        scan_from_manifest: true,
+        stage_b_publish_mode: cayenne::StageBPublishMode::Manifest,
+        inline_max_rows: 0,
+        compaction_background_interval_ms: 0,
+        ..Default::default()
+    };
+    let (table, ctx) =
+        setup_table_with_vortex_config(&fixture, "manifest_orphan_sweep", vortex_config).await;
+    let meta = table.metadata();
+    let snapshot_dir = PathBuf::from(&meta.path)
+        .join(&meta.table_id)
+        .join(&meta.current_snapshot_id);
+    std::fs::create_dir_all(&snapshot_dir)?;
+    let orphan_path = snapshot_dir.join("abandoned-stage-a.vortex");
+    let orphan = std::fs::File::create(&orphan_path)?;
+    orphan.set_times(
+        std::fs::FileTimes::new()
+            .set_accessed(std::time::UNIX_EPOCH)
+            .set_modified(std::time::UNIX_EPOCH),
+    )?;
+    drop(orphan);
+
+    ctx.sql("INSERT INTO manifest_orphan_sweep VALUES (1, 'Alice')")
+        .await?
+        .collect()
+        .await?;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut interval = tokio::time::interval(Duration::from_millis(10));
+        while orphan_path.exists() {
+            interval.tick().await;
+        }
+    })
+    .await
+    .expect("post-write orphan sweep should reclaim the old unowned file");
+    let manifest = table
+        .catalog()
+        .get_snapshot_files(&meta.table_id, &meta.current_snapshot_id)
+        .await?;
+    assert!(
+        manifest
+            .iter()
+            .all(|file| file.file_path != "abandoned-stage-a.vortex")
+    );
+    assert_eq!(
+        query_all(&ctx, "manifest_orphan_sweep").await,
+        vec![(1, "Alice".to_string())]
+    );
     Ok(())
 }
 
@@ -1110,6 +1354,136 @@ async fn test_wal_with_files_in_snapshot_self_heals_impl(
 
     Ok(())
 }
+
+// ============================================================================
+// Manifest hardening: recovering a WAL whose files were already moved into the
+// snapshot (the same benign "crash after move, before WAL removal" shape as
+// `test_wal_with_files_in_snapshot_self_heals_impl`) must also reconcile
+// `cayenne_snapshot_file` manifest rows for those files, not just unlink the
+// stale WAL. Without this, a table using `scan_from_manifest` (no
+// directory-LIST fallback) would silently never see rows written just before
+// a crash that landed in this exact window.
+// ============================================================================
+
+async fn test_wal_recovery_reconciles_manifest_rows_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Reconciliation is gated on `scan_from_manifest` (a directory-listing
+    // table never writes incremental manifest rows in the first place, so
+    // there is nothing to reconcile for it — see
+    // `insert_current_snapshot_manifest_rows`'s own gate) — this test exists
+    // specifically to prove the manifest gap this mode would otherwise have.
+    let vortex_config = cayenne::metadata::VortexConfig {
+        scan_from_manifest: true,
+        ..Default::default()
+    };
+    let (table, ctx) =
+        setup_table_with_vortex_config(&fixture, "wal_manifest_reconcile", vortex_config).await;
+
+    // Force the write through the Vortex-file path (bypassing the inline
+    // memtable's <INLINE_MAX_ROWS fast path) by inserting a large batch
+    // directly. After this, the current snapshot directory holds real
+    // `.vortex` files we can reference in a stale WAL.
+    let large_rows: i64 = 2000;
+    let ids: Vec<i64> = (1..=large_rows).collect();
+    let names: Vec<String> = ids.iter().map(|i| format!("n_{i}")).collect();
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let schema = table.schema();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(name_refs)),
+        ],
+    )?;
+    common::insert_batch(&table, batch).await?;
+
+    let meta = table.metadata();
+    let snapshot_dir = PathBuf::from(&meta.path)
+        .join(&meta.table_id)
+        .join(&meta.current_snapshot_id);
+    let vortex_files: Vec<String> = std::fs::read_dir(&snapshot_dir)?
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".vortex") {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        !vortex_files.is_empty(),
+        "test setup requires at least one Vortex file in the snapshot \
+         after the large batch insert; got an inline-only write instead"
+    );
+
+    // The normal insert path above already committed manifest rows for these
+    // files (this commit's Stage-B fix). Wipe them to reproduce the crash
+    // window this test targets: files durably moved into the snapshot, but
+    // their manifest rows never committed before the process died.
+    table
+        .catalog()
+        .clear_snapshot_files_except(&meta.table_id, "unrelated-nonexistent-snapshot")
+        .await?;
+    let rows_before_recovery = table
+        .catalog()
+        .get_snapshot_files(&meta.table_id, &meta.current_snapshot_id)
+        .await?;
+    assert!(
+        rows_before_recovery.is_empty(),
+        "test setup requires the manifest to be empty before triggering recovery"
+    );
+
+    // Plant a WAL referencing those (already-moved) files, identical in shape
+    // to `test_wal_with_files_in_snapshot_self_heals_impl` — staging is empty,
+    // so the audit finds every listed file already in the target snapshot.
+    let wal_content = serde_json::json!({
+        "table_name": "wal_manifest_reconcile",
+        "target_snapshot": &meta.current_snapshot_id,
+        "staged_files": &vortex_files,
+        "created_at": "2026-03-01T12:00:00Z"
+    });
+    let wal_path = write_manual_staging_wal(&table, "manual-manifest-reconcile", &wal_content)?;
+
+    // A subsequent staged write drives through `ensure_no_incomplete_write`.
+    let staged = begin_staged_append_with_rows(&table, &[(9002, "Z")]).await?;
+    staged.commit().await?;
+
+    assert!(
+        !wal_path.exists(),
+        "auto-recovery must unlink the stale WAL once it has verified that \
+         all listed files are accounted for in the snapshot"
+    );
+
+    let rows_after_recovery = table
+        .catalog()
+        .get_snapshot_files(&meta.table_id, &meta.current_snapshot_id)
+        .await?;
+    let reconciled_paths: std::collections::BTreeSet<&str> = rows_after_recovery
+        .iter()
+        .map(|f| f.file_path.as_str())
+        .collect();
+    for file_name in &vortex_files {
+        assert!(
+            reconciled_paths.contains(file_name.as_str()),
+            "recovery must reconcile a manifest row for '{file_name}', which was \
+             already durably moved into the snapshot before the simulated crash \
+             but had no manifest row committed"
+        );
+    }
+
+    let total = row_count(&ctx, "wal_manifest_reconcile").await;
+    assert_eq!(
+        total,
+        usize::try_from(large_rows).expect("row count fits") + 1
+    );
+
+    Ok(())
+}
+
+test_with_backends!(test_wal_recovery_reconciles_manifest_rows_impl);
 
 // ============================================================================
 // Integrity checksums (#11639): a checksum-framed staging WAL that fails its
@@ -1771,6 +2145,21 @@ async fn begin_staged_append_with_batch(
 ) -> Result<CayenneStagedAppend, Box<dyn std::error::Error>> {
     let stream = batch_stream(batch);
     Ok(table.begin_staged_append(stream, 1).await?)
+}
+
+fn vortex_file_names(dir: &std::path::Path) -> std::io::Result<Vec<String>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    std::fs::read_dir(dir)?
+        .filter_map(|entry| match entry {
+            Ok(entry) => {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.ends_with(".vortex").then_some(Ok(name))
+            }
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
 }
 
 fn batch_stream(batch: RecordBatch) -> SendableRecordBatchStream {

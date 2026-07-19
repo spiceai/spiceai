@@ -88,6 +88,50 @@ async fn create_sorted_table(
     )
 }
 
+/// Same as [`create_sorted_table`], but with `scan_from_manifest` enabled —
+/// for the manifest-hardening regression test proving `sort_and_rewrite_data`
+/// authors a manifest for its rewritten snapshot (a gap found and fixed
+/// alongside the on-conflict-append and mem-tier-checkpoint paths).
+async fn create_sorted_table_with_manifest(
+    fixture: &common::TestFixture,
+    table_name: &str,
+    schema: Arc<Schema>,
+    sort_columns: Vec<String>,
+    runtime_env: Arc<RuntimeEnv>,
+) -> Arc<CayenneTableProvider> {
+    let vortex_config = VortexConfig {
+        sort_columns,
+        scan_from_manifest: true,
+        ..VortexConfig::default()
+    };
+
+    let context = CayenneContext::new(
+        &vortex_config,
+        Arc::clone(&runtime_env),
+        "sort_rewrite_test",
+    );
+
+    let options = CreateTableOptions {
+        table_name: table_name.to_string(),
+        schema,
+        primary_key: vec![],
+        on_conflict: None,
+        base_path: fixture.data_path.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config,
+    };
+
+    let catalog_arc = Arc::clone(&fixture.catalog);
+    let catalog_arc: Arc<dyn MetadataCatalog> = catalog_arc;
+    Arc::new(
+        CayenneTableProviderBuilder::new(catalog_arc, runtime_env)
+            .with_context(context)
+            .create(options)
+            .await
+            .expect("table should be created"),
+    )
+}
+
 /// Read all data from a table via SQL, returning collected `RecordBatch`es.
 async fn query_all(
     ctx: &SessionContext,
@@ -230,6 +274,66 @@ async fn test_sort_rewrite_basic_impl(
     // Verify data is sorted (query without ORDER BY to check physical sort order)
     let results = query_all(&ctx, &table, "sort_basic").await;
     assert_eq!(total_rows(&results), 5, "should have 5 rows");
+
+    let ids = collect_i64_column(&results, "id");
+    let vals = collect_i64_column(&results, "value");
+    assert_eq!(ids, vec![10, 20, 30, 40, 50], "ids should be sorted");
+    assert_eq!(
+        vals,
+        vec![100, 200, 300, 400, 500],
+        "values should follow their ids"
+    );
+
+    Ok(())
+}
+
+test_with_backends!(test_sort_rewrite_basic_scan_from_manifest_impl);
+
+/// Manifest hardening regression test: `sort_and_rewrite_data` must author a
+/// manifest for its rewritten snapshot under `scan_from_manifest` — found as a
+/// gap during this hardening work (the rewrite minted a new current snapshot
+/// via `update_current_snapshot_id` but never called
+/// `author_uniform_snapshot_manifest`/`upsert_snapshot_manifest_from_listing`,
+/// unlike every other snapshot-publishing commit). Otherwise identical to
+/// `test_sort_rewrite_basic_impl` — a directory-listing table already covers
+/// this shape; this proves the manifest-routed scan agrees.
+async fn test_sort_rewrite_basic_scan_from_manifest_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    let ctx = SessionContext::new();
+    let table = create_sorted_table_with_manifest(
+        &fixture,
+        "sort_basic_manifest",
+        Arc::clone(&schema),
+        vec!["id".to_string()],
+        ctx.runtime_env(),
+    )
+    .await;
+
+    sql_insert(
+        &table,
+        "sort_basic_manifest",
+        "(50, 500), (10, 100), (30, 300), (20, 200), (40, 400)",
+    )
+    .await;
+
+    table
+        .sort_and_rewrite_data(128 * 1024 * 1024)
+        .await
+        .expect("sort_and_rewrite_data should succeed under scan_from_manifest");
+
+    let results = query_all(&ctx, &table, "sort_basic_manifest").await;
+    assert_eq!(
+        total_rows(&results),
+        5,
+        "all 5 rows must be visible through the manifest-routed scan after the rewrite \
+         (a regression here means the rewrite published a snapshot with no manifest rows)"
+    );
 
     let ids = collect_i64_column(&results, "id");
     let vals = collect_i64_column(&results, "value");

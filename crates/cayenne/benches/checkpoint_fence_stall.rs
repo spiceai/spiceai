@@ -368,10 +368,109 @@ fn bench_mem_tier_checkpoint_write_lock_stall(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Off-fence staged-append publish (Stage 0c — pointer-only publish).
+//
+// An append-only, pre-placed, manifest-scan generation used to publish under
+// `listing_fence.write()` across BOTH the `cayenne_snapshot_file` metastore
+// commit AND the staging-WAL removal (`place_or_publish_files` +
+// `remove_staging_wal_for`, inside `apply_under_barrier` / `finalize_staged_write`).
+// Every concurrent `scan()` holding `listing_fence.read()` stalled for that
+// full duration, once per staged-append publish (the CDC apply cadence).
+//
+// Stage 0c warms the manifest cache off-fence, then commits the manifest rows
+// (metastore) and removes the WAL OFF the fence, holding `listing_fence` only
+// for the synchronous in-memory manifest-cache flip (`ArcSwap` RCU + listing
+// refresh) — sub-microsecond, modeled by the same no-op the mem-tier lanes use.
+//
+//   - `commit_and_wal_under_fence/<rtt>` (BEFORE, 0b): fence held across the
+//     manifest commit + WAL removal + flip  ⇒ scan stall ≈ commit + wal.
+//   - `flip_only_under_fence/<rtt>`      (AFTER, 0c):  manifest commit + WAL run
+//     off the fence; fence held for the flip only  ⇒ scan stall ≈ µs.
+//
+// Same held-span methodology as the mem-tier lanes (`iter_custom` timing ONLY
+// the fence-held span; single-task and deterministic). The manifest upsert is
+// one metastore round trip; the WAL removal is one object-store/fs op (on S3 a
+// DELETE is a network round trip), so both are modeled at the deployment RTT.
+async fn commit_and_wal_under_fence(fence: &RwLock<()>, rtt: Duration) -> Duration {
+    let started = Instant::now();
+    let _guard = fence.write().await;
+    tokio::time::sleep(rtt).await; // cayenne_snapshot_file upsert — UNDER fence (0b)
+    tokio::time::sleep(rtt).await; // staging-WAL removal — UNDER fence (0b)
+    swap_no_op(); // in-memory manifest-cache flip + listing refresh
+    started.elapsed()
+}
+
+async fn flip_only_under_fence(fence: &RwLock<()>, rtt: Duration) -> Duration {
+    tokio::time::sleep(rtt).await; // manifest upsert — OFF fence (0c)
+    tokio::time::sleep(rtt).await; // WAL removal — OFF fence (0c)
+    let started = Instant::now();
+    let _guard = fence.write().await; // fence taken ONLY for the flip
+    swap_no_op();
+    started.elapsed()
+}
+
+fn bench_staged_append_publish_fence_stall(c: &mut Criterion) {
+    let rt = Runtime::new().expect("tokio runtime");
+    let fence = Arc::new(RwLock::new(()));
+
+    let mut group = c.benchmark_group("staged_append_publish_fence_stall");
+    for &(label, rtt) in RTTS {
+        let fence_a = Arc::clone(&fence);
+        group.bench_with_input(
+            BenchmarkId::new("commit_and_wal_under_fence", label),
+            &rtt,
+            |b, &rtt| {
+                let fence = Arc::clone(&fence_a);
+                b.to_async(&rt).iter_custom(|iters| {
+                    let fence = Arc::clone(&fence);
+                    async move {
+                        let mut held = Duration::ZERO;
+                        for _ in 0..iters {
+                            held += commit_and_wal_under_fence(&fence, rtt).await;
+                        }
+                        // The before lane must hold the fence across at least the
+                        // two round trips it serializes — guards the model from
+                        // silently measuring nothing.
+                        assert!(
+                            held >= rtt
+                                .saturating_mul(2)
+                                .saturating_mul(u32::try_from(iters).unwrap_or(u32::MAX)),
+                            "before lane must hold the fence across commit + WAL removal"
+                        );
+                        held
+                    }
+                });
+            },
+        );
+
+        let fence_b = Arc::clone(&fence);
+        group.bench_with_input(
+            BenchmarkId::new("flip_only_under_fence", label),
+            &rtt,
+            |b, &rtt| {
+                let fence = Arc::clone(&fence_b);
+                b.to_async(&rt).iter_custom(|iters| {
+                    let fence = Arc::clone(&fence);
+                    async move {
+                        let mut held = Duration::ZERO;
+                        for _ in 0..iters {
+                            held += flip_only_under_fence(&fence, rtt).await;
+                        }
+                        held
+                    }
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_checkpoint_fence_stall,
     bench_mem_tier_checkpoint_fence_stall,
-    bench_mem_tier_checkpoint_write_lock_stall
+    bench_mem_tier_checkpoint_write_lock_stall,
+    bench_staged_append_publish_fence_stall
 );
 criterion_main!(benches);

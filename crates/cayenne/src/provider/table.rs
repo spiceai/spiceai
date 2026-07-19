@@ -69,6 +69,7 @@ use crate::metadata::{
     CreateTableOptions, InlinedData, InlinedDataStats, InlinedDelete, PkConflictDetection,
     SnapshotFile, SnapshotFileStatistics, TableMetadata, TableStatistics,
 };
+use crate::provider::drain::{FrozenDrainLedger, FrozenGeneration, GenState};
 use crate::provider::scan::{
     CayenneAccelerationExec, SnapshotScanRef, round_robin_repartition_if_needed,
 };
@@ -149,7 +150,7 @@ use super::deletion_strategy::{
     PositionDeletionVector, RowConverterDeletionSnapshot,
 };
 use super::memory_account::CayenneMemoryAccount;
-use super::staging_wal::PreparedStagedAppend;
+use super::staging_wal::{PreparedStagedAppend, StagedFileMetadata};
 use super::vortex_format::PositionDeletionAccessPlanProvider;
 use arc_swap::ArcSwap;
 
@@ -865,10 +866,81 @@ pub(crate) const SEQ_RESERVE_BLOCK: i64 = 1024;
 /// reseeds from a DB high-water that is `>=` every value ever handed out and
 /// therefore never reissues one. See `reserve_sequences_local`.
 pub(crate) struct SeqAllocator {
-    /// Next sequence number to hand out.
-    next: i64,
+    /// Next sequence number to hand out (lowest UNUSED). Advanced lock-free by
+    /// the `try_reserve` CAS fast path; re-based to a fresh block on refill.
+    next: AtomicI64,
     /// Highest value durably written to `cayenne_table.current_sequence_number`.
-    persisted_hi: i64,
+    /// Monotonically increasing; published (`Release`) after the durable refill.
+    persisted_hi: AtomicI64,
+    /// Serializes the (rare) durable refill so only one winner issues the
+    /// metastore `UPDATE` per block exhaustion; losers re-check and retry the
+    /// lock-free fast path. Held ONLY on the refill path — never on the fast
+    /// path (§6.1: lock-free within a chunk, one-winner refill at exhaustion).
+    refill_lock: tokio::sync::Mutex<()>,
+}
+
+impl SeqAllocator {
+    /// Construct from a durable high-water: `next = persisted_hi + 1` is the
+    /// first unused sequence (the invariant `next - 1 == persisted_hi` holds at
+    /// open).
+    pub(crate) fn new(persisted_hi: i64) -> Self {
+        Self {
+            next: AtomicI64::new(persisted_hi + 1),
+            persisted_hi: AtomicI64::new(persisted_hi),
+            refill_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// The highest sequence handed out so far (`next - 1`). See
+    /// [`CayenneTableProvider::sequence_high_water`] for the required lock.
+    pub(crate) fn high_water(&self) -> i64 {
+        self.next.load(Ordering::Acquire) - 1
+    }
+
+    /// Lock-free fast path (§6.1 G0): reserve `count` (>= 1) consecutive
+    /// sequences iff the durable high-water already covers them. Returns the
+    /// first of `[first, first + count)`, or `None` when a refill is required
+    /// (the caller must durably advance `persisted_hi` and retry).
+    ///
+    /// Synchronous and await-free — callable from a pinned pool worker. Safe
+    /// because: (1) it never returns a value `> persisted_hi` (the check
+    /// precedes the claim and `persisted_hi` only ever increases, so the bound
+    /// cannot lapse between check and CAS); (2) the CAS makes each
+    /// `cur -> cur + count` transition single-winner, so no sequence is issued
+    /// twice.
+    fn try_reserve(&self, count: i64) -> Option<i64> {
+        loop {
+            let cur = self.next.load(Ordering::Acquire);
+            let last = cur.checked_add(count - 1)?;
+            if last > self.persisted_hi.load(Ordering::Acquire) {
+                return None; // block exhausted — refill needed
+            }
+            if self
+                .next
+                .compare_exchange_weak(cur, cur + count, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(cur);
+            }
+            // Lost the race for `cur` — another reserver advanced `next`; retry.
+        }
+    }
+
+    /// Non-claiming test of whether [`Self::try_reserve`] `count` would currently
+    /// succeed on its first CAS attempt — i.e. the durable high-water already
+    /// covers the next `count` sequences. Used ONLY by the refill-only path
+    /// ([`refill_sequence_block_in`]) to skip a redundant durable bump when a
+    /// prior winner already grew the block. NOT a reservation: a concurrent
+    /// reserver may consume the headroom between this check and a later
+    /// `try_reserve`, so the caller must still `try_reserve` (and re-bounce if it
+    /// then returns `None`) — this only avoids the metastore round-trip in the
+    /// common already-grown case.
+    fn can_reserve(&self, count: i64) -> bool {
+        let Some(last) = self.next.load(Ordering::Acquire).checked_add(count - 1) else {
+            return false;
+        };
+        last <= self.persisted_hi.load(Ordering::Acquire)
+    }
 }
 
 /// Reserve `count` (>= 1) consecutive sequence numbers from a shared in-memory
@@ -882,16 +954,38 @@ pub(crate) struct SeqAllocator {
 /// See [`CayenneTableProvider::reserve_sequences_local`] for the
 /// monotonicity-on-reopen correctness argument.
 pub(crate) async fn reserve_sequences_in(
-    allocator: &tokio::sync::Mutex<SeqAllocator>,
+    allocator: &SeqAllocator,
     catalog: &Arc<dyn MetadataCatalog>,
     table_id: &str,
     table_name: &str,
     count: u32,
 ) -> CatalogResult<i64> {
     let count = i64::from(count.max(1));
-    let mut allocator = allocator.lock().await;
+    loop {
+        // Fast path: lock-free CAS, no await, no metastore round trip. The
+        // common case once a block is reserved.
+        if let Some(first) = allocator.try_reserve(count) {
+            return Ok(first);
+        }
 
-    if allocator.next + count - 1 > allocator.persisted_hi {
+        // Slow path: the block is exhausted. Serialize the durable refill so
+        // exactly one winner issues the metastore UPDATE; losers block briefly
+        // on the refill lock, then find the block already grown and retry the
+        // fast path.
+        let _refill = allocator.refill_lock.lock().await;
+        // Re-attempt under the lock: a prior winner may already have refilled
+        // enough while we waited for the lock.
+        if let Some(first) = allocator.try_reserve(count) {
+            return Ok(first);
+        }
+
+        // We are the winner. Durably reserve a fresh block, then publish it:
+        // advance `next`'s floor to the block start (`fetch_max` tolerates a gap
+        // when a concurrent process claimed the previous DB high-water), THEN
+        // store `persisted_hi` with `Release` — so any reserver that observes the
+        // new `persisted_hi` (`Acquire`) also observes the re-based `next`,
+        // preserving the invariant `next - 1 <= persisted_hi` at every point an
+        // observer (or the next process after a crash) can read either value.
         let bump = std::cmp::max(SEQ_RESERVE_BLOCK, count);
         let bump_u32 = u32::try_from(bump).unwrap_or(u32::MAX);
         let block_first = catalog.reserve_sequence_numbers(table_id, bump_u32).await?;
@@ -903,19 +997,59 @@ pub(crate) async fn reserve_sequences_in(
                 ),
             }
         })?;
-        allocator.next = std::cmp::max(allocator.next, block_first);
-        allocator.persisted_hi = new_hi;
+        allocator.next.fetch_max(block_first, Ordering::AcqRel);
+        allocator.persisted_hi.store(new_hi, Ordering::Release);
+        // Loop: the fast path now succeeds against the grown block.
     }
+}
 
-    let first = allocator.next;
-    allocator.next += count;
-    debug_assert!(
-        allocator.next - 1 <= allocator.persisted_hi,
-        "B2 invariant violated: next-1 ({}) > persisted_hi ({})",
-        allocator.next - 1,
-        allocator.persisted_hi,
-    );
-    Ok(first)
+/// Durably GROW the shared sequence block so a subsequent
+/// [`SeqAllocator::try_reserve`]`(count)` succeeds, WITHOUT claiming any
+/// sequence. This is the async edge half of the drain-at-edge refill bounce
+/// (Stage 1 #3b): a synchronous `try_reserve` under a `parking_lot`
+/// `mem_tier_publish_lock` returned `None` (block exhausted), so the caller
+/// drops the lock, calls this off-lock to advance the durable high-water, then
+/// re-acquires the lock and re-runs `try_reserve` UNDER it — preserving the
+/// §2.3d invariant that the N=1 reservation is claimed under the publish lock
+/// (the only thing serializing it against the checkpoint's snapshot-sequence
+/// reservation). It deliberately does NOT return a claimed sequence, so no value
+/// is ever handed out off-lock.
+///
+/// One-winner via `refill_lock` (shared with [`reserve_sequences_in`], so a
+/// refill and a refill-bounce never double-bump); losers observe the grown block
+/// and return. Idempotent — a no-op when the block is already large enough. The
+/// monotonicity-on-reopen argument is identical to `reserve_sequences_in`: the
+/// fsynced `UPDATE … RETURNING` sets `persisted_hi` (with `Release`) before
+/// `next` is re-based, so a crash reseeds from a DB high-water `>=` every value
+/// ever handed out.
+pub(crate) async fn refill_sequence_block_in(
+    allocator: &SeqAllocator,
+    catalog: &Arc<dyn MetadataCatalog>,
+    table_id: &str,
+    table_name: &str,
+    count: u32,
+) -> CatalogResult<()> {
+    let count = i64::from(count.max(1));
+    let _refill = allocator.refill_lock.lock().await;
+    // A prior winner (or a concurrent `reserve_sequences_in` refill) may already
+    // have grown the block past `count`: skip the durable bump.
+    if allocator.can_reserve(count) {
+        return Ok(());
+    }
+    let bump = std::cmp::max(SEQ_RESERVE_BLOCK, count);
+    let bump_u32 = u32::try_from(bump).unwrap_or(u32::MAX);
+    let block_first = catalog.reserve_sequence_numbers(table_id, bump_u32).await?;
+    let reserved = i64::from(bump_u32);
+    let new_hi = block_first.checked_add(reserved - 1).ok_or_else(|| {
+        CatalogError::InvalidOperationNoSource {
+            message: format!(
+                "sequence-number high-water overflow reserving {reserved} for table {table_name}"
+            ),
+        }
+    })?;
+    allocator.next.fetch_max(block_first, Ordering::AcqRel);
+    allocator.persisted_hi.store(new_hi, Ordering::Release);
+    Ok(())
 }
 
 /// One retained mem-tier segment's deletion-filtered visible batches plus the
@@ -1224,6 +1358,42 @@ pub struct CayenneTableProvider {
     /// window the mid-pass overwrite guard defends. Consumed on first fire.
     #[cfg(test)]
     test_pre_publish_hook: Arc<ParkingMutex<Option<TestPrePublishHook>>>,
+    /// Test-only override for the `cayenne_ingest_substrate: pool` routing target
+    /// (Stage 1 #3c). When `Some`, `apply_memory_burst_via_pool` submits to THIS
+    /// private [`crate::ingest_pool::IngestPool`] instead of the process-global
+    /// one — so end-to-end apply-through-pool tests each drive an isolated pool
+    /// (no shared static, no cross-test serialization). Production always leaves
+    /// this `None` (the §8 core partition is machine-wide, one global pool).
+    /// Shared across writer clones so the descriptor's clone routes to the same
+    /// pool as the edge.
+    #[cfg(test)]
+    ingest_pool_override: Option<Arc<crate::ingest_pool::IngestPool>>,
+    /// Test-only fault injection: when set, the memory-apply interior panics at
+    /// its top (before any lock/mutation), so the worker-panic chaos test can
+    /// assert isolation + structured error + no torn tier. Per-provider (shared
+    /// across writer clones) so a panicking test never bleeds into a concurrent
+    /// one. Production never sets it.
+    #[cfg(test)]
+    force_apply_panic: Arc<AtomicBool>,
+    /// Test-only fault injection for the Stage 2a crash-injection recovery suite:
+    /// when armed, `drain_checkpoint_generation` aborts (one-shot, self-disarming)
+    /// in the `GenState::Spilling` state — AFTER the Vortex file is durably encoded
+    /// and fsynced but BEFORE `commit_mem_tier_checkpoint_metadata` publishes the
+    /// metastore pointer. This reproduces a crash mid-bake, leaving a
+    /// durable-but-unreferenced orphan snapshot file, so a recovery test can prove
+    /// the orphan never becomes visible on reopen (no dirty read of uncommitted
+    /// rows) and the un-acked tail replays PK-idempotently. Per-provider (shared
+    /// across writer clones). Production never sets it.
+    #[cfg(test)]
+    force_checkpoint_spill_fault: Arc<AtomicBool>,
+    /// Test-only pause gate for the D>1 detached checkpoint drain (Stage 2b Step
+    /// 3b-b). When `Some`, a checkpoint drain parks right after it commits to the bake
+    /// (`GenState::Spilling`), letting a test deterministically hold drain N in flight
+    /// while it starts freeze N+1 — proving the drains OVERLAP and the publish is
+    /// ordered oldest-first. `None` (default / production) makes the pause a no-op.
+    /// Shared across writer clones so a detached drain on a clone observes it.
+    #[cfg(test)]
+    checkpoint_drain_gate: Arc<ParkingMutex<Option<CheckpointDrainGate>>>,
     /// Protected snapshot IDs that should skip deletion filtering.
     ///
     /// When data is inserted while pending deletions exist, the new data is written
@@ -1236,6 +1406,20 @@ pub struct CayenneTableProvider {
     /// `ArcSwap`: scan paths take `Arc::clone` instead of cloning the
     /// `HashMap`; writes use `rcu` to publish a copy-on-write update.
     protected_snapshots: Arc<ArcSwap<HashMap<String, i64>>>,
+    /// In-memory cache of `cayenne_snapshot_file` rows, keyed by `snapshot_id`,
+    /// so a manifest-mode scan of an already-cached snapshot (the current
+    /// snapshot, or a still-protected one) reads from memory instead of
+    /// round-tripping the catalog on every scan. Wait-free reads via
+    /// `ArcSwap`, copy-on-write updates via `rcu` — same pattern as
+    /// `protected_snapshots`. A miss is always safe (falls through to a fresh
+    /// catalog read, which populates the entry); staleness is the real
+    /// concern, so every manifest-row writer keeps this in sync: incremental
+    /// inserts (`Self::apply_manifest_cache_delta`, called from
+    /// `Self::upsert_current_snapshot_manifest_rows`) delta-apply, wholesale
+    /// rebuilds (`Self::upsert_snapshot_manifest_from_listing`) replace the
+    /// entry outright, and `Self::prune_snapshot_manifest_to` drops every
+    /// entry except the one being kept.
+    manifest_cache: Arc<ArcSwap<HashMap<String, Arc<Vec<SnapshotFile>>>>>,
     /// Table-scoped warning dedupe for protected snapshot ids that cannot
     /// provide a `UUIDv7` timestamp for age-triggered maintenance.
     protected_snapshot_age_warning_keys: Arc<ParkingMutex<BoundedFifoSet>>,
@@ -1409,7 +1593,7 @@ pub struct CayenneTableProvider {
     /// common (in-block) path takes the lock, does arithmetic, drops it (no
     /// `await`). Shared across `clone_for_write` clones — the provider is a
     /// per-table singleton, so all writers of one table share one allocator.
-    seq_allocator: Arc<tokio::sync::Mutex<SeqAllocator>>,
+    seq_allocator: Arc<SeqAllocator>,
     /// Inline-conflict tombstones (Option D) that Stage-B has activated IN
     /// MEMORY but whose DURABLE `published = 1` flip has been deferred (cycle-4
     /// lever b1★ — Stage-B writer-free).
@@ -1522,6 +1706,39 @@ pub struct CayenneTableProvider {
     /// checkpoint to finish rather than racing it — natural backpressure, not
     /// a try-lock-with-fallback. Shared across writer clones.
     mem_checkpoint_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The shared in-flight mem-tier drain ledger (proposal §4.5, Model B — Stage
+    /// 2b Step 2). Every freeze/clear path (checkpoint, seal, spill, schema-
+    /// evolution flush, cold-tier promotion) records the front prefix it captured as
+    /// a [`FrozenGeneration`] here, then drives it through its lifecycle
+    /// ([`GenState`]) and reclaims it. Because Step 1b serializes ALL of those paths
+    /// on [`Self::mem_checkpoint_lock`], at most one `freeze()` exists at a time, so
+    /// this `D = 1` ledger is provably race-free and the [`ParkingMutex`] is
+    /// uncontended — it guards interior mutability behind `&self` and lets an
+    /// operation drive the front generation through brief, await-free critical
+    /// sections (the guard is NEVER held across an `.await`, the sync-substrate
+    /// invariant). Shared across writer clones (one ledger per table); Stage 2b Step
+    /// 3b-b raises `max_depth` and hands `D > 1` checkpoint drains to detached
+    /// `tokio::spawn` tasks (NOT the pinned ingest pool — the drain is async I/O-bound;
+    /// see the Step 3 executor decision).
+    drain_ledger: Arc<ParkingMutex<FrozenDrainLedger>>,
+    /// Depth-`D` drain ADMISSION (Stage 2b Step 3b-b): a permit is acquired before a
+    /// background-tick checkpoint captures+freezes and released when its (possibly
+    /// detached) drain reclaims the generation, so at most `max_depth` generations are
+    /// ever resident — the byte-budget-independent back-pressure that stalls a freeze
+    /// at capacity. Capacity equals the ledger's `max_depth`. Acquired ONLY at
+    /// `max_depth > 1`; at `D = 1` (config default) the drain runs inline under
+    /// `mem_checkpoint_lock` and this is never touched (byte-identical). Shared across
+    /// writer clones.
+    drain_admission: Arc<tokio::sync::Semaphore>,
+    /// Wakes drains waiting for their ORDERED-PUBLISH turn (Stage 2b Step 3b-b). At
+    /// `D > 1` encode/PUT fan out unordered, but the publish (metastore commit +
+    /// `listing_fence` swap + `retain_after` front-clear + slot ack) must be strictly
+    /// oldest-first — a later generation clearing the front `retain_after` before an
+    /// older one would drop the older generation's still-resident segments. A drain
+    /// waits until its generation is the ledger FRONT before publishing; every reclaim
+    /// advances the front and `notify_waiters()` here. Untouched at `D = 1` (the sole
+    /// generation is always the front). Shared across writer clones.
+    drain_publish_notify: Arc<tokio::sync::Notify>,
     /// Serializes the mem-tier *publish* (the `ArcSwap` swap + sequence
     /// reservation) across all writers — DECOUPLED from [`Self::listing_fence`]
     /// so an in-memory append no longer waits on scans (read-fence) or
@@ -1542,7 +1759,15 @@ pub struct CayenneTableProvider {
     /// the checkpoint capture takes ALL of them in index order to stay mutually
     /// exclusive with every appender (Phase 5). Serializes WRITERS only (not scans
     /// or compaction). At N=1 this is exactly the prior single publish lock.
-    mem_tier_publish_locks: Arc<[tokio::sync::Mutex<()>]>,
+    ///
+    /// `parking_lot::Mutex` (Stage 1 #3b): every critical section on these locks
+    /// is now synchronous and await-free (the reservation await became the
+    /// lock-free `try_reserve`, with the durable refill bounced OFF the lock), so
+    /// the guard is NEVER held across an `.await` — the sync-substrate invariant
+    /// that lets the memory apply run on a pinned pool worker (3c). NOTE:
+    /// `parking_lot` mutexes do NOT poison, so critical sections are ordered
+    /// "compute → single `store`" so a panic cannot leave a tier half-updated.
+    mem_tier_publish_locks: Arc<[ParkingMutex<()>]>,
     /// The single, monotone, per-APPLY slot-ack epoch axis for the sharded
     /// (`cdc_mem_tier_shards > 1`) in-memory CDC path (§3.4 Fix 1). Incremented
     /// once per apply (per coalesced burst), stamped identically onto every shard
@@ -1830,6 +2055,155 @@ struct PendingMaintainedAggregateDelete {
     pk_batch: RecordBatch,
 }
 
+/// Successful result of [`CayenneTableProvider::apply_memory_burst_locked`] —
+/// the synchronous, await-free interior of a memory-mode mem-tier append,
+/// factored out of `append_to_shard`'s publish-lock critical section (Stage 1
+/// #3b). The maintained-aggregate insert/delete are PREPARED under the publish
+/// lock (so the epoch advances atomically with the tombstone visibility) but
+/// APPLIED on the async edge AFTER the lock is dropped — they are the only edge
+/// work the interior can't do itself. This is the exact shape 3c hands to the
+/// pinned pool worker (interior sync, tail on the edge).
+pub(crate) struct MemApplyOutcome {
+    epoch: u64,
+    maintained_aggregate_insert: Option<PendingMaintainedAggregateInsert>,
+    maintained_aggregate_delete: Option<PendingMaintainedAggregateDelete>,
+}
+
+/// Why [`CayenneTableProvider::apply_memory_burst_locked`] returned WITHOUT
+/// applying (Stage 1 #3b). The interior is otherwise infallible — its only
+/// fallible/awaiting step, the sequence reservation, became the lock-free
+/// `try_reserve` — so a bounce is the sole non-success outcome. The async edge
+/// handles it off-lock and re-invokes the interior (run-to-completion); it never
+/// surfaces to a mutation caller. This makes the interior a pure sync function
+/// (no `.await`, no I/O) so its critical section is safe under a `parking_lot`
+/// publish lock, and is what 3c routes through the pool unchanged.
+pub(crate) enum ApplyInterrupt {
+    /// The lock-free `try_reserve` found the durable sequence block exhausted.
+    /// The edge must durably grow the block by at least `count`
+    /// (`refill_sequence_block`), then re-invoke the interior, which re-acquires
+    /// the publish lock and re-runs `try_reserve` UNDER it — preserving the
+    /// §2.3d invariant that the N=1 claim happens under the publish lock (the
+    /// only thing serializing it against the checkpoint's snapshot-sequence
+    /// reservation). Cold: ~once per `SEQ_RESERVE_BLOCK` reservations.
+    NeedsRefill { count: u32 },
+}
+
+/// An owned, `Send` package of everything [`CayenneTableProvider::apply_memory_burst_locked`]
+/// needs to run its synchronous interior on a pinned [`crate::ingest_pool`]
+/// worker (morsel pipeline, Stage 1 #3c). It is the concrete payload of
+/// [`crate::ingest_pool::Task::MemoryApply`] — a struct, not a `Box<dyn Fn>`, so
+/// the hot path allocates no per-task trait object (proposal §10).
+///
+/// The interior's working set (the tombstone HAMT, the memo delta) is born and
+/// dies on the worker, so it crosses no boundary and needs no `Sync`; only the
+/// `Send` *inputs* travel here. The `provider` is a `clone_for_write_operations`
+/// clone (all `Arc` shares — the writer state is shared across clones), so the
+/// worker mutates the SAME mem-tier / publish locks / allocator as the edge.
+///
+/// PANIC-SAFETY: the worker wraps [`Self::run_interior`] in `catch_unwind` and,
+/// on a panic, replies with [`MemoryApplyReply::Done(Err(..))`] — the
+/// `parking_lot` publish lock is released by unwinding (no poison) and the
+/// interior's "compute → single `store`" ordering means a panic cannot leave the
+/// tier `ArcSwap` half-updated, so the edge fails the apply cleanly, never a
+/// silent torn tier.
+pub(crate) struct MemoryApplyDescriptor {
+    /// Writer clone whose `apply_memory_burst_locked` the worker calls.
+    provider: Arc<CayenneTableProvider>,
+    shard_id: usize,
+    arc_batches: Arc<Vec<RecordBatch>>,
+    /// Owned; the interior takes `&mut` to `stamp` it under the publish lock.
+    /// Untouched on a `NeedsRefill` bounce (the interior returns before `stamp`),
+    /// so a re-submit re-stamps exactly once — matching the inline loop.
+    tombstones: crate::provider::mem_tier::SegmentTombstones,
+    incoming_rows: u64,
+    incoming_bytes: u64,
+    superseded: u64,
+    source_position: Option<u64>,
+    /// Owned clone of the shard's kept keys (EMPTY at N=1, so the clone is free
+    /// on the primary path; the shard's key set at N>1).
+    record_keys: PkDigestSet,
+    maintained_aggregate_delete_rows: Option<RecordBatch>,
+    reserved_sequences: Option<(i64, i64)>,
+    defer_maintained_aggregate: bool,
+    /// Pool → edge completion carrier. `Option` so the worker can `take` it to
+    /// reply while still owning the descriptor (needed on the `NeedsRefill`
+    /// bounce, which sends the descriptor back for a re-submit).
+    reply: Option<tokio::sync::oneshot::Sender<MemoryApplyReply>>,
+}
+
+/// The pool → edge reply for a submitted [`MemoryApplyDescriptor`] (Stage 1 #3c).
+pub(crate) enum MemoryApplyReply {
+    /// The interior ran to completion: `Ok` carries the applied epoch + prepared
+    /// maintained-aggregate deltas for the edge tail; `Err` signals the worker
+    /// panicked mid-apply (the edge fails the apply — no torn tier).
+    Done(std::result::Result<MemApplyOutcome, MemoryApplyError>),
+    /// The lock-free `try_reserve` found the durable block exhausted. The
+    /// descriptor is handed BACK so the edge can durably grow the block off-lock
+    /// and re-submit it (run-to-completion; cold, ~once per `SEQ_RESERVE_BLOCK`).
+    NeedsRefill {
+        count: u32,
+        descriptor: Box<MemoryApplyDescriptor>,
+    },
+}
+
+/// The worker panicked while applying a [`MemoryApplyDescriptor`]. Carried back
+/// so the edge returns a structured apply error rather than a torn tier.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MemoryApplyError;
+
+impl MemoryApplyDescriptor {
+    /// Run the synchronous, await-free interior. Called by the pinned worker
+    /// INSIDE its `catch_unwind`. Takes `&mut self` because the interior stamps
+    /// `tombstones` in place; on `NeedsRefill` `tombstones` is left untouched so
+    /// the edge can re-submit `self` unchanged.
+    pub(crate) fn run_interior(
+        &mut self,
+    ) -> std::result::Result<MemApplyOutcome, ApplyInterrupt> {
+        // Fault injection (tests only): panic at the TOP of the interior, before
+        // any lock is taken or tier state mutated, so the worker-panic chaos test
+        // can assert the `catch_unwind` in `run_task` converts it to a structured
+        // apply error, the worker survives, and the tier is uncorrupted. The flag
+        // is per-provider (shared across writer clones), so a panicking test never
+        // bleeds into a concurrent one.
+        #[cfg(test)]
+        assert!(
+            !self.provider.force_apply_panic.load(Ordering::Relaxed),
+            "cayenne test: injected memory-apply panic"
+        );
+        self.provider.apply_memory_burst_locked(
+            self.shard_id,
+            &self.arc_batches,
+            &mut self.tombstones,
+            self.incoming_rows,
+            self.incoming_bytes,
+            self.superseded,
+            self.source_position,
+            &self.record_keys,
+            self.maintained_aggregate_delete_rows.as_ref(),
+            self.reserved_sequences,
+            self.defer_maintained_aggregate,
+        )
+    }
+
+    /// Take the reply sender out (so the worker can reply while still owning the
+    /// descriptor for a `NeedsRefill` re-submit).
+    pub(crate) fn take_reply(
+        &mut self,
+    ) -> Option<tokio::sync::oneshot::Sender<MemoryApplyReply>> {
+        self.reply.take()
+    }
+
+    /// Install a fresh reply sender before a (re-)submit.
+    pub(crate) fn set_reply(&mut self, reply: tokio::sync::oneshot::Sender<MemoryApplyReply>) {
+        self.reply = Some(reply);
+    }
+
+    /// The table this descriptor applies to (for diagnostics / panic logging).
+    pub(crate) fn table_name(&self) -> &str {
+        self.provider.table_name()
+    }
+}
+
 /// RAII writer side of the maintained-aggregate scan seqlock. Construction
 /// changes the generation from even to odd before any mem-tier visibility
 /// mutation; drop publishes the next even generation after the epoch and all
@@ -2106,13 +2480,15 @@ pub(crate) const BAKE_DELETION_INDEX_TRIGGER: usize = 50_000;
 /// The two guards a mem-tier checkpoint holds, kept as a struct because their
 /// lifetimes differ: `_checkpoint` (`mem_checkpoint_lock`) spans the whole
 /// lifecycle — capture, encode, publish, clear, slot advance — serializing
-/// checkpoints; `write` is only capture-scoped. Callers keep the struct alive and
-/// pass only `write.take()` to `checkpoint_mem_tier_inner`, so the checkpoint guard
-/// is not accidentally released early.
+/// checkpoints against each other, the seal, the write-path spill, and a cold
+/// promotion; `write` is only capture-scoped. Callers keep the struct alive and
+/// pass only `write.take()` to `capture_and_freeze_checkpoint`, so the checkpoint
+/// guard is not accidentally released early. (Adapted from PR #11907 —
+/// `sgrebnov/cayenne-promotion-checkpoint-serialization`.)
 struct MemTierCheckpointGuards {
     /// `mem_checkpoint_lock`, held for the whole checkpoint lifecycle (read only via `Drop`).
     _checkpoint: tokio::sync::OwnedMutexGuard<()>,
-    /// N>1 capture `write_lock`; `checkpoint_mem_tier_inner` releases it right after
+    /// N>1 capture `write_lock`; `capture_and_freeze_checkpoint` releases it right after
     /// capture so the encode runs off `write_lock`. `None` at N==1 (capture is atomic).
     write: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
@@ -2327,6 +2703,210 @@ impl std::fmt::Debug for CayenneTableProvider {
         f.debug_struct("CayenneTableProvider")
             .field("table_metadata", &self.table_metadata)
             .finish_non_exhaustive()
+    }
+}
+
+/// RAII cleanup for the shared drain ledger (Stage 2b Step 2). A drain freezes a
+/// generation into [`CayenneTableProvider::drain_ledger`] and, on the happy path,
+/// drives it to a terminal state and reclaims it explicitly (disarming this guard).
+/// If the drain instead returns early on a `?` error or panics mid-flight, the
+/// generation would be stranded in the shared ledger and a later freeze would hit
+/// the depth bound and error the table permanently. On drop while still armed this
+/// guard CASCADE-discards that stranded generation and every younger one behind it
+/// ([`FrozenDrainLedger::discard_from_id`]), which loses nothing — the mem-tier
+/// segments are removed only at publish, so the rows are still live in the tier and
+/// re-frozen by the next capture.
+///
+/// IDENTITY-AWARE + CASCADING (Stage 2b Steps 3b + 3b-b-iii): the guard discards the
+/// generation with its recorded `id` (NOT the front) AND all younger generations still
+/// resident behind it — a failure invalidates their window bases (they summed this
+/// generation's un-cleared front into their own), so they must not publish a stale
+/// window. Addressing by id targets exactly this drain's generation wherever it sits at
+/// `D > 1`; the cascade then collapses the younger run. At `D = 1` the sole resident
+/// generation carries this id and is the front, so it is byte-identical to a single
+/// front discard. The guard drops BEFORE the operation releases `mem_checkpoint_lock`
+/// (declared after the lock guard, so reverse drop order), leaving the ledger clear of
+/// this generation for the next freeze.
+struct DrainCleanup<'a> {
+    ledger: &'a ParkingMutex<FrozenDrainLedger>,
+    /// Woken on a discard so a younger generation parked in the ordered-publish gate
+    /// ([`CayenneTableProvider::await_checkpoint_publish_turn`]) re-checks the front —
+    /// the failing generation left the ledger, so the front may have advanced.
+    publish_notify: &'a tokio::sync::Notify,
+    id: u64,
+    armed: bool,
+}
+
+impl DrainCleanup<'_> {
+    /// Arm the guard for the operation that just froze the generation with `id`.
+    fn armed<'a>(
+        ledger: &'a ParkingMutex<FrozenDrainLedger>,
+        publish_notify: &'a tokio::sync::Notify,
+        id: u64,
+    ) -> DrainCleanup<'a> {
+        DrainCleanup {
+            ledger,
+            publish_notify,
+            id,
+            armed: true,
+        }
+    }
+
+    /// The drain reached its terminal reclaim; its generation has left the ledger, so
+    /// the guard must not discard anything on drop.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DrainCleanup<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            // Error/panic path: the drain never reached its terminal reclaim. A brief,
+            // await-free critical section (Drop is synchronous) CASCADE-discards this
+            // drain's own stranded generation AND every younger generation still
+            // resident behind it (Stage 2b Step 3b-b-iii). The cascade is the D>1
+            // FAILURE contract: a failing generation never clears its front prefix, but
+            // each younger generation summed this one's `relative_counts` into its
+            // `window_base` on the promise that the front WOULD be cleared oldest-first
+            // ahead of it — so a younger generation that published after this failure
+            // would `retain_after` the wrong (un-cleared) front and corrupt the tier.
+            // Discarding the whole younger run collapses the pipeline to a safe point:
+            // nothing was cleared (publish clears only from the front, oldest-first, and
+            // none of these ever became the front), so every discarded generation's rows
+            // stay live in the tier and the source replays their un-acked epochs
+            // PK-idempotently. Generations OLDER than this one (ahead of it) never
+            // counted it, so they are untouched and publish/clear their own fronts.
+            self.ledger.lock().discard_from_id(self.id);
+            // The cascade advanced the ledger front, so wake every drain parked in the
+            // ordered-publish gate to re-check: an older survivor may now be the front
+            // (its turn), and each cascade-discarded younger drain observes
+            // `!is_resident` and ABORTS its publish (see `await_checkpoint_publish_turn`)
+            // rather than clearing a stale window. A no-op at D=1 (no drain is ever
+            // parked — the sole generation is always the front).
+            self.publish_notify.notify_waiters();
+        }
+    }
+}
+
+/// The claimed, immutable working copy of one frozen CHECKPOINT generation — the
+/// input to the off-lock drain ([`CayenneTableProvider::drain_checkpoint_generation`]).
+/// Owned (not borrowed from the ledger) so the drain reads it entirely off-lock and
+/// so Stage 2b Step 3b can `tokio::spawn` a `'static` task that TAKES it. Read from
+/// the front generation under one brief `drain_ledger` lock right after the freeze
+/// (never held across the encode `.await`s).
+struct CheckpointDrainClaim {
+    /// The ledger identity of the frozen generation this claim drains. The drain
+    /// drives its lifecycle (`Spilling` / `Published`) and, on failure, discards it by
+    /// this id — never by ledger position, so it is correct at `D > 1` where the
+    /// generation may not be the front.
+    id: u64,
+    /// The captured per-shard snapshots (whole live `segments` as of freeze).
+    shard_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>>,
+    /// Per-shard freeze-time resident-prefix offset — the base of this generation's
+    /// encode window. `[0; n]` at `D = 1` (empty ledger at freeze), so the window is
+    /// the whole captured snapshot and the encode is byte-identical.
+    window_base: Vec<usize>,
+    /// Per-shard own window length `N_G` (= absolute segment count − `window_base`).
+    /// Drives BOTH the encode window (`window_view(base, N_G)`) and the publish
+    /// `retain_after` front-clear (ordered oldest-first, so the live tier's front at
+    /// publish IS this window).
+    relative_counts: Vec<usize>,
+    /// The reserved snapshot sequence (`None` for the empty / position-based capture).
+    reserved_snapshot_sequence: Option<i64>,
+    /// The durable epoch this generation acks at publish (min-across-in-flight; the
+    /// sole in-flight generation at `D = 1`).
+    flushed_epoch: u64,
+}
+
+/// The claimed, immutable working copy of one frozen SEAL generation — the input to
+/// the off-lock seal drain ([`CayenneTableProvider::drain_seal_generation`]). The seal
+/// counterpart of [`CheckpointDrainClaim`]: owned (not borrowed from the ledger) so the
+/// drain reads it entirely off-lock and Stage 2b Step 3b-b can `tokio::spawn` a
+/// `'static` task that TAKES it. The seal marks per-shard boundaries rather than
+/// windowing an encode, so it carries no window base — `sealed_through` is the absolute
+/// per-shard boundary and the shadow reads `unsealed_view` (not a window).
+struct SealDrainClaim {
+    /// The ledger identity of the frozen generation this claim seals. The drain drives
+    /// its lifecycle (`Sealed`) and, on failure, discards it by this id — never by
+    /// ledger position (correct at `D > 1`).
+    id: u64,
+    /// The captured per-shard snapshots (whole live `segments` as of the seal freeze).
+    shard_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>>,
+    /// Per-shard absolute active→sealed boundary (the full prefix length at capture).
+    sealed_through: Vec<usize>,
+    /// The durable epoch this generation acks once sealed (MAX per-apply epoch over the
+    /// full captured prefix).
+    seal_epoch: u64,
+}
+
+/// The outcome of [`CayenneTableProvider::await_checkpoint_publish_turn`]: whether a
+/// parked drain won its ordered-publish turn or was cascade-discarded by an older
+/// failure (Stage 2b Step 3b-b-iii).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishTurn {
+    /// This generation is now the ledger front — proceed with the ordered publish.
+    Ours,
+    /// This generation left the ledger (an older drain failed and cascade-discarded it);
+    /// abort the publish without clearing/committing — its rows stay live for replay.
+    Discarded,
+}
+
+/// Test-only deterministic pause gate for the D>1 detached checkpoint drain (Stage 2b
+/// Step 3b-b). Parks a drain right after it commits to the bake (by generation id) so a
+/// test can hold drain N in flight while it starts freeze N+1 — proving the drains
+/// overlap — and then release parked drains in a CHOSEN order (Step 3b-b-iii) to fuzz
+/// the concurrency against a serial reference. Cloneable so the drain reads it out from
+/// under the `ParkingMutex` without holding the guard across the `.await`.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct CheckpointDrainGate {
+    /// Generation ids that reached the pause, in arrival order (never cleared) — the
+    /// test reads this to observe overlap and to pick a release order.
+    parked: Arc<ParkingMutex<Vec<u64>>>,
+    /// Generation ids the test has released; a parked drain proceeds once its id is in
+    /// this set. Releasing by id is what lets the fuzz choose the encode-start order
+    /// (the publish is always ordered oldest-first by the publish-turn gate regardless).
+    released: Arc<ParkingMutex<std::collections::HashSet<u64>>>,
+    /// Notified whenever `released` grows so parked drains re-check their id.
+    notify: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl CheckpointDrainGate {
+    /// How many drains have reached the pause so far (released or not).
+    fn arrived(&self) -> usize {
+        self.parked.lock().len()
+    }
+
+    /// The arrival-ordered ids of drains that have reached the pause but are not yet
+    /// released.
+    fn pending(&self) -> Vec<u64> {
+        let released = self.released.lock();
+        self.parked
+            .lock()
+            .iter()
+            .copied()
+            .filter(|id| !released.contains(id))
+            .collect()
+    }
+
+    /// Release the parked drain carrying `id` (idempotent).
+    fn release(&self, id: u64) {
+        self.released.lock().insert(id);
+        self.notify.notify_waiters();
+    }
+
+    /// Release every drain that has reached the pause so far.
+    fn release_all_parked(&self) {
+        let ids: Vec<u64> = self.parked.lock().clone();
+        {
+            let mut released = self.released.lock();
+            for id in ids {
+                released.insert(id);
+            }
+        }
+        self.notify.notify_waiters();
     }
 }
 
@@ -2639,6 +3219,93 @@ impl CayenneTableProvider {
     #[must_use]
     pub fn clone_for_write_operations(&self) -> Self {
         self.clone_for_write()
+    }
+
+    /// Test-only: route `cayenne_ingest_substrate: pool` applies to a PRIVATE
+    /// [`crate::ingest_pool::IngestPool`] instead of the process-global one, so an
+    /// end-to-end apply-through-pool test drives an isolated pool (no shared
+    /// static, no cross-test serialization). Shared across writer clones via
+    /// `clone_for_write`.
+    #[cfg(test)]
+    pub(crate) fn set_ingest_pool_override(
+        &mut self,
+        pool: Arc<crate::ingest_pool::IngestPool>,
+    ) {
+        self.ingest_pool_override = Some(pool);
+    }
+
+    /// Test-only: toggle the memory-apply panic injection (per-provider — never
+    /// bleeds into a concurrent test).
+    #[cfg(test)]
+    pub(crate) fn set_force_apply_panic(&self, on: bool) {
+        self.force_apply_panic.store(on, Ordering::Relaxed);
+    }
+
+    /// Test-only: arm the one-shot Stage 2a spilling-crash injection (per-provider).
+    /// The next `checkpoint_mem_tier` aborts in the `Spilling` state (durable file
+    /// encoded, metastore pointer NOT committed) and self-disarms, so a recovery
+    /// test can drop+reopen and assert the orphan file never surfaces.
+    #[cfg(test)]
+    pub(crate) fn arm_checkpoint_spill_fault(&self) {
+        self.force_checkpoint_spill_fault
+            .store(true, Ordering::Relaxed);
+    }
+
+    /// Test-only: raise the drain-pipeline depth `D` so the D>1 DETACHED checkpoint
+    /// drain path becomes reachable (config keeps `D = 1` until Step 3c ships the
+    /// settable knob). Must be called before any checkpoint/seal freeze, on a provider
+    /// whose ledger is still empty. Raises BOTH the ledger's resident-generation bound
+    /// AND the admission-semaphore capacity to match, and both are shared across writer
+    /// clones (so a detached drain on a clone sees the raised depth). The mem-tier
+    /// append stays synchronous — only the checkpoint drain pipelines.
+    #[cfg(test)]
+    pub(crate) fn set_drain_pipeline_depth_for_test(&self, depth: usize) {
+        assert!(depth >= 1, "drain pipeline depth is at least 1");
+        self.drain_ledger.lock().set_max_depth_for_test(depth);
+        // The ledger started at capacity 1; add the extra permits so the admission
+        // budget equals `depth`.
+        if depth > 1 {
+            self.drain_admission.add_permits(depth - 1);
+        }
+    }
+
+    /// Test-only: install a pause gate so each subsequent detached checkpoint drain
+    /// parks by generation id (after committing to the bake) until the test releases
+    /// that id. Returns the (cloneable) gate handle — `arrived`/`pending` observe the
+    /// parked drains, `release(id)`/`release_all_parked()` let them proceed — so a test
+    /// can prove drains OVERLAP and release them in a chosen order.
+    #[cfg(test)]
+    pub(crate) fn install_checkpoint_drain_gate_for_test(&self) -> CheckpointDrainGate {
+        let gate = CheckpointDrainGate {
+            parked: Arc::new(ParkingMutex::new(Vec::new())),
+            released: Arc::new(ParkingMutex::new(std::collections::HashSet::new())),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        };
+        *self.checkpoint_drain_gate.lock() = Some(gate.clone());
+        gate
+    }
+
+    /// Test-only pause point in the detached checkpoint drain: if a gate is installed,
+    /// record this generation's arrival (by id) and wait until the test releases that
+    /// id. No-op (default / production) when no gate is installed. Reads the gate out
+    /// from under its `ParkingMutex` so no guard is held across the `.await` (the
+    /// sync-substrate invariant); the wait arms the `Notified` before re-checking so a
+    /// release racing the check is not lost (the standard tokio idiom).
+    #[cfg(test)]
+    async fn checkpoint_drain_pause_point(&self, id: u64) {
+        let gate = self.checkpoint_drain_gate.lock().clone();
+        if let Some(gate) = gate {
+            gate.parked.lock().push(id);
+            loop {
+                let notified = gate.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if gate.released.lock().contains(&id) {
+                    return;
+                }
+                notified.await;
+            }
+        }
     }
 
     /// Append a CDC upsert stream using Cayenne's native writer path.
@@ -3252,6 +3919,139 @@ impl CayenneTableProvider {
     ///   ~1 dir/s of 32 MiB checkpoints holds ≤ ~120 dirs / a few GiB
     ///   transiently, and the sweep retries failed deletes each pass.
     const RETIRED_SNAPSHOT_DIR_GRACE: std::time::Duration = std::time::Duration::from_mins(2);
+    /// Minimum age before an unreferenced file in a live snapshot can be
+    /// reclaimed as abandoned pre-placement output.
+    const PREPLACED_ORPHAN_MIN_AGE: std::time::Duration = std::time::Duration::from_mins(5);
+    /// Bound one pass so cleanup never monopolizes the write lane.
+    const PREPLACED_ORPHAN_MAX_PER_PASS: usize = 64;
+
+    /// Reclaim old files that were pre-placed in a live snapshot but never
+    /// reached durable WAL or manifest publication. The write lock excludes an
+    /// active Stage A whose file names are not known until the sink completes;
+    /// incomplete-WAL recovery runs first and either publishes or retains every
+    /// durably owned generation. The remaining age-qualified, non-manifest files
+    /// are therefore abandoned output.
+    async fn sweep_preplaced_orphan_files(&self) {
+        if !self.preplace_staged_files() {
+            return;
+        }
+        let Ok(_write_guard) = self.write_lock_arc().try_lock_owned() else {
+            return;
+        };
+        if let Err(error) = self.ensure_no_incomplete_write().await {
+            tracing::warn!(
+                table = self.table_name(),
+                %error,
+                "Pre-placed orphan sweep skipped: staging-WAL recovery did not complete"
+            );
+            return;
+        }
+        if let Err(error) = self.sweep_preplaced_orphan_files_once().await {
+            tracing::warn!(
+                table = self.table_name(),
+                %error,
+                "Pre-placed orphan sweep failed (will retry)"
+            );
+        }
+    }
+
+    async fn sweep_preplaced_orphan_files_once(&self) -> Result<usize> {
+        let current = self.get_current_snapshot_id();
+        let protected = self.protected_snapshots.load();
+        let mut live_snapshot_ids = protected.keys().cloned().collect::<HashSet<_>>();
+        live_snapshot_ids.insert(current);
+        let all_rows = self
+            .catalog
+            .get_all_snapshot_files(&self.table_metadata.table_id)
+            .await?;
+        let referenced = Self::live_referenced_relative_paths(&all_rows, &live_snapshot_ids);
+        let mut removed = 0_usize;
+
+        for snapshot_id in live_snapshot_ids {
+            if removed >= Self::PREPLACED_ORPHAN_MAX_PER_PASS {
+                break;
+            }
+            if self.table_path().starts_with("s3://") {
+                let Some(prefix) = self.snapshot_object_store_prefix(&snapshot_id)? else {
+                    continue;
+                };
+                let config = self.require_object_store()?;
+                let mut objects = config.store.list(Some(&prefix));
+                while let Some(meta) = objects.next().await {
+                    let meta = meta.map_err(|source| Error::ObjectStore {
+                        operation: "list live snapshot for pre-placed orphan cleanup",
+                        table: self.table_name().to_string(),
+                        source,
+                    })?;
+                    let Some(file_name) = meta.location.filename() else {
+                        continue;
+                    };
+                    let relative = Self::manifest_file_relative_path(&snapshot_id, file_name);
+                    let old_enough = chrono::Utc::now()
+                        .signed_duration_since(meta.last_modified)
+                        .to_std()
+                        .is_ok_and(|age| age >= Self::PREPLACED_ORPHAN_MIN_AGE);
+                    if Self::is_compactable_data_file(file_name)
+                        && !referenced.contains(&relative)
+                        && old_enough
+                    {
+                        config
+                            .store
+                            .delete(&meta.location)
+                            .await
+                            .map_err(|source| Error::ObjectStore {
+                                operation: "delete abandoned pre-placed snapshot file",
+                                table: self.table_name().to_string(),
+                                source,
+                            })?;
+                        removed += 1;
+                        if removed >= Self::PREPLACED_ORPHAN_MAX_PER_PASS {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                let dir = Self::snapshot_dir_path(self.table_path(), self.table_id(), &snapshot_id);
+                let mut entries = match tokio::fs::read_dir(&dir).await {
+                    Ok(entries) => entries,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                while let Some(entry) = entries.next_entry().await? {
+                    let file_name = entry.file_name().to_string_lossy().into_owned();
+                    let relative = Self::manifest_file_relative_path(&snapshot_id, &file_name);
+                    let old_enough = entry
+                        .metadata()
+                        .await?
+                        .modified()
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age >= Self::PREPLACED_ORPHAN_MIN_AGE);
+                    if Self::is_compactable_data_file(&file_name)
+                        && !referenced.contains(&relative)
+                        && old_enough
+                    {
+                        match tokio::fs::remove_file(entry.path()).await {
+                            Ok(()) => removed += 1,
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(error) => return Err(error.into()),
+                        }
+                        if removed >= Self::PREPLACED_ORPHAN_MAX_PER_PASS {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if removed > 0 {
+            tracing::info!(
+                table = self.table_name(),
+                removed,
+                "Reclaimed abandoned pre-placed snapshot file(s)"
+            );
+        }
+        Ok(removed)
+    }
 
     /// Record that the catalog no longer references these snapshot dirs (their
     /// contents were merged into a successor snapshot). Physical deletion
@@ -4325,6 +5125,16 @@ impl CayenneTableProvider {
                     )
                     .await
                 {
+                    // Only pay the extra catalog round-trips (one read, one
+                    // write per file) when this table actually resolves scans
+                    // from the manifest — a directory-listing table keeps
+                    // today's exact cost/behavior and relies on the periodic
+                    // best-effort `rebuild_live_snapshot_manifests` sweep
+                    // instead, exactly as before this change.
+                    if self.scan_from_manifest() {
+                        self.insert_current_snapshot_manifest_rows(current_snapshot, &metas)
+                            .await?;
+                    }
                     *self.last_moved_snapshot_files.lock() =
                         Some((current_snapshot.to_string(), metas));
                 }
@@ -4332,6 +5142,400 @@ impl CayenneTableProvider {
         }
 
         Ok(())
+    }
+
+    /// Incrementally commit manifest rows (`cayenne_snapshot_file`) for files
+    /// just moved into the live current snapshot, as part of the same apply that
+    /// moved them — the append-path counterpart to
+    /// [`Self::upsert_snapshot_manifest_from_listing`]'s full-relist rebuild
+    /// (used by compaction/rewrite, which mints a whole new snapshot).
+    ///
+    /// Mandatory, not best-effort: `scan_from_manifest` no longer falls back to a
+    /// live directory LIST for a table whose manifest is otherwise established, so
+    /// a plain append MUST keep the manifest complete for it to stay correct.
+    /// Errors propagate (`?`) rather than log-and-continue.
+    ///
+    /// Tags every row with `[0, current_sequence]` — the same conservative,
+    /// always-bake-eligible range [`Self::rebuild_live_snapshot_manifests`] uses
+    /// for the current snapshot (a plain append cannot yet form a tighter range
+    /// cheaply here without threading the burst's reserved sequence through the
+    /// staged-append/WAL plumbing — a follow-up worth doing once this path is the
+    /// one Stage-B consumes, rather than before). `row_count`/`digest` are left as
+    /// the same best-effort hints [`Self::upsert_snapshot_manifest_from_listing`]
+    /// already treats as optional (0 / `None` is correct-but-imprecise, never
+    /// wrong; backfilled later by the periodic reconciliation sweep or the next
+    /// scan that reads the file's footer stats).
+    async fn insert_current_snapshot_manifest_rows(
+        &self,
+        current_snapshot: &str,
+        metas: &[ObjectMeta],
+    ) -> Result<()> {
+        let rows = metas.iter().filter_map(|meta| {
+            let file_name = meta.location.filename()?;
+            Some((
+                file_name.to_string(),
+                i64::try_from(meta.size).unwrap_or(i64::MAX),
+                0_i64,
+            ))
+        });
+        self.upsert_current_snapshot_manifest_rows(current_snapshot, rows)
+            .await
+    }
+
+    /// Same as [`Self::insert_current_snapshot_manifest_rows`], but for files
+    /// reported directly by a [`Self::write_to_snapshot`] call via a
+    /// [`vortex_datafusion::WrittenFilesCollector`] — carrying a real
+    /// footer-derived `row_count` rather than the ObjectMeta-based path's
+    /// best-effort `0`, and requiring no object-store call at all (the sink
+    /// already knows size and row count from the write itself).
+    async fn insert_current_snapshot_manifest_rows_from_written_files(
+        &self,
+        current_snapshot: &str,
+        files: &[vortex_datafusion::WrittenFile],
+    ) -> Result<()> {
+        let rows = files.iter().filter_map(|file| {
+            let file_name = file.path.filename()?;
+            Some((
+                file_name.to_string(),
+                i64::try_from(file.size_bytes).unwrap_or(i64::MAX),
+                i64::try_from(file.row_count).unwrap_or(i64::MAX),
+            ))
+        });
+        self.upsert_current_snapshot_manifest_rows(current_snapshot, rows)
+            .await
+    }
+
+    /// Atomically publish a pre-placed staged generation using the exact file
+    /// metadata persisted in its WAL. No data-file operation or directory LIST
+    /// occurs here.
+    pub(crate) async fn publish_preplaced_snapshot_files(
+        &self,
+        target_snapshot: &str,
+        files: &[StagedFileMetadata],
+    ) -> Result<()> {
+        let rows = files.iter().map(|file| {
+            (
+                file.file_name.clone(),
+                i64::try_from(file.file_size_bytes).unwrap_or(i64::MAX),
+                i64::try_from(file.row_count).unwrap_or(i64::MAX),
+            )
+        });
+        self.upsert_current_snapshot_manifest_rows(target_snapshot, rows)
+            .await?;
+        self.record_current_snapshot_files_added(files.len());
+        Ok(())
+    }
+
+    // ---- Stage 0c: pointer-only publish split ------------------------------
+    //
+    // `publish_preplaced_snapshot_files` above does three things at once —
+    // build the manifest rows (reading the snapshot sequence), durably upsert
+    // them to the catalog, and flip the in-memory manifest cache. Stage 0c
+    // needs those separated so only the last (a synchronous cache RCU) runs
+    // under the reader-blocking `listing_fence`, while the catalog await runs
+    // off it. `publish_preplaced_snapshot_files` is retained as-is for the
+    // crash-recovery reconciliation path (`ensure_no_incomplete_write`), which
+    // runs with a cold cache and no fence and simply needs the combined effect.
+
+    /// Build (but do not persist or publish) the `cayenne_snapshot_file` rows
+    /// for `files` freshly appended to `current_snapshot`. Reads the snapshot
+    /// sequence (async), so callers run it OFF the `listing_fence`. The
+    /// conservative `min_sequence = 0` / `max_sequence = current_sequence`
+    /// range matches `upsert_current_snapshot_manifest_rows` exactly.
+    pub(crate) async fn build_current_snapshot_manifest_rows(
+        &self,
+        current_snapshot: &str,
+        files: &[StagedFileMetadata],
+    ) -> Result<Vec<SnapshotFile>> {
+        let table_id = self.table_metadata.table_id.clone();
+        let current_sequence = self
+            .catalog
+            .get_snapshot_sequence(&table_id, current_snapshot)
+            .await?
+            .unwrap_or(0);
+        Ok(files
+            .iter()
+            .map(|file| SnapshotFile {
+                table_id: table_id.clone(),
+                snapshot_id: current_snapshot.to_string(),
+                file_path: file.file_name.clone(),
+                row_count: i64::try_from(file.row_count).unwrap_or(i64::MAX),
+                file_size_bytes: i64::try_from(file.file_size_bytes).unwrap_or(i64::MAX),
+                min_sequence: 0,
+                max_sequence: current_sequence,
+                digest: None,
+            })
+            .collect())
+    }
+
+    /// Durably persist pre-built manifest rows to the catalog. No cache
+    /// mutation (the caller flips the cache under the fence via
+    /// [`Self::flip_preplaced_manifest_cache`]). Runs OFF the `listing_fence`.
+    pub(crate) async fn materialize_current_snapshot_manifest_rows(
+        &self,
+        rows: &[SnapshotFile],
+    ) -> Result<()> {
+        self.catalog.upsert_snapshot_files(rows).await?;
+        self.record_current_snapshot_files_added(rows.len());
+        Ok(())
+    }
+
+    /// Flip the in-memory manifest cache for a pre-placed generation —
+    /// SYNCHRONOUS (an `ArcSwap` RCU), the only manifest-publish step that must
+    /// run under the held `listing_fence`. Authoritative only when the entry is
+    /// already warm; callers ensure that off-fence via
+    /// [`Self::warm_current_snapshot_manifest_cache`].
+    pub(crate) fn flip_preplaced_manifest_cache(
+        &self,
+        current_snapshot: &str,
+        rows: &[SnapshotFile],
+    ) {
+        self.apply_manifest_cache_delta(current_snapshot, rows);
+    }
+
+    /// Ensure the manifest cache entry for `snapshot_id` is populated, reading
+    /// through to the catalog on a cold miss (async). Run OFF the fence before
+    /// an under-fence [`Self::flip_preplaced_manifest_cache`] so the flip's
+    /// delta lands on a live entry (option A: the cache is authoritative for the
+    /// current snapshot, so a `scan()` never reads the catalog for it and thus
+    /// cannot observe the off-fence catalog commit early).
+    pub(crate) async fn warm_current_snapshot_manifest_cache(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<()> {
+        self.cached_snapshot_files(snapshot_id).await?;
+        Ok(())
+    }
+
+    /// Remove exact pre-placed files while rolling back an unpublished staged
+    /// generation. Files from other generations in the target snapshot are
+    /// never touched.
+    pub(crate) async fn remove_preplaced_snapshot_files(
+        &self,
+        target_snapshot: &str,
+        files: &[StagedFileMetadata],
+    ) -> Result<()> {
+        if self.table_path().starts_with("s3://") {
+            let config = self.require_object_store()?;
+            let Some(prefix) = self.snapshot_object_store_prefix(target_snapshot)? else {
+                return Ok(());
+            };
+            for file in files {
+                let path = ObjectStorePath::from(format!(
+                    "{}{name}",
+                    prefix.as_ref(),
+                    name = file.file_name
+                ));
+                config
+                    .store
+                    .delete(&path)
+                    .await
+                    .map_err(|source| Error::ObjectStore {
+                        operation: "delete unpublished pre-placed snapshot file",
+                        table: self.table_name().to_string(),
+                        source,
+                    })?;
+            }
+        } else {
+            let target_dir =
+                Self::snapshot_dir_path(self.table_path(), self.table_id(), target_snapshot);
+            for file in files {
+                match tokio::fs::remove_file(target_dir.join(&file.file_name)).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Shared upsert loop for both incremental manifest-row sources above: an
+    /// `(file_name, file_size_bytes, row_count)` triple per newly-written file,
+    /// tagged with `min_sequence = 0` / `max_sequence = current_sequence` — the
+    /// same conservative, always-bake-eligible, never-resurrecting range
+    /// `Self::upsert_snapshot_manifest_from_listing`'s `PreserveOrUniform` mode
+    /// falls back to for an untagged current-snapshot file (see its doc
+    /// comment). `row_count`/`digest` beyond what's passed in are left as the
+    /// same best-effort hints that path already treats as optional (0 / `None`
+    /// is correct-but-imprecise, never wrong; backfilled later by the periodic
+    /// reconciliation sweep or the next scan that reads the file's footer
+    /// stats).
+    async fn upsert_current_snapshot_manifest_rows(
+        &self,
+        current_snapshot: &str,
+        rows: impl Iterator<Item = (String, i64, i64)>,
+    ) -> Result<()> {
+        let table_id = self.table_metadata.table_id.clone();
+        let current_sequence = self
+            .catalog
+            .get_snapshot_sequence(&table_id, current_snapshot)
+            .await?
+            .unwrap_or(0);
+
+        let written = rows
+            .map(|(file_path, file_size_bytes, row_count)| SnapshotFile {
+                table_id: table_id.clone(),
+                snapshot_id: current_snapshot.to_string(),
+                file_path,
+                row_count,
+                file_size_bytes,
+                min_sequence: 0,
+                max_sequence: current_sequence,
+                digest: None,
+            })
+            .collect::<Vec<_>>();
+        self.catalog.upsert_snapshot_files(&written).await?;
+        self.apply_manifest_cache_delta(current_snapshot, &written);
+        Ok(())
+    }
+
+    /// Merge `additions` onto the cached manifest listing for `snapshot_id`,
+    /// mirroring `Self::apply_list_files_cache_additions`'s delta-apply for
+    /// the sibling `DataFusion` list-files cache. Only applied onto an
+    /// EXISTING cache entry — a cold miss is left alone (the next
+    /// `Self::cached_snapshot_files` read re-fetches the now-complete listing
+    /// straight from the catalog, which is always correct, just uncached for
+    /// that one read). A row sharing an existing entry's `file_path` replaces
+    /// it (upsert semantics, matching the catalog's `INSERT OR REPLACE`)
+    /// rather than duplicating it.
+    fn apply_manifest_cache_delta(&self, snapshot_id: &str, additions: &[SnapshotFile]) {
+        if additions.is_empty() {
+            return;
+        }
+        self.manifest_cache.rcu(|current| {
+            let Some(existing) = current.get(snapshot_id) else {
+                return Arc::clone(current);
+            };
+            let mut files = (**existing).clone();
+            files.retain(|f| !additions.iter().any(|a| a.file_path == f.file_path));
+            files.extend(additions.iter().cloned());
+            let mut new_map = (**current).clone();
+            new_map.insert(snapshot_id.to_string(), Arc::new(files));
+            Arc::new(new_map)
+        });
+    }
+
+    /// Replace the cached manifest listing for `snapshot_id` wholesale —
+    /// used after a full rebuild (`Self::upsert_snapshot_manifest_from_listing`)
+    /// rather than the incremental delta-apply above, since a rebuild's
+    /// output is already the complete, authoritative file set.
+    fn replace_manifest_cache_entry(&self, snapshot_id: &str, rows: &[SnapshotFile]) {
+        let rows = Arc::new(rows.to_vec());
+        self.manifest_cache.rcu(|current| {
+            let mut new_map = (**current).clone();
+            new_map.insert(snapshot_id.to_string(), Arc::clone(&rows));
+            Arc::new(new_map)
+        });
+    }
+
+    /// Drop every cached manifest entry except `keep_snapshot_id`'s, mirroring
+    /// `Self::prune_snapshot_manifest_to`'s catalog-side GC of stale manifest
+    /// rows for every other snapshot.
+    fn prune_manifest_cache_to(&self, keep_snapshot_id: &str) {
+        self.manifest_cache.rcu(|current| {
+            if current.len() <= 1 && current.contains_key(keep_snapshot_id) {
+                return Arc::clone(current);
+            }
+            let mut new_map = HashMap::new();
+            if let Some(rows) = current.get(keep_snapshot_id) {
+                new_map.insert(keep_snapshot_id.to_string(), Arc::clone(rows));
+            }
+            Arc::new(new_map)
+        });
+    }
+
+    /// Read `cayenne_snapshot_file` rows for `snapshot_id`, serving from
+    /// `Self::manifest_cache` when present so a manifest-mode scan of an
+    /// already-cached snapshot avoids the catalog round-trip. On a miss,
+    /// reads through to the catalog and populates the entry for next time.
+    async fn cached_snapshot_files(
+        &self,
+        snapshot_id: &str,
+    ) -> CatalogResult<Arc<Vec<SnapshotFile>>> {
+        if let Some(cached) = self.manifest_cache.load().get(snapshot_id) {
+            return Ok(Arc::clone(cached));
+        }
+        let rows = Arc::new(
+            self.catalog
+                .get_snapshot_files(&self.table_metadata.table_id, snapshot_id)
+                .await?,
+        );
+        self.manifest_cache.rcu(|current| {
+            let mut new_map = (**current).clone();
+            new_map.insert(snapshot_id.to_string(), Arc::clone(&rows));
+            Arc::new(new_map)
+        });
+        Ok(rows)
+    }
+
+    /// Reconcile manifest rows for a staged append recovered by
+    /// `ensure_no_incomplete_write`'s "resume the move" path, for the crash
+    /// window `Self::insert_current_snapshot_manifest_rows` alone cannot close:
+    /// the crash happened AFTER every staged file was already renamed/copied
+    /// into `target_snapshot` but BEFORE their manifest rows were committed.
+    /// `move_staged_files_to_snapshot` is then a no-op on retry (nothing left in
+    /// staging to move), so the manifest-insert that normally rides along with
+    /// the move never runs for these files — without this reconciliation step
+    /// they would be a permanent, silent orphan once `scan_from_manifest` has no
+    /// directory-LIST fallback to catch them.
+    ///
+    /// Idempotent (`upsert_snapshot_file` is `INSERT OR REPLACE`), so it is safe
+    /// to call unconditionally on every successful recovery of a
+    /// `CurrentSnapshot`-targeted WAL, whether or not the move actually moved
+    /// any files this time.
+    pub(crate) async fn reconcile_current_snapshot_manifest_rows_after_recovery(
+        &self,
+        target_snapshot: &str,
+        staged_files: &[String],
+    ) -> Result<()> {
+        if staged_files.is_empty() {
+            return Ok(());
+        }
+
+        let metas = if self.table_metadata.path.starts_with("s3://") {
+            let config = self.require_object_store()?;
+            let Some(prefix) = self.snapshot_object_store_prefix(target_snapshot)? else {
+                return Ok(());
+            };
+            let store = Arc::clone(&config.store);
+            let mut metas = Vec::with_capacity(staged_files.len());
+            for file_name in staged_files {
+                let path = ObjectStorePath::from(format!("{}{file_name}", prefix.as_ref()));
+                let meta = store.head(&path).await.map_err(|e| Error::ObjectStore {
+                    operation: "stat recovered snapshot file for manifest reconciliation",
+                    table: self.table_metadata.table_name.clone(),
+                    source: e,
+                })?;
+                metas.push(meta);
+            }
+            metas
+        } else {
+            let target_dir = Self::snapshot_dir_path(
+                &self.table_metadata.path,
+                &self.table_metadata.table_id,
+                target_snapshot,
+            );
+            let snapshot_dir_url = Self::snapshot_dir_url(
+                &self.table_metadata.path,
+                &self.table_metadata.table_id,
+                target_snapshot,
+            );
+            let moved_file_names: Vec<std::ffi::OsString> =
+                staged_files.iter().map(std::ffi::OsString::from).collect();
+            self.stat_moved_files_as_object_metas(&snapshot_dir_url, &target_dir, &moved_file_names)
+                .await
+                .ok_or_else(|| Error::Internal {
+                    table: self.table_metadata.table_name.clone(),
+                    message: format!(
+                        "Failed to stat recovered snapshot files for manifest reconciliation \
+                         in snapshot '{target_snapshot}'"
+                    ),
+                })?
+        };
+
+        self.insert_current_snapshot_manifest_rows(target_snapshot, &metas)
+            .await
     }
 
     /// Build the [`ObjectMeta`] entries for `moved_file_names` (just renamed into
@@ -4523,6 +5727,12 @@ impl CayenneTableProvider {
             && !moved_metas.is_empty()
             && moved_metas.len() == file_moves.len()
         {
+            // See the local-FS path: only pay the extra catalog round-trips
+            // when this table actually resolves scans from the manifest.
+            if self.scan_from_manifest() {
+                self.insert_current_snapshot_manifest_rows(current_snapshot, &moved_metas)
+                    .await?;
+            }
             *self.last_moved_snapshot_files.lock() =
                 Some((current_snapshot.to_string(), moved_metas));
         }
@@ -4706,10 +5916,10 @@ impl CayenneTableProvider {
         stream: SendableRecordBatchStream,
         staging_snapshot_id: &str,
         target_partitions: usize,
-    ) -> Result<u64> {
+    ) -> Result<(u64, Vec<vortex_datafusion::WrittenFile>)> {
         self.staging_may_have_files().store(true, Ordering::Release);
-        let (row_count, _writer_ops, _stats_acc) = self
-            .write_to_snapshot(
+        let ((row_count, _writer_ops, _stats_acc), written_files) = self
+            .write_to_snapshot_collecting_files(
                 stream,
                 self.target_file_size_bytes(),
                 staging_snapshot_id,
@@ -4718,7 +5928,7 @@ impl CayenneTableProvider {
                 super::delta_encoding::WriteClass::Delta,
             )
             .await?;
-        Ok(row_count)
+        Ok((row_count, written_files))
     }
 
     /// Sync a directory to ensure all files are durably written to disk.
@@ -5007,6 +6217,21 @@ impl CayenneTableProvider {
 
         let table_metadata = catalog.get_table(table_name).await?;
 
+        if table_metadata
+            .vortex_config
+            .stage_b_publish_mode
+            .preplaces_files()
+            && (table_metadata.partition_column.is_some()
+                || !table_metadata.vortex_config.scan_from_manifest)
+        {
+            return Err(Error::Internal {
+                table: table_name.to_string(),
+                message: "stage_b_publish_mode 'manifest' requires an unpartitioned table with authoritative manifest scans"
+                    .to_string(),
+            }
+            .into());
+        }
+
         // Use the provided context (for partition cache sharing) or build a
         // fresh one from this table's VortexConfig and the shared RuntimeEnv.
         let context = context.unwrap_or_else(|| {
@@ -5155,10 +6380,7 @@ impl CayenneTableProvider {
         // ever monotonically increasing) DB row, so every previously handed-out
         // value is strictly below the new `next` — nothing is reissued.
         let persisted_hi = table_metadata.current_sequence_number;
-        let seq_allocator = Arc::new(tokio::sync::Mutex::new(SeqAllocator {
-            next: persisted_hi + 1,
-            persisted_hi,
-        }));
+        let seq_allocator = Arc::new(SeqAllocator::new(persisted_hi));
 
         let force_staging_probe_on_startup = table_metadata.path.starts_with("s3://");
 
@@ -5192,6 +6414,18 @@ impl CayenneTableProvider {
         // `.max(1)` keeps the unsharded path when unset/0; `ShardedMemTier::empty`
         // also clamps, but pin it here so the field decl and lock-slice sizing agree.
         let mem_tier_shards = table_metadata.vortex_config.cdc_mem_tier_shards.max(1);
+        // Stage 2b Step 3c: bounded CDC drain-pipeline depth `D`. Default 1 =
+        // today's serial inline drain (byte-identical); `D > 1` pipelines the
+        // checkpoint drain (freeze N+1 overlaps drain N's off-lock encode/PUT).
+        // Read + clamped once here, at table-open, before any freeze — the
+        // production twin of `set_drain_pipeline_depth_for_test`: it sizes BOTH
+        // the drain ledger's resident-generation bound AND the admission-semaphore
+        // capacity to `D`, and both are shared across writer clones (so a detached
+        // drain on a clone sees the configured depth). Resident RAM ≈
+        // `D × checkpoint-tier-bytes` (§4.5), capped by `MAX_INGEST_PIPELINE_DEPTH`.
+        let drain_pipeline_depth = table_metadata
+            .vortex_config
+            .resolved_ingest_pipeline_depth();
 
         // Advertise the primary key as an (unverified) DataFusion constraint so
         // `TableProvider::constraints()` reflects it — runtime features gate on
@@ -5211,6 +6445,14 @@ impl CayenneTableProvider {
             current_snapshot_id: Arc::new(RwLock::new(table_metadata.current_snapshot_id.clone())),
             #[cfg(test)]
             test_pre_publish_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            ingest_pool_override: None,
+            #[cfg(test)]
+            force_apply_panic: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            force_checkpoint_spill_fault: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            checkpoint_drain_gate: Arc::new(ParkingMutex::new(None)),
             table_schema: Arc::new(ArcSwap::new(Arc::<arrow_schema::Schema>::clone(
                 &table_metadata.schema,
             ))),
@@ -5244,6 +6486,7 @@ impl CayenneTableProvider {
                 object_store_registered_runtime_envs,
             )),
             protected_snapshots: Arc::new(ArcSwap::from_pointee(protected_snapshots)),
+            manifest_cache: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             protected_snapshot_age_warning_keys: Arc::new(ParkingMutex::new(
                 BoundedFifoSet::with_capacity(PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT),
             )),
@@ -5296,8 +6539,18 @@ impl CayenneTableProvider {
             // a snapshot.
             current_sorted_snapshot: Arc::new(ArcSwap::from_pointee(None)),
             mem_checkpoint_lock: Arc::new(tokio::sync::Mutex::new(())),
+            // Stage 2b Step 2: one shared drain ledger per table, sized from config
+            // (`D = 1` = today's byte-identical serial path). Serialized against
+            // concurrent freezes by `mem_checkpoint_lock`.
+            drain_ledger: Arc::new(ParkingMutex::new(FrozenDrainLedger::new(
+                drain_pipeline_depth,
+            ))),
+            // Stage 2b Step 3b-b / 3c: admission capacity == the ledger's `max_depth`
+            // (`cayenne_ingest_pipeline_depth`, default 1). Only acquired at `D > 1`.
+            drain_admission: Arc::new(tokio::sync::Semaphore::new(drain_pipeline_depth)),
+            drain_publish_notify: Arc::new(tokio::sync::Notify::new()),
             mem_tier_publish_locks: (0..mem_tier_shards)
-                .map(|_| tokio::sync::Mutex::new(()))
+                .map(|_| ParkingMutex::new(()))
                 .collect::<Vec<_>>()
                 .into(),
             mem_tier_apply_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -5383,9 +6636,12 @@ impl CayenneTableProvider {
         // above already moved any interrupted staged append into its snapshot, so
         // the directory listing this reads is the final, committed file set. No
         // background task is running yet, so this cannot race a write or
-        // compaction. Best-effort: it leaves the manifest empty on failure and
-        // the scan falls back to directory listing.
-        provider.backfill_snapshot_manifest_if_empty().await;
+        // compaction. Best-effort for a directory-listing table: it leaves the
+        // manifest empty on failure and the scan falls back to directory
+        // listing. For a `scan_from_manifest` table, failing to even determine
+        // the manifest's state is not swallowed — the table fails to open.
+        provider.backfill_snapshot_manifest_if_empty().await?;
+        provider.sweep_preplaced_orphan_files().await;
 
         if let Err(error) = provider
             .rebuild_maintained_aggregates_from_visible_state()
@@ -5741,6 +6997,59 @@ impl CayenneTableProvider {
         estimated_bytes: Option<u64>,
         write_class: super::delta_encoding::WriteClass,
     ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
+        self.write_to_snapshot_with_collector(
+            stream,
+            target_size_bytes,
+            snapshot_id,
+            target_partitions,
+            estimated_bytes,
+            write_class,
+            None,
+        )
+        .await
+    }
+
+    /// Write a stream and return the exact files reported by the Vortex sink.
+    /// This is used by staged appends to persist durable publish intent without
+    /// listing the staging directory after the write.
+    pub(crate) async fn write_to_snapshot_collecting_files(
+        &self,
+        stream: SendableRecordBatchStream,
+        target_size_bytes: usize,
+        snapshot_id: &str,
+        target_partitions: usize,
+        estimated_bytes: Option<u64>,
+        write_class: super::delta_encoding::WriteClass,
+    ) -> Result<(
+        (u64, usize, Arc<ColumnStatsAccumulator>),
+        Vec<vortex_datafusion::WrittenFile>,
+    )> {
+        let collector = Arc::new(ParkingMutex::new(Vec::new()));
+        let result = self
+            .write_to_snapshot_with_collector(
+                stream,
+                target_size_bytes,
+                snapshot_id,
+                target_partitions,
+                estimated_bytes,
+                write_class,
+                Some(Arc::clone(&collector)),
+            )
+            .await?;
+        let files = std::mem::take(&mut *collector.lock());
+        Ok((result, files))
+    }
+
+    async fn write_to_snapshot_with_collector(
+        &self,
+        stream: SendableRecordBatchStream,
+        target_size_bytes: usize,
+        snapshot_id: &str,
+        target_partitions: usize,
+        estimated_bytes: Option<u64>,
+        write_class: super::delta_encoding::WriteClass,
+        supplied_collector: Option<vortex_datafusion::WrittenFilesCollector>,
+    ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
         use std::time::Instant;
 
@@ -5823,6 +7132,29 @@ impl CayenneTableProvider {
                 self.write_shard_config(target_partitions, target_size_bytes, estimated_bytes),
             ),
             None => self.write_shard_format(target_partitions, target_size_bytes, estimated_bytes),
+        };
+
+        // This write lands directly in the live current snapshot directory
+        // (the position-based mem-tier/inlined-data checkpoint paths — every
+        // other caller targets either a `_staging/<uuid>` dir or a brand-new,
+        // not-yet-current snapshot id, neither of which can equal
+        // `get_current_snapshot_id()` at this point). For those two callers,
+        // under `scan_from_manifest`, attach a collector so the Vortex sink
+        // reports exactly which file(s) it wrote — size and row count
+        // included — letting the manifest be updated incrementally below with
+        // no directory LIST at all, instead of the full-relist
+        // `upsert_snapshot_manifest_from_listing` fallback those two callers
+        // used before this collector existed.
+        let maintain_current_snapshot_manifest = supplied_collector.is_none()
+            && self.scan_from_manifest()
+            && snapshot_id == self.get_current_snapshot_id();
+        let written_files_collector: Option<vortex_datafusion::WrittenFilesCollector> =
+            supplied_collector.or_else(|| {
+                maintain_current_snapshot_manifest.then(|| Arc::new(ParkingMutex::new(Vec::new())))
+            });
+        let write_format = match written_files_collector.clone() {
+            Some(collector) => Arc::new(write_format.with_written_files_collector(collector)),
+            None => write_format,
         };
 
         // Create a new ListingTable pointing to the snapshot directory
@@ -5967,6 +7299,18 @@ impl CayenneTableProvider {
             .await?;
 
         collect(insert_plan, session_state.task_ctx()).await?;
+
+        // Maintain the manifest for the two position-based checkpoint
+        // callers (see the collector's attachment above) with the exact files
+        // the sink just reported — no directory LIST, no additional
+        // object-store call at all.
+        if maintain_current_snapshot_manifest && let Some(collector) = written_files_collector {
+            let files = std::mem::take(&mut *collector.lock());
+            if !files.is_empty() {
+                self.insert_current_snapshot_manifest_rows_from_written_files(snapshot_id, &files)
+                    .await?;
+            }
+        }
 
         let total_rows = total_rows_written.load(Ordering::Relaxed);
         // Files added ≈ number of concurrent shard writers (each writes ≥1 file
@@ -6367,7 +7711,16 @@ impl CayenneTableProvider {
             current_snapshot_id: Arc::clone(&self.current_snapshot_id),
             #[cfg(test)]
             test_pre_publish_hook: Arc::clone(&self.test_pre_publish_hook),
+            #[cfg(test)]
+            ingest_pool_override: self.ingest_pool_override.clone(),
+            #[cfg(test)]
+            force_apply_panic: Arc::clone(&self.force_apply_panic),
+            #[cfg(test)]
+            force_checkpoint_spill_fault: Arc::clone(&self.force_checkpoint_spill_fault),
+            #[cfg(test)]
+            checkpoint_drain_gate: Arc::clone(&self.checkpoint_drain_gate),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
+            manifest_cache: Arc::clone(&self.manifest_cache),
             protected_snapshot_age_warning_keys: Arc::clone(
                 &self.protected_snapshot_age_warning_keys,
             ),
@@ -6405,6 +7758,13 @@ impl CayenneTableProvider {
             // clone is observed by scanning clones, and cleared for all on a write.
             current_sorted_snapshot: Arc::clone(&self.current_sorted_snapshot),
             mem_checkpoint_lock: Arc::clone(&self.mem_checkpoint_lock),
+            // Shared across clones so every writer/background task records + drains
+            // generations through the SAME per-table drain ledger.
+            drain_ledger: Arc::clone(&self.drain_ledger),
+            // Shared so a detached drain (spawned on its own writer clone) draws from
+            // and returns to the SAME admission budget + publish-turn notifier.
+            drain_admission: Arc::clone(&self.drain_admission),
+            drain_publish_notify: Arc::clone(&self.drain_publish_notify),
             // Shared across clones so EVERY writer serializes on the one publish
             // lock (the seq-ordering invariant requires a single lock per table).
             mem_tier_publish_locks: Arc::clone(&self.mem_tier_publish_locks),
@@ -6485,6 +7845,31 @@ impl CayenneTableProvider {
         .await
     }
 
+    /// Lock-free, await-free reservation of `count` (>= 1) consecutive sequences
+    /// — the synchronous fast path callable from INSIDE a `parking_lot`
+    /// `mem_tier_publish_lock` (Stage 1 #3b) and, in 3c, from the pinned pool
+    /// worker. Returns the first of `[first, first + count)`, or `None` when the
+    /// durable block is exhausted (the caller drops the lock, calls
+    /// [`Self::refill_sequence_block`], and retries under the lock).
+    fn try_reserve_local(&self, count: i64) -> Option<i64> {
+        self.seq_allocator.try_reserve(count)
+    }
+
+    /// Durably grow this table's sequence block so a later
+    /// [`SeqAllocator::try_reserve`]`(count)` succeeds, WITHOUT claiming a
+    /// sequence — the off-lock refill half of the Stage 1 #3b drain-at-edge
+    /// bounce. See [`refill_sequence_block_in`].
+    async fn refill_sequence_block(&self, count: u32) -> CatalogResult<()> {
+        refill_sequence_block_in(
+            &self.seq_allocator,
+            &self.catalog,
+            &self.table_metadata.table_id,
+            &self.table_metadata.table_name,
+            count,
+        )
+        .await
+    }
+
     /// The highest sequence number handed out so far (the global high-water):
     /// `allocator.next - 1`, where `next` is the lowest UNUSED sequence.
     ///
@@ -6496,8 +7881,13 @@ impl CayenneTableProvider {
     /// sound compaction cutoff — a rewrite scan taken after this read sees every
     /// mutation `<= cutoff`, and mutations that arrive afterward (`> cutoff`) are
     /// carried forward rather than cleared.
+    // Kept `async` for caller-signature stability: `high_water()` became
+    // synchronous with the lock-free `AtomicI64` allocator (Stage 1 G0), but the
+    // `.await` call sites are left untouched here; de-async-ing is a mechanical
+    // cleanup for PR-extraction (0c-4), not this commit.
+    #[expect(clippy::unused_async)]
     pub(crate) async fn sequence_high_water(&self) -> i64 {
-        self.seq_allocator.lock().await.next - 1
+        self.seq_allocator.high_water()
     }
 
     /// Load the persisted optimizer statistics AND their exactness flag
@@ -11800,6 +13190,34 @@ impl CayenneTableProvider {
             }
         }
 
+        // Author this rewrite's manifest with the merged commit-seq range over
+        // every live snapshot (current + protected) it just consolidated —
+        // same computation and same rationale as the full-rewrite compaction
+        // path (`rewrite_current_snapshot_for_compaction`): the output
+        // materializes the FULL visible stream, so `[min over inputs
+        // min_sequence, max over inputs max_sequence]` is its true range;
+        // falls back to the conservative `[0, current table sequence]` when no
+        // input manifest is available. Unlike compaction, this path had no
+        // manifest-authoring call at all until now — same gap, same fix as
+        // `write_new_snapshot_after_validation` and `drain_checkpoint_generation`.
+        // A `scan_from_manifest` table has no directory-LIST fallback, so a
+        // failure here aborts the rewrite instead of publishing a snapshot
+        // with zero manifest rows; a directory-listing table is unaffected
+        // (no manifest-authoring call on this path at all, same as before).
+        if self.scan_from_manifest() {
+            let (merged_min, merged_max) = self
+                .merged_sequence_range_over_live_snapshots()
+                .await
+                .unwrap_or((0, self.table_metadata.current_sequence_number));
+            if let Err(e) = self
+                .author_uniform_snapshot_manifest(&new_snapshot_id, merged_min, merged_max)
+                .await
+            {
+                cleanup_failed_snapshot.await;
+                return Err(Error::Catalog { source: e });
+            }
+        }
+
         // Pre-create the listing table before committing to catalog.
         // This ensures that if listing table creation fails, we haven't committed
         // the catalog yet, avoiding an inconsistent state.
@@ -12708,6 +14126,7 @@ impl CayenneTableProvider {
 
         if state.refresh_listing || had_stats || retention_deleted > 0 {
             self.schedule_post_write_compaction();
+            self.sweep_preplaced_orphan_files().await;
         }
 
         // b1★ (cycle-4): persist any durable tombstone flips that the staged-batch
@@ -13413,6 +14832,7 @@ impl CayenneTableProvider {
         self.catalog
             .replace_snapshot_files(&table_id, snapshot_id, &replacement)
             .await?;
+        self.replace_manifest_cache_entry(snapshot_id, &replacement);
 
         Ok(files)
     }
@@ -13431,7 +14851,25 @@ impl CayenneTableProvider {
     ) -> CatalogResult<()> {
         self.catalog
             .clear_snapshot_files_except(&self.table_metadata.table_id, keep_snapshot_id)
-            .await
+            .await?;
+        self.prune_manifest_cache_to(keep_snapshot_id);
+        Ok(())
+    }
+
+    /// Clear every manifest row for this table, AND the in-memory manifest
+    /// cache (`Self::manifest_cache`) — the wholesale-clear counterpart to
+    /// `Self::prune_snapshot_manifest_to`'s catalog-side GC. Wraps
+    /// `MetadataCatalog::clear_snapshot_files` so a caller cannot forget the
+    /// cache half of the invariant: any code that clears manifest rows
+    /// through the raw catalog call directly (bypassing this) leaves a stale
+    /// cached listing behind for whatever snapshot was last read.
+    #[cfg(test)]
+    pub(crate) async fn clear_snapshot_manifest_for_test(&self) -> CatalogResult<()> {
+        self.catalog
+            .clear_snapshot_files(&self.table_metadata.table_id)
+            .await?;
+        self.manifest_cache.store(Arc::new(HashMap::new()));
+        Ok(())
     }
 
     /// Author one snapshot's manifest with a single uniform commit-seq range
@@ -13603,6 +15041,13 @@ impl CayenneTableProvider {
     /// manifest is not yet the scan's file source, so an incomplete manifest
     /// cannot make a scan miss a live file or read one outside its snapshot.
     async fn rebuild_live_snapshot_manifests(&self) {
+        // In pre-placement mode the manifest is the visibility boundary. A
+        // directory-derived rebuild would turn an abandoned, never-committed
+        // Stage-A file into visible data. Exact write/compaction transactions
+        // maintain this mode's manifest; physical listing is cleanup input only.
+        if self.preplace_staged_files() {
+            return;
+        }
         // Snapshot the live set as one coherent read (current + protected). The
         // held `compaction_lock` keeps a compaction from repointing it mid-pass.
         let current_snapshot = self.get_current_snapshot_id();
@@ -13677,10 +15122,31 @@ impl CayenneTableProvider {
     /// pays the directory listing — the same listing a scan would do anyway. Runs
     /// at open before the background compactor starts, so the live set cannot
     /// shift under it (no lock contention) and no scan can observe a partial
-    /// manifest. Best-effort: any failure leaves the manifest empty and is logged
-    /// — the dual-source read path then lists the directory, so a backfill error
-    /// can never make a scan miss a live file or read one outside its snapshot.
-    async fn backfill_snapshot_manifest_if_empty(&self) {
+    /// manifest.
+    ///
+    /// Best-effort for a table still on directory listing: any failure leaves
+    /// the manifest empty and is logged — the dual-source read path then lists
+    /// the directory, so a backfill error can never make a scan miss a live file
+    /// or read one outside its snapshot. For a `scan_from_manifest` table there
+    /// is no directory-LIST fallback left once this manifest is trusted, so
+    /// failing to even determine whether it needs backfilling must not be
+    /// silently swallowed — proceeding on an unknown manifest state risks
+    /// serving an incomplete file set as if it were complete; the table fails
+    /// to open instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when `scan_from_manifest` is enabled and the
+    /// existing-manifest read fails; otherwise always `Ok(())` (best-effort).
+    async fn backfill_snapshot_manifest_if_empty(&self) -> CatalogResult<()> {
+        // An empty manifest is authoritative in pre-placement mode. Rebuilding
+        // it from physical files could publish output from a process that died
+        // before making its WAL durable. Enabling this mode on an existing
+        // table therefore requires manifest hardening/backfill before the mode
+        // is persisted; open-time listing must never guess intent.
+        if self.preplace_staged_files() {
+            return Ok(());
+        }
         match self
             .catalog
             .get_all_snapshot_files(&self.table_metadata.table_id)
@@ -13689,12 +15155,15 @@ impl CayenneTableProvider {
             Ok(rows) if !rows.is_empty() => {
                 // Manifest already populated (write path or a prior backfill);
                 // leave it to the live write/compaction paths.
-                return;
+                return Ok(());
             }
             Ok(_) => {
                 // Empty: fall through to backfill from directory listing.
             }
             Err(error) => {
+                if self.context.scan_from_manifest() {
+                    return Err(error);
+                }
                 // Could not determine emptiness; skip rather than risk writing a
                 // partial manifest atop an unknown state. Directory listing
                 // remains the scan's source.
@@ -13704,7 +15173,7 @@ impl CayenneTableProvider {
                     "Snapshot manifest backfill skipped: failed to read existing manifest; \
                      scan falls back to directory listing"
                 );
-                return;
+                return Ok(());
             }
         }
 
@@ -13717,6 +15186,7 @@ impl CayenneTableProvider {
             "Backfilling empty snapshot manifest from directory listing at open"
         );
         self.rebuild_live_snapshot_manifests().await;
+        Ok(())
     }
 
     /// Debug-only observability check: every file the caller just authored
@@ -14242,6 +15712,30 @@ impl CayenneTableProvider {
                     generation_now,
                     "Aborting current-snapshot compaction: a concurrent append \
                      landed during the re-encode; discarding output and retrying"
+                );
+                drop(listing_guard);
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Ok(false);
+            }
+            // `scan_from_manifest` tables no longer fall back to a directory LIST
+            // (that's the whole point of hardening), so a snapshot flip MUST NOT
+            // proceed without a populated manifest for `new_snapshot_id` — an
+            // empty manifest on the new current snapshot would silently read back
+            // zero rows for a table that has data. `manifest_listed` is `None`
+            // only when `upsert_snapshot_manifest_from_listing` failed above; no
+            // catalog/in-memory mutation has happened yet, so this is a plain
+            // discard-and-retry, same as the other pre-commit checks in this
+            // block. Tables still on directory listing are unaffected: a failed
+            // population there is harmless (the scan already falls back to LIST).
+            if self.context.scan_from_manifest() && manifest_listed.is_none() {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    new_snapshot_id = new_snapshot_id.as_str(),
+                    "Aborting current-snapshot compaction: scan_from_manifest is enabled but \
+                     the new snapshot's manifest failed to populate; discarding output and \
+                     retrying rather than flipping to a snapshot with no manifest rows"
                 );
                 drop(listing_guard);
                 self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
@@ -15031,7 +16525,12 @@ impl CayenneTableProvider {
         }
 
         // Flush the in-RAM mem tier + inline into durable so the canonical visible
-        // read below captures the whole live set.
+        // read below captures the whole live set. This holds `write_lock` (acquired
+        // above) but NOT `mem_checkpoint_lock`; `checkpoint_mem_tier_holding_write_lock`
+        // takes the latter so promotion waits for any in-flight background checkpoint's
+        // full capture->encode->publish->clear before it captures — otherwise it would
+        // recapture the not-yet-cleared corpus and publish a duplicate durable copy
+        // baked into the cold tier (a former over-count on promoted tables, PR #11907).
         if self.cdc_durability().is_memory() {
             self.checkpoint_mem_tier_holding_write_lock().await?;
         }
@@ -15692,7 +17191,7 @@ impl CayenneTableProvider {
             .merged_sequence_range_over_snapshots(&old_ids)
             .await
             .unwrap_or((0, fence_max_delete_seq));
-        if let Err(error) = self
+        let manifest_authored = match self
             .upsert_snapshot_manifest_from_listing(
                 &new_snapshot_id,
                 ManifestSequenceTag::Uniform {
@@ -15702,14 +17201,40 @@ impl CayenneTableProvider {
             )
             .await
         {
+            Ok(_files) => true,
+            Err(error) => {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    new_snapshot_id = new_snapshot_id.as_str(),
+                    "Failed to author merged subset-compaction manifest before swap; \
+                     scan falls back to directory listing"
+                );
+                false
+            }
+        };
+
+        // `scan_from_manifest` tables have no directory-LIST fallback, so the CAS
+        // swap below MUST NOT publish `new_snapshot_id` as protected without a
+        // populated manifest — that would leave a live, referenced snapshot with
+        // zero manifest rows, and a scan resolving from it would silently read
+        // back no rows. No catalog mutation has happened yet, so this is a plain
+        // discard-and-retry (same as the other abort paths in this function).
+        // Tables still on directory listing are unaffected: a failed population
+        // there is harmless (the scan already falls back to LIST).
+        if self.context.scan_from_manifest() && !manifest_authored {
             tracing::warn!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
-                %error,
                 new_snapshot_id = new_snapshot_id.as_str(),
-                "Failed to author merged subset-compaction manifest before swap; \
-                 scan falls back to directory listing"
+                "Aborting subset-merge compaction: scan_from_manifest is enabled but the \
+                 merged snapshot's manifest failed to populate; discarding output and \
+                 retrying rather than publishing a snapshot with no manifest rows"
             );
+            self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                .await;
+            return Ok(false);
         }
 
         // --- Phase 3: CAS commit. ---
@@ -16232,7 +17757,7 @@ impl CayenneTableProvider {
             .merged_sequence_range_over_snapshots(&old_ids)
             .await
             .unwrap_or((0, fence_max_delete_seq));
-        if let Err(error) = self
+        let manifest_authored = match self
             .upsert_snapshot_manifest_from_listing(
                 &new_snapshot_id,
                 ManifestSequenceTag::Uniform {
@@ -16242,14 +17767,35 @@ impl CayenneTableProvider {
             )
             .await
         {
+            Ok(_files) => true,
+            Err(error) => {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    new_snapshot_id = new_snapshot_id.as_str(),
+                    "Failed to author merged seq-prefix-bake manifest before swap; \
+                     scan falls back to directory listing"
+                );
+                false
+            }
+        };
+
+        // See the subset-merge compaction path for the rationale: a
+        // `scan_from_manifest` table must never have a protected snapshot
+        // published without a populated manifest (no LIST fallback to save it).
+        if self.context.scan_from_manifest() && !manifest_authored {
             tracing::warn!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
-                %error,
                 new_snapshot_id = new_snapshot_id.as_str(),
-                "Failed to author merged seq-prefix-bake manifest before swap; \
-                 scan falls back to directory listing"
+                "Aborting seq-prefix-bake compaction: scan_from_manifest is enabled but the \
+                 merged snapshot's manifest failed to populate; discarding output and \
+                 retrying rather than publishing a snapshot with no manifest rows"
             );
+            self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                .await;
+            return Ok(false);
         }
 
         // --- Phase 3: CAS commit (atomically deactivate inputs, activate M). ---
@@ -17498,6 +19044,22 @@ impl CayenneTableProvider {
     pub(super) fn get_current_snapshot_id(&self) -> String {
         let guard = self.current_snapshot_id.read();
         guard.clone()
+    }
+
+    /// Whether this table resolves scans from the per-snapshot manifest
+    /// (`cayenne_snapshot_file`) rather than a directory listing. `self.context`
+    /// is private to this module, so other `provider` submodules (compaction,
+    /// overwrite) that need to gate a snapshot-publishing commit on manifest
+    /// population go through this accessor instead.
+    pub(super) fn scan_from_manifest(&self) -> bool {
+        self.context.scan_from_manifest()
+    }
+
+    #[must_use]
+    pub(super) fn preplace_staged_files(&self) -> bool {
+        self.context.preplace_staged_files()
+            && self.table_metadata.partition_column.is_none()
+            && self.scan_from_manifest()
     }
 
     /// Return the snapshot currently published by this provider.
@@ -19970,9 +21532,10 @@ impl CayenneTableProvider {
             });
         }
         // The caller (the in-memory upsert/delete apply path) holds this table's
-        // `write_lock`, so the checkpoint capture must NOT re-acquire it (tokio
-        // mutexes are not reentrant). The apply has not yet fanned out its shard
-        // appends at spill time, so the capture is already atomic regardless.
+        // `write_lock`, and this method holds `mem_checkpoint_lock` (acquired above),
+        // so the checkpoint capture must NOT re-acquire either (tokio mutexes are not
+        // reentrant). The apply has not yet fanned out its shard appends at spill time,
+        // so the capture is already atomic regardless.
         self.checkpoint_mem_tier_holding_locks().await?;
         Ok(())
     }
@@ -20049,11 +21612,22 @@ impl CayenneTableProvider {
             &crate::provider::on_conflict::OnConflictDeletions::default(),
         );
 
-        {
-            let _publish = self.mem_tier_publish_locks[0].lock().await;
+        // Reserve + swap under ONE continuous hold of the (`parking_lot`) publish
+        // lock. `try_reserve` keeps this section await-free; on block exhaustion
+        // the loop drops the lock, durably grows the block off-lock, and retries —
+        // the same drain-at-edge refill bounce as `append_to_shard`, so no `.await`
+        // is ever held under the publish lock. `tombstones` is stamped/cloned only
+        // on the successful pass (a bounce `continue`s before `stamp`).
+        loop {
+            let publish = self.mem_tier_publish_locks[0].lock();
             // delete < data so fresh rows survive their own (empty) tombstones —
             // matches the append path's sequence discipline.
-            let base_sequence = self.reserve_sequences_local(2).await?;
+            let Some(base_sequence) = self.try_reserve_local(2) else {
+                // Block exhausted — release the lock, grow it off-lock, retry.
+                drop(publish);
+                self.refill_sequence_block(2).await?;
+                continue;
+            };
             let (delete_sequence, data_sequence) = (base_sequence, base_sequence + 1);
             tombstones.stamp(delete_sequence);
             // retain_after(MAX) empties the current tier (version+1, epoch
@@ -20065,16 +21639,21 @@ impl CayenneTableProvider {
                 .append_segment_with_source_position(
                     Arc::clone(&arc_batches),
                     data_sequence,
-                    tombstones,
+                    tombstones.clone(),
                     incoming_bytes,
                     incoming_rows,
                     0,
                     None,
                 );
             self.mem_tier.shard(0).store(Arc::new(next));
-            // Memory-mode overwrite swaps the entire tier without a structural-epoch
-            // bump, so signal the scan-view maintainer to recompute the bundle.
+            // Overwrite changes the entire visible set; wake the scan-view maintainer
+            // so it republishes the merged view (the retired per-scan memos this used
+            // to invalidate are gone). Additive/bounded-stale: the tier swap under
+            // `publish` is atomic, so a scan serving the latest bundle sees a
+            // consistent all-old-or-all-new view (no torn overwrite).
             self.notify_scan_input_change();
+            drop(publish);
+            break;
         }
         Ok(incoming_rows)
     }
@@ -20094,8 +21673,9 @@ impl CayenneTableProvider {
             return Ok(true);
         }
         // Reached only via `wait_for_budget_or_spill` from this table's own apply
-        // (it self-spills as a backstop), which holds this table's `write_lock`, so
-        // the capture must not re-acquire it.
+        // (it self-spills as a backstop), which holds this table's `write_lock`; this
+        // method holds `mem_checkpoint_lock` (acquired above), so the capture must not
+        // re-acquire either.
         self.checkpoint_mem_tier_holding_locks().await?;
         Ok(false)
     }
@@ -20795,6 +22375,303 @@ impl CayenneTableProvider {
         // to sit while the lock was held.
         let mut tombstones = self.prepare_segment_tombstones(deletions);
 
+        // Apply the burst's synchronous, await-free interior under the
+        // (`parking_lot`) publish lock. The interior's only fallible/awaiting step
+        // — the sequence reservation — became the lock-free `try_reserve`, which
+        // can bounce ONCE per exhausted block: on `NeedsRefill` the edge grows the
+        // durable block OFF the lock and retries, and the retry re-acquires the
+        // publish lock and re-reserves UNDER it (§2.3d). `tombstones` is stamped
+        // and consumed only on a successful pass — a bounce returns BEFORE `stamp`,
+        // so a retry re-stamps with the final reserved sequence exactly once.
+        //
+        // `cayenne_ingest_substrate` (Stage 1 #3c) selects the EXECUTOR without
+        // changing this locking/refill logic: `Inline` (default) runs the interior
+        // on this tokio refresh task, byte-identical to before; `Pool` packages a
+        // `MemoryApplyDescriptor` and runs the SAME interior on a pinned
+        // `IngestPool` worker, awaiting the reply. Depth stays 1 — the caller holds
+        // `write_guard` across this whole call — so applies remain serial either
+        // way; the pool is *where* the apply runs, not *how many* run.
+        let outcome = match self.table_metadata.vortex_config.ingest_substrate {
+            crate::metadata::IngestSubstrate::Inline => loop {
+                match self.apply_memory_burst_locked(
+                    shard_id,
+                    &arc_batches,
+                    &mut tombstones,
+                    incoming_rows,
+                    incoming_bytes,
+                    superseded,
+                    source_position,
+                    record_keys,
+                    maintained_aggregate_delete_rows,
+                    reserved_sequences,
+                    defer_maintained_aggregate,
+                ) {
+                    Ok(outcome) => break outcome,
+                    Err(ApplyInterrupt::NeedsRefill { count }) => {
+                        // Cold path (~once per `SEQ_RESERVE_BLOCK` reservations):
+                        // durably grow the block OFF the publish lock, then retry
+                        // under it. No sequence is claimed off-lock, so the N=1
+                        // reserve stays serialized against the checkpoint's
+                        // snapshot-sequence reservation by the publish lock exactly
+                        // as before. Timed as `seq_refill_bounce` for the Stage-2
+                        // adaptive `SEQ_RESERVE_BLOCK` tuner (bounce rate × cost).
+                        let bounce_start = Instant::now();
+                        self.refill_sequence_block(count).await?;
+                        record_cayenne_write_phase(
+                            &self.table_metadata.table_name,
+                            "seq_refill_bounce",
+                            bounce_start,
+                        );
+                    }
+                }
+            },
+            crate::metadata::IngestSubstrate::Pool => {
+                self.apply_memory_burst_via_pool(
+                    shard_id,
+                    &arc_batches,
+                    tombstones,
+                    incoming_rows,
+                    incoming_bytes,
+                    superseded,
+                    source_position,
+                    record_keys,
+                    maintained_aggregate_delete_rows,
+                    reserved_sequences,
+                    defer_maintained_aggregate,
+                )
+                .await?
+            }
+        };
+
+        // Net the live row count by the superseded rows, exactly like the durable
+        // upsert path (`inserted - superseded`).
+        let net = i64::try_from(incoming_rows).unwrap_or(i64::MAX)
+            - i64::try_from(superseded).unwrap_or(i64::MAX);
+        self.inlined_row_count.fetch_add(net, Ordering::Relaxed);
+
+        // Accumulate the durable (file+inline) supersedes this append hid, so the
+        // next mem-tier checkpoint can net them out of its persisted `Delta`
+        // (`flushed_mem_rows` counts the new versions but not the durable rows they
+        // supersede, which stay physically resident until compaction). Without this
+        // the maintained count climbs toward "every row ever flushed". Reset by the
+        // checkpoint clear. See `mem_tier_pending_superseded`. Saturating so a
+        // long-lived process between checkpoints can never wrap `i64` negative (a
+        // negative accumulator would inflate the checkpoint delta via its
+        // `saturating_sub`); clamped at `i64::MAX` it only ever over-nets, keeping
+        // the maintained count Inexact-and-conservative rather than inflated.
+        let superseded_delta = i64::try_from(superseded).unwrap_or(i64::MAX);
+        let _ = self.mem_tier_pending_superseded.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_add(superseded_delta)),
+        );
+
+        // Apply the prepared maintained-aggregate insert/delete on the async EDGE,
+        // AFTER the publish lock is dropped — they are async, so the interior only
+        // PREPARED them (advancing the epoch atomically with the tombstone
+        // visibility) and handed them out for the edge to feed the applier.
+        self.apply_maintained_aggregate_insert_batches(outcome.maintained_aggregate_insert)
+            .await;
+        self.apply_maintained_aggregate_delete_pending(outcome.maintained_aggregate_delete)
+            .await;
+
+        Ok(outcome.epoch)
+    }
+
+    /// Run the memory apply's synchronous interior on the process-global pinned
+    /// [`crate::ingest_pool::IngestPool`] instead of inline (Stage 1 #3c, active
+    /// only under `cayenne_ingest_substrate: pool`). Packages a
+    /// [`MemoryApplyDescriptor`], submits it, and awaits the reply — running the
+    /// SAME `apply_memory_burst_locked` interior and the SAME refill-bounce loop
+    /// as the inline path, just on a pinned worker. Returns the [`MemApplyOutcome`]
+    /// for [`Self::append_to_shard`]'s shared edge tail.
+    ///
+    /// Depth = 1: the caller holds `write_guard` across this whole call, so applies
+    /// stay serial — the pool is *where* the apply runs, not *how many* (overlap is
+    /// Stage 2). `write_guard` (a `tokio::sync` guard, safe across `.await`) never
+    /// crosses to the worker; the `parking_lot` publish lock is taken and dropped
+    /// entirely inside the sync interior on the worker (never across an `.await`).
+    ///
+    /// Fallbacks preserve correctness identically: if no pool is installed, or it
+    /// is torn down before submit, the SAME interior runs inline on this edge; a
+    /// worker panic or a dropped reply surfaces as a structured apply error (never
+    /// a torn tier — see [`MemoryApplyDescriptor`]).
+    #[expect(clippy::too_many_arguments)]
+    async fn apply_memory_burst_via_pool(
+        &self,
+        shard_id: usize,
+        arc_batches: &Arc<Vec<RecordBatch>>,
+        tombstones: crate::provider::mem_tier::SegmentTombstones,
+        incoming_rows: u64,
+        incoming_bytes: u64,
+        superseded: u64,
+        source_position: Option<u64>,
+        record_keys: &PkDigestSet,
+        maintained_aggregate_delete_rows: Option<&RecordBatch>,
+        reserved_sequences: Option<(i64, i64)>,
+        defer_maintained_aggregate: bool,
+    ) -> Result<MemApplyOutcome> {
+        use crate::ingest_pool::{Task as IngestTask, submit_to_global_ingest_pool};
+
+        // Build the descriptor once; a `NeedsRefill` bounce hands it back for a
+        // re-submit, so it is reused across the loop (no per-bounce rebuild).
+        // `record_keys` is EMPTY at N=1 (the clone is free on the primary path);
+        // the `RecordBatch` clones below are Arc-buffer refcount bumps.
+        let mut descriptor = Box::new(MemoryApplyDescriptor {
+            provider: Arc::new(self.clone_for_write_operations()),
+            shard_id,
+            arc_batches: Arc::clone(arc_batches),
+            tombstones,
+            incoming_rows,
+            incoming_bytes,
+            superseded,
+            source_position,
+            record_keys: record_keys.clone(),
+            maintained_aggregate_delete_rows: maintained_aggregate_delete_rows.cloned(),
+            reserved_sequences,
+            defer_maintained_aggregate,
+            reply: None,
+        });
+
+        loop {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<MemoryApplyReply>();
+            descriptor.set_reply(reply_tx);
+            let handoff_start = Instant::now();
+
+            // Submit to the test-only private pool override when set (isolated
+            // end-to-end tests), else the process-global pool (production).
+            let submit_result = {
+                #[cfg(test)]
+                {
+                    match &self.ingest_pool_override {
+                        Some(pool) => pool.submit(IngestTask::MemoryApply(descriptor)),
+                        None => submit_to_global_ingest_pool(IngestTask::MemoryApply(descriptor)),
+                    }
+                }
+                #[cfg(not(test))]
+                {
+                    submit_to_global_ingest_pool(IngestTask::MemoryApply(descriptor))
+                }
+            };
+            if let Err(returned) = submit_result {
+                // No pool installed / torn down: run the SAME interior inline.
+                // The pattern's refutability differs by cfg — `Task` has a
+                // test-only `Probe` variant — so the extraction is cfg-split: an
+                // irrefutable destructure in release (only `MemoryApply` exists), a
+                // match with a `Probe` guard under `#[cfg(test)]`.
+                #[cfg(not(test))]
+                let IngestTask::MemoryApply(mut fallback) = returned;
+                #[cfg(test)]
+                let mut fallback = match returned {
+                    IngestTask::MemoryApply(descriptor) => descriptor,
+                    IngestTask::Probe { .. } => {
+                        unreachable!("submit returns the MemoryApply task it was handed")
+                    }
+                };
+                tracing::warn!(
+                    target: "cayenne::ingest_pool",
+                    table = %self.table_metadata.table_name,
+                    "cayenne_ingest_substrate: pool set but no global ingest pool is installed; applying inline"
+                );
+                match fallback.run_interior() {
+                    Ok(outcome) => return Ok(outcome),
+                    Err(ApplyInterrupt::NeedsRefill { count }) => {
+                        let bounce_start = Instant::now();
+                        self.refill_sequence_block(count).await?;
+                        record_cayenne_write_phase(
+                            &self.table_metadata.table_name,
+                            "seq_refill_bounce",
+                            bounce_start,
+                        );
+                        descriptor = fallback;
+                        continue;
+                    }
+                }
+            }
+
+            match reply_rx.await {
+                Ok(MemoryApplyReply::Done(Ok(outcome))) => {
+                    // Total submit→reply wall time (edge→pool channel + apply CPU +
+                    // oneshot + wake). The apply CPU itself is separately recorded
+                    // inside the interior (`inmemory_fence_wait`/`inmemory_fence_work`),
+                    // so `ingest_pool_handoff − (fence_wait + fence_work)` is the pure
+                    // hand-off overhead the §11.2 "hand-off must be small vs apply"
+                    // gate watches.
+                    record_cayenne_write_phase(
+                        &self.table_metadata.table_name,
+                        "ingest_pool_handoff",
+                        handoff_start,
+                    );
+                    return Ok(outcome);
+                }
+                Ok(MemoryApplyReply::Done(Err(MemoryApplyError))) => {
+                    return Err(Error::Internal {
+                        table: self.table_metadata.table_name.clone(),
+                        message: "ingest pool worker panicked applying a memory burst".to_string(),
+                    });
+                }
+                Ok(MemoryApplyReply::NeedsRefill {
+                    count,
+                    descriptor: bounced,
+                }) => {
+                    // Cold bounce (~once per `SEQ_RESERVE_BLOCK`): grow the durable
+                    // block off-lock, then re-submit the handed-back descriptor.
+                    descriptor = bounced;
+                    let bounce_start = Instant::now();
+                    self.refill_sequence_block(count).await?;
+                    record_cayenne_write_phase(
+                        &self.table_metadata.table_name,
+                        "seq_refill_bounce",
+                        bounce_start,
+                    );
+                }
+                Err(_recv) => {
+                    return Err(Error::Internal {
+                        table: self.table_metadata.table_name.clone(),
+                        message:
+                            "ingest pool worker dropped the memory-apply reply (pool torn down mid-apply)"
+                                .to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// The synchronous, await-free INTERIOR of a memory-mode mem-tier append —
+    /// the publish-lock critical section factored out of [`Self::append_to_shard`]
+    /// (Stage 1 #3b). Takes this shard's `mem_tier_publish_lock` (a `parking_lot`
+    /// mutex — safe precisely because this whole region is now await-free), does
+    /// the `try_reserve` + tombstone stamp + segment push + `ArcSwap` store + memo
+    /// extend + maintained-aggregate PREPARE, and returns the epoch plus the
+    /// prepared (not yet applied) maintained-aggregate deltas for the edge tail.
+    ///
+    /// Returns [`ApplyInterrupt::NeedsRefill`] when the lock-free `try_reserve`
+    /// finds the durable block exhausted (N=1 / legacy callers only — the sharded
+    /// N>1 callers pass `reserved_sequences: Some(..)` reserved up front under
+    /// `write_lock`, so they never bounce). On that interrupt it has taken NO
+    /// visible effect — the lock is dropped, nothing stamped/stored — so the edge
+    /// can safely grow the block and re-invoke it.
+    ///
+    /// PANIC-SAFETY: `parking_lot` mutexes do not poison, so the critical section
+    /// is ordered "compute the next tier → single `store`" — every fallible-free
+    /// step precedes the `store`, so a panic cannot leave the tier `ArcSwap`
+    /// half-updated. (In 3c the pinned worker wraps this call in `catch_unwind`
+    /// and reports the panic as a structured apply error.)
+    #[expect(clippy::too_many_arguments)]
+    fn apply_memory_burst_locked(
+        &self,
+        shard_id: usize,
+        arc_batches: &Arc<Vec<RecordBatch>>,
+        tombstones: &mut crate::provider::mem_tier::SegmentTombstones,
+        incoming_rows: u64,
+        incoming_bytes: u64,
+        superseded: u64,
+        source_position: Option<u64>,
+        record_keys: &PkDigestSet,
+        maintained_aggregate_delete_rows: Option<&RecordBatch>,
+        reserved_sequences: Option<(i64, i64)>,
+        defer_maintained_aggregate: bool,
+    ) -> std::result::Result<MemApplyOutcome, ApplyInterrupt> {
         let (epoch, maintained_aggregate_insert, maintained_aggregate_delete) = {
             // Publish the RAM swap under the dedicated `mem_tier_publish_lock`,
             // DECOUPLED from the listing fence. The mem-tier is an `ArcSwap`, so a
@@ -20822,8 +22699,10 @@ impl CayenneTableProvider {
             // disjoint shards of one apply's PK-fan-out append concurrently. The
             // checkpoint capture takes ALL shard locks in index order (Phase 5), so
             // it stays mutually exclusive with every appender. At N=1 this is the
-            // prior single publish lock (`locks[0]`).
-            let _publish = self.mem_tier_publish_locks[shard_id].lock().await;
+            // prior single publish lock (`locks[0]`). Now a `parking_lot` mutex:
+            // the section is fully synchronous, so the guard is never held across
+            // an `.await` (the sync-pool invariant).
+            let _publish = self.mem_tier_publish_locks[shard_id].lock();
             record_cayenne_write_phase(
                 &self.table_metadata.table_name,
                 "inmemory_fence_wait",
@@ -20835,25 +22714,31 @@ impl CayenneTableProvider {
             // own tombstones; the shared durable allocator keeps one monotone domain.
             //
             // `None` (N=1 / legacy callers): reserve the (delete, data) pair HERE,
-            // INSIDE the publish lock. The N=1 checkpoint takes no `write_lock`, so
-            // this lock is the ONLY thing serializing this reservation against the
-            // checkpoint's snapshot-sequence reservation (both reserve under it) —
-            // an unserialized reserve permanently over-counts (§2.3d). This `.await`
-            // under the lock is harmless at N=1: there is exactly one publish lock,
-            // so no cross-lock hold-and-wait can form.
+            // INSIDE the publish lock, via the lock-free `try_reserve`. The N=1
+            // checkpoint takes no `write_lock`, so this lock is the ONLY thing
+            // serializing this reservation against the checkpoint's snapshot-sequence
+            // reservation (both reserve under it) — an unserialized reserve
+            // permanently over-counts (§2.3d). `try_reserve` under the lock keeps
+            // that serialization byte-identical AND await-free; on block exhaustion
+            // it returns `NeedsRefill` so the edge grows the block off-lock and
+            // retries under the lock (NEVER pre-reserving off-lock at N=1).
             //
             // `Some` (N>1 sharded callers): the pair was reserved ONCE for the whole
             // apply under `write_lock`. At N>1 `write_lock` already excludes the
             // checkpoint capture (which also takes `write_lock`), so the publish lock
-            // is not needed to serialize the reservation — and NOT awaiting here is
-            // what keeps the lock-held region synchronous, so an append never holds a
-            // publish lock across an await and the off-`write_lock` checkpoint clear
-            // cannot deadlock it.
+            // is not needed to serialize the reservation — and reserving off-lock up
+            // front is what keeps this region synchronous even before `try_reserve`.
             let (delete_sequence, data_sequence) = if let Some(pair) = reserved_sequences {
                 pair
             } else {
-                let base_sequence = self.reserve_sequences_local(2).await?;
-                (base_sequence, base_sequence + 1)
+                match self.try_reserve_local(2) {
+                    Some(base_sequence) => (base_sequence, base_sequence + 1),
+                    // Block exhausted — bounce to the edge for a durable refill.
+                    // Nothing has been stamped/stored yet, so dropping `_publish`
+                    // here leaves no visible effect; the retry re-reserves under
+                    // the re-acquired lock.
+                    None => return Err(ApplyInterrupt::NeedsRefill { count: 2 }),
+                }
             };
             // STAMP the off-lock-built key set with the reserved delete sequence
             // (O(1) — only the scalar is set; the keys were built off-lock). This
@@ -20866,7 +22751,7 @@ impl CayenneTableProvider {
 
             let cur = self.mem_tier.shard(shard_id).load();
             let next = cur.append_segment_with_source_position(
-                Arc::clone(&arc_batches),
+                Arc::clone(arc_batches),
                 data_sequence,
                 tombstones.clone(),
                 incoming_bytes,
@@ -20964,7 +22849,7 @@ impl CayenneTableProvider {
                             || !tombstones.is_int64_empty()
                             || !tombstones.is_row_keys_empty())
                     {
-                        self.prepare_maintained_aggregate_insert_batches(Arc::clone(&arc_batches))
+                        self.prepare_maintained_aggregate_insert_batches(Arc::clone(arc_batches))
                     } else {
                         self.mark_maintained_aggregates_stale();
                         None
@@ -20999,41 +22884,18 @@ impl CayenneTableProvider {
             )
         };
 
-        // Net the live row count by the superseded rows, exactly like the durable
-        // upsert path (`inserted - superseded`).
-        let net = i64::try_from(incoming_rows).unwrap_or(i64::MAX)
-            - i64::try_from(superseded).unwrap_or(i64::MAX);
-        self.inlined_row_count.fetch_add(net, Ordering::Relaxed);
-
-        // Accumulate the durable (file+inline) supersedes this append hid, so the
-        // next mem-tier checkpoint can net them out of its persisted `Delta`
-        // (`flushed_mem_rows` counts the new versions but not the durable rows they
-        // supersede, which stay physically resident until compaction). Without this
-        // the maintained count climbs toward "every row ever flushed". Reset by the
-        // checkpoint clear. See `mem_tier_pending_superseded`. Saturating so a
-        // long-lived process between checkpoints can never wrap `i64` negative (a
-        // negative accumulator would inflate the checkpoint delta via its
-        // `saturating_sub`); clamped at `i64::MAX` it only ever over-nets, keeping
-        // the maintained count Inexact-and-conservative rather than inflated.
-        let superseded_delta = i64::try_from(superseded).unwrap_or(i64::MAX);
-        let _ = self.mem_tier_pending_superseded.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |current| Some(current.saturating_add(superseded_delta)),
-        );
-
-        self.apply_maintained_aggregate_insert_batches(maintained_aggregate_insert)
-            .await;
-        self.apply_maintained_aggregate_delete_pending(maintained_aggregate_delete)
-            .await;
-
-        Ok(epoch)
+        Ok(MemApplyOutcome {
+            epoch,
+            maintained_aggregate_insert,
+            maintained_aggregate_delete,
+        })
     }
 
     /// GUARANTEED acquisition of `mem_checkpoint_lock` plus the N>1 capture
     /// `write_lock`. Fast path when no writer is active; otherwise a fair queued
     /// `write -> mem` fallback that cannot starve and cannot invert against the
     /// spill/promotion (which hold `write_lock`, then await `mem_checkpoint_lock`).
+    /// (Adapted from PR #11907.)
     async fn acquire_capture_locks_blocking(&self) -> MemTierCheckpointGuards {
         let checkpoint = self.mem_checkpoint_lock_for_writer().lock_owned().await;
         if self.mem_tier.shard_count() == 1 {
@@ -21061,6 +22923,7 @@ impl CayenneTableProvider {
     /// moment either is contended — never blocking, never stalling applies. Used by
     /// the size-triggered periodic checkpoint that still has age headroom; it
     /// retries next tick (and the write-path spill drains under sustained load).
+    /// (Adapted from PR #11907.)
     fn try_acquire_capture_locks(&self) -> Option<MemTierCheckpointGuards> {
         let Ok(checkpoint) = self.mem_checkpoint_lock_for_writer().try_lock_owned() else {
             return None;
@@ -21075,11 +22938,14 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Checkpoint the in-memory CDC tier to a durable Vortex snapshot, publish it,
-    /// clear the captured tier prefix, and only then advance the source slot.
+    /// Checkpoint the in-memory CDC tier: encode the retained corpus to a durable
+    /// Vortex snapshot, clear the tier, then — and ONLY then — fire the
+    /// [`SlotAdvancer`] callback so the runtime advances the source slot to cover
+    /// every batch in the flushed epoch (the slot-deferral correctness contract).
     /// GUARANTEED: waits (fairly) for the capture locks, so it always makes
     /// progress. The complete lifecycle is serialized on `mem_checkpoint_lock` so
-    /// two snapshots can never encode the same captured corpus.
+    /// two snapshots can never encode the same captured corpus. (Adapted from
+    /// PR #11907.)
     ///
     /// # Errors
     ///
@@ -21087,64 +22953,407 @@ impl CayenneTableProvider {
     /// or tier clearing fails. The source slot is not advanced on failure.
     #[doc(hidden)]
     pub async fn checkpoint_mem_tier(&self) -> Result<u64> {
+        // At the config default (`D = 1`) the drain runs INLINE while `guards` holds
+        // `mem_checkpoint_lock` (byte-identical to pre-3b): freeze N is fully drained +
+        // reclaimed before freeze N+1 can acquire the lock. At `D > 1` (Step 3b-b) the
+        // drain DETACHES — freeze under the lock, release it, `tokio::spawn` the drain —
+        // so freeze N+1 overlaps drain N (the pipeline that lifts the drain ceiling).
+        if self.drain_pipeline_depth() == 1 {
+            let mut guards = self.acquire_capture_locks_blocking().await;
+            let write = guards.write.take();
+            let Some((claim, checkpoint_start)) = self.capture_and_freeze_checkpoint(write).await?
+            else {
+                return Ok(0);
+            };
+            return self.run_checkpoint_drain(claim, checkpoint_start).await;
+            // `guards` drops at scope end (after the inline drain), releasing the lock.
+        }
+        // `D > 1`: acquire a drain-admission permit BEFORE the capture so at most
+        // `max_depth` generations are ever resident (the back-pressure that stalls this
+        // freeze while the pipeline is full). The permit rides into the detached task
+        // and is released when its drain reclaims the generation.
+        let permit = self.acquire_drain_admission().await?;
         let mut guards = self.acquire_capture_locks_blocking().await;
-        // Keep `guards` alive so `mem_checkpoint_lock` spans the whole lifecycle;
-        // pass only the capture-scoped `write` guard to `inner`.
         let write = guards.write.take();
-        self.checkpoint_mem_tier_inner(write).await
+        let Some(claim) = self.capture_and_freeze_checkpoint(write).await? else {
+            return Ok(0);
+        };
+        // Freeze recorded the generation in the shared ledger; release
+        // `mem_checkpoint_lock` so the NEXT freeze can start while this drain runs.
+        drop(guards);
+        self.spawn_detached_checkpoint_drain(claim, permit);
+        // The detached drain advances the source slot when it publishes (ordered,
+        // min-across-in-flight); the tick returns now having admitted the generation.
+        Ok(0)
     }
 
     /// BEST-EFFORT counterpart to [`Self::checkpoint_mem_tier`]: returns
-    /// [`CheckpointAttempt::Busy`] instead of blocking when the capture locks are
-    /// contended. `Busy` never advances the source slot and is never reported as a
-    /// completed checkpoint.
+    /// [`CheckpointAttempt::Busy`] instead of blocking when the capture locks (or, at
+    /// `D > 1`, a drain-admission permit) are contended. `Busy` never advances the
+    /// source slot and is never reported as a completed checkpoint. (Adapted from
+    /// PR #11907.)
     async fn try_checkpoint_mem_tier(&self) -> Result<CheckpointAttempt> {
-        let Some(mut guards) = self.try_acquire_capture_locks() else {
+        if self.drain_pipeline_depth() == 1 {
+            let Some(mut guards) = self.try_acquire_capture_locks() else {
+                return Ok(CheckpointAttempt::Busy);
+            };
+            let write = guards.write.take();
+            let Some((claim, checkpoint_start)) = self.capture_and_freeze_checkpoint(write).await?
+            else {
+                return Ok(CheckpointAttempt::Completed(0));
+            };
+            let rows = self.run_checkpoint_drain(claim, checkpoint_start).await?;
+            return Ok(CheckpointAttempt::Completed(rows));
+        }
+        // `D > 1` best-effort: give up (`Busy`) the moment either a permit or a capture
+        // lock is contended — the deadline-driven `checkpoint_mem_tier` makes progress.
+        let Ok(permit) = Arc::clone(&self.drain_admission).try_acquire_owned() else {
             return Ok(CheckpointAttempt::Busy);
         };
-        // Keep `guards` alive across `inner`; pass only the `write` guard.
+        let Some(mut guards) = self.try_acquire_capture_locks() else {
+            return Ok(CheckpointAttempt::Busy); // `permit` drops here, released
+        };
         let write = guards.write.take();
-        let rows = self.checkpoint_mem_tier_inner(write).await?;
-        Ok(CheckpointAttempt::Completed(rows))
+        let Some(claim) = self.capture_and_freeze_checkpoint(write).await? else {
+            return Ok(CheckpointAttempt::Completed(0));
+        };
+        drop(guards);
+        self.spawn_detached_checkpoint_drain(claim, permit);
+        Ok(CheckpointAttempt::Completed(0))
     }
 
-    /// Checkpoint for a caller that already holds `write_lock`, but does not hold
+    /// The configured drain-pipeline depth `D` (`1` at the config default). Read once
+    /// per background-tick entry to choose the inline-vs-detached drain path.
+    fn drain_pipeline_depth(&self) -> usize {
+        self.drain_ledger.lock().max_depth()
+    }
+
+    /// Acquire a drain-admission permit (owned, `'static` so it rides into a detached
+    /// task). Blocks while `max_depth` generations are already resident — the depth
+    /// back-pressure. Only ever called at `D > 1`.
+    async fn acquire_drain_admission(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.drain_admission)
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: "mem-tier drain admission semaphore was closed".to_string(),
+            })
+    }
+
+    /// Acquire the D>1 seal QUIESCE barrier (Stage 2b Step 3b-b-iii): ALL `max_depth`
+    /// admission permits, so the seal captures over an empty drain ledger (no resident
+    /// detached checkpoint window for its un-windowed `unsealed_view` shadow to overlap)
+    /// and no checkpoint can freeze behind it while it is in flight. The returned permit
+    /// bundle is held for the whole seal and released on drop. Returns `Ok(None)` at
+    /// `D = 1` (the config default) — no barrier, byte-identical to the pre-3b-b-iii
+    /// seal. See [`Self::seal_mem_tier_durable`]'s call site for the full rationale and
+    /// the deadlock-freedom argument.
+    async fn acquire_seal_quiesce_barrier(
+        &self,
+    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+        let depth = self.drain_pipeline_depth();
+        if depth == 1 {
+            return Ok(None);
+        }
+        let permits = u32::try_from(depth).unwrap_or(u32::MAX);
+        Arc::clone(&self.drain_admission)
+            .acquire_many_owned(permits)
+            .await
+            .map(Some)
+            .map_err(|_| Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: "mem-tier drain admission semaphore was closed".to_string(),
+            })
+    }
+
+    /// Detach a captured checkpoint generation's drain onto a background `tokio::spawn`
+    /// task (Stage 2b Step 3b-b), so the next freeze overlaps this drain. The task owns
+    /// a writer clone (`Arc::new(self.clone_for_write())` — the `IngestTask.provider`
+    /// pattern; `drain_ledger` / admission / publish-notify / mem-tier are all shared
+    /// Arc fields, so the clone drains the SAME ledger this freeze recorded into) and
+    /// the admission `permit`, which releases (≈ generation reclaim) when the task ends.
+    ///
+    /// DETACHED-ERROR CONTRACT: a detached drain error cannot propagate back to the
+    /// tick. It is safe because the drain advances the slot only AFTER it publishes
+    /// (ordered ack), and `DrainCleanup` discards the generation on the failing `?` —
+    /// so a failed drain simply does not advance the slot, and the source replays the
+    /// un-acked tail PK-idempotently on the next poll (mirroring the crash-in-the-gap
+    /// recovery the 2a suite proves). It is surfaced as a warning only.
+    fn spawn_detached_checkpoint_drain(
+        &self,
+        claim: (CheckpointDrainClaim, Instant),
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
+        let (claim, checkpoint_start) = claim;
+        let provider = Arc::new(self.clone_for_write());
+        let table = self.table_metadata.table_name.clone();
+        tokio::spawn(async move {
+            // Held for the whole task so the admission slot frees only once this drain
+            // has reclaimed its generation (its publish/ack completes just before).
+            let _permit = permit;
+            if let Err(e) = provider.run_checkpoint_drain(claim, checkpoint_start).await {
+                tracing::warn!(
+                    target: "cayenne::mem_tier",
+                    table = %table,
+                    "Detached mem-tier checkpoint drain failed (slot ack not advanced; source replays PK-idempotently): {e}"
+                );
+            }
+        });
+    }
+
+    /// Checkpoint for a caller that already holds `write_lock`, but does NOT hold
     /// `mem_checkpoint_lock` (cold promotion). Serializing here prevents promotion
-    /// from recapturing a tier whose background checkpoint is still encoding.
-    async fn checkpoint_mem_tier_holding_write_lock(&self) -> Result<u64> {
+    /// from recapturing a tier whose background checkpoint is still encoding — the
+    /// former duplicate-row over-count on promoted tables (PR #11907). The caller
+    /// keeps its `write_lock` for the whole graduation, so `inner` gets `None`.
+    pub(crate) async fn checkpoint_mem_tier_holding_write_lock(&self) -> Result<u64> {
         let _checkpoint_guard = self.mem_checkpoint_lock_for_writer().lock_owned().await;
         self.checkpoint_mem_tier_holding_locks().await
     }
 
-    /// Checkpoint for a caller that already holds both `write_lock` and
-    /// `mem_checkpoint_lock` (write-path spill and schema evolution).
-    async fn checkpoint_mem_tier_holding_locks(&self) -> Result<u64> {
-        self.checkpoint_mem_tier_inner(None).await
+    /// Checkpoint for a caller that already holds BOTH `write_lock` and
+    /// `mem_checkpoint_lock` (the write-path inline/budget spill inside an apply, and
+    /// `evolve_schema_live`). Such a caller has excluded every other apply, and at
+    /// spill time the current apply has not yet fanned out its shard appends — so the
+    /// capture is already atomic and `inner` re-acquiring `write_lock` would deadlock
+    /// (tokio mutexes are not reentrant). `inner` gets `None` and touches neither lock.
+    pub(crate) async fn checkpoint_mem_tier_holding_locks(&self) -> Result<u64> {
+        // The caller holds BOTH locks for a larger operation, so the drain always runs
+        // INLINE here (it cannot release `mem_checkpoint_lock` — that is the caller's,
+        // held across the whole operation). Capture+freeze then drain, both under the
+        // caller's held lock — byte-identical to the pre-split combined method.
+        let Some((claim, checkpoint_start)) = self.capture_and_freeze_checkpoint(None).await? else {
+            return Ok(0);
+        };
+        self.run_checkpoint_drain(claim, checkpoint_start).await
+    }
+
+    /// The synchronous tail of the checkpoint capture, factored out so the capture
+    /// loop can confine its `parking_lot` publish guards to an inner block that
+    /// drops them before the (rare) refill `.await` — keeping the future `Send`.
+    ///
+    /// The cross-shard durable watermark on the SINGLE per-apply epoch axis
+    /// (§3.4 Fix 1) = the GLOBAL MAX apply-epoch captured across all shards, NOT
+    /// MIN. The apply-epoch is a single monotone counter assigned once per apply
+    /// under `write_lock` and stamped identically on every shard segment that apply
+    /// produces; an apply only appends to the shards whose keys it touched, so a
+    /// given epoch is not present in every shard. Because the capture is
+    /// all-shards-ATOMIC (under `write_lock`) and flushes each shard's COMPLETE
+    /// segment prefix, EVERY applied epoch `<=` this max is durable (it either
+    /// landed in some shard's flushed prefix, or touched no shard) — so MAX never
+    /// acks a not-yet-durable position and is live. MIN would UNDER-ack: a cold
+    /// (recently-untouched) shard pins the watermark low and the source slot never
+    /// advances → WAL never drains (the observed non-convergence). This is
+    /// LOAD-BEARING on "no single-shard / partial-prefix checkpoint exists"; a
+    /// partial checkpoint would make MAX a data-loss hole and require MIN. Shards
+    /// with no captured `source_position` (empty, or the `None`-stamped N==1 single
+    /// shard) are excluded, so at N==1 this is `None` and the slot-ack falls back
+    /// to the single shard's `MemTier::epoch` (byte-identical). The returned
+    /// `snapshot` is shard 0's snapshot at N==1 (byte-identical) or the cross-shard
+    /// UNION view at N>1 (disjoint keys ⇒ exact union).
+    fn checkpoint_durable_epoch_and_snapshot(
+        n: usize,
+        shard_snapshots: &[Arc<crate::provider::mem_tier::MemTier>],
+        flushed_counts: &[usize],
+    ) -> (Option<u64>, Arc<crate::provider::mem_tier::MemTier>) {
+        let durable_epoch = shard_snapshots
+            .iter()
+            .zip(flushed_counts.iter())
+            .filter_map(|(s, &c)| s.max_source_position_in_prefix(c))
+            .max();
+        let snapshot = if n == 1 {
+            Arc::clone(&shard_snapshots[0])
+        } else {
+            Arc::new(
+                crate::provider::mem_tier::ShardedMemTier::union_snapshot_view(
+                    shard_snapshots,
+                    durable_epoch.unwrap_or(0),
+                ),
+            )
+        };
+        (durable_epoch, snapshot)
+    }
+
+    /// Drive the drain generation identified by `id` under a brief, await-free
+    /// `drain_ledger` lock (Stage 2b Step 3b), returning `f`'s result (or `None` if no
+    /// resident generation carries `id`). The closure runs while the lock is held, so
+    /// it must not `.await` — it only records a lifecycle transition or stamps the
+    /// reserved sequence, both synchronous. A drain addresses ITS OWN generation by id
+    /// rather than by ledger position: at `D > 1` the drain's generation is not
+    /// necessarily the front (an older drain is still in flight ahead of it), so a
+    /// front-addressed drive would touch the wrong generation. At `D = 1` the sole
+    /// resident generation carries the current id, so this is the front —
+    /// byte-identical to the pre-3b front-addressed drive.
+    fn with_generation_by_id<R>(
+        &self,
+        id: u64,
+        f: impl FnOnce(&mut FrozenGeneration) -> R,
+    ) -> Option<R> {
+        let mut ledger = self.drain_ledger.lock();
+        let result = ledger.generation_mut_by_id(id).map(f);
+        debug_assert!(
+            result.is_some(),
+            "drove drain generation {id} while it was no longer resident"
+        );
+        result
+    }
+
+    /// Complete the drain of generation `id`: mark it terminal (`Published` for a bake
+    /// or `Sealed` for a seal), advance the source slot to the ORDERED
+    /// min-across-in-flight ack watermark, and disarm the abort guard.
+    ///
+    /// The transition and the contiguous-terminal-prefix reclaim run under ONE brief
+    /// `drain_ledger` lock so they are atomic w.r.t. a concurrent drain's own
+    /// completion. [`FrozenDrainLedger::reclaim_terminal_prefix_ack`] returns the max
+    /// epoch over the contiguous run of terminal generations reclaimed from the front
+    /// (oldest-first), or `None` when an OLDER generation is still in flight — so a
+    /// later generation that publishes first NEVER advances the slot past an unfinished
+    /// earlier one (min-across-in-flight, never `fetch_max`). At `D = 1` the sole
+    /// resident generation is the front: this reclaims exactly it and fires its epoch,
+    /// byte-identical to the pre-3b `fire(epoch); reclaim_front()` pair (the reclaim now
+    /// precedes the fire, which is observable only to a concurrent ledger reader — none
+    /// exists at `D = 1`, where `mem_checkpoint_lock` serializes freezes).
+    ///
+    /// `cleanup` is disarmed once the generation is terminal: at `D = 1` it has been
+    /// reclaimed; at `D > 1` it may linger `Published` until an older drain sweeps it,
+    /// but either way this drain succeeded, so the abort guard must not discard it.
+    async fn publish_generation_and_ack(
+        &self,
+        id: u64,
+        terminal: GenState,
+        cleanup: &mut DrainCleanup<'_>,
+    ) {
+        debug_assert!(
+            matches!(terminal, GenState::Published | GenState::Sealed),
+            "a drain completes into a terminal published/sealed state, not {terminal:?}"
+        );
+        let ack = {
+            let mut ledger = self.drain_ledger.lock();
+            match ledger.generation_mut_by_id(id) {
+                Some(g) => g.transition(terminal),
+                None => debug_assert!(
+                    false,
+                    "completing drain generation {id} while it was no longer resident"
+                ),
+            }
+            ledger.reclaim_terminal_prefix_ack()
+        };
+        cleanup.disarm();
+        // The reclaim above advanced the ledger front (this generation, and any
+        // contiguous already-terminal successors, left the ledger). Wake any drain
+        // parked in `await_checkpoint_publish_turn` waiting to become the front so it
+        // can take its ordered-publish turn (Step 3b-b). A no-op at `D = 1` (no drain
+        // is ever parked — the sole generation is already the front).
+        self.drain_publish_notify.notify_waiters();
+        if let Some(epoch) = ack {
+            self.fire_slot_advancer(epoch).await;
+        }
+    }
+
+    /// Wait until the generation identified by `id` is the FRONT (oldest in-flight) of
+    /// the drain ledger — its ordered-publish turn. Returns [`PublishTurn::Ours`]
+    /// immediately when it is already the front (ALWAYS the case at `D = 1`, where the
+    /// sole resident generation is the front — byte-identical, no suspension). At
+    /// `D > 1` a drain whose encode finished ahead of an older generation's parks here
+    /// until every older generation has published and reclaimed, so the publish section
+    /// (metastore commit → `listing_fence` swap → `retain_after` front-clear → slot ack)
+    /// runs strictly oldest-first. This is what makes the front-relative `retain_after`
+    /// clear safe: a later generation can only clear the tier front once it IS the
+    /// front, i.e. once every older generation's front prefix has already been cleared.
+    ///
+    /// Returns [`PublishTurn::Discarded`] when this generation is no longer resident: an
+    /// OLDER generation's drain failed and CASCADE-discarded this one (Step 3b-b-iii),
+    /// so it will never become the front and MUST NOT publish — its `window_base`
+    /// counted the failed older generation's now-un-cleared segments, so a
+    /// `retain_after` here would clear the wrong front. The caller aborts its publish;
+    /// the generation's rows stay live in the tier and the source replays PK-idempotently.
+    ///
+    /// The wait registers on [`Self::drain_publish_notify`] BEFORE re-checking the
+    /// front under the ledger lock, so a `notify_waiters()` fired by a concurrent
+    /// reclaim/cascade between the check and the await is not lost (the standard tokio
+    /// `Notified` idiom).
+    async fn await_checkpoint_publish_turn(&self, id: u64) -> PublishTurn {
+        loop {
+            let notified = self.drain_publish_notify.notified();
+            tokio::pin!(notified);
+            // Arm the waiter before the check so a reclaim's `notify_waiters()` that
+            // races this section still wakes us.
+            notified.as_mut().enable();
+            {
+                let ledger = self.drain_ledger.lock();
+                if ledger.front_id() == Some(id) {
+                    return PublishTurn::Ours;
+                }
+                // No longer resident ⇒ an older failure cascade-discarded us; abort.
+                if !ledger.is_resident(id) {
+                    return PublishTurn::Discarded;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    /// Await the ordered-publish turn for generation `id`, returning `true` to proceed
+    /// with the publish (this generation is now the front) or `false` to ABORT it (an
+    /// older drain failed and cascade-discarded this generation — Step 3b-b-iii). On
+    /// abort it disarms `cleanup`: the generation already left the ledger, so there is
+    /// nothing to discard, and the caller returns early WITHOUT the commit / fence swap /
+    /// `retain_after` clear — its rows stay live in the tier and the source replays the
+    /// un-acked epoch PK-idempotently. Byte-identical at `D = 1` (always the front, no
+    /// suspension, never discarded — so always `true`).
+    async fn take_publish_turn_or_abort(&self, id: u64, cleanup: &mut DrainCleanup<'_>) -> bool {
+        match self.await_checkpoint_publish_turn(id).await {
+            PublishTurn::Ours => true,
+            PublishTurn::Discarded => {
+                cleanup.disarm();
+                tracing::debug!(
+                    target: "cayenne::mem_tier",
+                    table = %self.table_metadata.table_name,
+                    generation = id,
+                    "detached checkpoint drain cascade-discarded by an older drain failure; aborting publish (rows stay live, source replays PK-idempotently)"
+                );
+                false
+            }
+        }
     }
 
     /// `owned_capture_write_lock` decides who releases `write_lock` after the
     /// all-shards-atomic capture — it is NOT a request to hold it longer:
     ///
-    /// - `Some(guard)` — the capture is the ONLY reason `write_lock` was taken
-    ///   (the public background-tick / seal path acquired it just for the capture).
-    ///   This method OWNS the guard and drops it the instant capture completes, so
-    ///   the durable encode runs off `write_lock` and concurrent CDC applies flow
-    ///   in parallel. Only ever `Some` at N>1 (at N==1 the single-shard capture is
-    ///   atomic without `write_lock`).
+    /// - `Some(guard)` — the capture is the ONLY reason `write_lock` was taken (the
+    ///   public `checkpoint_mem_tier` / `try_checkpoint_mem_tier` / seal path acquired
+    ///   it via `acquire_capture_locks_blocking` just for the capture). This method
+    ///   OWNS the guard and drops it the instant capture completes, so the durable
+    ///   encode runs off `write_lock` and concurrent CDC applies flow in parallel.
+    ///   Only ever `Some` at N>1 (at N==1 the single-shard capture is atomic).
     /// - `None` — the CALLER already holds `write_lock` for a larger operation and
     ///   keeps holding it across this checkpoint (write-path spill inside an apply,
     ///   `evolve_schema_live`, cold promotion). This method has no guard to manage;
     ///   the caller's lock stays held (those callers already exclude applies, so
-    ///   there is no off-lock parallelism to gain — and the guard is not ours to
-    ///   drop).
-    async fn checkpoint_mem_tier_inner(
+    ///   there is no off-lock parallelism to gain — and the guard is not ours to drop).
+    ///
+    /// `mem_checkpoint_lock` is ALWAYS held by the caller across this method (via the
+    /// guards struct or the `holding_*` wrappers), serializing the whole
+    /// capture → freeze lifecycle. (Adapted from PR #11907.)
+    ///
+    /// Stage 2b Step 3b-b split the former `checkpoint_mem_tier_inner` into this
+    /// capture+freeze half and [`Self::run_checkpoint_drain`]: this half is the O(1),
+    /// `M`-serialized capture + freeze; the drain half runs off-lock. Returns the
+    /// claimed immutable working copy plus the `checkpoint_start` instant (so the
+    /// drain's `mem_tier_checkpoint` phase metric spans the whole capture+drain exactly
+    /// as before), or `Ok(None)` in memory-resident mode (no durable checkpoint). The
+    /// caller decides whether to run the drain inline (holding `mem_checkpoint_lock`,
+    /// D=1) or via a detached task after releasing it (D>1) — splitting the capture
+    /// from the drain is what lets the caller release the lock between them.
+    async fn capture_and_freeze_checkpoint(
         &self,
         mut owned_capture_write_lock: Option<tokio::sync::OwnedMutexGuard<()>>,
-    ) -> Result<u64> {
+    ) -> Result<Option<(CheckpointDrainClaim, Instant)>> {
         // Memory mode (`mode: memory`) never checkpoints to Vortex — the mem-tier
         // is the permanent in-RAM store, so this is a no-op.
         if self.is_memory_resident_mode() {
-            return Ok(0);
+            return Ok(None);
         }
         let checkpoint_start = Instant::now();
         // Capture the corpus to flush AND reserve this checkpoint's
@@ -21192,105 +23401,76 @@ impl CayenneTableProvider {
         // With no lock-across-await on the apply side, the clear's index-order
         // acquisition cannot form a cycle with an apply.
         //
-        // `owned_capture_write_lock` is Some only for the public N>1 path. A caller
-        // using `checkpoint_mem_tier_holding_locks` owns its write guard outside
-        // this method, so it passes None and retains that lock for its operation.
-        let (shard_snapshots, flushed_counts, snapshot, durable_epoch, reserved_snapshot_sequence) = {
-            // Acquire all shard publish locks in index order (deadlock-free).
-            let mut guards = Vec::with_capacity(n);
-            for lock in self.mem_tier_publish_locks.iter() {
-                guards.push(lock.lock().await);
+        // `owned_capture_write_lock` is `Some` only for the public N>1 path (the
+        // caller acquired `write_lock` in `acquire_capture_locks_blocking` just for
+        // the capture and handed it to us to drop after). A caller using
+        // `checkpoint_mem_tier_holding_locks` owns its write guard outside this method,
+        // so it passes `None` and retains that lock for its operation. Held across the
+        // capture loop (including the rare refill `.await`) so the re-capture stays
+        // all-shards-atomic at N>1, then dropped right after the capture window.
+        let (shard_snapshots, flushed_counts, snapshot, durable_epoch, reserved_snapshot_sequence) = loop {
+            // Attempt the capture under all publish locks. The guards live ONLY
+            // inside this inner block and are dropped at its close, so no
+            // `parking_lot` guard is ever held across the refill `.await` below
+            // (the future stays `Send`). `Ok(tuple)` = captured; `Err(count)` =
+            // the snapshot-sequence block is exhausted and must be grown off-lock.
+            let attempt: std::result::Result<_, u32> = {
+                // Acquire all shard publish locks in index order (deadlock-free).
+                // `parking_lot` (sync): the capture is now await-free. On block
+                // exhaustion the outer loop grows the block off-lock and re-captures
+                // (re-loading the shard snapshots atomically with the retried
+                // reservation, so a concurrent N=1 append during the unlocked window
+                // cannot tear the capture). At N>1 `write_lock` (held across this
+                // loop) already excludes applies, so the re-load is identical.
+                let mut guards = Vec::with_capacity(n);
+                for lock in self.mem_tier_publish_locks.iter() {
+                    guards.push(lock.lock());
+                }
+                // All capture locks are now held (`write_lock` at N>1 + every shard
+                // publish lock). Emit the ACQUISITION WAIT as its own phase so it can be
+                // separated from the O(1) snapshot WORK: `mem_tier_checkpoint_capture`
+                // (the total, recorded below) minus this isolates whether the capture
+                // cost is lock contention — a deep apply backlog holding `write_lock` —
+                // versus the snapshot load. The two are indistinguishable in the single
+                // total timer, and that distinction is exactly what a freshness-tail
+                // diagnosis needs (a large `capture_lock_wait` ⇒ the fix is apply-path
+                // backpressure/throughput, NOT the already-O(1) capture).
+                record_cayenne_write_phase(
+                    &self.table_metadata.table_name,
+                    "capture_lock_wait",
+                    capture_start,
+                );
+                let shard_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
+                    .mem_tier
+                    .shards()
+                    .iter()
+                    .map(ArcSwap::load_full)
+                    .collect();
+                let flushed_counts: Vec<usize> =
+                    shard_snapshots.iter().map(|s| s.segments.len()).collect();
+                let any_nonempty = shard_snapshots.iter().any(|s| !s.is_empty());
+                // `Ok(None)` — no reservation needed (empty / position-based).
+                // `Ok(Some(seq))` — reserved under the locks. `Err(1)` — block
+                // exhausted; grow by 1 off-lock and re-capture. Cold (~once per
+                // `SEQ_RESERVE_BLOCK`).
+                let seq = if !any_nonempty || self.pk_deletion_strategy.is_position_based() {
+                    Ok(None)
+                } else {
+                    self.try_reserve_local(1).map(Some).ok_or(1u32)
+                };
+                seq.map(|seq| {
+                    let (durable_epoch, snapshot) =
+                        Self::checkpoint_durable_epoch_and_snapshot(n, &shard_snapshots, &flushed_counts);
+                    (shard_snapshots, flushed_counts, snapshot, durable_epoch, seq)
+                })
+                // `guards` dropped here at the end of the inner block.
+            };
+            match attempt {
+                Ok(tuple) => break tuple,
+                Err(count) => {
+                    self.refill_sequence_block(count).await?;
+                }
             }
-            // All capture locks are now held (`write_lock` at N>1 + every shard
-            // publish lock). Emit the ACQUISITION WAIT as its own phase so it can be
-            // separated from the O(1) snapshot WORK: `mem_tier_checkpoint_capture`
-            // (the total, recorded below) minus this isolates whether the capture
-            // cost is lock contention — a deep apply backlog holding `write_lock` —
-            // versus the snapshot load. The two are indistinguishable in the single
-            // total timer, and that distinction is exactly what a freshness-tail
-            // diagnosis needs (a large `capture_lock_wait` ⇒ the fix is apply-path
-            // backpressure/throughput, NOT the already-O(1) capture).
-            record_cayenne_write_phase(
-                &self.table_metadata.table_name,
-                "capture_lock_wait",
-                capture_start,
-            );
-            let shard_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
-                .mem_tier
-                .shards()
-                .iter()
-                .map(ArcSwap::load_full)
-                .collect();
-            let flushed_counts: Vec<usize> =
-                shard_snapshots.iter().map(|s| s.segments.len()).collect();
-            let any_nonempty = shard_snapshots.iter().any(|s| !s.is_empty());
-            let seq = if !any_nonempty || self.pk_deletion_strategy.is_position_based() {
-                None
-            } else {
-                Some(self.reserve_sequences_local(1).await?)
-            };
-            // The cross-shard durable watermark on the SINGLE per-apply epoch axis
-            // (§3.4 Fix 1). The apply-epoch is a single GLOBAL monotone counter
-            // assigned once per apply UNDER `write_lock`, then stamped identically
-            // on every shard segment that apply produces. An apply only ever appends
-            // segments to the shards whose keys it touched, so a given apply-epoch is
-            // NOT present in every shard (e.g. a delete-absorb apply that routed all
-            // its tombstones to a single shard). This capture is all-shards-ATOMIC —
-            // it runs under `write_lock` (no apply in flight) and flushes each
-            // shard's COMPLETE current segment prefix (`flushed_counts[s]` == the
-            // shard's full segment count) — so EVERY apply that has run is now fully
-            // durable. The durable high-watermark is therefore the GLOBAL MAX
-            // apply-epoch captured across all shards: every epoch <= it is fully
-            // durable (a lower-epoch apply either landed in some shard's flushed
-            // prefix, or touched no shard at all — either way it is durable). MIN
-            // would be WRONG here: it pins the watermark at the least-recently-
-            // touched shard's last apply, so a cold shard starves the source slot
-            // and WAL never drains (the observed non-convergence) even though every
-            // applied epoch is durable. MIN is only required when shards checkpoint
-            // INDEPENDENTLY at different source positions; with atomic whole-tier
-            // capture there is no partial coverage, so MAX is both safe (never acks
-            // a not-yet-durable position — capture is under `write_lock`) and live.
-            // Shards with no captured `source_position` (empty, or the `None`-stamped
-            // N==1 single shard) are excluded. At N==1 there is no `source_position`
-            // at all, so this is `None` and the slot-ack falls back to the single
-            // shard's `MemTier::epoch` below (byte-identical).
-            // Cross-shard durable watermark = MAX (not MIN) over shards of the
-            // per-apply slot-ack epoch in each shard's flushed FULL prefix. Safe
-            // because the capture is all-shards-atomic over every shard's full
-            // prefix (§3.4 Fix 2/3): every epoch `<=` this max is durable in some
-            // shard's prefix, so acking it loses nothing on crash. MIN would
-            // UNDER-ack — an apply stamps its epoch only on the shards it touched,
-            // so a cold (recently-untouched) shard pins MIN low and the source slot
-            // never advances → WAL never drains. LOAD-BEARING on "no single-shard /
-            // partial-prefix checkpoint exists" (the whole-tier triggers + the sole
-            // all-shards capture body below enforce it); a partial checkpoint would
-            // make MAX a data-loss hole and require reverting to a MIN watermark.
-            let durable_epoch = shard_snapshots
-                .iter()
-                .zip(flushed_counts.iter())
-                .filter_map(|(s, &c)| s.max_source_position_in_prefix(c))
-                .max();
-            // The metadata/encode path reads ONE tier's tombstones/epoch. At N==1
-            // that is shard 0's snapshot unchanged (byte-identical); at N>1 it is
-            // the cross-shard UNION view (disjoint keys ⇒ exact union).
-            let snapshot = if n == 1 {
-                Arc::clone(&shard_snapshots[0])
-            } else {
-                Arc::new(
-                    crate::provider::mem_tier::ShardedMemTier::union_snapshot_view(
-                        &shard_snapshots,
-                        durable_epoch.unwrap_or(0),
-                    ),
-                )
-            };
-            drop(guards);
-            (
-                shard_snapshots,
-                flushed_counts,
-                snapshot,
-                durable_epoch,
-                seq,
-            )
         };
         // The all-shards-atomic capture window: the per-shard snapshot load +
         // sequence reservation under the publish locks (and `write_lock` at N>1).
@@ -21312,19 +23492,170 @@ impl CayenneTableProvider {
         // (spill/evolve/promotion): `owned_capture_write_lock` is None and the
         // caller's guard stays held for the rest of its operation.
         drop(owned_capture_write_lock.take());
-        // Emptiness must be judged on the REAL captured shard snapshots, not the
-        // synthetic union view: `union_snapshot_view` carries the cross-shard
-        // tombstone union + the summed byte/row counts but ALWAYS has empty
-        // `segments` (the row-bearing segments are iterated per shard below), so
-        // `snapshot.is_empty()` (segments ∧ tombstones empty) would spuriously
-        // report a pure-insert tier as empty and skip the flush. At N==1
-        // `snapshot` IS shard 0's snapshot, so `is_empty()` there is the
-        // byte-identical pre-shard check; at N>1 a tier is empty only when every
-        // shard is empty.
+        // At N==1 the slot-ack currency stays the single shard's `MemTier::epoch`
+        // (no `source_position` stamped), byte-identical to the pre-shard path. At
+        // N>1 it is the shared per-apply `durable_epoch` MAX computed above.
+        let flushed_epoch = durable_epoch.unwrap_or(snapshot.epoch);
+        // FREEZE (Model B, proposal §4.5): record the captured prefix as a drain
+        // generation in the SHARED `drain_ledger` (Stage 2b Step 2), MOVING the
+        // captured state into it — the generation is the single source of truth. The
+        // live tier is UNTOUCHED — publish removes the front `flushed_counts` segments
+        // per shard via `retain_after`. The checkpoint bakes an un-sealed frozen tier
+        // directly, so it walks `Frozen → Spilling → Published → Reclaimed` and acks at
+        // publish (the un-decoupled §4.5 edge). At D=1 the ledger holds exactly this one
+        // generation for the (`mem_checkpoint_lock`-serialized) flush — the freeze is
+        // race-free because Step 1b serializes every freeze/clear path on that lock, so
+        // no second concurrent freeze can exist. `DrainCleanup` discards the generation
+        // on any early `?`/panic before reclaim, so the next serialized freeze starts
+        // on an empty ledger. Behavior is byte-identical to the pre-2b capture.
+        // Compute the encode WINDOW GEOMETRY under the ledger lock: the window base
+        // is Σ of the older still-resident generations' relative counts
+        // (`resident_prefix_counts`), and this generation's own relative count is
+        // `absolute − base` per shard. At D=1 the ledger is empty ⇒ base = `[0; n]` ⇒
+        // relative = the absolute `flushed_counts` ⇒ `window_view(0, len)` is the
+        // whole snapshot ⇒ byte-identical. The base + relative are recorded on the
+        // generation so the drain windows its captured snapshot to ONLY its own rows
+        // (the D>1 double-count fix) and clears exactly its own front prefix.
+        // FREEZE under the ledger lock, then CLAIM a working copy of the captured
+        // immutable state back off the returned handle (never held across the
+        // encode/commit `.await`s below). Reading from the freeze handle — rather than
+        // the ledger front — is identity-correct at `D > 1`, where the just-frozen
+        // generation is the BACK (newest), not the front (an older drain may still be
+        // in flight). At `D = 1` the ledger is empty at freeze, so it is the front too.
+        let claim = {
+            let mut ledger = self.drain_ledger.lock();
+            debug_assert!(
+                ledger.max_depth() > 1 || ledger.is_empty(),
+                "D=1 drain ledger must be empty before a checkpoint freeze (freezes serialized by mem_checkpoint_lock)"
+            );
+            let window_base = ledger.resident_prefix_counts(n);
+            let relative_counts: Vec<usize> = flushed_counts
+                .iter()
+                .zip(window_base.iter())
+                .map(|(&absolute, &base)| absolute.saturating_sub(base))
+                .collect();
+            match ledger.freeze(FrozenGeneration::freeze(
+                shard_snapshots,
+                window_base,
+                relative_counts,
+                reserved_snapshot_sequence,
+                flushed_epoch,
+            )) {
+                Ok(g) => Some(CheckpointDrainClaim {
+                    id: g.id,
+                    shard_snapshots: g.shard_snapshots.clone(),
+                    window_base: g.window_base.clone(),
+                    relative_counts: g.relative_counts.clone(),
+                    reserved_snapshot_sequence: g.reserved_seq,
+                    flushed_epoch: g.epoch,
+                }),
+                Err(_) => None,
+            }
+        };
+        let Some(claim) = claim else {
+            return Err(Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: "mem-tier drain ledger rejected the initial checkpoint freeze (depth bound broken)"
+                    .to_string(),
+            });
+        };
+        Ok(Some((claim, checkpoint_start)))
+    }
+
+    /// Run the off-lock CHECKPOINT drain for a claimed frozen generation: arm the abort
+    /// guard (addressed BY ITS ID — the happy path reclaims + disarms explicitly; an
+    /// early `?`/panic drops the guard, discarding THIS generation wherever it sits in
+    /// the ledger so the depth bound never blocks a later freeze) and drive the drain
+    /// (encode → PUT → commit → publish → ack → reclaim) on the claimed immutable
+    /// working copy. At `D = 1` the caller invokes this INLINE while still holding
+    /// `mem_checkpoint_lock` (byte-identical to the pre-split interleaved body); Stage 2b
+    /// Step 3b-b invokes it as the body of a detached `tokio::spawn` after releasing the
+    /// lock, so the next freeze overlaps the drain (the pipelined drain that lifts the
+    /// `cdc_durability: memory` ceiling). `checkpoint_start` spans the
+    /// `mem_tier_checkpoint` phase metric across the whole capture+drain.
+    async fn run_checkpoint_drain(
+        &self,
+        claim: CheckpointDrainClaim,
+        checkpoint_start: Instant,
+    ) -> Result<u64> {
+        let mut drain_cleanup =
+            DrainCleanup::armed(&self.drain_ledger, &self.drain_publish_notify, claim.id);
+        self.drain_checkpoint_generation(claim, checkpoint_start, &mut drain_cleanup)
+            .await
+    }
+
+    /// The off-lock CHECKPOINT drain (Stage 2b Step 3a): encode the claimed frozen
+    /// generation to a durable Vortex snapshot, publish it whole-unit under the
+    /// listing fence, advance the source slot to its durable epoch, then reclaim the
+    /// generation and disarm `cleanup`. Operates ONLY on the claimed immutable working
+    /// copy ([`CheckpointDrainClaim`]) plus `self` and the shared `drain_ledger`'s
+    /// front generation — it holds NO capture lock. At `D = 1` the caller runs it
+    /// inline under `mem_checkpoint_lock` (byte-identical); Step 3b spawns it as a
+    /// detached task after releasing that lock. `checkpoint_start` is threaded in so
+    /// the `mem_tier_checkpoint` phase metric spans the whole capture+drain exactly as
+    /// before the extraction.
+    async fn drain_checkpoint_generation(
+        &self,
+        claim: CheckpointDrainClaim,
+        checkpoint_start: Instant,
+        drain_cleanup: &mut DrainCleanup<'_>,
+    ) -> Result<u64> {
+        let CheckpointDrainClaim {
+            id,
+            shard_snapshots,
+            window_base,
+            relative_counts,
+            reserved_snapshot_sequence,
+            flushed_epoch,
+        } = claim;
+        let n = shard_snapshots.len();
+        // WINDOW the captured snapshots to ONLY this generation's own segments
+        // (`window_view(base, N_G)`). At D>1 a captured snapshot includes older
+        // still-resident generations' front prefixes, so encoding it whole would
+        // double-count their rows into this file; the window excludes them. At D=1
+        // `window_base = [0; n]` and `relative_counts` are the absolute counts, so
+        // each window is the whole captured snapshot via the full-window fast path —
+        // byte-identical to reading the tier directly. All downstream encode /
+        // snapshot / emptiness reads go through `windows`, and the publish clear drops
+        // exactly the front `relative_counts` (ordered oldest-first, so at publish the
+        // live tier's front IS this window).
+        let windows: Vec<Arc<crate::provider::mem_tier::MemTier>> = shard_snapshots
+            .iter()
+            .zip(window_base.iter())
+            .zip(relative_counts.iter())
+            .map(|((shard, &base), &count)| Arc::new(shard.window_view(base, count)))
+            .collect();
+        // Recompute the (union / shard-0) snapshot view from the windowed snapshots.
+        // Each window's segment count IS its `relative_counts` entry, so the prefix
+        // length for `max_source_position_in_prefix` is `relative_counts`.
+        let (window_durable_epoch, snapshot) =
+            Self::checkpoint_durable_epoch_and_snapshot(n, &windows, &relative_counts);
+        // WINDOW-LOCAL ack epoch invariant: `flushed_epoch` (claimed from the capture,
+        // computed over the WHOLE captured prefix `[0, absolute)`) equals the epoch over
+        // just THIS generation's window `[base, absolute)` — because a freeze's window is
+        // always the NEWEST tail of its capture and source position is monotone with
+        // append order, so the max over the whole prefix lies in the window. So each
+        // generation acks exactly its own window's durable watermark, never an older
+        // still-resident generation's (which the ordered publish makes durable first).
+        // At D=1 base=0, so the window IS the whole capture — trivially equal.
+        debug_assert_eq!(
+            window_durable_epoch.unwrap_or(snapshot.epoch),
+            flushed_epoch,
+            "window-local ack epoch must equal the claimed whole-capture epoch (tail invariant)"
+        );
+        // Emptiness must be judged on the WINDOWED snapshots, not the synthetic union
+        // view: `union_snapshot_view` carries the cross-shard tombstone union + the
+        // summed byte/row counts but ALWAYS has empty `segments` (the row-bearing
+        // segments are iterated per window below), so `snapshot.is_empty()` (segments
+        // ∧ tombstones empty) would spuriously report a pure-insert tier as empty and
+        // skip the flush. At N==1 `snapshot` IS window 0, so `is_empty()` there is the
+        // byte-identical pre-shard check; at N>1 a generation is empty only when every
+        // window is empty. (Judging on the raw captured snapshots would be wrong at
+        // D>1 — an empty window over a non-empty older prefix would report non-empty.)
         let nothing_to_flush = if n == 1 {
             snapshot.is_empty()
         } else {
-            shard_snapshots.iter().all(|s| s.is_empty())
+            windows.iter().all(|w| w.is_empty())
         };
         if nothing_to_flush {
             // The tier is fully empty — every epoch ever appended has already
@@ -21342,10 +23673,13 @@ impl CayenneTableProvider {
             self.refire_last_durable_slot_advancer().await;
             return Ok(0);
         }
-        // At N==1 the slot-ack currency stays the single shard's `MemTier::epoch`
-        // (no `source_position` stamped), byte-identical to the pre-shard path. At
-        // N>1 it is the shared per-apply `durable_epoch` MAX computed above.
-        let flushed_epoch = durable_epoch.unwrap_or(snapshot.epoch);
+        // Committed to draining this generation: claim it for the bake (by id).
+        self.with_generation_by_id(id, |g| g.transition(GenState::Spilling));
+        // Test-only deterministic pause: hold this drain in flight (Spilling) so a D>1
+        // test can start freeze N+1 while drain N is here, proving overlap. No-op in
+        // production (no gate installed).
+        #[cfg(test)]
+        self.checkpoint_drain_pause_point(id).await;
         let inlined_view = self.cached_inlined_view().await?;
         // The inline removal map is the WHOLE-TIER tombstone union (carried on
         // `snapshot.tombstones` — shard 0's at N==1, the cross-shard union at N>1),
@@ -21357,11 +23691,11 @@ impl CayenneTableProvider {
         // groups concatenate, each shard applying its OWN tombstones (§2.3e). At N==1
         // this is exactly `[visible_mem_tier_batches(shard 0)]`.
         let mut shard_groups: Vec<Vec<RecordBatch>> = Vec::new();
-        for shard in &shard_snapshots {
-            if shard.is_empty() || shard.segments.is_empty() {
+        for window in &windows {
+            if window.is_empty() || window.segments.is_empty() {
                 continue;
             }
-            let group = self.visible_mem_tier_batches(shard, None)?;
+            let group = self.visible_mem_tier_batches(window, None)?;
             if !group.is_empty() {
                 shard_groups.push(group);
             }
@@ -21410,6 +23744,13 @@ impl CayenneTableProvider {
             // moves past the deletes. All keys are pure deletes here (the
             // corpus is empty), so the commit writes delete-only entries and
             // registers no snapshot.
+            // ORDERED PUBLISH (Step 3b-b): this path commits DVs + clears the front
+            // prefix, so it must run after every older generation published. No-op at
+            // D=1 (this is the only, and therefore front, generation). ABORT if an
+            // older failure cascade-discarded this generation (Step 3b-b-iii).
+            if !self.take_publish_turn_or_abort(id, drain_cleanup).await {
+                return Ok(0);
+            }
             if let Some(sequence_number) = reserved_snapshot_sequence
                 && Self::mem_tier_has_tombstones(&snapshot)
             {
@@ -21431,7 +23772,7 @@ impl CayenneTableProvider {
                 self.commit_on_conflict_publish(update, None).await;
                 // All-shards clear (acquires each shard's publish lock itself).
                 self.clear_flushed_mem_tier_state_all_shards(
-                    &flushed_counts,
+                    &relative_counts,
                     !inlined_view.is_empty()
                         || self
                             .mem_tier_shadow_present
@@ -21446,7 +23787,7 @@ impl CayenneTableProvider {
                 // There is no durable state to publish here, so no listing fence is
                 // needed.
                 self.clear_flushed_mem_tier_state_all_shards(
-                    &flushed_counts,
+                    &relative_counts,
                     !inlined_view.is_empty()
                         || self
                             .mem_tier_shadow_present
@@ -21459,7 +23800,12 @@ impl CayenneTableProvider {
                 "mem_tier_checkpoint",
                 checkpoint_start,
             );
-            self.fire_slot_advancer(flushed_epoch).await;
+            // Tombstones-only drain: the durable DVs are committed and the front
+            // prefix cleared — the generation's whole-unit publish is complete. Drive
+            // it to `Published` and advance the slot to the ordered ack watermark
+            // (its own `flushed_epoch` at D=1), then disarm the cleanup guard.
+            self.publish_generation_and_ack(id, GenState::Published, drain_cleanup)
+                .await;
             return Ok(0);
         }
 
@@ -21504,18 +23850,34 @@ impl CayenneTableProvider {
         // ingest. The position-based strategy appends to the CURRENT snapshot and
         // therefore must keep encode+swap atomic under one held fence (unchanged).
         let stats = if self.pk_deletion_strategy.is_position_based() {
+            // ORDERED PUBLISH (Step 3b-b): the position-based path keeps encode+swap
+            // atomic under one held fence, so it cannot overlap encode across
+            // generations — take the publish turn up front. No-op at D=1 (and
+            // position-based tables never raise D above 1: they are single-shard and
+            // never engage the memory-mode mem-tier pipeline, so the abort branch is
+            // unreachable here — kept for uniformity with the other publish arms).
+            if !self.take_publish_turn_or_abort(id, drain_cleanup).await {
+                return Ok(0);
+            }
             let _fence = self.listing_fence.write().await;
             let target_size_bytes = self.context.target_file_size_bytes();
+            let current_snapshot = self.get_current_snapshot_id();
             let (_rows, _ops, stats) = self
                 .write_to_snapshot(
                     stream,
                     target_size_bytes,
-                    &self.get_current_snapshot_id(),
+                    &current_snapshot,
                     ctx.state().config().target_partitions(),
                     estimated_bytes,
                     super::delta_encoding::WriteClass::Delta,
                 )
                 .await?;
+            // This write lands straight in the current snapshot directory with
+            // no staging WAL, so it bypasses `insert_current_snapshot_manifest_rows`'s
+            // gate entirely — but `write_to_snapshot` itself maintains the
+            // manifest incrementally for exactly this case (see its
+            // `written_files_collector`), so no separate full-relist call is
+            // needed here.
             // Clear under the publish locks (inner to the held fence), uniform
             // with phase 2. Position-based tables never engage `append_to_mem_tier`
             // (`is_cdc_memory_mode()` is false for them — always a single shard),
@@ -21524,7 +23886,7 @@ impl CayenneTableProvider {
             // publish lock") unconditional. Lock order: fence (outer) → publish
             // (inner), same as phase 2.
             self.clear_flushed_mem_tier_state_all_shards(
-                &flushed_counts,
+                &relative_counts,
                 !inlined_view.is_empty()
                     || self
                         .mem_tier_shadow_present
@@ -21595,6 +23957,39 @@ impl CayenneTableProvider {
                 Self::sync_snapshot_dir(&snapshot_dir).await?;
             }
 
+            // ORDERED PUBLISH turn (Step 3b-b). The Vortex encode + fsync above (phase
+            // 1) ran OFF-lock and OFF-turn, so at D>1 generation N+1's encode overlaps
+            // generation N's whole drain (the pipeline win). But the metastore commit +
+            // fence swap + `retain_after` front-clear below (phase 2) must be strictly
+            // oldest-first: park here until this generation is the ledger front (every
+            // older generation published and reclaimed). No-op at D=1 (sole/front gen),
+            // so the pre-commit spill-fault crash boundary below is unchanged. ABORT if
+            // an older failure cascade-discarded this generation (Step 3b-b-iii): the
+            // orphan Vortex file just encoded stays unreferenced (invisible), and the
+            // rows stay live in the tier for PK-idempotent replay.
+            if !self.take_publish_turn_or_abort(id, drain_cleanup).await {
+                return Ok(0);
+            }
+
+            // Test-only Stage 2a spilling-crash injection: the generation is in
+            // `GenState::Spilling` here — the Vortex file is durably encoded and
+            // fsynced above, but the metastore pointer (`commit_mem_tier_checkpoint_metadata`,
+            // just below) has NOT been written and the slot has NOT advanced.
+            // Aborting one-shot reproduces a crash mid-bake, leaving a
+            // durable-but-unreferenced orphan file; the recovery suite drops+reopens
+            // and asserts the orphan never surfaces (no dirty read) before replaying.
+            #[cfg(test)]
+            if self
+                .force_checkpoint_spill_fault
+                .swap(false, Ordering::Relaxed)
+            {
+                return Err(Error::DataValidation {
+                    table: self.table_name().to_string(),
+                    message: "injected spilling-state crash before checkpoint commit (test-only)"
+                        .to_string(),
+                });
+            }
+
             let update = self
                 .commit_mem_tier_checkpoint_metadata(
                     &snapshot,
@@ -21603,6 +23998,25 @@ impl CayenneTableProvider {
                     &corpus_keys,
                 )
                 .await?;
+
+            // Author this checkpoint's protected-snapshot manifest with its
+            // exact commit-seq range `[sequence_number, sequence_number]` —
+            // every file here was written by this one checkpoint — BEFORE it
+            // becomes visible below. Same gap and same fix as the on-conflict
+            // append path in `mutation_writer.rs::write_new_snapshot_after_validation`:
+            // this mem-tier checkpoint flush never authored a manifest at all,
+            // so a `scan_from_manifest` table (no directory-LIST fallback)
+            // would silently never see the flushed rows. Only attempted (and
+            // only a hard failure) when the table actually resolves scans
+            // from the manifest.
+            if self.scan_from_manifest() {
+                self.author_uniform_snapshot_manifest(
+                    &new_snapshot_id,
+                    sequence_number,
+                    sequence_number,
+                )
+                .await?;
+            }
 
             // PHASE 2 — in-memory visibility swap, UNDER the fence. Cheap: an
             // ArcSwap publish, a tier clear, and a listing-table refresh — no
@@ -21647,7 +24061,7 @@ impl CayenneTableProvider {
                         .await?;
                 }
                 self.clear_flushed_mem_tier_state_all_shards(
-                    &flushed_counts,
+                    &relative_counts,
                     !inlined_view.is_empty()
                         || self
                             .mem_tier_shadow_present
@@ -21685,6 +24099,11 @@ impl CayenneTableProvider {
             self.record_current_snapshot_files_added(checkpoint_file_count);
             stats
         };
+        // The whole-unit atomic publish (file + DV in, front prefix out, under the
+        // listing fence) has completed for both the position-based and two-phase
+        // arms — the generation is published. It is driven to `Published` + reclaimed
+        // + acked together at the end (below), after the maintained-count persist,
+        // once nothing further can fail this drain.
 
         // Seed the persisted live `num_rows` from the mem-tier rows that just
         // became durable. Unlike the inline/staged path — which persists
@@ -21742,9 +24161,13 @@ impl CayenneTableProvider {
             elapsed_ms = u64::try_from(checkpoint_start.elapsed().as_millis()).unwrap_or(u64::MAX),
             "Mem-tier checkpoint flushed a durable snapshot"
         );
-        // ONLY NOW — after the Vortex file + metastore pointer are durable — tell
-        // the runtime it may advance the source slot to cover this epoch.
-        self.fire_slot_advancer(flushed_epoch).await;
+        // ONLY NOW — after the Vortex file + metastore pointer are durable — drive the
+        // generation to `Published` and tell the runtime it may advance the source slot
+        // to the ORDERED ack watermark (this generation's own `flushed_epoch` at D=1;
+        // pinned behind an unfinished older generation at D>1). Reclaims the captured
+        // Arcs and disarms the cleanup guard as part of the ack.
+        self.publish_generation_and_ack(id, GenState::Published, drain_cleanup)
+            .await;
 
         Ok(u64::try_from(flushed_mem_rows).unwrap_or(u64::MAX))
     }
@@ -21805,32 +24228,79 @@ impl CayenneTableProvider {
         if !self.is_cdc_memory_mode() || self.is_memory_resident_mode() {
             return Ok(0);
         }
-        let n = self.mem_tier.shard_count();
+        // D>1 SEAL QUIESCE BARRIER (Stage 2b Step 3b-b-iii). A seal is SINGLE-ORDERED
+        // (the drain-serialization audit) and does NOT window its capture — it shadows
+        // `unsealed_view()` over the WHOLE active prefix. At `D > 1` a detached checkpoint
+        // releases `mem_checkpoint_lock` after its freeze and drains off-lock, so a seal
+        // could otherwise freeze BEHIND a still-resident checkpoint whose not-yet-cleared
+        // window overlaps the seal's active prefix — doubly-persisting those rows (the
+        // over-count class PR #11907 fixed). So before capturing, DRAIN THE PIPELINE:
+        // hold all `max_depth` admission permits for the whole seal, which blocks until
+        // every in-flight detached checkpoint published + reclaimed (releasing its permit)
+        // and prevents any new checkpoint freeze (none can get a permit). The seal then
+        // captures over an EMPTY ledger — `window_base = [0; n]`, no checkpoint window
+        // ahead of it — exactly as at `D = 1`. Deadlock-free: a checkpoint's publish path
+        // takes only the listing fence + shard publish locks (never `mem_checkpoint_lock`,
+        // never a seal-held permit), so it makes full progress while the seal waits; and
+        // `acquire_many` is fair, so a steady checkpoint stream cannot starve the seal.
+        // No-op at `D = 1` (the config default) — byte-identical to the pre-3b-b-iii seal.
+        let _quiesce = self.acquire_seal_quiesce_barrier().await?;
         // A due seal must make progress even under sustained writes, so acquire the
         // capture locks with the GUARANTEED fair path (not a skip): fast try, then a
         // fair `write -> mem` queued fallback. Single-drainer w.r.t. the bake via
-        // `mem_checkpoint_lock`; the capture `write_lock` is released after capture.
+        // `mem_checkpoint_lock` (the same lock the periodic tick and the write-path
+        // spill hold around a checkpoint), so a seal never races a checkpoint's
+        // `fire_slot_advancer`; the capture `write_lock` is released after capture.
+        // (Adapted from PR #11907.)
         let mut guards = self.acquire_capture_locks_blocking().await;
         // Keep `guards` alive for the whole seal so `mem_checkpoint_lock` spans the
         // lifecycle; take only the capture-scoped `write` guard.
-        let mut owned_capture_write_lock = guards.write.take();
+        let write = guards.write.take();
+        // Capture + FREEZE the seal generation under `mem_checkpoint_lock` (the O(1),
+        // `M`-serialized portion), then run the off-lock seal drain. The freeze/drain
+        // seam mirrors `checkpoint_mem_tier`: at `D = 1` (config default) the drain runs
+        // INLINE while `guards` still holds `mem_checkpoint_lock` (byte-identical); Step
+        // 3b-b releases `guards` here and `tokio::spawn`s the drain at `D > 1`.
+        let Some(claim) = self.capture_and_freeze_seal(write)? else {
+            return Ok(0);
+        };
+        self.run_seal_drain(claim).await
+        // `guards` drops here (after the inline drain), releasing `mem_checkpoint_lock`.
+    }
 
-        // === ALL-SHARDS-ATOMIC CAPTURE (mirrors `checkpoint_mem_tier_inner`) ===
-        // At N>1 take `write_lock` so an apply's N shard appends are observed
-        // ALL-OR-NONE (§3.4 Fix 3): a torn capture would let the MAX watermark ack an
-        // apply_epoch not yet durable in every shard it touched → loss on crash. Then
-        // all shard publish locks in index order (deadlock-free), mutually exclusive
-        // with every shard's append swap. The coordinated helper above acquires the
+    /// Capture the mem-tier active pieces atomically and FREEZE them as a seal drain
+    /// generation in the shared `drain_ledger` — the O(1), `M`-serialized portion of a
+    /// seal. Returns the claimed immutable working copy ([`SealDrainClaim`]), or
+    /// `Ok(None)` when nothing has an active ingestion piece to seal. Split from the
+    /// drain ([`Self::run_seal_drain`]) so the caller can release `mem_checkpoint_lock`
+    /// between the two at `D > 1` (Step 3b-b); the seal counterpart of
+    /// [`Self::capture_and_freeze_checkpoint`].
+    ///
+    /// Synchronous (unlike the checkpoint counterpart): the seal capture takes only
+    /// `parking_lot` publish locks and reserves its seal sequence off-lock inside the
+    /// drain, so there is no refill `.await` here.
+    fn capture_and_freeze_seal(
+        &self,
+        mut owned_capture_write_lock: Option<tokio::sync::OwnedMutexGuard<()>>,
+    ) -> Result<Option<SealDrainClaim>> {
+        let n = self.mem_tier.shard_count();
+
+        // === ALL-SHARDS-ATOMIC CAPTURE (mirrors `capture_and_freeze_checkpoint`) ===
+        // At N>1 the coordinated helper above holds `write_lock` so an apply's N shard
+        // appends are observed ALL-OR-NONE (§3.4 Fix 3): a torn capture would let the
+        // MAX watermark ack an apply_epoch not yet durable in every shard it touched →
+        // loss on crash. Then all shard publish locks in index order (deadlock-free),
+        // mutually exclusive with every shard's append swap. The helper acquires the
         // two outer locks without awaiting either while holding the other, so a seal
         // serializes cleanly against a bake and a write-path spill. The durable
-        // encode/commit runs outside write_lock on the captured immutable snapshots,
-        // so concurrent applies keep flowing.
-        // At N==1 no `write_lock` is taken (a single `ArcSwap` load is already atomic)
-        // — byte-identical to the pre-sharding seal.
+        // encode/commit runs OUTSIDE `write_lock` on the captured immutable snapshots,
+        // so concurrent applies keep flowing. At N==1 no `write_lock` is taken (a
+        // single `ArcSwap` load is already atomic) — byte-identical to the pre-sharding
+        // seal.
         let (shard_snapshots, sealed_through, seal_epoch) = {
             let mut guards = Vec::with_capacity(n);
             for lock in self.mem_tier_publish_locks.iter() {
-                guards.push(lock.lock().await);
+                guards.push(lock.lock());
             }
             let shard_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
                 .mem_tier
@@ -21842,7 +24312,7 @@ impl CayenneTableProvider {
             if shard_snapshots.iter().all(|s| !s.has_unsealed_segments()) {
                 drop(guards);
                 drop(owned_capture_write_lock.take());
-                return Ok(0);
+                return Ok(None);
             }
             // Seal each shard's FULL current prefix. After this all-shards-atomic
             // seal every shard's full prefix is durable (its prior-sealed segments by
@@ -21866,6 +24336,101 @@ impl CayenneTableProvider {
         // run in parallel with the shadow write (the off-lock seal); everything below
         // reads only the captured immutable snapshots + the reserved seal sequence.
         drop(owned_capture_write_lock.take());
+
+        // FREEZE (Model B, proposal §4.5): record the captured active prefix as a
+        // drain generation in the SHARED `drain_ledger` (Stage 2b Step 2), MOVING the
+        // captured state into it — the generation is the single source of truth. The
+        // live tier is UNTOUCHED — the seal marks the per-shard boundary
+        // (`active → sealed`) without removing segments, so the rows stay in the read
+        // union; the durable shadow below reads only the captured immutable snapshots.
+        // The seal walks `Frozen → Sealed` (the lightweight durability + slot-ack
+        // cadence; no Vortex bake) and leaves the ledger after `Sealed`. The reserved
+        // seal sequence is stamped onto the generation after the off-lock reservation
+        // below. The freeze is race-free (Step 1b serializes every freeze on
+        // `mem_checkpoint_lock`); the `DrainCleanup` guard discards the generation on
+        // any early `?`/panic before reclaim. Byte-identical to the pre-2b seal.
+        // The seal records `sealed_through` (the absolute per-shard boundary) as its
+        // `relative_counts` — it marks the boundary rather than windowing an encode,
+        // so `window_base` is inert for the seal (the shadow reads `unsealed_view`,
+        // not a window). At D=1 `resident_prefix_counts` is `[0; n]` (empty ledger);
+        // D>1 seal composition is deferred to Step 3b (seal single-ordered per the
+        // drain-serialization audit).
+        // FREEZE, then CLAIM a working copy back off the returned handle (id included).
+        // Reading from the handle is identity-correct at D>1 (the just-frozen generation
+        // is the BACK, not the front); at D=1 the ledger is empty at freeze so it is the
+        // front too. The reserved seal sequence is NOT claimed here — it is reserved
+        // off-lock in the drain and stamped back onto the generation by id.
+        let claim = {
+            let mut ledger = self.drain_ledger.lock();
+            debug_assert!(
+                ledger.is_empty(),
+                "seal must freeze over an empty drain ledger (D=1: mem_checkpoint_lock-serialized inline drains; D>1: the seal quiesce barrier drained the pipeline)"
+            );
+            let window_base = ledger.resident_prefix_counts(n);
+            match ledger.freeze(FrozenGeneration::freeze(
+                shard_snapshots,
+                window_base,
+                sealed_through,
+                None,
+                seal_epoch,
+            )) {
+                Ok(g) => Some(SealDrainClaim {
+                    id: g.id,
+                    shard_snapshots: g.shard_snapshots.clone(),
+                    sealed_through: g.relative_counts.clone(),
+                    seal_epoch: g.epoch,
+                }),
+                Err(_) => None,
+            }
+        };
+        let Some(claim) = claim else {
+            return Err(Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: "mem-tier drain ledger rejected the initial seal freeze (depth bound broken)"
+                    .to_string(),
+            });
+        };
+        Ok(Some(claim))
+    }
+
+    /// Run the off-lock SEAL drain for a claimed frozen generation: arm the abort guard
+    /// (addressed by its id, identity-aware at `D > 1`) and drive the seal (build union
+    /// delta → durable shadow → mark boundary → ack → reclaim) on the claimed immutable
+    /// working copy. At `D = 1` the caller invokes this INLINE while still holding
+    /// `mem_checkpoint_lock` (byte-identical to the pre-split body); Step 3b-b invokes it
+    /// as the body of a detached `tokio::spawn` after releasing the lock. The seal
+    /// counterpart of [`Self::run_checkpoint_drain`].
+    async fn run_seal_drain(&self, claim: SealDrainClaim) -> Result<u64> {
+        let SealDrainClaim {
+            id,
+            shard_snapshots,
+            sealed_through,
+            seal_epoch,
+        } = claim;
+        let mut drain_cleanup =
+            DrainCleanup::armed(&self.drain_ledger, &self.drain_publish_notify, id);
+        self.drain_seal_generation(id, shard_snapshots, sealed_through, seal_epoch, &mut drain_cleanup)
+            .await
+    }
+
+    /// The off-lock SEAL drain (Stage 2b Step 3a): durably shadow the claimed frozen
+    /// active-piece generation into the unpublished inline corpus, mark each shard's
+    /// active→sealed boundary, advance the source slot to `seal_epoch`, then reclaim
+    /// the generation and disarm `cleanup`. Operates ONLY on the claimed immutable
+    /// working copy (`shard_snapshots` / `sealed_through` / `seal_epoch`) plus `self`
+    /// and the shared `drain_ledger`'s front generation — it holds NO capture lock, so
+    /// at `D = 1` the caller runs it inline under `mem_checkpoint_lock` (byte-identical)
+    /// and Step 3b spawns it as a detached task. The seal sequence is reserved off-lock
+    /// inside here and stamped back onto the generation (the freeze recorded `None`).
+    async fn drain_seal_generation(
+        &self,
+        id: u64,
+        shard_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>>,
+        sealed_through: Vec<usize>,
+        seal_epoch: u64,
+        drain_cleanup: &mut DrainCleanup<'_>,
+    ) -> Result<u64> {
+        let n = shard_snapshots.len();
 
         // === BUILD the union delta from the captured snapshots (off-lock) ===
         // Each shard's active piece as a delta view (tombstone/byte aggregates
@@ -21893,9 +24458,13 @@ impl CayenneTableProvider {
             // a durable row: the epoch is vacuously durable. Advance the per-shard
             // boundary + the slot so the active pieces are not re-scanned next seal.
             for (shard_id, &through) in sealed_through.iter().enumerate() {
-                self.mark_shard_sealed_through(shard_id, through).await;
+                self.mark_shard_sealed_through(shard_id, through);
             }
-            self.fire_slot_advancer(seal_epoch).await;
+            // Vacuously durable: the boundary is marked, so the generation is sealed.
+            // Drive it to `Sealed` and advance the slot to the ordered ack watermark
+            // (its own `seal_epoch` at D=1), then disarm the cleanup guard.
+            self.publish_generation_and_ack(id, GenState::Sealed, drain_cleanup)
+                .await;
             return Ok(0);
         }
 
@@ -21914,6 +24483,9 @@ impl CayenneTableProvider {
             .reserve_sequences_local(1)
             .await
             .map_err(|source| Error::Catalog { source })?;
+        // Stamp the off-lock reservation onto this generation by id (freeze recorded
+        // `None`); at D>1 the generation may not be the front.
+        self.with_generation_by_id(id, |g| g.set_reserved_seq(seal_sequence));
 
         // (a) Durable INSERTS → ONE unpublished inline-corpus BLOB over the
         // concatenated cross-shard visible rows. Durable commit only — NO
@@ -21972,14 +24544,16 @@ impl CayenneTableProvider {
         // shard's publish lock so the boundary store is atomic w.r.t. a concurrent
         // append's tier swap.
         for (shard_id, &through) in sealed_through.iter().enumerate() {
-            self.mark_shard_sealed_through(shard_id, through).await;
+            self.mark_shard_sealed_through(shard_id, through);
         }
-
-        // ONLY NOW — after every shard's active delta is durable — may the runtime
-        // advance the source slot to cover `seal_epoch`. A crash before this point
-        // leaves the slot un-advanced, so the source re-streams the tail and the
-        // PK-idempotent apply converges exactly-once.
-        self.fire_slot_advancer(seal_epoch).await;
+        // The active prefix is durable (inserts + tombstones) and the boundary marked
+        // — the generation is sealed. ONLY NOW — after every shard's active delta is
+        // durable — drive it to `Sealed` and advance the source slot to the ORDERED ack
+        // watermark (its own `seal_epoch` at D=1). A crash before this leaves the slot
+        // un-advanced, so the source re-streams the tail and the PK-idempotent apply
+        // converges exactly-once. Reclaims the generation and disarms the guard.
+        self.publish_generation_and_ack(id, GenState::Sealed, drain_cleanup)
+            .await;
 
         tracing::debug!(
             table = %self.table_metadata.table_name,
@@ -21997,8 +24571,8 @@ impl CayenneTableProvider {
     /// active segments under the same lock). `mark_sealed_through` clamps to the
     /// live segment count and never regresses the boundary, so a captured
     /// `sealed_through` stays valid even after intervening appends grew the tail.
-    async fn mark_shard_sealed_through(&self, shard_id: usize, sealed_through: usize) {
-        let _publish = self.mem_tier_publish_locks[shard_id].lock().await;
+    fn mark_shard_sealed_through(&self, shard_id: usize, sealed_through: usize) {
+        let _publish = self.mem_tier_publish_locks[shard_id].lock();
         let cur = self.mem_tier.shard(shard_id).load_full();
         let sealed = cur.mark_sealed_through(sealed_through);
         self.mem_tier.shard(shard_id).store(Arc::new(sealed));
@@ -22098,7 +24672,7 @@ impl CayenneTableProvider {
             // clear each shard's flushed prefix while held.
             let mut guards = Vec::with_capacity(self.mem_tier_publish_locks.len());
             for lock in self.mem_tier_publish_locks.iter() {
-                guards.push(lock.lock().await);
+                guards.push(lock.lock());
             }
             for (shard_id, &flushed_count) in flushed_counts.iter().enumerate() {
                 released_total = released_total.saturating_add(
@@ -22461,6 +25035,24 @@ impl CayenneTableProvider {
             )
             .await?;
 
+        // Author this protected snapshot's manifest with its exact commit-seq
+        // range `[sequence_number, sequence_number]` — every file here was
+        // written by this one commit — BEFORE it becomes visible below. Same
+        // gap and same fix as `write_new_snapshot_after_validation` and
+        // `drain_checkpoint_generation`: this inline-checkpoint-flush path
+        // authored no manifest at all, so a `scan_from_manifest` table (no
+        // directory-LIST fallback) would silently never see the flushed rows.
+        // Only attempted (and only a hard failure) when the table actually
+        // resolves scans from the manifest.
+        if self.scan_from_manifest() {
+            self.author_uniform_snapshot_manifest(
+                &new_snapshot_id,
+                sequence_number,
+                sequence_number,
+            )
+            .await?;
+        }
+
         // Protect this snapshot using its OWN allocated `sequence_number` as the
         // deletion threshold: the same value just persisted to
         // `cayenne_snapshot_sequence` and reloaded by `load_protected_snapshots` on
@@ -22606,16 +25198,24 @@ impl CayenneTableProvider {
 
             let stats = if self.pk_deletion_strategy.is_position_based() {
                 let target_size_bytes = self.context.target_file_size_bytes();
+                let current_snapshot = self.get_current_snapshot_id();
                 let (_rows, _ops, stats) = self
                     .write_to_snapshot(
                         stream,
                         target_size_bytes,
-                        &self.get_current_snapshot_id(),
+                        &current_snapshot,
                         ctx.state().config().target_partitions(),
                         estimated_bytes,
                         super::delta_encoding::WriteClass::Delta,
                     )
                     .await?;
+                // This writes straight into the current snapshot directory
+                // (no staging WAL, no `move_staged_files_to_snapshot`), so it
+                // bypasses `insert_current_snapshot_manifest_rows`'s own gate
+                // entirely — but `write_to_snapshot` itself maintains the
+                // manifest incrementally for exactly this case (see its
+                // `written_files_collector`), so no separate full-relist call
+                // is needed here.
                 stats
             } else {
                 // Lever B2: the checkpoint flush's new snapshot sequence comes
@@ -24100,57 +26700,54 @@ impl CayenneTableProvider {
     /// Resolve a snapshot's data files from the manifest (`cayenne_snapshot_file`)
     /// instead of by listing the snapshot directory.
     ///
-    /// Returns `Ok(Some(files))` only when the manifest is non-empty AND the scan
-    /// is unpartitioned. The manifest stores bare file *names* (the same strings a
-    /// directory listing yields); each is joined onto the snapshot directory
-    /// prefix and turned into a [`PartitionedFile`] exactly the way
-    /// [`pruned_partition_list`] does for an unpartitioned table — same
-    /// `ObjectMeta`-to-`PartitionedFile` conversion, same zero-size filter — so
-    /// the manifest-built file list is byte-identical to the directory-built one
-    /// for the same snapshot.
+    /// Returns `Ok(Some(files))` when the scan is unpartitioned — including
+    /// `Some(Vec::new())` for a snapshot whose manifest has zero rows, which
+    /// (now that manifest maintenance is mandatory wherever `scan_from_manifest`
+    /// is on — see `backfill_snapshot_manifest_if_empty` and
+    /// `insert_current_snapshot_manifest_rows`) means the snapshot genuinely has
+    /// no data files, not "not yet populated." The manifest stores bare file
+    /// *names* (the same strings a directory listing yields); each is joined
+    /// onto the snapshot directory prefix and turned into a [`PartitionedFile`]
+    /// exactly the way [`pruned_partition_list`] does for an unpartitioned table
+    /// — same `ObjectMeta`-to-`PartitionedFile` conversion, same zero-size
+    /// filter — so the manifest-built file list is byte-identical to the
+    /// directory-built one for the same snapshot.
     ///
-    /// Returns `Ok(None)` (the caller then falls back to directory listing) when:
-    /// - the manifest read fails (transient metastore error),
-    /// - the manifest has no rows for this snapshot (written before population,
-    ///   or a post-write rebuild that has not run / failed), or
-    /// - the table is partitioned (`table_partition_cols` non-empty) — the
+    /// Returns `Ok(None)` (the caller then falls back to directory listing) only
+    /// when the table is partitioned (`table_partition_cols` non-empty) — the
     ///   manifest does not persist partition values, so directory listing (which
     ///   derives them from the path) stays authoritative there.
     ///
-    /// This `None`-on-empty fallback is what keeps the flag from ever making a
-    /// scan miss a live file: an incomplete manifest degrades to listing, never
-    /// to a short read.
+    /// A manifest read failure for an eligible, unpartitioned table is returned
+    /// as an error. Falling back to the physical directory would make a future
+    /// pre-placed but not-yet-manifest-published file visible.
     async fn manifest_partitioned_files(
         &self,
         request: &SnapshotScanListingRequest<'_>,
-    ) -> Option<Vec<PartitionedFile>> {
+    ) -> DataFusionResult<Option<Vec<PartitionedFile>>> {
         // The manifest carries no partition values; let directory listing own
         // partitioned tables (it derives the values from the object path).
         if !request.options.table_partition_cols.is_empty() {
-            return None;
+            return Ok(None);
         }
 
-        let manifest = match self
-            .catalog
-            .get_snapshot_files(&self.table_metadata.table_id, request.snapshot_id)
+        let manifest = self
+            .cached_snapshot_files(request.snapshot_id)
             .await
-        {
-            Ok(rows) => rows,
-            Err(error) => {
-                tracing::debug!(
-                    table = %self.table_metadata.table_name,
-                    snapshot_id = request.snapshot_id,
-                    %error,
-                    "Manifest read failed; scan falls back to directory listing"
-                );
-                return None;
-            }
-        };
+            .map_err(|error| datafusion_common::DataFusionError::External(Box::new(error)))?;
 
         if manifest.is_empty() {
-            // Snapshot predates manifest population, or a post-write rebuild has
-            // not run yet: directory listing is still the authoritative source.
-            return None;
+            // This branch only runs when `scan_from_manifest` is on (see the
+            // caller), which means `backfill_snapshot_manifest_if_empty` already
+            // guaranteed at table-open time that the manifest is complete for
+            // every live snapshot (hard-erroring the open otherwise) and every
+            // snapshot-publishing commit since has kept it that way
+            // incrementally (`insert_current_snapshot_manifest_rows`,
+            // `upsert_snapshot_manifest_from_listing`'s now-mandatory callers).
+            // An empty manifest here is therefore authoritative — this snapshot
+            // genuinely has zero data files — not a "not yet populated" signal
+            // to fall back to a directory LIST.
+            return Ok(Some(Vec::new()));
         }
 
         // `prefix` is the parsed snapshot-directory path; joining the manifest's
@@ -24159,7 +26756,7 @@ impl CayenneTableProvider {
         // uses for the list-files-cache delta-apply).
         let prefix = request.table_url.prefix();
         let files = manifest
-            .into_iter()
+            .iter()
             // Mirror the listing's `size > 0` filter so empty placeholder files
             // (if any) are excluded identically.
             .filter(|file| file.file_size_bytes > 0)
@@ -24180,7 +26777,7 @@ impl CayenneTableProvider {
             })
             .collect::<Vec<_>>();
 
-        Some(files)
+        Ok(Some(files))
     }
 
     async fn list_files_for_snapshot_scan(
@@ -24215,7 +26812,7 @@ impl CayenneTableProvider {
         // (dual-source). The two sources are equal by construction — see
         // `manifest_partitioned_files` and `upsert_snapshot_manifest_from_listing`.
         let manifest_files = if self.context.scan_from_manifest() {
-            self.manifest_partitioned_files(request).await
+            self.manifest_partitioned_files(request).await?
         } else {
             None
         };
@@ -26815,6 +29412,7 @@ impl super::compaction::MemTierCheckpointRunner for CayenneTableProvider {
         // Guaranteed unless a size-triggered checkpoint still has age headroom (set
         // below). Deadline-driven firings (age-due, critical pressure,
         // flush-every-tick, due seal) stay guaranteed so they cannot be starved.
+        // (Adapted from PR #11907.)
         let mut best_effort = false;
         {
             // Whole-tier gate (SUM/oldest across shards, never per-shard): a
@@ -26905,13 +29503,15 @@ impl super::compaction::MemTierCheckpointRunner for CayenneTableProvider {
                 best_effort = size_ready && !age_reached;
             }
         }
-        // `checkpoint_mem_tier` serializes its complete capture -> publish
-        // lifecycle. A spill may drain the tier between the cheap early check and
-        // lock acquisition; the checkpoint's empty-tier path is an idempotent
-        // no-op (and may re-fire a late slot committer), so that race is safe.
-        // Size-triggered-with-headroom → best-effort (never stalls applies; skips on
-        // contention and retries next tick). Every deadline-driven firing uses the
-        // guaranteed path so it cannot be starved under sustained writes.
+        // `checkpoint_mem_tier` serializes its complete capture -> publish lifecycle
+        // on `mem_checkpoint_lock` (acquired inside via `acquire_capture_locks_blocking`),
+        // so this tick no longer pre-holds the lock. A spill may drain the tier between
+        // the cheap early check and lock acquisition; the checkpoint's empty-tier path
+        // is an idempotent no-op (and may re-fire a late slot committer), so that race
+        // is safe. Size-triggered-with-headroom → best-effort (never stalls applies;
+        // skips on contention and retries next tick). Every deadline-driven firing uses
+        // the guaranteed path so it cannot be starved under sustained writes.
+        // (Adapted from PR #11907.)
         if best_effort {
             match self.try_checkpoint_mem_tier().await {
                 Ok(CheckpointAttempt::Completed(rows)) => {
@@ -29704,6 +32304,322 @@ mod tests {
         (provider, temp_dir)
     }
 
+    /// Build a memory-mode provider whose CDC drain pipeline depth is set from
+    /// config (`cayenne_ingest_pipeline_depth`), NOT the test-only
+    /// `set_drain_pipeline_depth_for_test` override — so a test exercises the real
+    /// production actuator that sizes the ledger + admission budget at table-open.
+    /// Single `id: Int64` PK, caps large enough that appends never spill; checkpoints
+    /// are driven explicitly.
+    async fn create_memory_mode_table_with_pipeline_depth(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+        pipeline_depth: usize,
+    ) -> (CayenneTableProvider, tempfile::TempDir) {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("init catalog");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let vortex_config = VortexConfig {
+            cdc_durability: crate::metadata::CdcDurability::Memory,
+            cdc_mem_tier_max_bytes: i64::MAX,
+            ingest_pipeline_depth: pipeline_depth,
+            ..VortexConfig::default()
+        };
+        let options = CreateTableOptions {
+            table_name: table_name.to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config,
+        };
+        let provider = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .create(options)
+            .await
+            .expect("table created");
+        (provider, temp_dir)
+    }
+
+    /// Build a memory-mode provider with a chosen ingest substrate (Stage 1 #3c).
+    /// Single `id: Int64` PK, caps large enough that appends never spill — so the
+    /// mem-tier apply interior runs directly (inline or on the pinned pool).
+    async fn create_memory_mode_table_with_substrate(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+        substrate: crate::metadata::IngestSubstrate,
+    ) -> (CayenneTableProvider, tempfile::TempDir) {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("init catalog");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let vortex_config = VortexConfig {
+            cdc_durability: crate::metadata::CdcDurability::Memory,
+            cdc_mem_tier_max_bytes: i64::MAX,
+            ingest_substrate: substrate,
+            ..VortexConfig::default()
+        };
+        let options = CreateTableOptions {
+            table_name: table_name.to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config,
+        };
+        let provider = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .create(options)
+            .await
+            .expect("table created");
+        (provider, temp_dir)
+    }
+
+    /// A local pinned pool + a memory-mode provider whose `pool` substrate routes
+    /// to THAT pool (not the process-global one) — so each end-to-end test drives
+    /// an isolated pool with no shared static and no cross-test serialization. The
+    /// returned `Arc<IngestPool>` is kept alive by the caller; dropping it joins
+    /// the pinned worker (shutdown/join coverage).
+    async fn create_pooled_memory_mode_table(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> (
+        CayenneTableProvider,
+        Arc<crate::ingest_pool::IngestPool>,
+        tempfile::TempDir,
+    ) {
+        let (mut provider, tmp) = create_memory_mode_table_with_substrate(
+            table_name,
+            runtime_env,
+            crate::metadata::IngestSubstrate::Pool,
+        )
+        .await;
+        let pool = Arc::new(crate::ingest_pool::IngestPool::new(1));
+        provider.set_ingest_pool_override(Arc::clone(&pool));
+        (provider, pool, tmp)
+    }
+
+    /// Stage 1 #3c — routing the memory apply through the pinned pool
+    /// (`cayenne_ingest_substrate: pool`) is BYTE-IDENTICAL to inline: the same
+    /// append sequence yields the same epoch progression, the same visible scan,
+    /// and the same live row count. The pool is *where* the apply runs, not *what*
+    /// it computes. Uses a private local pool (no global static).
+    #[tokio::test]
+    async fn stage1_3c_pool_substrate_matches_inline() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let (inline, _t1) = create_memory_mode_table_with_substrate(
+            "s3c_inline",
+            Arc::clone(&runtime_env),
+            crate::metadata::IngestSubstrate::Inline,
+        )
+        .await;
+        let (pool, _local_pool, _t2) =
+            create_pooled_memory_mode_table("s3c_pool", Arc::clone(&runtime_env)).await;
+        assert!(inline.is_cdc_memory_mode() && pool.is_cdc_memory_mode());
+
+        let no_deletions = OnConflictDeletions::default();
+        let sequences: [&[i64]; 4] = [&[1, 2, 3], &[4, 5], &[6, 7, 8, 9], &[10]];
+        let mut inline_epochs = Vec::new();
+        let mut pool_epochs = Vec::new();
+        for ids in sequences {
+            let batch = int64_id_batch(ids);
+            let bytes = batch.get_array_memory_size() as u64;
+            let inline_epoch = inline
+                .append_to_mem_tier(vec![batch.clone()], &no_deletions, bytes, 0)
+                .await
+                .expect("inline append");
+            let pool_epoch = pool
+                .append_to_mem_tier(vec![batch], &no_deletions, bytes, 0)
+                .await
+                .expect("pool append");
+            inline_epochs.push(inline_epoch);
+            pool_epochs.push(pool_epoch);
+        }
+
+        assert_eq!(
+            inline_epochs, pool_epochs,
+            "pool substrate produces the same epoch progression as inline"
+        );
+        assert_eq!(
+            scan_sorted_ids(&inline).await,
+            scan_sorted_ids(&pool).await,
+            "pool substrate produces the same visible scan as inline"
+        );
+        assert_eq!(
+            inline.cached_inlined_row_count(),
+            pool.cached_inlined_row_count(),
+            "pool substrate produces the same live row count as inline"
+        );
+        assert_eq!(scan_sorted_ids(&pool).await, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    }
+
+    /// Stage 1 #3c — a worker panic mid-apply surfaces as a structured apply error
+    /// (never a torn tier), the pinned worker SURVIVES (`catch_unwind` isolates
+    /// it), and a subsequent apply succeeds. The injected panic fires at the top
+    /// of the interior (before any lock/mutation), so the tier is provably
+    /// uncorrupted — the pre-panic scan state is intact. Per-provider panic flag +
+    /// private pool ⇒ no cross-test bleed, no serialization.
+    #[tokio::test]
+    async fn stage1_3c_pool_worker_panic_surfaces_error_and_survives() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let (pool, _local_pool, _t) =
+            create_pooled_memory_mode_table("s3c_panic", Arc::clone(&runtime_env)).await;
+        let no_deletions = OnConflictDeletions::default();
+
+        // Seed a good apply so there is prior visible state to prove uncorrupted.
+        let seed = int64_id_batch(&[1, 2, 3]);
+        let seed_bytes = seed.get_array_memory_size() as u64;
+        pool.append_to_mem_tier(vec![seed], &no_deletions, seed_bytes, 0)
+            .await
+            .expect("seed append");
+        assert_eq!(scan_sorted_ids(&pool).await, vec![1, 2, 3]);
+
+        // Inject a panic into the next apply's interior.
+        pool.set_force_apply_panic(true);
+        let boom = int64_id_batch(&[4, 5]);
+        let boom_bytes = boom.get_array_memory_size() as u64;
+        let err = pool
+            .append_to_mem_tier(vec![boom], &no_deletions, boom_bytes, 0)
+            .await
+            .expect_err("a panicking apply surfaces a structured error");
+        assert!(
+            matches!(err, Error::Internal { .. }),
+            "worker panic → structured apply error, got {err:?}"
+        );
+        // Tier uncorrupted: the pre-panic state is intact (nothing from the boom).
+        assert_eq!(
+            scan_sorted_ids(&pool).await,
+            vec![1, 2, 3],
+            "the panicking apply left no partial state"
+        );
+
+        // The worker survived: a subsequent (non-panicking) apply succeeds.
+        pool.set_force_apply_panic(false);
+        let recover = int64_id_batch(&[6, 7]);
+        let recover_bytes = recover.get_array_memory_size() as u64;
+        pool.append_to_mem_tier(vec![recover], &no_deletions, recover_bytes, 0)
+            .await
+            .expect("apply after a worker panic succeeds (worker survived)");
+        assert_eq!(scan_sorted_ids(&pool).await, vec![1, 2, 3, 6, 7]);
+    }
+
+    /// Stage 1 #3c — with `cayenne_ingest_substrate: pool` set but NO pool
+    /// available (no private override, no global pool installed), the apply falls
+    /// back to running the SAME interior inline on the edge (correctness
+    /// preserved), rather than erroring. This is the ONLY end-to-end pool test
+    /// that touches the process-global static (to prove it is uninstalled), so it
+    /// is serialized with the global-pool lifecycle tests.
+    #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the test-serialization guard intentionally spans the test's awaits (parking_lot, no poisoning); it is not on any production path"
+    )]
+    async fn stage1_3c_pool_substrate_falls_back_inline_when_unavailable() {
+        let _serial = crate::ingest_pool::POOL_TEST_MUTEX.lock();
+        // Ensure no global pool is installed (and none is set as an override).
+        crate::ingest_pool::uninstall_global_ingest_pool();
+
+        let runtime_env = SessionContext::new().runtime_env();
+        let (pool, _t) = create_memory_mode_table_with_substrate(
+            "s3c_fallback",
+            Arc::clone(&runtime_env),
+            crate::metadata::IngestSubstrate::Pool,
+        )
+        .await;
+        let no_deletions = OnConflictDeletions::default();
+        let batch = int64_id_batch(&[1, 2, 3]);
+        let bytes = batch.get_array_memory_size() as u64;
+        pool.append_to_mem_tier(vec![batch], &no_deletions, bytes, 0)
+            .await
+            .expect("apply falls back to inline with no pool available");
+        assert_eq!(scan_sorted_ids(&pool).await, vec![1, 2, 3]);
+    }
+
+    /// Stage 1 #3c microbench (measurement aid, not a CI gate — `#[ignore]`, run
+    /// with `cargo test -p cayenne stage1_3c_microbench -- --ignored --nocapture`).
+    /// Prints per-apply latency for inline vs pool so the "hand-off must be small
+    /// vs apply" gate (§11.2) is observable. Depth = 1, so no overlap win is
+    /// expected — this isolates the channel + oneshot + wake cost. Uses a private
+    /// local pool.
+    #[tokio::test]
+    #[ignore = "manual microbench; run with --ignored --nocapture"]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "microbench per-apply latency print; precision loss is irrelevant to a human-read µs figure"
+    )]
+    async fn stage1_3c_microbench_inline_vs_pool_handoff() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let no_deletions = OnConflictDeletions::default();
+
+        // Sweep batch size so the "hand-off small vs apply" gate is read against
+        // the regime that matters: the hand-off is a ~fixed per-apply cost, so a
+        // degenerate 1-row apply shows a ~1:1 ratio, but a production-sized
+        // coalesced burst (§8.1: ~30k rows at 10k txn/s) dwarfs it. Distinct id
+        // ranges per apply (no supersede); caps are `i64::MAX` (no spill) and
+        // there is no periodic tick, so this isolates the pure apply interior.
+        // `(rows_per_apply, iters)` — fewer iters for bigger bursts to bound RAM.
+        let regimes: [(i64, i64); 3] = [(1, 2000), (1_000, 1_000), (10_000, 300)];
+
+        for (rows, iters) in regimes {
+            let mut per_apply_us = [0.0f64; 2];
+            // Fresh tables per regime so a growing tier never leaks across sizes.
+            let (inline, _ti) = create_memory_mode_table_with_substrate(
+                &format!("s3c_bench_inline_{rows}"),
+                Arc::clone(&runtime_env),
+                crate::metadata::IngestSubstrate::Inline,
+            )
+            .await;
+            let (pooled, _local_pool, _tp) = create_pooled_memory_mode_table(
+                &format!("s3c_bench_pool_{rows}"),
+                Arc::clone(&runtime_env),
+            )
+            .await;
+
+            for (idx, (label, provider)) in
+                [("inline", &inline), ("pool", &pooled)].into_iter().enumerate()
+            {
+                let start = Instant::now();
+                for i in 0..iters {
+                    // Disjoint id window per apply so nothing is superseded.
+                    let base = i * rows;
+                    let ids: Vec<i64> = (base..base + rows).collect();
+                    let batch = int64_id_batch(&ids);
+                    let bytes = batch.get_array_memory_size() as u64;
+                    provider
+                        .append_to_mem_tier(vec![batch], &no_deletions, bytes, 0)
+                        .await
+                        .expect("append");
+                }
+                let elapsed = start.elapsed();
+                let us = elapsed.as_micros() as f64 / iters as f64;
+                per_apply_us[idx] = us;
+                eprintln!(
+                    "[stage1_3c microbench] rows={rows:>6} {label:>6}: {iters} applies in {elapsed:?} = {us:.2} µs/apply"
+                );
+            }
+            let handoff = per_apply_us[1] - per_apply_us[0];
+            let ratio = handoff / per_apply_us[0];
+            eprintln!(
+                "[stage1_3c microbench] rows={rows:>6} HAND-OFF = {handoff:.2} µs/apply ({:.0}% of apply)",
+                ratio * 100.0
+            );
+        }
+    }
+
     /// A1-T2 — idle/pure-upsert source: the PERIODIC checkpoint tick advances the
     /// deferred slot ack even though no delete/truncate event trigger ever fires.
     /// This is the regression guard for the root cause's "0 checkpoints fired on
@@ -29781,6 +32697,274 @@ mod tests {
             scan_sorted_ids(&provider).await,
             vec![1, 2, 3, 4, 5],
             "flushed rows are durable and visible after the periodic checkpoint"
+        );
+    }
+
+    /// Stage 2b Step 3b-b — the D>1 DETACHED checkpoint drain overlaps freeze N+1 with
+    /// drain N yet still publishes strictly oldest-first. Proven against a D=1 SERIAL
+    /// reference: the same two bursts + checkpoints must produce the SAME durable scan
+    /// and the SAME final ack watermark, while the D=2 run keeps BOTH drains
+    /// concurrently in flight (overlap — the pipeline win) and its ack watermark stays
+    /// monotone (ordered publish never acks past an unfinished older generation). The
+    /// config keeps `D = 1`; `D = 2` here is the test-only override, and the mem-tier
+    /// append stays synchronous — only the checkpoint drain pipelines.
+    #[tokio::test]
+    async fn stage2b_d2_detached_checkpoint_drains_overlap_and_publish_ordered() {
+
+        struct AckRecorder(Arc<ParkingMutex<Vec<u64>>>);
+        #[async_trait::async_trait]
+        impl crate::provider::mem_tier::SlotAdvancer for AckRecorder {
+            async fn on_checkpoint_durable(&self, durable_epoch: u64) {
+                self.0.lock().push(durable_epoch);
+            }
+        }
+
+        // Bounded condition-poll (NOT a fixed readiness sleep): 2ms interval, ~4s cap,
+        // with a failure message — the sanctioned readiness-wait shape.
+        async fn wait_until(label: &str, cond: impl Fn() -> bool) {
+            for _ in 0..2000 {
+                if cond() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            panic!("condition '{label}' not met within timeout");
+        }
+
+        let none = OnConflictDeletions::default();
+
+        // ---- D=1 SERIAL REFERENCE: identical workload, inline drain (no gate). ----
+        let ref_env = SessionContext::new().runtime_env();
+        let (reference, _ref_tmp) =
+            create_memory_mode_table_with_caps("d1_reference", ref_env, i64::MAX, 0, 0).await;
+        let ref_acks = Arc::new(ParkingMutex::new(Vec::<u64>::new()));
+        reference.install_slot_advancer(Arc::new(AckRecorder(Arc::clone(&ref_acks))));
+        let rb1 = int64_id_batch(&[1, 2, 3]);
+        let rb1_bytes = rb1.get_array_memory_size() as u64;
+        reference
+            .append_to_mem_tier(vec![rb1], &none, rb1_bytes, 0)
+            .await
+            .expect("ref append 1");
+        reference.checkpoint_mem_tier().await.expect("ref checkpoint 1");
+        let rb2 = int64_id_batch(&[4, 5]);
+        let rb2_bytes = rb2.get_array_memory_size() as u64;
+        reference
+            .append_to_mem_tier(vec![rb2], &none, rb2_bytes, 0)
+            .await
+            .expect("ref append 2");
+        reference.checkpoint_mem_tier().await.expect("ref checkpoint 2");
+        let ref_scan = scan_sorted_ids(&reference).await;
+        let ref_final_ack = ref_acks.lock().last().copied();
+        assert_eq!(ref_scan, vec![1, 2, 3, 4, 5], "reference durable scan");
+
+        // ---- D=2 PIPELINED: freeze N+1 overlaps drain N. ----
+        let env = SessionContext::new().runtime_env();
+        let (provider, _tmp) =
+            create_memory_mode_table_with_caps("d2_overlap", env, i64::MAX, 0, 0).await;
+        assert!(provider.is_cdc_memory_mode(), "memory mode active");
+        let acks = Arc::new(ParkingMutex::new(Vec::<u64>::new()));
+        provider.install_slot_advancer(Arc::new(AckRecorder(Arc::clone(&acks))));
+        provider.set_drain_pipeline_depth_for_test(2);
+        let gate = provider.install_checkpoint_drain_gate_for_test();
+
+        // Burst 1 → freeze gen0 → detach → drain0 parks in flight (Spilling).
+        let a1 = int64_id_batch(&[1, 2, 3]);
+        let a1_bytes = a1.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![a1], &none, a1_bytes, 0)
+            .await
+            .expect("append 1");
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("freeze + detach gen0");
+        wait_until("drain0 parked", || gate.arrived() >= 1).await;
+
+        // Burst 2 → freeze gen1 WHILE drain0 is parked (the OVERLAP) → detach → parks.
+        let a2 = int64_id_batch(&[4, 5]);
+        let a2_bytes = a2.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![a2], &none, a2_bytes, 0)
+            .await
+            .expect("append 2");
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("freeze + detach gen1");
+        wait_until("both drains parked", || gate.arrived() >= 2).await;
+        assert_eq!(
+            provider.drain_ledger.lock().depth(),
+            2,
+            "two generations concurrently resident — freeze N+1 overlapped drain N"
+        );
+
+        // Release both; the ordered-publish gate must sweep gen0 before gen1.
+        gate.release_all_parked();
+        wait_until("ledger drained", || {
+            provider.drain_ledger.lock().is_empty()
+        })
+        .await;
+
+        // Ordered ack: monotone watermark, same FINAL value as the serial reference.
+        let recorded = acks.lock().clone();
+        assert!(!recorded.is_empty(), "at least one ack fired");
+        assert!(
+            recorded.windows(2).all(|w| w[0] <= w[1]),
+            "ack watermark monotone (ordered publish, never past an unfinished older gen): {recorded:?}"
+        );
+        assert_eq!(
+            recorded.last().copied(),
+            ref_final_ack,
+            "final ack equals the D=1 serial reference"
+        );
+
+        // Durable scan equals the serial reference — no resurrection, loss, or double-count.
+        assert!(
+            provider.mem_tier.tier().load().is_empty(),
+            "tier fully drained after both ordered publishes"
+        );
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            ref_scan,
+            "D=2 pipelined durable scan equals the D=1 serial reference"
+        );
+    }
+
+    /// Stage 2b Step 3c — the settable `cayenne_ingest_pipeline_depth` knob wires the
+    /// REAL detached D>1 drain path, without the test-only override. A provider built
+    /// with `ingest_pipeline_depth = 2` from config must (a) read back depth 2 through
+    /// the production `drain_pipeline_depth()` path and (b) actually pipeline: the same
+    /// two bursts + checkpoints keep BOTH drains concurrently resident (overlap) yet
+    /// publish strictly oldest-first, producing the SAME durable scan and final ack as a
+    /// D=1 serial reference. This is the production twin of
+    /// `stage2b_d2_detached_checkpoint_drains_overlap_and_publish_ordered`, proving the
+    /// config actuator (ledger `max_depth` + admission capacity sized at table-open)
+    /// enables the identical mechanism the test override does — the settable path is
+    /// only shipped now that the mechanism is proven, so the default (1) stays
+    /// byte-identical.
+    #[tokio::test]
+    async fn stage2b_3c_config_pipeline_depth_enables_detached_drain() {
+        struct AckRecorder(Arc<ParkingMutex<Vec<u64>>>);
+        #[async_trait::async_trait]
+        impl crate::provider::mem_tier::SlotAdvancer for AckRecorder {
+            async fn on_checkpoint_durable(&self, durable_epoch: u64) {
+                self.0.lock().push(durable_epoch);
+            }
+        }
+
+        // Bounded condition-poll (NOT a fixed readiness sleep): 2ms interval, ~4s cap.
+        async fn wait_until(label: &str, cond: impl Fn() -> bool) {
+            for _ in 0..2000 {
+                if cond() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            panic!("condition '{label}' not met within timeout");
+        }
+
+        let none = OnConflictDeletions::default();
+
+        // ---- D=1 SERIAL REFERENCE: identical workload, default-config inline drain. ----
+        let ref_env = SessionContext::new().runtime_env();
+        let (reference, _ref_tmp) =
+            create_memory_mode_table_with_pipeline_depth("d1_config_reference", ref_env, 1).await;
+        assert_eq!(
+            reference.drain_pipeline_depth(),
+            1,
+            "default config depth is 1 (byte-identical serial drain)"
+        );
+        let ref_acks = Arc::new(ParkingMutex::new(Vec::<u64>::new()));
+        reference.install_slot_advancer(Arc::new(AckRecorder(Arc::clone(&ref_acks))));
+        let rb1 = int64_id_batch(&[1, 2, 3]);
+        let rb1_bytes = rb1.get_array_memory_size() as u64;
+        reference
+            .append_to_mem_tier(vec![rb1], &none, rb1_bytes, 0)
+            .await
+            .expect("ref append 1");
+        reference.checkpoint_mem_tier().await.expect("ref checkpoint 1");
+        let rb2 = int64_id_batch(&[4, 5]);
+        let rb2_bytes = rb2.get_array_memory_size() as u64;
+        reference
+            .append_to_mem_tier(vec![rb2], &none, rb2_bytes, 0)
+            .await
+            .expect("ref append 2");
+        reference.checkpoint_mem_tier().await.expect("ref checkpoint 2");
+        let ref_scan = scan_sorted_ids(&reference).await;
+        let ref_final_ack = ref_acks.lock().last().copied();
+        assert_eq!(ref_scan, vec![1, 2, 3, 4, 5], "reference durable scan");
+
+        // ---- D=2 VIA CONFIG (no test override): freeze N+1 overlaps drain N. ----
+        let env = SessionContext::new().runtime_env();
+        let (provider, _tmp) =
+            create_memory_mode_table_with_pipeline_depth("d2_config", env, 2).await;
+        assert!(provider.is_cdc_memory_mode(), "memory mode active");
+        assert_eq!(
+            provider.drain_pipeline_depth(),
+            2,
+            "config `ingest_pipeline_depth = 2` sized the production drain pipeline"
+        );
+        let acks = Arc::new(ParkingMutex::new(Vec::<u64>::new()));
+        provider.install_slot_advancer(Arc::new(AckRecorder(Arc::clone(&acks))));
+        let gate = provider.install_checkpoint_drain_gate_for_test();
+
+        // Burst 1 → freeze gen0 → detach → drain0 parks in flight (Spilling).
+        let a1 = int64_id_batch(&[1, 2, 3]);
+        let a1_bytes = a1.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![a1], &none, a1_bytes, 0)
+            .await
+            .expect("append 1");
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("freeze + detach gen0");
+        wait_until("drain0 parked", || gate.arrived() >= 1).await;
+
+        // Burst 2 → freeze gen1 WHILE drain0 is parked (the OVERLAP) → detach → parks.
+        let a2 = int64_id_batch(&[4, 5]);
+        let a2_bytes = a2.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![a2], &none, a2_bytes, 0)
+            .await
+            .expect("append 2");
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("freeze + detach gen1");
+        wait_until("both drains parked", || gate.arrived() >= 2).await;
+        assert_eq!(
+            provider.drain_ledger.lock().depth(),
+            2,
+            "two generations concurrently resident — the config depth enabled the overlap"
+        );
+
+        // Release both; the ordered-publish gate must sweep gen0 before gen1.
+        gate.release_all_parked();
+        wait_until("ledger drained", || {
+            provider.drain_ledger.lock().is_empty()
+        })
+        .await;
+
+        let recorded = acks.lock().clone();
+        assert!(!recorded.is_empty(), "at least one ack fired");
+        assert!(
+            recorded.windows(2).all(|w| w[0] <= w[1]),
+            "ack watermark monotone (ordered publish, never past an unfinished older gen): {recorded:?}"
+        );
+        assert_eq!(
+            recorded.last().copied(),
+            ref_final_ack,
+            "final ack equals the D=1 serial reference"
+        );
+        assert!(
+            provider.mem_tier.tier().load().is_empty(),
+            "tier fully drained after both ordered publishes"
+        );
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            ref_scan,
+            "config-D=2 pipelined durable scan equals the D=1 serial reference"
         );
     }
 
@@ -30834,6 +34018,1207 @@ mod tests {
         );
     }
 
+    /// Stage 2a MODEL-BASED FUZZ — the frozen-tier drain ledger at `D = 1` is
+    /// byte-identical to a single-tier reference under EVERY interleaving of
+    /// insert / delete / seal / checkpoint (proposal §4.5; the 2a deliverable).
+    ///
+    /// The reference is a plain `BTreeSet<i64>` (the logical corpus). For each
+    /// bounded schedule the test drives the real provider and, after every op,
+    /// asserts:
+    ///
+    /// - **scan-equality + row-count** — the visible rows equal the reference set
+    ///   (a resurrected row appears, a lost row vanishes — both caught);
+    /// - **ack-safety** — the durable slot epoch is monotone non-decreasing (never
+    ///   a backward or premature ack; at `D = 1` the sole in-flight generation is
+    ///   trivially the min-across-in-flight watermark).
+    ///
+    /// After the whole schedule it drops the provider and reopens from catalog (a
+    /// clean restart) and asserts convergence to the DURABLE reference — the corpus
+    /// as of the last seal/checkpoint — proving no resurrection or loss across the
+    /// durability boundary (RAM-only tail is expected to be re-streamed from source,
+    /// so it is absent on reopen).
+    #[tokio::test]
+    async fn stage2a_drain_ledger_model_matches_single_tier_reference() {
+        #[derive(Clone, Copy, Debug)]
+        enum Op {
+            Insert(i64),
+            Delete(i64),
+            Seal,
+            Checkpoint,
+        }
+
+        // Exhaustive schedule length (base-`alphabet.len()` enumeration below).
+        const DEPTH: u32 = 4;
+
+        // Compact adversarial alphabet: two keys (so supersede / delete-then-
+        // reinsert across a drain boundary is exercised) plus both drain ops. Depth 4
+        // enumerates the load-bearing interleavings — e.g. insert→seal→delete→
+        // checkpoint (delete a sealed row, then bake) and insert→checkpoint→delete→
+        // seal (durable tombstone over a baked row).
+        let alphabet = [
+            Op::Insert(1),
+            Op::Insert(2),
+            Op::Delete(1),
+            Op::Seal,
+            Op::Checkpoint,
+        ];
+
+        // A handful of deeper curated schedules that exceed the exhaustive depth,
+        // stressing multi-generation drain sequences at D=1.
+        let curated: Vec<Vec<Op>> = vec![
+            vec![
+                Op::Insert(1),
+                Op::Seal,
+                Op::Insert(2),
+                Op::Checkpoint,
+                Op::Delete(1),
+                Op::Seal,
+                Op::Delete(2),
+                Op::Checkpoint,
+            ],
+            vec![
+                Op::Insert(1),
+                Op::Insert(2),
+                Op::Checkpoint,
+                Op::Delete(1),
+                Op::Insert(1),
+                Op::Seal,
+                Op::Checkpoint,
+            ],
+            vec![
+                Op::Delete(1),
+                Op::Seal,
+                Op::Insert(1),
+                Op::Delete(1),
+                Op::Checkpoint,
+                Op::Insert(2),
+                Op::Seal,
+            ],
+        ];
+
+        let runtime_env = SessionContext::new().runtime_env();
+        let n = alphabet.len();
+        let exhaustive = n.pow(DEPTH);
+
+        for schedule_idx in 0..(exhaustive + curated.len()) {
+            // Decode the schedule: exhaustive base-`n` schedules first, then curated.
+            let schedule: Vec<Op> = if schedule_idx < exhaustive {
+                let mut code = schedule_idx;
+                (0..DEPTH)
+                    .map(|_| {
+                        let op = alphabet[code % n];
+                        code /= n;
+                        op
+                    })
+                    .collect()
+            } else {
+                curated[schedule_idx - exhaustive].clone()
+            };
+
+            let table_name = format!("s2a_model_{schedule_idx}");
+            let (provider, catalog, _tmp) =
+                create_memory_mode_upsert_table(&table_name, Arc::clone(&runtime_env)).await;
+            let durable = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            provider.install_slot_advancer(std::sync::Arc::new(EpochRecorder(
+                std::sync::Arc::clone(&durable),
+            )));
+            let no_deletions = OnConflictDeletions::default();
+
+            // The logical corpus (live) and the durable corpus (as of the last drain).
+            let mut model: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+            let mut durable_model: std::collections::BTreeSet<i64> =
+                std::collections::BTreeSet::new();
+            let mut last_durable_epoch = 0u64;
+
+            for (op_idx, op) in schedule.iter().enumerate() {
+                match op {
+                    Op::Insert(key) => {
+                        // `append_to_mem_tier` is the RAW segment append (no upsert
+                        // supersede); a re-insert of an already-live key in this
+                        // id-only upsert table is a no-op to the visible set, so gate
+                        // the append on the reference actually gaining the key. A
+                        // re-insert AFTER a delete does append (the key left the model
+                        // on delete) — that reinsert-over-tombstone case is exercised.
+                        if model.insert(*key) {
+                            let batch = int64_id_batch(&[*key]);
+                            let bytes = batch.get_array_memory_size() as u64;
+                            provider
+                                .append_to_mem_tier(vec![batch], &no_deletions, bytes, 0)
+                                .await
+                                .expect("insert append");
+                        }
+                    }
+                    Op::Delete(key) => {
+                        // Ignore the returned absorb count; deleting an absent key is
+                        // a no-op in both the provider and the model.
+                        provider
+                            .write_cdc_delete_keys_in_memory(&int64_id_batch(&[*key]))
+                            .await
+                            .expect("delete");
+                        model.remove(key);
+                    }
+                    Op::Seal => {
+                        provider.seal_mem_tier_durable().await.expect("seal");
+                        // The seal makes the current visible corpus crash-recoverable.
+                        durable_model = model.clone();
+                    }
+                    Op::Checkpoint => {
+                        provider.checkpoint_mem_tier().await.expect("checkpoint");
+                        // The bake makes the current visible corpus durable.
+                        durable_model = model.clone();
+                    }
+                }
+
+                // scan-equality + row-count after EVERY op.
+                let got = scan_sorted_ids(&provider).await;
+                let want: Vec<i64> = model.iter().copied().collect();
+                assert_eq!(
+                    got, want,
+                    "schedule#{schedule_idx} {schedule:?} op#{op_idx} {op:?}: live scan != reference"
+                );
+                // ack-safety: durable epoch never regresses.
+                let now = durable.load(std::sync::atomic::Ordering::SeqCst);
+                assert!(
+                    now >= last_durable_epoch,
+                    "schedule#{schedule_idx} op#{op_idx}: durable epoch regressed {last_durable_epoch} -> {now}"
+                );
+                last_durable_epoch = now;
+            }
+
+            // Clean-restart convergence: reopen sees exactly the durable corpus.
+            drop(provider);
+            let reopened = CayenneTableProviderBuilder::new(catalog, Arc::clone(&runtime_env))
+                .open(&table_name)
+                .await
+                .expect("reopen");
+            let got = scan_sorted_ids(&reopened).await;
+            let want: Vec<i64> = durable_model.iter().copied().collect();
+            assert_eq!(
+                got, want,
+                "schedule#{schedule_idx} {schedule:?}: reopen != durable reference (resurrection or loss across the durability boundary)"
+            );
+        }
+    }
+
+    /// Stage 2a crash-injection — the `Spilling` boundary (§4.5). A checkpoint
+    /// that crashes AFTER durably encoding + fsyncing the Vortex file but BEFORE
+    /// committing the metastore pointer leaves a durable-but-unreferenced ORPHAN
+    /// file. On reopen that orphan MUST be invisible — surfacing it would be a
+    /// dirty read of never-committed rows (`CLAUDE.md`: query results can NEVER be
+    /// wrong) — and because the slot never advanced, the source re-streams the
+    /// un-acked tail and the replay converges PK-idempotently. The `Spilling`
+    /// state is reached deterministically with the one-shot
+    /// `arm_checkpoint_spill_fault` hook.
+    #[tokio::test]
+    async fn stage2a_crash_at_spilling_leaves_orphan_invisible_then_replays() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) =
+            create_memory_mode_upsert_table("s2a_spill_crash", Arc::clone(&runtime_env)).await;
+        let durable = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(std::sync::Arc::new(EpochRecorder(std::sync::Arc::clone(
+            &durable,
+        ))));
+
+        // Seed [1,2,3] and bake it durable — the recovery floor.
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(int64_id_batch(&[1, 2, 3])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed append");
+        provider.checkpoint_mem_tier().await.expect("seed checkpoint");
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 2, 3]);
+        let acked_after_seed = durable.load(std::sync::atomic::Ordering::SeqCst);
+
+        // Append [4,5] into the RAM tier (un-baked, un-acked).
+        let tail_epoch = provider
+            .write_cdc_append_stream(single_batch_stream(int64_id_batch(&[4, 5])), &ctx.task_ctx())
+            .await
+            .expect("tail append")
+            .in_memory_epoch()
+            .expect("the tail engaged the RAM tier");
+        assert!(tail_epoch > acked_after_seed, "the tail is a fresh un-acked epoch");
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 2, 3, 4, 5]);
+
+        // Arm the one-shot spilling crash: the checkpoint encodes [4,5] to a
+        // durable Vortex file, then aborts before committing the metastore pointer.
+        provider.arm_checkpoint_spill_fault();
+        let crashed = provider.checkpoint_mem_tier().await;
+        assert!(
+            crashed.is_err(),
+            "the injected spilling crash surfaces as a checkpoint error"
+        );
+        assert_eq!(
+            durable.load(std::sync::atomic::Ordering::SeqCst),
+            acked_after_seed,
+            "a checkpoint that crashed in Spilling must NOT advance the slot"
+        );
+
+        // CRASH: drop (RAM gone), reopen from the durable catalog. The orphan file
+        // for [4,5] is on disk but unreferenced by the metastore — it MUST NOT be
+        // visible.
+        drop(provider);
+        let reopened =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .open("s2a_spill_crash")
+                .await
+                .expect("reopen after spilling crash");
+        assert_eq!(
+            scan_sorted_ids(&reopened).await,
+            vec![1, 2, 3],
+            "the orphaned spill file must be invisible on reopen (no dirty read of uncommitted rows)"
+        );
+
+        // The source re-streams the un-acked tail; the replay converges (no loss,
+        // no duplicate) and a clean checkpoint now bakes it durable.
+        let durable2 = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        reopened.install_slot_advancer(std::sync::Arc::new(EpochRecorder(std::sync::Arc::clone(
+            &durable2,
+        ))));
+        let _ = reopened
+            .write_cdc_append_stream(single_batch_stream(int64_id_batch(&[4, 5])), &ctx.task_ctx())
+            .await
+            .expect("replay the un-acked tail");
+        assert_eq!(
+            scan_sorted_ids(&reopened).await,
+            vec![1, 2, 3, 4, 5],
+            "the replay converges with no loss"
+        );
+        reopened
+            .checkpoint_mem_tier()
+            .await
+            .expect("post-replay checkpoint");
+        assert_eq!(
+            scan_sorted_ids(&reopened).await,
+            vec![1, 2, 3, 4, 5],
+            "no resurrection or duplicate after the replay is baked durable"
+        );
+    }
+
+    /// Stage 2b Step 2 — the shared drain ledger's error-path cleanup. A checkpoint
+    /// that fails mid-drain (here the one-shot spilling fault, an in-process `Err`
+    /// raised while the generation is `Spilling`) must NOT strand its frozen
+    /// generation in the shared `drain_ledger`: the `DrainCleanup` guard discards it
+    /// on the early `?` return, so the NEXT checkpoint's freeze admits its generation
+    /// into an empty `D = 1` ledger and drains successfully. Without the guard the
+    /// stranded generation would trip the depth bound and every subsequent checkpoint
+    /// would error the table PERMANENTLY. No reopen — this is the same-process
+    /// recovery the crash-injection suite (which drops + reopens) does not cover.
+    #[tokio::test]
+    async fn stage2b_failed_drain_does_not_strand_generation_in_shared_ledger() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) =
+            create_memory_mode_upsert_table("s2b_ledger_cleanup", Arc::clone(&runtime_env)).await;
+        let durable = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(std::sync::Arc::new(EpochRecorder(std::sync::Arc::clone(
+            &durable,
+        ))));
+
+        // Seed [1,2,3] and bake it durable.
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(int64_id_batch(&[1, 2, 3])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed append");
+        provider.checkpoint_mem_tier().await.expect("seed checkpoint");
+        let acked_after_seed = durable.load(std::sync::atomic::Ordering::SeqCst);
+
+        // Append [4,5], then FAIL the checkpoint in `Spilling`: the fault returns an
+        // error after the encode but before the metastore commit + tier clear, so the
+        // generation is frozen-then-spilling and NEVER reclaimed on the happy path.
+        let _ = provider
+            .write_cdc_append_stream(single_batch_stream(int64_id_batch(&[4, 5])), &ctx.task_ctx())
+            .await
+            .expect("tail append");
+        provider.arm_checkpoint_spill_fault();
+        assert!(
+            provider.checkpoint_mem_tier().await.is_err(),
+            "the injected spilling fault surfaces as a checkpoint error"
+        );
+        assert_eq!(
+            durable.load(std::sync::atomic::Ordering::SeqCst),
+            acked_after_seed,
+            "a checkpoint that failed in Spilling must not advance the slot"
+        );
+        // The front prefix was never cleared, so the tail is still live in the tier.
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 2, 3, 4, 5]);
+
+        // THE ASSERTION: the next checkpoint's freeze must admit its generation into
+        // an empty ledger and drain successfully — proving the guard discarded the
+        // stranded generation. If it had leaked, this would return the D=1 "rejected
+        // the initial checkpoint freeze" internal error.
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("the checkpoint after a failed drain must succeed (guard cleaned the ledger)");
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1, 2, 3, 4, 5],
+            "the retried checkpoint bakes the tail durable with no loss or duplicate"
+        );
+        assert!(
+            durable.load(std::sync::atomic::Ordering::SeqCst) > acked_after_seed,
+            "the successful retry advances the slot past the seed"
+        );
+    }
+
+    /// Stage 2b Step 3b-b-iii — D>1 FAILURE cascade. When a detached checkpoint drain
+    /// fails at `Spilling`, its `DrainCleanup` must discard not only its own generation
+    /// but every YOUNGER generation still resident behind it: each younger freeze summed
+    /// the failing generation's front prefix into its own `window_base` on the promise
+    /// that the front would be cleared oldest-first ahead of it, so a younger generation
+    /// that published after the failure would `retain_after` the WRONG front and corrupt
+    /// the tier. Here two generations are held concurrently in flight (the overlap),
+    /// then the OLDER one is faulted; the cascade must collapse BOTH, advance no slot,
+    /// leave every row live in the tier, and never strand a generation (the next
+    /// checkpoint converges). Config keeps `D = 1`; `D = 2` is the test-only override.
+    #[tokio::test]
+    async fn stage2b_d2_older_drain_failure_cascade_discards_younger() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        // Bounded condition-poll (the sanctioned readiness-wait shape), not a sleep.
+        async fn wait_until(label: &str, cond: impl Fn() -> bool) {
+            for _ in 0..2000 {
+                if cond() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            panic!("condition '{label}' not met within timeout");
+        }
+
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) =
+            create_memory_mode_upsert_table("s2b_d2_cascade", Arc::clone(&runtime_env)).await;
+        let durable = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(std::sync::Arc::new(EpochRecorder(std::sync::Arc::clone(
+            &durable,
+        ))));
+
+        // Seed [1,2,3] and bake it durable at D=1 (inline, empty ledger afterward — the
+        // precondition for raising the depth).
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(int64_id_batch(&[1, 2, 3])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed append");
+        provider.checkpoint_mem_tier().await.expect("seed checkpoint");
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 2, 3]);
+        let acked_after_seed = durable.load(AtomicOrdering::SeqCst);
+
+        provider.set_drain_pipeline_depth_for_test(2);
+        let gate = provider.install_checkpoint_drain_gate_for_test();
+
+        // Freeze gen0 over [4,5] and gen1 over [6,7]; both detach and park at the pause
+        // (in flight, overlapping). The mem-tier append stays synchronous.
+        let _ = provider
+            .write_cdc_append_stream(single_batch_stream(int64_id_batch(&[4, 5])), &ctx.task_ctx())
+            .await
+            .expect("append [4,5]");
+        provider.checkpoint_mem_tier().await.expect("freeze + detach gen0");
+        wait_until("gen0 parked", || gate.arrived() >= 1).await;
+        let _ = provider
+            .write_cdc_append_stream(single_batch_stream(int64_id_batch(&[6, 7])), &ctx.task_ctx())
+            .await
+            .expect("append [6,7]");
+        provider.checkpoint_mem_tier().await.expect("freeze + detach gen1");
+        wait_until("both parked", || gate.arrived() >= 2).await;
+        assert_eq!(
+            provider.drain_ledger.lock().depth(),
+            2,
+            "two generations concurrently resident (overlap) before the fault"
+        );
+
+        // Arm the one-shot spilling fault: the OLDER generation (gen0, the front) trips
+        // it after its encode, at its ordered-publish turn. Release both; gen0 faults
+        // and cascade-discards gen1 (which aborts at the publish gate).
+        provider.arm_checkpoint_spill_fault();
+        gate.release_all_parked();
+        wait_until("ledger drained by the cascade", || {
+            provider.drain_ledger.lock().is_empty()
+        })
+        .await;
+
+        assert_eq!(
+            durable.load(AtomicOrdering::SeqCst),
+            acked_after_seed,
+            "a cascade after an older-drain failure advances no slot"
+        );
+        // Nothing was cleared — every row stays live in the tier for replay.
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1, 2, 3, 4, 5, 6, 7],
+            "cascade-discarded generations leave all rows live in the tier"
+        );
+
+        // No strand: the next checkpoint's freeze admits into the (now empty) ledger and
+        // drains the whole live tail. Release its single detached drain through the gate.
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("post-cascade checkpoint freezes + detaches");
+        wait_until("retry parked", || gate.arrived() >= 3).await;
+        gate.release_all_parked();
+        wait_until("retry drained", || provider.drain_ledger.lock().is_empty()).await;
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1, 2, 3, 4, 5, 6, 7],
+            "the retried checkpoint bakes the tail with no loss or duplicate"
+        );
+        assert!(
+            durable.load(AtomicOrdering::SeqCst) > acked_after_seed,
+            "the successful retry advances the slot past the seed"
+        );
+    }
+
+    /// Stage 2b Step 3b-b-iii — D>1 FAILURE cascade, REOPEN convergence. Same overlap +
+    /// older-drain fault as the in-process test, but here the process CRASHES (drop,
+    /// RAM lost) after the cascade. Both faulted generations left orphan Vortex files
+    /// (encoded before the fault / before the abort) but never committed a metastore
+    /// pointer, so on reopen only the seed is durable — the orphans MUST be invisible
+    /// (no dirty read). The source, having seen no ack past the seed, re-streams both
+    /// un-acked epochs and the PK-idempotent replay converges to the full set.
+    #[tokio::test]
+    async fn stage2b_d2_cascade_failure_reopen_converges() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        async fn wait_until(label: &str, cond: impl Fn() -> bool) {
+            for _ in 0..2000 {
+                if cond() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            panic!("condition '{label}' not met within timeout");
+        }
+
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) =
+            create_memory_mode_upsert_table("s2b_d2_cascade_reopen", Arc::clone(&runtime_env)).await;
+        let durable = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(std::sync::Arc::new(EpochRecorder(std::sync::Arc::clone(
+            &durable,
+        ))));
+
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(int64_id_batch(&[1, 2, 3])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed append");
+        provider.checkpoint_mem_tier().await.expect("seed checkpoint");
+        let acked_after_seed = durable.load(AtomicOrdering::SeqCst);
+
+        provider.set_drain_pipeline_depth_for_test(2);
+        let gate = provider.install_checkpoint_drain_gate_for_test();
+
+        let _ = provider
+            .write_cdc_append_stream(single_batch_stream(int64_id_batch(&[4, 5])), &ctx.task_ctx())
+            .await
+            .expect("append [4,5]");
+        provider.checkpoint_mem_tier().await.expect("freeze + detach gen0");
+        wait_until("gen0 parked", || gate.arrived() >= 1).await;
+        let _ = provider
+            .write_cdc_append_stream(single_batch_stream(int64_id_batch(&[6, 7])), &ctx.task_ctx())
+            .await
+            .expect("append [6,7]");
+        provider.checkpoint_mem_tier().await.expect("freeze + detach gen1");
+        wait_until("both parked", || gate.arrived() >= 2).await;
+
+        provider.arm_checkpoint_spill_fault();
+        gate.release_all_parked();
+        wait_until("ledger drained by the cascade", || {
+            provider.drain_ledger.lock().is_empty()
+        })
+        .await;
+        assert_eq!(
+            durable.load(AtomicOrdering::SeqCst),
+            acked_after_seed,
+            "the cascade advanced no slot"
+        );
+
+        // CRASH: drop (RAM gone), reopen. Only the seed is durable; both generations'
+        // orphan spill files are unreferenced and MUST be invisible.
+        drop(provider);
+        let reopened =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .open("s2b_d2_cascade_reopen")
+                .await
+                .expect("reopen after the D>1 cascade crash");
+        assert_eq!(
+            scan_sorted_ids(&reopened).await,
+            vec![1, 2, 3],
+            "both cascade orphans are invisible on reopen (no dirty read of uncommitted rows)"
+        );
+
+        // The source re-streams both un-acked epochs; the replay converges with no loss
+        // or duplicate, and a clean checkpoint bakes it durable.
+        let durable2 = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        reopened.install_slot_advancer(std::sync::Arc::new(EpochRecorder(std::sync::Arc::clone(
+            &durable2,
+        ))));
+        for tail in [[4, 5], [6, 7]] {
+            let _ = reopened
+                .write_cdc_append_stream(single_batch_stream(int64_id_batch(&tail)), &ctx.task_ctx())
+                .await
+                .expect("replay an un-acked epoch");
+        }
+        let ids = scan_sorted_ids(&reopened).await;
+        assert_eq!(ids, vec![1, 2, 3, 4, 5, 6, 7], "the replay converges with no loss");
+        let mut deduped = ids.clone();
+        deduped.dedup();
+        assert_eq!(ids, deduped, "no primary key appears twice after the replay");
+        reopened
+            .checkpoint_mem_tier()
+            .await
+            .expect("post-replay checkpoint");
+        assert_eq!(
+            scan_sorted_ids(&reopened).await,
+            vec![1, 2, 3, 4, 5, 6, 7],
+            "no resurrection or duplicate after the replay is baked durable"
+        );
+    }
+
+    /// Stage 2b Step 3b-b-iii — the D>1 SEAL quiesce barrier. A seal is single-ordered
+    /// and shadows the WHOLE active prefix (`unsealed_view`, un-windowed), so it must not
+    /// freeze behind a still-resident detached checkpoint — it would doubly-persist that
+    /// checkpoint's rows. Here a checkpoint (gen0) is held in flight over [4,5] while a
+    /// LATER burst [6,7] lands, then a seal is issued: the barrier must BLOCK the seal
+    /// (it holds only `max_depth − 1` free permits) until gen0 publishes + reclaims, and
+    /// the seal must then capture ONLY the remaining [6,7] — NOT gen0's already-baked
+    /// [4,5]. The sealed-row count (2, not 4) is the direct proof the barrier prevented
+    /// the overlap. Config keeps `D = 1`; `D = 2` is the test-only override.
+    #[tokio::test]
+    async fn stage2b_d2_seal_quiesces_behind_a_resident_checkpoint() {
+
+        async fn wait_until(label: &str, cond: impl Fn() -> bool) {
+            for _ in 0..2000 {
+                if cond() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            panic!("condition '{label}' not met within timeout");
+        }
+
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) =
+            create_memory_mode_upsert_table("s2b_d2_seal_barrier", Arc::clone(&runtime_env)).await;
+        let durable = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(std::sync::Arc::new(EpochRecorder(std::sync::Arc::clone(
+            &durable,
+        ))));
+
+        // Seed [1,2,3] durable at D=1 (empty ledger afterward), then raise D and gate.
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(int64_id_batch(&[1, 2, 3])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed append");
+        provider.checkpoint_mem_tier().await.expect("seed checkpoint");
+        provider.set_drain_pipeline_depth_for_test(2);
+        let gate = provider.install_checkpoint_drain_gate_for_test();
+
+        // gen0 freezes over [4,5] and parks in flight (holding one of the two permits).
+        let _ = provider
+            .write_cdc_append_stream(single_batch_stream(int64_id_batch(&[4, 5])), &ctx.task_ctx())
+            .await
+            .expect("append [4,5]");
+        provider.checkpoint_mem_tier().await.expect("freeze + detach gen0");
+        wait_until("gen0 parked", || gate.arrived() >= 1).await;
+        // A LATER burst [6,7] lands in the tier while gen0 is still resident. gen0's
+        // window is fixed at [4,5]; [6,7] is beyond it.
+        let _ = provider
+            .write_cdc_append_stream(single_batch_stream(int64_id_batch(&[6, 7])), &ctx.task_ctx())
+            .await
+            .expect("append [6,7]");
+
+        // Issue the seal on a detached clone (it would block the current task on the
+        // barrier otherwise). It must NOT make progress while gen0 holds a permit.
+        let seal_provider = Arc::new(provider.clone_for_write());
+        let seal = tokio::spawn(async move { seal_provider.seal_mem_tier_durable().await });
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            assert!(
+                !seal.is_finished(),
+                "the seal must block on the quiesce barrier while a checkpoint is resident"
+            );
+            assert!(
+                provider.drain_ledger.lock().depth() <= 1,
+                "the seal must not freeze a second generation while gen0 is resident"
+            );
+        }
+
+        // Release gen0: it publishes [4,5], clears the front, reclaims, frees its permit.
+        // The seal's barrier then acquires both permits and captures ONLY [6,7].
+        gate.release_all_parked();
+        let sealed_rows = seal
+            .await
+            .expect("seal task joins")
+            .expect("seal succeeds after the pipeline quiesces");
+        assert_eq!(
+            sealed_rows, 2,
+            "the seal captured ONLY the post-checkpoint tail [6,7] (2 rows) — not gen0's already-baked [4,5]; the barrier prevented the overlap"
+        );
+        wait_until("ledger drained", || provider.drain_ledger.lock().is_empty()).await;
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1, 2, 3, 4, 5, 6, 7],
+            "checkpoint [4,5] + seal [6,7] compose with no loss or double-count"
+        );
+
+        // Durability: [1..5] baked (seed + gen0), [6,7] in the inline seal shadow. Reopen
+        // recovers the full set with no duplicate.
+        drop(provider);
+        let reopened =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .open("s2b_d2_seal_barrier")
+                .await
+                .expect("reopen after the seal");
+        let ids = scan_sorted_ids(&reopened).await;
+        assert_eq!(
+            ids,
+            vec![1, 2, 3, 4, 5, 6, 7],
+            "the seal shadow + the checkpoint file recover the full set across a restart"
+        );
+        let mut deduped = ids.clone();
+        deduped.dedup();
+        assert_eq!(ids, deduped, "no primary key recovered twice");
+    }
+
+    /// Stage 2b Step 3b-b-iii — EXHAUSTIVE D>1 concurrency fuzz. For each workload
+    /// (insert-only, cross-window deletes, delete-then-reinsert-across-windows) and
+    /// EVERY release order of its `K = 3` generations, the D>1 pipelined drain must
+    /// produce the SAME durable scan and the SAME final slot ack as a D=1 SERIAL
+    /// reference over the identical bursts, with a strictly monotone ack watermark and a
+    /// durable-across-reopen result (no resurrection, no loss, no double-count). This is
+    /// the live-concurrency analogue of the pure-ledger
+    /// `reclaim_terminal_prefix_ack_min_across_all_publish_orders` + the `window_view`
+    /// composition fuzz: the encode-start order varies (released in a chosen order via
+    /// the per-id gate), but the publish is always ordered oldest-first, so the durable
+    /// outcome is invariant. Cross-window tombstones (a delete in a younger generation
+    /// of a key a published older generation owns) are resolved by the tier-blind,
+    /// sequence-ordered deletion index committed oldest-first — the reason windowing the
+    /// encode never reintroduces the Model-A resurrection. Config keeps `D = 1`; `D = 3`
+    /// is the test-only override; the mem-tier append stays synchronous.
+    #[tokio::test]
+    async fn stage2b_d3_concurrent_drain_fuzz_matches_serial_reference() {
+        const K: usize = 3;
+
+        struct AckRecorder(Arc<ParkingMutex<Vec<u64>>>);
+        #[async_trait::async_trait]
+        impl crate::provider::mem_tier::SlotAdvancer for AckRecorder {
+            async fn on_checkpoint_durable(&self, durable_epoch: u64) {
+                self.0.lock().push(durable_epoch);
+            }
+        }
+
+        async fn wait_until(label: &str, cond: impl Fn() -> bool) {
+            for _ in 0..2000 {
+                if cond() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            panic!("condition '{label}' not met within timeout");
+        }
+
+        // Apply one burst (insert `inserts`, tombstone the already-live `deletes`) to
+        // the RAM tier — the SAME primitive for the reference and the pipeline, so the
+        // only variable is the drain concurrency. Inserts and deletes are disjoint per
+        // burst (a delete targets an EARLIER burst's key => a cross-window tombstone).
+        async fn apply_burst(p: &CayenneTableProvider, inserts: &[i64], deletes: &[i64]) {
+            let batch = int64_id_batch(inserts);
+            let bytes = batch.get_array_memory_size() as u64;
+            let deletions = OnConflictDeletions {
+                deleted_inlined_pk_i64: deletes.to_vec(),
+                ..OnConflictDeletions::default()
+            };
+            p.append_to_mem_tier(vec![batch], &deletions, bytes, deletes.len() as u64)
+                .await
+                .expect("apply burst");
+        }
+
+        // Factorial-indexed permutation of 0..n (same shape as the ledger fuzz).
+        fn permutation(mut rank: usize, n: usize) -> Vec<usize> {
+            let mut items: Vec<usize> = (0..n).collect();
+            let mut out = Vec::with_capacity(n);
+            let mut divisor: usize = (1..=n).product();
+            for k in (1..=n).rev() {
+                divisor /= k;
+                let idx = rank / divisor;
+                rank %= divisor;
+                out.push(items.remove(idx));
+            }
+            out
+        }
+
+        // A fuzz workload: `bursts` is K (inserts, deletes) pairs — one generation each.
+        // Inserts/deletes are disjoint per burst and a delete targets an earlier burst's
+        // key (a cross-window tombstone). `expected` is the hand-computed live set.
+        struct Workload {
+            name: &'static str,
+            bursts: Vec<(Vec<i64>, Vec<i64>)>,
+            expected: Vec<i64>,
+        }
+
+        let workloads = vec![
+            Workload {
+                name: "insert_only",
+                bursts: vec![
+                    (vec![1, 2], vec![]),
+                    (vec![3, 4], vec![]),
+                    (vec![5, 6], vec![]),
+                ],
+                expected: vec![1, 2, 3, 4, 5, 6],
+            },
+            Workload {
+                name: "cross_window_deletes",
+                bursts: vec![
+                    (vec![1, 2, 3], vec![]),
+                    (vec![4, 5], vec![1]),
+                    (vec![6], vec![4]),
+                ],
+                expected: vec![2, 3, 5, 6],
+            },
+            Workload {
+                name: "delete_then_reinsert",
+                bursts: vec![
+                    (vec![1, 2], vec![]),
+                    (vec![3], vec![1]),
+                    (vec![1, 4], vec![]),
+                ],
+                expected: vec![1, 2, 3, 4],
+            },
+        ];
+
+        let factorial: usize = (1..=K).product();
+
+        for Workload {
+            name,
+            bursts,
+            expected,
+        } in &workloads
+        {
+            assert_eq!(bursts.len(), K, "each fuzz workload has exactly K bursts");
+            // ---- D=1 SERIAL REFERENCE over the identical bursts. ----
+            let ref_env = SessionContext::new().runtime_env();
+            let (reference, _ref_cat, _ref_tmp) =
+                create_memory_mode_upsert_table(&format!("fuzz_ref_{name}"), ref_env).await;
+            let ref_acks = Arc::new(ParkingMutex::new(Vec::<u64>::new()));
+            reference.install_slot_advancer(Arc::new(AckRecorder(Arc::clone(&ref_acks))));
+            for (inserts, deletes) in bursts {
+                apply_burst(&reference, inserts, deletes).await;
+                reference.checkpoint_mem_tier().await.expect("reference checkpoint");
+            }
+            let ref_scan = scan_sorted_ids(&reference).await;
+            let ref_final_ack = ref_acks.lock().last().copied();
+            assert_eq!(
+                &ref_scan, expected,
+                "workload {name}: the D=1 serial reference matches the hand-computed live set"
+            );
+
+            // ---- D=3 PIPELINE for EVERY release order. ----
+            for rank in 0..factorial {
+                let order = permutation(rank, K);
+                let env = SessionContext::new().runtime_env();
+                let (provider, catalog, _tmp) = create_memory_mode_upsert_table(
+                    &format!("fuzz_d3_{name}_{rank}"),
+                    Arc::clone(&env),
+                )
+                .await;
+                let acks = Arc::new(ParkingMutex::new(Vec::<u64>::new()));
+                provider.install_slot_advancer(Arc::new(AckRecorder(Arc::clone(&acks))));
+                provider.set_drain_pipeline_depth_for_test(K);
+                let gate = provider.install_checkpoint_drain_gate_for_test();
+
+                // Freeze all K generations, each parking in flight (arrival = freeze
+                // order, oldest first) — the overlap.
+                for (i, (inserts, deletes)) in bursts.iter().enumerate() {
+                    apply_burst(&provider, inserts, deletes).await;
+                    provider.checkpoint_mem_tier().await.expect("freeze + detach");
+                    wait_until(&format!("{name} gen{i} parked"), || gate.arrived() > i).await;
+                }
+                assert_eq!(
+                    provider.drain_ledger.lock().depth(),
+                    K,
+                    "workload {name} rank#{rank}: all {K} generations concurrently resident"
+                );
+
+                // Release the parked drains in the CHOSEN order; the publish-turn gate
+                // still serializes their publishes oldest-first.
+                let parked_ids = gate.pending();
+                assert_eq!(parked_ids.len(), K, "all K generations parked");
+                for &idx in &order {
+                    gate.release(parked_ids[idx]);
+                }
+                wait_until(&format!("{name} rank#{rank} drained"), || {
+                    provider.drain_ledger.lock().is_empty()
+                })
+                .await;
+
+                // Ack watermark monotone + equal final coverage to the serial reference.
+                let recorded = acks.lock().clone();
+                assert!(
+                    recorded.windows(2).all(|w| w[0] <= w[1]),
+                    "workload {name} rank#{rank} order {order:?}: ack watermark not monotone: {recorded:?}"
+                );
+                assert_eq!(
+                    recorded.last().copied(),
+                    ref_final_ack,
+                    "workload {name} rank#{rank} order {order:?}: final ack differs from the serial reference"
+                );
+
+                // Durable scan equals the serial reference — no resurrection/loss/double-count.
+                assert_eq!(
+                    scan_sorted_ids(&provider).await,
+                    ref_scan,
+                    "workload {name} rank#{rank} order {order:?}: D=3 pipelined scan differs from the D=1 reference"
+                );
+                assert!(
+                    provider.mem_tier.tier().load().is_empty(),
+                    "workload {name} rank#{rank}: tier fully drained after all ordered publishes"
+                );
+
+                // Reopen-convergence on the reverse-order permutation of each workload:
+                // everything published + acked, so a restart recovers the full set with
+                // no re-stream needed (no resurrection, no loss, no duplicate).
+                if rank == factorial - 1 {
+                    drop(provider);
+                    let reopened = CayenneTableProviderBuilder::new(
+                        Arc::clone(&catalog),
+                        Arc::clone(&env),
+                    )
+                    .open(&format!("fuzz_d3_{name}_{rank}"))
+                    .await
+                    .expect("reopen after the pipelined drain");
+                    let ids = scan_sorted_ids(&reopened).await;
+                    assert_eq!(
+                        &ids, &ref_scan,
+                        "workload {name}: the pipelined durable state recovers the reference set across a restart"
+                    );
+                    let mut deduped = ids.clone();
+                    deduped.dedup();
+                    assert_eq!(ids, deduped, "workload {name}: no primary key recovered twice");
+                }
+            }
+        }
+    }
+
+    /// Stage 2a crash-injection — the published-but-unacked boundary (the "crash
+    /// in the gap", `table.rs` two-phase checkpoint comment). A checkpoint commits
+    /// the durable file + metastore pointer and clears the tier, but the process
+    /// crashes before the source records the slot ack (`fire_slot_advancer` runs
+    /// post-fence). On restart the published rows are durable AND the source
+    /// re-streams the same epoch — so the replay of an already-published epoch MUST
+    /// be PK-idempotent (no duplicate, no resurrection). This is reachable via the
+    /// public API (a full checkpoint leaves the exact on-disk state of a crash in
+    /// the gap), so no fault hook is needed.
+    #[tokio::test]
+    async fn stage2a_crash_in_the_gap_published_replays_idempotently() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) =
+            create_memory_mode_upsert_table("s2a_gap_crash", Arc::clone(&runtime_env)).await;
+        let durable = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(std::sync::Arc::new(EpochRecorder(std::sync::Arc::clone(
+            &durable,
+        ))));
+
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(int64_id_batch(&[1, 2, 3])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed append");
+        provider.checkpoint_mem_tier().await.expect("seed checkpoint");
+        // The epoch whose rows are about to be published and whose ack is "lost".
+        // Key 3 overlaps the seed (exercises upsert supersede across the boundary).
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(int64_id_batch(&[3, 4, 5])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("gap-epoch append");
+        // Publish it fully — this IS the on-disk state at a crash in the gap
+        // (file + metastore pointer durable, tier cleared).
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("publish the gap epoch");
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 2, 3, 4, 5]);
+
+        // CRASH after the durable publish but (modeled) before the source recorded
+        // the ack. Reopen: the published rows are durable.
+        drop(provider);
+        let reopened =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .open("s2a_gap_crash")
+                .await
+                .expect("reopen after crash in the gap");
+        assert_eq!(
+            scan_sorted_ids(&reopened).await,
+            vec![1, 2, 3, 4, 5],
+            "the published checkpoint is durable across the crash"
+        );
+
+        // The source, having never seen the ack, RE-STREAMS the same epoch's rows
+        // over the already-published checkpoint. PK-idempotent apply must converge.
+        let durable2 = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        reopened.install_slot_advancer(std::sync::Arc::new(EpochRecorder(std::sync::Arc::clone(
+            &durable2,
+        ))));
+        let _ = reopened
+            .write_cdc_append_stream(
+                single_batch_stream(int64_id_batch(&[3, 4, 5])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("re-stream the un-acked (already-published) epoch");
+        let ids = scan_sorted_ids(&reopened).await;
+        assert_eq!(
+            ids,
+            vec![1, 2, 3, 4, 5],
+            "replaying an already-published epoch is idempotent (no duplicate, no resurrection)"
+        );
+        let mut deduped = ids.clone();
+        deduped.dedup();
+        assert_eq!(ids, deduped, "no primary key appears twice after the replay");
+        reopened
+            .checkpoint_mem_tier()
+            .await
+            .expect("bake the idempotent replay");
+        assert_eq!(
+            scan_sorted_ids(&reopened).await,
+            vec![1, 2, 3, 4, 5],
+            "baking the idempotent replay preserves the converged set"
+        );
+    }
+
+    /// Stage 2a crash-injection FUZZ — restart + replay convergence at every
+    /// transition boundary. For each schedule and each crash point, drop the
+    /// provider (RAM lost), reopen from the durable catalog, then REPLAY the ops
+    /// the source would re-deliver from the last durable ack forward, and assert
+    /// the live scan converges to the full single-tier reference with no duplicate
+    /// and no resurrection. Two crash flavors per point: a CLEAN crash (drop after
+    /// executing the prefix) and — at flushing checkpoint ops — a SPILLING crash
+    /// (durable file encoded, metastore pointer never committed) via the one-shot
+    /// `arm_checkpoint_spill_fault` hook. The existing
+    /// `stage2a_drain_ledger_model_matches_single_tier_reference` covers clean
+    /// end-of-schedule reopen; this adds the mid-flight crash + replay contract.
+    ///
+    /// The re-stream uses the upsert write path (`write_cdc_append_stream`) — the
+    /// faithful, PK-idempotent source-replay primitive — not the raw segment
+    /// append, so a replayed insert of an already-durable key supersedes instead
+    /// of duplicating.
+    #[tokio::test]
+    async fn stage2a_crash_injection_replay_converges() {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Op {
+            Insert(i64),
+            Delete(i64),
+            Seal,
+            Checkpoint,
+        }
+
+        async fn apply_op(ctx: &SessionContext, provider: &CayenneTableProvider, op: Op) {
+            match op {
+                Op::Insert(k) => {
+                    let _ = provider
+                        .write_cdc_append_stream(
+                            single_batch_stream(int64_id_batch(&[k])),
+                            &ctx.task_ctx(),
+                        )
+                        .await
+                        .expect("insert applies");
+                }
+                Op::Delete(k) => {
+                    provider
+                        .write_cdc_delete_keys_in_memory(&int64_id_batch(&[k]))
+                        .await
+                        .expect("delete applies");
+                }
+                Op::Seal => {
+                    provider.seal_mem_tier_durable().await.expect("seal applies");
+                }
+                Op::Checkpoint => {
+                    provider
+                        .checkpoint_mem_tier()
+                        .await
+                        .expect("checkpoint applies");
+                }
+            }
+        }
+
+        const DEPTH: u32 = 3;
+        // Two keys (cross-key supersede / delete-then-reinsert) plus both drains.
+        let alphabet = [
+            Op::Insert(1),
+            Op::Insert(2),
+            Op::Delete(1),
+            Op::Seal,
+            Op::Checkpoint,
+        ];
+
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let n = alphabet.len();
+        let total = n.pow(DEPTH);
+
+        for schedule_idx in 0..total {
+            let mut code = schedule_idx;
+            let schedule: Vec<Op> = (0..DEPTH)
+                .map(|_| {
+                    let op = alphabet[code % n];
+                    code /= n;
+                    op
+                })
+                .collect();
+            let len = schedule.len();
+
+            // Reference model: `prefix_live[k]` = the logical corpus after ops
+            // [0..=k]; `full_live` = the fully-converged corpus.
+            let mut prefix_live: Vec<std::collections::BTreeSet<i64>> = Vec::with_capacity(len);
+            {
+                let mut model: std::collections::BTreeSet<i64> =
+                    std::collections::BTreeSet::new();
+                for op in &schedule {
+                    match op {
+                        Op::Insert(k) => {
+                            model.insert(*k);
+                        }
+                        Op::Delete(k) => {
+                            model.remove(k);
+                        }
+                        Op::Seal | Op::Checkpoint => {}
+                    }
+                    prefix_live.push(model.clone());
+                }
+            }
+            let full_live: Vec<i64> = prefix_live
+                .last()
+                .map(|s| s.iter().copied().collect())
+                .unwrap_or_default();
+
+            // The last COMPLETED drain (Seal or Checkpoint) among indices [0..bound).
+            let last_drain_before = |bound: usize| -> Option<usize> {
+                (0..bound)
+                    .rev()
+                    .find(|&i| matches!(schedule[i], Op::Seal | Op::Checkpoint))
+            };
+
+            // Crash points. `crash_at` = number of prefix ops executed fully before
+            // the crash (0..=len). A `spill` crash additionally executes
+            // `schedule[crash_at]` as a checkpoint that crashes in Spilling — only
+            // when that op is a Checkpoint AND the tier is provably non-empty there
+            // (an empty-tier checkpoint early-returns before the fault site), which
+            // holds when at least one Insert occurred since the last Checkpoint
+            // (a Checkpoint clears the tier; a Seal does not).
+            let mut crash_points: Vec<(usize, bool)> = Vec::with_capacity(len + 1);
+            for c in 0..=len {
+                crash_points.push((c, false));
+            }
+            for (ci, op) in schedule.iter().enumerate() {
+                if !matches!(op, Op::Checkpoint) {
+                    continue;
+                }
+                let last_ckpt = (0..ci)
+                    .rev()
+                    .find(|&i| matches!(schedule[i], Op::Checkpoint));
+                let start = last_ckpt.map_or(0, |i| i + 1);
+                if schedule[start..ci]
+                    .iter()
+                    .any(|o| matches!(o, Op::Insert(_)))
+                {
+                    crash_points.push((ci, true));
+                }
+            }
+
+            for (variant, (crash_at, spill)) in crash_points.into_iter().enumerate() {
+                let table = format!("s2a_crash_{schedule_idx}_{variant}");
+                let (provider, catalog, _tmp) =
+                    create_memory_mode_upsert_table(&table, Arc::clone(&runtime_env)).await;
+                provider.install_slot_advancer(std::sync::Arc::new(EpochRecorder(
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                )));
+
+                // Execute the pre-crash prefix.
+                for &op in &schedule[..crash_at] {
+                    apply_op(&ctx, &provider, op).await;
+                }
+                // The last durable ack index. A crashed (Spilling) checkpoint never
+                // commits, so it does not count.
+                let mut drain_idx = last_drain_before(crash_at);
+                // At a spill crash, execute the crashing checkpoint (armed). If the
+                // tier has no rows to bake (empty, or a tombstones-only drain), the
+                // checkpoint COMMITS before reaching the Spilling injection site — a
+                // real completed drain at `crash_at` — so track it as such rather
+                // than asserting a crash that legitimately cannot happen there.
+                if spill {
+                    provider.arm_checkpoint_spill_fault();
+                    if provider.checkpoint_mem_tier().await.is_ok() {
+                        drain_idx = Some(crash_at);
+                    }
+                }
+                let durable_ref: Vec<i64> = match drain_idx {
+                    Some(d) => prefix_live[d].iter().copied().collect(),
+                    None => Vec::new(),
+                };
+
+                // CRASH + reopen: the durable corpus is exactly the last acked drain.
+                drop(provider);
+                let reopened = CayenneTableProviderBuilder::new(
+                    Arc::clone(&catalog),
+                    Arc::clone(&runtime_env),
+                )
+                .open(&table)
+                .await
+                .expect("reopen after crash");
+                assert_eq!(
+                    scan_sorted_ids(&reopened).await,
+                    durable_ref,
+                    "schedule#{schedule_idx} {schedule:?} v{variant} crash_at={crash_at} spill={spill}: reopen != durable reference (dirty read or loss)"
+                );
+
+                // Replay everything the source re-delivers from the last ack forward
+                // (idempotent upsert path); assert convergence to the full reference.
+                reopened.install_slot_advancer(std::sync::Arc::new(EpochRecorder(
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                )));
+                let replay_from = drain_idx.map_or(0, |d| d + 1);
+                for &op in &schedule[replay_from..] {
+                    apply_op(&ctx, &reopened, op).await;
+                }
+                let got = scan_sorted_ids(&reopened).await;
+                assert_eq!(
+                    got, full_live,
+                    "schedule#{schedule_idx} {schedule:?} v{variant} crash_at={crash_at} spill={spill}: replay did not converge to the full reference"
+                );
+                let mut deduped = got.clone();
+                deduped.dedup();
+                assert_eq!(
+                    got, deduped,
+                    "schedule#{schedule_idx} v{variant}: primary key duplicated after replay"
+                );
+            }
+        }
+    }
+
     /// The delete-absorb capability requires BOTH memory mode and
     /// `OnConflict::Upsert`; and even a capable provider routes deletes
     /// durable while UNARMED (no slot advancer installed).
@@ -31625,7 +36010,7 @@ mod tests {
 
         // The checkpoint encodes one file per shard with a NON-EMPTY captured
         // prefix — mirrors the `shard.is_empty() || shard.segments.is_empty()`
-        // skip in `checkpoint_mem_tier_inner`.
+        // skip in `drain_checkpoint_generation`.
         let non_empty_shards = (0..n)
             .filter(|&s| {
                 let tier = provider.mem_tier.shard(s).load();
@@ -33789,6 +38174,7 @@ mod tests {
         let manifest_only = provider
             .manifest_partitioned_files(&request)
             .await
+            .expect("manifest resolution should succeed")
             .expect("manifest resolver returns Some when the manifest is populated");
         assert_eq!(
             manifest_only.len(),
@@ -33834,31 +38220,38 @@ mod tests {
         );
         assert_eq!(manifest_files.statistics, listing_files.statistics);
 
-        // Dual-source fallback: clear the manifest and the resolver must return
-        // `None`, so the scan falls back to directory listing rather than reading
-        // a short (incomplete) file set.
+        // Hardened manifest model: an explicitly-cleared manifest is now
+        // AUTHORITATIVE, not a "not yet populated" signal — manifest
+        // maintenance is mandatory wherever `scan_from_manifest` is on
+        // (`backfill_snapshot_manifest_if_empty` at open,
+        // `insert_current_snapshot_manifest_rows` on every append, the
+        // mandatory manifest-population gate on every compaction/overwrite
+        // commit), so a real gap here means the snapshot genuinely has zero
+        // files, not that the manifest hasn't caught up yet. The resolver
+        // returns `Some(Vec::new())`, and the scan resolves zero files — it
+        // must NOT fall back to a directory listing that would silently
+        // resurrect a file set the manifest no longer vouches for.
         provider
-            .catalog
-            .clear_snapshot_files(&provider.table_metadata.table_id)
+            .clear_snapshot_manifest_for_test()
             .await
             .expect("manifest cleared");
+        let cleared = provider
+            .manifest_partitioned_files(&request)
+            .await
+            .expect("manifest resolution should succeed")
+            .expect("an empty manifest is authoritative (Some), not a fallback signal (None)");
         assert!(
-            provider
-                .manifest_partitioned_files(&request)
-                .await
-                .is_none(),
-            "an empty manifest must fall back to directory listing (Some -> None)"
+            cleared.is_empty(),
+            "a cleared manifest must resolve to zero files, not the directory listing's files"
         );
-        // The end-to-end listing must still succeed (and match the directory
-        // baseline) via the fallback even with the flag ON.
-        let fallback_files = provider
+        let cleared_scan = provider
             .list_files_for_snapshot_scan(&request)
             .await
-            .expect("scan file listing should fall back to directory listing");
-        assert_eq!(
-            path_row_counts(&fallback_files.file_groups),
-            path_row_counts(&listing_files.file_groups),
-            "with an empty manifest the flag-ON scan must fall back to the directory listing"
+            .expect("scan file listing should succeed against an authoritatively-empty manifest");
+        assert!(
+            path_row_counts(&cleared_scan.file_groups).is_empty(),
+            "with a cleared (authoritatively empty) manifest the flag-ON scan must resolve zero \
+             files, not fall back to the directory listing"
         );
     }
 
@@ -33967,8 +38360,7 @@ mod tests {
             "the two on-disk-file inserts must produce a multi-file snapshot to backfill"
         );
         provider
-            .catalog
-            .clear_snapshot_files(&table_id)
+            .clear_snapshot_manifest_for_test()
             .await
             .expect("clear manifest to simulate a pre-population snapshot");
         assert!(
@@ -35121,8 +39513,7 @@ mod tests {
         let table_id = provider.table_metadata.table_id.clone();
         let empty_id = ids[2].clone();
         provider
-            .catalog
-            .clear_snapshot_files(&table_id)
+            .clear_snapshot_manifest_for_test()
             .await
             .expect("clear all manifests");
         let seqs = [10_i64, 20, 30, 40, 50, 60];
@@ -37255,6 +41646,161 @@ mod tests {
         );
     }
 
+    // ----------------------------------------------------------------------
+    // Stage 1 #3b — drain-at-edge sync interior + `parking_lot` publish lock.
+    // ----------------------------------------------------------------------
+
+    /// (3b STRUCTURAL) The publish lock is a synchronous `parking_lot` mutex, so
+    /// no `.await` can be held under it. This is the compile-enforced half of "no
+    /// await under the publish lock": `.lock()` yields a guard DIRECTLY (a
+    /// `tokio::sync::Mutex` would return a future needing `.await`, so the type
+    /// annotation below would not compile). The other half — that the interior
+    /// holds NO guard across an await — is enforced crate-wide by the spawned
+    /// (`Send`) checkpoint/seal tick futures compiling: a `parking_lot` guard held
+    /// across `.await` makes a future `!Send`.
+    #[tokio::test]
+    async fn stage1_3b_publish_lock_is_synchronous_parking_lot() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_cdc_upsert_table("stage1_3b_sync_lock", ctx.runtime_env()).await;
+        // Compiles ONLY because the publish lock is `parking_lot` (sync). The
+        // explicit `MutexGuard` type pins the migration: it is acquired with no
+        // `.await`, so it can never be held across one.
+        let guard: parking_lot::MutexGuard<'_, ()> = provider.mem_tier_publish_locks[0].lock();
+        drop(guard);
+    }
+
+    /// (3b FORCED BLOCK EXHAUSTION) Drive the EXACT edge refill bounce the mem-tier
+    /// apply runs — `try_reserve_local` under the (conceptual) publish lock; on
+    /// `None`, `refill_sequence_block` OFF-lock, then retry — across several
+    /// `SEQ_RESERVE_BLOCK` boundaries (1024 under `cfg(test)`) and assert the
+    /// handed-out sequences are strictly monotonic + dense, contain no duplicate,
+    /// and never reissue a value after a bounce. This is the sequence-safety
+    /// invariant `apply_memory_burst_locked` / `overwrite_mem_tier` / the
+    /// checkpoint capture all depend on: growing the block off-lock and re-reserving
+    /// under the re-acquired lock (never pre-reserving off-lock) hands out one
+    /// monotone domain with no gap or reissue across the bounce.
+    #[tokio::test]
+    async fn stage1_3b_refill_bounce_sequences_monotonic_unique_no_reissue() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_cdc_upsert_table("stage1_3b_refill_bounce", ctx.runtime_env()).await;
+
+        // Each apply reserves a (delete, data) PAIR, so this forces many
+        // `try_reserve(2) -> None -> refill -> retry` bounces.
+        let iters = usize::try_from(SEQ_RESERVE_BLOCK * 3 + 5).expect("fits");
+        let mut handed: Vec<i64> = Vec::with_capacity(iters * 2);
+        let mut bounces = 0_u64;
+        for _ in 0..iters {
+            // The exact caller loop of `apply_memory_burst_locked`: reserve under
+            // the lock via the lock-free fast path; on exhaustion grow the block
+            // off-lock and retry (no sequence is ever claimed off-lock).
+            let base = loop {
+                let Some(base) = provider.try_reserve_local(2) else {
+                    bounces += 1;
+                    provider
+                        .refill_sequence_block(2)
+                        .await
+                        .expect("durable refill");
+                    continue;
+                };
+                break base;
+            };
+            handed.push(base);
+            handed.push(base + 1);
+        }
+
+        // MONOTONIC + DENSE: a fresh table starts at DB high-water 0 and every
+        // value is claimed under the lock in issue order → exactly 1, 2, 3, ….
+        for (expected, actual) in (1_i64..).zip(&handed) {
+            assert_eq!(
+                *actual, expected,
+                "sequences must be dense and strictly monotone across refill bounces"
+            );
+        }
+        // NO DUP / NO REISSUE across the block boundaries.
+        let mut sorted = handed.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            handed.len(),
+            "no sequence value may be reissued across a refill bounce"
+        );
+        // The bounce actually fired (else the test proves nothing about refill).
+        assert!(
+            bounces >= 3,
+            "expected multiple block-exhaustion bounces, got {bounces}"
+        );
+    }
+
+    /// (3b END-TO-END) The real memory-mode apply survives the refill bounce with
+    /// no data loss/dup/reorder. Drive enough distinct-key appends to cross a
+    /// `SEQ_RESERVE_BLOCK` boundary — each append reserves a (delete, data) pair
+    /// under the publish lock, so once the block is exhausted
+    /// `apply_memory_burst_locked` returns `NeedsRefill`, the edge grows the block
+    /// and RE-ACQUIRES the lock to re-reserve. Every appended key must be present
+    /// exactly once afterward: the bounce (drop lock → refill → re-acquire →
+    /// re-reserve → stamp/store) must not drop, duplicate, or reorder a row.
+    #[tokio::test]
+    async fn stage1_3b_memory_apply_survives_refill_bounce_no_loss_or_dup() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let runtime_env = SessionContext::new().runtime_env();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("init catalog");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let vortex_config = VortexConfig {
+            cdc_durability: crate::metadata::CdcDurability::Memory,
+            cdc_mem_tier_min_flush_bytes: 0,
+            ..VortexConfig::default()
+        };
+        let options = CreateTableOptions {
+            table_name: "stage1_3b_mem_bounce".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config,
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
+            .create(options)
+            .await
+            .expect("memory-mode table created");
+        assert!(provider.is_cdc_memory_mode(), "memory mode must be active");
+
+        // One append reserves 2 sequences, so > SEQ_RESERVE_BLOCK/2 SEPARATE
+        // appends cross a block boundary and force >= 1 refill bounce inside
+        // `apply_memory_burst_locked`. Append distinct keys one row per call.
+        let n_ids = SEQ_RESERVE_BLOCK / 2 + 200; // comfortably crosses one block
+        let no_deletions = OnConflictDeletions::default();
+        for id in 1..=n_ids {
+            let batch = int64_id_batch(&[id]);
+            let bytes = batch.get_array_memory_size() as u64;
+            provider
+                .append_to_mem_tier(vec![batch], &no_deletions, bytes, 0)
+                .await
+                .unwrap_or_else(|e| panic!("append id {id} through refill bounce: {e}"));
+        }
+
+        // Every key present exactly once, in order — no loss/dup/reorder through
+        // the (multiple) refill bounces this crossing triggered.
+        let expected: Vec<i64> = (1..=n_ids).collect();
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            expected,
+            "memory-mode apply must preserve every row across the seq refill bounce"
+        );
+    }
+
     #[tokio::test]
     async fn test_cdc_upsert_returns_pending_finalize_and_defers_visibility() {
         let ctx = SessionContext::new();
@@ -37950,7 +42496,7 @@ mod tests {
     /// `mem_checkpoint_lock` before it captures, rather than recapturing the same
     /// not-yet-cleared corpus (which would publish a duplicate copy). Once the
     /// in-flight checkpoint completes, promotion proceeds and captures the tier
-    /// exactly once.
+    /// exactly once. (Adapted from PR #11907.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn promotion_checkpoint_waits_for_inflight_mem_checkpoint() {
         let ctx = SessionContext::new();
@@ -38034,6 +42580,7 @@ mod tests {
     /// `try_lock(write)` fails, so it falls back to a fair `write -> mem` wait and
     /// BLOCKS until the writer releases, then acquires and flushes. Proves the
     /// guaranteed path makes progress under contention without starving.
+    /// (Adapted from PR #11907.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn guaranteed_checkpoint_waits_behind_ordinary_writer_then_flushes() {
         let ctx = SessionContext::new();
@@ -38103,6 +42650,7 @@ mod tests {
     /// The BEST-EFFORT `try_checkpoint_mem_tier` returns `Busy` when `write_lock`
     /// is contended and does NOT advance the source slot (the advancer never
     /// fires). Proves a skip is not mistaken for a completed durable checkpoint.
+    /// (Adapted from PR #11907.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn best_effort_checkpoint_returns_busy_without_advancing_slot() {
         struct CountingAdvancer(Arc<std::sync::atomic::AtomicU64>);
@@ -38159,7 +42707,7 @@ mod tests {
     /// A due seal uses the GUARANTEED acquisition: it fair-queues behind an
     /// ordinary writer, then completes and advances durability (fires the slot
     /// advancer). Proves the seal cannot be starved and honors its durability
-    /// cadence under contention.
+    /// cadence under contention. (Adapted from PR #11907.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn seal_waits_behind_ordinary_writer_then_advances_durability() {
         struct CountingAdvancer(Arc<std::sync::atomic::AtomicU64>);
@@ -38852,15 +43400,18 @@ mod tests {
         // the cap — exactly the state a redundant writer-side checkpoint would
         // needlessly re-encode.
         // This test owns the checkpoint guard directly (modelling an in-flight
-        // background op), so it calls the lock-held body. Single-shard (default
-        // `cdc_mem_tier_shards`) means the capture is atomic, so `None` is correct.
+        // background op via `in_flight_guard`), so it calls the lock-held body
+        // `checkpoint_mem_tier_holding_locks()` (capture+freeze with `None` then the
+        // inline drain) rather than the public entry (which would deadlock re-acquiring
+        // the held `mem_checkpoint_lock`). Single-shard (default `cdc_mem_tier_shards`)
+        // means the capture is atomic, so the `None` write-guard path is correct.
         assert_eq!(
             provider.mem_tier.shard_count(),
             1,
-            "inner(None) here relies on the single-shard (no write_lock) capture path"
+            "holding_locks here relies on the single-shard (no write_lock) capture path"
         );
         let flushed = provider
-            .checkpoint_mem_tier_inner(None)
+            .checkpoint_mem_tier_holding_locks()
             .await
             .expect("in-flight checkpoint drains the seed");
         assert_eq!(flushed, 4096, "the in-flight flush drained the seed rows");
@@ -44039,5 +48590,157 @@ mod tests {
             "a floor-stamped rebuild (the production clear->load_existing_keyset \
              path) must still conflict the stage_seq=5 txn against high-water 7"
         );
+    }
+
+    /// MANUAL PERF MICRO-BENCH (`#[ignore]`d — never runs in CI). Isolates the D>1
+    /// CDC drain-pipeline win from the OLTP-generation ceiling that dominates the
+    /// local HTAP path (SF100-on-18-cores is source-throughput-bound at ~430 txn/s,
+    /// so the mem-tier never fills and the checkpoint drain never contends — see the
+    /// `morsel_proposal` plan). Here there is NO Postgres and NO analytical query load:
+    /// it drives `append_to_mem_tier` + `checkpoint_mem_tier` back-to-back at full
+    /// rate so the checkpoint DRAIN (Vortex encode + metastore commit + fence publish)
+    /// is the throughput ceiling, then measures ingest-to-durable wall time at
+    /// `D = 1 / 2 / 4 / 8`.
+    ///
+    /// At `D=1` each `checkpoint_mem_tier` runs the drain INLINE — serial, so the next
+    /// freeze waits out the whole encode+commit+publish. At `D>1` it freezes + detaches
+    /// (`tokio::spawn`) and only blocks on the admission semaphore once `D` drains are
+    /// in flight, so freeze `N+1` overlaps drain `N`'s off-lock encode. The measured win
+    /// is higher sustained drain throughput (rows/s) as `D` rises — bounded by the global
+    /// encode-permit budget and available cores. Every `D` must land an identical durable
+    /// row set (correctness guard) — the pipeline only reorders WORK, never data.
+    ///
+    /// Run (release is essential — dev-profile encode is meaningless):
+    /// `cargo test -p cayenne --lib --release bench_drain_pipeline_depth -- --ignored --nocapture`
+    /// Tunable via env: `BENCH_BATCHES` (default 100), `BENCH_ROWS` per batch (default 100000).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    #[ignore = "manual perf micro-bench; run with --release --ignored --nocapture"]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "bench throughput display only; row counts are well under 2^52"
+    )]
+    async fn bench_drain_pipeline_depth() {
+        struct AckCounter(Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait::async_trait]
+        impl crate::provider::mem_tier::SlotAdvancer for AckCounter {
+            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        let batches: usize = std::env::var("BENCH_BATCHES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+        let rows_per_batch: usize = std::env::var("BENCH_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000);
+        let total_rows = batches * rows_per_batch;
+        let none = OnConflictDeletions::default();
+
+        eprintln!(
+            "\n=== CDC drain-pipeline micro-bench: {batches} batches x {rows_per_batch} rows = {total_rows} total (no PG, no OLAP) ==="
+        );
+        eprintln!(
+            "{:>4} {:>11} {:>11} {:>11} {:>13} {:>10} {:>7} {:>7}",
+            "D", "loop_ms", "drain_ms", "total_ms", "rows/s", "max_depth", "acks", "speedup"
+        );
+
+        let mut baseline_total_ms = 0.0_f64;
+        for depth in [1usize, 2, 4, 8] {
+            let env = SessionContext::new().runtime_env();
+            let (provider, _tmp) =
+                create_memory_mode_table_with_pipeline_depth("bench_drain", env, depth).await;
+            assert_eq!(
+                provider.drain_pipeline_depth(),
+                depth,
+                "config depth {depth} applied"
+            );
+            let ack_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            provider.install_slot_advancer(Arc::new(AckCounter(Arc::clone(&ack_count))));
+            let provider = Arc::new(provider);
+
+            // Sampler: record the max resident ledger depth (proves D>1 actually keeps
+            // multiple generations in flight — an overlap that never happens would read 1).
+            let max_depth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let sampler = {
+                let p = Arc::clone(&provider);
+                let md = Arc::clone(&max_depth);
+                let st = Arc::clone(&stop);
+                tokio::spawn(async move {
+                    while !st.load(std::sync::atomic::Ordering::Relaxed) {
+                        let d = p.drain_ledger.lock().depth();
+                        md.fetch_max(d, std::sync::atomic::Ordering::Relaxed);
+                        tokio::time::sleep(Duration::from_micros(200)).await;
+                    }
+                })
+            };
+
+            let loop_start = Instant::now();
+            let span = i64::try_from(rows_per_batch).expect("batch size fits i64");
+            for i in 0..batches {
+                let lo = i64::try_from(i * rows_per_batch).expect("batch offset fits i64");
+                let ids: Vec<i64> = (lo..lo + span).collect();
+                let rb = int64_id_batch(&ids);
+                let bytes = rb.get_array_memory_size() as u64;
+                provider
+                    .append_to_mem_tier(vec![rb], &none, bytes, 0)
+                    .await
+                    .expect("append");
+                // D=1: inline drain (blocks full encode+commit+publish). D>1: freeze +
+                // detach, blocking only on the admission semaphore when D drains fly.
+                provider.checkpoint_mem_tier().await.expect("checkpoint");
+            }
+            let loop_ms = loop_start.elapsed().as_secs_f64() * 1000.0;
+
+            // Tail: wait for the last detached drains to publish + clear the ledger.
+            let drain_start = Instant::now();
+            while !provider.drain_ledger.lock().is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            let drain_ms = drain_start.elapsed().as_secs_f64() * 1000.0;
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            sampler.await.expect("sampler join");
+
+            let total_ms = loop_ms + drain_ms;
+            let rows_per_s = (total_rows as f64) / (total_ms / 1000.0);
+            if depth == 1 {
+                baseline_total_ms = total_ms;
+            }
+            let speedup = if total_ms > 0.0 {
+                baseline_total_ms / total_ms
+            } else {
+                0.0
+            };
+
+            // Correctness guard: every D must land the identical durable row set.
+            let scanned = scan_sorted_ids(&provider).await;
+            assert_eq!(
+                scanned.len(),
+                total_rows,
+                "D={depth}: all {total_rows} rows durable after drain"
+            );
+            assert_eq!(scanned.first().copied(), Some(0), "D={depth}: min id 0");
+            assert_eq!(
+                scanned.last().copied(),
+                Some(i64::try_from(total_rows).expect("total fits i64") - 1),
+                "D={depth}: max id {}",
+                total_rows - 1
+            );
+
+            eprintln!(
+                "{:>4} {:>11.1} {:>11.1} {:>11.1} {:>13.0} {:>10} {:>7} {:>6.2}x",
+                depth,
+                loop_ms,
+                drain_ms,
+                total_ms,
+                rows_per_s,
+                max_depth.load(std::sync::atomic::Ordering::Relaxed),
+                ack_count.load(std::sync::atomic::Ordering::Relaxed),
+                speedup
+            );
+        }
     }
 }

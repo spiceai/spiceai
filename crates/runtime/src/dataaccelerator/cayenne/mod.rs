@@ -1271,6 +1271,76 @@ impl CayenneAccelerator {
                 }
                 config.cdc_durability = cayenne::metadata::CdcDurability::File;
             }
+            if let Some((key, value)) = ["cayenne_stage_b_publish_mode", "stage_b_publish_mode"]
+                .iter()
+                .find_map(|key| acceleration.params.get(*key).map(|value| (*key, value)))
+            {
+                if let Some(mode) = cayenne::metadata::StageBPublishMode::parse(value) {
+                    if mode.preplaces_files() && !acceleration.partition_by.is_empty() {
+                        tracing::warn!(
+                            "Dataset '{table_name}' set `{key}: manifest`, but manifest publication is not supported for partitioned Cayenne tables. Using `rename_sync`."
+                        );
+                    } else {
+                        config.stage_b_publish_mode = mode;
+                        if mode.preplaces_files() {
+                            config.scan_from_manifest = true;
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        "Dataset '{table_name}' contains an invalid `{key}` value: '{value}'. Expected one of: rename_sync, manifest. Using the default (rename_sync)."
+                    );
+                }
+            }
+            if let Some((key, value)) = ["cayenne_ingest_cores", "ingest_cores"]
+                .iter()
+                .find_map(|key| acceleration.params.get(*key).map(|value| (*key, value)))
+            {
+                if let Some(cores) = cayenne::metadata::IngestCores::parse(value) {
+                    config.ingest_cores = cores;
+                } else {
+                    tracing::warn!(
+                        "Dataset '{table_name}' contains an invalid `{key}` value: '{value}'. Expected `auto` or a positive integer core count. Using the default (auto)."
+                    );
+                }
+            }
+            if let Some((key, value)) = ["cayenne_ingest_substrate", "ingest_substrate"]
+                .iter()
+                .find_map(|key| acceleration.params.get(*key).map(|value| (*key, value)))
+            {
+                if let Some(substrate) = cayenne::metadata::IngestSubstrate::parse(value) {
+                    config.ingest_substrate = substrate;
+                } else {
+                    tracing::warn!(
+                        "Dataset '{table_name}' contains an invalid `{key}` value: '{value}'. Expected `inline` or `pool`. Using the default (inline)."
+                    );
+                }
+            }
+            // CDC drain-pipeline depth `D` (morsel pipeline, Stage 2b). Default 1 =
+            // today's serial inline drain. `>1` pipelines the checkpoint drain
+            // (freeze N+1 overlaps drain N's off-lock encode/PUT). A `usize`, so the
+            // "no user-facing booleans" rule is satisfied; validate the range here
+            // (a non-numeric value already warned in `parse_optional_usize`) — reject
+            // 0 (a checkpoint always needs a resident slot) and cap the memory budget
+            // (resident RAM scales with `D` — see `MAX_INGEST_PIPELINE_DEPTH`).
+            if let Some((key, depth)) = parse_optional_usize(
+                acceleration,
+                &["cayenne_ingest_pipeline_depth", "ingest_pipeline_depth"],
+            ) {
+                let max_depth = cayenne::metadata::MAX_INGEST_PIPELINE_DEPTH;
+                if depth == 0 {
+                    tracing::warn!(
+                        "Dataset '{table_name}' contains an invalid `{key}` value: '0'. The CDC drain pipeline depth must be at least 1. Using the default (1). See: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
+                    );
+                } else if depth > max_depth {
+                    tracing::warn!(
+                        "Dataset '{table_name}' contains a `{key}` value of {depth} that exceeds the maximum CDC drain pipeline depth of {max_depth} (resident RAM scales with the depth). Clamping to {max_depth}. See: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
+                    );
+                    config.ingest_pipeline_depth = max_depth;
+                } else {
+                    config.ingest_pipeline_depth = depth;
+                }
+            }
             config.cdc_mem_tier_max_bytes = parse_usize_aliases_as_i64(
                 acceleration,
                 &["cayenne_cdc_mem_tier_max_bytes", "cdc_mem_tier_max_bytes"],
@@ -2043,6 +2113,20 @@ impl CayenneAccelerator {
             Self::apply_memory_mode_overrides(&mut vortex_config, acceleration);
         }
 
+        // Stage 1 #3c: when this memory-mode table opts into the pinned ingest
+        // substrate (`cayenne_ingest_substrate: pool`), install — or resize in
+        // place — the process-global pinned ingest pool for the configured core
+        // policy. Idempotent and machine-wide (shared across every memory-mode
+        // table, like the mem-tier byte budget), so registering multiple pooled
+        // tables never thrashes workers. Inline tables never spin up the pool.
+        if memory_mode && vortex_config.ingest_substrate.is_pool() {
+            cayenne::install_global_ingest_pool(vortex_config.ingest_cores);
+            tracing::info!(
+                "Cayenne acceleration for {table_name} using pinned ingest substrate (cayenne_ingest_substrate: pool, cores: {:?})",
+                vortex_config.ingest_cores
+            );
+        }
+
         // Build S3 object store if using S3 Express One Zone storage. Memory mode
         // has no data directory or object store (and `cayenne_data_dir` errors for
         // it), so skip this entirely — memory-mode data lives only in RAM.
@@ -2395,8 +2479,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    62,
-    { S3_PARAMS_LEN + 62 },
+    66,
+    { S3_PARAMS_LEN + 66 },
 >(
     S3_PARAMETERS,
     [
@@ -2521,6 +2605,10 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Durability mode for the inline CDC write path. 'memory' (default, eligibility-gated) appends batches to an in-RAM tier and defers the source slot ack to a periodic/cap-triggered checkpoint, collapsing per-batch durability cost; on crash the un-checkpointed tail is replayed from the source slot (the apply is PK-idempotent, so exactly-once). Bounded by a per-table byte cap and a process-global byte budget so it cannot OOM. The memory path applies only to the small-write/CDC profile and non-partitioned tables; other profiles use 'file'. 'file' persists each CDC batch durably before advancing the source slot and remains the explicit conservative opt-out.")
             .one_of(&["file", "memory"])
             .default("memory"),
+        ParameterSpec::component("stage_b_publish_mode")
+            .description("How staged Cayenne files become visible. 'rename_sync' (default) writes under _staging and moves files into the snapshot during Stage B. 'manifest' pre-places immutable files in the target snapshot during Stage A and makes them visible with an atomic manifest update, eliminating data-file move/copy/fsync work from Stage B. Manifest mode is currently limited to unpartitioned tables.")
+            .one_of(&["rename_sync", "manifest"])
+            .default("rename_sync"),
         ParameterSpec::component("cdc_mem_tier_max_bytes")
             .description("Per-table RAM-tier byte cap before a forced spill (checkpoint) and slot advance, in cdc_durability: memory mode only. Auto-derived from host memory (~1/64 of RAM, clamped to 256 MiB - 1 GiB; 256 MiB on hosts at or under 16 GiB) — a rare backstop now that the non-fence-blocking background checkpointer is the primary flush. Set 0 to disable the per-table cap; the process-global byte budget still bounds aggregate resident memory. When both are set, whichever is breached first triggers the spill."),
         ParameterSpec::component("cdc_mem_tier_max_age_ms")
@@ -2531,6 +2619,16 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Periodic background mem-tier checkpoint interval in milliseconds, in cdc_durability: memory mode only. The accelerator spawns a per-table background task that checkpoints the RAM tier every interval (mirroring the background compactor); this advances the deferred source slot ack on an idle or pure-upsert stream that never trips a delete/truncate event trigger or a write-path cap. Default 1000 (1 s). Set 0 to disable the periodic task."),
         ParameterSpec::component("cdc_mem_tier_shards")
             .description("Number of PK-hash shards the in-RAM CDC tier is partitioned into, in cdc_durability: memory mode only (non-partitioned, key-based merge-on-read tables). Each shard is an independent serial validate->append domain keyed by the RowConverter OwnedRow bytes, so disjoint keys validate and append in parallel within one apply (intra-apply fan-out) while a key's whole version history — upserts AND delete tombstones — stays confined to its one owning shard (last-writer-wins preserved). Checkpoints are always all-shards-atomic on a single source-position axis. Default 1 (the byte-identical serial path). Raise (e.g. 4) on update/insert-heavy CDC tables to lift the per-apply serialization ceiling."),
+        ParameterSpec::component("ingest_cores")
+            .description("How many CPU cores the process-global CDC ingest pool reserves, pinning one worker thread per core (morsel pipeline). Machine-wide, not per-table — the pool is shared across every memory-mode table. 'auto' (default) reserves 1 core (apply is serial, so one worker saturates it while the rest stay available for queries); a positive integer reserves exactly that many. The ingest reservation is hard for ingest workers and advisory (OS-scheduled) for the unpinned query runtime.")
+            .default("auto"),
+        ParameterSpec::component("ingest_substrate")
+            .description("Where the memory-mode CDC apply runs (morsel pipeline, Stage 1). 'inline' (default) runs the apply on the tokio refresh task — today's byte-identical path. 'pool' routes the apply's synchronous interior through the process-global pinned ingest pool (cayenne_ingest_cores workers): the apply runs on a pinned worker while the refresh task holds back-pressure. At Stage 1 depth is 1 (applies stay serial), so 'pool' proves the substrate carries the real apply with no throughput change; pipeline overlap arrives in a later stage. Applies to cdc_durability: memory only.")
+            .one_of(&["inline", "pool"])
+            .default("inline"),
+        ParameterSpec::component("ingest_pipeline_depth")
+            .description("Depth D of the CDC checkpoint drain pipeline (morsel pipeline), in cdc_durability: memory mode only. Default 1 = today's serial inline drain: each RAM-tier checkpoint freezes, encodes, uploads, and clears under one lock before the next freeze can start. A value >1 lets up to D frozen checkpoint generations be resident at once — each freeze is O(1) under the lock, then the encode + object-store upload run off-lock on a detached task, so a later freeze overlaps an earlier generation's upload; publish still commits strictly oldest-first, so query results and the durable corpus are identical to depth 1. Raise it (e.g. 2-4) to lift the checkpoint-drain throughput ceiling on write-heavy memory-mode tables whose ingest is bounded by encode+upload latency. Resident RAM scales roughly with D x the checkpoint tier size, so the depth is capped at 8 (larger values clamp down).")
+            .default("1"),
         ParameterSpec::component("tuning")
             .description("Auto-tuning mode. 'auto': derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate, delete fraction, and arrival burstiness AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adapts the inline-memtable flush caps, the in-memory CDC tier byte cap, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. DEFAULT: when this is unset, the mode is 'adaptive' if extended schema inference produced metadata (the dataset set 'schema_inference: extended' and the source emitted it) — opting into extended schema enables self-tuning, and that metadata is the adaptive warm-start — otherwise 'auto'. Set 'cayenne_tuning: auto' explicitly to opt out of the closed loop even with extended schema. 'schema_inference: extended' also sharpens the 'adaptive' warm-start (inferred cardinality/size) but is not required for an explicit 'adaptive' — without it the controller relearns the row width from observed ingest and converges from the hardware-derived warm-start. In BOTH modes an explicit per-parameter value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set actuator is pinned (the loop will not move it).")
             .one_of(&["auto", "adaptive"]),
@@ -5198,6 +5296,67 @@ mod tests {
         assert_eq!(large_write_config.inline_max_rows, 321);
         assert_eq!(large_write_config.inline_max_bytes, 0);
         assert_eq!(large_write_config.inline_max_buffer_bytes, 0);
+    }
+
+    /// `cayenne_ingest_pipeline_depth` (morsel pipeline, Stage 2b Step 3c) parses a
+    /// valid `usize` through to the config, rejects `0` back to the default (1), and
+    /// clamps an over-large value to `MAX_INGEST_PIPELINE_DEPTH` (the memory budget
+    /// cap). Default (param unset) stays 1 — today's byte-identical serial drain.
+    #[tokio::test]
+    async fn test_ingest_pipeline_depth_param_parses_and_validates() {
+        let app = Arc::new(AppBuilder::new("test").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        let build = |name: &'static str, value: Option<&'static str>| {
+            let app = Arc::clone(&app);
+            let rt = Arc::clone(&rt);
+            async move {
+                let mut dataset = DatasetBuilder::try_new(name.to_string(), name)
+                    .expect("dataset builder")
+                    .with_app(app)
+                    .with_runtime(rt)
+                    .build()
+                    .expect("dataset");
+                let params = value
+                    .map(|v| {
+                        [("cayenne_ingest_pipeline_depth".to_string(), v.to_string())]
+                            .into_iter()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                dataset.acceleration = Some(Acceleration {
+                    engine: Engine::Cayenne,
+                    mode: Mode::File,
+                    refresh_mode: Some(RefreshMode::Changes),
+                    params,
+                    ..Default::default()
+                });
+                CayenneAccelerator::get_vortex_config(name, &dataset).await
+            }
+        };
+
+        assert_eq!(
+            build("depth_unset", None).await.ingest_pipeline_depth,
+            1,
+            "unset defaults to depth 1 (byte-identical serial drain)"
+        );
+        assert_eq!(
+            build("depth_valid", Some("3")).await.ingest_pipeline_depth,
+            3,
+            "a valid in-range depth passes through"
+        );
+        assert_eq!(
+            build("depth_zero", Some("0")).await.ingest_pipeline_depth,
+            1,
+            "depth 0 is rejected back to the default (1)"
+        );
+        assert_eq!(
+            build("depth_over_cap", Some("999"))
+                .await
+                .ingest_pipeline_depth,
+            cayenne::metadata::MAX_INGEST_PIPELINE_DEPTH,
+            "an over-large depth clamps to the memory-budget cap"
+        );
     }
 
     #[tokio::test]

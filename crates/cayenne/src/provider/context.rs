@@ -607,6 +607,13 @@ impl CayenneContext {
         self.config.scan_from_manifest
     }
 
+    /// Whether Stage A writes immutable files directly into their target
+    /// snapshot and Stage B publishes only manifest metadata.
+    #[must_use]
+    pub(crate) fn preplace_staged_files(&self) -> bool {
+        self.config.stage_b_publish_mode.preplaces_files()
+    }
+
     /// Whether the query/scan path advertises and decodes `Utf8`/`Binary`
     /// columns as Arrow view types (`Utf8View`/`BinaryView`). See
     /// [`crate::metadata::VortexConfig::force_view_read_schema`].

@@ -65,6 +65,7 @@ pub mod hll;
 #[cfg(feature = "partition-table-provider")]
 pub use ddl::CayenneDdlHandler;
 pub(crate) mod bounded_fifo;
+pub mod ingest_pool;
 pub mod logical_optimizer;
 pub mod maintained_aggregate;
 pub mod metadata;
@@ -84,6 +85,7 @@ pub mod row_converter;
 pub(crate) mod schema;
 pub mod stats;
 pub mod stats_aggregate;
+pub mod task_queue;
 
 pub use catalog::MetadataCatalog;
 pub use catalog::{CatalogError, CatalogResult};
@@ -91,9 +93,13 @@ pub use catalog_provider::{
     CayenneCatalogProvider, CayenneCatalogProviderConfig, CayenneSchemaProvider,
 };
 pub use cayenne_catalog::{CayenneCatalog, is_retryable_write_conflict};
+pub use ingest_pool::{
+    IngestPool, ProbeReport, install_global_ingest_pool, uninstall_global_ingest_pool,
+};
 pub use metadata::{
-    CdcDurability, DataFile, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
-    ObjectStoreConfig, PartitionMetadata, StorageClass, TableMetadata, TableStatistics,
+    CdcDurability, DataFile, DeleteFile, IngestCores, IngestSubstrate, InlinedData,
+    InlinedDataStats, InlinedDelete, ObjectStoreConfig, PartitionMetadata, StageBPublishMode,
+    StorageClass, TableMetadata, TableStatistics,
 };
 pub use metastore::sqlite::{SqliteAutoVacuum, SqliteMetastoreConfig, set_sqlite_metastore_config};
 pub use provider::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};

@@ -643,6 +643,181 @@ impl CdcDurability {
     }
 }
 
+/// How a staged append places and publishes its immutable data files.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageBPublishMode {
+    /// Write into `_staging`, then rename/copy files into the target snapshot
+    /// while holding the publication fence.
+    #[default]
+    RenameSync,
+    /// Write immutable files directly into the target snapshot during Stage A;
+    /// Stage B publishes their exact manifest rows without moving data files.
+    Manifest,
+}
+
+impl StageBPublishMode {
+    /// Parse a spicepod parameter value (`rename_sync` | `manifest`).
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "rename_sync" => Some(Self::RenameSync),
+            "manifest" => Some(Self::Manifest),
+            _ => None,
+        }
+    }
+
+    /// Whether Stage A pre-places files in their final snapshot directory.
+    #[must_use]
+    pub const fn preplaces_files(self) -> bool {
+        matches!(self, Self::Manifest)
+    }
+}
+
+/// How many CPU cores the process-global ingest pool reserves for CDC apply
+/// (morsel pipeline, proposal §8). The pool pins one `std::thread` worker per
+/// reserved core; the count is machine-wide, not per-table (the pool is a
+/// process-global substrate shared across every memory-mode table, like the
+/// in-memory CDC tier byte budget). Runtime-only — it never affects data
+/// layout, so it is not compared by `configuration_matches`.
+///
+/// The `auto`/`fixed` split is the enum `CLAUDE.md` requires (no user-facing
+/// booleans); the *integer* core count carried by `Fixed` is a plain size, not
+/// a hidden two-state flag, so it is allowed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestCores {
+    /// Runtime picks the ingest-core reservation. In Stage 1 this is **1**
+    /// pinned worker: apply is serial (the edge holds `write_guard` across the
+    /// submit/await), so a single worker saturates it, and holding back the
+    /// remaining cores keeps them available for query execution. The adaptive
+    /// grow/shrink partition controller (proposal §8.1 `n_ingest_cores`) is
+    /// Stage 2c; Stage 1 ships this static knob.
+    #[default]
+    Auto,
+    /// Reserve exactly `n` cores (pin `n` ingest workers). A value of `0` is
+    /// treated as `1` by [`IngestCores::worker_count`] — the pool always keeps
+    /// at least one worker so submitted apply work can drain.
+    Fixed(usize),
+}
+
+impl IngestCores {
+    /// Parse a spicepod parameter value: `auto`, or a bare integer `N`
+    /// (`fixed(N)`). Returns `None` for anything else so the caller can warn and
+    /// fall back to the default.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        let trimmed = value.trim();
+        if trimmed.eq_ignore_ascii_case("auto") {
+            return Some(Self::Auto);
+        }
+        trimmed.parse::<usize>().ok().map(Self::Fixed)
+    }
+
+    /// Whether this is the default `Auto` policy (used to skip serializing the
+    /// common case — this knob is runtime-only and process-global). Takes `&self`
+    /// so serde's `skip_serializing_if` can call it directly.
+    #[must_use]
+    pub const fn is_auto(&self) -> bool {
+        matches!(self, Self::Auto)
+    }
+
+    /// Number of pinned ingest workers this policy asks for. `Auto` = 1 in
+    /// Stage 1; `Fixed(n)` = `n`, clamped up to a minimum of 1 (the pool always
+    /// keeps one worker so apply work can drain).
+    #[must_use]
+    pub const fn worker_count(self) -> usize {
+        match self {
+            Self::Auto => 1,
+            Self::Fixed(n) => {
+                if n == 0 {
+                    1
+                } else {
+                    n
+                }
+            }
+        }
+    }
+}
+
+/// Where the memory-mode CDC apply's synchronous interior runs (morsel pipeline,
+/// Stage 1 #3c). A rollout flag — the Stage-1 analogue of `pipeline_depth: 1` —
+/// that lets the pinned-pool substrate ship behind a byte-identical fallback.
+///
+/// Runtime-only: it never affects data layout, so it is not compared by
+/// `configuration_matches`, and it is skipped when serializing the default
+/// (`Inline`) case. The `inline`/`pool` split is the `snake_case` enum
+/// `CLAUDE.md` requires (no user-facing booleans); each variant names the
+/// behavior, not an on/off state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestSubstrate {
+    /// Run `apply_memory_burst_locked` inline on the tokio refresh task — today's
+    /// path, byte-identical. The conservative, back-compat-preserving default.
+    #[default]
+    Inline,
+    /// Route the apply's synchronous interior through the process-global pinned
+    /// [`crate::ingest_pool::IngestPool`]: the edge packages a descriptor,
+    /// submits it, and awaits the reply while holding `write_guard` (so applies
+    /// stay serial at Stage 1 depth = 1 — the pool is *where* the apply runs, not
+    /// *how many* run). No overlap win yet; overlap is Stage 2's payoff.
+    Pool,
+}
+
+impl IngestSubstrate {
+    /// Parse a spicepod parameter value: `inline` or `pool`. Returns `None` for
+    /// anything else so the caller can warn and fall back to the default.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "inline" => Some(Self::Inline),
+            "pool" => Some(Self::Pool),
+            _ => None,
+        }
+    }
+
+    /// Whether this is the default `Inline` substrate (used to skip serializing
+    /// the common case). Takes `&self` so serde's `skip_serializing_if` can call
+    /// it directly.
+    #[must_use]
+    pub const fn is_inline(&self) -> bool {
+        matches!(self, Self::Inline)
+    }
+
+    /// Whether the apply should route through the pinned pool.
+    #[must_use]
+    pub const fn is_pool(&self) -> bool {
+        matches!(self, Self::Pool)
+    }
+}
+
+/// Upper bound on the CDC drain-pipeline depth `D` (`cayenne_ingest_pipeline_depth`,
+/// morsel pipeline Stage 2b). `D` bounds the number of frozen checkpoint generations
+/// that may be resident (encoding/uploading) at once, so peak RAM held by the drain
+/// pipeline is roughly `D × checkpoint-tier-bytes` (proposal §4.5). The overlap win
+/// saturates after a handful of concurrent drains (it hides encode + object-store PUT
+/// latency, not an unbounded fan-out), while resident RAM grows linearly with `D`, so
+/// the knob is capped here rather than left unbounded — a large `D` over large tiers
+/// is an OOM risk, not a throughput gain. Values above this clamp down to it.
+pub const MAX_INGEST_PIPELINE_DEPTH: usize = 8;
+
+/// Depth `1` by default — today's serial, byte-identical inline checkpoint drain
+/// (freeze → encode → publish → clear all under `mem_checkpoint_lock`). `>1` pipelines
+/// the drain so a later freeze overlaps an earlier generation's off-lock encode/PUT.
+fn default_ingest_pipeline_depth() -> usize {
+    1
+}
+
+/// Skip serializing the common default so an unset knob round-trips to byte-identical
+/// stored metadata.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde `skip_serializing_if` requires a `fn(&T) -> bool` signature"
+)]
+fn is_default_ingest_pipeline_depth(depth: &usize) -> bool {
+    *depth == default_ingest_pipeline_depth()
+}
+
 /// Which adaptive-tunable knobs the operator pinned with an explicit value. In
 /// `adaptive` mode the closed-loop controller must not move a pinned knob — its
 /// tuning bounds collapse to a single point so `decide()` naturally skips it and
@@ -1017,6 +1192,11 @@ pub struct VortexConfig {
     /// `upsert_snapshot_manifest_from_listing`).
     #[serde(default)]
     pub scan_from_manifest: bool,
+    /// Stage-B publication mode. `rename_sync` preserves the historical
+    /// staging-directory move. `manifest` pre-places immutable files during
+    /// Stage A and publishes them through the authoritative manifest.
+    #[serde(default)]
+    pub stage_b_publish_mode: StageBPublishMode,
     /// Which widening schema differences detected at table open (the requested
     /// schema vs the stored metastore schema) may be committed in place via
     /// `update_table_schema` instead of pinning the stored schema. Set by the
@@ -1147,9 +1327,54 @@ pub struct VortexConfig {
     /// interval to finish. From `cayenne_datalake_gc_interval_ms`; defaults to
     /// 5min, lowered in tests.
     pub cold_tier_gc_interval_ms: u64,
+    /// How many cores the process-global ingest pool reserves for CDC apply
+    /// (morsel pipeline, Stage 1 #3). Set from `cayenne_ingest_cores`. Defaults
+    /// to [`IngestCores::Auto`] (1 pinned worker in Stage 1). Process-global and
+    /// runtime-only — never compared by `configuration_matches` (does not affect
+    /// data layout), and skipped when serializing the common `Auto` case.
+    #[serde(default, skip_serializing_if = "IngestCores::is_auto")]
+    pub ingest_cores: IngestCores,
+    /// Where the memory-mode CDC apply's synchronous interior runs (morsel
+    /// pipeline, Stage 1 #3c). Set from `cayenne_ingest_substrate`. Defaults to
+    /// [`IngestSubstrate::Inline`] (today's byte-identical path); `pool` routes
+    /// the apply through the process-global pinned ingest pool. Runtime-only —
+    /// never compared by `configuration_matches` (does not affect data layout),
+    /// and skipped when serializing the common `Inline` case.
+    #[serde(default, skip_serializing_if = "IngestSubstrate::is_inline")]
+    pub ingest_substrate: IngestSubstrate,
+    /// Bounded depth `D` of the CDC checkpoint drain pipeline (morsel pipeline,
+    /// Stage 2b). Set from `cayenne_ingest_pipeline_depth`. Defaults to `1` —
+    /// today's serial inline drain, byte-identical: freeze, encode, publish, and
+    /// clear all run under `mem_checkpoint_lock`, so the next freeze waits for the
+    /// current drain. `>1` lets up to `D` frozen checkpoint generations be resident
+    /// at once: each freeze is O(1) under the lock, then the encode + object-store
+    /// PUT run off-lock on a detached task, so a later freeze overlaps an earlier
+    /// generation's upload (publish still commits strictly oldest-first — ordered
+    /// publish + min-across-in-flight ack). Applies to `cdc_durability: memory`
+    /// only. Runtime-only — never compared by `configuration_matches` (does not
+    /// affect data layout). Clamped to `[1, MAX_INGEST_PIPELINE_DEPTH]` by
+    /// [`VortexConfig::resolved_ingest_pipeline_depth`]; resident RAM is roughly
+    /// `D × checkpoint-tier-bytes` (proposal §4.5), which the upper bound caps.
+    #[serde(
+        default = "default_ingest_pipeline_depth",
+        skip_serializing_if = "is_default_ingest_pipeline_depth"
+    )]
+    pub ingest_pipeline_depth: usize,
 }
 
 impl VortexConfig {
+    /// Effective CDC drain-pipeline depth `D`, clamped to `[1, MAX_INGEST_PIPELINE_DEPTH]`.
+    /// The single derivation rule for every path that sizes the drain ledger / admission
+    /// budget from config. `0` (a nonsensical "no drains" value) clamps up to `1` so a
+    /// checkpoint always has at least one resident slot; an over-large value clamps down
+    /// to the memory-budget cap (see [`MAX_INGEST_PIPELINE_DEPTH`]). The runtime param
+    /// layer additionally warns on an out-of-range value; this is the defensive final
+    /// clamp so a stored/constructed config can never enable an out-of-range depth.
+    #[must_use]
+    pub fn resolved_ingest_pipeline_depth(&self) -> usize {
+        self.ingest_pipeline_depth.clamp(1, MAX_INGEST_PIPELINE_DEPTH)
+    }
+
     /// Whether the cold object-store tier is enabled (a non-empty location set).
     #[must_use]
     pub fn cold_tier_enabled(&self) -> bool {
@@ -1475,6 +1700,7 @@ impl Default for VortexConfig {
             // Directory listing stays the scan's file source by default; the
             // manifest is a dual-source supplement until proven complete.
             scan_from_manifest: false,
+            stage_b_publish_mode: StageBPublishMode::default(),
             schema_evolution: SchemaEvolutionMode::default(),
             goal_replication_lag_secs: None,
             goal_freshness_secs: None,
@@ -1495,13 +1721,16 @@ impl Default for VortexConfig {
             cold_tier_warm_max_files: 0,
             cold_tier_background_interval_ms: 60_000,
             cold_tier_gc_interval_ms: 300_000,
+            ingest_cores: IngestCores::default(),
+            ingest_substrate: IngestSubstrate::default(),
+            ingest_pipeline_depth: default_ingest_pipeline_depth(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PkConflictDetection, VortexConfig};
+    use super::{PkConflictDetection, StageBPublishMode, VortexConfig};
 
     #[test]
     fn test_concurrency_defaults_use_available_parallelism_where_global() {
@@ -1519,6 +1748,70 @@ mod tests {
     /// complete on every path. A regression flipping this default to `true`
     /// would silently make the manifest the authoritative scan source — guard
     /// both the struct default and the serde (empty-config) default.
+    /// `ingest_pipeline_depth` must default to 1 (today's byte-identical serial
+    /// drain), stay unserialized at the default (so stored metadata round-trips
+    /// unchanged), and clamp defensively to `[1, MAX_INGEST_PIPELINE_DEPTH]` — a
+    /// stored/constructed config can never enable an out-of-range depth (`0` would
+    /// leave a checkpoint with no resident slot; an over-large value blows the
+    /// `D × checkpoint-tier-bytes` memory budget).
+    #[test]
+    fn test_ingest_pipeline_depth_defaults_and_clamps() {
+        assert_eq!(
+            VortexConfig::default().ingest_pipeline_depth,
+            1,
+            "struct default depth is 1 (serial inline drain)"
+        );
+        let from_empty: VortexConfig = serde_json::from_str("{}").expect("valid empty config");
+        assert_eq!(
+            from_empty.ingest_pipeline_depth, 1,
+            "an empty config inherits depth 1 via serde default"
+        );
+        assert_eq!(from_empty.resolved_ingest_pipeline_depth(), 1);
+
+        let zero = VortexConfig {
+            ingest_pipeline_depth: 0,
+            ..VortexConfig::default()
+        };
+        assert_eq!(
+            zero.resolved_ingest_pipeline_depth(),
+            1,
+            "depth 0 clamps up to 1 (a checkpoint always needs one resident slot)"
+        );
+
+        let huge = VortexConfig {
+            ingest_pipeline_depth: 999,
+            ..VortexConfig::default()
+        };
+        assert_eq!(
+            huge.resolved_ingest_pipeline_depth(),
+            super::MAX_INGEST_PIPELINE_DEPTH,
+            "an over-large depth clamps down to the memory-budget cap"
+        );
+
+        let mid = VortexConfig {
+            ingest_pipeline_depth: 3,
+            ..VortexConfig::default()
+        };
+        assert_eq!(
+            mid.resolved_ingest_pipeline_depth(),
+            3,
+            "an in-range depth passes through unchanged"
+        );
+
+        let default_json =
+            serde_json::to_string(&VortexConfig::default()).expect("serialize default");
+        assert!(
+            !default_json.contains("ingest_pipeline_depth"),
+            "the default depth must not be serialized (byte-identical stored metadata)"
+        );
+        let opted: VortexConfig =
+            serde_json::from_str(r#"{"ingest_pipeline_depth": 4}"#).expect("valid opt-in");
+        assert_eq!(
+            opted.ingest_pipeline_depth, 4,
+            "a non-default depth deserializes as opt-in"
+        );
+    }
+
     #[test]
     fn test_scan_from_manifest_defaults_off() {
         assert!(
@@ -1536,6 +1829,22 @@ mod tests {
             opted_in.scan_from_manifest,
             "an explicit scan_from_manifest = true must deserialize as opt-in"
         );
+    }
+
+    #[test]
+    fn test_stage_b_publish_mode_defaults_to_rename_sync() {
+        assert_eq!(
+            VortexConfig::default().stage_b_publish_mode,
+            StageBPublishMode::RenameSync
+        );
+        let from_empty: VortexConfig = serde_json::from_str("{}").expect("valid empty config");
+        assert_eq!(
+            from_empty.stage_b_publish_mode,
+            StageBPublishMode::RenameSync
+        );
+        let opted_in: VortexConfig = serde_json::from_str(r#"{"stage_b_publish_mode":"manifest"}"#)
+            .expect("valid manifest publish mode");
+        assert_eq!(opted_in.stage_b_publish_mode, StageBPublishMode::Manifest);
     }
 
     #[test]

@@ -627,15 +627,86 @@ impl MemTier {
         }
     }
 
+    /// A synthetic single-tier VIEW over the segment window `segments[base..base + n)`
+    /// with the tombstone / byte / row / superseded aggregates REBUILT from just
+    /// those segments. This is the ENCODE input for ONE drain generation (proposal
+    /// §4.5, Model B).
+    ///
+    /// At depth `D > 1`, when an older generation's front prefix is still resident
+    /// (frozen but not yet published/cleared), a NEWER generation's captured snapshot
+    /// INCLUDES that older prefix (freeze captures the whole live `segments`), so the
+    /// newer generation must encode ONLY its own window `[base, base + n)` — where
+    /// `base` = Σ of the still-resident older generations' relative counts and `n` is
+    /// this generation's own relative count `N_G`. Encoding the whole captured
+    /// snapshot instead would DOUBLE-COUNT the older generation's rows into this
+    /// generation's file. At `D = 1` the window is the whole captured snapshot
+    /// (`base = 0`, `n = segments.len()`): this returns a cheap field-copy (`Arc` /
+    /// `im::HashMap` root bumps, no rebuild), byte-identical to reading the tier
+    /// directly — so the default path pays nothing.
+    ///
+    /// TOMBSTONE SEMANTICS — why windowing the encode input does NOT reintroduce the
+    /// Model-A resurrection bug: the view aggregates ONLY the window's OWN segment
+    /// tombstones; it bounds the ENCODE input, NOT tombstone resolution. Applying just
+    /// the window's tombstones to just the window's rows is the complete governing set
+    /// for those rows — a tombstone hides only rows at `data_sequence <=
+    /// delete_sequence`, and an OLDER generation's (lower-sequence) rows are never in
+    /// this window, so no in-window row escapes its own tombstone. A delete in this
+    /// window that must hide a row already spilled in an OLDER generation's file is
+    /// resolved by the ONE tier-wide, sequence-ordered deletion index at publish
+    /// (committed strictly oldest-first per the ordered-publish contract) — NOT by
+    /// this row filter. Model B keeps that single tier-wide deletion index, so
+    /// splitting the encode input by window never resurrects a durable row (unlike
+    /// Model A's per-container visible-row concat).
+    ///
+    /// Clamped so an out-of-range `base` / `n` (a capture/append race) can never slice
+    /// out of bounds. Cheap: clones only `Arc` / `im::HashMap` roots, never payload.
+    #[must_use]
+    pub(crate) fn window_view(&self, base: usize, n: usize) -> Self {
+        let start = base.min(self.segments.len());
+        let end = start.saturating_add(n).min(self.segments.len());
+        if start == 0 && end == self.segments.len() {
+            // Full window (the D=1 case): a field-copy — the accumulated tombstone
+            // corpus is value-equal to a fresh fold over every segment (`max` is
+            // commutative), so cloning it is byte-identical AND avoids the rebuild.
+            return self.clone();
+        }
+        let window: Vec<MemSegment> = self.segments[start..end].to_vec();
+        // Rebuild the window aggregate by folding each window segment's own
+        // tombstones at its own `delete_sequence` — structurally identical to
+        // [`Self::retain_after`] / [`Self::unsealed_view`], preserving per-key
+        // max-sequence semantics exactly.
+        let mut tombstones = InMemTombstones::default();
+        let mut bytes = 0u64;
+        let mut rows = 0u64;
+        let mut superseded = 0u64;
+        for segment in &window {
+            tombstones.merge_segment(&segment.tombstones);
+            bytes = bytes.saturating_add(segment.bytes);
+            rows = rows.saturating_add(segment.rows);
+            superseded = superseded.saturating_add(segment.superseded);
+        }
+        Self {
+            segments: Arc::new(window),
+            tombstones,
+            bytes,
+            rows,
+            superseded,
+            epoch: self.epoch,
+            oldest_append: self.oldest_append,
+            version: self.version,
+            // The seal boundary relative to the window: shifted down by the dropped
+            // front (`start`) and clamped to the window length.
+            sealed_segments: self.sealed_segments.saturating_sub(start).min(end - start),
+        }
+    }
+
     /// A synthetic single-tier VIEW over ONLY the ACTIVE ingestion piece
-    /// (`segments[sealed_segments..]`) with the tombstone/byte/row aggregates
-    /// REBUILT from just those segments — the delta a **seal** must durably shadow.
-    /// Structurally the same rebuild as [`Self::retain_after`] (fold each survivor
-    /// segment's own [`SegmentTombstones`] at its own `delete_sequence`), so the
-    /// aggregate tombstone map is exactly the delta's — NOT the whole tier's (whose
-    /// sealed prefix was already persisted by earlier seals; re-persisting it would
-    /// be redundant, though idempotent). `sealed_segments` is 0 (the view is all
-    /// active). Cheap: clones only `Arc`/`im::HashMap` roots, never batch payload.
+    /// (`segments[sealed_segments..]`) — the delta a **seal** must durably shadow.
+    /// Expressed as the window `[sealed_segments, len)` over
+    /// [`Self::window_view`]: the aggregate tombstone map is exactly the delta's —
+    /// NOT the whole tier's (whose sealed prefix earlier seals already persisted;
+    /// re-persisting it would be redundant, though idempotent). The window's
+    /// `sealed_segments` resolves to 0 (the view is all active).
     ///
     /// Correctness of applying only the delta's tombstones to the delta's rows: a
     /// tombstone hides only rows at a `data_sequence <= delete_sequence`, and the
@@ -644,28 +715,8 @@ impl MemTier {
     /// tombstones are the complete set that governs its visible rows.
     #[must_use]
     pub(crate) fn unsealed_view(&self) -> Self {
-        let unsealed: Vec<MemSegment> = self.unsealed_segments().to_vec();
-        let mut tombstones = InMemTombstones::default();
-        let mut bytes = 0u64;
-        let mut rows = 0u64;
-        let mut superseded = 0u64;
-        for segment in &unsealed {
-            tombstones.merge_segment(&segment.tombstones);
-            bytes = bytes.saturating_add(segment.bytes);
-            rows = rows.saturating_add(segment.rows);
-            superseded = superseded.saturating_add(segment.superseded);
-        }
-        Self {
-            segments: Arc::new(unsealed),
-            tombstones,
-            bytes,
-            rows,
-            superseded,
-            epoch: self.epoch,
-            oldest_append: self.oldest_append,
-            version: self.version,
-            sealed_segments: 0,
-        }
+        let sealed = self.sealed_segments.min(self.segments.len());
+        self.window_view(sealed, self.unsealed_segments().len())
     }
 }
 
@@ -1392,5 +1443,372 @@ mod tests {
             !view.tombstones.int64_pk.contains_key(&100),
             "sealed tombstone excluded from the delta view"
         );
+    }
+
+    /// Build an `n`-segment tier where segment `i` carries one row, deletes key
+    /// `100 + i` at delete-sequence `i + 1`, and stamps `source_position = i + 1`.
+    /// Each segment's aggregates are distinct so a window's rebuilt aggregate is
+    /// unambiguous.
+    fn tier_with_segments(n: i64) -> MemTier {
+        let mut tier = MemTier::empty();
+        for i in 0..n {
+            let mut ts = SegmentTombstones::from_int64_keys([100 + i]);
+            ts.stamp(i + 1);
+            tier = tier.append_segment_with_source_position(
+                Arc::new(vec![batch(&[i])]),
+                i + 1,
+                ts,
+                16,
+                1,
+                0,
+                Some(u64::try_from(i + 1).expect("small")),
+            );
+        }
+        tier
+    }
+
+    /// `window_view(0, len)` (the D=1 case) is a byte-identical field-copy of the
+    /// tier: same segments, same accumulated tombstone corpus, same aggregates and
+    /// metadata — so routing the default drain through the window primitive pays
+    /// nothing and changes nothing.
+    #[test]
+    fn window_view_full_is_field_identical() {
+        let tier = tier_with_segments(3).mark_sealed_through(1);
+        let full = tier.window_view(0, tier.segments.len());
+        assert_eq!(full.segments.len(), tier.segments.len());
+        assert_eq!(full.bytes, tier.bytes);
+        assert_eq!(full.rows, tier.rows);
+        assert_eq!(full.superseded, tier.superseded);
+        assert_eq!(full.epoch, tier.epoch);
+        assert_eq!(full.version, tier.version);
+        assert_eq!(full.sealed_segments, tier.sealed_segments);
+        // The full-window fast path shares the segment Arc (no rebuild, no copy).
+        assert!(
+            Arc::ptr_eq(&full.segments, &tier.segments),
+            "full window shares the segment Arc"
+        );
+        // Every tombstone key in the accumulated corpus is preserved at its sequence.
+        for i in 0..3i64 {
+            assert_eq!(full.tombstones.int64_pk.get(&(100 + i)), Some(&(i + 1)));
+        }
+    }
+
+    /// Adjacent windows PARTITION the tier's segments with no overlap and no gap —
+    /// the composition property the D>1 pipelined drain relies on: generation A
+    /// encodes `[0, k)`, generation B encodes `[k, k + m)`, and together they cover
+    /// exactly `[0, k + m)` once — the double-count-free encode.
+    #[test]
+    fn window_view_partitions_segments_no_double_count() {
+        let tier = tier_with_segments(4);
+        // base=0, N_A=1 ; base=1, N_B=2 ; base=3, N_C=1
+        let a = tier.window_view(0, 1);
+        let b = tier.window_view(1, 2);
+        let c = tier.window_view(3, 1);
+        assert_eq!(a.segments.len(), 1);
+        assert_eq!(b.segments.len(), 2);
+        assert_eq!(c.segments.len(), 1);
+        // Rows / bytes sum back to the whole tier (each segment counted once).
+        assert_eq!(a.rows + b.rows + c.rows, tier.rows);
+        assert_eq!(a.bytes + b.bytes + c.bytes, tier.bytes);
+        // Each window carries ONLY its own segments' tombstones (not the others').
+        assert!(a.tombstones.int64_pk.contains_key(&100));
+        assert!(!a.tombstones.int64_pk.contains_key(&101));
+        assert!(b.tombstones.int64_pk.contains_key(&101));
+        assert!(b.tombstones.int64_pk.contains_key(&102));
+        assert!(!b.tombstones.int64_pk.contains_key(&100));
+        assert!(!b.tombstones.int64_pk.contains_key(&103));
+        assert!(c.tombstones.int64_pk.contains_key(&103));
+    }
+
+    /// A window's slot-ack watermark is window-LOCAL: `max_source_position_in_prefix`
+    /// over the window sees only the window's own segments' source positions, so the
+    /// ack a generation fires covers only its own rows (min-across-in-flight, never a
+    /// later generation's epoch).
+    #[test]
+    fn window_view_max_source_position_is_window_local() {
+        let tier = tier_with_segments(4); // source positions 1,2,3,4
+        let mid = tier.window_view(1, 2); // segments carrying positions 2,3
+        assert_eq!(mid.segments.len(), 2);
+        assert_eq!(
+            mid.max_source_position_in_prefix(mid.segments.len()),
+            Some(3),
+            "window-local max is the window's own highest position"
+        );
+    }
+
+    /// `unsealed_view` is exactly the window `[sealed_segments, len)` — the
+    /// delegation preserves the seal-delta semantics (rebuilt active-only aggregates,
+    /// `sealed_segments = 0`, sealed tombstones excluded).
+    #[test]
+    fn unsealed_view_equals_tail_window() {
+        let tier = tier_with_segments(3).mark_sealed_through(1);
+        let view = tier.unsealed_view();
+        let window = tier.window_view(tier.sealed_segments, tier.segments.len() - tier.sealed_segments);
+        assert_eq!(view.segments.len(), window.segments.len());
+        assert_eq!(view.segments.len(), 2, "2 active segments after sealing 1");
+        assert_eq!(view.rows, window.rows);
+        assert_eq!(view.bytes, window.bytes);
+        assert_eq!(view.sealed_segments, 0);
+        assert_eq!(window.sealed_segments, 0);
+        // The sealed segment's tombstone (key 100) is excluded from both.
+        assert!(!view.tombstones.int64_pk.contains_key(&100));
+        assert!(!window.tombstones.int64_pk.contains_key(&100));
+        assert!(view.tombstones.int64_pk.contains_key(&101));
+        assert!(window.tombstones.int64_pk.contains_key(&101));
+    }
+
+    /// A window over a sealed-spanning range reports the seal boundary RELATIVE to
+    /// the window (shifted down by the dropped front, clamped to the window length).
+    #[test]
+    fn window_view_shifts_seal_boundary_relative() {
+        let tier = tier_with_segments(4).mark_sealed_through(3);
+        // Window [1, 3): drops 1 leading (sealed) segment; 3 - 1 = 2 sealed remain,
+        // clamped to the window length 2.
+        let w = tier.window_view(1, 2);
+        assert_eq!(w.segments.len(), 2);
+        assert_eq!(w.sealed_segments, 2, "3 - 1 = 2 sealed, clamped to window len 2");
+        // Window [3, 1): drops the whole sealed prefix; the tail is all active.
+        let tail = tier.window_view(3, 1);
+        assert_eq!(tail.segments.len(), 1);
+        assert_eq!(tail.sealed_segments, 0);
+    }
+
+    /// Out-of-range `base` / `n` clamp instead of panicking (a capture/append race
+    /// could observe a stale pair): `base >= len` yields an empty window; an
+    /// oversized `n` is clamped to the available tail.
+    #[test]
+    fn window_view_clamps_out_of_range() {
+        let tier = tier_with_segments(2);
+        let past_end = tier.window_view(5, 3);
+        assert!(past_end.segments.is_empty());
+        assert_eq!(past_end.rows, 0);
+        let oversized = tier.window_view(1, 999);
+        assert_eq!(oversized.segments.len(), 1, "clamped to the 1 available segment");
+    }
+
+    /// Stage 2b Step 3a-ii model fuzz — the D>1 window / relative-count COMPOSITION
+    /// over the PURE ledger + `window_view` logic (no concurrency, no provider). This
+    /// is the high-confidence correctness pass before Step 3b overlaps real threads:
+    /// it proves that with `D > 1` resident generations, the per-generation encode
+    /// windows compose EXACTLY back to the un-windowed drain — no double-count, no
+    /// gap, no dropped tombstone — and that ordered oldest-first publish reconstructs
+    /// each generation's front prefix.
+    ///
+    /// The alphabet builds a single-shard segment log (sharding is orthogonal — each
+    /// shard windows independently); `Freeze` captures the current tier as a
+    /// generation WITHOUT draining it, so multiple generations stay resident (the
+    /// `D > 1` residency the inline D=1 drain never reaches).
+    #[test]
+    fn stage2b_drain_windows_compose_over_d_gt_1_schedules() {
+        use crate::provider::drain::{FrozenDrainLedger, FrozenGeneration};
+
+        #[derive(Clone, Copy, Debug)]
+        enum Op {
+            Append(i64),
+            Delete(i64),
+            Freeze,
+        }
+
+        // Append segment `i` carrying source_position i+1; a Delete additionally
+        // stamps a tombstone for `key` at delete-sequence i+1. Distinct per-segment
+        // aggregates make a window's rebuilt aggregate unambiguous.
+        fn apply(tier: &MemTier, op_key: Option<i64>, seg_idx: i64) -> MemTier {
+            let seq = seg_idx + 1;
+            let mut ts = SegmentTombstones::default();
+            if let Some(k) = op_key {
+                ts = SegmentTombstones::from_int64_keys([k]);
+                ts.stamp(seq);
+            }
+            tier.append_segment_with_source_position(
+                Arc::new(vec![batch(&[seg_idx])]),
+                seq,
+                ts,
+                16,
+                1,
+                0,
+                Some(u64::try_from(seq).expect("small")),
+            )
+        }
+
+        const DEPTH: u32 = 5;
+
+        let alphabet = [Op::Append(1), Op::Append(2), Op::Delete(1), Op::Freeze];
+        let base_n = alphabet.len();
+        let exhaustive = base_n.pow(DEPTH);
+
+        let curated: Vec<Vec<Op>> = vec![
+            // Three resident generations before any publish (D=3): each owns a
+            // disjoint window; a delete lands in the middle generation.
+            vec![
+                Op::Append(1),
+                Op::Freeze,
+                Op::Append(2),
+                Op::Delete(1),
+                Op::Freeze,
+                Op::Append(1),
+                Op::Freeze,
+            ],
+            // A delete in a LATER generation over a key inserted in an EARLIER one —
+            // the tombstone must route to the later window (its own segment), and the
+            // union of window tombstones must still equal the whole prefix's.
+            vec![
+                Op::Append(1),
+                Op::Freeze,
+                Op::Append(2),
+                Op::Freeze,
+                Op::Delete(1),
+                Op::Freeze,
+            ],
+        ];
+
+        for schedule_idx in 0..(exhaustive + curated.len()) {
+            let schedule: Vec<Op> = if schedule_idx < exhaustive {
+                let mut code = schedule_idx;
+                (0..DEPTH)
+                    .map(|_| {
+                        let op = alphabet[code % base_n];
+                        code /= base_n;
+                        op
+                    })
+                    .collect()
+            } else {
+                curated[schedule_idx - exhaustive].clone()
+            };
+
+            let mut tier = MemTier::empty();
+            let mut seg_idx: i64 = 0;
+            // Bound the ledger generously so every freeze is admitted regardless of
+            // how many stay resident in this schedule.
+            let mut ledger = FrozenDrainLedger::new(DEPTH as usize + 2);
+            // Parallel record of each frozen generation's (base, N_G, captured
+            // snapshot) — the ledger exposes only its front, so the test keeps its
+            // own view to assert composition across ALL resident generations.
+            let mut gens: Vec<(usize, usize, Arc<MemTier>)> = Vec::new();
+
+            for op in &schedule {
+                match op {
+                    Op::Append(_k) => {
+                        // A pure insert segment: no tombstone. (The composition
+                        // assertions key on segment / tombstone geometry, not row
+                        // values, so the appended key itself is immaterial here.)
+                        tier = apply(&tier, None, seg_idx);
+                        seg_idx += 1;
+                    }
+                    Op::Delete(k) => {
+                        tier = apply(&tier, Some(*k), seg_idx);
+                        seg_idx += 1;
+                    }
+                    Op::Freeze => {
+                        let snapshot = Arc::new(tier.clone());
+                        let base = ledger.resident_prefix_counts(1);
+                        // P2 — resident_prefix_counts composes as Σ prior generations'
+                        // relative counts.
+                        let expected_base: usize = gens.iter().map(|(_, n, _)| *n).sum();
+                        assert_eq!(
+                            base[0], expected_base,
+                            "schedule#{schedule_idx} {schedule:?}: base != Σ prior N_G"
+                        );
+                        let n_g = snapshot.segments.len().saturating_sub(base[0]);
+                        gens.push((base[0], n_g, Arc::clone(&snapshot)));
+                        let admitted = ledger
+                            .freeze(FrozenGeneration::freeze(
+                                vec![snapshot],
+                                base,
+                                vec![n_g],
+                                None,
+                                u64::try_from(seg_idx).expect("small"),
+                            ))
+                            .is_ok();
+                        assert!(admitted, "schedule#{schedule_idx}: ledger rejected a freeze");
+                    }
+                }
+            }
+
+            // Nothing frozen ⇒ nothing to compose.
+            if gens.is_empty() {
+                continue;
+            }
+
+            let total_frozen: usize = gens.iter().map(|(_, n, _)| *n).sum();
+            let (last_base, last_n, _) = gens[gens.len() - 1];
+            // Σ N_G == base_last + N_last == the tier length at the last freeze.
+            assert_eq!(
+                total_frozen,
+                last_base + last_n,
+                "schedule#{schedule_idx} {schedule:?}: windows do not tile a contiguous prefix"
+            );
+
+            // Fold every generation's window tombstones + rows; compare against the
+            // whole frozen-prefix aggregate.
+            let mut union_tombstones = InMemTombstones::default();
+            let mut union_rows = 0u64;
+            let mut running_base = 0usize;
+            for (base, n_g, snapshot) in &gens {
+                // P1 — each generation's window is exactly its own contiguous slice
+                // [base, base+N_G) of the captured snapshot; bases are strictly
+                // non-decreasing and contiguous.
+                assert_eq!(
+                    *base, running_base,
+                    "schedule#{schedule_idx} {schedule:?}: window base is not contiguous with the prior window"
+                );
+                let window = snapshot.window_view(*base, *n_g);
+                assert_eq!(window.segments.len(), *n_g, "window segment count == N_G");
+                union_rows += window.rows;
+                // Merge with per-key MAX-sequence semantics: the SAME key may be
+                // deleted in more than one generation (at different sequences), which
+                // is not a double-count — the whole-prefix aggregate resolves it to
+                // the max, so the window union must too.
+                union_tombstones.merge_from(&window.tombstones);
+                running_base += *n_g;
+            }
+            // P5 — the union of the windows' tombstones equals the whole frozen
+            // prefix's aggregate (windowing the encode drops / duplicates NO
+            // tombstone → the tier-wide deletion index the ordered publish commits is
+            // complete → no resurrection).
+            let whole_prefix = tier.window_view(0, total_frozen);
+            assert_eq!(
+                union_tombstones.int64_pk.len(),
+                whole_prefix.tombstones.int64_pk.len(),
+                "schedule#{schedule_idx} {schedule:?}: union of window tombstones != whole-prefix tombstones"
+            );
+            for (k, seq) in whole_prefix.tombstones.int64_pk.iter() {
+                assert_eq!(
+                    union_tombstones.int64_pk.get(k),
+                    Some(seq),
+                    "schedule#{schedule_idx} {schedule:?}: window union missing/mismatched tombstone key {k}"
+                );
+            }
+            // Rows partition: Σ window rows == whole-prefix rows (each segment once).
+            assert_eq!(
+                union_rows, whole_prefix.rows,
+                "schedule#{schedule_idx} {schedule:?}: window rows do not sum to the whole prefix (double-count or gap)"
+            );
+
+            // P4 — ordered oldest-first publish: draining generation k drops exactly
+            // its front N_G from the live tier, and at that point the live front IS
+            // generation k's window (retain_after composes with the windows).
+            let mut live = tier.clone();
+            for (base, n_g, snapshot) in &gens {
+                let expected_window = snapshot.window_view(*base, *n_g);
+                let live_front = live.window_view(0, *n_g);
+                assert_eq!(
+                    live_front.rows, expected_window.rows,
+                    "schedule#{schedule_idx} {schedule:?}: live front rows != generation window rows at publish"
+                );
+                assert_eq!(
+                    live_front.tombstones.int64_pk.len(),
+                    expected_window.tombstones.int64_pk.len(),
+                    "schedule#{schedule_idx} {schedule:?}: live front tombstones != generation window at publish"
+                );
+                live = live.retain_after(*n_g);
+            }
+            // After publishing every frozen generation the live tier holds only the
+            // survivors appended after the last freeze.
+            assert_eq!(
+                live.segments.len(),
+                tier.segments.len() - total_frozen,
+                "schedule#{schedule_idx} {schedule:?}: residual after ordered publish != survivors"
+            );
+        }
     }
 }

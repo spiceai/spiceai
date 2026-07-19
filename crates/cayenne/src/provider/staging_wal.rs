@@ -74,6 +74,90 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::OwnedMutexGuard;
 
+/// Exact metadata for one file produced during Stage A and recorded in the
+/// staging WAL. Legacy WALs omit this field and retain `staged_files` only.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) struct StagedFileMetadata {
+    pub file_name: String,
+    pub file_size_bytes: u64,
+    pub row_count: u64,
+}
+
+/// Physical location of a staged generation's data files.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StagedFilePlacement {
+    /// Files live under `_staging/<id>` until Stage B moves them.
+    #[default]
+    Staging,
+    /// Files already live in the target snapshot and remain invisible until
+    /// their manifest rows are committed.
+    TargetSnapshot,
+}
+
+#[cfg(test)]
+mod staging_wal_format_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_wal_defaults_exact_file_metadata_to_empty() {
+        let wal: StagingWal = serde_json::from_str(
+            r#"{"table_name":"orders","target_snapshot":"snapshot-1","staged_files":["a.vortex"],"created_at":"2026-07-14T00:00:00Z"}"#,
+        )
+        .expect("legacy staging WAL should deserialize");
+
+        assert_eq!(wal.target_kind, StagingWalTargetKind::CurrentSnapshot);
+        assert!(wal.staged_file_metadata.is_empty());
+        assert_eq!(wal.staged_files, ["a.vortex"]);
+    }
+
+    #[test]
+    fn exact_file_metadata_round_trips() {
+        let wal = StagingWal {
+            table_name: "orders".to_string(),
+            target_snapshot: "snapshot-1".to_string(),
+            target_kind: StagingWalTargetKind::CurrentSnapshot,
+            staged_files: vec!["a.vortex".to_string()],
+            staged_file_metadata: vec![StagedFileMetadata {
+                file_name: "a.vortex".to_string(),
+                file_size_bytes: 4096,
+                row_count: 128,
+            }],
+            file_placement: StagedFilePlacement::Staging,
+            created_at: "2026-07-14T00:00:00Z".to_string(),
+        };
+
+        let encoded = serde_json::to_vec(&wal).expect("staging WAL should serialize");
+        let decoded: StagingWal =
+            serde_json::from_slice(&encoded).expect("staging WAL should deserialize");
+        assert_eq!(decoded.staged_file_metadata, wal.staged_file_metadata);
+        assert_eq!(decoded.staged_files, wal.staged_files);
+    }
+}
+
+pub(crate) fn staged_file_metadata_from_written_files(
+    table_name: &str,
+    files: Vec<vortex_datafusion::WrittenFile>,
+) -> Result<Vec<StagedFileMetadata>> {
+    files
+        .into_iter()
+        .map(|file| {
+            let file_name = file.path.filename().ok_or_else(|| Error::Internal {
+                table: table_name.to_string(),
+                message: format!(
+                    "Vortex sink reported a written path without a file name: {}",
+                    file.path
+                ),
+            })?;
+            Ok(StagedFileMetadata {
+                file_name: file_name.to_string(),
+                file_size_bytes: file.size_bytes,
+                row_count: file.row_count,
+            })
+        })
+        .collect()
+}
+
 /// Coordinates staged writes and the staging WAL lifecycle for a Cayenne table.
 ///
 /// This struct supports two usage patterns:
@@ -95,6 +179,8 @@ pub struct CayenneStagedAppend {
     target_snapshot_id: String,
     target_kind: StagingWalTargetKind,
     row_count: u64,
+    staged_file_metadata: Vec<StagedFileMetadata>,
+    file_placement: StagedFilePlacement,
 }
 
 impl std::fmt::Debug for CayenneStagedAppend {
@@ -107,6 +193,8 @@ impl std::fmt::Debug for CayenneStagedAppend {
             .field("target_snapshot_id", &self.target_snapshot_id)
             .field("target_kind", &self.target_kind)
             .field("row_count", &self.row_count)
+            .field("staged_file_count", &self.staged_file_metadata.len())
+            .field("file_placement", &self.file_placement)
             .finish()
     }
 }
@@ -162,6 +250,8 @@ impl CayenneStagedAppend {
         write_guard: Option<OwnedMutexGuard<()>>,
         staging_snapshot_id: String,
         row_count: u64,
+        staged_file_metadata: Vec<StagedFileMetadata>,
+        file_placement: StagedFilePlacement,
     ) -> Self {
         let target_snapshot_id = table.get_current_snapshot_id();
         Self {
@@ -172,6 +262,8 @@ impl CayenneStagedAppend {
             target_snapshot_id,
             target_kind: StagingWalTargetKind::CurrentSnapshot,
             row_count,
+            staged_file_metadata,
+            file_placement,
         }
     }
 
@@ -183,6 +275,8 @@ impl CayenneStagedAppend {
         target_snapshot_id: String,
         target_kind: StagingWalTargetKind,
         row_count: u64,
+        staged_file_metadata: Vec<StagedFileMetadata>,
+        file_placement: StagedFilePlacement,
     ) -> Self {
         Self {
             table,
@@ -192,6 +286,8 @@ impl CayenneStagedAppend {
             target_snapshot_id,
             target_kind,
             row_count,
+            staged_file_metadata,
+            file_placement,
         }
     }
 
@@ -214,19 +310,15 @@ impl CayenneStagedAppend {
     ///
     /// Returns an error if writing the WAL file fails.
     pub async fn write_wal(&self) -> Result<()> {
-        if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
-            self.table
-                .write_staging_wal_for(&self.staging_snapshot_id)
-                .await
-        } else {
-            self.table
-                .write_staging_wal_for_target(
-                    &self.staging_snapshot_id,
-                    &self.target_snapshot_id,
-                    self.target_kind,
-                )
-                .await
-        }
+        self.table
+            .write_staging_wal_for_target(
+                &self.staging_snapshot_id,
+                &self.target_snapshot_id,
+                self.target_kind,
+                &self.staged_file_metadata,
+                self.file_placement,
+            )
+            .await
     }
 
     /// Moves staged files into the configured target snapshot.
@@ -235,6 +327,17 @@ impl CayenneStagedAppend {
     ///
     /// Returns an error if moving the staged files fails.
     pub async fn move_staged_files(&self) -> Result<()> {
+        if self.file_placement == StagedFilePlacement::TargetSnapshot {
+            if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
+                self.table
+                    .publish_preplaced_snapshot_files(
+                        &self.target_snapshot_id,
+                        &self.staged_file_metadata,
+                    )
+                    .await?;
+            }
+            return Ok(());
+        }
         if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
             self.table
                 .move_staged_files_to_current_snapshot(&self.staging_snapshot_id)
@@ -263,6 +366,18 @@ impl CayenneStagedAppend {
         self.table.publish_current_snapshot_files_changed().await;
     }
 
+    /// Stage 0c fast-path gate for the one-shot `finalize_staged_write` publish:
+    /// a pre-placed generation targeting the current snapshot on a manifest-scan
+    /// table. This entry point (`write_staged_append`) carries no on-conflict
+    /// deletions — it is structurally append-only — so, unlike the
+    /// `PreparedStagedAppend` variant, there is no `prepared_on_conflict` to
+    /// check. Mirrors `PreparedStagedAppend::is_preplaced_append_only_current_snapshot`.
+    fn is_preplaced_append_only_current_snapshot(&self) -> bool {
+        self.file_placement == StagedFilePlacement::TargetSnapshot
+            && self.target_kind == StagingWalTargetKind::CurrentSnapshot
+            && self.table.scan_from_manifest()
+    }
+
     /// Executes the full WAL finalize sequence in order.
     ///
     /// # Errors
@@ -281,6 +396,49 @@ impl CayenneStagedAppend {
         let wal_start = Instant::now();
         self.write_wal().await?;
         record_cayenne_write_phase(self.table.table_name(), "publish_wal_write", wal_start);
+
+        // Stage 0c — pointer-only publish (append-only, pre-placed, manifest
+        // scans): the catalog commit + WAL removal run OFF the reader-blocking
+        // `listing_fence`; only the synchronous visibility flip holds it. See
+        // `apply_under_barrier` for the correctness argument.
+        if self.is_preplaced_append_only_current_snapshot() {
+            let lock_start = Instant::now();
+            let _visibility_guard = self.table.visibility_lock_arc().lock_owned().await;
+            record_cayenne_write_phase(self.table.table_name(), "publish_lock_wait", lock_start);
+
+            self.table
+                .warm_current_snapshot_manifest_cache(&self.target_snapshot_id)
+                .await?;
+            let rows = self
+                .table
+                .build_current_snapshot_manifest_rows(
+                    &self.target_snapshot_id,
+                    &self.staged_file_metadata,
+                )
+                .await?;
+
+            // Off-fence durable catalog commit FIRST (the only fallible step);
+            // see `apply_under_barrier` for the ordering rationale.
+            let commit_start = Instant::now();
+            self.table
+                .materialize_current_snapshot_manifest_rows(&rows)
+                .await?;
+            record_cayenne_write_phase(self.table.table_name(), "publish_commit", commit_start);
+
+            let fence_start = Instant::now();
+            {
+                let _fence = self.table.lock_listing_fence_write_owned().await;
+                self.table
+                    .flip_preplaced_manifest_cache(&self.target_snapshot_id, &rows);
+                self.table
+                    .publish_current_snapshot_files_changed_under_held_fence();
+                self.table.mark_maintained_aggregates_stale();
+            }
+            record_cayenne_write_phase(self.table.table_name(), "publish_fence_flip", fence_start);
+
+            self.remove_wal().await?;
+            return Ok(());
+        }
 
         let lock_start = Instant::now();
         let _visibility_guard = self.table.visibility_lock_arc().lock_owned().await;
@@ -346,19 +504,16 @@ impl CayenneStagedAppend {
         // disarmed once the receipt is built, handing the unregister to its `Drop`.
         let inflight_guard =
             InflightStagingAppendGuard::register(&self.table, &self.staging_snapshot_id);
-        let wal_write = if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
-            self.table
-                .write_staging_wal_for(&self.staging_snapshot_id)
-                .await
-        } else {
-            self.table
-                .write_staging_wal_for_target(
-                    &self.staging_snapshot_id,
-                    &self.target_snapshot_id,
-                    self.target_kind,
-                )
-                .await
-        };
+        let wal_write = self
+            .table
+            .write_staging_wal_for_target(
+                &self.staging_snapshot_id,
+                &self.target_snapshot_id,
+                self.target_kind,
+                &self.staged_file_metadata,
+                self.file_placement,
+            )
+            .await;
         // On a WAL-write error the `?` returns early here and `inflight_guard`
         // drops, reverting the registration.
         wal_write?;
@@ -388,6 +543,8 @@ impl CayenneStagedAppend {
             target_snapshot_id: self.target_snapshot_id,
             target_kind: self.target_kind,
             row_count: self.row_count,
+            staged_file_metadata: self.staged_file_metadata,
+            file_placement: self.file_placement,
             // Default: no incremental IVM feed. The write path attaches captured
             // batches via `set_ivm_feed_batches` only for IVM tables.
             ivm_feed_batches: None,
@@ -409,6 +566,14 @@ impl CayenneStagedAppend {
         // the lock mid-cleanup and transiently observe an `IncompleteWrite`
         // or leftover WAL.
         let _write_guard = self.write_guard;
+        if self.file_placement == StagedFilePlacement::TargetSnapshot {
+            self.table
+                .remove_preplaced_snapshot_files(
+                    &self.target_snapshot_id,
+                    &self.staged_file_metadata,
+                )
+                .await?;
+        }
         self.table
             .clear_staging_snapshot_dir(&self.staging_snapshot_id)
             .await
@@ -436,6 +601,8 @@ pub struct PreparedStagedAppend {
     target_snapshot_id: String,
     target_kind: StagingWalTargetKind,
     row_count: u64,
+    staged_file_metadata: Vec<StagedFileMetadata>,
+    file_placement: StagedFilePlacement,
     /// IVM feed: the insert `RecordBatches` captured at Stage A, present ONLY when
     /// this table has a registered maintained aggregate AND the write is
     /// incrementally feedable (set by the write path; `None` for non-IVM tables —
@@ -462,6 +629,8 @@ impl std::fmt::Debug for PreparedStagedAppend {
             .field("target_snapshot_id", &self.target_snapshot_id)
             .field("target_kind", &self.target_kind)
             .field("row_count", &self.row_count)
+            .field("staged_file_count", &self.staged_file_metadata.len())
+            .field("file_placement", &self.file_placement)
             .field("has_write_guard", &self.write_guard.is_some())
             .field("has_ivm_feed", &self.ivm_feed_batches.is_some())
             .field("has_on_conflict", &self.prepared_on_conflict.is_some())
@@ -483,6 +652,22 @@ impl Drop for PreparedStagedAppend {
 }
 
 impl PreparedStagedAppend {
+    async fn place_or_publish_files(&self) -> Result<()> {
+        if self.file_placement == StagedFilePlacement::TargetSnapshot {
+            if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
+                self.table
+                    .publish_preplaced_snapshot_files(
+                        &self.target_snapshot_id,
+                        &self.staged_file_metadata,
+                    )
+                    .await?;
+            }
+            return Ok(());
+        }
+        self.table
+            .move_staged_files_to_snapshot(&self.staging_snapshot_id, &self.target_snapshot_id)
+            .await
+    }
     /// Returns the number of rows staged for commit.
     #[must_use]
     pub fn row_count(&self) -> u64 {
@@ -807,15 +992,63 @@ impl PreparedStagedAppend {
     pub async fn apply_under_barrier(&self) -> Result<()> {
         let _write_guard = self.lock_current_snapshot_for_apply().await;
         let _visibility_guard = self.table.visibility_lock_arc().lock_owned().await;
-        // Hold the listing fence for the entire move + WAL removal + listing
+
+        // Stage 0c — pointer-only publish. For an append-only, pre-placed
+        // current-snapshot generation under manifest scans, the durable catalog
+        // commit and WAL removal no longer run under the reader-blocking
+        // `listing_fence`: only the synchronous in-memory visibility flip does.
+        // `write_lock` + `visibility_lock` (held here, NOT taken by `scan()`)
+        // still serialize this against compaction and other writers, so the
+        // off-fence catalog work is safe; `scan()` (which takes only
+        // `listing_fence.read()`) is unblocked for its duration.
+        if self.is_preplaced_append_only_current_snapshot() {
+            self.ensure_current_snapshot_target_unchanged()?;
+            // Off-fence: make the manifest cache authoritative for this snapshot
+            // (so `scan()` never reads the catalog for it and cannot observe the
+            // off-fence commit early), then build the rows (reads the sequence).
+            self.table
+                .warm_current_snapshot_manifest_cache(&self.target_snapshot_id)
+                .await?;
+            let rows = self
+                .table
+                .build_current_snapshot_manifest_rows(
+                    &self.target_snapshot_id,
+                    &self.staged_file_metadata,
+                )
+                .await?;
+            // Off-fence: durably commit the catalog rows FIRST — the only
+            // fallible step here. Doing it before the flip means we never leave
+            // an in-memory flip stranded without a durable catalog commit; a
+            // crash between here and WAL removal is reconciled idempotently by
+            // `ensure_no_incomplete_write` from the still-present WAL.
+            self.table
+                .materialize_current_snapshot_manifest_rows(&rows)
+                .await?;
+            // Reader-blocking fence: synchronous, infallible flip only, no await.
+            {
+                let _fence = self.table.lock_listing_fence_write_owned().await;
+                self.table
+                    .flip_preplaced_manifest_cache(&self.target_snapshot_id, &rows);
+                self.table
+                    .publish_current_snapshot_files_changed_under_held_fence();
+                self.table
+                    .feed_staged_ivm_under_fence(self.ivm_feed_batches.as_ref());
+            }
+            // Off-fence: WAL removal is the last, purely-recoverable step.
+            self.table
+                .remove_staging_wal_for(&self.staging_snapshot_id)
+                .await?;
+            return Ok(());
+        }
+
+        // Default path (rename_sync mode, upsert/delete, or non-manifest scans):
+        // hold the listing fence for the entire move + WAL removal + listing
         // swap sequence. Without this, `CayenneTableProvider::scan()` (which
         // holds `listing_fence.read()` across DataFusion's listing call) can
         // interleave with the move and observe a torn directory snapshot.
         let _fence = self.table.lock_listing_fence_write_owned().await;
         self.ensure_current_snapshot_target_unchanged()?;
-        self.table
-            .move_staged_files_to_snapshot(&self.staging_snapshot_id, &self.target_snapshot_id)
-            .await?;
+        self.place_or_publish_files().await?;
         if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
             self.table
                 .remove_staging_wal_for(&self.staging_snapshot_id)
@@ -830,6 +1063,19 @@ impl PreparedStagedAppend {
         self.table
             .feed_staged_ivm_under_fence(self.ivm_feed_batches.as_ref());
         Ok(())
+    }
+
+    /// Whether this receipt is the Stage 0c fast path: an append-only
+    /// (`prepared_on_conflict` is `None`), pre-placed generation targeting the
+    /// current snapshot on a manifest-scan table. Only this shape can publish
+    /// with the durable catalog commit moved off the `listing_fence`; every
+    /// other shape (`rename_sync` placement, upsert/delete tombstones,
+    /// protected-snapshot targets) keeps the all-under-fence path unchanged.
+    fn is_preplaced_append_only_current_snapshot(&self) -> bool {
+        self.file_placement == StagedFilePlacement::TargetSnapshot
+            && self.target_kind == StagingWalTargetKind::CurrentSnapshot
+            && self.prepared_on_conflict.is_none()
+            && self.table.scan_from_manifest()
     }
 
     /// Apply the staged write ASSUMING the caller already holds this
@@ -853,9 +1099,7 @@ impl PreparedStagedAppend {
     pub async fn apply_under_held_barrier(&self) -> Result<()> {
         let _write_guard = self.try_lock_current_snapshot_for_held_barrier()?;
         self.ensure_current_snapshot_target_unchanged()?;
-        self.table
-            .move_staged_files_to_snapshot(&self.staging_snapshot_id, &self.target_snapshot_id)
-            .await?;
+        self.place_or_publish_files().await?;
         if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
             self.table
                 .remove_staging_wal_for(&self.staging_snapshot_id)
@@ -1026,6 +1270,14 @@ impl PreparedStagedAppend {
     ///
     /// Returns an error if clearing the staging directory fails.
     pub async fn rollback(self) -> Result<()> {
+        if self.file_placement == StagedFilePlacement::TargetSnapshot {
+            self.table
+                .remove_preplaced_snapshot_files(
+                    &self.target_snapshot_id,
+                    &self.staged_file_metadata,
+                )
+                .await?;
+        }
         self.table
             .clear_staging_snapshot_dir(&self.staging_snapshot_id)
             .await?;
@@ -1056,6 +1308,12 @@ pub(crate) struct StagingWal {
     pub target_kind: StagingWalTargetKind,
     /// Names of the data files in the staging directory.
     pub staged_files: Vec<String>,
+    /// Exact Stage-A file metadata. Empty for legacy WAL records.
+    #[serde(default)]
+    pub staged_file_metadata: Vec<StagedFileMetadata>,
+    /// Whether files await a move or were pre-placed in `target_snapshot`.
+    #[serde(default)]
+    pub file_placement: StagedFilePlacement,
     /// ISO-8601 timestamp when this WAL entry was created.
     pub created_at: String,
 }
@@ -1178,14 +1436,24 @@ impl CayenneTableProvider {
         let staging_snapshot_id = Self::new_staging_snapshot_id();
         self.clear_staging_snapshot_dir(&staging_snapshot_id)
             .await?;
+        let target_snapshot_id = self.get_current_snapshot_id();
+        let file_placement = if self.preplace_staged_files() {
+            StagedFilePlacement::TargetSnapshot
+        } else {
+            StagedFilePlacement::Staging
+        };
+        let write_snapshot_id = match file_placement {
+            StagedFilePlacement::Staging => &staging_snapshot_id,
+            StagedFilePlacement::TargetSnapshot => &target_snapshot_id,
+        };
 
         self.staging_may_have_files().store(true, Ordering::Release);
 
-        let (row_count, _writer_ops, _stats_acc) = match self
-            .write_to_snapshot(
+        let ((row_count, _writer_ops, _stats_acc), written_files) = match self
+            .write_to_snapshot_collecting_files(
                 prepared_insert.stream,
                 self.target_file_size_bytes(),
-                &staging_snapshot_id,
+                write_snapshot_id,
                 target_partitions,
                 // The prepared insert is a lazily-consumed stream of unknown
                 // size; shard across the full write concurrency (prior behavior).
@@ -1207,12 +1475,16 @@ impl CayenneTableProvider {
                 return Err(e);
             }
         };
+        let staged_file_metadata =
+            staged_file_metadata_from_written_files(self.table_name(), written_files)?;
 
         Ok(CayenneStagedAppend::from_staged_append_in(
             self.clone_for_write(),
             Some(write_guard),
             staging_snapshot_id,
             row_count,
+            staged_file_metadata,
+            file_placement,
         ))
     }
 
@@ -1296,6 +1568,15 @@ impl CayenneTableProvider {
         setup_cleanup.snapshots.push(staging_snapshot_id.clone());
         self.clear_staging_snapshot_dir(&staging_snapshot_id)
             .await?;
+        let file_placement = if self.preplace_staged_files() {
+            StagedFilePlacement::TargetSnapshot
+        } else {
+            StagedFilePlacement::Staging
+        };
+        let write_snapshot_id = match file_placement {
+            StagedFilePlacement::Staging => &staging_snapshot_id,
+            StagedFilePlacement::TargetSnapshot => &target_snapshot_id,
+        };
         let prepared_insert = match self.prepare_stream_for_insert(data).await {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -1305,10 +1586,10 @@ impl CayenneTableProvider {
         };
         let may_have_on_conflict_deletions = prepared_insert.may_have_on_conflict_deletions();
         let post_validation = prepared_insert.post_validation();
-        let row_count = match self
+        let (row_count, written_files) = match self
             .write_stream_to_staging_snapshot(
                 prepared_insert.stream,
-                &staging_snapshot_id,
+                write_snapshot_id,
                 target_partitions,
             )
             .await
@@ -1321,6 +1602,8 @@ impl CayenneTableProvider {
                 return Err(error);
             }
         };
+        let staged_file_metadata =
+            staged_file_metadata_from_written_files(self.table_name(), written_files)?;
         let PostValidationState {
             on_conflict_deletions,
             validated_keys,
@@ -1358,6 +1641,8 @@ impl CayenneTableProvider {
             target_snapshot_id,
             StagingWalTargetKind::ProtectedSnapshot,
             row_count,
+            staged_file_metadata,
+            file_placement,
         );
         let mut prepared = staged.prepare().await?;
         if let Some(on_conflict) = prepared_on_conflict {
@@ -1380,29 +1665,32 @@ impl CayenneTableProvider {
     ///
     /// The WAL file is placed at `{table_path}/{table_id}/_staging/<id>/_wal.json`
     /// (local FS) or at the corresponding S3 key.
-    pub(crate) async fn write_staging_wal_for(&self, staging_snapshot_id: &str) -> Result<()> {
-        let current_snapshot = self.get_current_snapshot_id();
-
-        self.write_staging_wal_for_target(
-            staging_snapshot_id,
-            &current_snapshot,
-            StagingWalTargetKind::CurrentSnapshot,
-        )
-        .await
-    }
-
-    pub(crate) async fn write_staging_wal_for_target(
+    async fn write_staging_wal_for_target(
         &self,
         staging_snapshot_id: &str,
         target_snapshot: &str,
         target_kind: StagingWalTargetKind,
+        staged_file_metadata: &[StagedFileMetadata],
+        file_placement: StagedFilePlacement,
     ) -> Result<()> {
         if self.table_path().starts_with("s3://") {
-            self.write_staging_wal_s3(staging_snapshot_id, target_snapshot, target_kind)
-                .await?;
+            self.write_staging_wal_s3(
+                staging_snapshot_id,
+                target_snapshot,
+                target_kind,
+                staged_file_metadata,
+                file_placement,
+            )
+            .await?;
         } else {
-            self.write_staging_wal_local(staging_snapshot_id, target_snapshot, target_kind)
-                .await?;
+            self.write_staging_wal_local(
+                staging_snapshot_id,
+                target_snapshot,
+                target_kind,
+                staged_file_metadata,
+                file_placement,
+            )
+            .await?;
         }
         self.staging_wal_present().store(true, Ordering::Release);
         Ok(())
@@ -1414,28 +1702,26 @@ impl CayenneTableProvider {
         staging_snapshot_id: &str,
         target_snapshot: &str,
         target_kind: StagingWalTargetKind,
+        exact_file_metadata: &[StagedFileMetadata],
+        file_placement: StagedFilePlacement,
     ) -> Result<()> {
         let staging_dir =
             Self::snapshot_dir_path(self.table_path(), self.table_id(), staging_snapshot_id);
         Self::ensure_snapshot_dir_exists(&staging_dir).await?;
 
         // Collect staged data file names (exclude WAL bookkeeping files).
-        let mut staged_files = Vec::new();
-        let mut entries = tokio::fs::read_dir(&staging_dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            if entry.file_type().await?.is_file() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name != STAGING_WAL_FILENAME && name != STAGING_WAL_TMP_FILENAME {
-                    staged_files.push(name);
-                }
-            }
-        }
+        let staged_files = exact_file_metadata
+            .iter()
+            .map(|file| file.file_name.clone())
+            .collect();
 
         let wal = StagingWal {
             table_name: self.table_name().to_string(),
             target_snapshot: target_snapshot.to_string(),
             target_kind,
             staged_files,
+            staged_file_metadata: exact_file_metadata.to_vec(),
+            file_placement,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
 
@@ -1518,6 +1804,8 @@ impl CayenneTableProvider {
         staging_snapshot_id: &str,
         target_snapshot: &str,
         target_kind: StagingWalTargetKind,
+        exact_file_metadata: &[StagedFileMetadata],
+        file_placement: StagedFilePlacement,
     ) -> Result<()> {
         let config = self.require_object_store()?;
 
@@ -1525,32 +1813,9 @@ impl CayenneTableProvider {
             return Ok(());
         };
 
-        // List staged data files (exclude WAL bookkeeping objects).
-        let objects: Vec<_> = config
-            .store
-            .list(Some(&staging_prefix))
-            .try_collect()
-            .await
-            .map_err(|e| Error::ObjectStore {
-                operation: "list staging objects for WAL",
-                table: self.table_name().to_string(),
-                source: e,
-            })?;
-
-        let staged_files: Vec<String> = objects
+        let staged_files = exact_file_metadata
             .iter()
-            .filter_map(|meta| {
-                let name = meta
-                    .location
-                    .as_ref()
-                    .strip_prefix(staging_prefix.as_ref())
-                    .unwrap_or(meta.location.as_ref());
-                if name == STAGING_WAL_FILENAME || name == STAGING_WAL_TMP_FILENAME {
-                    None
-                } else {
-                    Some(name.to_string())
-                }
-            })
+            .map(|file| file.file_name.clone())
             .collect();
 
         let wal = StagingWal {
@@ -1558,6 +1823,8 @@ impl CayenneTableProvider {
             target_snapshot: target_snapshot.to_string(),
             target_kind,
             staged_files,
+            staged_file_metadata: exact_file_metadata.to_vec(),
+            file_placement,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
 
@@ -2079,11 +2346,68 @@ impl CayenneTableProvider {
                 "Incomplete staged append detected — attempting automated recovery"
             );
 
-            match self
-                .move_staged_files_to_snapshot(&staging_snapshot_id, &wal.target_snapshot)
-                .await
-            {
+            let placement_result = if wal.file_placement == StagedFilePlacement::TargetSnapshot {
+                Ok(())
+            } else {
+                self.move_staged_files_to_snapshot(&staging_snapshot_id, &wal.target_snapshot)
+                    .await
+            };
+            match placement_result {
                 Ok(()) => {
+                    // Close the crash window between "files renamed into the
+                    // target snapshot" and "manifest rows committed" that a plain
+                    // resumed move alone cannot close: if every staged file was
+                    // already in place before this recovery pass ran (the crash
+                    // landed after the move but before the manifest write),
+                    // `move_staged_files_to_snapshot` above is a no-op and never
+                    // re-triggers `insert_current_snapshot_manifest_rows`. Must
+                    // run BEFORE the WAL is removed below — a failure here must
+                    // leave the WAL in place so a later retry can complete it,
+                    // exactly like a failed move would. Protected-snapshot
+                    // targets are out of scope: they author their manifest via a
+                    // different (catalog-transaction) path, not this
+                    // current-snapshot-specific one.
+                    // Also skipped entirely for a directory-listing table: it
+                    // never wrote incremental manifest rows for this
+                    // generation in the first place (see
+                    // `insert_current_snapshot_manifest_rows`'s own gate), so
+                    // there is nothing to reconcile, and this keeps recovery's
+                    // cost identical to before this change for such tables.
+                    if wal.target_kind == StagingWalTargetKind::CurrentSnapshot
+                        && self.scan_from_manifest()
+                    {
+                        let reconcile = if wal.staged_file_metadata.is_empty() {
+                            self.reconcile_current_snapshot_manifest_rows_after_recovery(
+                                &wal.target_snapshot,
+                                &wal.staged_files,
+                            )
+                            .await
+                        } else {
+                            self.publish_preplaced_snapshot_files(
+                                &wal.target_snapshot,
+                                &wal.staged_file_metadata,
+                            )
+                            .await
+                        };
+                        if let Err(e) = reconcile {
+                            tracing::error!(
+                                table = table_name.as_str(),
+                                error = %e,
+                                "Automated recovery moved staged files but failed to reconcile \
+                                 their snapshot manifest rows"
+                            );
+                            return Err(Error::IncompleteWrite {
+                                table: table_name,
+                                message: format!(
+                                    "A previous write was interrupted while moving {} file(s) to '{}' (started at {}). Automated recovery moved the staged files, but failed to reconcile their manifest rows ({}). Refusing writes until the underlying issue is resolved. The WAL file is located at '{wal_location}'.{extra}",
+                                    wal.staged_files.len(),
+                                    wal.target_snapshot,
+                                    wal.created_at,
+                                    e
+                                ),
+                            });
+                        }
+                    }
                     if let Err(e) = self.remove_staging_wal_for(&staging_snapshot_id).await {
                         tracing::error!(
                             table = table_name.as_str(),

@@ -688,6 +688,11 @@ pub trait MetadataCatalog: Send + Sync {
     /// (`cayenne_snapshot_file`) — the complete file set for a snapshot.
     async fn upsert_snapshot_file(&self, file: &SnapshotFile) -> CatalogResult<()>;
 
+    /// Atomically upsert a set of rows into the authoritative per-snapshot
+    /// data-file manifest. Readers observe either none or all of one write's
+    /// additions.
+    async fn upsert_snapshot_files(&self, files: &[SnapshotFile]) -> CatalogResult<()>;
+
     /// Atomically replace the complete manifest for one snapshot. Readers see
     /// either the old complete set or the new complete set, never a partial
     /// prefix if an insert fails.

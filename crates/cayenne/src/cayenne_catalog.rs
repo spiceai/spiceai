@@ -3376,6 +3376,35 @@ impl MetadataCatalog for CayenneCatalog {
             .await
     }
 
+    async fn upsert_snapshot_files(&self, files: &[SnapshotFile]) -> CatalogResult<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+
+        let txn = self.begin_transaction().await?;
+        for file in files {
+            txn.execute(ExecuteParams {
+                sql: "INSERT OR REPLACE INTO cayenne_snapshot_file \
+                      (table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence, digest) \
+                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params: vec![
+                    MetastoreValue::Text(file.table_id.clone()),
+                    MetastoreValue::Text(file.snapshot_id.clone()),
+                    MetastoreValue::Text(file.file_path.clone()),
+                    MetastoreValue::Integer(file.row_count),
+                    MetastoreValue::Integer(file.file_size_bytes),
+                    MetastoreValue::Integer(file.min_sequence),
+                    MetastoreValue::Integer(file.max_sequence),
+                    file.digest
+                        .clone()
+                        .map_or(MetastoreValue::Null, MetastoreValue::Text),
+                ],
+            })
+            .await?;
+        }
+        txn.commit().await
+    }
+
     async fn replace_snapshot_files(
         &self,
         table_id: &str,

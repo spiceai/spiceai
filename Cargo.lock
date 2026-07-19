@@ -3529,7 +3529,10 @@ dependencies = [
  "bytes",
  "chdb-rust",
  "chrono",
+ "core_affinity",
  "criterion 0.7.0",
+ "crossbeam-channel",
+ "crossbeam-utils",
  "data_components",
  "datafusion",
  "datafusion-catalog",
@@ -3553,7 +3556,7 @@ dependencies = [
  "im",
  "insta",
  "libc",
- "loom",
+ "loom 0.7.2",
  "object_store 0.13.2",
  "parking_lot",
  "paste",
@@ -3568,6 +3571,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snafu",
+ "st3",
  "telemetry",
  "tempfile",
  "test-framework",
@@ -4832,6 +4836,17 @@ dependencies = [
  "bitflags 1.3.2",
  "core-foundation 0.9.4",
  "libc",
+]
+
+[[package]]
+name = "core_affinity"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a034b3a7b624016c6e13f5df875747cc25f884156aad2abd12b6c46797971342"
+dependencies = [
+ "libc",
+ "num_cpus",
+ "winapi",
 ]
 
 [[package]]
@@ -8576,6 +8591,19 @@ checksum = "0b32dfe1fdfc0bbde1f22a5da25355514b5e450c33a6af6770884c8750aedfbc"
 
 [[package]]
 name = "generator"
+version = "0.7.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5cc16584ff22b460a382b7feec54b23d2908d858152e5739a120b949293bd74e"
+dependencies = [
+ "cc",
+ "libc",
+ "log",
+ "rustversion",
+ "windows 0.48.0",
+]
+
+[[package]]
+name = "generator"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b3b854b0e584ead1a33f18b2fcad7cf7be18b3875c78816b753639aa501513ae"
@@ -11228,12 +11256,25 @@ dependencies = [
 
 [[package]]
 name = "loom"
+version = "0.5.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff50ecb28bb86013e935fb6683ab1f6d3a20016f123c76fd4c27470076ac30f5"
+dependencies = [
+ "cfg-if",
+ "generator 0.7.5",
+ "scoped-tls",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "loom"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "419e0dc8046cb947daa77eb95ae174acfbddb7673b4151f56d1eed8e93fbfaca"
 dependencies = [
  "cfg-if",
- "generator",
+ "generator 0.8.9",
  "scoped-tls",
  "tracing",
  "tracing-subscriber",
@@ -18179,7 +18220,7 @@ dependencies = [
  "assoc",
  "bitvec",
  "cfg-if",
- "generator",
+ "generator 0.8.9",
  "hex",
  "owo-colors",
  "rand 0.8.6",
@@ -18979,6 +19020,16 @@ dependencies = [
  "libc",
  "libssh2-sys",
  "parking_lot",
+]
+
+[[package]]
+name = "st3"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5a1d2cec4c9904d238075cb3a212615e67aee6acce849e4e565acf2320a7bf1"
+dependencies = [
+ "crossbeam-utils",
+ "loom 0.5.6",
 ]
 
 [[package]]
@@ -21041,7 +21092,7 @@ dependencies = [
  "libc",
  "libloading 0.8.9",
  "libm",
- "loom",
+ "loom 0.7.2",
  "miette",
  "num-bigint",
  "num-traits",
@@ -22045,6 +22096,7 @@ dependencies = [
  "moka",
  "object_store 0.13.2",
  "opentelemetry",
+ "parking_lot",
  "rstest 0.26.1",
  "tempfile",
  "tokio",

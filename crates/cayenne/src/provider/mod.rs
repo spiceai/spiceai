@@ -81,6 +81,7 @@ pub(crate) mod delete;
 pub mod deletion_index;
 pub(crate) mod deletion_strategy;
 pub(crate) mod delta_encoding;
+pub(crate) mod drain;
 pub(crate) mod fadvise_tier;
 pub(crate) mod file_digest;
 pub(crate) mod file_pruning;

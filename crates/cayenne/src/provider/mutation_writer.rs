@@ -83,7 +83,10 @@ use super::context::CayenneContext;
 use super::mem_tier_budget;
 use super::on_conflict::{PostValidationState, PreparedShardedInsertStream};
 use super::pk_index::PkDigestSet;
-use super::staging_wal::{CayenneStagedAppend, PreparedStagedAppend, StagingWalTargetKind};
+use super::staging_wal::{
+    CayenneStagedAppend, PreparedStagedAppend, StagedFilePlacement, StagingWalTargetKind,
+    staged_file_metadata_from_written_files,
+};
 use super::table::{CayenneCdcWrite, CayenneTableProvider, record_cayenne_write_phase};
 
 /// Record METRIC 4 (`cayenne_cdc_burst_rows` / `cayenne_cdc_burst_bytes`) for one
@@ -1271,6 +1274,26 @@ impl<'a> AppendMutationWriter<'a> {
             .record_written_snapshot_sequence(&new_snapshot_id, new_sequence)
             .await?;
         record_cayenne_write_phase(self.table.table_name(), "publish_seq", seq_start);
+
+        // Author this protected snapshot's manifest with its exact commit-seq
+        // range `[new_sequence, new_sequence]` — every file here was written by
+        // this one commit — BEFORE it becomes visible below. Unlike
+        // overwrite/compaction (which already authored a manifest here before
+        // this change), this path authored none at all: a `scan_from_manifest`
+        // table has no directory-LIST fallback, so publishing a protected
+        // snapshot with zero manifest rows would make its real, just-written
+        // data silently invisible to any scan. Only attempted (and only a hard
+        // failure) when the table actually resolves scans from the manifest —
+        // a directory-listing table keeps today's exact cost/behavior: no
+        // manifest-authoring call on this path at all, same as before this
+        // change, relying on the periodic best-effort
+        // `rebuild_live_snapshot_manifests` sweep instead.
+        if self.table.scan_from_manifest() {
+            self.table
+                .author_uniform_snapshot_manifest(&new_snapshot_id, new_sequence, new_sequence)
+                .await?;
+        }
+
         // Atomically publish the deletion-cache update and the protected snapshot
         // so concurrent scans never observe the new protected snapshot with a stale deletion view (the duplicate-PK window).
         let cas_start = Instant::now();
@@ -1421,6 +1444,16 @@ impl<'a> AppendMutationWriter<'a> {
         self.table
             .clear_staging_snapshot_dir(&staging_snapshot_id)
             .await?;
+        let target_snapshot_id = self.table.get_current_snapshot_id();
+        let file_placement = if self.table.preplace_staged_files() {
+            StagedFilePlacement::TargetSnapshot
+        } else {
+            StagedFilePlacement::Staging
+        };
+        let write_snapshot_id = match file_placement {
+            StagedFilePlacement::Staging => &staging_snapshot_id,
+            StagedFilePlacement::TargetSnapshot => &target_snapshot_id,
+        };
 
         // We are about to (or have started to) write Vortex files into the
         // staging directory. Mark it "dirty" so recovery/root cleanup
@@ -1431,12 +1464,12 @@ impl<'a> AppendMutationWriter<'a> {
             .store(true, Ordering::Release);
 
         let write_start = Instant::now();
-        let result = match self
+        let (result, written_files) = match self
             .table
-            .write_to_snapshot(
+            .write_to_snapshot_collecting_files(
                 stream,
                 target_size_bytes,
-                &staging_snapshot_id,
+                write_snapshot_id,
                 self.task_context.session_config().target_partitions(),
                 estimated_bytes,
                 crate::provider::delta_encoding::WriteClass::Delta,
@@ -1462,12 +1495,16 @@ impl<'a> AppendMutationWriter<'a> {
         // Fold the encode + object-store/disk upload latency into the adaptive
         // tuner's I/O-bound signal (CDC-apply path only; compaction is excluded).
         self.context.record_io_latency(write_start.elapsed());
+        let staged_file_metadata =
+            staged_file_metadata_from_written_files(self.table.table_name(), written_files)?;
 
         let staged_append = CayenneStagedAppend::from_staged_append_in(
             self.table.clone_for_write_operations(),
             None,
             staging_snapshot_id,
             result.0,
+            staged_file_metadata,
+            file_placement,
         );
         let publish_start = Instant::now();
         staged_append.finalize_staged_write().await?;
@@ -1532,12 +1569,21 @@ impl<'a> AppendMutationWriter<'a> {
             };
 
         let write_start = Instant::now();
-        let (rows, writer_ops, stats_acc) = match self
+        let file_placement = if self.table.preplace_staged_files() {
+            StagedFilePlacement::TargetSnapshot
+        } else {
+            StagedFilePlacement::Staging
+        };
+        let write_snapshot_id = match file_placement {
+            StagedFilePlacement::Staging => &target.staging_snapshot_id,
+            StagedFilePlacement::TargetSnapshot => &target.target_snapshot_id,
+        };
+        let ((rows, writer_ops, stats_acc), written_files) = match self
             .table
-            .write_to_snapshot(
+            .write_to_snapshot_collecting_files(
                 stream,
                 target_size_bytes,
-                &target.staging_snapshot_id,
+                write_snapshot_id,
                 self.task_context.session_config().target_partitions(),
                 target.estimated_bytes,
                 crate::provider::delta_encoding::WriteClass::Delta,
@@ -1563,6 +1609,8 @@ impl<'a> AppendMutationWriter<'a> {
         // Fold the encode + object-store/disk upload latency into the adaptive
         // tuner's I/O-bound signal (CDC-apply path only; compaction is excluded).
         self.context.record_io_latency(write_start.elapsed());
+        let staged_file_metadata =
+            staged_file_metadata_from_written_files(self.table.table_name(), written_files)?;
 
         let staged_append = CayenneStagedAppend::from_staged_append_to_snapshot(
             self.table.clone_for_write_operations(),
@@ -1572,6 +1620,8 @@ impl<'a> AppendMutationWriter<'a> {
             target.target_snapshot_id,
             target.target_kind,
             rows,
+            staged_file_metadata,
+            file_placement,
         );
         let prepare_start = Instant::now();
         let mut prepared_append = match staged_append.prepare().await {

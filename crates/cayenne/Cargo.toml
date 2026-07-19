@@ -22,6 +22,9 @@ async-trait = { workspace = true }
 base64.workspace = true
 bytes = { workspace = true }
 chrono = { workspace = true }
+core_affinity = { workspace = true }
+crossbeam-channel = { workspace = true }
+crossbeam-utils = { workspace = true }
 data_components = { path = "../data_components" }
 datafusion = { workspace = true }
 datafusion-catalog = { workspace = true }
@@ -75,6 +78,7 @@ vortex-scan = { workspace = true }
 vortex-session = { workspace = true }
 duckdb = { workspace = true, features = ["bundled"], optional = true }
 chdb-rust = { version = "1", optional = true }
+st3 = { workspace = true }
 # Force aegis to use pure-rust implementation for ARM64 builds to avoid C compilation issues
 [target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]
 aegis = { version = "0.9.3", default-features = false, features = [
@@ -130,12 +134,13 @@ tokio-stream = { workspace = true }
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 libc = "0.2"
 
-# `loom` model-checks the `StructuralVersion` seqlock's memory orderings
-# (`provider/structural_version.rs`). Gated on `cfg(cayenne_loom)` so it is
-# compiled ONLY under `RUSTFLAGS="--cfg cayenne_loom"` and never enters normal
-# test/CI builds. Run with:
+# `loom` model-checks cayenne's concurrency memory orderings. Gated on
+# `cfg(cayenne_loom)` so it is compiled ONLY under `RUSTFLAGS="--cfg cayenne_loom"`
+# and never enters normal test/CI builds. Two models:
 #   RUSTFLAGS="--cfg cayenne_loom" cargo test -p cayenne --lib \
-#     provider::structural_version --release
+#     provider::structural_version --release   # scan-view seqlock
+#   RUSTFLAGS="--cfg cayenne_loom" cargo test -p cayenne --lib \
+#     task_queue::loom_tests --release          # §10.1 PriorityMailbox
 [target.'cfg(cayenne_loom)'.dev-dependencies]
 loom = { workspace = true }
 

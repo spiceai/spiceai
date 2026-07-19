@@ -20,6 +20,8 @@ pub use format::VortexFormat;
 pub use format::VortexFormatFactory;
 pub use format::VortexTableOptions;
 pub use format::WriteShardConfig;
+pub use sink::WrittenFile;
+pub use sink::WrittenFilesCollector;
 pub use source::VortexSource;
 
 #[cfg(test)]

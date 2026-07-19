@@ -188,6 +188,22 @@ struct Workload {
     pk_keyset_cache_mb: Option<usize>,
     /// `true` = cold (datalake) tier enabled on a local `file://` store
     cold: bool,
+    /// `true` = route scans through the hardened `cayenne_snapshot_file`
+    /// manifest instead of a directory listing (manifest hardening,
+    /// commit 1). `assert_converged`'s per-op model check then validates the
+    /// manifest-driven scan agrees with the model across every upsert,
+    /// delete, delete-all, overwrite, compact, and restart this walk
+    /// generates — the same convergence property the directory-listing path
+    /// is already fuzzed against.
+    scan_from_manifest: bool,
+    /// `true` = `stage_b_publish_mode: Manifest` (Stage 0b/0c pre-placement):
+    /// Stage A writes data files directly into the target snapshot and Stage B
+    /// publishes their manifest rows instead of moving files. Requires
+    /// `scan_from_manifest`. Fuzzes the pre-place + off-fence-append-only
+    /// publish path (and, for on-conflict tables, the under-fence upsert publish
+    /// over pre-placed files) against the model oracle — proving no
+    /// vanish/duplicate across upsert/delete/delete-all/compact/restart.
+    preplace: bool,
 }
 
 // ============================================================================
@@ -210,6 +226,8 @@ fn config(
     durability: Durability,
     pk_keyset_cache_mb: Option<usize>,
     cold_url: Option<String>,
+    scan_from_manifest: bool,
+    preplace: bool,
 ) -> VortexConfig {
     let base = VortexConfig {
         target_vortex_file_size_mb: 1,
@@ -224,6 +242,14 @@ fn config(
         // conflict detection (instead of the exact PK keyset); `None` keeps the
         // default exact index. Lets one harness fuzz both existence paths.
         pk_keyset_cache_mb,
+        scan_from_manifest,
+        // Pre-placement (Stage 0b/0c) requires manifest scans; a preplace config
+        // is only ever constructed alongside `scan_from_manifest: true`.
+        stage_b_publish_mode: if preplace {
+            cayenne::metadata::StageBPublishMode::Manifest
+        } else {
+            cayenne::metadata::StageBPublishMode::RenameSync
+        },
         ..VortexConfig::default()
     };
     let base = match cold_url {
@@ -259,6 +285,8 @@ async fn create_table(
     durability: Durability,
     pk_keyset_cache_mb: Option<usize>,
     cold: bool,
+    scan_from_manifest: bool,
+    preplace: bool,
 ) -> TestResult<(Arc<CayenneTableProvider>, SessionContext)> {
     // Local `file://` cold store per table (no object-store config needed —
     // the default local store resolves it).
@@ -282,7 +310,14 @@ async fn create_table(
         ]))),
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
-        vortex_config: config(mode, durability, pk_keyset_cache_mb, cold_url),
+        vortex_config: config(
+            mode,
+            durability,
+            pk_keyset_cache_mb,
+            cold_url,
+            scan_from_manifest,
+            preplace,
+        ),
     };
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
@@ -738,6 +773,8 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
         w.durability,
         w.pk_keyset_cache_mb,
         w.cold,
+        w.scan_from_manifest,
+        w.preplace,
     )
     .await?;
     let mut rng = Rng::new(seed);
@@ -827,6 +864,8 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
         w.durability,
         w.pk_keyset_cache_mb,
         w.cold,
+        w.scan_from_manifest,
+        w.preplace,
     )
     .await?;
     let mut rng = Rng::new(seed);
@@ -1064,6 +1103,8 @@ fn sequential(mode: Mode) -> Workload {
         seeds: scaled_seeds(24),
         pk_keyset_cache_mb: None,
         cold: false,
+        scan_from_manifest: false,
+        preplace: false,
     }
 }
 // Sequential memory-CDC: drives the mem-tier append + checkpoint + seq-prefix bake
@@ -1082,6 +1123,8 @@ fn sequential_memory() -> Workload {
         seeds: scaled_seeds(16),
         pk_keyset_cache_mb: None,
         cold: false,
+        scan_from_manifest: false,
+        preplace: false,
     }
 }
 fn concurrent_mixed(mode: Mode) -> Workload {
@@ -1096,6 +1139,8 @@ fn concurrent_mixed(mode: Mode) -> Workload {
         seeds: scaled_seeds(16),
         pk_keyset_cache_mb: None,
         cold: false,
+        scan_from_manifest: false,
+        preplace: false,
     }
 }
 // Concurrent memory-CDC: foreground mem-tier upserts/deletes racing a background
@@ -1112,6 +1157,8 @@ fn concurrent_memory() -> Workload {
         seeds: scaled_seeds(8),
         pk_keyset_cache_mb: None,
         cold: false,
+        scan_from_manifest: false,
+        preplace: false,
     }
 }
 // High-collision variant: a small key space with many ops drives repeated
@@ -1137,6 +1184,8 @@ fn concurrent_mixed_dense(mode: Mode, pk_keyset_cache_mb: Option<usize>) -> Work
         seeds: scaled_seeds(6),
         pk_keyset_cache_mb,
         cold: false,
+        scan_from_manifest: false,
+        preplace: false,
     }
 }
 fn concurrent_upsert_only(mode: Mode) -> Workload {
@@ -1151,6 +1200,8 @@ fn concurrent_upsert_only(mode: Mode) -> Workload {
         seeds: scaled_seeds(10),
         pk_keyset_cache_mb: None,
         cold: false,
+        scan_from_manifest: false,
+        preplace: false,
     }
 }
 // Sequential cold walk: mixed ops + promotion/GC, model-checked after every op.
@@ -1178,6 +1229,8 @@ fn sequential_cold() -> Workload {
         seeds: scaled_seeds(16),
         pk_keyset_cache_mb: None,
         cold: true,
+        scan_from_manifest: false,
+        preplace: false,
     }
 }
 // Concurrent cold: foreground mixed delete/upsert + promotions + restarts with
@@ -1202,6 +1255,8 @@ fn concurrent_cold() -> Workload {
         seeds: scaled_seeds(6),
         pk_keyset_cache_mb: None,
         cold: true,
+        scan_from_manifest: false,
+        preplace: false,
     }
 }
 
@@ -1215,6 +1270,91 @@ async fn prop_sequential_position_impl(f: TestFixture) -> TestResult<()> {
 test_with_backends!(prop_sequential_key_impl);
 test_with_backends!(prop_sequential_position_impl);
 
+// --- Manifest hardening (commit 1): the same sequential/concurrent walks above,
+// routed through `scan_from_manifest` instead of directory listing ---
+//
+// `assert_converged`/`verify_aggregate_queries` run after every op regardless of
+// which file-resolution path the scan takes, so simply flipping
+// `scan_from_manifest` on for these existing walks fuzzes the manifest-backed
+// scan against the exact same upsert/delete/delete-all/overwrite/compact/restart
+// interleavings already exercised for directory listing — including compaction
+// (which mints a fresh snapshot's manifest), restart (which exercises
+// `backfill_snapshot_manifest_if_empty` and, on a durable metastore, resuming
+// from an already-populated manifest), and — in the concurrent variant — a
+// background compaction racing foreground manifest-writing appends.
+async fn prop_sequential_key_manifest_impl(f: TestFixture) -> TestResult<()> {
+    run_workload(
+        f,
+        Workload {
+            scan_from_manifest: true,
+            ..sequential(Mode::Key)
+        },
+    )
+    .await
+}
+async fn prop_sequential_position_manifest_impl(f: TestFixture) -> TestResult<()> {
+    run_workload(
+        f,
+        Workload {
+            scan_from_manifest: true,
+            ..sequential(Mode::Position)
+        },
+    )
+    .await
+}
+test_with_backends!(prop_sequential_key_manifest_impl);
+test_with_backends!(prop_sequential_position_manifest_impl);
+
+async fn prop_concurrent_key_manifest_impl(f: TestFixture) -> TestResult<()> {
+    run_workload(
+        f,
+        Workload {
+            scan_from_manifest: true,
+            ..concurrent_mixed(Mode::Key)
+        },
+    )
+    .await
+}
+test_with_backends!(prop_concurrent_key_manifest_impl);
+
+// --- Manifest + PRE-PLACEMENT (Stage 0b/0c) convergence ---
+//
+// Same walks as the `*_manifest_impl` variants above, but with
+// `stage_b_publish_mode: Manifest` so Stage A pre-places data files into the
+// target snapshot and Stage B publishes their manifest rows instead of moving
+// files. This fuzzes BOTH publish paths Stage 0c splits: the append-only
+// off-fence publish, and — because these are on-conflict (upsert) tables — the
+// upsert publish over pre-placed files (currently under-fence; proves it is
+// correct before any off-fence upsert refactor). `assert_converged`'s per-op
+// model check proves no row vanishes or duplicates across every
+// upsert/delete/delete-all/compact/restart interleaving, including a background
+// compaction racing foreground pre-placed appends in the concurrent variant.
+async fn prop_sequential_key_manifest_preplace_impl(f: TestFixture) -> TestResult<()> {
+    run_workload(
+        f,
+        Workload {
+            scan_from_manifest: true,
+            preplace: true,
+            ..sequential(Mode::Key)
+        },
+    )
+    .await
+}
+test_with_backends!(prop_sequential_key_manifest_preplace_impl);
+
+async fn prop_concurrent_key_manifest_preplace_impl(f: TestFixture) -> TestResult<()> {
+    run_workload(
+        f,
+        Workload {
+            scan_from_manifest: true,
+            preplace: true,
+            ..concurrent_mixed(Mode::Key)
+        },
+    )
+    .await
+}
+test_with_backends!(prop_concurrent_key_manifest_preplace_impl);
+
 // --- Memory-CDC convergence + count-exactness (mem-tier checkpoint + bake) ---
 //
 // Drives writes through the in-RAM CDC tier (`write_cdc_append_stream` /
@@ -1227,6 +1367,26 @@ async fn prop_sequential_memory_impl(f: TestFixture) -> TestResult<()> {
     run_workload(f, sequential_memory()).await
 }
 test_with_backends!(prop_sequential_memory_impl);
+
+// Manifest hardening (commit 1): the memory-durability checkpoint flush
+// (`checkpoint_mem_tier_inner`) publishes a new protected snapshot on every
+// seal + checkpoint, a code path distinct from the durable-path append/
+// on-conflict/compaction commits the other `*_manifest_impl` tests exercise.
+// It found its own manifest-authoring gap during this hardening work (fixed
+// alongside `write_new_snapshot_after_validation`), so it gets its own
+// dedicated fuzz coverage rather than assuming the durable-path coverage
+// generalizes.
+async fn prop_sequential_memory_manifest_impl(f: TestFixture) -> TestResult<()> {
+    run_workload(
+        f,
+        Workload {
+            scan_from_manifest: true,
+            ..sequential_memory()
+        },
+    )
+    .await
+}
+test_with_backends!(prop_sequential_memory_manifest_impl);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prop_concurrent_memory_sqlite() -> TestResult<()> {
@@ -1271,7 +1431,8 @@ async fn prop_concurrent_cold_sqlite() -> TestResult<()> {
 async fn reupsert_after_overwrite_delete_is_visible_impl(f: TestFixture) -> TestResult<()> {
     for mode in [Mode::Key, Mode::Position] {
         let name = format!("reupsert_min_{mode:?}");
-        let (table, ctx) = create_table(&f, &name, mode, Durability::File, None, false).await?;
+        let (table, ctx) =
+            create_table(&f, &name, mode, Durability::File, None, false, false, false).await?;
 
         overwrite(&table, &[(1, 100)]).await?;
         delete_key(&table, 1, Durability::File).await?;
@@ -1379,7 +1540,8 @@ async fn prop_concurrent_mixed_dense_bloom_position_sqlite() -> TestResult<()> {
 
 async fn run_concurrent_reads_seed(fixture: &TestFixture, mode: Mode, seed: u64) -> TestResult<()> {
     let name = format!("iso_{mode:?}_{seed}");
-    let (table, ctx) = create_table(fixture, &name, mode, Durability::File, None, false).await?;
+    let (table, ctx) =
+        create_table(fixture, &name, mode, Durability::File, None, false, false, false).await?;
     let mut rng = Rng::new(seed);
 
     let n: i64 = 200;

@@ -116,9 +116,11 @@ version = "2.2.0-unstable"
 # `tokio_unstable` is enabled via `RUSTFLAGS="--cfg tokio_unstable"` to expose the
 # per-worker tokio RuntimeMetrics (busy/park/steal). `cayenne_loom` is enabled the
 # same way (`RUSTFLAGS="--cfg cayenne_loom"`) to swap std atomics for loom's
-# model-checked ones in cayenne's `StructuralVersion` seqlock model tests. Declare
-# both so the otherwise-unknown cfg names don't trip the `unexpected_cfgs` lint on
-# builds without the flag. Declared workspace-wide (via each crate's
+# model-checked ones in cayenne's loom models: the `StructuralVersion` seqlock
+# (scan-view maintainer) and the §10.1 `PriorityMailbox` atomic orderings
+# (crates/cayenne/src/task_queue.rs). Declare both so the otherwise-unknown cfg
+# names don't trip the `unexpected_cfgs` lint on builds without the flag. Declared
+# workspace-wide (via each crate's
 # `lints.workspace = true`) rather than per-crate.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)', 'cfg(cayenne_loom)'] }
 
@@ -210,6 +212,19 @@ clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0
     "tokio_io",
     "tls",
 ] }
+# Cayenne ingest substrate (morsel pipeline, Stage 1 #3): a pinned std::thread
+# ingest pool over an MPMC channel. `core_affinity` pins ingest workers to
+# reserved cores; `crossbeam-channel` is the edge→pool descriptor channel. Both
+# were already in the lock transitively — naming them here makes them direct.
+# `st3` is the lock-free bounded LIFO work-stealing deque under the §10.1
+# three-queue `TaskQueue` (Stage 1 #3c); `crossbeam-utils` supplies `CachePadded`
+# for the `PriorityMailbox` gate atomics (false-sharing would re-serialize the
+# pool). Both were already in the lock transitively — naming them makes them
+# direct.
+core_affinity = "0.8"
+crossbeam-channel = "0.5"
+crossbeam-utils = "0.8"
+st3 = "0.4.1"
 datafusion = "54.0.0"
 datafusion-catalog = "54.0.0"
 datafusion-common = "54.0.0"
@@ -272,9 +287,10 @@ itertools = "0.14"
 linkme = "0.3.35"
 log = "0.4.22"
 logos = "0.16.1"
-# Model-checked concurrency primitives for cayenne's `StructuralVersion` seqlock
-# tests; compiled only under `RUSTFLAGS="--cfg cayenne_loom"` (a cfg-gated
-# dev-dependency), so it never enters normal builds.
+# Model-checked concurrency primitives for cayenne's loom models — the
+# `StructuralVersion` seqlock (scan-view) and the §10.1 `PriorityMailbox` orderings
+# (morsel task queue); compiled only under `RUSTFLAGS="--cfg cayenne_loom"` (a
+# cfg-gated dev-dependency), so it never enters normal builds.
 loom = "0.7"
 mailparse = "0.16.1"
 moka = { version = "0.12", features = ["future"] }
