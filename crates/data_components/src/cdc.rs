@@ -128,7 +128,19 @@ pub enum StreamError {
     MongoDB(crate::mongodb::stream::StreamError),
 }
 
-impl std::error::Error for StreamError {}
+impl std::error::Error for StreamError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            #[cfg(any(feature = "debezium", feature = "kafka"))]
+            StreamError::Kafka(e) => Some(e),
+            StreamError::Connector(e) => Some(&**e),
+            #[cfg(feature = "mongodb")]
+            StreamError::MongoDB(e) => Some(e),
+            // String-carrying variants have no underlying `Error` source.
+            _ => None,
+        }
+    }
+}
 
 impl From<ChangeBatchError> for StreamError {
     fn from(e: ChangeBatchError) -> Self {

@@ -582,8 +582,11 @@ impl DynamoDBTableProvider {
     ///
     /// # Errors
     ///
-    /// Returns an error if the truncate batch can't be built or the underlying
-    /// [`Self::bootstrap_stream`] scan fails to start.
+    /// Returns an error only if the underlying [`Self::bootstrap_stream`] scan
+    /// fails to start. A truncate-batch build failure is *not* returned here — it
+    /// is surfaced as the stream's first element (like the per-batch scan errors),
+    /// so the accelerator fails the changes stream visibly rather than skipping the
+    /// truncate.
     pub async fn overwrite_bootstrap_stream(
         self: Arc<Self>,
     ) -> Result<BoxStream<'static, Result<ChangeBatch, crate::cdc::StreamError>>> {
