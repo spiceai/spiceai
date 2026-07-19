@@ -8277,11 +8277,7 @@ impl CayenneTableProvider {
     fn flip_inlined_keyset_entries_to_file_unlocated(&self) {
         let mut guard = self.pk_keyset_cache.lock();
         if let Some(CachedPkIndex::Exact(keyset)) = guard.as_mut() {
-            for location in keyset.locations_mut() {
-                if matches!(location, RowLocation::Inlined) {
-                    *location = RowLocation::FileUnlocated;
-                }
-            }
+            keyset.flip_inlined_to_file_unlocated();
         }
         drop(guard);
         // The N>1 sharded cache carries the same per-key `RowLocation`s; flip them
@@ -8290,11 +8286,7 @@ impl CayenneTableProvider {
         let mut sharded = self.sharded_pk_keyset_cache.lock();
         if let Some(ShardedPkIndex::Exact(keysets)) = sharded.as_mut() {
             for keyset in keysets.iter_mut() {
-                for location in keyset.locations_mut() {
-                    if matches!(location, RowLocation::Inlined) {
-                        *location = RowLocation::FileUnlocated;
-                    }
-                }
+                keyset.flip_inlined_to_file_unlocated();
             }
         }
     }

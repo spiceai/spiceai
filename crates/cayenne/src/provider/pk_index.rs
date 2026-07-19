@@ -204,6 +204,26 @@ pub(crate) struct CachedPkKeyset {
     /// capture pass can skip them. Reset whenever the keyset is rebuilt (e.g.
     /// after compaction), which is exactly when the file set changes.
     pub(crate) captured_files: HashSet<Arc<str>>,
+    /// Digests of entries stamped [`RowLocation::Inlined`] since the last
+    /// [`Self::flip_inlined_to_file_unlocated`]. The post-inline-checkpoint
+    /// flip visits only these (O(recently-inlined)) instead of scanning the
+    /// whole resident keyset (O(total-keys)) — on a large table a checkpoint
+    /// flushes only a small recent batch, so the full scan was almost all
+    /// no-op iterations. EVERY location-setting method funnels an `Inlined`
+    /// stamp here (`insert_with_digest`, `try_insert_with_digest`,
+    /// `insert_if_absent`), which is the whole safety contract: nothing else
+    /// sets `Inlined`, and the only `location`-mutating path outside these
+    /// methods (position-capture via `location_mut`) only upgrades to
+    /// `FilePositioned`, away from `Inlined`. Entries later upgraded to
+    /// `FilePositioned`, or already flipped, are left as-is by the flip's
+    /// `matches!(Inlined)` guard, so stale digests in the list are harmless.
+    inlined_digests: Vec<u128>,
+    /// Set when `inlined_digests` would exceed the resident key count (heavy
+    /// re-stamping / near-whole-table inline). Bounds the list's memory to
+    /// O(keys); once set, the flip falls back to a full scan (identical
+    /// result, just not accelerated) and the list is dropped. Reset by the
+    /// flip.
+    inlined_overflow: bool,
 }
 
 impl CachedPkKeyset {
@@ -212,7 +232,27 @@ impl CachedPkKeyset {
             keys: HashMap::with_capacity_and_hasher(capacity, PrehashedBuildHasher),
             approx_bytes: 0,
             captured_files: HashSet::new(),
+            inlined_digests: Vec::new(),
+            inlined_overflow: false,
         }
+    }
+
+    /// Record that `digest` was just stamped [`RowLocation::Inlined`], so the
+    /// next [`Self::flip_inlined_to_file_unlocated`] visits it directly. Bounds
+    /// the tracking list to the resident key count: past that, a full scan is
+    /// no more expensive, so drop the list and set `inlined_overflow` (the flip
+    /// then scans). Called only for `Inlined` stamps.
+    #[inline]
+    fn note_inlined_digest(&mut self, digest: u128) {
+        if self.inlined_overflow {
+            return;
+        }
+        if self.inlined_digests.len() >= self.keys.len() {
+            self.inlined_overflow = true;
+            self.inlined_digests = Vec::new();
+            return;
+        }
+        self.inlined_digests.push(digest);
     }
 
     #[inline]
@@ -242,6 +282,7 @@ impl CachedPkKeyset {
             pk_digest(&key),
             "insert_with_digest called with a digest that does not match the key"
         );
+        let is_inlined = matches!(location, RowLocation::Inlined);
         match self.keys.entry(digest) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 entry.get_mut().location = location;
@@ -256,6 +297,9 @@ impl CachedPkKeyset {
                     sequence: 0,
                 });
             }
+        }
+        if is_inlined {
+            self.note_inlined_digest(digest);
         }
     }
 
@@ -277,7 +321,8 @@ impl CachedPkKeyset {
             pk_digest(key),
             "try_insert_with_digest called with a digest that does not match the key"
         );
-        match self.keys.entry(digest) {
+        let is_inlined = matches!(location, RowLocation::Inlined);
+        let outcome = match self.keys.entry(digest) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 entry.get_mut().location = location;
                 PkKeysetInsertOutcome::Updated
@@ -285,17 +330,24 @@ impl CachedPkKeyset {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 let entry_bytes = approx_pk_keyset_entry_bytes(key);
                 if self.approx_bytes.saturating_add(entry_bytes) > max_bytes {
-                    return PkKeysetInsertOutcome::OverBudget;
+                    PkKeysetInsertOutcome::OverBudget
+                } else {
+                    self.approx_bytes = self.approx_bytes.saturating_add(entry_bytes);
+                    entry.insert(PkKeysetEntry {
+                        row: key.clone(),
+                        location,
+                        sequence: 0,
+                    });
+                    PkKeysetInsertOutcome::Inserted
                 }
-                self.approx_bytes = self.approx_bytes.saturating_add(entry_bytes);
-                entry.insert(PkKeysetEntry {
-                    row: key.clone(),
-                    location,
-                    sequence: 0,
-                });
-                PkKeysetInsertOutcome::Inserted
             }
+        };
+        // Track the `Inlined` stamp for the fast flip — but not on OverBudget,
+        // where nothing was inserted and the entry's location is unchanged.
+        if is_inlined && outcome != PkKeysetInsertOutcome::OverBudget {
+            self.note_inlined_digest(digest);
         }
+        outcome
     }
 
     /// Insert `key` -> `location` only when the key is ABSENT, preserving an
@@ -304,7 +356,11 @@ impl CachedPkKeyset {
     /// Used by the mem-tier fold, which must not clobber a durable-scan location
     /// with `FileUnlocated`.
     pub(crate) fn insert_if_absent(&mut self, key: OwnedRow, location: RowLocation) {
-        if let std::collections::hash_map::Entry::Vacant(entry) = self.keys.entry(pk_digest(&key)) {
+        let digest = pk_digest(&key);
+        let is_inlined = matches!(location, RowLocation::Inlined);
+        let inserted = if let std::collections::hash_map::Entry::Vacant(entry) =
+            self.keys.entry(digest)
+        {
             self.approx_bytes = self
                 .approx_bytes
                 .saturating_add(approx_pk_keyset_entry_bytes(&key));
@@ -313,6 +369,14 @@ impl CachedPkKeyset {
                 location,
                 sequence: 0,
             });
+            true
+        } else {
+            // Present: the existing location is preserved (this method never
+            // clobbers), so no new `Inlined` state to track.
+            false
+        };
+        if inserted && is_inlined {
+            self.note_inlined_digest(digest);
         }
     }
 
@@ -369,10 +433,40 @@ impl CachedPkKeyset {
         self.keys.values().map(|entry| &entry.location)
     }
 
-    /// Mutable iterator over every entry's [`RowLocation`] (the
-    /// `Inlined -> FileUnlocated` flip after an inline checkpoint).
-    pub(crate) fn locations_mut(&mut self) -> impl Iterator<Item = &mut RowLocation> {
-        self.keys.values_mut().map(|entry| &mut entry.location)
+    /// Flip every currently-[`RowLocation::Inlined`] entry to
+    /// [`RowLocation::FileUnlocated`] after an inline checkpoint flushes the
+    /// memtable to Vortex files, so a later upsert tombstones a flushed key by a
+    /// key-based deletion vector rather than as a phantom inline conflict.
+    ///
+    /// Visits only the digests stamped `Inlined` since the last flip
+    /// (O(recently-inlined)) via `inlined_digests`, rather than scanning the
+    /// whole resident keyset — unless the tracking list overflowed
+    /// (`inlined_overflow`), in which case a full scan gives the identical
+    /// result. Stale digests (upgraded to `FilePositioned` by position-capture,
+    /// or already flipped) are skipped by the `matches!(Inlined)` guard.
+    pub(crate) fn flip_inlined_to_file_unlocated(&mut self) {
+        if self.inlined_overflow {
+            for entry in self.keys.values_mut() {
+                if matches!(entry.location, RowLocation::Inlined) {
+                    entry.location = RowLocation::FileUnlocated;
+                }
+            }
+            self.inlined_overflow = false;
+            self.inlined_digests.clear();
+            return;
+        }
+        // `mem::take` detaches the list so the drain borrows a local while the
+        // loop body freely borrows `self.keys` (avoids a split-borrow on
+        // `self`); the emptied Vec is restored to reuse its capacity.
+        let mut digests = std::mem::take(&mut self.inlined_digests);
+        for digest in digests.drain(..) {
+            if let Some(entry) = self.keys.get_mut(&digest) {
+                if matches!(entry.location, RowLocation::Inlined) {
+                    entry.location = RowLocation::FileUnlocated;
+                }
+            }
+        }
+        self.inlined_digests = digests;
     }
 
     /// Consume the keyset into `(key, location)` pairs (the shard split).

@@ -483,5 +483,9 @@ name = "pk_keyset_present_path"
 harness = false
 name = "validate_shard_keyset_presize_rehash"
 
+[[bench]]
+harness = false
+name = "flip_inlined_keyset_pending_list"
+
 [lints]
 workspace = true
