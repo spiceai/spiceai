@@ -402,13 +402,13 @@ flatbuffers = "25.2.10"
 # Vortex tagged releases publish version 0.1.0 in their Cargo.toml, not the actual release version,
 # so we specify git deps here directly. The [patch.crates-io] entries below exist to override
 # transitive vortex dependencies pulled in by other patched crates.
-vortex = { git = "https://github.com/spiceai/vortex.git", rev = "9de41742192021f6f16791254da0434f9450a25d" } # DIAG cold-stall-vortex-diag (0.76.0 + readat/decode tracing + cherry-pick #8677 #8711 detached-driver fix) off 409505dfd0 — revert before merge
-vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "9de41742192021f6f16791254da0434f9450a25d" } # DIAG cold-stall-vortex-diag (0.76.0 + readat/decode tracing + cherry-pick #8677 #8711 detached-driver fix) off 409505dfd0 — revert before merge
-vortex-btrblocks = { git = "https://github.com/spiceai/vortex.git", rev = "9de41742192021f6f16791254da0434f9450a25d" } # DIAG cold-stall-vortex-diag (0.76.0 + readat/decode tracing + cherry-pick #8677 #8711 detached-driver fix) off 409505dfd0 — revert before merge
+vortex = { git = "https://github.com/spiceai/vortex.git", rev = "831b80530adbdd7dac59f58ee51c1d2bf6241a3b" } # DIAG cold-stall-vortex-diag (0.76.0 + readat/decode tracing + cherry-pick #8677 #8711 detached-driver fix) off 409505dfd0 — revert before merge
+vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "831b80530adbdd7dac59f58ee51c1d2bf6241a3b" } # DIAG cold-stall-vortex-diag (0.76.0 + readat/decode tracing + cherry-pick #8677 #8711 detached-driver fix) off 409505dfd0 — revert before merge
+vortex-btrblocks = { git = "https://github.com/spiceai/vortex.git", rev = "831b80530adbdd7dac59f58ee51c1d2bf6241a3b" } # DIAG cold-stall-vortex-diag (0.76.0 + readat/decode tracing + cherry-pick #8677 #8711 detached-driver fix) off 409505dfd0 — revert before merge
 vortex-datafusion = { path = "crates/vortex" }
-vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "9de41742192021f6f16791254da0434f9450a25d" } # DIAG cold-stall-vortex-diag (0.76.0 + readat/decode tracing + cherry-pick #8677 #8711 detached-driver fix) off 409505dfd0 — revert before merge
-vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "9de41742192021f6f16791254da0434f9450a25d" } # DIAG cold-stall-vortex-diag (0.76.0 + readat/decode tracing + cherry-pick #8677 #8711 detached-driver fix) off 409505dfd0 — revert before merge
-vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "9de41742192021f6f16791254da0434f9450a25d" } # DIAG cold-stall-vortex-diag (0.76.0 + readat/decode tracing + cherry-pick #8677 #8711 detached-driver fix) off 409505dfd0 — revert before merge
+vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "831b80530adbdd7dac59f58ee51c1d2bf6241a3b" } # DIAG cold-stall-vortex-diag (0.76.0 + readat/decode tracing + cherry-pick #8677 #8711 detached-driver fix) off 409505dfd0 — revert before merge
+vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "831b80530adbdd7dac59f58ee51c1d2bf6241a3b" } # DIAG cold-stall-vortex-diag (0.76.0 + readat/decode tracing + cherry-pick #8677 #8711 detached-driver fix) off 409505dfd0 — revert before merge
+vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "831b80530adbdd7dac59f58ee51c1d2bf6241a3b" } # DIAG cold-stall-vortex-diag (0.76.0 + readat/decode tracing + cherry-pick #8677 #8711 detached-driver fix) off 409505dfd0 — revert before merge
 
 x509-certificate = "0.25.0"
 spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "93b75c3c7d1a812b23d00b45adf537d7a2415496" } # spiceai/spice-rs#77
@@ -540,9 +540,9 @@ arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a4037
 arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" } # branch: lukim/spiceai-58.3.0
 parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" }      # branch: lukim/spiceai-58.3.0
 
-vortex = { git = "https://github.com/spiceai/vortex.git", rev = "9de41742192021f6f16791254da0434f9450a25d" } # DIAG cold-stall-vortex-diag (0.76.0 + readat/decode tracing + cherry-pick #8677 #8711 detached-driver fix) off 409505dfd0 — revert before merge
-vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "9de41742192021f6f16791254da0434f9450a25d" } # DIAG cold-stall-vortex-diag (0.76.0 + readat/decode tracing + cherry-pick #8677 #8711 detached-driver fix) off 409505dfd0 — revert before merge
+vortex = { git = "https://github.com/spiceai/vortex.git", rev = "831b80530adbdd7dac59f58ee51c1d2bf6241a3b" } # DIAG cold-stall-vortex-diag (0.76.0 + readat/decode tracing + cherry-pick #8677 #8711 detached-driver fix) off 409505dfd0 — revert before merge
+vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "831b80530adbdd7dac59f58ee51c1d2bf6241a3b" } # DIAG cold-stall-vortex-diag (0.76.0 + readat/decode tracing + cherry-pick #8677 #8711 detached-driver fix) off 409505dfd0 — revert before merge
 vortex-datafusion = { path = "crates/vortex" }
-vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "9de41742192021f6f16791254da0434f9450a25d" } # DIAG cold-stall-vortex-diag (0.76.0 + readat/decode tracing + cherry-pick #8677 #8711 detached-driver fix) off 409505dfd0 — revert before merge
-vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "9de41742192021f6f16791254da0434f9450a25d" } # DIAG cold-stall-vortex-diag (0.76.0 + readat/decode tracing + cherry-pick #8677 #8711 detached-driver fix) off 409505dfd0 — revert before merge
-vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "9de41742192021f6f16791254da0434f9450a25d" } # DIAG cold-stall-vortex-diag (0.76.0 + readat/decode tracing + cherry-pick #8677 #8711 detached-driver fix) off 409505dfd0 — revert before merge
+vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "831b80530adbdd7dac59f58ee51c1d2bf6241a3b" } # DIAG cold-stall-vortex-diag (0.76.0 + readat/decode tracing + cherry-pick #8677 #8711 detached-driver fix) off 409505dfd0 — revert before merge
+vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "831b80530adbdd7dac59f58ee51c1d2bf6241a3b" } # DIAG cold-stall-vortex-diag (0.76.0 + readat/decode tracing + cherry-pick #8677 #8711 detached-driver fix) off 409505dfd0 — revert before merge
+vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "831b80530adbdd7dac59f58ee51c1d2bf6241a3b" } # DIAG cold-stall-vortex-diag (0.76.0 + readat/decode tracing + cherry-pick #8677 #8711 detached-driver fix) off 409505dfd0 — revert before merge
