@@ -81,6 +81,22 @@ runtime = "runtime"
 # Extensions that sit above the runtime crate (depend on `runtime`).
 spice-cloud = "extension"
 tpc-extension = "extension"
+# TEMPORARY (see docs/dev/crate_layering.md). This crate lives under
+# crates/data-connectors/ (which the path rule would place in `extension`), but
+# it is a leaf helper — its entire workspace-internal dep closure is empty (only
+# external deps: datafusion-common, datafusion-table-providers, snafu,
+# tokio-postgres). It holds the PostgreSQL catalog/CDC-support queries
+# (list_schemas/list_tables/primary_key_columns/check_cdc_prerequisites), which
+# `data_components::postgres::provider` re-exports so `runtime` reaches them
+# WITHOUT a direct dependency on a connector-* crate. Placing it in
+# `shared-utility` keeps the data_components -> connector-postgres-common edge a
+# legal same-tier dep. The eventual goal is to consolidate ALL PostgreSQL
+# functionality — `data_components::postgres`, this crate, and
+# `runtime::catalogconnector::postgres_accelerated` — into a single
+# `connector-postgres` crate that owns the CDC mechanisms; once runtime no longer
+# depends (even transitively via re-export) on these queries, drop this override
+# so the crate returns to the default `extension` tier.
+connector-postgres-common = "shared-utility"
 
 # --- foundation: near-dependency-free utilities + config/platform primitives.
 # (crates/ libraries whose full normal-dep closure stays within foundation.)
