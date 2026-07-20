@@ -1482,7 +1482,15 @@ impl DataFusion {
         // has its own dedicated runtime and memory carve-out.
         let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
         let query_reserve = (cores / 4).max(2);
-        let encode_budget = cores.saturating_sub(query_reserve).max(1);
+        // `SPICE_CAYENNE_ENCODE_BUDGET` overrides the derived cores−reserve budget for
+        // the ingest-vs-query CPU experiment (raising it lets drain-encode keep up
+        // faster at the cost of query CPU); unset/unparseable/`< 1` uses the derived
+        // default. `SPICE_`-prefixed so the HTAP CI `spiced_env` allowlist accepts it.
+        let encode_budget = std::env::var("SPICE_CAYENNE_ENCODE_BUDGET")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or_else(|| cores.saturating_sub(query_reserve).max(1));
         cayenne::set_global_encode_concurrency(encode_budget);
         tracing::info!(
             encode_budget,

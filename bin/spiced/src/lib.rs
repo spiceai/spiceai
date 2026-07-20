@@ -687,7 +687,12 @@ pub async fn run(args: Args) -> Result<()> {
     match App::get_runtime_param_opt::<String>(&app, "dedicated_thread_pool").as_deref() {
         Some("sql_engine") | None => {
             // This needs to be created after tracing is set up, or else task_history events aren't emitted.
-            let cpu_runtime = ManagedTokioRuntime::try_new()
+            // Named so the runtime-consolidation experiment can per-runtime-cap it via
+            // SPICE_ASYNC_WORKER_THREADS_CPU_WORKER (it is the query/DataFusion runtime
+            // measured as the swamped one); the global SPICE_ASYNC_WORKER_THREADS also caps it.
+            let cpu_runtime = ManagedTokioRuntime::builder()
+                .with_thread_name("cpu-worker")
+                .build()
                 .boxed()
                 .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
 

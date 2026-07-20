@@ -125,6 +125,75 @@ impl ManagedTokioRuntimeBuilder {
         self
     }
 
+    /// Resolve the worker-thread count, honoring the experiment env overrides:
+    /// a per-runtime `SPICE_ASYNC_WORKER_THREADS_<THREAD_NAME>` (name upper-cased,
+    /// non-alphanumeric → `_`) takes precedence over the global
+    /// `SPICE_ASYNC_WORKER_THREADS`; an unset/unparseable/`< 1` value falls back to
+    /// `default`. Right-sizes worker pools only — does not merge runtimes.
+    fn resolve_worker_threads(&self, default: usize) -> usize {
+        fn parse_pos(v: &str) -> Option<usize> {
+            v.trim().parse::<usize>().ok().filter(|n| *n >= 1)
+        }
+        if let Some(name) = &self.thread_name {
+            let key: String = name
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() {
+                        c.to_ascii_uppercase()
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            if let Some(n) = std::env::var(format!("SPICE_ASYNC_WORKER_THREADS_{key}"))
+                .ok()
+                .and_then(|v| parse_pos(&v))
+            {
+                return n;
+            }
+        }
+        std::env::var("SPICE_ASYNC_WORKER_THREADS")
+            .ok()
+            .and_then(|v| parse_pos(&v))
+            .unwrap_or(default)
+    }
+
+    /// Resolve the nice value for low-priority worker threads, honoring the
+    /// experiment env overrides: a per-runtime `SPICE_ASYNC_NICE_<THREAD_NAME>`
+    /// (name upper-cased, non-alphanumeric → `_`) takes precedence over the
+    /// global `SPICE_ASYNC_NICE`; unset/unparseable/out-of-range falls back to
+    /// `default`. Clamped to setpriority's valid range `[-20, 19]`. Lets the
+    /// compaction-vs-query CPU experiment raise background-runtime priority
+    /// (e.g. compaction nice 10 → 0) without a rebuild.
+    #[cfg(unix)]
+    fn resolve_nice(&self, default: i32) -> i32 {
+        fn parse_nice(v: &str) -> Option<i32> {
+            v.trim().parse::<i32>().ok().filter(|n| (-20..=19).contains(n))
+        }
+        if let Some(name) = &self.thread_name {
+            let key: String = name
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() {
+                        c.to_ascii_uppercase()
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            if let Some(n) = std::env::var(format!("SPICE_ASYNC_NICE_{key}"))
+                .ok()
+                .and_then(|v| parse_nice(&v))
+            {
+                return n;
+            }
+        }
+        std::env::var("SPICE_ASYNC_NICE")
+            .ok()
+            .and_then(|v| parse_nice(&v))
+            .unwrap_or(default)
+    }
+
     /// Build the runtime.
     ///
     /// # Errors
@@ -132,7 +201,17 @@ impl ManagedTokioRuntimeBuilder {
     /// Returns [`Error::RuntimeCreation`] if the Tokio runtime cannot be constructed.
     pub fn build(self) -> Result<ManagedTokioRuntime> {
         let cpu_cores = num_cpus::get();
-        let worker_threads = std::cmp::max(cpu_cores.saturating_sub(1), 1);
+        let default_workers = std::cmp::max(cpu_cores.saturating_sub(1), 1);
+        // EXPERIMENT (runtime-consolidation, env-toggleable — no rebuild): each managed
+        // runtime otherwise sizes to `num_cpus-1`, so N runtimes oversubscribe the box
+        // by ~N× (measured: query-`cpu` + compaction runtimes swamped while others idle).
+        // `SPICE_ASYNC_WORKER_THREADS_<THREAD_NAME>` (name upper-cased, non-alnum→`_`)
+        // caps one runtime; the global `SPICE_ASYNC_WORKER_THREADS` caps all; unset or
+        // invalid (<1) falls back to the default. This only right-sizes worker pools —
+        // it never MERGES runtimes, so runtime isolation (e.g. the HTTP/`/health`
+        // runtime staying responsive under query load) is unchanged. The
+        // `tokio_runtime_workers` gauge reports the applied count for confirmation.
+        let worker_threads = self.resolve_worker_threads(default_workers);
 
         let mut builder = tokio::runtime::Builder::new_multi_thread();
         builder
@@ -147,11 +226,14 @@ impl ManagedTokioRuntimeBuilder {
         // Set low priority on worker threads if requested (Unix only)
         #[cfg(unix)]
         if self.low_priority {
-            builder.on_thread_start(|| {
-                // Set nice value to 10 (lower priority than default 0, range is -20 to 19)
+            // Default nice 10 (lower priority than default 0, range -20 to 19);
+            // overridable per-runtime via `SPICE_ASYNC_NICE_<THREAD_NAME>` for the
+            // compaction-vs-query CPU experiment.
+            let nice = self.resolve_nice(10);
+            builder.on_thread_start(move || {
                 // SAFETY: setpriority is safe to call with PRIO_PROCESS and 0 (current thread)
                 unsafe {
-                    libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+                    libc::setpriority(libc::PRIO_PROCESS, 0, nice);
                 }
             });
         }
