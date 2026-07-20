@@ -117,7 +117,7 @@ fn append_change_event(
         return Ok(());
     }
 
-    let op = change.payload.op.to_string();
+    let op = change.payload.op.as_str();
     let change_data = match change.payload.op {
         Op::Delete => change
             .payload
@@ -131,7 +131,7 @@ fn append_change_event(
         struct_builder,
         schema,
         primary_key,
-        &op,
+        op,
         change_data,
         projection,
     )

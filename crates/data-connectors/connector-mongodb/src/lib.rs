@@ -696,18 +696,22 @@ async fn mongodb_inferred_schema_metadata(
     {
         Ok(Ok(details)) => details,
         Ok(Err(error)) => {
-            tracing::debug!(
+            // Graceful degradation: catalog enrichment failed (commonly the user
+            // lacks listIndexes/listCollections/collStats access). Fall back to the
+            // structural `_id` primary key only; secondary indexes, sort, and sizing
+            // are not inferred.
+            tracing::info!(
                 collection = collection_name,
                 %error,
-                "MongoDB catalog enrichment failed; inferring the `_id` primary key only"
+                "MongoDB schema inference degraded to the `_id` primary key only: catalog enrichment failed, usually because the connection user lacks catalog access. Secondary indexes, sort order, and sizing were not inferred."
             );
             MongoCatalogDetails::primary_key_only(&primary_key)
         }
         Err(_elapsed) => {
-            tracing::debug!(
+            tracing::info!(
                 collection = collection_name,
                 timeout_secs = MONGODB_CATALOG_TIMEOUT.as_secs(),
-                "MongoDB catalog enrichment timed out; inferring the `_id` primary key only"
+                "MongoDB schema inference degraded to the `_id` primary key only: catalog enrichment timed out. Secondary indexes, sort order, and sizing were not inferred."
             );
             MongoCatalogDetails::primary_key_only(&primary_key)
         }
@@ -725,21 +729,19 @@ async fn mongodb_inferred_schema_metadata(
     }
 }
 
-/// Enrich the provider's schema with inferred primary key / indexes / sort columns
-/// when the dataset opts into `schema_inference: extended`.
+/// Enrich the provider's schema with the inferred primary key / indexes / sort
+/// columns. Inference is always attempted; the `_id` primary key is structural
+/// (always available) and catalog enrichment (indexes, sort, sizing) is
+/// best-effort, degrading gracefully when the source restricts catalog access.
 async fn enrich_with_mongodb_metadata(
     pool: &Arc<MongoDBConnectionPool>,
     dataset: &Dataset,
     provider: Arc<dyn TableProvider>,
 ) -> Arc<dyn TableProvider> {
-    if !dataset.schema_inference.is_extended() {
-        return provider;
-    }
-
     tracing::debug!(
         dataset = %dataset.name,
         collection = %dataset.path(),
-        "Applying MongoDB extended schema inference (inferring `_id` primary key; catalog enrichment is best-effort)"
+        "Applying MongoDB schema inference (inferring `_id` primary key; catalog enrichment is best-effort)"
     );
     let inferred = mongodb_inferred_schema_metadata(pool, dataset.path()).await;
     if inferred.is_empty() {
@@ -753,7 +755,7 @@ async fn enrich_with_mongodb_metadata(
         sort_columns = inferred.sort_columns.len(),
         row_count = ?inferred.row_count,
         table_bytes = ?inferred.table_bytes,
-        "Inferred extended schema metadata from MongoDB catalog"
+        "Inferred schema metadata from MongoDB catalog"
     );
     data_components::metadata_enriched_table_provider(
         provider,

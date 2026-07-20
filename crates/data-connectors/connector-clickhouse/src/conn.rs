@@ -18,9 +18,9 @@ use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::block_to_arrow::block_to_arrow;
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
-use arrow_sql_gen::clickhouse::block_to_arrow;
 use async_stream::stream;
 use clickhouse_rs::{Block, ClientHandle, Pool};
 use datafusion::error::DataFusionError;
@@ -37,16 +37,16 @@ use snafu::prelude::*;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to connect to ClickHouse: {source}"))]
-    ConnectionPoolError {
+    ConnectionPool {
         source: clickhouse_rs::errors::Error,
     },
     #[snafu(display("Failed to execute ClickHouse query: {source}"))]
-    QueryError {
+    Query {
         source: clickhouse_rs::errors::Error,
     },
     #[snafu(display("Failed to convert query result to Arrow: {source}"))]
-    ConversionError {
-        source: arrow_sql_gen::clickhouse::Error,
+    Conversion {
+        source: crate::block_to_arrow::Error,
     },
 }
 
