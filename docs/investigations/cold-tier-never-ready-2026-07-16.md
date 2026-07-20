@@ -585,3 +585,36 @@ build (29708508223).
 
 Static analysis is now exhausted; the permanent-freeze native backtrace (promotion/scan thread's parked
 frame) remains the discriminator. Mechanism-capture continues on the dumper build (`4e1166096d`).
+
+### Cayenne sort-run driver reviewed (same day) — convergence on "parked scan"
+
+Traced the cold-write sort pipeline in `crates/cayenne/src/provider/streaming.rs`:
+- `bounded_sort_stream` (line 459) sorts in **sequential byte-bounded runs** via an `unfold` loop; each run
+  mints a fresh `SortExec` over `ChunkedSource::next_chunk(Bytes(run_size))`. The freeze is documented in-code
+  as "a `run_idx>=1` SortExec starts but never emits" (line 965) — i.e. a run-boundary stall.
+- `ChunkedSource`/`ChunkStream` (185-317): shares ONE inner scan stream across runs; enforces the
+  consume-sequentially contract by **poisoning** an overlapping chunk (typed error, not a hang) and polls the
+  inner stream synchronously under a `parking_lot::Mutex` **never held across `.await`** (poll_next is sync).
+  Boundary resumption is correct — run N ends at the cap via `Ready(None)` without polling inner; run N+1's
+  first poll re-registers its waker in the scan's `FuturesUnordered`, which drains any children that completed
+  in the gap. No lost-wake found here.
+- The regression guard `bounded_sort_concurrent_multi_run_spilling_does_not_deadlock` (line 972) uses a plain
+  `RecordBatchStreamAdapter` async input, **not** the real vortex `LazyScanStream` — so it cannot reproduce a
+  vortex-scan lost-wake. It passes; it is a guard, not a live repro.
+
+**Convergence.** The cayenne team's own documented hypothesis (lines 1062-1073) is: `GreedyMemoryPool` errors
+on exhaustion (never blocks), so "the CI HANG must involve a component that WAITS rather than errors — the
+parked cross-tier scan holding pool memory while the sort waits for its input — a circular wait." That lands
+on the exact same place as this session's source review: **the scan returns Pending and is never re-woken,
+holding `write_lock` + pool memory.** Neither the code comments nor a full re-read of oneshot / ChunkStream /
+buffer_unordered can name the dropped-wake site — every visible wake layer re-registers correctly.
+
+**Refined discriminator for the pending native backtrace** (the only remaining way to reach 100%):
+- scan/promotion thread **idle-parked at an `.await`**, no lock frame, all tokio workers idle ⇒ a lost-wake
+  inside `FuturesUnordered`/`buffer_unordered` or tokio scheduling (not app code, not oneshot);
+- all tokio workers **busy/blocked** with the scan's spawned split-reads queued ⇒ **worker-pool starvation**
+  (the eager `handle.spawn` tasks can't be scheduled) — a scheduling deadlock, not a lost-wake;
+- a `parking_lot::…::RawRwLock::lock`/`RawMutex::lock`/`lock_slow` frame on the promotion or a worker thread
+  ⇒ **lock deadlock** (names the lock).
+The scan-park counters from frozen run 29699291451 (`completed≈spawned`, ~78 undrained/unyielded) favor the
+first (drain-side lost-wake: tasks completed, results never drained) over starvation — the backtrace confirms.
