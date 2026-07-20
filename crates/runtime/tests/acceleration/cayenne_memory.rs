@@ -154,6 +154,19 @@ async fn test_cayenne_memory_mode_full_refresh_and_query() -> Result<(), anyhow:
                 "memory mode must not write anything to disk, but {data_path:?} exists"
             );
 
+            // Regression for #11922: memory mode must not create a stray, empty
+            // `file:` directory in the process working directory. The bug was a
+            // `file://`-schemed object-store URL reaching `create_dir_all`
+            // verbatim, so `create_dir_all("file:///")` collapsed to a single
+            // `file:` component.
+            let stray = std::env::current_dir()?.join("file:");
+            let stray_exists = stray.exists();
+            let _ = std::fs::remove_dir_all(&stray);
+            assert!(
+                !stray_exists,
+                "memory mode must not create a stray {stray:?} directory (#11922)"
+            );
+
             Ok(())
         })
         .await
