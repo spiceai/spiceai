@@ -51,7 +51,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 
 const SCHEMA_INFERENCE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -568,9 +567,6 @@ impl DataConnector for Debezium {
         &self,
         federated_table: Arc<FederatedTable>,
         _dataset: &Dataset,
-        _accelerated_table_provider: Arc<dyn TableProvider>,
-        _accelerator_write_mutex: Arc<Mutex<()>>,
-        _cpu_runtime: Option<tokio::runtime::Handle>,
     ) -> Option<ChangesStream> {
         Some(Box::pin(stream! {
             let table_provider = federated_table.table_provider().await;
