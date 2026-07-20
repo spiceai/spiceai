@@ -177,9 +177,9 @@ fn columns() -> Vec<ColumnSpec> {
     specs.push(ColumnSpec {
         field: Field::new("c_id", DataType::Int32, true),
         make: Box::new(|_rng, base| {
-            Arc::new(Int32Array::from_iter_values((0..8192_usize).map(move |i| {
-                i32::try_from((base + i) % 3000 + 1).expect("bounded by 3000")
-            })))
+            Arc::new(Int32Array::from_iter_values((0..8192_usize).map(
+                move |i| i32::try_from((base + i) % 3000 + 1).expect("bounded by 3000"),
+            )))
         }),
     });
 
@@ -278,9 +278,9 @@ fn columns() -> Vec<ColumnSpec> {
     specs.push(ColumnSpec {
         field: Field::new("f_rand", DataType::Float64, true),
         make: Box::new(|rng, _| {
-            Arc::new(Float64Array::from_iter_values(
-                (0..8192_usize).map(|_| f64::from_bits(0x3FF0_0000_0000_0000 | (rng.next() >> 12))),
-            ))
+            Arc::new(Float64Array::from_iter_values((0..8192_usize).map(|_| {
+                f64::from_bits(0x3FF0_0000_0000_0000 | (rng.next() >> 12))
+            })))
         }),
     });
 
@@ -354,8 +354,7 @@ async fn roundtrip(
 
     let dtype = DType::from_arrow(Arc::clone(schema));
     let owned: Vec<RecordBatch> = batches.to_vec();
-    let stream =
-        futures::stream::iter(owned.into_iter().map(|rb| ArrayRef::from_arrow(rb, false)));
+    let stream = futures::stream::iter(owned.into_iter().map(|rb| ArrayRef::from_arrow(rb, false)));
     let adapter = ArrayStreamAdapter::new(dtype, stream);
 
     let mut buf = ByteBufferMut::empty();
