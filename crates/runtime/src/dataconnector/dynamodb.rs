@@ -42,7 +42,6 @@ use snafu::ResultExt;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
-use tokio::sync::Mutex;
 use util::time_format::is_valid_format;
 
 // If we get `ShardNotFound` or `StreamBeyondRetention` on startup and checkpoint is old enough,
@@ -371,13 +370,6 @@ impl DataConnector for DynamoDB {
         &self,
         federated_table: Arc<FederatedTable>,
         dataset: &Dataset,
-        // The DynamoDB connector no longer writes the accelerator directly: it
-        // emits a Truncate + snapshot through the CDC change contract (see
-        // `emit_overwrite_then_live`), so the runtime's accelerator write path
-        // and CPU runtime are unused here.
-        _accelerated_table_provider: Arc<dyn TableProvider>,
-        _accelerator_write_mutex: Arc<Mutex<()>>,
-        _cpu_runtime: Option<tokio::runtime::Handle>,
     ) -> Option<ChangesStream> {
         let dataset = dataset.clone();
 
