@@ -29,7 +29,9 @@ use crate::dynamodb::json_nest::project_dynamodb_row;
 use crate::dynamodb::request_builder::DynamoDBRequestPlanBuilder;
 use crate::dynamodb::request_plan::{DynamoDBRequestPlan, QueryParams, ScanParams};
 use crate::dynamodb::schema::infer_arrow_schema_from_rows;
-use crate::dynamodb::stream::{StreamError, process_batch, record_batch_to_change_batch};
+use crate::dynamodb::stream::{
+    StreamError, process_batch, record_batch_to_change_batch, truncate_change_batch,
+};
 use crate::dynamodb::table_schema::DynamoDBTableSchema;
 use crate::dynamodb::unnest::unnest_dynamodb_rows;
 use crate::schema_discovery::merge_inferred_and_declared_schemas;
@@ -513,7 +515,7 @@ impl DynamoDBTableProvider {
                     &time_format,
                     projection.as_ref(),
                 )
-                .map_err(crate::cdc::StreamError::DynamoDB)
+                .map_err(crate::cdc::StreamError::from)
             });
 
         Ok(Box::pin(stream))
@@ -561,14 +563,47 @@ impl DynamoDBTableProvider {
                         record_batch.num_rows()
                     );
                     record_batch_to_change_batch(record_batch, &schema, &primary_keys)
-                        .map_err(crate::cdc::StreamError::DynamoDB)
+                        .map_err(crate::cdc::StreamError::from)
                 }
-                Err(e) => Err(crate::cdc::StreamError::DynamoDB(
-                    StreamError::FailedToReadRecordBatch { source: e },
-                )),
+                Err(e) => Err(StreamError::FailedToReadRecordBatch { source: e }.into()),
             });
 
         Ok(stream.boxed())
+    }
+
+    /// Full-overwrite bootstrap as a CDC change stream: a leading `op="t"`
+    /// truncate barrier followed by the table scan as `op="c"` inserts.
+    ///
+    /// Chained ahead of the live changes stream, this replaces the accelerator's
+    /// contents — dropping rows deleted at the source since the last checkpoint —
+    /// using only the CDC change contract, so the connector needs no direct
+    /// accelerator write path (`TableSink`/`InsertOp::Overwrite`). The truncate is
+    /// a no-op on an empty accelerator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if the underlying [`Self::bootstrap_stream`] scan
+    /// fails to start. A truncate-batch build failure is *not* returned here — it
+    /// is surfaced as the stream's first element (like the per-batch scan errors),
+    /// so the accelerator fails the changes stream visibly rather than skipping the
+    /// truncate.
+    pub async fn overwrite_bootstrap_stream(
+        self: Arc<Self>,
+    ) -> Result<BoxStream<'static, Result<ChangeBatch, crate::cdc::StreamError>>> {
+        // A truncate-build failure flows as the stream's first element (like the
+        // per-batch scan errors below), not as a setup error — the accelerator
+        // then surfaces it on the changes stream rather than silently skipping.
+        let truncate = truncate_change_batch(
+            self.table_schema.schema(),
+            &self.table_schema.primary_keys(),
+        )
+        .map_err(crate::cdc::StreamError::from);
+
+        let snapshot = Arc::clone(&self).bootstrap_stream().await?;
+
+        Ok(stream::once(async move { truncate })
+            .chain(snapshot)
+            .boxed())
     }
 
     #[must_use]

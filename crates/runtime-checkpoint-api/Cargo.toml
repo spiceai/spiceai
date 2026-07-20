@@ -1,0 +1,17 @@
+[package]
+name = "runtime-checkpoint-api"
+description = "CDC checkpoint/offset store interface: a per-dataset keyed blob store the accelerator implements and data-source connectors call."
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+snafu.workspace = true
+
+[lints]
+workspace = true

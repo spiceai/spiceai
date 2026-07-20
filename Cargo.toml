@@ -33,6 +33,7 @@ members = [
     "crates/package",
     "crates/runtime",
     "crates/runtime-api-types",
+    "crates/runtime-checkpoint-api",
     "crates/runtime-auth",
     "crates/runtime-metrics",
     "crates/runtime-async",
