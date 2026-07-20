@@ -303,7 +303,7 @@ async fn wait_for_executor_count(
     let start = Instant::now();
     loop {
         let count = manager
-            .get_executor_state()
+            .get_executors_state()
             .await
             .map_err(|e| anyhow::Error::msg(e.to_string()))?
             .len();
