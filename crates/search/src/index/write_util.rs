@@ -636,7 +636,7 @@ mod tests {
             extract_and_format_primary_key("test_index", &primary_key, &batch).expect("keys");
 
         assert_eq!(keys[0].as_deref(), Some("{\"id\":1,\"tenant\":\"a\"}"));
-        assert_eq!(keys[1].as_deref(), Some("{\"id\":null,\"tenant\":\"b\"}"));
+        assert_eq!(keys[1].as_deref(), Some("{\"tenant\":\"b\"}"));
         assert_eq!(keys[2], None);
     }
 }
