@@ -322,16 +322,67 @@ pub(crate) struct MemSegment {
     pub(crate) source_position: Option<u64>,
 }
 
+/// Newtype over the persistent segment vector carrying a MANUAL `Send`/`Sync`
+/// impl.
+///
+/// `im::Vector<MemSegment>` genuinely IS `Send + Sync` — every field of
+/// `MemSegment` is (`Arc<...>`, `i64`, and the `im::HashMap`-based tombstones,
+/// which are themselves `Send + Sync`). But `im`'s deeply-recursive HAMT node
+/// types make the compiler's AUTO-derivation of `Send`/`Sync` overflow the
+/// per-crate `recursion_limit` once this vector is nested (segment →
+/// `SegmentTombstones` → `im::HashMap<i64, ()>` → `im::nodes::hamt::Node`) and
+/// evaluated by a crate that transitively depends on cayenne — an `E0275`
+/// "overflow evaluating `..: Send`" in the `connector-*` / `spice-cloud` libs.
+/// Asserting the true fact here short-circuits that recursion at this field (the
+/// compiler uses the manual impl instead of recursing through `im`'s nodes), so
+/// nothing false is claimed. `Deref`/`DerefMut` expose the underlying vector, so
+/// call sites read / iterate / `push_back` exactly as before.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SegmentVec(im::Vector<MemSegment>);
+
+// SAFETY: the wrapped `im::Vector<MemSegment>` is `Send` (all of `MemSegment`'s
+// fields are); this impl only bypasses the compiler's recursion-limited
+// auto-derivation of that same fact — see the type docs.
+unsafe impl Send for SegmentVec {}
+// SAFETY: see the `Send` impl above — identical reasoning for `Sync`.
+unsafe impl Sync for SegmentVec {}
+
+impl SegmentVec {
+    fn new() -> Self {
+        SegmentVec(im::Vector::new())
+    }
+}
+
+impl std::ops::Deref for SegmentVec {
+    type Target = im::Vector<MemSegment>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for SegmentVec {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl FromIterator<MemSegment> for SegmentVec {
+    fn from_iter<I: IntoIterator<Item = MemSegment>>(iter: I) -> Self {
+        SegmentVec(iter.into_iter().collect())
+    }
+}
+
 /// The in-memory CDC tier for one table. Immutable once constructed: every
 /// mutation produces a new `Arc<MemTier>` that is stored into the provider's
 /// `ArcSwap`, so concurrent readers always observe a consistent snapshot and a
 /// writer's swap is O(1).
 #[derive(Debug, Clone)]
 pub(crate) struct MemTier {
-    /// Append-log of segments. `Arc<Vec<MemSegment>>` so a swap rebuilds only
-    /// the outer Vec (cloning `Arc<Vec<RecordBatch>>` element pointers), never
-    /// the batch data.
-    pub(crate) segments: Arc<Vec<MemSegment>>,
+    /// Append-log of segments as a persistent vector ([`SegmentVec`] over
+    /// `im::Vector`): a clone is an O(1) structural share and `push_back` is
+    /// O(log n), so an append no longer rebuilds the whole outer Vec — the old
+    /// `Arc<Vec<MemSegment>>` paid an O(N) element-pointer clone per append, i.e.
+    /// O(N^2) over a checkpoint window at high segment counts. Element data
+    /// (`Arc<Vec<RecordBatch>>`) is never deep-copied either way.
+    pub(crate) segments: SegmentVec,
     /// In-RAM tombstones accumulated across this tier's segments. Held as
     /// structurally-shared persistent maps ([`InMemTombstones`] over
     /// [`im::HashMap`]), so [`MemTier::append_segment`]'s clone of this field is
@@ -381,7 +432,7 @@ impl MemTier {
     /// only ever appended to when `cdc_durability: memory`).
     pub(crate) fn empty() -> Self {
         Self {
-            segments: Arc::new(Vec::new()),
+            segments: SegmentVec::new(),
             tombstones: InMemTombstones::default(),
             bytes: 0,
             rows: 0,
@@ -468,9 +519,10 @@ impl MemTier {
         let mut merged_tombstones = self.tombstones.clone();
         merged_tombstones.merge_segment(&tombstones);
 
-        let mut segments = Vec::with_capacity(self.segments.len() + 1);
-        segments.extend(self.segments.iter().cloned());
-        segments.push(MemSegment {
+        // O(1) structural-share clone of the persistent vector + O(log n)
+        // push_back — NOT the old O(N) rebuild of the whole outer Vec.
+        let mut segments = self.segments.clone();
+        segments.push_back(MemSegment {
             batches,
             data_sequence,
             statistics,
@@ -482,7 +534,7 @@ impl MemTier {
         });
 
         Self {
-            segments: Arc::new(segments),
+            segments,
             tombstones: merged_tombstones,
             bytes: self.bytes.saturating_add(incoming_bytes),
             rows: self.rows.saturating_add(incoming_rows),
@@ -516,7 +568,12 @@ impl MemTier {
             empty.version = self.version + 1;
             return empty;
         }
-        let survivors: Vec<MemSegment> = self.segments[flushed_segment_count..].to_vec();
+        let survivors: SegmentVec = self
+            .segments
+            .iter()
+            .skip(flushed_segment_count)
+            .cloned()
+            .collect();
         // Rebuild the survivor aggregate by folding each survivor's per-segment
         // tombstones (key set + its own stamped delete sequence) onto an empty
         // aggregate map — this runs at checkpoint time under the phase-2 listing
@@ -528,14 +585,14 @@ impl MemTier {
         let mut bytes = 0u64;
         let mut rows = 0u64;
         let mut superseded = 0u64;
-        for segment in &survivors {
+        for segment in survivors.iter() {
             tombstones.merge_segment(&segment.tombstones);
             bytes = bytes.saturating_add(segment.bytes);
             rows = rows.saturating_add(segment.rows);
             superseded = superseded.saturating_add(segment.superseded);
         }
         Self {
-            segments: Arc::new(survivors),
+            segments: survivors,
             tombstones,
             bytes,
             rows,
@@ -574,8 +631,9 @@ impl MemTier {
         flushed_segment_count: usize,
     ) -> Option<u64> {
         let end = flushed_segment_count.min(self.segments.len());
-        self.segments[..end]
+        self.segments
             .iter()
+            .take(end)
             .filter_map(|s| s.source_position)
             .max()
     }
@@ -584,14 +642,16 @@ impl MemTier {
     /// (`segments[sealed_segments..]`). These are the not-yet-durable rows a
     /// [`crate::provider::CayenneTableProvider::seal_mem_tier_durable`] still needs
     /// to shadow into the durable inline corpus before the slot may advance past
-    /// them. Empty immediately after a seal (or on an empty tier).
+    /// them. `0` immediately after a seal (or on an empty tier). (Returns a count
+    /// rather than a `&[MemSegment]` slice — `im::Vector` cannot borrow a
+    /// contiguous slice, and the only use was the length.)
     #[must_use]
-    pub(crate) fn unsealed_segments(&self) -> &[MemSegment] {
+    pub(crate) fn unsealed_segment_count(&self) -> usize {
         // `sealed_segments <= segments.len()` is a construction invariant, but a
         // capture/append race could in principle observe a stale pair; clamp so a
-        // slice-out-of-bounds can never occur.
+        // subtract can never underflow.
         let start = self.sealed_segments.min(self.segments.len());
-        &self.segments[start..]
+        self.segments.len() - start
     }
 
     /// Whether the ACTIVE ingestion piece holds any not-yet-sealed segment — i.e.
@@ -615,7 +675,7 @@ impl MemTier {
             .max(self.sealed_segments)
             .min(self.segments.len());
         Self {
-            segments: Arc::clone(&self.segments),
+            segments: self.segments.clone(),
             tombstones: self.tombstones.clone(),
             bytes: self.bytes,
             rows: self.rows,
@@ -670,7 +730,13 @@ impl MemTier {
             // commutative), so cloning it is byte-identical AND avoids the rebuild.
             return self.clone();
         }
-        let window: Vec<MemSegment> = self.segments[start..end].to_vec();
+        let window: SegmentVec = self
+            .segments
+            .iter()
+            .skip(start)
+            .take(end - start)
+            .cloned()
+            .collect();
         // Rebuild the window aggregate by folding each window segment's own
         // tombstones at its own `delete_sequence` — structurally identical to
         // [`Self::retain_after`] / [`Self::unsealed_view`], preserving per-key
@@ -679,14 +745,14 @@ impl MemTier {
         let mut bytes = 0u64;
         let mut rows = 0u64;
         let mut superseded = 0u64;
-        for segment in &window {
+        for segment in window.iter() {
             tombstones.merge_segment(&segment.tombstones);
             bytes = bytes.saturating_add(segment.bytes);
             rows = rows.saturating_add(segment.rows);
             superseded = superseded.saturating_add(segment.superseded);
         }
         Self {
-            segments: Arc::new(window),
+            segments: window,
             tombstones,
             bytes,
             rows,
@@ -716,7 +782,7 @@ impl MemTier {
     #[must_use]
     pub(crate) fn unsealed_view(&self) -> Self {
         let sealed = self.sealed_segments.min(self.segments.len());
-        self.window_view(sealed, self.unsealed_segments().len())
+        self.window_view(sealed, self.unsealed_segment_count())
     }
 }
 
@@ -892,7 +958,7 @@ impl ShardedMemTier {
             }
         }
         MemTier {
-            segments: Arc::new(Vec::new()),
+            segments: SegmentVec::new(),
             tombstones,
             bytes,
             rows,
@@ -1279,7 +1345,7 @@ mod tests {
         assert_eq!(tier.segments.len(), 3);
         assert_eq!(tier.sealed_segments, 0, "appends never seal");
         assert_eq!(
-            tier.unsealed_segments().len(),
+            tier.unsealed_segment_count(),
             3,
             "all 3 segments are active"
         );
@@ -1309,7 +1375,7 @@ mod tests {
             !sealed.has_unsealed_segments(),
             "nothing active after full seal"
         );
-        assert_eq!(sealed.unsealed_segments().len(), 0);
+        assert_eq!(sealed.unsealed_segment_count(), 0);
         // Segment payloads and aggregates are untouched by a seal (O(1) rebrand).
         assert_eq!(sealed.segments.len(), 2);
         assert_eq!(sealed.rows, tier.rows);
@@ -1346,7 +1412,7 @@ mod tests {
         );
         assert_eq!(grown.sealed_segments, 2);
         assert_eq!(
-            grown.unsealed_segments().len(),
+            grown.unsealed_segment_count(),
             1,
             "only the new segment is active"
         );
@@ -1392,7 +1458,7 @@ mod tests {
             after_partial.sealed_segments, 1,
             "3 - 2 = 1 sealed survives"
         );
-        assert_eq!(after_partial.unsealed_segments().len(), 1);
+        assert_eq!(after_partial.unsealed_segment_count(), 1);
 
         // Flush the first 3 (== sealed) from the ORIGINAL: boundary saturates to 0,
         // only the active segment survives.
@@ -1402,7 +1468,7 @@ mod tests {
             after_all_sealed.sealed_segments, 0,
             "the whole sealed prefix was flushed"
         );
-        assert_eq!(after_all_sealed.unsealed_segments().len(), 1);
+        assert_eq!(after_all_sealed.unsealed_segment_count(), 1);
 
         // Flush everything: empty tier, boundary 0.
         let after_full = tier.retain_after(4);
@@ -1482,10 +1548,12 @@ mod tests {
         assert_eq!(full.epoch, tier.epoch);
         assert_eq!(full.version, tier.version);
         assert_eq!(full.sealed_segments, tier.sealed_segments);
-        // The full-window fast path shares the segment Arc (no rebuild, no copy).
+        // The full-window fast path shares the segment vector (no rebuild, no
+        // copy): `im::Vector::clone` is an O(1) structural share, so the two
+        // point at the same root.
         assert!(
-            Arc::ptr_eq(&full.segments, &tier.segments),
-            "full window shares the segment Arc"
+            full.segments.ptr_eq(&tier.segments),
+            "full window shares the segment vector"
         );
         // Every tombstone key in the accumulated corpus is preserved at its sequence.
         for i in 0..3i64 {
