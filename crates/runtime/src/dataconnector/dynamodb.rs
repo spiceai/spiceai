@@ -460,7 +460,10 @@ async fn init_checkpoint_store(dataset: &Dataset) -> Option<Arc<dyn BlobCheckpoi
     checkpoint_store(dataset, DYNAMODB_STREAMS_CHECKPOINT_TABLE).await
 }
 
-/// Loads the checkpoint from the sidecar [`BlobCheckpointStore`], or initializes a new checkpoint if none exists.
+/// Loads the checkpoint from the sidecar [`BlobCheckpointStore`]. Falls back to
+/// re-initialization (a fresh scan) when there is no store, no persisted checkpoint,
+/// the persisted value can't be deserialized, *or* the store read fails — a store-read
+/// failure is logged and treated as an at-least-once re-bootstrap.
 /// Returns (`should_bootstrap`, checkpoint, `checkpoint_updated_at`).
 async fn load_or_initialize_checkpoint(
     dynamodb: &Arc<DynamoDBTableProvider>,
