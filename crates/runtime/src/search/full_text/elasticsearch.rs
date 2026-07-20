@@ -27,7 +27,7 @@ use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use runtime_datafusion_index::IndexedTableProvider;
 use secrecy::ExposeSecret;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 use crate::accelerated_table::{self, AcceleratedTable};
 use crate::changes::{Indexes, index_change_envelope};
