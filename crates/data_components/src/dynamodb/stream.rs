@@ -43,7 +43,7 @@ pub enum StreamError {
     FailedToReceiveMessage { source: dynamodb_streams::Error },
 
     #[snafu(display(
-        "DynamoDB Stream is beyond its 24-hour retention window; delete the acceleration to re-bootstrap the table: {source}"
+        "DynamoDB Stream is beyond its 24-hour retention window; drop this dataset's accelerated data (its acceleration files/tables) to force a fresh full re-bootstrap of the table: {source}"
     ))]
     StreamBeyondRetention { source: dynamodb_streams::Error },
 
@@ -162,6 +162,13 @@ fn get_primary_keys_array(primary_keys: &[String], row_count: usize) -> ListArra
         .downcast_mut::<ListBuilder<Box<dyn ArrayBuilder>>>()
         .unwrap_or_else(|| unreachable!("created above as a list builder"));
     for _ in 0..row_count {
+        // Match `process_batch`: encode "no primary keys" as a null list rather than
+        // a valid empty list, so every CDC batch this connector emits (snapshot,
+        // truncate, live) agrees on null-vs-empty semantics.
+        if primary_keys.is_empty() {
+            list_builder.append(false);
+            continue;
+        }
         let str_builder = list_builder
             .values()
             .as_any_mut()
