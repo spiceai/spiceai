@@ -17,13 +17,16 @@ limitations under the License.
 //! Engine-agnostic numeric comparison shared by the HTAP correctness gates
 //! (`analytical` and `row_count`).
 //!
-//! Postgres (the source of truth) and Cayenne emit the same logical values with
-//! different physical Arrow encodings. These helpers compare *values* — not
-//! their string renderings — with a type-aware tolerance:
-//!   * integer / decimal columns (row counts, money sums): **exact**, zero
-//!     tolerance — a count or a cent that drifts at all is a real defect;
-//!   * floating-point columns: a small relative epsilon — the only place real
-//!     rounding occurs in this pipeline (FP/encoding error here is < 0.001%).
+//! The source engine (Postgres or `MySQL` — the source of truth) and Cayenne emit
+//! the same logical values with different physical Arrow encodings. These
+//! helpers compare *values* — not their string renderings — with a type-aware
+//! tolerance:
+//!   * integers and *exact-reproduction* decimals (row counts, money `SUM`/
+//!     `MIN`/`MAX`): **exact**, zero tolerance — a count or a cent that drifts at
+//!     all is a real defect;
+//!   * floating-point columns and `AVG`/division decimals: a small relative
+//!     epsilon — the only places real rounding occurs in this pipeline (FP /
+//!     encoding / decimal-division error here is < 0.001%).
 //!
 //! Cells are compared after casting to `f64`. That is exact for integers and
 //! decimals whose magnitude stays below 2^53 (~9.0e15), which holds for every
@@ -38,6 +41,13 @@ use arrow::datatypes::DataType;
 /// real FP/encoding error (< 0.001%) yet far tighter than the legacy 5% gate,
 /// so a genuine sub-5% value drift is now caught instead of passing silently.
 pub const FLOAT_REL_TOLERANCE: f64 = 0.001;
+
+/// Decimal scale of TPC-C money columns (`NUMERIC(_,2)` — cents). Exact
+/// aggregates (`SUM`/`MIN`/`MAX`) preserve this scale, so they stay on the exact
+/// comparison path; only `AVG`/division inflates a decimal result beyond it.
+/// A decimal column whose scale exceeds this is therefore treated as an
+/// approximate (rounding-prone) aggregate. See [`approximate_columns`].
+pub const MONEY_SCALE: i8 = 2;
 
 /// Outcome of comparing the numeric columns of two row-aligned record batches.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -111,9 +121,10 @@ pub fn is_exact_numeric(dt: &DataType) -> bool {
 /// Per-column float-ness of a batch's schema, for the `actual_source_floats`
 /// argument of [`numeric_delta`].
 ///
-/// The analytical gate casts Spice's output to the *source* (Postgres) schema
+/// The analytical gate casts Spice's output to the *source* engine's schema
 /// before comparison, which turns an `avg()` that Spice computed as `Float64`
-/// into the `Decimal128` the PG arrow connector returns for `NUMERIC`. Captured
+/// into the `Decimal128` the source arrow connector returns for
+/// `NUMERIC`/`DECIMAL`. Captured
 /// from the pre-alignment actual batch, this lets [`numeric_delta`] keep the
 /// relative float tolerance for those approximate columns instead of demoting
 /// them to the exact integer/decimal path. The fingerprint gate runs identical
@@ -130,12 +141,23 @@ pub fn float_columns(batch: &RecordBatch) -> Vec<bool> {
 }
 
 /// Analytical-gate generalization of [`float_columns`]: flags a column for
-/// relative float tolerance when either side is float, or both are decimals of
-/// *different scale*. Exact reproductions (`SUM`/`MIN`/`MAX`/`COUNT`) keep the
-/// operand scale and stay exact; `AVG`/division inflate it per-engine (Postgres
-/// ~13 digits, `DataFusion` operand scale + 4), so their low digits legitimately
-/// differ. Must run pre-alignment (alignment casts actual to the source scale,
-/// erasing the signal); columns match by position.
+/// relative float tolerance when either side is float, or the column is a
+/// decimal produced by `AVG`/division. Exact reproductions (`SUM`/`MIN`/`MAX`/
+/// `COUNT`) preserve the operand scale (money is [`MONEY_SCALE`] digits in
+/// TPC-C) and stay exact; `AVG`/division *inflate* the scale — `DataFusion` and
+/// `MySQL` to operand scale + 4, Postgres to ~13 — so their low digits
+/// legitimately differ per-engine and must not be compared bit-exactly.
+///
+/// We detect that inflation directly rather than assuming the two engines
+/// *disagree* on the inflated scale: a decimal column is approximate when the
+/// scales differ **or** the (common) scale exceeds [`MONEY_SCALE`]. The
+/// scales-differ arm alone was Postgres-specific — `MySQL`'s `AVG` scale
+/// (operand + 4 = 6 for `NUMERIC(_,2)`) coincides with `DataFusion`'s, so a
+/// same-scale `AVG` used to fall into the exact path and a benign last-digit
+/// rounding difference tripped `DIVERGE`.
+///
+/// Must run pre-alignment (alignment casts actual to the source scale, erasing
+/// the signal); columns match by position.
 #[must_use]
 pub fn approximate_columns(expected: &RecordBatch, actual: &RecordBatch) -> Vec<bool> {
     let a_schema = actual.schema();
@@ -154,7 +176,7 @@ pub fn approximate_columns(expected: &RecordBatch, actual: &RecordBatch) -> Vec<
                 || is_float(a_dt)
                 || matches!(
                     (decimal_scale(e_dt), decimal_scale(a_dt)),
-                    (Some(es), Some(a_s)) if es != a_s
+                    (Some(es), Some(a_s)) if es != a_s || es.max(a_s) > MONEY_SCALE
                 )
         })
         .collect()
@@ -418,6 +440,52 @@ mod tests {
             approximate_columns(&expected, &actual),
             vec![true, false, false, true]
         );
+    }
+
+    #[test]
+    fn approximate_columns_flags_same_scale_inflated_avg() {
+        // MySQL regression (chbench_q1 `avg_amount`): both the source and
+        // DataFusion produce AVG(NUMERIC(_,2)) at scale 6 (operand + 4), so the
+        // scales *match*. The old "scales differ" heuristic left the column on
+        // the exact path, and a 1-ULP rounding difference (959.717385 vs
+        // 959.717384) tripped DIVERGE. Scale 6 > MONEY_SCALE (2) must now flag it
+        // approximate, while the money SUM (scale 2) and count stay exact.
+        let expected = batch(vec![
+            decimal_col("avg_amount", vec![959_717_385_i128], 38, 6),
+            decimal_col("sum_amount", vec![7_i128], 38, 2),
+            int_col("count_order", vec![1]),
+        ]);
+        let actual = batch(vec![
+            decimal_col("avg_amount", vec![959_717_384_i128], 38, 6),
+            decimal_col("sum_amount", vec![7_i128], 38, 2),
+            int_col("count_order", vec![1]),
+        ]);
+        assert_eq!(
+            approximate_columns(&expected, &actual),
+            vec![true, false, false],
+            "same-scale inflated AVG must be approximate; SUM/COUNT stay exact"
+        );
+
+        // With that classification the 1-ULP avg difference is within the
+        // relative float tolerance and must NOT fail the gate.
+        let approx = approximate_columns(&expected, &actual);
+        let delta = numeric_delta(&expected, &actual, &approx);
+        assert!(
+            !delta.exceeded,
+            "same-scale AVG rounding must pass under relative tolerance: {:?}",
+            delta.worst
+        );
+        assert!(delta.max_rel_delta > 0.0 && delta.max_rel_delta < FLOAT_REL_TOLERANCE);
+
+        // But a genuine one-cent drift in the exact money SUM still fails, so the
+        // fix does not weaken the exactness guarantee that matters.
+        let bad_sum = batch(vec![
+            decimal_col("avg_amount", vec![959_717_385_i128], 38, 6),
+            decimal_col("sum_amount", vec![8_i128], 38, 2),
+            int_col("count_order", vec![1]),
+        ]);
+        let delta = numeric_delta(&expected, &bad_sum, &approx);
+        assert!(delta.exceeded, "a one-cent SUM drift must still DIVERGE");
     }
 
     #[test]
