@@ -87,8 +87,13 @@ pub enum CheckpointError {
 /// (e.g. `KafkaOffsetStore`) instead — see the crate-level docs.
 #[async_trait]
 pub trait BlobCheckpointStore: Send + Sync {
-    /// Load the current blob checkpoint for this dataset, if one has been persisted.
-    async fn get(&self) -> Option<BlobCheckpoint>;
+    /// Load the current blob checkpoint for this dataset.
+    ///
+    /// Returns `Ok(None)` when no checkpoint has been persisted yet, and `Err` when the
+    /// store read itself fails (e.g. the accelerator is unavailable). Distinguishing the
+    /// two lets a connector log/propagate a store failure instead of silently treating
+    /// it as "no checkpoint" and re-bootstrapping from scratch.
+    async fn get(&self) -> Result<Option<BlobCheckpoint>, CheckpointError>;
 
     /// Persist `data` as the current blob checkpoint for this dataset, overwriting any
     /// previously stored value.

@@ -52,9 +52,15 @@ impl TursoBlobCheckpointStore {
 
 #[async_trait]
 impl BlobCheckpointStore for TursoBlobCheckpointStore {
-    async fn get(&self) -> Option<BlobCheckpoint> {
+    async fn get(&self) -> Result<Option<BlobCheckpoint>, CheckpointError> {
         let dataset_name = self.dataset_name.clone();
-        let conn = self.pool.connect().await.ok()?;
+        let conn = self
+            .pool
+            .connect()
+            .await
+            .map_err(|source| CheckpointError::Store {
+                source: Box::new(source),
+            })?;
         let table = self.table_name;
         let query = format!(
             "SELECT checkpoint_data, strftime('%s', updated_at) FROM {table} WHERE dataset_name = ?"
@@ -63,17 +69,28 @@ impl BlobCheckpointStore for TursoBlobCheckpointStore {
         let mut rows = conn
             .query(&query, turso::params![dataset_name])
             .await
-            .ok()?;
-        let row = rows.next().await.ok()??;
+            .map_err(|source| CheckpointError::Store {
+                source: Box::new(source),
+            })?;
+        let Some(row) = rows.next().await.map_err(|source| CheckpointError::Store {
+            source: Box::new(source),
+        })?
+        else {
+            return Ok(None);
+        };
 
-        let data = row.get::<String>(0).ok()?;
+        let data = row
+            .get::<String>(0)
+            .map_err(|source| CheckpointError::Store {
+                source: Box::new(source),
+            })?;
         let updated_at_epoch: Option<i64> = row.get::<i64>(1).ok();
         let updated_at = updated_at_epoch.and_then(|epoch| {
             u64::try_from(epoch)
                 .ok()
                 .and_then(|e| std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(e)))
         });
-        Some(BlobCheckpoint { data, updated_at })
+        Ok(Some(BlobCheckpoint { data, updated_at }))
     }
 
     async fn upsert(&self, data: &str) -> Result<(), CheckpointError> {

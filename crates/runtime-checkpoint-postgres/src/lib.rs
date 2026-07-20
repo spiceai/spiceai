@@ -50,25 +50,40 @@ impl PostgresBlobCheckpointStore {
 
 #[async_trait]
 impl BlobCheckpointStore for PostgresBlobCheckpointStore {
-    async fn get(&self) -> Option<BlobCheckpoint> {
-        let conn = self.pool.connect_direct().await.ok()?;
+    async fn get(&self) -> Result<Option<BlobCheckpoint>, CheckpointError> {
+        let conn = self
+            .pool
+            .connect_direct()
+            .await
+            .map_err(|source| CheckpointError::Store { source })?;
         let table = self.table_name;
         let query = format!(
             "SELECT checkpoint_data, EXTRACT(EPOCH FROM updated_at) FROM {table} WHERE dataset_name = $1"
         );
-        let stmt = conn.conn.prepare(&query).await.ok()?;
-        let row = conn
+        let stmt = conn
+            .conn
+            .prepare(&query)
+            .await
+            .map_err(|source| CheckpointError::Store {
+                source: Box::new(source),
+            })?;
+        let Some(row) = conn
             .conn
             .query_opt(&stmt, &[&self.dataset_name])
             .await
-            .ok()??;
+            .map_err(|source| CheckpointError::Store {
+                source: Box::new(source),
+            })?
+        else {
+            return Ok(None);
+        };
 
         let data: String = row.get(0);
         let updated_at_epoch: Option<f64> = row.get(1);
         let updated_at = updated_at_epoch.and_then(|epoch| {
             std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs_f64(epoch))
         });
-        Some(BlobCheckpoint { data, updated_at })
+        Ok(Some(BlobCheckpoint { data, updated_at }))
     }
 
     async fn upsert(&self, data: &str) -> Result<(), CheckpointError> {

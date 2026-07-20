@@ -50,15 +50,19 @@ impl SqliteBlobCheckpointStore {
 
 #[async_trait]
 impl BlobCheckpointStore for SqliteBlobCheckpointStore {
-    async fn get(&self) -> Option<BlobCheckpoint> {
+    async fn get(&self) -> Result<Option<BlobCheckpoint>, CheckpointError> {
         let dataset_name = self.dataset_name.clone();
         let table = self.table_name;
 
         let conn_sync = self.pool.connect_sync();
-        let conn = conn_sync.as_any().downcast_ref::<SqliteConnection>()?;
+        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+            return Err(CheckpointError::Store {
+                source: "expected a SqliteConnection from the sqlite pool".into(),
+            });
+        };
 
         conn.conn
-            .call(move |conn: &mut rusqlite::Connection| -> Result<BlobCheckpoint, rusqlite::Error> {
+            .call(move |conn: &mut rusqlite::Connection| -> Result<Option<BlobCheckpoint>, rusqlite::Error> {
                 let query = format!(
                     "SELECT checkpoint_data, strftime('%s', updated_at) FROM {table} WHERE dataset_name = ?"
                 );
@@ -73,13 +77,15 @@ impl BlobCheckpointStore for SqliteBlobCheckpointStore {
                             std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(e))
                         })
                     });
-                    Ok(BlobCheckpoint { data, updated_at })
+                    Ok(Some(BlobCheckpoint { data, updated_at }))
                 } else {
-                    Err(rusqlite::Error::QueryReturnedNoRows)
+                    Ok(None)
                 }
             })
             .await
-            .ok()
+            .map_err(|source| CheckpointError::Store {
+                source: Box::new(source),
+            })
     }
 
     async fn upsert(&self, data: &str) -> Result<(), CheckpointError> {

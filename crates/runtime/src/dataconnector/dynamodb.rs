@@ -471,30 +471,42 @@ async fn load_or_initialize_checkpoint(
     dynamodb_sys: Option<&Arc<dyn BlobCheckpointStore>>,
     dataset_name: &TableReference,
 ) -> Option<(bool, Checkpoint, Option<SystemTime>)> {
-    if let Some(dynamodb_sys) = dynamodb_sys {
-        if let Some(metadata) = dynamodb_sys.get().await {
-            match serde_json::from_str::<Checkpoint>(&metadata.data) {
-                Ok(checkpoint) => Some((false, checkpoint, metadata.updated_at)),
-                Err(err) => {
-                    tracing::warn!(
-                        dataset = %dataset_name,
-                        error = ?err,
-                        "Failed to deserialize lag, falling back to initialization"
-                    );
-                    get_latest_checkpoint(dynamodb, dataset_name)
-                        .await
-                        .map(|cp| (true, cp, None))
-                }
+    let Some(dynamodb_sys) = dynamodb_sys else {
+        return get_latest_checkpoint(dynamodb, dataset_name)
+            .await
+            .map(|cp| (true, cp, None));
+    };
+
+    match dynamodb_sys.get().await {
+        Ok(Some(metadata)) => match serde_json::from_str::<Checkpoint>(&metadata.data) {
+            Ok(checkpoint) => Some((false, checkpoint, metadata.updated_at)),
+            Err(err) => {
+                tracing::warn!(
+                    dataset = %dataset_name,
+                    error = ?err,
+                    "Failed to deserialize lag, falling back to initialization"
+                );
+                get_latest_checkpoint(dynamodb, dataset_name)
+                    .await
+                    .map(|cp| (true, cp, None))
             }
-        } else {
+        },
+        Ok(None) => get_latest_checkpoint(dynamodb, dataset_name)
+            .await
+            .map(|cp| (true, cp, None)),
+        Err(err) => {
+            // Surface the store-read failure (instead of silently treating it as
+            // "no checkpoint"), then fall back to a full re-bootstrap — the same
+            // safe at-least-once behavior as a missing checkpoint.
+            tracing::error!(
+                dataset = %dataset_name,
+                error = %err,
+                "Failed to read the DynamoDB checkpoint from the accelerator; re-bootstrapping from a fresh scan"
+            );
             get_latest_checkpoint(dynamodb, dataset_name)
                 .await
                 .map(|cp| (true, cp, None))
         }
-    } else {
-        get_latest_checkpoint(dynamodb, dataset_name)
-            .await
-            .map(|cp| (true, cp, None))
     }
 }
 

@@ -80,25 +80,26 @@ impl DuckDbBlobCheckpointStore {
         Ok(())
     }
 
-    fn get_blocking(&self) -> Option<BlobCheckpoint> {
-        let mut db_conn = Arc::clone(&self.pool).connect_sync().ok()?;
-        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
-            .ok()?
+    fn get_blocking(&self) -> Result<Option<BlobCheckpoint>, BoxedError> {
+        let mut db_conn = Arc::clone(&self.pool).connect_sync()?;
+        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)?
             .get_underlying_conn_mut();
         let table = self.table_name;
 
         let query = format!(
             "SELECT checkpoint_data, epoch(updated_at) FROM {table} WHERE dataset_name = ?"
         );
-        let mut stmt = duckdb_conn.prepare(&query).ok()?;
-        let mut rows = stmt.query([&self.dataset_name]).ok()?;
+        let mut stmt = duckdb_conn.prepare(&query)?;
+        let mut rows = stmt.query([&self.dataset_name])?;
 
-        let row = rows.next().ok()??;
-        let data: String = row.get(0).ok()?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let data: String = row.get(0)?;
         let updated_at_epoch: Option<f64> = row.get(1).ok();
         let updated_at = updated_at_epoch
             .and_then(|epoch| UNIX_EPOCH.checked_add(Duration::from_secs_f64(epoch)));
-        Some(BlobCheckpoint { data, updated_at })
+        Ok(Some(BlobCheckpoint { data, updated_at }))
     }
 }
 
@@ -106,8 +107,9 @@ impl DuckDbBlobCheckpointStore {
 impl BlobCheckpointStore for DuckDbBlobCheckpointStore {
     // The DuckDB pool is synchronous/blocking; this mirrors the previous behavior of
     // the per-connector sidecars (they called the sync path inline).
-    async fn get(&self) -> Option<BlobCheckpoint> {
+    async fn get(&self) -> Result<Option<BlobCheckpoint>, CheckpointError> {
         self.get_blocking()
+            .map_err(|source| CheckpointError::Store { source })
     }
 
     async fn upsert(&self, data: &str) -> Result<(), CheckpointError> {
