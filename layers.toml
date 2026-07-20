@@ -108,6 +108,9 @@ otel-arrow = "foundation"
 repl = "foundation"
 runtime-api-types = "foundation"
 runtime-async = "foundation"
+# Interface crate: the accelerator (runtime side) satisfies CheckpointStore; a
+# connector only calls it, so it lives low (foundation) below both.
+runtime-checkpoint-api = "foundation"
 runtime-cloud-connect = "foundation"
 runtime-datafusion-index = "foundation"
 runtime-metrics = "foundation"

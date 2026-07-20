@@ -42,6 +42,11 @@ pub enum StreamError {
     #[snafu(display("Failed to receive DynamoDB Stream record: {source}"))]
     FailedToReceiveMessage { source: dynamodb_streams::Error },
 
+    #[snafu(display(
+        "DynamoDB Stream is beyond its 24-hour retention window; drop this dataset's accelerated data (its acceleration files/tables) to force a fresh full re-bootstrap of the table: {source}"
+    ))]
+    StreamBeyondRetention { source: dynamodb_streams::Error },
+
     #[snafu(display("Unable to downcast ArrayBuilder"))]
     DowncastBuilder,
 
@@ -59,6 +64,19 @@ pub enum StreamError {
 
     #[snafu(display("Failed to read RecordBatch: {}", format_datafusion_error(source)))]
     FailedToReadRecordBatch { source: DataFusionError },
+}
+
+/// The `DynamoDB` connector owns the mapping from its concrete stream error to the
+/// connector-agnostic CDC contract error: it tags the `"DynamoDB"` connector name and
+/// boxes itself as the cause, so the CDC contract (and the runtime) never names
+/// `DynamoDB`-specific types while logs still identify the source connector.
+impl From<StreamError> for crate::cdc::StreamError {
+    fn from(e: StreamError) -> Self {
+        crate::cdc::StreamError::Connector {
+            connector: "DynamoDB",
+            source: Box::new(e),
+        }
+    }
 }
 
 // This function is used for bootstrapping stream which doesn't have checkpoints.
@@ -94,6 +112,46 @@ pub fn record_batch_to_change_batch(
     Ok(change_batch)
 }
 
+/// Builds a single-row `op="t"` (Truncate) change batch.
+///
+/// Emitted ahead of a bootstrap snapshot, the accelerator applies it as a
+/// delete-all barrier (`process_truncate` → `DELETE FROM <table> WHERE TRUE`) so
+/// a re-bootstrap over a persistent accelerator drops rows deleted at the source
+/// — the same overwrite semantics the old direct `InsertOp::Overwrite` gave,
+/// expressed entirely through the CDC change contract.
+///
+/// The row payload is all-null (Truncate ignores it) and uses the same
+/// [`changes_schema`] as [`record_batch_to_change_batch`], so the truncate and
+/// snapshot batches coalesce. `DynamoDB` infers an all-nullable schema, so the
+/// null payload validates against every field.
+pub fn truncate_change_batch(
+    table_schema: &Arc<Schema>,
+    primary_keys: &[String],
+) -> Result<ChangeBatch, StreamError> {
+    // "t" stands for ChangeOperation::Truncate
+    let op_array = StringArray::from(vec!["t"]);
+
+    let primary_keys_array = get_primary_keys_array(primary_keys, 1);
+
+    // Truncate carries no data. Build the whole `data` value as a single NULL
+    // struct row (the `data` field is nullable in `changes_schema`). A *valid*
+    // struct with all-null children would violate Arrow nullability for any
+    // non-nullable child field (`StructArray::new` rejects unmasked child nulls);
+    // a null struct masks child validity entirely while keeping the type identical
+    // to the snapshot/live batches so the apply path can still coalesce them.
+    let data_array =
+        arrow::array::new_null_array(&DataType::Struct(table_schema.fields().clone()), 1);
+
+    let new_schema = Arc::new(changes_schema(table_schema.as_ref()));
+    let new_record_batch = RecordBatch::try_new(
+        new_schema,
+        vec![Arc::new(op_array), Arc::new(primary_keys_array), data_array],
+    )
+    .context(FailedToCreateRecordBatchSnafu)?;
+
+    ChangeBatch::try_new(new_record_batch).context(FailedToCreateChangeBatchSnafu)
+}
+
 fn get_primary_keys_array(primary_keys: &[String], row_count: usize) -> ListArray {
     let mut list_builder_generic = make_builder(
         &DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
@@ -104,6 +162,13 @@ fn get_primary_keys_array(primary_keys: &[String], row_count: usize) -> ListArra
         .downcast_mut::<ListBuilder<Box<dyn ArrayBuilder>>>()
         .unwrap_or_else(|| unreachable!("created above as a list builder"));
     for _ in 0..row_count {
+        // Match `process_batch`: encode "no primary keys" as a null list rather than
+        // a valid empty list, so every CDC batch this connector emits (snapshot,
+        // truncate, live) agrees on null-vs-empty semantics.
+        if primary_keys.is_empty() {
+            list_builder.append(false);
+            continue;
+        }
         let str_builder = list_builder
             .values()
             .as_any_mut()
@@ -309,6 +374,56 @@ mod tests {
             },
             watermark: None,
         }
+    }
+
+    #[test]
+    fn truncate_change_batch_is_single_truncate_row() {
+        let table_schema = create_test_table_schema();
+        let primary_keys = vec!["id".to_string()];
+
+        let batch = truncate_change_batch(&table_schema, &primary_keys)
+            .expect("should build truncate batch");
+
+        // Exactly one row, op = "t" (Truncate) — the delete-all barrier.
+        assert_eq!(batch.record.num_rows(), 1);
+        assert!(matches!(batch.op(0), ChangeOperation::Truncate));
+    }
+
+    #[test]
+    fn truncate_change_batch_allows_non_nullable_fields() {
+        // A declared (non-inferred) schema can mark fields non-nullable. The
+        // truncate barrier carries no data, so its `data` value must be a NULL
+        // struct row rather than a valid struct with null children — otherwise
+        // Arrow rejects the unmasked null in the non-nullable child and this
+        // (correctness-critical rebootstrap) path fails.
+        let table_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let primary_keys = vec!["id".to_string()];
+
+        let batch = truncate_change_batch(&table_schema, &primary_keys)
+            .expect("truncate batch must build for schemas with non-nullable fields");
+
+        assert_eq!(batch.record.num_rows(), 1);
+        assert!(matches!(batch.op(0), ChangeOperation::Truncate));
+    }
+
+    #[test]
+    fn truncate_and_insert_batches_share_a_schema() {
+        // The truncate barrier and the snapshot inserts must carry the same
+        // `changes_schema` so the accelerator's apply path can coalesce them
+        // into one write; a mismatch would fail the Arrow concat at apply time.
+        let table_schema = create_test_table_schema();
+        let primary_keys = vec!["id".to_string()];
+
+        let insert_rows = RecordBatch::new_empty(Arc::clone(&table_schema));
+        let insert = record_batch_to_change_batch(insert_rows, &table_schema, &primary_keys)
+            .expect("should build insert batch");
+        let truncate = truncate_change_batch(&table_schema, &primary_keys)
+            .expect("should build truncate batch");
+
+        assert_eq!(insert.record.schema(), truncate.record.schema());
     }
 
     mod process_batch {

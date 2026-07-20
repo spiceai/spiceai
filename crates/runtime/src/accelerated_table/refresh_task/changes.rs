@@ -32,8 +32,6 @@ use cache::Caching;
 use cayenne::{CayenneCdcWrite, CayenneTableProvider};
 use data_components::arrow::{IndexedMemTable, write::MemTable};
 use data_components::cdc::{self, ChangeBatch, ChangeOperation, ChangesStream};
-#[cfg(feature = "dynamodb")]
-use data_components::dynamodb::stream::StreamError as DynamoDBStreamError;
 use data_components::index_maintenance::perform_index_maintenance;
 #[cfg(any(feature = "debezium", feature = "kafka"))]
 use data_components::kafka::{
@@ -3748,19 +3746,6 @@ fn handle_stream_error(err: &cdc::StreamError, dataset_name: &TableReference) ->
                 );
             }
         }
-        return StreamErrorType::Fatal;
-    }
-
-    #[cfg(feature = "dynamodb")]
-    if matches!(
-        err,
-        cdc::StreamError::DynamoDB(DynamoDBStreamError::FailedToReceiveMessage {
-            source: dynamodb_streams::Error::StreamBeyondRetention,
-        })
-    ) {
-        tracing::error!(
-            "DynamoDB Stream for dataset '{dataset_name}' is beyond 24 hour retention policy. Delete acceleration to initiate table bootstrapping"
-        );
         return StreamErrorType::Fatal;
     }
 
