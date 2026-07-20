@@ -540,3 +540,48 @@ on the CI runner), SHARED across concurrent promotions; two big-table sorts coll
 `GreedyMemoryPool` errors, never deadlocks), fully independent of the freeze. Fix knobs:
 `cayenne_compaction_memory_fraction` (raise) and/or `cold_clustering_run_size_mb` (lower). Note:
 `runtime.query.memory_limit` is the WRONG knob (it sizes the query pool, not the compaction pool).
+
+---
+
+## 2026-07-20 — Source-level exoneration of the oneshot join layer (why the fix was refuted)
+
+Read the pinned vortex diag tree (`f42235f4d`) end-to-end for the scan-driver wake chain, to interpret
+what the pending native backtrace must show.
+
+**Scan composition** (`vortex-layout/src/scan/scan_builder.rs:410-441`, `LazyScanStream`):
+`stream::iter(tasks).map(|t| handle.spawn(async { t.await; COMPLETED++ })).buffer_unordered(N).filter_map(YIELDED++)`
+with `N = concurrency(4) * num_workers`. Ordered path uses `.buffered(N)` instead.
+
+**Spawn + join** (`vortex-io/src/runtime/handle.rs`): `handle.spawn` eagerly spawns via `Executor::spawn`,
+which for tokio is `tokio::runtime::Handle::spawn` (`runtime/tokio.rs:44-57`) — a **real tokio task** with
+tokio's own stable, reliable waker; it runs to completion independent of the joining side and then
+`send.send(output)` on a `oneshot::channel`. The `Task` join future awaits `recv: oneshot::AsyncReceiver`.
+
+**Full wake chain on task completion:**
+`tokio task done → send.send() → oneshot recv waker → FuturesUnordered child-proxy waker → FU parent waker
+→ buffer_unordered → filter_map → DataFusion input adapter → SortExec → top-level task`.
+
+**Oneshot layer is CORRECT (source-verified, `oneshot 0.2.1`):**
+- `AsyncReceiver::poll` re-registers the latest waker on every poll — RECEIVING branch drops the old and
+  writes the new (`receiver.rs:705-707`). No stale-waker accumulation.
+- send-during-park race handled — `write_async_waker` does `compare_exchange(EMPTY,RECEIVING)` and on
+  `Err(MESSAGE)` takes the message immediately (`channel.rs:261-276`).
+- unparking race handled — `Err(UNPARKING)` self-wakes via `cx.waker().wake_by_ref()` (`receiver.rs:728-733`).
+  This *is* the #6221-class fix, already present.
+
+**Therefore the fix refutation is explained, not anomalous.** Swapping this oneshot to `tokio::sync::oneshot`
+could not help because the original already handles every send/recv/unpark race correctly. The oneshot join
+layer is **eliminated as the lost-wake source by inspection**, not only by the empirical freeze of the fix
+build (29708508223).
+
+**Remaining lost-wake suspects (what the backtrace must disambiguate):**
+1. `FuturesUnordered` parent-waker propagation under `buffer_unordered(N)` (the composition itself).
+2. The DataFusion input adapter between the scan and SortExec (`RecordBatchReceiverStream`-style mpsc hop —
+   adds another producer-task/consumer wake edge; "sort_input POLLED-THEN-PENDING" is measured at THIS edge).
+3. `custom_labels::with_current_labels()` wraps every spawned future (`runtime/tokio.rs:50`, unix-only) —
+   low risk (it only wraps the tokio-driven body, not the join), but unaudited.
+4. Not-a-lost-wake alternative still open: worker-pool starvation / a `RawRwLock`/`RawMutex::lock` deadlock —
+   the native backtrace names this directly (a `lock`/`lock_slow` frame on the promotion or a worker thread).
+
+Static analysis is now exhausted; the permanent-freeze native backtrace (promotion/scan thread's parked
+frame) remains the discriminator. Mechanism-capture continues on the dumper build (`4e1166096d`).
