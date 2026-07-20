@@ -43,7 +43,7 @@ limitations under the License.
 //! | level | scheme set |
 //! |---|---|
 //! | 0 | `Uncompressed` only (canonical arrays; zero search, zero transform) |
-//! | 1 | + `Constant` / `Sparse` (near-free detection; common CDC shapes) |
+//! | 1 | + `Sparse` (near-free detection; constant detection is built into the cascade as of Vortex 0.79) |
 //! | 2 | + `Dict` (cheap, high-value on repetitive CDC data) |
 //! | 3 | + cheap numeric schemes (`For`, `BitPacking`, `ZigZag`, `RunEnd`, `Sequence`) |
 //! | 4–6 | full default **minus FSST** (skips symbol-table training, keeps the rest) |
@@ -127,7 +127,8 @@ pub(crate) enum WriteClass {
 /// boundary can't drift apart.
 pub(crate) const FULL_LEVEL: u8 = DELTA_ENCODING_FULL_LEVEL;
 
-/// Level chosen by `auto` for small deltas. `Constant + Sparse + Dict` keeps
+/// Level chosen by `auto` for small deltas. `Sparse + Dict` (with the
+/// cascade's built-in constant detection) keeps
 /// the big repetitive-CDC wins (often 3-5×) while skipping the per-file
 /// strategy search and FSST training that dominate small-write encode cost.
 pub(crate) const AUTO_LIGHT_LEVEL: u8 = 2;
@@ -197,28 +198,21 @@ pub(crate) fn strategy_builder_for_level(level: u8) -> Option<WriteStrategyBuild
         0 => BtrBlocksCompressorBuilder::empty(),
         // 1: + constant / sparse detection (near-free; common CDC shapes).
         1 => builder_with_schemes(&[
-            &integer::IntConstantScheme,
             &integer::SparseScheme,
-            &float::FloatConstantScheme,
             &float::NullDominatedSparseScheme,
-            &string::StringConstantScheme,
             &string::NullDominatedSparseScheme,
         ]),
         // 2: + dictionary (cheap, high-value on repetitive CDC data).
         2 => builder_with_schemes(&[
-            &integer::IntConstantScheme,
             &integer::SparseScheme,
             &integer::IntDictScheme,
-            &float::FloatConstantScheme,
             &float::NullDominatedSparseScheme,
             &float::FloatDictScheme,
-            &string::StringConstantScheme,
             &string::NullDominatedSparseScheme,
             &string::StringDictScheme,
         ]),
         // 3: + cheap numeric schemes (FoR, BitPacking, ZigZag, RunEnd, Sequence).
         3 => builder_with_schemes(&[
-            &integer::IntConstantScheme,
             &integer::SparseScheme,
             &integer::IntDictScheme,
             &integer::FoRScheme,
@@ -226,11 +220,9 @@ pub(crate) fn strategy_builder_for_level(level: u8) -> Option<WriteStrategyBuild
             &integer::ZigZagScheme,
             &integer::RunEndScheme,
             &integer::SequenceScheme,
-            &float::FloatConstantScheme,
             &float::NullDominatedSparseScheme,
             &float::FloatDictScheme,
             &float::FloatRLEScheme,
-            &string::StringConstantScheme,
             &string::NullDominatedSparseScheme,
             &string::StringDictScheme,
         ]),

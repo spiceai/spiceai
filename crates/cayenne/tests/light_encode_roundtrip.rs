@@ -52,12 +52,12 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::util::display::array_value_to_string;
 use futures::StreamExt;
 use vortex::VortexSessionDefault;
-use vortex::array::arrow::{ArrowSessionExt, FromArrowArray};
 use vortex::array::stream::ArrayStreamAdapter;
 use vortex::array::{ArrayRef, VortexSessionExecute};
+use vortex::arrow::FromArrowType;
+use vortex::arrow::{ArrowSessionExt, FromArrowArray};
 use vortex::buffer::ByteBufferMut;
 use vortex::dtype::DType;
-use vortex::dtype::arrow::FromArrowType;
 use vortex::file::{OpenOptionsSessionExt, WriteOptionsSessionExt, WriteStrategyBuilder};
 use vortex_btrblocks::schemes::{float, integer, string};
 use vortex_btrblocks::{BtrBlocksCompressorBuilder, Scheme, SchemeExt};
@@ -83,26 +83,19 @@ fn strategy_builder_for_level(level: u8) -> Option<WriteStrategyBuilder> {
     let builder = match level {
         0 => BtrBlocksCompressorBuilder::empty(),
         1 => builder_with_schemes(&[
-            &integer::IntConstantScheme,
             &integer::SparseScheme,
-            &float::FloatConstantScheme,
             &float::NullDominatedSparseScheme,
-            &string::StringConstantScheme,
             &string::NullDominatedSparseScheme,
         ]),
         2 => builder_with_schemes(&[
-            &integer::IntConstantScheme,
             &integer::SparseScheme,
             &integer::IntDictScheme,
-            &float::FloatConstantScheme,
             &float::NullDominatedSparseScheme,
             &float::FloatDictScheme,
-            &string::StringConstantScheme,
             &string::NullDominatedSparseScheme,
             &string::StringDictScheme,
         ]),
         3 => builder_with_schemes(&[
-            &integer::IntConstantScheme,
             &integer::SparseScheme,
             &integer::IntDictScheme,
             &integer::FoRScheme,
@@ -110,11 +103,9 @@ fn strategy_builder_for_level(level: u8) -> Option<WriteStrategyBuilder> {
             &integer::ZigZagScheme,
             &integer::RunEndScheme,
             &integer::SequenceScheme,
-            &float::FloatConstantScheme,
             &float::NullDominatedSparseScheme,
             &float::FloatDictScheme,
             &float::FloatRLEScheme,
-            &string::StringConstantScheme,
             &string::NullDominatedSparseScheme,
             &string::StringDictScheme,
         ]),
