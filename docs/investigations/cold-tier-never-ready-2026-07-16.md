@@ -618,3 +618,23 @@ buffer_unordered can name the dropped-wake site — every visible wake layer re-
   ⇒ **lock deadlock** (names the lock).
 The scan-park counters from frozen run 29699291451 (`completed≈spawned`, ~78 undrained/unyielded) favor the
 first (drain-side lost-wake: tasks completed, results never drained) over starvation — the backtrace confirms.
+
+### Live local-repro datapoint (2026-07-20) — a transient STUCK-INSIDE-POLL
+
+The local single-table docker repro (dumper image) ran healthy/self-healing this session (counters grew,
+`order_line` promotion cycled runs 0→3 repeatedly, never permanently froze). The "SCAN STALLED" WARNs were
+the false-positive kind (backlog ~270-285 = normal `buffer_unordered` pipeline depth; counters advanced
+between ticks). One `cayenne::stall` tick showed a NEW, distinct diag:
+`sort_input_diag="STUCK-INSIDE-POLL: a RunInputStream::poll_next is blocked synchronously (ChunkStream mutex
+or sync execute_arrow decode)"` with `input_poll_inflight=1` — a *transient* synchronous block inside the
+input poll (the sync `execute_arrow` decode under the `ChunkStream` mutex, streaming.rs:294-298), which
+resolved on the next tick.
+
+This adds a **third mechanism branch** the permanent-freeze backtrace must distinguish, all separable by the
+`sort_input` diag captured at the freeze:
+- `POLLED-THEN-PENDING` (all permanent freezes so far) + `input_poll_inflight=0` ⇒ lost-wake (scan returned
+  Pending, never re-woken).
+- `STUCK-INSIDE-POLL` + `input_poll_inflight=1` *persisting* ⇒ a synchronous block inside the poll — the
+  `ChunkStream` inner `Mutex` or the sync `execute_arrow` decode never returning (NOT a lost-wake). Only ever
+  seen transient so far.
+- `SORTEXEC-NOT-POLLING` ⇒ SortExec parked downstream (sink/upload backpressure), not the scan.
