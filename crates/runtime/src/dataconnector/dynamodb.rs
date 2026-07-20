@@ -956,9 +956,7 @@ fn empty_change_batch(
     // and the post-snapshot checkpoint barrier, so a silent failure here is hard to
     // diagnose. Callers still degrade on `None` (see `emit_overwrite_then_live`).
     let record_batch = RecordBatch::try_new(schema_ref, empty_arrays)
-        .inspect_err(
-            |e| tracing::error!(error = %e, "Failed to build empty change RecordBatch"),
-        )
+        .inspect_err(|e| tracing::error!(error = %e, "Failed to build empty change RecordBatch"))
         .ok()?;
 
     ChangeBatch::try_new(record_batch)
