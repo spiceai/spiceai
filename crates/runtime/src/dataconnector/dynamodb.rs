@@ -454,14 +454,10 @@ const DYNAMODB_STREAMS_CHECKPOINT_TABLE: &str = "spice_sys_dynamodb_streams";
 /// Streams sidecar table. `None` means no usable accelerator connection, so the
 /// connector state is ephemeral and the stream restarts on every runtime restart.
 async fn init_checkpoint_store(dataset: &Dataset) -> Option<Arc<dyn BlobCheckpointStore>> {
-    let store = checkpoint_store(dataset, DYNAMODB_STREAMS_CHECKPOINT_TABLE).await;
-    if store.is_none() {
-        tracing::error!(
-            dataset = %dataset.name,
-            "Failed to initialize DynamoDB Streams sidecar checkpoint storage. Connector state is ephemeral and the stream will restart on every runtime restart"
-        );
-    }
-    store
+    // `None` (no usable accelerator connection) is a graceful "checkpointing
+    // unavailable" degradation; `checkpoint_store` already logs the underlying
+    // reason, so don't double-log it here.
+    checkpoint_store(dataset, DYNAMODB_STREAMS_CHECKPOINT_TABLE).await
 }
 
 /// Loads the checkpoint from the sidecar [`BlobCheckpointStore`], or initializes a new checkpoint if none exists.
