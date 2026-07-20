@@ -757,3 +757,34 @@ This is the textbook `arc_swap::rcu` livelock precondition: a **rare expensive**
 what the two native backtraces caught the `compaction-work` thread doing. Mechanism now corroborated from
 three independent angles: the ground-truth backtraces, the confirmed arc-swap 1.9.1 retry semantics, and this
 writer-contention pattern. Only the fix experiment (measure never-ready-rate drop) remains for literal 100%.
+
+---
+
+## 2026-07-20 — CORRECTION: two distinct mechanisms; the rcu theory does NOT explain the never-ready freeze
+
+The two 2026-07-20 native-backtrace sections above over-attributed the never-ready write-cold freeze to the
+`arc_swap::rcu` deletion-index prune. That is wrong, caught by a lock-mutual-exclusion argument:
+
+- `promote_warm_to_cold_inner` takes `compaction_lock.lock().await` (table.rs:14717) THEN `write_lock`
+  (14760) and holds BOTH across the whole graduation incl. write-cold-scan-sort.
+- `bake_seq_prefix_protected_snapshots` takes `compaction_lock.try_lock()` and SKIPS if held.
+- They are separate per-table workers (`BackgroundColdTierPromoter::promote_warm_to_cold` vs
+  `BackgroundCompactor::run_compaction_trigger` → bake), sharing the per-table `compaction_lock`.
+
+⇒ While a table's promotion is frozen in write-cold (holding `compaction_lock`), that SAME table's bake
+CANNOT run (already established here: "No `order_line` compaction runs again until after the freeze —
+promotion ⟂ compaction per table"). So the `compaction-work → bake → prune → rcu` thread in the never-ready
+capture (29717944124) is a DIFFERENT table's `BackgroundCompactor` — concurrent, NOT the cause of and NOT
+blocking the order_line scan freeze. Its appearance in that backtrace is a red herring for the never-ready case.
+
+**Two distinct problems (previously conflated because the same bake/rcu thread appeared in both dumps):**
+- **A — never-ready freeze** (29717944124, phase `write-cold-store-scan-sort-encode-upload`): the PROMOTION
+  holds compaction_lock+write_lock and its SCAN returns Pending (`POLLED-THEN-PENDING`). This is the original
+  shape-A wedge and remains the open puzzle — the bake/rcu livelock does NOT explain it.
+- **B — convergence stall** (29717858996, phase `await-compaction-lock`): a BAKE got compaction_lock first
+  and livelocks in `prune_deletes_at_or_below ← arc_swap::rcu`, blocking the promotion at await-compaction-lock.
+  This is a real, code-located, second bug (table.rs:17215/17227) — but it is NOT the never-ready freeze.
+
+**Refocus for the 2 more never-ready traces:** inspect the `BackgroundColdTierPromoter`/promotion thread and
+its scan tasks' parked location — NOT the compaction-work thread. The never-ready cause is still "why does the
+promotion's scan return Pending / stop producing," per the shape-A analysis.
