@@ -30,9 +30,16 @@ limitations under the License.
 //! one replication connection and one publication instead of each opening
 //! its own — WAL is decoded once for the whole catalog, not once per table.
 //!
-//! Every included table must have a primary key: catalog setup fails,
-//! naming the table, if one is missing. Use `include`/`exclude` to keep
-//! tables without a primary key out of an accelerated catalog's scope.
+//! Each table is accelerated according to its `PostgreSQL` `REPLICA IDENTITY`
+//! (see `classify_replica_identity`): `DEFAULT` + primary key and `USING INDEX`
+//! (keyed by the nominated unique index) replicate normally; `FULL` + primary
+//! key replicates too but logs a warning (heavier -- the full old-row image is
+//! written to the WAL on every `UPDATE`/`DELETE`). A table with no usable CDC
+//! key -- `NOTHING`, keyless `DEFAULT`, `FULL` without a key, or an unusable
+//! `USING INDEX` -- is skipped with an actionable warning and simply absent from
+//! the catalog namespace, rather than failing the whole catalog. `include`/
+//! `exclude` narrow scope and suppress the skip warning for known-ineligible
+//! tables (handle those via federation and/or `refresh_mode: full` instead).
 //!
 //! Before touching any table, `refresh()` validates the `PostgreSQL`
 //! prerequisites CDC needs (`wal_level = logical`, replication privilege)
@@ -51,7 +58,8 @@ use app::App;
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use data_components::postgres::provider::{
-    check_cdc_prerequisites, list_schemas, list_tables, primary_key_columns,
+    ReplicaIdentityOutcome, check_cdc_prerequisites, classify_replica_identity, list_schemas,
+    list_tables, replica_identity,
 };
 use data_components::postgres_replication::config::default_slot_name;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
@@ -64,7 +72,7 @@ use globset::GlobSet;
 use parking_lot::RwLock;
 use snafu::prelude::*;
 use spicepod::acceleration::{
-    Acceleration as SpicepodAcceleration, RefreshMode as SpicepodRefreshMode,
+    Acceleration as SpicepodAcceleration, OnConflictBehavior, RefreshMode as SpicepodRefreshMode,
 };
 use spicepod::component::dataset::Dataset as SpicepodDataset;
 use spicepod::param::Params;
@@ -126,6 +134,18 @@ fn synthesized_dataset_name(catalog_name: &str, schema_name: &str, table_name: &
         hex_encode(schema_name),
         hex_encode(table_name)
     )
+}
+
+/// Render `key` in the string form `ColumnReference` parses (see
+/// `datafusion_table_providers`'s `ColumnReference::try_from`): a single column
+/// verbatim, a compound key as `(a, b, ...)`. Used for BOTH the dataset's
+/// `primary_key` and its `on_conflict` upsert target so both parse to the same
+/// `ColumnReference` and the CDC path's upsert-on-key check matches.
+fn column_reference_string(key: &[String]) -> String {
+    match key {
+        [single] => single.clone(),
+        many => format!("({})", many.join(", ")),
+    }
 }
 
 /// A catalog provider that CDC-accelerates every table it discovers (subject
@@ -197,15 +217,18 @@ impl AcceleratedCatalogProvider {
     }
 
     /// Synthesizes (but does NOT spawn) the per-table CDC dataset for
-    /// `schema_name.table_name`, returning the name it will be registered under
-    /// and the built `Dataset`. Building is separated from spawning so the whole
-    /// catalog can be validated before any background bootstrap/CDC task starts
-    /// (see `refresh`); a build failure aborts the refresh with nothing spawned.
+    /// `schema_name.table_name`, keyed by `key` (the columns resolved from the
+    /// table's replica identity -- see `classify_replica_identity`). Returns the
+    /// name it will be registered under and the built `Dataset`. Building is
+    /// separated from spawning so the whole catalog can be validated before any
+    /// background bootstrap/CDC task starts (see `refresh`); a build failure
+    /// aborts the refresh with nothing spawned.
     #[expect(clippy::result_large_err)]
     fn build_accelerated_dataset(
         &self,
         schema_name: &str,
         table_name: &str,
+        key: &[String],
     ) -> Result<(String, crate::component::dataset::Dataset), crate::Error> {
         let dataset_name = synthesized_dataset_name(&self.catalog_name, schema_name, table_name);
 
@@ -227,14 +250,19 @@ impl AcceleratedCatalogProvider {
             dataset_name.clone(),
         )
         .with_params(Params::from_string_map(params));
-        // Schema inference is always attempted now (the `schema_inference` opt-in
-        // was removed upstream). For `refresh_mode: changes` the inferred primary
-        // key and its CDC upsert `on_conflict` are always applied
-        // (`apply_inferred_schema`), which is exactly what this synthesized CDC
-        // dataset relies on — so no explicit opt-in is needed here.
+        // Declare the CDC key EXPLICITLY rather than relying on schema inference:
+        // inference only derives a primary key from `indisprimary`, so a
+        // `REPLICA IDENTITY USING INDEX` table (no formal PK) would otherwise get
+        // no key. The same string keys both `primary_key` and the `on_conflict`
+        // upsert target so they parse to the same `ColumnReference` (which
+        // `connector-postgres`'s CDC path requires -- otherwise UPDATE events
+        // append duplicate rows). Inference still fills sort/secondary-indexes.
+        let key_ref = column_reference_string(key);
         spicepod_ds.acceleration = Some(SpicepodAcceleration {
             engine: Some(CAYENNE_ENGINE.to_string()),
             refresh_mode: Some(SpicepodRefreshMode::Changes),
+            primary_key: Some(key_ref.clone()),
+            on_conflict: HashMap::from([(key_ref, OnConflictBehavior::Upsert)]),
             ..SpicepodAcceleration::default()
         });
 
@@ -253,24 +281,27 @@ impl AcceleratedCatalogProvider {
     /// tables that `include`/`exclude` excluded from it, for the catalog's
     /// startup summary.
     ///
-    /// Validates and builds (but does NOT spawn) every selected table: any
-    /// table missing a primary key, or whose dataset fails to build, aborts with
-    /// an error. Spawning is deferred to `refresh` so the whole catalog is
-    /// validated before any background task starts. See [`SchemaPlan`].
+    /// Classifies and builds (but does NOT spawn) every selected table by its
+    /// `REPLICA IDENTITY` (see `classify_replica_identity`): tables with a usable
+    /// CDC key are built keyed by it (emitting a per-table info/warn describing
+    /// how they replicate), tables without one are skipped with an actionable
+    /// warning and counted in `SchemaPlan::skipped`. Only a genuine connection /
+    /// query / build failure aborts the refresh. Spawning is deferred to
+    /// `refresh` so the whole catalog is validated before any background task
+    /// starts. See [`SchemaPlan`].
     async fn plan_schema_provider(
         &self,
         schema_name: &str,
     ) -> Result<SchemaPlan, Box<dyn std::error::Error + Send + Sync>> {
-        // Views have no primary key and can't be CDC-accelerated -- exclude
-        // them at discovery so they never reach the per-table PK check below
-        // (which would otherwise reject every view with a misleading "has no
-        // primary key" error instead of simply not considering it).
+        // Views can't be CDC-accelerated (no replica identity) -- exclude them at
+        // discovery so they never reach the per-table classification below.
         let table_names = list_tables(&self.pool, schema_name, false)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
         let mut tables = HashMap::new();
         let mut excluded = 0usize;
+        let mut skipped = 0usize;
         let mut to_spawn = Vec::new();
         for table_name in table_names {
             if !table_is_selected(
@@ -284,7 +315,7 @@ impl AcceleratedCatalogProvider {
             }
 
             // Already running from a previous refresh -- reuse it rather
-            // than re-validating and re-spawning a duplicate bootstrap/CDC
+            // than re-classifying and re-spawning a duplicate bootstrap/CDC
             // task for a table `refresh()` already knows about.
             let spawn_key = (schema_name.to_string(), table_name.clone());
             let already_spawned = {
@@ -295,8 +326,8 @@ impl AcceleratedCatalogProvider {
             let dataset_name = if let Some(dataset_name) = already_spawned {
                 dataset_name
             } else {
-                // Quote each component (only when required) so the user-facing
-                // error below unambiguously identifies the table and round-trips
+                // Quote each component (only when required) so the per-table
+                // warnings below unambiguously identify the table and round-trip
                 // -- a bare `{schema}.{table}` is misleading for identifiers that
                 // need quoting (spaces, mixed case) or contain dots. Matches how
                 // `build_accelerated_dataset` and `foreign_key_target` quote
@@ -306,22 +337,48 @@ impl AcceleratedCatalogProvider {
                     quote_identifier(schema_name),
                     quote_identifier(&table_name)
                 );
-                let primary_key = primary_key_columns(&self.pool, schema_name, &table_name)
+                let identity = replica_identity(&self.pool, schema_name, &table_name)
                     .await
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-                if primary_key.is_empty() {
-                    return Err(format!(
-                        "Catalog '{}': table {table_path} has no primary key. Every table included in an accelerated catalog must have a primary key -- add one, or exclude the table via the catalog's `include`/`exclude` patterns.",
-                        self.catalog_name
-                    )
-                    .into());
-                }
+                // Resolve the CDC upsert key from the table's replica identity, or
+                // skip (not error) a table that has no usable one so the rest of
+                // the catalog still replicates. `DEFAULT` + primary key is the
+                // normal case and logs nothing (counted in the summary); the
+                // notable cases each get one line.
+                let key = match classify_replica_identity(&identity) {
+                    ReplicaIdentityOutcome::Skip { reason } => {
+                        skipped += 1;
+                        tracing::warn!(
+                            "Catalog '{}': skipping table {table_path}: {}. Exclude it via the catalog's `include`/`exclude` patterns to suppress this warning.",
+                            self.catalog_name,
+                            reason.explanation(),
+                        );
+                        continue;
+                    }
+                    ReplicaIdentityOutcome::AccelerateViaPrimaryKey { key } => key,
+                    ReplicaIdentityOutcome::AccelerateViaUniqueIndex { key } => {
+                        tracing::info!(
+                            "Catalog '{}': accelerating table {table_path} via its REPLICA IDENTITY unique index ({}).",
+                            self.catalog_name,
+                            key.join(", "),
+                        );
+                        key
+                    }
+                    ReplicaIdentityOutcome::AccelerateFullReplicaIdentity { key } => {
+                        tracing::warn!(
+                            "Catalog '{}': accelerating table {table_path} with REPLICA IDENTITY FULL (keyed by ({})) -- heavier than DEFAULT/USING INDEX: PostgreSQL logs the full old-row image on every UPDATE/DELETE. Prefer a primary key or USING INDEX where possible.",
+                            self.catalog_name,
+                            key.join(", "),
+                        );
+                        key
+                    }
+                };
 
                 // Build (validate) now; defer spawning to `refresh` so a later
-                // PK-less/unbuildable table can't leave this one orphaned.
+                // unbuildable table can't leave this one orphaned.
                 let (dataset_name, dataset) = self
-                    .build_accelerated_dataset(schema_name, &table_name)
+                    .build_accelerated_dataset(schema_name, &table_name, &key)
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
                 to_spawn.push((table_name.clone(), dataset_name.clone(), dataset));
                 dataset_name
@@ -333,6 +390,7 @@ impl AcceleratedCatalogProvider {
         Ok(SchemaPlan {
             tables,
             excluded,
+            skipped,
             to_spawn,
         })
     }
@@ -341,14 +399,15 @@ impl AcceleratedCatalogProvider {
 /// A validated, not-yet-spawned plan for one schema (see
 /// [`AcceleratedCatalogProvider::refresh`]): the `table_name -> dataset
 /// registration name` map for the schema provider, the number of tables
-/// `include`/`exclude` excluded, and the datasets that are new this refresh and
-/// still need spawning. Validation (every selected table has a primary key and
-/// builds) completes for the whole catalog before any dataset is spawned, so a
-/// later PK-less table can't leave earlier tables' bootstrap/CDC tasks running
-/// orphaned against a catalog that never registers.
+/// `include`/`exclude` excluded, the number skipped for having no usable replica
+/// identity, and the datasets that are new this refresh and still need spawning.
+/// Classification + build completes for the whole catalog before any dataset is
+/// spawned, so a later unbuildable table can't leave earlier tables' bootstrap/
+/// CDC tasks running orphaned against a catalog that never registers.
 struct SchemaPlan {
     tables: HashMap<String, String>,
     excluded: usize,
+    skipped: usize,
     /// `(table_name, dataset_name, built dataset)` for each new table.
     to_spawn: Vec<(String, String, crate::component::dataset::Dataset)>,
 }
@@ -368,18 +427,21 @@ impl RefreshableCatalogProvider for AcceleratedCatalogProvider {
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-        // Phase 1: discover, validate, and build every selected table across all
-        // schemas BEFORE spawning anything. A PK-less (or unbuildable) table
-        // aborts the whole refresh here with nothing spawned, so it can't leave
-        // earlier tables' bootstrap/CDC tasks running orphaned against a catalog
-        // that then never registers.
+        // Phase 1: discover, classify, and build every selected table across all
+        // schemas BEFORE spawning anything. Tables with no usable replica
+        // identity are skipped (with a warning), not fatal; only a genuine
+        // connection/query/build failure aborts here -- and when it does, nothing
+        // has been spawned, so it can't leave earlier tables' bootstrap/CDC tasks
+        // running orphaned against a catalog that then never registers.
         let mut plans = Vec::new();
         let mut included_tables = 0usize;
         let mut excluded_tables = 0usize;
+        let mut skipped_tables = 0usize;
         for schema_name in &schema_names {
             let plan = self.plan_schema_provider(schema_name).await?;
             included_tables += plan.tables.len();
             excluded_tables += plan.excluded;
+            skipped_tables += plan.skipped;
             plans.push((schema_name.clone(), plan));
         }
 
@@ -410,11 +472,12 @@ impl RefreshableCatalogProvider for AcceleratedCatalogProvider {
         }
 
         tracing::info!(
-            "Catalog '{}': accelerating {included_tables} table{} via CDC (shared replication slot '{}'); {excluded_tables} table{} excluded by include/exclude filters.",
+            "Catalog '{}': accelerating {included_tables} table{} via CDC (shared replication slot '{}'); {excluded_tables} table{} excluded by include/exclude filters; {skipped_tables} table{} skipped (no usable replica identity -- see warnings).",
             self.catalog_name,
             if included_tables == 1 { "" } else { "s" },
             self.slot_name,
             if excluded_tables == 1 { "" } else { "s" },
+            if skipped_tables == 1 { "" } else { "s" },
         );
 
         Ok(())
