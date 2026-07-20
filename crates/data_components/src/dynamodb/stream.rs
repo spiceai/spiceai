@@ -43,7 +43,7 @@ pub enum StreamError {
     FailedToReceiveMessage { source: dynamodb_streams::Error },
 
     #[snafu(display(
-        "DynamoDB Stream is beyond its 24-hour retention window; delete the acceleration to re-bootstrap the table: {source}"
+        "DynamoDB Stream is beyond its 24-hour retention window; drop this dataset's accelerated data (its acceleration files/tables) to force a fresh full re-bootstrap of the table: {source}"
     ))]
     StreamBeyondRetention { source: dynamodb_streams::Error },
 
@@ -133,23 +133,19 @@ pub fn truncate_change_batch(
 
     let primary_keys_array = get_primary_keys_array(primary_keys, 1);
 
-    // Truncate carries no data; a single all-null row keeps the data struct's
-    // type identical to the snapshot/live batches so the apply path can coalesce.
-    let data_columns: Vec<arrow_array::ArrayRef> = table_schema
-        .fields()
-        .iter()
-        .map(|f| arrow::array::new_null_array(f.data_type(), 1))
-        .collect();
-    let data_array = StructArray::new(table_schema.fields().clone(), data_columns, None);
+    // Truncate carries no data. Build the whole `data` value as a single NULL
+    // struct row (the `data` field is nullable in `changes_schema`). A *valid*
+    // struct with all-null children would violate Arrow nullability for any
+    // non-nullable child field (`StructArray::new` rejects unmasked child nulls);
+    // a null struct masks child validity entirely while keeping the type identical
+    // to the snapshot/live batches so the apply path can still coalesce them.
+    let data_array =
+        arrow::array::new_null_array(&DataType::Struct(table_schema.fields().clone()), 1);
 
     let new_schema = Arc::new(changes_schema(table_schema.as_ref()));
     let new_record_batch = RecordBatch::try_new(
         new_schema,
-        vec![
-            Arc::new(op_array),
-            Arc::new(primary_keys_array),
-            Arc::new(data_array),
-        ],
+        vec![Arc::new(op_array), Arc::new(primary_keys_array), data_array],
     )
     .context(FailedToCreateRecordBatchSnafu)?;
 
@@ -166,6 +162,13 @@ fn get_primary_keys_array(primary_keys: &[String], row_count: usize) -> ListArra
         .downcast_mut::<ListBuilder<Box<dyn ArrayBuilder>>>()
         .unwrap_or_else(|| unreachable!("created above as a list builder"));
     for _ in 0..row_count {
+        // Match `process_batch`: encode "no primary keys" as a null list rather than
+        // a valid empty list, so every CDC batch this connector emits (snapshot,
+        // truncate, live) agrees on null-vs-empty semantics.
+        if primary_keys.is_empty() {
+            list_builder.append(false);
+            continue;
+        }
         let str_builder = list_builder
             .values()
             .as_any_mut()
@@ -382,6 +385,26 @@ mod tests {
             .expect("should build truncate batch");
 
         // Exactly one row, op = "t" (Truncate) — the delete-all barrier.
+        assert_eq!(batch.record.num_rows(), 1);
+        assert!(matches!(batch.op(0), ChangeOperation::Truncate));
+    }
+
+    #[test]
+    fn truncate_change_batch_allows_non_nullable_fields() {
+        // A declared (non-inferred) schema can mark fields non-nullable. The
+        // truncate barrier carries no data, so its `data` value must be a NULL
+        // struct row rather than a valid struct with null children — otherwise
+        // Arrow rejects the unmasked null in the non-nullable child and this
+        // (correctness-critical rebootstrap) path fails.
+        let table_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let primary_keys = vec!["id".to_string()];
+
+        let batch = truncate_change_batch(&table_schema, &primary_keys)
+            .expect("truncate batch must build for schemas with non-nullable fields");
+
         assert_eq!(batch.record.num_rows(), 1);
         assert!(matches!(batch.op(0), ChangeOperation::Truncate));
     }

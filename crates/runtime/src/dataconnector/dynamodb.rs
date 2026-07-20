@@ -41,7 +41,6 @@ use snafu::ResultExt;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
-use tokio::sync::Mutex;
 use util::time_format::is_valid_format;
 
 // If we get `ShardNotFound` or `StreamBeyondRetention` on startup and checkpoint is old enough,
@@ -370,13 +369,6 @@ impl DataConnector for DynamoDB {
         &self,
         federated_table: Arc<FederatedTable>,
         dataset: &Dataset,
-        // The DynamoDB connector no longer writes the accelerator directly: it
-        // emits a Truncate + snapshot through the CDC change contract (see
-        // `emit_overwrite_then_live`), so the runtime's accelerator write path
-        // and CPU runtime are unused here.
-        _accelerated_table_provider: Arc<dyn TableProvider>,
-        _accelerator_write_mutex: Arc<Mutex<()>>,
-        _cpu_runtime: Option<tokio::runtime::Handle>,
     ) -> Option<ChangesStream> {
         let dataset = dataset.clone();
 
@@ -964,9 +956,16 @@ fn empty_change_batch(
         .map(|f| arrow::array::new_empty_array(f.data_type()))
         .collect();
 
-    let record_batch = RecordBatch::try_new(schema_ref, empty_arrays).ok()?;
+    // Log the concrete Arrow/CDC cause: this batch gates both the readiness signal
+    // and the post-snapshot checkpoint barrier, so a silent failure here is hard to
+    // diagnose. Callers still degrade on `None` (see `emit_overwrite_then_live`).
+    let record_batch = RecordBatch::try_new(schema_ref, empty_arrays)
+        .inspect_err(|e| tracing::error!(error = %e, "Failed to build empty change RecordBatch"))
+        .ok()?;
 
-    ChangeBatch::try_new(record_batch).ok()
+    ChangeBatch::try_new(record_batch)
+        .inspect_err(|e| tracing::error!(error = %e, "Failed to build empty ChangeBatch"))
+        .ok()
 }
 
 /// Creates an empty `ChangeEnvelope` with `dataset_is_ready = true` to signal ready state.
