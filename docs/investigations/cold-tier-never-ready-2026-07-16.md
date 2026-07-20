@@ -638,3 +638,53 @@ This adds a **third mechanism branch** the permanent-freeze backtrace must disti
   `ChunkStream` inner `Mutex` or the sync `execute_arrow` decode never returning (NOT a lost-wake). Only ever
   seen transient so far.
 - `SORTEXEC-NOT-POLLING` ⇒ SortExec parked downstream (sink/upload backpressure), not the scan.
+
+---
+
+## 2026-07-20 — FIRST FULL NATIVE BACKTRACE CAPTURED (CI run 29717858996) — deletion-index rcu livelock
+
+The dumper build's in-process all-thread native backtrace fired (reason: `stall table=order_line
+phase=await-compaction-lock`). ~300 threads symbolized cleanly. Findings:
+
+**No lock deadlock.** ZERO `parking_lot::…::RawMutex::lock`/`RawRwLock::lock`/`lock_slow` frames across all
+~300 threads. The `await-compaction-lock` is an async lock (its waiter parks as an idle tokio task, no lock
+frame). ⇒ the goal's "RawRwLock/RawMutex ⇒ lock deadlock" branch is ELIMINATED for this stall.
+
+**The one working thread** (`comm="compaction-work"`, tid 25264) — everything else idle (289 parked tokio
+workers `condvar::wait→multi_thread park_condvar`, 4 idle io-drivers `epoll_wait`, main in `block_on`):
+```
+KeyDeletionIndex::prune_deletes_at_or_below
+arc_swap::ArcSwapAny::rcu
+CayenneTableProvider::prune_deletion_index_at_or_below            (table.rs:17215 / :17227)
+CayenneTableProvider::bake_seq_prefix_protected_snapshots         (table.rs:15772)
+<CayenneTableProvider as CompactionRunner>::run_compaction_trigger   (holds compaction_lock)
+BackgroundCompactor::spawn
+→ tokio blocking-pool
+```
+
+**Mechanism (code-grounded).** `prune_deletion_index_at_or_below` prunes the tombstone index via
+`deletion_snapshot.rcu(|current| { let pruned = current.tombstones.prune_deletes_at_or_below(cutoff);
+Arc::new(Snapshot::from_index(pruned)) })`. `arc_swap::rcu` (1.9.1) **re-runs the closure on every CAS
+failure**: `loop { let new = f(&cur); let prev = compare_and_swap(cur,new); if ptr_eq {return} else {cur=prev} }`.
+The closure is an **O(N) rebuild of the ~30M-entry `KeyDeletionIndex`**. Under concurrent CDC writes to the
+same `deletion_snapshot` (OLTP delete load constantly appends tombstones), the expensive prune can never win
+the CAS ⇒ **rcu livelock**: unbounded retry, CPU-bound, holding `compaction_lock`, blocking the `order_line`
+promotion stuck at `await-compaction-lock`. Racy by nature (livelocks only when prune-duration exceeds the
+inter-write interval), matching the ~60% rate. The scanpark counters in the same dump were also anomalous:
+`in_flight=1650`, `stuck_before_project=70006` (task bodies suspended in projection_evaluation) — a *different*
+signature from the prior drain-side lost-wake (`completed≈spawned`).
+
+**HONEST SCOPE CAVEAT.** This run **became ready** (05:37:59) then FAILED the **convergence** gate
+(`replication did not converge`), and showed **0 POLLED-THEN-PENDING**. So this capture is the
+compaction/convergence stall mode — the deletion-index rcu livelock holding `compaction_lock` and starving
+promotion throughput — which is DISTINCT from (and may or may not share a cause with) the never-ready
+`POLLED-THEN-PENDING` scan freeze the goal targets. It does NOT by itself close the never-ready-freeze goal.
+Open question: does the same rcu livelock also drive the never-ready freeze (e.g. via the transient
+30M-entry allocations each rcu retry churns, pressuring the pool and starving the scan/sort)? Needs a
+POLLED-THEN-PENDING capture to compare the working-thread stack.
+
+**Candidate fix (independent of the freeze question — this is a real livelock bug).** Do NOT run an O(N)
+prune inside `arc_swap::rcu`. Options: (a) compute the pruned index once under a short exclusive lock / a
+single `swap` (accept one lost concurrent update and re-derive), (b) make the prune incremental/cheap, or
+(c) debounce/skip the prune when a bake ran recently. arc-swap's own docs warn `rcu` is only appropriate for
+cheap closures.
