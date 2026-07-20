@@ -688,3 +688,56 @@ prune inside `arc_swap::rcu`. Options: (a) compute the pruned index once under a
 single `swap` (accept one lost concurrent update and re-derive), (b) make the prune incremental/cheap, or
 (c) debounce/skip the prune when a bake ran recently. arc-swap's own docs warn `rcu` is only appropriate for
 cheap closures.
+
+---
+
+## 2026-07-20 — TARGET NEVER-READY FREEZE CAPTURED WITH NATIVE BACKTRACE (CI run 29717944124)
+
+Second native-backtrace capture — this one the **goal-target freeze**: `Spice runtime is ready`=0 (NEVER
+ready), `POLLED-THEN-PENDING`×48 sustained 06:12:47→06:36:18 (~24 min), backtrace fired at 06:12:48 reason
+`stall table=order_line phase=write-cold-store-scan-sort-encode-upload`. Run errored never-ready at 06:36:48.
+
+**Freeze-moment metrics (06:12:47):** phase=write-cold, in_phase_s=199, `progress_delta_tick=0`,
+`input_delta_tick=0`, `input_poll_entered_delta=0`, `sort_input_diag=POLLED-THEN-PENDING`,
+`encode_permits=48/48` (idle), `compaction_pool_used=6.99GB / 30.25GB` (**~23%, NOT exhausted**),
+`mem_tier_used=455MB`. Scanpark: `completed==spawned=41045, in_flight=0, backlog=120, stuck_before_project=0`.
+
+**The backtrace — ~300 threads, 0 lock frames (NO deadlock), runtime overwhelmingly idle** (286 parked
+workers `condvar→multi_thread park_condvar`, 5 io-drivers, main block_on). Only THREE CPU-active threads, ALL
+on the **deletion-index / tombstone machinery**:
+1. `compaction-work` — `KeyDeletionIndex::prune_deletes_at_or_below ← arc_swap::rcu ← prune_deletion_index_at_or_below ← bake_seq_prefix_protected_snapshots ← run_compaction_trigger ← BackgroundCompactor::spawn` (**identical to the convergence-mode capture 29717858996**).
+2. `cdc-apply-worke` — `SparseChunk::drop → Arc::drop_slow → … → drop_in_place<InMemTombstones>` inside `AppendMutationWriter::write_cdc_pipelined ← process_upsert_batch` — **freeing a huge `InMemTombstones`** (recursive O(N) free of an imbl/`sized_chunks` structure).
+3. `cdc-apply-worke` — another table's bootstrap snapshot (`BootstrapBuilder::append_from_row`) — progressing, expected.
+
+The order_line promotion itself (holding write_lock) is parked (suspended await) among the idle workers.
+
+**REVISED root-cause picture (ground-truth, corrects the prior pure "scan lost-wake" theory):**
+- **NOT a lock deadlock** — 0 `RawMutex`/`RawRwLock`/`lock_slow` frames across ~300 threads (both captures).
+- **NOT a hard scan lost-wake** — the scan **progresses**: `spawned` grew 41045 (06:13) → 267565 (06:36), and
+  `Bounded sort run complete` events fire throughout (06:11,06:12,06:14,06:16,06:17…). `backlog=120` is normal
+  `buffer_unordered` pipeline depth on a progressing scan, not undrained-lost-wake. `POLLED-THEN-PENDING` is a
+  SYMPTOM: the SortExec reads a huge input that is intermittently Pending between spilling runs; the 30s
+  watchdog samples it mid-Pending.
+- **NOT memory/backpressure** — pool ~23%, encode 48/48 idle, 286 idle workers (no starvation).
+- **The actual bottleneck is the deletion-index / tombstone machinery**, dominated by
+  `prune_deletion_index_at_or_below` under `arc_swap::rcu`: `deletion_snapshot.rcu(|cur| Snapshot::from_index(
+  cur.tombstones.prune_deletes_at_or_below(cutoff)))`. arc_swap::rcu (1.9.1, source-confirmed) **re-runs the
+  closure on every CAS failure**; the closure is an O(~30M-entry) `KeyDeletionIndex` prune+rebuild. Under
+  concurrent CDC tombstone writes to the same `deletion_snapshot` it livelocks / retries unboundedly (and the
+  paired `InMemTombstones` drop is an O(N) recursive free of the same huge structure). This CPU-heavy churn,
+  concurrent with the order_line cold-promotion's already-expensive multi-run spilling Z-order sort (which
+  holds write_lock the entire time), makes the promotion so slow it never completes within the ready_wait
+  budget ⇒ ingest blocked behind write_lock ⇒ spiced never ready.
+
+**PRIMARY, code-level, actionable bug (appears in BOTH captures; confirmed antipattern):**
+`CayenneTableProvider::prune_deletion_index_at_or_below` (table.rs:17215 / :17227) runs an O(N) prune+rebuild
+of a ~30M-entry index inside `arc_swap::rcu`. arc-swap's own docs restrict `rcu` to cheap closures. FIX: do
+the prune once under a short exclusive lock (single `store`/`swap`, accept & re-derive one lost concurrent
+update), or make the prune incremental, or debounce it. This removes the livelock and the transient
+30M-entry per-retry alloc/free churn.
+
+**Honest residual.** This capture shows slow-grind + tombstone-machinery CPU churn, not a proven *hard*
+permanent lost-wake. Some earlier counter-only captures (e.g. 29670291865) showed `input_delta_tick=0`
+sustained (scan input truly frozen) — possibly a distinct harder sub-mode. Confirming the fix is the decisive
+next step: patch the rcu prune and measure whether the never-ready rate collapses. If a hard-frozen run
+(counters truly frozen many ticks) is caught, its backtrace should be compared against this one.
