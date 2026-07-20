@@ -788,3 +788,35 @@ blocking the order_line scan freeze. Its appearance in that backtrace is a red h
 **Refocus for the 2 more never-ready traces:** inspect the `BackgroundColdTierPromoter`/promotion thread and
 its scan tasks' parked location — NOT the compaction-work thread. The never-ready cause is still "why does the
 promotion's scan return Pending / stop producing," per the shape-A analysis.
+
+---
+
+## 2026-07-20 — NEW LEAD (user): the cold-tier promotion runs on a NICE-10 low-priority runtime
+
+Traced the runtime the cold-tier promotion executes on:
+- `bin/spiced/src/lib.rs`: `compaction_runtime = ManagedTokioRuntime::builder().with_low_priority()
+  .with_thread_name("compaction-worker")` ⇒ **nice 10** (`runtime-async/src/lib.rs` build(): sets nice 10
+  for low_priority; `worker_threads = num_cpus-1`, so NOT thread-limited — priority-limited).
+- `BackgroundColdTierPromoter` "Runs on the shared low-priority compaction runtime" (compaction.rs:870) →
+  `run_cold_tier_promotion_tick → promote_warm_to_cold`. So the whole write-cold scan/sort/upload runs on
+  nice-10 threads WHILE holding `write_lock`. (`comm="compaction-work"` in both backtraces confirms.)
+- Sibling runtimes: `cdc_apply_runtime` = nice 0 (100 OLTP terminals), `cpu_runtime` = default (queries),
+  `refresh_runtime` = nice 10.
+
+**Reframed hypothesis for the never-ready freeze (fits the evidence better than any lost-wake):** under the
+SF1000 load the nice-0 cdc-apply + queries saturate the cores; the Linux scheduler starves the nice-10
+compaction runtime, so the promotion's scan/sort gets little CPU → the scan returns Pending and isn't
+advanced for long stretches → `POLLED-THEN-PENDING` / `input_delta_tick=0`. This is INDISTINGUISHABLE at the
+watchdog level from a lost wakeup, but the wake isn't lost — the runtime just isn't scheduled. Explains:
+scan progressed slowly (41K→267K, not a hard hang); 0 lock frames; no lost-wake ever found in source (there
+isn't one); racy ~60% (depends on load saturating the box during the bootstrap promotion); write_lock held
+for tens of minutes → never ready.
+
+**Tension to resolve:** the dumps showed ~286 idle-parked workers — if cores were truly idle a nice-10
+thread should run, so this may be BURSTY starvation + an already-slow spilling sort, not continuous
+starvation. Next never-ready traces: check the `compaction-worker` threads' state — on-CPU/runnable
+(⇒ starvation) vs parked-in-condvar with the scan idle (⇒ different cause).
+
+**Cheap, non-correctness-sensitive TEST (unlike the deletion-index fix):** drop `.with_low_priority()` on
+the compaction runtime (nice 0, matching cdc_apply) or add CPU headroom, and re-run — if the never-ready
+freeze vanishes, it was scheduler starvation of the low-priority promotion runtime.
