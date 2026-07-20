@@ -363,6 +363,67 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         }
     }
 
+    async fn validate_request(
+        &self,
+        tables: &[TableReference],
+        explicit_datasets_requested: bool,
+        additional_columns: &[Column],
+    ) -> Result<()> {
+        for tbl in tables {
+            let table_provider = self.df.get_table(tbl).await.ok_or_else(|| {
+                Error::DataSourcesNotFound {
+                    data_source: vec![tbl.clone()],
+                }
+            })?;
+
+            if explicit_datasets_requested {
+                let embedding_columns = self.embedding_columns_from_table(tbl).await;
+                let fts_candidates = self.full_text_search_candidates(tbl).await;
+
+                let has_search_capability = embedding_columns
+                    .as_ref()
+                    .is_some_and(|cols| !cols.is_empty())
+                    || fts_candidates
+                        .as_ref()
+                        .is_some_and(|res| res.as_ref().is_ok_and(|c| !c.is_empty()));
+
+                if !has_search_capability {
+                    return Err(Error::CannotSearchDataset {
+                        data_source: tbl.clone(),
+                    });
+                }
+            }
+
+            let schema = table_provider.schema();
+            for col in additional_columns {
+                let col_applies =
+                    col.relation.as_ref().is_none_or(|rel| {
+                        tbl.clone()
+                            .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                            == rel
+                                .clone()
+                                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                    });
+
+                if col_applies && schema.column_with_name(&col.name).is_none() {
+                    let available_columns = schema
+                        .fields()
+                        .iter()
+                        .map(|f| f.name().as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(Error::AdditionalColumnNotFound {
+                        column: col.name.clone(),
+                        data_source: tbl.clone(),
+                        available_columns,
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn search_with_cache(
         &self,
         req: &SearchRequest,
@@ -468,6 +529,9 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         if tables.is_empty() {
             return Err(Error::NoTablesWithSearchFound {});
         }
+
+        self.validate_request(&tables, explicit_datasets_requested, additional_columns)
+            .await?;
 
         let span = match Span::current() {
             span if matches!(span.metadata(), Some(metadata) if metadata.name() == "search") => {
