@@ -484,7 +484,7 @@ async fn load_or_initialize_checkpoint(
                 tracing::warn!(
                     dataset = %dataset_name,
                     error = ?err,
-                    "Failed to deserialize lag, falling back to initialization"
+                    "Failed to deserialize the persisted DynamoDB Streams checkpoint, falling back to re-initialization"
                 );
                 get_latest_checkpoint(dynamodb, dataset_name)
                     .await
