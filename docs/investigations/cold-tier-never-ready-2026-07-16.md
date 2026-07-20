@@ -741,3 +741,19 @@ permanent lost-wake. Some earlier counter-only captures (e.g. 29670291865) showe
 sustained (scan input truly frozen) — possibly a distinct harder sub-mode. Confirming the fix is the decisive
 next step: patch the rcu prune and measure whether the never-ready rate collapses. If a hard-frozen run
 (counters truly frozen many ticks) is caught, its backtrace should be compared against this one.
+
+### Causal link tightened (2026-07-20) — the rcu write-contention is real
+
+Confirmed the `deletion_snapshot` ArcSwap has BOTH frequent-cheap writers on the hot CDC-apply path AND the
+one expensive prune writer, all via `rcu` on the *same* ArcSwap:
+- `commit_on_conflict_deletion_update` (table.rs:11137) — every upsert-with-conflict apply batch.
+- `publish_staged_key_deletion_cache` (table.rs:10654), `update_file_deletion_cache` (9456),
+  `upgrade_tombstones_for_flushed_pks` (9582) — apply/flush path.
+- `prune_deletion_index_at_or_below` (table.rs:17215/17227) — the EXPENSIVE O(~30M) prune (compaction path).
+
+This is the textbook `arc_swap::rcu` livelock precondition: a **rare expensive** closure competing against
+**frequent cheap** swaps on one ArcSwap. Under active CDC ingest, the cheap apply-path rcus keep swapping
+`deletion_snapshot`, so the prune's expensive closure never wins its CAS and retries unboundedly — exactly
+what the two native backtraces caught the `compaction-work` thread doing. Mechanism now corroborated from
+three independent angles: the ground-truth backtraces, the confirmed arc-swap 1.9.1 retry semantics, and this
+writer-contention pattern. Only the fix experiment (measure never-ready-rate drop) remains for literal 100%.
