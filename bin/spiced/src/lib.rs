@@ -729,8 +729,12 @@ pub async fn run(args: Args) -> Result<()> {
             // not carve a compaction memory environment from the initial
             // spicepod. `set_compaction_runtime` injects the carved memory
             // environment only when one is available.
+            // DIAG(cold-stall): run the compaction runtime at DEFAULT priority (nice 0)
+            // instead of `.with_low_priority()` (nice 10). Tests the hypothesis that the
+            // never-ready cold-tier freeze is OS scheduler starvation of the nice-10
+            // promotion runtime under SF1000 load (nice-0 CDC apply + queries saturate
+            // cores). REVERT before merge if this is not the cause.
             let compaction_runtime = ManagedTokioRuntime::builder()
-                .with_low_priority()
                 .with_thread_name("compaction-worker")
                 .build()
                 .boxed()
