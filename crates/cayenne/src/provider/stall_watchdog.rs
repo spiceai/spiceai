@@ -410,6 +410,10 @@ fn watchdog_loop(interval: Duration, warn_after: Duration) {
                 "Cayenne operation has not advanced its phase — possible stall/deadlock (write_lock likely held; ingest for this table is blocked behind it). See sort_input_diag for the frozen-input cause. input_delta_tick=0 ⇒ scan/upstream parked; input advancing while progress_delta_tick=0 ⇒ sort/sink parked downstream; compaction_pool_used near total ⇒ spilling sort"
             );
             if op.should_dump {
+                // In-process native all-thread backtrace (ptrace-free): discriminates a
+                // parking_lot lock deadlock (lock frames) from an idle/lost-wake runtime park.
+                let reason = format!("stall table={} phase={}", op.table, op.phase);
+                super::thread_backtrace::dump_all_threads(&reason);
                 if let Some(handle) = op.runtime.as_ref() {
                     dump_runtime_tasks(handle, &op.table, op.phase);
                 }

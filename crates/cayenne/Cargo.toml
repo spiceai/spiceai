@@ -94,6 +94,7 @@ libc = "0.2"
 # working set. See the module docs.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+backtrace = "0.3"
 
 [features]
 default = []

@@ -359,3 +359,184 @@ cold/S3 read). This needs the tracing in the CI binary → push a `spiceai/vorte
 `409505dfd0`, bump the `Cargo.toml` rev, rebuild spiced, dispatch CI. With the frame known, write the
 reproducing test at that layer and land the fix at the pin. (Awaiting user go-ahead — this touches
 the vortex pin + an org push, beyond the diagnostics-only branch scope so far.)
+
+## FACT: compaction memory exhaustion is a clean ERROR + retry, NOT the freeze (observed 2026-07-18)
+
+Direct log evidence (a run with a small ~1.6 GB compaction pool):
+
+```
+WARN cayenne::compaction: Cold-tier promotion tick failed (warm tier left intact; retry next tick):
+  Not enough memory to continue external sort. Consider increasing 'datafusion.runtime.memory_limit'
+  or decreasing 'datafusion.execution.sort_spill_reservation_bytes'.
+caused by Resources exhausted: Additional allocation failed for ExternalSorterMerge[0] ...
+  Failed to allocate additional 10.0 MB for ExternalSorterMerge[0] ... 714.0 KB remain available
+  for the total memory pool: greedy(used: 1637.7 MB, pool_size: 1638.4 MB) table="oorder"
+```
+
+Key facts:
+- When the compaction `GreedyMemoryPool` cannot satisfy a sort/merge reservation, the `ExternalSorter`
+  (here in the **`ExternalSorterMerge`** phase, needing +10 MB) returns **`ResourcesExhausted`** — it
+  does **not** block or deadlock.
+- Cayenne **handles it gracefully**: `Cold-tier promotion tick failed (warm tier left intact; retry
+  next tick)` — the promotion aborts, releases its memory + `write_lock`, and retries on the next
+  tick. No hang.
+- Therefore memory exhaustion during compaction is **visible (a WARN with a `Resources exhausted`
+  cause) and self-recovering** — categorically different from the SF1000 freeze, which is a **silent
+  40-min hang with zero errors** while holding `write_lock`.
+- Corroborates the local unit test (`concurrent_promotions_pool_contention_errors_does_not_deadlock`)
+  and the earlier deduction: pool pressure ⇒ *error+retry*, not deadlock. The freeze must be a
+  pre-error mechanism (scan/driver lost-wakeup that never reaches a failing reservation), because a
+  genuine memory shortfall would surface as this WARN, not silence.
+- Note: in the SF1000 CI freeze the pool was pinned at ~94.6% (28.6/30.2 GB) with **no** such WARN —
+  i.e. the sorts were *waiting* (for parked scan input), not *failing to reserve*. The held memory is
+  a symptom of the parked scan, not the cause.
+- (The `not ready within 120s` in that log is just a short ready-wait on a slow bootstrap, not the
+  freeze; the "Not enough memory" WARN is a normal small-pool promotion retry.)
+
+## DEFINITIVE: reads exonerated; stall is scan-batch-production at a bounded_sort run boundary (frozen instrumented run 29627694719, 2026-07-18)
+
+A frozen CI run on the instrumented spiced (`67d4d14902` → `vortex@4b323e22c4` read tracing) gives the decisive picture:
+
+- **Sustained freeze**: `stock` cold-promotion, `write-cold-store-scan-sort-encode-upload`, `in_phase_s`
+  2015→2165 (35+ min), `progress` frozen at 17,053,697, `input_rows` frozen at 26,992,640 (both `delta=0`).
+- **Every vortex read completed**: `read_at start` without a matching `end` = **0 of 155,773** — including
+  cold S3 reads. Driver alive (`q_polled=0`, counts climbing).
+- **⇒ The freeze is NOT** a hung read, S3/MinIO connection, `FileSegmentSource` lost-wakeup, the driver,
+  or a `ChunkedSource` contract violation (runs are sequential).
+- **Precise locus**: stock's 2nd promotion ran `bounded_sort` `run_idx=0` to completion (17.05M rows),
+  then `run_idx=1` **started but never logged "input consumed"** — it froze ~9.94M rows into run 1
+  (`26.99M` cumulative − `17.05M` from run 0), with `progress` still at run-0's output (run 1's `SortExec`
+  is still consuming, has emitted nothing). All of run 1's underlying reads completed.
+- **Therefore** the scan `DFStream` (`execute_stream(TableProvider::scan)` → vortex decode/layout +
+  DataFusion scan-plan operators, incl. the `RepartitionExec`s seen in the memory log) returns `Pending`
+  forever at the **run≥1 boundary**, starving `run_idx=1`'s `SortExec`. This is the same "run≥1 started,
+  never consumed input" pattern as the first frozen run (29599553490) — now with reads proven complete beneath it.
+
+**Next narrowing (cayenne-side, no vortex change):** wrap the scan `DFStream` feeding `zorder_sort_stream`/
+`bounded_sort` with per-poll logging (Pending vs Ready, last wake), and log `ChunkStream`'s inner-poll
+result. That distinguishes "scan `DFStream` Pending forever" (→ vortex decode/layout or `RepartitionExec`
+backpressure across the run-boundary poll pause) from a `SortExec`-side stall. (Heavy `dropped`-read churn
+— 1.29M, order_line cold dominant — is harmless prefetch-then-cancel; 0 hung.)
+
+## LEADING HYPOTHESIS: known upstream waker-corruption bug class (oneshot + FuturesUnordered / sequence.rs), 2026-07-18
+
+An upstream-issue review connects this freeze to a documented waker-corruption bug class in exactly the
+vortex read/sequence path — our freeze being the **lost-wakeup (hang) sibling** of crashes already reported.
+
+Related issues:
+- **spiceai#8830 (CLOSED): "Cayenne acceleration panic in `FuturesUnordered::release_task`."** The `oneshot`
+  crate drops a stored waker in `Receiver::drop()`; when that waker is an `Arc<FuturesUnordered::Task>`,
+  re-entrant drop → panic/SIGSEGV. Fixed by switching to `tokio::sync::oneshot`.
+- **vortex#6221 (OPEN): "Occasional SIGSEGV under high concurrency."** Broader tracking of the same
+  `oneshot`+`FuturesUnordered` waker corruption. Still open. References spiceai#8830. (@sgrebnov.)
+- **vortex#4521 (CLOSED): "all wakers must have been removed."** A leaked-waker panic in
+  `vortex-layout/src/sequence.rs` (the sequencing/eval driver).
+
+Mechanism (why it's our freeze):
+- `vortex-layout/src/sequence.rs` `SequenceUniverse` stores `cx.waker().clone()` in a `HashMap` per
+  sequence id (`WaitSequenceFuture::poll`, line ~243) and, when a sequence finishes, `SequenceId::drop`
+  (line ~147-151) calls `remove(self)` → `w.wake()` on the *next* sequence's stored waker.
+- If that stored waker is **stale/corrupted, `wake()` no-ops** → the next sequence never re-polls →
+  decode/scan-batch-production stalls. This matches every observed fact: reads all complete (stall is
+  ABOVE the reads), stall is below/at decode, at a `bounded_sort` run-boundary poll pause/resume, all
+  workers `futex`-parked (no runnable task = a lost wakeup, not a busy loop).
+- The stored waker is frequently the `Arc<FuturesUnordered::Task>` from the upstream `buffer_unordered` —
+  the exact object #6221 says gets corrupted. So the crash (#8830/#6221), the leak-panic (#4521), and our
+  silent hang are three manifestations of the same waker-lifecycle bug.
+- The #6221/#8830 fix (`tokio::sync::oneshot`) landed **narrowly** — `spiceai/vortex@b27e89af5 (#9)` only
+  changed `vortex-io/src/runtime/single.rs`. **`FileSegmentSource` (`vortex-file/src/segments/source.rs`)
+  still uses the raw `oneshot` crate** (`oneshot::channel()`/`AsyncReceiver`) in our pin `409505dfd0`, so
+  the vulnerable pattern remains and its wakers feed the `sequence.rs` chain.
+
+Convergence with the instrumentation: this predicts the pending decode+poll-probe run will show
+`sort_input_diag = POLLED-THEN-PENDING` (scan `DFStream` returned `Pending`, waiting for a wake that never
+came) with `DECODE_INFLIGHT == 0` (stall above decode, in the sequence/eval waker) — a lost wakeup, not a
+stuck decode. If so, it corroborates the `sequence.rs`/`oneshot` waker hypothesis directly.
+
+Candidate fixes to trial: (1) apply the `tokio::sync::oneshot` switch to `FileSegmentSource` (the spot #9
+missed); (2) harden `sequence.rs`'s wake path against stale wakers; (3) try a newer vortex (pin is 0.76.0)
+that may fully resolve #6221.
+
+## 2026-07-19: poll-probe CONFIRMS scan lost-wakeup; exact path pinned; fix under test
+
+**Poll-probe verdict (frozen instrumented runs 29670291865 + 29670293472, binary 9e776866c).** Both
+`order_line` + `stock` cold-promotions stuck 1400+s in phase `write-cold-store-scan-sort-encode-upload`
+with `sort_input_diag = "POLLED-THEN-PENDING"` — the SortExec polled its input (the scan), the scan
+returned `Pending`, and the wake to resume never came. Ruled out by the *same* capture: NOT memory
+(`compaction_pool_used` ~14–22 GB of 30 GB, not exhausted — an adequate-pool run still froze), NOT
+downstream/encode backpressure (`encode_permits 48/48` idle), NOT stuck-in-poll, NOT SortExec-not-polling.
+This validates the 2026-07-18 prediction above. Racy: a 3rd same-binary run (29670295224) became READY, so
+~2/3 freeze, not deterministic — consistent with a waker race.
+
+**Eliminated fixes (do NOT resolve the freeze):** vortex #8677 + #8711 (detached read-driver panic
+handling + spawn-via-runtime) cherry-picked and tested — still froze; they only change panic *visibility*,
+and a panicking detached driver drops its Senders (→ error, not hang). `sequence.rs` `SequenceUniverse` is
+UNCHANGED 0.76→0.79 and, on review, its ordering protocol is sound (parked waiters always re-register). So
+the earlier `sequence.rs`/read-driver framing is set aside.
+
+**Exact scan path pinned (corrected).** The promotion scan runs through the DataFusion opener →
+`ScanBuilder::into_stream` → **`LazyScanStream`** (`vortex-layout/src/scan/scan_builder.rs`), whose
+`Stream`-state driver is `stream::iter(tasks).map(handle.spawn).buffer_unordered(concurrency)` — NOT
+`RepeatedScan::execute_stream` (a first instrumentation pass was misplaced there and fired 0 lines). Each
+split-read `Task` joins via the **oneshot crate** (`vortex-io/src/runtime/handle.rs`), and `buffer_unordered`
+drives them inside a `FuturesUnordered`.
+
+**Scan-park counter verdict (frozen run 29699291451, in-process dumper).** Tail:
+`spawned=284565 completed=284560 yielded=284482 backlog=78` then froze ⇒ task bodies COMPLETE
+(`completed≈spawned`) but ~78 completed splits were NOT drained (`yielded<completed`) while the scan
+returned `Pending` — a **drain-side lost-wake**, not stuck task bodies. (Caveat: backlog only 78, softer
+than a textbook lost-wake — treat as strongly-indicated, not proven.)
+
+**PR #9 gap = the scoped fix candidate.** #6221's `tokio::sync::oneshot` fix (spiceai/vortex `b27e89af5`,
+#9) was applied ONLY to `single.rs` (feature-gated) — NOT to `handle.rs`'s general `Task`, which is exactly
+what `LazyScanStream`'s `buffer_unordered` uses. Note the WHOLE-channel tokio swap on the older
+`spiceai-54-tokio-channels` branch (0.76-based) did NOT fix the hang, so this is *scoped, not proven* — the
+current `handle.rs`-only gap was never independently tested until now.
+
+**Lock-deadlock hypothesis (open, not ruled out).** Execution-path locks exist and are shared across
+concurrent split-read tasks — `FilterExpr` in `scan/filter.rs` (`ordering: RwLock<Vec<usize>>`,
+`conjunct_selectivity: Vec<RwLock<DDSketch>>`) and `file_stats.rs` `Arc<Mutex<ExecutionCtx>>`. `filter.rs`
+looks clean on inspection (no guard-across-`.await`, no re-entrant read→write), but `parking_lot`
+contention under high concurrency isn't excluded. Corroborating: earlier tokio task-dumps **timed out on
+synchronous blocks** — more consistent with a `parking_lot` block than a pure async park. The captured
+native dumps can't discriminate: `eu-stack`/`gdb` FAILED on every dump (`ptrace` blocked — CI runs in a
+container without `CAP_SYS_PTRACE`; `ptrace_scope` unsettable), and the ptrace-free `wchan` shows 365/370
+threads (incl. 64/65 `compaction-work`) in `futex_wait_queue` — the identical state for a lock-blocked
+thread AND an idle parked runtime worker. So lock-vs-lost-wake is UNRESOLVED by captured data.
+
+**write_lock wedge (shape A, code-confirmed).** `promote_warm_to_cold_inner` (`table.rs` ~14708) holds the
+table `write_lock` (`lock_owned`, ~14760) across the ENTIRE graduation incl. the scan/sort/encode/upload
+phase. So a parked scan → `write_lock` held forever → the table's CDC apply blocks → spiced never ready.
+"Promotion parked in scan" (cause) and "ingest apply wedged" (symptom) are the same wedge.
+
+**Diagnostics built (ptrace-free, in-process).** (1) scan-park counters + a **side-thread steady-state
+dumper** (`vortex-layout/src/scan/scanpark.rs`) that samples spawned/completed/yielded + task phase
+(started/filter_done/project_done) every 5s and emits DURING the stall — distinguishes stuck-body vs
+drain and localizes a stuck body to filter vs projection. (2) **in-process all-thread native backtrace**
+on stall (`cayenne/src/provider/thread_backtrace.rs`, signal-based, capture IPs in handler + symbolize
+outside), triggered by the stall watchdog — the ptrace-free equivalent of `gdb thread apply all bt` that
+will show `parking_lot::…::lock` frames (lock deadlock) vs runtime-park frames (idle/lost-wake). Built but
+deferred (shares the CI `chbench` DB with the fix runs).
+
+**THE FIX under test.** Extend #9's swap to `handle.rs`'s `Task` → `tokio::sync::oneshot` (feature-gated,
+mirroring `single.rs`): vortex `sgrebnov/cold-stall-vortex-oneshot-handle` @ `ea51ad3ea`, spiced
+`sgrebnov/0716-cold-stall-fix` @ `16c22041b` (build 29700121334).
+
+**Fix confirmation status + a correction.** An earlier "3/3 ready" claim was WRONG: two of those runs
+(29705563263, 29706653018) actually FAILED at `Setup spiced` — the fix binary wasn't in MinIO yet
+(dispatched in parallel before the build finished uploading) — and were misclassified because the loop
+defaulted to "ready" whenever it didn't see "not ready within" (compounded by truncated `--log` fetches).
+**Only 29706785855 is confirmed READY** (reached the post-ready convergence gate). A corrected toward-10
+loop (reliable `--log-failed` classification: `did not converge`⇒ready, `not ready within`⇒froze, else⇒
+infra/retry) is running to accumulate 10 genuine ready runs — which both confirms the fix and satisfies the
+goal's "10 successful ready runs" condition. Any fix-binary FREEZE would disprove the fix and re-open the
+mechanism track (deploy the deferred backtrace build).
+
+**SEPARATE issue — convergence (not the freeze).** Every fix run still fails the correctness gate with an
+`order_line` under-count ("replication did not converge"). Root: the promotion sort runs in a dedicated
+**compaction memory pool** sized by `cayenne_compaction_memory_fraction` (default 0.2 of host RAM, ≈4.8 GB
+on the CI runner), SHARED across concurrent promotions; two big-table sorts collide → `ResourcesExhausted`
+→ tick errors + retries → order_line never promotes → apply lags. This is a clean ERROR path (the
+`GreedyMemoryPool` errors, never deadlocks), fully independent of the freeze. Fix knobs:
+`cayenne_compaction_memory_fraction` (raise) and/or `cold_clustering_run_size_mb` (lower). Note:
+`runtime.query.memory_limit` is the WRONG knob (it sizes the query pool, not the compaction pool).
