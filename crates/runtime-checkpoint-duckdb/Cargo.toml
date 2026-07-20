@@ -26,6 +26,7 @@ description = "Per-dataset blob checkpoint store backed by a DuckDB accelerator 
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
 async-trait.workspace = true
 datafusion-table-providers = { workspace = true, features = ["duckdb"] }
+tokio = { workspace = true, features = ["rt"] }
 
 [lints]
 workspace = true

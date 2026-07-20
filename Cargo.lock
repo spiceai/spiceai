@@ -16635,6 +16635,7 @@ dependencies = [
  "async-trait",
  "datafusion-table-providers",
  "runtime-checkpoint-api",
+ "tokio",
 ]
 
 [[package]]

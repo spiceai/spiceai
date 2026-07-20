@@ -57,6 +57,24 @@ impl BlobCheckpointStore for PostgresBlobCheckpointStore {
             .await
             .map_err(|source| CheckpointError::Store { source })?;
         let table = self.table_name;
+
+        // Ensure the sidecar table exists so a fresh accelerator reads as "no
+        // checkpoint yet" (Ok(None)) rather than a missing-table store error.
+        let create_table = format!(
+            "CREATE TABLE IF NOT EXISTS {table} (
+                dataset_name TEXT PRIMARY KEY,
+                checkpoint_data TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )"
+        );
+        conn.conn
+            .execute(&create_table, &[])
+            .await
+            .map_err(|source| CheckpointError::Store {
+                source: Box::new(source),
+            })?;
+
         let query = format!(
             "SELECT checkpoint_data, EXTRACT(EPOCH FROM updated_at) FROM {table} WHERE dataset_name = $1"
         );

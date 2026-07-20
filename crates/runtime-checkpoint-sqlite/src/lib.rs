@@ -63,6 +63,18 @@ impl BlobCheckpointStore for SqliteBlobCheckpointStore {
 
         conn.conn
             .call(move |conn: &mut rusqlite::Connection| -> Result<Option<BlobCheckpoint>, rusqlite::Error> {
+                // Ensure the sidecar table exists so a fresh accelerator reads as
+                // "no checkpoint yet" (Ok(None)) rather than a missing-table error.
+                let create_table = format!(
+                    "CREATE TABLE IF NOT EXISTS {table} (
+                        dataset_name TEXT PRIMARY KEY,
+                        checkpoint_data TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )"
+                );
+                conn.execute(&create_table, [])?;
+
                 let query = format!(
                     "SELECT checkpoint_data, strftime('%s', updated_at) FROM {table} WHERE dataset_name = ?"
                 );

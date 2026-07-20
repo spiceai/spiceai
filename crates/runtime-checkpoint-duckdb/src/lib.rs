@@ -52,21 +52,28 @@ impl DuckDbBlobCheckpointStore {
         }
     }
 
-    fn upsert_blocking(&self, data: &str) -> Result<(), BoxedError> {
-        let mut db_conn = Arc::clone(&self.pool).connect_sync()?;
-        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)?
-            .get_underlying_conn_mut();
-        let table = self.table_name;
-
-        let create_table = format!(
+    fn create_table_sql(table: &str) -> String {
+        format!(
             "CREATE TABLE IF NOT EXISTS {table} (
                 dataset_name TEXT PRIMARY KEY,
                 checkpoint_data TEXT,
                 created_at TIMESTAMP,
                 updated_at TIMESTAMP
             )"
-        );
-        duckdb_conn.execute(&create_table, [])?;
+        )
+    }
+
+    fn upsert_blocking(
+        pool: &Arc<DuckDbConnectionPool>,
+        dataset_name: &str,
+        table: &str,
+        data: &str,
+    ) -> Result<(), BoxedError> {
+        let mut db_conn = Arc::clone(pool).connect_sync()?;
+        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)?
+            .get_underlying_conn_mut();
+
+        duckdb_conn.execute(&Self::create_table_sql(table), [])?;
 
         let upsert = format!(
             "INSERT INTO {table} (dataset_name, checkpoint_data, created_at, updated_at)
@@ -75,22 +82,28 @@ impl DuckDbBlobCheckpointStore {
                 checkpoint_data = excluded.checkpoint_data,
                 updated_at = now()"
         );
-        let data = data.to_string();
-        duckdb_conn.execute(&upsert, [&self.dataset_name, &data])?;
+        duckdb_conn.execute(&upsert, [dataset_name, data])?;
         Ok(())
     }
 
-    fn get_blocking(&self) -> Result<Option<BlobCheckpoint>, BoxedError> {
-        let mut db_conn = Arc::clone(&self.pool).connect_sync()?;
+    fn get_blocking(
+        pool: &Arc<DuckDbConnectionPool>,
+        dataset_name: &str,
+        table: &str,
+    ) -> Result<Option<BlobCheckpoint>, BoxedError> {
+        let mut db_conn = Arc::clone(pool).connect_sync()?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)?
             .get_underlying_conn_mut();
-        let table = self.table_name;
+
+        // Ensure the sidecar table exists so a fresh accelerator reads as "no
+        // checkpoint yet" (Ok(None)) rather than a missing-table store error.
+        duckdb_conn.execute(&Self::create_table_sql(table), [])?;
 
         let query = format!(
             "SELECT checkpoint_data, epoch(updated_at) FROM {table} WHERE dataset_name = ?"
         );
         let mut stmt = duckdb_conn.prepare(&query)?;
-        let mut rows = stmt.query([&self.dataset_name])?;
+        let mut rows = stmt.query([dataset_name])?;
 
         let Some(row) = rows.next()? else {
             return Ok(None);
@@ -105,15 +118,32 @@ impl DuckDbBlobCheckpointStore {
 
 #[async_trait]
 impl BlobCheckpointStore for DuckDbBlobCheckpointStore {
-    // The DuckDB pool is synchronous/blocking; this mirrors the previous behavior of
-    // the per-connector sidecars (they called the sync path inline).
     async fn get(&self) -> Result<Option<BlobCheckpoint>, CheckpointError> {
-        self.get_blocking()
+        // The DuckDB pool is synchronous/blocking, so run it off the async worker
+        // via spawn_blocking rather than stalling the runtime thread.
+        let pool = Arc::clone(&self.pool);
+        let dataset_name = self.dataset_name.clone();
+        let table = self.table_name;
+        tokio::task::spawn_blocking(move || Self::get_blocking(&pool, &dataset_name, table))
+            .await
+            .map_err(|source| CheckpointError::Store {
+                source: Box::new(source),
+            })?
             .map_err(|source| CheckpointError::Store { source })
     }
 
     async fn upsert(&self, data: &str) -> Result<(), CheckpointError> {
-        self.upsert_blocking(data)
-            .map_err(|source| CheckpointError::Store { source })
+        let pool = Arc::clone(&self.pool);
+        let dataset_name = self.dataset_name.clone();
+        let table = self.table_name;
+        let data = data.to_string();
+        tokio::task::spawn_blocking(move || {
+            Self::upsert_blocking(&pool, &dataset_name, table, &data)
+        })
+        .await
+        .map_err(|source| CheckpointError::Store {
+            source: Box::new(source),
+        })?
+        .map_err(|source| CheckpointError::Store { source })
     }
 }

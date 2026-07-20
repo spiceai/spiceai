@@ -234,9 +234,21 @@ pub async fn checkpoint_store(
     table_name: &'static str,
 ) -> Option<Arc<dyn BlobCheckpointStore>> {
     let registry = dataset.runtime.accelerator_engine_registry();
-    let connection = acceleration_connection(dataset, registry, OpenOption::CreateIfNotExists)
+    let connection = match acceleration_connection(dataset, registry, OpenOption::CreateIfNotExists)
         .await
-        .ok()?;
+    {
+        Ok(connection) => connection,
+        Err(e) => {
+            // Surface *why* checkpointing is unavailable (missing engine feature,
+            // missing file, pool-init failure, …) instead of a silent `None`.
+            tracing::warn!(
+                dataset = %dataset.name,
+                error = %e,
+                "Could not resolve the dataset's accelerator connection for checkpoint storage; the connector will run without a persisted checkpoint"
+            );
+            return None;
+        }
+    };
     let dataset_name = dataset.name.to_string();
 
     // Exhaustive over the compiled `AccelerationConnection` variants — no wildcard, so
