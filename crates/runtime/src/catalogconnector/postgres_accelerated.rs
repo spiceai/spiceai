@@ -196,16 +196,17 @@ impl AcceleratedCatalogProvider {
         }
     }
 
-    /// Synthesizes and kicks off (fire-and-forget, same retry-forever
-    /// semantics as any spicepod-declared dataset) the per-table CDC dataset
-    /// for `schema_name.table_name`. Returns the name it was registered
-    /// under so the schema provider can look it up later.
+    /// Synthesizes (but does NOT spawn) the per-table CDC dataset for
+    /// `schema_name.table_name`, returning the name it will be registered under
+    /// and the built `Dataset`. Building is separated from spawning so the whole
+    /// catalog can be validated before any background bootstrap/CDC task starts
+    /// (see `refresh`); a build failure aborts the refresh with nothing spawned.
     #[expect(clippy::result_large_err)]
-    fn spawn_accelerated_dataset(
+    fn build_accelerated_dataset(
         &self,
         schema_name: &str,
         table_name: &str,
-    ) -> Result<String, crate::Error> {
+    ) -> Result<(String, crate::component::dataset::Dataset), crate::Error> {
         let dataset_name = synthesized_dataset_name(&self.catalog_name, schema_name, table_name);
 
         let mut params = self.dataset_params.clone();
@@ -245,19 +246,21 @@ impl AcceleratedCatalogProvider {
                 dataset: dataset_name.clone(),
             })?;
 
-        let runtime = Arc::clone(&self.runtime);
-        tokio::spawn(runtime.load_synthesized_dataset(Arc::new(dataset)));
-
-        Ok(dataset_name)
+        Ok((dataset_name, dataset))
     }
 
     /// Returns the schema provider along with the number of discovered
     /// tables that `include`/`exclude` excluded from it, for the catalog's
     /// startup summary.
-    async fn build_schema_provider(
+    ///
+    /// Validates and builds (but does NOT spawn) every selected table: any
+    /// table missing a primary key, or whose dataset fails to build, aborts with
+    /// an error. Spawning is deferred to `refresh` so the whole catalog is
+    /// validated before any background task starts. See [`SchemaPlan`].
+    async fn plan_schema_provider(
         &self,
         schema_name: &str,
-    ) -> Result<(AcceleratedSchemaProvider, usize), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<SchemaPlan, Box<dyn std::error::Error + Send + Sync>> {
         // Views have no primary key and can't be CDC-accelerated -- exclude
         // them at discovery so they never reach the per-table PK check below
         // (which would otherwise reject every view with a misleading "has no
@@ -268,6 +271,7 @@ impl AcceleratedCatalogProvider {
 
         let mut tables = HashMap::new();
         let mut excluded = 0usize;
+        let mut to_spawn = Vec::new();
         for table_name in table_names {
             if !table_is_selected(
                 schema_name,
@@ -304,27 +308,39 @@ impl AcceleratedCatalogProvider {
                     .into());
                 }
 
-                let dataset_name = self
-                    .spawn_accelerated_dataset(schema_name, &table_name)
+                // Build (validate) now; defer spawning to `refresh` so a later
+                // PK-less/unbuildable table can't leave this one orphaned.
+                let (dataset_name, dataset) = self
+                    .build_accelerated_dataset(schema_name, &table_name)
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-
-                let mut guard = self.spawned.write();
-                guard.insert(spawn_key, dataset_name.clone());
-
+                to_spawn.push((table_name.clone(), dataset_name.clone(), dataset));
                 dataset_name
             };
 
             tables.insert(table_name, dataset_name);
         }
 
-        Ok((
-            AcceleratedSchemaProvider {
-                runtime: Arc::clone(&self.runtime),
-                tables: RwLock::new(tables),
-            },
+        Ok(SchemaPlan {
+            tables,
             excluded,
-        ))
+            to_spawn,
+        })
     }
+}
+
+/// A validated, not-yet-spawned plan for one schema (see
+/// [`AcceleratedCatalogProvider::refresh`]): the `table_name -> dataset
+/// registration name` map for the schema provider, the number of tables
+/// `include`/`exclude` excluded, and the datasets that are new this refresh and
+/// still need spawning. Validation (every selected table has a primary key and
+/// builds) completes for the whole catalog before any dataset is spawned, so a
+/// later PK-less table can't leave earlier tables' bootstrap/CDC tasks running
+/// orphaned against a catalog that never registers.
+struct SchemaPlan {
+    tables: HashMap<String, String>,
+    excluded: usize,
+    /// `(table_name, dataset_name, built dataset)` for each new table.
+    to_spawn: Vec<(String, String, crate::component::dataset::Dataset)>,
 }
 
 #[async_trait]
@@ -342,14 +358,40 @@ impl RefreshableCatalogProvider for AcceleratedCatalogProvider {
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-        let mut schemas = HashMap::new();
+        // Phase 1: discover, validate, and build every selected table across all
+        // schemas BEFORE spawning anything. A PK-less (or unbuildable) table
+        // aborts the whole refresh here with nothing spawned, so it can't leave
+        // earlier tables' bootstrap/CDC tasks running orphaned against a catalog
+        // that then never registers.
+        let mut plans = Vec::new();
         let mut included_tables = 0usize;
         let mut excluded_tables = 0usize;
         for schema_name in &schema_names {
-            let (schema_provider, excluded) = self.build_schema_provider(schema_name).await?;
-            included_tables += schema_provider.table_names().len();
-            excluded_tables += excluded;
-            schemas.insert(schema_name.clone(), Arc::new(schema_provider));
+            let plan = self.plan_schema_provider(schema_name).await?;
+            included_tables += plan.tables.len();
+            excluded_tables += plan.excluded;
+            plans.push((schema_name.clone(), plan));
+        }
+
+        // Phase 2: the whole catalog validated -- now spawn the new datasets
+        // (fire-and-forget, same retry-forever semantics as any spicepod-declared
+        // dataset) and build the schema providers. These steps are infallible, so
+        // registration can no longer be left partially applied.
+        let mut schemas = HashMap::new();
+        for (schema_name, plan) in plans {
+            for (table_name, dataset_name, dataset) in plan.to_spawn {
+                self.spawned
+                    .write()
+                    .insert((schema_name.clone(), table_name), dataset_name);
+                tokio::spawn(Arc::clone(&self.runtime).load_synthesized_dataset(Arc::new(dataset)));
+            }
+            schemas.insert(
+                schema_name,
+                Arc::new(AcceleratedSchemaProvider {
+                    runtime: Arc::clone(&self.runtime),
+                    tables: RwLock::new(plan.tables),
+                }),
+            );
         }
 
         {
