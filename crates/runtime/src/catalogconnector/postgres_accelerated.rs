@@ -295,7 +295,17 @@ impl AcceleratedCatalogProvider {
             let dataset_name = if let Some(dataset_name) = already_spawned {
                 dataset_name
             } else {
-                let table_path = format!("{schema_name}.{table_name}");
+                // Quote each component (only when required) so the user-facing
+                // error below unambiguously identifies the table and round-trips
+                // -- a bare `{schema}.{table}` is misleading for identifiers that
+                // need quoting (spaces, mixed case) or contain dots. Matches how
+                // `build_accelerated_dataset` and `foreign_key_target` quote
+                // (see #11727).
+                let table_path = format!(
+                    "{}.{}",
+                    quote_identifier(schema_name),
+                    quote_identifier(&table_name)
+                );
                 let primary_key = primary_key_columns(&self.pool, schema_name, &table_name)
                     .await
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
