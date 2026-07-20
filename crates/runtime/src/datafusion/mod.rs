@@ -762,6 +762,9 @@ pub struct DataFusion {
     // merge + full snapshot rewrite). Isolated from the query and refresh runtimes so the
     // CPU-heavy rewrite can't steal worker threads from queries or CDC ingest.
     compaction_runtime: OnceLock<ManagedTokioRuntime>,
+    // DIAG(cold-stall) exp2: dedicated runtime for cold-tier promotion, isolated
+    // from the shared compaction/bake pool. REVERT before merge.
+    cold_tier_promotion_runtime: OnceLock<ManagedTokioRuntime>,
     // Dedicated DataFusion environment for compaction whose memory pool is a separate
     // budget carved from the query memory limit (sized in the builder). `Some` only when
     // Cayenne acceleration is configured and dedicated thread pools are enabled; compaction
@@ -1450,6 +1453,19 @@ impl DataFusion {
     /// tasks spawn here instead of on the ambient (refresh/query) runtime.
     /// Isolating compaction keeps the CPU-heavy snapshot rewrite off the
     /// latency-sensitive query and CDC paths while letting it use spare cores.
+    /// DIAG(cold-stall) exp2: set the dedicated cold-tier promotion runtime,
+    /// isolating promotion from the shared compaction/bake pool. REVERT before merge.
+    pub fn set_cold_tier_promotion_runtime(&self, handle: ManagedTokioRuntime) {
+        let tokio_handle = handle.handle().clone();
+        if self.cold_tier_promotion_runtime.set(handle).is_err() {
+            tracing::debug!(
+                "Dedicated cold-tier promotion runtime already set; dropping the redundant one"
+            );
+            return;
+        }
+        cayenne::set_cold_tier_promotion_runtime_handle(tokio_handle);
+    }
+
     pub fn set_compaction_runtime(&self, handle: ManagedTokioRuntime) {
         let tokio_handle = handle.handle().clone();
         if self.compaction_runtime.set(handle).is_err() {

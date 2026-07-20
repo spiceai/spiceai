@@ -63,6 +63,12 @@ use tokio::task::JoinHandle;
 /// `dedicated_thread_pool=disabled` — compaction falls back to [`tokio::spawn`]
 /// on the ambient runtime, preserving prior behavior.
 static COMPACTION_RUNTIME: LazyLock<RwLock<Option<Handle>>> = LazyLock::new(|| RwLock::new(None));
+// DIAG(cold-stall) exp2: dedicated runtime for cold-tier PROMOTION
+// (`BackgroundColdTierPromoter`), isolated from the shared compaction pool that
+// also runs bakes + size-tier compaction. When unset, cold promotion falls back
+// to `spawn_compaction` (the shared pool) — i.e. prior behavior. REVERT before merge.
+static COLD_TIER_PROMOTION_RUNTIME: LazyLock<RwLock<Option<Handle>>> =
+    LazyLock::new(|| RwLock::new(None));
 static COMPACTION_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 static IN_FLIGHT_COMPACTION_PASSES: LazyLock<CompactionPassTracker> =
     LazyLock::new(CompactionPassTracker::default);
@@ -194,6 +200,29 @@ where
 {
     let handle = COMPACTION_RUNTIME.read().clone();
     spawn_on(handle.as_ref(), future)
+}
+
+/// DIAG(cold-stall) exp2: inject the dedicated cold-tier promotion runtime handle.
+pub fn set_cold_tier_promotion_runtime_handle(handle: Handle) {
+    let mut guard = COLD_TIER_PROMOTION_RUNTIME.write();
+    *guard = Some(handle);
+}
+
+/// DIAG(cold-stall) exp2: spawn a cold-tier promotion task onto the dedicated
+/// promotion runtime if one has been injected, otherwise fall back to the shared
+/// compaction runtime (prior behavior). Returns the [`JoinHandle`] so callers can
+/// abort on drop (works across runtimes).
+pub(crate) fn spawn_cold_promotion<F>(future: F) -> JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let handle = COLD_TIER_PROMOTION_RUNTIME.read().clone();
+    if handle.is_some() {
+        spawn_on(handle.as_ref(), future)
+    } else {
+        spawn_compaction(future)
+    }
 }
 
 /// Wait for active Vortex-producing Cayenne maintenance passes to finish.
@@ -889,7 +918,9 @@ impl BackgroundColdTierPromoter {
         let shutdown = Arc::new(Notify::new());
         let shutdown_task = Arc::clone(&shutdown);
 
-        let handle = spawn_compaction(async move {
+        // DIAG(cold-stall) exp2: dedicated promotion runtime (falls back to the
+        // shared compaction pool if unset).
+        let handle = spawn_cold_promotion(async move {
             let mut current = interval;
             loop {
                 tokio::select! {

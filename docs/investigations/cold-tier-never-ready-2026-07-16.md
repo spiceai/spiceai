@@ -820,3 +820,17 @@ starvation. Next never-ready traces: check the `compaction-worker` threads' stat
 **Cheap, non-correctness-sensitive TEST (unlike the deletion-index fix):** drop `.with_low_priority()` on
 the compaction runtime (nice 0, matching cdc_apply) or add CPU headroom, and re-run — if the never-ready
 freeze vanishes, it was scheduler starvation of the low-priority promotion runtime.
+
+### Local capture 2026-07-20 (table=customer) — supports load-dependent starvation
+
+Local docker (full pod) fired a native backtrace on the write-cold phase-duration threshold, but it was a
+SOFT trigger, not the target freeze: `sort_input_diag="SORTEXEC-NOT-POLLING"` with `progress_delta_tick` > 0
+(cold rows written grew 5M→12M→16M across ticks) — the promotion was SLOWLY PROGRESSING, not hung. The
+155-thread dump: ~136 parked (futex_wait) + 4 io-drivers + **~10 threads actively on-CPU in the cold-write
+ENCODE path** — `vortex_fsst::compress` (×4), `ShardedPkIndex::record_keys_in_shard`, `arrow_select::interleave`,
+arrow→vortex conversion. 0 lock frames. So locally the promotion *gets* CPU and grinds forward (heavy FSST
+encode + spilling sort of ~19M rows) → self-heals; it does NOT hit the hard never-ready. This is consistent
+with the never-ready being **load-dependent scheduler starvation**: CI's 100-terminal OLTP (nice-0) saturates
+cores and starves the nice-10 promotion; a lighter local load lets it progress. (Distinct sub-phase from the
+CI never-ready POLLED-THEN-PENDING: local caught the sort-drain/encode stage, CI caught the scan stage — both
+"slow promotion holding write_lock," different sub-stages.)

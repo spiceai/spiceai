@@ -117,7 +117,8 @@ pub(crate) mod zorder;
 // Re-export the main type at the module level for convenience
 pub use compaction::{
     begin_compaction_shutdown, drain_compaction_tasks, in_flight_compaction_tasks,
-    reset_compaction_shutdown, set_compaction_runtime_env, set_compaction_runtime_handle,
+    reset_compaction_shutdown, set_cold_tier_promotion_runtime_handle,
+    set_compaction_runtime_env, set_compaction_runtime_handle,
 };
 pub use context::CayenneContext;
 pub use mem_tier::SlotAdvancer;

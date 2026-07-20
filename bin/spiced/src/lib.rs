@@ -729,18 +729,32 @@ pub async fn run(args: Args) -> Result<()> {
             // not carve a compaction memory environment from the initial
             // spicepod. `set_compaction_runtime` injects the carved memory
             // environment only when one is available.
-            // DIAG(cold-stall): run the compaction runtime at DEFAULT priority (nice 0)
-            // instead of `.with_low_priority()` (nice 10). Tests the hypothesis that the
-            // never-ready cold-tier freeze is OS scheduler starvation of the nice-10
-            // promotion runtime under SF1000 load (nice-0 CDC apply + queries saturate
-            // cores). REVERT before merge if this is not the cause.
+            // DIAG(cold-stall) exp2: general compaction/bakes KEEP the original low
+            // priority (nice 10). Only cold-tier promotion gets a dedicated
+            // performance (nice 0) runtime below. Isolates "cold promotion needs its
+            // own performance pool" from general-compaction priority. REVERT before merge.
             let compaction_runtime = ManagedTokioRuntime::builder()
+                .with_low_priority()
                 .with_thread_name("compaction-worker")
                 .build()
                 .boxed()
                 .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
 
             rt.datafusion().set_compaction_runtime(compaction_runtime);
+
+            // DIAG(cold-stall) exp2: dedicated runtime for cold-tier PROMOTION,
+            // isolated from the shared compaction/bake pool. nice 0 (default) —
+            // combined with the nice-0 compaction runtime, this isolates the
+            // "promotion shares threads with bakes" variable to identify whether
+            // the never-ready freeze is thread contention vs priority vs internal.
+            // REVERT before merge.
+            let cold_promo_runtime = ManagedTokioRuntime::builder()
+                .with_thread_name("cold-promo-worker")
+                .build()
+                .boxed()
+                .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
+
+            rt.datafusion().set_cold_tier_promotion_runtime(cold_promo_runtime);
         }
         Some("disabled") => {
             tracing::info!(

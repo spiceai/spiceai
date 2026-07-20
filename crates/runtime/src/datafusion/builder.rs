@@ -1202,6 +1202,7 @@ impl DataFusionBuilder {
             refresh_runtime: OnceLock::new(),
             cdc_apply_runtime: OnceLock::new(),
             compaction_runtime: OnceLock::new(),
+            cold_tier_promotion_runtime: OnceLock::new(),
             compaction_runtime_env,
             compaction_memory_bytes,
             query_memory_pool_bytes,
