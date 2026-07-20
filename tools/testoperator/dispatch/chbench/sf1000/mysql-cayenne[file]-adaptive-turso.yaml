@@ -7,4 +7,4 @@ tests:
     duration: 900
     ready_wait: 900
     query_overrides: chbench-skip-slow
-    rate: 1000
+    rate: 7500
