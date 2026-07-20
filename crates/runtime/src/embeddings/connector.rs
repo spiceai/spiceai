@@ -343,7 +343,9 @@ impl DataConnector for EmbeddingConnector {
             let Some(underlying_federated_table) =
                 underlying_federated_table_for_indexed_table(&table_provider)
             else {
-                return self.inner_connector.changes_stream(federated_table, dataset);
+                return self
+                    .inner_connector
+                    .changes_stream(federated_table, dataset);
             };
 
             // Avoid reindexing full-text indexes.

@@ -2889,8 +2889,7 @@ impl DataFusion {
                 },
             );
 
-            let changes_stream =
-                source.changes_stream(Arc::clone(&source_table_provider), dataset);
+            let changes_stream = source.changes_stream(Arc::clone(&source_table_provider), dataset);
 
             if let Some(changes_stream) = changes_stream {
                 accelerated_table_builder.changes_stream(changes_stream);
