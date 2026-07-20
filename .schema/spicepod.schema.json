@@ -129,28 +129,10 @@
   "x-spice-connectors": {
     "dataConnectors": [
       {
-        "name": "abfs",
-        "prefix": "abfs",
-        "paramsRef": "#/$defs/AbfsDataConnectorParams",
-        "schemaRef": "#/$defs/AbfsDataset"
-      },
-      {
-        "name": "abfss",
-        "prefix": "abfs",
-        "paramsRef": "#/$defs/AbfssDataConnectorParams",
-        "schemaRef": "#/$defs/AbfssDataset"
-      },
-      {
         "name": "debezium",
         "prefix": "debezium",
         "paramsRef": "#/$defs/DebeziumDataConnectorParams",
         "schemaRef": "#/$defs/DebeziumDataset"
-      },
-      {
-        "name": "ducklake",
-        "prefix": "ducklake",
-        "paramsRef": "#/$defs/DucklakeDataConnectorParams",
-        "schemaRef": "#/$defs/DucklakeDataset"
       },
       {
         "name": "dynamodb",
@@ -163,36 +145,6 @@
         "prefix": "file",
         "paramsRef": "#/$defs/FileDataConnectorParams",
         "schemaRef": "#/$defs/FileDataset"
-      },
-      {
-        "name": "gcs",
-        "prefix": "gcs",
-        "paramsRef": "#/$defs/GcsDataConnectorParams",
-        "schemaRef": "#/$defs/GcsDataset"
-      },
-      {
-        "name": "git",
-        "prefix": "git",
-        "paramsRef": "#/$defs/GitDataConnectorParams",
-        "schemaRef": "#/$defs/GitDataset"
-      },
-      {
-        "name": "github",
-        "prefix": "github",
-        "paramsRef": "#/$defs/GithubDataConnectorParams",
-        "schemaRef": "#/$defs/GithubDataset"
-      },
-      {
-        "name": "glue",
-        "prefix": "glue",
-        "paramsRef": "#/$defs/GlueDataConnectorParams",
-        "schemaRef": "#/$defs/GlueDataset"
-      },
-      {
-        "name": "gs",
-        "prefix": "gcs",
-        "paramsRef": "#/$defs/GsDataConnectorParams",
-        "schemaRef": "#/$defs/GsDataset"
       },
       {
         "name": "http",
@@ -211,12 +163,6 @@
         "prefix": "iceberg",
         "paramsRef": "#/$defs/IcebergDataConnectorParams",
         "schemaRef": "#/$defs/IcebergDataset"
-      },
-      {
-        "name": "kafka",
-        "prefix": "kafka",
-        "paramsRef": "#/$defs/KafkaDataConnectorParams",
-        "schemaRef": "#/$defs/KafkaDataset"
       },
       {
         "name": "localpod",
@@ -241,18 +187,6 @@
         "prefix": "sink",
         "paramsRef": "#/$defs/SinkDataConnectorParams",
         "schemaRef": "#/$defs/SinkDataset"
-      },
-      {
-        "name": "spice.ai",
-        "prefix": "spiceai",
-        "paramsRef": "#/$defs/SpiceAiDataConnectorParams",
-        "schemaRef": "#/$defs/SpiceAiDataset"
-      },
-      {
-        "name": "spiceai",
-        "prefix": "spiceai",
-        "paramsRef": "#/$defs/SpiceaiDataConnectorParams",
-        "schemaRef": "#/$defs/SpiceaiDataset"
       }
     ],
     "dataAccelerators": [
@@ -1314,6 +1248,38 @@
             "boolean",
             "null"
           ]
+        },
+        "eager_aggregation": {
+          "description": "Enable the cost-based eager-aggregation physical optimizer, which pushes a\npartial aggregation below a join when a statistics-based cost model\npredicts a large row reduction, then re-aggregates above the join. Maps to\n`datafusion.optimizer.enable_eager_aggregation`. Defaults to `true` in\nspiced (`DataFusion`'s own default is `false`); set to `false` to disable.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "eager_aggregation_min_reduction_factor": {
+          "description": "Minimum predicted row-reduction factor required for the eager-aggregation\ncost gate to push an aggregation below a join. Maps to\n`datafusion.optimizer.eager_aggregation_min_reduction_factor`; unset uses\nthe `DataFusion` default (`4`).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "eager_aggregation_max_pushed_groups": {
+          "description": "Absolute cap on the number of groups an eager-aggregation push may\nintroduce (`0` = uncapped). Maps to\n`datafusion.optimizer.eager_aggregation_max_pushed_groups`; unset uses the\n`DataFusion` default (`0`).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "timeout": {
+          "description": "Maximum wall-clock duration a query may run before it is automatically\ncancelled, as a human-readable duration (e.g. `30s`, `5m`). The clock\ncovers the query's full lifetime: planning, admission-control waits\n(`max_concurrent_queries`), execution, and streaming results to the\nclient. Applies to queries issued through the runtime's query APIs\n(HTTP, Flight, Flight SQL); internal runtime queries (acceleration\nrefreshes, health checks) are exempt. Enforcement is cooperative\n(best-effort): the query is cancelled at its next cancellation\ncheckpoint, so actual runtime can slightly exceed the configured\nvalue. On expiry the query fails with a timeout error: HTTP 504 /\ngRPC `DEADLINE_EXCEEDED` when the timeout is observed before the\nresponse starts; once results are already streaming the status can\nno longer change, so the in-progress stream is terminated with the\nerror instead — data streamed before expiry will have been\ndelivered, but the stream never ends silently as if complete.\nUnset = no timeout.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },
@@ -1630,6 +1596,12 @@
                 "type": "string"
               }
             },
+            "exclude": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
             "dataset_params": {
               "anyOf": [
                 {
@@ -1650,6 +1622,17 @@
               "anyOf": [
                 {
                   "$ref": "#/$defs/Metrics"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "acceleration": {
+              "description": "Automatically bootstrap and accelerate every table discovered by this\ncatalog, with zero per-table configuration. Only `refresh_mode: changes`\n(CDC) is supported today; there is no catalog-level `full` mode.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/CatalogAcceleration"
                 },
                 {
                   "type": "null"
@@ -1729,6 +1712,38 @@
           "type": "string",
           "const": "read_write_create"
         }
+      ]
+    },
+    "CatalogAcceleration": {
+      "description": "Acceleration configuration for an entire [`Catalog`]: bootstraps and\nCDC-accelerates every table the catalog connector discovers (subject to\n`include`/`exclude`), without per-table configuration.\n\nEvery included table must have a primary key — catalog setup fails\nnaming any table that doesn't, rather than silently skipping it or\nfalling back to a heavier access pattern. Use `include`/`exclude` to keep\ntables without a primary key out of an accelerated catalog's scope.\n\nDeliberately excludes per-table-only concepts (`primary_key`,\n`on_conflict`, `indexes`, per-table overrides) — those remain exclusively\non a dataset's own `acceleration` block.",
+      "type": "object",
+      "properties": {
+        "engine": {
+          "$ref": "#/$defs/CatalogAccelerationEngine",
+          "default": "cayenne"
+        },
+        "refresh_mode": {
+          "description": "Required and explicit: there is no catalog-level default, since the\nonly supported value today is `changes` (CDC).",
+          "$ref": "#/$defs/CatalogRefreshMode"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "refresh_mode"
+      ]
+    },
+    "CatalogAccelerationEngine": {
+      "description": "Accelerator engine used for catalog-wide acceleration. Only `cayenne` is\nsupported today.",
+      "type": "string",
+      "enum": [
+        "cayenne"
+      ]
+    },
+    "CatalogRefreshMode": {
+      "description": "Refresh mode for catalog-wide acceleration. Only CDC (`changes`) is\nsupported today; there is no catalog-level `full` mode.",
+      "type": "string",
+      "enum": [
+        "changes"
       ]
     },
     "ComponentReference": {
@@ -1937,48 +1952,12 @@
           "if": {
             "properties": {
               "from": {
-                "pattern": "^abfs:"
-              }
-            }
-          },
-          "then": {
-            "$ref": "#/$defs/AbfsDataset"
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "from": {
-                "pattern": "^abfss:"
-              }
-            }
-          },
-          "then": {
-            "$ref": "#/$defs/AbfssDataset"
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "from": {
                 "pattern": "^debezium:"
               }
             }
           },
           "then": {
             "$ref": "#/$defs/DebeziumDataset"
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "from": {
-                "pattern": "^ducklake:"
-              }
-            }
-          },
-          "then": {
-            "$ref": "#/$defs/DucklakeDataset"
           }
         },
         {
@@ -2003,66 +1982,6 @@
           },
           "then": {
             "$ref": "#/$defs/FileDataset"
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "from": {
-                "pattern": "^gcs:"
-              }
-            }
-          },
-          "then": {
-            "$ref": "#/$defs/GcsDataset"
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "from": {
-                "pattern": "^git:"
-              }
-            }
-          },
-          "then": {
-            "$ref": "#/$defs/GitDataset"
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "from": {
-                "pattern": "^github:"
-              }
-            }
-          },
-          "then": {
-            "$ref": "#/$defs/GithubDataset"
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "from": {
-                "pattern": "^glue:"
-              }
-            }
-          },
-          "then": {
-            "$ref": "#/$defs/GlueDataset"
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "from": {
-                "pattern": "^gs:"
-              }
-            }
-          },
-          "then": {
-            "$ref": "#/$defs/GsDataset"
           }
         },
         {
@@ -2099,18 +2018,6 @@
           },
           "then": {
             "$ref": "#/$defs/IcebergDataset"
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "from": {
-                "pattern": "^kafka:"
-              }
-            }
-          },
-          "then": {
-            "$ref": "#/$defs/KafkaDataset"
           }
         },
         {
@@ -2159,30 +2066,6 @@
           },
           "then": {
             "$ref": "#/$defs/SinkDataset"
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "from": {
-                "pattern": "^spice\\.ai:"
-              }
-            }
-          },
-          "then": {
-            "$ref": "#/$defs/SpiceAiDataset"
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "from": {
-                "pattern": "^spiceai:"
-              }
-            }
-          },
-          "then": {
-            "$ref": "#/$defs/SpiceaiDataset"
           }
         }
       ]
@@ -2235,6 +2118,7 @@
           "additionalProperties": true
         }
       },
+      "additionalProperties": false,
       "required": [
         "name"
       ]
@@ -2312,7 +2196,8 @@
           "format": "uint",
           "minimum": 0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "EmbeddingChunkConfig": {
       "type": "object",
@@ -2398,6 +2283,7 @@
           ]
         }
       },
+      "additionalProperties": false,
       "required": [
         "enabled"
       ]
@@ -4146,582 +4032,6 @@
         }
       ]
     },
-    "AbfsDataConnectorParams": {
-      "title": "AbfsParams",
-      "type": "object",
-      "properties": {
-        "abfs_account": {
-          "description": "Azure Storage account name.",
-          "type": "string",
-          "x-secret": true
-        },
-        "abfs_container_name": {
-          "description": "Azure Storage container name.",
-          "type": "string",
-          "x-secret": true
-        },
-        "abfs_access_key": {
-          "description": "Azure Storage account access key.",
-          "type": "string",
-          "x-secret": true
-        },
-        "abfs_bearer_token": {
-          "description": "Bearer token to use in Azure requests.",
-          "type": "string",
-          "x-secret": true
-        },
-        "abfs_client_id": {
-          "description": "Azure client ID.",
-          "type": "string",
-          "x-secret": true
-        },
-        "abfs_client_secret": {
-          "description": "Azure client secret.",
-          "type": "string",
-          "x-secret": true
-        },
-        "abfs_tenant_id": {
-          "description": "Azure tenant ID.",
-          "type": "string",
-          "x-secret": true
-        },
-        "abfs_sas_string": {
-          "description": "Azure SAS string.",
-          "type": "string",
-          "x-secret": true
-        },
-        "abfs_endpoint": {
-          "description": "Azure Storage endpoint.",
-          "type": "string",
-          "x-secret": true
-        },
-        "abfs_use_emulator": {
-          "description": "Use the Azure Storage emulator.",
-          "type": "string",
-          "default": "false",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "abfs_use_fabric_endpoint": {
-          "description": "Use the Azure Storage fabric endpoint.",
-          "type": "string",
-          "default": "false",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "allow_http": {
-          "description": "Allow insecure HTTP connections.",
-          "type": "string",
-          "default": "false",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "abfs_authority_host": {
-          "description": "Sets an alternative authority host.",
-          "type": "string"
-        },
-        "abfs_max_retries": {
-          "description": "The maximum number of retries.",
-          "type": "string",
-          "default": "3"
-        },
-        "abfs_retry_timeout": {
-          "description": "Retry timeout.",
-          "type": "string"
-        },
-        "abfs_backoff_initial_duration": {
-          "description": "Initial backoff duration.",
-          "type": "string"
-        },
-        "abfs_backoff_max_duration": {
-          "description": "Maximum backoff duration.",
-          "type": "string"
-        },
-        "abfs_backoff_base": {
-          "description": "The base of the exponential to use",
-          "type": "string"
-        },
-        "abfs_proxy_url": {
-          "description": "Proxy URL to use when connecting",
-          "type": "string"
-        },
-        "abfs_proxy_ca_certificate": {
-          "description": "CA certificate for the proxy.",
-          "type": "string",
-          "x-secret": true
-        },
-        "abfs_proxy_excludes": {
-          "description": "Set list of hosts to exclude from proxy connections",
-          "type": "string"
-        },
-        "abfs_msi_endpoint": {
-          "description": "Sets the endpoint for acquiring managed identity tokens.",
-          "type": "string",
-          "x-secret": true
-        },
-        "abfs_federated_token_file": {
-          "description": "Sets a file path for acquiring Azure federated identity token in Kubernetes",
-          "type": "string"
-        },
-        "abfs_use_cli": {
-          "description": "Set if the Azure CLI should be used for acquiring access tokens.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "abfs_skip_signature": {
-          "description": "Skip fetching credentials and skip signing requests. Used for interacting with public containers.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "abfs_disable_tagging": {
-          "description": "Ignore any tags provided to put_opts",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "client_timeout": {
-          "description": "The timeout setting for Azure client.",
-          "type": "string"
-        },
-        "abfs_versioning": {
-          "description": "Enables Azure blob versioning support when set to 'enabled'. Defaults to 'disabled'.",
-          "type": "string",
-          "default": "disabled"
-        },
-        "file_format": {
-          "type": "string"
-        },
-        "file_extension": {
-          "type": "string"
-        },
-        "schema_infer_max_records": {
-          "description": "Set a limit in terms of records to scan to infer the schema.",
-          "type": "string"
-        },
-        "tsv_has_header": {
-          "description": "Set true to indicate that the first line is a header.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "tsv_quote": {
-          "description": "The quote character in a row.",
-          "type": "string"
-        },
-        "tsv_escape": {
-          "description": "The escape character in a row.",
-          "type": "string"
-        },
-        "tsv_schema_infer_max_records": {
-          "description": "**DEPRECATED**: use 'schema_infer_max_records' instead\n\nSet a limit in terms of records to scan to infer the schema.",
-          "type": "string",
-          "deprecated": true
-        },
-        "csv_has_header": {
-          "description": "Set true to indicate that the first line is a header.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "csv_quote": {
-          "description": "The quote character in a row.",
-          "type": "string"
-        },
-        "csv_escape": {
-          "description": "The escape character in a row.",
-          "type": "string"
-        },
-        "csv_schema_infer_max_records": {
-          "description": "**DEPRECATED**: use 'schema_infer_max_records' instead\n\nSet a limit in terms of records to scan to infer the schema.",
-          "type": "string",
-          "deprecated": true
-        },
-        "csv_delimiter": {
-          "description": "The character separating values within a row.",
-          "type": "string"
-        },
-        "file_compression_type": {
-          "description": "The type of compression used on the file. If unset, Spice infers compression from file extensions such as .gz, .bz2, .xz, and .zst. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
-          "type": "string",
-          "enum": [
-            "GZIP",
-            "BZIP2",
-            "XZ",
-            "ZSTD",
-            "UNCOMPRESSED"
-          ]
-        },
-        "hive_partitioning_enabled": {
-          "description": "Enable partitioning using hive-style partitioning from the folder structure. Defaults to false.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "schema_source_path": {
-          "description": "Specify a path to use for schema inference.",
-          "type": "string"
-        },
-        "json_format": {
-          "description": "json | jsonl | ndjson | ldjson | array | object | soda | socrata | auto. When 'file_format' is explicitly 'json', effective default is 'json' (no SODA auto-detection).",
-          "type": "string",
-          "default": "auto",
-          "enum": [
-            "json",
-            "jsonl",
-            "ndjson",
-            "ldjson",
-            "array",
-            "object",
-            "soda",
-            "socrata",
-            "auto"
-          ]
-        },
-        "json_pointer": {
-          "description": "An RFC 6901 JSON Pointer to extract data from within a JSON value. E.g. '/data' for {\"data\": [...]} or '/response/items' for nested objects. A leading '/' is added automatically if missing.",
-          "type": "string"
-        },
-        "json_path": {
-          "description": "Alias for 'json_pointer'. An RFC 6901 JSON Pointer to extract data from within a JSON value.",
-          "type": "string"
-        },
-        "flatten_json": {
-          "description": "Set true to flatten nested structs in JSON as separate columns.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "soda_metadata": {
-          "description": "Set to 'enabled' to include Socrata internal metadata columns (sid, id, position, etc.) in the schema for SODA format responses. Defaults to disabled.",
-          "type": "string",
-          "default": "disabled",
-          "enum": [
-            "enabled",
-            "disabled"
-          ]
-        },
-        "refresh_skip": {
-          "description": "Control skipping refreshes for single-file S3 datasets when cached ETag/Version metadata matches. Set to 'enabled' (default) or 'disabled'.",
-          "type": "string",
-          "default": "enabled",
-          "enum": [
-            "enabled",
-            "disabled"
-          ]
-        }
-      },
-      "additionalProperties": true
-    },
-    "AbfssDataConnectorParams": {
-      "title": "AbfssParams",
-      "type": "object",
-      "properties": {
-        "abfs_account": {
-          "description": "Azure Storage account name.",
-          "type": "string",
-          "x-secret": true
-        },
-        "abfs_container_name": {
-          "description": "Azure Storage container name.",
-          "type": "string",
-          "x-secret": true
-        },
-        "abfs_access_key": {
-          "description": "Azure Storage account access key.",
-          "type": "string",
-          "x-secret": true
-        },
-        "abfs_bearer_token": {
-          "description": "Bearer token to use in Azure requests.",
-          "type": "string",
-          "x-secret": true
-        },
-        "abfs_client_id": {
-          "description": "Azure client ID.",
-          "type": "string",
-          "x-secret": true
-        },
-        "abfs_client_secret": {
-          "description": "Azure client secret.",
-          "type": "string",
-          "x-secret": true
-        },
-        "abfs_tenant_id": {
-          "description": "Azure tenant ID.",
-          "type": "string",
-          "x-secret": true
-        },
-        "abfs_sas_string": {
-          "description": "Azure SAS string.",
-          "type": "string",
-          "x-secret": true
-        },
-        "abfs_endpoint": {
-          "description": "Azure Storage endpoint.",
-          "type": "string",
-          "x-secret": true
-        },
-        "abfs_use_emulator": {
-          "description": "Use the Azure Storage emulator.",
-          "type": "string",
-          "default": "false",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "abfs_use_fabric_endpoint": {
-          "description": "Use the Azure Storage fabric endpoint.",
-          "type": "string",
-          "default": "false",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "allow_http": {
-          "description": "Allow insecure HTTP connections.",
-          "type": "string",
-          "default": "false",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "abfs_authority_host": {
-          "description": "Sets an alternative authority host.",
-          "type": "string"
-        },
-        "abfs_max_retries": {
-          "description": "The maximum number of retries.",
-          "type": "string",
-          "default": "3"
-        },
-        "abfs_retry_timeout": {
-          "description": "Retry timeout.",
-          "type": "string"
-        },
-        "abfs_backoff_initial_duration": {
-          "description": "Initial backoff duration.",
-          "type": "string"
-        },
-        "abfs_backoff_max_duration": {
-          "description": "Maximum backoff duration.",
-          "type": "string"
-        },
-        "abfs_backoff_base": {
-          "description": "The base of the exponential to use",
-          "type": "string"
-        },
-        "abfs_proxy_url": {
-          "description": "Proxy URL to use when connecting",
-          "type": "string"
-        },
-        "abfs_proxy_ca_certificate": {
-          "description": "CA certificate for the proxy.",
-          "type": "string",
-          "x-secret": true
-        },
-        "abfs_proxy_excludes": {
-          "description": "Set list of hosts to exclude from proxy connections",
-          "type": "string"
-        },
-        "abfs_msi_endpoint": {
-          "description": "Sets the endpoint for acquiring managed identity tokens.",
-          "type": "string",
-          "x-secret": true
-        },
-        "abfs_federated_token_file": {
-          "description": "Sets a file path for acquiring Azure federated identity token in Kubernetes",
-          "type": "string"
-        },
-        "abfs_use_cli": {
-          "description": "Set if the Azure CLI should be used for acquiring access tokens.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "abfs_skip_signature": {
-          "description": "Skip fetching credentials and skip signing requests. Used for interacting with public containers.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "abfs_disable_tagging": {
-          "description": "Ignore any tags provided to put_opts",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "client_timeout": {
-          "description": "The timeout setting for Azure client.",
-          "type": "string"
-        },
-        "abfs_versioning": {
-          "description": "Enables Azure blob versioning support when set to 'enabled'. Defaults to 'disabled'.",
-          "type": "string",
-          "default": "disabled"
-        },
-        "file_format": {
-          "type": "string"
-        },
-        "file_extension": {
-          "type": "string"
-        },
-        "schema_infer_max_records": {
-          "description": "Set a limit in terms of records to scan to infer the schema.",
-          "type": "string"
-        },
-        "tsv_has_header": {
-          "description": "Set true to indicate that the first line is a header.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "tsv_quote": {
-          "description": "The quote character in a row.",
-          "type": "string"
-        },
-        "tsv_escape": {
-          "description": "The escape character in a row.",
-          "type": "string"
-        },
-        "tsv_schema_infer_max_records": {
-          "description": "**DEPRECATED**: use 'schema_infer_max_records' instead\n\nSet a limit in terms of records to scan to infer the schema.",
-          "type": "string",
-          "deprecated": true
-        },
-        "csv_has_header": {
-          "description": "Set true to indicate that the first line is a header.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "csv_quote": {
-          "description": "The quote character in a row.",
-          "type": "string"
-        },
-        "csv_escape": {
-          "description": "The escape character in a row.",
-          "type": "string"
-        },
-        "csv_schema_infer_max_records": {
-          "description": "**DEPRECATED**: use 'schema_infer_max_records' instead\n\nSet a limit in terms of records to scan to infer the schema.",
-          "type": "string",
-          "deprecated": true
-        },
-        "csv_delimiter": {
-          "description": "The character separating values within a row.",
-          "type": "string"
-        },
-        "file_compression_type": {
-          "description": "The type of compression used on the file. If unset, Spice infers compression from file extensions such as .gz, .bz2, .xz, and .zst. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
-          "type": "string",
-          "enum": [
-            "GZIP",
-            "BZIP2",
-            "XZ",
-            "ZSTD",
-            "UNCOMPRESSED"
-          ]
-        },
-        "hive_partitioning_enabled": {
-          "description": "Enable partitioning using hive-style partitioning from the folder structure. Defaults to false.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "schema_source_path": {
-          "description": "Specify a path to use for schema inference.",
-          "type": "string"
-        },
-        "json_format": {
-          "description": "json | jsonl | ndjson | ldjson | array | object | soda | socrata | auto. When 'file_format' is explicitly 'json', effective default is 'json' (no SODA auto-detection).",
-          "type": "string",
-          "default": "auto",
-          "enum": [
-            "json",
-            "jsonl",
-            "ndjson",
-            "ldjson",
-            "array",
-            "object",
-            "soda",
-            "socrata",
-            "auto"
-          ]
-        },
-        "json_pointer": {
-          "description": "An RFC 6901 JSON Pointer to extract data from within a JSON value. E.g. '/data' for {\"data\": [...]} or '/response/items' for nested objects. A leading '/' is added automatically if missing.",
-          "type": "string"
-        },
-        "json_path": {
-          "description": "Alias for 'json_pointer'. An RFC 6901 JSON Pointer to extract data from within a JSON value.",
-          "type": "string"
-        },
-        "flatten_json": {
-          "description": "Set true to flatten nested structs in JSON as separate columns.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "soda_metadata": {
-          "description": "Set to 'enabled' to include Socrata internal metadata columns (sid, id, position, etc.) in the schema for SODA format responses. Defaults to disabled.",
-          "type": "string",
-          "default": "disabled",
-          "enum": [
-            "enabled",
-            "disabled"
-          ]
-        },
-        "refresh_skip": {
-          "description": "Control skipping refreshes for single-file S3 datasets when cached ETag/Version metadata matches. Set to 'enabled' (default) or 'disabled'.",
-          "type": "string",
-          "default": "enabled",
-          "enum": [
-            "enabled",
-            "disabled"
-          ]
-        }
-      },
-      "additionalProperties": true
-    },
     "DebeziumDataConnectorParams": {
       "title": "DebeziumParams",
       "type": "object",
@@ -4817,52 +4127,6 @@
       ],
       "additionalProperties": true
     },
-    "DucklakeDataConnectorParams": {
-      "title": "DucklakeParams",
-      "type": "object",
-      "properties": {
-        "ducklake_connection_string": {
-          "description": "The DuckLake connection string (e.g., 's3://bucket/path/metadata.ducklake').",
-          "type": "string"
-        },
-        "ducklake_name": {
-          "description": "The name to attach the DuckLake catalog as in DuckDB. Defaults to 'ducklake'.",
-          "type": "string"
-        },
-        "ducklake_open": {
-          "description": "Optional path to an existing DuckDB file. If not provided, an in-memory DuckDB is used.",
-          "type": "string"
-        },
-        "ducklake_aws_region": {
-          "description": "The AWS region for S3 storage.",
-          "type": "string",
-          "x-secret": true
-        },
-        "ducklake_aws_access_key_id": {
-          "description": "The AWS access key ID for S3 storage.",
-          "type": "string",
-          "x-secret": true
-        },
-        "ducklake_aws_secret_access_key": {
-          "description": "The AWS secret access key for S3 storage.",
-          "type": "string",
-          "x-secret": true
-        },
-        "ducklake_aws_endpoint": {
-          "description": "Custom S3-compatible endpoint URL (e.g. for MinIO).",
-          "type": "string",
-          "x-secret": true
-        },
-        "ducklake_aws_allow_http": {
-          "description": "Allow HTTP (non-TLS) connections to S3.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "ducklake_connection_string"
-      ],
-      "additionalProperties": true
-    },
     "DynamodbDataConnectorParams": {
       "title": "DynamodbParams",
       "type": "object",
@@ -4954,829 +4218,6 @@
       "title": "FileParams",
       "type": "object",
       "properties": {
-        "file_format": {
-          "type": "string"
-        },
-        "file_extension": {
-          "type": "string"
-        },
-        "schema_infer_max_records": {
-          "description": "Set a limit in terms of records to scan to infer the schema.",
-          "type": "string"
-        },
-        "tsv_has_header": {
-          "description": "Set true to indicate that the first line is a header.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "tsv_quote": {
-          "description": "The quote character in a row.",
-          "type": "string"
-        },
-        "tsv_escape": {
-          "description": "The escape character in a row.",
-          "type": "string"
-        },
-        "tsv_schema_infer_max_records": {
-          "description": "**DEPRECATED**: use 'schema_infer_max_records' instead\n\nSet a limit in terms of records to scan to infer the schema.",
-          "type": "string",
-          "deprecated": true
-        },
-        "csv_has_header": {
-          "description": "Set true to indicate that the first line is a header.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "csv_quote": {
-          "description": "The quote character in a row.",
-          "type": "string"
-        },
-        "csv_escape": {
-          "description": "The escape character in a row.",
-          "type": "string"
-        },
-        "csv_schema_infer_max_records": {
-          "description": "**DEPRECATED**: use 'schema_infer_max_records' instead\n\nSet a limit in terms of records to scan to infer the schema.",
-          "type": "string",
-          "deprecated": true
-        },
-        "csv_delimiter": {
-          "description": "The character separating values within a row.",
-          "type": "string"
-        },
-        "file_compression_type": {
-          "description": "The type of compression used on the file. If unset, Spice infers compression from file extensions such as .gz, .bz2, .xz, and .zst. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
-          "type": "string",
-          "enum": [
-            "GZIP",
-            "BZIP2",
-            "XZ",
-            "ZSTD",
-            "UNCOMPRESSED"
-          ]
-        },
-        "hive_partitioning_enabled": {
-          "description": "Enable partitioning using hive-style partitioning from the folder structure. Defaults to false.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "schema_source_path": {
-          "description": "Specify a path to use for schema inference.",
-          "type": "string"
-        },
-        "json_format": {
-          "description": "json | jsonl | ndjson | ldjson | array | object | soda | socrata | auto. When 'file_format' is explicitly 'json', effective default is 'json' (no SODA auto-detection).",
-          "type": "string",
-          "default": "auto",
-          "enum": [
-            "json",
-            "jsonl",
-            "ndjson",
-            "ldjson",
-            "array",
-            "object",
-            "soda",
-            "socrata",
-            "auto"
-          ]
-        },
-        "json_pointer": {
-          "description": "An RFC 6901 JSON Pointer to extract data from within a JSON value. E.g. '/data' for {\"data\": [...]} or '/response/items' for nested objects. A leading '/' is added automatically if missing.",
-          "type": "string"
-        },
-        "json_path": {
-          "description": "Alias for 'json_pointer'. An RFC 6901 JSON Pointer to extract data from within a JSON value.",
-          "type": "string"
-        },
-        "flatten_json": {
-          "description": "Set true to flatten nested structs in JSON as separate columns.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "soda_metadata": {
-          "description": "Set to 'enabled' to include Socrata internal metadata columns (sid, id, position, etc.) in the schema for SODA format responses. Defaults to disabled.",
-          "type": "string",
-          "default": "disabled",
-          "enum": [
-            "enabled",
-            "disabled"
-          ]
-        },
-        "refresh_skip": {
-          "description": "Control skipping refreshes for single-file S3 datasets when cached ETag/Version metadata matches. Set to 'enabled' (default) or 'disabled'.",
-          "type": "string",
-          "default": "enabled",
-          "enum": [
-            "enabled",
-            "disabled"
-          ]
-        }
-      },
-      "additionalProperties": true
-    },
-    "GcsDataConnectorParams": {
-      "title": "GcsParams",
-      "type": "object",
-      "properties": {
-        "gcs_service_account_path": {
-          "description": "Path to a GCS service account JSON key file.",
-          "type": "string",
-          "x-secret": true
-        },
-        "gcs_service_account_key": {
-          "description": "GCS service account JSON key as a string.",
-          "type": "string",
-          "x-secret": true
-        },
-        "gcs_application_default_credentials": {
-          "description": "Use Google Application Default Credentials for authentication. If GOOGLE_APPLICATION_CREDENTIALS env var is set, uses that path.",
-          "type": "string",
-          "default": "false",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "allow_http": {
-          "description": "Allow insecure HTTP connections.",
-          "type": "string",
-          "default": "false",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "gcs_max_retries": {
-          "description": "The maximum number of retries.",
-          "type": "string",
-          "default": "3"
-        },
-        "gcs_retry_timeout": {
-          "description": "Retry timeout.",
-          "type": "string"
-        },
-        "gcs_backoff_initial_duration": {
-          "description": "Initial backoff duration.",
-          "type": "string"
-        },
-        "gcs_backoff_max_duration": {
-          "description": "Maximum backoff duration.",
-          "type": "string"
-        },
-        "gcs_backoff_base": {
-          "description": "The base of the exponential to use",
-          "type": "string"
-        },
-        "gcs_skip_signature": {
-          "description": "Skip signing requests. Used for public buckets.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "client_timeout": {
-          "description": "The timeout setting for GCS client.",
-          "type": "string"
-        },
-        "file_format": {
-          "type": "string"
-        },
-        "file_extension": {
-          "type": "string"
-        },
-        "schema_infer_max_records": {
-          "description": "Set a limit in terms of records to scan to infer the schema.",
-          "type": "string"
-        },
-        "tsv_has_header": {
-          "description": "Set true to indicate that the first line is a header.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "tsv_quote": {
-          "description": "The quote character in a row.",
-          "type": "string"
-        },
-        "tsv_escape": {
-          "description": "The escape character in a row.",
-          "type": "string"
-        },
-        "tsv_schema_infer_max_records": {
-          "description": "**DEPRECATED**: use 'schema_infer_max_records' instead\n\nSet a limit in terms of records to scan to infer the schema.",
-          "type": "string",
-          "deprecated": true
-        },
-        "csv_has_header": {
-          "description": "Set true to indicate that the first line is a header.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "csv_quote": {
-          "description": "The quote character in a row.",
-          "type": "string"
-        },
-        "csv_escape": {
-          "description": "The escape character in a row.",
-          "type": "string"
-        },
-        "csv_schema_infer_max_records": {
-          "description": "**DEPRECATED**: use 'schema_infer_max_records' instead\n\nSet a limit in terms of records to scan to infer the schema.",
-          "type": "string",
-          "deprecated": true
-        },
-        "csv_delimiter": {
-          "description": "The character separating values within a row.",
-          "type": "string"
-        },
-        "file_compression_type": {
-          "description": "The type of compression used on the file. If unset, Spice infers compression from file extensions such as .gz, .bz2, .xz, and .zst. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
-          "type": "string",
-          "enum": [
-            "GZIP",
-            "BZIP2",
-            "XZ",
-            "ZSTD",
-            "UNCOMPRESSED"
-          ]
-        },
-        "hive_partitioning_enabled": {
-          "description": "Enable partitioning using hive-style partitioning from the folder structure. Defaults to false.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "schema_source_path": {
-          "description": "Specify a path to use for schema inference.",
-          "type": "string"
-        },
-        "json_format": {
-          "description": "json | jsonl | ndjson | ldjson | array | object | soda | socrata | auto. When 'file_format' is explicitly 'json', effective default is 'json' (no SODA auto-detection).",
-          "type": "string",
-          "default": "auto",
-          "enum": [
-            "json",
-            "jsonl",
-            "ndjson",
-            "ldjson",
-            "array",
-            "object",
-            "soda",
-            "socrata",
-            "auto"
-          ]
-        },
-        "json_pointer": {
-          "description": "An RFC 6901 JSON Pointer to extract data from within a JSON value. E.g. '/data' for {\"data\": [...]} or '/response/items' for nested objects. A leading '/' is added automatically if missing.",
-          "type": "string"
-        },
-        "json_path": {
-          "description": "Alias for 'json_pointer'. An RFC 6901 JSON Pointer to extract data from within a JSON value.",
-          "type": "string"
-        },
-        "flatten_json": {
-          "description": "Set true to flatten nested structs in JSON as separate columns.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "soda_metadata": {
-          "description": "Set to 'enabled' to include Socrata internal metadata columns (sid, id, position, etc.) in the schema for SODA format responses. Defaults to disabled.",
-          "type": "string",
-          "default": "disabled",
-          "enum": [
-            "enabled",
-            "disabled"
-          ]
-        },
-        "refresh_skip": {
-          "description": "Control skipping refreshes for single-file S3 datasets when cached ETag/Version metadata matches. Set to 'enabled' (default) or 'disabled'.",
-          "type": "string",
-          "default": "enabled",
-          "enum": [
-            "enabled",
-            "disabled"
-          ]
-        }
-      },
-      "additionalProperties": true
-    },
-    "GitDataConnectorParams": {
-      "title": "GitParams",
-      "type": "object",
-      "properties": {
-        "include": {
-          "description": "Include only files matching the glob pattern. Multiple patterns can be separated by comma or semicolon.",
-          "type": "string",
-          "examples": [
-            "*.rs",
-            "**/*.yaml;src/**/*.json"
-          ]
-        },
-        "fetch_content": {
-          "description": "Whether to fetch file content. Set to 'true' to include file content in the 'content' column.",
-          "type": "string",
-          "default": "false",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "cache_path": {
-          "description": "Custom path for the local Git repository cache. If not specified, uses system temp directory.",
-          "type": "string"
-        },
-        "max_files": {
-          "description": "Maximum number of files to materialize from a Git repository. Default: 5000. Hard limit: 50000.",
-          "type": "string",
-          "default": "5000"
-        },
-        "max_file_bytes": {
-          "description": "Maximum size (bytes) for an individual file when fetching content. Files larger than this value are skipped. Default: 524288. Maximum: 5242880 (5 MiB).",
-          "type": "string"
-        },
-        "git_username": {
-          "description": "Username for HTTP(S) basic authentication.",
-          "type": "string"
-        },
-        "git_password": {
-          "description": "Password or personal access token for HTTP(S) basic authentication.",
-          "type": "string",
-          "x-secret": true
-        },
-        "git_token": {
-          "description": "Personal access token used for HTTP(S) authentication. Equivalent to providing a username of 'x-access-token' with the token as the password.",
-          "type": "string",
-          "x-secret": true
-        },
-        "git_ssh_key": {
-          "description": "Absolute path to an SSH private key used to authenticate to the remote repository.",
-          "type": "string"
-        },
-        "git_ssh_passphrase": {
-          "description": "Passphrase for the SSH private key identified by 'ssh_key'.",
-          "type": "string",
-          "x-secret": true
-        },
-        "git_ssh_use_agent": {
-          "description": "When 'true', attempt to authenticate via the running ssh-agent when no explicit ssh_key is provided. Defaults to 'true'.",
-          "type": "string",
-          "default": "true",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "enable_lfs": {
-          "description": "Whether to fetch git-lfs objects after clone/fetch. Requires the 'git-lfs' CLI to be available on PATH.",
-          "type": "string",
-          "default": "false",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "max_concurrent_requests": {
-          "description": "Maximum number of concurrent Git network operations (clone/fetch) across datasets that share the same repository URL.",
-          "type": "string",
-          "default": "4"
-        },
-        "git_max_retries": {
-          "description": "Maximum number of retries when the connector encounters a transient error cloning or fetching from the remote.",
-          "type": "string",
-          "default": "3"
-        },
-        "backoff_method": {
-          "description": "Backoff strategy for retries on transient errors.",
-          "type": "string",
-          "default": "exponential",
-          "enum": [
-            "exponential",
-            "fibonacci"
-          ]
-        },
-        "disable_on_permanent_error": {
-          "description": "When true, a permanent error (authentication failure, access denied) will disable the connector to prevent a thundering herd of failed requests.",
-          "type": "string",
-          "default": "true",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "git_include": {
-          "description": "**DEPRECATED**: Rename 'git_include' to 'include'.\n\n[deprecated] Use unprefixed 'include'.",
-          "type": "string",
-          "deprecated": true
-        },
-        "git_fetch_content": {
-          "description": "**DEPRECATED**: Rename 'git_fetch_content' to 'fetch_content'.\n\n[deprecated] Use unprefixed 'fetch_content'.",
-          "type": "string",
-          "deprecated": true
-        },
-        "git_cache_path": {
-          "description": "**DEPRECATED**: Rename 'git_cache_path' to 'cache_path'.\n\n[deprecated] Use unprefixed 'cache_path'.",
-          "type": "string",
-          "deprecated": true
-        },
-        "git_max_files": {
-          "description": "**DEPRECATED**: Rename 'git_max_files' to 'max_files'.\n\n[deprecated] Use unprefixed 'max_files'.",
-          "type": "string",
-          "deprecated": true
-        },
-        "git_max_file_bytes": {
-          "description": "**DEPRECATED**: Rename 'git_max_file_bytes' to 'max_file_bytes'.\n\n[deprecated] Use unprefixed 'max_file_bytes'.",
-          "type": "string",
-          "deprecated": true
-        },
-        "git_enable_lfs": {
-          "description": "**DEPRECATED**: Rename 'git_enable_lfs' to 'enable_lfs'.\n\n[deprecated] Use unprefixed 'enable_lfs'.",
-          "type": "string",
-          "deprecated": true
-        }
-      },
-      "additionalProperties": true
-    },
-    "GithubDataConnectorParams": {
-      "title": "GithubParams",
-      "type": "object",
-      "properties": {
-        "github_token": {
-          "description": "A Github token.",
-          "type": "string",
-          "x-secret": true
-        },
-        "github_client_id": {
-          "description": "The Github App Client ID.",
-          "type": "string",
-          "x-secret": true
-        },
-        "github_private_key": {
-          "description": "The Github App private key.",
-          "type": "string",
-          "x-secret": true
-        },
-        "github_installation_id": {
-          "description": "The Github App installation ID.",
-          "type": "string",
-          "x-secret": true
-        },
-        "github_query_mode": {
-          "description": "Specify what search mode (REST, GraphQL, Search API) to use when retrieving results.",
-          "type": "string",
-          "default": "auto"
-        },
-        "github_endpoint": {
-          "description": "The Github API endpoint.",
-          "type": "string",
-          "default": "https://api.github.com"
-        },
-        "github_include_comments": {
-          "description": "Specifies the types of comments to fetch: 'all', 'review', 'discussion', or 'none'.",
-          "type": "string",
-          "default": "none"
-        },
-        "github_max_comments_fetched": {
-          "description": "Maximum number of comments to fetch per discussion or review thread.",
-          "type": "string",
-          "default": "100"
-        },
-        "github_include_commits": {
-          "description": "Whether to fetch commit information (created_at, updated_at) for files. Set to 'true' to enable.",
-          "type": "string",
-          "default": "false"
-        },
-        "github_workflow_logs": {
-          "description": "Whether to download and include workflow run logs. Set to 'enabled' to download logs for each workflow run. Defaults to 'disabled'.",
-          "type": "string",
-          "default": "disabled"
-        },
-        "max_concurrent_requests": {
-          "description": "Maximum number of concurrent GitHub HTTP requests for this authentication context. If unset, falls back to runtime.source_rate_control.github_concurrent_connections_limit, deprecated runtime.params.github_max_concurrent_connections, or the connector default.",
-          "type": "string"
-        },
-        "include": {
-          "description": "Include only files matching the pattern.",
-          "type": "string",
-          "examples": [
-            "*.json",
-            "**/*.yaml;src/**/*.json"
-          ]
-        }
-      },
-      "additionalProperties": true
-    },
-    "GlueDataConnectorParams": {
-      "title": "GlueParams",
-      "type": "object",
-      "properties": {
-        "glue_catalog_id": {
-          "type": "string",
-          "x-secret": true
-        },
-        "glue_region": {
-          "description": "AWS region for the S3 bucket (e.g. 'us-east-1').\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
-          "type": "string",
-          "examples": [
-            "us-east-1",
-            "eu-west-1"
-          ],
-          "x-secret": true
-        },
-        "glue_endpoint": {
-          "description": "Custom S3-compatible endpoint URL. Leave empty for AWS S3.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
-          "type": "string",
-          "examples": [
-            "https://s3.us-east-1.amazonaws.com",
-            "http://minio.local:9000"
-          ],
-          "x-secret": true
-        },
-        "glue_url_style": {
-          "description": "Controls S3 URL addressing style. Supported values: 'vhost' and 'path'. When not set, auto-detected from the endpoint.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
-          "type": "string",
-          "enum": [
-            "vhost",
-            "path"
-          ]
-        },
-        "glue_key": {
-          "description": "AWS access key ID (used when auth='key').\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
-          "type": "string",
-          "x-secret": true
-        },
-        "glue_secret": {
-          "description": "AWS secret access key (used when auth='key').\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
-          "type": "string",
-          "x-secret": true
-        },
-        "glue_session_token": {
-          "description": "Temporary AWS session token (used with STS credentials).\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
-          "type": "string",
-          "x-secret": true
-        },
-        "glue_auth": {
-          "description": "Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
-          "type": "string",
-          "examples": [
-            "iam_role",
-            "key"
-          ],
-          "enum": [
-            "public",
-            "iam_role",
-            "key"
-          ],
-          "x-secret": true
-        },
-        "glue_iam_role_source": {
-          "description": "IAM role credential source (used when auth is 'iam_role' or unset, i.e. default IAM-based auth). 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
-          "type": "string",
-          "enum": [
-            "auto",
-            "metadata",
-            "env"
-          ]
-        },
-        "glue_versioning": {
-          "description": "Enables S3 object versioning support when set to 'enabled'. Defaults to 'enabled'.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
-          "type": "string",
-          "default": "enabled"
-        },
-        "client_timeout": {
-          "description": "The timeout setting for S3 client.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
-          "type": "string",
-          "examples": [
-            "30s"
-          ]
-        },
-        "allow_http": {
-          "description": "Allow HTTP protocol for S3 endpoint.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "file_format": {
-          "type": "string"
-        },
-        "file_extension": {
-          "type": "string"
-        },
-        "schema_infer_max_records": {
-          "description": "Set a limit in terms of records to scan to infer the schema.",
-          "type": "string"
-        },
-        "tsv_has_header": {
-          "description": "Set true to indicate that the first line is a header.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "tsv_quote": {
-          "description": "The quote character in a row.",
-          "type": "string"
-        },
-        "tsv_escape": {
-          "description": "The escape character in a row.",
-          "type": "string"
-        },
-        "tsv_schema_infer_max_records": {
-          "description": "**DEPRECATED**: use 'schema_infer_max_records' instead\n\nSet a limit in terms of records to scan to infer the schema.",
-          "type": "string",
-          "deprecated": true
-        },
-        "csv_has_header": {
-          "description": "Set true to indicate that the first line is a header.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "csv_quote": {
-          "description": "The quote character in a row.",
-          "type": "string"
-        },
-        "csv_escape": {
-          "description": "The escape character in a row.",
-          "type": "string"
-        },
-        "csv_schema_infer_max_records": {
-          "description": "**DEPRECATED**: use 'schema_infer_max_records' instead\n\nSet a limit in terms of records to scan to infer the schema.",
-          "type": "string",
-          "deprecated": true
-        },
-        "csv_delimiter": {
-          "description": "The character separating values within a row.",
-          "type": "string"
-        },
-        "file_compression_type": {
-          "description": "The type of compression used on the file. If unset, Spice infers compression from file extensions such as .gz, .bz2, .xz, and .zst. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
-          "type": "string",
-          "enum": [
-            "GZIP",
-            "BZIP2",
-            "XZ",
-            "ZSTD",
-            "UNCOMPRESSED"
-          ]
-        },
-        "hive_partitioning_enabled": {
-          "description": "Enable partitioning using hive-style partitioning from the folder structure. Defaults to false.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "schema_source_path": {
-          "description": "Specify a path to use for schema inference.",
-          "type": "string"
-        },
-        "json_format": {
-          "description": "json | jsonl | ndjson | ldjson | array | object | soda | socrata | auto. When 'file_format' is explicitly 'json', effective default is 'json' (no SODA auto-detection).",
-          "type": "string",
-          "default": "auto",
-          "enum": [
-            "json",
-            "jsonl",
-            "ndjson",
-            "ldjson",
-            "array",
-            "object",
-            "soda",
-            "socrata",
-            "auto"
-          ]
-        },
-        "json_pointer": {
-          "description": "An RFC 6901 JSON Pointer to extract data from within a JSON value. E.g. '/data' for {\"data\": [...]} or '/response/items' for nested objects. A leading '/' is added automatically if missing.",
-          "type": "string"
-        },
-        "json_path": {
-          "description": "Alias for 'json_pointer'. An RFC 6901 JSON Pointer to extract data from within a JSON value.",
-          "type": "string"
-        },
-        "flatten_json": {
-          "description": "Set true to flatten nested structs in JSON as separate columns.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "soda_metadata": {
-          "description": "Set to 'enabled' to include Socrata internal metadata columns (sid, id, position, etc.) in the schema for SODA format responses. Defaults to disabled.",
-          "type": "string",
-          "default": "disabled",
-          "enum": [
-            "enabled",
-            "disabled"
-          ]
-        },
-        "refresh_skip": {
-          "description": "Control skipping refreshes for single-file S3 datasets when cached ETag/Version metadata matches. Set to 'enabled' (default) or 'disabled'.",
-          "type": "string",
-          "default": "enabled",
-          "enum": [
-            "enabled",
-            "disabled"
-          ]
-        }
-      },
-      "additionalProperties": true
-    },
-    "GsDataConnectorParams": {
-      "title": "GsParams",
-      "type": "object",
-      "properties": {
-        "gcs_service_account_path": {
-          "description": "Path to a GCS service account JSON key file.",
-          "type": "string",
-          "x-secret": true
-        },
-        "gcs_service_account_key": {
-          "description": "GCS service account JSON key as a string.",
-          "type": "string",
-          "x-secret": true
-        },
-        "gcs_application_default_credentials": {
-          "description": "Use Google Application Default Credentials for authentication. If GOOGLE_APPLICATION_CREDENTIALS env var is set, uses that path.",
-          "type": "string",
-          "default": "false",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "allow_http": {
-          "description": "Allow insecure HTTP connections.",
-          "type": "string",
-          "default": "false",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "gcs_max_retries": {
-          "description": "The maximum number of retries.",
-          "type": "string",
-          "default": "3"
-        },
-        "gcs_retry_timeout": {
-          "description": "Retry timeout.",
-          "type": "string"
-        },
-        "gcs_backoff_initial_duration": {
-          "description": "Initial backoff duration.",
-          "type": "string"
-        },
-        "gcs_backoff_max_duration": {
-          "description": "Maximum backoff duration.",
-          "type": "string"
-        },
-        "gcs_backoff_base": {
-          "description": "The base of the exponential to use",
-          "type": "string"
-        },
-        "gcs_skip_signature": {
-          "description": "Skip signing requests. Used for public buckets.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "client_timeout": {
-          "description": "The timeout setting for GCS client.",
-          "type": "string"
-        },
         "file_format": {
           "type": "string"
         },
@@ -6735,119 +5176,6 @@
       },
       "additionalProperties": true
     },
-    "KafkaDataConnectorParams": {
-      "title": "KafkaParams",
-      "type": "object",
-      "properties": {
-        "kafka_bootstrap_servers": {
-          "description": "A list of host/port pairs for establishing the initial Kafka cluster connection.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
-          "type": "string",
-          "examples": [
-            "broker1.kafka.internal:9092,broker2.kafka.internal:9092"
-          ]
-        },
-        "kafka_security_protocol": {
-          "description": "Security protocol for Kafka connections. Default: 'sasl_ssl'.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
-          "type": "string",
-          "default": "sasl_ssl",
-          "enum": [
-            "plaintext",
-            "ssl",
-            "sasl_plaintext",
-            "sasl_ssl"
-          ]
-        },
-        "kafka_sasl_mechanism": {
-          "description": "SASL authentication mechanism. Default: 'SCRAM-SHA-512'.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
-          "type": "string",
-          "default": "SCRAM-SHA-512",
-          "enum": [
-            "PLAIN",
-            "SCRAM-SHA-256",
-            "SCRAM-SHA-512"
-          ]
-        },
-        "kafka_sasl_username": {
-          "description": "SASL username.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
-          "type": "string",
-          "x-secret": true
-        },
-        "kafka_sasl_password": {
-          "description": "SASL password.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
-          "type": "string",
-          "x-secret": true
-        },
-        "kafka_ssl_ca_location": {
-          "description": "Path to the SSL/TLS CA certificate file for server verification.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
-          "type": "string",
-          "x-secret": true
-        },
-        "kafka_ssl_certificate_location": {
-          "description": "Path to the client SSL/TLS certificate file for mTLS authentication.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
-          "type": "string",
-          "x-secret": true
-        },
-        "kafka_ssl_key_location": {
-          "description": "Path to the client SSL/TLS private key file for mTLS authentication.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
-          "type": "string",
-          "x-secret": true
-        },
-        "kafka_ssl_key_password": {
-          "description": "Password for the client SSL/TLS private key, if encrypted.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
-          "type": "string",
-          "x-secret": true
-        },
-        "kafka_enable_ssl_certificate_verification": {
-          "description": "Enable SSL/TLS certificate verification. Default: 'true'.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
-          "type": "string",
-          "default": "true",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "kafka_ssl_endpoint_identification_algorithm": {
-          "description": "SSL/TLS endpoint identification algorithm. Default: 'https'.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
-          "type": "string",
-          "default": "https",
-          "enum": [
-            "none",
-            "https"
-          ]
-        },
-        "schema_infer_max_records": {
-          "description": "Number of Kafka messages to sample for schema inference. Increase if your data has optional fields or varying structure.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
-          "type": "string",
-          "default": "1"
-        },
-        "flatten_json": {
-          "description": "Set true to flatten nested structs in JSON as separate columns.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "kafka_consumer_group_id": {
-          "description": "Kafka consumer group id to use for this dataset. If not set, a unique id will be generated.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
-          "type": "string"
-        },
-        "batch_max_size": {
-          "description": "Maximum number of change events to batch together before processing.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
-          "type": "string",
-          "default": "10000"
-        },
-        "batch_max_duration": {
-          "description": "Maximum time to wait for a batch to fill before processing.\n\nSee: https://spiceai.org/docs/components/data-connectors/kafka",
-          "type": "string",
-          "default": "1s"
-        }
-      },
-      "required": [
-        "kafka_bootstrap_servers"
-      ],
-      "additionalProperties": true
-    },
     "LocalpodDataConnectorParams": {
       "title": "LocalpodParams",
       "type": "object",
@@ -7086,98 +5414,6 @@
       "properties": {},
       "additionalProperties": true
     },
-    "SpiceAiDataConnectorParams": {
-      "title": "SpiceAiParams",
-      "type": "object",
-      "properties": {
-        "spiceai_api_key": {
-          "type": "string",
-          "x-secret": true
-        },
-        "spiceai_token": {
-          "type": "string",
-          "x-secret": true
-        },
-        "spiceai_region": {
-          "type": "string"
-        },
-        "spiceai_endpoint": {
-          "type": "string"
-        },
-        "spiceai_flight_endpoint": {
-          "type": "string"
-        },
-        "spiceai_tls_ca_certificate_file": {
-          "description": "Path to a CA certificate file (PEM format) to use for TLS verification instead of system certificates.",
-          "type": "string"
-        },
-        "spiceai_tls_client_certificate_file": {
-          "description": "Path to a PEM client certificate chain to present during the TLS handshake when the upstream Spice runtime requires mutual TLS. Must be set together with 'tls_client_key_file'. Mutually exclusive with 'tls_client_certificate' and 'tls_client_key'.",
-          "type": "string"
-        },
-        "spiceai_tls_client_key_file": {
-          "description": "Path to the PEM private key matching 'tls_client_certificate_file'. Must be set together with 'tls_client_certificate_file'. Mutually exclusive with 'tls_client_certificate' and 'tls_client_key'.",
-          "type": "string"
-        },
-        "spiceai_tls_client_certificate": {
-          "description": "Inline PEM client certificate chain (or ${ secrets:... } reference) to present during the TLS handshake for mutual TLS. Must be set together with 'tls_client_key'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'.",
-          "type": "string",
-          "x-secret": true
-        },
-        "spiceai_tls_client_key": {
-          "description": "Inline PEM private key (or ${ secrets:... } reference) matching 'tls_client_certificate'. Must be set together with 'tls_client_certificate'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'.",
-          "type": "string",
-          "x-secret": true
-        }
-      },
-      "additionalProperties": true
-    },
-    "SpiceaiDataConnectorParams": {
-      "title": "SpiceaiParams",
-      "type": "object",
-      "properties": {
-        "spiceai_api_key": {
-          "type": "string",
-          "x-secret": true
-        },
-        "spiceai_token": {
-          "type": "string",
-          "x-secret": true
-        },
-        "spiceai_region": {
-          "type": "string"
-        },
-        "spiceai_endpoint": {
-          "type": "string"
-        },
-        "spiceai_flight_endpoint": {
-          "type": "string"
-        },
-        "spiceai_tls_ca_certificate_file": {
-          "description": "Path to a CA certificate file (PEM format) to use for TLS verification instead of system certificates.",
-          "type": "string"
-        },
-        "spiceai_tls_client_certificate_file": {
-          "description": "Path to a PEM client certificate chain to present during the TLS handshake when the upstream Spice runtime requires mutual TLS. Must be set together with 'tls_client_key_file'. Mutually exclusive with 'tls_client_certificate' and 'tls_client_key'.",
-          "type": "string"
-        },
-        "spiceai_tls_client_key_file": {
-          "description": "Path to the PEM private key matching 'tls_client_certificate_file'. Must be set together with 'tls_client_certificate_file'. Mutually exclusive with 'tls_client_certificate' and 'tls_client_key'.",
-          "type": "string"
-        },
-        "spiceai_tls_client_certificate": {
-          "description": "Inline PEM client certificate chain (or ${ secrets:... } reference) to present during the TLS handshake for mutual TLS. Must be set together with 'tls_client_key'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'.",
-          "type": "string",
-          "x-secret": true
-        },
-        "spiceai_tls_client_key": {
-          "description": "Inline PEM private key (or ${ secrets:... } reference) matching 'tls_client_certificate'. Must be set together with 'tls_client_certificate'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'.",
-          "type": "string",
-          "x-secret": true
-        }
-      },
-      "additionalProperties": true
-    },
     "ArrowAcceleratorParams": {
       "title": "ArrowParams",
       "type": "object",
@@ -7301,6 +5537,88 @@
             "false"
           ]
         },
+        "cayenne_datalake_location": {
+          "description": "Object-store URL prefix for the datalake tier, e.g. 's3://bucket/prefix' — the storage-cascade bottom tier. When set, a background promotion stage graduates the warm local-disk tier to read-optimized, Z-order-clustered Vortex files on this store, and queries span warm + cold with per-tier pushdown. Unset (default) disables the tier. Requires key-based deletes and a primary key (auto-resolved). Partitioned and position-delete tables are not supported.",
+          "type": "string"
+        },
+        "cayenne_datalake_clustering_columns": {
+          "description": "Comma-separated liquid-clustering key columns for datalake files (multi-column Z-order), e.g. 'tenant_id,ts'. When unset, falls back to cayenne_sort_columns, then the primary key. Clustering tightens each cold file's per-column zone maps so selective queries on any clustering dimension prune at the storage layer.",
+          "type": "string"
+        },
+        "cayenne_datalake_s3_auth": {
+          "description": "Authentication method for the datalake S3 store. 'iam_role' (default) uses environment/SDK credentials; 'key' uses cayenne_datalake_s3_key/_secret.",
+          "type": "string",
+          "default": "iam_role",
+          "enum": [
+            "iam_role",
+            "key"
+          ]
+        },
+        "cayenne_datalake_s3_key": {
+          "description": "Access key ID for the datalake S3 store (with cayenne_datalake_s3_auth: key).",
+          "type": "string",
+          "x-secret": true
+        },
+        "cayenne_datalake_s3_secret": {
+          "description": "Secret access key for the datalake S3 store (with cayenne_datalake_s3_auth: key).",
+          "type": "string",
+          "x-secret": true
+        },
+        "cayenne_datalake_s3_session_token": {
+          "description": "Optional session token for the datalake S3 store (with cayenne_datalake_s3_auth: key).",
+          "type": "string",
+          "x-secret": true
+        },
+        "cayenne_datalake_s3_region": {
+          "description": "AWS region of the datalake S3 bucket. Defaults to the environment region (AWS_REGION/AWS_DEFAULT_REGION), then us-east-1; inert for S3-compatible endpoints.",
+          "type": "string"
+        },
+        "cayenne_datalake_s3_endpoint": {
+          "description": "Custom S3 endpoint URL for the datalake store (e.g. an S3-compatible store such as MinIO). http:// endpoints implicitly allow HTTP.",
+          "type": "string"
+        },
+        "cayenne_datalake_s3_allow_http": {
+          "description": "Allow plain-HTTP connections to the datalake S3 endpoint. Default: false.",
+          "type": "string",
+          "default": "false",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "cayenne_datalake_s3_client_timeout": {
+          "description": "HTTP client timeout for datalake store requests, as a duration (e.g. '2m'). Default: 2m.",
+          "type": "string"
+        },
+        "cayenne_datalake_s3_unsigned_payload": {
+          "description": "Use unsigned payloads for datalake S3 uploads. Default: true.",
+          "type": "string",
+          "default": "true",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "cayenne_datalake_target_file_size_mb": {
+          "description": "Target size for datalake (cold) tier Vortex files in MB. Larger than the warm cayenne_target_file_size_mb because object stores favor fewer, larger objects and cold scans are range reads. Default: 512.",
+          "type": "string"
+        },
+        "cayenne_datalake_warm_max_bytes": {
+          "description": "The warm tier graduates to the datalake once its total Vortex bytes reach this threshold. Pairs with cayenne_datalake_warm_max_files; 0 disables the byte trigger, but when BOTH triggers are 0/unset this one defaults to 16 x cayenne_datalake_target_file_size_mb.",
+          "type": "string"
+        },
+        "cayenne_datalake_warm_max_files": {
+          "description": "The warm tier graduates to the datalake once its Vortex file count reaches this threshold. 0 (default) disables the file-count trigger; when cayenne_datalake_warm_max_bytes is also 0/unset, the byte trigger defaults to 16 x cayenne_datalake_target_file_size_mb.",
+          "type": "string"
+        },
+        "cayenne_datalake_promotion_interval_ms": {
+          "description": "How often the background loop evaluates the warm-to-datalake promotion trigger. Default: 60000 (60s).",
+          "type": "string"
+        },
+        "cayenne_datalake_gc_interval_ms": {
+          "description": "Physical-GC cadence and orphan grace for superseded datalake objects: the background sweep runs about this often and deletes an object no longer referenced by the manifest only once it has been observed orphaned for at least this long (so an in-flight scan has a full interval to finish). Default: 300000 (5min).",
+          "type": "string"
+        },
         "cayenne_sort_columns": {
           "description": "Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id').",
           "type": "string"
@@ -7356,10 +5674,6 @@
         },
         "cayenne_bake_deletion_index_trigger": {
           "description": "Deletion-index size (count of live primary-key tombstones) at or above which the seq-prefix bake (key-delete merge-on-read compaction) runs. The bake consolidates the settled older prefix of protected snapshots so their tombstones drop out of the live deletion index, lowering per-query merge-on-read probe cost at the cost of write amplification. A larger value bakes less often (bounds write-amp); a smaller value bakes more often (smaller index, cheaper probe). Key-delete tables only. Default: 50000.",
-          "type": "string"
-        },
-        "cayenne_orphaned_dv_cleanup_min_files": {
-          "description": "Number of orphan-eligible key-based deletion vectors (cayenne_delete_file rows) that must accumulate before a background cleanup sweep reclaims their .arrow files. A key deletion vector becomes orphaned once time-based retention empties the protected snapshot(s) it shadowed. The sweep is lock-free and runs off the write path on the dedicated compaction runtime, so this only trades sweep frequency against lingering disk — never ingest latency. Set to 0 (or leave unset) to disable cleanup entirely (the default, pre-feature behavior); a value >= 1 enables it. Default: 0 (disabled).",
           "type": "string"
         },
         "cayenne_compaction_trigger_protected_snapshots": {
@@ -7509,12 +5823,6 @@
         "duckdb_index_scan_max_count": {
           "type": "string"
         },
-        "partition_mode": {
-          "type": "string"
-        },
-        "duckdb_partitioned_write_flush_threshold_rows": {
-          "type": "string"
-        },
         "connection_pool_size": {
           "description": "The maximum number of client connections created in the duckdb connection pool.",
           "type": "string"
@@ -7523,9 +5831,6 @@
           "type": "string"
         },
         "on_refresh_sort_columns": {
-          "type": "string"
-        },
-        "partitioned_write_buffer": {
           "type": "string"
         },
         "optimizer_duckdb_aggregate_pushdown": {
@@ -10147,374 +8452,6 @@
       },
       "additionalProperties": true
     },
-    "AbfsDataset": {
-      "type": "object",
-      "properties": {
-        "from": {
-          "description": "Data source path for abfs connector. Format: abfs:<path>",
-          "type": "string",
-          "pattern": "^abfs:"
-        },
-        "name": {
-          "type": "string"
-        },
-        "params": {
-          "description": "Connection parameters for the abfs data connector.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/AbfsDataConnectorParams"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "metadata": {
-          "type": "object",
-          "additionalProperties": true
-        },
-        "columns": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Column"
-          }
-        },
-        "access": {
-          "$ref": "#/$defs/AccessMode"
-        },
-        "has_metadata_table": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "replication": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Replication"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_partition_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_partition_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "acceleration": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Acceleration"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "embeddings": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ColumnEmbeddingConfig"
-          }
-        },
-        "dependsOn": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "invalid_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/InvalidTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "deprecated": true
-        },
-        "unsupported_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/UnsupportedTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "on_schema_change": {
-          "$ref": "#/$defs/OnSchemaChange"
-        },
-        "ready_state": {
-          "$ref": "#/$defs/ReadyState"
-        },
-        "metrics": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Metrics"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "vectors": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/VectorStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "full_text_search": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/FtsStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "check_availability": {
-          "$ref": "#/$defs/CheckAvailability"
-        },
-        "schema_inference": {
-          "$ref": "#/$defs/SchemaInference"
-        },
-        "mode": {
-          "$ref": "#/$defs/AccessMode"
-        }
-      },
-      "required": [
-        "from",
-        "name"
-      ],
-      "additionalProperties": false
-    },
-    "AbfssDataset": {
-      "type": "object",
-      "properties": {
-        "from": {
-          "description": "Data source path for abfss connector. Format: abfss:<path>",
-          "type": "string",
-          "pattern": "^abfss:"
-        },
-        "name": {
-          "type": "string"
-        },
-        "params": {
-          "description": "Connection parameters for the abfss data connector.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/AbfssDataConnectorParams"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "metadata": {
-          "type": "object",
-          "additionalProperties": true
-        },
-        "columns": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Column"
-          }
-        },
-        "access": {
-          "$ref": "#/$defs/AccessMode"
-        },
-        "has_metadata_table": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "replication": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Replication"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_partition_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_partition_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "acceleration": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Acceleration"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "embeddings": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ColumnEmbeddingConfig"
-          }
-        },
-        "dependsOn": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "invalid_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/InvalidTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "deprecated": true
-        },
-        "unsupported_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/UnsupportedTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "on_schema_change": {
-          "$ref": "#/$defs/OnSchemaChange"
-        },
-        "ready_state": {
-          "$ref": "#/$defs/ReadyState"
-        },
-        "metrics": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Metrics"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "vectors": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/VectorStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "full_text_search": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/FtsStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "check_availability": {
-          "$ref": "#/$defs/CheckAvailability"
-        },
-        "schema_inference": {
-          "$ref": "#/$defs/SchemaInference"
-        },
-        "mode": {
-          "$ref": "#/$defs/AccessMode"
-        }
-      },
-      "required": [
-        "from",
-        "name"
-      ],
-      "additionalProperties": false
-    },
     "DebeziumDataset": {
       "type": "object",
       "properties": {
@@ -10531,190 +8468,6 @@
           "anyOf": [
             {
               "$ref": "#/$defs/DebeziumDataConnectorParams"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "metadata": {
-          "type": "object",
-          "additionalProperties": true
-        },
-        "columns": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Column"
-          }
-        },
-        "access": {
-          "$ref": "#/$defs/AccessMode"
-        },
-        "has_metadata_table": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "replication": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Replication"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_partition_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_partition_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "acceleration": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Acceleration"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "embeddings": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ColumnEmbeddingConfig"
-          }
-        },
-        "dependsOn": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "invalid_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/InvalidTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "deprecated": true
-        },
-        "unsupported_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/UnsupportedTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "on_schema_change": {
-          "$ref": "#/$defs/OnSchemaChange"
-        },
-        "ready_state": {
-          "$ref": "#/$defs/ReadyState"
-        },
-        "metrics": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Metrics"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "vectors": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/VectorStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "full_text_search": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/FtsStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "check_availability": {
-          "$ref": "#/$defs/CheckAvailability"
-        },
-        "schema_inference": {
-          "$ref": "#/$defs/SchemaInference"
-        },
-        "mode": {
-          "$ref": "#/$defs/AccessMode"
-        }
-      },
-      "required": [
-        "from",
-        "name"
-      ],
-      "additionalProperties": false
-    },
-    "DucklakeDataset": {
-      "type": "object",
-      "properties": {
-        "from": {
-          "description": "Data source path for ducklake connector. Format: ducklake:<path>",
-          "type": "string",
-          "pattern": "^ducklake:"
-        },
-        "name": {
-          "type": "string"
-        },
-        "params": {
-          "description": "Connection parameters for the ducklake data connector.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/DucklakeDataConnectorParams"
             },
             {
               "type": "null"
@@ -11083,926 +8836,6 @@
           "anyOf": [
             {
               "$ref": "#/$defs/FileDataConnectorParams"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "metadata": {
-          "type": "object",
-          "additionalProperties": true
-        },
-        "columns": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Column"
-          }
-        },
-        "access": {
-          "$ref": "#/$defs/AccessMode"
-        },
-        "has_metadata_table": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "replication": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Replication"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_partition_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_partition_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "acceleration": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Acceleration"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "embeddings": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ColumnEmbeddingConfig"
-          }
-        },
-        "dependsOn": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "invalid_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/InvalidTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "deprecated": true
-        },
-        "unsupported_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/UnsupportedTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "on_schema_change": {
-          "$ref": "#/$defs/OnSchemaChange"
-        },
-        "ready_state": {
-          "$ref": "#/$defs/ReadyState"
-        },
-        "metrics": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Metrics"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "vectors": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/VectorStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "full_text_search": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/FtsStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "check_availability": {
-          "$ref": "#/$defs/CheckAvailability"
-        },
-        "schema_inference": {
-          "$ref": "#/$defs/SchemaInference"
-        },
-        "mode": {
-          "$ref": "#/$defs/AccessMode"
-        }
-      },
-      "required": [
-        "from",
-        "name"
-      ],
-      "additionalProperties": false
-    },
-    "GcsDataset": {
-      "type": "object",
-      "properties": {
-        "from": {
-          "description": "Data source path for gcs connector. Format: gcs:<path>",
-          "type": "string",
-          "pattern": "^gcs:"
-        },
-        "name": {
-          "type": "string"
-        },
-        "params": {
-          "description": "Connection parameters for the gcs data connector.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/GcsDataConnectorParams"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "metadata": {
-          "type": "object",
-          "additionalProperties": true
-        },
-        "columns": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Column"
-          }
-        },
-        "access": {
-          "$ref": "#/$defs/AccessMode"
-        },
-        "has_metadata_table": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "replication": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Replication"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_partition_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_partition_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "acceleration": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Acceleration"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "embeddings": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ColumnEmbeddingConfig"
-          }
-        },
-        "dependsOn": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "invalid_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/InvalidTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "deprecated": true
-        },
-        "unsupported_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/UnsupportedTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "on_schema_change": {
-          "$ref": "#/$defs/OnSchemaChange"
-        },
-        "ready_state": {
-          "$ref": "#/$defs/ReadyState"
-        },
-        "metrics": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Metrics"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "vectors": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/VectorStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "full_text_search": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/FtsStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "check_availability": {
-          "$ref": "#/$defs/CheckAvailability"
-        },
-        "schema_inference": {
-          "$ref": "#/$defs/SchemaInference"
-        },
-        "mode": {
-          "$ref": "#/$defs/AccessMode"
-        }
-      },
-      "required": [
-        "from",
-        "name"
-      ],
-      "additionalProperties": false
-    },
-    "GitDataset": {
-      "type": "object",
-      "properties": {
-        "from": {
-          "description": "Data source path for git connector. Format: git:<path>",
-          "type": "string",
-          "pattern": "^git:"
-        },
-        "name": {
-          "type": "string"
-        },
-        "params": {
-          "description": "Connection parameters for the git data connector.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/GitDataConnectorParams"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "metadata": {
-          "type": "object",
-          "additionalProperties": true
-        },
-        "columns": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Column"
-          }
-        },
-        "access": {
-          "$ref": "#/$defs/AccessMode"
-        },
-        "has_metadata_table": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "replication": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Replication"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_partition_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_partition_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "acceleration": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Acceleration"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "embeddings": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ColumnEmbeddingConfig"
-          }
-        },
-        "dependsOn": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "invalid_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/InvalidTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "deprecated": true
-        },
-        "unsupported_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/UnsupportedTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "on_schema_change": {
-          "$ref": "#/$defs/OnSchemaChange"
-        },
-        "ready_state": {
-          "$ref": "#/$defs/ReadyState"
-        },
-        "metrics": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Metrics"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "vectors": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/VectorStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "full_text_search": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/FtsStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "check_availability": {
-          "$ref": "#/$defs/CheckAvailability"
-        },
-        "schema_inference": {
-          "$ref": "#/$defs/SchemaInference"
-        },
-        "mode": {
-          "$ref": "#/$defs/AccessMode"
-        }
-      },
-      "required": [
-        "from",
-        "name"
-      ],
-      "additionalProperties": false
-    },
-    "GithubDataset": {
-      "type": "object",
-      "properties": {
-        "from": {
-          "description": "Data source path for github connector. Format: github:<path>",
-          "type": "string",
-          "pattern": "^github:"
-        },
-        "name": {
-          "type": "string"
-        },
-        "params": {
-          "description": "Connection parameters for the github data connector.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/GithubDataConnectorParams"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "metadata": {
-          "type": "object",
-          "additionalProperties": true
-        },
-        "columns": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Column"
-          }
-        },
-        "access": {
-          "$ref": "#/$defs/AccessMode"
-        },
-        "has_metadata_table": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "replication": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Replication"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_partition_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_partition_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "acceleration": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Acceleration"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "embeddings": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ColumnEmbeddingConfig"
-          }
-        },
-        "dependsOn": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "invalid_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/InvalidTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "deprecated": true
-        },
-        "unsupported_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/UnsupportedTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "on_schema_change": {
-          "$ref": "#/$defs/OnSchemaChange"
-        },
-        "ready_state": {
-          "$ref": "#/$defs/ReadyState"
-        },
-        "metrics": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Metrics"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "vectors": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/VectorStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "full_text_search": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/FtsStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "check_availability": {
-          "$ref": "#/$defs/CheckAvailability"
-        },
-        "schema_inference": {
-          "$ref": "#/$defs/SchemaInference"
-        },
-        "mode": {
-          "$ref": "#/$defs/AccessMode"
-        }
-      },
-      "required": [
-        "from",
-        "name"
-      ],
-      "additionalProperties": false
-    },
-    "GlueDataset": {
-      "type": "object",
-      "properties": {
-        "from": {
-          "description": "Data source path for glue connector. Format: glue:<path>",
-          "type": "string",
-          "pattern": "^glue:"
-        },
-        "name": {
-          "type": "string"
-        },
-        "params": {
-          "description": "Connection parameters for the glue data connector.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/GlueDataConnectorParams"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "metadata": {
-          "type": "object",
-          "additionalProperties": true
-        },
-        "columns": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Column"
-          }
-        },
-        "access": {
-          "$ref": "#/$defs/AccessMode"
-        },
-        "has_metadata_table": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "replication": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Replication"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_partition_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_partition_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "acceleration": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Acceleration"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "embeddings": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ColumnEmbeddingConfig"
-          }
-        },
-        "dependsOn": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "invalid_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/InvalidTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "deprecated": true
-        },
-        "unsupported_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/UnsupportedTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "on_schema_change": {
-          "$ref": "#/$defs/OnSchemaChange"
-        },
-        "ready_state": {
-          "$ref": "#/$defs/ReadyState"
-        },
-        "metrics": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Metrics"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "vectors": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/VectorStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "full_text_search": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/FtsStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "check_availability": {
-          "$ref": "#/$defs/CheckAvailability"
-        },
-        "schema_inference": {
-          "$ref": "#/$defs/SchemaInference"
-        },
-        "mode": {
-          "$ref": "#/$defs/AccessMode"
-        }
-      },
-      "required": [
-        "from",
-        "name"
-      ],
-      "additionalProperties": false
-    },
-    "GsDataset": {
-      "type": "object",
-      "properties": {
-        "from": {
-          "description": "Data source path for gs connector. Format: gs:<path>",
-          "type": "string",
-          "pattern": "^gs:"
-        },
-        "name": {
-          "type": "string"
-        },
-        "params": {
-          "description": "Connection parameters for the gs data connector.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/GsDataConnectorParams"
             },
             {
               "type": "null"
@@ -12555,190 +9388,6 @@
           "anyOf": [
             {
               "$ref": "#/$defs/IcebergDataConnectorParams"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "metadata": {
-          "type": "object",
-          "additionalProperties": true
-        },
-        "columns": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Column"
-          }
-        },
-        "access": {
-          "$ref": "#/$defs/AccessMode"
-        },
-        "has_metadata_table": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "replication": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Replication"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_partition_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_partition_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "acceleration": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Acceleration"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "embeddings": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ColumnEmbeddingConfig"
-          }
-        },
-        "dependsOn": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "invalid_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/InvalidTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "deprecated": true
-        },
-        "unsupported_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/UnsupportedTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "on_schema_change": {
-          "$ref": "#/$defs/OnSchemaChange"
-        },
-        "ready_state": {
-          "$ref": "#/$defs/ReadyState"
-        },
-        "metrics": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Metrics"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "vectors": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/VectorStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "full_text_search": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/FtsStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "check_availability": {
-          "$ref": "#/$defs/CheckAvailability"
-        },
-        "schema_inference": {
-          "$ref": "#/$defs/SchemaInference"
-        },
-        "mode": {
-          "$ref": "#/$defs/AccessMode"
-        }
-      },
-      "required": [
-        "from",
-        "name"
-      ],
-      "additionalProperties": false
-    },
-    "KafkaDataset": {
-      "type": "object",
-      "properties": {
-        "from": {
-          "description": "Data source path for kafka connector. Format: kafka:<path>",
-          "type": "string",
-          "pattern": "^kafka:"
-        },
-        "name": {
-          "type": "string"
-        },
-        "params": {
-          "description": "Connection parameters for the kafka data connector.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/KafkaDataConnectorParams"
             },
             {
               "type": "null"
@@ -13475,374 +10124,6 @@
           "anyOf": [
             {
               "$ref": "#/$defs/SinkDataConnectorParams"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "metadata": {
-          "type": "object",
-          "additionalProperties": true
-        },
-        "columns": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Column"
-          }
-        },
-        "access": {
-          "$ref": "#/$defs/AccessMode"
-        },
-        "has_metadata_table": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "replication": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Replication"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_partition_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_partition_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "acceleration": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Acceleration"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "embeddings": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ColumnEmbeddingConfig"
-          }
-        },
-        "dependsOn": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "invalid_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/InvalidTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "deprecated": true
-        },
-        "unsupported_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/UnsupportedTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "on_schema_change": {
-          "$ref": "#/$defs/OnSchemaChange"
-        },
-        "ready_state": {
-          "$ref": "#/$defs/ReadyState"
-        },
-        "metrics": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Metrics"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "vectors": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/VectorStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "full_text_search": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/FtsStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "check_availability": {
-          "$ref": "#/$defs/CheckAvailability"
-        },
-        "schema_inference": {
-          "$ref": "#/$defs/SchemaInference"
-        },
-        "mode": {
-          "$ref": "#/$defs/AccessMode"
-        }
-      },
-      "required": [
-        "from",
-        "name"
-      ],
-      "additionalProperties": false
-    },
-    "SpiceAiDataset": {
-      "type": "object",
-      "properties": {
-        "from": {
-          "description": "Data source path for spice.ai connector. Format: spice.ai:<path>",
-          "type": "string",
-          "pattern": "^spice\\.ai:"
-        },
-        "name": {
-          "type": "string"
-        },
-        "params": {
-          "description": "Connection parameters for the spice.ai data connector.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SpiceAiDataConnectorParams"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "metadata": {
-          "type": "object",
-          "additionalProperties": true
-        },
-        "columns": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Column"
-          }
-        },
-        "access": {
-          "$ref": "#/$defs/AccessMode"
-        },
-        "has_metadata_table": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "replication": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Replication"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_partition_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_partition_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "acceleration": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Acceleration"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "embeddings": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ColumnEmbeddingConfig"
-          }
-        },
-        "dependsOn": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "invalid_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/InvalidTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "deprecated": true
-        },
-        "unsupported_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/UnsupportedTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "on_schema_change": {
-          "$ref": "#/$defs/OnSchemaChange"
-        },
-        "ready_state": {
-          "$ref": "#/$defs/ReadyState"
-        },
-        "metrics": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Metrics"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "vectors": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/VectorStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "full_text_search": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/FtsStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "check_availability": {
-          "$ref": "#/$defs/CheckAvailability"
-        },
-        "schema_inference": {
-          "$ref": "#/$defs/SchemaInference"
-        },
-        "mode": {
-          "$ref": "#/$defs/AccessMode"
-        }
-      },
-      "required": [
-        "from",
-        "name"
-      ],
-      "additionalProperties": false
-    },
-    "SpiceaiDataset": {
-      "type": "object",
-      "properties": {
-        "from": {
-          "description": "Data source path for spiceai connector. Format: spiceai:<path>",
-          "type": "string",
-          "pattern": "^spiceai:"
-        },
-        "name": {
-          "type": "string"
-        },
-        "params": {
-          "description": "Connection parameters for the spiceai data connector.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SpiceaiDataConnectorParams"
             },
             {
               "type": "null"
@@ -15210,6 +11491,12 @@
             "type": "string"
           }
         },
+        "exclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "dataset_params": {
           "anyOf": [
             {
@@ -15230,6 +11517,17 @@
           "anyOf": [
             {
               "$ref": "#/$defs/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acceleration": {
+          "description": "Automatically bootstrap and accelerate every table discovered by this\ncatalog, with zero per-table configuration. Only `refresh_mode: changes`\n(CDC) is supported today; there is no catalog-level `full` mode.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CatalogAcceleration"
             },
             {
               "type": "null"
@@ -15287,6 +11585,12 @@
             "type": "string"
           }
         },
+        "exclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "dataset_params": {
           "anyOf": [
             {
@@ -15307,6 +11611,17 @@
           "anyOf": [
             {
               "$ref": "#/$defs/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acceleration": {
+          "description": "Automatically bootstrap and accelerate every table discovered by this\ncatalog, with zero per-table configuration. Only `refresh_mode: changes`\n(CDC) is supported today; there is no catalog-level `full` mode.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CatalogAcceleration"
             },
             {
               "type": "null"
@@ -15364,6 +11679,12 @@
             "type": "string"
           }
         },
+        "exclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "dataset_params": {
           "anyOf": [
             {
@@ -15384,6 +11705,17 @@
           "anyOf": [
             {
               "$ref": "#/$defs/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acceleration": {
+          "description": "Automatically bootstrap and accelerate every table discovered by this\ncatalog, with zero per-table configuration. Only `refresh_mode: changes`\n(CDC) is supported today; there is no catalog-level `full` mode.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CatalogAcceleration"
             },
             {
               "type": "null"
@@ -15441,6 +11773,12 @@
             "type": "string"
           }
         },
+        "exclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "dataset_params": {
           "anyOf": [
             {
@@ -15461,6 +11799,17 @@
           "anyOf": [
             {
               "$ref": "#/$defs/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acceleration": {
+          "description": "Automatically bootstrap and accelerate every table discovered by this\ncatalog, with zero per-table configuration. Only `refresh_mode: changes`\n(CDC) is supported today; there is no catalog-level `full` mode.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CatalogAcceleration"
             },
             {
               "type": "null"
@@ -16303,6 +12652,12 @@
             "type": "string"
           }
         },
+        "exclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "dataset_params": {
           "anyOf": [
             {
@@ -16323,6 +12678,17 @@
           "anyOf": [
             {
               "$ref": "#/$defs/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acceleration": {
+          "description": "Automatically bootstrap and accelerate every table discovered by this\ncatalog, with zero per-table configuration. Only `refresh_mode: changes`\n(CDC) is supported today; there is no catalog-level `full` mode.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CatalogAcceleration"
             },
             {
               "type": "null"

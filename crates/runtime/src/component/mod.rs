@@ -31,6 +31,11 @@ pub enum Error {
         "'{name}' is a reserved catalog name and cannot be used. Choose a different name for the catalog."
     ))]
     ReservedCatalogName { name: String },
+
+    #[snafu(display(
+        "Catalog '{name}': acceleration is not supported for provider '{provider}'. Remove the 'acceleration' block, or use provider 'pg'. Docs: https://spiceai.org/docs/components/catalogs"
+    ))]
+    CatalogAccelerationUnsupportedProvider { name: String, provider: String },
 }
 
 pub mod access;

@@ -20,6 +20,7 @@ limitations under the License.
 //! discovery via `information_schema` queries.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
+use crate::catalogconnector::postgres_accelerated::AcceleratedCatalogProvider;
 use crate::{Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams};
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
@@ -120,14 +121,20 @@ impl CatalogConnector for PostgresCatalog {
             .with_unsupported_type_action(unsupported_type_action);
 
         let pool = Arc::new(pool);
-        let table_factory = Arc::new(PostgresTableFactory::new(Arc::clone(&pool)));
 
-        let catalog_provider = Arc::new(PostgresCatalogProvider::new(
-            catalog.name.clone(),
-            pool,
-            table_factory,
-            catalog.include.clone(),
-        ));
+        let catalog_provider: Arc<dyn RefreshableCatalogProvider> =
+            if catalog.acceleration.is_some() {
+                Arc::new(AcceleratedCatalogProvider::new(catalog, pool))
+            } else {
+                let table_factory = Arc::new(PostgresTableFactory::new(Arc::clone(&pool)));
+                Arc::new(PostgresCatalogProvider::new(
+                    catalog.name.clone(),
+                    pool,
+                    table_factory,
+                    catalog.include.clone(),
+                    catalog.exclude.clone(),
+                ))
+            };
 
         catalog_provider
             .refresh()
@@ -138,6 +145,6 @@ impl CatalogConnector for PostgresCatalog {
                 source: e,
             })?;
 
-        Ok(catalog_provider as Arc<dyn RefreshableCatalogProvider>)
+        Ok(catalog_provider)
     }
 }
