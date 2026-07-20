@@ -205,12 +205,16 @@ impl AnalyticalReport {
 /// Run every CH-benCH analytical query against both the source and Spice,
 /// comparing results.
 ///
-/// Queries are streamed through [`StreamExt::buffered`] with a `concurrency`
-/// window (controllable, at least one and never more than the query count), so
-/// several queries run at once; each in-flight query runs the source and Spice
-/// sides *in parallel* (see [`evaluate_query`]). `buffered` yields results in
-/// submission order, so the returned report preserves the original query order
-/// regardless of completion order.
+/// Queries are streamed through [`StreamExt::buffer_unordered`] with a
+/// `concurrency` window (controllable, at least one and never more than the
+/// query count), so several queries run at once; each in-flight query runs the
+/// source and Spice sides *in parallel* (see [`evaluate_query`]).
+/// `buffer_unordered` frees a window slot the moment *any* query completes, so
+/// the next query is admitted immediately — a slow query never dams finished
+/// ones behind it in the window (unlike `buffered`, whose in-submission-order
+/// yielding causes head-of-line blocking and bursty dispatch). Results come
+/// back in completion order, so we re-sort by the original submission index to
+/// keep the returned report in query order.
 pub async fn verify_analytical_results(
     driver: Arc<dyn ChBenchDriver>,
     spice: &SpiceClients,
@@ -233,34 +237,41 @@ pub async fn verify_analytical_results(
         "\nRunning analytical-query gate over {n} queries ({workers} concurrent, source+Spice in parallel per query)"
     );
 
-    // Stream the queries through a `buffered(workers)` window: up to `workers`
-    // `evaluate_query` futures run concurrently and results are yielded in
-    // submission order, so `collect` reconstructs the report in query order with
-    // no per-index bookkeeping. The futures are polled in place (not spawned), so
-    // they borrow `driver` and `spice` for the duration of this call — no
+    // Stream the queries through a `buffer_unordered(workers)` window: up to
+    // `workers` `evaluate_query` futures run concurrently, and a slot is freed as
+    // soon as *any* future completes (rolling concurrency — no head-of-line
+    // blocking). Because results arrive in completion order, each future carries
+    // its submission index so we can re-sort the collected report back into query
+    // order afterward. The futures are polled in place (not spawned), so they
+    // borrow `driver` and `spice` for the duration of this call — no
     // `'static`/`Send` bound and no cloning of the clients.
     let driver = &driver;
     let overall = Instant::now();
-    let results: Vec<AnalyticalQueryResult> = futures::stream::iter(queries.iter())
-        .map(|query| async move {
-            // Logged when the query is admitted into the `buffered` window (only
-            // `workers` are in flight at once), so CI output shows exactly which
-            // queries started before a cancellation/timeout and which are still
-            // waiting for a slot.
-            println!("  [{}] dispatching (source + Spice)", query.name);
-            let started = Instant::now();
-            let result = evaluate_query(query, driver, spice).await;
-            println!(
-                "  [{}] done in {:.1}s — {}",
-                query.name,
-                started.elapsed().as_secs_f64(),
-                result.outcome.label()
-            );
-            result
-        })
-        .buffered(workers)
-        .collect()
-        .await;
+    let mut indexed: Vec<(usize, AnalyticalQueryResult)> =
+        futures::stream::iter(queries.iter().enumerate())
+            .map(|(idx, query)| async move {
+                // Logged when the query is admitted into the `buffer_unordered` window
+                // (only `workers` are in flight at once), so CI output shows exactly
+                // which queries started before a cancellation/timeout and which are
+                // still waiting for a slot.
+                println!("  [{}] dispatching (source + Spice)", query.name);
+                let started = Instant::now();
+                let result = evaluate_query(query, driver, spice).await;
+                println!(
+                    "  [{}] done in {:.1}s — {}",
+                    query.name,
+                    started.elapsed().as_secs_f64(),
+                    result.outcome.label()
+                );
+                (idx, result)
+            })
+            .buffer_unordered(workers)
+            .collect()
+            .await;
+    // Restore submission order for a deterministic, query-ordered report.
+    indexed.sort_by_key(|(idx, _)| *idx);
+    let results: Vec<AnalyticalQueryResult> =
+        indexed.into_iter().map(|(_, result)| result).collect();
     println!(
         "Analytical-query gate finished all {n} queries in {:.1}s",
         overall.elapsed().as_secs_f64()
