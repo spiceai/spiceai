@@ -145,12 +145,18 @@ impl CdcIngestHandle {
 
         let rows = batch.record.num_rows();
         let (result_tx, result_rx) = oneshot::channel();
-        self.tx
-            .send(IngestWork { batch, result_tx })
-            .await
-            .map_err(|_| Error::ChannelClosed {
-                dataset: dataset.to_string(),
-            })?;
+        // `send` waits for capacity, so a saturated channel would otherwise hang
+        // the request indefinitely — never reaching the ack timeout below and
+        // never returning the documented 503. Bound it with the same budget.
+        match tokio::time::timeout(timeout, self.tx.send(IngestWork { batch, result_tx })).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => {
+                return ChannelClosedSnafu {
+                    dataset: dataset.to_string(),
+                }
+                .fail();
+            }
+        }
 
         match tokio::time::timeout(timeout, result_rx).await {
             Ok(Ok(Ok(()))) => Ok(rows),
@@ -194,6 +200,34 @@ fn register_handle(dataset_name: &str, handle: CdcIngestHandle) {
     }
 }
 
+/// Remove this dataset's registry entries, but only where the stored handle is
+/// still the one `tx` belongs to. On hot reload the replacement stream registers
+/// before the outgoing one finishes draining, so an unconditional remove-by-name
+/// would delete the *new* handle and 404 a healthy dataset.
+fn unregister_handle_owned(dataset_name: &str, tx: &mpsc::Sender<IngestWork>) {
+    REGISTRY.remove_if(dataset_name, |_, handle| handle.tx.same_channel(tx));
+    if let Some(bare) = dataset_name.rsplit('.').next()
+        && bare != dataset_name
+    {
+        REGISTRY.remove_if(bare, |_, handle| handle.tx.same_channel(tx));
+    }
+}
+
+/// Unregisters on drop, so the entry cannot outlive the stream that owns it —
+/// including when the consumer drops the stream early (dataset unload, refresh
+/// task abort), where the stream body's trailing cleanup never runs.
+struct RegistryGuard {
+    dataset_name: String,
+    tx: mpsc::Sender<IngestWork>,
+}
+
+impl Drop for RegistryGuard {
+    fn drop(&mut self) {
+        unregister_handle_owned(&self.dataset_name, &self.tx);
+    }
+}
+
+#[cfg(test)]
 fn unregister_handle(dataset_name: &str) {
     REGISTRY.remove(dataset_name);
     if let Some(bare) = dataset_name.rsplit('.').next()
@@ -396,6 +430,10 @@ impl DataConnector for CdcIngest {
         Some(Box::pin(stream! {
             let table_provider = federated_table.table_provider().await;
             let Some(table) = table_provider.downcast_ref::<CdcIngestTable>() else {
+                tracing::error!(
+                    dataset = %dataset_name,
+                    "CDC ingest could not resolve its table provider, so no change events will be accepted. This dataset will not become ready"
+                );
                 return;
             };
 
@@ -403,8 +441,6 @@ impl DataConnector for CdcIngest {
             while let Some(item) = changes_stream.next().await {
                 yield item;
             }
-
-            unregister_handle(&dataset_name);
         }))
     }
 }
@@ -428,14 +464,22 @@ impl CdcIngestTable {
                 primary_keys: self.primary_keys.clone(),
                 schema_registry_url: self.schema_registry_url.clone(),
                 avro_schema_json: self.avro_schema_json.clone(),
-                tx,
+                tx: tx.clone(),
             },
         );
 
         let schema = Arc::clone(&self.schema);
         let dataset_name = self.dataset_name.clone();
+        // Moved into the stream, so every exit path — normal end, early return,
+        // or the consumer dropping the stream mid-await — unregisters exactly
+        // this registration.
+        let guard = RegistryGuard {
+            dataset_name: dataset_name.clone(),
+            tx,
+        };
 
         Box::pin(stream! {
+            let _guard = guard;
             match build_ready_signal_envelope(&schema) {
                 Ok(ready) => yield Ok(ready),
                 Err(e) => {
@@ -444,7 +488,6 @@ impl CdcIngestTable {
                         "Failed to build CDC ready signal: {e}"
                     );
                     yield Err(cdc::StreamError::External(e.to_string()));
-                    unregister_handle(&dataset_name);
                     return;
                 }
             }
@@ -464,8 +507,6 @@ impl CdcIngestTable {
                     true,
                 ));
             }
-
-            unregister_handle(&dataset_name);
         })
     }
 }
@@ -544,8 +585,11 @@ pub async fn ingest_http_body(
     if content_type.is_some()
         && CdcFormat::from_content_type(content_type.unwrap_or_default()).is_none()
     {
-        // Unknown content-type — still try JSON if it looks like JSON.
-        if body.first() == Some(&b'{') || body.first() == Some(&b'[') {
+        // Unknown content-type — still try JSON if it looks like JSON. Skip
+        // leading whitespace first: pretty-printed bodies and NDJSON with a
+        // leading newline are valid JSON but do not start with `{`/`[`.
+        let first_non_ws = body.iter().find(|b| !b.is_ascii_whitespace());
+        if matches!(first_non_ws, Some(&b'{' | &b'[')) {
             return handle
                 .ingest(
                     dataset_name,
