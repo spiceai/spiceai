@@ -808,19 +808,21 @@ pub mod cayenne {
     static SCAN_VIEW_WAIT_DURATION_MS: OnceLock<Histogram<f64>> = OnceLock::new();
 
     /// Records a scan that had to WAIT for the maintainer to publish a bundle built
-    /// at or after a forced structural event (schema evolve / truncate / overwrite /
-    /// reopen) — the only case the non-blocking, bounded-stale scan gate blocks on;
-    /// ordinary CDC churn is served from the latest published bundle without waiting.
-    /// Expect ~0 in steady state; a rising count / duration means the maintainer is
-    /// lagging a structural transition (the scan sits idle on the gate rather than
-    /// recomputing on a query core). `dimensions` should carry `dataset`.
+    /// at or after a LIVE SCHEMA-EVOLUTION — the only event that bumps the structural
+    /// generation the scan gate keys on, and so the only case the non-blocking,
+    /// bounded-stale gate ever blocks on. Every other change (ordinary CDC churn AND
+    /// truncate / overwrite / full-delete / reopen) advances only the additive
+    /// scan-input version and is served from the latest published bundle without
+    /// waiting. Expect ~0 in steady state; a rising count / duration means the
+    /// maintainer is lagging a schema transition (the scan sits idle on the gate
+    /// rather than recomputing on a query core). `dimensions` should carry `dataset`.
     pub fn track_scan_view_wait(duration: Duration, dimensions: &[KeyValue]) {
         SCAN_VIEW_WAITS
             .get_or_init(|| {
                 operational_meter()
                     .u64_counter("cayenne_scan_view_waits_total")
                     .with_description(
-                        "Scans that waited for the scan-view maintainer to publish a bundle built at or after a forced structural event (the only case the non-blocking, bounded-stale scan gate blocks on).",
+                        "Scans that waited for the scan-view maintainer to publish a bundle built at or after a live schema-evolution (the only event the non-blocking, bounded-stale scan gate blocks on; every other change is served bounded-stale).",
                     )
                     .with_unit("scans")
                     .build()
@@ -831,7 +833,7 @@ pub mod cayenne {
                 operational_meter()
                     .f64_histogram("cayenne_scan_view_wait_duration_ms")
                     .with_description(
-                        "Time a scan spent waiting on the scan-view gate for a bundle built at or after a forced structural event.",
+                        "Time a scan spent waiting on the scan-view gate for a bundle built at or after a live schema-evolution.",
                     )
                     .with_unit("ms")
                     .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())

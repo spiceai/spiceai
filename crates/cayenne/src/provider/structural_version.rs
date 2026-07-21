@@ -14,15 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! A seqlock-style version gate for FORCED structural table events (truncate,
-//! full-table delete, `INSERT OVERWRITE`, live schema-evolve, drop/reopen).
+//! A seqlock-style version gate for FORCED structural table events whose mutation
+//! runs OFF the listing fence and could otherwise tear a straddling maintainer
+//! capture. Today the sole wired writer is **live schema-evolution** (its all-shards
+//! mem-tier flush runs off-fence — see `begin_mutation` at the widen site); the
+//! primitive is deliberately general so other off-fence discontinuities can adopt it.
 //!
-//! Ordinary CDC churn (append / row-delete / upsert / checkpoint / compaction)
-//! does NOT touch this — only discontinuities that make a previously-computed
-//! scan view semantically WRONG (not merely stale) advance it. This lets the
-//! scan-view maintainer publish bounded-stale bundles freely for ordinary churn
-//! while GUARANTEEING that a post-forced-event scan never runs on a pre-event
-//! bundle.
+//! Ordinary CDC churn (append / row-delete / upsert / checkpoint / compaction) does
+//! NOT touch this, and neither do the FENCE-SERIALIZED snapshot events (truncate /
+//! full-table delete / `INSERT OVERWRITE` / reopen): the listing fence already
+//! serializes their capture, so they advance only the additive `scan_input_version`
+//! and are served bounded-stale. Only an off-fence discontinuity that would make a
+//! previously-computed scan view semantically WRONG (not merely stale) advances this.
+//! This lets the scan-view maintainer publish bounded-stale bundles freely for
+//! everything else while GUARANTEEING that a post-schema-evolve scan never runs on a
+//! pre-evolution bundle.
 //!
 //! Protocol (odd = mutation in flight, even = stable), a versioned seqlock:
 //! - Forced-event writer: [`StructuralVersion::begin_mutation`] bumps the counter
@@ -103,6 +109,15 @@ impl StructuralVersion {
     /// after its odd bump), release/acquire makes `v1` observe that bump (`>= odd`)
     /// and the equality check fails. The `Acquire` fence before `v1` covers any
     /// non-`ArcSwap` reads inside `build`. The loom model verifies this.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "sync reference impl exercised by the unit tests + loom model; production \
+                      captures across an `.await` via `read_validated_async`, which mirrors this \
+                      exact load ordering"
+        )
+    )]
     pub(crate) fn read_validated<T>(&self, build: impl FnOnce() -> T) -> Option<(u64, T)> {
         let v0 = self.version.load(Ordering::Acquire);
         if v0 & 1 != 0 {

@@ -103,17 +103,6 @@ pub(crate) mod sink;
 pub(crate) mod staged_upsert;
 pub(crate) mod staging_wal;
 pub(crate) mod streaming;
-// The `StructuralVersion` seqlock is introduced here with its own loom model but is
-// not wired into the provider until a later commit in this stack, so on the plain
-// (non-test) build every item is dead; the `expect` is fulfilled there and removed
-// when the provider + scan gate start using it.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into the provider mutation sites + scan gate in a later commit"
-    )
-)]
 pub(crate) mod structural_version;
 pub(crate) mod table;
 pub(crate) mod transaction;
