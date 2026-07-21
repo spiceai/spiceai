@@ -20,7 +20,7 @@ All criteria must be met for the connector to be considered Stable, with excepti
 | Dremio                           | ✅              | @Sevenannn      |
 | DuckDB                           | ✅              | @peasee         |
 | DuckLake                         | ➖              |                 |
-| DynamoDB                         | ➖              |                 |
+| DynamoDB                         | ✅              | @krinart        |
 | File                             | ✅              | @ewgenius       |
 | FlightSQL                        | ➖              |                 |
 | FTP/SFTP                         | ➖              |                 |
