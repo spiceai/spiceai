@@ -7320,7 +7320,7 @@ impl CayenneTableProvider {
     /// so it is safe to run before (or concurrently with) the serial
     /// validate->append. The routing is keyed on the `OwnedRow` bytes so it agrees
     /// with the per-shard bloom/keyset and tombstone routing (see [`shard_of_pk`]).
-    fn split_batch_by_pk_shard(
+    pub(crate) fn split_batch_by_pk_shard(
         batch: &RecordBatch,
         pk_indices: &[usize],
         converter: &RowConverter,
@@ -8328,7 +8328,6 @@ impl CayenneTableProvider {
     pub(crate) async fn prepare_stream_for_insert_sharded(
         &self,
         stream: SendableRecordBatchStream,
-        n: usize,
     ) -> Result<Option<PreparedShardedInsertStream>> {
         let Some(pk_indices) = self.primary_key_indices()? else {
             return Ok(None);
@@ -8350,34 +8349,19 @@ impl CayenneTableProvider {
             .clone()
             .unwrap_or(OnConflict::DoNothingAll);
 
-        if self.context.pk_conflict_detection() == PkConflictDetection::None {
-            tracing::trace!(
-                table = %self.table_metadata.table_name,
-                "Skipping Cayenne primary-key conflict detection for sharded append"
-            );
-            return Ok(Some(PreparedShardedInsertStream {
-                stream,
-                pk_indices,
-                converter,
-                sharded_index: None,
-                on_conflict,
-            }));
-        }
-
-        // Reuse the existing single-index build (cache reuse / persisted bloom /
-        // full rebuild — all byte-identical to the serial path), then route into N
-        // per-shard views. A key inherits the shard of its `OwnedRow` bytes
-        // everywhere (§3.5), so the per-shard split agrees with the tier append +
-        // tombstone routing.
-        let sharded_index = self
-            .build_sharded_pk_index(&pk_indices, &converter, n)
-            .await?;
-
+        // NOTE: the per-shard existence index (`build_sharded_pk_index`) is NOT
+        // built here anymore. It is built in the lock-held APPLY stage
+        // (`apply_cdc_in_memory_sharded`) so a PIPELINED prepare never `take()`s the
+        // shared keyset cache — the take/validate/restore must stay serial under
+        // `write_lock`. This is byte-identical for the inline path (prepare→apply
+        // run back-to-back on one thread): the index build simply moves from before
+        // the stream drain to just after it, and the drain never touches the index.
+        // `pk_conflict_detection: none` is re-derived in apply (it skips the build
+        // there exactly as this branch used to skip it).
         Ok(Some(PreparedShardedInsertStream {
             stream,
             pk_indices,
             converter,
-            sharded_index: Some(sharded_index),
             on_conflict,
         }))
     }
@@ -8392,7 +8376,7 @@ impl CayenneTableProvider {
     ///   unrecoverable), so when an over-budget upsert table falls back to a
     ///   bloom we build `n` per-shard blooms by routing each loaded key. At
     ///   `n == 1` the single bloom wraps directly.
-    async fn build_sharded_pk_index(
+    pub(crate) async fn build_sharded_pk_index(
         &self,
         pk_indices: &[usize],
         converter: &RowConverter,
@@ -9121,39 +9105,20 @@ impl CayenneTableProvider {
 
     pub(crate) async fn validate_and_append_sharded(
         &self,
-        batches: Vec<RecordBatch>,
+        per_shard_batches: Vec<Vec<RecordBatch>>,
+        per_shard_bytes: Vec<u64>,
         mut sharded_index: Option<ShardedPkIndex>,
         pk_indices: &[usize],
         converter: &RowConverter,
         on_conflict: &OnConflict,
-        total_incoming_bytes: u64,
     ) -> Result<ShardedApplyResult> {
-        let n = self.mem_tier.shard_count().max(1);
-
-        // 1. Split every raw batch into N per-shard sub-batches (order-preserving
-        //    Arrow filter on the OwnedRow shard hash).
-        //    `per_shard_batches[s]` accumulates shard s's sub-batches in apply
-        //    order. Empty sub-batches are dropped (an empty append is a no-op).
-        let mut per_shard_batches: Vec<Vec<RecordBatch>> = vec![Vec::new(); n];
-        let mut per_shard_bytes: Vec<u64> = vec![0; n];
-        for batch in &batches {
-            let shards = Self::split_batch_by_pk_shard(batch, pk_indices, converter, n)?;
-            for (s, sub) in shards.into_iter().enumerate() {
-                if sub.num_rows() == 0 {
-                    continue;
-                }
-                per_shard_bytes[s] =
-                    per_shard_bytes[s].saturating_add(sub.get_array_memory_size() as u64);
-                per_shard_batches[s].push(sub);
-            }
-        }
-        // Guard against rounding loss: ensure the byte reservation accounting sums
-        // back to the whole-apply figure the caller reserved (assign any remainder
-        // to shard 0). At N=1 `per_shard_bytes[0]` is the whole apply.
-        let assigned: u64 = per_shard_bytes.iter().fold(0, |a, b| a.saturating_add(*b));
-        if assigned < total_incoming_bytes && !per_shard_bytes.is_empty() {
-            per_shard_bytes[0] = per_shard_bytes[0].saturating_add(total_incoming_bytes - assigned);
-        }
+        // The per-shard split (`split_batch_by_pk_shard` — the PK `RowConverter`
+        // encode + shard-hash + order-preserving Arrow filter) and its byte
+        // accounting (including the rounding-remainder assignment to shard 0) have
+        // moved OFF the `write_lock` critical section into the PREPARE stage
+        // (`prepare_cdc_in_memory_sharded`); this fn receives the already-split
+        // sub-batches. `converter`/`pk_indices` remain for per-shard on-conflict
+        // validation below.
 
         // 2. Validate each shard CONCURRENTLY against ITS existence view, building
         //    that shard's `OnConflictDeletions`. The shards are independent — a key
@@ -9198,10 +9163,14 @@ impl CayenneTableProvider {
             const SMALL_APPLY_INLINE_ROWS: usize = 32;
             let index_ref = sharded_index.as_ref();
             let non_empty_shards = per_shard_batches.iter().filter(|b| !b.is_empty()).count();
-            // Total rows in this apply. Split preserves every row (only empty
-            // sub-batches are dropped), so the incoming batches sum to the same
-            // count the shards do — computed here without re-touching the data.
-            let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            // Total rows in this apply, summed across the pre-split per-shard
+            // sub-batches (the split preserved every row; only empty sub-batches
+            // were dropped in prepare).
+            let total_rows: usize = per_shard_batches
+                .iter()
+                .flat_map(|shard| shard.iter())
+                .map(RecordBatch::num_rows)
+                .sum();
             if non_empty_shards <= 1 || total_rows <= SMALL_APPLY_INLINE_ROWS {
                 // INLINE: either ≤1 non-empty shard (no cross-shard parallelism to
                 // exploit) or a small enough apply that the per-shard OS-thread

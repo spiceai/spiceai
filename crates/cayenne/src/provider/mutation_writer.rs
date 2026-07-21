@@ -81,7 +81,10 @@ use super::Result;
 use super::column_stats::ColumnStatsAccumulator;
 use super::context::CayenneContext;
 use super::mem_tier_budget;
-use super::on_conflict::{PostValidationState, PreparedShardedInsertStream};
+use super::on_conflict::{
+    PostValidationState, PreparedMemShardedApply, PreparedShardedInsertStream,
+};
+use crate::metadata::PkConflictDetection;
 use super::pk_index::PkDigestSet;
 use super::staging_wal::{CayenneStagedAppend, PreparedStagedAppend, StagingWalTargetKind};
 use super::table::{CayenneCdcWrite, CayenneTableProvider, record_cayenne_write_phase};
@@ -340,11 +343,7 @@ impl<'a> AppendMutationWriter<'a> {
             && self.table.has_slot_advancer()
             && self.table.metadata().partition_column.is_none()
         {
-            if let Some(prepared) = self
-                .table
-                .prepare_stream_for_insert_sharded(data, mem_tier_shards)
-                .await?
-            {
+            if let Some(prepared) = self.table.prepare_stream_for_insert_sharded(data).await? {
                 match self
                     .write_cdc_in_memory_sharded(prepared, write_guard, write_start)
                     .await?
@@ -861,34 +860,50 @@ impl<'a> AppendMutationWriter<'a> {
         )))
     }
 
-    /// Sharded (N>1) in-memory CDC write path (§5 Phase 3, step b). Drains the
-    /// RAW decoded stream, applies the whole-apply OOM-safety caps/budget exactly
-    /// as [`Self::write_cdc_in_memory`], then DECOUPLES decode from validation:
-    /// each batch is split by PK shard and the per-batch on-conflict validation
-    /// runs PER SHARD ([`CayenneTableProvider::validate_and_append_sharded`]),
-    /// with the N shard appends joined concurrently. The combined post-validation
-    /// state is published for the durable fallback.
+    /// Sharded (N>1) in-memory CDC write path (§5 Phase 3, step b), as the inline
+    /// composition of the two pipeline stages: [`Self::prepare_cdc_in_memory_sharded`]
+    /// (off-`write_lock`: decode + PK-shard split) and
+    /// [`Self::apply_cdc_in_memory_sharded`] (under `write_lock`: build index +
+    /// cap/spill/budget + per-shard validate + append). Running them back-to-back
+    /// on one task is byte-identical to the pre-split path; the runtime's pipelined
+    /// Stage A/Stage B invoke the two stages separately across a bounded handoff so
+    /// the recv loop keeps draining while a slow apply proceeds off the recv path.
     ///
-    /// Engaged only at N>1; the N=1 write path never reaches here, so today's
-    /// behavior is byte-identical.
+    /// Engaged only at N>1; the N=1 write path never reaches here.
     async fn write_cdc_in_memory_sharded(
         &self,
         prepared: PreparedShardedInsertStream,
         write_guard: OwnedMutexGuard<()>,
         write_start: Instant,
     ) -> Result<MemShardedOutcome> {
+        let prepared_apply = self.prepare_cdc_in_memory_sharded(prepared).await?;
+        self.apply_cdc_in_memory_sharded(prepared_apply, write_guard, write_start)
+            .await
+    }
+
+    /// PREPARE stage (off `write_lock`, pipeline-safe): drain the RAW decoded
+    /// upstream stream into RAM and split every batch by PK shard
+    /// (`split_batch_by_pk_shard` — the PK `RowConverter` encode + shard-hash +
+    /// order-preserving Arrow filter). Touches NO shared keyset cache and NO tier
+    /// state, so multiple prepares are safe to run concurrently (the pipelined
+    /// PREPARE the runtime runs ahead of the serial APPLY). The existence-index
+    /// build + validation + append all belong to [`Self::apply_cdc_in_memory_sharded`].
+    async fn prepare_cdc_in_memory_sharded(
+        &self,
+        prepared: PreparedShardedInsertStream,
+    ) -> Result<PreparedMemShardedApply> {
         let PreparedShardedInsertStream {
             mut stream,
             pk_indices,
             converter,
-            sharded_index,
             on_conflict,
         } = prepared;
+        let n = self.table.mem_tier_shard_count().max(1);
 
         // Drain the RAW stream into RAM (no validation wrapper — validation is
-        // deferred to the per-shard step below).
+        // deferred to the per-shard APPLY step).
         let schema = stream.schema();
-        let mut batches: Vec<RecordBatch> = Vec::new();
+        let mut original_batches: Vec<RecordBatch> = Vec::new();
         let mut incoming_bytes: u64 = 0;
         let mut incoming_rows: u64 = 0;
         let drain_start = Instant::now();
@@ -896,7 +911,7 @@ impl<'a> AppendMutationWriter<'a> {
             let batch = batch?;
             incoming_bytes = incoming_bytes.saturating_add(batch.get_array_memory_size() as u64);
             incoming_rows = incoming_rows.saturating_add(batch.num_rows() as u64);
-            batches.push(batch);
+            original_batches.push(batch);
         }
         drop(stream);
         record_cayenne_write_phase(
@@ -904,6 +919,86 @@ impl<'a> AppendMutationWriter<'a> {
             "inmemory_stream_drain",
             drain_start,
         );
+
+        // Split every raw batch into N per-shard sub-batches OFF the `write_lock`
+        // (this — the PK `RowConverter` encode + shard hash + order-preserving Arrow
+        // filter — moved out of `validate_and_append_sharded`'s lock-held region).
+        // Empty sub-batches are dropped (an empty append is a no-op).
+        let split_start = Instant::now();
+        let mut per_shard_batches: Vec<Vec<RecordBatch>> = vec![Vec::new(); n];
+        let mut per_shard_bytes: Vec<u64> = vec![0; n];
+        for batch in &original_batches {
+            let shards =
+                CayenneTableProvider::split_batch_by_pk_shard(batch, &pk_indices, &converter, n)?;
+            for (s, sub) in shards.into_iter().enumerate() {
+                if sub.num_rows() == 0 {
+                    continue;
+                }
+                per_shard_bytes[s] =
+                    per_shard_bytes[s].saturating_add(sub.get_array_memory_size() as u64);
+                per_shard_batches[s].push(sub);
+            }
+        }
+        // Guard against rounding loss: ensure the byte accounting sums back to the
+        // whole-apply figure (assign any remainder to shard 0). At N=1
+        // `per_shard_bytes[0]` is the whole apply.
+        let assigned: u64 = per_shard_bytes.iter().fold(0, |a, b| a.saturating_add(*b));
+        if assigned < incoming_bytes && !per_shard_bytes.is_empty() {
+            per_shard_bytes[0] = per_shard_bytes[0].saturating_add(incoming_bytes - assigned);
+        }
+        record_cayenne_write_phase(self.table.table_name(), "inmemory_shard_split", split_start);
+
+        Ok(PreparedMemShardedApply {
+            original_batches,
+            per_shard_batches,
+            per_shard_bytes,
+            pk_indices,
+            converter,
+            on_conflict,
+            incoming_bytes,
+            incoming_rows,
+            schema,
+        })
+    }
+
+    /// APPLY stage (under `write_lock`, SERIAL in source order): build the per-shard
+    /// existence index (the take-from-cache that must stay serial), enforce the
+    /// whole-apply OOM caps/budget, then run the per-shard on-conflict validation +
+    /// append ([`CayenneTableProvider::validate_and_append_sharded`]) on the
+    /// already-split batches and stamp the shared per-apply slot-ack epoch.
+    async fn apply_cdc_in_memory_sharded(
+        &self,
+        prepared: PreparedMemShardedApply,
+        write_guard: OwnedMutexGuard<()>,
+        write_start: Instant,
+    ) -> Result<MemShardedOutcome> {
+        let PreparedMemShardedApply {
+            original_batches,
+            per_shard_batches,
+            per_shard_bytes,
+            pk_indices,
+            converter,
+            on_conflict,
+            incoming_bytes,
+            incoming_rows,
+            schema,
+        } = prepared;
+        let n = self.table.mem_tier_shard_count().max(1);
+
+        // Build the per-shard existence index HERE (under `write_lock`, serial), not
+        // in PREPARE — the take-from-cache must not race a pipelined prepare. Skip
+        // when conflict detection is off (`pk_conflict_detection: none`), which the
+        // prepared stream used to signal with `sharded_index: None`; re-derived here
+        // so the drain never depends on it.
+        let sharded_index = if self.context.pk_conflict_detection() == PkConflictDetection::None {
+            None
+        } else {
+            Some(
+                self.table
+                    .build_sharded_pk_index(&pk_indices, &converter, n)
+                    .await?,
+            )
+        };
 
         // Whole-apply (whole-tier) OOM-safety: per-table byte cap spill + global
         // budget reservation, identical to the serial path. The byte trigger is
@@ -930,36 +1025,29 @@ impl<'a> AppendMutationWriter<'a> {
             record_cayenne_write_phase(self.table.table_name(), "inmemory_budget_wait", wait_start);
             if !admitted? {
                 // Sustained overload: hand the buffered raw batches to the durable
-                // path. Populate the combined post-validation state by running the
-                // sharded validate+append? No — on fallback we must NOT append to
-                // the tier. Instead run validation only to produce the combined
-                // on-conflict deletions for the durable path. The simplest correct
-                // route: re-run validation through the standard serial prepare on
-                // the durable side (it rebuilds the single index). We therefore
-                // hand back the raw batches with an EMPTY post-validation; the
-                // durable `write_prepared_stream` re-validates via its own
-                // `prepare_stream_for_insert`. To keep that contract, the fallback
-                // re-streams the raw batches into a FRESH `prepare_stream_for_insert`
-                // at the caller.
+                // path (NO tier mutation happened). The caller re-streams them
+                // through the standard serial `prepare_stream_for_insert` so the
+                // durable path re-validates against the single index.
                 return Ok(MemShardedOutcome::FallBackToDurable {
-                    batches,
+                    batches: original_batches,
                     schema,
                     write_guard,
                 });
             }
         }
 
-        // Validate + append per shard. On error, release the byte reservation so
-        // the global budget doesn't leak (matching the serial path).
+        // Validate + append per shard on the already-split batches. On error,
+        // release the byte reservation so the global budget doesn't leak (matching
+        // the serial path).
         let apply = match self
             .table
             .validate_and_append_sharded(
-                batches,
+                per_shard_batches,
+                per_shard_bytes,
                 sharded_index,
                 &pk_indices,
                 &converter,
                 &on_conflict,
-                incoming_bytes,
             )
             .await
         {

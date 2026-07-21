@@ -22,7 +22,7 @@ limitations under the License.
 //! scan/update plumbing. The provider drives these from its insert/delete path.
 
 use super::delete::CayenneDeletionSink;
-use super::pk_index::{CachedPkIndex, PkDigestSet, PkExistenceRef, ShardedPkIndex};
+use super::pk_index::{CachedPkIndex, PkDigestSet, PkExistenceRef};
 use crate::metadata::InlinedData;
 
 use arrow::record_batch::RecordBatch;
@@ -656,9 +656,16 @@ impl PreparedInsertStream {
 /// Unlike [`PreparedInsertStream`], the stream is the RAW decoded upstream — NOT
 /// wrapped in an [`OnConflictValidationStream`] — because the sharded path runs
 /// the on-conflict validation PER SHARD after splitting each batch by
-/// `shard_of_pk`. The pre-apply existence snapshot is carried as a
-/// [`ShardedPkIndex`] (one existence view per shard), so a shard validates only
-/// against its own keys (a key's whole history is confined to one shard, §3.1).
+/// `shard_of_pk`. A key validates only against its own keys (a key's whole
+/// history is confined to one shard, §3.1).
+///
+/// The per-shard existence snapshot ([`ShardedPkIndex`]) is deliberately NOT
+/// carried here: it is built in the lock-held APPLY stage
+/// (`apply_cdc_in_memory_sharded`), not in this off-lock PREPARE stage, so that a
+/// PIPELINED prepare never `take()`s the shared keyset cache — two concurrent
+/// prepares would otherwise race the cache (second forced into an expensive,
+/// possibly-inconsistent cold rebuild). The index take/validate/restore must stay
+/// serial under `write_lock`; only the decode + PK-encode/shard split is off-lock.
 ///
 /// The single-shard (`n == 1`) path never uses this — it takes the existing
 /// `prepare_stream_for_insert` flow unchanged, keeping N=1 byte-identical.
@@ -671,13 +678,45 @@ pub(crate) struct PreparedShardedInsertStream {
     /// so it can be the table's cached `pk_row_converter` (zero per-apply rebuild)
     /// for composite PKs, or a freshly built one for `Int64` PKs (no cache).
     pub(crate) converter: Arc<RowConverter>,
-    /// Pre-apply per-shard existence snapshot. `None` when conflict detection is
-    /// off (`pk_conflict_detection: none`) or the source trusts uniqueness — the
-    /// drain then appends every row with no validation, mirroring the immediate
-    /// path.
-    pub(crate) sharded_index: Option<ShardedPkIndex>,
     /// The resolved on-conflict behavior for this table.
     pub(crate) on_conflict: OnConflict,
+}
+
+/// Output of the sharded in-memory CDC **PREPARE** stage
+/// ([`crate::provider::mutation_writer::AppendMutationWriter::prepare_cdc_in_memory_sharded`]):
+/// the drained + PK-sharded batches ready for the lock-held **APPLY** stage
+/// ([`crate::provider::mutation_writer::AppendMutationWriter::apply_cdc_in_memory_sharded`]).
+///
+/// Built entirely OFF the `write_lock` critical section — the stream drain
+/// (decode) plus the per-shard split (`split_batch_by_pk_shard`: the PK
+/// `RowConverter` encode + shard-hash + order-preserving Arrow filter) — and
+/// WITHOUT touching the shared keyset cache or any tier state, so it is safe to
+/// build concurrently (the pipelined PREPARE the runtime's Stage A runs ahead of
+/// the serial Stage B APPLY). It is owned (`'static`) + `Send` so it can cross the
+/// Stage A → Stage B handoff.
+pub(crate) struct PreparedMemShardedApply {
+    /// The raw drained batches, retained ONLY for the durable-fallback re-stream
+    /// (sustained-overload path); not consumed on the fast path.
+    pub(crate) original_batches: Vec<RecordBatch>,
+    /// Per-shard sub-batches (order-preserving split by `shard_of_pk`) — the APPLY
+    /// stage's validate + append input.
+    pub(crate) per_shard_batches: Vec<Vec<RecordBatch>>,
+    /// Per-shard byte accounting (rounding remainder assigned to shard 0), summing
+    /// to `incoming_bytes`.
+    pub(crate) per_shard_bytes: Vec<u64>,
+    /// PK column indices, for the APPLY stage's index build + per-shard validation.
+    pub(crate) pk_indices: Vec<usize>,
+    /// The PK existence converter (the table's cached `Arc<RowConverter>` or a
+    /// freshly built one), reused for the APPLY stage's per-shard validation.
+    pub(crate) converter: Arc<RowConverter>,
+    /// The resolved on-conflict behavior for this table.
+    pub(crate) on_conflict: OnConflict,
+    /// Total incoming bytes across all batches (cap/budget accounting).
+    pub(crate) incoming_bytes: u64,
+    /// Total incoming rows (returned as the write's row count).
+    pub(crate) incoming_rows: u64,
+    /// The drained stream's schema, for the durable-fallback re-stream.
+    pub(crate) schema: SchemaRef,
 }
 
 #[derive(Default)]
