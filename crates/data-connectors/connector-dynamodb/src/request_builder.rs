@@ -13,9 +13,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::dynamodb::request_plan::{DynamoDBRequestPlan, QueryParamsBuilder, ScanParamsBuilder};
-use crate::dynamodb::table_schema::DynamoDBTableSchema;
-use crate::dynamodb::utils::FilterStringVisitor;
+use crate::request_plan::{DynamoDBRequestPlan, QueryParamsBuilder, ScanParamsBuilder};
+use crate::table_schema::DynamoDBTableSchema;
+use crate::utils::FilterStringVisitor;
 use aws_sdk_dynamodb::types::AttributeValue;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};

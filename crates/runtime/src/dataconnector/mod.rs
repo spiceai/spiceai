@@ -124,6 +124,17 @@ pub static DATA_CONNECTOR_REGISTRATIONS: [DataConnectorRegistration] = [..];
 ///
 /// Using this macro automatically adds the connector to the distributed slice,
 /// making it available for discovery by the runtime.
+///
+/// # Linking (connectors in their own crate)
+///
+/// The registration this generates is a `#[linkme::distributed_slice]` static, and a static
+/// is included only when its crate is actually linked — merely being a Cargo dependency is
+/// **not** enough, because the linker drops the unreferenced static. So a connector defined in
+/// its own crate (e.g. a `connector-*` crate) must be **force-linked** in every binary/tool that
+/// should see it, via `use <crate> as _;`: currently `bin/spiced` (so `register_all()` registers
+/// it) and `tools/spicepodschema` (so it appears in the generated schema). Miss that line and the
+/// connector silently vanishes from both. Connectors defined inside `runtime` itself need nothing
+/// extra, since `runtime` is always linked.
 #[macro_export]
 macro_rules! register_data_connector {
     ($fn_name:ident, $static_name:ident, $name:expr, $factory:path) => {
@@ -156,8 +167,6 @@ macro_rules! register_data_connector {
 // #[cfg(feature = "cosmosdb")] pub mod cosmosdb;
 #[cfg(feature = "debezium")]
 pub mod debezium;
-#[cfg(feature = "dynamodb")]
-pub mod dynamodb;
 pub mod file;
 
 // git: moved to crates/data-connectors/connector-git
