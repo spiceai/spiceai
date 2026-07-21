@@ -62,6 +62,7 @@ use {
 
 use crate::component::dataset::acceleration::Engine;
 use crate::dataaccelerator::AcceleratorEngineRegistry;
+use runtime_checkpoint_api::BlobCheckpointStore;
 
 pub mod dataset_checkpoint;
 #[cfg(feature = "debezium")]
@@ -69,9 +70,6 @@ pub mod debezium_kafka;
 
 #[cfg(feature = "kafka")]
 pub mod kafka;
-
-#[cfg(feature = "dynamodb")]
-pub mod dynamodb;
 
 #[cfg(feature = "mongodb")]
 pub mod mongodb;
@@ -213,6 +211,108 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub enum OpenOption {
     CreateIfNotExists,
     OpenExisting,
+}
+
+/// Construct the per-dataset **blob** checkpoint store backed by the dataset's own
+/// accelerator, writing into the sidecar `table_name`. Returns `None` when the dataset
+/// has no usable accelerator connection (acceleration disabled, or the engine isn't
+/// compiled in), so a CDC connector degrades to re-bootstrapping from scratch rather
+/// than failing.
+///
+/// This is the seam that lets CDC connectors persist their stream position without
+/// naming any runtime-internal accelerator type: they receive an
+/// `Arc<dyn BlobCheckpointStore>` and never see the engine. Resolving the connection
+/// needs the accelerator engine registry, which is why this factory lives in `runtime`.
+#[cfg(any(
+    feature = "duckdb",
+    feature = "sqlite",
+    feature = "postgres-accel",
+    feature = "turso"
+))]
+pub async fn checkpoint_store(
+    dataset: &crate::component::dataset::Dataset,
+    table_name: &'static str,
+) -> Option<Arc<dyn BlobCheckpointStore>> {
+    let registry = dataset.runtime.accelerator_engine_registry();
+    let connection = match acceleration_connection(dataset, registry, OpenOption::CreateIfNotExists)
+        .await
+    {
+        Ok(connection) => connection,
+        Err(e) => {
+            // Surface *why* checkpointing is unavailable (missing engine feature,
+            // missing file, pool-init failure, …) instead of a silent `None`.
+            tracing::warn!(
+                dataset = %dataset.name,
+                error = %e,
+                "Could not resolve the dataset's accelerator connection for checkpoint storage; the connector will run without a persisted checkpoint"
+            );
+            return None;
+        }
+    };
+    let dataset_name = dataset.name.to_string();
+
+    // Exhaustive over the compiled `AccelerationConnection` variants — no wildcard, so
+    // adding an accelerator variant forces a matching arm here.
+    let store: Arc<dyn BlobCheckpointStore> = match connection {
+        #[cfg(feature = "duckdb")]
+        AccelerationConnection::DuckDB(pool) => {
+            Arc::new(runtime_checkpoint_duckdb::DuckDbBlobCheckpointStore::new(
+                pool,
+                dataset_name,
+                table_name,
+            ))
+        }
+        #[cfg(feature = "postgres-accel")]
+        AccelerationConnection::Postgres(pool) => Arc::new(
+            runtime_checkpoint_postgres::PostgresBlobCheckpointStore::new(
+                pool,
+                dataset_name,
+                table_name,
+            ),
+        ),
+        #[cfg(feature = "sqlite")]
+        AccelerationConnection::SQLite(pool) => {
+            Arc::new(runtime_checkpoint_sqlite::SqliteBlobCheckpointStore::new(
+                pool,
+                dataset_name,
+                table_name,
+            ))
+        }
+        #[cfg(feature = "turso")]
+        AccelerationConnection::Turso(pool) => Arc::new(
+            runtime_checkpoint_turso::TursoBlobCheckpointStore::new(pool, dataset_name, table_name),
+        ),
+        #[cfg(all(not(windows), feature = "sqlite"))]
+        AccelerationConnection::Cayenne(pool) => {
+            Arc::new(runtime_checkpoint_sqlite::SqliteBlobCheckpointStore::new(
+                pool,
+                dataset_name,
+                table_name,
+            ))
+        }
+    };
+    Some(store)
+}
+
+/// No accelerator backend is compiled in, so nothing can persist a checkpoint: the
+/// connector runs stateless (ephemeral, re-bootstrapping on restart). Signature parity
+/// with the accelerator-backed variant above (see it for the full contract).
+#[cfg(not(any(
+    feature = "duckdb",
+    feature = "sqlite",
+    feature = "postgres-accel",
+    feature = "turso"
+)))]
+#[expect(
+    clippy::unused_async,
+    reason = "signature parity with the accelerator-backed build; no async work when no backend is compiled in"
+)]
+pub async fn checkpoint_store(
+    dataset: &crate::component::dataset::Dataset,
+    table_name: &'static str,
+) -> Option<Arc<dyn BlobCheckpointStore>> {
+    let _ = (dataset, table_name);
+    None
 }
 
 async fn acceleration_connection(
