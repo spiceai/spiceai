@@ -13,6 +13,7 @@ All criteria must be met for the embedding component to be considered RC.
 | Databricks              | ➖         |              |
 | File                    | ✅         | @Jeadie      |
 | Hugging Face            | ✅         | @Jeadie      |
+| Model2Vec               | ➖         |              |
 | OpenAI                  | ✅         | @ewgenius    |
 | Spice.ai Cloud Platform | ➖         |              |
 

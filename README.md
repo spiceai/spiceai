@@ -203,6 +203,8 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 
 ## Supported Data Connectors
 
+Statuses match the signed DRI tables in [`docs/criteria/connectors/`](docs/criteria/connectors/).
+
 | Name                               | Description                           | Status            | Protocol/Format              |
 | ---------------------------------- | ------------------------------------- | ----------------- | ---------------------------- |
 | `databricks (mode: delta_lake)`    | [Databricks][databricks]              | Stable            | S3/Delta Lake                |
@@ -215,20 +217,20 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `s3`                               | [S3][s3]                              | Stable            | Parquet, CSV                 |
 | `mysql`                            | MySQL (with native binlog CDC)        | Stable            |                              |
 | `spice.ai`                         | [Spice.ai][spiceai]                   | Stable            | Arrow Flight                 |
-| `dynamodb`                         | Amazon DynamoDB (with Streams)        | Stable            |                              |
+| `dynamodb`                         | Amazon DynamoDB (with Streams)        | Release Candidate |                              |
 | `graphql`                          | GraphQL                               | Release Candidate | JSON                         |
 | `cosmosdb`                         | Azure Cosmos DB (NoSQL)               | Release Candidate |                              |
 | `git`                              | Git repositories                      | Release Candidate |                              |
-| `snowflake`                        | Snowflake                             | Release Candidate | Arrow                        |
-| `adbc`                             | ADBC                                  | Release Candidate | Arrow                        |
-| `iceberg`                          | [Apache Iceberg][iceberg] (read+write) | Release Candidate | Parquet                      |
+| `snowflake`                        | Snowflake                             | Beta              | Arrow                        |
+| `iceberg`                          | [Apache Iceberg][iceberg] (read+write) | Beta              | Parquet                      |
 | `databricks (mode: spark_connect)` | [Databricks][databricks]              | Beta              | [Spark Connect][spark]       |
 | `ducklake`                         | [DuckLake][ducklake]                  | Beta              | Parquet                      |
-| `flightsql`                        | FlightSQL                             | Beta              | Arrow Flight SQL             |
 | `mssql`                            | Microsoft SQL Server                  | Beta              | Tabular Data Stream (TDS)    |
-| `odbc`                             | ODBC                                  | Beta              | ODBC                         |
 | `spark`                            | Spark                                 | Beta              | [Spark Connect][spark]       |
-| `sharepoint`                       | Microsoft SharePoint                  | Beta              | Object-store listing         |
+| `adbc`                             | ADBC                                  | Alpha             | Arrow                        |
+| `flightsql`                        | FlightSQL                             | Alpha             | Arrow Flight SQL             |
+| `odbc`                             | ODBC                                  | Alpha             | ODBC                         |
+| `sharepoint`                       | Microsoft SharePoint                  | Alpha             | Object-store listing         |
 | `oracle`                           | Oracle                                | Alpha             | [Oracle ODPI-C][ODPIC]       |
 | `abfs`                             | Azure BlobFS                          | Alpha             | Parquet, CSV                 |
 | `clickhouse`                       | ClickHouse                            | Alpha             |                              |
@@ -260,9 +262,11 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 
 ## Supported Data Accelerators
 
+Statuses match the signed DRI tables in [`docs/criteria/accelerators/`](docs/criteria/accelerators/).
+
 | Name       | Description                       | Status            | Engine Modes     |
 | ---------- | --------------------------------- | ----------------- | ---------------- |
-| `cayenne`  | [Spice Cayenne (Vortex)][cayenne] | Release Candidate | `file`           |
+| `cayenne`  | [Spice Cayenne (Vortex)][cayenne] | Stable            | `file`           |
 | `arrow`    | [In-Memory Arrow Records][arrow]  | Stable            | `memory`         |
 | `duckdb`   | Embedded [DuckDB][duckdb]         | Stable            | `memory`, `file` |
 | `postgres` | Attached [PostgreSQL][postgres]   | Release Candidate | N/A              |
@@ -294,7 +298,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `openai`      | OpenAI (or compatible) embeddings endpoint   | Release Candidate | -            | OpenAI-compatible embeddings endpoint  |
 | `file`        | Local filesystem                             | Release Candidate | ONNX         | GGUF, GGML, SafeTensor                 |
 | `huggingface` | Models hosted on HuggingFace                 | Release Candidate | ONNX         | GGUF, GGML, SafeTensor                 |
-| `model2vec`   | Static embeddings (500x faster)              | Release Candidate | Model2Vec    | -                                      |
+| `model2vec`   | Static embeddings (500x faster)              | Alpha             | Model2Vec    | -                                      |
 | `azure`       | Azure OpenAI                                 | Alpha             | -            | OpenAI-compatible HTTP endpoint        |
 | `bedrock`     | AWS Bedrock (Titan, Cohere, Nova, Nova 2)    | Alpha             | -            | OpenAI-compatible HTTP endpoint        |
 
@@ -312,10 +316,12 @@ Configured as `.vectors.engine` on a column-level embedding.
 
 Catalog Connectors connect to external catalog providers and make their tables available for federated SQL query in Spice. The schema hierarchy of the external catalog is preserved.
 
+Statuses match the signed DRI tables in [`docs/criteria/catalogs/`](docs/criteria/catalogs/).
+
 | Name            | Description             | Status | Protocol/Format              |
 | --------------- | ----------------------- | ------ | ---------------------------- |
-| `spice.ai`      | Spice.ai Cloud Platform | Stable | Arrow Flight                 |
 | `unity_catalog` | Unity Catalog           | Stable | Delta Lake                   |
+| `spice.ai`      | Spice.ai Cloud Platform | Beta   | Arrow Flight                 |
 | `databricks`    | Databricks              | Beta   | Spark Connect, S3/Delta Lake |
 | `iceberg`       | Apache Iceberg          | Beta   | Parquet                      |
 | `ducklake`      | DuckLake                | Beta   | Parquet                      |

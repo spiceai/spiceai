@@ -28,7 +28,7 @@ All criteria must be met for the connector to be considered Beta, with exception
 | Git                              | ✅           | @lukekim        |
 | GitHub                           | ✅           | @peasee         |
 | Glue                             | ➖           |                 |
-| GraphQL                          | ➖           |                 |
+| GraphQL                          | ✅           | @peasee         |
 | HTTP/HTTPS                       | ➖           |                 |
 | Iceberg                          | ✅           | @phillipleblanc |
 | IMAP                             | ➖           |                 |
