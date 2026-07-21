@@ -14251,67 +14251,23 @@ impl CayenneTableProvider {
         let session_state = Arc::new(ctx.state());
         let schema = self.table_schema();
 
-        // Bloom-eligible (upsert) tables split output so each file stays under the
-        // PK-bloom row cap (else no bloom → full cold scan on keyset rebuild). Only
-        // narrow-row tables reach the cap; others write a single chunk.
-        let bloom_eligible = self.upsert_bloom_eligible() && !self.pk_column_indices.is_empty();
-        if bloom_eligible {
-            // All chunks write to the SAME dir: the Vortex sink names files with a
-            // fresh per-write `write_id` UUID, so sequential writes never collide
-            // (flat layout, identical to the single-write path).
-            let row_cap = Self::cold_file_row_cap();
-            let source = super::streaming::ChunkedSource::new(Arc::clone(&schema), stream);
-            let mut chunk_idx: usize = 0;
-            while !source.is_exhausted() {
-                if chunk_idx == 1 {
-                    // Once per splitting promotion (on entering the 2nd chunk).
-                    tracing::warn!(
-                        target: "cayenne::compaction",
-                        table = self.table_metadata.table_name.as_str(),
-                        cold_file_row_cap = row_cap,
-                        bloom_cap_bytes = COLD_PK_BLOOM_PER_FILE_MAX_BYTES,
-                        "Cold-tier promotion is splitting output into multiple row-bounded files to keep each file's PK bloom within the per-file cap"
-                    );
-                }
-                let chunk_stream: SendableRecordBatchStream =
-                    Box::pin(source.next_chunk(super::streaming::ChunkCap::Rows(row_cap)));
-                tracing::info!(
-                    target: "cayenne::compaction",
-                    table = self.table_metadata.table_name.as_str(),
-                    chunk_idx,
-                    "Datalake promotion: cold chunk upload starting"
-                );
-                let chunk_start = Instant::now();
-                self.insert_stream_into_cold_dir(
-                    session_state.as_ref(),
-                    &write_format,
-                    &cold_dir_url,
-                    chunk_stream,
-                )
-                .await?;
-                tracing::info!(
-                    target: "cayenne::compaction",
-                    table = self.table_metadata.table_name.as_str(),
-                    chunk_idx,
-                    duration_ms = chunk_start.elapsed().as_millis(),
-                    "Datalake promotion: cold chunk upload complete"
-                );
-                chunk_idx = chunk_idx.saturating_add(1);
-            }
-        } else {
-            tracing::info!(
-                target: "cayenne::compaction",
-                table = self.table_metadata.table_name.as_str(),
-                "Datalake promotion: cold upload starting (single stream)"
-            );
-            self.insert_stream_into_cold_dir(
-                session_state.as_ref(),
-                &write_format,
-                &cold_dir_url,
-                stream,
-            )
-            .await?;
-        }
+        // DIAG(cold-stall): write-side ChunkStream REMOVED. PK bloom is now any-size
+        // (per-file cap removed in build_cold_file_pk_bloom), so there is no reason to
+        // row-split output into multiple files. Write the whole sorted stream as ONE
+        // cold file — no ChunkedSource, no per-file row cap. REVERT before merge.
+        let _ = &schema; // schema no longer consumed here (was ChunkedSource input)
+        tracing::info!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            "Datalake promotion: cold upload starting (single stream, unchunked)"
+        );
+        self.insert_stream_into_cold_dir(
+            session_state.as_ref(),
+            &write_format,
+            &cold_dir_url,
+            stream,
+        )
+        .await?;
 
         // List the written cold files and read each footer for accurate per-file
         // stats + row counts (so listing-time pruning is exact).
@@ -14424,19 +14380,9 @@ impl CayenneTableProvider {
         if expected_keys == 0 {
             return Ok(None);
         }
-        // Skip (fall back to the exact cold scan) when the right-sized bloom
-        // would blow the per-file cap — keeps the manifest/snapshot bounded on
-        // huge cold files.
-        if expected_keys.saturating_mul(10) / 8 > COLD_PK_BLOOM_PER_FILE_MAX_BYTES {
-            tracing::warn!(
-                target: "cayenne::compaction",
-                table = self.table_metadata.table_name.as_str(),
-                file = file_url,
-                expected_keys,
-                "Cold-tier file exceeds the per-file PK-bloom cap; keyset rebuild falls back to the exact cold scan for this table"
-            );
-            return Ok(None);
-        }
+        // DIAG(cold-stall): per-file PK-bloom cap REMOVED — allow a bloom of any
+        // size (sized to fit all keys). No fall-back-to-exact-scan skip, so every
+        // cold file gets a right-sized bloom regardless of key count. REVERT before merge.
 
         let listing_table = Self::create_listing_table(
             file_url,
@@ -14451,8 +14397,9 @@ impl CayenneTableProvider {
         let mut stream =
             datafusion_physical_plan::execute_stream(scan_plan, session_state.task_ctx())?;
 
-        let mut bloom =
-            PkBloom::with_expected_keys(expected_keys, COLD_PK_BLOOM_PER_FILE_MAX_BYTES);
+        // DIAG(cold-stall): usize::MAX budget => bloom sized purely by expected_keys
+        // (no per-file cap). REVERT before merge.
+        let mut bloom = PkBloom::with_expected_keys(expected_keys, usize::MAX);
         // After projection, the PK columns are at indices 0..pk_indices.len(),
         // in `pk_indices` order — the same order `converter` (built over
         // `pk_indices`) and the CDC probe expect.

@@ -28,14 +28,15 @@ use datafusion_execution::TaskContext;
 use datafusion_physical_plan::DisplayAs;
 use datafusion_physical_plan::DisplayFormatType;
 use datafusion_physical_plan::ExecutionPlan;
-use datafusion_physical_plan::metrics::MetricsSet;
 use datafusion_physical_plan::PlanProperties;
 use datafusion_physical_plan::RecordBatchStream;
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType, Partitioning};
+use datafusion_physical_plan::metrics::MetricsSet;
 use futures::Stream;
 use futures::StreamExt;
 use futures::stream::unfold;
 use parking_lot::Mutex;
+use std::future::Future; // DIAG(cold-stall) kick-in: poll the self-wake timer
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -345,6 +346,11 @@ struct RunInputStream {
     /// watchdog to separate SortExec-not-polling vs polled-Pending vs
     /// stuck-inside-poll when `input_rows_total` is frozen. Diagnostics only.
     input_poll: Option<Arc<InputPollProbe>>,
+    /// DIAG(cold-stall) kick-in: periodic self-wake timer. When the underlying scan
+    /// returns Pending (possibly with a lost drain-wake), we arm a ~1.5s timer on
+    /// `cx` so the SortExec re-polls this input and drains any stranded-ready
+    /// backlog instead of freezing forever. REVERT before merge.
+    kick: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl Stream for RunInputStream {
@@ -404,7 +410,18 @@ impl Stream for RunInputStream {
                 }
                 Poll::Ready(None)
             }
-            other => other,
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
+            Poll::Pending => {
+                // DIAG(cold-stall) kick-in: arm a ~1.5s self-wake so a lost drain-wake
+                // self-heals — the SortExec re-polls this input and drains any
+                // stranded-ready backlog instead of freezing. REVERT before merge.
+                let mut kick =
+                    Box::pin(tokio::time::sleep(std::time::Duration::from_millis(1500)));
+                if kick.as_mut().poll(cx).is_pending() {
+                    this.kick = Some(kick);
+                }
+                Poll::Pending
+            }
         }
     }
 }
@@ -578,6 +595,7 @@ pub(crate) fn bounded_sort_stream(
                     ended: false,
                     input_rows_total: input_rows_total.clone(),
                     input_poll: input_poll.clone(),
+                    kick: None,
                 });
                 match util::stream_utils::sort_stream_with_plan(input, &sort_columns, &task_ctx) {
                     Ok((sorted, plan)) => {
@@ -634,6 +652,44 @@ mod tests {
     fn source_stream(schema: &SchemaRef, batches: Vec<RecordBatch>) -> DFStream {
         let s = stream::iter(batches.into_iter().map(Ok));
         Box::pin(RecordBatchStreamAdapter::new(Arc::clone(schema), s))
+    }
+
+    struct PendingOnceBeforeEofStream {
+        schema: SchemaRef,
+        batch: Option<RecordBatch>,
+        returned_pending: bool,
+    }
+
+    impl PendingOnceBeforeEofStream {
+        fn new(schema: &SchemaRef, batch: RecordBatch) -> Self {
+            Self {
+                schema: Arc::clone(schema),
+                batch: Some(batch),
+                returned_pending: false,
+            }
+        }
+    }
+
+    impl Stream for PendingOnceBeforeEofStream {
+        type Item = datafusion_common::Result<RecordBatch>;
+
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            if let Some(batch) = self.batch.take() {
+                return Poll::Ready(Some(Ok(batch)));
+            }
+            if !self.returned_pending {
+                self.returned_pending = true;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            Poll::Ready(None)
+        }
+    }
+
+    impl RecordBatchStream for PendingOnceBeforeEofStream {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
     }
 
     async fn drain_ids<S>(mut stream: S) -> Vec<i64>
@@ -847,6 +903,208 @@ mod tests {
         );
     }
 
+    /// Exact run-boundary EOF is discovered by the next run because
+    /// `ChunkStream` ends on the cap without lookahead. If that next run sees
+    /// `Pending` before EOF, a correct upstream wake must let `SortExec` poll
+    /// again and finish instead of parking forever.
+    #[tokio::test]
+    async fn bounded_sort_exact_cap_then_pending_eof_does_not_deadlock() {
+        use std::time::Duration;
+
+        let schema = id_schema();
+        let batch = id_batch_of(&schema, &[3, 1, 2, 0]);
+        let run_size = batch.get_array_memory_size();
+        let input: DFStream = Box::pin(PendingOnceBeforeEofStream::new(&schema, batch));
+        let input_poll = Arc::new(InputPollProbe::default());
+
+        let sorted = bounded_sort_stream(
+            "test_table",
+            input,
+            vec!["id".to_string()],
+            &test_task_ctx(),
+            run_size,
+            None,
+            Some(Arc::clone(&input_poll)),
+        );
+
+        let got = tokio::time::timeout(Duration::from_secs(5), drain_ids(sorted))
+            .await
+            .expect("bounded sort must not hang after exact cap then Pending-before-EOF");
+        assert_eq!(got, vec![0, 1, 2, 3]);
+        assert_eq!(
+            input_poll.inflight.load(Ordering::Relaxed),
+            0,
+            "no input poll should remain stuck in ChunkStream"
+        );
+        assert_eq!(
+            input_poll.last_return.load(Ordering::Relaxed),
+            POLL_RET_EOF,
+            "the probe run should wake and observe EOF after Pending"
+        );
+    }
+
+    /// Ignored stress harness for the `buffer_unordered`/`FuturesUnordered`
+    /// discussion around independently-spawned futures completing after the
+    /// parent stream has parked on `Pending`. It intentionally uses plain Tokio
+    /// `JoinHandle`s first: if this fails, the problem is in the futures/Tokio
+    /// composition itself; if it passes, the next target is Vortex's `Task`
+    /// wrapper or the real scan pipeline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "stress harness for a suspected buffer_unordered tail-wake race; run explicitly"]
+    async fn buffer_unordered_spawned_join_tail_wake_stress() {
+        use std::env;
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+        use tokio::sync::watch;
+
+        let iterations = env::var("BUFFER_UNORDERED_STRESS_ITERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(10_000);
+        let tasks = env::var("BUFFER_UNORDERED_STRESS_TASKS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(512);
+        let concurrency = env::var("BUFFER_UNORDERED_STRESS_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(128);
+
+        for iter in 0..iterations {
+            let completed = Arc::new(AtomicUsize::new(0));
+            let yielded = Arc::new(AtomicUsize::new(0));
+            let (gate_tx, gate_rx) = watch::channel(false);
+
+            let handles: Vec<_> = (0..tasks)
+                .map(|task_idx| {
+                    let mut gate_rx = gate_rx.clone();
+                    let completed = Arc::clone(&completed);
+                    tokio::spawn(async move {
+                        while !*gate_rx.borrow_and_update() {
+                            gate_rx.changed().await.expect("gate sender lives");
+                        }
+                        if task_idx % 3 == 0 {
+                            tokio::task::yield_now().await;
+                        }
+                        completed.fetch_add(1, Ordering::Relaxed);
+                        task_idx
+                    })
+                })
+                .collect();
+            drop(gate_rx);
+
+            let stream = stream::iter(handles).buffer_unordered(concurrency);
+            tokio::pin!(stream);
+
+            // Poll once before opening the gate so `buffer_unordered` fills its
+            // in-flight set and parks with no completed join handles.
+            let first = tokio::time::timeout(Duration::from_millis(25), stream.next()).await;
+            assert!(
+                first.is_err(),
+                "iteration {iter}: stream produced before the task gate opened"
+            );
+
+            gate_tx.send(true).expect("receivers live");
+            let drained = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut count = 0usize;
+                while let Some(item) = stream.next().await {
+                    let _task_idx = item.expect("spawned task should not panic");
+                    yielded.fetch_add(1, Ordering::Relaxed);
+                    count += 1;
+                }
+                count
+            })
+            .await;
+
+            assert!(
+                matches!(drained, Ok(n) if n == tasks),
+                "iteration {iter}: buffer_unordered did not drain after gate release; drained={drained:?} completed={} yielded={}",
+                completed.load(Ordering::Relaxed),
+                yielded.load(Ordering::Relaxed),
+            );
+        }
+    }
+
+    /// Same tail-wake stress as [`buffer_unordered_spawned_join_tail_wake_stress`],
+    /// but using Vortex's `Task` wrapper (`Handle::spawn` + oneshot receiver),
+    /// which is the shape used by the Vortex scan builder before
+    /// `buffer_unordered`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "stress harness for Vortex Task + buffer_unordered tail-wake race; run explicitly"]
+    async fn buffer_unordered_vortex_task_tail_wake_stress() {
+        use std::env;
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+        use tokio::sync::watch;
+        use vortex::io::runtime::Handle;
+
+        let iterations = env::var("BUFFER_UNORDERED_STRESS_ITERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(10_000);
+        let tasks = env::var("BUFFER_UNORDERED_STRESS_TASKS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(512);
+        let concurrency = env::var("BUFFER_UNORDERED_STRESS_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(128);
+        let handle = Handle::find().expect("tokio-backed Vortex runtime handle");
+
+        for iter in 0..iterations {
+            let completed = Arc::new(AtomicUsize::new(0));
+            let yielded = Arc::new(AtomicUsize::new(0));
+            let (gate_tx, gate_rx) = watch::channel(false);
+
+            let tasks_vec: Vec<_> = (0..tasks)
+                .map(|task_idx| {
+                    let mut gate_rx = gate_rx.clone();
+                    let completed = Arc::clone(&completed);
+                    handle.spawn(async move {
+                        while !*gate_rx.borrow_and_update() {
+                            gate_rx.changed().await.expect("gate sender lives");
+                        }
+                        if task_idx % 3 == 0 {
+                            tokio::task::yield_now().await;
+                        }
+                        completed.fetch_add(1, Ordering::Relaxed);
+                        task_idx
+                    })
+                })
+                .collect();
+            drop(gate_rx);
+
+            let stream = stream::iter(tasks_vec).buffer_unordered(concurrency);
+            tokio::pin!(stream);
+
+            let first = tokio::time::timeout(Duration::from_millis(25), stream.next()).await;
+            assert!(
+                first.is_err(),
+                "iteration {iter}: stream produced before the task gate opened"
+            );
+
+            gate_tx.send(true).expect("receivers live");
+            let drained = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut count = 0usize;
+                while let Some(task_idx) = stream.next().await {
+                    yielded.fetch_add(1, Ordering::Relaxed);
+                    count += 1;
+                    let _ = task_idx;
+                }
+                count
+            })
+            .await;
+
+            assert!(
+                matches!(drained, Ok(n) if n == tasks),
+                "iteration {iter}: Vortex Task buffer_unordered did not drain after gate release; drained={drained:?} completed={} yielded={}",
+                completed.load(Ordering::Relaxed),
+                yielded.load(Ordering::Relaxed),
+            );
+        }
+    }
+
     /// NULLs in the sort column: rows conserved, NULLs sorted last within each
     /// run (the `sort_stream` ascending default).
     #[tokio::test]
@@ -912,8 +1170,15 @@ mod tests {
             id_batch_of(&schema, &[2, 0, 1]),
         ];
         let input = source_stream(&schema, batches);
-        let sorted =
-            bounded_sort_stream("test_table", input, Vec::new(), &test_task_ctx(), 1, None, None);
+        let sorted = bounded_sort_stream(
+            "test_table",
+            input,
+            Vec::new(),
+            &test_task_ctx(),
+            1,
+            None,
+            None,
+        );
         let got = drain_ids(sorted).await;
         assert_eq!(got, vec![5, 3, 4, 2, 0, 1], "passthrough preserves order");
     }
@@ -1201,11 +1466,21 @@ mod tests {
 
         // Small run size ⇒ many runs ⇒ many inter-run polling pauses of the scan stream.
         let run_size = batch_bytes.saturating_mul(4);
-        let sorted =
-            bounded_sort_stream("t", stream, vec!["id".to_string()], &ctx, run_size, None, None);
+        let sorted = bounded_sort_stream(
+            "t",
+            stream,
+            vec!["id".to_string()],
+            &ctx,
+            run_size,
+            None,
+            None,
+        );
 
         let res = tokio::time::timeout(Duration::from_secs(30), drain_ids(sorted)).await;
-        eprintln!("repartitioned-scan repro: n_batches={n_batches} run_size={run_size} ok={}", res.is_ok());
+        eprintln!(
+            "repartitioned-scan repro: n_batches={n_batches} run_size={run_size} ok={}",
+            res.is_ok()
+        );
         assert!(
             res.is_ok(),
             "bounded_sort over a repartitioned scan hung at a run boundary — reproduces the scan-DFStream Pending-at-run-boundary freeze"
