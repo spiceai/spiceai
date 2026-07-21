@@ -1359,7 +1359,10 @@ mod deferred_tests {
             assert_eq!(env.is_dataset_ready(), ready);
             let batch = env.change_batch().expect("already built");
             assert_eq!(batch.record.num_rows(), 0, "heartbeat carries no rows");
-            assert!(batch.is_heartbeat(), "zero-row stamped batch is a heartbeat");
+            assert!(
+                batch.is_heartbeat(),
+                "zero-row stamped batch is a heartbeat"
+            );
             assert_eq!(
                 batch.source_commit_ts_ms(),
                 Some(ts),
@@ -1378,9 +1381,6 @@ mod deferred_tests {
         ]));
         let env = build_heartbeat_envelope(&schema, None, false)
             .expect("heartbeat builds with non-null columns");
-        assert_eq!(
-            env.change_batch().expect("built").record.num_rows(),
-            0
-        );
+        assert_eq!(env.change_batch().expect("built").record.num_rows(), 0);
     }
 }

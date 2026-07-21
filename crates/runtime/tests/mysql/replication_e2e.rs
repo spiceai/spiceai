@@ -474,7 +474,12 @@ async fn mysql_binlog_replication_restart_resume_cayenne() -> Result<(), anyhow:
 
             // ---- Run 1: cold bootstrap the snapshot, then shut down. ----
             {
-                let rt = Arc::new(Runtime::builder().with_app(make_rt("42001").build()).build().await);
+                let rt = Arc::new(
+                    Runtime::builder()
+                        .with_app(make_rt("42001").build())
+                        .build()
+                        .await,
+                );
                 tokio::select! {
                     () = tokio::time::sleep(Duration::from_secs(90)) => {
                         return Err(anyhow!("run 1: timed out loading"));
@@ -497,7 +502,12 @@ async fn mysql_binlog_replication_restart_resume_cayenne() -> Result<(), anyhow:
 
             // ---- Run 2: resume from the persisted sidecar position. ----
             {
-                let rt = Arc::new(Runtime::builder().with_app(make_rt("42002").build()).build().await);
+                let rt = Arc::new(
+                    Runtime::builder()
+                        .with_app(make_rt("42002").build())
+                        .build()
+                        .await,
+                );
                 tokio::select! {
                     () = tokio::time::sleep(Duration::from_secs(90)) => {
                         return Err(anyhow!("run 2: timed out loading"));
