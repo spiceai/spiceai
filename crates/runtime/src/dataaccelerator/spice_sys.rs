@@ -71,6 +71,11 @@ pub mod debezium_kafka;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 
+// Driver-free sidecar (SQL + JSON only, like `dataset_checkpoint`/`caching_engine`),
+// so it is always compiled: the `connector-dynamodb` crate calls
+// `dynamodb::init_checkpoint_store` regardless of which accelerator backend is enabled.
+pub mod dynamodb;
+
 #[cfg(feature = "mongodb")]
 pub mod mongodb;
 
