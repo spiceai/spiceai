@@ -40,6 +40,7 @@ dynamodb-streams = { path = "../../dynamodb-streams" }
 fundu.workspace = true
 futures.workspace = true
 humantime.workspace = true
+linkme.workspace = true
 opentelemetry.workspace = true
 runtime = { path = "../../runtime" }
 runtime-api-types = { path = "../../runtime-api-types" }

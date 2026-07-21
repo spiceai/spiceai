@@ -17,25 +17,42 @@ limitations under the License.
 //! Collector module for gathering `ParameterSpecs` from all registered connectors, accelerators,
 //! and model sources.
 //!
-//! Connectors resident in `runtime` self-register into the `linkme` distributed slice, which this
-//! module iterates. Connectors extracted into their own `connector-*` crates register explicitly
-//! at binary startup instead, so this module enumerates each one's `factory()` directly (which
-//! also forces their linkage) to keep them in the generated schema.
-
-use std::sync::Arc;
+//! This module explicitly references all connector modules to ensure they are linked into the
+//! binary and their `linkme` distributed slice registrations are included.
 
 use runtime::dataaccelerator::DATA_ACCELERATOR_REGISTRATIONS;
-use runtime::dataconnector::{DATA_CONNECTOR_REGISTRATIONS, DataConnectorFactory};
+use runtime::dataconnector::DATA_CONNECTOR_REGISTRATIONS;
 use runtime::model::params::{
     anthropic, azure, bedrock, databricks, file, google, huggingface, openai, xai,
 };
 use runtime_parameters::ParameterSpec;
 
-// Connectors still resident in `runtime` self-register into `DATA_CONNECTOR_REGISTRATIONS`
-// (linkme). The extracted `connector-*` crates register explicitly at binary startup rather
-// than into that slice, so `collect_data_connectors` enumerates each one's `factory()` directly
-// (which also forces their linkage here). connector-nfs (system libnfs) and connector-odbc (ODBC
-// driver manager) are intentionally omitted, matching their optional-at-build status.
+// Force linkage of all data connector modules by referencing their factory types.
+// Without these references, the linker may not include the modules and their
+// `register_data_connector!` registrations won't appear in DATA_CONNECTOR_REGISTRATIONS.
+use connector_clickhouse as _;
+use connector_delta_lake as _;
+use connector_dremio as _;
+use connector_duckdb as _;
+use connector_dynamodb as _;
+use connector_flightsql as _;
+use connector_ftp as _;
+use connector_graphql as _;
+use connector_imap as _;
+use connector_mongodb as _;
+use connector_mssql as _;
+use connector_mysql as _;
+// connector-nfs requires system libnfs library
+use connector_oracle as _;
+// #[expect(unused_imports)]
+// use runtime::dataconnector::odbc as _;
+use connector_postgres as _;
+use connector_scylladb as _;
+use connector_sftp as _;
+use connector_sharepoint as _;
+use connector_smb as _;
+use connector_snowflake as _;
+use connector_spark as _;
 #[expect(unused_imports)]
 use runtime::dataconnector::s3 as _;
 #[expect(unused_imports)]
@@ -112,83 +129,6 @@ pub fn collect_data_connectors() -> Vec<ConnectorSchema> {
             }
         })
         .collect();
-
-    // Extracted `connector-*` crates register explicitly at binary startup (via
-    // `register_connector_factory`) instead of into the linkme slice above, so enumerate each
-    // one's `factory()` here to keep it in the generated schema. Keep this list in sync with the
-    // explicit registrations in `bin/spiced`. Duplicates against the slice are removed by the
-    // `dedup_by(name)` below.
-    let extracted: [(&str, Arc<dyn DataConnectorFactory>); 20] = [
-        (
-            connector_clickhouse::CONNECTOR_NAME,
-            connector_clickhouse::factory(),
-        ),
-        (
-            connector_delta_lake::CONNECTOR_NAME,
-            connector_delta_lake::factory(),
-        ),
-        (
-            connector_dremio::CONNECTOR_NAME,
-            connector_dremio::factory(),
-        ),
-        (
-            connector_duckdb::CONNECTOR_NAME,
-            connector_duckdb::factory(),
-        ),
-        (
-            connector_dynamodb::CONNECTOR_NAME,
-            connector_dynamodb::factory(),
-        ),
-        (
-            connector_flightsql::CONNECTOR_NAME,
-            connector_flightsql::factory(),
-        ),
-        (connector_ftp::CONNECTOR_NAME, connector_ftp::factory()),
-        (
-            connector_graphql::CONNECTOR_NAME,
-            connector_graphql::factory(),
-        ),
-        (connector_imap::CONNECTOR_NAME, connector_imap::factory()),
-        (
-            connector_mongodb::CONNECTOR_NAME,
-            connector_mongodb::factory(),
-        ),
-        (connector_mssql::CONNECTOR_NAME, connector_mssql::factory()),
-        (connector_mysql::CONNECTOR_NAME, connector_mysql::factory()),
-        (
-            connector_oracle::CONNECTOR_NAME,
-            connector_oracle::factory(),
-        ),
-        (
-            connector_postgres::CONNECTOR_NAME,
-            connector_postgres::factory(),
-        ),
-        (
-            connector_scylladb::CONNECTOR_NAME,
-            connector_scylladb::factory(),
-        ),
-        (connector_sftp::CONNECTOR_NAME, connector_sftp::factory()),
-        (
-            connector_sharepoint::CONNECTOR_NAME,
-            connector_sharepoint::factory(),
-        ),
-        (connector_smb::CONNECTOR_NAME, connector_smb::factory()),
-        (
-            connector_snowflake::CONNECTOR_NAME,
-            connector_snowflake::factory(),
-        ),
-        (connector_spark::CONNECTOR_NAME, connector_spark::factory()),
-    ];
-    connectors.extend(
-        extracted
-            .into_iter()
-            .map(|(name, factory)| ConnectorSchema {
-                name: name.to_string(),
-                prefix: factory.prefix(),
-                parameters: factory.parameters(),
-            }),
-    );
-
     connectors.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.prefix.cmp(b.prefix)));
     connectors.dedup_by(|a, b| a.name == b.name);
     connectors
@@ -311,4 +251,27 @@ pub fn collect_model_sources() -> Vec<ModelSourceSchema> {
             parameters: google::PARAMETERS,
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Spot-check drift guard: connectors that self-register into the `linkme` slice must appear
+    /// in the generated schema. This catches a broken force-linkage (`use connector_* as _;`) or a
+    /// connector silently dropping out of `.schema/spicepod.schema.json`. `dynamodb` is checked
+    /// specifically because it is the first connector extracted into its own crate while keeping
+    /// slice registration; extend this list as more connectors adopt the pattern.
+    #[test]
+    fn documents_slice_registered_connectors() {
+        let names: Vec<String> = collect_data_connectors()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert!(!names.is_empty(), "no data connectors were collected");
+        assert!(
+            names.iter().any(|n| n == "dynamodb"),
+            "connector 'dynamodb' missing from the generated schema; collected: {names:?}"
+        );
+    }
 }

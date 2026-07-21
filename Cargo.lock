@@ -4298,6 +4298,7 @@ dependencies = [
  "fundu",
  "futures",
  "humantime",
+ "linkme",
  "opentelemetry",
  "runtime",
  "runtime-api-types",

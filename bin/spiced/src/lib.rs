@@ -30,6 +30,10 @@ use app::spicepod::component::runtime::{
 };
 use app::{App, AppBuilder};
 use clap::{ArgAction, Parser, ValueEnum};
+// Force-link connector-dynamodb so its `register_data_connector!` entry lands in the linkme
+// slice; `register_all()` then registers it (no explicit `register_connector_factory` call).
+#[cfg(feature = "dynamodb")]
+use connector_dynamodb as _;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
@@ -127,12 +131,10 @@ pub async fn register_external_connectors() {
     )
     .await;
 
-    #[cfg(feature = "dynamodb")]
-    register_connector_factory(
-        connector_dynamodb::CONNECTOR_NAME,
-        connector_dynamodb::factory(),
-    )
-    .await;
+    // DynamoDB self-registers into the linkme slice (`register_data_connector!`); `register_all()`
+    // picks it up. bin/spiced only needs to force-link the crate — see the `use connector_dynamodb
+    // as _;` at the top of this module. (Other connectors still register explicitly here; unifying
+    // them onto the slice is a follow-up.)
 
     #[cfg(feature = "adbc")]
     register_connector_factory(connector_adbc::CONNECTOR_NAME, connector_adbc::factory()).await;
