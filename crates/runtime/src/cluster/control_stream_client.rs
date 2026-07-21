@@ -508,7 +508,7 @@ async fn handle_scheduler_message(
                 match executor
                     .cancel_task(
                         task.task_id as usize,
-                        task.job_id.clone(),
+                        task.job_id.clone().into(),
                         task.stage_id as usize,
                         task.partition_id as usize,
                     )
