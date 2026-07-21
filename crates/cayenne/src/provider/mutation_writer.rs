@@ -1086,6 +1086,41 @@ impl<'a> AppendMutationWriter<'a> {
         )))
     }
 
+    /// Test-only microbench probe: drive the sharded in-memory CDC apply as its
+    /// two pipeline stages — off-`write_lock` PREPARE (decode + PK-shard split) and
+    /// lock-held APPLY (build index + cap/budget + per-shard probe/validate +
+    /// append) — and return each stage's measured wall time plus the mem-tier
+    /// epoch. Quantifies how much apply work stays under `write_lock` at different
+    /// conflict rates (the lock-shortening signal driving C7).
+    #[cfg(test)]
+    pub(super) async fn timed_sharded_prepare_apply(
+        &self,
+        data: SendableRecordBatchStream,
+    ) -> Result<(std::time::Duration, std::time::Duration, Option<u64>)> {
+        let prepare_start = Instant::now();
+        let prepared_stream = self
+            .table
+            .prepare_stream_for_insert_sharded(data)
+            .await?
+            .expect("sharded prepare requires a primary key");
+        let prepared_apply = self.prepare_cdc_in_memory_sharded(prepared_stream).await?;
+        let prepare_elapsed = prepare_start.elapsed();
+
+        // Time the write_lock critical section only (exclude the lock acquisition).
+        let write_guard = self.table.write_lock_arc().lock_owned().await;
+        let apply_start = Instant::now();
+        let outcome = self
+            .apply_cdc_in_memory_sharded(prepared_apply, write_guard, Instant::now())
+            .await?;
+        let apply_elapsed = apply_start.elapsed();
+
+        let epoch = match outcome {
+            MemShardedOutcome::Done(write) => write.in_memory_epoch(),
+            MemShardedOutcome::FallBackToDurable { .. } => None,
+        };
+        Ok((prepare_elapsed, apply_elapsed, epoch))
+    }
+
     pub(super) async fn write(&self, data: SendableRecordBatchStream) -> Result<u64> {
         self.table.ensure_no_incomplete_write().await?;
 

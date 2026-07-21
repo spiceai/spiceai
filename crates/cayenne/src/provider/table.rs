@@ -31452,6 +31452,121 @@ mod tests {
         collect_id_value_pairs(&ctx, &provider, table).await
     }
 
+    /// Microbench (ignored): measure how much sharded in-memory CDC apply work
+    /// stays UNDER `write_lock` — the serial critical section (build index +
+    /// cap/budget + per-shard probe/validate + append) — vs the off-lock PREPARE
+    /// (decode + PK-shard split), across conflict rates 0% / 10% / 100%. The 100%
+    /// case is the hot-key storm (every row supersedes an existing key → probe hit
+    /// + tombstone), the regime that back-pressures the shared CDC reader. This is
+    /// the C1 baseline for judging whether C7 (seq-aware speculative probe) needs to
+    /// move the probe off-lock.
+    ///
+    /// Run: `cargo test -p cayenne --lib bench_sharded_apply_under_lock -- --ignored --nocapture`
+    /// Env: `BENCH_KEYS` (warm keyset, default 50000), `BENCH_BURSTS` (measured
+    /// bursts, default 200), `BENCH_BURST_ROWS` (rows/burst, default 256),
+    /// `BENCH_SHARDS` (default 4).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "microbench; run explicitly with --ignored --nocapture"]
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        reason = "microbench reporting/key math; precision + truncation are irrelevant here"
+    )]
+    async fn bench_sharded_apply_under_lock() {
+        fn env_usize(key: &str, default: usize) -> usize {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        }
+        let warm_keys = env_usize("BENCH_KEYS", 50_000);
+        let bursts = env_usize("BENCH_BURSTS", 200);
+        let burst_rows = env_usize("BENCH_BURST_ROWS", 256);
+        let shards = env_usize("BENCH_SHARDS", 4);
+        let warm_total = i64::try_from(warm_keys).expect("warm_keys fits i64");
+
+        eprintln!(
+            "[bench_apply] config: warm_keys={warm_keys} bursts={bursts} burst_rows={burst_rows} shards={shards}"
+        );
+
+        for &conflict_pct in &[0_u64, 10, 100] {
+            let ctx = SessionContext::new();
+            let runtime_env = ctx.runtime_env();
+            let table = format!("bench_apply_c{conflict_pct}");
+            let (provider, _catalog, _tmp) =
+                create_sharded_cdc_upsert_table(&table, Arc::clone(&runtime_env), shards).await;
+            let schema = Arc::clone(&provider.table_metadata.schema);
+            let task_ctx = ctx.task_ctx();
+
+            // Warm: load `warm_keys` distinct keys so the existence index + tier are
+            // populated (so the probe has something to hit at >0% conflict).
+            let mut k: i64 = 0;
+            while k < warm_total {
+                let n = (warm_total - k).min(8192);
+                let ids: Vec<i64> = (k..k + n).collect();
+                let values: Vec<i64> = ids.iter().map(|id| id * 10).collect();
+                let _ = provider
+                    .write_cdc_append_stream(
+                        single_batch_stream(id_value_batch(Arc::clone(&schema), &ids, &values)),
+                        &task_ctx,
+                    )
+                    .await
+                    .expect("warm load");
+                k += n;
+            }
+
+            // Deterministic key stream (xorshift64*), seeded per conflict rate.
+            let mut rng: u64 = 0x1234_5678_9abc_def0 ^ conflict_pct;
+            let mut next = move || {
+                rng ^= rng >> 12;
+                rng ^= rng << 25;
+                rng ^= rng >> 27;
+                rng.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            };
+            let mut new_key: i64 = warm_total; // fresh keys start past the warm range
+
+            let mut prepare_total = std::time::Duration::ZERO;
+            let mut apply_total = std::time::Duration::ZERO;
+            let mut measured_rows: u64 = 0;
+
+            for _ in 0..bursts {
+                let mut ids = Vec::with_capacity(burst_rows);
+                let mut values = Vec::with_capacity(burst_rows);
+                for _ in 0..burst_rows {
+                    let is_conflict = warm_keys > 0 && (next() % 100) < conflict_pct;
+                    let id = if is_conflict {
+                        i64::try_from(next() % warm_keys as u64).unwrap_or(0)
+                    } else {
+                        let id = new_key;
+                        new_key += 1;
+                        id
+                    };
+                    ids.push(id);
+                    values.push(i64::try_from(next() % 1_000_000).unwrap_or(0));
+                }
+                let batch = id_value_batch(Arc::clone(&schema), &ids, &values);
+                let writer = AppendMutationWriter::new(&provider, &provider.context, &task_ctx);
+                let (prep, apply, _epoch) = writer
+                    .timed_sharded_prepare_apply(single_batch_stream(batch))
+                    .await
+                    .expect("timed sharded apply");
+                prepare_total += prep;
+                apply_total += apply;
+                measured_rows += burst_rows as u64;
+            }
+
+            let prep_us = prepare_total.as_secs_f64() * 1e6;
+            let apply_us = apply_total.as_secs_f64() * 1e6;
+            let per_row_apply = apply_us / measured_rows as f64;
+            let under_lock_frac = 100.0 * apply_us / (apply_us + prep_us);
+            eprintln!(
+                "[bench_apply] conflict={conflict_pct:>3}%  rows={measured_rows}  \
+                 prepare(off-lock)={prep_us:>11.0}us  apply(UNDER-LOCK)={apply_us:>11.0}us  \
+                 under-lock/row={per_row_apply:>6.3}us  under-lock_frac={under_lock_frac:>5.1}%"
+            );
+        }
+    }
+
     /// §6.1 LWW-EQUIVALENCE — the headline property. The SAME random
     /// (pk, version) apply schedule, routed through N ∈ {1, 4, 8} shards, must
     /// produce a result row-for-row IDENTICAL to the serial (N=1) path — the
