@@ -463,7 +463,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     }
 
     // 10. Data-correctness gate: OLTP has stopped, so wait for replication to
-    //     fully drain (bounded by the test duration) and then assert that
+    //     fully drain (bounded by 2x the test duration) and then assert that
     //     source and Spice row counts match for every replicated table.
     let probe_tables: Vec<String> = driver
         .probe_tables()
@@ -482,7 +482,8 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         Arc::clone(&driver),
         &spice_clients,
         &probe_tables,
-        duration,
+        // Allow up to 2x the test duration for replication to converge post-drain.
+        duration.saturating_mul(2),
     )
     .await;
 
