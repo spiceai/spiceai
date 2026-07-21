@@ -115,19 +115,19 @@ impl CdcIngestHandle {
         timeout: Duration,
     ) -> Result<usize> {
         let batch = match format {
-            CdcFormat::Json => decode::json_body_to_change_batch(
-                &self.schema,
-                &self.primary_keys,
-                body,
-            )
-            .map_err(|e| Error::Decode {
-                dataset: dataset.to_string(),
-                message: e.to_string(),
-            })?,
+            CdcFormat::Json => {
+                decode::json_body_to_change_batch(&self.schema, &self.primary_keys, body).map_err(
+                    |e| Error::Decode {
+                        dataset: dataset.to_string(),
+                        message: e.to_string(),
+                    },
+                )?
+            }
             CdcFormat::Avro => {
                 let options = AvroDecodeOptions {
                     schema_registry_url: self.schema_registry_url.clone(),
-                    avro_schema_json: avro_schema_override.or_else(|| self.avro_schema_json.clone()),
+                    avro_schema_json: avro_schema_override
+                        .or_else(|| self.avro_schema_json.clone()),
                 };
                 data_components::debezium::avro::avro_body_to_change_batch(
                     &self.schema,
@@ -135,6 +135,7 @@ impl CdcIngestHandle {
                     body,
                     &options,
                 )
+                .await
                 .map_err(|e| Error::Decode {
                     dataset: dataset.to_string(),
                     message: e.to_string(),
@@ -233,9 +234,7 @@ impl CommitChange for IngestCommitter {
 impl Drop for IngestCommitter {
     fn drop(&mut self) {
         if let Some(tx) = self.result_tx.take() {
-            let _ = tx.send(Err(
-                "CDC change was dropped before apply commit".to_string()
-            ));
+            let _ = tx.send(Err("CDC change was dropped before apply commit".to_string()));
         }
     }
 }
@@ -635,9 +634,7 @@ mod tests {
         let work = rx.recv().await.expect("work");
         assert_eq!(work.batch.record.num_rows(), 1);
         // Simulate successful apply.
-        work.result_tx
-            .send(Ok(()))
-            .expect("ack");
+        work.result_tx.send(Ok(())).expect("ack");
 
         let applied = ingest.await.expect("join").expect("ingest ok");
         assert_eq!(applied, 1);
@@ -657,5 +654,3 @@ mod tests {
         assert!(matches!(err, Error::NotRegistered { .. }));
     }
 }
-
-

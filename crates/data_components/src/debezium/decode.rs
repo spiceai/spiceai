@@ -117,11 +117,11 @@ pub fn parse_json_change_events(body: &[u8]) -> Result<Vec<ChangeEvent>> {
             continue;
         }
         let value: serde_json::Value =
-            serde_json::from_str(line).context(JsonParseSnafu).map_err(|e| {
-                Error::Invalid {
+            serde_json::from_str(line)
+                .context(JsonParseSnafu)
+                .map_err(|e| Error::Invalid {
                     message: format!("Invalid NDJSON on line {}: {e}", line_no + 1),
-                }
-            })?;
+                })?;
         events.extend(events_from_json_value(value)?);
     }
     ensure!(!events.is_empty(), EmptyBodySnafu);
@@ -158,10 +158,7 @@ pub fn change_events_to_batch(
     primary_keys: &[String],
     events: &[ChangeEvent],
 ) -> Result<ChangeBatch> {
-    ensure!(
-        !events.is_empty(),
-        EmptyBodySnafu
-    );
+    ensure!(!events.is_empty(), EmptyBodySnafu);
 
     let refs: Vec<&ChangeEvent> = events.iter().collect();
     let source_commit_ts_ms = events
@@ -223,8 +220,8 @@ mod tests {
         let events = parse_json_change_events(body).expect("parse");
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0].payload.op, Op::Create));
-        let batch = change_events_to_batch(&table_schema(), &["id".to_string()], &events)
-            .expect("batch");
+        let batch =
+            change_events_to_batch(&table_schema(), &["id".to_string()], &events).expect("batch");
         assert_eq!(batch.record.num_rows(), 1);
     }
 

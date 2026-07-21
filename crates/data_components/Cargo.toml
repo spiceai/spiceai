@@ -151,7 +151,7 @@ databricks = [
     "spark_connect",
     "datafusion-table-providers/federation",
 ]
-debezium = ["dep:rdkafka", "dep:apache-avro", "reqwest/blocking"]
+debezium = ["dep:rdkafka", "dep:apache-avro"]
 default = []
 delta_lake = ["dep:delta_kernel"]
 elasticsearch = ["dep:elasticsearch"]

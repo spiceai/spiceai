@@ -208,6 +208,75 @@ async fn cdc_ingest_json_create_update_delete() -> anyhow::Result<()> {
                 .expect("post delete");
             assert_eq!(resp.status(), 200, "delete: {}", resp.text().await.unwrap_or_default());
 
+            // AVRO create: raw Avro datum with the schema supplied via the
+            // X-Avro-Schema header. Bytes are the Avro binary encoding of
+            // {before: null, after: {id: 2, name: "eve"}, op: "c", ts_ms: 5}
+            // against the header schema (field order: before, after, op, ts_ms):
+            //   before: union branch 0 (null)          -> 0x00
+            //   after:  union branch 1 (Value)         -> 0x02
+            //     id:   long 2 (zigzag 4)              -> 0x04
+            //     name: string "eve" (len 3, zigzag 6) -> 0x06 'e' 'v' 'e'
+            //   op:     string "c" (len 1)             -> 0x02 'c'
+            //   ts_ms:  long 5 (zigzag 10)             -> 0x0A
+            let avro_schema = r#"{"type":"record","name":"Envelope","fields":[{"name":"before","type":["null",{"type":"record","name":"Value","fields":[{"name":"id","type":"long"},{"name":"name","type":"string"}]}],"default":null},{"name":"after","type":["null","Value"],"default":null},{"name":"op","type":"string"},{"name":"ts_ms","type":"long","default":0}]}"#;
+            let avro_create: &[u8] = &[0x00, 0x02, 0x04, 0x06, b'e', b'v', b'e', 0x02, b'c', 0x0A];
+            let resp = client
+                .post(&url)
+                .header("content-type", "application/vnd.debezium+avro")
+                .header("x-avro-schema", avro_schema)
+                .body(avro_create.to_vec())
+                .send()
+                .await
+                .expect("post avro create");
+            assert_eq!(
+                resp.status(),
+                200,
+                "avro create: {}",
+                resp.text().await.unwrap_or_default()
+            );
+
+            // The JSON delete removed id=1, so the table should converge to
+            // exactly the Avro-created row (2, "eve") — verifying both the
+            // delete apply and the Avro ingest end-to-end.
+            let avro_applied = wait_until_true(Duration::from_secs(10), || {
+                let rt = Arc::clone(&rt);
+                async move {
+                    let batches = rt
+                        .datafusion()
+                        .query_builder("SELECT id, name FROM orders ORDER BY id")
+                        .build()
+                        .run()
+                        .await
+                        .expect("query")
+                        .data
+                        .try_collect::<Vec<_>>()
+                        .await
+                        .expect("collect");
+                    let mut rows = Vec::new();
+                    for batch in &batches {
+                        let ids = batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<arrow::array::Int64Array>()
+                            .expect("id col");
+                        let names = batch
+                            .column(1)
+                            .as_any()
+                            .downcast_ref::<arrow::array::StringArray>()
+                            .expect("name col");
+                        for i in 0..batch.num_rows() {
+                            rows.push((ids.value(i), names.value(i).to_string()));
+                        }
+                    }
+                    rows == [(2, "eve".to_string())]
+                }
+            })
+            .await;
+            assert!(
+                avro_applied,
+                "expected exactly one row (2, 'eve') after JSON delete + Avro create"
+            );
+
             // Bad content-type
             let resp = client
                 .post(&url)

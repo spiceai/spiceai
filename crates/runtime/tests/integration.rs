@@ -88,11 +88,11 @@ mod iceberg;
 mod iceberg_api;
 mod json;
 
+#[cfg(feature = "debezium")]
+mod cdc_ingest;
 mod cluster_tls_reload;
 #[cfg(feature = "kafka")]
 mod kafka;
-#[cfg(feature = "debezium")]
-mod cdc_ingest;
 mod metadata;
 #[cfg(feature = "mongodb")]
 mod mongo;

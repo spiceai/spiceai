@@ -83,11 +83,7 @@ pub struct CdcIngestResponse {
         (status = 503, description = "Ingest channel unavailable"),
     )
 ))]
-pub(crate) async fn post(
-    Path(name): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
+pub(crate) async fn post(Path(name): Path<String>, headers: HeaderMap, body: Bytes) -> Response {
     if let Some(resp) = require_write_access().await {
         return resp;
     }
@@ -140,4 +136,3 @@ fn ingest_error_response(err: &IngestError) -> Response {
     };
     (status, Json(json!({ "message": message }))).into_response()
 }
-

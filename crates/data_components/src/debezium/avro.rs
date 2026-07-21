@@ -28,6 +28,7 @@ limitations under the License.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use apache_avro::{Schema as AvroSchema, from_avro_datum, types::Value as AvroValue};
 use arrow::datatypes::SchemaRef;
@@ -76,6 +77,26 @@ type SchemaCache = HashMap<SchemaCacheKey, Arc<AvroSchema>>;
 static SCHEMA_CACHE: std::sync::LazyLock<Mutex<SchemaCache>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Process-wide cache of explicitly-supplied schemas (dataset `avro_schema`
+/// param or `X-Avro-Schema` header), keyed by the schema JSON text so the same
+/// schema is parsed once, not on every request.
+static EXPLICIT_SCHEMA_CACHE: std::sync::LazyLock<Mutex<HashMap<String, Arc<AvroSchema>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Real deployments use a handful of schemas; the cap only bounds memory if a
+/// client streams many distinct `X-Avro-Schema` values.
+const EXPLICIT_SCHEMA_CACHE_MAX: usize = 32;
+
+/// Shared HTTP client for Schema Registry fetches: connection reuse plus
+/// bounded timeouts so a hung registry cannot stall ingest indefinitely.
+static REGISTRY_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_default()
+});
+
 /// Options for decoding an Avro CDC body.
 #[derive(Debug, Clone, Default)]
 pub struct AvroDecodeOptions {
@@ -86,7 +107,10 @@ pub struct AvroDecodeOptions {
 }
 
 /// Decode one Avro-encoded Debezium record into change events.
-pub fn parse_avro_change_events(
+///
+/// Async because resolving a Confluent wire-format schema id may fetch from
+/// the Schema Registry; cached schemas resolve without I/O.
+pub async fn parse_avro_change_events(
     body: &[u8],
     options: &AvroDecodeOptions,
 ) -> Result<Vec<ChangeEvent>> {
@@ -96,44 +120,62 @@ pub fn parse_avro_change_events(
     // selected when a registry URL is configured — many raw Avro datums start
     // with `0` (e.g. union null branch) and would otherwise be misdetected.
     let (schema, datum) = if let Some(schema_json) = options.avro_schema_json.as_deref() {
-        let schema = Arc::new(
-            AvroSchema::parse_str(schema_json)
-                .map_err(|e| Error::InvalidSchema {
-                    source: Box::new(e),
-                })?,
-        );
-        (schema, body)
+        (parse_explicit_schema(schema_json)?, body)
     } else if options.schema_registry_url.is_some() && is_confluent_wire_format(body) {
         let (schema_id, datum) = split_confluent_wire(body)?;
         let registry = options
             .schema_registry_url
             .as_deref()
             .context(MissingSchemaSnafu)?;
-        let schema = fetch_schema(registry, schema_id)?;
+        let schema = fetch_schema(registry, schema_id).await?;
         (schema, datum)
     } else {
         return MissingSchemaSnafu.fail();
     };
 
-    let value = from_avro_datum(schema.as_ref(), &mut std::io::Cursor::new(datum), None)
-        .map_err(|e| Error::DecodeDatum {
-            source: Box::new(e),
+    let value =
+        from_avro_datum(schema.as_ref(), &mut std::io::Cursor::new(datum), None).map_err(|e| {
+            Error::DecodeDatum {
+                source: Box::new(e),
+            }
         })?;
     let event = avro_value_to_change_event(&value)?;
     Ok(vec![event])
 }
 
 /// Decode Avro body and convert to a [`ChangeBatch`].
-pub fn avro_body_to_change_batch(
+pub async fn avro_body_to_change_batch(
     table_schema: &SchemaRef,
     primary_keys: &[String],
     body: &[u8],
     options: &AvroDecodeOptions,
 ) -> DecodeResult<ChangeBatch> {
-    let events = parse_avro_change_events(body, options).map_err(|e| DecodeError::Invalid {
-        message: e.to_string(),
-    })?;
+    let events =
+        parse_avro_change_events(body, options)
+            .await
+            .map_err(|e| DecodeError::Invalid {
+                message: e.to_string(),
+            })?;
     decode::change_events_to_batch(table_schema, primary_keys, &events)
+}
+
+/// Parse (or fetch from cache) an explicitly-supplied Avro schema JSON.
+fn parse_explicit_schema(schema_json: &str) -> Result<Arc<AvroSchema>> {
+    if let Some(schema) = EXPLICIT_SCHEMA_CACHE.lock().get(schema_json).cloned() {
+        return Ok(schema);
+    }
+    let schema =
+        Arc::new(
+            AvroSchema::parse_str(schema_json).map_err(|e| Error::InvalidSchema {
+                source: Box::new(e),
+            })?,
+        );
+    let mut cache = EXPLICIT_SCHEMA_CACHE.lock();
+    if cache.len() >= EXPLICIT_SCHEMA_CACHE_MAX {
+        cache.clear();
+    }
+    cache.insert(schema_json.to_string(), Arc::clone(&schema));
+    Ok(schema)
 }
 
 fn is_confluent_wire_format(body: &[u8]) -> bool {
@@ -146,21 +188,22 @@ fn split_confluent_wire(body: &[u8]) -> Result<(u32, &[u8])> {
     Ok((id, &body[5..]))
 }
 
-fn fetch_schema(registry_url: &str, schema_id: u32) -> Result<Arc<AvroSchema>> {
+async fn fetch_schema(registry_url: &str, schema_id: u32) -> Result<Arc<AvroSchema>> {
     let base = registry_url.trim_end_matches('/');
     let key = (base.to_string(), schema_id);
     if let Some(schema) = SCHEMA_CACHE.lock().get(&key).cloned() {
         return Ok(schema);
     }
 
-    // Schema Registry access is synchronous on the decode path; use a short
-    // blocking HTTP client. Callers on async runtimes should decode via
-    // `spawn_blocking` for large batches.
     let url = format!("{base}/schemas/ids/{schema_id}");
-    let response = reqwest::blocking::Client::new()
+    let response = REGISTRY_CLIENT
         .get(&url)
-        .header("Accept", "application/vnd.schemaregistry.v1+json, application/json")
+        .header(
+            "Accept",
+            "application/vnd.schemaregistry.v1+json, application/json",
+        )
         .send()
+        .await
         .map_err(|e| Error::RegistryFetch {
             url: base.to_string(),
             schema_id,
@@ -176,7 +219,7 @@ fn fetch_schema(registry_url: &str, schema_id: u32) -> Result<Arc<AvroSchema>> {
         .fail();
     }
 
-    let body: serde_json::Value = response.json().map_err(|e| Error::RegistryFetch {
+    let body: serde_json::Value = response.json().await.map_err(|e| Error::RegistryFetch {
         url: base.to_string(),
         schema_id,
         message: e.to_string(),
@@ -214,19 +257,16 @@ fn avro_value_to_change_event(value: &AvroValue) -> Result<ChangeEvent> {
     };
 
     // Full envelope `{ payload: {...} }` or payload-as-root.
-    let fields: &[(String, AvroValue)] =
-        if let Some((_, AvroValue::Record(payload))) = record.iter().find(|(k, _)| k == "payload")
-        {
-            payload.as_slice()
-        } else {
-            record.as_slice()
-        };
+    let fields: &[(String, AvroValue)] = if let Some((_, AvroValue::Record(payload))) =
+        record.iter().find(|(k, _)| k == "payload")
+    {
+        payload.as_slice()
+    } else {
+        record.as_slice()
+    };
 
     let field = |name: &str| -> Option<&AvroValue> {
-        fields
-            .iter()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v)
+        fields.iter().find(|(k, _)| k == name).map(|(_, v)| v)
     };
 
     let op = match field("op") {
@@ -321,12 +361,9 @@ fn avro_to_json(value: &AvroValue) -> Result<serde_json::Value> {
         AvroValue::Float(f) => serde_json::json!(f),
         AvroValue::Double(f) => serde_json::json!(f),
         AvroValue::String(s) | AvroValue::Enum(_, s) => serde_json::Value::String(s.clone()),
-        AvroValue::Bytes(b) | AvroValue::Fixed(_, b) => {
-            serde_json::Value::String(base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                b,
-            ))
-        }
+        AvroValue::Bytes(b) | AvroValue::Fixed(_, b) => serde_json::Value::String(
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b),
+        ),
         AvroValue::Array(items) => {
             let mut arr = Vec::with_capacity(items.len());
             for item in items {
@@ -377,8 +414,8 @@ mod tests {
     use super::*;
     use apache_avro::{to_avro_datum, types::Record};
 
-    #[test]
-    fn decodes_raw_avro_payload() {
+    #[tokio::test]
+    async fn decodes_raw_avro_payload() {
         let schema = r#"{
             "type": "record",
             "name": "Envelope",
@@ -419,6 +456,7 @@ mod tests {
                 ..Default::default()
             },
         )
+        .await
         .expect("parse");
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0].payload.op, Op::Create));

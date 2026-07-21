@@ -337,10 +337,7 @@ pub(crate) fn routes(
         .route("/v1/catalogs", get(v1::catalogs::get))
         .route("/v1/functions", get(v1::functions::list))
         .route("/v1/datasets", get(v1::datasets::get))
-        .route(
-            "/v1/datasets/{name}/cdc",
-            post(v1::cdc::post),
-        )
+        .route("/v1/datasets/{name}/cdc", post(v1::cdc::post))
         .route(
             "/v1/datasets/{name}/acceleration/refresh",
             post(v1::datasets::refresh),
