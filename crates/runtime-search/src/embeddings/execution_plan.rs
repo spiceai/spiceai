@@ -62,7 +62,7 @@ pub struct EmbeddingTableExec {
 
     base_plan: Arc<dyn ExecutionPlan>,
 
-    embedded_columns: HashMap<String, EmbeddingColumnConfig>,
+    embedded_columns: Arc<HashMap<String, EmbeddingColumnConfig>>,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
 }
 
@@ -109,7 +109,7 @@ impl ExecutionPlan for EmbeddingTableExec {
             &self.filters,
             self.limit,
             Arc::clone(&self.base_plan).with_new_children(children)?,
-            self.embedded_columns.clone(),
+            Arc::clone(&self.embedded_columns),
             Arc::clone(&self.embedding_models),
         )) as Arc<dyn ExecutionPlan>)
     }
@@ -125,7 +125,7 @@ impl ExecutionPlan for EmbeddingTableExec {
             to_sendable_stream(
                 s,
                 Arc::clone(&self.projected_schema),
-                self.embedded_columns.clone(),
+                Arc::clone(&self.embedded_columns),
                 Arc::clone(&self.embedding_models),
             ),
         )))
@@ -139,7 +139,7 @@ impl EmbeddingTableExec {
         filters: &[Expr],
         limit: Option<usize>,
         base_plan: Arc<dyn ExecutionPlan>,
-        embedded_columns: HashMap<String, EmbeddingColumnConfig>,
+        embedded_columns: Arc<HashMap<String, EmbeddingColumnConfig>>,
         embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     ) -> Self {
         Self {
@@ -173,7 +173,7 @@ impl EmbeddingTableExec {
 fn to_sendable_stream(
     mut base_stream: SendableRecordBatchStream,
     projected_schema: SchemaRef,
-    embedded_columns: HashMap<String, EmbeddingColumnConfig>,
+    embedded_columns: Arc<HashMap<String, EmbeddingColumnConfig>>,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> + 'static {
     stream! {
@@ -847,11 +847,11 @@ async fn get_vectors_with_chunker(
     let embedded_data: Vec<Vec<f32>> = if model.supports_sync_embeddings() {
         let pool = build_embedding_pool(model.parallelism())?;
         let model = Arc::clone(&model);
-        let sync_embed_chunks = chunks.clone();
 
+        // Sync path must move `chunks` into spawn_blocking (no further use after this branch).
         let batches = task::spawn_blocking(move || {
             pool.install(|| {
-                sync_embed_chunks
+                chunks
                     .into_par_iter()
                     .chunks(32)
                     .map(|chunk| model.embed_sync(EmbeddingInput::StringArray(chunk)))
@@ -862,8 +862,9 @@ async fn get_vectors_with_chunker(
 
         batches.into_iter().flatten().collect()
     } else {
+        // Move chunks into embed; avoid cloning the full Vec<String>.
         model
-            .embed(EmbeddingInput::StringArray(chunks.clone()))
+            .embed(EmbeddingInput::StringArray(chunks))
             .await
             .boxed()?
     };

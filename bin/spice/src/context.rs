@@ -156,7 +156,7 @@ impl RuntimeContext {
         for env_file in &env_files {
             let path = self.app_dir.join(env_file);
             if path.exists()
-                && let Ok(env_map) = dotenvy::from_path_iter(&path)
+                && let Ok(env_map) = dotenv::from_path_iter(&path)
             {
                 for item in env_map.flatten() {
                     if item.0 == "SPICE_SPICEAI_API_KEY" || item.0 == "SPICE_API_KEY" {

@@ -20,8 +20,9 @@ Previously every PR push ran the whole suite — lint, build, unit tests,
 integration tests, E2E — and then the merge queue ran much of it *again* on
 merge. That is slow feedback and a lot of duplicated CI. With sign-off:
 
-- **Fast local feedback.** `make signoff` runs lint + unit tests on your
-  hardware, which is typically faster than waiting for a remote runner.
+- **Fast local feedback.** `make signoff` target-lints changed crates first,
+  then runs full lint + unit tests on your hardware — faster fail-first than a
+  remote runner, and faster than workspace lint alone when a change is wrong.
 - **No duplicated CI.** The full suite runs once, in the queue, on the merged
   commit — not on every push and again on merge.
 - **Same safety.** Nothing reaches `trunk` without the full suite passing on the
@@ -51,24 +52,92 @@ From a clean Git checkout or JJ workspace, with your branch/bookmark pushed
 and up to date:
 
 ```bash
-make signoff          # runs `make lint-rust` + `make build-cli nextest`, then attests
+make signoff          # targeted crate lint → full lint + unit tests, then attests
 ```
 
-On success it posts a `signoff` commit status on your current `HEAD`. Open or
-refresh the PR and the **Attestation** check turns green, which — together with a
-review — lets a maintainer add the PR to the merge queue.
+`make signoff` first diffs the branch against `trunk`, maps changed files to
+workspace crates, and runs `make lint-rust PACKAGES="…"` for fast fail-first
+feedback. It then always runs the full `make lint-rust` and
+`make build-cli nextest` gate. Set `SIGNOFF_SKIP_TARGETED_LINT=1` to skip the
+scoped pre-lint.
 
-The sign-off is bound to the **exact commit** you pushed. If you push a new
-commit, the old sign-off no longer applies and you must run `make signoff` again.
+On success it posts a `signoff` commit status on your current `HEAD`. If the
+**Attestation** check already ran and failed before the sign-off existed, the
+script re-runs that job via the `gh` CLI so it turns green without you having
+to open or refresh the PR. (If no run is found yet — e.g. before the PR's
+first CI run — or the rerun call fails, it falls back to prompting you to
+open/refresh the PR yourself.) That, together with a review, lets a
+maintainer add the PR to the merge queue.
+
+The sign-off is normally bound to the **exact commit** you pushed. If you push a
+code change, the old sign-off no longer applies and you must run `make signoff`
+again. The only exception is merging the PR's base branch. **Attestation** walks
+up to 100 successive merge commits on the first-parent chain to find a sign-off.
+`HEAD` must merge the current base commit, each older merged base must appear in
+order on the current base branch's first-parent history, and every merge tree
+must exactly match Git's conflict-free automatic result. A conflict resolution,
+amended merge, octopus merge, or merge from another branch still requires a new
+sign-off.
+`scripts/signoff status` reports only a commit's own status; the inheritance
+check runs in the PR's **Attestation** workflow.
+
+### Reverts are fast-tracked
+
+A pull request that only reverts commits already on the base branch passes
+**Attestation** automatically — no local `make signoff` needed. Undoing a change
+that already landed (and so already passed the full suite on its way in) is
+low-risk, and the merge queue still re-runs the whole suite on the merged
+result before it can reach `trunk`.
+
+The **Attestation** workflow fast-tracks a PR when **all** of the following hold:
+
+- Every commit the PR introduces is a Git revert — it carries the
+  `This reverts commit <sha>.` footer that `git revert` writes. A single
+  non-revert commit disqualifies the PR and it needs a normal sign-off.
+- Each reverted commit is already on the base branch (an ancestor of the base
+  tip). You can't fast-track "reverting" something that never merged.
+- The PR is from the same repository, not a fork. Fork contributors can't
+  self-sign-off anyway (posting a status needs write access), so a fork revert
+  still takes a maintainer sign-off — this keeps the trusted-committer boundary.
+
+To fast-track, just open the revert PR the normal way (e.g. `git revert <sha>`
+keeps the footer intact); the check passes on its own. If you amend a revert
+with extra changes, or squash the footer out of the message, it falls back to
+requiring a sign-off.
 
 Options:
 
 ```bash
 scripts/signoff -f            # sign off even with an uncommitted/unpushed tree
 scripts/signoff --no-verify   # attest without running the checks (honor system)
-scripts/signoff status        # is HEAD signed off?
+scripts/signoff status        # does HEAD have its own sign-off?
 scripts/signoff --help        # full usage
 ```
+
+### Remote sign-off (self-hosted runner)
+
+When you can't (or don't want to) run the checks on your machine, dispatch the
+**Remote Sign-off** workflow. It runs the same fail-fast sequence as local
+`make signoff` on a self-hosted runner, then posts the `signoff` status
+attributed to you:
+
+```bash
+make signoff-remote                 # current branch
+gh workflow run signoff.yml -f branch=<your-branch>
+gh run watch --workflow signoff.yml
+```
+
+The workflow:
+
+1. Checks out your branch (full history) and fetches `trunk`
+2. Target-lints crates touched by the branch vs `trunk` (GitHub compare API as a
+   fallback when merge-base isn't available)
+3. Runs full `make lint-rust` + `make build-cli nextest`
+4. Posts pending → success/failure `signoff` statuses, then re-runs
+   **Attestation** if needed
+
+Requires write access to the repository (same as local sign-off — fork
+contributors still need a maintainer to sign off).
 
 ### Jujutsu workspaces
 
@@ -95,9 +164,11 @@ path, so existing Git behavior is unchanged.
 
 ### "No developer sign-off found for &lt;sha&gt;"
 
-The Attestation check couldn't find a green `signoff` status for the PR's head
-commit. Make sure the commit under review is pushed, then run `make signoff`
-again. A new push always needs a fresh sign-off.
+The Attestation check couldn't find an applicable green `signoff` status. It
+checks the PR's head commit first, then walks backward through clean, unmodified
+base merges on the first-parent chain. Make sure the commit under review is
+pushed, then run `make signoff` again. Any new code or manual merge resolution
+needs a fresh sign-off.
 
 ### External contributors (forks)
 
@@ -113,8 +184,9 @@ merge queue is still the real gate.
 
 | Stage | Trigger | Checks |
 | --- | --- | --- |
-| Local | `make signoff` | `make lint-rust`, `make build-cli nextest` |
-| Pull request | `pull_request` | **Attestation** + PR hygiene; merge-queue check names report lightweight skipped/passthrough results |
+| Local | `make signoff` | targeted `make lint-rust PACKAGES=…` (changed crates), then full `make lint-rust`, `make build-cli nextest` |
+| Remote | `make signoff-remote` / `signoff.yml` | same checks as local on a self-hosted runner; posts `signoff` as the dispatcher |
+| Pull request | `pull_request` | **Attestation** (validates the sign-off, or auto-passes a pure revert) + PR hygiene; merge-queue check names report lightweight skipped/passthrough results |
 | Merge queue | `merge_group` | the full required suite (below) + advisory niche checks |
 
 Required checks in the merge queue (the `trunk` ruleset):

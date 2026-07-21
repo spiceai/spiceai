@@ -188,30 +188,34 @@ pub fn find_col_index(
 #[must_use]
 pub fn flatten_json_obj(value: &Value, delimiter: &str) -> Value {
     let mut out = serde_json::Map::new();
-    flatten_json(value, String::new(), delimiter, &mut out);
+    let mut path = String::new();
+    // Clone once at the root so nested recursion can move leaf Values into `out`
+    // instead of cloning each leaf and allocating a new path String per key.
+    flatten_json(value.clone(), &mut path, delimiter, &mut out);
     Value::Object(out)
 }
 
 fn flatten_json(
-    value: &Value,
-    prefix: String,
+    value: Value,
+    path: &mut String,
     delimiter: &str,
     out: &mut serde_json::Map<String, Value>,
 ) {
     match value {
         Value::Object(map) => {
             for (k, v) in map {
-                let new_prefix = if prefix.is_empty() {
-                    k.clone()
-                } else {
-                    format!("{prefix}{delimiter}{k}")
-                };
-                flatten_json(v, new_prefix, delimiter, out);
+                let mark = path.len();
+                if mark > 0 {
+                    path.push_str(delimiter);
+                }
+                path.push_str(&k);
+                flatten_json(v, path, delimiter, out);
+                path.truncate(mark);
             }
         }
-        _ => {
-            // For arrays and scalar values (null, boolean, number, string)
-            out.insert(prefix, value.clone());
+        other => {
+            // Arrays and scalar values (null, boolean, number, string): move into output.
+            out.insert(path.clone(), other);
         }
     }
 }

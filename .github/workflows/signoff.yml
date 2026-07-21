@@ -1,0 +1,153 @@
+---
+# Copyright 2024-2026 The Spice.ai OSS Authors
+#
+# Remote developer sign-off — run the same checks as `make signoff` on a
+# self-hosted runner, then post the `signoff` commit status on the branch HEAD
+# so the PR's Attestation check turns green.
+#
+# Same fail-fast order as local sign-off:
+#   1. Targeted lint of crates touched by the branch vs trunk
+#   2. Full workspace lint (make lint-rust)
+#   3. CLI build + unit tests (make build-cli nextest)
+#   4. Post signoff status + re-run Attestation if needed
+#
+# Use this when you can't (or don't want to) run the checks locally:
+#   make signoff-remote
+#   gh workflow run signoff.yml -f branch=<your-branch>
+name: Remote Sign-off
+
+run-name: Remote Sign-off (${{ inputs.branch }})
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to sign off (must be pushed to origin)'
+        required: true
+        type: string
+
+concurrency:
+  group: signoff-${{ github.event.inputs.branch }}
+  cancel-in-progress: true
+
+env:
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_TIMEOUT: 60
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+jobs:
+  sign-off:
+    name: Sign off on ${{ github.event.inputs.branch }}
+    runs-on: spiceai-macos
+    permissions:
+      contents: read
+      statuses: write
+      # scripts/signoff re-runs the PR's completed pr.yml run so the
+      # 'Attestation' check re-evaluates the sign-off status it just posted;
+      # the "re-run a workflow" API needs actions: write. Without it the
+      # refresh 403s and Attestation stays stuck on its pre-sign-off failure.
+      actions: write
+      # Needed so scripts/signoff can find the PR and its Attestation run.
+      pull-requests: read
+    env:
+      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Drive remote-specific behavior in scripts/signoff (pending status,
+      # "via remote" description, GitHub compare fallback, step summary).
+      SIGNOFF_REMOTE_RUN: '1'
+      SIGNOFF_ACTOR: ${{ github.actor }}
+      SIGNOFF_DEBUG: '1'
+
+    steps:
+      - name: Validate branch input
+        env:
+          BRANCH: ${{ github.event.inputs.branch }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${BRANCH// }" ]]; then
+            echo "::error::branch input is required"
+            exit 1
+          fi
+          # Mirror scripts/signoff remote: allow feature/foo, reject whitespace,
+          # quotes, $, `, leading dashes, absolute paths, `..`, and any char
+          # outside [A-Za-z0-9._/-] so dispatch/checkout cannot be broken by the name.
+          if [[ "$BRANCH" =~ [[:space:]] || "$BRANCH" == -* || "$BRANCH" == /* || "$BRANCH" == *..* \
+              || "$BRANCH" == *\"* || "$BRANCH" == *\'* || "$BRANCH" == *\$* || "$BRANCH" == *\`* ]]; then
+            echo "::error::invalid branch name: '${BRANCH}'"
+            exit 1
+          fi
+          if [[ ! "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "::error::invalid branch name: '${BRANCH}'"
+            exit 1
+          fi
+          echo "Signing off branch: ${BRANCH}"
+          echo "Triggered by: ${{ github.actor }}"
+          echo "Targeted pre-lint base: trunk (fixed)"
+
+      - name: Check out branch
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.inputs.branch }}
+          # Full history so local merge-base with trunk works when trunk is present.
+          # scripts/signoff still falls back to the GitHub compare API if needed.
+          fetch-depth: 0
+
+      - name: Fetch trunk for targeted pre-lint
+        run: |
+          set -euo pipefail
+          echo "Fetching origin/trunk for targeted pre-lint merge-base…"
+          git fetch --no-tags origin "trunk:refs/remotes/origin/trunk" \
+            || git fetch --no-tags origin trunk
+          echo "HEAD: $(git rev-parse --short HEAD)"
+          echo "merge-base with origin/trunk: $(git merge-base HEAD origin/trunk 2>/dev/null | cut -c1-12 || echo 'n/a (API fallback)')"
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
+
+      - name: Set up spiceio
+        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@973bc49a7be396ec9430255ad0f7ed684d7a1317 # v0.5.8
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: sccache
+          region: us-west-1
+
+      - name: Set up sccache
+        uses: ./.github/actions/setup-sccache
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
+
+      - name: Install Protoc
+        uses: ./.github/actions/install-protoc
+
+      - name: Set up make
+        uses: ./.github/actions/setup-make
+
+      - name: Set up cc
+        uses: ./.github/actions/setup-cc
+
+      - name: Sign off
+        # -f: Actions checkouts have no @{push} upstream tracking, so the local
+        # clean/pushed guards would otherwise refuse to run. The branch ref was
+        # just checked out from origin, so HEAD is exactly the remote tip.
+        run: scripts/signoff -f
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Show sccache stats
+        if: env.SCCACHE_SETUP == 'true'
+        run: sccache --show-stats
+
+      - name: Kill spiceio
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true

@@ -47,7 +47,7 @@ use spicepod::semantic::ColumnLevelEmbeddingConfig;
 use spicepod::vector::VectorStore;
 use std::any::Any;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 use runtime_search::embeddings::table::EmbeddingTable;
 
@@ -334,9 +334,6 @@ impl DataConnector for EmbeddingConnector {
         &self,
         federated_table: Arc<FederatedTable>,
         dataset: &Dataset,
-        accelerated_table_provider: Arc<dyn TableProvider>,
-        accelerator_write_mutex: Arc<Mutex<()>>,
-        cpu_runtime: Option<tokio::runtime::Handle>,
     ) -> Option<ChangesStream> {
         let table_provider = federated_table.try_table_provider_sync()?;
         if let Some(indexed_table) = table_provider
@@ -346,13 +343,9 @@ impl DataConnector for EmbeddingConnector {
             let Some(underlying_federated_table) =
                 underlying_federated_table_for_indexed_table(&table_provider)
             else {
-                return self.inner_connector.changes_stream(
-                    federated_table,
-                    dataset,
-                    accelerated_table_provider,
-                    accelerator_write_mutex,
-                    cpu_runtime,
-                );
+                return self
+                    .inner_connector
+                    .changes_stream(federated_table, dataset);
             };
 
             // Avoid reindexing full-text indexes.
@@ -370,13 +363,7 @@ impl DataConnector for EmbeddingConnector {
 
             let stream = self
                 .inner_connector
-                .changes_stream(
-                    underlying_federated_table,
-                    dataset,
-                    accelerated_table_provider,
-                    accelerator_write_mutex,
-                    cpu_runtime,
-                )?
+                .changes_stream(underlying_federated_table, dataset)?
                 .then(move |item| index_change_envelope(item, Arc::clone(&indexes)))
                 .boxed();
 
@@ -389,9 +376,6 @@ impl DataConnector for EmbeddingConnector {
                     &vector_scan.table_provider,
                 ))),
                 dataset,
-                accelerated_table_provider,
-                accelerator_write_mutex,
-                cpu_runtime,
             )
         } else if let Some(embedding_table) = table_provider.downcast_ref::<EmbeddingTable>() {
             let embedding_table = Arc::new(embedding_table.clone());
@@ -400,13 +384,7 @@ impl DataConnector for EmbeddingConnector {
 
             Some(
                 self.inner_connector
-                    .changes_stream(
-                        underlying_federated_table,
-                        dataset,
-                        accelerated_table_provider,
-                        accelerator_write_mutex,
-                        cpu_runtime,
-                    )?
+                    .changes_stream(underlying_federated_table, dataset)?
                     .then(move |item| {
                         Self::embed_change_envelope(item, Arc::clone(&embedding_table))
                     })

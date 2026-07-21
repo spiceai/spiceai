@@ -14,16 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Integration test for extended schema inference on the `MySQL` connector.
+//! Integration test for schema inference on the `MySQL` connector.
 //!
 //! Guards the CDC path that depends on the inferred primary key: a dataset with
-//! `refresh_mode: changes` and `schema_inference: extended` but **no declared
-//! `primary_key`** must still load and replicate UPDATE/DELETE events. This only
-//! works if the connector infers the primary key from `information_schema` and
-//! seeds it into the acceleration config — without it, `refresh_mode: changes`
-//! fails with "no primary key available". A `standard`-inference control confirms
-//! inference is opt-in (and that, without it, the same changes-mode dataset gets
-//! no primary key).
+//! `refresh_mode: changes` but **no declared `primary_key`** must still load and
+//! replicate UPDATE/DELETE events. This only works if the connector infers the
+//! primary key from `information_schema` (always attempted) and seeds it into the
+//! acceleration config — without it, `refresh_mode: changes` fails with "no primary
+//! key available".
 //!
 //! Precise value-level checks of the wire contract live in the fast unit tests in
 //! `data_components::inferred_schema`.
@@ -37,7 +35,7 @@ use app::AppBuilder;
 use mysql_async::prelude::Queryable;
 use runtime::Runtime;
 use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
-use spicepod::component::dataset::{Dataset, SchemaInference};
+use spicepod::component::dataset::Dataset;
 use spicepod::param::Params;
 use tokio::time::sleep;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
@@ -48,12 +46,10 @@ use crate::utils::{
 };
 use crate::{configure_test_datafusion, init_tracing};
 
-// Distinct, unused host ports per test so the two tests can start their own
-// container concurrently (Rust runs tests in parallel) without racing each other
-// or the replication suite (which uses 13324). The container name is derived from
-// the port, so a unique port also means a unique container.
-const MYSQL_EXTENDED_INFERENCE_PORT: u16 = 13328;
-const MYSQL_STANDARD_INFERENCE_PORT: u16 = 13329;
+// A distinct, unused host port so this test can start its own container without
+// racing the replication suite (which uses 13324). The container name is derived
+// from the port, so a unique port also means a unique container.
+const MYSQL_INFERENCE_PORT: u16 = 13328;
 const CHANGE_PROPAGATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Composite-PK table so the test also proves multi-column key inference (in key
@@ -90,15 +86,14 @@ fn mysql_params(port: u16) -> HashMap<String, String> {
     ])
 }
 
-/// A `refresh_mode: changes` dataset with the given inference level and, crucially,
-/// **no** `primary_key` / `on_conflict` — those must come from inference.
-fn inventory_dataset(port: u16, schema_inference: SchemaInference) -> Dataset {
+/// A `refresh_mode: changes` dataset with, crucially, **no** `primary_key` /
+/// `on_conflict` — those must come from (always-on) inference.
+fn inventory_dataset(port: u16) -> Dataset {
     let mut dataset = Dataset::new(
         "mysql:mysqldb.inventory".to_string(),
         "inventory".to_string(),
     );
     dataset.params = Some(Params::from_string_map(mysql_params(port)));
-    dataset.schema_inference = schema_inference;
     dataset.acceleration = Some(Acceleration {
         enabled: true,
         engine: Some("arrow".to_string()),
@@ -157,12 +152,12 @@ async fn wait_for_scalar_i64(
     }
 }
 
-/// With `schema_inference: extended`, a changes-mode dataset that declares no
-/// primary key still loads (the PK is inferred from `information_schema`) and
-/// correctly routes a live UPDATE and DELETE — the exact path that failed with
-/// "no primary key available" before `MySQL` extended inference existed.
+/// A changes-mode dataset that declares no primary key still loads (the PK is
+/// inferred from `information_schema`) and correctly routes a live UPDATE and
+/// DELETE — the exact path that failed with "no primary key available" before
+/// `MySQL` schema inference existed.
 #[tokio::test]
-async fn test_extended_inference_enables_cdc_without_declared_pk() -> Result<(), anyhow::Error> {
+async fn test_inference_enables_cdc_without_declared_pk() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
         "integration=debug,data_components::mysql_replication=debug,info",
     ));
@@ -170,12 +165,12 @@ async fn test_extended_inference_enables_cdc_without_declared_pk() -> Result<(),
 
     test_request_context()
         .scope(async {
-            let _container = common::start_mysql_docker_container(MYSQL_EXTENDED_INFERENCE_PORT)
+            let _container = common::start_mysql_docker_container(MYSQL_INFERENCE_PORT)
                 .await
                 .map_err(|e| anyhow!("start container: {e}"))?;
 
             // Create + seed on the source (retry to absorb InnoDB DDL-readiness races).
-            let pool = common::get_mysql_conn(MYSQL_EXTENDED_INFERENCE_PORT)?;
+            let pool = common::get_mysql_conn(MYSQL_INFERENCE_PORT)?;
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
             retry(retry_strategy, || async {
                 exec(&pool, "DROP TABLE IF EXISTS inventory")
@@ -189,10 +184,7 @@ async fn test_extended_inference_enables_cdc_without_declared_pk() -> Result<(),
             .await?;
 
             let app = AppBuilder::new("mysql_schema_inference_test")
-                .with_dataset(inventory_dataset(
-                    MYSQL_EXTENDED_INFERENCE_PORT,
-                    SchemaInference::Extended,
-                ))
+                .with_dataset(inventory_dataset(MYSQL_INFERENCE_PORT))
                 .build();
 
             configure_test_datafusion();
@@ -227,62 +219,6 @@ async fn test_extended_inference_enables_cdc_without_declared_pk() -> Result<(),
             // Live DELETE keyed on the composite PK routes correctly too.
             exec(&pool, "DELETE FROM inventory WHERE w_id = 2 AND sku = 'A'").await?;
             wait_for_scalar_i64(&rt, "SELECT count(*) FROM inventory", 2).await?;
-
-            Ok(())
-        })
-        .await
-}
-
-/// Control: with the default `schema_inference: standard`, a full-refresh dataset
-/// loads normally — confirming inference is purely opt-in and never required for
-/// the non-CDC path.
-#[tokio::test]
-async fn test_standard_inference_full_refresh_loads() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    register_test_connectors().await;
-
-    test_request_context()
-        .scope(async {
-            let _container = common::start_mysql_docker_container(MYSQL_STANDARD_INFERENCE_PORT)
-                .await
-                .map_err(|e| anyhow!("start container: {e}"))?;
-
-            let pool = common::get_mysql_conn(MYSQL_STANDARD_INFERENCE_PORT)?;
-            let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
-            retry(retry_strategy, || async {
-                exec(&pool, "DROP TABLE IF EXISTS inventory")
-                    .await
-                    .map_err(RetryError::transient)?;
-                exec(&pool, CREATE_TABLE_SQL)
-                    .await
-                    .map_err(RetryError::transient)?;
-                exec(&pool, SEED_SQL).await.map_err(RetryError::transient)
-            })
-            .await?;
-
-            let mut dataset =
-                inventory_dataset(MYSQL_STANDARD_INFERENCE_PORT, SchemaInference::Standard);
-            // Full refresh needs no primary key, so this is a clean opt-in control.
-            if let Some(accel) = dataset.acceleration.as_mut() {
-                accel.refresh_mode = Some(RefreshMode::Full);
-            }
-
-            let app = AppBuilder::new("mysql_schema_inference_standard_test")
-                .with_dataset(dataset)
-                .build();
-
-            configure_test_datafusion();
-            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-
-            tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(90)) => {
-                    return Err(anyhow!("timed out waiting for dataset to load"));
-                }
-                () = Arc::clone(&rt).load_components() => {}
-            }
-            runtime_ready_check(&rt).await;
-
-            wait_for_scalar_i64(&rt, "SELECT count(*) FROM inventory", 3).await?;
 
             Ok(())
         })

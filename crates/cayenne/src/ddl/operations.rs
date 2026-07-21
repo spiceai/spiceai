@@ -409,7 +409,7 @@ async fn build_partitioned_provider(
     let partition_expr_for_error =
         partition_expr_sql.map_or_else(|| partition_expr.to_string(), String::clone);
 
-    tracing::info!(
+    tracing::debug!(
         table = %table_name,
         partition_expr = %partition_expr_for_error,
         "CayenneCreateTableExec: validating partition expression"
@@ -631,9 +631,18 @@ mod tests {
                 && let Some(value) = name.strip_prefix("ts_day_bucket=")
             {
                 bucket_dirs += 1;
+                // The partition key is written through the versioned, path-safe
+                // codec (`runtime_table_partition::creator::filename::encode_key`,
+                // e.g. `v1.ts_us.v<hex>` for a `Timestamp(Microsecond)` bucket), so
+                // the dir name is filesystem-safe without being a bare integer.
+                // Assert filesystem-safety directly — the codec's own unit tests
+                // cover the exact encoding.
                 assert!(
-                    value.chars().all(|c| c.is_ascii_digit()),
-                    "bucket dir must be a filesystem-safe integer, got {name}"
+                    !value.is_empty()
+                        && value
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_'),
+                    "bucket dir must be a filesystem-safe partition key, got {name}"
                 );
             }
         }

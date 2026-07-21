@@ -231,13 +231,24 @@ impl<'a> FilterStringVisitor<'a> {
 
     fn get_column_alias(&self, column_name: &str) -> String {
         if self.schema.is_flattened_field(column_name) {
-            column_name
-                .split('.')
-                .map(|segment| format!("#{segment}"))
-                .collect::<Vec<_>>()
-                .join(".")
+            // One allocation: "#seg1.#seg2..." without intermediate Vec/String per segment.
+            let segment_count = column_name.bytes().filter(|&b| b == b'.').count() + 1;
+            let mut alias = String::with_capacity(column_name.len() + segment_count);
+            let mut first = true;
+            for segment in column_name.split('.') {
+                if !first {
+                    alias.push('.');
+                }
+                first = false;
+                alias.push('#');
+                alias.push_str(segment);
+            }
+            alias
         } else {
-            format!("#{column_name}")
+            let mut alias = String::with_capacity(column_name.len() + 1);
+            alias.push('#');
+            alias.push_str(column_name);
+            alias
         }
     }
 }

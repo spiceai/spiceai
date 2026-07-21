@@ -23,7 +23,7 @@ limitations under the License.
 //!    Spice Cloud portal:
 //!
 //!    ```text
-//!    spice connect SPICE-ADOPT-7K2P-9XYZ-A1B2
+//!    spice connect SPICE-ADOPT-7K2PX-9XYZ2-A1B2C-D3E4F
 //!    ```
 //!
 //!    or one of the explicit subcommands `status`/`forget`.
@@ -47,7 +47,7 @@ use clap::{Args, Subcommand};
     long_about = r#"`spice connect` has two modes:
 
 CLOUD CONNECT ADOPTION:
-  spice connect SPICE-ADOPT-XXXX-XXXX     Stage an adoption code so the next
+  spice connect SPICE-ADOPT-XXXXX-XXXXX-XXXXX-XXXXX   Stage an adoption code so the next
                                           `spiced` start connects to Spice Cloud
                                           and is shown as "Pending Adoption" in
                                           the portal.
@@ -68,7 +68,7 @@ LEGACY POD-ADD BEHAVIOR:
                                           fetched.
 
 EXAMPLES
-  spice connect SPICE-ADOPT-7K2P-9XYZ-A1B2
+  spice connect SPICE-ADOPT-7K2PX-9XYZ2-A1B2C-D3E4F
   spice connect status
   spice connect forget
   spice connect spiceai/quickstart
@@ -134,7 +134,7 @@ pub async fn execute(ctx: &RuntimeContext, args: ConnectArgs) -> Result<()> {
         return Err(crate::error::Error::InvalidArgument {
             message: format!(
                 "'{target}' looks like a Spice Cloud adoption code but is malformed. \
-                 Expected SPICE-ADOPT-XXXX-XXXX-... (each segment is 4 uppercase \
+                 Expected SPICE-ADOPT-XXXXX-XXXXX-XXXXX-XXXXX (each segment is 5 uppercase \
                  letters or digits). Copy the code from your Spice Cloud portal and retry."
             ),
         });
@@ -422,7 +422,9 @@ mod tests {
     #[test]
     fn looks_like_adoption_code_matches_prefix() {
         // Well-formed and malformed adoption codes both look like codes.
-        assert!(looks_like_adoption_code("SPICE-ADOPT-7K2P-9XYZ-A1B2"));
+        assert!(looks_like_adoption_code(
+            "SPICE-ADOPT-7K2PX-9XYZ2-A1B2C-D3E4F"
+        ));
         assert!(looks_like_adoption_code("SPICE-ADOPT-AAA-BBBB"));
         assert!(looks_like_adoption_code("SPICE-ADOPT-aaaa-BBBB"));
         assert!(looks_like_adoption_code("SPICE-ADOPT"));

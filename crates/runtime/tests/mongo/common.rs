@@ -20,7 +20,7 @@ use bollard::secret::HealthConfig;
 #[cfg(feature = "duckdb")]
 use spicepod::acceleration::{Mode, OnConflictBehavior, RefreshMode};
 #[cfg(feature = "duckdb")]
-use spicepod::component::dataset::{OnSchemaChange, SchemaInference};
+use spicepod::component::dataset::OnSchemaChange;
 use spicepod::{
     acceleration::Acceleration, component::dataset::Dataset, param::Params as DatasetParams,
 };
@@ -55,14 +55,13 @@ pub fn make_mongodb_dataset(path: &str, name: &str, port: u16, accelerated: bool
     dataset
 }
 
-/// Like [`make_mongodb_dataset`] (DuckDB-accelerated, full refresh) but opts into
-/// `schema_inference: extended` with no explicit primary key, so the runtime infers
-/// `_id` as the primary key and surfaces the collection's secondary indexes and sort
-/// order. The non-CDC counterpart to [`make_mongodb_change_stream_dataset_inferred`].
+/// Like [`make_mongodb_dataset`] (DuckDB-accelerated, full refresh) but with no
+/// explicit primary key, so always-on schema inference infers `_id` as the primary
+/// key and surfaces the collection's secondary indexes and sort order. The non-CDC
+/// counterpart to [`make_mongodb_change_stream_dataset_inferred`].
 #[cfg(feature = "duckdb")]
-pub fn make_mongodb_extended_inference_dataset(path: &str, name: &str, port: u16) -> Dataset {
+pub fn make_mongodb_inference_dataset(path: &str, name: &str, port: u16) -> Dataset {
     let mut dataset = make_mongodb_dataset(path, name, port, false);
-    dataset.schema_inference = SchemaInference::Extended;
     dataset.acceleration = Some(Acceleration {
         enabled: true,
         engine: Some("duckdb".to_string()),
@@ -73,14 +72,13 @@ pub fn make_mongodb_extended_inference_dataset(path: &str, name: &str, port: u16
 }
 
 /// `MongoDB` source accelerated into a **file-backed** `DuckDB` table with
-/// `on_schema_change: sync_all_columns` and extended inference, for the
-/// restart-time widening test. File-backed (`duckdb_file`, `Mode::File`) so the
-/// accelerated table and its checkpoint survive the restart that re-infers the
-/// (now wider) source schema and drives in-place evolution.
+/// `on_schema_change: sync_all_columns`, for the restart-time widening test.
+/// File-backed (`duckdb_file`, `Mode::File`) so the accelerated table and its
+/// checkpoint survive the restart that re-infers the (now wider) source schema and
+/// drives in-place evolution.
 #[cfg(feature = "duckdb")]
 pub fn make_mongodb_widen_dataset(path: &str, name: &str, port: u16, duckdb_file: &str) -> Dataset {
     let mut dataset = make_mongodb_dataset(path, name, port, false);
-    dataset.schema_inference = SchemaInference::Extended;
     dataset.on_schema_change = OnSchemaChange::SyncAllColumns;
     dataset.acceleration = Some(Acceleration {
         enabled: true,
@@ -126,7 +124,7 @@ pub fn make_mongodb_change_stream_dataset(path: &str, name: &str, port: u16) -> 
 }
 
 /// Like [`make_mongodb_change_stream_dataset`] but omits `primary_key` and
-/// `on_conflict`, relying on `schema_inference: extended` to infer `_id` as the
+/// `on_conflict`, relying on always-on schema inference to infer `_id` as the
 /// primary key (and seed the matching upsert) so `MongoDB` Streams work without
 /// manual configuration.
 #[cfg(feature = "duckdb")]
@@ -147,8 +145,7 @@ pub fn make_mongodb_change_stream_dataset_inferred(path: &str, name: &str, port:
         ("change_stream_batch_size".to_string(), "10".to_string()),
     ]);
     dataset.params = Some(DatasetParams::from_string_map(params));
-    // No primary_key / on_conflict — extended inference supplies `_id` + upsert.
-    dataset.schema_inference = SchemaInference::Extended;
+    // No primary_key / on_conflict — schema inference supplies `_id` + upsert.
     dataset.acceleration = Some(Acceleration {
         enabled: true,
         engine: Some("duckdb".to_string()),

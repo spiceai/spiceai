@@ -77,6 +77,26 @@ pub struct HtapArgs {
     /// 0.0 = report only (no gate); set e.g. 0.85 on the HTAP smoke to catch regressions.
     #[arg(long, default_value_t = 0.0, value_parser = parse_phase_coverage)]
     pub(crate) min_phase_coverage: f64,
+
+    /// Skip the analytical-query correctness gate (re-running every CH-benCH
+    /// analytical query against both source and Spice and diffing results).
+    /// It is the most expensive correctness check and is not part of the
+    /// measurement, so experiments that only care about tpmC/QPH/lag can skip
+    /// it to save time; the row-count gate (replication drain + per-table
+    /// parity) always still runs. Default `false` (gate runs) to keep data
+    /// correctness the default — scheduled/monitoring runs should never set
+    /// this.
+    #[arg(long, default_value_t = false)]
+    pub(crate) skip_analytic_gate: bool,
+
+    /// Number of analytical-query-gate queries to evaluate concurrently. Each
+    /// worker runs its query's source and Spice sides in parallel, so the gate
+    /// keeps up to this many queries in flight against each engine. Bounded to
+    /// at least 1 and never more than the query count. Raise it to shorten the
+    /// gate on fast sources; lower it to ease load on a small source connection
+    /// pool. Default 4.
+    #[arg(long, default_value_t = 4)]
+    pub(crate) analytic_gate_concurrency: usize,
 }
 
 /// Parse and validate `--min-phase-coverage`: a fraction in the inclusive range

@@ -85,6 +85,7 @@ const INTERNAL_COMPONENTS: &[&str] = &[
     "runtime",
     "secrets",
     "data_components",
+    "cayenne",
     "cache",
     "extensions",
     "spice_cloud",
@@ -243,6 +244,14 @@ where
         .map(|app| app.runtime.task_history.min_plan_duration_as_millis())
         .transpose()?
         .flatten();
+
+    df.set_plan_capture_config(
+        runtime::datafusion::query::plan_capture::PlanCaptureConfig {
+            captured_plan: captured_plan.clone(),
+            min_plan_duration_ms,
+            min_sql_duration_ms,
+        },
+    );
 
     // Compute node_id for cluster mode: "host:port"
     let node_id: Option<Arc<str>> = df.cluster_config.effective_role().and_then(|_| {

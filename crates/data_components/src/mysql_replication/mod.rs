@@ -542,7 +542,7 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
     // when resuming via GTID.
     let (resume_position, resume_gtid, use_gtid): (Option<BinlogPosition>, Option<GtidSet>, bool) =
         match persisted {
-            Some(persisted) if params.snapshot_mode == InitialSnapshotMode::Enabled => {
+            Some(persisted) if params.snapshot_mode == InitialSnapshotMode::Always => {
                 tracing::info!(
                     dataset = %dataset_name,
                     position = %persisted.position,

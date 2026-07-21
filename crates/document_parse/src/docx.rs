@@ -49,8 +49,9 @@ impl DocxParser {
     }
 }
 
+#[async_trait::async_trait]
 impl DocumentParser for DocxParser {
-    fn parse(&self, raw: &Bytes) -> Result<Arc<dyn Document>> {
+    async fn parse(&self, raw: &Bytes) -> Result<Arc<dyn Document>> {
         let doc = read_docx(raw).boxed().context(InternalParsingSnafu {
             format: DocumentType::Docx,
         })?;

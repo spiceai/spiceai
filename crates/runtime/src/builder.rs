@@ -349,6 +349,13 @@ impl RuntimeBuilder {
         let target_partitions = query.target_partitions;
         let max_concurrent_queries = query.max_concurrent_queries;
 
+        // The effective timeout is resolved per request by
+        // `RequestContextBuilder::build` from the app's `runtime.query.timeout`;
+        // validate here so a misconfigured value is warned about once at startup
+        if let Err(e) = query.timeout() {
+            tracing::warn!("{e} No query timeout will be applied.");
+        }
+
         let metrics = spicepod_rt.metrics.clone();
 
         let dataset_parallelism = spicepod_rt.dataset_load_parallelism;
@@ -787,6 +794,14 @@ impl RuntimeBuilder {
             telemetry_config: self.telemetry_config,
         };
 
+        // Executors: register cluster status before any concurrent
+        // `load_components` / `start_servers` race so readiness cannot pass on
+        // dataset-only status while task slots are still closed (#11758 Fix B).
+        if is_cluster_executor {
+            rt.status
+                .update_cluster("executor", status::ComponentStatus::Initializing);
+        }
+
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();
         for factory in self.extensions {
             let mut extension = factory.create();
@@ -833,6 +848,16 @@ impl Default for RuntimeBuilder {
 }
 
 #[cfg(not(feature = "rate-control"))]
+// This build has no persisted rate-control backend, so this stub never awaits.
+// It must stay `async` to match the `rate-control` variant's signature: the sole
+// caller awaits the result unconditionally. The suppression is inherently
+// feature-conditional — it exists only in this `cfg(not(rate-control))` variant,
+// exactly the build where the lint fires; under `rate-control` this whole fn is
+// compiled out and the real variant awaits.
+#[expect(
+    clippy::unused_async,
+    reason = "signature parity with the rate-control variant; caller awaits unconditionally"
+)]
 async fn build_http_rate_control_registry(
     source_rate_control: Option<&SpicepodSourceRateControl>,
     secrets: Arc<RwLock<Secrets>>,

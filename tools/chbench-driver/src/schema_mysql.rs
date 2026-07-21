@@ -21,6 +21,8 @@ limitations under the License.
 //! dialect DDL. Postgres-WAL-specific replication cleanup has no `MySQL`
 //! equivalent and is omitted.
 
+use std::time::Instant;
+
 use mysql_async::prelude::Queryable;
 
 use crate::Result;
@@ -37,6 +39,44 @@ use crate::Result;
 pub async fn drop_tables(conn: &mut mysql_async::Conn) -> Result<()> {
     println!("  dropping {} tables", crate::schema::ALL_TABLES.len());
 
+    // Bound metadata-lock waits. A `DROP TABLE` blocked by another session holding
+    // a lock otherwise waits up to the server default `lock_wait_timeout`
+    // (31536000s ≈ 1 year), so a single stuck drop silently consumes the whole CI
+    // job budget. 60s makes a blocked drop fail fast with a clear
+    // "Lock wait timeout exceeded" error instead of hanging.
+    conn.query_drop("SET SESSION lock_wait_timeout = 60")
+        .await
+        .map_err(|source| crate::Error::MySql {
+            action: "set lock_wait_timeout".into(),
+            source,
+        })?;
+
+    // A prior run killed abruptly (e.g. the CI runner was terminated mid-run) can
+    // leave sessions still holding metadata locks on the tables we are about to
+    // drop, which is exactly what blocks the drop above. Terminate any other
+    // sessions before dropping. Without PROCESS/CONNECTION_ADMIN this account sees
+    // and can KILL only its own threads — precisely the CDC/loader connections a
+    // previous run may have leaked. Best-effort: a session may already be gone
+    // (killed/timed out) between the SELECT and the KILL, which is fine.
+    let stale: Vec<u64> = conn
+        .query("SELECT ID FROM information_schema.PROCESSLIST WHERE ID <> CONNECTION_ID()")
+        .await
+        .map_err(|source| crate::Error::MySql {
+            action: "list stale sessions".into(),
+            source,
+        })?;
+    if !stale.is_empty() {
+        println!(
+            "  terminating {} stale MySQL session(s) before drop",
+            stale.len()
+        );
+        for id in stale {
+            if let Err(e) = conn.query_drop(format!("KILL {id}")).await {
+                eprintln!("  KILL {id} skipped (session likely already gone): {e}");
+            }
+        }
+    }
+
     conn.query_drop("SET FOREIGN_KEY_CHECKS=0")
         .await
         .map_err(|source| crate::Error::MySql {
@@ -45,6 +85,7 @@ pub async fn drop_tables(conn: &mut mysql_async::Conn) -> Result<()> {
         })?;
 
     for table in crate::schema::ALL_TABLES.iter().rev() {
+        let started = Instant::now();
         let sql = format!("DROP TABLE IF EXISTS {table}");
         conn.query_drop(&sql)
             .await
@@ -52,6 +93,12 @@ pub async fn drop_tables(conn: &mut mysql_async::Conn) -> Result<()> {
                 action: format!("drop table {table}"),
                 source,
             })?;
+        // Per-table timing so a future hang is immediately attributable to the
+        // exact table (and therefore the lock) it stuck on.
+        println!(
+            "    dropped {table} ({:.1}s)",
+            started.elapsed().as_secs_f64()
+        );
     }
 
     conn.query_drop("SET FOREIGN_KEY_CHECKS=1")
@@ -83,8 +130,8 @@ pub async fn create_tables(conn: &mut mysql_async::Conn) -> Result<()> {
                 w_city VARCHAR(20) NOT NULL,
                 w_state CHAR(2) NOT NULL,
                 w_zip CHAR(9) NOT NULL,
-                w_tax DOUBLE NOT NULL,
-                w_ytd DOUBLE NOT NULL,
+                w_tax DECIMAL(4,4) NOT NULL,
+                w_ytd DECIMAL(12,2) NOT NULL,
                 PRIMARY KEY (w_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs",
         ),
@@ -99,8 +146,8 @@ pub async fn create_tables(conn: &mut mysql_async::Conn) -> Result<()> {
                 d_city VARCHAR(20) NOT NULL,
                 d_state CHAR(2) NOT NULL,
                 d_zip CHAR(9) NOT NULL,
-                d_tax DOUBLE NOT NULL,
-                d_ytd DOUBLE NOT NULL,
+                d_tax DECIMAL(4,4) NOT NULL,
+                d_ytd DECIMAL(12,2) NOT NULL,
                 d_next_o_id INT NOT NULL,
                 PRIMARY KEY (d_w_id, d_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs",
@@ -122,9 +169,9 @@ pub async fn create_tables(conn: &mut mysql_async::Conn) -> Result<()> {
                 c_phone CHAR(16) NOT NULL,
                 c_since DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
                 c_credit CHAR(2) NOT NULL,
-                c_credit_lim DOUBLE NOT NULL,
-                c_discount DOUBLE NOT NULL,
-                c_balance DOUBLE NOT NULL,
+                c_credit_lim DECIMAL(12,2) NOT NULL,
+                c_discount DECIMAL(4,4) NOT NULL,
+                c_balance DECIMAL(12,2) NOT NULL,
                 c_ytd_payment DOUBLE NOT NULL,
                 c_payment_cnt INT NOT NULL,
                 c_delivery_cnt INT NOT NULL,
@@ -141,7 +188,7 @@ pub async fn create_tables(conn: &mut mysql_async::Conn) -> Result<()> {
                 h_d_id INT NOT NULL,
                 h_w_id INT NOT NULL,
                 h_date DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-                h_amount DOUBLE NOT NULL,
+                h_amount DECIMAL(6,2) NOT NULL,
                 h_data VARCHAR(24) NOT NULL
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs",
         ),
@@ -179,7 +226,7 @@ pub async fn create_tables(conn: &mut mysql_async::Conn) -> Result<()> {
                 ol_supply_w_id INT NOT NULL,
                 ol_delivery_d DATETIME(6) NULL DEFAULT NULL,
                 ol_quantity INT NOT NULL,
-                ol_amount DOUBLE NOT NULL,
+                ol_amount DECIMAL(6,2) NOT NULL,
                 ol_dist_info CHAR(24) NOT NULL,
                 PRIMARY KEY (ol_w_id, ol_d_id, ol_o_id, ol_number)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs",
@@ -213,7 +260,7 @@ pub async fn create_tables(conn: &mut mysql_async::Conn) -> Result<()> {
                 i_id INT NOT NULL,
                 i_im_id INT NOT NULL,
                 i_name VARCHAR(24) NOT NULL,
-                i_price DOUBLE NOT NULL,
+                i_price DECIMAL(5,2) NOT NULL,
                 i_data VARCHAR(50) NOT NULL,
                 PRIMARY KEY (i_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs",
@@ -246,7 +293,7 @@ pub async fn create_tables(conn: &mut mysql_async::Conn) -> Result<()> {
                 su_address VARCHAR(40) NOT NULL,
                 su_nationkey BIGINT NOT NULL,
                 su_phone VARCHAR(15) NOT NULL,
-                su_acctbal DOUBLE NOT NULL,
+                su_acctbal DECIMAL(12,2) NOT NULL,
                 su_comment VARCHAR(101) NOT NULL,
                 PRIMARY KEY (su_suppkey)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs",
@@ -266,7 +313,7 @@ pub async fn create_tables(conn: &mut mysql_async::Conn) -> Result<()> {
     // Add the _bench_ts column (with default) to all mutated TPC-C tables so the
     // seed rows are stamped by the column default. The BEFORE INSERT/UPDATE
     // triggers are created *after* the load (see `create_triggers`) so they do
-    // not fire per-row during the bulk seed/clone.
+    // not fire per-row during the bulk seed load.
     add_bench_ts_columns(conn).await?;
 
     Ok(())
@@ -276,7 +323,7 @@ pub async fn create_tables(conn: &mut mysql_async::Conn) -> Result<()> {
 ///
 /// Called *after* the bulk load so `InnoDB` builds each index once via its sorted
 /// bulk-index build, instead of maintaining the B-trees incrementally on every
-/// seed/clone insert.
+/// seed load insert.
 ///
 /// # Errors
 ///
@@ -353,7 +400,7 @@ async fn add_bench_ts_columns(conn: &mut mysql_async::Conn) -> Result<()> {
 
 /// Create the `_bench_ts` `BEFORE INSERT` and `BEFORE UPDATE` triggers on all
 /// mutated TPC-C tables. Called *after* the bulk load so the triggers do not
-/// fire per-row during the seed/clone — the seed rows are already stamped by
+/// fire per-row during the seed load — the seed rows are already stamped by
 /// the column default (see [`add_bench_ts_columns`]).
 ///
 /// `MySQL` cannot combine INSERT and UPDATE into a single trigger, so two

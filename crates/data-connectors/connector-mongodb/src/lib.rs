@@ -26,7 +26,6 @@ limitations under the License.
 mod changes;
 
 use async_trait::async_trait;
-use data_components::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
 use data_components::inferred_schema::{InferredIndex, InferredSchema, InferredSortColumn};
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::mongodb::{
@@ -146,22 +145,10 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("change_stream_batch_size")
         .description("Number of Change Stream events MongoDB should request from the server per batch.")
         .default("1000"),
-    ParameterSpec::runtime("mongodb_replication_initial_snapshot")
-        .description("When `refresh_mode: changes` first loads the collection's existing documents: 'auto' (default) snapshots when no resumable resume token exists and resumes without a snapshot when one does; 'disabled' streams change events only, from the current point; 'enabled' snapshots on every start, discarding any persisted resume token. Default: auto.")
-        .default("auto")
-        .one_of_ignore_ascii_case(InitialSnapshotMode::VALUES),
-    ParameterSpec::runtime("mongodb_replication_invalid_checkpoint_behavior")
-        .description("Behavior when a persisted Change Stream resume token cannot be honored by the server (e.g. past the oplog retention window). 'error' (default) surfaces a clear error so the operator can decide (re-snapshotting a large collection should be opt-in). 'restart' drops the persisted token and re-snapshots the collection. Default: error.")
-        .one_of_ignore_ascii_case(InvalidCheckpointBehavior::VALUES),
-    ParameterSpec::runtime("mongodb_replication_ready_lag")
-        .description("For `refresh_mode: changes`, the dataset is marked Ready once its replication lag (now minus the newest applied change's cluster time) falls below this. It stays not-ready while snapshotting or draining a backlog, so it never serves stale data. Default: 2s.")
-        .default("2s"),
-    // Deprecated alias of `mongodb_replication_invalid_checkpoint_behavior`
-    // (rebootstrap -> restart). Kept so existing spicepods keep loading.
     ParameterSpec::runtime("mongodb_resume_token_invalid_behavior")
-        .description("[deprecated] Use `mongodb_replication_invalid_checkpoint_behavior` (error|restart) instead. 'rebootstrap' maps to 'restart'.")
-        .one_of(&["error", "rebootstrap"])
-        .deprecated("Renamed to 'mongodb_replication_invalid_checkpoint_behavior'; 'rebootstrap' -> 'restart'."),
+        .description("Behavior when a persisted Change Stream resume token cannot be honored by the server (e.g. past the oplog retention window). 'error' surfaces a clear error so the operator can decide (recommended default; re-snapshotting a large collection should be opt-in). 'rebootstrap' drops the persisted token and re-snapshots the collection.")
+        .default("error")
+        .one_of(&["error", "rebootstrap"]),
 ];
 
 const IGNORED_IF_URI: &[&str] = &[
@@ -709,18 +696,22 @@ async fn mongodb_inferred_schema_metadata(
     {
         Ok(Ok(details)) => details,
         Ok(Err(error)) => {
-            tracing::debug!(
+            // Graceful degradation: catalog enrichment failed (commonly the user
+            // lacks listIndexes/listCollections/collStats access). Fall back to the
+            // structural `_id` primary key only; secondary indexes, sort, and sizing
+            // are not inferred.
+            tracing::info!(
                 collection = collection_name,
                 %error,
-                "MongoDB catalog enrichment failed; inferring the `_id` primary key only"
+                "MongoDB schema inference degraded to the `_id` primary key only: catalog enrichment failed, usually because the connection user lacks catalog access. Secondary indexes, sort order, and sizing were not inferred."
             );
             MongoCatalogDetails::primary_key_only(&primary_key)
         }
         Err(_elapsed) => {
-            tracing::debug!(
+            tracing::info!(
                 collection = collection_name,
                 timeout_secs = MONGODB_CATALOG_TIMEOUT.as_secs(),
-                "MongoDB catalog enrichment timed out; inferring the `_id` primary key only"
+                "MongoDB schema inference degraded to the `_id` primary key only: catalog enrichment timed out. Secondary indexes, sort order, and sizing were not inferred."
             );
             MongoCatalogDetails::primary_key_only(&primary_key)
         }
@@ -738,21 +729,19 @@ async fn mongodb_inferred_schema_metadata(
     }
 }
 
-/// Enrich the provider's schema with inferred primary key / indexes / sort columns
-/// when the dataset opts into `schema_inference: extended`.
+/// Enrich the provider's schema with the inferred primary key / indexes / sort
+/// columns. Inference is always attempted; the `_id` primary key is structural
+/// (always available) and catalog enrichment (indexes, sort, sizing) is
+/// best-effort, degrading gracefully when the source restricts catalog access.
 async fn enrich_with_mongodb_metadata(
     pool: &Arc<MongoDBConnectionPool>,
     dataset: &Dataset,
     provider: Arc<dyn TableProvider>,
 ) -> Arc<dyn TableProvider> {
-    if !dataset.schema_inference.is_extended() {
-        return provider;
-    }
-
     tracing::debug!(
         dataset = %dataset.name,
         collection = %dataset.path(),
-        "Applying MongoDB extended schema inference (inferring `_id` primary key; catalog enrichment is best-effort)"
+        "Applying MongoDB schema inference (inferring `_id` primary key; catalog enrichment is best-effort)"
     );
     let inferred = mongodb_inferred_schema_metadata(pool, dataset.path()).await;
     if inferred.is_empty() {
@@ -766,7 +755,7 @@ async fn enrich_with_mongodb_metadata(
         sort_columns = inferred.sort_columns.len(),
         row_count = ?inferred.row_count,
         table_bytes = ?inferred.table_bytes,
-        "Inferred extended schema metadata from MongoDB catalog"
+        "Inferred schema metadata from MongoDB catalog"
     );
     data_components::metadata_enriched_table_provider(
         provider,
@@ -810,9 +799,6 @@ impl DataConnector for MongoDB {
         &self,
         federated_table: Arc<FederatedTable>,
         dataset: &Dataset,
-        _accelerated_table_provider: Arc<dyn TableProvider>,
-        _accelerator_write_mutex: Arc<tokio::sync::Mutex<()>>,
-        _cpu_runtime: Option<tokio::runtime::Handle>,
     ) -> Option<data_components::cdc::ChangesStream> {
         Some(changes::build_changes_stream(
             Arc::clone(&self.pool),

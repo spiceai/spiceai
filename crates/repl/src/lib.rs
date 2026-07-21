@@ -1149,8 +1149,7 @@ fn display_grpc_error(err: &Status) {
         ),
         Code::DeadlineExceeded => (
             "Timeout",
-            "Query exceeded time limit. Optimize query or increase timeout if configurable."
-                .to_string(),
+            "Query exceeded time limit. Optimize query or increase query timeout.".to_string(),
         ),
         Code::Unauthenticated => (
             "Authentication Failed",

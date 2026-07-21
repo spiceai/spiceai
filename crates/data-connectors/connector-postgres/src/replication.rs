@@ -633,7 +633,12 @@ fn replication_params_from_connector_params(
     let host = required_string(params, "host")?;
     let port = optional_parse::<u16>(params, "port", 5432, "a port number (0-65535)")?;
     let user = required_string(params, "user")?;
-    let password_str = required_secret(params, "pass")?;
+    // Optional, mirroring the connection pool (`pg_pass` is `.secret()` but not
+    // `.required()`): the replication connection uses the same credentials as
+    // the bootstrap/pool connection against the same server, so a source that
+    // accepts a passwordless connection (e.g. `trust` auth) must not be forced
+    // to set `pg_pass` here when bootstrap already connected without one.
+    let password_str = optional_string(params, "pass").unwrap_or_default();
     let database = required_string(params, "db")?;
     let sslmode =
         config::SslMode::from_str_strict(optional_string(params, "sslmode").as_deref())
@@ -718,13 +723,6 @@ fn required_string(params: &Parameters, key: &str) -> std::result::Result<String
     }
 }
 
-fn required_secret(params: &Parameters, key: &str) -> std::result::Result<String, String> {
-    match params.get(key).expose() {
-        ExposedParamLookup::Present(v) => Ok(v.to_string()),
-        ExposedParamLookup::Absent(name) => Err(format!("missing required secret `{name}`")),
-    }
-}
-
 fn optional_string(params: &Parameters, key: &str) -> Option<String> {
     match params.get(key).expose() {
         ExposedParamLookup::Present(v) => Some(v.to_string()),
@@ -797,12 +795,12 @@ fn optional_bool(
 ///
 /// - `Auto` -> `(true, false)`: snapshot a freshly-created slot; the caller still
 ///   forces a resume snapshot for a non-persistent accelerator.
-/// - `Enabled` -> `(true, true)`: snapshot on every start, including slot resume.
+/// - `Always` -> `(true, true)`: snapshot on every start, including slot resume.
 /// - `Disabled` -> `(false, false)`: never snapshot.
 fn snapshot_flags(mode: InitialSnapshotMode) -> (bool, bool) {
     match mode {
         InitialSnapshotMode::Auto => (true, false),
-        InitialSnapshotMode::Enabled => (true, true),
+        InitialSnapshotMode::Always => (true, true),
         InitialSnapshotMode::Disabled => (false, false),
     }
 }

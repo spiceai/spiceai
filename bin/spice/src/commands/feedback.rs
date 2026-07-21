@@ -40,7 +40,7 @@ pub fn execute(_args: &FeedbackArgs) -> Result<()> {
     println!("\n  {FEEDBACK_URL}\n");
     println!("If the browser does not open, visit the URL above manually.");
 
-    let _ = open::that(FEEDBACK_URL);
+    let _ = system_open::that(FEEDBACK_URL);
 
     Ok(())
 }
