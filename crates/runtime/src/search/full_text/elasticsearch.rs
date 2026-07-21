@@ -37,7 +37,7 @@ use crate::component::{
 };
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::federated_table::FederatedTable;
-use crate::search::full_text::table::add_elasticsearch_fts_to_table;
+use crate::search::full_text::table::add_compound_fts_to_table;
 use crate::search::util::find_concrete_table_provider;
 use runtime_metrics::component::MetricsProvider;
 use runtime_secrets::Secrets;
@@ -168,7 +168,7 @@ impl DataConnector for ElasticsearchFullTextConnector {
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let inner = self.inner_connector.read_provider(dataset).await?;
-        add_elasticsearch_fts_to_table(inner, &dataset.columns, &dataset.name, &self.fts_params)
+        add_compound_fts_to_table(inner, &dataset.columns, &dataset.name, &self.fts_params)
             .await
             .map(|idx| Arc::new(idx) as Arc<dyn TableProvider>)
             .map_err(|e| DataConnectorError::InvalidConfiguration {
@@ -185,20 +185,15 @@ impl DataConnector for ElasticsearchFullTextConnector {
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         match self.inner_connector.read_write_provider(dataset).await {
             Some(Ok(inner)) => Some(
-                add_elasticsearch_fts_to_table(
-                    inner,
-                    &dataset.columns,
-                    &dataset.name,
-                    &self.fts_params,
-                )
-                .await
-                .map(|idx| Arc::new(idx) as Arc<dyn TableProvider>)
-                .map_err(|e| DataConnectorError::InvalidConfiguration {
-                    dataconnector: dataset.source().to_string(),
-                    message: e.to_string(),
-                    connector_component: dataset.into(),
-                    source: e,
-                }),
+                add_compound_fts_to_table(inner, &dataset.columns, &dataset.name, &self.fts_params)
+                    .await
+                    .map(|idx| Arc::new(idx) as Arc<dyn TableProvider>)
+                    .map_err(|e| DataConnectorError::InvalidConfiguration {
+                        dataconnector: dataset.source().to_string(),
+                        message: e.to_string(),
+                        connector_component: dataset.into(),
+                        source: e,
+                    }),
             ),
             Some(Err(e)) => Some(Err(e)),
             None => None,

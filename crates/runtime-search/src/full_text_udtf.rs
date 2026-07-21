@@ -42,6 +42,8 @@ use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 use futures::FutureExt;
 use search::generation::text_search::index::FullTextDatabaseIndex;
 #[cfg(feature = "elasticsearch")]
+use search::index::compound::CompoundSearchIndex;
+#[cfg(feature = "elasticsearch")]
 use search::index::elasticsearch::ElasticsearchTextIndex;
 use search::{
     index::SearchIndex,
@@ -431,6 +433,58 @@ impl<E: TableProviderExplorer + 'static> TableFunctionImpl for TextSearchTableFu
                 args.tbl
             )));
         };
+
+        // Phase 0: compound (write-through) full-text index — a warm Tantivy primary paired
+        // with an external Elasticsearch secondary. For single-column FTS datasets with an
+        // external store, only the compound is registered, so this arm must precede the
+        // concrete Tantivy and Elasticsearch probes below.
+        #[cfg(feature = "elasticsearch")]
+        if let Some((compound_indexes, _)) = self
+            .explorer
+            .find_index::<CompoundSearchIndex>(&table_provider)
+            && !compound_indexes.is_empty()
+        {
+            // Each compound keys on a single search column (multi-column is out of scope,
+            // tracked in #11963): pick the compound matching the requested column, or the sole
+            // compound when no column argument was supplied.
+            let compound = if let Some(ref requested) = args.column {
+                compound_indexes
+                    .iter()
+                    .find(|c| &c.search_column() == requested)
+                    .copied()
+            } else if compound_indexes.len() == 1 {
+                Some(compound_indexes[0])
+            } else {
+                None
+            };
+            if let Some(compound) = compound {
+                let column = compound.search_column();
+                let udtf_source = UdtfSource::TextSearch {
+                    table: args.tbl.to_string(),
+                    query: args.query.clone(),
+                    column: Some(column),
+                    limit: args.limit,
+                    include_score: args.include_score,
+                };
+                return Ok(Arc::new(
+                    SearchQueryProvider::try_from_index(
+                        &(Arc::new(compound.clone()) as Arc<dyn SearchIndex>),
+                        Arc::clone(&table_provider),
+                        args.query.as_str(),
+                        args.limit,
+                    )?
+                    .with_udtf_source(udtf_source)
+                    .with_include_score(args.include_score.unwrap_or(true))
+                    .call_on_scan(Arc::new(|| {
+                        async {
+                            let request_context = RequestContext::current(AsyncMarker::new().await);
+                            telemetry::track_text_search(&request_context.to_dimensions());
+                        }
+                        .boxed()
+                    })),
+                ));
+            }
+        }
 
         let fts_indexes = self
             .explorer
