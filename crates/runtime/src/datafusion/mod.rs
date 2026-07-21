@@ -40,6 +40,7 @@ use crate::dataaccelerator::{self, BootstrapStatus};
 use crate::dataaccelerator::{AcceleratorEngineRegistry, get_acceleration_layout};
 use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
+use crate::dataconnector::sink::SINK_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::datafusion::query::{Query, registry::QueryCancelRegistry};
@@ -564,6 +565,51 @@ fn engine_to_acceleration_engine(engine: Engine) -> Option<AccelerationEngine> {
         #[cfg(not(windows))]
         Engine::Cayenne => Some(AccelerationEngine::Cayenne),
         _ => None,
+    }
+}
+
+/// The write destination selected for an accelerated, writable dataset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceleratedWriteMode {
+    /// Writes go only to the local accelerator (source is read-only or discards writes).
+    AcceleratorOnly,
+    /// Writes commit to the accelerator first, then reconcile to the federated source.
+    WriteBack,
+    /// Writes go to the federated source; the accelerator catches up via refresh (default).
+    WriteThrough,
+}
+
+/// Decide where an accelerated dataset's writes should go, given its source connector,
+/// access mode, `on_conflict`/CDC configuration, and configured write mode.
+///
+/// The `sink` connector is special: it discards writes and disables refresh, so its
+/// accelerator is never fed by a refresh cycle. Routing sink writes through the default
+/// `WriteThrough` path sends every row to the discarding sink and leaves the accelerated
+/// table stuck "loading initial data" forever — so accelerated `sink:` datasets must write
+/// directly to the accelerator instead.
+fn select_accelerated_write_mode(
+    source: &str,
+    allows_write: bool,
+    has_on_conflict: bool,
+    has_changes_refresh: bool,
+    configured_write_mode: spicepod::acceleration::WriteMode,
+) -> AcceleratedWriteMode {
+    // on_conflict without CDC means the source may be read-only; writes go to the accelerator.
+    if has_on_conflict && !has_changes_refresh {
+        return AcceleratedWriteMode::AcceleratorOnly;
+    }
+
+    if !allows_write {
+        return AcceleratedWriteMode::WriteThrough;
+    }
+
+    if source == SINK_DATACONNECTOR {
+        return AcceleratedWriteMode::AcceleratorOnly;
+    }
+
+    match configured_write_mode {
+        spicepod::acceleration::WriteMode::WriteBack => AcceleratedWriteMode::WriteBack,
+        spicepod::acceleration::WriteMode::WriteThrough => AcceleratedWriteMode::WriteThrough,
     }
 }
 
@@ -2920,24 +2966,29 @@ impl DataFusion {
         // on_conflict forces accelerator-only writes when CDC is not in use. With CDC
         // (refresh_mode: changes), on_conflict is for WAL UPDATE upsert routing only and
         // does not override the write destination — writes follow write_mode instead.
-        if has_on_conflict && !has_changes_refresh {
-            accelerated_table_builder.write_to_accelerator_only();
-        } else if dataset.access().allows_write() {
-            match acceleration_settings.write_mode {
-                spicepod::acceleration::WriteMode::WriteBack => {
-                    accelerated_table_builder.write_back();
-                }
-                spicepod::acceleration::WriteMode::WriteThrough => {
-                    // Source-sync write; the accelerator catches up through the refresh
-                    // mechanism (WAL replication for `refresh_mode: changes`, periodic
-                    // refresh otherwise). `WriteMode::WriteThrough` is the default builder
-                    // state, so no method call is required here.
-                    //
-                    // Note: this is intentionally *not* the dual atomic write path
-                    // (`builder.dual_write()`). That path is reserved for the Iceberg
-                    // federated catalog cache use case where no refresh stream propagates
-                    // writes to the accelerator. See spiceai/spiceai#10960.
-                }
+        match select_accelerated_write_mode(
+            dataset.source(),
+            dataset.access().allows_write(),
+            has_on_conflict,
+            has_changes_refresh,
+            acceleration_settings.write_mode,
+        ) {
+            AcceleratedWriteMode::AcceleratorOnly => {
+                accelerated_table_builder.write_to_accelerator_only();
+            }
+            AcceleratedWriteMode::WriteBack => {
+                accelerated_table_builder.write_back();
+            }
+            AcceleratedWriteMode::WriteThrough => {
+                // Source-sync write; the accelerator catches up through the refresh
+                // mechanism (WAL replication for `refresh_mode: changes`, periodic
+                // refresh otherwise). `WriteMode::WriteThrough` is the default builder
+                // state, so no method call is required here.
+                //
+                // Note: this is intentionally *not* the dual atomic write path
+                // (`builder.dual_write()`). That path is reserved for the Iceberg
+                // federated catalog cache use case where no refresh stream propagates
+                // writes to the accelerator. See spiceai/spiceai#10960.
             }
         }
 
@@ -5039,6 +5090,84 @@ mod tests {
     use crate::builder::RuntimeBuilder;
 
     use super::*;
+
+    #[test]
+    fn accelerated_sink_dataset_writes_to_accelerator_only() {
+        // Regression: the `sink` connector discards writes and disables refresh, so an
+        // accelerated `sink:` dataset must write directly to the accelerator — otherwise the
+        // default WriteThrough path sends data to the discarding sink and the table never
+        // completes its initial load (stuck "Acceleration not ready; loading initial data").
+        for configured in [
+            spicepod::acceleration::WriteMode::WriteThrough,
+            spicepod::acceleration::WriteMode::WriteBack,
+        ] {
+            assert_eq!(
+                select_accelerated_write_mode(SINK_DATACONNECTOR, true, false, false, configured),
+                AcceleratedWriteMode::AcceleratorOnly,
+                "accelerated sink dataset (configured={configured:?}) must write accelerator-only"
+            );
+        }
+    }
+
+    #[test]
+    fn non_sink_write_mode_selection_is_unchanged() {
+        // A normal federated source keeps its configured write mode.
+        assert_eq!(
+            select_accelerated_write_mode(
+                "postgres",
+                true,
+                false,
+                false,
+                spicepod::acceleration::WriteMode::WriteThrough,
+            ),
+            AcceleratedWriteMode::WriteThrough,
+        );
+        assert_eq!(
+            select_accelerated_write_mode(
+                "postgres",
+                true,
+                false,
+                false,
+                spicepod::acceleration::WriteMode::WriteBack,
+            ),
+            AcceleratedWriteMode::WriteBack,
+        );
+
+        // on_conflict without CDC forces accelerator-only regardless of source.
+        assert_eq!(
+            select_accelerated_write_mode(
+                "postgres",
+                true,
+                true,
+                false,
+                spicepod::acceleration::WriteMode::WriteThrough,
+            ),
+            AcceleratedWriteMode::AcceleratorOnly,
+        );
+        // on_conflict *with* CDC does not force accelerator-only.
+        assert_eq!(
+            select_accelerated_write_mode(
+                "postgres",
+                true,
+                true,
+                true,
+                spicepod::acceleration::WriteMode::WriteThrough,
+            ),
+            AcceleratedWriteMode::WriteThrough,
+        );
+
+        // A read-only dataset stays WriteThrough even for a sink source (no writes routed).
+        assert_eq!(
+            select_accelerated_write_mode(
+                SINK_DATACONNECTOR,
+                false,
+                false,
+                false,
+                spicepod::acceleration::WriteMode::WriteThrough,
+            ),
+            AcceleratedWriteMode::WriteThrough,
+        );
+    }
 
     fn streaming_broadcast_test_batch(value: i32) -> RecordBatch {
         RecordBatch::try_new(
