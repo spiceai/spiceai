@@ -163,6 +163,11 @@ impl Index for MockIndex {
         Ok(())
     }
 
+    async fn delete_by_keys(&self, keys: RecordBatch) -> DataFusionResult<()> {
+        self.record(&format!("delete_by_keys:{}", keys.num_rows()));
+        Ok(())
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -777,4 +782,97 @@ async fn list_primary_only_never_reads_secondary() {
     let (sources, ids) = collect_sources_and_ids(plan).await;
     assert_eq!(sources, vec!["primary".to_string()]);
     assert_eq!(ids, vec![9]);
+}
+
+fn delete_keys_batch(rows: usize) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    #[expect(clippy::cast_possible_wrap, reason = "small test row counts")]
+    let ids: Vec<i64> = (0..rows as i64).collect();
+    RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(ids))]).expect("valid keys batch")
+}
+
+#[tokio::test]
+async fn delete_by_keys_hits_both_primary_and_secondary() {
+    let events = Arc::new(Mutex::new(vec![]));
+    let primary = MockIndex::new("primary", &events);
+    let secondary = MockIndex::new("secondary", &events);
+    let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
+
+    idx.delete_by_keys(delete_keys_batch(2))
+        .await
+        .expect("delete_by_keys succeeds");
+
+    let events = events.lock().expect("event log mutex").clone();
+    assert!(events.contains(&"primary:delete_by_keys:2".to_string()));
+    assert!(events.contains(&"secondary:delete_by_keys:2".to_string()));
+}
+
+#[tokio::test]
+async fn delete_warm_by_keys_hits_only_primary() {
+    let events = Arc::new(Mutex::new(vec![]));
+    let primary = MockIndex::new("primary", &events);
+    let secondary = MockIndex::new("secondary", &events);
+    let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
+
+    idx.delete_warm_by_keys(delete_keys_batch(3))
+        .await
+        .expect("delete_warm_by_keys succeeds");
+
+    let events = events.lock().expect("event log mutex").clone();
+    assert!(events.contains(&"primary:delete_by_keys:3".to_string()));
+    assert!(
+        !events.iter().any(|e| e.starts_with("secondary:delete_by_keys")),
+        "warm-only delete must not reach the secondary/fallback index: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn vector_delete_by_keys_hits_both_primary_and_secondary() {
+    let events = Arc::new(Mutex::new(vec![]));
+    let mut primary = MockIndex::new("primary", &events);
+    primary.dimension = Some(4);
+    let mut secondary = MockIndex::new("secondary", &events);
+    secondary.dimension = Some(4);
+
+    let idx = CompoundVectorIndex::try_new(
+        Arc::new(primary) as Arc<dyn VectorIndex>,
+        Arc::new(secondary) as Arc<dyn VectorIndex>,
+        CompoundReadMode::PrimaryOnly,
+    )
+    .expect("compatible vector indexes");
+
+    idx.delete_by_keys(delete_keys_batch(1))
+        .await
+        .expect("delete_by_keys succeeds");
+
+    let events = events.lock().expect("event log mutex").clone();
+    assert!(events.contains(&"primary:delete_by_keys:1".to_string()));
+    assert!(events.contains(&"secondary:delete_by_keys:1".to_string()));
+}
+
+#[tokio::test]
+async fn vector_delete_warm_by_keys_hits_only_primary() {
+    let events = Arc::new(Mutex::new(vec![]));
+    let mut primary = MockIndex::new("primary", &events);
+    primary.dimension = Some(4);
+    let mut secondary = MockIndex::new("secondary", &events);
+    secondary.dimension = Some(4);
+
+    let idx = CompoundVectorIndex::try_new(
+        Arc::new(primary) as Arc<dyn VectorIndex>,
+        Arc::new(secondary) as Arc<dyn VectorIndex>,
+        CompoundReadMode::PrimaryOnly,
+    )
+    .expect("compatible vector indexes");
+
+    idx.delete_warm_by_keys(delete_keys_batch(1))
+        .await
+        .expect("delete_warm_by_keys succeeds");
+
+    let events = events.lock().expect("event log mutex").clone();
+    assert!(events.contains(&"primary:delete_by_keys:1".to_string()));
+    assert!(
+        !events.iter().any(|e| e.starts_with("secondary:delete_by_keys")),
+        "warm-only delete must not reach the secondary/fallback index: {events:?}"
+    );
 }

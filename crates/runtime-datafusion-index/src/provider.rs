@@ -161,6 +161,22 @@ impl TableProvider for IndexedTableProvider {
         state: &dyn Session,
         filters: Vec<Expr>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        // Resolve-then-delete for every attached index *before* delegating: each index's
+        // `delete_by_predicate` override reads `self.underlying` under `filters` to find its own
+        // matching primary keys, which only works while the matching rows still exist. Best-effort
+        // — an index delete failure is logged, not propagated, so a transient index-side error
+        // never blocks the authoritative row delete below (self-heals via full refresh).
+        for index in &self.indexes {
+            if let Err(e) = index
+                .delete_by_predicate(&self.underlying, state, filters.clone())
+                .await
+            {
+                tracing::error!(
+                    "Index '{}' failed to delete entries for a table delete (best-effort, continuing): {e}",
+                    index.name()
+                );
+            }
+        }
         self.underlying.delete_from(state, filters).await
     }
 

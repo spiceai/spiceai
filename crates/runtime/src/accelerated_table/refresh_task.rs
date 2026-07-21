@@ -196,7 +196,7 @@ struct RefreshStat {
 /// [`IndexedTableProvider`] layer. Kept as a plain fn (not async) so that the
 /// `HashSet<*const ()>` used for dedup never appears inside an async fn and cannot
 /// make the enclosing future non-`Send`.
-fn collect_indexes_from_provider(
+pub(crate) fn collect_indexes_from_provider(
     root: Arc<dyn datafusion::catalog::TableProvider>,
 ) -> Vec<Arc<dyn runtime_datafusion_index::Index + Send + Sync>> {
     use runtime_datafusion_index::IndexedTableProvider;

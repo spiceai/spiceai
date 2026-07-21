@@ -60,6 +60,7 @@ use datafusion::{
 };
 
 mod compute_query;
+mod delete;
 mod write;
 
 #[derive(Debug, Clone)]
@@ -381,6 +382,23 @@ impl Index for S3Vector {
             .into_iter()
             .map(|rb| async { self.write(rb).await.map_err(DataFusionError::External) });
         try_join_all(futs).await
+    }
+
+    async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {
+        delete::delete_by_keys(self, &keys).await
+    }
+
+    async fn delete_by_key_prefix(&self, prefix_keys: RecordBatch) -> Result<(), DataFusionError> {
+        delete::delete_by_key_prefix(self, &prefix_keys).await
+    }
+
+    async fn delete_by_predicate(
+        &self,
+        accelerator: &Arc<dyn datafusion::catalog::TableProvider>,
+        session: &dyn datafusion::catalog::Session,
+        filters: Vec<Expr>,
+    ) -> Result<(), DataFusionError> {
+        crate::index::search_index_delete_by_predicate(self, accelerator, session, filters).await
     }
 }
 

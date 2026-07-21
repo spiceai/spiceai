@@ -39,8 +39,13 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow_schema::{ArrowError, Field, FieldRef, Schema};
-use datafusion::error::DataFusionError;
+use datafusion::{
+    catalog::{Session, TableProvider},
+    error::{DataFusionError, Result as DataFusionResult},
+    prelude::Expr,
+};
 use itertools::Itertools;
+use runtime_datafusion_index::Index;
 use snafu::{ResultExt, Snafu, ensure};
 
 pub use search_index::CompoundSearchIndex;
@@ -277,4 +282,51 @@ async fn compound_on_write_start(
         return Err(secondary_err);
     }
     Ok(())
+}
+
+/// Delete `keys` from both indexes (full/both-scope, per [`Index::delete_by_keys`]'s contract).
+/// Both deletes run concurrently and both are driven to completion even if one fails, matching
+/// [`compound_on_write_start`]'s "neither index left inconsistent" approach.
+async fn compound_delete_by_keys(
+    primary: &dyn Index,
+    secondary: &dyn Index,
+    keys: RecordBatch,
+) -> DataFusionResult<()> {
+    let (primary_result, secondary_result) =
+        futures::join!(primary.delete_by_keys(keys.clone()), secondary.delete_by_keys(keys));
+    primary_result.and(secondary_result)
+}
+
+/// Prefix-key counterpart of [`compound_delete_by_keys`] — fans `prefix_keys` out to both
+/// indexes' own [`Index::delete_by_key_prefix`], rather than the default (which would route
+/// through this type's own `delete_by_keys` override and therefore the wrong, exact-match,
+/// semantics). Needed so a `ChunkedSearchIndex`/`ChunkedVectorIndex` wrapping a compound index
+/// resolves prefix deletes correctly regardless of wrapper nesting order.
+async fn compound_delete_by_key_prefix(
+    primary: &dyn Index,
+    secondary: &dyn Index,
+    prefix_keys: RecordBatch,
+) -> DataFusionResult<()> {
+    let (primary_result, secondary_result) = futures::join!(
+        primary.delete_by_key_prefix(prefix_keys.clone()),
+        secondary.delete_by_key_prefix(prefix_keys)
+    );
+    primary_result.and(secondary_result)
+}
+
+/// Delete entries matching `filters` from both indexes (full/both-scope). Each side resolves the
+/// predicate against `accelerator` independently via its own `delete_by_predicate` override —
+/// compatible because primary and secondary are validated to share identical primary-key fields.
+async fn compound_delete_by_predicate(
+    primary: &dyn Index,
+    secondary: &dyn Index,
+    accelerator: &Arc<dyn TableProvider>,
+    session: &dyn Session,
+    filters: Vec<Expr>,
+) -> DataFusionResult<()> {
+    let (primary_result, secondary_result) = futures::join!(
+        primary.delete_by_predicate(accelerator, session, filters.clone()),
+        secondary.delete_by_predicate(accelerator, session, filters)
+    );
+    primary_result.and(secondary_result)
 }

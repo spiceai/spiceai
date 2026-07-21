@@ -15,15 +15,19 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use std::{any::Any, fmt::Debug};
+use std::{any::Any, fmt::Debug, sync::Arc};
 
 use datafusion::arrow::array::RecordBatch;
+use datafusion::catalog::{Session, TableProvider};
 use datafusion::error::Result;
+use datafusion::prelude::Expr;
 use snafu::prelude::*;
 
 pub mod analyzer;
+mod delete;
 mod provider;
 pub mod util;
+pub use delete::{build_key_match_predicate, resolve_keys_matching_predicate};
 pub use provider::*;
 pub use util::{INDEXED_INNER, InnerProviderFn, find_concrete_table_provider_with};
 
@@ -75,6 +79,52 @@ pub trait Index: Debug + Send + Sync + 'static {
     /// already exists). Not called for CDC writes — those maintain indexes automatically via
     /// `DuckDB` VSS on each insert.
     async fn on_write_complete(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Delete index entries for the given primary-key rows.
+    ///
+    /// Default is a no-op — correct for indexes whose entries live inside the accelerated
+    /// table row itself (co-located; removed automatically when the accelerator deletes the
+    /// row). Implementations backed by a separate store (S3 Vectors, Elasticsearch) must
+    /// override this to remove the corresponding entries there.
+    ///
+    /// Full/both-scope by convention: a wrapper composing several backing indexes (e.g. a
+    /// writethrough+fallback pair) must fan this out to every index it composes.
+    async fn delete_by_keys(&self, keys: RecordBatch) -> Result<()> {
+        let _ = keys;
+        Ok(())
+    }
+
+    /// Delete index entries whose key columns match every column present in `prefix_keys` —
+    /// `prefix_keys`'s own schema names the columns to match on, which may be a strict subset of
+    /// this index's full key.
+    ///
+    /// Default: delegates to [`Index::delete_by_keys`], which is correct whenever an index's full
+    /// key IS the columns callers ever pass (the overwhelming majority of indexes). The one
+    /// exception is a wrapper that augments its inner index's key with extra columns the caller
+    /// never sees (`ChunkedSearchIndex`/`ChunkedVectorIndex`, which add a chunk id) — those
+    /// implementations call `delete_by_key_prefix` on the *inner* index with the outer
+    /// (unaugmented) keys, so the inner index must resolve/delete every entry matching just the
+    /// given columns, regardless of the augmented column's value.
+    async fn delete_by_key_prefix(&self, prefix_keys: RecordBatch) -> Result<()> {
+        self.delete_by_keys(prefix_keys).await
+    }
+
+    /// Delete index entries matching `filters` — the same predicate shape
+    /// [`TableProvider::delete_from`] receives.
+    ///
+    /// Default is a no-op. Implementations that need this (anything with primary keys — i.e.
+    /// nearly everything except a bare co-located index) resolve `filters` to concrete primary
+    /// keys via [`resolve_keys_matching_predicate`], scanning `accelerator` under the original
+    /// predicate *before* any row is actually removed, then call [`Index::delete_by_keys`].
+    async fn delete_by_predicate(
+        &self,
+        accelerator: &Arc<dyn TableProvider>,
+        session: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> Result<()> {
+        let _ = (accelerator, session, filters);
         Ok(())
     }
 

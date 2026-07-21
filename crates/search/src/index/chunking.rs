@@ -2,7 +2,7 @@ use std::{any::Any, sync::Arc};
 
 use crate::{
     SEARCH_SCORE_COLUMN_NAME,
-    index::{SearchIndex, VectorIndex, embedding_col},
+    index::{SearchIndex, VectorIndex, embedding_col, search_index_delete_by_predicate},
     metadata::MetadataColumn,
 };
 
@@ -19,8 +19,9 @@ use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use chunking::Chunker;
 use datafusion::{
+    catalog::{Session, TableProvider},
     common::Column,
-    error::DataFusionError,
+    error::{DataFusionError, Result as DataFusionResult},
     functions_aggregate::expr_fn::{array_agg, first_value},
     logical_expr::{Aggregate, LogicalPlan, Sort, SortExpr, expr::Alias},
     prelude::{Expr, ExprFunctionExt, col},
@@ -97,6 +98,23 @@ impl Index for ChunkedSearchIndex {
 
     async fn on_write_complete(&self) -> Result<(), DataFusionError> {
         self.inner.on_write_complete().await
+    }
+
+    /// `keys` is shaped by [`SearchIndex::primary_fields`], which excludes
+    /// [`CHUNKED_INDEX_CHUNK_KEY`] — so every chunk row for a given outer key must go, not just
+    /// one. Forwarded as a *prefix* delete on `inner` (whose own key includes the chunk id), so
+    /// `inner` is responsible for matching every chunk regardless of chunk id.
+    async fn delete_by_keys(&self, keys: RecordBatch) -> DataFusionResult<()> {
+        self.inner.delete_by_key_prefix(keys).await
+    }
+
+    async fn delete_by_predicate(
+        &self,
+        accelerator: &Arc<dyn TableProvider>,
+        session: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> DataFusionResult<()> {
+        search_index_delete_by_predicate(self, accelerator, session, filters).await
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -763,6 +781,24 @@ impl Index for ChunkedVectorIndex {
 
     async fn on_write_complete(&self) -> Result<(), DataFusionError> {
         self.inner.on_write_complete().await
+    }
+
+    async fn delete_by_keys(&self, keys: RecordBatch) -> DataFusionResult<()> {
+        ChunkedSearchIndex::new(
+            Arc::clone(&self.inner) as Arc<dyn SearchIndex>,
+            Arc::clone(&self.chunker),
+        )
+        .delete_by_keys(keys)
+        .await
+    }
+
+    async fn delete_by_predicate(
+        &self,
+        accelerator: &Arc<dyn TableProvider>,
+        session: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> DataFusionResult<()> {
+        search_index_delete_by_predicate(self, accelerator, session, filters).await
     }
 
     fn as_any(&self) -> &dyn Any {

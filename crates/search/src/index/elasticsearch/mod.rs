@@ -20,6 +20,7 @@ limitations under the License.
 //! with the Spice search pipeline, enabling hybrid search via `vector_search`,
 //! `text_search`, and `rrf` UDTFs.
 
+mod delete;
 mod write;
 
 use std::any::Any;
@@ -469,6 +470,23 @@ impl Index for ElasticsearchIndex {
             .on_write_complete(self.client.as_ref(), &self.es_index)
             .await
     }
+
+    async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {
+        delete::delete_by_keys(self.client.as_ref(), &self.es_index, &keys).await
+    }
+
+    // No `delete_by_key_prefix` override needed: `_delete_by_query` filters by whatever field
+    // values are given, so the default (delegating to `delete_by_keys`) is already correct for
+    // a prefix (subset-of-columns) delete.
+
+    async fn delete_by_predicate(
+        &self,
+        accelerator: &std::sync::Arc<dyn TableProvider>,
+        session: &dyn datafusion::catalog::Session,
+        filters: Vec<datafusion::prelude::Expr>,
+    ) -> Result<(), DataFusionError> {
+        crate::index::search_index_delete_by_predicate(self, accelerator, session, filters).await
+    }
 }
 
 impl ElasticsearchIndex {
@@ -710,6 +728,19 @@ impl Index for ElasticsearchTextIndex {
         self.write_maintenance
             .on_write_complete(self.client.as_ref(), &self.es_index)
             .await
+    }
+
+    async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {
+        delete::delete_by_keys(self.client.as_ref(), &self.es_index, &keys).await
+    }
+
+    async fn delete_by_predicate(
+        &self,
+        accelerator: &std::sync::Arc<dyn TableProvider>,
+        session: &dyn datafusion::catalog::Session,
+        filters: Vec<datafusion::prelude::Expr>,
+    ) -> Result<(), DataFusionError> {
+        crate::index::search_index_delete_by_predicate(self, accelerator, session, filters).await
     }
 }
 
