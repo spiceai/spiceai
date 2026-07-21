@@ -91,6 +91,8 @@ mod json;
 mod cluster_tls_reload;
 #[cfg(feature = "kafka")]
 mod kafka;
+#[cfg(feature = "debezium")]
+mod cdc_ingest;
 mod metadata;
 #[cfg(feature = "mongodb")]
 mod mongo;

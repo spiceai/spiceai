@@ -491,7 +491,7 @@ Dropping or renaming columns in use by Spice will require rebuilding the acceler
 | Schema registry required | Yes (Avro/Protobuf)                          | No — schema derived from Postgres catalog + Spice dataset |
 | Latency                  | Kafka-bound (~100ms+)                        | Commit-driven, typically <100ms                           |
 
-If you are already running Kafka for other reasons, the Debezium path still works via the existing `kafka` / `debezium` connectors. For greenfield Postgres → Spice CDC, prefer this feature.
+If you are already running Kafka for other reasons, the Debezium path still works via the existing `kafka` / `debezium` connectors. For Debezium plugins **without** Kafka, use push ingest (`from: cdc:…` — see [cdc-debezium-ingest.md](./cdc-debezium-ingest.md)). For greenfield Postgres → Spice CDC, prefer this native feature.
 
 ## See also
 

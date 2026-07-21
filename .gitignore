@@ -17,6 +17,7 @@ Makefile.local
 spicepod.yaml
 !test/tpc-bench/tpch-spicepod/spicepod.yaml
 !examples/cosmosdb-connector/spicepod.yaml
+!examples/cdc-debezium-ingest/spicepod.yaml
 !test/spicepods/chbench/local-writeback/spicepod.yaml
 
 target/

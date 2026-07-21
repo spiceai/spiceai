@@ -16,6 +16,7 @@ All criteria must be met for the connector to be considered Alpha. As Alpha sign
 | Databricks (mode: spark_connect) | ✅             | @Sevenannn      |
 | Databricks (mode: sql_warehouse) | ➖             |                 |
 | Debezium                         | ➖             |                 |
+| CDC (Debezium push ingest)       | ➖             |                 |
 | Delta Lake                       | ✅             | @Sevenannn      |
 | Dremio                           | ✅             | @Sevenannn      |
 | DuckDB                           | ✅             | @peasee         |

@@ -155,6 +155,8 @@ macro_rules! register_data_connector {
 // cosmosdb: moved to crates/data-connectors/connector-cosmosdb
 // #[cfg(feature = "cosmosdb")] pub mod cosmosdb;
 #[cfg(feature = "debezium")]
+pub mod cdc_ingest;
+#[cfg(feature = "debezium")]
 pub mod debezium;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
