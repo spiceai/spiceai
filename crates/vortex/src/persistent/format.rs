@@ -49,10 +49,11 @@ use futures::stream;
 use object_store::ObjectMeta;
 use object_store::ObjectStore;
 use vortex::VortexSessionDefault;
+use vortex::arrow::ArrowSessionExt;
+use vortex::arrow::FromArrowType;
 use vortex::dtype::DType;
 use vortex::dtype::Nullability;
 use vortex::dtype::PType;
-use vortex::dtype::arrow::FromArrowType;
 use vortex::error::VortexResult;
 use vortex::expr::stats;
 use vortex::expr::stats::Stat;
@@ -592,7 +593,8 @@ impl FileFormat for VortexFormat {
                             .as_any()
                             .downcast_ref::<CachedVortexMetadata>()
                     {
-                        let inferred_schema = cached_vortex.footer().dtype().to_arrow_schema()?;
+                        let inferred_schema =
+                            session.arrow().to_arrow_schema(cached_vortex.footer().dtype())?;
                         return VortexResult::Ok((object.location, inferred_schema));
                     }
 
@@ -624,7 +626,7 @@ impl FileFormat for VortexFormat {
                     let entry = CachedFileMetadataEntry::new(object.clone(), cached_metadata);
                     cache.put(&object.location, entry);
 
-                    let inferred_schema = vxf.dtype().to_arrow_schema()?;
+                    let inferred_schema = session.arrow().to_arrow_schema(vxf.dtype())?;
                     VortexResult::Ok((object.location, inferred_schema))
                 })
                 .map(|result| -> DFResult<_> {
