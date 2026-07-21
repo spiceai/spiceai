@@ -44,6 +44,9 @@ pub struct Catalog {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<String>,
 
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Params>,
 
@@ -56,6 +59,12 @@ pub struct Catalog {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
+
+    /// Automatically bootstrap and accelerate every table discovered by this
+    /// catalog, with zero per-table configuration. Only `refresh_mode: changes`
+    /// (CDC) is supported today; there is no catalog-level `full` mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceleration: Option<CatalogAcceleration>,
 }
 
 impl Catalog {
@@ -68,10 +77,12 @@ impl Catalog {
             metadata: HashMap::default(),
             access: AccessMode::default(),
             include: Vec::default(),
+            exclude: Vec::default(),
             params: None,
             dataset_params: None,
             depends_on: Vec::default(),
             metrics: None,
+            acceleration: None,
         }
     }
 
@@ -91,10 +102,172 @@ impl WithDependsOn<Catalog> for Catalog {
             metadata: self.metadata.clone(),
             access: self.access.clone(),
             include: self.include.clone(),
+            exclude: self.exclude.clone(),
             params: self.params.clone(),
             dataset_params: self.dataset_params.clone(),
             depends_on: depends_on.to_vec(),
             metrics: self.metrics.clone(),
+            acceleration: self.acceleration.clone(),
         }
+    }
+}
+
+/// Acceleration configuration for an entire [`Catalog`]: bootstraps and
+/// CDC-accelerates every table the catalog connector discovers (subject to
+/// `include`/`exclude`), without per-table configuration.
+///
+/// Every included table must have a primary key — catalog setup fails
+/// naming any table that doesn't, rather than silently skipping it or
+/// falling back to a heavier access pattern. Use `include`/`exclude` to keep
+/// tables without a primary key out of an accelerated catalog's scope.
+///
+/// Deliberately excludes per-table-only concepts (`primary_key`,
+/// `on_conflict`, `indexes`, per-table overrides) — those remain exclusively
+/// on a dataset's own `acceleration` block.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct CatalogAcceleration {
+    #[serde(default)]
+    pub engine: CatalogAccelerationEngine,
+
+    /// Required and explicit: there is no catalog-level default, since the
+    /// only supported value today is `changes` (CDC).
+    pub refresh_mode: CatalogRefreshMode,
+}
+
+/// Accelerator engine used for catalog-wide acceleration. Only `cayenne` is
+/// supported today.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogAccelerationEngine {
+    #[default]
+    Cayenne,
+}
+
+/// Refresh mode for catalog-wide acceleration. Only CDC (`changes`) is
+/// supported today; there is no catalog-level `full` mode.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogRefreshMode {
+    Changes,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yaml;
+
+    fn parse(yaml_str: &str) -> Catalog {
+        yaml::from_str(yaml_str).expect("Failed to parse Catalog")
+    }
+
+    #[test]
+    fn test_catalog_without_acceleration_defaults_to_none() {
+        let catalog = parse(
+            "
+                from: pg
+                name: my_pg
+            ",
+        );
+        assert_eq!(catalog.acceleration, None);
+        assert!(catalog.exclude.is_empty());
+    }
+
+    #[test]
+    fn test_catalog_acceleration_minimal_config_defaults() {
+        let catalog = parse(
+            "
+                from: pg
+                name: my_pg
+                acceleration:
+                  refresh_mode: changes
+            ",
+        );
+        let acceleration = catalog
+            .acceleration
+            .expect("acceleration should be present");
+        assert_eq!(acceleration.engine, CatalogAccelerationEngine::Cayenne);
+        assert_eq!(acceleration.refresh_mode, CatalogRefreshMode::Changes);
+    }
+
+    #[test]
+    fn test_catalog_acceleration_requires_explicit_refresh_mode() {
+        let result = yaml::from_str::<Catalog>(
+            "
+                from: pg
+                name: my_pg
+                acceleration: {}
+            ",
+        );
+        assert!(
+            result.is_err(),
+            "refresh_mode must be required, not defaulted"
+        );
+    }
+
+    #[test]
+    fn test_catalog_acceleration_rejects_unknown_engine() {
+        let result = yaml::from_str::<Catalog>(
+            "
+                from: pg
+                name: my_pg
+                acceleration:
+                  engine: duckdb
+                  refresh_mode: changes
+            ",
+        );
+        assert!(result.is_err(), "only `cayenne` is a supported engine");
+    }
+
+    #[test]
+    fn test_catalog_acceleration_rejects_full_refresh_mode() {
+        let result = yaml::from_str::<Catalog>(
+            "
+                from: pg
+                name: my_pg
+                acceleration:
+                  refresh_mode: full
+            ",
+        );
+        assert!(
+            result.is_err(),
+            "full refresh is out of scope for catalog-level acceleration"
+        );
+    }
+
+    #[test]
+    fn test_catalog_acceleration_rejects_unknown_field() {
+        let result = yaml::from_str::<Catalog>(
+            "
+                from: pg
+                name: my_pg
+                acceleration:
+                  refresh_mode: changes
+                  on_missing_primary_key: skip
+            ",
+        );
+        assert!(
+            result.is_err(),
+            "on_missing_primary_key was removed; missing a primary key is always an error"
+        );
+    }
+
+    #[test]
+    fn test_catalog_include_and_exclude_parse() {
+        let catalog = parse(
+            "
+                from: pg
+                name: my_pg
+                include:
+                  - 'public.*'
+                exclude:
+                  - 'private.*'
+            ",
+        );
+        assert_eq!(catalog.include, vec!["public.*".to_string()]);
+        assert_eq!(catalog.exclude, vec!["private.*".to_string()]);
     }
 }

@@ -848,6 +848,16 @@ impl Default for RuntimeBuilder {
 }
 
 #[cfg(not(feature = "rate-control"))]
+// This build has no persisted rate-control backend, so this stub never awaits.
+// It must stay `async` to match the `rate-control` variant's signature: the sole
+// caller awaits the result unconditionally. The suppression is inherently
+// feature-conditional — it exists only in this `cfg(not(rate-control))` variant,
+// exactly the build where the lint fires; under `rate-control` this whole fn is
+// compiled out and the real variant awaits.
+#[expect(
+    clippy::unused_async,
+    reason = "signature parity with the rate-control variant; caller awaits unconditionally"
+)]
 async fn build_http_rate_control_registry(
     source_rate_control: Option<&SpicepodSourceRateControl>,
     secrets: Arc<RwLock<Secrets>>,

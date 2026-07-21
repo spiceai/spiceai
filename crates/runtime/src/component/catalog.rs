@@ -36,6 +36,53 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Acceleration configuration for an entire [`Catalog`]. See
+/// [`spicepod_catalog::CatalogAcceleration`] for the user-facing schema this
+/// mirrors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogAcceleration {
+    pub engine: CatalogAccelerationEngine,
+    pub refresh_mode: CatalogRefreshMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CatalogAccelerationEngine {
+    #[default]
+    Cayenne,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogRefreshMode {
+    Changes,
+}
+
+impl From<spicepod_catalog::CatalogAccelerationEngine> for CatalogAccelerationEngine {
+    fn from(engine: spicepod_catalog::CatalogAccelerationEngine) -> Self {
+        match engine {
+            spicepod_catalog::CatalogAccelerationEngine::Cayenne => {
+                CatalogAccelerationEngine::Cayenne
+            }
+        }
+    }
+}
+
+impl From<spicepod_catalog::CatalogRefreshMode> for CatalogRefreshMode {
+    fn from(refresh_mode: spicepod_catalog::CatalogRefreshMode) -> Self {
+        match refresh_mode {
+            spicepod_catalog::CatalogRefreshMode::Changes => CatalogRefreshMode::Changes,
+        }
+    }
+}
+
+impl From<spicepod_catalog::CatalogAcceleration> for CatalogAcceleration {
+    fn from(acceleration: spicepod_catalog::CatalogAcceleration) -> Self {
+        CatalogAcceleration {
+            engine: acceleration.engine.into(),
+            refresh_mode: acceleration.refresh_mode.into(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Catalog {
     pub provider: String,
@@ -45,8 +92,11 @@ pub struct Catalog {
     pub access: AccessMode,
     pub(crate) orig_include: Vec<String>,
     pub include: Option<GlobSet>,
+    pub(crate) orig_exclude: Vec<String>,
+    pub exclude: Option<GlobSet>,
     pub params: HashMap<String, String>,
     pub dataset_params: HashMap<String, String>,
+    pub acceleration: Option<CatalogAcceleration>,
     pub app: Arc<App>,
     pub runtime: Arc<Runtime>,
 }
@@ -61,8 +111,11 @@ impl std::fmt::Debug for Catalog {
             .field("access", &self.access)
             .field("orig_include", &self.orig_include)
             .field("include", &self.include)
+            .field("orig_exclude", &self.orig_exclude)
+            .field("exclude", &self.exclude)
             .field("params", &self.params)
             .field("dataset_params", &self.dataset_params)
+            .field("acceleration", &self.acceleration)
             .field("app", &self.app)
             .finish_non_exhaustive()
     }
@@ -74,8 +127,10 @@ impl PartialEq for Catalog {
             && self.name == other.name
             && self.access == other.access
             && self.orig_include == other.orig_include
+            && self.orig_exclude == other.orig_exclude
             && self.params == other.params
             && self.dataset_params == other.dataset_params
+            && self.acceleration == other.acceleration
     }
 }
 
@@ -154,36 +209,43 @@ pub struct CatalogBuilder {
     pub access: AccessMode,
     orig_include: Vec<String>,
     pub include: Option<GlobSet>,
+    orig_exclude: Vec<String>,
+    pub exclude: Option<GlobSet>,
     pub params: HashMap<String, String>,
     pub dataset_params: HashMap<String, String>,
+    pub acceleration: Option<CatalogAcceleration>,
     pub app: Option<Arc<App>>,
     pub runtime: Option<Arc<Runtime>>,
+}
+
+#[expect(clippy::result_large_err)]
+fn compile_globset(patterns: &[String]) -> std::result::Result<Option<GlobSet>, crate::Error> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+
+    let mut globset_builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        let glob = Glob::new(pattern).context(crate::InvalidGlobPatternSnafu { pattern })?;
+        globset_builder.add(glob);
+    }
+
+    Ok(Some(
+        globset_builder
+            .build()
+            .context(crate::ErrorConvertingGlobSetToRegexSnafu)?,
+    ))
 }
 
 impl TryFrom<spicepod_catalog::Catalog> for CatalogBuilder {
     type Error = crate::Error;
 
-    #[expect(clippy::result_large_err)]
     fn try_from(catalog: spicepod_catalog::Catalog) -> std::result::Result<Self, Self::Error> {
         let provider = Catalog::provider(&catalog.from);
         let catalog_id = Catalog::catalog_id(&catalog.from).map(String::from);
 
-        let mut globset_opt: Option<GlobSet> = None;
-        if !catalog.include.is_empty() {
-            let mut globset_builder = GlobSetBuilder::new();
-            let include_iter = catalog.include.iter().map(|pattern| {
-                Glob::new(pattern).context(crate::InvalidGlobPatternSnafu { pattern })
-            });
-            for glob in include_iter {
-                globset_builder.add(glob?);
-            }
-
-            globset_opt = Some(
-                globset_builder
-                    .build()
-                    .context(crate::ErrorConvertingGlobSetToRegexSnafu)?,
-            );
-        }
+        let include = compile_globset(&catalog.include)?;
+        let exclude = compile_globset(&catalog.exclude)?;
 
         validate_identifier(&catalog.name).context(crate::ComponentSnafu)?;
 
@@ -198,6 +260,27 @@ impl TryFrom<spicepod_catalog::Catalog> for CatalogBuilder {
             });
         }
 
+        // Catalog-level acceleration is only implemented for the `pg`
+        // provider (see `catalogconnector::postgres_accelerated`) -- every
+        // other provider's connector ignores `catalog.acceleration`
+        // entirely, which would otherwise silently no-op a user's config.
+        // Feature-gated: without the `postgres` feature the `pg` catalog
+        // connector isn't compiled in at all, so no provider supports catalog
+        // acceleration and any `acceleration` config is rejected.
+        #[cfg(feature = "postgres")]
+        let acceleration_supported = provider == crate::catalogconnector::postgres::PREFIX;
+        #[cfg(not(feature = "postgres"))]
+        let acceleration_supported = false;
+
+        if catalog.acceleration.is_some() && !acceleration_supported {
+            return Err(crate::Error::ComponentError {
+                source: super::Error::CatalogAccelerationUnsupportedProvider {
+                    name: catalog.name.clone(),
+                    provider: provider.to_string(),
+                },
+            });
+        }
+
         Ok(CatalogBuilder {
             provider: provider.to_string(),
             catalog_id,
@@ -205,7 +288,9 @@ impl TryFrom<spicepod_catalog::Catalog> for CatalogBuilder {
             name: catalog.name,
             access: AccessMode::from(catalog.access),
             orig_include: catalog.include.clone(),
-            include: globset_opt,
+            include,
+            orig_exclude: catalog.exclude.clone(),
+            exclude,
             params: catalog
                 .params
                 .as_ref()
@@ -216,6 +301,7 @@ impl TryFrom<spicepod_catalog::Catalog> for CatalogBuilder {
                 .as_ref()
                 .map(Params::as_string_map)
                 .unwrap_or_default(),
+            acceleration: catalog.acceleration.map(CatalogAcceleration::from),
             app: None,
             runtime: None,
         })
@@ -246,8 +332,11 @@ impl CatalogBuilder {
             access: AccessMode::default(),
             orig_include: Vec::default(),
             include: None,
+            orig_exclude: Vec::default(),
+            exclude: None,
             params: HashMap::default(),
             dataset_params: HashMap::default(),
+            acceleration: None,
             app: None,
             runtime: None,
         })
@@ -283,12 +372,102 @@ impl CatalogBuilder {
             access: self.access,
             orig_include: self.orig_include,
             include: self.include,
+            orig_exclude: self.orig_exclude,
+            exclude: self.exclude,
             params: self.params,
             dataset_params: self.dataset_params,
+            acceleration: self.acceleration,
             app,
             runtime,
         };
 
         Ok(catalog)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spicepod_catalog(
+        include: &[&str],
+        exclude: &[&str],
+        acceleration: Option<spicepod_catalog::CatalogAcceleration>,
+    ) -> spicepod_catalog::Catalog {
+        spicepod_catalog::Catalog {
+            from: "pg".to_string(),
+            name: "my_pg".to_string(),
+            description: None,
+            metadata: HashMap::default(),
+            access: spicepod::component::access::AccessMode::default(),
+            include: include.iter().map(ToString::to_string).collect(),
+            exclude: exclude.iter().map(ToString::to_string).collect(),
+            params: None,
+            dataset_params: None,
+            depends_on: Vec::default(),
+            metrics: None,
+            acceleration,
+        }
+    }
+
+    #[test]
+    fn test_try_from_without_acceleration() {
+        let builder =
+            CatalogBuilder::try_from(spicepod_catalog(&[], &[], None)).expect("should build");
+        assert_eq!(builder.acceleration, None);
+        assert!(builder.include.is_none());
+        assert!(builder.exclude.is_none());
+    }
+
+    #[test]
+    fn test_try_from_compiles_include_and_exclude_globsets() {
+        let builder =
+            CatalogBuilder::try_from(spicepod_catalog(&["public.*"], &["private.*"], None))
+                .expect("should build");
+
+        let include = builder.include.expect("include globset should be built");
+        assert!(include.is_match("public.orders"));
+        assert!(!include.is_match("private.secrets"));
+
+        let exclude = builder.exclude.expect("exclude globset should be built");
+        assert!(exclude.is_match("private.secrets"));
+        assert!(!exclude.is_match("public.orders"));
+    }
+
+    #[test]
+    fn test_try_from_maps_acceleration() {
+        let acceleration = spicepod_catalog::CatalogAcceleration {
+            engine: spicepod_catalog::CatalogAccelerationEngine::Cayenne,
+            refresh_mode: spicepod_catalog::CatalogRefreshMode::Changes,
+        };
+
+        let builder = CatalogBuilder::try_from(spicepod_catalog(&[], &[], Some(acceleration)))
+            .expect("should build");
+
+        let mapped = builder.acceleration.expect("acceleration should be mapped");
+        assert_eq!(mapped.engine, CatalogAccelerationEngine::Cayenne);
+        assert_eq!(mapped.refresh_mode, CatalogRefreshMode::Changes);
+    }
+
+    #[test]
+    fn test_try_from_rejects_acceleration_for_unsupported_provider() {
+        let acceleration = spicepod_catalog::CatalogAcceleration {
+            engine: spicepod_catalog::CatalogAccelerationEngine::Cayenne,
+            refresh_mode: spicepod_catalog::CatalogRefreshMode::Changes,
+        };
+        let mut catalog = spicepod_catalog(&[], &[], Some(acceleration));
+        catalog.from = "mysql".to_string();
+
+        let result = CatalogBuilder::try_from(catalog);
+        assert!(
+            result.is_err(),
+            "acceleration on a provider other than 'pg' should be rejected, not silently ignored"
+        );
+    }
+
+    #[test]
+    fn test_try_from_rejects_invalid_glob_pattern() {
+        let result = CatalogBuilder::try_from(spicepod_catalog(&["["], &[], None));
+        assert!(result.is_err(), "malformed glob pattern should fail");
     }
 }

@@ -38,6 +38,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use snafu::prelude::*;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -1116,28 +1117,11 @@ impl MessageBatchCommitter {
         consumer: &'static KafkaConsumer,
         messages: &[KafkaMessage<'_, K, V>],
     ) -> Self {
-        let mut max_offsets: HashMap<(String, i32), i64> = HashMap::new();
-
-        for msg in messages {
-            let key = (msg.topic().to_string(), msg.partition());
-            max_offsets
-                .entry(key)
-                .and_modify(|existing| {
-                    if msg.offset() > *existing {
-                        *existing = msg.offset();
-                    }
-                })
-                .or_insert(msg.offset());
-        }
-
-        let offsets = max_offsets
-            .into_iter()
-            .map(|((topic, partition), offset)| KafkaOffset {
-                topic,
-                partition,
-                offset,
-            })
-            .collect();
+        let offsets = max_kafka_offsets(
+            messages
+                .iter()
+                .map(|msg| (msg.topic(), msg.partition(), msg.offset())),
+        );
 
         Self {
             consumer,
@@ -1151,28 +1135,11 @@ impl MessageBatchCommitter {
         consumer: &'static KafkaConsumer,
         messages: &[BorrowedMessage<'_>],
     ) -> Self {
-        let mut max_offsets: HashMap<(String, i32), i64> = HashMap::new();
-
-        for msg in messages {
-            let key = (msg.topic().to_string(), msg.partition());
-            max_offsets
-                .entry(key)
-                .and_modify(|existing| {
-                    if msg.offset() > *existing {
-                        *existing = msg.offset();
-                    }
-                })
-                .or_insert(msg.offset());
-        }
-
-        let offsets = max_offsets
-            .into_iter()
-            .map(|((topic, partition), offset)| KafkaOffset {
-                topic,
-                partition,
-                offset,
-            })
-            .collect();
+        let offsets = max_kafka_offsets(
+            messages
+                .iter()
+                .map(|msg| (msg.topic(), msg.partition(), msg.offset())),
+        );
 
         Self {
             consumer,
@@ -1330,7 +1297,8 @@ fn messages_to_change_batch(
         return values_to_change_batch(values.iter(), Some(delimiter), schema);
     }
 
-    payloads_to_change_batch(payloads.into_iter(), schema)
+    // Prefer raw payload bytes when flatten is unused (no Value round-trip).
+    payloads_to_change_batch(&payloads, schema)
 }
 
 fn message_payload<'a>(message: &'a BorrowedMessage<'_>) -> Result<&'a [u8], cdc::StreamError> {
@@ -1343,8 +1311,77 @@ fn message_payload<'a>(message: &'a BorrowedMessage<'_>) -> Result<&'a [u8], cdc
     })
 }
 
-fn payloads_to_change_batch<'a>(
-    payloads: impl Iterator<Item = &'a [u8]>,
+/// Track max offset per partition for a message batch.
+///
+/// Single-topic batches (the common case for [`KafkaConsumer::subscribe`]) key
+/// by partition only and allocate the topic `String` once. Multi-topic batches
+/// intern each distinct topic `&str` once, allocating owned strings only when
+/// building the final [`KafkaOffset`] list.
+fn max_kafka_offsets<'a>(
+    messages: impl IntoIterator<Item = (&'a str, i32, i64)>,
+) -> Vec<KafkaOffset> {
+    let messages: Vec<(&str, i32, i64)> = messages.into_iter().collect();
+    if messages.is_empty() {
+        return Vec::new();
+    }
+
+    let first_topic = messages[0].0;
+    let single_topic = messages.iter().all(|(topic, _, _)| *topic == first_topic);
+
+    if single_topic {
+        let mut max_by_partition: HashMap<i32, i64> = HashMap::new();
+        for (_, partition, offset) in &messages {
+            max_by_partition
+                .entry(*partition)
+                .and_modify(|existing| {
+                    if *offset > *existing {
+                        *existing = *offset;
+                    }
+                })
+                .or_insert(*offset);
+        }
+        let topic = first_topic.to_string();
+        return max_by_partition
+            .into_iter()
+            .map(|(partition, offset)| KafkaOffset {
+                topic: topic.clone(),
+                partition,
+                offset,
+            })
+            .collect();
+    }
+
+    let mut topic_names: Vec<&str> = Vec::new();
+    let mut max_offsets: HashMap<(usize, i32), i64> = HashMap::new();
+    for (topic, partition, offset) in &messages {
+        let topic_idx = if let Some(idx) = topic_names.iter().position(|t| t == topic) {
+            idx
+        } else {
+            topic_names.push(*topic);
+            topic_names.len() - 1
+        };
+        max_offsets
+            .entry((topic_idx, *partition))
+            .and_modify(|existing| {
+                if *offset > *existing {
+                    *existing = *offset;
+                }
+            })
+            .or_insert(*offset);
+    }
+
+    max_offsets
+        .into_iter()
+        .map(|((topic_idx, partition), offset)| KafkaOffset {
+            topic: topic_names[topic_idx].to_string(),
+            partition,
+            offset,
+        })
+        .collect()
+}
+
+fn payloads_to_change_batch(
+    payloads: &[&[u8]],
     schema: &Arc<Schema>,
 ) -> Result<ChangeBatch, cdc::StreamError> {
     // Fast path (no flatten): feed the raw JSON payload bytes straight to the
@@ -1353,20 +1390,23 @@ fn payloads_to_change_batch<'a>(
     // arrow-json accepts both newline-delimited and whitespace-separated JSON
     // values, so joining payloads with '\n' is safe even when a producer emits
     // pretty-printed (multi-line) objects.
-    let mut joined: Vec<u8> = Vec::new();
-    let mut count: usize = 0;
-    for payload in payloads {
-        if !joined.is_empty() {
-            joined.push(b'\n');
-        }
-        joined.extend_from_slice(payload);
-        count += 1;
-    }
-
-    if count == 0 {
+    if payloads.is_empty() {
         return Err(cdc::StreamError::Arrow(
             "No Kafka message payload found in batch".to_string(),
         ));
+    }
+
+    let capacity = payloads
+        .iter()
+        .map(|p| p.len())
+        .sum::<usize>()
+        .saturating_add(payloads.len().saturating_sub(1));
+    let mut joined = Vec::with_capacity(capacity);
+    for (i, payload) in payloads.iter().enumerate() {
+        if i > 0 {
+            joined.push(b'\n');
+        }
+        joined.extend_from_slice(payload);
     }
 
     json_bytes_to_change_batch(&joined, schema)
@@ -1377,14 +1417,32 @@ fn values_to_change_batch<'a>(
     flatten_json: Option<&String>,
     schema: &Arc<Schema>,
 ) -> Result<ChangeBatch, cdc::StreamError> {
-    // Build newline-delimited JSON from all values
-    let json_values = values
-        .map(|value| match flatten_json {
-            Some(delimiter) => dataformat_json::flatten_json_obj(value, delimiter).to_string(),
-            None => value.to_string(),
-        })
-        .collect::<Vec<_>>();
-    let json_str = json_values.join("\n");
+    // Stream serialized values into one NDJSON buffer (no intermediate Vec + join).
+    let (lower, upper) = values.size_hint();
+    let estimate = upper.unwrap_or(lower);
+    let mut json_str = String::with_capacity(estimate.saturating_mul(64));
+    let mut count = 0usize;
+    for value in values {
+        if count > 0 {
+            json_str.push('\n');
+        }
+        match flatten_json {
+            Some(delimiter) => {
+                let flattened = dataformat_json::flatten_json_obj(value, delimiter);
+                let _ = write!(json_str, "{flattened}");
+            }
+            None => {
+                let _ = write!(json_str, "{value}");
+            }
+        }
+        count += 1;
+    }
+
+    if count == 0 {
+        return Err(cdc::StreamError::Arrow(
+            "No Kafka message payload found in batch".to_string(),
+        ));
+    }
 
     json_bytes_to_change_batch(json_str.as_bytes(), schema)
 }
@@ -1430,7 +1488,7 @@ pub mod bench_wrappers {
         payloads: &[&[u8]],
         schema: &Arc<Schema>,
     ) -> Result<ChangeBatch, cdc::StreamError> {
-        payloads_to_change_batch(payloads.iter().copied(), schema)
+        payloads_to_change_batch(payloads, schema)
     }
 
     /// Legacy round-trip path: bytes -> serde_json::Value -> to_string() -> Arrow.
@@ -1614,8 +1672,7 @@ mod tests {
             "name": "bob"
         }"#;
 
-        let result =
-            payloads_to_change_batch([first.as_slice(), second.as_slice()].into_iter(), &schema);
+        let result = payloads_to_change_batch(&[first.as_slice(), second.as_slice()], &schema);
 
         assert!(result.is_ok());
         let batch = result.expect("batch");
@@ -1631,7 +1688,10 @@ mod tests {
 
         match result {
             Err(cdc::StreamError::Arrow(msg)) => {
-                assert!(msg.contains("No record batch found"));
+                assert!(
+                    msg.contains("No Kafka message payload found"),
+                    "unexpected error: {msg}"
+                );
             }
             _ => panic!("Expected Arrow error"),
         }
@@ -1665,14 +1725,14 @@ mod tests {
         };
 
         // direct (this PR's fast path), number form
-        let direct_num = payloads_to_change_batch([raw_num.as_slice()].into_iter(), &schema)
-            .expect("direct num");
+        let direct_num =
+            payloads_to_change_batch(&[raw_num.as_slice()], &schema).expect("direct num");
         // current round-trip path, number form
         let v_num = serde_json::from_slice::<Value>(raw_num).expect("parse num");
         let rt_num = values_to_change_batch([v_num].iter(), None, &schema).expect("roundtrip num");
         // direct, string form (decimal-as-string control)
-        let direct_str = payloads_to_change_batch([raw_str.as_slice()].into_iter(), &schema)
-            .expect("direct str");
+        let direct_str =
+            payloads_to_change_batch(&[raw_str.as_slice()], &schema).expect("direct str");
 
         eprintln!("[decimal-precision] exact          = {exact}");
         eprintln!("[decimal-precision] direct(num)     = {}", amt(&direct_num));

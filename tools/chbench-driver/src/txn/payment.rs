@@ -22,6 +22,7 @@ limitations under the License.
 use std::time::SystemTime;
 
 use ::rand::{Rng, RngExt};
+use rust_decimal::Decimal;
 use tokio_postgres::Client;
 
 use super::TerminalAssignment;
@@ -40,7 +41,11 @@ pub async fn run(
 ) -> Result<()> {
     let w_id = assignment.home_w_id;
     let d_id = rng.random_range(assignment.district_lo..=assignment.district_hi);
-    let h_amount: f64 = f64::from(rng.random_range(100..=500_000)) / 100.0;
+    // Exact cents/100 (same i32 RNG draw as before). c_ytd_payment is DOUBLE, so
+    // it needs an f64 bind; the NUMERIC columns take the Decimal.
+    let h_cents: i32 = rng.random_range(100..=500_000);
+    let h_amount = Decimal::new(i64::from(h_cents), 2);
+    let h_amount_f64 = f64::from(h_cents) / 100.0;
 
     // 60% by last name, 40% by customer ID (spec 2.5.1.2)
     let by_name = rng.random_range(0..100) < 60;
@@ -191,7 +196,7 @@ pub async fn run(
             &stmts.update_customer_with_data,
             &[
                 &h_amount,
-                &h_amount,
+                &h_amount_f64,
                 &new_data,
                 &customer_wh,
                 &customer_dist,
@@ -206,7 +211,13 @@ pub async fn run(
     } else {
         tx.execute(
             &stmts.update_customer,
-            &[&h_amount, &h_amount, &customer_wh, &customer_dist, &c_id],
+            &[
+                &h_amount,
+                &h_amount_f64,
+                &customer_wh,
+                &customer_dist,
+                &c_id,
+            ],
         )
         .await
         .map_err(|source| crate::Error::Sql {

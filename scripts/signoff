@@ -8,6 +8,11 @@
 # your sign-off and lets the PR into the merge queue, where the *full* suite of
 # tests and checks runs as the real gate.
 #
+# Pure reverts skip this entirely: a PR that only reverts commits already on the
+# base branch passes the Attestation check automatically (validated in pr.yml),
+# since the merge queue still re-runs the full suite on the merged result. See
+# docs/dev/ci_signoff.md ("Reverts are fast-tracked").
+#
 # This is Spice's take on 37signals' approach of moving CI back to developer
 # machines (https://world.hey.com/dhh/we-re-moving-continuous-integration-back-to-developer-machines-3ac6c611),
 # modeled on their open-source tool basecamp/gh-signoff. The twist: local
@@ -26,11 +31,22 @@
 # Environment:
 #   SIGNOFF_BRANCH    Branch/ruleset to target for install/check (default: trunk)
 #   SIGNOFF_REMOTE    Git remote to use in a JJ workspace (default: origin)
+#   SIGNOFF_ACTOR     Attribution login (remote workflow sets this to the
+#                     human who dispatched the run; defaults to gh/git user)
+#   SIGNOFF_REMOTE_RUN  Set by .github/workflows/signoff.yml — pending/failure
+#                     statuses, "via remote" description, GitHub step summary
 #   SIGNOFF_DEBUG     Set to any value for verbose debug logging
+#   SIGNOFF_SKIP_TARGETED_LINT  Set to any value to skip the branch-scoped pre-lint
+#
+# Targeted pre-lint always diffs against trunk (not configurable).
+#
+# Remote (self-hosted runner) alternative to local `make signoff`:
+#   make signoff-remote                  # gh workflow run signoff.yml for HEAD branch
+#   gh workflow run signoff.yml -f branch=<branch>
 
 set -euo pipefail
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.2.0"
 # Fixed, not configurable: it must match the hardcoded context the Attestation
 # workflow (pr.yml) looks for, so an env override would silently break the gate.
 readonly STATUS_CONTEXT="signoff"
@@ -39,6 +55,13 @@ readonly TARGET_REMOTE="${SIGNOFF_REMOTE:-origin}"
 DEBUG="${SIGNOFF_DEBUG:-}"
 VCS=""
 JJ_REMOTE_URL=""
+# Packages excluded from workspace lint (must match Makefile lint-rust excludes).
+readonly LINT_EXCLUDED_PACKAGES="libnfs lopdf ttf-parser pdf-extract"
+
+# True when running under the Remote Sign-off workflow. Drives pending/failure
+# statuses, "via remote" descriptions, and the GitHub Actions step summary.
+# GITHUB_ACTIONS alone is not enough — other workflows must not inherit this.
+is_remote_run() { [[ -n "${SIGNOFF_REMOTE_RUN:-}" ]]; }
 
 # The single source of truth for the checks required to merge. `install` writes
 # exactly this list into the trunk ruleset's required status checks. Every name
@@ -219,20 +242,271 @@ ensure_clean_and_pushed() {
   fi
 }
 
+# --- branch → package mapping (targeted pre-lint) ----------------------------
+
+# Targeted pre-lint always diffs against trunk (fixed, not configurable).
+readonly LINT_BASE_BRANCH="trunk"
+
+# Resolve trunk to a local git/jj ref usable with merge-base / jj diff.
+# Fails if the ref isn't present locally (caller may fall back to API).
+resolve_local_trunk_ref() {
+  if [[ "$VCS" == "jj" ]]; then
+    if jj --color=never --no-pager log \
+      -r "remote_bookmarks(exact:\"${LINT_BASE_BRANCH}\", remote=exact:\"${TARGET_REMOTE}\")" \
+      --no-graph -T 'commit_id' -n 1 >/dev/null 2>&1; then
+      echo "${LINT_BASE_BRANCH}@${TARGET_REMOTE}"
+      return 0
+    fi
+    if jj --color=never --no-pager log -r "bookmarks(exact:\"${LINT_BASE_BRANCH}\")" \
+      --no-graph -T 'commit_id' -n 1 >/dev/null 2>&1; then
+      echo "$LINT_BASE_BRANCH"
+      return 0
+    fi
+    return 1
+  fi
+
+  if git rev-parse --verify "refs/remotes/${TARGET_REMOTE}/${LINT_BASE_BRANCH}" >/dev/null 2>&1; then
+    echo "${TARGET_REMOTE}/${LINT_BASE_BRANCH}"
+    return 0
+  fi
+  if git rev-parse --verify "refs/heads/${LINT_BASE_BRANCH}" >/dev/null 2>&1; then
+    echo "$LINT_BASE_BRANCH"
+    return 0
+  fi
+  return 1
+}
+
+# GitHub compare API — works on shallow clones where merge-base is unavailable.
+# Prints one filename per line. Returns non-zero if the API call fails or the
+# compare is truncated beyond usefulness (caller skips targeted lint).
+github_compare_files() {
+  local head_sha="$1"
+  local repo payload
+
+  repo=$(repo_slug) || return 1
+
+  # three-dot compare: merge-base of trunk...head → head (same as a PR diff).
+  # GitHub caps the files list at 300; when truncated, skip targeted pre-lint
+  # rather than linting an incomplete package set.
+  # Emit: first line "true"/"false" (truncated), then one filename per line.
+  # Keep stderr so auth/rate-limit/network errors from `gh` are visible when
+  # the compare fallback fails (caller still degrades to full workspace lint).
+  payload=$(gh api "repos/${repo}/compare/${LINT_BASE_BRANCH}...${head_sha}" \
+    --jq '(.truncated // false | tostring), (.files[]?.filename // empty)') \
+    || return 1
+
+  local truncated rest
+  truncated="${payload%%$'\n'*}"
+  if [[ "$truncated" == "true" ]]; then
+    debug "GitHub compare is truncated (300+ files) — skipping targeted pre-lint"
+    return 1
+  fi
+  rest="${payload#*$'\n'}"
+  # When there are no files, payload is a single line ("false") and rest==payload.
+  if [[ "$rest" == "$payload" ]]; then
+    return 0
+  fi
+  printf '%s\n' "$rest"
+}
+
+# List paths changed on this branch relative to the merge-base with trunk.
+# With a dirty tree (signoff -f), includes uncommitted working-tree changes when
+# using local git. Falls back to the GitHub compare API on shallow clones
+# (remote sign-off).
+changed_files_vs_trunk() {
+  local revision="$1"
+  local base_ref base_sha head_sha files
+
+  if [[ "$VCS" == "jj" ]]; then
+    if base_ref=$(resolve_local_trunk_ref); then
+      # `jj diff --from A --to B` is the branch delta; working-copy edits on an
+      # empty @ parent are already in `revision` when current_revision selected @.
+      jj --color=never --no-pager diff --from "$base_ref" --to "$revision" --name-only
+      return 0
+    fi
+    debug "JJ trunk not local — trying GitHub compare API"
+    head_sha=$(revision_sha "$revision") || return 1
+    github_compare_files "$head_sha"
+    return
+  fi
+
+  if base_ref=$(resolve_local_trunk_ref) \
+    && base_sha=$(git merge-base HEAD "$base_ref" 2>/dev/null); then
+    # No second revision → working tree vs trunk (covers committed + dirty -f).
+    # Untracked files are invisible to `git diff` but still need package mapping
+    # under `scripts/signoff -f` (dirty tree).
+    {
+      git diff --name-only --diff-filter=ACDMRT "$base_sha"
+      git ls-files --others --exclude-standard
+    } | sort -u
+    return 0
+  fi
+
+  debug "merge-base with trunk unavailable (shallow clone?) — trying GitHub compare API"
+  head_sha=$(git rev-parse HEAD) || return 1
+  files=$(github_compare_files "$head_sha") || return 1
+  printf '%s\n' "$files"
+}
+
+# Map changed file paths (stdin, one per line) to workspace package names.
+# Uses `cargo metadata` so package names match what `-p` expects (including
+# nested members under crates/data-connectors/*).
+packages_for_changed_files() {
+  command -v cargo >/dev/null 2>&1 || fail "cargo not found — required for sign-off checks"
+  # Targeted pre-lint is an optional fail-fast step: without python3, skip it
+  # (return non-zero, caller tolerates) — the full workspace lint still runs.
+  if ! command -v python3 >/dev/null 2>&1; then
+    info "python3 not found — skipping targeted pre-lint (full workspace lint still runs)"
+    return 1
+  fi
+
+  local metadata files
+  # Read paths first — a heredoc would otherwise consume stdin for the program.
+  files=$(cat)
+  [[ -n "${files//[$'\t\n\r ']/}" ]] || return 0
+
+  # Keep stderr so cargo's own error (missing rustc, bad manifest, …) is visible.
+  metadata=$(cargo metadata --no-deps --format-version 1) \
+    || fail "cargo metadata failed — is this a Cargo workspace?"
+
+  # Paths + metadata via env (heredoc is the program source, not stdin data).
+  # Use a different env name than the readonly shell constant — bash rejects
+  # VAR=value command when VAR is readonly, even if the value is unchanged.
+  CHANGED_FILES="$files" PACKAGES_METADATA="$metadata" \
+    SIGNOFF_LINT_EXCLUDED="$LINT_EXCLUDED_PACKAGES" python3 <<'PY'
+import json, os
+from pathlib import Path
+
+meta = json.loads(os.environ["PACKAGES_METADATA"])
+excluded = set(os.environ.get("SIGNOFF_LINT_EXCLUDED", "").split())
+workspace_root = Path(meta["workspace_root"]).resolve()
+
+# Longest package root first so nested members (connector-postgres) win over
+# a parent path if both ever appeared (they shouldn't for exclusive members).
+packages = []
+for p in meta["packages"]:
+    name = p["name"]
+    if name in excluded:
+        continue
+    root = Path(p["manifest_path"]).resolve().parent
+    try:
+        root.relative_to(workspace_root)
+    except ValueError:
+        continue
+    packages.append((str(root) + os.sep, name))
+packages.sort(key=lambda x: len(x[0]), reverse=True)
+
+found = set()
+for raw in os.environ["CHANGED_FILES"].splitlines():
+    path = raw.strip()
+    if not path:
+        continue
+    # Normalize under the workspace for prefix matching. Trailing-sep roots
+    # avoid matching sibling packages that share a prefix (runtime vs
+    # runtime-auth).
+    abs_path = str((workspace_root / path).resolve())
+    for root, name in packages:
+        if abs_path == root.rstrip(os.sep) or abs_path.startswith(root):
+            found.add(name)
+            break
+
+for name in sorted(found):
+    print(name)
+PY
+}
+
+# Resolve workspace packages touched by the current branch vs trunk. Prints a
+# space-separated list, or nothing if there are no package changes.
+changed_workspace_packages() {
+  local revision="$1"
+  local files packages
+
+  info "Diff base for targeted pre-lint: ${LINT_BASE_BRANCH}"
+
+  if ! files=$(changed_files_vs_trunk "$revision"); then
+    info "Could not list changed files vs ${LINT_BASE_BRANCH} — skipping targeted pre-lint"
+    return 0
+  fi
+  if [[ -z "${files//[$'\t\n\r ']/}" ]]; then
+    debug "no changed files vs ${LINT_BASE_BRANCH}"
+    return 0
+  fi
+  debug "changed files:"$'\n'"$files"
+
+  packages=$(printf '%s\n' "$files" | packages_for_changed_files) || true
+  if [[ -z "${packages//[$'\t\n\r ']/}" ]]; then
+    debug "no workspace packages in the changed files"
+    return 0
+  fi
+
+  # Collapse newlines → spaces for `make PACKAGES=…`.
+  echo "$packages" | tr '\n' ' ' | sed 's/[[:space:]]*$//'
+}
+
+# Append a short markdown section to the GitHub Actions job summary (no-op
+# outside Actions, or when the summary file isn't writable).
+append_step_summary() {
+  local text="$1"
+  [[ -n "${GITHUB_STEP_SUMMARY:-}" ]] || return 0
+  printf '%s\n' "$text" >>"$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+}
+
+# Post a commit status for STATUS_CONTEXT. Used for pending/failure on remote
+# runs and the final success attestation.
+post_commit_status() {
+  local repo="$1" sha="$2" state="$3" description="$4"
+  description="${description:0:140}"
+  debug "posting ${STATUS_CONTEXT}=${state} on ${repo}@${sha}: ${description}"
+  gh api --method POST "repos/${repo}/statuses/${sha}" \
+    -f state="$state" \
+    -f context="${STATUS_CONTEXT}" \
+    -f "description=${description}" >/dev/null
+}
+
 # --- commands ----------------------------------------------------------------
 
 # Run the same fast checks the old PR build ran: lint + build + unit tests.
 # The heavier suite (release build, integration, e2e, ...) runs in the merge
 # queue, so it deliberately isn't part of the local sign-off.
 #
+# Fail-fast order:
+#   1. Targeted lint on packages touched by the branch (fast feedback)
+#   2. Full workspace lint (the real gate)
+#   3. CLI build + unit tests
+#
 # Output streams straight to the terminal — call this bare, never `$(run_checks)`,
 # which would capture make's stdout.
 run_checks() {
+  local revision="${1:-}"
+  local packages=""
+
+  if [[ -z "${SIGNOFF_SKIP_TARGETED_LINT:-}" && -n "$revision" ]]; then
+    packages=$(changed_workspace_packages "$revision" || true)
+  fi
+
+  if [[ -n "$packages" ]]; then
+    info "Targeted pre-lint for changed packages: ${packages}"
+    info "  (make lint-rust PACKAGES=\"${packages}\" FEATURES=)"
+    append_step_summary "### Targeted pre-lint"$'\n'"Packages: \`${packages}\`"$'\n'
+    # Package defaults only — workspace features (models, …) are not valid on
+    # every crate. FEATURES= clears any user-exported FEATURES so the Makefile
+    # does not reintroduce a workspace-only set. Full lint below still uses the
+    # complete feature set. Explicit `|| return` so failures short-circuit even
+    # when the caller has temporarily disabled `set -e` (see cmd_signoff).
+    make lint-rust PACKAGES="$packages" FEATURES= || return $?
+    info "Targeted pre-lint passed — running full workspace lint…"
+  else
+    info "No changed workspace packages detected (or targeted lint skipped) — running full workspace lint…"
+    append_step_summary "### Targeted pre-lint"$'\n'"Skipped (no changed workspace packages, or unavailable base/diff)."$'\n'
+  fi
+
   info "Running Rust lint (make lint-rust)…"
-  make lint-rust
+  # Clear PACKAGES/FEATURES so a user-exported env cannot scope or re-feature
+  # the full gate; empty values leave the Makefile on its workspace defaults.
+  make lint-rust PACKAGES= FEATURES= || return $?
 
   info "Building the CLI and running unit tests (make build-cli nextest)…"
-  make build-cli nextest
+  make build-cli nextest || return $?
 }
 
 # After a successful sign-off, the PR's `Attestation` job (pr.yml) only
@@ -299,29 +573,63 @@ cmd_signoff() {
 
   require_tools
 
-  local revision sha user repo description start
+  local revision sha user repo description start via elapsed
   revision=$(current_revision "$force")
   $force || ensure_clean_and_pushed "$revision"
   sha=$(revision_sha "$revision") || fail "could not resolve ${revision}"
-  user=$(gh api user --jq .login 2>/dev/null || local_user_name || echo "unknown")
+  # Remote workflow passes the human who dispatched the run (SIGNOFF_ACTOR).
+  # Otherwise: `gh api user` needs a user-scoped token; under a CI GITHUB_TOKEN
+  # it 403s and can echo the error body to stdout, so accept its result only if
+  # it looks like a GitHub login. Then fall back to the CI actor (set in
+  # Actions) or the VCS-configured name (which may contain spaces — fine for a
+  # description).
+  user="${SIGNOFF_ACTOR:-}"
+  if [[ -z "$user" ]]; then
+    user=$(gh api user --jq .login 2>/dev/null || true)
+    if [[ ! "$user" =~ ^[A-Za-z0-9-]{1,39}$ ]]; then
+      user="${GITHUB_ACTOR:-$(local_user_name 2>/dev/null || true)}"
+    fi
+  fi
+  [[ -n "$user" ]] || user="unknown"
   repo=$(repo_slug)
+  via=""
+  is_remote_run && via=" via remote"
 
   if $verify; then
+    local check_status=0
     start=$(date +%s)
-    run_checks
-    description="Signed off by ${user} — lint+test passed in $(( $(date +%s) - start ))s"
+    if is_remote_run; then
+      post_commit_status "$repo" "$sha" pending \
+        "Remote sign-off in progress (triggered by ${user})…" \
+        || info "warning: could not post pending sign-off status"
+    fi
+    # Capture status without wrapping in `if`/`||` (those also disable set -e
+    # for the LHS). run_checks uses explicit `|| return` so make failures still
+    # short-circuit under the temporary `set +e` used for status capture.
+    set +e
+    run_checks "$revision"
+    check_status=$?
+    set -e
+    if [[ "$check_status" -ne 0 ]]; then
+      elapsed=$(( $(date +%s) - start ))
+      if is_remote_run; then
+        post_commit_status "$repo" "$sha" failure \
+          "Sign-off checks failed after ${elapsed}s (triggered by ${user})" \
+          || true
+        append_step_summary "### Sign-off"$'\n'"**Failed** after ${elapsed}s."$'\n'
+      fi
+      fail "sign-off checks failed"
+    fi
+    elapsed=$(( $(date +%s) - start ))
+    description="Signed off by ${user}${via} — lint+test passed in ${elapsed}s"
   else
-    description="Signed off by ${user} (checks not verified locally)"
+    description="Signed off by ${user}${via} (checks not verified locally)"
   fi
-  # Commit-status descriptions are capped at 140 characters.
-  description="${description:0:140}"
 
-  debug "posting ${STATUS_CONTEXT}=success on ${repo}@${sha}"
-  gh api --method POST "repos/${repo}/statuses/${sha}" \
-    -f state=success \
-    -f context="${STATUS_CONTEXT}" \
-    -f "description=${description}" >/dev/null \
+  post_commit_status "$repo" "$sha" success "$description" \
     || fail "failed to post the sign-off status (do you have write access to ${repo}?)"
+
+  append_step_summary "### Sign-off"$'\n'"**Success** on \`${sha:0:12}\` — ${description}"$'\n'
 
   echo "${OK} Signed off on ${sha:0:12} — ${description}"
   refresh_attestation_check "$sha" "$repo"
@@ -451,12 +759,64 @@ cmd_install() {
   echo "${OK} '${TARGET_BRANCH}' now requires developer sign-off + the full merge-queue suite."
 }
 
+# Dispatch .github/workflows/signoff.yml for the current branch (Git or JJ).
+# Branch names are validated to a safe charset so they cannot break shell
+# quoting or the workflow input parser.
+cmd_remote() {
+  require_tools
+
+  local branch
+  if [[ "$VCS" == "jj" ]]; then
+    # Prefer a local bookmark on @, then on the selected remote tip revision.
+    # Take the first line without `head` (SIGPIPE under pipefail).
+    local bookmarks
+    bookmarks=$(jj --color=never --no-pager log -r '@ & bookmarks()' --no-graph \
+      -T 'local_bookmarks.map(|b| b.name()).join("\n")' 2>/dev/null || true)
+    branch="${bookmarks%%$'\n'*}"
+    if [[ -z "$branch" ]]; then
+      local revision
+      revision=$(current_revision false)
+      bookmarks=$(jj --color=never --no-pager log -r "${revision} & bookmarks()" --no-graph \
+        -T 'local_bookmarks.map(|b| b.name()).join("\n")' 2>/dev/null || true)
+      branch="${bookmarks%%$'\n'*}"
+    fi
+    [[ -n "$branch" ]] \
+      || fail "no JJ bookmark on the working-copy tip — bookmark the change, or: gh workflow run signoff.yml -f branch=<name>"
+  else
+    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+    [[ -n "$branch" && "$branch" != "HEAD" ]] \
+      || fail "not on a named Git branch — check out a branch, or: gh workflow run signoff.yml -f branch=<name>"
+  fi
+
+  # Mirror the workflow input validation: allow feature/foo, reject whitespace,
+  # quotes, and path tricks so -f branch=… cannot be broken by the name.
+  if [[ "$branch" =~ [[:space:]] || "$branch" == -* || "$branch" == /* || "$branch" == *..* \
+      || "$branch" == *\"* || "$branch" == *\'* || "$branch" == *\$* || "$branch" == *\`* ]]; then
+    fail "refusing to dispatch Remote Sign-off for unsafe branch name: '${branch}'"
+  fi
+  if [[ ! "$branch" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+    fail "refusing to dispatch Remote Sign-off for invalid branch name: '${branch}'"
+  fi
+
+  local repo
+  repo=$(repo_slug) || fail "could not resolve GitHub repo for workflow dispatch"
+
+  info "Dispatching Remote Sign-off for ${branch} on ${repo}…"
+  # --repo so non-colocated JJ workspaces (no .git) still resolve the remote;
+  # --raw-field avoids shell re-quoting pitfalls; the branch was validated above.
+  gh workflow run signoff.yml --repo "$repo" --raw-field "branch=${branch}" \
+    || fail "failed to dispatch signoff.yml"
+  echo "${OK} Dispatched. Watch with: gh run watch --repo ${repo} --workflow signoff.yml"
+}
+
 cmd_help() {
   cat >&2 <<EOF
 scripts/signoff ${VERSION} — local CI attestation for Spice.ai
 
 Developers:
   make signoff                 Run lint + unit tests, then sign off on HEAD
+  make signoff-remote          Dispatch Remote Sign-off for the current branch
+  scripts/signoff remote       Same as make signoff-remote (Git + JJ)
   scripts/signoff -f           Sign off even with a dirty/unpushed tree
   scripts/signoff --no-verify  Sign off without running checks (honor system)
   scripts/signoff status       Show the sign-off status of HEAD
@@ -465,6 +825,16 @@ Maintainers:
   scripts/signoff check        Show whether '${TARGET_BRANCH}' requires sign-off
   scripts/signoff install      Preview the required-checks change (dry run)
   scripts/signoff install --yes  Apply it (needs admin on the repo)
+
+Checks (when verify is on):
+  1. Targeted lint of crates touched by this branch vs trunk
+     (make lint-rust PACKAGES="…") — fail-fast feedback
+  2. Full workspace lint (make lint-rust)
+  3. CLI build + unit tests (make build-cli nextest)
+
+  Set SIGNOFF_SKIP_TARGETED_LINT=1 to skip step 1.
+  Remote runs (.github/workflows/signoff.yml) set SIGNOFF_REMOTE_RUN and use
+  the GitHub compare API when the clone is too shallow for merge-base.
 
 The sign-off is a '${STATUS_CONTEXT}' commit status bound to the exact commit you
 pushed. Sign off again after any code change or manual conflict resolution. The
@@ -477,6 +847,7 @@ main() {
   case "${1:-}" in
     ""|signoff) shift || true; cmd_signoff "$@" ;;
     -f|--force|--no-verify) cmd_signoff "$@" ;;
+    remote)   shift; cmd_remote "$@" ;;
     status)   shift; cmd_status "$@" ;;
     check)    shift; cmd_check "$@" ;;
     install)  shift; cmd_install "$@" ;;
