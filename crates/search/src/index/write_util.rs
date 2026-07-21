@@ -207,7 +207,10 @@ where
 
 fn composite_primary_key_is_all_null(value: &Value) -> bool {
     match value {
-        Value::Object(fields) => !fields.is_empty() && fields.values().all(Value::is_null),
+        // `arrow_json` omits null fields by default, so an all-null composite key serializes
+        // to an empty object rather than one with explicit nulls; `all()` on the empty
+        // iterator is vacuously true, which is the behavior we want here.
+        Value::Object(fields) => fields.values().all(Value::is_null),
         _ => false,
     }
 }
