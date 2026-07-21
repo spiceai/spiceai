@@ -43,9 +43,9 @@ limitations under the License.
 //! | level | scheme set |
 //! |---|---|
 //! | 0 | `Uncompressed` only (canonical arrays; zero search, zero transform) |
-//! | 1 | + `Constant` / `Sparse` (near-free detection; common CDC shapes) |
-//! | 2 | + `Dict` (cheap, high-value on repetitive CDC data) |
-//! | 3 | + cheap numeric schemes (`For`, `BitPacking`, `ZigZag`, `RunEnd`, `Sequence`) |
+//! | 1 | `Sparse` only (near-free detection; constant detection is built into the cascade as of Vortex 0.79) |
+//! | 2 | string `Zstd` only — the `auto` light level (one entropy pass over the string residual; numerics stay canonical until compaction) |
+//! | 3 | rich light: dictionaries + cheap numeric schemes (`For`, `BitPacking`, `ZigZag`, `RunEnd`, `Sequence`) + `Zstd` |
 //! | 4–6 | full default **minus FSST** (skips symbol-table training, keeps the rest) |
 //! | 7–10 | full default `BtrBlocks` cascade (today's behavior; upper levels reserved) |
 //!
@@ -125,14 +125,18 @@ pub(crate) enum WriteClass {
 /// and the mapping boundary can't drift apart.
 pub(crate) const FULL_LEVEL: u8 = DELTA_ENCODING_FULL_LEVEL;
 
-/// Level chosen by `auto` for every delta write. `Constant + Sparse + Dict`
-/// keeps the big repetitive-CDC wins (often 3-5×) while skipping the per-file
-/// `BtrBlocks` strategy search and FSST symbol-table training that dominate
-/// encode cost. Every delta is transient — compaction re-encodes it at
-/// [`FULL_LEVEL`] — so the light scheme set trades a larger transient file
-/// (compaction folds it) for materially cheaper CDC-hot-path encode; the full
-/// cascade is reserved for the durable [`WriteClass::Maintenance`] artifacts
-/// whose encoding quality pays for scan throughput.
+/// Level chosen by `auto` for every delta write: string `Zstd` only. A single
+/// entropy-coding pass over the string residual captures most of the
+/// transient-file byte win (417k-row harness, release: 103.1 MB vs 172.5 MB
+/// for the prior Sparse+Dict set and 115.8 MB for the FULL cascade) at equal
+/// light-path encode wall time, while skipping the per-file strategy search
+/// and FSST training that dominate small-write encode cost. Every delta is
+/// transient — compaction re-encodes it at [`FULL_LEVEL`] — so the light
+/// scheme set trades a larger transient file (compaction folds it) for
+/// materially cheaper CDC-hot-path encode. Numeric columns stay canonical on
+/// this path; the full cascade is reserved for the durable
+/// [`WriteClass::Maintenance`] artifacts whose encoding quality pays for scan
+/// throughput.
 pub(crate) const AUTO_LIGHT_LEVEL: u8 = 2;
 
 /// Resolve the effective encoding level for one snapshot write.
@@ -176,30 +180,25 @@ pub(crate) fn strategy_builder_for_level(level: u8) -> Option<WriteStrategyBuild
     let builder = match level {
         // 0: no schemes — pure canonical/uncompressed (zero search, zero transform).
         0 => BtrBlocksCompressorBuilder::empty(),
-        // 1: + constant / sparse detection (near-free; common CDC shapes).
+        // 1: + sparse detection (near-free; common CDC shapes). Constant
+        // detection is built into the cascading compressor as of Vortex 0.79.
         1 => builder_with_schemes(&[
-            &integer::IntConstantScheme,
             &integer::SparseScheme,
-            &float::FloatConstantScheme,
             &float::NullDominatedSparseScheme,
-            &string::StringConstantScheme,
             &string::NullDominatedSparseScheme,
         ]),
-        // 2: + dictionary (cheap, high-value on repetitive CDC data).
-        2 => builder_with_schemes(&[
-            &integer::IntConstantScheme,
-            &integer::SparseScheme,
-            &integer::IntDictScheme,
-            &float::FloatConstantScheme,
-            &float::NullDominatedSparseScheme,
-            &float::FloatDictScheme,
-            &string::StringConstantScheme,
-            &string::NullDominatedSparseScheme,
-            &string::StringDictScheme,
-        ]),
-        // 3: + cheap numeric schemes (FoR, BitPacking, ZigZag, RunEnd, Sequence).
+        // 2 (the `auto` light level): string Zstd only. One entropy-coding
+        // pass over the string residual captures most of the transient-file
+        // byte win at light-path encode cost — measured on the 417k-row
+        // round-trip harness (release): zstd-only 103.1 MB vs Sparse+Dict
+        // 172.5 MB vs the FULL cascade 115.8 MB, at statistically equal
+        // encode wall time (~100 ms; FULL 126 ms). Numeric columns stay
+        // canonical here; compaction's FULL re-encode optimizes them for the
+        // long-lived artifact. Dict+numeric light sets remain at level 3 as
+        // the explicit A/B rung (dict+zstd measured only ~4% smaller).
+        2 => builder_with_schemes(&[&string::ZstdScheme]),
+        // 3: rich light — dictionaries + cheap numeric schemes + Zstd.
         3 => builder_with_schemes(&[
-            &integer::IntConstantScheme,
             &integer::SparseScheme,
             &integer::IntDictScheme,
             &integer::FoRScheme,
@@ -207,13 +206,12 @@ pub(crate) fn strategy_builder_for_level(level: u8) -> Option<WriteStrategyBuild
             &integer::ZigZagScheme,
             &integer::RunEndScheme,
             &integer::SequenceScheme,
-            &float::FloatConstantScheme,
             &float::NullDominatedSparseScheme,
             &float::FloatDictScheme,
             &float::FloatRLEScheme,
-            &string::StringConstantScheme,
             &string::NullDominatedSparseScheme,
             &string::StringDictScheme,
+            &string::ZstdScheme,
         ]),
         // 4-6: everything in the default set except FSST — the symbol-table
         // training is the profiled dominant fixed cost on small string-bearing

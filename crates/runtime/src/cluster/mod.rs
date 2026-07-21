@@ -336,6 +336,7 @@ fn spawn_scheduler_poll_loop(
                         tcp_keepalive_seconds: grpc_client.tcp_keep_alive_seconds,
                         http2_keepalive_interval_seconds: grpc_client
                             .http2_keep_alive_interval_seconds,
+                        ..Default::default()
                     };
                     let scheduler_endpoint =
                         match create_grpc_client_endpoint(endpoint_url.clone(), Some(&grpc_config))
@@ -1487,6 +1488,7 @@ pub async fn initialize_cluster_executor(
                 resource: Some(Resource::TaskSlots(concurrent_tasks)),
             }],
         }),
+        os_info: None,
     };
 
     // Use advertise address as node_id for metrics
@@ -1985,7 +1987,7 @@ async fn create_scheduler_server(
 
                     Some(TaskCancelInfo {
                         task_id,
-                        job_id: task.job_id,
+                        job_id: task.job_id.to_string(),
                         stage_id,
                         partition_id,
                     })
