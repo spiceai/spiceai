@@ -78,21 +78,27 @@ impl FromStr for AwsIamRoleSource {
 /// validation and typo warnings for the whole component. Credential
 /// *resolution* stays on the runtime's `Parameters`-based AWS auth path, so
 /// the auth fields carry no `autoload_secret`: a credential present only in a
-/// secret store is `None` here and supplied by the auth layer.
+/// secret store is `None` here and supplied by the auth layer. `bucket`,
+/// `arn`, and `index` keep their historical secret-store autoload (the old
+/// `ParameterSpec` marked them `.secret()`); `distance_metric` intentionally
+/// does not — it is not a secret.
 #[derive(Debug, TypedParams)]
 #[params(prefix = "s3_vectors")]
 pub struct S3VectorsParams {
     /// The S3 bucket name to use for the S3 Vectors index.
-    pub bucket: Option<String>,
+    #[param(autoload_secret)]
+    pub bucket: Option<SecretString>,
     /// The distance metric to be used for similarity search. One of: euclidean | cosine.
     pub distance_metric: Option<S3DistanceMetric>,
     /// The duration to wait prior to receiving the first response byte, in time unit format. E.g. 30s, 1m.
     #[param(runtime, parse_with = fundu::parse_duration)]
     pub client_timeout: Option<std::time::Duration>,
     /// The S3 Vectors bucket ARN to use for the S3 Vectors index.
-    pub arn: Option<String>,
+    #[param(autoload_secret)]
+    pub arn: Option<SecretString>,
     /// The S3 Vectors index name to use within the bucket.
-    pub index: Option<String>,
+    #[param(autoload_secret)]
+    pub index: Option<SecretString>,
     /// The AWS region to use.
     pub aws_region: Option<String>,
     /// The AWS access key ID to use.
@@ -110,6 +116,7 @@ pub struct S3VectorsParams {
     #[param(default = "100000")]
     pub batch_write_rows: usize,
     /// If true, during periods where write throughput exceeds S3 vector rate limits, create and spill to a separate physical index. Incompatible with vector partitioning.
+    #[param(parse_with = crate::store_params::parse_bool)]
     pub spill_writes: Option<bool>,
 }
 
@@ -118,6 +125,8 @@ mod tests {
     use super::*;
     use runtime_parameters::typed::{ParamsError, TypedParams as _};
     use runtime_secrets::Secrets;
+    use secrecy::ExposeSecret;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
@@ -144,7 +153,10 @@ mod tests {
         .await
         .expect("S3 Vectors parameters should be valid");
 
-        assert_eq!(typed.bucket.as_deref(), Some("my-bucket"));
+        assert_eq!(
+            typed.bucket.as_ref().map(ExposeSecret::expose_secret),
+            Some("my-bucket")
+        );
         assert_eq!(typed.distance_metric, Some(S3DistanceMetric::Cosine));
         assert_eq!(
             typed.client_timeout,
@@ -192,5 +204,64 @@ mod tests {
                 .contains("Invalid value for parameter 's3_vectors_aws_iam_role_source'"),
             "unexpected message: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn spill_writes_accepts_lenient_boolean_forms() {
+        let typed = try_s3_params(&[("s3_vectors_spill_writes", "yes")])
+            .await
+            .expect("lenient boolean forms should be accepted");
+        assert_eq!(typed.spill_writes, Some(true));
+
+        let err = try_s3_params(&[("s3_vectors_spill_writes", "sometimes")])
+            .await
+            .expect_err("non-boolean spill_writes should be rejected");
+        assert!(
+            err.to_string()
+                .contains("Invalid value for parameter 's3_vectors_spill_writes'"),
+            "unexpected message: {err}"
+        );
+    }
+
+    struct StaticSecretStore(HashMap<String, String>);
+
+    #[async_trait::async_trait]
+    impl runtime_secrets::SecretStore for StaticSecretStore {
+        async fn get_secret(
+            &self,
+            key: &str,
+        ) -> runtime_secrets::AnyErrorResult<Option<SecretString>> {
+            Ok(self.0.get(key).map(|v| SecretString::from(v.clone())))
+        }
+    }
+
+    #[tokio::test]
+    async fn bucket_and_index_autoload_from_secret_stores() {
+        let mut secrets = Secrets::new();
+        secrets.register_store(
+            "test",
+            Arc::new(StaticSecretStore(HashMap::from([
+                ("s3_vectors_bucket".to_string(), "secret-bucket".to_string()),
+                ("s3_vectors_index".to_string(), "secret-index".to_string()),
+            ]))),
+        );
+
+        let typed = S3VectorsParams::try_from_params(
+            "AWS S3 Vectors store",
+            HashMap::new(),
+            &Arc::new(RwLock::new(secrets)),
+        )
+        .await
+        .expect("S3 Vectors parameters should be valid");
+
+        assert_eq!(
+            typed.bucket.as_ref().map(ExposeSecret::expose_secret),
+            Some("secret-bucket")
+        );
+        assert_eq!(
+            typed.index.as_ref().map(ExposeSecret::expose_secret),
+            Some("secret-index")
+        );
+        assert!(typed.arn.is_none());
     }
 }

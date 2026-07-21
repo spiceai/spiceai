@@ -35,6 +35,7 @@ pub struct DuckDbVectorParams {
     /// Not yet supported for the `DuckDB` vector engine.
     pub partition_by: Option<String>,
     /// Not supported for the `DuckDB` vector engine.
+    #[param(parse_with = crate::store_params::parse_bool)]
     pub spill_writes: Option<bool>,
 }
 
@@ -168,10 +169,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spill_writes_accepts_lenient_boolean_forms() {
+        let params = duckdb_params(&[("duckdb_spill_writes", "YES")]).await;
+        assert!(params.spill_writes_enabled());
+
+        let params = duckdb_params(&[("duckdb_spill_writes", "0")]).await;
+        assert!(!params.spill_writes_enabled());
+    }
+
+    #[tokio::test]
     async fn rejects_non_boolean_spill_writes() {
-        // `bool` parsing is strict: the previously lenient "yes"/"1" forms are
-        // rejected with a structured error instead of being silently coerced.
-        let err = try_duckdb_params(&[("duckdb_spill_writes", "yes")])
+        let err = try_duckdb_params(&[("duckdb_spill_writes", "sometimes")])
             .await
             .expect_err("non-boolean spill_writes should be rejected");
         assert!(

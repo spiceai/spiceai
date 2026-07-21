@@ -110,13 +110,14 @@ pub struct ElasticsearchVectorParams {
     /// Temporary Elasticsearch `index.refresh_interval` to apply before full/append writes, then restore afterward (ES duration syntax; relayed as-is). Set to -1 to disable refresh during bulk loading.
     pub bulk_load_refresh_interval: Option<String>,
     /// Run Elasticsearch `_forcemerge` after full/append writes. Default: false.
-    #[param(default = "false")]
+    #[param(default = "false", parse_with = crate::store_params::parse_bool)]
     pub force_merge_after_write: bool,
     /// Maximum number of segments to use with `_forcemerge` after full/append writes; must be positive. Setting this also enables force merge. Default when `force_merge_after_write=true`: 1.
     pub force_merge_segments: Option<u32>,
     /// Not yet supported for the Elasticsearch vector engine.
     pub partition_by: Option<String>,
     /// Not yet supported for the Elasticsearch vector engine.
+    #[param(parse_with = crate::store_params::parse_bool)]
     pub spill_writes: Option<bool>,
 }
 
@@ -165,7 +166,7 @@ pub struct ElasticsearchFtsParams {
     /// Temporary Elasticsearch `index.refresh_interval` to apply before full/append writes, then restore afterward (ES duration syntax; relayed as-is). Set to -1 to disable refresh during bulk loading.
     pub bulk_load_refresh_interval: Option<String>,
     /// Run Elasticsearch `_forcemerge` after full/append writes. Default: false.
-    #[param(default = "false")]
+    #[param(default = "false", parse_with = crate::store_params::parse_bool)]
     pub force_merge_after_write: bool,
     /// Maximum number of segments to use with `_forcemerge` after full/append writes; must be positive. Setting this also enables force merge. Default when `force_merge_after_write=true`: 1.
     pub force_merge_segments: Option<u32>,
@@ -445,6 +446,33 @@ mod tests {
         assert!(!typed.force_merge_after_write);
         assert!(typed.index.is_none());
         assert!(typed.index_settings.is_none());
+    }
+
+    #[tokio::test]
+    async fn bool_params_accept_lenient_forms() {
+        let typed = try_es_params(&[("elasticsearch_force_merge_after_write", "1")])
+            .await
+            .expect("lenient boolean forms should be accepted");
+        assert!(typed.force_merge_after_write);
+
+        let typed = try_es_params(&[("elasticsearch_spill_writes", "No")])
+            .await
+            .expect("lenient boolean forms should be accepted");
+        assert_eq!(typed.spill_writes, Some(false));
+
+        let typed = try_fts_params(&[("force_merge_after_write", "Yes")])
+            .await
+            .expect("lenient boolean forms should be accepted");
+        assert!(typed.force_merge_after_write);
+
+        let err = try_fts_params(&[("force_merge_after_write", "sometimes")])
+            .await
+            .expect_err("non-boolean force_merge_after_write should be rejected");
+        assert!(
+            err.to_string()
+                .contains("Invalid value for parameter 'elasticsearch_force_merge_after_write'"),
+            "unexpected message: {err}"
+        );
     }
 
     #[tokio::test]

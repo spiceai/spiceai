@@ -28,3 +28,18 @@ pub mod duckdb;
 pub mod elasticsearch;
 #[cfg(feature = "s3_vectors")]
 pub mod s3;
+
+/// Parses a user-facing boolean parameter (`#[param(parse_with = ...)]`
+/// parser), accepting the historically lenient forms: `true`/`1`/`yes` and
+/// `false`/`0`/`no`, case-insensitive and trimmed.
+///
+/// # Errors
+///
+/// Returns an error when the value is none of the accepted forms.
+pub fn parse_bool(raw: &str) -> Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" => Ok(true),
+        "false" | "0" | "no" => Ok(false),
+        _ => Err(format!("Expected true or false. Found {raw}.")),
+    }
+}

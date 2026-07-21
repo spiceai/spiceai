@@ -44,6 +44,7 @@ use crate::{
 use runtime_parameters::typed::TypedParams as _;
 use runtime_search::store_params::s3::{S3DistanceMetric, S3VectorsParams};
 use runtime_secrets::{Secrets, get_params_with_secrets};
+use secrecy::ExposeSecret;
 mod client;
 mod metrics;
 use client::S3VectorsTelemetryMiddleware;
@@ -200,9 +201,9 @@ async fn try_vector_table(
     model_name: &str,
 ) -> Result<S3VectorsTable, Box<dyn std::error::Error + Send + Sync>> {
     let id = match (
-        params.arn.as_deref(),
-        params.bucket.as_deref(),
-        params.index.as_deref(),
+        params.arn.as_ref().map(ExposeSecret::expose_secret),
+        params.bucket.as_ref().map(ExposeSecret::expose_secret),
+        params.index.as_ref().map(ExposeSecret::expose_secret),
     ) {
         (Some(_), Some(_), Some(_)) => Err("Cannot specify both 's3_vectors_arn' and 's3_vectors_bucket'.".to_string()),
         (Some(arn), None, None) => Ok(S3VectorIdentifier::IndexArn(arn.to_string())),
