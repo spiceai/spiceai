@@ -1936,6 +1936,9 @@
             "check_availability": {
               "$ref": "#/$defs/CheckAvailability"
             },
+            "schema_inference": {
+              "$ref": "#/$defs/SchemaInference"
+            },
             "mode": {
               "$ref": "#/$defs/AccessMode"
             }
@@ -2858,25 +2861,11 @@
     },
     "MaintainedAggregateFunction": {
       "description": "Aggregate functions supported by Cayenne maintained aggregate views.",
-      "oneOf": [
-        {
-          "type": "string",
-          "enum": [
-            "count",
-            "sum",
-            "avg"
-          ]
-        },
-        {
-          "description": "`MIN(column)` over integer / temporal / decimal families (engine-side).\nRetraction-hard: requires a primary key so deletes can drop the extremum.",
-          "type": "string",
-          "const": "min"
-        },
-        {
-          "description": "`MAX(column)` — mirror of [`Self::Min`].",
-          "type": "string",
-          "const": "max"
-        }
+      "type": "string",
+      "enum": [
+        "count",
+        "sum",
+        "avg"
       ]
     },
     "MaintainedAggregatesConfig": {
@@ -3196,6 +3185,21 @@
           "description": "The dataset is not checked for availability.",
           "type": "string",
           "const": "disabled"
+        }
+      ]
+    },
+    "SchemaInference": {
+      "description": "Selects the depth of source-schema inference.\n\nBase column/type inference is always performed and required — this knob only\ncontrols whether the runtime *additionally* infers the table's primary key,\nsecondary indexes, and sort/clustering columns to fill acceleration settings\nthe user did not specify in the Spicepod.\n\nApplies to all refresh modes. Only connectors that emit inferred-schema\nmetadata (currently `PostgreSQL` and `MongoDB`) are affected; others treat\n`extended` as a no-op.",
+      "oneOf": [
+        {
+          "description": "Base column/type inference only (default) — exactly as before. The column\nschema is always inferred from the source; no primary-key/index/sort\ndetection is performed.",
+          "type": "string",
+          "const": "standard"
+        },
+        {
+          "description": "In addition to the base column schema, auto-detect and apply the primary\nkey, secondary indexes, and sort/clustering columns from the source when\nthey are not explicitly configured.",
+          "type": "string",
+          "const": "extended"
         }
       ]
     },
@@ -5534,7 +5538,7 @@
           ]
         },
         "cayenne_datalake_location": {
-          "description": "Object-store URL prefix for the datalake tier, e.g. 's3://bucket/prefix' — the storage-cascade bottom tier. When set, a background tiering loop moves warm local-disk data to read-optimized, Z-order-clustered Vortex files on this store, and queries span warm + datalake with per-tier pushdown. Unset (default) disables the tier. Requires key-based deletes and a primary key (auto-resolved). Partitioned and position-delete tables are not supported.",
+          "description": "Object-store URL prefix for the datalake tier, e.g. 's3://bucket/prefix' — the storage-cascade bottom tier. When set, a background promotion stage graduates the warm local-disk tier to read-optimized, Z-order-clustered Vortex files on this store, and queries span warm + cold with per-tier pushdown. Unset (default) disables the tier. Requires key-based deletes and a primary key (auto-resolved). Partitioned and position-delete tables are not supported.",
           "type": "string"
         },
         "cayenne_datalake_clustering_columns": {
@@ -5600,15 +5604,15 @@
           "type": "string"
         },
         "cayenne_datalake_warm_max_bytes": {
-          "description": "Warm-tier data moves to the datalake once the warm tier's total Vortex bytes reach this threshold. Pairs with cayenne_datalake_warm_max_files; 0 disables the byte trigger, but when BOTH triggers are 0/unset this one defaults to 16 x cayenne_datalake_target_file_size_mb.",
+          "description": "The warm tier graduates to the datalake once its total Vortex bytes reach this threshold. Pairs with cayenne_datalake_warm_max_files; 0 disables the byte trigger, but when BOTH triggers are 0/unset this one defaults to 16 x cayenne_datalake_target_file_size_mb.",
           "type": "string"
         },
         "cayenne_datalake_warm_max_files": {
-          "description": "Warm-tier data moves to the datalake once the warm tier's Vortex file count reaches this threshold. 0 (default) disables the file-count trigger; when cayenne_datalake_warm_max_bytes is also 0/unset, the byte trigger defaults to 16 x cayenne_datalake_target_file_size_mb.",
+          "description": "The warm tier graduates to the datalake once its Vortex file count reaches this threshold. 0 (default) disables the file-count trigger; when cayenne_datalake_warm_max_bytes is also 0/unset, the byte trigger defaults to 16 x cayenne_datalake_target_file_size_mb.",
           "type": "string"
         },
-        "cayenne_datalake_tiering_check_interval_ms": {
-          "description": "How often the background loop checks whether warm-tier data should move to the datalake (a check does not guarantee a move). Normally auto-tuned; override for testing. Default: 60000 (60s).",
+        "cayenne_datalake_promotion_interval_ms": {
+          "description": "How often the background loop evaluates the warm-to-datalake promotion trigger. Default: 60000 (60s).",
           "type": "string"
         },
         "cayenne_datalake_gc_interval_ms": {
@@ -5620,7 +5624,7 @@
           "type": "string"
         },
         "cayenne_shard_key_columns": {
-          "description": "Comma-separated list of columns to hash-cluster rows by during intra-write sharding (the parallel encode fan-out), e.g. 'tenant_id'. When unset, the shard key derives from the primary key (PK-hash clustering); tables without a primary key shard round-robin. Schema inference fills this from the source's declared partition/shard key when the user leaves it unset. Ignored for sorted tables: sort_columns forces a single serial writer.",
+          "description": "Comma-separated list of columns to hash-cluster rows by during intra-write sharding (the parallel encode fan-out), e.g. 'tenant_id'. When unset, the shard key derives from the primary key (PK-hash clustering); tables without a primary key shard round-robin. Extended schema inference (schema_inference: extended) fills this from the source's declared partition/shard key when the user leaves it unset. Ignored for sorted tables: sort_columns forces a single serial writer.",
           "type": "string"
         },
         "cayenne_compression_strategy": {
@@ -5681,7 +5685,7 @@
           "type": "string"
         },
         "cayenne_compaction_max_levels": {
-          "description": "Maximum number of consecutive compaction passes per trigger. Bounds write amplification when tiered compaction keeps producing new candidates. Default: 3.",
+          "description": "Maximum number of consecutive compaction passes per trigger. Bounds write amplification when promotion keeps producing new candidates. Default: 3.",
           "type": "string",
           "default": "3"
         },
@@ -5748,7 +5752,7 @@
           "type": "string"
         },
         "cayenne_tuning": {
-          "description": "Auto-tuning mode. 'auto': derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate, delete fraction, and arrival burstiness AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adapts the inline-memtable flush caps, the in-memory CDC tier byte cap, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. DEFAULT: when this is unset, the mode is 'auto' — except that a configured cayenne_goal_* SLO implies 'adaptive' unless you set 'auto' explicitly. Set 'cayenne_tuning: adaptive' explicitly to enable the closed loop without a goal. Schema inference is always attempted and sharpens the 'adaptive' warm-start (inferred cardinality/size) but is not required for it — without inferred metadata the controller relearns the row width from observed ingest and converges from the hardware-derived warm-start. In BOTH modes an explicit per-parameter value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set actuator is pinned (the loop will not move it).",
+          "description": "Auto-tuning mode. 'auto': derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate, delete fraction, and arrival burstiness AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adapts the inline-memtable flush caps, the in-memory CDC tier byte cap, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. DEFAULT: when this is unset, the mode is 'adaptive' if extended schema inference produced metadata (the dataset set 'schema_inference: extended' and the source emitted it) — opting into extended schema enables self-tuning, and that metadata is the adaptive warm-start — otherwise 'auto'. Set 'cayenne_tuning: auto' explicitly to opt out of the closed loop even with extended schema. 'schema_inference: extended' also sharpens the 'adaptive' warm-start (inferred cardinality/size) but is not required for an explicit 'adaptive' — without it the controller relearns the row width from observed ingest and converges from the hardware-derived warm-start. In BOTH modes an explicit per-parameter value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set actuator is pinned (the loop will not move it).",
           "type": "string",
           "enum": [
             "auto",
@@ -8619,6 +8623,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -8799,6 +8806,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -8981,6 +8991,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -9161,6 +9174,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -9343,6 +9359,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -9523,6 +9542,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -9705,6 +9727,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -9885,6 +9910,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -10067,6 +10095,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -10247,6 +10278,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -10438,6 +10472,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -10627,6 +10664,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -10818,6 +10858,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -11007,6 +11050,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -11198,6 +11244,9 @@
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
+        },
         "mode": {
           "$ref": "#/$defs/AccessMode"
         }
@@ -11387,6 +11436,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
@@ -12546,6 +12598,9 @@
         },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
+        },
+        "schema_inference": {
+          "$ref": "#/$defs/SchemaInference"
         },
         "mode": {
           "$ref": "#/$defs/AccessMode"
