@@ -136,6 +136,10 @@ runtime-acceleration = { path = "../runtime-acceleration" }
 runtime-api-types = { path = "../runtime-api-types" }
 runtime-async = { path = "../runtime-async" }
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
+runtime-checkpoint-duckdb = { path = "../runtime-checkpoint-duckdb", optional = true }
+runtime-checkpoint-sqlite = { path = "../runtime-checkpoint-sqlite", optional = true }
+runtime-checkpoint-postgres = { path = "../runtime-checkpoint-postgres", optional = true }
+runtime-checkpoint-turso = { path = "../runtime-checkpoint-turso", optional = true }
 runtime-metrics = { path = "../runtime-metrics" }
 runtime-auth = { path = "../runtime-auth" }
 runtime-cluster = { path = "../runtime-cluster" }
@@ -305,6 +309,7 @@ elasticsearch = [
 ]
 duckdb = [
     "dep:duckdb",
+    "dep:runtime-checkpoint-duckdb",
     "db_connection_pool/duckdb",
     "data_components/duckdb",
     "datafusion-optimizer-rules/duckdb",
@@ -361,7 +366,7 @@ postgres = [
     "data_components/postgres",
     "datafusion-table-providers/postgres",
 ]
-postgres-accel = ["postgres", "dep:tokio-postgres"]
+postgres-accel = ["postgres", "dep:tokio-postgres", "dep:runtime-checkpoint-postgres"]
 
 s3_vectors = [
     "data_components/s3_vectors",
@@ -386,6 +391,7 @@ spark = ["data_components/spark_connect"]
 spicebench = []
 sqlite = [
     "dep:tokio-rusqlite",
+    "dep:runtime-checkpoint-sqlite",
     "db_connection_pool/sqlite",
     "data_components/sqlite",
     "dep:rusqlite",
@@ -394,6 +400,7 @@ sqlite = [
 turso = [
     "dep:turso",
     "dep:tokio-rusqlite",
+    "dep:runtime-checkpoint-turso",
     "db_connection_pool/sqlite",
     "data_components/sqlite",
     "data_components/turso",
