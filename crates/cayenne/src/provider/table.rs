@@ -19454,14 +19454,22 @@ impl CayenneTableProvider {
             Self::scan_view_refresh_floor(),
             self.scan_view_shutdown.clone(),
         ));
-        // `OnceLock::set` fails only if already initialized — a lost race just drops
-        // the extra handle, aborting its own task.
-        self.scan_view_builder
-            .set(ScanViewBuilder {
-                handle: Some(handle),
-                shutdown: self.scan_view_shutdown.clone(),
-            })
-            .is_ok()
+        // `OnceLock::set` fails only if already initialized. Dropping a `JoinHandle`
+        // only DETACHES its task (it keeps running) rather than aborting it, so on a
+        // lost init race we must explicitly `abort()` the extra maintainer loop —
+        // otherwise a duplicate publisher runs, doubling the build CPU.
+        match self.scan_view_builder.set(ScanViewBuilder {
+            handle: Some(handle),
+            shutdown: self.scan_view_shutdown.clone(),
+        }) {
+            Ok(()) => true,
+            Err(loser) => {
+                if let Some(loser_handle) = &loser.handle {
+                    loser_handle.abort();
+                }
+                false
+            }
+        }
     }
 
     /// The background scan-view maintainer loop. Captures the live scan input and,
@@ -19578,6 +19586,12 @@ impl CayenneTableProvider {
                         provider.scan_view.store(Some(Arc::new(view)));
                         // Wake scans parked on the freshness gate.
                         provider.scan_view_published.notify_waiters();
+                        // Advance the published-input watermark ONLY on a successful
+                        // publish. On build/join failure `prev` is left unchanged so
+                        // the next iteration still sees `changed` and RETRIES (paced by
+                        // the floor sleep below — no busy-loop) instead of parking on a
+                        // stale bundle once the input quiesces.
+                        prev = Some(raw_for_prev);
                     }
                     Ok(Err(error)) => tracing::warn!(
                         target: "cayenne::scan_view",
@@ -19592,7 +19606,6 @@ impl CayenneTableProvider {
                         "scan-view build task did not complete; keeping the builder alive"
                     ),
                 }
-                prev = Some(raw_for_prev);
                 let compute_elapsed = compute_start.elapsed();
                 // Metric: one build+publish, off the query path. Count ≪ scan count,
                 // and the duration is the capture+build cost the query path no longer

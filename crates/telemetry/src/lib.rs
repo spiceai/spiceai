@@ -807,10 +807,12 @@ pub mod cayenne {
     static SCAN_VIEW_WAITS: OnceLock<Counter<u64>> = OnceLock::new();
     static SCAN_VIEW_WAIT_DURATION_MS: OnceLock<Histogram<f64>> = OnceLock::new();
 
-    /// Records a scan that had to WAIT for the maintainer to publish a bundle fresh
-    /// enough for its linearizable freshness gate (rather than finding one already
-    /// published). Expect ~0 in steady state; a rising count / duration means the
-    /// maintainer is lagging query demand (the scan sits idle on the gate rather than
+    /// Records a scan that had to WAIT for the maintainer to publish a bundle built
+    /// at or after a forced structural event (schema evolve / truncate / overwrite /
+    /// reopen) — the only case the non-blocking, bounded-stale scan gate blocks on;
+    /// ordinary CDC churn is served from the latest published bundle without waiting.
+    /// Expect ~0 in steady state; a rising count / duration means the maintainer is
+    /// lagging a structural transition (the scan sits idle on the gate rather than
     /// recomputing on a query core). `dimensions` should carry `dataset`.
     pub fn track_scan_view_wait(duration: Duration, dimensions: &[KeyValue]) {
         SCAN_VIEW_WAITS
@@ -818,7 +820,7 @@ pub mod cayenne {
                 operational_meter()
                     .u64_counter("cayenne_scan_view_waits_total")
                     .with_description(
-                        "Scans that waited for the scan-view maintainer to publish a bundle fresh enough for the linearizable freshness gate.",
+                        "Scans that waited for the scan-view maintainer to publish a bundle built at or after a forced structural event (the only case the non-blocking, bounded-stale scan gate blocks on).",
                     )
                     .with_unit("scans")
                     .build()
@@ -829,7 +831,7 @@ pub mod cayenne {
                 operational_meter()
                     .f64_histogram("cayenne_scan_view_wait_duration_ms")
                     .with_description(
-                        "Time a scan spent waiting on the scan-view freshness gate for a fresh-enough published bundle.",
+                        "Time a scan spent waiting on the scan-view gate for a bundle built at or after a forced structural event.",
                     )
                     .with_unit("ms")
                     .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
