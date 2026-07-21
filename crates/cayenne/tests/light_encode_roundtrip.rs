@@ -37,7 +37,7 @@ limitations under the License.
 //! - sliced input batches (the coalesced-CDC apply shape)
 //! - one jumbo multi-block batch (the large mem-tier checkpoint shape)
 //!
-//! Default sizing is CI-friendly (~57k rows; Vortex compresses per fixed 8K-row
+//! Default sizing is CI-friendly (~74k rows; Vortex compresses per fixed 8K-row
 //! block, so per-block coverage is identical to larger runs). Set
 //! `LIGHT_ROUNDTRIP_LARGE=1` for the full 417k-row audit dataset.
 
@@ -450,7 +450,7 @@ async fn roundtrip(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn light_levels_roundtrip_multichunk() {
-    // CI default: 2 small + 3 sliced + one 4×8192 jumbo ≈ 57k rows. Vortex
+    // CI default: 2 small + 3 sliced + one 4×8192 jumbo = 73,728 rows. Vortex
     // compresses per fixed 8K-row block, so per-block scheme coverage matches
     // the full audit dataset; LIGHT_ROUNDTRIP_LARGE=1 restores it (~417k rows).
     let large = std::env::var("LIGHT_ROUNDTRIP_LARGE").is_ok();
