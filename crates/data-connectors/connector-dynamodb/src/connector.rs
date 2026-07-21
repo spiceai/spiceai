@@ -315,6 +315,16 @@ impl DataConnector for DynamoDB {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(crate::dml::DEFAULT_WRITE_PARALLELISM);
+        // A zero would flow into `mpsc::channel(write_parallelism * 2)` (0 capacity panics in
+        // Tokio) and spawn no writer tasks, so reject it as a configuration error rather than
+        // crashing the write path.
+        if write_parallelism == 0 {
+            return Err(DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "dynamodb".to_string(),
+                message: "DynamoDB parameter 'write_parallelism' is invalid: must be a positive integer (got 0). Refer to https://spiceai.org/docs/components/data-connectors/dynamodb".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+            });
+        }
 
         let provider = DynamoDBTableProvider::try_new(
             config,
