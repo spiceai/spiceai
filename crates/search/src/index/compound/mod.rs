@@ -292,8 +292,10 @@ async fn compound_delete_by_keys(
     secondary: &dyn Index,
     keys: RecordBatch,
 ) -> DataFusionResult<()> {
-    let (primary_result, secondary_result) =
-        futures::join!(primary.delete_by_keys(keys.clone()), secondary.delete_by_keys(keys));
+    let (primary_result, secondary_result) = futures::join!(
+        primary.delete_by_keys(keys.clone()),
+        secondary.delete_by_keys(keys)
+    );
     primary_result.and(secondary_result)
 }
 

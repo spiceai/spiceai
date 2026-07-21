@@ -81,7 +81,10 @@ pub async fn resolve_keys_matching_predicate(
 /// Returns `None` if `keys` has zero rows. Used to translate a batch of primary-key rows into a
 /// predicate a store can filter/query by, e.g. when a wrapper index (chunked, compound) needs to
 /// address a backing store's own data using a subset of that store's key columns.
-pub fn build_key_match_predicate(keys: &RecordBatch, key_columns: &[String]) -> Result<Option<Expr>> {
+pub fn build_key_match_predicate(
+    keys: &RecordBatch,
+    key_columns: &[String],
+) -> Result<Option<Expr>> {
     let arrays: Vec<_> = key_columns
         .iter()
         .map(|name| keys.column_by_name(name).cloned())
@@ -154,8 +157,8 @@ mod tests {
     #[test]
     fn build_key_match_predicate_empty_batch_returns_none() {
         let keys = id_name_batch(&[], &[]);
-        let predicate = build_key_match_predicate(&keys, &["id".to_string()])
-            .expect("should not error");
+        let predicate =
+            build_key_match_predicate(&keys, &["id".to_string()]).expect("should not error");
         assert!(predicate.is_none());
     }
 
@@ -199,7 +202,11 @@ mod tests {
             .await
             .expect("resolve should succeed");
 
-        assert_eq!(keys.num_columns(), 1, "projected down to just the id column");
+        assert_eq!(
+            keys.num_columns(),
+            1,
+            "projected down to just the id column"
+        );
         let id_col = keys
             .column(0)
             .as_any()

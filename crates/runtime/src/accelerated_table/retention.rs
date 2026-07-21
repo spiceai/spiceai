@@ -17,7 +17,9 @@ limitations under the License.
 use std::{sync::Arc, time::SystemTime};
 
 use crate::{
-    accelerated_table::{DataRetentionFilter, Retention, refresh, refresh_task::collect_indexes_from_provider},
+    accelerated_table::{
+        DataRetentionFilter, Retention, refresh, refresh_task::collect_indexes_from_provider,
+    },
     component::dataset::TimeFormat,
     datafusion::{
         builder::get_df_default_config,

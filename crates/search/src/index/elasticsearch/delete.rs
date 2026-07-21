@@ -84,9 +84,9 @@ fn build_or_of_row_term_queries(keys: &RecordBatch) -> DataFusionResult<Option<V
 
 fn scalar_to_term_value(value: &ScalarValue) -> Option<Value> {
     match value {
-        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) | ScalarValue::Utf8View(Some(s)) => {
-            Some(Value::String(s.clone()))
-        }
+        ScalarValue::Utf8(Some(s))
+        | ScalarValue::LargeUtf8(Some(s))
+        | ScalarValue::Utf8View(Some(s)) => Some(Value::String(s.clone())),
         ScalarValue::Boolean(Some(b)) => Some(Value::Bool(*b)),
         ScalarValue::Int8(Some(v)) => Some(json!(v)),
         ScalarValue::Int16(Some(v)) => Some(json!(v)),

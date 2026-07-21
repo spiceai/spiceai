@@ -821,7 +821,9 @@ async fn delete_warm_by_keys_hits_only_primary() {
     let events = events.lock().expect("event log mutex").clone();
     assert!(events.contains(&"primary:delete_by_keys:3".to_string()));
     assert!(
-        !events.iter().any(|e| e.starts_with("secondary:delete_by_keys")),
+        !events
+            .iter()
+            .any(|e| e.starts_with("secondary:delete_by_keys")),
         "warm-only delete must not reach the secondary/fallback index: {events:?}"
     );
 }
@@ -872,7 +874,9 @@ async fn vector_delete_warm_by_keys_hits_only_primary() {
     let events = events.lock().expect("event log mutex").clone();
     assert!(events.contains(&"primary:delete_by_keys:1".to_string()));
     assert!(
-        !events.iter().any(|e| e.starts_with("secondary:delete_by_keys")),
+        !events
+            .iter()
+            .any(|e| e.starts_with("secondary:delete_by_keys")),
         "warm-only delete must not reach the secondary/fallback index: {events:?}"
     );
 }

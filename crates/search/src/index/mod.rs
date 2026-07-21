@@ -43,13 +43,13 @@ use crate::index::compound::{CompoundSearchIndex, CompoundVectorIndex};
 pub use native_vector::NativeVectorIndex;
 pub use vector_table::VectorScanTableProvider;
 
+use crate::generation::text_search::index::FullTextDatabaseIndex;
 #[cfg(feature = "duckdb")]
 use crate::index::duckdb::DuckDBVectorIndex;
 #[cfg(feature = "elasticsearch")]
 use crate::index::elasticsearch::{ElasticsearchIndex, ElasticsearchTextIndex};
 #[cfg(feature = "s3_vectors")]
 use crate::index::s3_vectors::S3Vector;
-use crate::generation::text_search::index::FullTextDatabaseIndex;
 
 /// A [`SearchIndex`] is a table index that can provide search results for arbitrary queries (see [`SearchIndex::query_table_provider`]).
 /// This trait supports both vector similarity search and full-text search implementations.
@@ -111,8 +111,9 @@ pub async fn search_index_delete_by_predicate(
     session: &dyn Session,
     filters: Vec<Expr>,
 ) -> DataFusionResult<()> {
-    let keys = resolve_keys_matching_predicate(accelerator, session, filters, &index.primary_fields())
-        .await?;
+    let keys =
+        resolve_keys_matching_predicate(accelerator, session, filters, &index.primary_fields())
+            .await?;
     if keys.num_rows() == 0 {
         return Ok(());
     }
@@ -160,9 +161,7 @@ pub fn derived_columns_from_vector_index(
 ///
 /// Mirrors [`derived_columns_from_vector_index`]'s manual downcast list — extend both together
 /// when a new concrete index type is added.
-pub fn as_search_index<'a>(
-    index: &'a Arc<dyn Index + Send + Sync>,
-) -> Option<&'a dyn SearchIndex> {
+pub fn as_search_index(index: &Arc<dyn Index + Send + Sync>) -> Option<&dyn SearchIndex> {
     if let Some(idx) = index.as_any().downcast_ref::<NativeVectorIndex>() {
         return Some(idx as &dyn SearchIndex);
     }

@@ -37,11 +37,12 @@ pub async fn delete_by_keys(index: &S3Vector, keys: &RecordBatch) -> DataFusionR
         ));
     }
 
-    let key_strings: Vec<String> = extract_and_format_primary_key(index.name(), &index.primary_key, keys)
-        .map_err(|e| DataFusionError::External(Box::new(*e)))?
-        .into_iter()
-        .flatten()
-        .collect();
+    let key_strings: Vec<String> =
+        extract_and_format_primary_key(index.name(), &index.primary_key, keys)
+            .map_err(|e| DataFusionError::External(Box::new(*e)))?
+            .into_iter()
+            .flatten()
+            .collect();
 
     index
         .table
@@ -58,7 +59,10 @@ pub async fn delete_by_keys(index: &S3Vector, keys: &RecordBatch) -> DataFusionR
 /// scanning the index's own [`VectorIndex::list_table_provider`] with the prefix predicate
 /// applied client-side, then re-derives the exact composite keys for the matches and deletes
 /// them via [`delete_by_keys`].
-pub async fn delete_by_key_prefix(index: &S3Vector, prefix_keys: &RecordBatch) -> DataFusionResult<()> {
+pub async fn delete_by_key_prefix(
+    index: &S3Vector,
+    prefix_keys: &RecordBatch,
+) -> DataFusionResult<()> {
     if !index.partition_by.is_empty() {
         return Err(DataFusionError::NotImplemented(
             "S3Vector prefix delete is not yet supported for a partitioned vector index"
@@ -77,10 +81,16 @@ pub async fn delete_by_key_prefix(index: &S3Vector, prefix_keys: &RecordBatch) -
     };
 
     let list_plan = index.list_table_provider()?;
-    let filtered_plan = LogicalPlanBuilder::from(list_plan).filter(predicate)?.build()?;
+    let filtered_plan = LogicalPlanBuilder::from(list_plan)
+        .filter(predicate)?
+        .build()?;
 
     let ctx = SessionContext::new();
-    let matches = ctx.execute_logical_plan(filtered_plan).await?.collect().await?;
+    let matches = ctx
+        .execute_logical_plan(filtered_plan)
+        .await?
+        .collect()
+        .await?;
 
     if matches.is_empty() || matches.iter().all(|b| b.num_rows() == 0) {
         return Ok(());

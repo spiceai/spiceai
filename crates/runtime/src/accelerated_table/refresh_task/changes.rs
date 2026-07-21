@@ -60,8 +60,8 @@ use runtime_datafusion_index::{
 };
 use runtime_metrics::acceleration as metrics;
 use runtime_search::embeddings::table::EmbeddingTable;
-use search::index::as_search_index;
 use runtime_table_partition::provider::PartitionTableProvider;
+use search::index::as_search_index;
 #[cfg(test)]
 use snafu::OptionExt;
 use snafu::ResultExt;
@@ -2900,8 +2900,7 @@ impl RefreshTask {
                     // index-aware handling — drive index deletion explicitly here instead.
                     // Best-effort: an index failure is logged, not propagated, so it can't
                     // block the (already-applied) accelerator-side delete above.
-                    if let Some(keys) =
-                        build_pk_only_batch_from_change_batch(change_batch, chunk)?
+                    if let Some(keys) = build_pk_only_batch_from_change_batch(change_batch, chunk)?
                     {
                         for index in collect_indexes_from_provider(Arc::clone(&self.accelerator)) {
                             if let Some(search_index) = as_search_index(&index) {
@@ -4093,7 +4092,11 @@ mod tests {
             .expect("should not error")
             .expect("keyed rows produce a batch");
 
-        assert_eq!(keys.num_columns(), 1, "only the 'id' key column, not 'name'");
+        assert_eq!(
+            keys.num_columns(),
+            1,
+            "only the 'id' key column, not 'name'"
+        );
         assert_eq!(keys.schema().field(0).name(), "id");
         let id_col = keys
             .column(0)
@@ -4129,8 +4132,8 @@ mod tests {
         let change_batch =
             create_test_change_batch(vec!["d"], &[vec!["id"]], vec![1], vec![Some("Alice")]);
 
-        let result = build_pk_only_batch_from_change_batch(&change_batch, &[])
-            .expect("should not error");
+        let result =
+            build_pk_only_batch_from_change_batch(&change_batch, &[]).expect("should not error");
         assert!(result.is_none());
     }
 
