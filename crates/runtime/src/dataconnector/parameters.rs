@@ -30,7 +30,9 @@ use super::{
     ConnectorComponent, DATA_CONNECTOR_FACTORY_REGISTRY, DataConnectorError, ODBC_DATACONNECTOR,
 };
 
-pub(crate) mod aws;
+// `pub` (not `pub(crate)`): the AWS config helper is used by extracted AWS
+// connector crates (e.g. connector-dynamodb) as well as in-tree ones (glue).
+pub mod aws;
 pub mod azure;
 pub mod gcs;
 
