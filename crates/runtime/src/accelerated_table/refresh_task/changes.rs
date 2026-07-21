@@ -527,6 +527,53 @@ pub struct CdcConfig {
     /// interruptible; keys across chunks are distinct, so semantics are
     /// preserved (each key deleted exactly once).
     pub delete_subbatch_max: usize,
+    /// How the CDC apply loop applies a coalesced burst to the accelerator.
+    /// See [`CdcApplyMode`]. Defaults to [`CdcApplyMode::Inline`] (the historical,
+    /// byte-identical behavior).
+    pub apply_mode: CdcApplyMode,
+}
+
+/// How the CDC apply loop applies a coalesced burst to the accelerator — an enum
+/// (not a bool) so it can grow a third mode and each value names its behavior.
+///
+/// - `Inline`: recv-coalesce and the full validate+append run on the SAME apply
+///   task, `.await`ed inline. A slow apply keeps the prefetch channel full, which
+///   back-pressures the shared CDC reader (all tables stall on the shared slot).
+///   This is the historical behavior and the conservative default.
+/// - `Pipelined`: recv + coalesce (+ off-lock prepare) run on the apply loop and
+///   hand off to a dedicated Stage-B applier task over a bounded queue, so the
+///   apply loop keeps draining the prefetch channel while a slow apply proceeds
+///   off the recv path — a slow table no longer back-pressures the shared reader.
+///   Only engaged for `cdc_durability: memory` (the pipelined seam); every other
+///   table stays `Inline`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CdcApplyMode {
+    /// Apply inline on the recv loop (byte-identical historical behavior).
+    #[default]
+    Inline,
+    /// Decouple recv+coalesce from validate+append via a bounded handoff.
+    Pipelined,
+}
+
+impl CdcApplyMode {
+    /// Parse the user-facing `cdc_apply` value (case-insensitive). Returns `None`
+    /// for an unrecognized value so callers can warn and fall back.
+    #[must_use]
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "inline" => Some(Self::Inline),
+            "pipelined" => Some(Self::Pipelined),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Inline => "inline",
+            Self::Pipelined => "pipelined",
+        }
+    }
 }
 
 const CDC_PREFETCH_BUFFER_DEFAULT: usize = 128;
@@ -587,6 +634,7 @@ impl Default for CdcConfig {
             max_coalesce_age_ms: CDC_MAX_COALESCE_AGE_MS_DEFAULT,
             commit_timeout: Duration::from_millis(CDC_COMMIT_TIMEOUT_MS_DEFAULT as u64),
             delete_subbatch_max: CDC_DELETE_SUBBATCH_MAX_DEFAULT,
+            apply_mode: CdcApplyMode::Inline,
         }
     }
 }
@@ -793,6 +841,7 @@ fn cdc_config() -> CdcConfig {
             CDC_DELETE_SUBBATCH_MAX_DEFAULT,
             CDC_DELETE_SUBBATCH_MAX_MAX,
         ),
+        apply_mode: parse_env_apply_mode("SPICE_CDC_APPLY", CdcApplyMode::default()),
     }
 }
 
@@ -858,6 +907,7 @@ pub(crate) const CDC_RUNTIME_PARAMS: &[&str] = &[
     "cdc_max_coalesce_age_ms",
     "cdc_commit_timeout_ms",
     "cdc_delete_subbatch_max",
+    "cdc_apply",
 ];
 
 /// Build a [`CdcConfig`] from the spicepod `runtime.params` map, reading
@@ -909,6 +959,12 @@ pub fn cdc_config_from_params(params: &std::collections::HashMap<String, String>
             "SPICE_CDC_DELETE_SUBBATCH_MAX",
             CDC_DELETE_SUBBATCH_MAX_DEFAULT,
             CDC_DELETE_SUBBATCH_MAX_MAX,
+        ),
+        apply_mode: resolve_cdc_apply_mode(
+            params,
+            "cdc_apply",
+            "SPICE_CDC_APPLY",
+            CdcApplyMode::default(),
         ),
     }
 }
@@ -971,6 +1027,7 @@ pub(crate) fn cdc_config_overlay(
             base.delete_subbatch_max,
             CDC_DELETE_SUBBATCH_MAX_MAX,
         ),
+        apply_mode: overlay_cdc_apply_mode(dataset_params, "cdc_apply", base.apply_mode),
     }
 }
 
@@ -1054,6 +1111,58 @@ fn parse_env_u64(var: &'static str, default: u64) -> u64 {
             }
         },
     }
+}
+
+/// Resolve [`CdcApplyMode`] from `var`, falling back to `default` on missing or
+/// unrecognized values (with a warning so misconfiguration is visible).
+fn parse_env_apply_mode(var: &'static str, default: CdcApplyMode) -> CdcApplyMode {
+    match std::env::var(var) {
+        Err(_) => default,
+        Ok(raw) => CdcApplyMode::parse(&raw).unwrap_or_else(|| {
+            tracing::warn!(
+                "{var}={raw:?} is not a valid cdc_apply mode (inline|pipelined); using default {}",
+                default.as_str()
+            );
+            default
+        }),
+    }
+}
+
+/// Resolve `cdc_apply` from `runtime.params`, falling back to the matching env
+/// var then `default` when missing or unrecognized.
+fn resolve_cdc_apply_mode(
+    params: &std::collections::HashMap<String, String>,
+    key: &'static str,
+    env_var: &'static str,
+    default: CdcApplyMode,
+) -> CdcApplyMode {
+    if let Some(raw) = params.get(key) {
+        if let Some(mode) = CdcApplyMode::parse(raw) {
+            return mode;
+        }
+        tracing::warn!(
+            "runtime.params.{key}={raw:?} is not a valid cdc_apply mode (inline|pipelined); falling back to {env_var}/default"
+        );
+    }
+    parse_env_apply_mode(env_var, default)
+}
+
+/// Overlay a per-dataset `cdc_apply` on top of an already-resolved base mode.
+fn overlay_cdc_apply_mode(
+    params: &std::collections::HashMap<String, String>,
+    key: &'static str,
+    base: CdcApplyMode,
+) -> CdcApplyMode {
+    let Some(raw) = params.get(key) else {
+        return base;
+    };
+    CdcApplyMode::parse(raw).unwrap_or_else(|| {
+        tracing::warn!(
+            "dataset acceleration.params.{key}={raw:?} is not a valid cdc_apply mode (inline|pipelined); keeping value {}",
+            base.as_str()
+        );
+        base
+    })
 }
 
 impl RefreshTask {
@@ -3860,6 +3969,7 @@ mod tests {
             max_coalesce_age_ms: 250,
             commit_timeout: Duration::from_secs(30),
             delete_subbatch_max: CDC_DELETE_SUBBATCH_MAX_DEFAULT,
+            apply_mode: CdcApplyMode::Inline,
         };
         let overlaid = cdc_config_overlay(
             base,
@@ -5482,6 +5592,7 @@ mod tests {
             max_coalesce_age_ms,
             commit_timeout: Duration::from_secs(30),
             delete_subbatch_max: CDC_DELETE_SUBBATCH_MAX_DEFAULT,
+            apply_mode: CdcApplyMode::Inline,
         }
     }
 
@@ -5634,6 +5745,7 @@ mod tests {
             max_coalesce_age_ms: 60_000,
             commit_timeout: Duration::from_secs(30),
             delete_subbatch_max: CDC_DELETE_SUBBATCH_MAX_DEFAULT,
+            apply_mode: CdcApplyMode::Inline,
         };
 
         let stream: ChangesStream = YieldOnceThenParkStream {
@@ -6786,5 +6898,58 @@ mod tests {
         assert!(result.is_ok(), "Non-null PK should succeed");
         let (str_val, _expr) = result.expect("already asserted Ok");
         assert_eq!(str_val, "42");
+    }
+
+    #[test]
+    fn cdc_apply_mode_parses_and_overlays() {
+        use std::collections::HashMap;
+
+        // Value parsing (case-insensitive, trimmed; unknown -> None).
+        assert_eq!(CdcApplyMode::parse("inline"), Some(CdcApplyMode::Inline));
+        assert_eq!(
+            CdcApplyMode::parse("PIPELINED"),
+            Some(CdcApplyMode::Pipelined)
+        );
+        assert_eq!(
+            CdcApplyMode::parse("  pipelined "),
+            Some(CdcApplyMode::Pipelined)
+        );
+        assert_eq!(CdcApplyMode::parse("bogus"), None);
+
+        // Conservative default (inline) when the param is absent.
+        let empty: HashMap<String, String> = HashMap::new();
+        assert_eq!(
+            cdc_config_from_params(&empty).apply_mode,
+            CdcApplyMode::Inline
+        );
+
+        // Explicit pipelined via runtime.params.
+        let mut params = HashMap::new();
+        params.insert("cdc_apply".to_string(), "pipelined".to_string());
+        assert_eq!(
+            cdc_config_from_params(&params).apply_mode,
+            CdcApplyMode::Pipelined
+        );
+
+        // Invalid value falls back to the default (inline), not an error.
+        let mut bad = HashMap::new();
+        bad.insert("cdc_apply".to_string(), "nonsense".to_string());
+        assert_eq!(cdc_config_from_params(&bad).apply_mode, CdcApplyMode::Inline);
+
+        // Per-dataset overlay can flip the base mode, and an absent overlay keeps it.
+        let base = CdcConfig {
+            apply_mode: CdcApplyMode::Pipelined,
+            ..cdc_config_from_params(&empty)
+        };
+        let mut ds = HashMap::new();
+        ds.insert("cdc_apply".to_string(), "inline".to_string());
+        assert_eq!(
+            cdc_config_overlay(base, &ds).apply_mode,
+            CdcApplyMode::Inline
+        );
+        assert_eq!(
+            cdc_config_overlay(base, &empty).apply_mode,
+            CdcApplyMode::Pipelined
+        );
     }
 }

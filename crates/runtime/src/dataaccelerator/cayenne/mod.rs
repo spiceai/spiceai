@@ -2382,8 +2382,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    62,
-    { S3_PARAMS_LEN + 62 },
+    63,
+    { S3_PARAMS_LEN + 63 },
 >(
     S3_PARAMETERS,
     [
@@ -2542,6 +2542,10 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Per-dataset override for the linger window (ms) the CDC apply loop waits for additional envelopes before flushing."),
         ParameterSpec::runtime("cdc_commit_timeout_ms")
             .description("Per-dataset override for the CDC source-side commit timeout (ms)."),
+        ParameterSpec::runtime("cdc_apply")
+            .description("How the CDC apply loop applies a coalesced burst: 'inline' (default; recv-coalesce and validate+append run on the same task) or 'pipelined' (decouple recv+coalesce from validate+append via a bounded handoff so a slow table stops back-pressuring the shared CDC reader; only engaged for cdc_durability: memory).")
+            .one_of(&["inline", "pipelined"])
+            .default("inline"),
     ],
 );
 
