@@ -16474,6 +16474,10 @@ dependencies = [
  "runtime-async",
  "runtime-auth",
  "runtime-checkpoint-api",
+ "runtime-checkpoint-duckdb",
+ "runtime-checkpoint-postgres",
+ "runtime-checkpoint-sqlite",
+ "runtime-checkpoint-turso",
  "runtime-cluster",
  "runtime-datafusion",
  "runtime-datafusion-index",
@@ -16633,6 +16637,46 @@ version = "2.2.0-unstable"
 dependencies = [
  "async-trait",
  "snafu",
+]
+
+[[package]]
+name = "runtime-checkpoint-duckdb"
+version = "2.2.0-unstable"
+dependencies = [
+ "async-trait",
+ "datafusion-table-providers",
+ "runtime-checkpoint-api",
+ "tokio",
+]
+
+[[package]]
+name = "runtime-checkpoint-postgres"
+version = "2.2.0-unstable"
+dependencies = [
+ "async-trait",
+ "datafusion-table-providers",
+ "runtime-checkpoint-api",
+ "tokio-postgres",
+]
+
+[[package]]
+name = "runtime-checkpoint-sqlite"
+version = "2.2.0-unstable"
+dependencies = [
+ "async-trait",
+ "datafusion-table-providers",
+ "runtime-checkpoint-api",
+ "rusqlite",
+]
+
+[[package]]
+name = "runtime-checkpoint-turso"
+version = "2.2.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "runtime-checkpoint-api",
+ "turso",
 ]
 
 [[package]]
