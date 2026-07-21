@@ -203,8 +203,6 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 
 ## Supported Data Connectors
 
-Statuses match the signed DRI tables in [`docs/criteria/connectors/`](docs/criteria/connectors/).
-
 | Name                               | Description                           | Status            | Protocol/Format              |
 | ---------------------------------- | ------------------------------------- | ----------------- | ---------------------------- |
 | `databricks (mode: delta_lake)`    | [Databricks][databricks]              | Stable            | S3/Delta Lake                |
@@ -221,16 +219,16 @@ Statuses match the signed DRI tables in [`docs/criteria/connectors/`](docs/crite
 | `graphql`                          | GraphQL                               | Release Candidate | JSON                         |
 | `cosmosdb`                         | Azure Cosmos DB (NoSQL)               | Release Candidate |                              |
 | `git`                              | Git repositories                      | Release Candidate |                              |
-| `snowflake`                        | Snowflake                             | Beta              | Arrow                        |
-| `iceberg`                          | [Apache Iceberg][iceberg] (read+write) | Beta              | Parquet                      |
+| `snowflake`                        | Snowflake                             | Release Candidate | Arrow                        |
+| `adbc`                             | ADBC                                  | Release Candidate | Arrow                        |
+| `iceberg`                          | [Apache Iceberg][iceberg] (read+write) | Release Candidate | Parquet                      |
 | `databricks (mode: spark_connect)` | [Databricks][databricks]              | Beta              | [Spark Connect][spark]       |
 | `ducklake`                         | [DuckLake][ducklake]                  | Beta              | Parquet                      |
+| `flightsql`                        | FlightSQL                             | Beta              | Arrow Flight SQL             |
 | `mssql`                            | Microsoft SQL Server                  | Beta              | Tabular Data Stream (TDS)    |
+| `odbc`                             | ODBC                                  | Beta              | ODBC                         |
 | `spark`                            | Spark                                 | Beta              | [Spark Connect][spark]       |
-| `adbc`                             | ADBC                                  | Alpha             | Arrow                        |
-| `flightsql`                        | FlightSQL                             | Alpha             | Arrow Flight SQL             |
-| `odbc`                             | ODBC                                  | Alpha             | ODBC                         |
-| `sharepoint`                       | Microsoft SharePoint                  | Alpha             | Object-store listing         |
+| `sharepoint`                       | Microsoft SharePoint                  | Beta              | Object-store listing         |
 | `oracle`                           | Oracle                                | Alpha             | [Oracle ODPI-C][ODPIC]       |
 | `abfs`                             | Azure BlobFS                          | Alpha             | Parquet, CSV                 |
 | `clickhouse`                       | ClickHouse                            | Alpha             |                              |
@@ -261,8 +259,6 @@ Statuses match the signed DRI tables in [`docs/criteria/connectors/`](docs/crite
 [ODPIC]: https://oracle.github.io/odpi/
 
 ## Supported Data Accelerators
-
-Statuses match the signed DRI tables in [`docs/criteria/accelerators/`](docs/criteria/accelerators/).
 
 | Name       | Description                       | Status            | Engine Modes     |
 | ---------- | --------------------------------- | ----------------- | ---------------- |
@@ -298,7 +294,7 @@ Statuses match the signed DRI tables in [`docs/criteria/accelerators/`](docs/cri
 | `openai`      | OpenAI (or compatible) embeddings endpoint   | Release Candidate | -            | OpenAI-compatible embeddings endpoint  |
 | `file`        | Local filesystem                             | Release Candidate | ONNX         | GGUF, GGML, SafeTensor                 |
 | `huggingface` | Models hosted on HuggingFace                 | Release Candidate | ONNX         | GGUF, GGML, SafeTensor                 |
-| `model2vec`   | Static embeddings (500x faster)              | Alpha             | Model2Vec    | -                                      |
+| `model2vec`   | Static embeddings (500x faster)              | Release Candidate | Model2Vec    | -                                      |
 | `azure`       | Azure OpenAI                                 | Alpha             | -            | OpenAI-compatible HTTP endpoint        |
 | `bedrock`     | AWS Bedrock (Titan, Cohere, Nova, Nova 2)    | Alpha             | -            | OpenAI-compatible HTTP endpoint        |
 
@@ -316,12 +312,10 @@ Configured as `.vectors.engine` on a column-level embedding.
 
 Catalog Connectors connect to external catalog providers and make their tables available for federated SQL query in Spice. The schema hierarchy of the external catalog is preserved.
 
-Statuses match the signed DRI tables in [`docs/criteria/catalogs/`](docs/criteria/catalogs/).
-
 | Name            | Description             | Status | Protocol/Format              |
 | --------------- | ----------------------- | ------ | ---------------------------- |
+| `spice.ai`      | Spice.ai Cloud Platform | Stable | Arrow Flight                 |
 | `unity_catalog` | Unity Catalog           | Stable | Delta Lake                   |
-| `spice.ai`      | Spice.ai Cloud Platform | Beta   | Arrow Flight                 |
 | `databricks`    | Databricks              | Beta   | Spark Connect, S3/Delta Lake |
 | `iceberg`       | Apache Iceberg          | Beta   | Parquet                      |
 | `ducklake`      | DuckLake                | Beta   | Parquet                      |
