@@ -15717,6 +15717,18 @@ impl CayenneTableProvider {
     /// `run_compaction_trigger`.
     #[doc(hidden)]
     pub async fn bake_seq_prefix_protected_snapshots(&self) -> Result<bool> {
+        // DIAG(cold-stall): experiment gate. `CAYENNE_DISABLE_SEQ_PREFIX_BAKE=1` skips the seq-prefix
+        // bake, including its O(N) deletion-index prune `rcu` (the Mode-2/cause-B churn). Safe: the
+        // prune is an optimization, so skipping it only leaves baked tombstones in the index
+        // (probe-miss + extra memory), never corrupts data. Lets us test cold promotion in isolation
+        // from the deletion-index churn. REVERT before merge.
+        static SEQ_PREFIX_BAKE_DISABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("CAYENNE_DISABLE_SEQ_PREFIX_BAKE")
+                .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"))
+        });
+        if *SEQ_PREFIX_BAKE_DISABLED {
+            return Ok(false);
+        }
         // GATE: key-delete tables only. Position deletes are file-scoped (the
         // prune is a no-op for them) and their subset compaction must serialize
         // against writers — neither is the seq-prefix bake's domain.
