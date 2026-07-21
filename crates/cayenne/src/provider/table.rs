@@ -1584,6 +1584,11 @@ pub struct CayenneTableProvider {
     /// this state when a scan captured the same [`maintained_aggregate_epoch`]
     /// as its physical shard snapshots and the registry is fresh at that epoch.
     maintained_aggregates: Arc<MaintainedAggregateRegistry>,
+    /// Default-on filter-column hit histogram (F4). Scans record which columns
+    /// appear in pushdown filters; when `sort_columns` is empty, compaction
+    /// sorts the rewrite by the hottest observed columns so zone maps prune
+    /// selective queries without spicepod setup. Shared across clones.
+    filter_column_observations: super::predicate_stats::SharedFilterColumnObservations,
     /// Visibility epoch for the maintained aggregate registry. Advanced under
     /// the same write barriers that publish scan-visible table changes.
     maintained_aggregate_epoch: Arc<AtomicU64>,
@@ -5167,6 +5172,7 @@ impl CayenneTableProvider {
             orphan_dv_sweep_scheduled: Arc::new(AtomicBool::new(false)),
             post_write_maintenance: Arc::new(PostWriteMaintenance::default()),
             maintained_aggregates,
+            filter_column_observations: Arc::new(super::predicate_stats::FilterColumnObservations::new()),
             maintained_aggregate_epoch: Arc::new(AtomicU64::new(0)),
             maintained_aggregate_visibility_sequence: Arc::new(AtomicU64::new(0)),
             maintained_aggregate_tx,
@@ -6239,6 +6245,7 @@ impl CayenneTableProvider {
             orphan_dv_sweep_scheduled: Arc::clone(&self.orphan_dv_sweep_scheduled),
             post_write_maintenance: Arc::clone(&self.post_write_maintenance),
             maintained_aggregates: Arc::clone(&self.maintained_aggregates),
+            filter_column_observations: Arc::clone(&self.filter_column_observations),
             maintained_aggregate_epoch: Arc::clone(&self.maintained_aggregate_epoch),
             maintained_aggregate_visibility_sequence: Arc::clone(
                 &self.maintained_aggregate_visibility_sequence,
@@ -11384,24 +11391,54 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if sorting fails or if configured sort columns don't exist.
-    fn sort_stream(&self, stream: SendableRecordBatchStream) -> Result<SendableRecordBatchStream> {
+    /// Sort a stream by the given column list (configured or auto-observed).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if sorting fails.
+    fn sort_stream_by_columns(
+        &self,
+        stream: SendableRecordBatchStream,
+        sort_columns: &[String],
+    ) -> Result<SendableRecordBatchStream> {
         use datafusion_execution::TaskContext;
+
+        if sort_columns.is_empty() {
+            return Ok(stream);
+        }
 
         // Create a task context with default memory pool and runtime settings
         // This will use the configured spill directory and compression settings
         let task_ctx = Arc::new(TaskContext::default());
 
         tracing::debug!(
-            "Sorting refresh data by columns {:?} for table {} using DataFusion SortExec with disk spilling support",
-            self.context.sort_columns(),
+            "Sorting data by columns {:?} for table {} using DataFusion SortExec with disk spilling support",
+            sort_columns,
             self.table_metadata.table_name
         );
 
-        // Use the common stream sorting utility
-        let sorted_stream =
-            util::stream_utils::sort_stream(stream, self.context.sort_columns(), &task_ctx)?;
+        let sorted_stream = util::stream_utils::sort_stream(stream, sort_columns, &task_ctx)?;
 
         Ok(sorted_stream)
+    }
+
+    /// Effective sort columns for a snapshot rewrite under default settings.
+    ///
+    /// Operator-configured `sort_columns` always win. When empty (the default),
+    /// returns the hottest filter columns observed on scans so compaction can
+    /// cluster cold files without spicepod setup (F4 adaptive layout).
+    ///
+    /// Public so integration tests can assert the default-on policy without
+    /// reaching private compaction internals.
+    #[must_use]
+    pub fn effective_sort_columns_for_rewrite(&self) -> Vec<String> {
+        if self.context.has_sort_columns() {
+            return self.context.sort_columns().to_vec();
+        }
+        self.filter_column_observations.top_columns(
+            super::predicate_stats::DEFAULT_AUTO_CLUSTER_TOP_K,
+            self.table_schema().as_ref(),
+        )
     }
 
     /// Sort and rewrite data by reading from the current listing table, writing
@@ -11446,10 +11483,12 @@ impl CayenneTableProvider {
             return Ok(());
         }
 
+        let rewrite_sort_columns = self.effective_sort_columns_for_rewrite();
         tracing::debug!(
-            "Sorting and rewriting data for table {} by columns {:?}",
+            "Sorting and rewriting data for table {} by columns {:?} (auto_from_filters={})",
             self.table_metadata.table_name,
-            self.context.sort_columns()
+            rewrite_sort_columns,
+            !self.context.has_sort_columns()
         );
 
         // Create a session context and scan the logical table view to get all
@@ -11458,8 +11497,8 @@ impl CayenneTableProvider {
         let ctx = self.create_session_context();
         let (stream, _) = self.visible_file_stream_for_rewrite(&ctx).await?;
 
-        // Sort the stream using our existing sort logic
-        let sorted_stream = self.sort_stream(stream)?;
+        // Configured sort_columns win; default empty uses hottest observed filters (F4).
+        let sorted_stream = self.sort_stream_by_columns(stream, &rewrite_sort_columns)?;
 
         // Write sorted data to a new snapshot directory. Because SortExec lazily
         // reads input files via DataSourceExec, writing to a separate directory
@@ -13785,14 +13824,19 @@ impl CayenneTableProvider {
             )
         };
 
-        if self.context.has_sort_columns() {
+        // Configured sort_columns win; otherwise (default empty) sort by the
+        // hottest observed filter columns so selective scans prune zone maps
+        // without spicepod setup (F4 adaptive cold layout).
+        let rewrite_sort_columns = self.effective_sort_columns_for_rewrite();
+        if !rewrite_sort_columns.is_empty() {
             tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
-                sort_columns = ?self.context.sort_columns(),
+                sort_columns = ?rewrite_sort_columns,
+                auto_from_filters = !self.context.has_sort_columns(),
                 "Sorting compaction rewrite before writing consolidated output files"
             );
-            stream = self.sort_stream(stream)?;
+            stream = self.sort_stream_by_columns(stream, &rewrite_sort_columns)?;
         }
 
         // Compaction is the file-count reduction path. Ordinary appends shard
@@ -14148,8 +14192,9 @@ impl CayenneTableProvider {
     }
 
     /// Resolve the cold-tier clustering columns to schema indices:
-    /// `cayenne_datalake_clustering_columns` → else `cayenne_sort_columns` → else the
-    /// primary key. Returns the indices that exist in the schema (empty = no
+    /// `cayenne_datalake_clustering_columns` → else `cayenne_sort_columns` →
+    /// else hottest observed filter columns (F4 default-on) → else the primary
+    /// key. Returns the indices that exist in the schema (empty = no
     /// clustering, promotion writes unsorted).
     fn resolve_cold_clustering_indices(&self) -> Vec<usize> {
         let schema = self.table_schema();
@@ -14159,7 +14204,15 @@ impl CayenneTableProvider {
         } else if !self.context.sort_columns().is_empty() {
             self.context.sort_columns().to_vec()
         } else {
-            self.table_metadata.primary_key.clone()
+            let observed = self.filter_column_observations.top_columns(
+                super::predicate_stats::DEFAULT_AUTO_CLUSTER_TOP_K,
+                schema.as_ref(),
+            );
+            if observed.is_empty() {
+                self.table_metadata.primary_key.clone()
+            } else {
+                observed
+            }
         };
         names
             .iter()
@@ -24574,6 +24627,11 @@ impl TableProvider for CayenneTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        // F4 default-on layout: record which columns this scan filters on so
+        // background compaction can cluster cold files without spicepod setup.
+        // Cheap (mutex + HashMap bump); empty filters are a no-op.
+        self.filter_column_observations.record_filters(filters);
+
         // Register object store with the session's runtime env if configured for S3 Express One Zone.
         // This ensures the session can access S3 when the underlying ListingTable reads data.
         if let Some(ref config) = self.object_store_config {
