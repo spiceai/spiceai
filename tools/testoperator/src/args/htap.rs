@@ -88,6 +88,15 @@ pub struct HtapArgs {
     /// this.
     #[arg(long, default_value_t = false)]
     pub(crate) skip_analytic_gate: bool,
+
+    /// Number of analytical-query-gate queries to evaluate concurrently. Each
+    /// worker runs its query's source and Spice sides in parallel, so the gate
+    /// keeps up to this many queries in flight against each engine. Bounded to
+    /// at least 1 and never more than the query count. Raise it to shorten the
+    /// gate on fast sources; lower it to ease load on a small source connection
+    /// pool. Default 4.
+    #[arg(long, default_value_t = 4)]
+    pub(crate) analytic_gate_concurrency: usize,
 }
 
 /// Parse and validate `--min-phase-coverage`: a fraction in the inclusive range
