@@ -33,13 +33,10 @@ use {
     crate::embeddings::construct_chunker,
     arrow_schema::{Schema, SchemaRef},
     chunking::ChunkingConfig,
-    llms::embeddings::Embed,
     runtime_datafusion_index::{Index, IndexedTableProvider},
+    runtime_search::embeddings::warm_index::with_memory_warm_index,
     search::index::{
-        SearchIndex, VectorIndex, VectorScanTableProvider,
-        chunking::ChunkedSearchIndex,
-        compound::{CompoundReadMode, CompoundVectorIndex},
-        memory::{MemoryDistanceMetric, MemoryVectorIndex},
+        SearchIndex, VectorIndex, VectorScanTableProvider, chunking::ChunkedSearchIndex,
     },
     search::metadata::{MetadataColumn, MetadataColumns},
     snafu::ResultExt,
@@ -287,76 +284,6 @@ async fn wrap_table_as_index_s3(
     Ok(Arc::new(provider))
 }
 
-/// Pair `engine_index` with an in-memory warm index in a writethrough
-/// [`CompoundVectorIndex`]: writes go to both indexes, and searches are served from
-/// memory, falling back to the vector engine for any search where the in-memory index
-/// returns zero results (e.g. before writes have repopulated it after a restart).
-///
-/// The warm index is an optimization: when a compatible in-memory index cannot be built
-/// (e.g. the engine's distance metric has no in-memory equivalent), the engine index is
-/// returned unchanged and a warning is logged — a dataset that works without a warm
-/// index must never fail to load because of one.
-///
-/// `metadata_columns` must only contain columns the engine index exposes in both its
-/// list and query plans; otherwise the fallback projection cannot be built at read time.
-/// When the index is chunked, `engine_index`'s primary key must already be augmented
-/// with the chunk key.
-#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
-fn with_memory_warm_index(
-    tbl: &TableReference,
-    engine_index: Arc<dyn VectorIndex>,
-    metadata_columns: MetadataColumns,
-    embedder: Arc<dyn Embed>,
-    metric: &str,
-) -> Arc<dyn VectorIndex> {
-    let memory_metric = match MemoryDistanceMetric::try_from(metric) {
-        Ok(memory_metric) => memory_metric,
-        Err(err) => {
-            tracing::warn!(
-                "Not adding an in-memory warm vector index for table {tbl}: {err} Searches will be served by the vector engine directly."
-            );
-            return engine_index;
-        }
-    };
-
-    let memory_index = match MemoryVectorIndex::try_new(
-        engine_index.search_column(),
-        engine_index.primary_fields(),
-        metadata_columns,
-        embedder,
-        engine_index.dimension(),
-        memory_metric,
-    ) {
-        Ok(memory_index) => Arc::new(memory_index) as Arc<dyn VectorIndex>,
-        Err(err) => {
-            tracing::warn!(
-                "Not adding an in-memory warm vector index for table {tbl}: {err} Searches will be served by the vector engine directly."
-            );
-            return engine_index;
-        }
-    };
-
-    match CompoundVectorIndex::try_new(
-        memory_index,
-        Arc::clone(&engine_index),
-        CompoundReadMode::FallbackToSecondary,
-    ) {
-        Ok(compound) => {
-            tracing::debug!(
-                "Added an in-memory warm vector index for table {tbl} column {}",
-                engine_index.search_column()
-            );
-            Arc::new(compound) as Arc<dyn VectorIndex>
-        }
-        Err(err) => {
-            tracing::warn!(
-                "Not adding an in-memory warm vector index for table {tbl}: {err} Searches will be served by the vector engine directly."
-            );
-            engine_index
-        }
-    }
-}
-
 /// Wrap `index` (whose primary key must already be augmented with the chunk key via
 /// [`ChunkedSearchIndex::augment_primary_key`]) in a [`ChunkedSearchIndex`] and attach
 /// it to `provider`.
@@ -489,10 +416,9 @@ async fn wrap_table_as_index_elasticsearch(
 
     for (column, config) in embedding_columns {
         let chunking = config.chunking.as_ref().filter(|cfg| cfg.enabled);
-        let (augmented_columns, index_schema) = if chunking.is_some() {
-            updated_chunked_search_index_format(&inner_table_provider, columns, &column)
-        } else {
-            (columns.to_vec(), inner_table_provider.schema())
+        let (augmented_columns, index_schema) = match chunking {
+            Some(_) => updated_chunked_search_index_format(&inner_table_provider, columns, &column),
+            None => (columns.to_vec(), inner_table_provider.schema()),
         };
 
         let mut es_index = super::elasticsearch::try_from_table(
@@ -508,55 +434,49 @@ async fn wrap_table_as_index_elasticsearch(
         )
         .await?;
 
-        if chunking.is_some() {
-            tracing::debug!(
-                "[Elasticsearch][table={tbl}] Chunking column {}",
-                es_index.embedded_column
-            );
-            es_index.primary_key = ChunkedSearchIndex::augment_primary_key(es_index.primary_key);
-        }
+        provider = match chunking {
+            Some(chunking) => {
+                tracing::debug!(
+                    "[Elasticsearch][table={tbl}] Chunking column {}",
+                    es_index.embedded_column
+                );
+                // The Elasticsearch chunked query plan omits the chunk key column, so the
+                // fallback projection from a warm in-memory index onto Elasticsearch results
+                // cannot be built — serve reads from Elasticsearch directly.
+                tracing::debug!(
+                    "Not adding an in-memory warm vector index for table {tbl}: chunking is enabled on the Elasticsearch vector engine."
+                );
+                es_index.primary_key =
+                    ChunkedSearchIndex::augment_primary_key(es_index.primary_key);
 
-        let embedder = Arc::clone(&es_index.compute_query);
-        let similarity = es_index.similarity.clone();
-        let engine_index = Arc::new(es_index) as Arc<dyn VectorIndex>;
-        let vector_index = if chunking.is_some() {
-            // The Elasticsearch chunked query plan omits the chunk key column, so the
-            // fallback projection from a warm in-memory index onto Elasticsearch results
-            // cannot be built — serve reads from Elasticsearch directly.
-            tracing::debug!(
-                "Not adding an in-memory warm vector index for table {tbl}: chunking is enabled on the Elasticsearch vector engine."
-            );
-            engine_index
-        } else {
-            // Unlike S3 Vectors, the Elasticsearch list & query plans do not expose
-            // metadata columns, so the warm index must not store any — otherwise the
-            // fallback projection onto the Elasticsearch results cannot be built.
-            with_memory_warm_index(
-                tbl,
-                engine_index,
-                MetadataColumns::none(),
-                embedder,
-                similarity.as_str(),
-            )
+                construct_chunked_vector_index(
+                    provider,
+                    embedding_models,
+                    chunking,
+                    Arc::new(es_index) as Arc<dyn SearchIndex>,
+                    config.model.as_str(),
+                    file_format,
+                )
+                .await?
+            }
+            None => {
+                // Unlike S3 Vectors, the Elasticsearch list & query plans do not expose
+                // metadata columns, so the warm index must not store any — otherwise the
+                // fallback projection onto the Elasticsearch results cannot be built.
+                let vector_index = with_memory_warm_index(
+                    tbl,
+                    Arc::new(es_index) as Arc<dyn VectorIndex>,
+                    MetadataColumns::none(),
+                    Arc::clone(&es_index.compute_query),
+                    es_index.similarity.as_str(),
+                );
+
+                provider.underlying = Arc::new(
+                    VectorScanTableProvider::try_new(provider.underlying, &vector_index).boxed()?,
+                ) as Arc<dyn TableProvider>;
+                provider.add_index(vector_index as Arc<dyn Index>)
+            }
         };
-
-        if let Some(chunking) = chunking {
-            provider = construct_chunked_vector_index(
-                provider,
-                embedding_models,
-                chunking,
-                vector_index as Arc<dyn SearchIndex>,
-                config.model.as_str(),
-                file_format,
-            )
-            .await?;
-        } else {
-            provider.underlying = Arc::new(
-                VectorScanTableProvider::try_new(provider.underlying, &vector_index)
-                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?,
-            ) as Arc<dyn TableProvider>;
-            provider = provider.add_index(vector_index as Arc<dyn Index>);
-        }
     }
 
     tracing::info!(
@@ -564,105 +484,4 @@ async fn wrap_table_as_index_elasticsearch(
         start.elapsed()
     );
     Ok(Arc::new(provider))
-}
-
-#[cfg(all(test, any(feature = "s3_vectors", feature = "elasticsearch")))]
-mod tests {
-    use super::*;
-    use crate::embeddings::index::tests::PretendVectorIndex;
-    use arrow_schema::{DataType, Field};
-    use async_trait::async_trait;
-    use llms::embeddings::{Embed, EmbeddingInput};
-    use search::index::compound::CompoundVectorIndex;
-
-    #[derive(Debug)]
-    struct NoopEmbed;
-
-    #[async_trait]
-    impl Embed for NoopEmbed {
-        async fn embed(&self, _input: EmbeddingInput) -> llms::embeddings::Result<Vec<Vec<f32>>> {
-            Ok(vec![])
-        }
-
-        fn size(&self) -> i32 {
-            3
-        }
-    }
-
-    /// A [`PretendVectorIndex`] whose embedded column carries `dimension`-sized vectors
-    /// (`dimension: 0` produces a plain string column, i.e. an invalid vector dimension).
-    fn pretend_index(dimension: i32) -> Arc<dyn VectorIndex> {
-        let content_type = if dimension > 0 {
-            DataType::FixedSizeList(
-                Arc::new(Field::new_list_field(DataType::Float32, false)),
-                dimension,
-            )
-        } else {
-            DataType::Utf8
-        };
-        let schema = Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("content", content_type, true),
-        ]);
-        Arc::new(PretendVectorIndex::new(
-            "content".to_string(),
-            vec![Field::new("id", DataType::Int64, false)],
-            schema,
-        ))
-    }
-
-    #[test]
-    fn warm_index_wraps_the_engine_index_in_a_compound() {
-        let index = with_memory_warm_index(
-            &TableReference::bare("tbl"),
-            pretend_index(3),
-            MetadataColumns::none(),
-            Arc::new(NoopEmbed),
-            "cosine",
-        );
-        assert!(
-            index
-                .as_any()
-                .downcast_ref::<CompoundVectorIndex>()
-                .is_some(),
-            "the engine index should be wrapped in a CompoundVectorIndex"
-        );
-    }
-
-    #[test]
-    fn warm_index_is_skipped_for_an_unknown_metric() {
-        let index = with_memory_warm_index(
-            &TableReference::bare("tbl"),
-            pretend_index(3),
-            MetadataColumns::none(),
-            Arc::new(NoopEmbed),
-            "hyperbolic",
-        );
-        assert!(
-            index
-                .as_any()
-                .downcast_ref::<PretendVectorIndex>()
-                .is_some(),
-            "an unknown metric must return the engine index unchanged"
-        );
-    }
-
-    #[test]
-    fn warm_index_is_skipped_when_the_memory_index_cannot_be_built() {
-        // A non-vector embedded column reports dimension 0, which the memory index rejects.
-        let index = with_memory_warm_index(
-            &TableReference::bare("tbl"),
-            pretend_index(0),
-            MetadataColumns::none(),
-            Arc::new(NoopEmbed),
-            "cosine",
-        );
-        assert!(
-            index
-                .as_any()
-                .downcast_ref::<PretendVectorIndex>()
-                .is_some(),
-            "a memory index construction failure must return the engine index unchanged"
-        );
-    }
 }
