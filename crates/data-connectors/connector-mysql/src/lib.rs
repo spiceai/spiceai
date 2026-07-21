@@ -165,18 +165,6 @@ const PARAMETERS: &[ParameterSpec] = &[
         )
         .one_of_ignore_ascii_case(InitialSnapshotMode::VALUES)
         .help_link(MYSQL_DOCS),
-    // Deprecated alias of `replication_initial_snapshot` (auto|never|always ->
-    // auto|always|disabled). Kept so existing spicepods keep loading.
-    ParameterSpec::component("replication_snapshot_mode")
-        .description(
-            "[deprecated] Use `mysql_replication_initial_snapshot` (auto|always|disabled) \
-             instead. 'never' maps to 'disabled'.",
-        )
-        .one_of_ignore_ascii_case(&["auto", "never", "always"])
-        .deprecated(
-            "Renamed to 'mysql_replication_initial_snapshot'; 'never' -> 'disabled'.",
-        )
-        .help_link(MYSQL_DOCS),
     ParameterSpec::component("replication_checkpoint_interval")
         .description(
             "How often the committed binlog position is persisted to the accelerator sidecar \
@@ -208,19 +196,6 @@ const PARAMETERS: &[ParameterSpec] = &[
              stale data. Default: 2s.",
         )
         .default("2s")
-        .help_link(MYSQL_DOCS),
-    // Deprecated alias of `replication_invalid_checkpoint_behavior`
-    // (rebootstrap -> restart). Kept so existing spicepods keep loading.
-    ParameterSpec::component("replication_invalid_position_behavior")
-        .description(
-            "[deprecated] Use `mysql_replication_invalid_checkpoint_behavior` (error|restart) \
-             instead. 'rebootstrap' maps to 'restart'.",
-        )
-        .one_of_ignore_ascii_case(&["error", "rebootstrap"])
-        .deprecated(
-            "Renamed to 'mysql_replication_invalid_checkpoint_behavior'; \
-             'rebootstrap' -> 'restart'.",
-        )
         .help_link(MYSQL_DOCS),
 ];
 

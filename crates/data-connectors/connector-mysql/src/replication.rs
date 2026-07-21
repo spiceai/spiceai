@@ -769,59 +769,29 @@ fn optional_enum<T>(
     })
 }
 
-/// Resolve the initial-snapshot mode, preferring the canonical
-/// `mysql_replication_initial_snapshot` (`auto|enabled|disabled`) and falling
-/// back to the deprecated `mysql_replication_snapshot_mode`
-/// (`auto|never|always`). Defaults to [`InitialSnapshotMode::Auto`] when neither is set.
+/// Resolve the initial-snapshot mode from `mysql_replication_initial_snapshot`
+/// (`auto|always|disabled`). Defaults to [`InitialSnapshotMode::Auto`] when unset.
 fn parse_snapshot_mode(params: &Parameters) -> Result<InitialSnapshotMode, String> {
-    if let Some(mode) = optional_enum(
+    Ok(optional_enum(
         params,
         "replication_initial_snapshot",
         "'auto', 'always', or 'disabled'",
         InitialSnapshotMode::from_canonical,
-    )? {
-        return Ok(mode);
-    }
-    // Deprecated `mysql_replication_snapshot_mode` (auto|never|always).
-    Ok(optional_enum(
-        params,
-        "replication_snapshot_mode",
-        "'auto', 'never', or 'always'",
-        |value| match value {
-            "auto" => Some(InitialSnapshotMode::Auto),
-            "never" => Some(InitialSnapshotMode::Disabled),
-            "always" => Some(InitialSnapshotMode::Always),
-            _ => None,
-        },
     )?
     .unwrap_or_default())
 }
 
-/// Resolve the invalid-checkpoint behavior, preferring the canonical
-/// `mysql_replication_invalid_checkpoint_behavior` (`error|restart`) and falling
-/// back to the deprecated `mysql_replication_invalid_position_behavior`
-/// (`error|rebootstrap`). Defaults to [`InvalidCheckpointBehavior::Error`].
+/// Resolve the invalid-checkpoint behavior from
+/// `mysql_replication_invalid_checkpoint_behavior` (`error|restart`).
+/// Defaults to [`InvalidCheckpointBehavior::Error`] when unset.
 fn parse_invalid_checkpoint_behavior(
     params: &Parameters,
 ) -> Result<InvalidCheckpointBehavior, String> {
-    if let Some(behavior) = optional_enum(
+    Ok(optional_enum(
         params,
         "replication_invalid_checkpoint_behavior",
         "'error' or 'restart'",
         InvalidCheckpointBehavior::from_canonical,
-    )? {
-        return Ok(behavior);
-    }
-    // Deprecated `mysql_replication_invalid_position_behavior` (error|rebootstrap).
-    Ok(optional_enum(
-        params,
-        "replication_invalid_position_behavior",
-        "'error' or 'rebootstrap'",
-        |value| match value {
-            "error" => Some(InvalidCheckpointBehavior::Error),
-            "rebootstrap" => Some(InvalidCheckpointBehavior::Restart),
-            _ => None,
-        },
     )?
     .unwrap_or_default())
 }
@@ -943,47 +913,6 @@ mod tests {
     }
 
     #[test]
-    fn invalid_position_behavior_parses_strictly() {
-        let params = params_with(&[("replication_invalid_position_behavior", "rebootstrap")]);
-        let repl = replication_params_from_connector_params(&params, "orders")
-            .expect("valid params parse");
-        assert_eq!(
-            repl.invalid_position_behavior,
-            InvalidCheckpointBehavior::Restart
-        );
-
-        let params = params_with(&[("replication_invalid_position_behavior", "reboot")]);
-        let err = replication_params_from_connector_params(&params, "orders")
-            .expect_err("typo must error");
-        assert!(err.contains("'error' or 'rebootstrap'"), "got: {err}");
-    }
-
-    #[test]
-    fn snapshot_mode_parses_strictly() {
-        for (raw, expected) in [
-            ("auto", InitialSnapshotMode::Auto),
-            ("never", InitialSnapshotMode::Disabled),
-            ("ALWAYS", InitialSnapshotMode::Always),
-        ] {
-            let params = params_with(&[("replication_snapshot_mode", raw)]);
-            let repl = replication_params_from_connector_params(&params, "orders")
-                .expect("valid params parse");
-            assert_eq!(repl.snapshot_mode, expected, "raw: {raw}");
-        }
-
-        // A typo must error loudly, not silently fall back to `auto` —
-        // a misread `never` would otherwise snapshot a table the operator
-        // explicitly opted out of copying.
-        let params = params_with(&[("replication_snapshot_mode", "nevr")]);
-        let err = replication_params_from_connector_params(&params, "orders")
-            .expect_err("typo'd mode must error");
-        assert!(
-            err.contains("mysql_replication_snapshot_mode"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
     fn initial_snapshot_parses_strictly() {
         for (raw, expected) in [
             ("auto", InitialSnapshotMode::Auto),
@@ -1028,29 +957,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn canonical_snapshot_key_wins_over_deprecated_alias() {
-        // Both set: the canonical `initial_snapshot` takes precedence over the
-        // deprecated `snapshot_mode`.
-        let params = params_with(&[
-            ("replication_initial_snapshot", "disabled"),
-            ("replication_snapshot_mode", "always"),
-        ]);
-        let repl = replication_params_from_connector_params(&params, "orders")
-            .expect("valid params parse");
-        assert_eq!(repl.snapshot_mode, InitialSnapshotMode::Disabled);
-
-        let params = params_with(&[
-            ("replication_invalid_checkpoint_behavior", "restart"),
-            ("replication_invalid_position_behavior", "error"),
-        ]);
-        let repl = replication_params_from_connector_params(&params, "orders")
-            .expect("valid params parse");
-        assert_eq!(
-            repl.invalid_position_behavior,
-            InvalidCheckpointBehavior::Restart
-        );
-    }
 
     #[test]
     fn ready_lag_parses_and_defaults() {
