@@ -17,6 +17,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use datafusion::sql::TableReference;
+use datafusion_expr::ScalarUDF;
 use llms::embeddings::Embed;
 use search::index::{
     VectorIndex,
@@ -45,6 +46,8 @@ pub fn with_memory_warm_index(
     engine_index: Arc<dyn VectorIndex>,
     metadata_columns: MetadataColumns,
     embedder: Arc<dyn Embed>,
+    embed_udf: &Arc<ScalarUDF>,
+    model_name: &String,
     metric: &str,
 ) -> Arc<dyn VectorIndex> {
     let memory_metric = match MemoryDistanceMetric::try_from(metric) {
@@ -62,7 +65,8 @@ pub fn with_memory_warm_index(
         engine_index.primary_fields(),
         metadata_columns,
         embedder,
-        engine_index.dimension(),
+        Arc::clone(embed_udf),
+        model_name.clone(),
         memory_metric,
     ) {
         Ok(memory_index) => Arc::new(memory_index) as Arc<dyn VectorIndex>,

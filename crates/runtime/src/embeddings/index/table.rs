@@ -19,6 +19,7 @@ use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
 use datafusion::datasource::TableProvider;
 use datafusion::{prelude::SessionContext, sql::TableReference};
+use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
 use spicepod::vector::VectorStore;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -104,6 +105,7 @@ pub async fn wrap_table_as_index(
         #[cfg(feature = "elasticsearch")]
         Some("elasticsearch" | "es") => {
             wrap_table_as_index_elasticsearch(
+                ctx,
                 embedding_models,
                 secrets,
                 tbl,
@@ -201,6 +203,12 @@ async fn wrap_table_as_index_s3(
         tracing::debug!("[S3Vectors][table={tbl}] No partitioning");
     }
 
+    let Some(embed_udf) = ctx.state().scalar_functions().get(EMBED_UDF_NAME).cloned() else {
+        return Err(Box::from(format!(
+            "No scalar UDF '{EMBED_UDF_NAME}' found in context"
+        )));
+    };
+
     let embedding_columns: Vec<_> = columns
         .iter()
         .filter_map(|c| {
@@ -249,6 +257,7 @@ async fn wrap_table_as_index_s3(
         // The S3 index exposes its metadata columns in both its list and query plans,
         // so the warm index mirrors them — a fallback read then serves the same columns
         // a warm read does.
+
         let metadata_columns = s3_index.metadata_columns.clone();
         let embedder = Arc::clone(&s3_index.compute_query);
         let metric = s3_index.table.distance_metric.clone();
@@ -257,6 +266,8 @@ async fn wrap_table_as_index_s3(
             Arc::new(s3_index) as Arc<dyn VectorIndex>,
             metadata_columns,
             embedder,
+            &embed_udf,
+            &config.model,
             metric.as_str(),
         );
 
@@ -386,6 +397,7 @@ fn get_partition_expressions(
 
 #[cfg(feature = "elasticsearch")]
 async fn wrap_table_as_index_elasticsearch(
+    ctx: &Arc<SessionContext>,
     embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
     secrets: &Arc<RwLock<Secrets>>,
     tbl: &TableReference,
@@ -412,6 +424,12 @@ async fn wrap_table_as_index_elasticsearch(
         indexed.clone()
     } else {
         runtime_datafusion_index::IndexedTableProvider::new(Arc::clone(&inner_table_provider))
+    };
+
+    let Some(embed_udf) = ctx.state().scalar_functions().get(EMBED_UDF_NAME).cloned() else {
+        return Err(Box::from(format!(
+            "No scalar UDF '{EMBED_UDF_NAME}' found in context"
+        )));
     };
 
     for (column, config) in embedding_columns {
@@ -465,9 +483,11 @@ async fn wrap_table_as_index_elasticsearch(
                 // fallback projection onto the Elasticsearch results cannot be built.
                 let vector_index = with_memory_warm_index(
                     tbl,
-                    Arc::new(es_index) as Arc<dyn VectorIndex>,
+                    Arc::new(es_index.clone()) as Arc<dyn VectorIndex>,
                     MetadataColumns::none(),
                     Arc::clone(&es_index.compute_query),
+                    &embed_udf,
+                    &config.model,
                     es_index.similarity.as_str(),
                 );
 
