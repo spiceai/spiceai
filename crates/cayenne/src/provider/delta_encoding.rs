@@ -130,7 +130,7 @@ pub(crate) const FULL_LEVEL: u8 = DELTA_ENCODING_FULL_LEVEL;
 /// transient-file byte win (417k-row harness, release: 103.1 MB vs 172.5 MB
 /// for the prior Sparse+Dict set and 115.8 MB for the FULL cascade) at equal
 /// light-path encode wall time, while skipping the per-file strategy search
-/// and FSST training that dominate small-write encode cost. Every delta is
+/// and FSST training that dominates small-write encode cost. Every delta is
 /// transient — compaction re-encodes it at [`FULL_LEVEL`] — so the light
 /// scheme set trades a larger transient file (compaction folds it) for
 /// materially cheaper CDC-hot-path encode. Numeric columns stay canonical on

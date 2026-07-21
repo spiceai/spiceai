@@ -5618,7 +5618,7 @@ impl CayenneTableProvider {
         //
         // Delta writes additionally resolve a `cayenne_delta_encoding` level:
         // under `auto` every delta encodes with a light scheme set (skipping the
-        // per-file BtrBlocks strategy search + FSST training that dominate
+        // per-file BtrBlocks strategy search + FSST training that dominates
         // encode cost) and is re-encoded properly when compaction folds it.
         // Maintenance writes (compaction, rewrites, overwrites) always use the
         // full default strategy. See `provider::delta_encoding`.
