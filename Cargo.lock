@@ -4119,6 +4119,7 @@ checksum = "510ca239cf13b7f8d16a2b48f263de7b4f8c566f0af58d901031473c76afb1e3"
 name = "connector-abfs"
 version = "2.2.0-unstable"
 dependencies = [
+ "linkme",
  "object_store 0.13.2",
  "runtime",
  "secrecy",
@@ -4142,6 +4143,7 @@ dependencies = [
  "datafusion",
  "datafusion-table-providers",
  "futures",
+ "linkme",
  "parking_lot",
  "runtime",
  "secrecy",
@@ -4184,6 +4186,7 @@ dependencies = [
  "data_components",
  "datafusion",
  "datafusion-table-providers",
+ "linkme",
  "opentelemetry",
  "runtime",
  "runtime-api-types",
@@ -4280,6 +4283,7 @@ dependencies = [
  "datafusion",
  "datafusion-table-providers",
  "duckdb",
+ "linkme",
  "runtime",
  "snafu",
  "tokio",
@@ -4371,6 +4375,7 @@ dependencies = [
 name = "connector-gcs"
 version = "2.2.0-unstable"
 dependencies = [
+ "linkme",
  "object_store 0.13.2",
  "runtime",
  "snafu",
@@ -4386,6 +4391,7 @@ dependencies = [
  "data_components",
  "datafusion",
  "globset",
+ "linkme",
  "opentelemetry",
  "reqwest 0.13.4",
  "runtime",
@@ -4414,6 +4420,7 @@ dependencies = [
  "governor",
  "graphql-parser",
  "http 1.4.1",
+ "linkme",
  "reqwest 0.13.4",
  "runtime",
  "runtime-rate-control",
@@ -4433,6 +4440,7 @@ dependencies = [
 name = "connector-glue"
 version = "2.2.0-unstable"
 dependencies = [
+ "linkme",
  "runtime",
 ]
 
@@ -4483,6 +4491,7 @@ dependencies = [
  "datafusion",
  "fundu",
  "futures",
+ "linkme",
  "opentelemetry",
  "runtime",
  "runtime-api-types",
@@ -4612,6 +4621,7 @@ dependencies = [
  "datafusion-table-providers",
  "fundu",
  "futures",
+ "linkme",
  "opentelemetry",
  "runtime",
  "runtime-api-types",
@@ -4744,6 +4754,7 @@ dependencies = [
 name = "connector-spiceai"
 version = "2.2.0-unstable"
 dependencies = [
+ "linkme",
  "runtime",
 ]
 
