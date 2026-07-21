@@ -155,7 +155,7 @@ struct ColumnSpec {
     make: MakeColumn,
 }
 
-fn columns() -> Vec<ColumnSpec> {
+fn columns(large: bool) -> Vec<ColumnSpec> {
     let mut specs: Vec<ColumnSpec> = Vec::new();
 
     // c_id shape: cycling 1..=3000 (integer-dictionary candidate)
@@ -189,15 +189,19 @@ fn columns() -> Vec<ColumnSpec> {
     });
 
     // dict-cardinality boundary pools (random assignment, not cycling, so any
-    // internal re-chunking still sees high cardinality per compression unit)
+    // internal re-chunking still sees high cardinality per compression unit).
+    // Column names keep the boundary each probes at large scale; in CI mode the
+    // pools cap at one block's worth of rows (8192) — per-8K-block cardinality
+    // can't exceed that anyway, and the cap keeps default pool build cheap.
     for k in [255_usize, 256, 257, 65535, 65536, 65537, 100_000] {
+        let pool_len = if large { k } else { k.min(8192) };
         let mut pool_rng = Rng(0xC0_FFEE ^ u64::try_from(k).expect("small"));
-        let pool = string_pool(&mut pool_rng, k);
+        let pool = string_pool(&mut pool_rng, pool_len);
         specs.push(ColumnSpec {
             field: Field::new(format!("b{k}"), DataType::Utf8, true),
             make: Box::new(move |rng, _| {
                 Arc::new(StringArray::from_iter_values(
-                    (0..8192_usize).map(|_| pool[rng.next_usize() % pool.len()].clone()),
+                    (0..8192_usize).map(|_| &pool[rng.next_usize() % pool.len()]),
                 ))
             }),
         });
@@ -273,8 +277,12 @@ fn columns() -> Vec<ColumnSpec> {
 
 /// Build the dataset: `n_small` 8192-row batches, 3 sliced batches, and one
 /// jumbo batch of `jumbo_chunks` × 8192 rows (as a single `RecordBatch`).
-fn build_batches(n_small: usize, jumbo_chunks: usize) -> (SchemaRef, Vec<RecordBatch>) {
-    let mut specs = columns();
+fn build_batches(
+    n_small: usize,
+    jumbo_chunks: usize,
+    large: bool,
+) -> (SchemaRef, Vec<RecordBatch>) {
+    let mut specs = columns(large);
     let schema: SchemaRef = Arc::new(Schema::new(
         specs.iter().map(|s| s.field.clone()).collect::<Vec<_>>(),
     ));
@@ -445,12 +453,9 @@ async fn light_levels_roundtrip_multichunk() {
     // CI default: 2 small + 3 sliced + one 4×8192 jumbo ≈ 57k rows. Vortex
     // compresses per fixed 8K-row block, so per-block scheme coverage matches
     // the full audit dataset; LIGHT_ROUNDTRIP_LARGE=1 restores it (~417k rows).
-    let (n_small, jumbo) = if std::env::var("LIGHT_ROUNDTRIP_LARGE").is_ok() {
-        (16, 32)
-    } else {
-        (2, 4)
-    };
-    let (schema, batches) = build_batches(n_small, jumbo);
+    let large = std::env::var("LIGHT_ROUNDTRIP_LARGE").is_ok();
+    let (n_small, jumbo) = if large { (16, 32) } else { (2, 4) };
+    let (schema, batches) = build_batches(n_small, jumbo, large);
     let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
     eprintln!(
         "dataset: {} batches, {total} rows, {} cols",
