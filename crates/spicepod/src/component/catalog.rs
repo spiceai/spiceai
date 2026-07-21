@@ -116,10 +116,14 @@ impl WithDependsOn<Catalog> for Catalog {
 /// CDC-accelerates every table the catalog connector discovers (subject to
 /// `include`/`exclude`), without per-table configuration.
 ///
-/// Every included table must have a primary key — catalog setup fails
-/// naming any table that doesn't, rather than silently skipping it or
-/// falling back to a heavier access pattern. Use `include`/`exclude` to keep
-/// tables without a primary key out of an accelerated catalog's scope.
+/// Each table is accelerated according to its source `REPLICA IDENTITY`:
+/// `DEFAULT` (primary key) and `USING INDEX` (a nominated unique index)
+/// replicate normally, `FULL` replicates but is heavier (logged as a warning).
+/// A table with no usable CDC key (`NOTHING`, or `DEFAULT`/`FULL` without a key)
+/// is skipped with a warning and left out of the catalog's namespace, rather
+/// than failing the whole catalog. Use `include`/`exclude` to narrow scope and
+/// suppress the skip warning for tables you'll handle another way (federation
+/// and/or a per-dataset `refresh_mode: full`).
 ///
 /// Deliberately excludes per-table-only concepts (`primary_key`,
 /// `on_conflict`, `indexes`, per-table overrides) — those remain exclusively
