@@ -34,13 +34,13 @@ pub enum CacheStatus {
 
 impl CacheStatus {
     #[must_use]
-    pub fn to_header_string(&self) -> Option<String> {
+    pub fn to_header_string(self) -> Option<&'static str> {
         match self {
             CacheStatus::CacheDisabled => None,
-            CacheStatus::CacheBypass => Some("BYPASS".to_string()),
-            CacheStatus::CacheHit => Some("HIT".to_string()),
-            CacheStatus::CacheMiss => Some("MISS".to_string()),
-            CacheStatus::CacheStaleWhileRevalidate => Some("STALE".to_string()),
+            CacheStatus::CacheBypass => Some("BYPASS"),
+            CacheStatus::CacheHit => Some("HIT"),
+            CacheStatus::CacheMiss => Some("MISS"),
+            CacheStatus::CacheStaleWhileRevalidate => Some("STALE"),
         }
     }
 }

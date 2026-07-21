@@ -20,19 +20,21 @@ limitations under the License.
 //! after plan construction are visible — `VectorScanTableProvider` builds the
 //! list plan once at construction, and `query_table_provider` is a sync fn.
 
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use arrow_schema::{DataType, Field, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     catalog::{MemTable, Session},
+    common::{Constraints, not_impl_err},
     datasource::{DefaultTableSource, TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::Expr,
     physical_plan::ExecutionPlan,
 };
 use datafusion_expr::{
-    Expr as LogicalExpr, LogicalPlanBuilder, Operator, ScalarUDF, binary_expr, col, lit,
+    Expr as LogicalExpr, LogicalPlan, LogicalPlanBuilder, Operator, ScalarUDF,
+    TableProviderFilterPushDown, binary_expr, col, lit,
 };
 use parking_lot::RwLock;
 use runtime_datafusion_udfs::{
@@ -56,6 +58,7 @@ impl MemoryVectorListTable {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for MemoryVectorListTable {
     fn schema(&self) -> SchemaRef {
@@ -77,6 +80,80 @@ impl TableProvider for MemoryVectorListTable {
         MemTable::try_new(self.schema(), vec![batches])?
             .scan(state, projection, filters, limit)
             .await
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        None
+    }
+
+    fn get_table_definition(&self) -> Option<&str> {
+        None
+    }
+
+    fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
+        None
+    }
+
+    fn get_column_default(&self, _column: &str) -> Option<&Expr> {
+        None
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        Ok(vec![
+            TableProviderFilterPushDown::Unsupported;
+            filters.len()
+        ])
+    }
+
+    fn statistics(&self) -> Option<datafusion::common::Statistics> {
+        None
+    }
+
+    async fn scan_with_args<'a>(
+        &self,
+        state: &dyn Session,
+        args: datafusion::catalog::ScanArgs<'a>,
+    ) -> DataFusionResult<datafusion::catalog::ScanResult> {
+        let filters = args.filters().unwrap_or(&[]);
+        let projection = args.projection().map(<[usize]>::to_vec);
+        let limit = args.limit();
+        let plan = self
+            .scan(state, projection.as_ref(), filters, limit)
+            .await?;
+        Ok(plan.into())
+    }
+
+    async fn insert_into(
+        &self,
+        _state: &dyn Session,
+        _input: Arc<dyn ExecutionPlan>,
+        _op: datafusion::logical_expr::dml::InsertOp,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        not_impl_err!("Insert into not supported for 'MemoryVectorListTable' table")
+    }
+
+    async fn delete_from(
+        &self,
+        _state: &dyn Session,
+        _filters: Vec<Expr>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        not_impl_err!("DELETE not supported for 'MemoryVectorListTable' table")
+    }
+
+    async fn update(
+        &self,
+        _state: &dyn Session,
+        _assignments: Vec<(String, Expr)>,
+        _filters: Vec<Expr>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        not_impl_err!("UPDATE not supported for 'MemoryVectorListTable' table")
+    }
+
+    async fn truncate(&self, _state: &dyn Session) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        not_impl_err!("TRUNCATE not supported for 'MemoryVectorListTable' table")
     }
 }
 
@@ -177,6 +254,7 @@ impl MemoryVectorQueryTable {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for MemoryVectorQueryTable {
     fn schema(&self) -> SchemaRef {
@@ -227,5 +305,77 @@ impl TableProvider for MemoryVectorQueryTable {
 
         let logical_plan = builder.build()?;
         state.create_physical_plan(&logical_plan).await
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        None
+    }
+
+    fn get_table_definition(&self) -> Option<&str> {
+        None
+    }
+
+    fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
+        None
+    }
+
+    fn get_column_default(&self, _column: &str) -> Option<&Expr> {
+        None
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        // We explicitly add filters atop `LogicalPlanBuilder` during `MemoryVectorQueryTable::scan`.
+        Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
+    }
+
+    fn statistics(&self) -> Option<datafusion::common::Statistics> {
+        None
+    }
+
+    async fn scan_with_args<'a>(
+        &self,
+        state: &dyn Session,
+        args: datafusion::catalog::ScanArgs<'a>,
+    ) -> DataFusionResult<datafusion::catalog::ScanResult> {
+        let filters = args.filters().unwrap_or(&[]);
+        let projection = args.projection().map(<[usize]>::to_vec);
+        let limit = args.limit();
+        let plan = self
+            .scan(state, projection.as_ref(), filters, limit)
+            .await?;
+        Ok(plan.into())
+    }
+
+    async fn insert_into(
+        &self,
+        _state: &dyn Session,
+        _input: Arc<dyn ExecutionPlan>,
+        _op: datafusion::logical_expr::dml::InsertOp,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        not_impl_err!("Insert into not supported for 'MemoryVectorQueryTable' table")
+    }
+
+    async fn delete_from(
+        &self,
+        _state: &dyn Session,
+        _filters: Vec<Expr>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        not_impl_err!("DELETE not supported for 'MemoryVectorQueryTable' table")
+    }
+
+    async fn update(
+        &self,
+        _state: &dyn Session,
+        _assignments: Vec<(String, Expr)>,
+        _filters: Vec<Expr>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        not_impl_err!("UPDATE not supported for 'MemoryVectorQueryTable' table")
+    }
+
+    async fn truncate(&self, _state: &dyn Session) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        not_impl_err!("TRUNCATE not supported for 'MemoryVectorQueryTable' table")
     }
 }

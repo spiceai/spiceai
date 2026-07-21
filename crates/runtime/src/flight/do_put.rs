@@ -30,7 +30,7 @@ use datafusion::{
     error::DataFusionError, execution::SendableRecordBatchStream,
     physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
 };
-use opentelemetry::KeyValue;
+use opentelemetry::{KeyValue, Value};
 use prost::Message as _;
 use runtime_auth::AuthRequestContext;
 use tokio::sync::mpsc::{self, Sender};
@@ -192,8 +192,11 @@ pub(crate) async fn handle(
     };
     let path = datafusion.normalize_table_reference(path);
 
-    // Initializing tracking here so that both counter and duration have consistent path dimensions
-    let start = metrics::track_flight_request("do_put", Some(&path.to_string())).await;
+    // Allocate path label once for request + per-batch metrics (avoids re-stringifying per batch).
+    let path_label: Arc<str> = Arc::from(path.to_string());
+    let start =
+        metrics::track_flight_request_value("do_put", Some(Value::from(Arc::clone(&path_label))))
+            .await;
 
     if !datafusion.is_writable(&path) && !datafusion.is_path_catalog_writable(&path) {
         return Err(Status::invalid_argument(format!(
@@ -269,6 +272,7 @@ pub(crate) async fn handle(
     let first_message = first_message.clone();
     let response_stream = create_response_stream(
         path,
+        path_label,
         schema,
         Arc::clone(&datafusion),
         streaming_flight,
@@ -321,6 +325,7 @@ where
 
 fn create_response_stream(
     path: TableReference,
+    path_label: Arc<str>,
     schema: SchemaRef,
     df: Arc<DataFusion>,
     mut streaming_flight: Peekable<Streaming<FlightData>>,
@@ -347,7 +352,7 @@ fn create_response_stream(
         let mut write_future = Box::pin(df.write_streaming_data(&path, streaming_update));
 
         if let Some(first_batch) = first_batch {
-            yield handle_record_batch(first_batch, &batch_tx, &path.to_string()).await;
+            yield handle_record_batch(first_batch, &batch_tx, &path_label).await;
         }
 
         // Use a single pinned Sleep future that is reset on each received message,
@@ -444,8 +449,7 @@ fn create_response_stream(
                             // sink and the idle deadline polled while the send is
                             // pending so backpressure propagates instead of
                             // deadlocking.
-                            let path_str = path.to_string();
-                            let batch_send = handle_record_batch(new_batch, &batch_tx, &path_str);
+                            let batch_send = handle_record_batch(new_batch, &batch_tx, &path_label);
                             let mut batch_send = std::pin::pin!(batch_send);
                             tokio::select! {
                                 biased;
@@ -541,11 +545,11 @@ fn create_response_stream(
 async fn handle_record_batch(
     batch: RecordBatch,
     batch_tx: &Sender<Result<RecordBatch, DataFusionError>>,
-    path: &str,
+    path: &Arc<str>,
 ) -> Result<PutResult, Status> {
     tracing::trace!("Received batch with {} rows", batch.num_rows());
 
-    let labels = [KeyValue::new("dataset", path.to_string())];
+    let labels = [KeyValue::new("dataset", Arc::clone(path))];
     metrics::DO_PUT_ROWS_WRITTEN.add(batch.num_rows() as u64, &labels);
     metrics::DO_PUT_BYTES_WRITTEN.add(batch.get_array_memory_size() as u64, &labels);
 

@@ -385,7 +385,7 @@ fn flatten_author_field(comment: &mut Value) {
 
 fn custom_unnestter(object: &Value) -> Result<Vec<Value>> {
     // Unnest normally, then handle the `thread_comments` and `discussion` fields
-    unnest_json_object_to_depth(object, 1, &DuplicateBehavior::Error).map(|mut values| {
+    unnest_json_object_to_depth(object.clone(), 1, &DuplicateBehavior::Error).map(|mut values| {
         for value in &mut values {
             if let Value::Object(obj) = value {
                 if let Some(thread_comments) = obj.remove("thread_comments") {

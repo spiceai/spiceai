@@ -20,8 +20,9 @@ Previously every PR push ran the whole suite — lint, build, unit tests,
 integration tests, E2E — and then the merge queue ran much of it *again* on
 merge. That is slow feedback and a lot of duplicated CI. With sign-off:
 
-- **Fast local feedback.** `make signoff` runs lint + unit tests on your
-  hardware, which is typically faster than waiting for a remote runner.
+- **Fast local feedback.** `make signoff` target-lints changed crates first,
+  then runs full lint + unit tests on your hardware — faster fail-first than a
+  remote runner, and faster than workspace lint alone when a change is wrong.
 - **No duplicated CI.** The full suite runs once, in the queue, on the merged
   commit — not on every push and again on merge.
 - **Same safety.** Nothing reaches `trunk` without the full suite passing on the
@@ -51,8 +52,14 @@ From a clean Git checkout or JJ workspace, with your branch/bookmark pushed
 and up to date:
 
 ```bash
-make signoff          # runs `make lint-rust` + `make build-cli nextest`, then attests
+make signoff          # targeted crate lint → full lint + unit tests, then attests
 ```
+
+`make signoff` first diffs the branch against `trunk`, maps changed files to
+workspace crates, and runs `make lint-rust PACKAGES="…"` for fast fail-first
+feedback. It then always runs the full `make lint-rust` and
+`make build-cli nextest` gate. Set `SIGNOFF_SKIP_TARGETED_LINT=1` to skip the
+scoped pre-lint.
 
 On success it posts a `signoff` commit status on your current `HEAD`. If the
 **Attestation** check already ran and failed before the sign-off existed, the
@@ -107,6 +114,31 @@ scripts/signoff status        # does HEAD have its own sign-off?
 scripts/signoff --help        # full usage
 ```
 
+### Remote sign-off (self-hosted runner)
+
+When you can't (or don't want to) run the checks on your machine, dispatch the
+**Remote Sign-off** workflow. It runs the same fail-fast sequence as local
+`make signoff` on a self-hosted runner, then posts the `signoff` status
+attributed to you:
+
+```bash
+make signoff-remote                 # current branch
+gh workflow run signoff.yml -f branch=<your-branch>
+gh run watch --workflow signoff.yml
+```
+
+The workflow:
+
+1. Checks out your branch (full history) and fetches `trunk`
+2. Target-lints crates touched by the branch vs `trunk` (GitHub compare API as a
+   fallback when merge-base isn't available)
+3. Runs full `make lint-rust` + `make build-cli nextest`
+4. Posts pending → success/failure `signoff` statuses, then re-runs
+   **Attestation** if needed
+
+Requires write access to the repository (same as local sign-off — fork
+contributors still need a maintainer to sign off).
+
 ### Jujutsu workspaces
 
 `make signoff` also works in non-colocated JJ workspaces (where there is a
@@ -152,7 +184,8 @@ merge queue is still the real gate.
 
 | Stage | Trigger | Checks |
 | --- | --- | --- |
-| Local | `make signoff` | `make lint-rust`, `make build-cli nextest` |
+| Local | `make signoff` | targeted `make lint-rust PACKAGES=…` (changed crates), then full `make lint-rust`, `make build-cli nextest` |
+| Remote | `make signoff-remote` / `signoff.yml` | same checks as local on a self-hosted runner; posts `signoff` as the dispatcher |
 | Pull request | `pull_request` | **Attestation** (validates the sign-off, or auto-passes a pure revert) + PR hygiene; merge-queue check names report lightweight skipped/passthrough results |
 | Merge queue | `merge_group` | the full required suite (below) + advisory niche checks |
 

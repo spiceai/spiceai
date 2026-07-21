@@ -23,14 +23,19 @@ limitations under the License.
 //! incremental builds - changes to this connector only require rebuilding
 //! this crate, not the entire runtime.
 
+mod block_to_arrow;
+mod conn;
+mod factory;
+mod pool;
+
 use async_trait::async_trait;
 use clickhouse_rs::Options;
 use data_components::Read;
-use data_components::clickhouse::ClickhouseTableFactory;
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::sql::db_connection_pool::Error as DbConnectionPoolError;
-use db_connection_pool::clickhousepool::ClickhouseConnectionPool;
+use factory::ClickhouseTableFactory;
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
+use pool::ClickhouseConnectionPool;
 use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,

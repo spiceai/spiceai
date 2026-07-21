@@ -17,7 +17,7 @@ limitations under the License.
 use std::sync::LazyLock;
 
 use opentelemetry::{
-    KeyValue, global,
+    KeyValue, Value, global,
     metrics::{Counter, Histogram, Meter},
 };
 
@@ -36,13 +36,25 @@ pub(crate) static FLIGHT_REQUEST_DURATION_MS: LazyLock<Histogram<f64>> = LazyLoc
         .build()
 });
 
-pub async fn track_flight_request(method: &str, command: Option<&str>) -> TimeMeasurement {
+/// Track a Flight RPC. `command` is a static label for fixed RPC variants.
+pub async fn track_flight_request(
+    method: &'static str,
+    command: Option<&'static str>,
+) -> TimeMeasurement {
+    track_flight_request_value(method, command.map(Value::from)).await
+}
+
+/// Track a Flight RPC with an owned/shared command label (e.g. dynamic table path).
+pub(crate) async fn track_flight_request_value(
+    method: &'static str,
+    command: Option<Value>,
+) -> TimeMeasurement {
     let request_context = RequestContext::current(AsyncMarker::new().await);
 
-    let mut dimensions = vec![KeyValue::new("method", method.to_string())];
+    let mut dimensions = vec![KeyValue::new("method", method)];
 
-    if let Some(method) = command {
-        dimensions.push(KeyValue::new("command", method.to_string()));
+    if let Some(command) = command {
+        dimensions.push(KeyValue::new("command", command));
     }
 
     dimensions.extend(request_context.to_dimensions());

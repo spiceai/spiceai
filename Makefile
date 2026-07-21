@@ -61,12 +61,19 @@ ci:
 	make -C bin/spice
 	make -C bin/spiced
 
-# Local CI attestation ("developer sign-off"). Runs lint + unit tests, then
-# posts a `signoff` commit status on HEAD so the PR can enter the merge queue,
-# where the full suite runs. See scripts/signoff and docs/dev/ci_signoff.md.
+# Local CI attestation ("developer sign-off"). Target-lints changed crates,
+# then full lint + unit tests, then posts a `signoff` commit status on HEAD so
+# the PR can enter the merge queue. See scripts/signoff and docs/dev/ci_signoff.md.
 .PHONY: signoff
 signoff:
 	@./scripts/signoff
+
+# Dispatch the Remote Sign-off workflow for the current branch (self-hosted).
+# Supports Git and JJ via scripts/signoff remote. Targeted pre-lint always
+# diffs against trunk.
+.PHONY: signoff-remote
+signoff-remote:
+	@./scripts/signoff remote
 
 .PHONY: test
 test:
@@ -108,15 +115,45 @@ test-integration-models-without-openai:
 test-bench:
 	@cargo bench -p runtime --features postgres,spark,mysql
 
+## Optional: PACKAGES="pkg1 pkg2" to lint specific packages instead of the whole workspace
+## Optional: FEATURES="feat1,feat2" to override features
+## Feature defaults: when FEATURES is unset, uses the full release feature set for
+## workspace-wide linting (unless PACKAGES is set, then uses package defaults —
+## workspace features like `models` are not valid on every crate).
+## Example: make lint-rust PACKAGES="runtime data_components"
+## Example: make lint-rust-fix PACKAGES="runtime data_components" FEATURES="duckdb,postgres"
+PACKAGES ?=
+FEATURES ?=
+# Use strip non-empty checks (not bare ifdef): PACKAGES/FEATURES are always
+# assigned via ?=, and empty command-line overrides (PACKAGES= FEATURES=) must
+# fall through to workspace defaults — not emit `-p`/`--features` with no value.
+ifneq ($(strip $(PACKAGES)),)
+_LINT_PKG_FLAGS := $(foreach p,$(PACKAGES),-p $(p))
+_LINT_WORKSPACE_FLAGS := $(_LINT_PKG_FLAGS)
+_FMT_FLAGS := $(_LINT_PKG_FLAGS)
+else
+_LINT_WORKSPACE_FLAGS := --workspace --exclude libnfs --exclude lopdf --exclude ttf-parser --exclude pdf-extract
+_FMT_FLAGS := --all
+endif
+# Apply FEATURES if provided, otherwise default to hardcoded features only for workspace-wide linting
+ifneq ($(strip $(FEATURES)),)
+_FEATURES_FLAGS := --features $(FEATURES)
+else ifneq ($(strip $(PACKAGES)),)
+_FEATURES_FLAGS :=
+else
+_FEATURES_FLAGS := --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control,spicebench
+endif
+
 .PHONY: lint lint-rust
 lint: lint-rust
 
+# Full workspace lint (default), or scoped via PACKAGES=… for a fast fail-first pass.
 lint-rust:
-	cargo fmt --all -- --check
+	cargo fmt $(_FMT_FLAGS) -- --check
 	## Crate-layering guard (fast, no compile): no crate may depend on a higher tier. See docs/dev/crate_layering.md
 	python3 scripts/check_crate_layers.py
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going --lib --bins --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control,spicebench --workspace --exclude libnfs --exclude lopdf --exclude ttf-parser --exclude pdf-extract -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going --lib --bins $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -131,7 +168,7 @@ lint-rust:
 		-Dclippy::todo \
 		-Dclippy::assertions_on_result_states \
 		-Dclippy::allow_attributes
-	cargo clippy $(CARGO_PROFILE) --keep-going --tests --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control,spicebench --workspace --exclude libnfs --exclude lopdf --exclude ttf-parser --exclude pdf-extract -- \
+	cargo clippy $(CARGO_PROFILE) --keep-going --tests $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -147,29 +184,6 @@ lint-rust:
 		-Dclippy::assertions_on_result_states \
 		-Dclippy::allow_attributes \
 		-Aunfulfilled_lint_expectations
-
-## Optional: PACKAGES="pkg1 pkg2" to lint specific packages instead of the whole workspace
-## Optional: FEATURES="feat1,feat2" to override features
-## Feature defaults: when FEATURES is unset, uses aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control for workspace (unless PACKAGES is set, then uses package defaults)
-## Example: make lint-rust-fix PACKAGES="runtime data_components" FEATURES="duckdb,postgres"
-PACKAGES ?=
-FEATURES ?=
-ifdef PACKAGES
-_LINT_PKG_FLAGS := $(foreach p,$(PACKAGES),-p $(p))
-_LINT_WORKSPACE_FLAGS := $(_LINT_PKG_FLAGS)
-_FMT_FLAGS := $(_LINT_PKG_FLAGS)
-else
-_LINT_WORKSPACE_FLAGS := --workspace --exclude libnfs --exclude lopdf --exclude ttf-parser --exclude pdf-extract
-_FMT_FLAGS := --all
-endif
-# Apply FEATURES if provided, otherwise default to hardcoded features only for workspace-wide linting
-ifdef FEATURES
-_FEATURES_FLAGS := --features $(FEATURES)
-else ifdef PACKAGES
-_FEATURES_FLAGS :=
-else
-_FEATURES_FLAGS := --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control,spicebench
-endif
 
 lint-rust-fix:
 	cargo fmt $(_FMT_FLAGS)

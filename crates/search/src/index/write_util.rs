@@ -72,6 +72,9 @@ pub enum Error {
     #[snafu(display("Cannot update embedding column in record batch: {source}"))]
     CannotUpdateEmbeddingColumn { source: arrow::error::ArrowError },
 
+    #[snafu(display("Cannot sort record batch columns alphabetically: {source}"))]
+    CannotSortColumnsAlphabetically { source: arrow::error::ArrowError },
+
     #[snafu(display(
         "Cannot create embedding array: no valid embeddings found to determine dimension"
     ))]
@@ -179,7 +182,13 @@ pub fn extract_and_format_primary_key(
 
             values
                 .into_iter()
-                .map(|v| serde_json::to_string(&v).map(Some))
+                .map(|v| {
+                    if composite_primary_key_is_all_null(&v) {
+                        Ok(None)
+                    } else {
+                        serde_json::to_string(&v).map(Some)
+                    }
+                })
                 .collect::<Result<Vec<_>, _>>()
                 .context(IssueWithJsonProcessingSnafu {
                     index: index_name.to_string(),
@@ -194,6 +203,13 @@ where
     I: Iterator<Item = Option<&'a str>>,
 {
     iter.map(|opt| opt.map(ToString::to_string)).collect()
+}
+
+fn composite_primary_key_is_all_null(value: &Value) -> bool {
+    match value {
+        Value::Object(fields) => !fields.is_empty() && fields.values().all(Value::is_null),
+        _ => false,
+    }
 }
 
 /// Embed the given `column_idx` from the [`RecordBatch`], assuming it is a String-like value.
@@ -334,14 +350,14 @@ pub fn sort_columns_alphabetically(record: RecordBatch) -> Result<RecordBatch, B
         Arc::new(Schema::new(fields.into_iter().cloned().collect::<Vec<_>>())),
         arrs,
     )
-    .context(CannotUpdateEmbeddingColumnSnafu)
+    .context(CannotSortColumnsAlphabeticallySnafu)
     .map_err(Box::from)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{FixedSizeListArray, Float32Array, Float32Builder, StringArray};
+    use arrow::array::{FixedSizeListArray, Float32Array, Float32Builder, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Schema};
 
     // Helper function to create a test RecordBatch with text and embedding columns
@@ -395,6 +411,25 @@ mod tests {
 
         RecordBatch::try_new(Arc::new(schema), vec![Arc::new(text_array)])
             .expect("Failed to create test RecordBatch with text only")
+    }
+
+    fn create_composite_primary_key_batch(
+        id: Vec<Option<i32>>,
+        tenant: Vec<Option<&str>>,
+    ) -> RecordBatch {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("tenant", DataType::Utf8, true),
+        ]);
+
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int32Array::from(id)),
+                Arc::new(StringArray::from(tenant)),
+            ],
+        )
+        .expect("valid composite primary key batch")
     }
 
     #[test]
@@ -584,5 +619,24 @@ mod tests {
             .map(|f| f.name().clone())
             .collect();
         assert_eq!(names, vec!["alpha".to_string(), "zeta".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_and_format_primary_key_composite_all_null_returns_none() {
+        let batch = create_composite_primary_key_batch(
+            vec![Some(1), None, None],
+            vec![Some("a"), Some("b"), None],
+        );
+        let primary_key = vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("tenant", DataType::Utf8, true),
+        ];
+
+        let keys =
+            extract_and_format_primary_key("test_index", &primary_key, &batch).expect("keys");
+
+        assert_eq!(keys[0].as_deref(), Some("{\"id\":1,\"tenant\":\"a\"}"));
+        assert_eq!(keys[1].as_deref(), Some("{\"tenant\":\"b\"}"));
+        assert_eq!(keys[2], None);
     }
 }

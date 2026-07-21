@@ -435,8 +435,8 @@ impl HardwareProfile {
     }
 }
 
-/// Data-/workload-shape signals, derived from the dataset's refresh mode and the
-/// extended schema inference (`data_components::inferred_schema`). These refine
+/// Data-/workload-shape signals, derived from the dataset's refresh mode and
+/// schema inference (`data_components::inferred_schema`). These refine
 /// the hardware-only derivations: an upsert/CDC table with a known cardinality
 /// gets a right-sized keyset, and a known average row width sharpens the inline
 /// memtable's row cap. All fields degrade gracefully — an unknown signal falls
@@ -455,7 +455,7 @@ pub(crate) struct WorkloadProfile {
     pub row_count: Option<u64>,
     /// Estimated source table byte size, if inferred.
     pub table_bytes: Option<u64>,
-    /// Whether the connector emitted any extended schema metadata. Primary key,
+    /// Whether the connector emitted any inferred schema metadata. Primary key,
     /// index, and sort metadata are useful adaptive warm-start signals even when
     /// rough sizing is unavailable.
     pub inferred_metadata: InferredMetadata,
