@@ -43,9 +43,9 @@ limitations under the License.
 //! | level | scheme set |
 //! |---|---|
 //! | 0 | `Uncompressed` only (canonical arrays; zero search, zero transform) |
-//! | 1 | + `Sparse` (near-free detection; constant detection is built into the cascade as of Vortex 0.79) |
-//! | 2 | + `Dict` (cheap, high-value on repetitive CDC data) |
-//! | 3 | + cheap numeric schemes (`For`, `BitPacking`, `ZigZag`, `RunEnd`, `Sequence`) |
+//! | 1 | `Sparse` only (near-free detection; constant detection is built into the cascade as of Vortex 0.79) |
+//! | 2 | string `Zstd` only — the `auto` light level (one entropy pass over the string residual; numerics stay canonical until compaction) |
+//! | 3 | rich light: dictionaries + cheap numeric schemes (`For`, `BitPacking`, `ZigZag`, `RunEnd`, `Sequence`) + `Zstd` |
 //! | 4–6 | full default **minus FSST** (skips symbol-table training, keeps the rest) |
 //! | 7–10 | full default `BtrBlocks` cascade (today's behavior; upper levels reserved) |
 //!
@@ -127,10 +127,14 @@ pub(crate) enum WriteClass {
 /// boundary can't drift apart.
 pub(crate) const FULL_LEVEL: u8 = DELTA_ENCODING_FULL_LEVEL;
 
-/// Level chosen by `auto` for small deltas. `Sparse + Dict` (with the
-/// cascade's built-in constant detection) keeps
-/// the big repetitive-CDC wins (often 3-5×) while skipping the per-file
-/// strategy search and FSST training that dominate small-write encode cost.
+/// Level chosen by `auto` for small deltas: string `Zstd` only. A single
+/// entropy-coding pass over the string residual captures most of the
+/// transient-file byte win (417k-row harness, release: 103.1 MB vs 172.5 MB
+/// for the prior Sparse+Dict set and 115.8 MB for the FULL cascade) at equal
+/// light-path encode wall time, while skipping the per-file strategy search
+/// and FSST training that dominate small-write encode cost. Numeric columns
+/// stay canonical on this path; compaction's FULL re-encode optimizes the
+/// long-lived artifact.
 pub(crate) const AUTO_LIGHT_LEVEL: u8 = 2;
 
 /// Under `auto`, a delta is "small" when its estimated bytes are below
@@ -203,16 +207,17 @@ pub(crate) fn strategy_builder_for_level(level: u8) -> Option<WriteStrategyBuild
             &float::NullDominatedSparseScheme,
             &string::NullDominatedSparseScheme,
         ]),
-        // 2: + dictionary (cheap, high-value on repetitive CDC data).
-        2 => builder_with_schemes(&[
-            &integer::SparseScheme,
-            &integer::IntDictScheme,
-            &float::NullDominatedSparseScheme,
-            &float::FloatDictScheme,
-            &string::NullDominatedSparseScheme,
-            &string::StringDictScheme,
-        ]),
-        // 3: + cheap numeric schemes (FoR, BitPacking, ZigZag, RunEnd, Sequence).
+        // 2 (the `auto` light level): string Zstd only. One entropy-coding
+        // pass over the string residual captures most of the transient-file
+        // byte win at light-path encode cost — measured on the 417k-row
+        // round-trip harness (release): zstd-only 103.1 MB vs Sparse+Dict
+        // 172.5 MB vs the FULL cascade 115.8 MB, at statistically equal
+        // encode wall time (~100 ms; FULL 126 ms). Numeric columns stay
+        // canonical here; compaction's FULL re-encode optimizes them for the
+        // long-lived artifact. Dict+numeric light sets remain at level 3 as
+        // the explicit A/B rung (dict+zstd measured only ~4% smaller).
+        2 => builder_with_schemes(&[&string::ZstdScheme]),
+        // 3: rich light — dictionaries + cheap numeric schemes + Zstd.
         3 => builder_with_schemes(&[
             &integer::SparseScheme,
             &integer::IntDictScheme,
@@ -226,6 +231,7 @@ pub(crate) fn strategy_builder_for_level(level: u8) -> Option<WriteStrategyBuild
             &float::FloatRLEScheme,
             &string::NullDominatedSparseScheme,
             &string::StringDictScheme,
+            &string::ZstdScheme,
         ]),
         // 4-6: everything in the default set except FSST — the symbol-table
         // training is the profiled dominant fixed cost on small string-bearing

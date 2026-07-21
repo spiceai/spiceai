@@ -87,14 +87,7 @@ fn strategy_builder_for_level(level: u8) -> Option<WriteStrategyBuilder> {
             &float::NullDominatedSparseScheme,
             &string::NullDominatedSparseScheme,
         ]),
-        2 => builder_with_schemes(&[
-            &integer::SparseScheme,
-            &integer::IntDictScheme,
-            &float::NullDominatedSparseScheme,
-            &float::FloatDictScheme,
-            &string::NullDominatedSparseScheme,
-            &string::StringDictScheme,
-        ]),
+        2 => builder_with_schemes(&[&string::ZstdScheme]),
         3 => builder_with_schemes(&[
             &integer::SparseScheme,
             &integer::IntDictScheme,
@@ -108,6 +101,7 @@ fn strategy_builder_for_level(level: u8) -> Option<WriteStrategyBuilder> {
             &float::FloatRLEScheme,
             &string::NullDominatedSparseScheme,
             &string::StringDictScheme,
+            &string::ZstdScheme,
         ]),
         _ => BtrBlocksCompressorBuilder::default().exclude_schemes([string::FSSTScheme.id()]),
     };
@@ -348,13 +342,16 @@ async fn roundtrip(
     let adapter = ArrayStreamAdapter::new(dtype, stream);
 
     let mut buf = ByteBufferMut::empty();
+    let encode_start = std::time::Instant::now();
     session
         .write_options()
         .write(&mut buf, adapter)
         .await
         .expect("vortex write must succeed");
+    let encode_ms = encode_start.elapsed().as_millis();
 
     let file_len = buf.len();
+    eprintln!("[{level_label}] encode_ms={encode_ms}");
 
     // Read back with a *default* session (mirrors the production read path:
     // the write strategy is not registered on read).
