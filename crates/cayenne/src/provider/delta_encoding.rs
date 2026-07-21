@@ -196,7 +196,8 @@ pub(crate) fn strategy_builder_for_level(level: u8) -> Option<WriteStrategyBuild
     let builder = match level {
         // 0: no schemes — pure canonical/uncompressed (zero search, zero transform).
         0 => BtrBlocksCompressorBuilder::empty(),
-        // 1: + constant / sparse detection (near-free; common CDC shapes).
+        // 1: + sparse detection (near-free; common CDC shapes). Constant
+        // detection is built into the cascading compressor as of Vortex 0.79.
         1 => builder_with_schemes(&[
             &integer::SparseScheme,
             &float::NullDominatedSparseScheme,

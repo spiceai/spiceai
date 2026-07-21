@@ -197,11 +197,10 @@ fn columns() -> Vec<ColumnSpec> {
     // dict-cardinality boundary pools (random assignment, not cycling, so any
     // internal re-chunking still sees high cardinality per compression unit)
     for k in [255_usize, 256, 257, 65535, 65536, 65537, 100_000] {
-        let name: &'static str = Box::leak(format!("b{k}").into_boxed_str());
         let mut pool_rng = Rng(0xC0_FFEE ^ u64::try_from(k).expect("small"));
         let pool = string_pool(&mut pool_rng, k);
         specs.push(ColumnSpec {
-            field: Field::new(name, DataType::Utf8, true),
+            field: Field::new(format!("b{k}"), DataType::Utf8, true),
             make: Box::new(move |rng, _| {
                 Arc::new(StringArray::from_iter_values(
                     (0..8192_usize).map(|_| pool[rng.next_usize() % pool.len()].clone()),
