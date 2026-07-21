@@ -16473,6 +16473,7 @@ dependencies = [
  "runtime-api-types",
  "runtime-async",
  "runtime-auth",
+ "runtime-checkpoint-api",
  "runtime-cluster",
  "runtime-datafusion",
  "runtime-datafusion-index",
@@ -16624,6 +16625,14 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "x509-certificate",
+]
+
+[[package]]
+name = "runtime-checkpoint-api"
+version = "2.2.0-unstable"
+dependencies = [
+ "async-trait",
+ "snafu",
 ]
 
 [[package]]

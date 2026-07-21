@@ -97,9 +97,6 @@ impl DataConnector for DeferredConnector {
         &self,
         _federated_table: Arc<crate::federated_table::FederatedTable>,
         _dataset: &Dataset,
-        _accelerated_table_provider: Arc<dyn TableProvider>,
-        _accelerator_write_mutex: Arc<tokio::sync::Mutex<()>>,
-        _cpu_runtime: Option<tokio::runtime::Handle>,
     ) -> Option<data_components::cdc::ChangesStream> {
         None
     }

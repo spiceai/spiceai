@@ -40,6 +40,7 @@ limitations under the License.
 //!   `LATERAL json_tree(s.body)` usage via `UNNEST`. The scalar form takes
 //!   only the JSON argument and always runs with default caps.
 
+use std::borrow::Cow;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, LazyLock};
 
@@ -164,7 +165,7 @@ static ROW_LIST_TYPE: LazyLock<DataType> = LazyLock::new(|| {
 pub struct TreeRow {
     pub key: Option<String>,
     pub value: Option<String>,
-    pub type_name: String,
+    pub type_name: &'static str,
     pub atom: Option<String>,
     pub id: i64,
     pub parent: Option<i64>,
@@ -247,7 +248,7 @@ fn visit(
     ctx.rows.push(TreeRow {
         key,
         value: Some(node.to_string()),
-        type_name: type_of(node).to_owned(),
+        type_name: type_of(node),
         atom: atom_of(node),
         id,
         parent,
@@ -320,7 +321,7 @@ fn atom_of(v: &Value) -> Option<String> {
     }
 }
 
-fn escape_object_key(key: &str) -> String {
+fn escape_object_key(key: &str) -> Cow<'_, str> {
     // SQLite / DuckDB JSON-path shorthand (`$.a.b`) accepts identifier-style
     // keys only — anything else, including hyphens, must be bracket-quoted so
     // consumers can re-parse the `fullkey`.
@@ -328,9 +329,16 @@ fn escape_object_key(key: &str) -> String {
     let simple = first.is_some_and(|c| !c.is_ascii_digit())
         && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
     if simple {
-        key.to_owned()
+        Cow::Borrowed(key)
     } else {
-        format!("[{}]", serde_json::Value::String(key.to_owned()))
+        // Serialize the key as a JSON string literal (no intermediate
+        // `Value::String` allocation), then wrap in brackets.
+        match serde_json::to_string(key) {
+            Ok(encoded) => Cow::Owned(format!("[{encoded}]")),
+            // `to_string` on `&str` is effectively infallible; keep a
+            // defensive fallback that still produces a bracket-quoted key.
+            Err(_) => Cow::Owned(format!("[\"{key}\"]")),
+        }
     }
 }
 
@@ -493,7 +501,7 @@ fn build_tree_arrays(rows: &[TreeRow]) -> Vec<ArrayRef> {
             Some(v) => value.append_value(v),
             None => value.append_null(),
         }
-        type_name.append_value(&row.type_name);
+        type_name.append_value(row.type_name);
         match &row.atom {
             Some(v) => atom.append_value(v),
             None => atom.append_null(),

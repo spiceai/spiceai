@@ -603,9 +603,6 @@ impl DataConnector for MySQL {
         &self,
         federated_table: Arc<runtime::federated_table::FederatedTable>,
         dataset: &Dataset,
-        _accelerated_table_provider: Arc<dyn TableProvider>,
-        _accelerator_write_mutex: Arc<tokio::sync::Mutex<()>>,
-        _cpu_runtime: Option<tokio::runtime::Handle>,
     ) -> Option<data_components::cdc::ChangesStream> {
         Some(replication::build_changes_stream(
             &self.params,
