@@ -48,10 +48,10 @@ use super::manifest::{ManifestSequenceTag, SeqPrefixPlan};
 use super::mutation_writer::AppendMutationWriter;
 use super::on_conflict::{
     BatchValidationResult, CheckpointCorpusKeys, ExtractedPrimaryKeys, InlineAwareDeletionSink,
-    InlinedDataRewrite, Int64DeletionDelta, OnConflictContext,
-    OnConflictDeletionUpdate, OnConflictDeletions, OnConflictUpdate, OnConflictValidationStream,
-    PendingTombstoneDeltas, PkDeletionSnapshot, PkKeysetInvalidatingDeletionSink,
-    PreparedInsertStream, PreparedOnConflictDeletionPublish, PreparedOnConflictDurablePayload,
+    InlinedDataRewrite, Int64DeletionDelta, OnConflictContext, OnConflictDeletionUpdate,
+    OnConflictDeletions, OnConflictUpdate, OnConflictValidationStream, PendingTombstoneDeltas,
+    PkDeletionSnapshot, PkKeysetInvalidatingDeletionSink, PreparedInsertStream,
+    PreparedOnConflictDeletionPublish, PreparedOnConflictDurablePayload,
     PreparedProtectedSnapshotUpdate, PreparedShardedInsertStream, ProtectedSnapshotScan,
     RowKeyDeletionDelta, ShardedApplyResult, pk_deletion_snapshot_for_strategy,
 };
@@ -19613,8 +19613,10 @@ impl CayenneTableProvider {
                 // re-synchronize into a lockstep rebuild herd. Skip the math entirely
                 // when the floor is zero (rebuild as fast as input changes).
                 if !floor.is_zero() {
-                    let jittered =
-                        Self::jitter_floor(floor, jitter_seed ^ u64::from(compute_elapsed.subsec_nanos()));
+                    let jittered = Self::jitter_floor(
+                        floor,
+                        jitter_seed ^ u64::from(compute_elapsed.subsec_nanos()),
+                    );
                     let remaining = jittered.saturating_sub(compute_elapsed);
                     if !remaining.is_zero() {
                         tokio::select! {
@@ -22205,12 +22207,13 @@ impl CayenneTableProvider {
         shards: &[Arc<crate::provider::mem_tier::MemTier>],
     ) -> datafusion_common::Result<Arc<[VisibleMemTierSegment]>> {
         Ok(Arc::from(
-            self.visible_mem_tier_segments_unpruned(shards).map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to apply in-memory CDC tier deletion visibility for table {}: {e}",
-                    self.table_metadata.table_name
-                ))
-            })?,
+            self.visible_mem_tier_segments_unpruned(shards)
+                .map_err(|e| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Failed to apply in-memory CDC tier deletion visibility for table {}: {e}",
+                        self.table_metadata.table_name
+                    ))
+                })?,
         ))
     }
 
@@ -38955,7 +38958,10 @@ mod tests {
         // The cheap anchors must be genuinely stable, not trivially always-equal.
         assert_eq!(first.current_snapshot_id, second.current_snapshot_id);
         assert_eq!(first.structural_epoch, second.structural_epoch);
-        assert_eq!(first.maintained_aggregate_epoch, second.maintained_aggregate_epoch);
+        assert_eq!(
+            first.maintained_aggregate_epoch,
+            second.maintained_aggregate_epoch
+        );
         assert!(Arc::ptr_eq(&first.inlined_view, &second.inlined_view));
         assert!(Arc::ptr_eq(&first.protected_map, &second.protected_map));
 
@@ -39130,7 +39136,10 @@ mod tests {
             )
             .await
             .expect("first RAM append");
-        assert!(write1.in_memory_epoch().is_some(), "first append engaged RAM");
+        assert!(
+            write1.in_memory_epoch().is_some(),
+            "first append engaged RAM"
+        );
         assert!(
             wait_for_pairs(&provider, &[(1, 10), (2, 20)]).await,
             "the wired append notify must wake the builder to publish the first append"
@@ -39145,7 +39154,10 @@ mod tests {
             )
             .await
             .expect("second RAM append");
-        assert!(write2.in_memory_epoch().is_some(), "second append engaged RAM");
+        assert!(
+            write2.in_memory_epoch().is_some(),
+            "second append engaged RAM"
+        );
         assert!(
             wait_for_pairs(&provider, &[(1, 10), (2, 20), (3, 30)]).await,
             "the wired notify must wake the PARKED builder for a subsequent mutation"
@@ -39187,7 +39199,10 @@ mod tests {
             )
             .await
             .expect("first RAM append");
-        assert!(write1.in_memory_epoch().is_some(), "first append engaged RAM");
+        assert!(
+            write1.in_memory_epoch().is_some(),
+            "first append engaged RAM"
+        );
         // Ordinary churn is bounded-stale: the scan serves the latest published bundle
         // (non-blocking), so this write becomes visible once the maintainer publishes —
         // poll for it rather than asserting immediate visibility.
@@ -39203,7 +39218,10 @@ mod tests {
             )
             .await
             .expect("second RAM append");
-        assert!(write2.in_memory_epoch().is_some(), "second append engaged RAM");
+        assert!(
+            write2.in_memory_epoch().is_some(),
+            "second append engaged RAM"
+        );
         assert!(
             wait_for_pairs(&provider, &[(1, 10), (2, 20), (3, 30)]).await,
             "scan must reflect the second write too once the maintainer publishes (bounded-stale)"
@@ -39240,7 +39258,10 @@ mod tests {
             )
             .await
             .expect("RAM append");
-        assert!(write.in_memory_epoch().is_some(), "append engaged the RAM tier");
+        assert!(
+            write.in_memory_epoch().is_some(),
+            "append engaged the RAM tier"
+        );
 
         // Capture + build the bundle a scan would borrow, and HOLD the Arc for the
         // rest of the test (as an in-flight scan's plan would).

@@ -186,14 +186,22 @@ mod tests {
         let sv = StructuralVersion::new();
         {
             let _g = sv.begin_mutation();
-            assert_eq!(sv.current() & 1, 1, "odd while a forced mutation is in flight");
+            assert_eq!(
+                sv.current() & 1,
+                1,
+                "odd while a forced mutation is in flight"
+            );
             // A build started during a forced mutation must NOT publish.
             assert!(
                 sv.read_validated(|| 1).is_none(),
                 "read_validated must refuse to publish during a forced mutation"
             );
         }
-        assert_eq!(sv.current(), 2, "even + advanced by two after the guard drops");
+        assert_eq!(
+            sv.current(),
+            2,
+            "even + advanced by two after the guard drops"
+        );
         assert!(
             sv.read_validated(|| 1).is_some(),
             "stable again after the event"
