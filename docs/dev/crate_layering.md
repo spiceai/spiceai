@@ -409,6 +409,22 @@ baseline](#measured-compile-time-baseline)):
    `pgwire-replication` folds into `data-postgres` rather than staying a foundation
    dependency.
 
+> **In-flight example — PostgreSQL (temporary `shared-utility` override).**
+> `connector-postgres-common` lives under `crates/data-connectors/` (which the
+> path rule would place in `extension`) but is pinned to `shared-utility` via a
+> `[override]` in `layers.toml`. It is a leaf helper — its workspace-internal dep
+> closure is empty — holding the PostgreSQL catalog/CDC-support queries
+> (`list_schemas`/`list_tables`/`primary_key_columns`/`check_cdc_prerequisites`),
+> which `data_components::postgres::provider` re-exports so `runtime` reaches them
+> without a direct `connector-*` dependency. The override keeps the
+> `data_components -> connector-postgres-common` edge a legal *same-tier* dep in
+> the interim. Under move #3 the goal is to fold **all** PostgreSQL functionality —
+> `data_components::postgres`, `connector-postgres-common`, and
+> `runtime::catalogconnector::postgres_accelerated` (the CDC/catalog-acceleration
+> glue) — into a single `connector-postgres` (`data-postgres`) crate that owns the
+> CDC mechanisms. Once `runtime` no longer reaches these queries (even transitively
+> via the re-export), drop the override so the crate returns to `extension`.
+
 ### Method: inverting one seam
 
 Each seam (connector, catalog, checkpoint, …) follows the same mechanical, reviewable

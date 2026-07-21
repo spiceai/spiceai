@@ -519,6 +519,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_catalog_acceleration_example_spicepods_load() {
+        const FILES: [&str; 2] = [
+            "../../test/spicepods/tpch/sf1/accelerated/postgres[catalog][changes].yaml",
+            "../../tools/spicepodschema/tests/spicepod.catalogs.yaml",
+        ];
+
+        for file in FILES {
+            let path = PathBuf::from(file);
+            Spicepod::load_exact(&path)
+                .await
+                .unwrap_or_else(|e| panic!("Should load spicepod {file}: {e}"));
+        }
+    }
+
+    #[tokio::test]
     async fn test_spicepod_with_functions_loads() {
         let pod = Spicepod::load_exact(&PathBuf::from("./tests/spicepod_with_functions.yaml"))
             .await

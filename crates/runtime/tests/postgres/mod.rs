@@ -30,6 +30,8 @@ use crate::{init_tracing, utils::test_request_context};
 
 #[cfg(feature = "postgres")]
 pub mod catalog;
+#[cfg(feature = "postgres")]
+pub mod catalog_changes;
 #[cfg(all(feature = "postgres", feature = "duckdb"))]
 pub mod comments;
 pub mod common;

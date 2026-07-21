@@ -217,19 +217,36 @@ pub async fn verify_after_drain(
                 driver.row_count(table),
                 spice.count(table),
             );
+            // Sampled *after* the probe returns, so a slow probe (e.g. an
+            // unindexed MAX(_bench_ts) full scan) shows up as a jump in the
+            // per-table `+Ns` between adjacent lines.
+            let elapsed = start.elapsed().as_secs();
 
             // A transient error (e.g. a momentary connection blip while replication is still draining) should not fail
             // the whole gate — treat it as "not caught up" and keep polling until max_wait.
             match (src_ts, spice_ts, src_n, spice_n) {
                 (Ok(src_ts), Ok(spice_ts), Ok(src_n), Ok(spice_n)) => {
-                    if !(src_ts == spice_ts && src_n == spice_n) {
+                    let count_ok = src_n == spice_n;
+                    let ts_ok = src_ts == spice_ts;
+                    // How far the Spice copy trails the source's newest stamped
+                    // mutation (MAX(_bench_ts)), in ms; `n/a` if either side is empty.
+                    let ts_lag = match (src_ts, spice_ts) {
+                        (Some(s), Some(p)) => format!("{}ms", (s - p) / 1000),
+                        _ => "n/a".to_string(),
+                    };
+                    println!(
+                        "  drain-probe +{elapsed}s {table:<11} rows src={src_n} spice={spice_n} [{}] | max_bench_ts lag {ts_lag} [{}]",
+                        if count_ok { "ok" } else { "behind" },
+                        if ts_ok { "ok" } else { "behind" },
+                    );
+                    if !(count_ok && ts_ok) {
                         all_caught_up = false;
                     }
                 }
                 (src_ts, spice_ts, src_n, spice_n) => {
                     all_caught_up = false;
                     eprintln!(
-                        "Data correctness probe: {table} src_ts={src_ts:?} spice_ts={spice_ts:?} src_count={src_n:?} spice_count={spice_n:?}"
+                        "  drain-probe +{elapsed}s {table} PROBE ERROR src_ts={src_ts:?} spice_ts={spice_ts:?} src_count={src_n:?} spice_count={spice_n:?}"
                     );
                 }
             }
