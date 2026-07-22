@@ -828,7 +828,7 @@ async fn enrollment_issues_identity_and_streams_over_mtls() {
         dir.path().join("identity.json"),
         dir.path().to_path_buf(),
         Some(ADOPTION_CODE.to_string()),
-        Duration::from_secs(12 * 60 * 60),
+        Duration::from_hours(12),
     );
 
     let (runtime, _rt_state) = E2eRuntime::new(0);
@@ -889,7 +889,7 @@ async fn adoption_code_is_single_use() {
         dir1.path().join("identity.json"),
         dir1.path().to_path_buf(),
         Some(ADOPTION_CODE.to_string()),
-        Duration::from_secs(12 * 60 * 60),
+        Duration::from_hours(12),
     );
     let (runtime1, _s1) = E2eRuntime::new(0);
     let (handle1, _identity) = enroll(&harness, &config1, runtime1).await;
@@ -903,7 +903,7 @@ async fn adoption_code_is_single_use() {
         identity_path2.clone(),
         dir2.path().to_path_buf(),
         Some(ADOPTION_CODE.to_string()),
-        Duration::from_secs(12 * 60 * 60),
+        Duration::from_hours(12),
     );
     let (runtime2, _s2) = E2eRuntime::new(0);
     let handle2 = runtime_cloud_connect::CloudConnect::start(config2, runtime2)
@@ -947,13 +947,14 @@ async fn identity_is_reused_across_restart_over_mtls() {
         identity_path.clone(),
         dir.path().to_path_buf(),
         Some(ADOPTION_CODE.to_string()),
-        Duration::from_secs(12 * 60 * 60),
+        Duration::from_hours(12),
     );
     let (runtime, _s) = E2eRuntime::new(0);
     let (handle, _identity) = enroll(&harness, &enroll_cfg, runtime).await;
     handle.shutdown().await; // simulate process stop; identity.json persists.
 
-    let hellos_before = with_captured!(Arc::clone(&harness.gateway.captured), c => c.hellos.len());
+    let captured = Arc::clone(&harness.gateway.captured);
+    let hellos_before = with_captured!(captured, c => c.hellos.len());
 
     // Second boot: NO adoption code — the client must load the persisted
     // identity and reconnect over mTLS, presenting its client certificate,
@@ -963,7 +964,7 @@ async fn identity_is_reused_across_restart_over_mtls() {
         identity_path.clone(),
         dir.path().to_path_buf(),
         None,
-        Duration::from_secs(12 * 60 * 60),
+        Duration::from_hours(12),
     );
     let (runtime2, _s2) = E2eRuntime::new(0);
     let handle2 = runtime_cloud_connect::CloudConnect::start(reuse_cfg, runtime2)
@@ -1004,7 +1005,7 @@ async fn heartbeat_and_telemetry_cadence() {
         dir.path().join("identity.json"),
         dir.path().to_path_buf(),
         Some(ADOPTION_CODE.to_string()),
-        Duration::from_secs(12 * 60 * 60),
+        Duration::from_hours(12),
     );
     let (runtime, _s) = E2eRuntime::new(0);
     let (handle, _identity) = enroll(&harness, &config, runtime).await;
@@ -1052,7 +1053,7 @@ async fn run_query_read_only_caps_and_audit() {
         dir.path().join("identity.json"),
         dir.path().to_path_buf(),
         Some(ADOPTION_CODE.to_string()),
-        Duration::from_secs(12 * 60 * 60),
+        Duration::from_hours(12),
     );
     // The fabricated table has more rows than the requested cap, so the
     // result must come back truncated.
@@ -1178,7 +1179,7 @@ async fn apply_spicepod_hot_applies_and_persists() {
         dir.path().join("identity.json"),
         dir.path().to_path_buf(),
         Some(ADOPTION_CODE.to_string()),
-        Duration::from_secs(12 * 60 * 60),
+        Duration::from_hours(12),
     );
     let (runtime, rt_state) = E2eRuntime::new(0);
     let (handle, _identity) = enroll(&harness, &config, runtime).await;
@@ -1245,7 +1246,7 @@ async fn reconnects_over_mtls_after_disconnect() {
         dir.path().join("identity.json"),
         dir.path().to_path_buf(),
         Some(ADOPTION_CODE.to_string()),
-        Duration::from_secs(12 * 60 * 60),
+        Duration::from_hours(12),
     );
     let (runtime, _s) = E2eRuntime::new(0);
 
@@ -1403,7 +1404,7 @@ async fn forget_clears_identity_and_exits() {
         identity_path.clone(),
         dir.path().to_path_buf(),
         Some(ADOPTION_CODE.to_string()),
-        Duration::from_secs(12 * 60 * 60),
+        Duration::from_hours(12),
     );
     let (runtime, _s) = E2eRuntime::new(0);
     let (handle, _identity) = enroll(&harness, &config, runtime).await;

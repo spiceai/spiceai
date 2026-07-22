@@ -249,7 +249,7 @@ fn config_with(
         runtime_version: "v0.0.0-test".to_string(),
         heartbeat_interval: Duration::from_secs(30),
         telemetry_interval: Duration::from_mins(1),
-        renewal_lead: Duration::from_secs(12 * 60 * 60),
+        renewal_lead: Duration::from_hours(12),
     }
 }
 

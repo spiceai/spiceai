@@ -54,7 +54,7 @@ pub const RENEW_PATH: &str = "/v1/cloud-connect/renew";
 /// How long past the leaf's `not_after` a renewal is still accepted by the
 /// cloud (mirrors the server-side grace). Past this the identity is dead
 /// and a fresh adoption code is required.
-pub const RENEWAL_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+pub const RENEWAL_GRACE: Duration = Duration::from_hours(30 * 24);
 
 /// Errors from the out-of-band enroll/renew HTTP flow.
 #[derive(Debug, Snafu)]
@@ -315,8 +315,7 @@ impl EnrollClient {
         // present, falling back to a bounded slice of the raw body.
         let message = match response.text().await {
             Ok(text) => serde_json::from_str::<ErrorBody>(&text)
-                .map(|b| b.error)
-                .unwrap_or_else(|_| bounded(&text, 256)),
+                .map_or_else(|_| bounded(&text, 256), |b| b.error),
             Err(_) => String::new(),
         };
         // 5xx is transient by definition; 429 (rate limit) and 408 (request
@@ -503,8 +502,8 @@ mod tests {
             pending_adopt_code_path: None,
             runtime_version: "v0-test".to_string(),
             heartbeat_interval: Duration::from_secs(30),
-            telemetry_interval: Duration::from_secs(60),
-            renewal_lead: Duration::from_secs(12 * 60 * 60),
+            telemetry_interval: Duration::from_mins(1),
+            renewal_lead: Duration::from_hours(12),
         }
     }
 

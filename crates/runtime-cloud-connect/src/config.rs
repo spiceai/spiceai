@@ -28,7 +28,7 @@ pub const DEFAULT_ENDPOINT: &str = "https://cloud.spice.ai";
 /// Default lead time before the identity cert's `not_after` at which the
 /// client renews. The cloud issues 24h leaves, so a 12h lead yields the
 /// ~12h renewal cadence of the BYOC operator.
-pub const DEFAULT_RENEWAL_LEAD: Duration = Duration::from_secs(12 * 60 * 60);
+pub const DEFAULT_RENEWAL_LEAD: Duration = Duration::from_hours(12);
 
 /// Default cadence for `Heartbeat` frames on an established stream.
 pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);

@@ -76,7 +76,7 @@ const MAX_BACKOFF: Duration = Duration::from_mins(1);
 /// How long after a failed (transient) in-stream renewal attempt the next
 /// attempt is made. Short enough to fit many retries into the grace
 /// window, long enough not to hammer the cloud.
-const RENEW_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const RENEW_RETRY_INTERVAL: Duration = Duration::from_mins(5);
 
 /// Outbound channel size: bounded to keep memory predictable.
 const CLIENT_CHANNEL_SIZE: usize = 64;
@@ -998,6 +998,44 @@ fn past_renewal_grace(identity: &Identity) -> bool {
                 .saturating_add(RENEWAL_GRACE.as_secs())
 }
 
+/// Trust anchors for verifying the gateway's SERVER certificate on the mTLS
+/// channel.
+struct ServerTrust<'a> {
+    /// Whether to trust the host's native root store. Always `true`: per
+    /// DR-025 (#7) the gateway serves a publicly-trusted (Let's Encrypt)
+    /// server cert that chains to a public CA.
+    native_roots: bool,
+    /// Extra anchors trusted *on top of* the native roots — the enrollment CA
+    /// bundle and any dev/self-hosted CA — for a gateway that instead serves
+    /// an internally-signed cert.
+    extra_cas: Vec<&'a str>,
+}
+
+/// Decide the trust anchors for verifying the gateway's SERVER certificate.
+///
+/// The host's native root store is **always** trusted — the gateway serves a
+/// publicly-trusted (Let's Encrypt) server cert (DR-025 #7). The enrollment CA
+/// bundle (`ca_bundle_pem`) and any dev/self-hosted CA (`dev_ca_pem`) are added
+/// as *extra* anchors only, never as the exclusive root.
+///
+/// NB: the enrollment CA (`ca_bundle_pem`) is CA1 — it signs our own CLIENT
+/// identity presented on the same channel — NOT the gateway's server cert,
+/// which chains to a public CA (CA2). Pinning the server-cert trust to CA1
+/// exclusively is wrong: it rejects the public server cert as `UnknownIssuer`.
+fn server_trust<'a>(ca_bundle_pem: &'a str, dev_ca_pem: Option<&'a str>) -> ServerTrust<'a> {
+    let mut extra_cas = Vec::new();
+    if !ca_bundle_pem.is_empty() {
+        extra_cas.push(ca_bundle_pem);
+    }
+    if let Some(dev_ca) = dev_ca_pem {
+        extra_cas.push(dev_ca);
+    }
+    ServerTrust {
+        native_roots: true,
+        extra_cas,
+    }
+}
+
 fn build_channel(
     config: &CloudConnectConfig,
     endpoint_url: &str,
@@ -1018,31 +1056,14 @@ fn build_channel(
     if !config.insecure {
         let mut tls = ClientTlsConfig::new();
 
-        // Trust roots for verifying the gateway. Precedence:
-        //
-        // 1. The issuing-CA bundle pinned at enrollment (`ca_bundle_pem`)
-        //    and any dev/self-hosted CA in `ca_cert_pem`. When either is
-        //    present we verify against those roots *exclusively* — the
-        //    enroll contract has the gateway present a cert chaining to
-        //    `ca_bundle_pem` on the mTLS port, and pinning keeps
-        //    reconnects deterministic (no dependence on the host's native
-        //    trust store).
-        // 2. Otherwise the public root store — for gateways serving a
-        //    publicly-trusted certificate.
-        let mut pinned_roots: Vec<&str> = Vec::new();
-        if !identity.ca_bundle_pem.is_empty() {
-            pinned_roots.push(identity.ca_bundle_pem.as_str());
-        }
-        if let Some(ref ca_pem) = config.ca_cert_pem {
-            pinned_roots.push(ca_pem.as_str());
-        }
-
-        if pinned_roots.is_empty() {
+        // Trust roots for verifying the gateway's SERVER certificate — see
+        // [`server_trust`] for the (subtle) rationale.
+        let trust = server_trust(&identity.ca_bundle_pem, config.ca_cert_pem.as_deref());
+        if trust.native_roots {
             tls = tls.with_native_roots();
-        } else {
-            for ca_pem in pinned_roots {
-                tls = tls.ca_certificate(Certificate::from_pem(ca_pem.as_bytes()));
-            }
+        }
+        for ca_pem in trust.extra_cas {
+            tls = tls.ca_certificate(Certificate::from_pem(ca_pem.as_bytes()));
         }
 
         // Mutual TLS: present the cloud-issued leaf and its private key as
@@ -1421,13 +1442,13 @@ mod tests {
     #[test]
     fn renewal_never_due_for_unbounded_identity() {
         let id = identity_with_not_after(0);
-        assert!(!renewal_due(&id, Duration::from_secs(12 * 60 * 60)));
+        assert!(!renewal_due(&id, Duration::from_hours(12)));
         assert!(!past_renewal_grace(&id));
     }
 
     #[test]
     fn renewal_due_within_lead_of_expiry() {
-        let lead = Duration::from_secs(12 * 60 * 60);
+        let lead = Duration::from_hours(12);
         // Expires in 1h with a 12h lead: due now.
         let soon = identity_with_not_after(now_unix() + 3600);
         assert!(renewal_due(&soon, lead));
@@ -1445,5 +1466,38 @@ mod tests {
         let long_dead =
             identity_with_not_after(now_unix().saturating_sub(RENEWAL_GRACE.as_secs() + 60));
         assert!(past_renewal_grace(&long_dead));
+    }
+
+    #[test]
+    fn server_trust_always_trusts_native_roots_even_with_pinned_bundle() {
+        // Regression guard: the gateway serves a public (Let's Encrypt) server
+        // cert that chains to a public CA — NOT to the enrollment
+        // `ca_bundle_pem`, which signs our own CLIENT identity. Pinning the
+        // server-cert trust to `ca_bundle_pem` exclusively (dropping the native
+        // roots) rejected the public cert as `UnknownIssuer`. Native roots must
+        // ALWAYS be trusted, even when an enrollment bundle is present.
+        let trust = server_trust("CA-BUNDLE-PEM", None);
+        assert!(
+            trust.native_roots,
+            "native roots must be trusted even alongside a pinned CA bundle"
+        );
+        assert_eq!(trust.extra_cas, vec!["CA-BUNDLE-PEM"]);
+    }
+
+    #[test]
+    fn server_trust_adds_bundle_and_dev_ca_as_extra_anchors() {
+        // Both the enrollment bundle and a dev/self-hosted CA are added on top
+        // of (not instead of) the native roots.
+        let trust = server_trust("CA-BUNDLE-PEM", Some("DEV-CA-PEM"));
+        assert!(trust.native_roots);
+        assert_eq!(trust.extra_cas, vec!["CA-BUNDLE-PEM", "DEV-CA-PEM"]);
+    }
+
+    #[test]
+    fn server_trust_native_roots_only_when_no_pins() {
+        // No enrollment bundle and no dev CA: native roots alone.
+        let trust = server_trust("", None);
+        assert!(trust.native_roots);
+        assert!(trust.extra_cas.is_empty());
     }
 }

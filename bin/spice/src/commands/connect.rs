@@ -351,15 +351,37 @@ fn looks_like_adoption_code(target: &str) -> bool {
 }
 
 fn mask_code(code: &str) -> String {
-    let mut parts = code.split('-').collect::<Vec<_>>();
-    let len = parts.len();
-    if len < 3 {
-        return code.to_string();
+    // Grouped form (`SPICE-ADOPT-XXXXX-XXXXX-...`): mask the interior segments,
+    // keeping the `SPICE-ADOPT` prefix and the final segment for recognition.
+    if code.contains('-') {
+        let mut parts = code.split('-').collect::<Vec<_>>();
+        let len = parts.len();
+        if len < 3 {
+            return code.to_string();
+        }
+        for part in parts.iter_mut().take(len - 1).skip(2) {
+            *part = "****";
+        }
+        return parts.join("-");
     }
-    for part in parts.iter_mut().take(len - 1).skip(2) {
-        *part = "****";
+    // Dash-less token (the raw 64-hex code the portal mints today): a single-use
+    // secret, so mask the middle by characters rather than printing it whole.
+    // Short strings have nothing meaningful to hide and are left as-is.
+    mask_opaque_token(code)
+}
+
+/// Mask an opaque single-use token, keeping a short prefix and suffix for
+/// recognition and replacing the middle with `****`. Tokens short enough that
+/// masking would reveal most of them are returned unchanged.
+fn mask_opaque_token(token: &str) -> String {
+    const KEEP: usize = 4;
+    let chars: Vec<char> = token.chars().collect();
+    if chars.len() <= KEEP * 2 {
+        return token.to_string();
     }
-    parts.join("-")
+    let prefix: String = chars[..KEEP].iter().collect();
+    let suffix: String = chars[chars.len() - KEEP..].iter().collect();
+    format!("{prefix}****{suffix}")
 }
 
 #[cfg(unix)]
@@ -421,6 +443,20 @@ mod tests {
     fn mask_code_short_codes_unchanged() {
         assert_eq!(mask_code("SHORT"), "SHORT");
         assert_eq!(mask_code("FOO-BAR"), "FOO-BAR");
+    }
+
+    #[test]
+    fn mask_code_masks_raw_hex_token() {
+        // The cloud portal mints randomBytes(32).toString('hex') — a 64-char
+        // dash-less single-use secret. `spice connect status` must NOT print it
+        // whole: mask the middle, keeping only a short prefix/suffix.
+        let code = "9f500bdec2f2dcf06e50f255d6d8291603e9b10f5abf500a5de5ad6d2069837d";
+        let masked = mask_code(code);
+        assert_eq!(masked, "9f50****837d");
+        assert!(
+            !masked.contains("bdec2f2"),
+            "the interior of the adoption code must not be shown: {masked}"
+        );
     }
 
     #[test]

@@ -223,12 +223,21 @@ impl CloudConnect {
 
 /// Validate an adoption code shape.
 ///
-/// Format: `SPICE-ADOPT-XXXXX-XXXXX-...` where each `XXXXX` segment is 5
-/// uppercase ASCII alphanumeric characters (the portal mints RFC4648 base32,
-/// A-Z2-7), and there are between 2 and 5 segments (the portal mints 4). The
-/// actual code may be looser server-side; this is the client-side sanity check.
+/// Accepts either shape a portal may mint:
+/// - a raw 32-byte hex string (64 hex digits) — what the cloud portal
+///   currently mints (`randomBytes(32).toString('hex')`), or
+/// - the grouped form `SPICE-ADOPT-XXXXX-XXXXX-...` where each `XXXXX` segment
+///   is 5 uppercase ASCII alphanumerics, with 2–5 segments.
+///
+/// This is a client-side sanity check to tell an adoption code apart from a
+/// Spicepod path (`<org>/<pod>`); the code is validated authoritatively
+/// server-side at enroll.
 #[must_use]
 pub fn is_valid_adoption_code(code: &str) -> bool {
+    // Raw 32-byte hex (64 hex digits) — the format the cloud portal mints today.
+    if code.len() == 64 && code.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return true;
+    }
     let mut parts = code.split('-');
     if parts.next() != Some("SPICE") {
         return false;
@@ -273,6 +282,16 @@ mod tests {
         assert!(is_valid_adoption_code(
             "SPICE-ADOPT-11111-22222-33333-44444-55555"
         ));
+    }
+
+    #[test]
+    fn accepts_raw_hex_adoption_code() {
+        // The cloud portal mints randomBytes(32).toString('hex') — 64 hex chars.
+        assert!(is_valid_adoption_code(
+            "9f500bdec2f2dcf06e50f255d6d8291603e9b10f5abf500a5de5ad6d2069837d"
+        ));
+        assert!(!is_valid_adoption_code("9f500bde")); // too short
+        assert!(!is_valid_adoption_code(&"z".repeat(64))); // 64 chars but non-hex
     }
 
     #[test]
