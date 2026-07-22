@@ -4713,20 +4713,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "connector-snowflake-native"
-version = "2.2.0-unstable"
-dependencies = [
- "async-trait",
- "data_components",
- "datafusion",
- "datafusion-table-providers",
- "db_connection_pool",
- "runtime",
- "snafu",
- "snowflake-api",
-]
-
-[[package]]
 name = "connector-spark"
 version = "2.2.0-unstable"
 dependencies = [
