@@ -22,7 +22,7 @@ limitations under the License.
 //! server-side table filter: every subscriber receives the *entire* server
 //! binlog. A dedicated per-dataset dump would therefore just duplicate the
 //! whole stream for no benefit, so there is no per-dataset path and no opt-in:
-//! this module is the sole streaming engine for MySQL CDC. Sharing is keyed by
+//! this module is the sole streaming engine for `MySQL` CDC. Sharing is keyed by
 //! *connection identity* ([`SourceKey`]) — datasets that connect the same way
 //! (host, port, user, password, TLS, `server_id`) join a single *shared source*
 //! (one dump connection, one `server_id`), with decoded transactions routed by
@@ -327,7 +327,10 @@ impl AckTable {
                 slot.state.store(held, Ordering::Release);
             }
             None => {
-                members.insert(key.clone(), Arc::new(AckSlot::new(at, gtid_seed, snapshotting)));
+                members.insert(
+                    key.clone(),
+                    Arc::new(AckSlot::new(at, gtid_seed, snapshotting)),
+                );
             }
         }
     }
@@ -512,9 +515,10 @@ impl CommitChange for SnapshotBoundaryCommitter {
         // not persisted until the pump's next checkpoint tick; a crash in that
         // window would needlessly re-snapshot. Running here (after every
         // snapshot batch has been applied) makes the head durable immediately.
-        if let (Some(member), Some(slot)) =
-            (self.source.member(&self.key), self.source.ack.slot(&self.key))
-        {
+        if let (Some(member), Some(slot)) = (
+            self.source.member(&self.key),
+            self.source.ack.slot(&self.key),
+        ) {
             let persisted = persisted_for(&member, &slot);
             if let Err(e) = member.position_store.save(&persisted).await {
                 tracing::warn!(dataset = %self.dataset, error = %e, "failed to persist shared mysql binlog snapshot head");
@@ -777,11 +781,8 @@ async fn attach_member(
     // GTID auto-positioning is used whenever the source reports gtid_mode = ON
     // (all members share the connection, so all agree). Failover-safe; decides
     // the member's cursor type at bootstrap and drives the shared dump.
-    let use_gtid = super::setup::gtid_mode_is_on(
-        super::setup::detect_gtid_mode(&mut conn)
-            .await?
-            .as_deref(),
-    );
+    let use_gtid =
+        super::setup::gtid_mode_is_on(super::setup::detect_gtid_mode(&mut conn).await?.as_deref());
     let cursor_type = if use_gtid {
         CursorType::Gtid
     } else {
@@ -1036,7 +1037,10 @@ async fn resolve_start_position(
     let (head, head_gtid) = if use_gtid {
         super::setup::fetch_head_and_gtid(conn).await?
     } else {
-        (super::setup::fetch_head_position(conn).await?, GtidSet::new())
+        (
+            super::setup::fetch_head_position(conn).await?,
+            GtidSet::new(),
+        )
     };
     if params.snapshot_mode == InitialSnapshotMode::Disabled {
         let initial = PersistedPosition {
@@ -1232,8 +1236,15 @@ async fn run_pump(source: Arc<SharedSource>) {
             GtidSet::new()
         };
 
-        let mut stream =
-            match open_binlog_stream(&params, &resume, &connection, use_gtid, &resume_gtid).await {
+        let mut stream = match open_binlog_stream(
+            &params,
+            &resume,
+            &connection,
+            use_gtid,
+            &resume_gtid,
+        )
+        .await
+        {
             Ok(stream) => {
                 backoff.reset();
                 if reconnect_attempts > 0 {
@@ -1250,7 +1261,11 @@ async fn run_pump(source: Arc<SharedSource>) {
                 // The shared min was purged from the source. Surface it to every
                 // member; on reload/restart each member re-evaluates its own
                 // persisted position via `invalid_checkpoint_behavior`.
-                fatal_broadcast(&source, purged_position_error(&resume, &connection).to_string()).await;
+                fatal_broadcast(
+                    &source,
+                    purged_position_error(&resume, &connection).to_string(),
+                )
+                .await;
                 break 'reconnect;
             }
             Err(e) if super::resilience::is_transient_mysql(&e) => {
@@ -1341,8 +1356,11 @@ async fn run_pump(source: Arc<SharedSource>) {
                         .ack
                         .flush_position()
                         .unwrap_or_else(|| current_file_pos(&current_file));
-                    fatal_broadcast(&source, purged_position_error(&resume, &connection).to_string())
-                        .await;
+                    fatal_broadcast(
+                        &source,
+                        purged_position_error(&resume, &connection).to_string(),
+                    )
+                    .await;
                     break 'reconnect;
                 }
                 Err(e) if super::resilience::is_transient_mysql(&e) => {

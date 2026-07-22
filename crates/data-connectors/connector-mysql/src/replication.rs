@@ -39,8 +39,6 @@ use data_components::mysql_replication::{
 use datafusion::sql::TableReference;
 use futures::StreamExt;
 use mysql_async::{Opts, OptsBuilder, SslOpts};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use opentelemetry::KeyValue;
 use runtime::component::dataset::Dataset;
 use runtime::dataaccelerator::spice_sys::{
@@ -50,6 +48,8 @@ use runtime::dataaccelerator::spice_sys::{
 use runtime::federated_table::FederatedTable;
 use runtime::parameters::Parameters;
 use runtime_metrics::component::{MetricSpec, MetricType, ObserveMetricCallback};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 const DEFAULT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_BOOTSTRAP_BATCH_SIZE: usize = 8192;
@@ -1010,19 +1010,29 @@ mod tests {
                 .server_id
         };
 
-        let base = derive(&[("host", "localhost"), ("pass", "pw1"), ("sslmode", "disabled")]);
+        let base = derive(&[
+            ("host", "localhost"),
+            ("pass", "pw1"),
+            ("sslmode", "disabled"),
+        ]);
 
         // Different password, same host/port/user.
-        let other_pass =
-            derive(&[("host", "localhost"), ("pass", "pw2"), ("sslmode", "disabled")]);
+        let other_pass = derive(&[
+            ("host", "localhost"),
+            ("pass", "pw2"),
+            ("sslmode", "disabled"),
+        ]);
         assert_ne!(
             base, other_pass,
             "a different password must derive a different server_id"
         );
 
         // TLS on vs off, same credentials.
-        let with_tls =
-            derive(&[("host", "localhost"), ("pass", "pw1"), ("sslmode", "required")]);
+        let with_tls = derive(&[
+            ("host", "localhost"),
+            ("pass", "pw1"),
+            ("sslmode", "required"),
+        ]);
         assert_ne!(
             base, with_tls,
             "a different TLS mode must derive a different server_id"
