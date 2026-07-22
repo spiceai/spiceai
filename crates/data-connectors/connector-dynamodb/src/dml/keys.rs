@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Shared primary key extraction logic for `DynamoDB` DML operations.
 
-use crate::dynamodb::utils::scalar_to_attribute_value;
+use crate::utils::scalar_to_attribute_value;
 use arrow::array::Array;
 use aws_sdk_dynamodb::types::AttributeValue;
 use datafusion::common::ScalarValue;

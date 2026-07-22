@@ -132,8 +132,6 @@ pub mod delta_lake;
 pub mod duckdb;
 #[cfg(feature = "duckdb")]
 pub mod ducklake;
-#[cfg(feature = "dynamodb")]
-pub mod dynamodb;
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;
 #[cfg(feature = "federation")]

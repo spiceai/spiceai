@@ -14,28 +14,27 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    ParameterSpec, Parameters, parameters::aws::initiate_config_with_auth_method,
-};
-use crate::component::dataset::Dataset;
-use crate::component::dataset::acceleration::RefreshMode;
-use crate::dataaccelerator::spice_sys::OpenOption;
-use crate::dataaccelerator::spice_sys::dynamodb::DynamoDBSys;
-use crate::dataconnector::schema_projection::{ProjectionPolicy, parse_schema_projection};
-use crate::federated_table::FederatedTable;
+use crate::Error;
+use crate::provider::DynamoDBTableProvider;
+use crate::stream::StreamError as DynamoDBStreamError;
 use async_trait::async_trait;
 use data_components::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError};
-use data_components::dynamodb::Error;
-use data_components::dynamodb::provider::DynamoDBTableProvider;
-use data_components::dynamodb::stream::StreamError as DynamoDBStreamError;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use dynamodb_streams::{Checkpoint, Metrics, MetricsCollector};
 use futures::stream::{self, StreamExt};
 use opentelemetry::KeyValue;
+use runtime::component::dataset::Dataset;
+use runtime::component::dataset::acceleration::RefreshMode;
+use runtime::dataaccelerator::spice_sys::dynamodb::init_checkpoint_store;
+use runtime::dataconnector::schema_projection::{ProjectionPolicy, parse_schema_projection};
+use runtime::dataconnector::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    ParameterSpec, Parameters, parameters::aws::initiate_config_with_auth_method,
+};
+use runtime::federated_table::FederatedTable;
 use runtime_api_types::v1::ComponentType;
-use runtime_checkpoint_api::CheckpointStore;
+use runtime_checkpoint_api::BlobCheckpointStore;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_parameters::ExposedParamLookup;
 use snafu::ResultExt;
@@ -157,7 +156,7 @@ impl DataConnectorFactory for DynamoDBFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let dynamodb = DynamoDB {
                 params: params.parameters,
@@ -246,7 +245,7 @@ impl DataConnector for DynamoDB {
             .unwrap_or(Duration::from_secs(0));
 
         let unnest_depth = match self.params.get("unnest_depth").expose() {
-            ExposedParamLookup::Present(unnest_depth_str) => Some(usize::from_str(unnest_depth_str).boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
+            ExposedParamLookup::Present(unnest_depth_str) => Some(usize::from_str(unnest_depth_str).boxed().context(runtime::dataconnector::InvalidConfigurationSnafu {
                 dataconnector: "dynamodb".to_string(),
                 message: format!(
                     "DynamoDB parameter 'unnest_depth' must be an integer, not {unnest_depth_str}"),
@@ -265,7 +264,7 @@ impl DataConnector for DynamoDB {
         {
             SEGMENTS_AUTO_STR => None,
             config_segments_str => {
-                let config_segments = usize::from_str(config_segments_str).boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
+                let config_segments = usize::from_str(config_segments_str).boxed().context(runtime::dataconnector::InvalidConfigurationSnafu {
                     dataconnector: "dynamodb".to_string(),
                     message: format!(
                         "DynamoDB parameter 'scan_segments' must be either an integer > 0 or 'auto', not {config_segments_str}"),
@@ -315,7 +314,17 @@ impl DataConnector for DynamoDB {
             .expose()
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(data_components::dynamodb::dml::DEFAULT_WRITE_PARALLELISM);
+            .unwrap_or(crate::dml::DEFAULT_WRITE_PARALLELISM);
+        // A zero would flow into `mpsc::channel(write_parallelism * 2)` (0 capacity panics in
+        // Tokio) and spawn no writer tasks, so reject it as a configuration error rather than
+        // crashing the write path.
+        if write_parallelism == 0 {
+            return Err(DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "dynamodb".to_string(),
+                message: "DynamoDB parameter 'write_parallelism' is invalid: must be a positive integer (got 0). Refer to https://spiceai.org/docs/components/data-connectors/dynamodb".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+            });
+        }
 
         let provider = DynamoDBTableProvider::try_new(
             config,
@@ -347,7 +356,7 @@ impl DataConnector for DynamoDB {
             return Err(DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "dynamodb".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
-                source: Box::new(data_components::dynamodb::Error::StreamsNotEnabled {
+                source: Box::new(crate::Error::StreamsNotEnabled {
                     table_name: table_name.to_string(),
                 }),
             });
@@ -406,18 +415,19 @@ impl DataConnector for DynamoDB {
                 let acceptable_lag = dynamodb_ref.ready_lag;
                 let dataset_name = dataset.name.clone();
                 let dynamodb = Arc::new(dynamodb_ref.clone());
-                let dynamodb_sys = Arc::new(if dataset.is_file_accelerated() {
-                    initialize_dynamodb_sys(&dataset).await
-                } else {
-                    tracing::warn!(
-                        dataset = %dataset_name,
-                        "DynamoDB Streams dataset is not file-accelerated. Connector state is ephemeral and the stream will restart on every runtime restart"
-                    );
-                    None
-                });
+                let dynamodb_sys: Option<Arc<dyn BlobCheckpointStore>> =
+                    if dataset.is_file_accelerated() {
+                        init_checkpoint_store(&dataset).await
+                    } else {
+                        tracing::warn!(
+                            dataset = %dataset_name,
+                            "DynamoDB Streams dataset is not file-accelerated. Connector state is ephemeral and the stream will restart on every runtime restart"
+                        );
+                        None
+                    };
 
                 let (should_bootstrap, checkpoint, checkpoint_updated_at) =
-                    load_or_initialize_checkpoint(&dynamodb, &dynamodb_sys, &dataset_name).await?;
+                    load_or_initialize_checkpoint(&dynamodb, dynamodb_sys.as_ref(), &dataset_name).await?;
 
                 if should_bootstrap {
                     create_bootstrap_stream(
@@ -446,51 +456,52 @@ impl DataConnector for DynamoDB {
     }
 }
 
-async fn initialize_dynamodb_sys(dataset: &Dataset) -> Option<DynamoDBSys> {
-    match DynamoDBSys::try_new(dataset, OpenOption::CreateIfNotExists).await {
-        Ok(sys) => Some(sys),
-        Err(err) => {
-            tracing::error!(
-                dataset = %dataset.name,
-                error = ?err,
-                "Failed to initialize DynamoDB Streams sidecar checkpoint storage. Connector state is ephemeral and the stream will restart on every runtime restart"
-            );
-            None
-        }
-    }
-}
-
-/// Loads checkpoint from `DynamoDBSys`, or initializes a new checkpoint if none exists.
+/// Loads the checkpoint from the sidecar [`BlobCheckpointStore`]. Falls back to
+/// re-initialization (a fresh scan) when there is no store, no persisted checkpoint,
+/// the persisted value can't be deserialized, *or* the store read fails — a store-read
+/// failure is logged and treated as an at-least-once re-bootstrap.
 /// Returns (`should_bootstrap`, checkpoint, `checkpoint_updated_at`).
 async fn load_or_initialize_checkpoint(
     dynamodb: &Arc<DynamoDBTableProvider>,
-    dynamodb_sys: &Arc<Option<DynamoDBSys>>,
+    dynamodb_sys: Option<&Arc<dyn BlobCheckpointStore>>,
     dataset_name: &TableReference,
 ) -> Option<(bool, Checkpoint, Option<SystemTime>)> {
-    if let Some(ref dynamodb_sys) = **dynamodb_sys {
-        if let Some(metadata) = dynamodb_sys.get().await {
-            match serde_json::from_str::<Checkpoint>(&metadata.data) {
-                Ok(checkpoint) => Some((false, checkpoint, metadata.updated_at)),
-                Err(err) => {
-                    tracing::warn!(
-                        dataset = %dataset_name,
-                        error = ?err,
-                        "Failed to deserialize lag, falling back to initialization"
-                    );
-                    get_latest_checkpoint(dynamodb, dataset_name)
-                        .await
-                        .map(|cp| (true, cp, None))
-                }
+    let Some(dynamodb_sys) = dynamodb_sys else {
+        return get_latest_checkpoint(dynamodb, dataset_name)
+            .await
+            .map(|cp| (true, cp, None));
+    };
+
+    match dynamodb_sys.get().await {
+        Ok(Some(metadata)) => match serde_json::from_str::<Checkpoint>(&metadata.data) {
+            Ok(checkpoint) => Some((false, checkpoint, metadata.updated_at)),
+            Err(err) => {
+                tracing::warn!(
+                    dataset = %dataset_name,
+                    error = ?err,
+                    "Failed to deserialize the persisted DynamoDB Streams checkpoint, falling back to re-initialization"
+                );
+                get_latest_checkpoint(dynamodb, dataset_name)
+                    .await
+                    .map(|cp| (true, cp, None))
             }
-        } else {
+        },
+        Ok(None) => get_latest_checkpoint(dynamodb, dataset_name)
+            .await
+            .map(|cp| (true, cp, None)),
+        Err(err) => {
+            // Surface the store-read failure (instead of silently treating it as
+            // "no checkpoint"), then fall back to a full re-bootstrap — the same
+            // safe at-least-once behavior as a missing checkpoint.
+            tracing::error!(
+                dataset = %dataset_name,
+                error = %err,
+                "Failed to read the DynamoDB checkpoint from the accelerator; re-bootstrapping from a fresh scan"
+            );
             get_latest_checkpoint(dynamodb, dataset_name)
                 .await
                 .map(|cp| (true, cp, None))
         }
-    } else {
-        get_latest_checkpoint(dynamodb, dataset_name)
-            .await
-            .map(|cp| (true, cp, None))
     }
 }
 
@@ -524,7 +535,7 @@ async fn get_latest_checkpoint(
 /// the changes stream from the checkpoint captured before the scan started.
 async fn create_bootstrap_stream(
     dynamodb: Arc<DynamoDBTableProvider>,
-    dynamodb_sys: Arc<Option<DynamoDBSys>>,
+    dynamodb_sys: Option<Arc<dyn BlobCheckpointStore>>,
     checkpoint: Checkpoint,
     acceptable_lag: Duration,
     dataset_name: TableReference,
@@ -561,7 +572,7 @@ async fn create_bootstrap_stream(
 /// behavior.
 async fn emit_overwrite_then_live(
     dynamodb: Arc<DynamoDBTableProvider>,
-    dynamodb_sys: Arc<Option<DynamoDBSys>>,
+    dynamodb_sys: Option<Arc<dyn BlobCheckpointStore>>,
     checkpoint: Checkpoint,
     acceptable_lag: Duration,
     dataset_name: TableReference,
@@ -593,7 +604,7 @@ async fn emit_overwrite_then_live(
     };
     let checkpoint_envelope = ChangeEnvelope::from_parts(
         Box::new(DynamoDBStreamCommitter::new(
-            Arc::clone(&dynamodb_sys),
+            dynamodb_sys.clone(),
             checkpoint.clone(),
         )),
         checkpoint_batch,
@@ -632,7 +643,7 @@ async fn emit_overwrite_then_live(
 #[expect(clippy::too_many_arguments)]
 fn resume_from_checkpoint_stream(
     dynamodb: Arc<DynamoDBTableProvider>,
-    dynamodb_sys: Arc<Option<DynamoDBSys>>,
+    dynamodb_sys: Option<Arc<dyn BlobCheckpointStore>>,
     checkpoint: Checkpoint,
     checkpoint_updated_at: Option<SystemTime>,
     acceptable_lag: Duration,
@@ -643,7 +654,7 @@ fn resume_from_checkpoint_stream(
     stream::once(async move {
             match changes_stream_from_checkpoint(
                 Arc::clone(&dynamodb),
-                Arc::clone(&dynamodb_sys),
+                dynamodb_sys.clone(),
                 checkpoint,
                 acceptable_lag,
                 dataset_name.clone(),
@@ -714,7 +725,7 @@ fn resume_from_checkpoint_stream(
                         );
                         rebootstrap_table(
                             &dynamodb,
-                            &dynamodb_sys,
+                            dynamodb_sys.as_ref(),
                             acceptable_lag,
                             &dataset_name,
                             lag_exceeds_behavior,
@@ -749,7 +760,7 @@ fn resume_from_checkpoint_stream(
                         );
                         rebootstrap_table(
                             &dynamodb,
-                            &dynamodb_sys,
+                            dynamodb_sys.as_ref(),
                             acceptable_lag,
                             &dataset_name,
                             lag_exceeds_behavior,
@@ -776,7 +787,7 @@ fn resume_from_checkpoint_stream(
 
 async fn changes_stream_from_checkpoint(
     dynamodb: Arc<DynamoDBTableProvider>,
-    dynamodb_sys: Arc<Option<DynamoDBSys>>,
+    dynamodb_sys: Option<Arc<dyn BlobCheckpointStore>>,
     checkpoint: Checkpoint,
     acceptable_lag: Duration,
     dataset_name: TableReference,
@@ -805,7 +816,7 @@ async fn changes_stream_from_checkpoint(
 
                 ChangeEnvelope::new(
                     Box::new(DynamoDBStreamCommitter::new(
-                        Arc::clone(&dynamodb_sys),
+                        dynamodb_sys.clone(),
                         checkpoint,
                     )),
                     change_batch,
@@ -818,7 +829,7 @@ async fn changes_stream_from_checkpoint(
 
 async fn rebootstrap_table(
     dynamodb: &Arc<DynamoDBTableProvider>,
-    dynamodb_sys: &Arc<Option<DynamoDBSys>>,
+    dynamodb_sys: Option<&Arc<dyn BlobCheckpointStore>>,
     acceptable_lag: Duration,
     dataset_name: &TableReference,
     behavior: LagExceedsShardRetentionBehavior,
@@ -843,7 +854,7 @@ async fn rebootstrap_table(
 
         // Clone values needed for the async rebootstrap
         let dynamodb = Arc::clone(dynamodb);
-        let dynamodb_sys = Arc::clone(dynamodb_sys);
+        let dynamodb_sys = dynamodb_sys.cloned();
         let dataset_name = dataset_name.clone();
 
         // Return stream: ready envelope first, then rebootstrap happens, then changes stream
@@ -854,7 +865,7 @@ async fn rebootstrap_table(
                         // Perform rebootstrap in this async block
                         do_rebootstrap(
                             &dynamodb,
-                            &dynamodb_sys,
+                            dynamodb_sys.as_ref(),
                             acceptable_lag,
                             &dataset_name,
                             metrics_collector,
@@ -885,7 +896,7 @@ async fn rebootstrap_table(
 /// [`emit_overwrite_then_live`]).
 async fn do_rebootstrap(
     dynamodb: &Arc<DynamoDBTableProvider>,
-    dynamodb_sys: &Arc<Option<DynamoDBSys>>,
+    dynamodb_sys: Option<&Arc<dyn BlobCheckpointStore>>,
     acceptable_lag: Duration,
     dataset_name: &TableReference,
     metrics_collector: Arc<MetricsCollector>,
@@ -912,7 +923,7 @@ async fn do_rebootstrap(
 
     let stream = emit_overwrite_then_live(
         Arc::clone(dynamodb),
-        Arc::clone(dynamodb_sys),
+        dynamodb_sys.cloned(),
         new_checkpoint,
         acceptable_lag,
         dataset_name.clone(),
@@ -1062,13 +1073,13 @@ impl CommitChange for NoOpCommitter {
 }
 
 pub struct DynamoDBStreamCommitter {
-    dynamodb_sys: Arc<Option<DynamoDBSys>>,
+    dynamodb_sys: Option<Arc<dyn BlobCheckpointStore>>,
     checkpoint: Checkpoint,
 }
 
 impl DynamoDBStreamCommitter {
     #[must_use]
-    pub fn new(dynamodb_sys: Arc<Option<DynamoDBSys>>, checkpoint: Checkpoint) -> Self {
+    pub fn new(dynamodb_sys: Option<Arc<dyn BlobCheckpointStore>>, checkpoint: Checkpoint) -> Self {
         Self {
             dynamodb_sys,
             checkpoint,
@@ -1098,12 +1109,10 @@ impl CommitChange for DynamoDBStreamCommitter {
     }
 }
 
-register_data_connector!("dynamodb", DynamoDBFactory);
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::component::dataset::builder::DatasetBuilder;
+    use runtime::component::dataset::builder::DatasetBuilder;
     use serde_json::json;
     use spicepod::semantic::Column;
     use std::collections::HashMap;
@@ -1112,7 +1121,7 @@ mod tests {
         let mut dataset = DatasetBuilder::try_new("test:test_dataset".to_string(), "test_dataset")
             .expect("Failed to create builder")
             .with_app(Arc::new(app::AppBuilder::new("test_app").build()))
-            .with_runtime(Arc::new(crate::Runtime::builder().build().await))
+            .with_runtime(Arc::new(runtime::Runtime::builder().build().await))
             .build()
             .expect("Failed to build dataset");
 
