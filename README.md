@@ -262,7 +262,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 
 | Name       | Description                       | Status            | Engine Modes     |
 | ---------- | --------------------------------- | ----------------- | ---------------- |
-| `cayenne`  | [Spice Cayenne (Vortex)][cayenne] | Release Candidate | `file`           |
+| `cayenne`  | [Spice Cayenne (Vortex)][cayenne] | Stable            | `file`           |
 | `arrow`    | [In-Memory Arrow Records][arrow]  | Stable            | `memory`         |
 | `duckdb`   | Embedded [DuckDB][duckdb]         | Stable            | `memory`, `file` |
 | `postgres` | Attached [PostgreSQL][postgres]   | Release Candidate | N/A              |
@@ -320,6 +320,7 @@ Catalog Connectors connect to external catalog providers and make their tables a
 | `iceberg`       | Apache Iceberg          | Beta   | Parquet                      |
 | `ducklake`      | DuckLake                | Beta   | Parquet                      |
 | `glue`          | AWS Glue                | Alpha  | CSV, Parquet, Iceberg        |
+| `pg`            | PostgreSQL (with native WAL CDC catalog acceleration) | Alpha | PostgreSQL Wire Protocol |
 
 ## Supported Secret Stores
 

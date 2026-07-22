@@ -103,10 +103,11 @@ as the Postgres connector's snapshot/WAL boundary.
 | Parameter | Default | Description |
 | --- | --- | --- |
 | `mysql_replication_server_id` | derived | The `server_id` this replica registers with. Must be unique among all replicas attached to the source; the default is derived from the dataset name and process, so two spiced instances don't collide. |
-| `mysql_replication_snapshot_mode` | `auto` | When existing rows load: `auto` snapshots when no resumable position exists; `never` streams changes only; `always` re-snapshots on every start. |
+| `mysql_replication_initial_snapshot` | `auto` | When existing rows load: `auto` snapshots when no resumable position exists; `disabled` streams changes only; `always` re-snapshots on every start. |
 | `mysql_replication_checkpoint_interval` | `10s` | How often the committed position persists to the sidecar. Bounds crash-replay volume. |
 | `mysql_replication_bootstrap_batch_size` | `8192` | Rows per emitted snapshot batch (max `1048576`). |
-| `mysql_replication_invalid_position_behavior` | `error` | What to do when the persisted position was purged from the source: `error` or `rebootstrap` (drop the position and re-snapshot). |
+| `mysql_replication_invalid_checkpoint_behavior` | `error` | What to do when the persisted position was purged from the source: `error` or `restart` (drop the position and re-snapshot). |
+| `mysql_replication_ready_lag` | `2s` | For `refresh_mode: changes`, the dataset is marked Ready once its replication lag (now minus the newest applied change's source-commit time) falls below this — it stays not-ready while snapshotting or draining a backlog, so it never serves stale or incomplete data. Accepts any [fundu](https://docs.rs/fundu) duration string. |
 
 The runtime-level CDC apply tunables (`cdc_prefetch_buffer`,
 `cdc_max_coalesced_envelopes`, `cdc_max_coalesced_bytes`,
@@ -122,7 +123,7 @@ resume losslessly. By default this surfaces as an error naming the fix; set
 
 ```yaml
 params:
-  mysql_replication_invalid_position_behavior: rebootstrap
+  mysql_replication_invalid_checkpoint_behavior: restart
 ```
 
 to instead drop the stale position, truncate the accelerator, and re-snapshot
@@ -167,14 +168,14 @@ fingerprint of the source ordinal layout (column names, types, order, and
 primary-key membership) alongside the dataset schema. On restart, Spice
 refuses to resume when either has drifted — including source-only reorders
 that leave the dataset schema unchanged — and either errors or re-bootstraps
-per `mysql_replication_invalid_position_behavior`. Checkpoints written before
+per `mysql_replication_invalid_checkpoint_behavior`. Checkpoints written before
 layout fingerprinting (legacy) are treated the same way: set
-`mysql_replication_invalid_position_behavior: rebootstrap` once to rebuild
+`mysql_replication_invalid_checkpoint_behavior: restart` once to rebuild
 (see [#11763](https://github.com/spiceai/spiceai/issues/11763) for the
 upgrade/release-note tracking).
 
 If the stream stopped across a DDL boundary with an un-checkpointed tail,
-re-bootstrap with `mysql_replication_invalid_position_behavior: rebootstrap`.
+re-bootstrap with `mysql_replication_invalid_checkpoint_behavior: restart`.
 Quiescing writes to the table around DDL avoids that case entirely.
 
 **Lag + multiple same-count DDLs:** mid-stream adopt re-reads today's

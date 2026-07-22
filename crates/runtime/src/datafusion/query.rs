@@ -904,7 +904,7 @@ impl Query {
         // the Ballista job id so it can be addressed across schedulers.
         let ballista_job_id = if mode == DistributedSubmitMode::Resume {
             scheduler
-                .recover_job(job_id)
+                .recover_job(&ballista_core::JobId::from(job_id))
                 .await
                 .map_err(|e| Error::JobSubmissionFailed {
                     message: e.to_string(),

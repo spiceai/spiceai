@@ -46,13 +46,11 @@ use snafu::Snafu;
 
 use crate::cdc::{
     ChangeEnvelope, ChangesStream, CommitChange, CommitError, NoOpCommitter, StreamError,
-    build_ready_signal_envelope,
+    build_heartbeat_envelope,
 };
 
-pub use config::{
-    BinlogPosition, InvalidPositionBehavior, ReplicationParams, SnapshotMode, derive_server_id,
-    process_nonce,
-};
+use crate::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
+pub use config::{BinlogPosition, ReplicationParams, derive_server_id, process_nonce};
 pub use metrics::{Metrics as ReplicationMetrics, MetricsCollector as ReplicationMetricsCollector};
 
 #[derive(Debug, Snafu)]
@@ -487,7 +485,7 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
     let checkpoint_schema_json = encode_checkpoint_schema_json(schema_json.as_deref(), &layout);
 
     let resume_position = match persisted {
-        Some(persisted) if params.snapshot_mode == SnapshotMode::Always => {
+        Some(persisted) if params.snapshot_mode == InitialSnapshotMode::Always => {
             tracing::info!(
                 dataset = %dataset_name,
                 position = %persisted.position,
@@ -503,16 +501,16 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
                 &layout_fingerprint,
             ) {
                 match params.invalid_position_behavior {
-                    InvalidPositionBehavior::Error => {
+                    InvalidCheckpointBehavior::Error => {
                         return StalePositionSnafu {
                             message: format!(
-                                "cannot resume mysql binlog for {dataset_name} from {}: {drift}. Replaying historical row images against the current source layout would mis-map columns. Set `mysql_replication_invalid_position_behavior: rebootstrap` to drop the saved position and re-snapshot the table.",
+                                "cannot resume mysql binlog for {dataset_name} from {}: {drift}. Replaying historical row images against the current source layout would mis-map columns. Set `mysql_replication_invalid_checkpoint_behavior: restart` to drop the saved position and re-snapshot the table.",
                                 persisted.position
                             ),
                         }
                         .fail();
                     }
-                    InvalidPositionBehavior::Rebootstrap => {
+                    InvalidCheckpointBehavior::Restart => {
                         tracing::warn!(
                             dataset = %dataset_name,
                             position = %persisted.position,
@@ -533,12 +531,12 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
                 Some(persisted.position)
             } else {
                 match params.invalid_position_behavior {
-                    InvalidPositionBehavior::Error => {
+                    InvalidCheckpointBehavior::Error => {
                         return StalePositionSnafu {
                             message: format!(
                                 "persisted binlog position {} is no longer on the server \
                                  (binary logs were purged). Set \
-                                 `mysql_replication_invalid_position_behavior: rebootstrap` to \
+                                 `mysql_replication_invalid_checkpoint_behavior: restart` to \
                                  drop the saved position and re-snapshot the table, or increase \
                                  `binlog_expire_logs_seconds` on the source.",
                                 persisted.position
@@ -546,11 +544,11 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
                         }
                         .fail();
                     }
-                    InvalidPositionBehavior::Rebootstrap => {
+                    InvalidCheckpointBehavior::Restart => {
                         tracing::warn!(
                             dataset = %dataset_name,
                             position = %persisted.position,
-                            "persisted binlog position was purged from the source; rebootstrap \
+                            "persisted binlog position was purged from the source; restart \
                              behavior enabled, falling back to a fresh snapshot"
                         );
                         if let Err(e) = position_store.clear().await {
@@ -578,8 +576,11 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
     //                     captured head.
     let (start, prelude): (BinlogPosition, ChangesStream) = if let Some(position) = resume_position
     {
-        // Resume: no snapshot. Signal readiness immediately — on a quiet
-        // source the first binlog event may be arbitrarily far away.
+        // Resume: no snapshot. Readiness is lag-based — the binlog stream marks
+        // the dataset Ready once it has caught up to the source head (see
+        // `binlog::start_binlog_stream` and `mysql_replication_ready_lag`), so a
+        // quiet source whose first event is far away stays not-ready until a
+        // heartbeat confirms it is caught up.
         if let Err(e) = conn.disconnect().await {
             tracing::debug!(dataset = %dataset_name, error = %e, "setup connection disconnect");
         }
@@ -589,8 +590,12 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
             "mysql replication: resuming binlog stream from persisted position; skipping snapshot"
         );
         metrics.mark_bootstrap_complete();
-        let ready = ready_envelope(&schema)?;
-        (position, Box::pin(stream::once(async move { Ok(ready) })))
+        (
+            position,
+            Box::pin(stream::empty::<
+                std::result::Result<ChangeEnvelope, StreamError>,
+            >()),
+        )
     } else {
         // Cold start: capture the binlog head BEFORE any snapshot so the
         // overlap replays idempotently.
@@ -598,7 +603,7 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
         // Seed snapshot progress from the source's approximate row count
         // (`information_schema.TABLES`) so operators get a progress signal;
         // best-effort — absence just leaves the metric unset.
-        if params.snapshot_mode != SnapshotMode::Never {
+        if params.snapshot_mode != InitialSnapshotMode::Disabled {
             match setup::fetch_approx_row_count(&mut conn, &database, &table).await {
                 Ok(Some(expected)) => metrics.set_bootstrap_rows_expected(expected),
                 Ok(None) => {}
@@ -611,11 +616,11 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
             tracing::debug!(dataset = %dataset_name, error = %e, "setup connection disconnect");
         }
 
-        if params.snapshot_mode == SnapshotMode::Never {
+        if params.snapshot_mode == InitialSnapshotMode::Disabled {
             tracing::info!(
                 dataset = %dataset_name,
                 position = %head,
-                "mysql replication: `snapshot_mode: never` — streaming changes from the \
+                "mysql replication: `initial_snapshot: disabled` — streaming changes from the \
                  current binlog head without snapshotting existing rows"
             );
             metrics.mark_bootstrap_complete();
@@ -634,8 +639,14 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
                      checkpoint will re-attach at the then-current head"
                 );
             }
-            let ready = ready_envelope(&schema)?;
-            (head, Box::pin(stream::once(async move { Ok(ready) })))
+            // Readiness is lag-based; the binlog stream marks the dataset Ready
+            // once it has caught up to the head captured above.
+            (
+                head,
+                Box::pin(stream::empty::<
+                    std::result::Result<ChangeEnvelope, StreamError>,
+                >()),
+            )
         } else {
             // Lead with a TRUNCATE envelope so a re-bootstrap over a
             // persistent accelerator clears rows deleted on the source while
@@ -654,36 +665,41 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
                 metrics: Arc::clone(&metrics),
             });
 
-            // The captured head position commits piggy-backed on the
-            // ready-signal envelope, after the runtime has durably applied
-            // the whole snapshot. A crash before then leaves the sidecar
-            // empty, so the next start re-bootstraps from scratch.
-            let (_, ready_batch, is_ready) =
-                ready_envelope(&schema)?
-                    .into_parts()
-                    .map_err(|e| Error::BuildReadySignal {
-                        message: e.to_string(),
-                    })?;
-            let ready = ChangeEnvelope::from_parts(
+            // The captured head position is persisted by a zero-row
+            // snapshot-boundary envelope's committer, after the runtime has
+            // durably applied the whole snapshot. A crash before then leaves
+            // the sidecar empty, so the next start re-bootstraps from scratch.
+            // The envelope is NOT ready-signalling (`false`): readiness is
+            // lag-based and comes from the binlog stream once it catches up to
+            // `head`, so a large snapshot's replay backlog keeps the dataset
+            // not-ready until it drains.
+            let (_, boundary_batch, _) = build_heartbeat_envelope(&schema, None, false)
+                .map_err(|e| Error::SchemaMismatch {
+                    message: e.to_string(),
+                })?
+                .into_parts()
+                .map_err(|e| Error::SchemaMismatch {
+                    message: e.to_string(),
+                })?;
+            let boundary = ChangeEnvelope::from_parts(
                 Box::new(InitialPositionCommitter {
                     store: Arc::clone(&position_store),
                     position: PersistedPosition {
                         position: head.clone(),
                         schema_json: checkpoint_schema_json.clone(),
                     },
+                    dataset: dataset_name.clone(),
                 }),
-                ready_batch,
-                is_ready,
+                boundary_batch,
+                false,
             );
 
-            (
-                head,
-                Box::pin(
-                    stream::once(async move { Ok(truncate) })
-                        .chain(snapshot)
-                        .chain(stream::once(async move { Ok(ready) })),
-                ),
-            )
+            let snapshot_prelude: ChangesStream = Box::pin(
+                stream::once(async move { Ok(truncate) })
+                    .chain(snapshot)
+                    .chain(stream::once(async move { Ok(boundary) })),
+            );
+            (head, snapshot_prelude)
         }
     };
 
@@ -707,13 +723,6 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
     Ok(Box::pin(prelude.chain(binlog)))
 }
 
-/// Empty ready-signal envelope (no-op committer).
-fn ready_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope> {
-    build_ready_signal_envelope(schema).map_err(|e| Error::SchemaMismatch {
-        message: e.to_string(),
-    })
-}
-
 /// A single-row `op="t"` envelope with a no-op committer, emitted ahead of a
 /// snapshot to clear stale accelerator state.
 fn truncate_envelope(
@@ -732,6 +741,8 @@ fn truncate_envelope(
 struct InitialPositionCommitter {
     store: Arc<dyn PositionStore>,
     position: PersistedPosition,
+    /// Dataset name, for the committer-progress log line.
+    dataset: String,
 }
 
 #[async_trait]
@@ -740,7 +751,15 @@ impl CommitChange for InitialPositionCommitter {
         self.store
             .save(&self.position)
             .await
-            .map_err(|source| CommitError::UnableToCommitChange { source })
+            .map_err(|source| CommitError::UnableToCommitChange { source })?;
+        // Snapshot-boundary commit: no source-commit timestamp, so lag is `None`.
+        crate::cdc::log_committer_progress(
+            "mysql",
+            &self.dataset,
+            &self.position.position.to_string(),
+            None,
+        );
+        Ok(())
     }
 }
 

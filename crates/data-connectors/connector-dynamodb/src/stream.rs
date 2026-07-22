@@ -14,12 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use super::{Error, Result};
-use crate::arrow::struct_builder::StructBuilder;
-use crate::cdc::{ChangeBatch, ChangeBatchError, changes_schema};
-use crate::dynamodb::arrow::append_item_to_struct_builder;
-use crate::dynamodb::json_nest::project_dynamodb_row;
-use crate::dynamodb::unnest::unnest_dynamodb_row;
-use crate::schema_projection::SchemaProjection;
+use crate::arrow::append_item_to_struct_builder;
+use crate::json_nest::project_dynamodb_row;
+use crate::unnest::unnest_dynamodb_row;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::error::ArrowError;
 use arrow_array::builder::{ArrayBuilder, ListBuilder, StringBuilder, make_builder};
@@ -27,6 +24,9 @@ use arrow_array::{ListArray, RecordBatch, StringArray, StructArray};
 use aws_sdk_dynamodb::types::AttributeValue as DynamoDbAttributeValue;
 use aws_sdk_dynamodbstreams::types::AttributeValue as StreamsAttributeValue;
 use aws_sdk_dynamodbstreams::types::OperationType;
+use data_components::arrow::struct_builder::StructBuilder;
+use data_components::cdc::{ChangeBatch, ChangeBatchError, changes_schema};
+use data_components::schema_projection::SchemaProjection;
 use datafusion::error::DataFusionError;
 use dynamodb_streams::DynamoDBStreamBatch;
 use dynamodb_streams::checkpoint::Checkpoint;
@@ -70,17 +70,22 @@ pub enum StreamError {
 /// connector-agnostic CDC contract error: it tags the `"DynamoDB"` connector name and
 /// boxes itself as the cause, so the CDC contract (and the runtime) never names
 /// `DynamoDB`-specific types while logs still identify the source connector.
-impl From<StreamError> for crate::cdc::StreamError {
+impl From<StreamError> for data_components::cdc::StreamError {
     fn from(e: StreamError) -> Self {
-        crate::cdc::StreamError::Connector {
+        data_components::cdc::StreamError::Connector {
             connector: "DynamoDB",
             source: Box::new(e),
         }
     }
 }
 
-// This function is used for bootstrapping stream which doesn't have checkpoints.
-// Incoming batches are from TableProvider.scan() method.
+/// Converts a scan `RecordBatch` into an `op="c"` (insert) change batch for the
+/// bootstrap stream (which has no checkpoints); incoming batches come from
+/// `TableProvider::scan`.
+///
+/// # Errors
+///
+/// Returns [`StreamError`] if the change record batch can't be constructed.
 pub fn record_batch_to_change_batch(
     batch: RecordBatch,
     table_schema: &Arc<Schema>,
@@ -124,6 +129,10 @@ pub fn record_batch_to_change_batch(
 /// [`changes_schema`] as [`record_batch_to_change_batch`], so the truncate and
 /// snapshot batches coalesce. `DynamoDB` infers an all-nullable schema, so the
 /// null payload validates against every field.
+///
+/// # Errors
+///
+/// Returns [`StreamError`] if the change batch can't be built.
 pub fn truncate_change_batch(
     table_schema: &Arc<Schema>,
     primary_keys: &[String],
@@ -182,8 +191,12 @@ fn get_primary_keys_array(primary_keys: &[String], row_count: usize) -> ListArra
     list_builder.finish()
 }
 
-// This function is used for processing stream batches which have checkpoints.
-// Incoming batches are from DynamoDB Streams.
+/// Converts a `DynamoDB` Streams batch (which carries checkpoints) into a change
+/// batch plus its checkpoint and watermark.
+///
+/// # Errors
+///
+/// Returns [`StreamError`] if a record can't be decoded or the batch can't be built.
 pub fn process_batch(
     batch: DynamoDBStreamBatch,
     table_schema: &Arc<Schema>,
@@ -330,11 +343,11 @@ fn downcast_builder<T: ArrayBuilder>(builder: &mut dyn ArrayBuilder) -> Option<&
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cdc::ChangeOperation;
     use arrow::datatypes::{DataType, Field, SchemaRef};
     use aws_sdk_dynamodbstreams::types::{
         AttributeValue as StreamsAttributeValue, OperationType, Record, StreamRecord,
     };
+    use data_components::cdc::ChangeOperation;
     use dynamodb_streams::DynamoDBStreamBatch;
     use dynamodb_streams::checkpoint::Checkpoint;
     use std::collections::HashMap;
@@ -428,7 +441,7 @@ mod tests {
 
     mod process_batch {
         use super::*;
-        use crate::schema_projection::{ColumnSource, ProjectedColumn, SchemaProjection};
+        use data_components::schema_projection::{ColumnSource, ProjectedColumn, SchemaProjection};
 
         /// Build a JSON-nesting `SchemaProjection`: the given names are kept as
         /// static columns and `catch_all` collects the rest.

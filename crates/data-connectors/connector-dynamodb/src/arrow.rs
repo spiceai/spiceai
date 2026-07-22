@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use super::{Error, Result};
-use crate::arrow::struct_builder::StructBuilder;
 use arrow::array::{
     BinaryBuilder, BooleanBuilder, Date32Builder, Float64Builder, Int64Builder, ListBuilder,
     NullBuilder, RecordBatch, StringBuilder, TimestampMillisecondBuilder,
@@ -24,6 +23,7 @@ use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow_array::builder::ArrayBuilder;
 use aws_sdk_dynamodb::types::AttributeValue;
 use chrono::NaiveDate;
+use data_components::arrow::struct_builder::StructBuilder;
 use serde_json::Value;
 use std::collections::HashMap;
 use util::time_format::{ParsedDateTime, parse_datetime};

@@ -789,6 +789,7 @@ pub enum QueryOverrides {
     Turso,
     BigQuery,
     ScyllaDB,
+    ChbenchSkipSlow, // heaviest CH-benCH analytical queries (q10, q18)
 }
 
 impl QueryOverrides {
@@ -1355,6 +1356,10 @@ pub fn get_chbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query>
     match overrides {
         // https://github.com/spiceai/spiceai/issues/11011
         Some(QueryOverrides::DuckDB) => remove_chbench_query!(queries, 21),
+        // q10 and q18 are the heaviest analytical queries; skip them where the
+        // run only needs the rest (e.g. large-SF sources where they dominate the
+        // gate/QPH wall-clock).
+        Some(QueryOverrides::ChbenchSkipSlow) => remove_chbench_query!(queries, 10, 18),
         Some(_) | None => queries,
     }
 }

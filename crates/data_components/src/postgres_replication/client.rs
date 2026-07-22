@@ -53,9 +53,12 @@ pub struct WalStreamInput {
     /// pgoutput `Relation` messages are reconciled against the working schema
     /// (widening adopted, breaking changes surfaced as actionable errors).
     pub schema_evolution_policy: SchemaEvolutionPolicy,
-    /// When `true`, the first envelope emitted will signal the dataset as
-    /// ready — used when we skip bootstrap (existing slot resume path).
-    pub is_dataset_ready_on_first_event: bool,
+    /// Lag-based readiness threshold. Each committed transaction's envelope is
+    /// marked `is_dataset_ready` when its source commit time is within this of
+    /// now, and a caught-up keepalive emits a heartbeat carrying the same
+    /// verdict. The dataset therefore becomes Ready only once the stream has
+    /// caught up to the source head — never merely because bootstrap finished.
+    pub ready_lag: Duration,
     pub confirmed_flush: Arc<AtomicU64>,
     pub metrics: Arc<ReplicationMetricsCollector>,
 }
@@ -164,7 +167,7 @@ fn wal_stream(
     let primary_keys = input.primary_keys;
     let generated_columns = input.generated_columns;
     let confirmed_flush = Arc::clone(&input.confirmed_flush);
-    let mark_ready_on_first = input.is_dataset_ready_on_first_event;
+    let ready_lag = input.ready_lag;
     let policy = input.schema_evolution_policy;
     let metrics = input.metrics;
 
@@ -174,7 +177,6 @@ fn wal_stream(
         // streams started by a later Runtime in the same process capture the
         // newer epoch and are unaffected.
         let shutdown_epoch = crate::cdc::shutdown_epoch();
-        let mut first_emitted = !mark_ready_on_first;
         // The working schema starts at the dataset schema and (policy
         // permitting) widens when the source relation gains columns or widens
         // types. It persists across reconnects — the OID baseline in the
@@ -198,6 +200,13 @@ fn wal_stream(
         let mut client_slot: Option<ReplicationClient> = initial_client;
         let mut backoff = super::resilience::Backoff::default_for_stream();
         let mut last_emitted_commit_lsn = confirmed_flush.load(Ordering::Relaxed);
+        // Throttle idle-heartbeat emission: Postgres delivers keepalives in
+        // bursts (one per chunk of filtered/unrelated WAL it decodes to advance
+        // our confirmed position), so cap readiness heartbeats at one per
+        // `heartbeat_every` to avoid flooding the apply loop and logs. The
+        // per-keepalive position ACK below is unaffected.
+        let heartbeat_every = crate::cdc::heartbeat_interval(ready_lag);
+        let mut last_heartbeat_at: Option<std::time::Instant> = None;
         // Counts consecutive failed connect/recv attempts in the current
         // outage cycle. Reset to 0 on each successful connect. Used to:
         //   - Demote repeat WARN noise to DEBUG once an outage is established
@@ -509,14 +518,20 @@ fn wal_stream(
                             )))?
                             .with_source_commit_ts_ms(commit_ts_ms);
 
-                        let is_ready = !first_emitted;
-                        first_emitted = true;
+                        // Lag-based readiness: mark this transaction's envelope
+                        // ready only if its source commit time is within
+                        // `ready_lag` of now, i.e. the stream has caught up to
+                        // the source head. A backlog (snapshot drain, resume
+                        // catch-up) keeps the dataset not-ready until it closes.
+                        let is_ready =
+                            crate::cdc::source_commit_within_ready_lag(commit_ts_ms, ready_lag);
 
                         let envelope = envelope_with_lsn(
                             batch,
                             Arc::clone(&confirmed_flush),
                             end_lsn.0,
                             is_ready,
+                            dataset_name.clone(),
                         );
                         last_emitted_commit_lsn = end_lsn.0;
                         yield envelope;
@@ -542,7 +557,11 @@ fn wal_stream(
                     metrics.set_confirmed_flush_lsn(applied);
                     client.update_applied_lsn(Lsn(applied));
                 }
-                ReplicationEvent::KeepAlive { wal_end, reply_requested: _, .. } => {
+                ReplicationEvent::KeepAlive {
+                    wal_end,
+                    server_time_micros,
+                    reply_requested: _,
+                } => {
                     metrics.set_server_wal_end(wal_end.0);
                     // KeepAlive `wal_end` can advance even when this publication
                     // emitted no table changes. If no decoded transaction is
@@ -559,6 +578,56 @@ fn wal_stream(
                     );
                     metrics.set_confirmed_flush_lsn(applied);
                     client.update_applied_lsn(Lsn(applied));
+
+                    // Idle heartbeat for lag-based readiness. A keepalive with no
+                    // pending transaction proves this stream has caught up to the
+                    // source head: every prior Commit envelope was already yielded
+                    // in order, so by the time the apply loop reaches this
+                    // heartbeat it has applied them all. The server keepalive clock
+                    // is a source-attested "nothing newer than now" (never a local
+                    // `now()`), so a quiet, caught-up source still reaches Ready,
+                    // while a still-draining backlog (pending txn) emits nothing and
+                    // is never flagged Ready prematurely. `server_time_micros` is
+                    // Postgres-epoch (2000-01-01) microseconds; the crate uses 0
+                    // only for synthetic keepalives, which we skip.
+                    if txn.is_none()
+                        && server_time_micros > 0
+                        && last_heartbeat_at.is_none_or(|at| at.elapsed() >= heartbeat_every)
+                    {
+                        let heartbeat_ts_ms = pg_epoch_to_system_time(server_time_micros)
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .ok()
+                            .and_then(|d| i64::try_from(d.as_millis()).ok());
+                        let is_ready = crate::cdc::source_commit_within_ready_lag(
+                            heartbeat_ts_ms,
+                            ready_lag,
+                        );
+                        let heartbeat = crate::cdc::build_heartbeat_envelope(
+                            &working_schema,
+                            heartbeat_ts_ms,
+                            is_ready,
+                        )
+                        .map_err(|e| {
+                            StreamError::External(format!(
+                                "heartbeat envelope build failed for {dataset_name}: {e}"
+                            ))
+                        })?;
+                        // Log the idle heartbeat so lag-based readiness can be verified
+                        // from the logs alongside committer progress (target
+                        // spice_cdc::heartbeat).
+                        let heartbeat_lag_ms = crate::cdc::replication_lag_ms(heartbeat_ts_ms);
+                        tracing::debug!(
+                            target: "spice_cdc::heartbeat",
+                            connector = "postgres",
+                            dataset = %dataset_name,
+                            source_commit_ts_ms = ?heartbeat_ts_ms,
+                            is_dataset_ready = is_ready,
+                            lag_ms = ?heartbeat_lag_ms,
+                            "CDC idle heartbeat emitted"
+                        );
+                        last_heartbeat_at = Some(std::time::Instant::now());
+                        yield heartbeat;
+                    }
                 }
                 ReplicationEvent::Message { .. } => {}
                 ReplicationEvent::StoppedAt { reached } => {

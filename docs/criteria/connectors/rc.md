@@ -8,7 +8,7 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 
 | Connector                        | RC Quality | DRI Sign-off |
 | -------------------------------- | ---------- | ------------ |
-| ADBC                             | ➖          |              |
+| ADBC                             | ✅          | @lukekim     |
 | Azure BlobFS                     | ➖          |              |
 | Clickhouse                       | ➖          |              |
 | Cosmos DB (NoSQL)                | ✅          | @lukekim     |
@@ -30,7 +30,7 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 | Glue                             | ➖          |              |
 | GraphQL                          | ✅          | @peasee      |
 | HTTP/HTTPS                       | ➖          |              |
-| Iceberg                          | ➖          |              |
+| Iceberg                          | ✅          | @phillipleblanc |
 | IMAP                             | ➖          |              |
 | Kafka                            | ➖          |              |
 | Localpod                         | ➖          |              |
@@ -45,7 +45,7 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 | ScyllaDB                         | ➖          |              |
 | Sharepoint                       | ➖          |              |
 | SMB                              | ➖          |              |
-| Snowflake                        | ➖          |              |
+| Snowflake                        | ✅          | @phillipleblanc |
 | Spark                            | ➖          |              |
 | Spice.ai Cloud Platform          | ✅          | @peasee      |
 

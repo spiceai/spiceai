@@ -21,6 +21,7 @@ use std::sync::Arc;
 use util::format_datafusion_error;
 
 mod arrow;
+mod connector;
 pub mod dml;
 mod json_nest;
 pub mod provider;
@@ -32,7 +33,29 @@ mod table_schema;
 mod unnest;
 mod utils;
 
+pub use connector::{DynamoDB, DynamoDBFactory};
 pub use json_nest::project_dynamodb_row;
+
+/// The connector name used in Spicepod `from:` strings and for factory registration.
+pub const CONNECTOR_NAME: &str = "dynamodb";
+
+// Self-register into `runtime`'s `linkme` distributed slice (the same mechanism the
+// runtime-resident connectors use). `register_all()` bridges the slice into the runtime
+// factory registry, and the spicepod schema generator reads the slice — so a `bin/spiced`
+// that force-links this crate (`use connector_dynamodb as _;`) gets both runtime registration
+// and schema coverage with no explicit `register_connector_factory` call.
+runtime::register_data_connector!(
+    register_dynamodb_connector,
+    DYNAMODB_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    DynamoDBFactory
+);
+
+/// Returns the `DynamoDB` [`DataConnectorFactory`](runtime::dataconnector::DataConnectorFactory).
+#[must_use]
+pub fn factory() -> Arc<dyn runtime::dataconnector::DataConnectorFactory> {
+    DynamoDBFactory::new_arc()
+}
 
 type DynamoDBRow = HashMap<String, AttributeValue>;
 
