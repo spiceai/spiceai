@@ -605,36 +605,35 @@ fn replication_params_from_connector_params(
     // binlog dump under one `server_id` (the dump is server-wide), so the id is
     // derived from the CONNECTION identity — every dataset on the same server
     // computes the same id. An explicit `mysql_replication_server_id` still wins.
-    let server_id = match optional_string(params, "replication_server_id") {
-        Some(raw) => raw.trim().parse::<u32>().map_err(|e| {
+    let server_id = if let Some(raw) = optional_string(params, "replication_server_id") {
+        raw.trim().parse::<u32>().map_err(|e| {
             let user_param = params.user_param("replication_server_id");
             format!("parameter `{user_param}` must be a u32 server id, got {raw:?}: {e}")
-        })?,
-        None => {
-            // Derive from the FULL connection identity that the shared-source
-            // key coalesces on — host/port/user PLUS password and TLS config —
-            // not just host/port/user. Two datasets that differ only by
-            // password or `sslmode` get distinct shared-source keys and thus
-            // separate binlog dumps; they must therefore also get distinct
-            // server_ids, because MySQL drops a replication connection whose
-            // server_id collides with another's (dump thrashing otherwise).
-            // `SslOpts`/`&str` both hash, so the same tuple that keys the
-            // source keys the id. `DefaultHasher::new()` is fixed-seed, so the
-            // derivation stays deterministic within a process (equal
-            // connections coalesce); cross-process variance is supplied by
-            // `process_nonce()` and is harmless (MySQL keeps no id state).
-            let mut hasher = DefaultHasher::new();
-            opts.pass().hash(&mut hasher);
-            opts.ssl_opts().hash(&mut hasher);
-            let conn_identity = format!(
-                "{}:{}:{}:{:x}",
-                opts.ip_or_hostname(),
-                opts.tcp_port(),
-                opts.user().unwrap_or_default(),
-                hasher.finish()
-            );
-            derive_server_id(&conn_identity, process_nonce())
-        }
+        })?
+    } else {
+        // Derive from the FULL connection identity that the shared-source
+        // key coalesces on — host/port/user PLUS password and TLS config —
+        // not just host/port/user. Two datasets that differ only by
+        // password or `sslmode` get distinct shared-source keys and thus
+        // separate binlog dumps; they must therefore also get distinct
+        // server_ids, because MySQL drops a replication connection whose
+        // server_id collides with another's (dump thrashing otherwise).
+        // `SslOpts`/`&str` both hash, so the same tuple that keys the
+        // source keys the id. `DefaultHasher::new()` is fixed-seed, so the
+        // derivation stays deterministic within a process (equal
+        // connections coalesce); cross-process variance is supplied by
+        // `process_nonce()` and is harmless (MySQL keeps no id state).
+        let mut hasher = DefaultHasher::new();
+        opts.pass().hash(&mut hasher);
+        opts.ssl_opts().hash(&mut hasher);
+        let conn_identity = format!(
+            "{}:{}:{}:{:x}",
+            opts.ip_or_hostname(),
+            opts.tcp_port(),
+            opts.user().unwrap_or_default(),
+            hasher.finish()
+        );
+        derive_server_id(&conn_identity, process_nonce())
     };
     let snapshot_mode = parse_snapshot_mode(params)?;
     let checkpoint_interval = optional_duration(

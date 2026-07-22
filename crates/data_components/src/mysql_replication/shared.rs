@@ -838,6 +838,11 @@ async fn attach_member(
         snapshot = snapshotting,
         rejoining,
         members = source.live_member_count(),
+        // GTID on/off is decided by the source's `gtid_mode` and drives the
+        // cursor type; surface it here so every join (cold or resume) shows
+        // whether failover-safe GTID positioning is active.
+        gtid = use_gtid,
+        cursor = %cursor_type.as_str(),
         "dataset joined shared mysql binlog group"
     );
 
