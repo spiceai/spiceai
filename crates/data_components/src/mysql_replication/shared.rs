@@ -301,6 +301,7 @@ impl AckTable {
     /// is RESET to `at` — a resume position, or a fresh head on rebootstrap.
     /// `at` may be below the stale held floor; the pump replays the gap
     /// idempotently. Held from here until a (re)connect promotes it.
+    #[cfg(test)]
     fn register(&self, key: &MemberKey, at: BinlogPosition, snapshotting: bool) {
         self.register_with_gtid(key, at, GtidSet::new(), snapshotting);
     }
@@ -1185,8 +1186,9 @@ async fn run_pump(source: Arc<SharedSource>) {
     // an event-path emission a quiet-but-heartbeating source would never reach
     // Ready (the per-dataset stream emits readiness on both paths too).
     let mut last_heartbeat_at = Instant::now();
-    // Last position persisted per member, to skip no-op sidecar writes.
-    let mut last_persisted: HashMap<MemberKey, BinlogPosition> = HashMap::new();
+    // Last checkpoint identity persisted per member, to skip no-op sidecar
+    // writes (position + GTID set — see `PersistIdentity`).
+    let mut last_persisted: HashMap<MemberKey, PersistIdentity> = HashMap::new();
 
     'reconnect: loop {
         if crate::cdc::shutdown_epoch() != shutdown_epoch {
@@ -1862,9 +1864,17 @@ fn persisted_for(member: &MemberHandle, slot: &AckSlot) -> PersistedPosition {
     }
 }
 
+/// The checkpoint identity used to skip no-op sidecar writes: the committed
+/// position AND the executed GTID set. Both must be compared — after a source
+/// failover a member's file+offset can freeze (the promoted primary streams
+/// from a lower ordinal, which monotonic-max rejects) while its GTID set keeps
+/// growing; deduping on position alone would then stop persisting and let the
+/// crash-replay window grow without bound.
+type PersistIdentity = (BinlogPosition, Option<String>);
+
 /// Persist each member's own committed position to its own sidecar (skipping
 /// no-op writes). The shared resume is the min across these on restart.
-async fn persist_all(source: &Arc<SharedSource>, last: &mut HashMap<MemberKey, BinlogPosition>) {
+async fn persist_all(source: &Arc<SharedSource>, last: &mut HashMap<MemberKey, PersistIdentity>) {
     for (key, member) in source.live_members() {
         let Some(slot) = source.ack.slot(&key) else {
             continue;
@@ -1876,18 +1886,19 @@ async fn persist_all(source: &Arc<SharedSource>, last: &mut HashMap<MemberKey, B
         if slot.has(SNAPSHOTTING) {
             continue;
         }
-        let committed = slot.committed();
-        if last.get(&key) == Some(&committed) {
+        let persisted = persisted_for(&member, &slot);
+        let identity: PersistIdentity = (persisted.position.clone(), persisted.gtid_set.clone());
+        if last.get(&key) == Some(&identity) {
             continue;
         }
-        let persisted = persisted_for(&member, &slot);
         match member.position_store.save(&persisted).await {
             Ok(()) => {
                 member.metrics.inc_checkpoint_persist();
+                let committed = &persisted.position;
                 member
                     .metrics
                     .set_committed_position(committed.file_ordinal().unwrap_or(0), committed.pos);
-                last.insert(key, committed);
+                last.insert(key, identity);
             }
             Err(e) => {
                 member.metrics.inc_checkpoint_persist_error();
