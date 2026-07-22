@@ -1053,9 +1053,12 @@ struct ScanView {
     /// this bundle was built at (EVEN — a validated, non-torn capture). The scan gate
     /// serves a bundle NON-BLOCKING for ordinary CDC churn — freshness is bounded by
     /// the maintainer's refresh cadence (the floor), well within the freshness SLO —
-    /// and only WAITS when a forced structural event (truncate / full-delete /
-    /// `INSERT OVERWRITE` / schema-evolve / reopen) has advanced the generation past
-    /// the published bundle, so a post-event scan never runs on a pre-event structure.
+    /// and only WAITS across a **live schema-evolution**, the sole event wired to
+    /// `StructuralVersion::begin_mutation()` in this PR (its off-fence all-shards
+    /// mem-tier flush could otherwise tear a straddling capture). The other forced
+    /// snapshot events (truncate / full-delete / `INSERT OVERWRITE` / reopen) are
+    /// fence-serialized and advance only the additive `scan_input_version`, so they
+    /// are served bounded-stale like ordinary churn and never make a scan wait.
     /// See [`CayenneTableProvider::structural_version`].
     structural_version: u64,
 }
@@ -19531,12 +19534,14 @@ impl CayenneTableProvider {
             // whole (capture + build) period to `floor`, not `floor` ON TOP of it.
             let compute_start = Instant::now();
 
-            // Capture the scan input INSIDE the forced-event seqlock: the closure runs
-            // between the version reads, so a capture that straddled a forced
-            // structural event (truncate / full-delete / overwrite / schema-evolve /
-            // reopen) — which mutates both fence-protected AND fence-decoupled mem-tier
-            // state — is DISCARDED (`None`) rather than published as a torn bundle. The
-            // closure encapsulates the pairing (the maintainer cannot forget the
+            // Capture the scan input INSIDE the seqlock: the closure runs between the
+            // version reads, so a capture that straddled a LIVE SCHEMA-EVOLUTION — the
+            // sole event wired to `begin_mutation`, whose off-fence all-shards mem-tier
+            // flush mutates fence-decoupled state the listing fence cannot serialize —
+            // is DISCARDED (`None`) rather than published as a torn bundle. (The other
+            // forced snapshot events — truncate / full-delete / overwrite / reopen —
+            // are fence-serialized, so the fence alone already prevents a torn capture.)
+            // The closure encapsulates the pairing (the maintainer cannot forget the
             // re-check); the loom model of `read_validated` covers the load ordering.
             let (structural_version, raw) = match provider
                 .structural_version
@@ -19664,14 +19669,15 @@ impl CayenneTableProvider {
     /// off the maintainer's critical path (blocking here starves query throughput and,
     /// on a CPU-bound host, the apply too).
     ///
-    /// It WAITS in exactly one case: a forced STRUCTURAL event (truncate / full-delete
-    /// / `INSERT OVERWRITE` / schema-evolve / reopen) has advanced the structural
-    /// generation past the published bundle. Then the scan must see a view of the NEW
-    /// structure, so it waits for the maintainer's post-event publish (bounded by ~one
-    /// build; these events are rare). Ordinary appends/deletes/upserts do NOT advance
-    /// the structural generation, so they never make a scan wait. Registering the
-    /// `notified()` BEFORE the re-check means a publish that races the park is not
-    /// missed.
+    /// It WAITS in exactly one case: a **live schema-evolution** — the sole event wired
+    /// to advance the structural generation (`StructuralVersion::begin_mutation`) — has
+    /// advanced it past the published bundle. Then the scan must see the NEW schema, so
+    /// it waits for the maintainer's post-evolution publish (bounded by ~one build;
+    /// rare). Every other change — ordinary appends/deletes/upserts AND the
+    /// fence-serialized snapshot events (truncate / full-delete / `INSERT OVERWRITE` /
+    /// reopen) — advances only the additive scan-input version, so it is served
+    /// bounded-stale and never makes a scan wait. Registering the `notified()` BEFORE
+    /// the re-check means a publish that races the park is not missed.
     ///
     /// The ONE inline build is under builder ABSENCE — a provider whose maintainer has
     /// not been spawned (a unit-test provider, or the brief window before the runtime
