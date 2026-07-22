@@ -278,7 +278,7 @@ impl DuckDBAccelerator {
         instance_usage
     }
 
-    fn spicepod_dataset_duckdb_file_path(
+    pub(crate) fn spicepod_dataset_duckdb_file_path(
         &self,
         dataset: &spicepod::component::dataset::Dataset,
     ) -> Option<String> {
@@ -696,6 +696,20 @@ impl DataAccelerator for DuckDBAccelerator {
 
             Some(make_on_refresh_write_handler(dataset_name, config))
         });
+
+        // Coordinated auto memory limit: when the operator did not set
+        // `duckdb_memory_limit` on this dataset, apply the runtime-computed
+        // per-instance cap (see `accelerator_memory_budget`) so this DuckDB
+        // instance's ceiling — DuckDB's own default is ~80% of RAM — plus the query
+        // pool and the other DuckDB instances can't over-commit host memory. Here
+        // `memory_limit` is the prefix-stripped `duckdb_memory_limit`; an explicit
+        // value always wins because the guard skips a key that is already present.
+        if !cmd.options.contains_key("memory_limit")
+            && let Some(auto_limit) =
+                crate::accelerator_memory_budget::duckdb_auto_memory_limit_option()
+        {
+            cmd.options.insert("memory_limit".to_string(), auto_limit);
+        }
 
         Ok(create_table_provider(&self.duckdb_factory, &cmd, write_completion_handler).await?)
     }

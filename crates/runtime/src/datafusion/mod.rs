@@ -1635,9 +1635,13 @@ impl DataFusion {
                 // Same coordinated partition as the static install (one tested
                 // definition of the no-overcommit invariant), but from LIVE pool
                 // usage, and never above the static ceiling so it can't overcommit.
-                let dynamic =
-                    builder::coordinated_mem_tier_budget(total_memory, pool_used, compaction_used)
-                        .min(static_ceiling_bytes);
+                let dynamic = builder::coordinated_mem_tier_budget(
+                    total_memory,
+                    pool_used,
+                    compaction_used,
+                    crate::accelerator_memory_budget::duckdb_total_reservation_bytes(),
+                )
+                .min(static_ceiling_bytes);
                 cayenne::update_global_mem_tier_total(dynamic);
             }
         });
