@@ -235,6 +235,11 @@ struct MemberHandle {
     generated_columns: Vec<String>,
     sender: mpsc::Sender<std::result::Result<ChangeEnvelope, StreamError>>,
     metrics: Arc<ReplicationMetricsCollector>,
+    /// Lag-based readiness threshold for this member's dataset. WAL envelopes
+    /// and idle keepalive heartbeats are flagged `is_dataset_ready` when their
+    /// source-commit time is within this of now, so the dataset becomes Ready
+    /// only once it has caught up to the source head.
+    ready_lag: std::time::Duration,
 }
 
 /// `LIVE`: the member is attached and routing to it is allowed. Cleared on
@@ -452,6 +457,13 @@ impl AckTable {
         }
         self.shared_flush.load(Ordering::Acquire)
     }
+
+    /// Whether `key`'s member has been promoted to the streaming phase (past its
+    /// initial snapshot). Cold-path only (idle-heartbeat readiness gating); the
+    /// hot commit/deliver paths read `STREAMING` off the cached `AckSlot`.
+    fn is_streaming(&self, key: &MemberKey) -> bool {
+        self.slot(key).is_some_and(|slot| slot.has(STREAMING))
+    }
 }
 
 /// Key-addressed conveniences for tests, mirroring the production paths that
@@ -470,10 +482,6 @@ impl AckTable {
         if let Some(slot) = self.slot(key) {
             slot.deliver(lsn);
         }
-    }
-
-    fn is_streaming(&self, key: &MemberKey) -> bool {
-        self.slot(key).is_some_and(|slot| slot.has(STREAMING))
     }
 
     fn committed(&self, key: &MemberKey) -> u64 {
@@ -505,12 +513,23 @@ fn advance_monotonic(flush: &AtomicU64, to: u64) {
 struct SharedLsnCommitter {
     slot: Arc<AckSlot>,
     flush_to: u64,
+    /// Member dataset name, for the committer-progress log line.
+    dataset: String,
+    /// Source-commit timestamp (ms since the Unix epoch) of the batch this
+    /// commit acks; `None` when the transaction carried no commit time.
+    source_commit_ts_ms: Option<i64>,
 }
 
 #[async_trait]
 impl CommitChange for SharedLsnCommitter {
     async fn commit(&self) -> std::result::Result<(), CommitError> {
         self.slot.commit(self.flush_to);
+        crate::cdc::log_committer_progress(
+            "postgres",
+            &self.dataset,
+            &format!("lsn={}", self.flush_to),
+            self.source_commit_ts_ms,
+        );
         Ok(())
     }
 
@@ -870,6 +889,7 @@ async fn attach_member(
             generated_columns: setup.generated_columns.clone(),
             sender,
             metrics: Arc::clone(&metrics),
+            ready_lag: params.ready_lag,
         }),
     );
     // Membership liveness is now observable (`dataset_postgres_replication_member_attached`):
@@ -962,12 +982,13 @@ async fn attach_member(
         Box::pin(snapshot.chain(bootstrap_finished))
     } else {
         metrics.mark_bootstrap_complete();
-        let envelope = crate::cdc::build_ready_signal_envelope(&schema).map_err(|e| {
-            Error::SchemaMismatch {
-                message: e.to_string(),
-            }
-        })?;
-        Box::pin(stream::once(async move { Ok(envelope) }))
+        // Readiness is lag-based: a resuming member becomes Ready via lag-gated
+        // WAL envelopes and the pump's keepalive heartbeats (see `deliver_commit`
+        // and `run_pump`'s KeepAlive handling), not an immediate resume-time
+        // ready signal that could mark a still-behind member Ready.
+        Box::pin(stream::empty::<
+            std::result::Result<ChangeEnvelope, StreamError>,
+        >())
     };
 
     Ok(Box::pin(head.chain(ReceiverStream::new(receiver))))
@@ -1108,6 +1129,13 @@ async fn run_pump(source: Arc<SharedSource>) {
     let publication_name = params.publication_name.clone();
     let mut backoff = resilience::Backoff::default_for_stream();
     let mut reconnect_attempts: u32 = 0;
+    // Throttle idle-heartbeat fan-out: keepalives arrive in bursts (one per
+    // chunk of filtered/unrelated WAL the slot decodes), so emit at most one
+    // heartbeat round per `heartbeat_every`. The per-keepalive `credit_idle`
+    // ACK is unaffected. Members share the slot's connection params, so the
+    // interval is derived from the source's ready_lag.
+    let heartbeat_every = crate::cdc::heartbeat_interval(params.ready_lag);
+    let mut last_heartbeat_at: Option<std::time::Instant> = None;
     // When the stream dropped (set as the inner loop breaks to reconnect); consumed
     // on the next successful connect to attribute the disconnected duration.
     let mut disconnect_at: Option<std::time::Instant> = None;
@@ -1420,7 +1448,11 @@ async fn run_pump(source: Arc<SharedSource>) {
                     client.update_applied_lsn(Lsn(source.ack.flush_lsn()));
                     should_flush = true;
                 }
-                ReplicationEvent::KeepAlive { wal_end, .. } => {
+                ReplicationEvent::KeepAlive {
+                    wal_end,
+                    server_time_micros,
+                    ..
+                } => {
                     // Accumulate the server WAL end; the per-member fan-out
                     // (server_wal_end + confirmed_flush) happens once in the
                     // consolidated boundary flush below, not inline per event.
@@ -1428,6 +1460,72 @@ async fn run_pump(source: Arc<SharedSource>) {
                     should_flush = true;
                     if !txn_open {
                         source.ack.credit_idle(wal_end.0);
+                        // Idle heartbeat for lag-based readiness. `!txn_open`
+                        // means the pump has caught up to the source head, so a
+                        // streaming member with a drained channel is caught up
+                        // too. Fan out a zero-row heartbeat stamped with the
+                        // source-attested keepalive clock via NON-BLOCKING
+                        // try_send: a member whose bounded queue is full is
+                        // behind, so dropping its heartbeat is both harmless (a
+                        // later keepalive re-sends) and correct, and — the fix
+                        // for the reverted #11554 heartbeat regression — a slow
+                        // member can never block this fan-out and starve another
+                        // member's Ready signal. Only streaming members (promoted
+                        // past their snapshot) are eligible; a still-snapshotting
+                        // member has not caught up. `server_time_micros` is
+                        // Postgres-epoch microseconds; 0 marks a synthetic
+                        // keepalive, which we skip.
+                        if server_time_micros > 0
+                            && last_heartbeat_at.is_none_or(|at| at.elapsed() >= heartbeat_every)
+                        {
+                            last_heartbeat_at = Some(std::time::Instant::now());
+                            let heartbeat_ts_ms =
+                                client::pg_epoch_to_system_time(server_time_micros)
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .ok()
+                                    .and_then(|d| i64::try_from(d.as_millis()).ok());
+                            for (member_key, member) in source.live_members() {
+                                if !source.ack.is_streaming(&member_key) {
+                                    continue;
+                                }
+                                let is_ready = crate::cdc::source_commit_within_ready_lag(
+                                    heartbeat_ts_ms,
+                                    member.ready_lag,
+                                );
+                                match crate::cdc::build_heartbeat_envelope(
+                                    &member.schema,
+                                    heartbeat_ts_ms,
+                                    is_ready,
+                                ) {
+                                    Ok(heartbeat) => {
+                                        // Log the idle heartbeat (per member) so
+                                        // lag-based readiness can be verified from
+                                        // the logs (target spice_cdc::heartbeat).
+                                        let heartbeat_lag_ms =
+                                            crate::cdc::replication_lag_ms(heartbeat_ts_ms);
+                                        tracing::debug!(
+                                            target: "spice_cdc::heartbeat",
+                                            connector = "postgres",
+                                            dataset = %member.dataset_name,
+                                            source_commit_ts_ms = ?heartbeat_ts_ms,
+                                            is_dataset_ready = is_ready,
+                                            lag_ms = ?heartbeat_lag_ms,
+                                            "CDC idle heartbeat emitted"
+                                        );
+                                        // Drop-if-full / drop-if-closed: never
+                                        // block the pump on a slow member.
+                                        let _ = member.sender.try_send(Ok(heartbeat));
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            dataset = %member.dataset_name,
+                                            error = %e,
+                                            "failed to build shared Postgres CDC heartbeat envelope; skipping"
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                     client.update_applied_lsn(Lsn(source.ack.flush_lsn()));
                 }
@@ -1770,15 +1868,20 @@ async fn deliver_commit(
         // `member_fatal`, isolating it to the one dataset.
         let rows = PgChangeRows::new(Arc::clone(&member.schema), rel.clone(), raw, commit_ts_ms);
         member.metrics.inc_transaction();
-        // Readiness was already signaled by the member's snapshot / ready
-        // envelope at subscribe time, so WAL envelopes never need to carry it.
+        // Lag-based readiness: this WAL envelope marks the dataset Ready only if
+        // its source commit time is within the member's `ready_lag` of now, i.e.
+        // the member has caught up to the source head. A backlog (post-snapshot
+        // gap replay, resume catch-up) keeps the dataset not-ready until closed.
+        let is_ready = crate::cdc::source_commit_within_ready_lag(commit_ts_ms, member.ready_lag);
         let envelope = ChangeEnvelope::new_from_rows(
             Box::new(SharedLsnCommitter {
                 slot: Arc::clone(slot),
                 flush_to: end_lsn,
+                dataset: member.dataset_name.clone(),
+                source_commit_ts_ms: commit_ts_ms,
             }),
             Box::new(rows),
-            false,
+            is_ready,
         );
         slot.deliver(end_lsn);
         match deliver_to_member(
@@ -1849,6 +1952,7 @@ mod tests {
             shared: true,
             member_channel_capacity: DEFAULT_MEMBER_CHANNEL_CAPACITY,
             pg_output_format: crate::postgres_replication::PgOutputFormat::Binary,
+            ready_lag: crate::cdc::DEFAULT_READY_LAG,
         }
     }
 
@@ -1879,6 +1983,7 @@ mod tests {
                     generated_columns: vec![],
                     sender,
                     metrics: Arc::clone(&metrics),
+                    ready_lag: crate::cdc::DEFAULT_READY_LAG,
                 }),
             );
             probes.push((member_key, metrics, receiver));
@@ -2126,6 +2231,8 @@ mod tests {
         let committer = SharedLsnCommitter {
             slot: ack.slot(&key("a")).expect("slot registered"),
             flush_to: 42,
+            dataset: "test".to_string(),
+            source_commit_ts_ms: None,
         };
         assert!(committer.supports_deferral());
         committer.commit().await.expect("commit");

@@ -20,8 +20,9 @@ limitations under the License.
 //! `REPEATABLE READ` transaction to provide a stable view for the snapshot
 //! scan. This does NOT imply exported-snapshot or slot-creation-LSN-consistent
 //! semantics across the snapshot/WAL boundary — see the module-level doc
-//! comment on [`super::start_replication_stream`]. The last envelope flips
-//! `is_dataset_ready=true`.
+//! comment on [`super::start_replication_stream`]. Readiness is lag-based and
+//! comes from the WAL stream once it catches up to the source head; the
+//! snapshot's final envelope is a not-ready boundary marker.
 
 use std::sync::{Arc, atomic::AtomicU64};
 
@@ -237,7 +238,7 @@ pub fn snapshot_stream(
                     .map(|f| BootstrapBuilder::new(f.data_type()))
                     .collect::<Result<Vec<_>>>()
                     .map_err(super::err_to_stream)?;
-                yield envelope_with_lsn(batch, Arc::clone(&confirmed_flush), 0, false);
+                yield envelope_with_lsn(batch, Arc::clone(&confirmed_flush), 0, false, dataset_name.clone());
                 if let Some(percent) = metrics.bootstrap_progress_percent() {
                     tracing::debug!(
                         dataset = %dataset_name,
@@ -252,9 +253,10 @@ pub fn snapshot_stream(
 
         // Build the final batch but do NOT yield it yet. We first commit the
         // REPEATABLE READ transaction; only if that succeeds do we emit the
-        // ready-signalling envelope. If COMMIT fails we error out and the
-        // runtime never sees `is_dataset_ready=true`, matching the durable
-        // state of the bootstrap.
+        // snapshot-boundary envelope. If COMMIT fails we error out and the
+        // runtime never sees the snapshot, matching the durable state of the
+        // bootstrap. Readiness itself is lag-based and comes from the WAL
+        // stream that follows, not from this envelope.
         let final_batch = if rows_in_batch > 0 {
             finish_batch(
                 &dataset_schema,
@@ -264,7 +266,8 @@ pub fn snapshot_stream(
             )
             .map_err(super::err_to_stream)?
         } else {
-            // Empty table: still need an envelope to flip the ready flag. The
+            // Empty table: still emit a zero-row snapshot-boundary envelope so
+            // the WAL stream has a clean schema baseline to chain from. The
             // batch has zero rows.
             finish_batch(&dataset_schema, &mut builders, 0, &primary_keys)
                 .map_err(super::err_to_stream)?
@@ -287,8 +290,12 @@ pub fn snapshot_stream(
             "initial snapshot bootstrap complete"
         );
 
-        // Yield AFTER the commit has succeeded so readiness matches durability.
-        yield envelope_with_lsn(final_batch, Arc::clone(&confirmed_flush), 0, true);
+        // Yield AFTER the commit has succeeded. The `false` flag keeps
+        // readiness lag-based: the WAL stream that follows marks the dataset
+        // Ready only once it has caught up to the source head (see
+        // `client::wal_stream` and `pg_replication_ready_lag`), so this
+        // snapshot-boundary envelope does not itself flip the ready flag.
+        yield envelope_with_lsn(final_batch, Arc::clone(&confirmed_flush), 0, false, dataset_name.clone());
     })
 }
 

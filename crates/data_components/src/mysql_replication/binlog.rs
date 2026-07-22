@@ -52,7 +52,9 @@ use super::metrics::MetricsCollector;
 use super::rows::{TransactionBuffer, build_change_batch, normalize_binlog_value, truncate_change};
 use super::setup::TableLayout;
 use super::{CheckpointMeta, Error, PersistedPosition, PositionStore, Result};
-use crate::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError, StreamError};
+use crate::cdc::{
+    ChangeEnvelope, ChangesStream, CommitChange, CommitError, StreamError, build_heartbeat_envelope,
+};
 
 pub(super) struct BinlogStreamInput {
     pub params: ReplicationParams,
@@ -109,12 +111,23 @@ impl AckState {
 struct PositionCommitter {
     ack: Arc<AckState>,
     position: BinlogPosition,
+    /// Dataset name, for the committer-progress log line.
+    dataset: String,
+    /// Source-commit timestamp (ms since the Unix epoch) of the transaction
+    /// this commit acks; `None` when the source event carried no timestamp.
+    source_commit_ts_ms: Option<i64>,
 }
 
 #[async_trait]
 impl CommitChange for PositionCommitter {
     async fn commit(&self) -> std::result::Result<(), CommitError> {
         self.ack.advance(&self.position);
+        crate::cdc::log_committer_progress(
+            "mysql",
+            &self.dataset,
+            &self.position.to_string(),
+            self.source_commit_ts_ms,
+        );
         Ok(())
     }
 
@@ -209,6 +222,12 @@ fn binlog_change_stream(
         let mut side_conn: Option<Conn> = None;
         let mut backoff = super::resilience::StreamBackoff::default_for_stream();
         let mut reconnect_attempts: u32 = 0;
+        let ready_lag = params.ready_lag;
+        // Idle readiness cadence: wake at least this often so a caught-up but
+        // quiet source emits a lag-based readiness heartbeat within ~ready_lag,
+        // even when the server streams its own (clock-less) binlog heartbeats.
+        // Capped at the checkpoint interval so it never slows position saves.
+        let idle_tick = crate::cdc::heartbeat_interval(ready_lag).min(params.checkpoint_interval);
 
         'reconnect: loop {
             if crate::cdc::shutdown_epoch() != shutdown_epoch {
@@ -281,7 +300,7 @@ fn binlog_change_stream(
                     // Release the dump thread now rather than at process
                     // exit; the shutdown drain phase can take tens of
                     // seconds. Checked per event and per idle tick, so the
-                    // bound is one checkpoint interval on a quiet source.
+                    // bound is one idle readiness tick on a quiet source.
                     if let Err(e) = stream.close().await {
                         tracing::debug!(dataset = %dataset_name, error = %e, "binlog stream close during shutdown");
                     }
@@ -290,21 +309,32 @@ fn binlog_change_stream(
                     break 'reconnect;
                 }
 
-                // Bound the wait so idle checkpointing (and shutdown checks)
-                // never depend on the server actually honoring the heartbeat
-                // request — a quiet source with no heartbeats must still
-                // persist acked positions every interval.
-                let next_event =
-                    match tokio::time::timeout(params.checkpoint_interval, stream.next()).await {
-                        Ok(item) => item,
-                        Err(_idle) => {
+                // Bound the wait at the idle readiness tick so shutdown checks,
+                // idle checkpointing, and readiness heartbeats never depend on
+                // the server actually honoring the heartbeat request — a quiet
+                // source with no server heartbeats must still reach Ready and
+                // persist acked positions.
+                let next_event = match tokio::time::timeout(idle_tick, stream.next()).await {
+                    Ok(item) => item,
+                    Err(_idle) => {
+                        // Persist at the checkpoint cadence (a no-op when the
+                        // position has not advanced).
+                        if last_persist_at.elapsed() >= params.checkpoint_interval {
                             checkpointer.persist(&ack, &mut resume).await;
-                            poll_source_head(&mut side_conn, &params, &resume, &metrics, &dataset_name)
-                                .await;
                             last_persist_at = Instant::now();
-                            continue 'recv;
                         }
-                    };
+                        // When caught up to the source head, emit a lag-based
+                        // readiness heartbeat stamped with a fresh source clock
+                        // so a quiet, caught-up source still reaches Ready.
+                        if let Some(source_now_ms) =
+                            poll_source_head(&mut side_conn, &params, &resume, &metrics, &dataset_name)
+                                .await
+                        {
+                            yield readiness_heartbeat(&schema, source_now_ms, ready_lag, &dataset_name)?;
+                        }
+                        continue 'recv;
+                    }
+                };
                 let Some(event) = next_event else {
                     // Server closed the dump cleanly — treat as transient.
                     metrics.inc_recv_error();
@@ -453,7 +483,7 @@ fn binlog_change_stream(
                                          {database}.{table} changed shape ({} columns on the \
                                          event, {} validated) and the new layout cannot be \
                                          adopted: {reason}. Re-bootstrap by setting \
-                                         `mysql_replication_invalid_position_behavior: rebootstrap`.",
+                                         `mysql_replication_invalid_checkpoint_behavior: restart`.",
                                         tme.columns_count(),
                                         layout.columns.len()
                                     )))?;
@@ -537,9 +567,17 @@ fn binlog_change_stream(
                                             "TRUNCATE from mysql binlog queued for accelerator"
                                         );
                                         let envelope = ChangeEnvelope::new(
-                                            Box::new(PositionCommitter { ack: Arc::clone(&ack), position: commit_pos.clone() }),
+                                            Box::new(PositionCommitter {
+                                                ack: Arc::clone(&ack),
+                                                position: commit_pos.clone(),
+                                                dataset: dataset_name.clone(),
+                                                source_commit_ts_ms: commit_ts_ms(event_timestamp),
+                                            }),
                                             batch,
-                                            false,
+                                            crate::cdc::source_commit_within_ready_lag(
+                                                commit_ts_ms(event_timestamp),
+                                                ready_lag,
+                                            ),
                                         );
                                         last_emitted = Some(commit_pos);
                                         yield envelope;
@@ -594,7 +632,7 @@ fn binlog_change_stream(
                                                      {database}.{table} (statement: {statement}) cannot be adopted \
                                                      mid-stream: {e}. Update the dataset schema to match the new \
                                                      table definition, or re-bootstrap by setting \
-                                                     `mysql_replication_invalid_position_behavior: rebootstrap`."
+                                                     `mysql_replication_invalid_checkpoint_behavior: restart`."
                                                 )))?;
                                                 unreachable!();
                                             }
@@ -610,7 +648,7 @@ fn binlog_change_stream(
                                              {database}.{table} (statement: {statement}). The subscribed table \
                                              no longer exists under this name — fix the source (or the dataset) \
                                              and re-bootstrap by setting \
-                                             `mysql_replication_invalid_position_behavior: rebootstrap`."
+                                             `mysql_replication_invalid_checkpoint_behavior: restart`."
                                         )))?;
                                         unreachable!();
                                     }
@@ -647,7 +685,7 @@ fn binlog_change_stream(
                 if let Some(commit_pos) = pending_commit {
                     if let Some(envelope) = commit_transaction(
                         &mut txn, &commit_pos, event_timestamp, &schema, &primary_keys,
-                        &column_map, &ack, &metrics, &dataset_name,
+                        &column_map, &ack, &metrics, &dataset_name, ready_lag,
                     )? {
                         last_emitted = Some(commit_pos);
                         yield envelope;
@@ -683,9 +721,17 @@ fn binlog_change_stream(
                 let flush_adopt = checkpointer.pending_adopt_ready(&resume);
                 if flush_adopt || last_persist_at.elapsed() >= params.checkpoint_interval {
                     checkpointer.persist(&ack, &mut resume).await;
-                    if !flush_adopt {
-                        poll_source_head(&mut side_conn, &params, &resume, &metrics, &dataset_name)
-                            .await;
+                    // A layout-adopt flush fires off-interval only to durably
+                    // record the new fingerprint — skip the head
+                    // poll/heartbeat there. On a regular interval flush, poll the
+                    // source head and, when caught up, emit a lag-based readiness
+                    // heartbeat.
+                    if !flush_adopt
+                        && let Some(source_now_ms) =
+                            poll_source_head(&mut side_conn, &params, &resume, &metrics, &dataset_name)
+                                .await
+                    {
+                        yield readiness_heartbeat(&schema, source_now_ms, ready_lag, &dataset_name)?;
                     }
                     last_persist_at = Instant::now();
                 }
@@ -862,6 +908,7 @@ fn commit_transaction(
     ack: &Arc<AckState>,
     metrics: &MetricsCollector,
     dataset_name: &str,
+    ready_lag: Duration,
 ) -> std::result::Result<Option<ChangeEnvelope>, StreamError> {
     metrics.inc_transaction();
     record_watermark(metrics, event_timestamp);
@@ -879,14 +926,48 @@ fn commit_transaction(
         })?
         .with_source_commit_ts_ms(commit_ts_ms(event_timestamp));
 
+    // Lag-based readiness: mark Ready only when this commit's source time is
+    // within `ready_lag` of now, i.e. the stream has caught up to the head.
     Ok(Some(ChangeEnvelope::new(
         Box::new(PositionCommitter {
             ack: Arc::clone(ack),
             position: commit_pos.clone(),
+            dataset: dataset_name.to_string(),
+            source_commit_ts_ms: commit_ts_ms(event_timestamp),
         }),
         batch,
-        false,
+        crate::cdc::source_commit_within_ready_lag(commit_ts_ms(event_timestamp), ready_lag),
     )))
+}
+
+/// Build an idle readiness heartbeat: a zero-row envelope stamped with a
+/// source-attested clock (`source_now_ms`), flagged Ready when that clock is
+/// within `ready_lag` of now. Emitted only when the stream has caught up to the
+/// source head, so it never marks a still-behind dataset Ready.
+fn readiness_heartbeat(
+    schema: &SchemaRef,
+    source_now_ms: i64,
+    ready_lag: Duration,
+    dataset_name: &str,
+) -> std::result::Result<ChangeEnvelope, StreamError> {
+    let is_ready = crate::cdc::source_commit_within_ready_lag(Some(source_now_ms), ready_lag);
+    // Log the idle heartbeat so lag-based readiness can be verified from the logs
+    // (target spice_cdc::heartbeat). Covers both call sites of this helper.
+    let lag_ms = crate::cdc::replication_lag_ms(Some(source_now_ms));
+    tracing::debug!(
+        target: "spice_cdc::heartbeat",
+        connector = "mysql",
+        dataset = %dataset_name,
+        source_commit_ts_ms = source_now_ms,
+        is_dataset_ready = is_ready,
+        lag_ms = ?lag_ms,
+        "CDC idle heartbeat emitted"
+    );
+    build_heartbeat_envelope(schema, Some(source_now_ms), is_ready).map_err(|e| {
+        StreamError::External(format!(
+            "heartbeat envelope build failed for {dataset_name}: {e}"
+        ))
+    })
 }
 
 fn record_watermark(metrics: &MetricsCollector, event_timestamp: u32) {
@@ -1307,7 +1388,7 @@ async fn poll_source_head(
     resume: &BinlogPosition,
     metrics: &MetricsCollector,
     dataset_name: &str,
-) {
+) -> Option<i64> {
     let conn = match side_conn {
         Some(conn) => conn,
         None => match Conn::new(params.opts.clone()).await {
@@ -1318,17 +1399,12 @@ async fn poll_source_head(
                     error = %e,
                     "failed to open the source-head polling connection; lag metrics deferred"
                 );
-                return;
+                return None;
             }
         },
     };
-    match super::setup::fetch_head_position(conn).await {
-        Ok(head) => {
-            // Byte lag is exact only within one binlog file; across files
-            // the metric goes absent rather than guessing.
-            let lag_bytes = (head.file == resume.file).then(|| head.pos.saturating_sub(resume.pos));
-            metrics.set_source_head(head.file_ordinal().unwrap_or(0), head.pos, lag_bytes);
-        }
+    let head = match super::setup::fetch_head_position(conn).await {
+        Ok(head) => head,
         Err(e) => {
             tracing::debug!(
                 dataset = %dataset_name,
@@ -1336,6 +1412,32 @@ async fn poll_source_head(
                 "source-head poll failed; dropping the polling connection"
             );
             *side_conn = None;
+            return None;
+        }
+    };
+    // Byte lag is exact only within one binlog file; across files the metric
+    // goes absent rather than guessing.
+    let lag_bytes = (head.file == resume.file).then(|| head.pos.saturating_sub(resume.pos));
+    metrics.set_source_head(head.file_ordinal().unwrap_or(0), head.pos, lag_bytes);
+
+    // Only once the stream has caught up to the head may a readiness heartbeat
+    // carry a fresh "current as of now" clock — emitting one while a backlog
+    // remains would mark the dataset Ready before it has applied those changes.
+    if *resume < head {
+        return None;
+    }
+    // Source-attested clock (the source's own NOW(), never a local now()), so a
+    // caught-up idle source still reaches Ready under lag-based readiness.
+    match super::setup::fetch_source_now_ms(conn).await {
+        Ok(source_now_ms) => Some(source_now_ms),
+        Err(e) => {
+            tracing::debug!(
+                dataset = %dataset_name,
+                error = %e,
+                "source clock query failed; readiness heartbeat deferred"
+            );
+            *side_conn = None;
+            None
         }
     }
 }
@@ -1344,7 +1446,7 @@ fn purged_position_error(resume: &BinlogPosition, dataset_name: &str) -> StreamE
     StreamError::External(format!(
         "mysql binlog for {dataset_name}: the source no longer has binlog position {resume} \
          (binary logs were purged). Restart the dataset with \
-         `mysql_replication_invalid_position_behavior: rebootstrap` to drop the saved position \
+         `mysql_replication_invalid_checkpoint_behavior: restart` to drop the saved position \
          and re-snapshot the table, or increase `binlog_expire_logs_seconds` on the source."
     ))
 }

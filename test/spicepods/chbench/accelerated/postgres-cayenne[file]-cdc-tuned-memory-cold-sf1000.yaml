@@ -54,7 +54,7 @@ datasets:
     params:
       <<: *postgres_params
       pg_replication_slot: spice_district
-      pg_replication_initial_snapshot: 'true'
+      pg_replication_initial_snapshot: auto
       pg_replication_bootstrap_batch_size: '1048576'
     acceleration:
       enabled: true
@@ -128,7 +128,7 @@ datasets:
     params:
       <<: *postgres_params
       pg_replication_slot: spice_customer
-      pg_replication_initial_snapshot: 'true'
+      pg_replication_initial_snapshot: auto
       pg_replication_bootstrap_batch_size: '1048576'
     acceleration:
       enabled: true
@@ -151,7 +151,7 @@ datasets:
     params:
       <<: *postgres_params
       pg_replication_slot: spice_new_order
-      pg_replication_initial_snapshot: 'true'
+      pg_replication_initial_snapshot: auto
       pg_replication_bootstrap_batch_size: '1048576'
     acceleration:
       enabled: true
@@ -170,7 +170,7 @@ datasets:
     params:
       <<: *postgres_params
       pg_replication_slot: spice_oorder
-      pg_replication_initial_snapshot: 'true'
+      pg_replication_initial_snapshot: auto
       pg_replication_bootstrap_batch_size: '1048576'
     acceleration:
       enabled: true
@@ -189,7 +189,7 @@ datasets:
     params:
       <<: *postgres_params
       pg_replication_slot: spice_order_line
-      pg_replication_initial_snapshot: 'true'
+      pg_replication_initial_snapshot: auto
       pg_replication_bootstrap_batch_size: '1048576'
     acceleration:
       enabled: true
@@ -213,7 +213,7 @@ datasets:
     params:
       <<: *postgres_params
       pg_replication_slot: spice_stock
-      pg_replication_initial_snapshot: 'true'
+      pg_replication_initial_snapshot: auto
       pg_replication_bootstrap_batch_size: '1048576'
     acceleration:
       enabled: true
@@ -237,7 +237,7 @@ datasets:
     params:
       <<: *postgres_params
       pg_replication_slot: spice_warehouse
-      pg_replication_initial_snapshot: 'true'
+      pg_replication_initial_snapshot: auto
       pg_replication_bootstrap_batch_size: '1048576'
     acceleration:
       enabled: true

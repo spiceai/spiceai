@@ -173,7 +173,7 @@ pub mod file;
 // github: moved to crates/data-connectors/connector-github
 pub mod https;
 // kafka connector moved to crates/data-connectors/connector-kafka; module kept for debezium sidecar types
-#[cfg(feature = "kafka")]
+#[cfg(feature = "debezium")]
 pub mod kafka;
 pub mod localpod;
 pub mod memory;
