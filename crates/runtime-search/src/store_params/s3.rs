@@ -40,7 +40,7 @@ impl FromStr for S3DistanceMetric {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
+        match s.trim().to_ascii_lowercase().as_str() {
             "euclidean" => Ok(S3DistanceMetric::Euclidean),
             "cosine" => Ok(S3DistanceMetric::Cosine),
             other => Err(format!("must be one of: euclidean, cosine. Found {other}")),
@@ -60,7 +60,7 @@ impl FromStr for AwsIamRoleSource {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
+        match s.trim().to_ascii_lowercase().as_str() {
             "auto" => Ok(AwsIamRoleSource::Auto),
             "metadata" => Ok(AwsIamRoleSource::Metadata),
             "env" => Ok(AwsIamRoleSource::Env),
