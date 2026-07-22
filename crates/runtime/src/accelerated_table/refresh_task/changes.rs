@@ -61,7 +61,6 @@ use runtime_datafusion_index::{
 use runtime_metrics::acceleration as metrics;
 use runtime_search::embeddings::table::EmbeddingTable;
 use runtime_table_partition::provider::PartitionTableProvider;
-use search::index::as_search_index;
 #[cfg(test)]
 use snafu::OptionExt;
 use snafu::ResultExt;
@@ -2903,13 +2902,11 @@ impl RefreshTask {
                     if let Some(keys) = build_pk_only_batch_from_change_batch(change_batch, chunk)?
                     {
                         for index in collect_indexes_from_provider(Arc::clone(&self.accelerator)) {
-                            if let Some(search_index) = as_search_index(&index) {
-                                if let Err(e) = search_index.delete_by_keys(keys.clone()).await {
-                                    tracing::error!(
-                                        "Index '{}' failed to delete entries for a CDC delete via the Cayenne fast path (best-effort, continuing): {e}",
-                                        index.name()
-                                    );
-                                }
+                            if let Err(e) = index.delete_by_keys(keys.clone()).await {
+                                tracing::error!(
+                                    "Index '{}' failed to delete entries for a CDC delete via the Cayenne fast path (best-effort, continuing): {e}",
+                                    index.name()
+                                );
                             }
                         }
                     }

@@ -20,10 +20,8 @@ use arrow::array::RecordBatch;
 use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::{
-    catalog::{Session, TableProvider},
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::LogicalPlan,
-    prelude::Expr,
 };
 use futures::future::try_join_all;
 use runtime_datafusion_index::Index;
@@ -31,10 +29,9 @@ use runtime_datafusion_index::Index;
 use crate::index::{SearchIndex, VectorIndex};
 
 use super::{
-    CompoundReadMode, CompoundVectorIndex, Error, compound_delete_by_key_prefix,
-    compound_delete_by_keys, compound_delete_by_predicate, compound_on_write_start,
-    compound_required_columns, compound_write, fallback::fallback_on_empty_plan,
-    validate_compatibility,
+    CompoundReadMode, CompoundVectorIndex, Error, compound_delete_by_keys,
+    compound_on_write_start, compound_required_columns, compound_write,
+    fallback::fallback_on_empty_plan, validate_compatibility,
 };
 
 /// A [`SearchIndex`] that writes through to two compatible underlying indexes and serves
@@ -114,27 +111,6 @@ impl Index for CompoundSearchIndex {
 
     async fn delete_by_keys(&self, keys: RecordBatch) -> DataFusionResult<()> {
         compound_delete_by_keys(self.primary.as_ref(), self.secondary.as_ref(), keys).await
-    }
-
-    async fn delete_by_key_prefix(&self, prefix_keys: RecordBatch) -> DataFusionResult<()> {
-        compound_delete_by_key_prefix(self.primary.as_ref(), self.secondary.as_ref(), prefix_keys)
-            .await
-    }
-
-    async fn delete_by_predicate(
-        &self,
-        accelerator: &Arc<dyn TableProvider>,
-        session: &dyn Session,
-        filters: Vec<Expr>,
-    ) -> DataFusionResult<()> {
-        compound_delete_by_predicate(
-            self.primary.as_ref(),
-            self.secondary.as_ref(),
-            accelerator,
-            session,
-            filters,
-        )
-        .await
     }
 
     fn as_any(&self) -> &dyn Any {

@@ -26,14 +26,17 @@ use datafusion::error::Result;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder, col};
 use datafusion::physical_plan::collect;
 
-/// Resolves the primary-key rows of `accelerator` that currently match `filters`, projected down
-/// to `key_fields`.
+/// Resolves the rows of `table` that currently match `filters`, projected down to
+/// `key_columns` — a generic way to read "the rows matching a predicate, but only these
+/// columns" out of any [`TableProvider`]. `filters` may reference *any* column of `table`, not
+/// just `key_columns`: the predicate is evaluated against `table`'s full schema, and only the
+/// result is narrowed to `key_columns`.
 ///
-/// This is a read against `accelerator`'s *current* state, so callers must run it before the
-/// matching rows are actually deleted from `accelerator` — otherwise there is nothing left to
-/// resolve. Used by [`crate::Index::delete_by_predicate`] overrides to bridge a predicate-only
-/// delete (retention, an ad hoc SQL `DELETE`) down to the primary-key-based
-/// [`crate::Index::delete_by_keys`] every backend actually implements.
+/// This is a read against `table`'s *current* state — callers deleting rows must run it before
+/// the matching rows are actually removed, otherwise there is nothing left to resolve. Used by
+/// [`crate::Index::delete_by_predicate`]'s default to bridge a predicate-only delete (retention,
+/// an ad hoc SQL `DELETE`) down to the primary-key-based [`crate::Index::delete_by_keys`] every
+/// backend actually implements; `key_columns` is typically [`crate::Index::required_columns`].
 ///
 /// Builds and runs a real `LogicalPlan` (scan → filter → project) through
 /// [`Session::create_physical_plan`] rather than calling [`TableProvider::scan`] directly:
@@ -41,28 +44,29 @@ use datafusion::physical_plan::collect;
 /// `Unsupported`/`Inexact` and rely on the query planner to add the actual `FilterExec` above the
 /// scan, which only happens by going through plan creation.
 pub async fn resolve_keys_matching_predicate(
-    accelerator: &Arc<dyn TableProvider>,
+    table: &Arc<dyn TableProvider>,
     session: &dyn Session,
     filters: Vec<Expr>,
-    key_fields: &[Field],
+    key_columns: &[String],
 ) -> Result<RecordBatch> {
-    let schema = accelerator.schema();
-    let key_schema = Arc::new(Schema::new(key_fields.to_vec()));
-
-    if key_fields
+    let schema = table.schema();
+    let key_fields: Vec<Field> = key_columns
         .iter()
-        .any(|f| schema.index_of(f.name()).is_err())
-    {
-        // A key field isn't a column on `accelerator` — nothing to resolve.
+        .filter_map(|name| schema.field_with_name(name).ok().cloned())
+        .collect();
+    let key_schema = Arc::new(Schema::new(key_fields));
+
+    if key_schema.fields().len() != key_columns.len() {
+        // A requested column isn't on `table` — nothing to resolve.
         return Ok(RecordBatch::new_empty(key_schema));
     }
 
-    let table_source = Arc::new(DefaultTableSource::new(Arc::clone(accelerator)));
-    let mut builder = LogicalPlanBuilder::scan("accelerator", table_source, None)?;
+    let table_source = Arc::new(DefaultTableSource::new(Arc::clone(table)));
+    let mut builder = LogicalPlanBuilder::scan("t", table_source, None)?;
     for filter in filters {
         builder = builder.filter(filter)?;
     }
-    let projection: Vec<Expr> = key_fields.iter().map(|f| col(f.name())).collect();
+    let projection: Vec<Expr> = key_columns.iter().map(|name| col(name.as_str())).collect();
     let plan = builder.project(projection)?.build()?;
 
     let physical_plan = session.create_physical_plan(&plan).await?;
@@ -196,9 +200,9 @@ mod tests {
 
         let ctx = SessionContext::new();
         let filters = vec![col("id").gt(datafusion::logical_expr::lit(2_i64))];
-        let key_fields = vec![Field::new("id", DataType::Int64, false)];
+        let key_columns = vec!["id".to_string()];
 
-        let keys = resolve_keys_matching_predicate(&table, &ctx.state(), filters, &key_fields)
+        let keys = resolve_keys_matching_predicate(&table, &ctx.state(), filters, &key_columns)
             .await
             .expect("resolve should succeed");
 
@@ -217,6 +221,35 @@ mod tests {
         assert_eq!(values, vec![3, 4]);
     }
 
+    /// Point of this test: the filter references `name`, a column that isn't in `key_columns` at
+    /// all — `resolve_keys_matching_predicate` must still apply it correctly, since the filter is
+    /// evaluated against `table`'s full schema, not restricted to `key_columns`.
+    #[tokio::test]
+    async fn resolve_keys_matching_predicate_filters_on_a_non_key_column() {
+        let batch = id_name_batch(&[1, 2, 3, 4], &["a", "b", "a", "b"]);
+        let schema = batch.schema();
+        let table: Arc<dyn TableProvider> =
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("mem table"));
+
+        let ctx = SessionContext::new();
+        let filters = vec![col("name").eq(datafusion::logical_expr::lit("b"))];
+        let key_columns = vec!["id".to_string()];
+
+        let keys = resolve_keys_matching_predicate(&table, &ctx.state(), filters, &key_columns)
+            .await
+            .expect("resolve should succeed");
+
+        assert_eq!(keys.num_columns(), 1, "still projected down to just id");
+        let id_col = keys
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id column is Int64");
+        let mut values: Vec<i64> = id_col.values().to_vec();
+        values.sort_unstable();
+        assert_eq!(values, vec![2, 4], "only rows where name = 'b'");
+    }
+
     #[tokio::test]
     async fn resolve_keys_matching_predicate_no_matches_returns_empty_batch() {
         let batch = id_name_batch(&[1, 2], &["a", "b"]);
@@ -226,9 +259,9 @@ mod tests {
 
         let ctx = SessionContext::new();
         let filters = vec![col("id").gt(datafusion::logical_expr::lit(100_i64))];
-        let key_fields = vec![Field::new("id", DataType::Int64, false)];
+        let key_columns = vec!["id".to_string()];
 
-        let keys = resolve_keys_matching_predicate(&table, &ctx.state(), filters, &key_fields)
+        let keys = resolve_keys_matching_predicate(&table, &ctx.state(), filters, &key_columns)
             .await
             .expect("resolve should succeed");
 
@@ -236,16 +269,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_keys_matching_predicate_missing_key_field_returns_empty_batch() {
+    async fn resolve_keys_matching_predicate_missing_key_column_returns_empty_batch() {
         let batch = id_name_batch(&[1, 2], &["a", "b"]);
         let schema = batch.schema();
         let table: Arc<dyn TableProvider> =
             Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("mem table"));
 
         let ctx = SessionContext::new();
-        let key_fields = vec![Field::new("not_a_column", DataType::Int64, false)];
+        let key_columns = vec!["not_a_column".to_string()];
 
-        let keys = resolve_keys_matching_predicate(&table, &ctx.state(), vec![], &key_fields)
+        let keys = resolve_keys_matching_predicate(&table, &ctx.state(), vec![], &key_columns)
             .await
             .expect("resolve should succeed");
 

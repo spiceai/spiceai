@@ -472,20 +472,8 @@ impl Index for ElasticsearchIndex {
     }
 
     async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {
-        delete::delete_by_keys(self.client.as_ref(), &self.es_index, &keys).await
-    }
-
-    // No `delete_by_key_prefix` override needed: `_delete_by_query` filters by whatever field
-    // values are given, so the default (delegating to `delete_by_keys`) is already correct for
-    // a prefix (subset-of-columns) delete.
-
-    async fn delete_by_predicate(
-        &self,
-        accelerator: &std::sync::Arc<dyn TableProvider>,
-        session: &dyn datafusion::catalog::Session,
-        filters: Vec<datafusion::prelude::Expr>,
-    ) -> Result<(), DataFusionError> {
-        crate::index::search_index_delete_by_predicate(self, accelerator, session, filters).await
+        let key_columns: Vec<String> = self.primary_key.iter().map(|f| f.name().clone()).collect();
+        delete::delete_by_keys(self.client.as_ref(), &self.es_index, &key_columns, &keys).await
     }
 }
 
@@ -731,16 +719,8 @@ impl Index for ElasticsearchTextIndex {
     }
 
     async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {
-        delete::delete_by_keys(self.client.as_ref(), &self.es_index, &keys).await
-    }
-
-    async fn delete_by_predicate(
-        &self,
-        accelerator: &std::sync::Arc<dyn TableProvider>,
-        session: &dyn datafusion::catalog::Session,
-        filters: Vec<datafusion::prelude::Expr>,
-    ) -> Result<(), DataFusionError> {
-        crate::index::search_index_delete_by_predicate(self, accelerator, session, filters).await
+        let key_columns: Vec<String> = self.primary_key.iter().map(|f| f.name().clone()).collect();
+        delete::delete_by_keys(self.client.as_ref(), &self.es_index, &key_columns, &keys).await
     }
 }
 
@@ -863,6 +843,13 @@ mod write_maintenance_tests {
             &self,
             _: &str,
             _: &[(Option<String>, serde_json::Value)],
+        ) -> elasticsearch::Result<serde_json::Value> {
+            unimplemented!()
+        }
+        async fn delete_by_query(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
         ) -> elasticsearch::Result<serde_json::Value> {
             unimplemented!()
         }

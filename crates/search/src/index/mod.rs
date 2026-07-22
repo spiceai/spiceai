@@ -20,12 +20,10 @@ use arrow::array::RecordBatch;
 use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::{
-    catalog::{Session, TableProvider},
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::LogicalPlan,
-    prelude::Expr,
 };
-use runtime_datafusion_index::{Index, resolve_keys_matching_predicate};
+use runtime_datafusion_index::Index;
 
 pub mod chunking;
 pub mod compound;
@@ -95,29 +93,6 @@ pub trait SearchIndex: Index + std::fmt::Debug + Send + Sync + 'static {
     async fn delete_warm_by_keys(&self, keys: RecordBatch) -> DataFusionResult<()> {
         self.delete_by_keys(keys).await
     }
-}
-
-/// Shared [`Index::delete_by_predicate`] bridge for any [`SearchIndex`]: resolves `filters`
-/// against `accelerator` down to concrete primary-key rows (via
-/// [`resolve_keys_matching_predicate`], using `index.primary_fields()`), then deletes by key.
-///
-/// Every concrete `SearchIndex`-backed index that needs a working `delete_by_predicate` (i.e.
-/// anything except a co-located index, which is already a no-op for granular deletes) should
-/// implement it as a one-line call to this function — see `S3Vector`/`ElasticsearchIndex`/
-/// `ChunkedSearchIndex`'s `impl Index` blocks.
-pub async fn search_index_delete_by_predicate(
-    index: &dyn SearchIndex,
-    accelerator: &Arc<dyn TableProvider>,
-    session: &dyn Session,
-    filters: Vec<Expr>,
-) -> DataFusionResult<()> {
-    let keys =
-        resolve_keys_matching_predicate(accelerator, session, filters, &index.primary_fields())
-            .await?;
-    if keys.num_rows() == 0 {
-        return Ok(());
-    }
-    index.delete_by_keys(keys).await
 }
 
 /// Extracts the derived column names from a vector index implementation.

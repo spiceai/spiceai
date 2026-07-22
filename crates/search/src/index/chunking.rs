@@ -2,7 +2,7 @@ use std::{any::Any, sync::Arc};
 
 use crate::{
     SEARCH_SCORE_COLUMN_NAME,
-    index::{SearchIndex, VectorIndex, embedding_col, search_index_delete_by_predicate},
+    index::{SearchIndex, VectorIndex, embedding_col},
     metadata::MetadataColumn,
 };
 
@@ -19,18 +19,18 @@ use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use chunking::Chunker;
 use datafusion::{
-    catalog::{Session, TableProvider},
     common::Column,
     error::{DataFusionError, Result as DataFusionResult},
+    execution::context::SessionContext,
     functions_aggregate::expr_fn::{array_agg, first_value},
-    logical_expr::{Aggregate, LogicalPlan, Sort, SortExpr, expr::Alias},
+    logical_expr::{Aggregate, LogicalPlan, LogicalPlanBuilder, Sort, SortExpr, expr::Alias},
     prelude::{Expr, ExprFunctionExt, col},
     sql::TableReference,
 };
 use datafusion_expr::ident;
 use futures::future::try_join_all;
 use itertools::Itertools;
-use runtime_datafusion_index::Index;
+use runtime_datafusion_index::{Index, build_key_match_predicate};
 use snafu::{ResultExt, Snafu};
 use util::{arrow::repeat, convert_string_arrow_to_iterator};
 
@@ -102,24 +102,65 @@ impl Index for ChunkedSearchIndex {
 
     /// `keys` is shaped by [`SearchIndex::primary_fields`], which excludes
     /// [`CHUNKED_INDEX_CHUNK_KEY`] — so every chunk row for a given outer key must go, not just
-    /// one. Forwarded as a *prefix* delete on `inner` (whose own key includes the chunk id), so
-    /// `inner` is responsible for matching every chunk regardless of chunk id.
+    /// one. `self.inner`'s own key includes the chunk id, which this doesn't know the value of,
+    /// so resolving exactly which chunk rows exist requires querying `self.inner`'s own data —
+    /// only possible when `self.inner` is a [`VectorIndex`] (see
+    /// [`delete_chunked_vector_by_outer_keys`]; plain full-text indexes have no generic "list
+    /// everything" surface to query).
     async fn delete_by_keys(&self, keys: RecordBatch) -> DataFusionResult<()> {
-        self.inner.delete_by_key_prefix(keys).await
-    }
-
-    async fn delete_by_predicate(
-        &self,
-        accelerator: &Arc<dyn TableProvider>,
-        session: &dyn Session,
-        filters: Vec<Expr>,
-    ) -> DataFusionResult<()> {
-        search_index_delete_by_predicate(self, accelerator, session, filters).await
+        let Some(inner_vector) = Arc::clone(&self.inner).as_vector_index() else {
+            return Err(DataFusionError::NotImplemented(
+                "Deleting from a chunked non-vector search index is not yet supported (no way to \
+                 enumerate its existing chunks for a given primary key)"
+                    .to_string(),
+            ));
+        };
+        delete_chunked_vector_by_outer_keys(&inner_vector, keys).await
     }
 
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// Deletes every entry in `inner` whose primary-key columns match a row of `outer_keys` (which
+/// carry only the outer/pre-chunk key columns — `inner`'s own key additionally has the chunk id,
+/// whose values aren't known here). Resolves the exact matching entries by scanning `inner`'s own
+/// [`VectorIndex::list_table_provider`] with a predicate built from `outer_keys`, then deletes
+/// those resolved (chunk-key-included) rows via `inner`'s normal [`Index::delete_by_keys`].
+async fn delete_chunked_vector_by_outer_keys(
+    inner: &Arc<dyn VectorIndex>,
+    outer_keys: RecordBatch,
+) -> DataFusionResult<()> {
+    let outer_columns: Vec<String> = outer_keys
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    let Some(predicate) = build_key_match_predicate(&outer_keys, &outer_columns)? else {
+        return Ok(());
+    };
+
+    let list_plan = inner.list_table_provider()?;
+    let filtered_plan = LogicalPlanBuilder::from(list_plan)
+        .filter(predicate)?
+        .build()?;
+
+    let ctx = SessionContext::new();
+    let matches = ctx
+        .execute_logical_plan(filtered_plan)
+        .await?
+        .collect()
+        .await?;
+
+    for batch in matches {
+        if batch.num_rows() > 0 {
+            inner.delete_by_keys(batch).await?;
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Snafu)]
@@ -783,22 +824,10 @@ impl Index for ChunkedVectorIndex {
         self.inner.on_write_complete().await
     }
 
+    /// See [`ChunkedSearchIndex::delete_by_keys`] — same outer-key-to-chunk-resolution logic,
+    /// specialized here since `self.inner` is already known to be a [`VectorIndex`].
     async fn delete_by_keys(&self, keys: RecordBatch) -> DataFusionResult<()> {
-        ChunkedSearchIndex::new(
-            Arc::clone(&self.inner) as Arc<dyn SearchIndex>,
-            Arc::clone(&self.chunker),
-        )
-        .delete_by_keys(keys)
-        .await
-    }
-
-    async fn delete_by_predicate(
-        &self,
-        accelerator: &Arc<dyn TableProvider>,
-        session: &dyn Session,
-        filters: Vec<Expr>,
-    ) -> DataFusionResult<()> {
-        search_index_delete_by_predicate(self, accelerator, session, filters).await
+        delete_chunked_vector_by_outer_keys(&self.inner, keys).await
     }
 
     fn as_any(&self) -> &dyn Any {

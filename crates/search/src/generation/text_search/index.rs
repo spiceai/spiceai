@@ -101,15 +101,6 @@ impl Index for FullTextDatabaseIndex {
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))
     }
-
-    async fn delete_by_predicate(
-        &self,
-        accelerator: &Arc<dyn TableProvider>,
-        session: &dyn datafusion::catalog::Session,
-        filters: Vec<datafusion::prelude::Expr>,
-    ) -> Result<(), DataFusionError> {
-        crate::index::search_index_delete_by_predicate(self, accelerator, session, filters).await
-    }
 }
 
 impl FullTextDatabaseIndex {

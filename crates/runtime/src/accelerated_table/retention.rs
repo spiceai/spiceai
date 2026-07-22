@@ -89,10 +89,12 @@ pub(crate) async fn apply_retention_filters_once(
         default_runtime_env(io_runtime.clone()),
     );
 
-    // Resolve each attached search index's matching primary keys *before* the delete below runs
-    // — the predicate is evaluated by scanning `accelerator`'s current (pre-delete) rows, so
-    // there is nothing left to resolve once they're gone. The actual per-index delete happens
-    // after the accelerator delete succeeds (best-effort, see below).
+    // Resolve each attached index's matching rows (projected to its own required columns)
+    // *before* the delete below runs — the predicate is evaluated by scanning `accelerator`'s
+    // current (pre-delete) rows, so there is nothing left to resolve once they're gone. The
+    // actual per-index delete happens after the accelerator delete succeeds (best-effort, see
+    // below). Only indexes recognized by `as_search_index` support the warm-only scope retention
+    // needs, so resolution is skipped for anything else.
     let indexes = collect_indexes_from_provider(Arc::clone(accelerator));
     let mut warm_deletes: Vec<(&dyn SearchIndex, RecordBatch)> = Vec::new();
     for index in &indexes {
@@ -103,7 +105,7 @@ pub(crate) async fn apply_retention_filters_once(
             accelerator,
             &ctx.state(),
             vec![expr.clone()],
-            &search_index.primary_fields(),
+            &index.required_columns(),
         )
         .await
         {
@@ -111,7 +113,7 @@ pub(crate) async fn apply_retention_filters_once(
             Ok(_) => {}
             Err(e) => tracing::warn!(
                 "[retention] Failed to resolve keys for index '{}' (skipping its warm-index cleanup this cycle): {e}",
-                search_index.name()
+                index.name()
             ),
         }
     }

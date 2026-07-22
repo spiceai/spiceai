@@ -89,6 +89,12 @@ pub trait Index: Debug + Send + Sync + 'static {
     /// row). Implementations backed by a separate store (S3 Vectors, Elasticsearch) must
     /// override this to remove the corresponding entries there.
     ///
+    /// `keys` may carry more columns than an implementation's own primary key (see
+    /// [`Index::delete_by_predicate`]'s default, which resolves on [`Index::required_columns`]
+    /// rather than a narrower key) — implementations must look up their own known key column(s)
+    /// by name and ignore anything else present, rather than assuming `keys`' schema is exactly
+    /// their key.
+    ///
     /// Full/both-scope by convention: a wrapper composing several backing indexes (e.g. a
     /// writethrough+fallback pair) must fan this out to every index it composes.
     async fn delete_by_keys(&self, keys: RecordBatch) -> Result<()> {
@@ -96,36 +102,35 @@ pub trait Index: Debug + Send + Sync + 'static {
         Ok(())
     }
 
-    /// Delete index entries whose key columns match every column present in `prefix_keys` —
-    /// `prefix_keys`'s own schema names the columns to match on, which may be a strict subset of
-    /// this index's full key.
-    ///
-    /// Default: delegates to [`Index::delete_by_keys`], which is correct whenever an index's full
-    /// key IS the columns callers ever pass (the overwhelming majority of indexes). The one
-    /// exception is a wrapper that augments its inner index's key with extra columns the caller
-    /// never sees (`ChunkedSearchIndex`/`ChunkedVectorIndex`, which add a chunk id) — those
-    /// implementations call `delete_by_key_prefix` on the *inner* index with the outer
-    /// (unaugmented) keys, so the inner index must resolve/delete every entry matching just the
-    /// given columns, regardless of the augmented column's value.
-    async fn delete_by_key_prefix(&self, prefix_keys: RecordBatch) -> Result<()> {
-        self.delete_by_keys(prefix_keys).await
-    }
-
     /// Delete index entries matching `filters` — the same predicate shape
     /// [`TableProvider::delete_from`] receives.
     ///
-    /// Default is a no-op. Implementations that need this (anything with primary keys — i.e.
-    /// nearly everything except a bare co-located index) resolve `filters` to concrete primary
-    /// keys via [`resolve_keys_matching_predicate`], scanning `accelerator` under the original
-    /// predicate *before* any row is actually removed, then call [`Index::delete_by_keys`].
+    /// Default: resolves `filters` against `table` (scanning under the *original* predicate,
+    /// before any row is actually removed — there is nothing left to resolve once they're gone),
+    /// projected down to [`Index::required_columns`], then calls [`Index::delete_by_keys`] with
+    /// the result. This is deliberately robust to `filters` referencing columns this index knows
+    /// nothing about: the filter is evaluated against `table`'s *own* full schema (`table` is
+    /// generally the real base/accelerated table, which has every column), and only the
+    /// *projection* is narrowed to this index's columns — so an unrelated filter column never
+    /// needs to exist in this index's own store, only on `table`.
+    ///
+    /// Most implementations should not need to override this — override [`Index::delete_by_keys`]
+    /// instead. Override this only when composing other indexes (see `CompoundSearchIndex`'s
+    /// fan-out) or when an index's `required_columns` includes columns not visible to a
+    /// consistent `delete_by_keys` shape.
     async fn delete_by_predicate(
         &self,
-        accelerator: &Arc<dyn TableProvider>,
+        table: &Arc<dyn TableProvider>,
         session: &dyn Session,
         filters: Vec<Expr>,
     ) -> Result<()> {
-        let _ = (accelerator, session, filters);
-        Ok(())
+        let keys =
+            resolve_keys_matching_predicate(table, session, filters, &self.required_columns())
+                .await?;
+        if keys.num_rows() == 0 {
+            return Ok(());
+        }
+        self.delete_by_keys(keys).await
     }
 
     fn as_any(&self) -> &dyn Any;

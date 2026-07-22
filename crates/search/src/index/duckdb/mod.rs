@@ -278,6 +278,19 @@ impl Index for DuckDBVectorIndex {
         .await
         .map_err(|e| DataFusionError::Execution(format!("HNSW index creation task failed: {e}")))?
     }
+
+    // Co-located: embeddings live in the DuckDB-accelerated table itself, kept in sync by
+    // DuckDB VSS whenever the table's own rows are deleted — `delete_by_keys` stays the default
+    // no-op. Override `delete_by_predicate` too so a delete doesn't pay for a pointless resolve
+    // scan.
+    async fn delete_by_predicate(
+        &self,
+        _table: &Arc<dyn datafusion::catalog::TableProvider>,
+        _session: &dyn datafusion::catalog::Session,
+        _filters: Vec<datafusion::prelude::Expr>,
+    ) -> DataFusionResult<()> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

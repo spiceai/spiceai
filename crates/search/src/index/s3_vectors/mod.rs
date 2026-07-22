@@ -387,19 +387,6 @@ impl Index for S3Vector {
     async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {
         delete::delete_by_keys(self, &keys).await
     }
-
-    async fn delete_by_key_prefix(&self, prefix_keys: RecordBatch) -> Result<(), DataFusionError> {
-        delete::delete_by_key_prefix(self, &prefix_keys).await
-    }
-
-    async fn delete_by_predicate(
-        &self,
-        accelerator: &Arc<dyn datafusion::catalog::TableProvider>,
-        session: &dyn datafusion::catalog::Session,
-        filters: Vec<Expr>,
-    ) -> Result<(), DataFusionError> {
-        crate::index::search_index_delete_by_predicate(self, accelerator, session, filters).await
-    }
 }
 
 /// For a given data type, determine the variant within the JSON `Union(_, Sparse)` that would be populated from the associated [`datafusion_functions_json::udfs::json_get_udf`].
