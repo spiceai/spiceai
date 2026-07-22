@@ -677,19 +677,20 @@ truncate_str() {
   fi
 }
 
-# One line per PR: colored icon, PR number, in-flight Remote Sign-off run id
-# (blank-padded when there isn't one, so the title column stays aligned), and
-# the title (truncated to the terminal width). A non-empty `run_id` means a
-# Remote Sign-off is currently queued/in_progress on this branch — that run
-# is necessarily for the branch's current tip, since it checks out the ref
-# live rather than a fixed SHA.
+# One line per PR: colored icon, PR number, a Remote Sign-off run id when one
+# is relevant (blank-padded when there isn't one, so the title column stays
+# aligned), and the title (truncated to the terminal width). `running`=1
+# means a run is currently queued/in_progress on this branch (necessarily for
+# its current tip, since the workflow checks out the ref live); otherwise
+# `run_id`, if set, is the most recent *failed* run for a `failure`/`error`
+# state, so you can jump straight to its logs instead of re-triggering blind.
 print_pr_row() {
-  local number="$1" title="$2" state="$3" run_id="$4" width="$5"
-  local icon room run_col
+  local number="$1" title="$2" state="$3" run_id="$4" running="$5" width="$6"
+  local icon room run_col run_color
 
-  if [[ -n "$run_id" ]]; then
+  if [[ "$running" == "1" ]]; then
     icon="${C_YELLOW}⟳${C_RESET}"
-    run_col="${C_YELLOW}$(printf '%-12s' "$run_id")${C_RESET}"
+    run_color="$C_YELLOW"
   else
     case "$state" in
       success)       icon="${C_GREEN}${OK}${C_RESET}" ;;
@@ -697,6 +698,12 @@ print_pr_row() {
       failure|error) icon="${C_RED}${NO}${C_RESET}" ;;   # a sign-off attempt ran and failed
       *)             icon="${C_DIM}○${C_RESET}" ;;       # none: never attempted
     esac
+    run_color="$C_RED"
+  fi
+
+  if [[ -n "$run_id" ]]; then
+    run_col="${run_color}$(printf '%-12s' "$run_id")${C_RESET}"
+  else
     run_col="$(printf '%-12s' '')"
   fi
 
@@ -732,7 +739,7 @@ cmd_mine() {
   # title instead, so we match on that exact string.
   local remote_runs
   remote_runs=$(gh run list --repo "$repo" --workflow signoff.yml \
-    --json displayTitle,status,databaseId --limit 50) || remote_runs="[]"
+    --json displayTitle,status,conclusion,databaseId --limit 50) || remote_runs="[]"
 
   local width
   width=$(tput cols 2>/dev/null) || width=100
@@ -740,7 +747,7 @@ cmd_mine() {
   echo "${C_BOLD}${repo}${C_RESET} — ${count} open PR(s)"
   echo
 
-  local i pr number title branch sha combined state run_id
+  local i pr number title branch sha combined state run_id running
   for ((i = 0; i < count; i++)); do
     pr=$(jq -c ".[$i]" <<<"$prs")
     number=$(jq -r '.number' <<<"$pr")
@@ -751,11 +758,21 @@ cmd_mine() {
     combined=$(gh api "repos/${repo}/commits/${sha}/status" 2>/dev/null) || combined='{}'
     state=$(jq -r "first(.statuses[]? | select(.context==\"${STATUS_CONTEXT}\") | .state) // \"none\"" <<<"$combined")
 
+    running=0
     run_id=$(jq -r --arg title "Remote Sign-off (${branch})" \
       '[.[] | select(.displayTitle == $title and (.status == "in_progress" or .status == "queued"))][0].databaseId // empty' \
       <<<"$remote_runs")
+    if [[ -n "$run_id" ]]; then
+      running=1
+    elif [[ "$state" == "failure" || "$state" == "error" ]]; then
+      # Most recent completed+failed run for this branch, so a failed
+      # attestation links straight to its logs instead of a bare icon.
+      run_id=$(jq -r --arg title "Remote Sign-off (${branch})" \
+        '[.[] | select(.displayTitle == $title and .status == "completed" and .conclusion == "failure")][0].databaseId // empty' \
+        <<<"$remote_runs")
+    fi
 
-    print_pr_row "$number" "$title" "$state" "$run_id" "$width"
+    print_pr_row "$number" "$title" "$state" "$run_id" "$running" "$width"
   done
 
   echo
