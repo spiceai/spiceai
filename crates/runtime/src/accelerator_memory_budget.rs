@@ -130,8 +130,10 @@ pub struct DuckDbBudgetInputs {
     /// Sum of the explicit ceilings — one per explicit instance (the max value if
     /// datasets on the same instance disagree).
     pub sum_explicit_bytes: u64,
-    /// Some instance has both explicit-limit and un-limited datasets (`DuckDB`'s
-    /// `memory_limit` is per-instance, so this is ambiguous — surfaced in the warning).
+    /// Some instance has an inconsistent `duckdb_memory_limit` across the datasets
+    /// that share it — mixed set/unset, or different explicit values. `DuckDB`'s
+    /// `memory_limit` is per-instance (last dataset created wins), so the effective
+    /// limit is ambiguous — surfaced in the warning.
     pub has_mixed_instance: bool,
     /// Human labels (in-memory / file path) of the un-limited instances, for the warning.
     pub unset_instance_labels: Vec<String>,
@@ -166,12 +168,20 @@ pub struct AcceleratorMemoryPlan {
 }
 
 impl AcceleratorMemoryPlan {
-    fn noop(effective_query_pool_bytes: u64, projected_ceiling_bytes: u64) -> Self {
+    /// A `NoOp` plan: no query-pool reduction and no per-instance cap. Still carries
+    /// `duckdb_reservation_bytes` — the true (un-coordinated) `DuckDB` ceiling — so a
+    /// co-resident Cayenne in-memory tier accounts for it even when the config
+    /// already fits and we apply nothing.
+    fn noop(
+        effective_query_pool_bytes: u64,
+        projected_ceiling_bytes: u64,
+        duckdb_reservation_bytes: u64,
+    ) -> Self {
         Self {
             outcome: PlanOutcome::NoOp,
             per_instance_cap_bytes: 0,
             query_pool_cap_bytes: None,
-            duckdb_reservation_bytes: 0,
+            duckdb_reservation_bytes,
             effective_query_pool_bytes,
             projected_ceiling_bytes,
             residual_overcommit: false,
@@ -214,11 +224,25 @@ pub fn plan(
 
     let effective_query_default = query_explicit.unwrap_or(base);
 
-    // Nothing to coordinate: no DuckDB, a degenerate host, or the naive ceilings
-    // already fit within RAM (any un-limited instance forces 90%+80% ≥ 170%, so
-    // this "fits" branch only spares benign all-explicit / explicit-query pods).
-    if num_duckdb == 0 || total_memory == 0 || projected_ceiling_bytes <= total_memory {
-        return AcceleratorMemoryPlan::noop(effective_query_default, projected_ceiling_bytes);
+    // No DuckDB accelerators, or a degenerate host: reserve nothing.
+    if num_duckdb == 0 || total_memory == 0 {
+        return AcceleratorMemoryPlan::noop(effective_query_default, projected_ceiling_bytes, 0);
+    }
+
+    // The naive ceilings already fit within RAM (any un-limited instance forces
+    // 90%+80% ≥ 170%, so this branch mostly spares benign all-explicit / small
+    // explicit-query pods). Apply no caps and don't reduce the query pool — but
+    // STILL publish the true DuckDB ceiling (honored explicit limits plus DuckDB's
+    // own ~80% default for any un-limited instance) so a co-resident Cayenne
+    // in-memory tier can't float into memory DuckDB will actually use.
+    if projected_ceiling_bytes <= total_memory {
+        let uncoordinated_reservation =
+            sum_explicit.saturating_add(duckdb_default_per_instance.saturating_mul(unset));
+        return AcceleratorMemoryPlan::noop(
+            effective_query_default,
+            projected_ceiling_bytes,
+            uncoordinated_reservation,
+        );
     }
 
     let base_free = base.saturating_sub(sum_explicit);
@@ -403,6 +427,8 @@ mod tests {
     }
 
     /// All-explicit, query unset but small explicit ceilings ⇒ already fits ⇒ `NoOp`.
+    /// The true `DuckDB` ceiling is still reserved so a co-resident Cayenne tier
+    /// accounts for it even though nothing is capped.
     #[test]
     fn all_explicit_small_fits_is_noop() {
         let (total, base) = total_and_base();
@@ -413,6 +439,26 @@ mod tests {
         };
         let p = plan(total, base, None, &inputs);
         assert_eq!(p.outcome, PlanOutcome::NoOp);
+        assert_eq!(p.per_instance_cap_bytes, 0);
+        assert_eq!(p.query_pool_cap_bytes, None);
+        assert_eq!(p.duckdb_reservation_bytes, GIB); // reserved despite the NoOp
+    }
+
+    /// A `NoOp` with an un-limited instance that fits (tiny explicit query pool) still
+    /// reserves `DuckDB`'s own ~80% default for that instance — otherwise a co-resident
+    /// Cayenne tier could float into the memory `DuckDB` will use.
+    #[test]
+    fn noop_reserves_duckdb_default_for_unset_instance() {
+        let (total, base) = total_and_base();
+        let q = total / 10; // 10% explicit query pool; 10% + 80% = 90% ≤ total ⇒ NoOp
+        let inputs = DuckDbBudgetInputs {
+            num_unset_instances: 1,
+            ..Default::default()
+        };
+        let p = plan(total, base, Some(q), &inputs);
+        assert_eq!(p.outcome, PlanOutcome::NoOp);
+        assert_eq!(p.per_instance_cap_bytes, 0); // nothing capped
+        assert_eq!(p.duckdb_reservation_bytes, total * 80 / 100);
     }
 
     /// All-explicit, query unset, explicit ceilings large enough that 90%+explicit

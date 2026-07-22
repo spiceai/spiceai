@@ -1181,6 +1181,10 @@ fn duckdb_budget_inputs(
     struct InstanceAgg {
         explicit_max: Option<u64>,
         has_unset: bool,
+        /// Datasets sharing this instance set DIFFERENT explicit `duckdb_memory_limit`
+        /// values. Since the setting is per-instance (last dataset created wins), the
+        /// effective limit is ambiguous — surfaced in the warning.
+        conflicting_explicit: bool,
     }
 
     let mut inputs = DuckDbBudgetInputs::default();
@@ -1228,6 +1232,13 @@ fn duckdb_budget_inputs(
         let agg = instances.entry(key).or_default();
         match explicit {
             Some(bytes) => {
+                // A different explicit value than one already seen on this instance
+                // means the datasets disagree on the per-instance limit.
+                if let Some(prev) = agg.explicit_max
+                    && prev != bytes
+                {
+                    agg.conflicting_explicit = true;
+                }
                 agg.explicit_max = Some(agg.explicit_max.map_or(bytes, |m| m.max(bytes)));
             }
             None => agg.has_unset = true,
@@ -1238,7 +1249,9 @@ fn duckdb_budget_inputs(
         if let Some(bytes) = agg.explicit_max {
             inputs.num_explicit_instances += 1;
             inputs.sum_explicit_bytes = inputs.sum_explicit_bytes.saturating_add(bytes);
-            if agg.has_unset {
+            // Inconsistent per-instance limit: some datasets set it and some didn't,
+            // or datasets set different explicit values. Either way it's ambiguous.
+            if agg.has_unset || agg.conflicting_explicit {
                 inputs.has_mixed_instance = true;
             }
         } else {
@@ -1279,7 +1292,7 @@ fn emit_duckdb_memory_budget_warning(
     let per_instance_h = hb(plan.per_instance_cap_bytes);
     let duckdb_default_h = hb(total_memory.saturating_mul(80) / 100);
     let mixed = if inputs.has_mixed_instance {
-        " One or more DuckDB instances mix datasets with and without duckdb_memory_limit; because DuckDB's memory_limit is per-instance, set it consistently on all datasets sharing an instance."
+        " One or more DuckDB instances have inconsistent duckdb_memory_limit across the datasets that share them (mixed set/unset, or different explicit values); because DuckDB's memory_limit is per-instance the last dataset created wins, so set it consistently on all datasets sharing an instance."
     } else {
         ""
     };
@@ -1627,6 +1640,32 @@ mod test {
         let inputs = inputs_for(vec![arrow_ds]);
         assert_eq!(inputs.num_unset_instances, 0);
         assert_eq!(inputs.num_explicit_instances, 0);
+
+        // Two datasets on the SAME file with DIFFERENT explicit limits → one
+        // explicit instance flagged as inconsistent (per-instance limit is ambiguous).
+        let inputs = inputs_for(vec![
+            duckdb_ds(
+                "a",
+                Mode::File,
+                &[
+                    ("duckdb_file", "/tmp/spice-mbt-conflict.db"),
+                    ("duckdb_memory_limit", "2GiB"),
+                ],
+            ),
+            duckdb_ds(
+                "b",
+                Mode::File,
+                &[
+                    ("duckdb_file", "/tmp/spice-mbt-conflict.db"),
+                    ("duckdb_memory_limit", "4GiB"),
+                ],
+            ),
+        ]);
+        assert_eq!(inputs.num_explicit_instances, 1);
+        assert_eq!(inputs.num_unset_instances, 0);
+        assert!(inputs.has_mixed_instance, "conflicting per-instance limits");
+        // The instance's ceiling uses the max of the conflicting values.
+        assert_eq!(inputs.sum_explicit_bytes, 4 * 1024 * 1024 * 1024);
     }
 
     #[test]
