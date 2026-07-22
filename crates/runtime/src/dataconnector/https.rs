@@ -919,13 +919,11 @@ impl Https {
             .map(str::to_string);
         let client_secret = self.params.get("auth_client_secret").ok().cloned();
 
-        // Nothing OAuth-related set at all: no auth to configure.
-        if token_url.is_none()
-            && refresh_token.is_none()
-            && grant_type_param.is_none()
-            && client_id.is_none()
-            && client_secret.is_none()
-        {
+        // Nothing OAuth-related set at all: no auth to configure. Uses the same
+        // key list as the routing gate so any OAuth2 param (e.g. auth_header
+        // without auth_token_url) reaches the validation below rather than being
+        // silently ignored.
+        if !any_oauth_param_set(&self.params) {
             return Ok(None);
         }
 
@@ -1290,6 +1288,35 @@ impl Https {
 }
 
 /// Returns true if the supplied connector parameters indicate a
+/// User-facing OAuth2 parameter names (before the connector `http_` prefix).
+/// Setting any of these signals the user intends OAuth2 on a dynamic JSON API
+/// endpoint. Kept as one list so the routing gate ([`params_indicate_dynamic_api`])
+/// and the resolver ([`Https::resolve_oauth2_auth`]) can't drift — if they did,
+/// an OAuth2 param without `auth_token_url` would route to the listing connector
+/// and its config would be silently ignored instead of failing validation.
+const OAUTH_PARAM_KEYS: &[&str] = &[
+    "auth_token_url",
+    "auth_refresh_token",
+    "auth_grant_type",
+    "auth_client_id",
+    "auth_client_secret",
+    "auth_scopes",
+    "auth_client_auth",
+    "auth_header",
+    "auth_header_format",
+];
+
+/// Returns true if any OAuth2 parameter is set to a non-empty value.
+fn any_oauth_param_set(params: &Parameters) -> bool {
+    OAUTH_PARAM_KEYS.iter().any(|key| {
+        params
+            .get(key)
+            .expose()
+            .ok()
+            .is_some_and(|v| !v.trim().is_empty())
+    })
+}
+
 /// dynamic HTTP API endpoint (as opposed to a static file download).
 /// Mirrors `Https::has_dynamic_api_params`, which is the canonical
 /// runtime check; kept as a free function so the `HttpsFactory`
@@ -1338,21 +1365,15 @@ fn params_indicate_dynamic_api(params: &Parameters) -> bool {
         .any(|key| params.get(key).expose().ok().is_some());
 
     // OAuth2 authentication is only wired into the dynamic JSON API provider
-    // (the listing connector cannot apply it). So the presence of an OAuth2
-    // token endpoint means the user intends the JSON API path — routing them to
-    // the listing connector instead would silently drop their auth config.
-    let has_oauth = params
-        .get("auth_token_url")
-        .expose()
-        .ok()
-        .is_some_and(|v| !v.trim().is_empty());
-
+    // (the listing connector cannot apply it). Any OAuth2 param means the user
+    // intends the JSON API path — routing them to the listing connector instead
+    // would silently drop (and skip validating) their auth config.
     has_allowed_paths
         || has_query_filters
         || has_body_filters
         || has_header_filters
         || has_pagination
-        || has_oauth
+        || any_oauth_param_set(params)
 }
 
 /// Build the schema for a JSON-nested HTTP table from the user's

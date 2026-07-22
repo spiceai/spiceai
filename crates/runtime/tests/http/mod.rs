@@ -621,7 +621,7 @@ async fn test_http_json_api_dynamic() -> Result<(), String> {
         .await
 }
 
-/// Mock of a Shopify-style API secured with the OAuth2 client-credentials
+/// Mock of a Shopify-style API secured with the `OAuth2` client-credentials
 /// grant. `POST /oauth/token` validates `grant_type=client_credentials` plus
 /// client credentials (in the body) and returns an access token with **no**
 /// refresh token. `GET /data` returns rows only when the request carries
@@ -630,7 +630,8 @@ async fn start_oauth_cc_server() -> Result<(tokio::sync::oneshot::Sender<()>, So
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
 
     // Shared between the token endpoint (issues) and data endpoint (validates).
-    let issued_token: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+    let issued_token: Arc<tokio::sync::Mutex<Option<String>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
     let token_state = Arc::clone(&issued_token);
     let data_state = Arc::clone(&issued_token);
 
@@ -660,7 +661,7 @@ async fn start_oauth_cc_server() -> Result<(tokio::sync::oneshot::Sender<()>, So
                         );
                     }
                     let token = "shpat_integration_token".to_string();
-                    *token_state.lock().expect("token mutex") = Some(token.clone());
+                    *token_state.lock().await = Some(token.clone());
                     // Deliberately NO refresh_token, matching Shopify.
                     let body = json!({
                         "access_token": token,
@@ -689,7 +690,7 @@ async fn start_oauth_cc_server() -> Result<(tokio::sync::oneshot::Sender<()>, So
                         .get("x-shopify-access-token")
                         .and_then(|v| v.to_str().ok())
                         .map(str::to_string);
-                    let current = data_state.lock().expect("token mutex").clone();
+                    let current = data_state.lock().await.clone();
                     if current.is_none() || provided != current {
                         return (
                             StatusCode::UNAUTHORIZED,
@@ -722,7 +723,7 @@ async fn start_oauth_cc_server() -> Result<(tokio::sync::oneshot::Sender<()>, So
     Ok((tx, addr))
 }
 
-/// End-to-end: the HTTP connector performs an OAuth2 **client-credentials**
+/// End-to-end: the HTTP connector performs an `OAuth2` **client-credentials**
 /// exchange (no refresh token) and attaches the issued token to data requests
 /// via a **custom header** (`X-Shopify-Access-Token`), not `Authorization:
 /// Bearer`. Exercises the full wired path — spicepod params -> resolver ->
