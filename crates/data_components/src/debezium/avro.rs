@@ -87,8 +87,11 @@ static EXPLICIT_SCHEMA_CACHE: std::sync::LazyLock<Mutex<HashMap<String, Arc<Avro
 /// client streams many distinct `X-Avro-Schema` values.
 const EXPLICIT_SCHEMA_CACHE_MAX: usize = 32;
 
-/// Shared HTTP client for Schema Registry fetches: connection reuse plus
-/// bounded timeouts so a hung registry cannot stall ingest indefinitely.
+/// Shared HTTP client for Schema Registry fetches (connection reuse). The
+/// client-level timeouts below are best-effort; the hard bound is the
+/// `tokio::time::timeout` wrapping the whole fetch in `fetch_schema`, so a
+/// registry that hangs mid-connect or mid-body-read cannot stall ingest even if
+/// the builder fell back to a client without configured timeouts.
 static REGISTRY_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
@@ -96,6 +99,10 @@ static REGISTRY_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLo
         .build()
         .unwrap_or_default()
 });
+
+/// Hard wall-clock bound on a full Schema Registry fetch (connect + body read),
+/// enforced independently of the HTTP client's own timeouts.
+const REGISTRY_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Options for decoding an Avro CDC body.
 #[derive(Debug, Clone, Default)]
@@ -196,34 +203,52 @@ async fn fetch_schema(registry_url: &str, schema_id: u32) -> Result<Arc<AvroSche
     }
 
     let url = format!("{base}/schemas/ids/{schema_id}");
-    let response = REGISTRY_CLIENT
-        .get(&url)
-        .header(
-            "Accept",
-            "application/vnd.schemaregistry.v1+json, application/json",
-        )
-        .send()
-        .await
-        .map_err(|e| Error::RegistryFetch {
-            url: base.to_string(),
-            schema_id,
-            message: e.to_string(),
-        })?;
-
-    if !response.status().is_success() {
-        return RegistryFetchSnafu {
-            url: base.to_string(),
-            schema_id,
-            message: format!("HTTP {}", response.status()),
+    // Hard-bound the entire network operation (connect + send + body read) so a
+    // registry that hangs at any stage cannot stall ingest, independent of
+    // whether the client's own timeouts were configured.
+    let fetch = async {
+        let response = REGISTRY_CLIENT
+            .get(&url)
+            .header(
+                "Accept",
+                "application/vnd.schemaregistry.v1+json, application/json",
+            )
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Ok(Err(format!("HTTP {status}")));
         }
-        .fail();
-    }
+        Ok::<_, reqwest::Error>(Ok(response.json::<serde_json::Value>().await?))
+    };
 
-    let body: serde_json::Value = response.json().await.map_err(|e| Error::RegistryFetch {
-        url: base.to_string(),
-        schema_id,
-        message: e.to_string(),
-    })?;
+    let body: serde_json::Value = match tokio::time::timeout(REGISTRY_FETCH_TIMEOUT, fetch).await {
+        Ok(Ok(Ok(body))) => body,
+        Ok(Ok(Err(message))) => {
+            return RegistryFetchSnafu {
+                url: base.to_string(),
+                schema_id,
+                message,
+            }
+            .fail();
+        }
+        Ok(Err(e)) => {
+            return RegistryFetchSnafu {
+                url: base.to_string(),
+                schema_id,
+                message: e.to_string(),
+            }
+            .fail();
+        }
+        Err(_) => {
+            return RegistryFetchSnafu {
+                url: base.to_string(),
+                schema_id,
+                message: format!("timed out after {}s", REGISTRY_FETCH_TIMEOUT.as_secs()),
+            }
+            .fail();
+        }
+    };
     let schema_str = body
         .get("schema")
         .and_then(|v| v.as_str())
