@@ -19,23 +19,19 @@ use super::{
     FailedToInitializeStreamSnafu, Result, ScanSnafu, TableDoesNotExistSnafu,
     TableStatusIsNotActiveSnafu,
 };
-use crate::cdc::ChangeBatch;
-use crate::delete::DeletionExec;
-use crate::dynamodb::arrow::dynamodb_items_to_arrow;
-use crate::dynamodb::dml::delete::DynamoDBDeletionSink;
-use crate::dynamodb::dml::insert::DynamoDBInsertSink;
-use crate::dynamodb::dml::update::{DynamoDBUpdateExec, UpdateConfig};
-use crate::dynamodb::json_nest::project_dynamodb_row;
-use crate::dynamodb::request_builder::DynamoDBRequestPlanBuilder;
-use crate::dynamodb::request_plan::{DynamoDBRequestPlan, QueryParams, ScanParams};
-use crate::dynamodb::schema::infer_arrow_schema_from_rows;
-use crate::dynamodb::stream::{
+use crate::arrow::dynamodb_items_to_arrow;
+use crate::dml::delete::DynamoDBDeletionSink;
+use crate::dml::insert::DynamoDBInsertSink;
+use crate::dml::update::{DynamoDBUpdateExec, UpdateConfig};
+use crate::json_nest::project_dynamodb_row;
+use crate::request_builder::DynamoDBRequestPlanBuilder;
+use crate::request_plan::{DynamoDBRequestPlan, QueryParams, ScanParams};
+use crate::schema::infer_arrow_schema_from_rows;
+use crate::stream::{
     StreamError, process_batch, record_batch_to_change_batch, truncate_change_batch,
 };
-use crate::dynamodb::table_schema::DynamoDBTableSchema;
-use crate::dynamodb::unnest::unnest_dynamodb_rows;
-use crate::schema_discovery::merge_inferred_and_declared_schemas;
-use crate::schema_projection::SchemaProjection;
+use crate::table_schema::DynamoDBTableSchema;
+use crate::unnest::unnest_dynamodb_rows;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use aws_config::SdkConfig;
@@ -45,6 +41,10 @@ use aws_sdk_dynamodb::{
     types::{AttributeValue, KeyType, TableStatus},
 };
 use aws_smithy_async::future::pagination_stream::TryFlatMap;
+use data_components::cdc::ChangeBatch;
+use data_components::delete::DeletionExec;
+use data_components::schema_discovery::merge_inferred_and_declared_schemas;
+use data_components::schema_projection::SchemaProjection;
 use datafusion::common::{Constraint, Constraints, DFSchema};
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::DefaultTableSource;
@@ -224,6 +224,11 @@ impl DynamoDBTableProvider {
     /// Use this when the table schema is known upfront (e.g., from DDL) and
     /// scan-based inference is not needed or possible (empty table).
     /// Partition and sort keys are fetched from the `DynamoDB` table metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `DynamoDB` table metadata can't be fetched or the
+    /// declared schema is incompatible with the table's key definitions.
     #[expect(clippy::too_many_arguments)]
     pub async fn try_new_with_schema(
         sdk_config: SdkConfig,
@@ -479,6 +484,11 @@ impl DynamoDBTableProvider {
         }
     }
 
+    /// Fetches the latest global checkpoint (current shard positions) for the stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `DynamoDB` stream can't be initialized.
     pub async fn latest_global_checkpoint(&self) -> Result<Checkpoint> {
         self.streams_client
             .latest_global_checkpoint()
@@ -486,13 +496,21 @@ impl DynamoDBTableProvider {
             .context(FailedToInitializeStreamSnafu)
     }
 
+    /// Opens a change stream from `checkpoint`, mapping records to CDC change batches.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stream can't be initialized from the checkpoint.
     pub async fn stream_from_checkpoint(
         &self,
         checkpoint: Checkpoint,
     ) -> Result<
         BoxStream<
             'static,
-            Result<(ChangeBatch, Checkpoint, Option<SystemTime>), crate::cdc::StreamError>,
+            Result<
+                (ChangeBatch, Checkpoint, Option<SystemTime>),
+                data_components::cdc::StreamError,
+            >,
         >,
     > {
         let table_schema = Arc::clone(self.table_schema.schema());
@@ -515,7 +533,7 @@ impl DynamoDBTableProvider {
                     &time_format,
                     projection.as_ref(),
                 )
-                .map_err(crate::cdc::StreamError::from)
+                .map_err(data_components::cdc::StreamError::from)
             });
 
         Ok(Box::pin(stream))
@@ -530,7 +548,7 @@ impl DynamoDBTableProvider {
     /// - Stream execution fails
     pub async fn bootstrap_stream(
         self: Arc<Self>,
-    ) -> Result<BoxStream<'static, Result<ChangeBatch, crate::cdc::StreamError>>> {
+    ) -> Result<BoxStream<'static, Result<ChangeBatch, data_components::cdc::StreamError>>> {
         let schema = Arc::clone(self.table_schema.schema());
         let table_name = self.table_schema.table_name();
         let primary_keys = self.table_schema.primary_keys();
@@ -563,7 +581,7 @@ impl DynamoDBTableProvider {
                         record_batch.num_rows()
                     );
                     record_batch_to_change_batch(record_batch, &schema, &primary_keys)
-                        .map_err(crate::cdc::StreamError::from)
+                        .map_err(data_components::cdc::StreamError::from)
                 }
                 Err(e) => Err(StreamError::FailedToReadRecordBatch { source: e }.into()),
             });
@@ -589,7 +607,7 @@ impl DynamoDBTableProvider {
     /// truncate.
     pub async fn overwrite_bootstrap_stream(
         self: Arc<Self>,
-    ) -> Result<BoxStream<'static, Result<ChangeBatch, crate::cdc::StreamError>>> {
+    ) -> Result<BoxStream<'static, Result<ChangeBatch, data_components::cdc::StreamError>>> {
         // A truncate-build failure flows as the stream's first element (like the
         // per-batch scan errors below), not as a setup error — the accelerator
         // then surfaces it on the changes stream rather than silently skipping.
@@ -597,7 +615,7 @@ impl DynamoDBTableProvider {
             self.table_schema.schema(),
             &self.table_schema.primary_keys(),
         )
-        .map_err(crate::cdc::StreamError::from);
+        .map_err(data_components::cdc::StreamError::from);
 
         let snapshot = Arc::clone(&self).bootstrap_stream().await?;
 

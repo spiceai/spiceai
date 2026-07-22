@@ -23,12 +23,8 @@ arrow-schema = { workspace = true, features = ["serde"] }
 arrow_tools = { path = "../arrow_tools" }
 async-stream.workspace = true
 async-trait.workspace = true
-aws-config = { workspace = true, optional = true }
 aws-credential-types.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
-aws-sdk-dynamodb = { workspace = true, optional = true }
-aws-sdk-dynamodbstreams = { workspace = true, optional = true }
-aws-smithy-async = { workspace = true, optional = true }
 azure_core = { version = "0.31.0", optional = true }
 azure_data_cosmos = { version = "0.30.0", default-features = false, features = [
     "hmac_rust",
@@ -58,7 +54,6 @@ duckdb = { workspace = true, features = [
     "vtab-arrow",
     "appender-arrow",
 ], optional = true }
-dynamodb-streams = { path = "../dynamodb-streams", optional = true }
 flight_client = { path = "../flight_client" }
 futures.workspace = true
 git2 = { workspace = true }
@@ -160,13 +155,6 @@ duckdb = [
     "db_connection_pool/duckdb",
     "datafusion-table-providers/duckdb",
     "datafusion-table-providers/duckdb-federation",
-]
-dynamodb = [
-    "dep:aws-config",
-    "dep:aws-sdk-dynamodb",
-    "dep:aws-sdk-dynamodbstreams",
-    "dep:aws-smithy-async",
-    "dep:dynamodb-streams",
 ]
 flightsql = []
 imap = ["dep:charset", "dep:imap", "dep:mailparse"]

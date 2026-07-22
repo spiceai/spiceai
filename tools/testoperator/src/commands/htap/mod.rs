@@ -496,7 +496,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         Ok(report) => {
             report.emit();
             // If replication failed to converge, re-scrape the live lag one more time for diagnostics
-            if report.converged_at.is_none() {
+            if !report.convergence.converged() {
                 match crate::spiced_metrics::MetricsScraper::scrape_once().await {
                     Ok(metrics) => {
                         // Re-sample source-side stats fresh: the background scraper

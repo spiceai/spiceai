@@ -19,6 +19,7 @@ connector-clickhouse = { path = "../../crates/data-connectors/connector-clickhou
 connector-cosmosdb = { path = "../../crates/data-connectors/connector-cosmosdb", optional = true }
 connector-databricks = { path = "../../crates/data-connectors/connector-databricks", optional = true }
 connector-delta-lake = { path = "../../crates/data-connectors/connector-delta-lake", optional = true }
+connector-dynamodb = { path = "../../crates/data-connectors/connector-dynamodb", optional = true }
 connector-dremio = { path = "../../crates/data-connectors/connector-dremio", optional = true }
 connector-duckdb = { path = "../../crates/data-connectors/connector-duckdb", optional = true }
 connector-ducklake = { path = "../../crates/data-connectors/connector-ducklake" }
@@ -139,7 +140,7 @@ dev = ["runtime/dev"]
 dremio = ["connector-dremio", "runtime/dremio"]
 elasticsearch = ["connector-elasticsearch", "runtime/elasticsearch"]
 duckdb = ["connector-duckdb", "runtime/duckdb"]
-dynamodb = ["runtime/dynamodb"]
+dynamodb = ["connector-dynamodb"]
 flightsql = ["connector-flightsql", "runtime/flightsql"]
 ftp = ["connector-ftp", "runtime/ftp"]
 http-functions = ["runtime/http-functions"]

@@ -692,6 +692,11 @@ async fn do_register_test_connectors() {
     )
     .await;
     register_connector_factory(
+        connector_dynamodb::CONNECTOR_NAME,
+        connector_dynamodb::factory(),
+    )
+    .await;
+    register_connector_factory(
         connector_databricks::CONNECTOR_NAME,
         connector_databricks::factory(),
     )

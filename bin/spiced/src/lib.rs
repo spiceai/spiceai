@@ -30,6 +30,14 @@ use app::spicepod::component::runtime::{
 };
 use app::{App, AppBuilder};
 use clap::{ArgAction, Parser, ValueEnum};
+// Force-linkage for connectors that self-register via `register_data_connector!` (the linkme
+// distributed slice). A crate contributes its slice entry only when it is actually linked, and a
+// plain Cargo dependency is not enough — the linker drops the unreferenced static — so every such
+// connector needs a `use <crate> as _;` line in this block. `register_all()` then registers them
+// at startup; no explicit `register_connector_factory` call is required for these. (Currently just
+// DynamoDB; the other extracted connectors move onto this pattern in a follow-up.)
+#[cfg(feature = "dynamodb")]
+use connector_dynamodb as _;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
