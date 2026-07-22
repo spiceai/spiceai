@@ -293,28 +293,37 @@ pub async fn fetch_head_position(conn: &mut Conn) -> Result<BinlogPosition> {
     }
 }
 
-/// Whether the source has GTIDs fully enabled (`@@GLOBAL.gtid_mode = ON`).
+/// The source's observed `@@GLOBAL.gtid_mode`, normalized (trimmed, uppercased)
+/// so it can be reported verbatim in logs and compared for the on/off decision.
 ///
-/// Returns `false` for `OFF`, the transitional `ON_PERMISSIVE`/`OFF_PERMISSIVE`
+/// `None` means the server does not support `MySQL`-format GTIDs at all —
+/// `MariaDB` and pre-GTID `MySQL` don't know the variable (server error `1193`,
+/// `ER_UNKNOWN_SYSTEM_VARIABLE`), which is not a fatal error — so callers can
+/// report "GTIDs unsupported" rather than a confusing literal value. Otherwise
+/// the value is the reported mode: only the exact `Some("ON")` enables GTID
+/// auto-positioning; `OFF` and the transitional `ON_PERMISSIVE`/`OFF_PERMISSIVE`
 /// states (a mixed topology can still emit anonymous transactions, which GTID
-/// auto-positioning cannot resume from), and for servers that don't know the
-/// variable at all — `MariaDB` and pre-GTID `MySQL` report it as unknown (server
-/// error `1193`, `ER_UNKNOWN_SYSTEM_VARIABLE`), which means "no `MySQL`-format
-/// GTIDs here", not a fatal error.
-pub async fn detect_gtid_on(conn: &mut Conn) -> Result<bool> {
+/// auto-positioning cannot resume from) mean file+offset.
+pub async fn detect_gtid_mode(conn: &mut Conn) -> Result<Option<String>> {
     match conn
         .query_first::<Option<String>, _>("SELECT @@GLOBAL.gtid_mode")
         .await
     {
-        Ok(row) => Ok(row
-            .flatten()
-            .is_some_and(|mode| mode.trim().eq_ignore_ascii_case("ON"))),
-        // 1193: ER_UNKNOWN_SYSTEM_VARIABLE (MariaDB / pre-GTID MySQL).
-        Err(mysql_async::Error::Server(ref e)) if e.code == 1193 => Ok(false),
+        Ok(row) => Ok(row.flatten().map(|mode| mode.trim().to_ascii_uppercase())),
+        // 1193: ER_UNKNOWN_SYSTEM_VARIABLE (MariaDB / pre-GTID MySQL) — the
+        // variable does not exist, so GTIDs are unsupported here.
+        Err(mysql_async::Error::Server(ref e)) if e.code == 1193 => Ok(None),
         Err(e) => Err(e).context(SetupQuerySnafu {
             context: "SELECT @@GLOBAL.gtid_mode",
         }),
     }
+}
+
+/// Whether an observed [`detect_gtid_mode`] value enables GTID auto-positioning
+/// (exactly `ON`). `None` (GTIDs unsupported) is not on.
+#[must_use]
+pub fn gtid_mode_is_on(observed: Option<&str>) -> bool {
+    matches!(observed, Some(mode) if mode.eq_ignore_ascii_case("ON"))
 }
 
 /// The current binlog head together with the source's executed GTID set,

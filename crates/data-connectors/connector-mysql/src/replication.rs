@@ -32,9 +32,9 @@ use async_trait::async_trait;
 use data_components::cdc::{ChangesStream, StreamError};
 use data_components::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
 use data_components::mysql_replication::{
-    BinlogPosition, NoopPositionStore, PersistedPosition, PositionStore, ReplicationMetrics,
-    ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput, StoreError,
-    derive_server_id, process_nonce, start_replication_stream,
+    BinlogPosition, CursorType, NoopPositionStore, PersistedPosition, PositionStore,
+    ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
+    StoreError, derive_server_id, process_nonce, start_replication_stream,
 };
 use datafusion::sql::TableReference;
 use futures::StreamExt;
@@ -266,6 +266,10 @@ impl PositionStore for SidecarPositionStore {
             position: BinlogPosition::new(cp.binlog_file, cp.binlog_pos),
             schema_json: cp.schema_json,
             gtid_set: cp.gtid_executed,
+            // An unset/unknown stored type resolves to `None`, which the
+            // replication layer treats as an incompatible checkpoint rather than
+            // guessing the cursor type.
+            cursor_type: cp.cursor_type.as_deref().and_then(CursorType::from_stored),
         }))
     }
 
@@ -276,6 +280,7 @@ impl PositionStore for SidecarPositionStore {
                 binlog_pos: position.position.pos,
                 schema_json: position.schema_json.clone(),
                 gtid_executed: position.gtid_set.clone(),
+                cursor_type: position.cursor_type.map(|c| c.as_str().to_string()),
                 updated_at: None,
             })
             .await

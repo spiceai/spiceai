@@ -47,7 +47,7 @@ use mysql_async::binlog::events::{EventData, RowsEventData, TableMapEvent};
 use mysql_async::binlog::row::BinlogRow;
 use mysql_async::{BinlogStream, BinlogStreamRequest, Conn, Value};
 
-use super::config::{BinlogPosition, ReplicationParams};
+use super::config::{BinlogPosition, CursorType, ReplicationParams};
 use super::gtid::GtidSet;
 use super::metrics::MetricsCollector;
 use super::rows::{TransactionBuffer, build_change_batch, normalize_binlog_value, truncate_change};
@@ -1382,6 +1382,13 @@ impl Checkpointer {
             // under the in-order commit contract everything up to `resume` is
             // in the set, and nothing past it (see `AckState`).
             gtid_set: self.use_gtid.then(|| ack.gtid_snapshot().to_string()),
+            // Stored explicitly so classification never depends on whether the
+            // (possibly empty) GTID set round-trips as non-null.
+            cursor_type: Some(if self.use_gtid {
+                CursorType::Gtid
+            } else {
+                CursorType::File
+            }),
         };
         match self.store.save(&persisted).await {
             Ok(()) => {

@@ -29,8 +29,13 @@ limitations under the License.
 //!
 //! `gtid_executed` holds the source's executed GTID set for failover-safe
 //! resume (`COM_BINLOG_DUMP_GTID`); it is `NULL` for file+offset positioning.
-//! It was added after the initial schema, so the column is created lazily via
-//! `ALTER TABLE ... ADD COLUMN` on tables that predate it.
+//! `cursor_type` (`file`|`gtid`) records the checkpoint's positioning type
+//! explicitly, so resume never has to *infer* it from whether `gtid_executed`
+//! is set — an empty GTID set (`gtid_mode = ON`, zero transactions yet) must
+//! still reload as `gtid`, and an engine that maps an empty string to `NULL`
+//! must not silently reclassify it as `file`. Both columns were added after the
+//! initial schema, so each is created lazily via `ALTER TABLE ... ADD COLUMN`
+//! on tables that predate it.
 //!
 //! ```sql
 //! CREATE TABLE spice_sys_mysql_binlog (
@@ -39,6 +44,7 @@ limitations under the License.
 //!     binlog_pos BIGINT NOT NULL,
 //!     schema_json TEXT,
 //!     gtid_executed TEXT,
+//!     cursor_type TEXT,
 //!     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 //!     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 //! );
@@ -78,8 +84,14 @@ pub struct MySqlBinlogCheckpoint {
     /// runs.
     pub schema_json: Option<String>,
     /// Optional executed GTID set (`uuid:range` text) for failover-safe resume
-    /// via `COM_BINLOG_DUMP_GTID`. `None` for file+offset positioning.
+    /// via `COM_BINLOG_DUMP_GTID`. `None` for file+offset positioning; may be an
+    /// empty string when `gtid_mode = ON` but no transactions have committed.
     pub gtid_executed: Option<String>,
+    /// The checkpoint's positioning type (`file`|`gtid`), stored explicitly so
+    /// resume never infers it from `gtid_executed`. `None` on rows written
+    /// before this column existed (the replication layer treats that as an
+    /// incompatible checkpoint rather than guessing).
+    pub cursor_type: Option<String>,
     /// When the row was last updated. Populated by the database layer on read.
     pub updated_at: Option<std::time::SystemTime>,
 }

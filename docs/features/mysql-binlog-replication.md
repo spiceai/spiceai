@@ -220,7 +220,22 @@ bootstrapped, Spice uses GTID positioning if the source runs with
 `gtid_mode = ON`, and file+offset otherwise. The executed set is captured
 atomically with the snapshot head, extended per committed transaction, and
 persisted alongside the file position in the `spice_sys_mysql_binlog` sidecar
-(`gtid_executed` column).
+(`gtid_executed` column, plus an explicit `file`|`gtid` `cursor_type` so the
+type is always known on resume, never inferred).
+
+Because it's automatic and otherwise silent, Spice **logs the resolved
+positioning** at stream start so you can confirm a dataset is failover-safe:
+
+- `INFO … GTID auto-positioning active (failover-safe resume)` — GTID in use.
+- `WARN … file+offset positioning (source gtid_mode is 'OFF', not 'ON') …
+  resume is NOT failover-safe; a source promotion will force a full re-snapshot`
+  — the source is GTID-capable but not `ON` (the value is named: `OFF`,
+  `ON_PERMISSIVE`, …).
+- `WARN … file+offset positioning (this server does not support GTIDs) …` — a
+  MariaDB or pre-GTID MySQL source.
+
+The `replication_gtid_enabled` metric mirrors this (`1` = GTID, `0` =
+file+offset) for dashboards/alerts.
 
 **Requirements & notes:**
 
