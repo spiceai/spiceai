@@ -1501,14 +1501,9 @@ async fn run_pump(source: Arc<SharedSource>) {
                                         // Log the idle heartbeat (per member) so
                                         // lag-based readiness can be verified from
                                         // the logs (target spice_cdc::heartbeat).
-                                        let heartbeat_lag_ms = heartbeat_ts_ms.and_then(|ts| {
-                                            std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .ok()
-                                                .and_then(|d| i64::try_from(d.as_millis()).ok())
-                                                .map(|now| now.saturating_sub(ts))
-                                        });
-                                        tracing::info!(
+                                        let heartbeat_lag_ms =
+                                            crate::cdc::replication_lag_ms(heartbeat_ts_ms);
+                                        tracing::debug!(
                                             target: "spice_cdc::heartbeat",
                                             connector = "postgres",
                                             dataset = %member.dataset_name,

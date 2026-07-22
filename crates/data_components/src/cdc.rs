@@ -125,15 +125,34 @@ pub enum StreamError {
     Arrow(String),
     /// External error not originating from `ChangesStream` core logic, such as index processing failure.
     External(String),
-    #[cfg(feature = "dynamodb")]
-    /// Error from `DynamoDB`, such as failure during streaming or subscription.
-    DynamoDB(crate::dynamodb::stream::StreamError),
+    /// Error surfaced by a data-source connector's change stream: the connector
+    /// names itself (`connector`) and attaches its own concrete error as the boxed
+    /// `source` cause, keeping this CDC contract connector-agnostic.
+    Connector {
+        /// Static name of the connector that produced the error (e.g. `"DynamoDB"`),
+        /// so logs that print only `{err}` still identify the source connector.
+        connector: &'static str,
+        /// The connector's concrete error, preserved as the chained cause.
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[cfg(feature = "mongodb")]
     /// Error from `MongoDB`, such as failure during change stream processing.
     MongoDB(crate::mongodb::stream::StreamError),
 }
 
-impl std::error::Error for StreamError {}
+impl std::error::Error for StreamError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            #[cfg(any(feature = "debezium", feature = "kafka"))]
+            StreamError::Kafka(e) => Some(e),
+            StreamError::Connector { source, .. } => Some(&**source),
+            #[cfg(feature = "mongodb")]
+            StreamError::MongoDB(e) => Some(e),
+            // String-carrying variants have no underlying `Error` source.
+            _ => None,
+        }
+    }
+}
 
 impl From<ChangeBatchError> for StreamError {
     fn from(e: ChangeBatchError) -> Self {
@@ -154,8 +173,9 @@ impl std::fmt::Display for StreamError {
             StreamError::Flight(e) => write!(f, "Arrow Flight error: {e}"),
             StreamError::Arrow(e) => write!(f, "Arrow error: {e}"),
             StreamError::External(e) => write!(f, "External error: {e}"),
-            #[cfg(feature = "dynamodb")]
-            StreamError::DynamoDB(e) => write!(f, "DynamoDB error: {e}"),
+            StreamError::Connector { connector, source } => {
+                write!(f, "{connector} error: {source}")
+            }
             #[cfg(feature = "mongodb")]
             StreamError::MongoDB(e) => write!(f, "MongoDB error: {e}"),
         }
@@ -580,20 +600,41 @@ impl CommitChange for NoOpCommitter {
 ///
 /// `source_commit_ts_ms` is `None` for snapshot-boundary / no-timestamp commits
 /// (lag is then reported as `None`).
+/// Convert a [`SystemTime`] to milliseconds since the Unix epoch, or `None` if it
+/// predates the epoch or overflows `i64`.
+#[must_use]
+pub fn system_time_to_unix_ms(t: SystemTime) -> Option<i64> {
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+}
+
+/// Current wall-clock time as milliseconds since the Unix epoch, or `None` if the
+/// clock is unavailable.
+#[must_use]
+pub fn now_unix_ms() -> Option<i64> {
+    system_time_to_unix_ms(SystemTime::now())
+}
+
+/// Replication lag in milliseconds: wall-clock now minus the source-commit
+/// timestamp, clamped to `>= 0`. `None` when the source timestamp is unknown or
+/// the clock is unavailable. Shared by the `spice_cdc::*` log lines and the lag
+/// gauge so every CDC connector computes lag identically.
+#[must_use]
+pub fn replication_lag_ms(source_commit_ts_ms: Option<i64>) -> Option<i64> {
+    match (now_unix_ms(), source_commit_ts_ms) {
+        (Some(now), Some(ts)) => Some(now.saturating_sub(ts).max(0)),
+        _ => None,
+    }
+}
+
 pub fn log_committer_progress(
     connector: &str,
     dataset: &str,
     position: &str,
     source_commit_ts_ms: Option<i64>,
 ) {
-    let now_ms = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .ok()
-        .and_then(|d| i64::try_from(d.as_millis()).ok());
-    let lag_ms = match (now_ms, source_commit_ts_ms) {
-        (Some(now), Some(ts)) => Some(now.saturating_sub(ts)),
-        _ => None,
-    };
+    let lag_ms = replication_lag_ms(source_commit_ts_ms);
     tracing::debug!(
         target: "spice_cdc::commit",
         connector,
@@ -699,14 +740,9 @@ pub fn source_commit_within_ready_lag(
     source_commit_ts_ms: Option<i64>,
     ready_lag: Duration,
 ) -> bool {
-    let Some(ts_ms) = source_commit_ts_ms else {
+    let Some(lag_ms) = replication_lag_ms(source_commit_ts_ms) else {
         return false;
     };
-    let now_ms = match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
-        Ok(elapsed) => i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX),
-        Err(_) => return false,
-    };
-    let lag_ms = now_ms.saturating_sub(ts_ms).max(0);
     u128::from(lag_ms.unsigned_abs()) < ready_lag.as_millis()
 }
 
@@ -1267,5 +1303,84 @@ mod deferred_tests {
             env.change_batch().expect("already built").record.num_rows(),
             0
         );
+    }
+
+    // ----- lag-based readiness helpers -----
+
+    #[test]
+    fn source_commit_within_ready_lag_gates_on_freshness() {
+        let now = now_unix_ms().expect("clock available");
+        let lag = Duration::from_secs(2);
+
+        // A commit 500ms in the past is within a 2s window -> caught up.
+        assert!(source_commit_within_ready_lag(Some(now - 500), lag));
+        // A commit 5s in the past is beyond the window -> still behind.
+        assert!(!source_commit_within_ready_lag(Some(now - 5_000), lag));
+        // No upstream timestamp is never ready: there is no freshness proof.
+        assert!(!source_commit_within_ready_lag(None, lag));
+        // A source clock slightly ahead of ours (small skew) clamps to zero lag
+        // and reads as ready rather than flapping.
+        assert!(source_commit_within_ready_lag(Some(now + 500), lag));
+    }
+
+    #[test]
+    fn source_commit_within_ready_lag_is_strict_at_the_boundary() {
+        // `ready_lag` of zero can never be satisfied (lag is always >= 0 and the
+        // comparison is strict `<`), so a zero threshold never marks Ready.
+        let now = now_unix_ms().expect("clock available");
+        assert!(!source_commit_within_ready_lag(
+            Some(now),
+            Duration::from_secs(0)
+        ));
+    }
+
+    #[test]
+    fn replication_lag_ms_clamps_and_handles_missing_ts() {
+        // No source timestamp -> no lag signal.
+        assert_eq!(replication_lag_ms(None), None);
+
+        let now = now_unix_ms().expect("clock available");
+        // A past commit reports a non-negative lag in the expected ballpark.
+        let lag = replication_lag_ms(Some(now - 1_000)).expect("some lag");
+        assert!((900..=60_000).contains(&lag), "unexpected lag: {lag}");
+
+        // A future commit (source clock ahead) clamps to zero, never negative.
+        assert_eq!(replication_lag_ms(Some(now + 10_000)), Some(0));
+    }
+
+    #[test]
+    fn heartbeat_envelope_is_empty_stamps_ts_and_propagates_ready_flag() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let ts = now_unix_ms().expect("clock available");
+
+        for ready in [true, false] {
+            let env = build_heartbeat_envelope(&schema, Some(ts), ready)
+                .expect("heartbeat envelope builds");
+            assert_eq!(env.is_dataset_ready(), ready);
+            let batch = env.change_batch().expect("already built");
+            assert_eq!(batch.record.num_rows(), 0, "heartbeat carries no rows");
+            assert!(
+                batch.is_heartbeat(),
+                "zero-row stamped batch is a heartbeat"
+            );
+            assert_eq!(
+                batch.source_commit_ts_ms(),
+                Some(ts),
+                "heartbeat carries the source-attested clock"
+            );
+        }
+    }
+
+    #[test]
+    fn heartbeat_envelope_builds_for_non_null_primary_key_schema() {
+        // A `nullable: false` column must not break the coalesce with real
+        // change batches: the heartbeat normalizes fields to nullable.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let env = build_heartbeat_envelope(&schema, None, false)
+            .expect("heartbeat builds with non-null columns");
+        assert_eq!(env.change_batch().expect("built").record.num_rows(), 0);
     }
 }

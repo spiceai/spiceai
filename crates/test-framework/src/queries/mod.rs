@@ -770,7 +770,6 @@ pub enum QueryOverrides {
     ODBCDatabricks,
     DuckDB,
     DuckDBOnZeroResults,
-    DuckDBPartitioned,
     Snowflake,
     Oracle,
     IcebergSF1,
@@ -790,6 +789,7 @@ pub enum QueryOverrides {
     Turso,
     BigQuery,
     ScyllaDB,
+    ChbenchSkipSlow, // heaviest CH-benCH analytical queries (q10, q18)
 }
 
 impl QueryOverrides {
@@ -1168,12 +1168,6 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
             simple_q6,
             simple_q7
         ),
-        Some(QueryOverrides::DuckDBPartitioned) => remove_tpch_query!(
-            queries,
-            17, // Correlated scalar subquery can only be used in Projection; https://github.com/spiceai/spiceai/issues/8384
-            20, // Physical plan does not support logical expression ScalarSubquery(<subquery>); https://github.com/spiceai/spiceai/issues/8384
-            21  // Binder Error; https://github.com/spiceai/spiceai/issues/8384
-        ),
         Some(QueryOverrides::Turso) => remove_tpch_query!(
             queries,
             2, // Correlated scalar subquery not supported; DF limitation, Turso tests are not cross-table federated
@@ -1362,6 +1356,10 @@ pub fn get_chbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query>
     match overrides {
         // https://github.com/spiceai/spiceai/issues/11011
         Some(QueryOverrides::DuckDB) => remove_chbench_query!(queries, 21),
+        // q10 and q18 are the heaviest analytical queries; skip them where the
+        // run only needs the rest (e.g. large-SF sources where they dominate the
+        // gate/QPH wall-clock).
+        Some(QueryOverrides::ChbenchSkipSlow) => remove_chbench_query!(queries, 10, 18),
         Some(_) | None => queries,
     }
 }

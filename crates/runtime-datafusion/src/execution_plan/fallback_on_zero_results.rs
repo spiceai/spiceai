@@ -159,16 +159,6 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
         let schema = input_stream.schema();
         let scan_params = self.fallback_scan_params.clone();
         let table_name = self.table_name.clone();
-        let fallback_msg = format!(
-            r#"Accelerated table "{}" returned 0 results for query with filter [{}], sending query to federated table..."#,
-            self.table_name,
-            self.fallback_scan_params
-                .filters
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<String>>()
-                .join(", ")
-        );
 
         let federated_provider_callback = Arc::clone(&self.fallback_table_provider);
         let potentially_fallback_stream = stream::once(async move {
@@ -195,6 +185,16 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
                 Box::pin(stream_adapter) as SendableRecordBatchStream
             } else {
                 tracing::trace!("FallbackOnZeroResultsScanExec input_stream.next() returned None");
+                // Build the log message only on the empty-stream fallback path.
+                let fallback_msg = format!(
+                    r#"Accelerated table "{table_name}" returned 0 results for query with filter [{}], sending query to federated table..."#,
+                    scan_params
+                        .filters
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<String>>()
+                        .join(", ")
+                );
                 tracing::debug!("{fallback_msg}");
                 metrics::FEDERATED_FALLBACK.add(1, &[KeyValue::new("dataset_name", table_name.to_string())]);
                 let federated_provider = federated_provider_callback().await;

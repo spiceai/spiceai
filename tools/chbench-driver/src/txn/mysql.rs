@@ -33,6 +33,7 @@ use std::fmt::Write as _;
 use ::rand::{Rng, RngExt};
 use mysql_async::prelude::Queryable;
 use mysql_async::{Row, Value};
+use rust_decimal::Decimal;
 
 use super::TerminalAssignment;
 use crate::Result;
@@ -84,7 +85,7 @@ async fn run_new_order(
         ol_i_id: i32,
         ol_supply_w_id: i32,
         ol_number: i32,
-        ol_amount: f64,
+        ol_amount: Decimal,
         ol_dist_info: String,
     }
 
@@ -132,7 +133,7 @@ async fn run_new_order(
         })?;
 
     // 1. SELECT customer + warehouse info
-    let customer_row: Option<(f64, String, String, f64)> = tx
+    let customer_row: Option<(Decimal, String, String, Decimal)> = tx
         .exec_first(
             "SELECT c_discount, c_last, c_credit, w_tax \
              FROM customer, warehouse \
@@ -152,7 +153,7 @@ async fn run_new_order(
     };
 
     // 2. SELECT district FOR UPDATE
-    let district_row: Option<(i32, f64)> = tx
+    let district_row: Option<(i32, Decimal)> = tx
         .exec_first(
             "SELECT d_next_o_id, d_tax FROM district \
              WHERE d_id = ? AND d_w_id = ? FOR UPDATE",
@@ -233,7 +234,7 @@ async fn run_new_order(
         }
 
         // SELECT item
-        let item_row: Option<(f64, String, String)> = tx
+        let item_row: Option<(Decimal, String, String)> = tx
             .exec_first(
                 "SELECT i_price, i_name, i_data FROM item WHERE i_id = ?",
                 (ol_i_id,),
@@ -274,8 +275,11 @@ async fn run_new_order(
             s_quantity += 91;
         }
 
-        let ol_amount =
-            f64::from(ol_quantity) * i_price * (1.0 + w_tax + d_tax) * (1.0 - c_discount);
+        // Exact decimal arithmetic; MySQL rounds to DECIMAL(6,2) on store.
+        let ol_amount = Decimal::from(ol_quantity)
+            * i_price
+            * (Decimal::ONE + w_tax + d_tax)
+            * (Decimal::ONE - c_discount);
 
         writes.push(LineWrite {
             s_quantity,
@@ -366,7 +370,11 @@ async fn run_payment(
 ) -> Result<()> {
     let w_id = assignment.home_w_id;
     let d_id = rng.random_range(assignment.district_lo..=assignment.district_hi);
-    let h_amount: f64 = f64::from(rng.random_range(100..=500_000)) / 100.0;
+    // Exact cents/100 (same i32 RNG draw as before). c_ytd_payment is DOUBLE, so
+    // it needs an f64 bind; the DECIMAL columns take the Decimal.
+    let h_cents: i32 = rng.random_range(100..=500_000);
+    let h_amount = Decimal::new(i64::from(h_cents), 2);
+    let h_amount_f64 = f64::from(h_cents) / 100.0;
 
     // 60% by last name, 40% by customer ID (spec 2.5.1.2)
     let by_name = rng.random_range(0..100) < 60;
@@ -551,7 +559,7 @@ async fn run_payment(
              WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?",
             (
                 h_amount,
-                h_amount,
+                h_amount_f64,
                 new_data,
                 customer_wh,
                 customer_dist,
@@ -568,7 +576,7 @@ async fn run_payment(
             "UPDATE customer SET c_balance = c_balance - ?, c_ytd_payment = c_ytd_payment + ?, \
              c_payment_cnt = c_payment_cnt + 1 \
              WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?",
-            (h_amount, h_amount, customer_wh, customer_dist, c_id),
+            (h_amount, h_amount_f64, customer_wh, customer_dist, c_id),
         )
         .await
         .map_err(|source| crate::Error::MySql {
@@ -700,7 +708,7 @@ async fn run_delivery(
         })?;
 
         // 6. SUM order_line amounts
-        let sum_row: Option<(f64,)> = tx
+        let sum_row: Option<(Decimal,)> = tx
             .exec_first(
                 "SELECT COALESCE(SUM(ol_amount), 0) FROM order_line WHERE ol_w_id = ? AND ol_d_id = ? AND ol_o_id = ?",
                 (w_id, d_id, no_o_id),

@@ -28,15 +28,15 @@ use std::time::Duration;
 
 /// When the initial snapshot of a source's existing rows runs for a
 /// `refresh_mode: changes` dataset. User parameter:
-/// `{connector}_replication_initial_snapshot` (`auto|enabled|disabled`).
+/// `{connector}_replication_initial_snapshot` (`auto|always|disabled`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum InitialSnapshotMode {
     /// `auto` (default): snapshot when no resumable position/token/checkpoint
     /// exists; resume without a snapshot when one does.
     #[default]
     Auto,
-    /// `enabled`: snapshot on every start, discarding any persisted position.
-    Enabled,
+    /// `always`: snapshot on every start, discarding any persisted position.
+    Always,
     /// `disabled`: never snapshot; stream changes only.
     Disabled,
 }
@@ -44,7 +44,7 @@ pub enum InitialSnapshotMode {
 impl InitialSnapshotMode {
     /// The accepted user-facing values, in canonical order. Use for
     /// `ParameterSpec::one_of_ignore_ascii_case` and error messages.
-    pub const VALUES: &'static [&'static str] = &["auto", "enabled", "disabled"];
+    pub const VALUES: &'static [&'static str] = &["auto", "always", "disabled"];
 
     /// Parse a canonical value (case-insensitive, surrounding whitespace
     /// trimmed). Returns `None` for anything unrecognized.
@@ -52,7 +52,7 @@ impl InitialSnapshotMode {
     pub fn from_canonical(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "auto" => Some(Self::Auto),
-            "enabled" => Some(Self::Enabled),
+            "always" => Some(Self::Always),
             "disabled" => Some(Self::Disabled),
             _ => None,
         }
@@ -117,8 +117,8 @@ mod tests {
             Some(InitialSnapshotMode::Auto)
         );
         assert_eq!(
-            InitialSnapshotMode::from_canonical("enabled"),
-            Some(InitialSnapshotMode::Enabled)
+            InitialSnapshotMode::from_canonical("always"),
+            Some(InitialSnapshotMode::Always)
         );
         assert_eq!(
             InitialSnapshotMode::from_canonical("disabled"),

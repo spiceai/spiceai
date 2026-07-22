@@ -161,8 +161,6 @@ pub enum QueryOverridesArg {
     Duckdb,
     #[serde(rename = "duckdb-zero-results")]
     DuckdbZeroResults,
-    #[serde(rename = "duckdb-partitioned")]
-    DuckdbPartitioned,
     #[serde(rename = "snowflake")]
     Snowflake,
     #[serde(rename = "oracle")]
@@ -209,6 +207,9 @@ pub enum QueryOverridesArg {
     #[serde(rename = "scylladb")]
     #[value(name = "scylladb")]
     ScyllaDB,
+    #[serde(rename = "chbench-skip-slow")]
+    #[value(name = "chbench-skip-slow")]
+    ChbenchSkipSlow,
 }
 
 impl From<QuerySetArg> for QuerySet {
@@ -308,7 +309,6 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::ODBCDatabricks => QueryOverrides::ODBCDatabricks,
             QueryOverridesArg::Duckdb => QueryOverrides::DuckDB,
             QueryOverridesArg::DuckdbZeroResults => QueryOverrides::DuckDBOnZeroResults,
-            QueryOverridesArg::DuckdbPartitioned => QueryOverrides::DuckDBPartitioned,
             QueryOverridesArg::Snowflake => QueryOverrides::Snowflake,
             QueryOverridesArg::Oracle => QueryOverrides::Oracle,
             QueryOverridesArg::IcebergSF1 => QueryOverrides::IcebergSF1,
@@ -330,6 +330,7 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::Turso => QueryOverrides::Turso,
             QueryOverridesArg::BigQuery => QueryOverrides::BigQuery,
             QueryOverridesArg::ScyllaDB => QueryOverrides::ScyllaDB,
+            QueryOverridesArg::ChbenchSkipSlow => QueryOverrides::ChbenchSkipSlow,
         }
     }
 }

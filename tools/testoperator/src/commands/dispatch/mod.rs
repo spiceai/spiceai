@@ -185,9 +185,8 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
         payload = map_numbers_to_strings(payload);
 
         println!(
-            "{}/{} - Dispatching {test_type} test from {}",
+            "{}/{total_tests} - Dispatching {test_type} test from {}",
             index + 1,
-            total_tests,
             path.display(),
         );
 
@@ -233,19 +232,20 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
             }
             None => {
                 // Dispatch workflow without concurrency limit
-                workflow.send(octo_client.actions(), Some(payload)).await
+                workflow.run_workflow(&octo_client, Some(payload)).await
             }
         };
-
-        if let Err(e) = result {
-            eprintln!("Failed to dispatch {}. Error: {e:?}", path.display());
-            failed_dispatches.push((path.display().to_string(), e));
-            continue;
+        match result {
+            Err(e) => {
+                eprintln!("❌ Failed to dispatch {}. Error: {e:?}", path.display());
+                failed_dispatches.push((path.display().to_string(), e));
+            }
+            Ok(run_url) => {
+                // sleep to space out runs
+                println!("✅ {run_url} is running");
+                tokio::time::sleep(std::time::Duration::from_secs(80)).await;
+            }
         }
-
-        // sleep to space out runs
-        println!("Waiting for next run...");
-        tokio::time::sleep(std::time::Duration::from_secs(80)).await;
     }
 
     if !failed_dispatches.is_empty() {
@@ -263,13 +263,15 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
 /// or until the 30 minutes max wait time expires.
 ///
 /// - `max_concurrent`: maximum number of active runs allowed
+///
+/// Returns a URL to the Github workflow run.
 async fn dispatch_workflow_with_concurrency(
     workflow: GitHubWorkflow,
     octo: &Octocrab,
     input: Option<serde_json::Value>,
     max_concurrent: usize,
     slot_wait_timeout: Duration,
-) -> Result<()> {
+) -> Result<String> {
     println!(
         "Checking for available slot to run workflow (limit: {max_concurrent} concurrent runs, waiting up to {} min)...",
         slot_wait_timeout.as_secs() / 60
@@ -278,7 +280,7 @@ async fn dispatch_workflow_with_concurrency(
         eprintln!("Error waiting for slot: {err}");
     }
 
-    workflow.send(octo.actions(), input).await
+    workflow.run_workflow(octo, input).await
 }
 
 /// Waits until the number of already queued runs is below the given limit,

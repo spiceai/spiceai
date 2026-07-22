@@ -54,8 +54,21 @@ use datafusion_datasource::source::DataSourceExec;
 use futures::StreamExt;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 
+use runtime_datafusion::extension::request_context::resolve_request_context;
+
 use crate::accelerated_table::refresh::Refresher;
 use crate::federated_table::FederatedTable;
+
+/// Whether a Cayenne transaction is active on the live execution context. When it is, the
+/// write STAGES to the accelerator (published/rolled back atomically at COMMIT) and the
+/// delivery worker reconciles it to the source from the dirty-key markers written in the
+/// commit transaction — so the sink must NOT also fire-and-forget the write to the source
+/// (that would push staged-but-uncommitted rows and duplicate the worker's delivery).
+/// Mirrors the INSERT path (`WriteBackDataSink::write_all`).
+fn request_in_transaction(context: &TaskContext) -> bool {
+    resolve_request_context(context, false)
+        .is_some_and(|rc| rc.extension::<cayenne::CayenneTransaction>().is_some())
+}
 
 pub(crate) fn validate_insert_op(insert_op: InsertOp) -> DataFusionResult<()> {
     match insert_op {
@@ -167,6 +180,20 @@ impl DataSink for WriteBackDataSink {
 
         self.refresher.set_initial_load_completed(true);
 
+        // Durable federated write-back (#11838): a write inside a Cayenne
+        // transaction STAGES to the accelerator and is reconciled to the source
+        // by the delivery worker (from the dirty-key markers written in the same
+        // commit) — NOT by this fire-and-forget forward. Forwarding here would
+        // push staged-but-uncommitted batches to the source before COMMIT (and
+        // duplicate what the worker delivers), so skip it when a transaction is
+        // active on this request context. Non-transaction writes keep the
+        // ordinary write-back forward.
+        let in_transaction = resolve_request_context(context, false)
+            .is_some_and(|rc| rc.extension::<cayenne::CayenneTransaction>().is_some());
+        if in_transaction {
+            return Ok(row_count);
+        }
+
         // Forward the same buffered batches to the federated source in the
         // background. Failures are logged but do not affect the synchronous
         // response.
@@ -233,14 +260,23 @@ struct WriteBackDeletionSink {
 
 #[async_trait]
 impl DeletionSink for WriteBackDeletionSink {
-    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let task_ctx = self.session_state.task_ctx();
+    async fn delete_from(
+        &self,
+        context: Arc<TaskContext>,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        // Execute under the LIVE execution context so a delete inside a Cayenne
+        // transaction STAGES rather than publishing immediately (see request_in_transaction).
         let batches = datafusion::physical_plan::collect(
             Arc::clone(&self.accelerator_plan),
-            Arc::clone(&task_ctx),
+            Arc::clone(&context),
         )
         .await?;
         let count = extract_dml_count(&batches);
+
+        // Inside a transaction, the delivery worker reconciles the change to the source.
+        if request_in_transaction(&context) {
+            return Ok(count);
+        }
 
         let federated = Arc::clone(&self.federated);
         let filters = self.filters.clone();
@@ -310,14 +346,26 @@ struct WriteBackUpdateSink {
 
 #[async_trait]
 impl DeletionSink for WriteBackUpdateSink {
-    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let task_ctx = self.session_state.task_ctx();
+    async fn delete_from(
+        &self,
+        context: Arc<TaskContext>,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        // Execute the accelerator plan under the LIVE execution context so a write inside
+        // a Cayenne transaction STAGES (and is published/rolled back atomically at COMMIT)
+        // rather than publishing immediately. Using a fresh context here would make the
+        // accelerator's transaction-aware sink publish, defeating gated rollback.
         let batches = datafusion::physical_plan::collect(
             Arc::clone(&self.accelerator_plan),
-            Arc::clone(&task_ctx),
+            Arc::clone(&context),
         )
         .await?;
         let count = extract_dml_count(&batches);
+
+        // Inside a transaction, the delivery worker reconciles the committed change to the
+        // source from the commit-transaction markers; do NOT also fire-and-forget it here.
+        if request_in_transaction(&context) {
+            return Ok(count);
+        }
 
         let federated = Arc::clone(&self.federated);
         let assignments = self.assignments.clone();
@@ -363,7 +411,7 @@ pub(super) fn extract_dml_count(batches: &[RecordBatch]) -> u64 {
 /// cast to the target provider's schema so differences between the
 /// accelerator and federated source schemas (extra columns, differing
 /// types) don't cause incorrect writes.
-async fn execute_insert(
+pub(crate) async fn execute_insert(
     table: Arc<dyn TableProvider>,
     input_schema: SchemaRef,
     batches: Vec<RecordBatch>,
@@ -547,6 +595,96 @@ mod tests {
         }
     }
 
+    /// A federated `TableProvider` that sets `forwarded` whenever one of its write methods
+    /// runs, so a test can assert whether the write-back sink's fire-and-forget federated
+    /// forward was spawned.
+    struct SignalingTableProvider {
+        schema: SchemaRef,
+        forwarded: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl SignalingTableProvider {
+        fn new_arc(forwarded: Arc<std::sync::atomic::AtomicBool>) -> Arc<dyn TableProvider> {
+            Arc::new(Self {
+                schema: Arc::new(Schema::new(vec![Field::new(
+                    "count",
+                    DataType::UInt64,
+                    false,
+                )])),
+                forwarded,
+            })
+        }
+    }
+
+    /// Drain any fire-and-forget task the sink may have spawned. `#[tokio::test]` uses a
+    /// current-thread runtime, so a `tokio::spawn`ed task only makes progress when the test
+    /// yields; after enough yields the `forwarded` flag deterministically reflects whether
+    /// the forward ran — no wall-clock timeout, so a slow/busy CI cannot cause a false pass.
+    /// (The positive-control tests below prove this drain is sufficient: they observe the
+    /// flag set through the same path.)
+    async fn drain_spawned_tasks() {
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    impl std::fmt::Debug for SignalingTableProvider {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "SignalingTableProvider")
+        }
+    }
+
+    #[async_trait]
+    impl TableProvider for SignalingTableProvider {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+        async fn scan(
+            &self,
+            _state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Err(DataFusionError::NotImplemented("scan".to_string()))
+        }
+        async fn delete_from(
+            &self,
+            _state: &dyn Session,
+            _filters: Vec<Expr>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.forwarded
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(count_exec(0))
+        }
+        async fn update(
+            &self,
+            _state: &dyn Session,
+            _assignments: Vec<(String, Expr)>,
+            _filters: Vec<Expr>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.forwarded
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(count_exec(0))
+        }
+    }
+
+    /// Build a `TaskContext` whose session config carries a `RequestContext` with an active
+    /// `CayenneTransaction` — the exact shape `resolve_request_context` reads at execution
+    /// time, so the sinks' `request_in_transaction` check sees a live transaction.
+    fn task_ctx_in_transaction() -> Arc<TaskContext> {
+        use datafusion::prelude::SessionConfig;
+        use runtime_request_context::{Protocol, RequestContextBuilder};
+
+        let request_context = Arc::new(RequestContextBuilder::new(Protocol::Internal).build());
+        request_context.insert_extension(cayenne::CayenneTransaction::new());
+        let config = SessionConfig::new().with_extension(request_context);
+        Arc::new(TaskContext::default().with_session_config(config))
+    }
+
     // ── extract_dml_count ────────────────────────────────────────────────
 
     #[test]
@@ -607,10 +745,13 @@ mod tests {
             accelerator_plan: count_exec(42),
             federated,
             filters: vec![],
-            session_state,
+            session_state: session_state.clone(),
         };
 
-        let count = sink.delete_from().await.expect("deletion should succeed");
+        let count = sink
+            .delete_from(session_state.task_ctx())
+            .await
+            .expect("deletion should succeed");
         assert_eq!(count, 42);
     }
 
@@ -624,10 +765,13 @@ mod tests {
             accelerator_plan: ErrorExec::new_arc("accelerator delete failed"),
             federated,
             filters: vec![],
-            session_state,
+            session_state: session_state.clone(),
         };
 
-        let err = sink.delete_from().await.expect_err("deletion should fail");
+        let err = sink
+            .delete_from(session_state.task_ctx())
+            .await
+            .expect_err("deletion should fail");
         assert!(err.to_string().contains("accelerator delete failed"));
     }
 
@@ -644,10 +788,13 @@ mod tests {
             federated,
             assignments: vec![],
             filters: vec![],
-            session_state,
+            session_state: session_state.clone(),
         };
 
-        let count = sink.delete_from().await.expect("update should succeed");
+        let count = sink
+            .delete_from(session_state.task_ctx())
+            .await
+            .expect("update should succeed");
         assert_eq!(count, 7);
     }
 
@@ -662,10 +809,126 @@ mod tests {
             federated,
             assignments: vec![],
             filters: vec![],
+            session_state: session_state.clone(),
+        };
+
+        let err = sink
+            .delete_from(session_state.task_ctx())
+            .await
+            .expect_err("update should fail");
+        assert!(err.to_string().contains("accelerator update failed"));
+    }
+
+    // ── transaction-aware federated forward (skip while in a transaction) ─
+
+    #[tokio::test]
+    async fn write_back_deletion_forwards_when_not_in_transaction() {
+        // Positive control: outside a transaction the delete is published, so the
+        // fire-and-forget federated forward runs (proving the mock detects it).
+        let session_state = SessionContext::new().state();
+        let forwarded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let federated = Arc::new(FederatedTable::Immediate(SignalingTableProvider::new_arc(
+            Arc::clone(&forwarded),
+        )));
+        let sink = WriteBackDeletionSink {
+            accelerator_plan: count_exec(3),
+            federated,
+            filters: vec![],
+            session_state: session_state.clone(),
+        };
+
+        let count = sink
+            .delete_from(session_state.task_ctx())
+            .await
+            .expect("deletion should succeed");
+        assert_eq!(count, 3);
+        drain_spawned_tasks().await;
+        assert!(
+            forwarded.load(std::sync::atomic::Ordering::SeqCst),
+            "federated forward must run when not in a transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_back_deletion_skips_forward_in_transaction() {
+        // Inside a transaction the delete only STAGES; the delivery worker reconciles it
+        // from the commit markers, so the sink must NOT fire the federated forward (that
+        // would push a staged-but-uncommitted delete to the source).
+        let session_state = SessionContext::new().state();
+        let forwarded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let federated = Arc::new(FederatedTable::Immediate(SignalingTableProvider::new_arc(
+            Arc::clone(&forwarded),
+        )));
+        let sink = WriteBackDeletionSink {
+            accelerator_plan: count_exec(42),
+            federated,
+            filters: vec![],
             session_state,
         };
 
-        let err = sink.delete_from().await.expect_err("update should fail");
-        assert!(err.to_string().contains("accelerator update failed"));
+        let count = sink
+            .delete_from(task_ctx_in_transaction())
+            .await
+            .expect("deletion should succeed");
+        assert_eq!(count, 42);
+        drain_spawned_tasks().await;
+        assert!(
+            !forwarded.load(std::sync::atomic::Ordering::SeqCst),
+            "federated forward must be skipped inside a transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_back_update_forwards_when_not_in_transaction() {
+        let session_state = SessionContext::new().state();
+        let forwarded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let federated = Arc::new(FederatedTable::Immediate(SignalingTableProvider::new_arc(
+            Arc::clone(&forwarded),
+        )));
+        let sink = WriteBackUpdateSink {
+            accelerator_plan: count_exec(5),
+            federated,
+            assignments: vec![],
+            filters: vec![],
+            session_state: session_state.clone(),
+        };
+
+        let count = sink
+            .delete_from(session_state.task_ctx())
+            .await
+            .expect("update should succeed");
+        assert_eq!(count, 5);
+        drain_spawned_tasks().await;
+        assert!(
+            forwarded.load(std::sync::atomic::Ordering::SeqCst),
+            "federated forward must run when not in a transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_back_update_skips_forward_in_transaction() {
+        let session_state = SessionContext::new().state();
+        let forwarded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let federated = Arc::new(FederatedTable::Immediate(SignalingTableProvider::new_arc(
+            Arc::clone(&forwarded),
+        )));
+        let sink = WriteBackUpdateSink {
+            accelerator_plan: count_exec(7),
+            federated,
+            assignments: vec![],
+            filters: vec![],
+            session_state,
+        };
+
+        let count = sink
+            .delete_from(task_ctx_in_transaction())
+            .await
+            .expect("update should succeed");
+        assert_eq!(count, 7);
+        drain_spawned_tasks().await;
+        assert!(
+            !forwarded.load(std::sync::atomic::Ordering::SeqCst),
+            "federated forward must be skipped inside a transaction"
+        );
     }
 }

@@ -722,7 +722,7 @@ fn binlog_change_stream(
                 if flush_adopt || last_persist_at.elapsed() >= params.checkpoint_interval {
                     checkpointer.persist(&ack, &mut resume).await;
                     // A layout-adopt flush fires off-interval only to durably
-                    // record the new fingerprint (trunk #11761) — skip the head
+                    // record the new fingerprint — skip the head
                     // poll/heartbeat there. On a regular interval flush, poll the
                     // source head and, when caught up, emit a lag-based readiness
                     // heartbeat.
@@ -953,12 +953,8 @@ pub(super) fn readiness_heartbeat(
     let is_ready = crate::cdc::source_commit_within_ready_lag(Some(source_now_ms), ready_lag);
     // Log the idle heartbeat so lag-based readiness can be verified from the logs
     // (target spice_cdc::heartbeat). Covers both call sites of this helper.
-    let lag_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|d| i64::try_from(d.as_millis()).ok())
-        .map(|now| now.saturating_sub(source_now_ms));
-    tracing::info!(
+    let lag_ms = crate::cdc::replication_lag_ms(Some(source_now_ms));
+    tracing::debug!(
         target: "spice_cdc::heartbeat",
         connector = "mysql",
         dataset = %dataset_name,

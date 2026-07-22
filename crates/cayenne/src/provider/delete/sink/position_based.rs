@@ -20,7 +20,7 @@ limitations under the License.
 //! It uses file-local row positions tracked via `RoaringBitmap` for efficient
 //! row exclusion during Vortex scans.
 
-// `vortex::array::arrow::IntoArrowArray::into_arrow_preferred` is deprecated in favour of
+// `vortex::arrow::IntoArrowArray::into_arrow_preferred` is deprecated in favour of
 // `execute_arrow(ctx)`; migrating requires threading a Vortex session through the delete path,
 // which is deferred. Use `expect` (not `allow`) so it resurfaces once that migration lands.
 #![expect(deprecated)]
@@ -45,14 +45,41 @@ use futures::StreamExt;
 use object_store::ObjectStore;
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 use vortex::VortexSessionDefault;
-use vortex::array::arrow::IntoArrowArray;
+use vortex::arrow::IntoArrowArray;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::layout::layouts::row_idx::row_idx;
 use vortex_datafusion::DefaultExpressionConvertor;
 use vortex_datafusion::ExpressionConvertor;
 use vortex_session::VortexSession;
+
+struct PositionDeleteCleanup(Vec<PathBuf>);
+
+impl Drop for PositionDeleteCleanup {
+    fn drop(&mut self) {
+        let paths = std::mem::take(&mut self.0);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                crate::provider::delete::cleanup_uncommitted_delete_paths(&paths).await;
+            });
+        } else {
+            std::thread::spawn(move || {
+                for path in paths {
+                    match std::fs::remove_file(path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "Failed to clean uncommitted deletion-vector file"
+                        ),
+                    }
+                }
+            });
+        }
+    }
+}
 
 static MAX_CONCURRENT_FILE_SCANS: LazyLock<usize> = LazyLock::new(get_available_parallelism);
 
@@ -775,8 +802,6 @@ impl CayenneDeletionSink {
         // Build write specs and precompute cache updates while counting TRUE new deletions
         // (set difference between incoming row_ids and existing cache per file).
         let mut new_deletion_count: usize = 0;
-        let mut overflow_count: u64 = 0;
-        let mut first_overflow_id: Option<u64> = None;
         let mut specs: Vec<DeletionVectorWriteSpec> = Vec::new();
         let mut cache_updates: HashMap<String, Arc<PositionDeletionVector>> = HashMap::new();
 
@@ -789,14 +814,15 @@ impl CayenneDeletionSink {
             // Deduplicate incoming row IDs first to avoid over-counting and redundant writes.
             let mut unique_new_row_ids: Vec<u32> = Vec::with_capacity(incoming_row_ids.len());
             for &id in incoming_row_ids {
-                if let Ok(id32) = u32::try_from(id) {
-                    unique_new_row_ids.push(id32);
-                } else {
-                    if first_overflow_id.is_none() {
-                        first_overflow_id = Some(id);
-                    }
-                    overflow_count += 1;
-                }
+                let id32 = u32::try_from(id).map_err(|_| Error::DataValidation {
+                    table: table_name.clone(),
+                    message: format!(
+                        "Position deletion row ID {id} for data file '{file_path}' exceeds the supported maximum {}. Compact the table into files with at most {} rows before using position-based deletion.",
+                        u32::MAX,
+                        u32::MAX
+                    ),
+                })?;
+                unique_new_row_ids.push(id32);
             }
             unique_new_row_ids.sort_unstable();
             unique_new_row_ids.dedup();
@@ -814,7 +840,12 @@ impl CayenneDeletionSink {
                 continue;
             }
 
-            new_deletion_count += newly_added_for_file;
+            new_deletion_count = new_deletion_count
+                .checked_add(newly_added_for_file)
+                .ok_or_else(|| Error::Internal {
+                    table: table_name.clone(),
+                    message: "New position-deletion count overflowed usize".to_string(),
+                })?;
 
             // Union existing + new into one bitmap, then derive the writer-bound
             // `Vec<u64>` from its monotone iterator — saves a separate
@@ -841,31 +872,38 @@ impl CayenneDeletionSink {
             );
         }
 
-        if overflow_count > 0 {
-            tracing::warn!(
-                "Skipped {} row ID(s) that exceed u32::MAX (first: {}) - table should be compacted",
-                overflow_count,
-                first_overflow_id.unwrap_or(0)
-            );
-        }
-
         if specs.is_empty() {
             return Ok(0);
         }
 
         let results = writer.write(specs).await?;
-
-        for result in results {
-            self.catalog.add_delete_file(result.delete_file).await?;
-
-            // Validate we received position-based identifiers as expected
+        for result in &results {
             if matches!(&result.identifiers, DeletionIdentifier::KeyBased(_)) {
+                for written in &results {
+                    Self::cleanup_uncommitted_delete_file(&written.delete_file.path).await;
+                }
                 return Err(Error::Internal {
                     table: table_name.clone(),
                     message: "Unexpected key-based deletion in position-based sink".to_string(),
                 });
             }
         }
+        let delete_files = results
+            .into_iter()
+            .map(|result| result.delete_file)
+            .collect::<Vec<_>>();
+        let cleanup_paths = delete_files
+            .iter()
+            .map(|delete_file| delete_file.path.clone())
+            .collect::<Vec<_>>();
+        let mut cleanup_guard =
+            PositionDeleteCleanup(cleanup_paths.iter().map(PathBuf::from).collect());
+        if let Err(error) = self.catalog.add_delete_files(delete_files).await {
+            super::super::cleanup_uncommitted_delete_paths(&cleanup_guard.0).await;
+            cleanup_guard.0.clear();
+            return Err(error.into());
+        }
+        cleanup_guard.0.clear();
 
         // Build a fresh snapshot. Cloning the outer HashMap now only clones
         // small (String, Arc<PositionDeletionVector>) entries — unchanged files

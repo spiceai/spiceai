@@ -34,10 +34,10 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 use vortex::array::ArrayRef;
-use vortex::array::arrow::FromArrowArray;
 use vortex::array::stream::ArrayStreamAdapter;
+use vortex::arrow::FromArrowArray;
+use vortex::arrow::FromArrowType;
 use vortex::dtype::DType;
-use vortex::dtype::arrow::FromArrowType;
 use vortex::file::WriteOptionsSessionExt;
 use vortex::file::WriteSummary;
 use vortex::io::VortexWrite;
@@ -878,8 +878,8 @@ mod tests {
     use datafusion_physical_expr::expressions::Column;
     use object_store::path::Path;
     use vortex::VortexSessionDefault;
+    use vortex::arrow::FromArrowType;
     use vortex::dtype::DType;
-    use vortex::dtype::arrow::FromArrowType;
     use vortex::file::WriteSummary;
     use vortex::session::VortexSession;
 
