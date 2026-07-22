@@ -243,7 +243,11 @@ pub fn plan(
     let per_instance_cap_bytes = duckdb_pool_total
         .checked_div(unset)
         .map_or(0, |per_instance| {
-            per_instance.max(DUCKDB_MIN_INSTANCE_CAP_BYTES)
+            // Floor to whole MiB so the published cap, the aggregate reservation, and
+            // the warning all equal what DuckDB is actually set to — `SET memory_limit`
+            // is emitted as floored MiB (see `format_duckdb_memory_limit`). The 128 MiB
+            // floor is already MiB-aligned, so `max` before flooring is exact.
+            (per_instance.max(DUCKDB_MIN_INSTANCE_CAP_BYTES) / MIB) * MIB
         });
 
     let duckdb_reservation_bytes =
@@ -274,6 +278,13 @@ mod tests {
     };
 
     const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+
+    /// Whole-MiB floor — per-instance caps are floored so they match DuckDB's
+    /// applied `SET memory_limit` (see `format_duckdb_memory_limit`).
+    fn floor_mib(bytes: u64) -> u64 {
+        (bytes / MIB) * MIB
+    }
 
     /// 32 GiB host, 90% non-Cayenne query default.
     fn total_and_base() -> (u64, u64) {
@@ -315,7 +326,7 @@ mod tests {
         let p = plan(total, base, None, &unset(1));
         assert_eq!(p.outcome, PlanOutcome::Applied);
         assert_eq!(p.effective_query_pool_bytes, base / 2);
-        assert_eq!(p.per_instance_cap_bytes, base - base / 2);
+        assert_eq!(p.per_instance_cap_bytes, floor_mib(base - base / 2));
         assert_eq!(p.query_pool_cap_bytes, Some(base / 2));
         assert!(!p.residual_overcommit);
         // The whole point: query + DuckDB ≤ base ≤ 90% of host, leaving ≥10% headroom.
@@ -331,10 +342,34 @@ mod tests {
             let p = plan(total, base, None, &unset(n));
             assert_eq!(p.outcome, PlanOutcome::Applied);
             let duckdb_half = base - p.effective_query_pool_bytes;
-            assert_eq!(p.per_instance_cap_bytes, duckdb_half / u64::from(n));
+            assert_eq!(
+                p.per_instance_cap_bytes,
+                floor_mib(duckdb_half / u64::from(n))
+            );
             assert!(
                 p.effective_query_pool_bytes + p.duckdb_reservation_bytes <= base,
                 "n={n} overcommits base"
+            );
+        }
+    }
+
+    /// Every published per-instance cap is whole-MiB aligned, so the warning and
+    /// the aggregate reservation exactly match DuckDB's floored `SET memory_limit`.
+    #[test]
+    fn per_instance_cap_is_mib_aligned() {
+        let (total, base) = total_and_base();
+        for n in 1..=8_u32 {
+            let p = plan(total, base, None, &unset(n));
+            assert_eq!(
+                p.per_instance_cap_bytes % MIB,
+                0,
+                "n={n}: cap {} not MiB-aligned",
+                p.per_instance_cap_bytes
+            );
+            assert_eq!(
+                p.duckdb_reservation_bytes % MIB,
+                0,
+                "n={n}: reservation not MiB-aligned"
             );
         }
     }
@@ -401,7 +436,7 @@ mod tests {
         assert_eq!(p.outcome, PlanOutcome::Applied);
         assert_eq!(p.effective_query_pool_bytes, q);
         assert_eq!(p.query_pool_cap_bytes, None); // never override an explicit limit
-        assert_eq!(p.per_instance_cap_bytes, (base - q) / 2);
+        assert_eq!(p.per_instance_cap_bytes, floor_mib((base - q) / 2));
     }
 
     /// An explicit query limit that itself over-commits: honored, `DuckDB` floored,

@@ -1633,20 +1633,21 @@ pub(crate) fn coordinated_mem_tier_budget(
     total_memory: u64,
     query_pool_bytes: u64,
     compaction_pool_bytes: u64,
-    duckdb_reservation_bytes: u64,
+    external_reservation_bytes: u64,
 ) -> u64 {
     let headroom = total_memory / MEM_TIER_HEADROOM_FRACTION;
     let base_ceiling = total_memory / MEM_TIER_CEILING_FRACTION;
     let floor = (total_memory / MEM_TIER_FLOOR_FRACTION).min(base_ceiling);
-    // A co-resident DuckDB accelerator carries its own aggregate ceiling
-    // (`duckdb_reservation_bytes`) OUTSIDE the query/compaction pools, carved from
-    // the same host RAM by the coordinated budget. Subtract it here so the tier —
-    // and especially its query-light float below — can't reclaim room already
-    // reserved for DuckDB. `0` when no DuckDB accelerators are configured.
+    // Memory reserved OUTSIDE the query and compaction pools by other subsystems —
+    // today a co-resident DuckDB accelerator's aggregate ceiling (see
+    // `accelerator_memory_budget`), and any future external consumer — carved from
+    // the same host RAM by the coordinated budget. Subtract it here so the tier,
+    // and especially its query-light float below, can't reclaim room already
+    // reserved elsewhere. `0` when nothing external is reserved.
     let remainder = total_memory
         .saturating_sub(query_pool_bytes)
         .saturating_sub(compaction_pool_bytes)
-        .saturating_sub(duckdb_reservation_bytes)
+        .saturating_sub(external_reservation_bytes)
         .saturating_sub(headroom);
     // Floating ceiling for query-light deployments: when the query + compaction
     // pools are sized well below the default partition (an operator who set a low
@@ -1663,7 +1664,7 @@ pub(crate) fn coordinated_mem_tier_budget(
     let float_room = total_memory
         .saturating_sub(query_pool_bytes)
         .saturating_sub(compaction_pool_bytes)
-        .saturating_sub(duckdb_reservation_bytes)
+        .saturating_sub(external_reservation_bytes)
         .saturating_sub(2 * headroom);
     let ceiling = base_ceiling.max(float_room.min(total_memory / MEM_TIER_FLOAT_CEILING_FRACTION));
     remainder.clamp(floor, ceiling)

@@ -1284,7 +1284,26 @@ fn emit_duckdb_memory_budget_warning(
         ""
     };
 
-    if plan.residual_overcommit {
+    if n == 0 {
+        // Every DuckDB instance set an explicit duckdb_memory_limit — there are no
+        // un-limited instances to auto-cap, only the query pool was reduced to fit
+        // those explicit ceilings. (Describe just that, not a "0 instances capped".)
+        if plan.residual_overcommit {
+            tracing::warn!(
+                total_memory_bytes = total_memory,
+                query_pool_bytes = plan.effective_query_pool_bytes,
+                duckdb_explicit_bytes = inputs.sum_explicit_bytes,
+                "The explicit DuckDB accelerator memory limits plus the query pool over-commit host memory: they can exceed the {total_h} available to this process (cgroup-aware), risking an OOM kill under load. Lower the per-dataset duckdb_memory_limit values and/or runtime.query.memory_limit so combined ceilings fit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
+            );
+        } else {
+            tracing::warn!(
+                total_memory_bytes = total_memory,
+                query_pool_bytes = plan.effective_query_pool_bytes,
+                duckdb_explicit_bytes = inputs.sum_explicit_bytes,
+                "Reduced the DataFusion query pool to {query_h} so it plus the explicit DuckDB accelerator memory limits fit the {total_h} available to this process (cgroup-aware). To customize, set runtime.query.memory_limit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
+            );
+        }
+    } else if plan.residual_overcommit {
         tracing::warn!(
             total_memory_bytes = total_memory,
             projected_ceiling_bytes = plan.projected_ceiling_bytes,
