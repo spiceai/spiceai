@@ -621,7 +621,7 @@ impl HttpTableProvider {
                 !self
                     .auth
                     .as_ref()
-                    .is_some_and(|auth| auth.header_name() == &parsed),
+                    .is_some_and(|auth| auth.header_name() == parsed),
                 ConfigurationSnafu {
                     message: format!(
                         "request_header_allowlist cannot include '{name}' when HTTP authentication is configured; that header carries the auth token. Remove '{name}' from request_header_allowlist or disable HTTP authentication.",
@@ -3316,7 +3316,7 @@ impl HttpTableProvider {
             if self
                 .auth
                 .as_ref()
-                .is_some_and(|auth| auth.header_name() == &header_name)
+                .is_some_and(|auth| auth.header_name() == header_name)
             {
                 return Err(Error::FilterRejected {
                     message: format!(

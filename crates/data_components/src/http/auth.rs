@@ -20,7 +20,7 @@ limitations under the License.
 //! uses to decorate outgoing requests. The main implementation is
 //! [`OAuth2Auth`], which acquires short-lived access tokens from a configured
 //! token endpoint and refreshes them in the background before they expire. Two
-//! OAuth2 grants are supported (see [`OAuthGrant`]):
+//! `OAuth2` grants are supported (see [`OAuthGrant`]):
 //!
 //! - the refresh-token grant (RFC 6749 §6): exchange a long-lived refresh token
 //!   for access tokens; the endpoint may rotate the refresh token;
