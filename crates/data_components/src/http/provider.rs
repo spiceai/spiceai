@@ -720,8 +720,8 @@ impl HttpTableProvider {
     }
 
     /// Attach an [`HttpAuthenticator`](super::auth::HttpAuthenticator) that decorates
-    /// every outgoing data request (e.g. to apply a bearer token refreshed in the
-    /// background by [`RefreshTokenAuth`](super::auth::RefreshTokenAuth)).
+    /// every outgoing data request (e.g. to apply an access token refreshed in the
+    /// background by [`OAuth2Auth`](super::auth::OAuth2Auth)).
     #[must_use]
     pub fn with_auth(mut self, auth: Arc<dyn super::auth::HttpAuthenticator>) -> Self {
         self.auth = Some(auth);
@@ -4052,7 +4052,7 @@ mod tests {
 
         // Allowlisting the exact header the auth token occupies is rejected.
         let err = base_provider()
-            .with_auth(Arc::clone(&auth) as Arc<dyn super::auth::HttpAuthenticator>)
+            .with_auth(Arc::clone(&auth) as Arc<dyn super::super::auth::HttpAuthenticator>)
             .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["x-shopify-access-token"])
             .expect_err("allowlisting the configured auth header must be rejected");
         match err {
@@ -4072,7 +4072,7 @@ mod tests {
         // A different header name is unaffected — the guard is keyed on the
         // configured name, not hard-coded to `authorization`.
         base_provider()
-            .with_auth(auth as Arc<dyn super::auth::HttpAuthenticator>)
+            .with_auth(auth as Arc<dyn super::super::auth::HttpAuthenticator>)
             .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["x-region"])
             .expect("a non-auth header name should be allowlisted fine");
     }
@@ -4087,7 +4087,7 @@ mod tests {
             .expect("allowlisted before auth configured")
             .with_auth(Arc::new(CustomHeaderAuthenticator(HeaderName::from_static(
                 "x-shopify-access-token",
-            ))) as Arc<dyn super::auth::HttpAuthenticator>);
+            ))) as Arc<dyn super::super::auth::HttpAuthenticator>);
         let filters = vec![Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::Column(Column::from_name("request_headers"))),
             op: Operator::Eq,
