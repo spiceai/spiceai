@@ -541,7 +541,7 @@ async fn mysql_binlog_replication_restart_resume_cayenne() -> Result<(), anyhow:
         .await
 }
 
-/// P0 GTID auto-positioning resume (issue #11669): on a `gtid_mode = ON` source,
+/// GTID auto-positioning resume: on a `gtid_mode = ON` source,
 /// the connector bootstraps a GTID cursor and, after a process restart, resumes
 /// via `COM_BINLOG_DUMP_GTID` from the persisted executed set with no
 /// duplicates or gaps. If GTID resume were broken (e.g. the dump-request set or

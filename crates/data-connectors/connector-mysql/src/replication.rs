@@ -262,14 +262,26 @@ impl PositionStore for SidecarPositionStore {
         // `MySqlBinlogSys::get` swallows read errors into `None`, matching the
         // MongoDB sidecar: an unreadable checkpoint re-bootstraps rather than
         // wedging the dataset.
-        Ok(self.sys.get().await.map(|cp| PersistedPosition {
-            position: BinlogPosition::new(cp.binlog_file, cp.binlog_pos),
-            schema_json: cp.schema_json,
-            gtid_set: cp.gtid_executed,
-            // An unset/unknown stored type resolves to `None`, which the
-            // replication layer treats as an incompatible checkpoint rather than
-            // guessing the cursor type.
-            cursor_type: cp.cursor_type.as_deref().and_then(CursorType::from_stored),
+        Ok(self.sys.get().await.map(|cp| {
+            // The type is always written by this connector; the absent case can
+            // only arise from a pre-release dev checkpoint (the column didn't
+            // exist). Resolve it here from the GTID set rather than propagating
+            // an `Option` through resume.
+            let cursor_type = cp
+                .cursor_type
+                .as_deref()
+                .and_then(CursorType::from_stored)
+                .unwrap_or(if cp.gtid_executed.is_some() {
+                    CursorType::Gtid
+                } else {
+                    CursorType::File
+                });
+            PersistedPosition {
+                position: BinlogPosition::new(cp.binlog_file, cp.binlog_pos),
+                schema_json: cp.schema_json,
+                gtid_set: cp.gtid_executed,
+                cursor_type,
+            }
         }))
     }
 
@@ -280,7 +292,7 @@ impl PositionStore for SidecarPositionStore {
                 binlog_pos: position.position.pos,
                 schema_json: position.schema_json.clone(),
                 gtid_executed: position.gtid_set.clone(),
-                cursor_type: position.cursor_type.map(|c| c.as_str().to_string()),
+                cursor_type: Some(position.cursor_type.as_str().to_string()),
                 updated_at: None,
             })
             .await

@@ -1404,11 +1404,11 @@ impl Checkpointer {
             gtid_set: gtid_set.clone(),
             // Stored explicitly so classification never depends on whether the
             // (possibly empty) GTID set round-trips as non-null.
-            cursor_type: Some(if self.use_gtid {
+            cursor_type: if self.use_gtid {
                 CursorType::Gtid
             } else {
                 CursorType::File
-            }),
+            },
         };
         match self.store.save(&persisted).await {
             Ok(()) => {
@@ -1929,7 +1929,7 @@ mod tests {
             .expect("lock")
             .clone()
             .expect("a checkpoint was saved");
-        assert_eq!(saved.cursor_type, Some(CursorType::Gtid));
+        assert_eq!(saved.cursor_type, CursorType::Gtid);
         assert_eq!(
             saved.gtid_set.as_deref(),
             Some(format!("{uuid}:5-6").as_str())

@@ -228,7 +228,7 @@ mod tests {
         assert_eq!(retrieved.cursor_type, checkpoint.cursor_type);
     }
 
-    /// F7: an empty GTID executed set must round-trip as `gtid`, never
+    /// An empty GTID executed set must round-trip as `gtid`, never
     /// reclassify as file+offset (see the sqlite twin for the rationale).
     #[tokio::test]
     async fn test_duckdb_empty_gtid_set_stays_gtid() {

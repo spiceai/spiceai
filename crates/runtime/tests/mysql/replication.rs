@@ -443,7 +443,7 @@ async fn purged_position_behavior() -> Result<(), anyhow::Error> {
         position: data_components::mysql_replication::BinlogPosition::new("binlog.999999", 4),
         schema_json: Some(stale_meta),
         gtid_set: None,
-        cursor_type: Some(CursorType::File),
+        cursor_type: CursorType::File,
     };
 
     // Default behavior (`error`): the stream surfaces an actionable error.

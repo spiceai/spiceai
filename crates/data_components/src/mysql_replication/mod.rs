@@ -135,8 +135,7 @@ pub enum Error {
          `gtid_mode = ON` (it may have been reconfigured, or this is a different server without \
          GTIDs). Resuming by file+offset instead would silently start from a server-local \
          position that does not correspond to the applied GTID set. Restore `gtid_mode = ON` on \
-         the source, or drop the accelerator's persisted state (its `spice_sys_mysql_binlog` row) \
-         to re-bootstrap by file+offset. \
+         the source to re-bootstrap by file+offset. \
          See: https://spiceai.org/docs/components/data-connectors/mysql"
     ))]
     GtidResumeUnavailable {
@@ -150,7 +149,8 @@ pub enum Error {
          emitted an anonymous transaction (no GTID). This means the source's `gtid_mode` is not \
          fully ON (e.g. ON_PERMISSIVE), so the applied GTID set cannot describe every \
          transaction. Set `gtid_mode = ON` on the source, or drop the accelerator's persisted \
-         state to re-bootstrap by file+offset."
+         state to re-bootstrap by file+offset. \
+         See: https://spiceai.org/docs/components/data-connectors/mysql"
     ))]
     AnonymousTransactionUnderGtid { dataset: String },
 }
@@ -181,11 +181,8 @@ pub struct PersistedPosition {
     /// `COM_BINLOG_DUMP_GTID`.
     pub gtid_set: Option<String>,
     /// The checkpoint's cursor type, stored explicitly rather than inferred
-    /// from `gtid_set` (an empty GTID set must still resume as GTID; see
-    /// [`CursorType`]). `None` marks a checkpoint that predates the stored type
-    /// (or is corrupt): the caller treats it as incompatible rather than
-    /// guessing, so a mis-typed resume can never silently open a failover gap.
-    pub cursor_type: Option<CursorType>,
+    /// from `gtid_set` (an empty GTID set must still resume as GTID; see [`CursorType`])
+    pub cursor_type: CursorType,
 }
 
 /// Version tag for [`CheckpointMeta`] serialized into `schema_json`.
@@ -561,23 +558,21 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
                 tracing::info!(
                     dataset = %dataset_name,
                     position = %persisted.position,
-                    "`snapshot_mode: always`: running the initial snapshot despite a persisted \
-                     binlog position"
+                    "`snapshot_mode: always`: running the initial snapshot despite a persisted binlog position"
                 );
                 (None, None, cold_start_use_gtid)
             }
             Some(persisted) => {
-                // The checkpoint's cursor type is stored, not inferred: an empty
-                // GTID set (`gtid_mode = ON`, zero txns yet) must still resume as
-                // GTID, so a mis-typed resume can never silently open a failover
-                // gap. `None` marks a checkpoint with no stored type (written by
-                // an incompatible build) or corrupt data.
-                let checkpoint_type = persisted.cursor_type;
+                // The checkpoint's cursor type is stored, not inferred, so an
+                // empty GTID set (`gtid_mode = ON`, zero txns yet) still resumes
+                // as GTID and a mis-typed resume can never silently open a
+                // failover gap.
+                let cursor = persisted.cursor_type;
 
                 // A GTID-bootstrapped dataset cannot keep its cursor type if the
                 // server no longer supports GTID — hard error, never a silent
                 // file+offset downgrade.
-                if checkpoint_type == Some(CursorType::Gtid) && !gtid_on {
+                if cursor == CursorType::Gtid && !gtid_on {
                     return GtidResumeUnavailableSnafu {
                         dataset: dataset_name.clone(),
                         database: database.clone(),
@@ -586,16 +581,18 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
                     .fail();
                 }
 
-                match checkpoint_type {
-                    // No stored cursor type → cannot safely classify the resume.
-                    // Treat as an incompatible checkpoint (there are no released
-                    // checkpoints without a type; this only arises from a dev
-                    // build) → honors `invalid_position_behavior`.
-                    None => match params.invalid_position_behavior {
+                // Layout/schema drift is a same-type concern → honors
+                // `invalid_position_behavior`.
+                if let Err(drift) = check_resume_compatibility(
+                    persisted.schema_json.as_deref(),
+                    schema_json.as_deref(),
+                    &layout_fingerprint,
+                ) {
+                    match params.invalid_position_behavior {
                         InvalidCheckpointBehavior::Error => {
                             return StalePositionSnafu {
                                 message: format!(
-                                    "cannot resume mysql binlog for {dataset_name} from {}: the persisted checkpoint has no stored cursor type (it was written by an incompatible build). Set `mysql_replication_invalid_checkpoint_behavior: restart` to drop the saved position and re-snapshot the table.",
+                                    "cannot resume mysql binlog for {dataset_name} from {}: {drift}. Replaying historical row images against the current source layout would mis-map columns. Set `mysql_replication_invalid_checkpoint_behavior: restart` to drop the saved position and re-snapshot the table.",
                                     persisted.position
                                 ),
                             }
@@ -605,110 +602,73 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
                             tracing::warn!(
                                 dataset = %dataset_name,
                                 position = %persisted.position,
-                                "persisted binlog checkpoint has no stored cursor type; restart behavior enabled, falling back to a fresh snapshot"
+                                drift = %drift,
+                                "persisted binlog checkpoint is incompatible with the current source layout / dataset schema; rebootstrap behavior enabled, falling back to a fresh snapshot"
                             );
                             clear_position(&position_store, &dataset_name).await;
                             (None, None, cold_start_use_gtid)
                         }
-                    },
-                    Some(cursor) => {
-                        // Layout/schema drift is a same-type concern → honors
+                    }
+                } else {
+                    match cursor {
+                        // GTID resume: the server computes the start point from
+                        // the executed set, so no binlog-file-existence pre-check.
+                        // An empty stored set is legitimate (parses to the empty
+                        // set); a corrupt one is a same-type data problem → honors
                         // `invalid_position_behavior`.
-                        if let Err(drift) = check_resume_compatibility(
-                            persisted.schema_json.as_deref(),
-                            schema_json.as_deref(),
-                            &layout_fingerprint,
-                        ) {
-                            match params.invalid_position_behavior {
-                                InvalidCheckpointBehavior::Error => {
-                                    return StalePositionSnafu {
-                                        message: format!(
-                                            "cannot resume mysql binlog for {dataset_name} from {}: {drift}. Replaying historical row images against the current source layout would mis-map columns. Set `mysql_replication_invalid_checkpoint_behavior: restart` to drop the saved position and re-snapshot the table.",
-                                            persisted.position
-                                        ),
-                                    }
-                                    .fail();
-                                }
-                                InvalidCheckpointBehavior::Restart => {
-                                    tracing::warn!(
-                                        dataset = %dataset_name,
-                                        position = %persisted.position,
-                                        drift = %drift,
-                                        "persisted binlog checkpoint is incompatible with the current source layout / dataset schema; rebootstrap behavior enabled, falling back to a fresh snapshot"
-                                    );
-                                    clear_position(&position_store, &dataset_name).await;
-                                    (None, None, cold_start_use_gtid)
-                                }
-                            }
-                        } else {
-                            match cursor {
-                                // GTID resume: the server computes the start point
-                                // from the executed set, so no binlog-file-existence
-                                // pre-check. An empty stored set is legitimate (parses
-                                // to the empty set); a corrupt one is a same-type data
-                                // problem → honors `invalid_position_behavior`.
-                                CursorType::Gtid => {
-                                    match GtidSet::parse(
-                                        persisted.gtid_set.as_deref().unwrap_or_default(),
-                                    ) {
-                                        Ok(set) => (Some(persisted.position), Some(set), true),
-                                        Err(message) => match params.invalid_position_behavior {
-                                            InvalidCheckpointBehavior::Error => {
-                                                return GtidParseSnafu {
-                                                    message: format!(
-                                                        "cannot resume mysql binlog for {dataset_name}: persisted GTID set is corrupt ({message}). Set `mysql_replication_invalid_checkpoint_behavior: restart` to re-snapshot."
-                                                    ),
-                                                }
-                                                .fail();
-                                            }
-                                            InvalidCheckpointBehavior::Restart => {
-                                                tracing::warn!(
-                                                    dataset = %dataset_name,
-                                                    error = %message,
-                                                    "persisted GTID set is corrupt; restart behavior enabled, falling back to a fresh snapshot"
-                                                );
-                                                clear_position(&position_store, &dataset_name)
-                                                    .await;
-                                                (None, None, cold_start_use_gtid)
-                                            }
-                                        },
-                                    }
-                                }
-                                CursorType::File => {
-                                    if setup::binlog_file_exists(
-                                        &mut conn,
-                                        &persisted.position.file,
-                                    )
-                                    .await?
-                                    {
-                                        (Some(persisted.position), None, false)
-                                    } else {
-                                        match params.invalid_position_behavior {
-                                            InvalidCheckpointBehavior::Error => {
-                                                return StalePositionSnafu {
-                                                    message: format!(
-                                                        "persisted binlog position {} is no longer on the server \
-                                                         (binary logs were purged). Set \
-                                                         `mysql_replication_invalid_checkpoint_behavior: restart` to \
-                                                         drop the saved position and re-snapshot the table, or increase \
-                                                         `binlog_expire_logs_seconds` on the source.",
-                                                        persisted.position
-                                                    ),
-                                                }
-                                                .fail();
-                                            }
-                                            InvalidCheckpointBehavior::Restart => {
-                                                tracing::warn!(
-                                                    dataset = %dataset_name,
-                                                    position = %persisted.position,
-                                                    "persisted binlog position was purged from the source; restart \
-                                                     behavior enabled, falling back to a fresh snapshot"
-                                                );
-                                                clear_position(&position_store, &dataset_name)
-                                                    .await;
-                                                (None, None, cold_start_use_gtid)
-                                            }
+                        CursorType::Gtid => {
+                            match GtidSet::parse(persisted.gtid_set.as_deref().unwrap_or_default())
+                            {
+                                Ok(set) => (Some(persisted.position), Some(set), true),
+                                Err(message) => match params.invalid_position_behavior {
+                                    InvalidCheckpointBehavior::Error => {
+                                        return GtidParseSnafu {
+                                            message: format!(
+                                                "cannot resume mysql binlog for {dataset_name}: persisted GTID set is corrupt ({message}). Set `mysql_replication_invalid_checkpoint_behavior: restart` to re-snapshot."
+                                            ),
                                         }
+                                        .fail();
+                                    }
+                                    InvalidCheckpointBehavior::Restart => {
+                                        tracing::warn!(
+                                            dataset = %dataset_name,
+                                            error = %message,
+                                            "persisted GTID set is corrupt; restart behavior enabled, falling back to a fresh snapshot"
+                                        );
+                                        clear_position(&position_store, &dataset_name).await;
+                                        (None, None, cold_start_use_gtid)
+                                    }
+                                },
+                            }
+                        }
+                        CursorType::File => {
+                            if setup::binlog_file_exists(&mut conn, &persisted.position.file)
+                                .await?
+                            {
+                                (Some(persisted.position), None, false)
+                            } else {
+                                match params.invalid_position_behavior {
+                                    InvalidCheckpointBehavior::Error => {
+                                        return StalePositionSnafu {
+                                            message: format!(
+                                                "persisted binlog position {} is no longer on the server \
+                                                 (binary logs were purged). Set \
+                                                 `mysql_replication_invalid_checkpoint_behavior: restart` to \
+                                                 drop the saved position and re-snapshot the table, or increase \
+                                                 `binlog_expire_logs_seconds` on the source.",
+                                                persisted.position
+                                            ),
+                                        }
+                                        .fail();
+                                    }
+                                    InvalidCheckpointBehavior::Restart => {
+                                        tracing::warn!(
+                                            dataset = %dataset_name,
+                                            position = %persisted.position,
+                                            "persisted binlog position was purged from the source; restart behavior enabled, falling back to a fresh snapshot"
+                                        );
+                                        clear_position(&position_store, &dataset_name).await;
+                                        (None, None, cold_start_use_gtid)
                                     }
                                 }
                             }
@@ -794,11 +754,11 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
         let seed = if use_gtid { head_gtid } else { GtidSet::new() };
         let checkpoint_gtid = use_gtid.then(|| seed.to_string());
         // Stored explicitly so an empty GTID seed still reloads as GTID.
-        let checkpoint_cursor_type = Some(if use_gtid {
+        let checkpoint_cursor_type = if use_gtid {
             CursorType::Gtid
         } else {
             CursorType::File
-        });
+        };
         // Seed snapshot progress from the source's approximate row count
         // (`information_schema.TABLES`) so operators get a progress signal;
         // best-effort — absence just leaves the metric unset.
