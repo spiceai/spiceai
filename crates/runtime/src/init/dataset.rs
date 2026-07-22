@@ -579,6 +579,8 @@ impl Runtime {
     ///
     /// Used for datasets synthesized at runtime (e.g. by catalog-level
     /// acceleration) rather than declared in the Spicepod `datasets:` list.
+    // Only the PostgreSQL catalog connector synthesizes datasets today.
+    #[cfg(feature = "postgres")]
     pub(crate) async fn load_synthesized_dataset(self: Arc<Self>, ds: Arc<Dataset>) {
         // Throttle accelerator init to the same `dataset_load_parallelism` budget
         // `load_dataset` enforces. Catalog-level acceleration spawns one

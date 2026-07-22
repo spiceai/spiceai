@@ -13,6 +13,7 @@ All criteria must be met for the embedding component to be considered Stable.
 | Databricks              | ➖             |              |
 | File                    | ➖             |              |
 | Hugging Face            | ➖             |              |
+| Model2Vec               | ➖             |              |
 | OpenAI                  | ➖             |              |
 | Spice.ai Cloud Platform | ➖             |              |
 
