@@ -58,6 +58,8 @@ use crate::{configure_test_datafusion, init_tracing};
 const MYSQL_E2E_PORT: u16 = 13322;
 #[cfg(not(target_os = "windows"))]
 const MYSQL_E2E_CAYENNE_PORT: u16 = 13323;
+#[cfg(not(target_os = "windows"))]
+const MYSQL_E2E_RESTART_PORT: u16 = 13321;
 
 /// The accelerator engine a run of the e2e exercises.
 struct EngineConfig {
@@ -407,4 +409,132 @@ async fn mysql_binlog_replication_end_to_end_cayenne() -> Result<(), anyhow::Err
         },
     )
     .await
+}
+
+/// Restart / resume round-trip through the full runtime on the file-backed
+/// Cayenne accelerator: a second runtime pointed at the same accelerator dirs
+/// resumes from the persisted `spice_sys_mysql_binlog` position (no
+/// re-snapshot), replays the changes made while it was down, and re-reaches
+/// Ready via lag-based readiness — proving durable data + resumable position
+/// survive a process restart.
+#[cfg(not(target_os = "windows"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_binlog_replication_restart_resume_cayenne() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,runtime=debug,data_components::mysql_replication=debug,info",
+    ));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let port = MYSQL_E2E_RESTART_PORT;
+            let _container = common::start_mysql_docker_container(port)
+                .await
+                .map_err(|e| anyhow!("start container: {e}"))?;
+
+            // Seed just the orders table on the source.
+            let pool = common::get_mysql_conn(port)?;
+            exec(&pool, DDL_STATEMENTS[1]).await?; // repl_orders
+            exec(&pool, SEED_STATEMENTS[1]).await?; // 4 rows
+
+            // File-backed Cayenne dirs shared across both runtime instances, so
+            // the second run finds the persisted rows + binlog position.
+            let temp_dir = tempfile::tempdir()?;
+            let data_dir = temp_dir.path().join("cayenne");
+            std::fs::create_dir_all(&data_dir)?;
+            let accel_params = HashMap::from([
+                (
+                    "cayenne_file_path".to_string(),
+                    data_dir.display().to_string(),
+                ),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    temp_dir.path().join("metadata.db").display().to_string(),
+                ),
+            ]);
+            // Distinct server_ids so the two runs never collide on the source
+            // replica id within the same process (a real process restart reuses
+            // the derived id, but sequential runs here overlap briefly).
+            let make_rt = |server_id: &str| {
+                let mut params = mysql_params(port);
+                params.insert(
+                    "mysql_replication_server_id".to_string(),
+                    server_id.to_string(),
+                );
+                let engine = EngineConfig {
+                    engine: "cayenne",
+                    mode: spicepod::acceleration::Mode::File,
+                    accel_params: accel_params.clone(),
+                };
+                let ds = make_dataset(&DATASETS[1], &params, &engine);
+                AppBuilder::new("mysql_replication_restart").with_dataset(ds)
+            };
+
+            configure_test_datafusion();
+
+            // ---- Run 1: cold bootstrap the snapshot, then shut down. ----
+            {
+                let rt = Arc::new(
+                    Runtime::builder()
+                        .with_app(make_rt("42001").build())
+                        .build()
+                        .await,
+                );
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_secs(90)) => {
+                        return Err(anyhow!("run 1: timed out loading"));
+                    }
+                    () = Arc::clone(&rt).load_components() => {}
+                }
+                runtime_ready_check(&rt).await;
+                wait_for_scalar_i64(&rt, "SELECT count(*) FROM repl_orders", 4).await?;
+                // Dropping the runtime cancels the binlog stream and releases the
+                // source replica connection.
+                drop(rt);
+            }
+
+            // ---- Gap: a change made while no runtime is streaming. ----
+            exec(
+                &pool,
+                "INSERT INTO repl_orders (o_id, o_p_id, o_qty, o_status) VALUES (999, 1, 5, 'gap')",
+            )
+            .await?;
+
+            // ---- Run 2: resume from the persisted sidecar position. ----
+            {
+                let rt = Arc::new(
+                    Runtime::builder()
+                        .with_app(make_rt("42002").build())
+                        .build()
+                        .await,
+                );
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_secs(90)) => {
+                        return Err(anyhow!("run 2: timed out loading"));
+                    }
+                    () = Arc::clone(&rt).load_components() => {}
+                }
+                runtime_ready_check(&rt).await;
+
+                // The gap insert replays from the resumed position -> 5 rows,
+                // and the originally-snapshotted rows are still present (durable
+                // accelerator data, not a re-snapshot that could have raced).
+                wait_for_scalar_i64(&rt, "SELECT count(*) FROM repl_orders", 5).await?;
+                assert_eq!(
+                    scalar_i64(&rt, "SELECT o_qty FROM repl_orders WHERE o_id = 999").await?,
+                    5,
+                    "the change made while down must replay after resume"
+                );
+                assert_eq!(
+                    scalar_i64(&rt, "SELECT count(*) FROM repl_orders WHERE o_id = 100").await?,
+                    1,
+                    "originally-replicated rows must survive the restart"
+                );
+                drop(rt);
+            }
+
+            pool.disconnect().await?;
+            Ok(())
+        })
+        .await
 }

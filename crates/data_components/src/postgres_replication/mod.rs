@@ -310,21 +310,6 @@ async fn start_inner(
             None
         };
 
-    // When we skip bootstrap (slot resume or `initial_snapshot: false`), emit
-    // an immediate empty `is_dataset_ready=true` envelope so the runtime marks
-    // the dataset ready without having to wait for the first WAL change. On
-    // quiet sources that wait could be indefinite.
-    let skip_bootstrap_ready: Option<ChangesStream> = if bootstrap_stream.is_none() {
-        let envelope = crate::cdc::build_ready_signal_envelope(&schema).map_err(|e| {
-            Error::SchemaMismatch {
-                message: e.to_string(),
-            }
-        })?;
-        Some(Box::pin(futures::stream::once(async move { Ok(envelope) })))
-    } else {
-        None
-    };
-
     if !outcome.generated_columns.is_empty() {
         tracing::warn!(
             dataset = %dataset_name,
@@ -336,7 +321,9 @@ async fn start_inner(
         );
     }
 
-    // 3. Start the WAL stream.
+    // 3. Start the WAL stream. Capture `ready_lag` (Copy) before `params` is
+    // moved into the stream input below.
+    let ready_lag = params.ready_lag;
     let wal_stream = client::start_wal_stream(client::WalStreamInput {
         params,
         slot_name: outcome.slot_name.clone(),
@@ -347,18 +334,19 @@ async fn start_inner(
         generated_columns: outcome.generated_columns.clone(),
         dataset_name,
         schema_evolution_policy,
-        // The dataset is already marked ready by `skip_bootstrap_ready` (if
-        // bootstrap was skipped) or by the final bootstrap envelope.
-        is_dataset_ready_on_first_event: false,
+        // Readiness is purely lag-based: the WAL stream marks the dataset Ready
+        // once it has caught up to the source head (commit/keepalive lag below
+        // `ready_lag`), so neither bootstrap completion nor slot resume flips
+        // the ready flag on its own.
+        ready_lag,
         confirmed_flush,
         metrics,
     })
     .await?;
 
-    Ok(match (bootstrap_stream, skip_bootstrap_ready) {
-        (Some(boot), _) => Box::pin(boot.chain(wal_stream)),
-        (None, Some(ready)) => Box::pin(ready.chain(wal_stream)),
-        (None, None) => wal_stream,
+    Ok(match bootstrap_stream {
+        Some(boot) => Box::pin(boot.chain(wal_stream)),
+        None => wal_stream,
     })
 }
 
