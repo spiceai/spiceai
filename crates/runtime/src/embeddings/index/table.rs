@@ -19,6 +19,7 @@ use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
 use datafusion::datasource::TableProvider;
 use datafusion::{prelude::SessionContext, sql::TableReference};
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
 use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
 use spicepod::vector::VectorStore;
 use std::sync::Arc;

@@ -791,6 +791,8 @@ mod warm_memory {
     use crate::index::memory::{MemoryDistanceMetric, MemoryVectorIndex};
     use crate::metadata::MetadataColumns;
     use arrow::array::{FixedSizeListArray, Float32Array, Float64Array};
+    use datafusion::scalar::ScalarValue;
+    use datafusion_expr::{ScalarUDF, Volatility};
     use llms::embeddings::{Embed, EmbeddingInput};
 
     const DIM: i32 = 3;
@@ -829,7 +831,18 @@ mod warm_memory {
             vec![Field::new("id", DataType::Int64, false)],
             MetadataColumns::none(),
             Arc::new(ByteEmbed),
-            DIM,
+            Arc::new(ScalarUDF::new_from_impl(create_udf(
+                "embed",
+                vec![],
+                DataType::Utf8,
+                Volatility::Stable,
+                Arc::new(|_| {
+                    Ok(ColumnarValue::Scalar(ScalarValue::FixedSizeList(Arc::new(
+                        FixedSizeListArray::from_iter_primitive(vec![], DIM),
+                    ))))
+                }),
+            ))),
+            "model".to_string(),
             MemoryDistanceMetric::Cosine,
         )
         .expect("valid memory index")
@@ -847,16 +860,15 @@ mod warm_memory {
     }
 
     fn embedding_array(rows: usize) -> Arc<FixedSizeListArray> {
-        let values = Float32Array::from(
-            (0..rows)
-                .flat_map(|_| [1.0_f32, 0.0, 0.0])
-                .collect::<Vec<_>>(),
-        );
         Arc::new(
             FixedSizeListArray::try_new(
                 Arc::new(Field::new_list_field(DataType::Float32, false)),
                 DIM,
-                Arc::new(values),
+                Arc::new(Float32Array::from(
+                    (0..rows)
+                        .flat_map(|_| [1.0_f32, 0.0, 0.0])
+                        .collect::<Vec<_>>(),
+                )),
                 None,
             )
             .expect("valid fixed size list"),
@@ -885,14 +897,13 @@ mod warm_memory {
     /// A list-result batch shaped like the memory index's list plan (its stored schema):
     /// embedding + primary key.
     fn engine_list_batch(ids: &[i64]) -> RecordBatch {
-        let rows = ids.len();
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 embedding_field(),
                 Field::new("id", DataType::Int64, false),
             ])),
             vec![
-                embedding_array(rows),
+                embedding_array(ids.len()),
                 Arc::new(Int64Array::from(ids.to_vec())),
             ],
         )
@@ -900,8 +911,7 @@ mod warm_memory {
     }
 
     async fn collect_ids(plan: LogicalPlan) -> Vec<i64> {
-        let ctx = SessionContext::new();
-        let batches = ctx
+        let batches = SessionContext::new()
             .execute_logical_plan(plan)
             .await
             .expect("plan executes")
