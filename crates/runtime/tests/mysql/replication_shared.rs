@@ -44,7 +44,7 @@ use async_trait::async_trait;
 use data_components::cdc::{ChangeEnvelope, ChangesStream, StreamError};
 use data_components::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
 use data_components::mysql_replication::{
-    PersistedPosition, PositionStore, ReplicationMetricsCollector, ReplicationParams,
+    CursorType, PersistedPosition, PositionStore, ReplicationMetricsCollector, ReplicationParams,
     ReplicationStreamInput, StoreError, start_replication_stream,
 };
 use futures::StreamExt;
@@ -571,12 +571,126 @@ async fn shared_group_rejects_duplicate_source_table() -> Result<(), anyhow::Err
         anyhow::bail!("a duplicate source table on the same connection must be rejected")
     };
     assert!(
-        err.to_string().contains("already replicated by another dataset"),
+        err.to_string()
+            .contains("already replicated by another dataset"),
         "error must name the duplicate-subscription cause, got: {err}"
     );
 
     drop(first);
     drop(dup);
+    pool.disconnect().await?;
+    Ok(())
+}
+
+/// Restore under GTID auto-positioning — the failover-safe path. On a
+/// `gtid_mode = ON` source, a shared group bootstraps with GTID cursors
+/// (`cursor_type = Gtid`, a persisted executed set), and after a restart resumes
+/// via `COM_BINLOG_DUMP_GTID` from the intersection of members' executed sets,
+/// replaying the gap with no dependence on binlog file+offset (which would not
+/// survive a source promotion). This is the multi-member analog of the
+/// per-dataset `replication_e2e::mysql_binlog_replication_gtid_resume_cayenne`.
+#[tokio::test(flavor = "multi_thread")]
+async fn shared_group_gtid_restore_resumes_via_executed_set() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::mysql_replication=debug,info"));
+
+    let port = MYSQL_SHARED_PORT + 4;
+    let _container = common::start_mysql_gtid_docker_container(port).await?;
+    let pool = common::get_mysql_conn(port)?;
+    // Confirm the source really issues GTIDs, else this would silently exercise
+    // the file+offset path instead of GTID auto-positioning.
+    {
+        let mut conn = pool.get_conn().await?;
+        let mode: String = conn
+            .query_first::<String, _>("SELECT @@GLOBAL.gtid_mode")
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("gtid_mode query returned no row"))?;
+        anyhow::ensure!(
+            mode == "ON",
+            "container must run with gtid_mode = ON, got {mode}"
+        );
+    }
+    setup_table(&pool, "gtid_a", &[(1, "a1"), (2, "a2")]).await?;
+    setup_table(&pool, "gtid_b", &[(1, "b1"), (2, "b2")]).await?;
+
+    let store_a: Arc<dyn PositionStore> = Arc::new(MemoryPositionStore::default());
+    let store_b: Arc<dyn PositionStore> = Arc::new(MemoryPositionStore::default());
+
+    // --- Run 1: bootstrap both members under GTID, apply a live change to each,
+    //            and let the shared pump persist GTID checkpoints. ---
+    {
+        let mut stream_a =
+            start_replication_stream(stream_input(port, 210_401, "gtid_a", Arc::clone(&store_a)));
+        drain_bootstrap(&mut stream_a, "gtid run1 a", &[1, 2]).await?;
+        let mut stream_b =
+            start_replication_stream(stream_input(port, 210_401, "gtid_b", Arc::clone(&store_b)));
+        drain_bootstrap(&mut stream_b, "gtid run1 b", &[1, 2]).await?;
+        wait_for_ready(&mut stream_a, "gtid run1 a readiness").await?;
+        wait_for_ready(&mut stream_b, "gtid run1 b readiness").await?;
+
+        exec(&pool, "INSERT INTO gtid_a VALUES (3, 'a3')").await?;
+        expect_single_change(&mut stream_a, "gtid run1 a insert", "c", 3).await?;
+        exec(&pool, "INSERT INTO gtid_b VALUES (4, 'b4')").await?;
+        expect_single_change(&mut stream_b, "gtid run1 b insert", "c", 4).await?;
+
+        // Drive both streams until each member persists a checkpoint.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let _ = tokio::time::timeout(Duration::from_millis(250), stream_a.next()).await;
+            let _ = tokio::time::timeout(Duration::from_millis(250), stream_b.next()).await;
+            if store_a.load().await.expect("store a").is_some()
+                && store_b.load().await.expect("store b").is_some()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shared pump never persisted GTID checkpoints"
+            );
+        }
+
+        // Both checkpoints must be GTID cursors carrying an executed set — proof
+        // the shared pump positions by GTID (failover-safe), not file+offset.
+        for (store, who) in [(&store_a, "a"), (&store_b, "b")] {
+            let cp = store
+                .load()
+                .await
+                .expect("store readable")
+                .expect("member persisted a checkpoint");
+            assert_eq!(
+                cp.cursor_type,
+                CursorType::Gtid,
+                "member {who} must persist a GTID cursor"
+            );
+            let set = cp
+                .gtid_set
+                .expect("a GTID cursor must carry an executed set");
+            assert!(
+                !set.is_empty(),
+                "member {who} executed set must be non-empty after live changes"
+            );
+        }
+
+        drop(stream_a);
+        drop(stream_b);
+    }
+
+    // --- Gap: changes made while no member is streaming. ---
+    exec(&pool, "INSERT INTO gtid_a VALUES (5, 'a5')").await?;
+    exec(&pool, "INSERT INTO gtid_b VALUES (6, 'b6')").await?;
+
+    // --- Run 2: resume via GTID auto-positioning from the persisted executed
+    //            sets. A fresh server_id (GTID resume is set-driven, not
+    //            file+offset) matches a real process restart, which derives a new
+    //            id — the gap must still replay with no gaps. ---
+    let mut stream_a =
+        start_replication_stream(stream_input(port, 210_402, "gtid_a", Arc::clone(&store_a)));
+    let mut stream_b =
+        start_replication_stream(stream_input(port, 210_402, "gtid_b", Arc::clone(&store_b)));
+    wait_for_id(&mut stream_a, "gtid resume replay a", 5).await?;
+    wait_for_id(&mut stream_b, "gtid resume replay b", 6).await?;
+
+    drop(stream_a);
+    drop(stream_b);
     pool.disconnect().await?;
     Ok(())
 }
