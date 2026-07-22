@@ -101,6 +101,10 @@ impl MongoSys {
         })
     }
 
+    #[cfg_attr(
+        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        expect(clippy::unused_async)
+    )]
     pub async fn get(&self) -> Option<MongoCheckpointMetadata> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
@@ -123,6 +127,10 @@ impl MongoSys {
         }
     }
 
+    #[cfg_attr(
+        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        expect(clippy::unused_async)
+    )]
     pub async fn upsert(
         &self,
         #[cfg_attr(
@@ -157,6 +165,10 @@ impl MongoSys {
         }
     }
 
+    #[cfg_attr(
+        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        expect(clippy::unused_async)
+    )]
     pub async fn delete(&self) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
