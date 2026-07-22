@@ -52,10 +52,21 @@ const MYSQL_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_mins(1);
 pub async fn start_mysql_docker_container(
     port: u16,
 ) -> Result<RunningContainer<'static>, anyhow::Error> {
+    start_mysql_docker_container_with_image(port, MYSQL_IMAGE).await
+}
+
+/// Start a `MySQL` container on `port` using a specific image tag. Used by the
+/// version matrix to exercise both the `SHOW BINARY LOG STATUS` path (8.2+) and
+/// the `SHOW MASTER STATUS` fallback (8.0).
+#[instrument]
+pub async fn start_mysql_docker_container_with_image(
+    port: u16,
+    image: &str,
+) -> Result<RunningContainer<'static>, anyhow::Error> {
     let container_name = format!("{MYSQL_DOCKER_CONTAINER}-{port}");
     let container_name: &'static str = Box::leak(container_name.into_boxed_str());
     let running_container = ContainerRunnerBuilder::new(container_name)
-        .image(MYSQL_IMAGE.to_string())
+        .image(image.to_string())
         .add_port_binding(3306, port)
         .add_env_var("MYSQL_ROOT_PASSWORD", MYSQL_ROOT_PASSWORD)
         .add_env_var("MYSQL_DATABASE", "mysqldb")
