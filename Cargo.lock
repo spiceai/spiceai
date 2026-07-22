@@ -4500,6 +4500,8 @@ dependencies = [
 name = "connector-mongodb"
 version = "2.2.0-unstable"
 dependencies = [
+ "arrow",
+ "arrow-buffer",
  "async-stream",
  "async-trait",
  "data_components",
@@ -5807,7 +5809,6 @@ dependencies = [
  "insta",
  "logos",
  "mailparse",
- "mongodb",
  "mysql_async",
  "native-tls",
  "num_cpus",

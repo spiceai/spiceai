@@ -14,13 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::cdc::{ChangeBatch, ChangeBatchError, changes_schema};
-use crate::schema_projection::SchemaProjection;
 use arrow::{
     array::{ArrayRef, ListArray, RecordBatch, StringArray, StructArray, new_null_array},
     datatypes::{Field, Schema, SchemaRef},
 };
 use arrow_buffer::OffsetBuffer;
+use data_components::cdc::{ChangeBatch, ChangeBatchError, changes_schema};
+use data_components::schema_projection::SchemaProjection;
 use datafusion_table_providers::mongodb::{
     Error as MongoDBError,
     projection::project_bson_document,
@@ -292,9 +292,9 @@ fn build_primary_keys_array<'a>(rows: impl Iterator<Item = &'a [String]>) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cdc::ChangeOperation;
     use arrow::array::{Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use data_components::cdc::ChangeOperation;
     use mongodb::bson::{doc, from_document};
 
     fn schema() -> SchemaRef {
@@ -534,5 +534,18 @@ mod tests {
         .expect_err("unsupported operation should fail");
 
         assert!(matches!(error, StreamError::UnsupportedOperation { .. }));
+    }
+}
+
+/// Maps this connector's concrete stream error to the connector-agnostic CDC contract
+/// error, tagging the `"MongoDB"` connector name and boxing itself as the cause — so the
+/// CDC contract (and the runtime) never names `MongoDB`-specific types while logs still
+/// identify the source connector.
+impl From<StreamError> for data_components::cdc::StreamError {
+    fn from(e: StreamError) -> Self {
+        data_components::cdc::StreamError::Connector {
+            connector: "MongoDB",
+            source: Box::new(e),
+        }
     }
 }
