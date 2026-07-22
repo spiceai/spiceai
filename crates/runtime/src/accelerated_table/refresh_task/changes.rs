@@ -2733,6 +2733,22 @@ impl RefreshTask {
 
         let sub_batches = group_into_sub_batches(&change_batch);
 
+        // Per-table coalesce-ratio instrumentation: raw input rows vs the
+        // distinct-key rows that survive same-key LWW collapse. input/output ≈ the
+        // effective same-key coalescing for this table (~1 = insert-heavy / no
+        // repeats; ≫1 = update-heavy hot keys), which sizes cross-burst coalescing
+        // per table from the metrics dump — for every table, not just the hot ones.
+        {
+            let input_rows = u64::try_from(change_batch.record.num_rows()).unwrap_or(u64::MAX);
+            let output_rows: u64 = sub_batches
+                .iter()
+                .map(|(_, row_indices)| u64::try_from(row_indices.len()).unwrap_or(u64::MAX))
+                .sum();
+            let labels = self.dataset_metric_labels.dataset();
+            metrics::CDC_COALESCE_INPUT_ROWS.add(input_rows, labels);
+            metrics::CDC_COALESCE_OUTPUT_ROWS.add(output_rows, labels);
+        }
+
         tracing::trace!(
             "Processing append/change stream batch: dataset={}, rows={}, sub-batches={}",
             self.dataset_name,

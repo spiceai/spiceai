@@ -223,6 +223,29 @@ pub static CDC_APPLY_BURST_ROWS_TOTAL: LazyLock<Counter<u64>> = LazyLock::new(||
         .build()
 });
 
+/// Raw CDC change rows fed into same-key coalescing (`group_into_sub_batches`),
+/// per dataset. Paired with [`CDC_COALESCE_OUTPUT_ROWS`]; the ratio input/output
+/// is the effective same-key collapse for this table (~1 = insert-heavy / no
+/// repeats, ≫1 = update-heavy hot keys). Sizes cross-burst coalescing per table.
+pub static CDC_COALESCE_INPUT_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("dataset_acceleration_cdc_coalesce_input_rows_total")
+        .with_description("Raw CDC change rows fed into same-key coalescing.")
+        .with_unit("rows")
+        .build()
+});
+
+/// Distinct-key CDC rows that survive same-key coalescing (`group_into_sub_batches`
+/// output), per dataset. See [`CDC_COALESCE_INPUT_ROWS`] — input/output is the
+/// coalesce ratio.
+pub static CDC_COALESCE_OUTPUT_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("dataset_acceleration_cdc_coalesce_output_rows_total")
+        .with_description("Distinct-key CDC rows surviving same-key coalescing.")
+        .with_unit("rows")
+        .build()
+});
+
 pub static CDC_APPLY_FIXED_COST_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     METER
         .f64_histogram("dataset_acceleration_cdc_apply_fixed_cost_ms")
