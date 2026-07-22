@@ -62,18 +62,20 @@ ci:
 	make -C bin/spiced
 
 # Local CI attestation ("developer sign-off"). Skips Rust lint/build/tests when
-# the branch has no changed .rs files vs trunk; otherwise target-lints changed
-# crates, then full lint + unit tests. Posts a `signoff` commit status on HEAD
-# so the PR can enter the merge queue. See scripts/signoff and docs/dev/ci_signoff.md.
+# the branch has no Rust-affecting files vs trunk (.rs, Cargo.toml/lock,
+# rust-toolchain*, .cargo/*); otherwise target-lints changed crates, then full
+# lint + unit tests. Posts a `signoff` commit status on HEAD so the PR can enter
+# the merge queue. See scripts/signoff and docs/dev/ci_signoff.md.
 .PHONY: signoff
 signoff:
 	@./scripts/signoff
 
 # Remote sign-off for the current branch: probe lab SSH hosts (192.168.1.100,
-# 192.168.1.101) for ~/dev/spice2 and run scripts/signoff there when available;
-# otherwise dispatch the self-hosted GitHub Actions signoff.yml workflow.
-# Supports Git and JJ via scripts/signoff remote. Skips Rust lint/build/tests
-# when the branch has no changed .rs files vs trunk (same as local signoff).
+# 192.168.1.101) for a Git checkout at $HOME/dev/spice2 and run scripts/signoff
+# there when available; otherwise dispatch the self-hosted GitHub Actions
+# signoff.yml workflow. Supports Git and JJ via scripts/signoff remote. Skips
+# Rust lint/build/tests when the branch has no Rust-affecting files vs trunk
+# (same as local signoff).
 .PHONY: signoff-remote
 signoff-remote:
 	@./scripts/signoff remote

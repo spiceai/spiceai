@@ -55,8 +55,9 @@ and up to date:
 make signoff          # targeted crate lint → full lint + unit tests, then attests
 ```
 
-`make signoff` first diffs the branch against `trunk`. If that diff contains no
-`.rs` files, Rust lint/build/unit tests are skipped and the sign-off status is
+`make signoff` first diffs the branch against `trunk`. If that diff has no
+Rust-affecting files (`.rs`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain*`,
+`.cargo/*`), Rust lint/build/unit tests are skipped and the sign-off status is
 still posted (docs/YAML/script-only changes). Otherwise it maps changed files to
 workspace crates, runs `make lint-rust PACKAGES="…"` for fast fail-first
 feedback, then the full `make lint-rust` and `make build-cli nextest` gate. Set
@@ -125,10 +126,10 @@ make signoff-remote                 # current branch
 
 `make signoff-remote` first probes lab hosts over SSH (`192.168.1.100`,
 `192.168.1.101` by default; override with `SIGNOFF_SSH_HOSTS`). The first host
-that answers and has a `~/dev/spice2` checkout is used: it fetches your pushed
-branch into that clone and runs `scripts/signoff -f` there (same checks and
-skip-if-no-`.rs` behavior as local). Override the remote path with
-`SIGNOFF_SSH_REPO=/absolute/path`.
+that answers and has a Git checkout at `$HOME/dev/spice2` is used: it fetches
+your pushed branch into that clone and runs `scripts/signoff -f` there (same
+checks and Rust-skip behavior as local). Override the remote path with an
+absolute path only: `SIGNOFF_SSH_REPO=/absolute/path` (`~` is not expanded).
 
 If no SSH host is usable, it falls back to dispatching the **Remote Sign-off**
 GitHub Actions workflow on a self-hosted runner:
@@ -143,8 +144,8 @@ The Actions workflow:
 1. Checks out your branch (full history) and fetches `trunk`
 2. Target-lints crates touched by the branch vs `trunk` (GitHub compare API as a
    fallback when merge-base isn't available), or skips Rust checks when the
-   branch has no changed `.rs` files
-3. Runs full `make lint-rust` + `make build-cli nextest` when Rust changed
+   branch has no Rust-affecting files
+3. Runs full `make lint-rust` + `make build-cli nextest` when Rust is affected
 4. Posts pending → success/failure `signoff` statuses, then re-runs
    **Attestation** if needed
 
@@ -197,8 +198,8 @@ merge queue is still the real gate.
 
 | Stage | Trigger | Checks |
 | --- | --- | --- |
-| Local | `make signoff` | skip Rust if no `.rs` in the branch diff; else targeted `make lint-rust PACKAGES=…`, full `make lint-rust`, `make build-cli nextest` |
-| Remote | `make signoff-remote` | same checks via lab SSH (`~/dev/spice2` on 192.168.1.100/101) if reachable, else self-hosted `signoff.yml`; posts `signoff` |
+| Local | `make signoff` | skip Rust if no Rust-affecting files in the branch diff; else targeted `make lint-rust PACKAGES=…`, full `make lint-rust`, `make build-cli nextest` |
+| Remote | `make signoff-remote` | same checks via lab SSH (`$HOME/dev/spice2` on 192.168.1.100/101) if reachable, else self-hosted `signoff.yml`; posts `signoff` |
 | Pull request | `pull_request` | **Attestation** (validates the sign-off, or auto-passes a pure revert) + PR hygiene; merge-queue check names report lightweight skipped/passthrough results |
 | Merge queue | `merge_group` | the full required suite (below) + advisory niche checks |
 

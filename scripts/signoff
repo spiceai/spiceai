@@ -39,14 +39,16 @@
 #   SIGNOFF_SKIP_TARGETED_LINT  Set to any value to skip the branch-scoped pre-lint
 #   SIGNOFF_SSH_HOSTS Space-separated hosts for make signoff-remote (default:
 #                     192.168.1.100 192.168.1.101). First host that answers SSH
-#                     and has ~/dev/spice2 is used; otherwise falls back to GHA.
-#   SIGNOFF_SSH_REPO  Path to the spice2 checkout on the SSH host (default:
-#                     $HOME/dev/spice2 on the remote). Relative paths are not
-#                     supported — use an absolute path or ~/….
+#                     and has a Git checkout at $HOME/dev/spice2 is used;
+#                     otherwise falls back to GHA.
+#   SIGNOFF_SSH_REPO  Absolute path to the spice2 Git checkout on the SSH host
+#                     (default: $HOME/dev/spice2 on the remote). Must start with
+#                     / — ~ and relative paths are not expanded through SSH argv.
 #
 # Targeted pre-lint always diffs against trunk (not configurable).
-# When the branch has no changed .rs files vs trunk, Rust lint/build/tests are
-# skipped (both local and remote); the sign-off status is still posted.
+# When the branch has no Rust-affecting changes vs trunk (.rs, Cargo.toml,
+# Cargo.lock, rust-toolchain*, .cargo/*), Rust lint/build/tests are skipped
+# (both local and remote); the sign-off status is still posted.
 #
 # Remote alternative to local `make signoff`:
 #   make signoff-remote                  # SSH to a lab host if available, else GHA
@@ -475,9 +477,11 @@ post_commit_status() {
 
 # --- commands ----------------------------------------------------------------
 
-# True when the branch delta vs trunk includes at least one `.rs` file.
-# Prints nothing. Exit 0 = has Rust changes (or unknown — run checks).
-# Exit 1 = definitively no `.rs` files in the changed set → safe to skip.
+# True when the branch delta vs trunk can affect Rust lint/build/tests.
+# Matches .rs sources plus Cargo/toolchain config that can break those gates:
+#   *.rs, Cargo.toml, Cargo.lock, rust-toolchain[.toml], .cargo/*
+# Prints nothing. Exit 0 = has Rust-affecting changes (or unknown — run checks).
+# Exit 1 = no such paths in the changed set → safe to skip.
 # Unknown (diff unavailable) returns 0 so we never skip when we can't tell.
 branch_has_rust_changes() {
   local revision="$1"
@@ -491,12 +495,13 @@ branch_has_rust_changes() {
     debug "no changed files vs ${LINT_BASE_BRANCH} — no Rust changes"
     return 1
   fi
-  # Match paths ending in .rs (case-sensitive; Rust sources are always .rs).
-  if printf '%s\n' "$files" | grep -qE '\.rs$'; then
-    debug "changed .rs files present — will run Rust checks"
+  # Paths that can change what cargo/clippy/fmt/nextest do (not docs/scripts alone).
+  if printf '%s\n' "$files" | grep -qE \
+      '(\.rs$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain(\.toml)?$|(^|/)\.cargo/)'; then
+    debug "Rust-affecting files present — will run Rust checks"
     return 0
   fi
-  debug "no .rs files in changed set — can skip Rust lint/build/tests"
+  debug "no Rust-affecting files in changed set — can skip Rust lint/build/tests"
   return 1
 }
 
@@ -505,7 +510,7 @@ branch_has_rust_changes() {
 # queue, so it deliberately isn't part of the local sign-off.
 #
 # Fail-fast order:
-#   0. Skip all Rust work when the branch has no changed .rs files vs trunk
+#   0. Skip all Rust work when the branch has no Rust-affecting files vs trunk
 #   1. Targeted lint on packages touched by the branch (fast feedback)
 #   2. Full workspace lint (the real gate)
 #   3. CLI build + unit tests
@@ -520,8 +525,8 @@ run_checks() {
   # Non-Rust-only changes (docs, YAML, scripts, …): still attest, but skip the
   # expensive lint/build/test gate. Unknown diffs fall through and run checks.
   if [[ -n "$revision" ]] && ! branch_has_rust_changes "$revision"; then
-    info "No .rs files changed vs ${LINT_BASE_BRANCH} — skipping Rust lint, build, and unit tests"
-    append_step_summary "### Rust checks"$'\n'"Skipped (no \`.rs\` files in the branch diff vs \`${LINT_BASE_BRANCH}\`)."$'\n'
+    info "No Rust-affecting files changed vs ${LINT_BASE_BRANCH} — skipping Rust lint, build, and unit tests"
+    append_step_summary "### Rust checks"$'\n'"Skipped (no \`.rs\` / Cargo / rust-toolchain / \`.cargo/\` files in the branch diff vs \`${LINT_BASE_BRANCH}\`)."$'\n'
     SIGNOFF_CHECK_SUMMARY="no Rust changes (lint/test skipped)"
     return 0
   fi
@@ -809,8 +814,9 @@ cmd_install() {
   echo "${OK} '${TARGET_BRANCH}' now requires developer sign-off + the full merge-queue suite."
 }
 
-# Validate SIGNOFF_SSH_REPO (optional override). Empty → default ~/dev/spice2
-# on the remote. Absolute path only; tight charset so it is safe in ssh argv.
+# Validate SIGNOFF_SSH_REPO (optional override). Empty → default $HOME/dev/spice2
+# on the remote. Absolute path only (/…); tight charset so it is safe in ssh argv.
+# ~ and relative paths are rejected — they are not expanded through SSH argv.
 signoff_ssh_repo_or_default() {
   local remote_repo="${SIGNOFF_SSH_REPO:-}"
   if [[ -z "$remote_repo" ]]; then
@@ -818,13 +824,15 @@ signoff_ssh_repo_or_default() {
     return 0
   fi
   [[ "$remote_repo" == /* ]] \
-    || fail "SIGNOFF_SSH_REPO must be an absolute path (got: '${remote_repo}')"
+    || fail "SIGNOFF_SSH_REPO must be an absolute path starting with / (got: '${remote_repo}')"
   [[ "$remote_repo" =~ ^[A-Za-z0-9._/-]+$ ]] \
     || fail "SIGNOFF_SSH_REPO contains unsafe characters: '${remote_repo}'"
   echo "$remote_repo"
 }
 
-# Probe SIGNOFF_SSH_HOSTS (default lab IPs) for BatchMode SSH + a spice2 checkout.
+# Probe SIGNOFF_SSH_HOSTS (default lab IPs) for BatchMode SSH + a spice2 Git checkout.
+# Only Git is accepted (run_signoff_via_ssh requires git); a bare .jj workspace
+# would pass a looser probe and then fail the sign-off itself.
 # Prints the first usable host to stdout; status messages go to stderr via info.
 # Exit 0 with a host, or 1 if none are usable.
 find_signoff_ssh_host() {
@@ -834,9 +842,10 @@ find_signoff_ssh_host() {
 
   if [[ -n "$remote_repo" ]]; then
     # Path already charset-validated; embed as a single-quoted remote literal.
-    probe_cmd="repo='${remote_repo}'; test -d \"\$repo\" && { test -e \"\$repo/.git\" || test -d \"\$repo/.jj\"; }"
+    # Require .git (file or dir) — matches run_signoff_via_ssh Git-only support.
+    probe_cmd="repo='${remote_repo}'; test -d \"\$repo\" && test -e \"\$repo/.git\""
   else
-    probe_cmd='repo="$HOME/dev/spice2"; test -d "$repo" && { test -e "$repo/.git" || test -d "$repo/.jj"; }'
+    probe_cmd='repo="$HOME/dev/spice2"; test -d "$repo" && test -e "$repo/.git"'
   fi
 
   for host in $hosts; do
@@ -869,7 +878,7 @@ run_signoff_via_ssh() {
   local remote_repo
   remote_repo=$(signoff_ssh_repo_or_default)
 
-  info "Running sign-off via SSH on ${host}:${remote_repo:-~/dev/spice2} (branch ${branch})…"
+  info "Running sign-off via SSH on ${host}:${remote_repo:-\$HOME/dev/spice2} (branch ${branch})…"
   # Remote command is `bash -s -- <branch> <repo-or-empty>`; the heredoc is
   # stdin for bash -s. Branch is charset-validated in cmd_remote; repo is an
   # absolute path or empty (→ $HOME/dev/spice2 on the remote).
@@ -981,8 +990,8 @@ Maintainers:
   scripts/signoff install --yes  Apply it (needs admin on the repo)
 
 Checks (when verify is on):
-  0. If the branch has no changed .rs files vs trunk → skip Rust lint/build/tests
-     (still posts the sign-off status)
+  0. If the branch has no Rust-affecting files vs trunk (.rs, Cargo.toml/lock,
+     rust-toolchain*, .cargo/*) → skip Rust lint/build/tests (still posts status)
   1. Targeted lint of crates touched by this branch vs trunk
      (make lint-rust PACKAGES="…") — fail-fast feedback
   2. Full workspace lint (make lint-rust)
@@ -993,8 +1002,9 @@ Checks (when verify is on):
   the GitHub compare API when the clone is too shallow for merge-base.
 
   make signoff-remote probes SIGNOFF_SSH_HOSTS (default: ${DEFAULT_SIGNOFF_SSH_HOSTS})
-  for SSH + ~/dev/spice2, checks out the pushed branch there, and runs signoff.
-  If no host is usable, it falls back to dispatching signoff.yml on GitHub Actions.
+  for SSH + a Git checkout at \$HOME/dev/spice2, checks out the pushed branch
+  there, and runs signoff. If no host is usable, it falls back to dispatching
+  signoff.yml on GitHub Actions.
 
 The sign-off is a '${STATUS_CONTEXT}' commit status bound to the exact commit you
 pushed. Sign off again after any code change or manual conflict resolution. The
