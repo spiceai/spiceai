@@ -201,6 +201,15 @@ fn write_lock<T>(m: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
     m.write().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Monotonic-max advance of a mutex-guarded binlog position — the shared logic
+/// behind [`AckSlot::commit`] and [`AckSlot::deliver`].
+fn advance_position(m: &Mutex<BinlogPosition>, to: &BinlogPosition) {
+    let mut g = lock(m);
+    if *to > *g {
+        *g = to.clone();
+    }
+}
+
 /// `LIVE`: attached; routing to it is allowed once also `STREAMING`.
 const LIVE: u8 = 0b001;
 /// `SNAPSHOTTING`: the member's initial snapshot is still running.
@@ -240,17 +249,11 @@ impl AckSlot {
 
     /// Advance this member's committed floor (monotonic-max).
     fn commit(&self, to: &BinlogPosition) {
-        let mut g = lock(&self.committed);
-        if *to > *g {
-            *g = to.clone();
-        }
+        advance_position(&self.committed, to);
     }
     /// Record an envelope delivered into this member's channel (monotonic-max).
     fn deliver(&self, to: &BinlogPosition) {
-        let mut g = lock(&self.delivered);
-        if *to > *g {
-            *g = to.clone();
-        }
+        advance_position(&self.delivered, to);
     }
 
     /// Whether the member has already durably applied this commit — used to
@@ -797,14 +800,13 @@ async fn attach_member(
         // the member stays SNAPSHOTTING and re-snapshots on rejoin (see
         // `detach_member`). `persist_all` also skips SNAPSHOTTING members until
         // this fires.
+        let schema_mismatch = |e: crate::cdc::ChangeBatchError| Error::SchemaMismatch {
+            message: e.to_string(),
+        };
         let (_, boundary_batch, _) = crate::cdc::build_heartbeat_envelope(&schema, None, false)
-            .map_err(|e| Error::SchemaMismatch {
-                message: e.to_string(),
-            })?
+            .map_err(schema_mismatch)?
             .into_parts()
-            .map_err(|e| Error::SchemaMismatch {
-                message: e.to_string(),
-            })?;
+            .map_err(schema_mismatch)?;
         let boundary = ChangeEnvelope::from_parts(
             Box::new(SnapshotBoundaryCommitter {
                 source: Arc::clone(source),
