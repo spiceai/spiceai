@@ -741,6 +741,11 @@ async fn attach_member(
     // promotes it and reconnects), or an immediate empty head on resume.
     let head: ChangesStream = if snapshotting {
         let dataset_for_boundary = dataset_name.clone();
+        // Clear stale accelerator state before the snapshot so a cold or
+        // re-bootstrap (`invalid_checkpoint_behavior: restart`) load is a full
+        // replace, not an upsert over rows the source no longer has — mirrors
+        // the per-dataset `start_inner` truncate prelude.
+        let truncate = super::truncate_envelope(&schema, &primary_keys, &column_map)?;
         let snapshot = super::bootstrap::snapshot_stream(super::bootstrap::SnapshotInput {
             params: params.clone(),
             layout,
@@ -779,7 +784,11 @@ async fn attach_member(
             boundary_batch,
             false,
         );
-        Box::pin(snapshot.chain(stream::once(async move { Ok(boundary) })))
+        Box::pin(
+            stream::once(async move { Ok(truncate) })
+                .chain(snapshot)
+                .chain(stream::once(async move { Ok(boundary) })),
+        )
     } else {
         metrics.mark_bootstrap_complete();
         Box::pin(stream::empty::<
@@ -965,6 +974,13 @@ async fn run_pump(source: Arc<SharedSource>) {
         .min(IDLE_TICK_CAP);
     let mut side_conn: Option<Conn> = None;
     let mut last_persist_at = Instant::now();
+    // Throttles the head-poll + readiness heartbeat. Emitted on BOTH the idle
+    // branch and the event path: the server streams its own binlog heartbeats
+    // every ~checkpoint_interval/2, so on a caught-up source `stream.next()`
+    // resolves before the idle timeout and the idle branch is starved — without
+    // an event-path emission a quiet-but-heartbeating source would never reach
+    // Ready (the per-dataset stream emits readiness on both paths too).
+    let mut last_heartbeat_at = Instant::now();
     // Last position persisted per member, to skip no-op sidecar writes.
     let mut last_persisted: HashMap<MemberKey, BinlogPosition> = HashMap::new();
 
@@ -1066,6 +1082,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                         last_persist_at = Instant::now();
                     }
                     poll_head_and_heartbeat(&source, &mut side_conn, &params).await;
+                    last_heartbeat_at = Instant::now();
                     continue 'recv;
                 }
             };
@@ -1316,6 +1333,15 @@ async fn run_pump(source: Arc<SharedSource>) {
             if last_persist_at.elapsed() >= params.checkpoint_interval {
                 persist_all(&source, &mut last_persisted).await;
                 last_persist_at = Instant::now();
+            }
+
+            // Event-path readiness: the server's own binlog heartbeats keep this
+            // loop from ever hitting the idle branch on a caught-up source, so
+            // publish head/lag metrics and fan a readiness heartbeat here too,
+            // throttled to the idle-tick cadence.
+            if last_heartbeat_at.elapsed() >= idle_tick {
+                poll_head_and_heartbeat(&source, &mut side_conn, &params).await;
+                last_heartbeat_at = Instant::now();
             }
         } // 'recv
 
