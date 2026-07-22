@@ -128,12 +128,14 @@ mod cloud_connect;
 mod spiced_tracing;
 mod tls;
 
-/// Registers all external data connectors with the runtime.
+/// Registers the connector *aliases* — secondary names that reuse an existing connector's
+/// factory under a different prefix (`abfss`, `gs`) or a legacy name.
 ///
-/// This function must be called during runtime initialization to make the
-/// extracted connector crates available. Unlike the built-in connectors in
-/// the runtime crate, external connectors are not automatically registered
-/// via the `linkme` distributed slice pattern.
+/// The connectors themselves self-register into the `linkme` `DATA_CONNECTOR_REGISTRATIONS`
+/// slice via `register_data_connector!` and are force-linked by the `use connector_* as _;`
+/// block at the top of this module, so `runtime::dataconnector::register_all()` registers them
+/// at startup. Only these alias/legacy names, which map a second string to the same factory,
+/// need an explicit registration here.
 pub async fn register_external_connectors() {
     use runtime::dataconnector::register_connector_factory;
 

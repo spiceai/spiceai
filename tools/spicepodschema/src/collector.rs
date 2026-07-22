@@ -46,6 +46,15 @@ use connector_mysql as _;
 use connector_oracle as _;
 // #[expect(unused_imports)]
 // use runtime::dataconnector::odbc as _;
+use connector_abfs as _;
+use connector_cosmosdb as _;
+use connector_databricks as _;
+use connector_ducklake as _;
+use connector_elasticsearch as _;
+use connector_gcs as _;
+use connector_git as _;
+use connector_github as _;
+use connector_glue as _;
 use connector_postgres as _;
 use connector_scylladb as _;
 use connector_sftp as _;
@@ -53,6 +62,7 @@ use connector_sharepoint as _;
 use connector_smb as _;
 use connector_snowflake as _;
 use connector_spark as _;
+use connector_spiceai as _;
 #[expect(unused_imports)]
 use runtime::dataconnector::s3 as _;
 #[expect(unused_imports)]
