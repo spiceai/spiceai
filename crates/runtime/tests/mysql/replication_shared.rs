@@ -694,3 +694,38 @@ async fn shared_group_gtid_restore_resumes_via_executed_set() -> Result<(), anyh
     pool.disconnect().await?;
     Ok(())
 }
+
+/// A single dataset on its own shared dump — the common production case where
+/// sharing coalesces exactly one member. Verifies the always-on shared path
+/// serves a lone member end-to-end: cold snapshot, then create/update/delete
+/// each routed and committed. The multi-dataset fan-out is covered by
+/// `shared_group_multiplexes_and_routes_per_table`.
+#[tokio::test(flavor = "multi_thread")]
+async fn shared_group_single_dataset_streams_snapshot_and_changes() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::mysql_replication=debug,info"));
+
+    let port = MYSQL_SHARED_PORT + 5;
+    let _container = common::start_mysql_docker_container(port).await?;
+    let pool = common::get_mysql_conn(port)?;
+    setup_table(&pool, "solo", &[(1, "s1"), (2, "s2")]).await?;
+
+    let store: Arc<dyn PositionStore> = Arc::new(MemoryPositionStore::default());
+    let mut stream =
+        start_replication_stream(stream_input(port, 210_501, "solo", Arc::clone(&store)));
+    drain_bootstrap(&mut stream, "solo member", &[1, 2]).await?;
+    wait_for_ready(&mut stream, "solo member readiness").await?;
+
+    // Live create/update/delete each route to the single member and commit.
+    exec(&pool, "INSERT INTO solo VALUES (3, 's3')").await?;
+    expect_single_change(&mut stream, "solo insert", "c", 3).await?;
+
+    exec(&pool, "UPDATE solo SET name = 's1b' WHERE id = 1").await?;
+    expect_single_change(&mut stream, "solo update", "u", 1).await?;
+
+    exec(&pool, "DELETE FROM solo WHERE id = 2").await?;
+    expect_single_change(&mut stream, "solo delete", "d", 2).await?;
+
+    drop(stream);
+    pool.disconnect().await?;
+    Ok(())
+}
