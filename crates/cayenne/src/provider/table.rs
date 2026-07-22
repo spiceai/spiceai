@@ -8325,7 +8325,7 @@ impl CayenneTableProvider {
     /// Returns `Ok(None)` when no primary key is configured, or
     /// `pk_conflict_detection: none` (the caller appends raw with no validation,
     /// mirroring `PreparedInsertStream::immediate`).
-    pub(crate) async fn prepare_stream_for_insert_sharded(
+    pub(crate) fn prepare_stream_for_insert_sharded(
         &self,
         stream: SendableRecordBatchStream,
     ) -> Result<Option<PreparedShardedInsertStream>> {
@@ -31469,8 +31469,7 @@ mod tests {
     #[ignore = "microbench; run explicitly with --ignored --nocapture"]
     #[expect(
         clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        reason = "microbench reporting/key math; precision + truncation are irrelevant here"
+        reason = "microbench reporting math casts row counts to f64; precision is irrelevant here"
     )]
     async fn bench_sharded_apply_under_lock() {
         fn env_usize(key: &str, default: usize) -> usize {

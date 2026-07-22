@@ -262,15 +262,16 @@ async fn apply_stream(
     let commits = Arc::new(TokioMutex::new(Vec::new()));
     let stream = stream_of(ops, &commits);
     let refresh = Arc::new(RwLock::new(Refresh::default()));
-    task.start_changes_stream(
-        refresh,
-        stream,
-        None,
-        None,
-        Arc::new(AtomicBool::new(false)),
-    )
-    .await
-    .expect("start_changes_stream");
+    Arc::new(task)
+        .start_changes_stream(
+            refresh,
+            stream,
+            None,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("start_changes_stream");
     commits.lock().await.clone()
 }
 

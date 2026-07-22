@@ -225,15 +225,16 @@ async fn cdc_into_cayenne_data_inlining_e2e() {
     let stream = make_n_envelopes(N, &commits);
 
     let refresh = Arc::new(RwLock::new(Refresh::default()));
-    task.start_changes_stream(
-        refresh,
-        stream,
-        None,
-        None,
-        Arc::new(AtomicBool::new(false)),
-    )
-    .await
-    .expect("start_changes_stream");
+    Arc::new(task)
+        .start_changes_stream(
+            refresh,
+            stream,
+            None,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("start_changes_stream");
 
     // Every envelope's commit should have fired exactly once, in stream order.
     let expected_commits: Vec<i64> = (0..N)

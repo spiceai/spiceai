@@ -343,7 +343,7 @@ impl<'a> AppendMutationWriter<'a> {
             && self.table.has_slot_advancer()
             && self.table.metadata().partition_column.is_none()
         {
-            if let Some(prepared) = self.table.prepare_stream_for_insert_sharded(data).await? {
+            if let Some(prepared) = self.table.prepare_stream_for_insert_sharded(data)? {
                 match self
                     .write_cdc_in_memory_sharded(prepared, write_guard, write_start)
                     .await?
@@ -1100,8 +1100,7 @@ impl<'a> AppendMutationWriter<'a> {
         let prepare_start = Instant::now();
         let prepared_stream = self
             .table
-            .prepare_stream_for_insert_sharded(data)
-            .await?
+            .prepare_stream_for_insert_sharded(data)?
             .expect("sharded prepare requires a primary key");
         let prepared_apply = self.prepare_cdc_in_memory_sharded(prepared_stream).await?;
         let prepare_elapsed = prepare_start.elapsed();
