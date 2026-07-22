@@ -920,7 +920,7 @@ impl Https {
         let client_secret = self.params.get("auth_client_secret").ok().cloned();
 
         // Nothing OAuth-related set at all: no auth to configure. Uses the same
-        // key list as the routing gate so any OAuth2 param (e.g. auth_header
+        // key list as the routing gate so any OAuth2 param (e.g. auth_header_name
         // without auth_token_url) reaches the validation below rather than being
         // silently ignored.
         if !any_oauth_param_set(&self.params) {
@@ -1023,40 +1023,28 @@ impl Https {
     }
 
     /// Resolve the header the access token is attached to. Defaults to
-    /// `Authorization: Bearer <token>`; `auth_header` and `auth_header_format`
-    /// override the name and value template (e.g. `X-Shopify-Access-Token` /
-    /// `{token}`).
+    /// `Authorization` (which carries `Bearer <token>`); `auth_header_name`
+    /// overrides it (e.g. `X-Shopify-Access-Token`, which carries the bare
+    /// token).
     fn resolve_token_header(&self, dataset: &Dataset) -> DataConnectorResult<TokenHeader> {
         let name = self
             .params
-            .get("auth_header")
-            .expose()
-            .ok()
-            .map(str::trim)
-            .filter(|v| !v.is_empty());
-        let value_format = self
-            .params
-            .get("auth_header_format")
+            .get("auth_header_name")
             .expose()
             .ok()
             .map(str::trim)
             .filter(|v| !v.is_empty());
 
-        if name.is_none() && value_format.is_none() {
+        let Some(name) = name else {
             return Ok(TokenHeader::default());
-        }
+        };
 
-        TokenHeader::new(
-            name.unwrap_or("Authorization"),
-            value_format.unwrap_or("Bearer {token}"),
-        )
-        .map_err(|e| DataConnectorError::InvalidConfigurationNoSource {
+        TokenHeader::new(name).map_err(|e| DataConnectorError::InvalidConfigurationNoSource {
             dataconnector: "https".to_string(),
             connector_component: ConnectorComponent::from(dataset),
             message: format!(
-                "Invalid OAuth2 auth header configuration ('{}' / '{}'): {e}",
-                self.params.user_param("auth_header"),
-                self.params.user_param("auth_header_format"),
+                "Invalid OAuth2 auth header configuration ('{}'): {e}",
+                self.params.user_param("auth_header_name"),
             ),
         })
     }
@@ -1302,8 +1290,7 @@ const OAUTH_PARAM_KEYS: &[&str] = &[
     "auth_client_secret",
     "auth_scopes",
     "auth_client_auth",
-    "auth_header",
-    "auth_header_format",
+    "auth_header_name",
 ];
 
 /// Returns true if any `OAuth2` parameter is set to a non-empty value.
@@ -1701,7 +1688,7 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::runtime("pagination_page_size")
             .description("Number of items per page for query-parameter pagination. Must be a positive integer greater than 0. Used to expand {limit} in pagination_query_params and to detect the last page (fewer results than page_size = done)."),
         ParameterSpec::runtime("auth_token_url")
-            .description("OAuth2 token endpoint URL. Enables OAuth2: the connector acquires short-lived access tokens (refresh-token grant by default, or client_credentials via auth_grant_type) and attaches them to data requests ('Authorization: Bearer <token>' by default, configurable via auth_header/auth_header_format). Applies to JSON API endpoints only."),
+            .description("OAuth2 token endpoint URL. Enables OAuth2: the connector acquires short-lived access tokens (refresh-token grant by default, or client_credentials via auth_grant_type) and attaches them to data requests ('Authorization: Bearer <token>' by default, or the bare token under a custom auth_header_name). Applies to JSON API endpoints only."),
         ParameterSpec::runtime("auth_grant_type")
             .description("OAuth2 grant type: 'refresh_token' (default, RFC 6749 §6) or 'client_credentials' (RFC 6749 §4.4). client_credentials authenticates with client_id/client_secret and issues no refresh token, re-exchanging before expiry (e.g. Shopify Admin API).")
             .one_of(&["refresh_token", "client_credentials"]),
@@ -1711,10 +1698,8 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             .description("OAuth2 client_id presented to the token endpoint. Required for confidential clients and for the client_credentials grant; optional for public clients. Paired with http_auth_client_secret."),
         ParameterSpec::component("auth_client_secret").secret()
             .description("OAuth2 client_secret presented to the token endpoint. Required for confidential clients and for the client_credentials grant; must be set together with http_auth_client_id."),
-        ParameterSpec::runtime("auth_header")
-            .description("HTTP header name that carries the access token. Default: 'Authorization'. Set a custom name for non-standard APIs, e.g. 'X-Shopify-Access-Token'."),
-        ParameterSpec::runtime("auth_header_format")
-            .description("Template for the access-token header value; must contain '{token}' exactly once. Default: 'Bearer {token}'. Use '{token}' for APIs that expect the bare token (e.g. Shopify)."),
+        ParameterSpec::runtime("auth_header_name")
+            .description("HTTP header name that carries the access token. Default: 'Authorization', which sends 'Bearer <token>'. Any other header name (e.g. 'X-Shopify-Access-Token') sends the bare token instead."),
         ParameterSpec::runtime("auth_scopes")
             .description("Space-separated OAuth2 scopes to request when refreshing. Omit to inherit the scopes bound to the refresh token. Optional."),
         // Validation happens via `ClientAuthMethod::parse`, which is case-
@@ -3015,8 +3000,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
             ("http_auth_client_id", "shopify-cid"),
             ("http_auth_client_secret", "shopify-secret"),
             ("auth_client_auth", "body"),
-            ("auth_header", "X-Shopify-Access-Token"),
-            ("auth_header_format", "{token}"),
+            ("auth_header_name", "X-Shopify-Access-Token"),
         ])
         .await;
         let dataset = test_dataset("https://shop.example.com", RefreshMode::Append, None).await;
@@ -3087,23 +3071,23 @@ uGgYIHbi/F+GaiUPzDyqe5p9
     }
 
     #[tokio::test]
-    async fn resolve_oauth2_auth_rejects_invalid_header_format() {
+    async fn resolve_oauth2_auth_rejects_invalid_header_name() {
         let connector = test_connector_with(&[
             ("auth_token_url", "https://example.com/oauth/token"),
             ("http_auth_refresh_token", "rt"),
-            ("auth_header_format", "no-placeholder-here"),
+            ("auth_header_name", "Not A Valid Header"),
         ])
         .await;
         let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
 
         let error = connector
             .resolve_oauth2_auth(&dataset)
-            .expect_err("header format without {token} should be rejected");
+            .expect_err("an invalid header name should be rejected");
         match error {
             DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
                 assert!(
-                    message.contains("auth_header_format"),
-                    "expected error to mention auth_header_format, got: {message}"
+                    message.contains("auth_header_name"),
+                    "expected error to mention auth_header_name, got: {message}"
                 );
             }
             other => panic!("expected InvalidConfigurationNoSource, got: {other}"),

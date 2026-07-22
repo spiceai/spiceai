@@ -29,9 +29,9 @@ limitations under the License.
 //!   refresh simply re-runs the same exchange (e.g. Shopify Admin API).
 //!
 //! By default the access token is attached as `Authorization: Bearer <token>`,
-//! but the header name and value template are configurable via [`TokenHeader`]
-//! so non-standard schemes work too (e.g. Shopify's
-//! `X-Shopify-Access-Token: <token>`).
+//! but the header name is configurable via [`TokenHeader`]; a non-`Authorization`
+//! header carries the bare token, so non-standard schemes work too (e.g.
+//! Shopify's `X-Shopify-Access-Token: <token>`).
 
 use std::fmt;
 use std::sync::Arc;
@@ -71,10 +71,6 @@ const MAX_REFRESH_BACKOFF_SECS: u64 = 300;
 /// `Error::TokenEndpointStatus`. Prevents accidentally surfacing large or
 /// multi-line payloads (which may embed sensitive details) into callers.
 const MAX_ERROR_BODY_BYTES: usize = 512;
-
-/// Placeholder replaced with the access token in a [`TokenHeader`] value
-/// template.
-const TOKEN_PLACEHOLDER: &str = "{token}";
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -120,11 +116,6 @@ pub enum Error {
         name: String,
         source: reqwest::header::InvalidHeaderName,
     },
-
-    #[snafu(display(
-        "OAuth2 auth header format must contain the '{{token}}' placeholder exactly once. Got: '{format}'"
-    ))]
-    InvalidHeaderFormat { format: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -193,41 +184,37 @@ impl OAuthGrant {
     }
 }
 
-/// Where and how the obtained access token is attached to outgoing data
-/// requests.
+/// Where the obtained access token is attached to outgoing data requests.
 ///
-/// Defaults to the standard `Authorization: Bearer <token>`. APIs that use a
-/// non-standard scheme configure a custom header name and value template — for
-/// example the Shopify Admin API expects `X-Shopify-Access-Token: <token>`
-/// (header name `X-Shopify-Access-Token`, value template `{token}`).
+/// Only the header *name* is user-configurable; the value scheme is derived
+/// from it. The `Authorization` header (the default) carries `Bearer <token>`
+/// per RFC 6750; any other header carries the bare `<token>` — matching APIs
+/// with non-standard schemes, e.g. the Shopify Admin API's
+/// `X-Shopify-Access-Token: <token>`.
 #[derive(Clone, Debug)]
 pub struct TokenHeader {
     name: HeaderName,
-    format: String,
 }
 
 impl Default for TokenHeader {
     fn default() -> Self {
         Self {
             name: AUTHORIZATION,
-            format: format!("Bearer {TOKEN_PLACEHOLDER}"),
         }
     }
 }
 
 impl TokenHeader {
-    /// Build a token header from user-facing config.
+    /// Build a token header from the user-facing header name.
     ///
     /// `name` is the HTTP header name (e.g. `Authorization`,
-    /// `X-Shopify-Access-Token`). `format` is the header value template; it
-    /// must contain the `{token}` placeholder exactly once (e.g.
-    /// `Bearer {token}` or `{token}`).
+    /// `X-Shopify-Access-Token`). The value scheme is derived: `Authorization`
+    /// yields `Bearer <token>`, any other header yields the bare `<token>`.
     ///
     /// # Errors
     /// Returns [`Error::InvalidHeaderName`] if `name` is not a valid HTTP header
-    /// name, or [`Error::InvalidHeaderFormat`] if `format` does not contain
-    /// exactly one `{token}` placeholder.
-    pub fn new(name: &str, format: &str) -> Result<Self> {
+    /// name.
+    pub fn new(name: &str) -> Result<Self> {
         let trimmed = name.trim();
         let header_name = HeaderName::from_bytes(trimmed.as_bytes()).map_err(|source| {
             Error::InvalidHeaderName {
@@ -235,16 +222,7 @@ impl TokenHeader {
                 source,
             }
         })?;
-        ensure!(
-            format.matches(TOKEN_PLACEHOLDER).count() == 1,
-            InvalidHeaderFormatSnafu {
-                format: format.to_string(),
-            }
-        );
-        Ok(Self {
-            name: header_name,
-            format: format.to_string(),
-        })
+        Ok(Self { name: header_name })
     }
 
     /// The configured header name.
@@ -253,11 +231,15 @@ impl TokenHeader {
         &self.name
     }
 
-    /// Render the sensitive header value for `access_token`.
+    /// Render the sensitive header value for `access_token`. The scheme depends
+    /// on the header name: `Bearer <token>` for `Authorization`, bare `<token>`
+    /// otherwise.
     fn header_value(&self, access_token: &SecretString) -> Result<HeaderValue> {
-        let raw = self
-            .format
-            .replace(TOKEN_PLACEHOLDER, access_token.expose_secret());
+        let raw = if self.name == AUTHORIZATION {
+            format!("Bearer {}", access_token.expose_secret())
+        } else {
+            access_token.expose_secret().to_string()
+        };
         let mut header = HeaderValue::from_str(&raw).context(InvalidAccessTokenSnafu)?;
         header.set_sensitive(true);
         Ok(header)
@@ -712,11 +694,32 @@ mod tests {
 
     #[test]
     fn token_header_validation() {
+        // Default: Authorization -> Bearer scheme.
         let default = TokenHeader::default();
         assert_eq!(default.name(), &AUTHORIZATION);
+        assert_eq!(
+            default
+                .header_value(&SecretString::from("abc"))
+                .expect("value")
+                .to_str()
+                .unwrap_or(""),
+            "Bearer abc"
+        );
 
-        let shopify = TokenHeader::new("X-Shopify-Access-Token", "{token}")
-            .expect("valid custom header should parse");
+        // Explicit Authorization (any case) also gets the Bearer scheme.
+        let explicit = TokenHeader::new("authorization").expect("valid header");
+        assert_eq!(
+            explicit
+                .header_value(&SecretString::from("abc"))
+                .expect("value")
+                .to_str()
+                .unwrap_or(""),
+            "Bearer abc"
+        );
+
+        // Any other header carries the bare token.
+        let shopify =
+            TokenHeader::new("X-Shopify-Access-Token").expect("valid custom header should parse");
         assert_eq!(shopify.name().as_str(), "x-shopify-access-token");
         let value = shopify
             .header_value(&SecretString::from("shpat_abc"))
@@ -725,20 +728,9 @@ mod tests {
         assert!(value.is_sensitive(), "token header must be sensitive");
 
         assert!(matches!(
-            TokenHeader::new("Bad Header Name", "{token}"),
+            TokenHeader::new("Bad Header Name"),
             Err(Error::InvalidHeaderName { .. })
         ));
-        assert!(matches!(
-            TokenHeader::new("Authorization", "Bearer no-placeholder"),
-            Err(Error::InvalidHeaderFormat { .. })
-        ));
-        assert!(
-            matches!(
-                TokenHeader::new("Authorization", "{token}{token}"),
-                Err(Error::InvalidHeaderFormat { .. })
-            ),
-            "duplicate placeholder should be rejected"
-        );
     }
 
     #[test]
@@ -890,8 +882,7 @@ mod tests {
             client_secret: Some(SecretString::from("shopify-secret")),
             scopes: None,
             client_auth: ClientAuthMethod::Body,
-            header: TokenHeader::new("X-Shopify-Access-Token", "{token}")
-                .expect("valid header config"),
+            header: TokenHeader::new("X-Shopify-Access-Token").expect("valid header config"),
         };
 
         let resp = exchange_token(&client, &config, &OAuthGrant::ClientCredentials)
@@ -993,8 +984,7 @@ mod tests {
             client_secret: Some(SecretString::from("csec")),
             scopes: None,
             client_auth: ClientAuthMethod::Body,
-            header: TokenHeader::new("X-Shopify-Access-Token", "{token}")
-                .expect("valid header config"),
+            header: TokenHeader::new("X-Shopify-Access-Token").expect("valid header config"),
         };
 
         let auth = OAuth2Auth::try_new(config, OAuthGrant::ClientCredentials)

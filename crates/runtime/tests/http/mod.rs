@@ -761,10 +761,9 @@ async fn test_http_oauth_client_credentials_custom_header() -> Result<(), String
                 ),
                 ("auth_client_auth".to_string(), "body".to_string()),
                 (
-                    "auth_header".to_string(),
+                    "auth_header_name".to_string(),
                     "X-Shopify-Access-Token".to_string(),
                 ),
-                ("auth_header_format".to_string(), "{token}".to_string()),
             ])));
 
             let app = AppBuilder::new("http_oauth_cc_test")
