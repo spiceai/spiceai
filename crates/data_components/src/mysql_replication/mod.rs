@@ -543,8 +543,9 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
     let layout_fingerprint = layout.fingerprint();
     let checkpoint_schema_json = encode_checkpoint_schema_json(schema_json.as_deref(), &layout);
 
-    // Resume plan. A persisted checkpoint's cursor type — GTID iff it carries a
-    // GTID set — is authoritative on resume: the dataset keeps the type it was
+    // Resume plan. A persisted checkpoint's *stored* cursor type is
+    // authoritative on resume (read from the sidecar, never inferred from
+    // whether a GTID set is present): the dataset keeps the type it was
     // bootstrapped with. A GTID checkpoint whose server can no longer do GTID
     // is a hard error (never a silent downgrade to file+offset, which would
     // resume from a server-local position unrelated to the applied GTID set); a

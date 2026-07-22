@@ -397,8 +397,8 @@ pub(crate) const REPLICATION_METRICS: &[MetricSpec] = &[
     .auto_register(),
     MetricSpec::new("replication_gtid_enabled", MetricType::ObservableGaugeU64)
         .description(
-            "1 when the stream resumes via GTID auto-positioning (failover-safe); 0 for \
-             binlog file+offset positioning.",
+            "1 when the stream is positioning by GTID auto-positioning (failover-safe) — on \
+             cold bootstrap or resume; 0 for binlog file+offset positioning.",
         )
         .auto_register(),
     MetricSpec::new(

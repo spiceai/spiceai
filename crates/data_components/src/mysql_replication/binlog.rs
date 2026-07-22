@@ -263,6 +263,9 @@ fn binlog_change_stream(
             metrics: Arc::clone(&metrics),
             last_persisted: start,
             use_gtid,
+            // Seed from the resume set so the first checkpoint only fires once
+            // the executed set actually grows past what was already persisted.
+            last_persisted_gtid: ack.gtid_snapshot().to_string(),
         };
         // The GTID of the transaction group currently buffering, captured from
         // its GtidEvent and handed to the committer at commit time.
@@ -1164,6 +1167,14 @@ struct Checkpointer {
     /// Persist the executed GTID set alongside the file position (failover-safe
     /// resume). When false, `gtid_set` stays `None` and resume is file+offset.
     use_gtid: bool,
+    /// The executed GTID set (serialized) last durably persisted. Under GTID the
+    /// set is the authoritative cursor: a failover can repoint the stream at a
+    /// server whose binlog file ordinals are *lower* than the persisted one, so
+    /// `resume` (ordered by file ordinal) may never advance again even as the
+    /// set keeps growing. Gating persistence on this too — not only on `resume`
+    /// — keeps the failover-safe GTID checkpoint advancing so the crash-replay
+    /// window stays bounded. Empty (and unused) when `use_gtid` is false.
+    last_persisted_gtid: String,
 }
 
 impl Checkpointer {
@@ -1372,16 +1383,25 @@ impl Checkpointer {
             advance_max(resume, committed);
         }
         let fingerprint_updated = self.apply_pending_adopt_if_ready(resume);
-        if *resume <= self.last_persisted && !fingerprint_updated {
+        // Snapshot the executed set at the same instant as the position: under
+        // the in-order commit contract everything up to `resume` is in the set,
+        // and nothing past it (see `AckState`).
+        let gtid_set = self.use_gtid.then(|| ack.gtid_snapshot().to_string());
+        // Under GTID the set is the real cursor. A failover can leave `resume`
+        // frozen (new source's file ordinals lower than the persisted one), so
+        // also persist whenever the executed set has grown — otherwise the
+        // failover-safe checkpoint would stop advancing and the replay window
+        // would grow without bound.
+        let gtid_advanced = gtid_set
+            .as_deref()
+            .is_some_and(|set| set != self.last_persisted_gtid);
+        if *resume <= self.last_persisted && !fingerprint_updated && !gtid_advanced {
             return;
         }
         let persisted = PersistedPosition {
             position: resume.clone(),
             schema_json: self.schema_json.clone(),
-            // Snapshot the executed set at the same instant as the position:
-            // under the in-order commit contract everything up to `resume` is
-            // in the set, and nothing past it (see `AckState`).
-            gtid_set: self.use_gtid.then(|| ack.gtid_snapshot().to_string()),
+            gtid_set: gtid_set.clone(),
             // Stored explicitly so classification never depends on whether the
             // (possibly empty) GTID set round-trips as non-null.
             cursor_type: Some(if self.use_gtid {
@@ -1397,6 +1417,9 @@ impl Checkpointer {
                     .set_committed_position(resume.file_ordinal().unwrap_or(0), resume.pos);
                 if *resume >= self.last_persisted {
                     self.last_persisted = resume.clone();
+                }
+                if let Some(set) = gtid_set {
+                    self.last_persisted_gtid = set;
                 }
             }
             Err(e) => {
@@ -1835,6 +1858,92 @@ fn parse_table_ref(tokens: &[Token], idx: &mut usize) -> Option<(Option<String>,
 mod tests {
     use super::*;
 
+    /// Regression (failover durability): under GTID the executed set is the
+    /// authoritative cursor. After a failover the promoted primary's binlog
+    /// file ordinals can be *lower* than the persisted position, so `resume`
+    /// never advances again — but the checkpoint must still persist as the set
+    /// grows, or the crash-replay window grows without bound.
+    #[tokio::test]
+    async fn gtid_checkpoint_persists_when_set_advances_though_position_frozen() {
+        use super::super::{PersistedPosition, PositionStore, StoreError};
+        use async_trait::async_trait;
+        use std::sync::Mutex as StdMutex;
+
+        #[derive(Default)]
+        struct RecordingStore {
+            saved: StdMutex<Option<PersistedPosition>>,
+            saves: StdMutex<u32>,
+        }
+        #[async_trait]
+        impl PositionStore for RecordingStore {
+            async fn load(&self) -> std::result::Result<Option<PersistedPosition>, StoreError> {
+                Ok(self.saved.lock().expect("lock").clone())
+            }
+            async fn save(&self, p: &PersistedPosition) -> std::result::Result<(), StoreError> {
+                *self.saved.lock().expect("lock") = Some(p.clone());
+                *self.saves.lock().expect("lock") += 1;
+                Ok(())
+            }
+            async fn clear(&self) -> std::result::Result<(), StoreError> {
+                *self.saved.lock().expect("lock") = None;
+                Ok(())
+            }
+        }
+
+        let uuid = Uuid::parse_str("3e11fa47-71ca-11e1-9e33-c80aa9429562").expect("uuid");
+        // Seed = the set already persisted before the failover.
+        let mut seed = GtidSet::new();
+        seed.add(uuid, 5);
+
+        let store = Arc::new(RecordingStore::default());
+        // Persisted position is high (old primary, binlog.000042); the promoted
+        // primary streams from a lower ordinal (binlog.000001).
+        let mut checkpointer = Checkpointer {
+            store: Arc::clone(&store) as Arc<dyn PositionStore>,
+            schema_json: None,
+            pending_adopt: None,
+            dataset_name: "orders".to_string(),
+            metrics: MetricsCollector::new(),
+            last_persisted: BinlogPosition::new("binlog.000042", 1000),
+            use_gtid: true,
+            last_persisted_gtid: seed.to_string(),
+        };
+
+        let ack = AckState::new(seed);
+        // Post-failover: a committed position with a LOWER file ordinal (so
+        // `resume` cannot advance), plus a newly-applied txn that grows the set.
+        ack.advance(&BinlogPosition::new("binlog.000001", 500));
+        ack.add_gtid(uuid, 6);
+
+        let mut resume = BinlogPosition::new("binlog.000042", 1000);
+        checkpointer.persist(&ack, &mut resume).await;
+
+        assert_eq!(
+            *store.saves.lock().expect("lock"),
+            1,
+            "must persist when the executed set advances even though the position is frozen"
+        );
+        let saved = store
+            .saved
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("a checkpoint was saved");
+        assert_eq!(saved.cursor_type, Some(CursorType::Gtid));
+        assert_eq!(
+            saved.gtid_set.as_deref(),
+            Some(format!("{uuid}:5-6").as_str())
+        );
+
+        // No further advance → no redundant persist.
+        checkpointer.persist(&ack, &mut resume).await;
+        assert_eq!(
+            *store.saves.lock().expect("lock"),
+            1,
+            "must not persist again when neither the position nor the set advanced"
+        );
+    }
+
     #[test]
     fn safe_advance_requires_drained_and_idle() {
         let emitted = BinlogPosition::new("binlog.000001", 500);
@@ -1907,6 +2016,7 @@ mod tests {
             metrics: MetricsCollector::new(),
             last_persisted: BinlogPosition::new("binlog.000001", 100),
             use_gtid: false,
+            last_persisted_gtid: String::new(),
         };
 
         let pre_adopt = AdoptedLayout {
@@ -1986,6 +2096,7 @@ mod tests {
             metrics: MetricsCollector::new(),
             last_persisted: BinlogPosition::new("binlog.000001", 100),
             use_gtid: false,
+            last_persisted_gtid: String::new(),
         };
         checkpointer.note_adopted_layout(
             &AdoptedLayout {
@@ -2047,6 +2158,7 @@ mod tests {
             metrics: MetricsCollector::new(),
             last_persisted: BinlogPosition::new("binlog.000001", 100),
             use_gtid: false,
+            last_persisted_gtid: String::new(),
         };
 
         let ba = BinlogPosition::new("binlog.000001", 500);
@@ -2162,6 +2274,7 @@ mod tests {
             metrics: MetricsCollector::new(),
             last_persisted: BinlogPosition::new("binlog.000001", 100),
             use_gtid: false,
+            last_persisted_gtid: String::new(),
         };
 
         let ba = BinlogPosition::new("binlog.000001", 500);
@@ -2273,6 +2386,7 @@ mod tests {
             metrics: MetricsCollector::new(),
             last_persisted: BinlogPosition::new("binlog.000001", 100),
             use_gtid: false,
+            last_persisted_gtid: String::new(),
         };
 
         // First change recorded only via TableMap@T1; second via ALTER@A2.

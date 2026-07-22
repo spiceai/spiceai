@@ -202,7 +202,7 @@ Exposed under `dataset_mysql_*` alongside the connection-pool metrics:
 | `replication_schema_mismatch_errors_total` | Mid-stream DDL detections. |
 | `replication_recv_errors_total` / `replication_reconnects_total` | Transport health. |
 | `replication_checkpoint_persists_total` / `_errors_total` | Sidecar checkpoint writes. |
-| `replication_gtid_enabled` | `1` when resuming via GTID auto-positioning, `0` for file+offset. |
+| `replication_gtid_enabled` | `1` when positioning by GTID auto-positioning (cold bootstrap or resume), `0` for file+offset. |
 
 ## Failover-safe resume (GTID)
 
