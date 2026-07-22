@@ -84,16 +84,21 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 impl Error {
-    /// `true` when retrying the same request cannot succeed: the server
-    /// authoritatively rejected the credential/request (4xx), or the
-    /// failure is local and deterministic (proof-of-possession signing).
-    /// Transport failures and 5xx responses are transient.
+    /// `true` only when the cloud *authoritatively rejected* the request
+    /// (4xx `Rejected`): the adoption code is invalid/consumed/expired, or the
+    /// identity was revoked. This is the sole condition under which the caller
+    /// may take a destructive action — burning the staged adoption code or
+    /// clearing the on-disk identity.
+    ///
+    /// Note this deliberately EXCLUDES [`Error::ProofOfPossession`]. A
+    /// proof-of-possession / key-material failure is *local* and never reaches
+    /// the cloud (during enroll it fails before the HTTP request; during renew
+    /// the code was never at stake), so it must NOT burn an un-consumed code or
+    /// discard a still-valid identity — it is retried instead. Transport
+    /// failures and 5xx responses are likewise transient (retryable).
     #[must_use]
-    pub fn is_permanent(&self) -> bool {
-        matches!(
-            self,
-            Error::Rejected { .. } | Error::ProofOfPossession { .. }
-        )
+    pub fn is_authoritative_rejection(&self) -> bool {
+        matches!(self, Error::Rejected { .. })
     }
 }
 
@@ -456,7 +461,17 @@ mod tests {
     fn sign_pop_rejects_garbage_key() {
         let material = IdentityStore::generate_enrollment().expect("material");
         let err = sign_pop("not a pem", &material.csr_pem).expect_err("must fail");
-        assert!(err.is_permanent(), "a local signing failure is permanent");
+        assert!(
+            matches!(err, Error::ProofOfPossession { .. }),
+            "a local signing failure is a proof-of-possession error"
+        );
+        // A local PoP/crypto failure is NOT an authoritative cloud rejection:
+        // it must never burn an un-consumed adoption code or clear a valid
+        // identity — the caller retries instead.
+        assert!(
+            !err.is_authoritative_rejection(),
+            "a local signing failure must not be treated as a cloud rejection"
+        );
     }
 
     #[test]
@@ -478,16 +493,24 @@ mod tests {
 
     #[test]
     fn rejection_classification() {
+        // Only an authoritative 4xx cloud rejection may trigger destructive
+        // cleanup (burn the code / clear the identity).
         let rejected = Error::Rejected {
             status: 401,
             message: "Adoption code already used".to_string(),
         };
-        assert!(rejected.is_permanent());
+        assert!(rejected.is_authoritative_rejection());
+        // 5xx is transient — retryable, never destructive.
         let server = Error::ServerError {
             status: 503,
             message: String::new(),
         };
-        assert!(!server.is_permanent());
+        assert!(!server.is_authoritative_rejection());
+        // A local proof-of-possession failure is not a cloud rejection.
+        let pop = Error::ProofOfPossession {
+            reason: "key material generation failed".to_string(),
+        };
+        assert!(!pop.is_authoritative_rejection());
     }
 
     fn test_config(enroll_endpoint: &str) -> CloudConnectConfig {

@@ -234,10 +234,11 @@ impl ClientDriver {
                 Ok(()) => {
                     *backoff = MIN_BACKOFF;
                 }
-                Err(err) if err.is_permanent() => {
-                    // The code is dead (invalid, already consumed, or
-                    // expired): discard the staged file so a restart does
-                    // not re-send it, and exit with an actionable message.
+                Err(err) if err.is_authoritative_rejection() => {
+                    // The cloud authoritatively rejected the code — it is dead
+                    // (invalid, already consumed, or expired): discard the
+                    // staged file so a restart does not re-send it, and exit
+                    // with an actionable message.
                     self.discard_pending_code().await;
                     tracing::error!(
                         "Cloud Connect: enrollment with {} was rejected: {err}; exiting cloud-connect. Mint a new adoption code in the Spice Cloud portal, run `spice connect <code>`, and restart spiced. See: https://spiceai.org/docs",
@@ -246,6 +247,10 @@ impl ClientDriver {
                     return CredentialStep::Exit;
                 }
                 Err(err) => {
+                    // Transient (transport / 5xx) OR a local failure that never
+                    // reached the cloud (e.g. key-material generation). Either
+                    // way the code was NOT consumed, so keep the staged code
+                    // and retry rather than burning it.
                     tracing::warn!(
                         "Cloud Connect: enrollment attempt against {} failed (will retry): {err}",
                         self.config.enroll_endpoint
@@ -265,12 +270,13 @@ impl ClientDriver {
         {
             match self.renew_once(enroll_client).await {
                 Ok(()) => {}
-                Err(err) if err.is_permanent() => {
-                    // Renewal permanently refused: the instance was
-                    // forgotten/revoked cloud-side (refusing renewal IS the
-                    // revocation, DR-025) or the pinned key no longer
-                    // matches. The identity is dead; the next pass enrolls
-                    // with a staged code or exits with re-adopt guidance.
+                Err(err) if err.is_authoritative_rejection() => {
+                    // Renewal authoritatively refused by the cloud: the
+                    // instance was forgotten/revoked cloud-side (refusing
+                    // renewal IS the revocation, DR-025) or the pinned key no
+                    // longer matches. The identity is dead; the next pass
+                    // enrolls with a staged code or exits with re-adopt
+                    // guidance.
                     tracing::error!(
                         "Cloud Connect: identity renewal was refused: {err}; clearing the local identity"
                     );
@@ -278,6 +284,9 @@ impl ClientDriver {
                     return CredentialStep::Retry;
                 }
                 Err(err) => {
+                    // Transient, or a local key-material/PoP failure — the
+                    // cloud did not reject us, so keep the identity: the
+                    // existing leaf may still be usable to connect.
                     tracing::warn!("Cloud Connect: identity renewal failed (will retry): {err}");
                     if self.identity.as_ref().is_some_and(Identity::is_expired) {
                         // The leaf is expired: the gateway will reject it, so
@@ -619,11 +628,11 @@ impl ClientDriver {
                 () = sleep_or_never(renew_delay) => {
                     match self.renew_once(enroll_client).await {
                         Ok(()) => {}
-                        Err(err) if err.is_permanent() => {
-                            // Refusing renewal IS the revocation (DR-025):
-                            // the identity is dead, so clear it and leave
-                            // the stream — the outer loop decides whether a
-                            // staged code allows re-enrollment.
+                        Err(err) if err.is_authoritative_rejection() => {
+                            // The cloud refusing renewal IS the revocation
+                            // (DR-025): the identity is dead, so clear it and
+                            // leave the stream — the outer loop decides whether
+                            // a staged code allows re-enrollment.
                             tracing::error!(
                                 "Cloud Connect: identity renewal was refused: {err}; clearing the local identity"
                             );
@@ -631,6 +640,9 @@ impl ClientDriver {
                             break ExitReason::IdentityRevoked;
                         }
                         Err(err) => {
+                            // Transient, or a local key-material/PoP failure —
+                            // not a cloud rejection, so keep the identity and
+                            // retry; the current leaf keeps the stream alive.
                             tracing::warn!(
                                 "Cloud Connect: identity renewal failed (retrying in {}): {err}",
                                 humanize(RENEW_RETRY_INTERVAL)
