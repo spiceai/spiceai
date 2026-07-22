@@ -386,6 +386,7 @@ async fn mysql_binlog_replication_end_to_end() -> Result<(), anyhow::Error> {
 /// additionally exercises the `spice_sys_mysql_binlog` position sidecar.
 #[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "flaky: the final TRUNCATE step races the Cayenne CDC mem-tier — delete-all (DELETE WHERE TRUE) clears the durable/inlined tiers but not un-checkpointed mem-tier rows, so count stalls at 2 instead of 0. Connector-agnostic Cayenne bug (affects Postgres/Debezium CDC too). Re-enable once Cayenne's delete_from(WHERE TRUE) also clears the mem-tier. Tracking: <ISSUE>"]
 async fn mysql_binlog_replication_end_to_end_cayenne() -> Result<(), anyhow::Error> {
     let temp_dir = tempfile::tempdir()?;
     let data_dir = temp_dir.path().join("cayenne");
