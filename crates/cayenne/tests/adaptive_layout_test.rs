@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -130,7 +130,8 @@ async fn default_layout_learns_filter_columns_from_scans() {
         Field::new("amount", DataType::Int64, false),
     ]));
 
-    let provider = create_default_table(&fixture, "t_learn", Arc::clone(&schema), runtime_env).await;
+    let provider =
+        create_default_table(&fixture, "t_learn", Arc::clone(&schema), runtime_env).await;
     insert_rows(&provider, "t_learn", 200).await;
 
     // Before any filtered scan, auto sort columns are empty (no observations).
@@ -257,7 +258,10 @@ async fn sort_and_rewrite_uses_observed_filter_column() {
     }
 
     assert_eq!(
-        provider.effective_sort_columns_for_rewrite().first().map(String::as_str),
+        provider
+            .effective_sort_columns_for_rewrite()
+            .first()
+            .map(String::as_str),
         Some("region")
     );
 

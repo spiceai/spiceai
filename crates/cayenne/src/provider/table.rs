@@ -5172,7 +5172,9 @@ impl CayenneTableProvider {
             orphan_dv_sweep_scheduled: Arc::new(AtomicBool::new(false)),
             post_write_maintenance: Arc::new(PostWriteMaintenance::default()),
             maintained_aggregates,
-            filter_column_observations: Arc::new(super::predicate_stats::FilterColumnObservations::new()),
+            filter_column_observations: Arc::new(
+                super::predicate_stats::FilterColumnObservations::new(),
+            ),
             maintained_aggregate_epoch: Arc::new(AtomicU64::new(0)),
             maintained_aggregate_visibility_sequence: Arc::new(AtomicU64::new(0)),
             maintained_aggregate_tx,
@@ -11386,12 +11388,10 @@ impl CayenneTableProvider {
     ///
     /// # Errors
     ///
-    /// Returns an error if sorting fails or if configured sort columns don't exist.
-    /// Sort a stream by the given column list (configured or auto-observed).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if sorting fails.
+    /// Returns an error only if the sort execution itself fails. Columns missing
+    /// from the stream schema (or otherwise unparseable) are skipped with a
+    /// warning and the stream is returned unsorted (see
+    /// `util::stream_utils::sort_stream`) — never surfaced as an error.
     fn sort_stream_by_columns(
         &self,
         stream: SendableRecordBatchStream,

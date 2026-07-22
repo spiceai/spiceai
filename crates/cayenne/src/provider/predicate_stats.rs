@@ -71,9 +71,14 @@ impl FilterColumnObservations {
         // Cap cardinality: drop lowest-hit keys when over the limit so memory
         // stays bounded under wide schemas / ad-hoc column churn.
         while state.len() > MAX_TRACKED_COLUMNS {
+            // Deterministic victim: the coldest column, breaking ties by name so
+            // eviction never depends on the randomized `HashMap` iteration order
+            // (non-determinism there would leak into the observed set and thus
+            // auto-layout under column churn). Ties retain the lexicographically
+            // smaller name, matching `top_columns`' tie-break.
             let victim = state
                 .iter()
-                .min_by_key(|(_, hits)| *hits)
+                .min_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
                 .map(|(name, _)| name.clone());
             if let Some(name) = victim {
                 state.remove(&name);
@@ -147,10 +152,7 @@ mod tests {
     #[test]
     fn record_filters_counts_distinct_columns_per_call() {
         let observations = FilterColumnObservations::new();
-        let filters = vec![
-            col("region").eq(lit("west")),
-            col("amount").gt(lit(10_i64)),
-        ];
+        let filters = vec![col("region").eq(lit("west")), col("amount").gt(lit(10_i64))];
         observations.record_filters(&filters);
         observations.record_filters(&filters);
         assert_eq!(observations.hits("region"), 2);
@@ -197,11 +199,7 @@ mod tests {
         top.sort();
         assert_eq!(
             top,
-            vec![
-                "amount".to_string(),
-                "region".to_string(),
-                "ts".to_string()
-            ]
+            vec!["amount".to_string(), "region".to_string(), "ts".to_string()]
         );
     }
 }
