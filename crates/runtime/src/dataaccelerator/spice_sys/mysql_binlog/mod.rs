@@ -88,9 +88,10 @@ pub struct MySqlBinlogCheckpoint {
     /// empty string when `gtid_mode = ON` but no transactions have committed.
     pub gtid_executed: Option<String>,
     /// The checkpoint's positioning type (`file`|`gtid`), stored explicitly so
-    /// resume never infers it from `gtid_executed`. `None` on rows written
-    /// before this column existed (the replication layer treats that as an
-    /// incompatible checkpoint rather than guessing).
+    /// resume doesn't need to infer it from `gtid_executed` in the normal case.
+    /// `None` only on rows written before this column existed (unreleased-
+    /// feature dev checkpoints); the connector's sidecar loader resolves that
+    /// case by inferring the type from `gtid_executed`.
     pub cursor_type: Option<String>,
     /// When the row was last updated. Populated by the database layer on read.
     pub updated_at: Option<std::time::SystemTime>,
