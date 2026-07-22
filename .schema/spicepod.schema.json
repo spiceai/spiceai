@@ -2311,6 +2311,7 @@
         "timestamptz",
         "unix_seconds",
         "unix_millis",
+        "unix_nanos",
         "ISO8601",
         "date"
       ]

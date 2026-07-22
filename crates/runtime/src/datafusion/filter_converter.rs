@@ -63,6 +63,7 @@ fn time_format_to_unix_scale(time_format: Option<TimeFormat>) -> Option<u128> {
     match time_format {
         Some(TimeFormat::UnixSeconds) => Some(1_000_000_000),
         Some(TimeFormat::UnixMillis) => Some(1_000_000),
+        Some(TimeFormat::UnixNanos) => Some(1),
         Some(
             TimeFormat::Timestamp
             | TimeFormat::Timestamptz
@@ -92,6 +93,12 @@ mod test {
             TimeFormat::UnixSeconds,
             1_620_000_000_000_000_000,
             "timestamp > UInt64(1620000000)",
+        );
+        test(
+            Field::new("timestamp", DataType::Int64, false),
+            TimeFormat::UnixNanos,
+            1_620_000_000_000_000_000,
+            "timestamp > UInt64(1620000000000000000)",
         );
         test(
             Field::new(

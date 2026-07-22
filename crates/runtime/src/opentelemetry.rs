@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::sync::Arc;
+use std::sync::Weak;
 
 use arrow::array::ArrayBuilder;
 use arrow::array::ArrayRef;
@@ -50,7 +51,7 @@ use tonic::Status;
 use tonic::async_trait;
 use tonic::codec::CompressionEncoding;
 
-use crate::{tracers::OnceTracer, warn_once};
+use crate::{Runtime, tracers::OnceTracer, warn_once};
 use runtime_query_engine::query_engine::{QueryEngine, UpdateType};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -116,7 +117,24 @@ fn is_reserved_column(name: &str) -> bool {
 
 pub struct Service {
     datafusion: Arc<dyn QueryEngine>,
+    /// Weak handle to the runtime, used to evolve an accelerated metric table's schema
+    /// in place when a new metric dimension (attribute column) arrives, per the dataset's
+    /// `on_schema_change` policy. `None` (or a dead weak ref) disables write-time evolution
+    /// and metrics with new dimensions are rejected as before.
+    runtime: Option<Weak<Runtime>>,
     once_tracer: OnceTracer,
+}
+
+/// Names of columns present in `incoming` but absent from `existing` (by name). New metric
+/// dimensions are strictly additive nullable columns, so a non-empty result is the signal to
+/// attempt write-time schema evolution before writing.
+fn detect_added_columns(existing: &Schema, incoming: &Schema) -> Vec<String> {
+    incoming
+        .fields()
+        .iter()
+        .filter(|field| existing.field_with_name(field.name()).is_err())
+        .map(|field| field.name().clone())
+        .collect()
 }
 
 #[async_trait]
@@ -161,7 +179,7 @@ impl MetricsService for Service {
                     );
 
                     match record_batch_result {
-                        Ok(record_batch) => {
+                        Ok(mut record_batch) => {
                             if !self
                                 .datafusion
                                 .is_writable(&TableReference::bare(metric.name.clone()))
@@ -178,6 +196,70 @@ impl MetricsService for Service {
                                 );
                                 rejected_data_points += data_points_count;
                                 continue;
+                            }
+
+                            // Pre-flight schema evolution: when this batch introduces new
+                            // dimension columns beyond the stored schema, evolve the
+                            // accelerator (per `on_schema_change`) BEFORE writing so the
+                            // rebound provider accepts the wider batch. On `block`/`fail`,
+                            // an unsupported engine, or an incompatible change this is a
+                            // no-op and the write below rejects the batch as it does today.
+                            if let Some(existing) = existing_schema.as_ref() {
+                                let added =
+                                    detect_added_columns(existing, record_batch.schema().as_ref());
+                                if !added.is_empty()
+                                    && let Some(runtime) =
+                                        self.runtime.as_ref().and_then(Weak::upgrade)
+                                {
+                                    let table_ref = TableReference::bare(metric.name.clone());
+                                    match runtime
+                                        .evolve_accelerated_schema_for_write(
+                                            &table_ref,
+                                            &record_batch.schema(),
+                                        )
+                                        .await
+                                    {
+                                        Ok(Some(evolved)) => {
+                                            tracing::debug!(
+                                                "OpenTelemetry export: evolved schema for metric {} (added dimension(s): {})",
+                                                metric.name,
+                                                added.join(", ")
+                                            );
+                                            // Rebuild against the evolved schema so the batch
+                                            // matches the rebound provider exactly by column
+                                            // set AND order (verify_schema is exact-positional).
+                                            match metric_data_to_record_batch(
+                                                metric.name.as_str(),
+                                                &data,
+                                                Some(&evolved),
+                                            )
+                                            .0
+                                            {
+                                                Ok(rebuilt) => record_batch = rebuilt,
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        "Failed to rebuild OpenTelemetry batch for metric {} after schema evolution: {e}",
+                                                        metric.name
+                                                    );
+                                                    rejected_data_points += data_points_count;
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        Ok(None) => {
+                                            // Not evolved (block/fail/incompatible/unsupported);
+                                            // fall through to the write, which rejects as today.
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "Failed to evolve schema for OpenTelemetry metric {}: {e}",
+                                                metric.name
+                                            );
+                                            rejected_data_points += data_points_count;
+                                            continue;
+                                        }
+                                    }
+                                }
                             }
 
                             let schema = record_batch.schema();
@@ -508,10 +590,7 @@ fn histogram_data_points_to_record_batch(
         .iter()
         .map(|(name, array)| Arc::new(Field::new(*name, array.data_type().clone(), true)))
         .collect();
-    let mut columns: Vec<ArrayRef> = value_columns
-        .into_iter()
-        .map(|(_, array)| array)
-        .collect();
+    let mut columns: Vec<ArrayRef> = value_columns.into_iter().map(|(_, array)| array).collect();
 
     let (attribute_fields_map, attribute_columns_map) =
         attributes_to_fields_and_columns(metric, attributes.as_slice(), existing_schema);
@@ -747,9 +826,13 @@ fn append_null(
 ///
 /// This is used to add OpenTelemetry metrics ingestion to the Flight gRPC server.
 #[must_use]
-pub fn create_metrics_service(datafusion: Arc<dyn QueryEngine>) -> MetricsServiceServer<Service> {
+pub fn create_metrics_service(
+    datafusion: Arc<dyn QueryEngine>,
+    runtime: Option<Weak<Runtime>>,
+) -> MetricsServiceServer<Service> {
     let service = Service {
         datafusion,
+        runtime,
         once_tracer: OnceTracer::new(),
     };
     MetricsServiceServer::new(service).accept_compressed(CompressionEncoding::Gzip)
@@ -774,6 +857,17 @@ mod tests {
                 value: Some(any_value::Value::StringValue(value.to_string())),
             }),
             ..Default::default()
+        }
+    }
+
+    fn number_data_point(value: f64, attributes: Vec<KeyValue>) -> NumberDataPoint {
+        NumberDataPoint {
+            attributes,
+            start_time_unix_nano: 100,
+            time_unix_nano: 200,
+            exemplars: vec![],
+            flags: 0,
+            value: Some(Value::AsDouble(value)),
         }
     }
 
@@ -925,17 +1019,37 @@ mod tests {
         // value lands on the correct row.
         let data = Data::Histogram(Histogram {
             data_points: vec![
-                histogram_data_point(1, Some(1.0), None, None, vec![1], vec![], vec![
-                    string_attribute("protocol", "http"),
-                ]),
-                histogram_data_point(2, Some(2.0), None, None, vec![2], vec![], vec![
-                    string_attribute("protocol", "http"),
-                ]),
+                histogram_data_point(
+                    1,
+                    Some(1.0),
+                    None,
+                    None,
+                    vec![1],
+                    vec![],
+                    vec![string_attribute("protocol", "http")],
+                ),
+                histogram_data_point(
+                    2,
+                    Some(2.0),
+                    None,
+                    None,
+                    vec![2],
+                    vec![],
+                    vec![string_attribute("protocol", "http")],
+                ),
                 // Third data point introduces a brand-new `tenant` attribute at row index 2.
-                histogram_data_point(3, Some(3.0), None, None, vec![3], vec![], vec![
-                    string_attribute("protocol", "flightsql"),
-                    string_attribute("tenant", "acme"),
-                ]),
+                histogram_data_point(
+                    3,
+                    Some(3.0),
+                    None,
+                    None,
+                    vec![3],
+                    vec![],
+                    vec![
+                        string_attribute("protocol", "flightsql"),
+                        string_attribute("tenant", "acme"),
+                    ],
+                ),
             ],
             aggregation_temporality: 0,
         });
@@ -1033,5 +1147,77 @@ mod tests {
             1,
             "count column should appear exactly once"
         );
+    }
+
+    #[test]
+    fn detect_added_columns_reports_only_new_named_columns() {
+        let existing = Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Float64, true),
+            Field::new(TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+            Field::new("region", DataType::Utf8, true),
+        ]);
+        // Same columns plus a new `tier` dimension.
+        let incoming = Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Float64, true),
+            Field::new(TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+            Field::new("region", DataType::Utf8, true),
+            Field::new("tier", DataType::Utf8, true),
+        ]);
+        assert_eq!(
+            detect_added_columns(&existing, &incoming),
+            vec!["tier".to_string()]
+        );
+        // No new columns -> empty (no evolution trigger).
+        assert!(detect_added_columns(&existing, &existing).is_empty());
+        // A subset (missing column) reports nothing added, even though it differs.
+        assert!(detect_added_columns(&incoming, &existing).is_empty());
+    }
+
+    #[test]
+    fn rebuild_against_evolved_schema_matches_exact_field_order() {
+        // A metric first seen with only `region`, then a data point adds `tier`. The batch
+        // built against the pre-evolution schema and the batch rebuilt against the evolved
+        // schema must agree on column set AND order, since the write path's verify_schema is
+        // exact-positional.
+        let first = Data::Gauge(opentelemetry_proto::tonic::metrics::v1::Gauge {
+            data_points: vec![number_data_point(
+                1.0,
+                vec![string_attribute("region", "us")],
+            )],
+        });
+        let (first_result, _) = metric_data_to_record_batch("svc_requests", &first, None);
+        let first_schema = first_result.expect("first batch builds").schema();
+
+        // Second export introduces `tier`; build against the first schema to get the widened one.
+        let second = Data::Gauge(opentelemetry_proto::tonic::metrics::v1::Gauge {
+            data_points: vec![number_data_point(
+                2.0,
+                vec![
+                    string_attribute("region", "eu"),
+                    string_attribute("tier", "gold"),
+                ],
+            )],
+        });
+        let (widened_result, _) =
+            metric_data_to_record_batch("svc_requests", &second, Some(first_schema.as_ref()));
+        let widened_schema = widened_result.expect("widened batch builds").schema();
+        assert!(detect_added_columns(&first_schema, &widened_schema) == vec!["tier".to_string()]);
+
+        // Rebuilding the same data against the (evolved) widened schema yields the identical
+        // field order — the invariant the OTel pre-flight relies on for the rebuilt batch.
+        let (rebuilt_result, _) =
+            metric_data_to_record_batch("svc_requests", &second, Some(widened_schema.as_ref()));
+        let rebuilt_schema = rebuilt_result.expect("rebuilt batch builds").schema();
+        let widened_names: Vec<&str> = widened_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        let rebuilt_names: Vec<&str> = rebuilt_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(widened_names, rebuilt_names);
     }
 }
