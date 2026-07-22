@@ -77,6 +77,10 @@ type SchemaCache = HashMap<SchemaCacheKey, Arc<AvroSchema>>;
 static SCHEMA_CACHE: std::sync::LazyLock<Mutex<SchemaCache>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Registry schema ids are stable and few per deployment; the cap only bounds
+/// memory if a process fetches from many registries or churns schema ids.
+const SCHEMA_CACHE_MAX: usize = 256;
+
 /// Process-wide cache of explicitly-supplied schemas (dataset `avro_schema`
 /// param or `X-Avro-Schema` header), keyed by the schema JSON text so the same
 /// schema is parsed once, not on every request.
@@ -263,7 +267,11 @@ async fn fetch_schema(registry_url: &str, schema_id: u32) -> Result<Arc<AvroSche
             source: Box::new(e),
         })?,
     );
-    SCHEMA_CACHE.lock().insert(key, Arc::clone(&schema));
+    let mut cache = SCHEMA_CACHE.lock();
+    if cache.len() >= SCHEMA_CACHE_MAX {
+        cache.clear();
+    }
+    cache.insert(key, Arc::clone(&schema));
     Ok(schema)
 }
 

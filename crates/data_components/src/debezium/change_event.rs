@@ -87,8 +87,13 @@ impl ChangeEvent {
 
     /// Parse a JSON Debezium message that may be either a full
     /// `{schema, payload}` envelope or a schemaless payload object.
+    ///
+    /// A Debezium envelope carries `op` *inside* `payload`, whereas a schemaless
+    /// payload carries `op` at the root. Treating the message as an envelope only
+    /// when the root has no `op` avoids mis-detecting a schemaless event that
+    /// happens to have a column literally named `payload`.
     pub fn from_json_value(value: serde_json::Value) -> Result<Self, serde_json::Error> {
-        if value.get("payload").is_some() {
+        if value.get("op").is_none() && value.get("payload").is_some() {
             return serde_json::from_value(value);
         }
         let payload: Payload = serde_json::from_value(value)?;

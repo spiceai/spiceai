@@ -154,7 +154,7 @@ async fn cdc_ingest_json_create_update_delete() -> anyhow::Result<()> {
                 .send()
                 .await
                 .expect("post create");
-            assert_eq!(resp.status(), 200, "create: {}", resp.text().await.unwrap_or_default());
+            assert_eq!(resp.status(), reqwest::StatusCode::OK, "create: {}", resp.text().await.unwrap_or_default());
 
             // UPDATE
             let update = r#"{"before":{"id":1,"name":"alice"},"after":{"id":1,"name":"bob"},"op":"u","ts_ms":2,"source":{}}"#;
@@ -165,7 +165,7 @@ async fn cdc_ingest_json_create_update_delete() -> anyhow::Result<()> {
                 .send()
                 .await
                 .expect("post update");
-            assert_eq!(resp.status(), 200, "update: {}", resp.text().await.unwrap_or_default());
+            assert_eq!(resp.status(), reqwest::StatusCode::OK, "update: {}", resp.text().await.unwrap_or_default());
 
             // Query via SQL
             let mut seen_bob = false;
@@ -206,7 +206,7 @@ async fn cdc_ingest_json_create_update_delete() -> anyhow::Result<()> {
                 .send()
                 .await
                 .expect("post delete");
-            assert_eq!(resp.status(), 200, "delete: {}", resp.text().await.unwrap_or_default());
+            assert_eq!(resp.status(), reqwest::StatusCode::OK, "delete: {}", resp.text().await.unwrap_or_default());
 
             // AVRO create: raw Avro datum with the schema supplied via the
             // X-Avro-Schema header. Bytes are the Avro binary encoding of
@@ -230,7 +230,7 @@ async fn cdc_ingest_json_create_update_delete() -> anyhow::Result<()> {
                 .expect("post avro create");
             assert_eq!(
                 resp.status(),
-                200,
+                reqwest::StatusCode::OK,
                 "avro create: {}",
                 resp.text().await.unwrap_or_default()
             );
