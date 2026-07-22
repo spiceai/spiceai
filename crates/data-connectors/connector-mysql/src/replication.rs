@@ -262,26 +262,30 @@ impl PositionStore for SidecarPositionStore {
         // `MySqlBinlogSys::get` swallows read errors into `None`, matching the
         // MongoDB sidecar: an unreadable checkpoint re-bootstraps rather than
         // wedging the dataset.
-        Ok(self.sys.get().await.map(|cp| {
-            // The type is always written by this connector, so a missing value
-            // is not expected (the feature has never shipped — no legacy rows).
-            // Resolve it defensively from the GTID set rather than propagating an
-            // `Option` through resume.
-            let cursor_type = cp
-                .cursor_type
-                .as_deref()
-                .and_then(CursorType::from_stored)
-                .unwrap_or(if cp.gtid_executed.is_some() {
-                    CursorType::Gtid
-                } else {
-                    CursorType::File
-                });
-            PersistedPosition {
-                position: BinlogPosition::new(cp.binlog_file, cp.binlog_pos),
-                schema_json: cp.schema_json,
-                gtid_set: cp.gtid_executed,
-                cursor_type,
-            }
+        let Some(cp) = self.sys.get().await else {
+            return Ok(None);
+        };
+        // `cursor_type` is written as exactly `file`/`gtid`. Distinguish:
+        //   - present + valid → use it;
+        //   - present + unparseable → corrupt row; error rather than guess (a
+        //     GTID dataset must not silently downgrade to file+offset);
+        //   - absent (`None`) → the column didn't exist (unreleased-feature dev
+        //     row, never a shipped one), so infer defensively from the GTID set.
+        let cursor_type = match cp.cursor_type.as_deref() {
+            Some(raw) => CursorType::from_stored(raw).ok_or_else(|| -> StoreError {
+                format!(
+                    "persisted cursor_type {raw:?} is not 'file' or 'gtid' (corrupt checkpoint)"
+                )
+                .into()
+            })?,
+            None if cp.gtid_executed.is_some() => CursorType::Gtid,
+            None => CursorType::File,
+        };
+        Ok(Some(PersistedPosition {
+            position: BinlogPosition::new(cp.binlog_file, cp.binlog_pos),
+            schema_json: cp.schema_json,
+            gtid_set: cp.gtid_executed,
+            cursor_type,
         }))
     }
 

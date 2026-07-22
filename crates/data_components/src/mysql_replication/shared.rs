@@ -976,14 +976,28 @@ async fn resolve_start_position(
                                 table: table.to_string(),
                             });
                         }
-                        match GtidSet::parse(persisted.gtid_set.as_deref().unwrap_or_default()) {
+                        // A stored *empty* set is legitimate (`Some("")` →
+                        // empty set: `gtid_mode = ON` with zero txns applied
+                        // yet). A *missing* set (`None`) or an unparseable one
+                        // is a corrupt/incomplete checkpoint — not a
+                        // known-empty set — so it must not silently resume from
+                        // the start of the source's binlogs; it honors
+                        // `invalid_position_behavior`.
+                        let parsed = match persisted.gtid_set.as_deref() {
+                            Some(raw) => {
+                                GtidSet::parse(raw).map_err(|_| "corrupt persisted GTID set")
+                            }
+                            None => Err("GTID checkpoint has no executed set \
+                                         (corrupt or incomplete)"),
+                        };
+                        match parsed {
                             Ok(set) => Some((persisted.position, set)),
-                            Err(_) => {
+                            Err(reason) => {
                                 apply_invalid_checkpoint(
                                     params,
                                     position_store,
                                     dataset_name,
-                                    "corrupt persisted GTID set",
+                                    reason,
                                 )
                                 .await?;
                                 None
