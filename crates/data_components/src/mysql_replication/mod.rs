@@ -615,18 +615,27 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
                     match cursor {
                         // GTID resume: the server computes the start point from
                         // the executed set, so no binlog-file-existence pre-check.
-                        // An empty stored set is legitimate (parses to the empty
-                        // set); a corrupt one is a same-type data problem → honors
-                        // `invalid_position_behavior`.
+                        // A stored *empty* set is legitimate (`Some("")` → empty
+                        // set: `gtid_mode = ON` with zero txns applied yet). A
+                        // *missing* set (`None`) or an unparseable one is a
+                        // corrupt/incomplete checkpoint — not a known-empty set —
+                        // so it must not silently resume from the start of the
+                        // source's binlogs; it honors `invalid_position_behavior`.
                         CursorType::Gtid => {
-                            match GtidSet::parse(persisted.gtid_set.as_deref().unwrap_or_default())
-                            {
+                            let parsed = match persisted.gtid_set.as_deref() {
+                                Some(raw) => GtidSet::parse(raw)
+                                    .map_err(|m| format!("persisted GTID set is corrupt ({m})")),
+                                None => Err("persisted checkpoint is marked GTID but has no \
+                                             executed set (corrupt or incomplete)"
+                                    .to_string()),
+                            };
+                            match parsed {
                                 Ok(set) => (Some(persisted.position), Some(set), true),
-                                Err(message) => match params.invalid_position_behavior {
+                                Err(detail) => match params.invalid_position_behavior {
                                     InvalidCheckpointBehavior::Error => {
                                         return GtidParseSnafu {
                                             message: format!(
-                                                "cannot resume mysql binlog for {dataset_name}: persisted GTID set is corrupt ({message}). Set `mysql_replication_invalid_checkpoint_behavior: restart` to re-snapshot."
+                                                "cannot resume mysql binlog for {dataset_name}: {detail}. Set `mysql_replication_invalid_checkpoint_behavior: restart` to re-snapshot."
                                             ),
                                         }
                                         .fail();
@@ -634,8 +643,8 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
                                     InvalidCheckpointBehavior::Restart => {
                                         tracing::warn!(
                                             dataset = %dataset_name,
-                                            error = %message,
-                                            "persisted GTID set is corrupt; restart behavior enabled, falling back to a fresh snapshot"
+                                            reason = %detail,
+                                            "GTID checkpoint unusable; restart behavior enabled, falling back to a fresh snapshot"
                                         );
                                         clear_position(&position_store, &dataset_name).await;
                                         (None, None, cold_start_use_gtid)
