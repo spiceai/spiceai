@@ -206,11 +206,16 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         // Compound (write-through) full-text index: a warm Tantivy primary paired with an
         // external Elasticsearch secondary. Registered instead of the concrete indexes for
         // single-column FTS datasets with an external store, so this must precede the concrete
-        // `FullTextDatabaseIndex` branch below.
+        // `FullTextDatabaseIndex` branch below. A `CompoundSearchIndex` may compose *vector*
+        // tiers, so only text compounds (those without a vector view) back FTS discovery.
         #[cfg(feature = "elasticsearch")]
         {
             use search::index::compound::CompoundSearchIndex;
-            if let Some(compound) = indexed_table.get_index::<CompoundSearchIndex>() {
+            if let Some(compound) = indexed_table
+                .get_indexes::<CompoundSearchIndex>()
+                .into_iter()
+                .find(|c| Arc::new((*c).clone()).as_vector_index().is_none())
+            {
                 return Some(
                     as_compound_text_candidate_generations(
                         compound.search_column(),

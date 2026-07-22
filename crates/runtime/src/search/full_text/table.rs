@@ -32,7 +32,7 @@ use search::generation::text_search::index::FullTextDatabaseIndex;
 ///
 /// `store_fields_override` replaces the store-fields set derived from the columns' vector
 /// metadata: the compound warm-tier caller passes `Some(&[])` so the index's query schema is
-/// exactly `[primary key…, __search_score]` (matching the Elasticsearch secondary tier); the
+/// exactly `[primary key…, _score]` (matching the Elasticsearch secondary tier); the
 /// plain full-text caller passes `None` to keep the metadata-derived set.
 ///
 /// Expects at least one [`Column`] to have a full text search column configured.
@@ -214,7 +214,7 @@ pub(crate) async fn add_compound_fts_to_table(
             .await?;
 
     // Warm Tantivy tier over the raw base provider with `store_fields = []`, so its query schema
-    // is exactly `[primary key…, __search_score]` — the same column set the Elasticsearch tier
+    // is exactly `[primary key…, _score]` — the same column set the Elasticsearch tier
     // emits, which is what the compound's empty-result fallback requires.
     let warm_index = match build_full_text_database_index(
         Arc::clone(&inner_table_provider),

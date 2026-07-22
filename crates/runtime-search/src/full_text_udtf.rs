@@ -437,27 +437,58 @@ impl<E: TableProviderExplorer + 'static> TableFunctionImpl for TextSearchTableFu
         // Phase 0: compound (write-through) full-text index — a warm Tantivy primary paired
         // with an external Elasticsearch secondary. For single-column FTS datasets with an
         // external store, only the compound is registered, so this arm must precede the
-        // concrete Tantivy and Elasticsearch probes below.
+        // concrete Tantivy and Elasticsearch probes below. A `CompoundSearchIndex` can also
+        // compose *vector* tiers, so restrict to text compounds (those without a vector view).
         #[cfg(feature = "elasticsearch")]
         if let Some((compound_indexes, _)) = self
             .explorer
             .find_index::<CompoundSearchIndex>(&table_provider)
-            && !compound_indexes.is_empty()
         {
-            // Each compound keys on a single search column (multi-column is out of scope,
-            // tracked in #11963): pick the compound matching the requested column, or the sole
-            // compound when no column argument was supplied.
-            let compound = if let Some(ref requested) = args.column {
-                compound_indexes
-                    .iter()
-                    .find(|c| &c.search_column() == requested)
-                    .copied()
-            } else if compound_indexes.len() == 1 {
-                Some(compound_indexes[0])
-            } else {
-                None
-            };
-            if let Some(compound) = compound {
+            let text_compounds: Vec<&CompoundSearchIndex> = compound_indexes
+                .into_iter()
+                .filter(|c| Arc::new((*c).clone()).as_vector_index().is_none())
+                .collect();
+
+            if !text_compounds.is_empty() {
+                // Each compound keys on a single search column (multi-column is out of scope,
+                // tracked in #11963): pick the compound matching the requested column, or the
+                // sole compound when no column argument was supplied.
+                let compound = if let Some(ref requested) = args.column {
+                    text_compounds
+                        .iter()
+                        .copied()
+                        .find(|c| &c.search_column() == requested)
+                } else if text_compounds.len() == 1 {
+                    Some(text_compounds[0])
+                } else {
+                    None
+                };
+
+                let Some(compound) = compound else {
+                    // The compound(s) are this table's full-text mechanism, so an unmatched
+                    // explicit column — or an omitted column when several are indexed — is an
+                    // error here. Mirror the concrete-index arm rather than falling through to
+                    // the misleading "does not have a full text search index" message below.
+                    let indexed: Vec<String> =
+                        text_compounds.iter().map(|c| c.search_column()).collect();
+                    if let Some(ref requested) = args.column {
+                        return Err(DataFusionError::Plan(format!(
+                            "User function 'text_search' is called on table '{}' that does not have a full text search index on '{requested}' column. Indexed column(s): {}.{}",
+                            args.tbl,
+                            indexed.join(", "),
+                            suggest_column(requested, &indexed)
+                                .map(|s| format!(" Did you mean '{s}'?"))
+                                .unwrap_or_default()
+                        )));
+                    }
+                    return Err(DataFusionError::Plan(format!(
+                        "User function 'text_search' is called on table '{}' that has {} full text search column(s) ({}). Must call 'text_search' with a column parameter, e.g. `text_search(\"my table\", 'my query', my_search_col)`",
+                        args.tbl,
+                        indexed.len(),
+                        indexed.join(", "),
+                    )));
+                };
+
                 let column = compound.search_column();
                 let udtf_source = UdtfSource::TextSearch {
                     table: args.tbl.to_string(),
