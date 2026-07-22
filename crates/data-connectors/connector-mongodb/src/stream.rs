@@ -303,6 +303,19 @@ fn build_primary_keys_array<'a>(rows: impl Iterator<Item = &'a [String]>) -> Res
     ))
 }
 
+/// Maps this connector's concrete stream error to the connector-agnostic CDC contract
+/// error, tagging the `"MongoDB"` connector name and boxing itself as the cause — so the
+/// CDC contract (and the runtime) never names `MongoDB`-specific types while logs still
+/// identify the source connector.
+impl From<StreamError> for data_components::cdc::StreamError {
+    fn from(e: StreamError) -> Self {
+        data_components::cdc::StreamError::Connector {
+            connector: "MongoDB",
+            source: Box::new(e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,18 +561,5 @@ mod tests {
         .expect_err("unsupported operation should fail");
 
         assert!(matches!(error, StreamError::UnsupportedOperation { .. }));
-    }
-}
-
-/// Maps this connector's concrete stream error to the connector-agnostic CDC contract
-/// error, tagging the `"MongoDB"` connector name and boxing itself as the cause — so the
-/// CDC contract (and the runtime) never names `MongoDB`-specific types while logs still
-/// identify the source connector.
-impl From<StreamError> for data_components::cdc::StreamError {
-    fn from(e: StreamError) -> Self {
-        data_components::cdc::StreamError::Connector {
-            connector: "MongoDB",
-            source: Box::new(e),
-        }
     }
 }
