@@ -996,13 +996,16 @@ impl RawScanInput {
     /// plus the remaining scan inputs (protected map, inline view, current
     /// snapshot, IVM epoch).
     ///
-    /// Deliberately HASH-FREE on the builder's hot loop: a `MemTier` is immutable
-    /// once published (an append/checkpoint SWAPS the shard's `ArcSwap` to a new
-    /// `Arc`, never mutates in place), so `Arc::ptr_eq` per shard is an exact
-    /// change test — no `version_hash_of` (which hashes every shard's version).
-    /// Every other field compares by `Arc::ptr_eq` / `index_ptr` / an int — never a
-    /// deep compare of tombstones or batches. The `scan_guard` is deliberately NOT
-    /// compared: it is a per-capture lease, not scan-visible state.
+    /// Deliberately HASH-FREE on the builder's hot loop: the per-shard `MemTier`
+    /// carries a monotonic CONTENT `version` bumped on every scan-visible change
+    /// (append / checkpoint) but PRESERVED across a seal (`mark_sealed_through`
+    /// swaps the shard `Arc` yet keeps `version`, because a seal is scan-transparent).
+    /// So we compare the per-shard `version` (a plain int) — NOT `Arc::ptr_eq`, which
+    /// would over-trigger a rebuild on every seal — and without `version_hash_of`
+    /// (which hashes every shard). Every other field compares by `Arc::ptr_eq` /
+    /// `index_ptr` / an int — never a deep compare of tombstones or batches. The
+    /// `scan_guard` is deliberately NOT compared: it is a per-capture lease, not
+    /// scan-visible state.
     fn changed(&self, prev: &RawScanInput) -> bool {
         self.current_snapshot_id != prev.current_snapshot_id
             || self.structural_epoch != prev.structural_epoch
@@ -1013,7 +1016,7 @@ impl RawScanInput {
                 .mem_tier_shards
                 .iter()
                 .zip(&prev.mem_tier_shards)
-                .any(|(a, b)| !Arc::ptr_eq(a, b))
+                .any(|(a, b)| a.version != b.version)
             || !Arc::ptr_eq(&self.protected_map, &prev.protected_map)
             || !Arc::ptr_eq(&self.inlined_view, &prev.inlined_view)
     }
