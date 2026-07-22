@@ -15,6 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::too_many_arguments)]
 
+use crate::component::dataset::acceleration::ZeroResultsAction;
 use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
 use datafusion::datasource::TableProvider;
@@ -61,6 +62,7 @@ pub async fn wrap_table_as_index(
     file_format: Option<&str>,
     inner_table_provider: Arc<dyn TableProvider>,
     vector_store: &VectorStore,
+    on_zero_results: &ZeroResultsAction,
 ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
     let schema = inner_table_provider.schema();
     for c in columns {
@@ -77,7 +79,7 @@ pub async fn wrap_table_as_index(
     #[cfg(not(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb")))]
     let _ = file_format;
     #[cfg(not(any(feature = "s3_vectors", feature = "elasticsearch")))]
-    let _ = secrets;
+    let _ = (secrets, on_zero_results);
     #[cfg(not(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb")))]
     let _ = (
         embedding_models,
@@ -99,6 +101,7 @@ pub async fn wrap_table_as_index(
                 file_format,
                 inner_table_provider,
                 vector_store,
+                on_zero_results,
             )
             .await
         }
@@ -113,6 +116,7 @@ pub async fn wrap_table_as_index(
                 file_format,
                 inner_table_provider,
                 vector_store,
+                on_zero_results,
             )
             .await
         }
@@ -192,6 +196,7 @@ async fn wrap_table_as_index_s3(
     file_format: Option<&str>,
     inner_table_provider: Arc<dyn TableProvider + 'static>,
     vector_store: &VectorStore,
+    on_zero_results: &ZeroResultsAction,
 ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!("S3 Vectors for table {tbl} initializing...");
     let start = std::time::Instant::now();
@@ -269,6 +274,7 @@ async fn wrap_table_as_index_s3(
             &embed_udf,
             &config.model,
             metric.as_str(),
+            on_zero_results,
         );
 
         if let Some(chunking) = chunking {
@@ -405,6 +411,7 @@ async fn wrap_table_as_index_elasticsearch(
     file_format: Option<&str>,
     inner_table_provider: Arc<dyn TableProvider + 'static>,
     vector_store: &VectorStore,
+    on_zero_results: &ZeroResultsAction,
 ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!("Elasticsearch vector engine for table {tbl} initializing...");
     let start = std::time::Instant::now();
@@ -489,6 +496,7 @@ async fn wrap_table_as_index_elasticsearch(
                     &embed_udf,
                     &config.model,
                     es_index.similarity.as_str(),
+                    on_zero_results,
                 );
 
                 provider.underlying = Arc::new(

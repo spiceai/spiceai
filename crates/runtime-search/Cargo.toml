@@ -26,6 +26,7 @@ datafusion-functions-json = { workspace = true }
 futures.workspace = true
 itertools.workspace = true
 llms = { path = "../llms", default-features = false }
+runtime-acceleration = { path = "../runtime-acceleration" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
 runtime-proto = { path = "../runtime-proto" }

@@ -19,6 +19,7 @@ use std::sync::Arc;
 use datafusion::sql::TableReference;
 use datafusion_expr::ScalarUDF;
 use llms::embeddings::Embed;
+use runtime_acceleration::acceleration::ZeroResultsAction;
 use search::index::{
     VectorIndex,
     compound::{CompoundReadMode, CompoundVectorIndex},
@@ -28,8 +29,11 @@ use search::metadata::MetadataColumns;
 
 /// Pair `engine_index` with an in-memory warm index in a writethrough
 /// [`CompoundVectorIndex`]: writes go to both indexes, and searches are served from
-/// memory, falling back to the vector engine for any search where the in-memory index
-/// returns zero results (e.g. before writes have repopulated it after a restart).
+/// memory. Whether a search that returns zero results from memory (e.g. before writes
+/// have repopulated it after a restart) falls back to the vector engine is controlled
+/// by `on_zero_results`, mirroring the dataset's `acceleration.on_zero_results` setting:
+/// [`ZeroResultsAction::UseSource`] falls back to the engine index, while
+/// [`ZeroResultsAction::ReturnEmpty`] serves the (possibly empty) in-memory result as-is.
 ///
 /// The warm index is an optimization: when a compatible in-memory index cannot be built
 /// (e.g. the engine's distance metric has no in-memory equivalent), the engine index is
@@ -49,7 +53,13 @@ pub fn with_memory_warm_index(
     embed_udf: &Arc<ScalarUDF>,
     model_name: &String,
     metric: &str,
+    on_zero_results: &ZeroResultsAction,
 ) -> Arc<dyn VectorIndex> {
+    let read_mode = match on_zero_results {
+        ZeroResultsAction::ReturnEmpty => CompoundReadMode::PrimaryOnly,
+        ZeroResultsAction::UseSource => CompoundReadMode::FallbackToSecondary,
+    };
+
     let memory_metric = match MemoryDistanceMetric::try_from(metric) {
         Ok(memory_metric) => memory_metric,
         Err(err) => {
@@ -78,11 +88,7 @@ pub fn with_memory_warm_index(
         }
     };
 
-    match CompoundVectorIndex::try_new(
-        memory_index,
-        Arc::clone(&engine_index),
-        CompoundReadMode::FallbackToSecondary,
-    ) {
+    match CompoundVectorIndex::try_new(memory_index, Arc::clone(&engine_index), read_mode) {
         Ok(compound) => {
             tracing::debug!(
                 "Added an in-memory warm vector index for table {tbl} column {}",
@@ -109,10 +115,21 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
     use datafusion::error::DataFusionError;
+    use datafusion::logical_expr::{Volatility, create_udf};
     use datafusion_expr::LogicalPlan;
     use llms::embeddings::EmbeddingInput;
     use runtime_datafusion_index::Index;
     use search::index::SearchIndex;
+
+    fn noop_embed_udf() -> Arc<ScalarUDF> {
+        Arc::new(create_udf(
+            "embed",
+            vec![],
+            DataType::Null,
+            Volatility::Volatile,
+            Arc::new(|_| unimplemented!("not exercised by with_memory_warm_index tests")),
+        ))
+    }
 
     #[derive(Debug)]
     struct NoopEmbed;
@@ -223,7 +240,10 @@ mod tests {
             pretend_index(3),
             MetadataColumns::none(),
             Arc::new(NoopEmbed),
+            &noop_embed_udf(),
+            &"model".to_string(),
             "cosine",
+            &ZeroResultsAction::UseSource,
         );
         assert!(
             index
@@ -235,13 +255,59 @@ mod tests {
     }
 
     #[test]
+    fn warm_index_read_mode_follows_on_zero_results() {
+        let use_source = with_memory_warm_index(
+            &TableReference::bare("tbl"),
+            pretend_index(3),
+            MetadataColumns::none(),
+            Arc::new(NoopEmbed),
+            &noop_embed_udf(),
+            &"model".to_string(),
+            "cosine",
+            &ZeroResultsAction::UseSource,
+        );
+        assert_eq!(
+            use_source
+                .as_any()
+                .downcast_ref::<CompoundVectorIndex>()
+                .expect("wrapped in a CompoundVectorIndex")
+                .read_mode(),
+            CompoundReadMode::FallbackToSecondary,
+            "on_zero_results: use_source must fall back to the engine index on zero results"
+        );
+
+        let return_empty = with_memory_warm_index(
+            &TableReference::bare("tbl"),
+            pretend_index(3),
+            MetadataColumns::none(),
+            Arc::new(NoopEmbed),
+            &noop_embed_udf(),
+            &"model".to_string(),
+            "cosine",
+            &ZeroResultsAction::ReturnEmpty,
+        );
+        assert_eq!(
+            return_empty
+                .as_any()
+                .downcast_ref::<CompoundVectorIndex>()
+                .expect("wrapped in a CompoundVectorIndex")
+                .read_mode(),
+            CompoundReadMode::PrimaryOnly,
+            "on_zero_results: return_empty must not fall back to the engine index"
+        );
+    }
+
+    #[test]
     fn warm_index_is_skipped_for_an_unknown_metric() {
         let index = with_memory_warm_index(
             &TableReference::bare("tbl"),
             pretend_index(3),
             MetadataColumns::none(),
             Arc::new(NoopEmbed),
+            &noop_embed_udf(),
+            &"model".to_string(),
             "hyperbolic",
+            &ZeroResultsAction::UseSource,
         );
         assert!(
             index
@@ -260,7 +326,10 @@ mod tests {
             pretend_index(0),
             MetadataColumns::none(),
             Arc::new(NoopEmbed),
+            &noop_embed_udf(),
+            &"model".to_string(),
             "cosine",
+            &ZeroResultsAction::UseSource,
         );
         assert!(
             index
