@@ -47,7 +47,7 @@ use datafusion_table_providers::sql::{
 use scylla::client::session::Session as ScyllaSession;
 use snafu::prelude::*;
 
-use crate::Read;
+use data_components::Read;
 
 pub use cql_dialect::CqlDialect;
 pub use table_schema::ScyllaDBTableSchema;

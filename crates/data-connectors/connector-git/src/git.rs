@@ -23,11 +23,11 @@ use std::time::Duration;
 use std::{path::Path, sync::Arc};
 use url::Url;
 
-use crate::{arrow::write::MemTable, rate_limit::RateLimiter};
 use arrow::{
     array::{ArrayRef, Int64Builder, RecordBatch, StringBuilder, TimestampMillisecondBuilder},
     datatypes::{DataType, Field, Schema, SchemaRef},
 };
+use data_components::{arrow::write::MemTable, rate_limit::RateLimiter};
 use datafusion::{
     catalog::Session,
     datasource::{TableProvider, TableType},

@@ -14,9 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+mod odbc;
+
+use crate::odbc::ODBCTableFactory;
 use async_trait::async_trait;
 use data_components::Read;
-use data_components::odbc::ODBCTableFactory;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::unparser::dialect::{
     CustomDialect, CustomDialectBuilder, DateFieldExtractStyle, DefaultDialect, Dialect,

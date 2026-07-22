@@ -67,6 +67,20 @@ clickhouse-rs = ["connector-clickhouse"]
 aws-sdk-dynamodbstreams = ["connector-dynamodb", "dynamodb-streams"]
 aws-sdk-dynamodb = ["connector-dynamodb", "dynamodb-streams", "testoperator", "spidapter"]
 
+# git2 now lives only in connector-git (the git provider moved out of data_components).
+git2 = ["connector-git"]
+
+# The IMAP driver stack (imap client + charset + mailparse) moved out of
+# data_components into connector-imap.
+charset = ["connector-imap"]
+imap = ["connector-imap"]
+mailparse = ["connector-imap"]
+
+# NOTE: scylla is intentionally NOT restricted here. The ScyllaDB provider moved
+# into connector-scylladb, but the ScyllaDbConnectionPool still lives in the shared
+# db_connection_pool crate (behind its `scylladb` feature), exactly like odbc-api.
+# So scylla is a shared pool driver, not a connector-confined one.
+
 # Path-prefix rules (checked after per-crate overrides, in order).
 [[rules]]
 path_prefix = "bin/"

@@ -14,41 +14,24 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::function_support::FunctionSupport;
 use async_trait::async_trait;
+use data_components::function_support::FunctionSupport;
 use datafusion::{
     datasource::TableProvider,
     sql::{TableReference, unparser::dialect::Dialect},
 };
-use datafusion_table_providers::sql::{
-    db_connection_pool as db_connection_pool_datafusion,
-    sql_provider_datafusion::{SqlTable, expr::Engine},
-};
+use datafusion_table_providers::sql::sql_provider_datafusion::{SqlTable, expr::Engine};
 use db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
 use snafu::prelude::*;
 use std::sync::Arc;
 
-use crate::Read;
-use crate::federation::create_spice_federated_table_provider;
+use data_components::Read;
+use data_components::federation::create_spice_federated_table_provider;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to connect to ODBC data source: {source}"))]
-    DbConnectionError {
-        source: db_connection_pool_datafusion::dbconnection::GenericError,
-    },
     #[snafu(display("The table '{table_name}' doesn't exist in the ODBC data source"))]
     TableDoesntExist { table_name: String },
-
-    #[snafu(display("Failed to get a connection from the ODBC connection pool: {source}"))]
-    UnableToGetConnectionFromPool {
-        source: db_connection_pool_datafusion::Error,
-    },
-
-    #[snafu(display("Failed to retrieve table schema from the ODBC data source: {source}"))]
-    UnableToGetSchema {
-        source: db_connection_pool_datafusion::dbconnection::Error,
-    },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;

@@ -4382,19 +4382,25 @@ dependencies = [
 name = "connector-git"
 version = "2.2.0-unstable"
 dependencies = [
+ "arrow",
  "async-trait",
+ "dashmap",
  "data_components",
  "datafusion",
+ "git2",
  "globset",
  "opentelemetry",
+ "regex",
  "reqwest 0.13.4",
  "runtime",
  "runtime-api-types",
  "runtime-metrics",
  "secrecy",
  "snafu",
+ "tempfile",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -4459,11 +4465,14 @@ dependencies = [
 name = "connector-imap"
 version = "2.2.0-unstable"
 dependencies = [
+ "arrow",
  "async-trait",
+ "charset",
  "data_components",
  "datafusion",
  "imap",
  "linkme",
+ "mailparse",
  "paste",
  "regex",
  "runtime",
@@ -4577,6 +4586,7 @@ dependencies = [
  "async-trait",
  "data_components",
  "datafusion",
+ "datafusion-table-providers",
  "db_connection_pool",
  "linkme",
  "paste",
@@ -4637,9 +4647,11 @@ dependencies = [
 name = "connector-scylladb"
 version = "2.2.0-unstable"
 dependencies = [
+ "arrow",
  "async-trait",
  "data_components",
  "datafusion",
+ "datafusion-table-providers",
  "db_connection_pool",
  "linkme",
  "ns_lookup",
@@ -5771,7 +5783,6 @@ dependencies = [
  "bigdecimal",
  "brotli",
  "bytes",
- "charset",
  "chrono",
  "connector-postgres-common",
  "criterion 0.7.0",
@@ -5790,7 +5801,6 @@ dependencies = [
  "flate2",
  "flight_client",
  "futures",
- "git2",
  "globset",
  "graph-rs-sdk",
  "graphql-parser",
@@ -5802,11 +5812,9 @@ dependencies = [
  "iceberg-datafusion",
  "iceberg-storage-opendal",
  "iceberg_test_utils",
- "imap",
  "indexmap 2.14.0",
  "insta",
  "logos",
- "mailparse",
  "mongodb",
  "mysql_async",
  "native-tls",
@@ -5830,7 +5838,6 @@ dependencies = [
  "rustc-hash 2.1.2",
  "s3_vectors",
  "s3_vectors_metadata_filter",
- "scylla",
  "secrecy",
  "serde",
  "serde_json",
@@ -16559,7 +16566,6 @@ dependencies = [
  "scheduler",
  "schemars 1.2.1",
  "scopeguard",
- "scylla",
  "search",
  "secrecy",
  "serde",

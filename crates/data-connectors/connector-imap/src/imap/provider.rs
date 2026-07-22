@@ -28,7 +28,7 @@ use datafusion::{
 use mailparse::{ParsedMail, dateparse, parse_mail};
 use snafu::prelude::*;
 
-use crate::arrow::write::MemTable;
+use data_components::arrow::write::MemTable;
 
 use super::{
     EmailMessage, Error, FailedToLogoutSnafu, FailedToParseHeaderSnafu, FetchMessagesSnafu,

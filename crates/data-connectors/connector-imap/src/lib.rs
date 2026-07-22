@@ -14,11 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_trait::async_trait;
-use data_components::imap::{
+mod imap;
+
+use crate::imap::{
     ImapTableProvider,
     session::{ImapAuthMode, ImapAuthModeParameter, ImapSSLMode, ImapSession},
 };
+use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use regex::Regex;
 use runtime::component::dataset::Dataset;
