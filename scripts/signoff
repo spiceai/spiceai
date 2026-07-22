@@ -37,16 +37,26 @@
 #                     statuses, "via remote" description, GitHub step summary
 #   SIGNOFF_DEBUG     Set to any value for verbose debug logging
 #   SIGNOFF_SKIP_TARGETED_LINT  Set to any value to skip the branch-scoped pre-lint
+#   SIGNOFF_SSH_HOSTS Space-separated hosts for make signoff-remote (default:
+#                     192.168.1.100 192.168.1.101). First host that answers SSH
+#                     and has ~/dev/spice2 is used; otherwise falls back to GHA.
+#   SIGNOFF_SSH_REPO  Path to the spice2 checkout on the SSH host (default:
+#                     $HOME/dev/spice2 on the remote). Relative paths are not
+#                     supported — use an absolute path or ~/….
 #
 # Targeted pre-lint always diffs against trunk (not configurable).
+# When the branch has no changed .rs files vs trunk, Rust lint/build/tests are
+# skipped (both local and remote); the sign-off status is still posted.
 #
-# Remote (self-hosted runner) alternative to local `make signoff`:
-#   make signoff-remote                  # gh workflow run signoff.yml for HEAD branch
+# Remote alternative to local `make signoff`:
+#   make signoff-remote                  # SSH to a lab host if available, else GHA
 #   gh workflow run signoff.yml -f branch=<branch>
 
 set -euo pipefail
 
-readonly VERSION="1.2.0"
+readonly VERSION="1.3.0"
+# Default LAN lab hosts for `signoff remote` (SSH path). Overridable via env.
+readonly DEFAULT_SIGNOFF_SSH_HOSTS="192.168.1.100 192.168.1.101"
 # Fixed, not configurable: it must match the hardcoded context the Attestation
 # workflow (pr.yml) looks for, so an env override would silently break the gate.
 readonly STATUS_CONTEXT="signoff"
@@ -465,20 +475,56 @@ post_commit_status() {
 
 # --- commands ----------------------------------------------------------------
 
+# True when the branch delta vs trunk includes at least one `.rs` file.
+# Prints nothing. Exit 0 = has Rust changes (or unknown — run checks).
+# Exit 1 = definitively no `.rs` files in the changed set → safe to skip.
+# Unknown (diff unavailable) returns 0 so we never skip when we can't tell.
+branch_has_rust_changes() {
+  local revision="$1"
+  local files
+
+  if ! files=$(changed_files_vs_trunk "$revision"); then
+    debug "could not list changed files — assuming Rust changes (will run checks)"
+    return 0
+  fi
+  if [[ -z "${files//[$'\t\n\r ']/}" ]]; then
+    debug "no changed files vs ${LINT_BASE_BRANCH} — no Rust changes"
+    return 1
+  fi
+  # Match paths ending in .rs (case-sensitive; Rust sources are always .rs).
+  if printf '%s\n' "$files" | grep -qE '\.rs$'; then
+    debug "changed .rs files present — will run Rust checks"
+    return 0
+  fi
+  debug "no .rs files in changed set — can skip Rust lint/build/tests"
+  return 1
+}
+
 # Run the same fast checks the old PR build ran: lint + build + unit tests.
 # The heavier suite (release build, integration, e2e, ...) runs in the merge
 # queue, so it deliberately isn't part of the local sign-off.
 #
 # Fail-fast order:
+#   0. Skip all Rust work when the branch has no changed .rs files vs trunk
 #   1. Targeted lint on packages touched by the branch (fast feedback)
 #   2. Full workspace lint (the real gate)
 #   3. CLI build + unit tests
 #
+# Sets SIGNOFF_CHECK_SUMMARY (short phrase for the commit-status description).
 # Output streams straight to the terminal — call this bare, never `$(run_checks)`,
 # which would capture make's stdout.
 run_checks() {
   local revision="${1:-}"
   local packages=""
+
+  # Non-Rust-only changes (docs, YAML, scripts, …): still attest, but skip the
+  # expensive lint/build/test gate. Unknown diffs fall through and run checks.
+  if [[ -n "$revision" ]] && ! branch_has_rust_changes "$revision"; then
+    info "No .rs files changed vs ${LINT_BASE_BRANCH} — skipping Rust lint, build, and unit tests"
+    append_step_summary "### Rust checks"$'\n'"Skipped (no \`.rs\` files in the branch diff vs \`${LINT_BASE_BRANCH}\`)."$'\n'
+    SIGNOFF_CHECK_SUMMARY="no Rust changes (lint/test skipped)"
+    return 0
+  fi
 
   if [[ -z "${SIGNOFF_SKIP_TARGETED_LINT:-}" && -n "$revision" ]]; then
     packages=$(changed_workspace_packages "$revision" || true)
@@ -507,6 +553,8 @@ run_checks() {
 
   info "Building the CLI and running unit tests (make build-cli nextest)…"
   make build-cli nextest || return $?
+
+  SIGNOFF_CHECK_SUMMARY="lint+test passed"
 }
 
 # After a successful sign-off, the PR's `Attestation` job (pr.yml) only
@@ -597,6 +645,8 @@ cmd_signoff() {
 
   if $verify; then
     local check_status=0
+    # Default summary; run_checks overwrites on success (incl. Rust-skip path).
+    SIGNOFF_CHECK_SUMMARY="lint+test passed"
     start=$(date +%s)
     if is_remote_run; then
       post_commit_status "$repo" "$sha" pending \
@@ -621,7 +671,7 @@ cmd_signoff() {
       fail "sign-off checks failed"
     fi
     elapsed=$(( $(date +%s) - start ))
-    description="Signed off by ${user}${via} — lint+test passed in ${elapsed}s"
+    description="Signed off by ${user}${via} — ${SIGNOFF_CHECK_SUMMARY} in ${elapsed}s"
   else
     description="Signed off by ${user}${via} (checks not verified locally)"
   fi
@@ -759,9 +809,107 @@ cmd_install() {
   echo "${OK} '${TARGET_BRANCH}' now requires developer sign-off + the full merge-queue suite."
 }
 
-# Dispatch .github/workflows/signoff.yml for the current branch (Git or JJ).
+# Validate SIGNOFF_SSH_REPO (optional override). Empty → default ~/dev/spice2
+# on the remote. Absolute path only; tight charset so it is safe in ssh argv.
+signoff_ssh_repo_or_default() {
+  local remote_repo="${SIGNOFF_SSH_REPO:-}"
+  if [[ -z "$remote_repo" ]]; then
+    echo ""
+    return 0
+  fi
+  [[ "$remote_repo" == /* ]] \
+    || fail "SIGNOFF_SSH_REPO must be an absolute path (got: '${remote_repo}')"
+  [[ "$remote_repo" =~ ^[A-Za-z0-9._/-]+$ ]] \
+    || fail "SIGNOFF_SSH_REPO contains unsafe characters: '${remote_repo}'"
+  echo "$remote_repo"
+}
+
+# Probe SIGNOFF_SSH_HOSTS (default lab IPs) for BatchMode SSH + a spice2 checkout.
+# Prints the first usable host to stdout; status messages go to stderr via info.
+# Exit 0 with a host, or 1 if none are usable.
+find_signoff_ssh_host() {
+  local hosts host remote_repo probe_cmd
+  hosts="${SIGNOFF_SSH_HOSTS:-$DEFAULT_SIGNOFF_SSH_HOSTS}"
+  remote_repo=$(signoff_ssh_repo_or_default)
+
+  if [[ -n "$remote_repo" ]]; then
+    # Path already charset-validated; embed as a single-quoted remote literal.
+    probe_cmd="repo='${remote_repo}'; test -d \"\$repo\" && { test -e \"\$repo/.git\" || test -d \"\$repo/.jj\"; }"
+  else
+    probe_cmd='repo="$HOME/dev/spice2"; test -d "$repo" && { test -e "$repo/.git" || test -d "$repo/.jj"; }'
+  fi
+
+  for host in $hosts; do
+    # Hostnames/IPs only — keep the charset tight so ssh argv stays safe.
+    if [[ ! "$host" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      info "  ${NO} skipping invalid SSH host name: '${host}'"
+      continue
+    fi
+    info "Probing SSH connectivity to ${host}…"
+    # BatchMode: never prompt for a password. Short connect timeout so offline
+    # hosts don't stall the developer. stdin from /dev/null so ssh can't eat
+    # a surrounding heredoc or pipe.
+    if ssh -o BatchMode=yes -o ConnectTimeout=1 -o ConnectionAttempts=1 \
+        -o StrictHostKeyChecking=accept-new \
+        "$host" "$probe_cmd" </dev/null 2>/dev/null; then
+      info "  ${OK} ${host} reachable and spice2 repo present"
+      echo "$host"
+      return 0
+    fi
+    info "  ${NO} ${host} unavailable or missing spice2 repo"
+  done
+  return 1
+}
+
+# SSH into a lab host, check out the pushed branch in its spice2 clone, and run
+# scripts/signoff -f there (same attestation as local; -f because checkout -B
+# leaves no @{push} tracking). Branch must already be on origin.
+run_signoff_via_ssh() {
+  local host="$1" branch="$2"
+  local remote_repo
+  remote_repo=$(signoff_ssh_repo_or_default)
+
+  info "Running sign-off via SSH on ${host}:${remote_repo:-~/dev/spice2} (branch ${branch})…"
+  # Remote command is `bash -s -- <branch> <repo-or-empty>`; the heredoc is
+  # stdin for bash -s. Branch is charset-validated in cmd_remote; repo is an
+  # absolute path or empty (→ $HOME/dev/spice2 on the remote).
+  # shellcheck disable=SC2029 # intentional: host/branch/repo are validated
+  ssh -o BatchMode=yes -o ConnectTimeout=1 -o ConnectionAttempts=1 \
+    -o StrictHostKeyChecking=accept-new \
+    -o ServerAliveInterval=30 -o ServerAliveCountMax=120 \
+    "$host" bash -s -- "$branch" "$remote_repo" <<'REMOTE'
+set -euo pipefail
+branch="$1"
+# Empty $2 → default lab checkout path on this host.
+if [[ -n "${2:-}" ]]; then
+  repo="$2"
+else
+  repo="${HOME}/dev/spice2"
+fi
+cd "$repo" || { echo "✗ cannot cd to ${repo}" >&2; exit 1; }
+
+if command -v git >/dev/null 2>&1 && git rev-parse --show-toplevel >/dev/null 2>&1; then
+  echo "Fetching origin/${branch} into ${repo}…"
+  git fetch --no-tags origin "+refs/heads/${branch}:refs/remotes/origin/${branch}" \
+    || { echo "✗ fetch failed — is '${branch}' pushed to origin?" >&2; exit 1; }
+  # -f discards any dirty local state on the lab machine; HEAD matches origin.
+  git checkout -f -B "$branch" "origin/${branch}"
+  git reset --hard "origin/${branch}"
+  echo "HEAD is now $(git rev-parse --short HEAD) on ${branch}"
+  # -f: no @{push} after checkout -B; tree matches origin tip we just fetched.
+  exec ./scripts/signoff -f
+fi
+
+echo "✗ ${repo} is not a Git checkout (SSH remote sign-off requires Git)" >&2
+exit 1
+REMOTE
+}
+
+# Dispatch remote sign-off for the current branch (Git or JJ).
+# Prefer a LAN SSH host with ~/dev/spice2 (lab machines); fall back to the
+# GitHub Actions Remote Sign-off workflow when no host is reachable.
 # Branch names are validated to a safe charset so they cannot break shell
-# quoting or the workflow input parser.
+# quoting, the SSH remote script, or the workflow input parser.
 cmd_remote() {
   require_tools
 
@@ -798,10 +946,16 @@ cmd_remote() {
     fail "refusing to dispatch Remote Sign-off for invalid branch name: '${branch}'"
   fi
 
+  local host
+  if host=$(find_signoff_ssh_host); then
+    run_signoff_via_ssh "$host" "$branch"
+    return
+  fi
+
   local repo
   repo=$(repo_slug) || fail "could not resolve GitHub repo for workflow dispatch"
 
-  info "Dispatching Remote Sign-off for ${branch} on ${repo}…"
+  info "No SSH sign-off host available — dispatching GitHub Actions Remote Sign-off for ${branch} on ${repo}…"
   # --repo so non-colocated JJ workspaces (no .git) still resolve the remote;
   # --raw-field avoids shell re-quoting pitfalls; the branch was validated above.
   gh workflow run signoff.yml --repo "$repo" --raw-field "branch=${branch}" \
@@ -815,7 +969,7 @@ scripts/signoff ${VERSION} — local CI attestation for Spice.ai
 
 Developers:
   make signoff                 Run lint + unit tests, then sign off on HEAD
-  make signoff-remote          Dispatch Remote Sign-off for the current branch
+  make signoff-remote          SSH lab host if available, else GHA Remote Sign-off
   scripts/signoff remote       Same as make signoff-remote (Git + JJ)
   scripts/signoff -f           Sign off even with a dirty/unpushed tree
   scripts/signoff --no-verify  Sign off without running checks (honor system)
@@ -827,6 +981,8 @@ Maintainers:
   scripts/signoff install --yes  Apply it (needs admin on the repo)
 
 Checks (when verify is on):
+  0. If the branch has no changed .rs files vs trunk → skip Rust lint/build/tests
+     (still posts the sign-off status)
   1. Targeted lint of crates touched by this branch vs trunk
      (make lint-rust PACKAGES="…") — fail-fast feedback
   2. Full workspace lint (make lint-rust)
@@ -835,6 +991,10 @@ Checks (when verify is on):
   Set SIGNOFF_SKIP_TARGETED_LINT=1 to skip step 1.
   Remote runs (.github/workflows/signoff.yml) set SIGNOFF_REMOTE_RUN and use
   the GitHub compare API when the clone is too shallow for merge-base.
+
+  make signoff-remote probes SIGNOFF_SSH_HOSTS (default: ${DEFAULT_SIGNOFF_SSH_HOSTS})
+  for SSH + ~/dev/spice2, checks out the pushed branch there, and runs signoff.
+  If no host is usable, it falls back to dispatching signoff.yml on GitHub Actions.
 
 The sign-off is a '${STATUS_CONTEXT}' commit status bound to the exact commit you
 pushed. Sign off again after any code change or manual conflict resolution. The

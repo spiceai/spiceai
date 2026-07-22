@@ -55,11 +55,12 @@ and up to date:
 make signoff          # targeted crate lint → full lint + unit tests, then attests
 ```
 
-`make signoff` first diffs the branch against `trunk`, maps changed files to
-workspace crates, and runs `make lint-rust PACKAGES="…"` for fast fail-first
-feedback. It then always runs the full `make lint-rust` and
-`make build-cli nextest` gate. Set `SIGNOFF_SKIP_TARGETED_LINT=1` to skip the
-scoped pre-lint.
+`make signoff` first diffs the branch against `trunk`. If that diff contains no
+`.rs` files, Rust lint/build/unit tests are skipped and the sign-off status is
+still posted (docs/YAML/script-only changes). Otherwise it maps changed files to
+workspace crates, runs `make lint-rust PACKAGES="…"` for fast fail-first
+feedback, then the full `make lint-rust` and `make build-cli nextest` gate. Set
+`SIGNOFF_SKIP_TARGETED_LINT=1` to skip the scoped pre-lint.
 
 On success it posts a `signoff` commit status on your current `HEAD`. If the
 **Attestation** check already ran and failed before the sign-off existed, the
@@ -114,30 +115,42 @@ scripts/signoff status        # does HEAD have its own sign-off?
 scripts/signoff --help        # full usage
 ```
 
-### Remote sign-off (self-hosted runner)
+### Remote sign-off (lab SSH host or self-hosted runner)
 
-When you can't (or don't want to) run the checks on your machine, dispatch the
-**Remote Sign-off** workflow. It runs the same fail-fast sequence as local
-`make signoff` on a self-hosted runner, then posts the `signoff` status
-attributed to you:
+When you can't (or don't want to) run the checks on your machine:
 
 ```bash
 make signoff-remote                 # current branch
+```
+
+`make signoff-remote` first probes lab hosts over SSH (`192.168.1.100`,
+`192.168.1.101` by default; override with `SIGNOFF_SSH_HOSTS`). The first host
+that answers and has a `~/dev/spice2` checkout is used: it fetches your pushed
+branch into that clone and runs `scripts/signoff -f` there (same checks and
+skip-if-no-`.rs` behavior as local). Override the remote path with
+`SIGNOFF_SSH_REPO=/absolute/path`.
+
+If no SSH host is usable, it falls back to dispatching the **Remote Sign-off**
+GitHub Actions workflow on a self-hosted runner:
+
+```bash
 gh workflow run signoff.yml -f branch=<your-branch>
 gh run watch --workflow signoff.yml
 ```
 
-The workflow:
+The Actions workflow:
 
 1. Checks out your branch (full history) and fetches `trunk`
 2. Target-lints crates touched by the branch vs `trunk` (GitHub compare API as a
-   fallback when merge-base isn't available)
-3. Runs full `make lint-rust` + `make build-cli nextest`
+   fallback when merge-base isn't available), or skips Rust checks when the
+   branch has no changed `.rs` files
+3. Runs full `make lint-rust` + `make build-cli nextest` when Rust changed
 4. Posts pending → success/failure `signoff` statuses, then re-runs
    **Attestation** if needed
 
 Requires write access to the repository (same as local sign-off — fork
-contributors still need a maintainer to sign off).
+contributors still need a maintainer to sign off). The lab SSH path also needs
+SSH key access to the host and `gh` auth on that machine.
 
 ### Jujutsu workspaces
 
@@ -184,8 +197,8 @@ merge queue is still the real gate.
 
 | Stage | Trigger | Checks |
 | --- | --- | --- |
-| Local | `make signoff` | targeted `make lint-rust PACKAGES=…` (changed crates), then full `make lint-rust`, `make build-cli nextest` |
-| Remote | `make signoff-remote` / `signoff.yml` | same checks as local on a self-hosted runner; posts `signoff` as the dispatcher |
+| Local | `make signoff` | skip Rust if no `.rs` in the branch diff; else targeted `make lint-rust PACKAGES=…`, full `make lint-rust`, `make build-cli nextest` |
+| Remote | `make signoff-remote` | same checks via lab SSH (`~/dev/spice2` on 192.168.1.100/101) if reachable, else self-hosted `signoff.yml`; posts `signoff` |
 | Pull request | `pull_request` | **Attestation** (validates the sign-off, or auto-passes a pure revert) + PR hygiene; merge-queue check names report lightweight skipped/passthrough results |
 | Merge queue | `merge_group` | the full required suite (below) + advisory niche checks |
 
