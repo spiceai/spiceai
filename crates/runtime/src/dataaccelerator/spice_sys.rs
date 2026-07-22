@@ -71,6 +71,11 @@ pub mod debezium_kafka;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 
+// Driver-free sidecar (SQL + JSON only, like `dataset_checkpoint`/`caching_engine`),
+// so it is always compiled: the `connector-dynamodb` crate calls
+// `dynamodb::init_checkpoint_store` regardless of which accelerator backend is enabled.
+pub mod dynamodb;
+
 #[cfg(feature = "mongodb")]
 pub mod mongodb;
 
@@ -303,10 +308,6 @@ pub async fn checkpoint_store(
     feature = "postgres-accel",
     feature = "turso"
 )))]
-#[expect(
-    clippy::unused_async,
-    reason = "signature parity with the accelerator-backed build; no async work when no backend is compiled in"
-)]
 pub async fn checkpoint_store(
     dataset: &crate::component::dataset::Dataset,
     table_name: &'static str,

@@ -61,7 +61,7 @@ const MYSQL_E2E_CAYENNE_PORT: u16 = 13323;
 #[cfg(not(target_os = "windows"))]
 const MYSQL_E2E_RESTART_PORT: u16 = 13321;
 #[cfg(not(target_os = "windows"))]
-const MYSQL_E2E_GTID_PORT: u16 = 13324;
+const MYSQL_E2E_GTID_PORT: u16 = 13330;
 
 /// The accelerator engine a run of the e2e exercises.
 struct EngineConfig {

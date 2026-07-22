@@ -111,6 +111,13 @@ impl MySqlBinlogSys {
         })
     }
 
+    #[cfg_attr(
+        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        expect(
+            clippy::unused_async,
+            reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
+        )
+    )]
     pub async fn get(&self) -> Option<MySqlBinlogCheckpoint> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
@@ -168,6 +175,13 @@ impl MySqlBinlogSys {
         .await
     }
 
+    #[cfg_attr(
+        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        expect(
+            clippy::unused_async,
+            reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
+        )
+    )]
     async fn upsert_once(
         &self,
         #[cfg_attr(
@@ -202,6 +216,13 @@ impl MySqlBinlogSys {
         }
     }
 
+    #[cfg_attr(
+        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        expect(
+            clippy::unused_async,
+            reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
+        )
+    )]
     pub async fn delete(&self) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]

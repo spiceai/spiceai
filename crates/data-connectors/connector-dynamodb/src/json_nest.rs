@@ -1,4 +1,4 @@
-use crate::dynamodb::DynamoDBRow;
+use crate::DynamoDBRow;
 use aws_sdk_dynamodb::types::AttributeValue;
 use base64::{Engine as _, engine::general_purpose};
 use serde_json::{Value, json};
@@ -40,7 +40,7 @@ fn attribute_value_to_json(attr: &AttributeValue) -> Value {
 
 /// `RowShape` adapter for `DynamoDB`. A row (`HashMap<String, AttributeValue>`)
 /// is viewed as an `AttributeValue::M`; nested objects are nested `M` values.
-/// This lets the generic [`crate::schema_projection`] core reshape `DynamoDB`
+/// This lets the generic [`data_components::schema_projection`] core reshape `DynamoDB`
 /// rows without any DynamoDB-specific projection logic.
 ///
 /// `RowShape` is defined in the `datafusion-table-providers` fork, and
@@ -48,7 +48,7 @@ fn attribute_value_to_json(attr: &AttributeValue) -> Value {
 /// newtype to satisfy the orphan rule.
 struct AttrShape(AttributeValue);
 
-impl crate::schema_projection::RowShape for AttrShape {
+impl data_components::schema_projection::RowShape for AttrShape {
     fn into_object(self) -> std::result::Result<Vec<(String, Self)>, Self> {
         match self.0 {
             AttributeValue::M(map) => Ok(map.into_iter().map(|(k, v)| (k, AttrShape(v))).collect()),
@@ -76,11 +76,11 @@ impl crate::schema_projection::RowShape for AttrShape {
 /// unwraps. A non-`M` result (only possible for a non-object row, which a
 /// `DynamoDB` item never is) yields an empty row.
 ///
-/// [`SchemaProjection`]: crate::schema_projection::SchemaProjection
+/// [`SchemaProjection`]: data_components::schema_projection::SchemaProjection
 #[must_use]
 pub fn project_dynamodb_row(
     row: DynamoDBRow,
-    projection: &crate::schema_projection::SchemaProjection,
+    projection: &data_components::schema_projection::SchemaProjection,
 ) -> DynamoDBRow {
     let wrapped = AttrShape(AttributeValue::M(row.into_iter().collect()));
     match projection.project_row(wrapped).0 {

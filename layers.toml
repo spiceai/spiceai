@@ -58,6 +58,15 @@ forbid = [["extension-utility", "runtime"]]
 # decoder all moved out of data_components / db_connection_pool / arrow_sql_gen).
 clickhouse-rs = ["connector-clickhouse"]
 
+# The DynamoDB AWS SDK drivers moved out of runtime + data_components into
+# connector-dynamodb. `dynamodb-streams` is the low-level streams client the
+# connector builds on; `testoperator`/`spidapter` drive DynamoDB in bench/adapter
+# tooling. runtime keeps aws-sdk-dynamodb only as a (dev-dep-exempt) test dependency,
+# so it is intentionally absent here — a normal-dep regression into runtime/
+# data_components would fail this guard.
+aws-sdk-dynamodbstreams = ["connector-dynamodb", "dynamodb-streams"]
+aws-sdk-dynamodb = ["connector-dynamodb", "dynamodb-streams", "testoperator", "spidapter"]
+
 # Path-prefix rules (checked after per-crate overrides, in order).
 [[rules]]
 path_prefix = "bin/"

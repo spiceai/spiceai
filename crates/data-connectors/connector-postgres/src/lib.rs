@@ -173,7 +173,7 @@ const PARAMETERS: &[ParameterSpec] = &[
             "When `refresh_mode: changes` first loads the table's existing rows: 'auto' \
              (default) snapshots a freshly-created replication slot and resumes an existing one \
              without a snapshot (a non-persistent accelerator still re-snapshots on every start); \
-             'disabled' streams WAL changes only; 'enabled' snapshots on every start, including \
+             'disabled' streams WAL changes only; 'always' snapshots on every start, including \
              slot resume. The legacy booleans 'true'/'false' map to 'auto'/'disabled'. \
              Default: auto.",
         )
