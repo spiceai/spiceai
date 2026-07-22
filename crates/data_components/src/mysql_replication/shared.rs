@@ -809,7 +809,7 @@ async fn resolve_start_position(
         })?;
 
     let resume: Option<BinlogPosition> = match persisted {
-        Some(_) if params.snapshot_mode == InitialSnapshotMode::Enabled => None,
+        Some(_) if params.snapshot_mode == InitialSnapshotMode::Always => None,
         Some(persisted) => {
             if check_resume_compatibility(
                 persisted.schema_json.as_deref(),
@@ -1742,6 +1742,225 @@ mod tests {
         assert!(
             !ack.is_streaming(&key("db", "a")),
             "rejoined member is held until promoted"
+        );
+    }
+
+    #[test]
+    fn credit_idle_skips_members_with_inflight_envelopes() {
+        // The idle safe-advance may only credit a member whose delivered floor
+        // equals its committed floor (nothing in flight). A member with an
+        // outstanding, not-yet-acked delivery must hold its own floor — crediting
+        // it would ack past a change the consumer has not durably applied.
+        let ack = AckTable::default();
+        ack.register(&key("db", "a"), pos("binlog.000001", 100), false);
+        ack.register(&key("db", "b"), pos("binlog.000001", 100), false);
+        ack.promote_ready_members();
+
+        // `a` has an in-flight envelope: delivered past committed.
+        ack.slot(&key("db", "a"))
+            .expect("slot")
+            .deliver(&pos("binlog.000001", 300));
+        ack.credit_idle(&pos("binlog.000001", 500));
+
+        // `b` (idle) was credited to 500; `a` holds the floor at its committed
+        // 100 because its outstanding delivery is not yet acked.
+        assert_eq!(
+            ack.committed(&key("db", "b")),
+            Some(pos("binlog.000001", 500))
+        );
+        assert_eq!(
+            ack.committed(&key("db", "a")),
+            Some(pos("binlog.000001", 100)),
+            "member with an in-flight envelope must not be credited"
+        );
+        assert_eq!(ack.flush_position(), Some(pos("binlog.000001", 100)));
+
+        // The consumer acks `a`'s delivery; the shared floor advances.
+        ack.slot(&key("db", "a"))
+            .expect("slot")
+            .commit(&pos("binlog.000001", 300));
+        assert_eq!(ack.flush_position(), Some(pos("binlog.000001", 300)));
+
+        // `a` is idle again — a later idle credit advances everyone.
+        ack.credit_idle(&pos("binlog.000001", 600));
+        assert_eq!(ack.flush_position(), Some(pos("binlog.000001", 600)));
+    }
+
+    #[test]
+    fn replayed_older_commits_never_regress() {
+        // On a reconnect from the shared min, a member ahead of the min re-sees
+        // commits it already applied. `AckSlot::commit` is a monotonic-max, so an
+        // older replayed commit is a no-op, and `already_committed` reports it as
+        // applied so the pump suppresses the re-delivery.
+        let ack = AckTable::default();
+        ack.register(&key("db", "a"), pos("binlog.000001", 500), false);
+        ack.promote_ready_members();
+        let slot = ack.slot(&key("db", "a")).expect("slot");
+
+        slot.commit(&pos("binlog.000010", 900));
+        assert_eq!(slot.committed(), pos("binlog.000010", 900));
+
+        // An older replayed commit must not regress the floor.
+        slot.commit(&pos("binlog.000005", 100));
+        assert_eq!(
+            slot.committed(),
+            pos("binlog.000010", 900),
+            "an older replayed commit must not regress the floor"
+        );
+
+        // The replay is reported already-applied (suppressed), only a strictly
+        // newer position is not.
+        assert!(slot.already_committed(&pos("binlog.000005", 100)));
+        assert!(slot.already_committed(&pos("binlog.000010", 900)));
+        assert!(!slot.already_committed(&pos("binlog.000010", 901)));
+    }
+
+    #[tokio::test]
+    async fn shared_committer_advances_floor_and_absorbs_same_slot() {
+        let ack = AckTable::default();
+        ack.register(&key("db", "a"), pos("binlog.000001", 100), false);
+        ack.register(&key("db", "b"), pos("binlog.000001", 100), false);
+        ack.promote_ready_members();
+        let slot = ack.slot(&key("db", "a")).expect("slot");
+
+        // `commit()` advances the member's committed floor to `flush_to`.
+        let committer = SharedPositionCommitter {
+            slot: Arc::clone(&slot),
+            flush_to: pos("binlog.000001", 500),
+            dataset: "orders".into(),
+            source_commit_ts_ms: Some(1),
+        };
+        committer.commit().await.expect("commit");
+        assert_eq!(slot.committed(), pos("binlog.000001", 500));
+
+        // `try_absorb` folds a later commit to the SAME slot, keeping the higher
+        // position (sound because commit is a monotonic-max).
+        let mut first = SharedPositionCommitter {
+            slot: Arc::clone(&slot),
+            flush_to: pos("binlog.000001", 500),
+            dataset: "orders".into(),
+            source_commit_ts_ms: Some(1),
+        };
+        let later = SharedPositionCommitter {
+            slot: Arc::clone(&slot),
+            flush_to: pos("binlog.000001", 900),
+            dataset: "orders".into(),
+            source_commit_ts_ms: Some(2),
+        };
+        assert!(first.try_absorb(&later));
+        assert_eq!(first.flush_to, pos("binlog.000001", 900));
+        assert_eq!(first.source_commit_ts_ms, Some(2));
+
+        // A committer for a DIFFERENT slot is never absorbed.
+        let other = SharedPositionCommitter {
+            slot: ack.slot(&key("db", "b")).expect("slot"),
+            flush_to: pos("binlog.000001", 999),
+            dataset: "customers".into(),
+            source_commit_ts_ms: Some(3),
+        };
+        assert!(!first.try_absorb(&other));
+        assert_eq!(
+            first.flush_to,
+            pos("binlog.000001", 900),
+            "a rejected absorb must not change flush_to"
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_to_member_reports_receiver_gone() {
+        // A dropped receiver (dataset stream torn down) must surface as
+        // `ReceiverGone` so the pump detaches the member and holds its floor,
+        // never wedging on a dead channel.
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let outcome = deliver_to_member(
+            &sender,
+            Err(StreamError::External("x".to_string())),
+            crate::cdc::shutdown_epoch(),
+        )
+        .await;
+        assert!(matches!(outcome, DeliverOutcome::ReceiverGone));
+    }
+
+    #[test]
+    fn credit_idle_interleaving_never_over_credits() {
+        // The load-bearing cross-thread invariant: the committer (consumer
+        // thread) advances `committed` while the pump thread races `credit_idle`
+        // ahead. `credit_idle` writes commit-before-deliver and only credits a
+        // member it observed idle, so the shared floor can never run past what a
+        // member has durably applied, and never regresses.
+        const N: u64 = 20_000;
+        let ack = Arc::new(AckTable::default());
+        ack.register(&key("db", "a"), pos("binlog.000001", 1), false);
+        ack.promote_ready_members();
+        let slot = ack.slot(&key("db", "a")).expect("slot");
+        let done = Arc::new(AtomicBool::new(false));
+
+        std::thread::scope(|s| {
+            // Committer: deliver then commit, strictly increasing. Signals `done`
+            // on completion so the crediter's busy loop terminates.
+            {
+                let slot = Arc::clone(&slot);
+                let done = Arc::clone(&done);
+                s.spawn(move || {
+                    for p in 2..=N {
+                        slot.deliver(&pos("binlog.000001", p));
+                        slot.commit(&pos("binlog.000001", p));
+                    }
+                    done.store(true, Ordering::Release);
+                });
+            }
+            // Idle-crediter: race `upto` ahead of the committer until it's done.
+            {
+                let ack = Arc::clone(&ack);
+                let done = Arc::clone(&done);
+                s.spawn(move || {
+                    let upto = pos("binlog.000001", N + 1000);
+                    while !done.load(Ordering::Acquire) {
+                        ack.credit_idle(&upto);
+                    }
+                });
+            }
+            // Observer: (1) the shared floor never exceeds the member's own
+            // committed position (acking past durable apply is the data-loss bug
+            // this design guards against), and (2) the floor never regresses. Read
+            // the floor BEFORE committed: both monotonic, so a later committed
+            // read is >= the value the floor was computed from — a floor that
+            // jumped past a real in-flight commit is thus observable, not masked.
+            {
+                let ack = Arc::clone(&ack);
+                let slot = Arc::clone(&slot);
+                s.spawn(move || {
+                    let mut last_floor = pos("binlog.000001", 0);
+                    for _ in 0..200_000 {
+                        let floor = ack.flush_position().expect("one member");
+                        let committed = slot.committed();
+                        assert!(
+                            floor <= committed,
+                            "floor {floor} ran past committed {committed}"
+                        );
+                        assert!(
+                            floor >= last_floor,
+                            "floor regressed {last_floor} -> {floor}"
+                        );
+                        last_floor = floor;
+                    }
+                });
+            }
+        });
+
+        // Quiescence: `credit_idle` may legitimately have advanced the idle member
+        // up to its `upto` (N+1000), so `committed` lands in [N, N+1000]; the floor
+        // (single member ⇒ its committed) must have converged to it.
+        let final_committed = slot.committed();
+        assert!(
+            (N..=N + 1000).contains(&final_committed.pos),
+            "committed {final_committed} outside any writer's range"
+        );
+        assert_eq!(
+            ack.flush_position(),
+            Some(final_committed),
+            "floor converged to the member's committed"
         );
     }
 }
