@@ -731,14 +731,20 @@ async fn test_catalog_acceleration_fails_loudly_when_no_tables_eligible()
                 rt.status().get_catalog_statuses().get(CATALOG_NAME)
             );
 
-            // And the error must name the problem actionably.
-            if let Some(ComponentStatus::Error(Some(message))) =
-                rt.status().get_catalog_statuses().get(CATALOG_NAME)
-            {
-                anyhow::ensure!(
-                    message.contains("no tables are eligible"),
-                    "error message should be actionable, got: {message}"
-                );
+            // And the error must carry an actionable message. An `Error(None)`
+            // (message-less) or any non-`Error` status is a failure here, not a
+            // case to skip -- the whole point is that the failure is loud AND
+            // explains itself.
+            match rt.status().get_catalog_statuses().get(CATALOG_NAME) {
+                Some(ComponentStatus::Error(Some(message))) => {
+                    anyhow::ensure!(
+                        message.contains("no tables are eligible"),
+                        "error message should be actionable, got: {message}"
+                    );
+                }
+                other => anyhow::bail!(
+                    "catalog should be in an Error state with an actionable message, got {other:?}"
+                ),
             }
 
             // The catalog's tables must not be queryable.
