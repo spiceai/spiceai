@@ -72,14 +72,42 @@ impl TableCorrectness {
     }
 }
 
+/// How replication convergence was established for the report.
+///
+/// The drain-wait loop's per-table probes can be minutes stale at large scale
+/// factors (a `COUNT(*)`/`MAX(_bench_ts)` full scan per side per table), so a
+/// timed-out loop is not proof of non-convergence — the fresher final snapshot
+/// gets the last word (see #11953, where a fully-matched final snapshot was
+/// still reported as "replication did not converge").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Convergence {
+    /// Every probed table was observed caught-up during the drain wait.
+    Within(Duration),
+    /// The drain wait timed out, but the final snapshot then showed every
+    /// table caught up (row counts and `MAX(_bench_ts)` both match): the
+    /// backlog drained later than the in-loop probes could observe. The
+    /// duration is when the confirming snapshot ran — an upper bound on the
+    /// real convergence time, not a measurement of it.
+    ObservedAtFinalSnapshot(Duration),
+    /// The final snapshot still shows divergence after the wait timed out.
+    No,
+}
+
+impl Convergence {
+    /// Whether replication is known to have converged (in-loop or at the
+    /// final snapshot).
+    pub fn converged(self) -> bool {
+        !matches!(self, Convergence::No)
+    }
+}
+
 /// Final data-correctness report produced after replication drains.
 #[derive(Debug)]
 pub struct CorrectnessReport {
     /// Per-table final row-count comparison.
     pub tables: Vec<TableCorrectness>,
-    /// Time at which replication fully converged, or `None` if it did not
-    /// converge within the wait bound.
-    pub converged_at: Option<Duration>,
+    /// Whether (and how) replication converged.
+    pub convergence: Convergence,
     /// How long the drain wait took.
     pub wait_duration: Duration,
 }
@@ -88,13 +116,25 @@ impl CorrectnessReport {
     /// Print a human-readable correctness summary and record OTEL metrics.
     pub fn emit(&self) {
         println!("\nData Correctness");
-        if let Some(converged_at) = self.converged_at {
-            println!("  replication converged in {}ms", converged_at.as_millis());
-        } else {
-            println!(
-                "  replication DID NOT converge within {}ms",
-                self.wait_duration.as_millis()
-            );
+        match self.convergence {
+            Convergence::Within(at) => {
+                println!("  replication converged in {}ms", at.as_millis());
+            }
+            Convergence::ObservedAtFinalSnapshot(at) => {
+                println!(
+                    "  replication converged late — the drain wait timed out after {}ms, \
+                     but the final snapshot (row counts + MAX(_bench_ts)) shows every table \
+                     caught up as of {}ms",
+                    self.wait_duration.as_millis(),
+                    at.as_millis(),
+                );
+            }
+            Convergence::No => {
+                println!(
+                    "  replication DID NOT converge within {}ms",
+                    self.wait_duration.as_millis()
+                );
+            }
         }
         println!(
             "  {:<14} {:>14} {:>14} {:>8} {:>16}",
@@ -131,7 +171,7 @@ impl CorrectnessReport {
             );
         }
 
-        let failed = mismatches + u64::from(self.converged_at.is_none());
+        let failed = mismatches + u64::from(!self.convergence.converged());
         crate::metrics::CORRECTNESS_ROUNDS_TOTAL.record(1, &[]);
         crate::metrics::CORRECTNESS_ROUNDS_PASSED.record(u64::from(failed == 0), &[]);
         crate::metrics::CORRECTNESS_ROUNDS_FAILED.record(u64::from(failed != 0), &[]);
@@ -141,7 +181,7 @@ impl CorrectnessReport {
         } else {
             println!(
                 "  verdict: FAILED — {mismatches} table(s) mismatched{}",
-                if self.converged_at.is_some() {
+                if self.convergence.converged() {
                     String::new()
                 } else {
                     ", replication did not converge".to_string()
@@ -154,7 +194,7 @@ impl CorrectnessReport {
     /// row counts disagree. `None` means the gate passed.
     pub fn failure_message(&self) -> Option<String> {
         let mut problems = Vec::new();
-        if self.converged_at.is_none() {
+        if !self.convergence.converged() {
             problems.push(format!(
                 "replication did not converge within {}ms",
                 self.wait_duration.as_millis()
@@ -188,11 +228,69 @@ impl CorrectnessReport {
     }
 }
 
+/// A probed table is caught up when both row counts and `MAX(_bench_ts)`
+/// agree between the source and Spice.
+///
+/// `None == None` (both sides empty) counts as caught up; an empty side
+/// against a non-empty side does not. The single definition of "caught up" —
+/// both the drain loop and the final snapshot delegate here so the two
+/// verdict sites cannot drift apart.
+fn table_caught_up(src_ts: Option<i64>, spice_ts: Option<i64>, src_n: i64, spice_n: i64) -> bool {
+    src_ts == spice_ts && src_n == spice_n
+}
+
+/// One full probe of a table: source/Spice `MAX(_bench_ts)` and row counts,
+/// all four queries issued concurrently. Shared by the drain loop and the
+/// final snapshot so the probe wiring exists once.
+async fn probe_table(
+    driver: &Arc<dyn ChBenchDriver>,
+    spice: &SpiceClients,
+    table: &str,
+) -> (
+    chbench_driver::Result<Option<i64>>,
+    anyhow::Result<Option<i64>>,
+    chbench_driver::Result<i64>,
+    anyhow::Result<i64>,
+) {
+    tokio::join!(
+        driver.max_bench_ts(table),
+        spice.max_bench_ts(table),
+        driver.row_count(table),
+        spice.count(table),
+    )
+}
+
+/// Resolve the convergence verdict from the in-loop observation and the final
+/// snapshot.
+///
+/// The in-loop result wins when the loop observed convergence; otherwise the
+/// final snapshot — strictly fresher than any in-loop probe — decides. A
+/// timed-out loop whose final snapshot shows every table caught up converged
+/// *late*, not "not at all" (#11953).
+fn resolve_convergence(
+    in_loop: Option<Duration>,
+    final_snapshot_caught_up: bool,
+    observed_at: Duration,
+) -> Convergence {
+    match in_loop {
+        Some(at) => Convergence::Within(at),
+        None if final_snapshot_caught_up => Convergence::ObservedAtFinalSnapshot(observed_at),
+        None => Convergence::No,
+    }
+}
+
 /// Wait for replication to fully drain, then snapshot final source/Spice counts.
 ///
 /// Polls each table until both `MAX(_bench_ts)` and `COUNT(*)` agree between the
-/// source and Spice, bounded by `max_wait`. After the wait (converged or timed
-/// out) a final count comparison is taken for the report.
+/// source and Spice, bounded by `max_wait`. A table observed caught-up is not
+/// re-probed: the source is static once OLTP stops and CDC applies in commit
+/// order, so a caught-up table cannot fall behind again — and skipping it keeps
+/// later passes cheap at large scale factors, where a single probe is a
+/// full-table `COUNT(*)`/`MAX(_bench_ts)` scan that can take minutes. After the
+/// wait (converged or timed out) a final comparison is taken for the report;
+/// when the loop timed out, that fresher snapshot decides convergence (a slow
+/// probe pass otherwise reports "did not converge" from observations that are
+/// minutes stale — #11953).
 pub async fn verify_after_drain(
     driver: Arc<dyn ChBenchDriver>,
     spice: &SpiceClients,
@@ -208,15 +306,24 @@ pub async fn verify_after_drain(
         max_wait.as_secs()
     );
 
-    let converged_at = loop {
-        let mut all_caught_up = true;
-        for table in tables {
-            let (src_ts, spice_ts, src_n, spice_n) = tokio::join!(
-                driver.max_bench_ts(table),
-                spice.max_bench_ts(table),
-                driver.row_count(table),
-                spice.count(table),
-            );
+    // Tables observed caught-up so far, by index into `tables`. Latched tables
+    // are not re-probed: the source is static once OLTP stops and CDC applies
+    // in commit order, so a caught-up table cannot fall behind again — and a
+    // re-probe is a full-table scan that can take minutes at large scale
+    // factors.
+    let mut latched = vec![false; tables.len()];
+    let converged_at = 'wait: loop {
+        for (i, table) in tables.iter().enumerate() {
+            if latched[i] {
+                continue;
+            }
+            // Re-check the deadline before every table, not once per pass: a
+            // single probe can take minutes at large scale factors, and a
+            // pass-granular check overshoots `max_wait` by a whole pass.
+            if Instant::now() >= deadline {
+                break 'wait None;
+            }
+            let (src_ts, spice_ts, src_n, spice_n) = probe_table(&driver, spice, table).await;
             // Sampled *after* the probe returns, so a slow probe (e.g. an
             // unindexed MAX(_bench_ts) full scan) shows up as a jump in the
             // per-table `+Ns` between adjacent lines.
@@ -239,12 +346,11 @@ pub async fn verify_after_drain(
                         if count_ok { "ok" } else { "behind" },
                         if ts_ok { "ok" } else { "behind" },
                     );
-                    if !(count_ok && ts_ok) {
-                        all_caught_up = false;
+                    if table_caught_up(src_ts, spice_ts, src_n, spice_n) {
+                        latched[i] = true;
                     }
                 }
                 (src_ts, spice_ts, src_n, spice_n) => {
-                    all_caught_up = false;
                     eprintln!(
                         "  drain-probe +{elapsed}s {table} PROBE ERROR src_ts={src_ts:?} spice_ts={spice_ts:?} src_count={src_n:?} spice_count={spice_n:?}"
                     );
@@ -252,7 +358,7 @@ pub async fn verify_after_drain(
             }
         }
 
-        if all_caught_up {
+        if latched.iter().all(|&caught_up| caught_up) {
             break Some(start.elapsed());
         }
         if Instant::now() >= deadline {
@@ -260,6 +366,7 @@ pub async fn verify_after_drain(
         }
         sleep(poll).await;
     };
+    let wait_duration = start.elapsed();
 
     // Final snapshot for the report: counts plus a per-column content
     // fingerprint. The fingerprint runs once here (not every poll) — a
@@ -267,11 +374,36 @@ pub async fn verify_after_drain(
     // second. Counts converging means replication caught up; the fingerprint
     // then answers the distinct question "is the content actually correct?",
     // catching value-level corruption that COUNT(*) + MAX(_bench_ts) miss.
+    //
+    // When the drain wait timed out, this snapshot decides convergence: a
+    // table the loop never latched is re-probed in full (counts AND
+    // `MAX(_bench_ts)`), while a latched table only needs its counts to still
+    // match — its max ts was already confirmed at latch time and, with the
+    // source static, cannot regress (the same argument that lets the loop
+    // skip re-probing it). Every table caught up here means replication
+    // converged, just later than the loop observed. A probe error, or any
+    // table still behind, leaves the timeout verdict standing (fail closed).
+    let timed_out = converged_at.is_none();
+    let mut final_snapshot_caught_up = true;
     let mut table_results = Vec::with_capacity(tables.len());
-    for table in tables {
-        let (source_count, spice_count) = tokio::join!(driver.row_count(table), spice.count(table));
-        let source_count = source_count?;
-        let spice_count = spice_count?;
+    for (i, table) in tables.iter().enumerate() {
+        let (source_count, spice_count, caught_up) = if timed_out && !latched[i] {
+            let (src_ts, spice_ts, src_n, spice_n) = probe_table(&driver, spice, table).await;
+            let (src_n, spice_n) = (src_n?, spice_n?);
+            let caught_up = match (src_ts, spice_ts) {
+                (Ok(src_ts), Ok(spice_ts)) => table_caught_up(src_ts, spice_ts, src_n, spice_n),
+                // A MAX(_bench_ts) probe error cannot confirm convergence.
+                _ => false,
+            };
+            (src_n, spice_n, caught_up)
+        } else {
+            let (src_n, spice_n) = tokio::join!(driver.row_count(table), spice.count(table));
+            let (src_n, spice_n) = (src_n?, spice_n?);
+            (src_n, spice_n, src_n == spice_n)
+        };
+        if !caught_up {
+            final_snapshot_caught_up = false;
+        }
         // Only fingerprint when counts already agree — comparing content over a
         // differing row set adds no signal (the count mismatch is the finding).
         let content = if source_count == spice_count {
@@ -289,8 +421,8 @@ pub async fn verify_after_drain(
 
     Ok(CorrectnessReport {
         tables: table_results,
-        converged_at,
-        wait_duration: start.elapsed(),
+        convergence: resolve_convergence(converged_at, final_snapshot_caught_up, start.elapsed()),
+        wait_duration,
     })
 }
 
@@ -448,6 +580,99 @@ fn build_fingerprint_sql(table: &str, schema: &SchemaRef) -> anyhow::Result<Stri
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+
+    fn matched_table(name: &str) -> TableCorrectness {
+        TableCorrectness {
+            table: name.to_string(),
+            source_count: 42,
+            spice_count: 42,
+            content: ContentCheck::Match { max_rel_delta: 0.0 },
+        }
+    }
+
+    #[test]
+    fn table_caught_up_requires_both_counts_and_max_ts() {
+        // Fully caught up.
+        assert!(table_caught_up(Some(1000), Some(1000), 5, 5));
+        // Both sides empty is caught up (a table the workload never touched).
+        assert!(table_caught_up(None, None, 0, 0));
+        // Spice trailing on MAX(_bench_ts) alone (a missed/stale update
+        // preserves counts) is not caught up.
+        assert!(!table_caught_up(Some(1000), Some(999), 5, 5));
+        // Counts trailing alone is not caught up.
+        assert!(!table_caught_up(Some(1000), Some(1000), 5, 4));
+        // One side empty against a non-empty side is not caught up.
+        assert!(!table_caught_up(Some(1000), None, 5, 0));
+        assert!(!table_caught_up(None, Some(1000), 0, 5));
+    }
+
+    #[test]
+    fn convergence_resolution_prefers_in_loop_then_final_snapshot() {
+        let at = Duration::from_secs(10);
+        // Observed during the drain wait.
+        assert_eq!(
+            resolve_convergence(Some(at), false, Duration::from_secs(99)),
+            Convergence::Within(at)
+        );
+        // Regression for #11953: the loop timed out, but the fresher final
+        // snapshot shows every table caught up — converged late, not a
+        // failure.
+        assert_eq!(
+            resolve_convergence(None, true, at),
+            Convergence::ObservedAtFinalSnapshot(at)
+        );
+        // Timed out and the final snapshot still diverges — a real failure.
+        assert_eq!(resolve_convergence(None, false, at), Convergence::No);
+    }
+
+    #[test]
+    fn late_convergence_passes_the_gate() {
+        // Regression for #11953: a timed-out drain wait whose final snapshot
+        // fully matches must not fail the run.
+        let report = CorrectnessReport {
+            tables: vec![matched_table("customer"), matched_table("order_line")],
+            convergence: Convergence::ObservedAtFinalSnapshot(Duration::from_secs(1002)),
+            wait_duration: Duration::from_mins(15),
+        };
+        assert_eq!(report.failure_message(), None);
+    }
+
+    #[test]
+    fn non_convergence_still_fails_the_gate() {
+        let report = CorrectnessReport {
+            tables: vec![matched_table("customer")],
+            convergence: Convergence::No,
+            wait_duration: Duration::from_mins(15),
+        };
+        let message = report
+            .failure_message()
+            .expect("non-convergence must fail the gate");
+        assert!(
+            message.contains("replication did not converge within 900000ms"),
+            "unexpected failure message: {message}"
+        );
+    }
+
+    #[test]
+    fn count_mismatch_fails_even_when_converged() {
+        let report = CorrectnessReport {
+            tables: vec![TableCorrectness {
+                table: "stock".to_string(),
+                source_count: 10,
+                spice_count: 9,
+                content: ContentCheck::Skipped("row counts differ".to_string()),
+            }],
+            convergence: Convergence::Within(Duration::from_secs(5)),
+            wait_duration: Duration::from_secs(5),
+        };
+        let message = report
+            .failure_message()
+            .expect("count mismatch must fail the gate");
+        assert!(
+            message.contains("stock: source=10 spice=9 (diff 1)"),
+            "unexpected failure message: {message}"
+        );
+    }
 
     #[test]
     fn fingerprint_sql_counts_all_columns_minmax_numerics_sum_exact_only() {

@@ -34,6 +34,7 @@ use connector_clickhouse as _;
 use connector_delta_lake as _;
 use connector_dremio as _;
 use connector_duckdb as _;
+use connector_dynamodb as _;
 use connector_flightsql as _;
 use connector_ftp as _;
 use connector_graphql as _;
@@ -250,4 +251,27 @@ pub fn collect_model_sources() -> Vec<ModelSourceSchema> {
             parameters: google::PARAMETERS,
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Spot-check drift guard: connectors that self-register into the `linkme` slice must appear
+    /// in the generated schema. This catches a broken force-linkage (`use connector_* as _;`) or a
+    /// connector silently dropping out of `.schema/spicepod.schema.json`. `dynamodb` is checked
+    /// specifically because it is the first connector extracted into its own crate while keeping
+    /// slice registration; extend this list as more connectors adopt the pattern.
+    #[test]
+    fn documents_slice_registered_connectors() {
+        let names: Vec<String> = collect_data_connectors()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert!(!names.is_empty(), "no data connectors were collected");
+        assert!(
+            names.iter().any(|n| n == "dynamodb"),
+            "connector 'dynamodb' missing from the generated schema; collected: {names:?}"
+        );
+    }
 }
