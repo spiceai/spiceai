@@ -806,7 +806,7 @@ fn snapshot_flags(mode: InitialSnapshotMode) -> (bool, bool) {
 }
 
 /// Resolve `pg_replication_initial_snapshot` into the two internal snapshot
-/// flags. Accepts the shared canonical vocabulary (`auto|enabled|disabled`, via
+/// flags. Accepts the shared canonical vocabulary (`auto|always|disabled`, via
 /// [`InitialSnapshotMode::from_canonical`]) and, for backward compatibility, the
 /// legacy booleans `true|false` (mapped to `auto|disabled`).
 ///
@@ -827,7 +827,7 @@ fn parse_initial_snapshot(params: &Parameters) -> std::result::Result<(bool, boo
     match trimmed.to_ascii_lowercase().as_str() {
         legacy @ ("true" | "1" | "yes" | "y") => {
             tracing::warn!(
-                "parameter `{}` uses the deprecated boolean value {legacy:?}; use 'auto' instead (or 'enabled'/'disabled')",
+                "parameter `{}` uses the deprecated boolean value {legacy:?}; use 'auto' instead (or 'always'/'disabled')",
                 params.user_param("replication_initial_snapshot")
             );
             Ok(snapshot_flags(InitialSnapshotMode::Auto))
@@ -842,7 +842,7 @@ fn parse_initial_snapshot(params: &Parameters) -> std::result::Result<(bool, boo
         other => {
             let user_param = params.user_param("replication_initial_snapshot");
             Err(format!(
-                "parameter `{user_param}` must be 'auto', 'enabled', or 'disabled', got {other:?}"
+                "parameter `{user_param}` must be 'auto', 'always', or 'disabled', got {other:?}"
             ))
         }
     }
@@ -1017,7 +1017,7 @@ mod tests {
         for (raw, expected) in [
             ("auto", (true, false)),
             ("AUTO", (true, false)),
-            ("enabled", (true, true)),
+            ("always", (true, true)),
             ("disabled", (false, false)),
             // Deprecated boolean spellings map to auto / disabled.
             ("true", (true, false)),
@@ -1041,7 +1041,7 @@ mod tests {
             .expect_err("typo must error");
         assert_eq!(
             err,
-            "parameter `pg_replication_initial_snapshot` must be 'auto', 'enabled', or 'disabled', got \"sometimes\"".to_string()
+            "parameter `pg_replication_initial_snapshot` must be 'auto', 'always', or 'disabled', got \"sometimes\"".to_string()
         );
     }
 

@@ -173,7 +173,7 @@ async fn next_change_envelope(
     stream: &mut ChangesStream,
     context: &str,
 ) -> Result<ChangeEnvelope, anyhow::Error> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
     loop {
         let envelope = next_envelope(stream, context).await?;
         if num_rows(&envelope) > 0 {
@@ -197,7 +197,7 @@ async fn wait_for_ready(
     stream: &mut ChangesStream,
     context: &str,
 ) -> Result<ChangeEnvelope, anyhow::Error> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
     loop {
         let envelope = next_envelope(stream, context).await?;
         if envelope.is_dataset_ready() {
