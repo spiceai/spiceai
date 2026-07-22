@@ -11471,18 +11471,31 @@ impl CayenneTableProvider {
             return self.context.sort_columns().to_vec();
         }
         let schema = self.table_schema();
-        self.filter_column_observations
-            .top_columns(
-                super::predicate_stats::DEFAULT_AUTO_CLUSTER_TOP_K,
-                schema.as_ref(),
-            )
+        let observed = self.filter_column_observations.top_columns(
+            super::predicate_stats::DEFAULT_AUTO_CLUSTER_TOP_K,
+            schema.as_ref(),
+        );
+        if observed.is_empty() {
+            // No filters observed yet — don't invent a sort key; the warm rewrite
+            // just compacts unsorted until a hot column is seen.
+            return Vec::new();
+        }
+        let sortable: Vec<String> = observed
             .into_iter()
             .filter(|name| {
                 schema
                     .field_with_name(name)
                     .is_ok_and(|field| is_row_sortable_type(field.data_type()))
             })
-            .collect()
+            .collect();
+        if sortable.is_empty() {
+            // Hot columns were observed but none are row-sortable (e.g. all
+            // `Map`): fall back to the primary key so the rewrite still gets a
+            // safe, deterministic clustering key instead of no clustering at all
+            // (mirrors the cold-tier fallback in `resolve_cold_clustering_indices`).
+            return self.table_metadata.primary_key.clone();
+        }
+        sortable
     }
 
     /// Sort and rewrite data by reading from the current listing table, writing
@@ -14275,7 +14288,17 @@ impl CayenneTableProvider {
         };
         names
             .iter()
-            .filter_map(|n| schema.index_of(n).ok())
+            .filter_map(|n| {
+                // Resolve an exact field name first; else parse the extended
+                // `col [ASC|DESC] [NULLS ...]` syntax that `sort_columns` accepts
+                // (direction is irrelevant to the Z-order curve) so a configured
+                // `sort_columns: ["amount DESC"]` still clusters cold files rather
+                // than being silently dropped by a literal-name lookup.
+                schema.index_of(n.trim()).ok().or_else(|| {
+                    util::stream_utils::parse_sort_entry(n)
+                        .and_then(|(col, _)| schema.index_of(col).ok())
+                })
+            })
             .collect()
     }
 
@@ -24688,8 +24711,13 @@ impl TableProvider for CayenneTableProvider {
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         // F4 default-on layout: record which columns this scan filters on so
         // background compaction can cluster cold files without spicepod setup.
-        // Cheap (mutex + HashMap bump); empty filters are a no-op.
-        self.filter_column_observations.record_filters(filters);
+        // Cheap (mutex + HashMap bump); empty filters are a no-op. Skipped when
+        // `sort_columns` is configured: observations are never consulted then
+        // (warm rewrite and cold clustering both use the configured columns), so
+        // recording would be pure hot-path overhead.
+        if !self.context.has_sort_columns() {
+            self.filter_column_observations.record_filters(filters);
+        }
 
         // Register object store with the session's runtime env if configured for S3 Express One Zone.
         // This ensures the session can access S3 when the underlying ListingTable reads data.
