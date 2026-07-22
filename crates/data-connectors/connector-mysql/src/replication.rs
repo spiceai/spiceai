@@ -32,9 +32,9 @@ use async_trait::async_trait;
 use data_components::cdc::{ChangesStream, StreamError};
 use data_components::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
 use data_components::mysql_replication::{
-    BinlogPosition, NoopPositionStore, PersistedPosition, PositionStore, ReplicationMetrics,
-    ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput, StoreError,
-    derive_server_id, process_nonce, start_replication_stream,
+    BinlogPosition, CursorType, NoopPositionStore, PersistedPosition, PositionStore,
+    ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
+    StoreError, derive_server_id, process_nonce, start_replication_stream,
 };
 use datafusion::sql::TableReference;
 use futures::StreamExt;
@@ -262,9 +262,26 @@ impl PositionStore for SidecarPositionStore {
         // `MySqlBinlogSys::get` swallows read errors into `None`, matching the
         // MongoDB sidecar: an unreadable checkpoint re-bootstraps rather than
         // wedging the dataset.
-        Ok(self.sys.get().await.map(|cp| PersistedPosition {
-            position: BinlogPosition::new(cp.binlog_file, cp.binlog_pos),
-            schema_json: cp.schema_json,
+        Ok(self.sys.get().await.map(|cp| {
+            // The type is always written by this connector, so a missing value
+            // is not expected (the feature has never shipped — no legacy rows).
+            // Resolve it defensively from the GTID set rather than propagating an
+            // `Option` through resume.
+            let cursor_type = cp
+                .cursor_type
+                .as_deref()
+                .and_then(CursorType::from_stored)
+                .unwrap_or(if cp.gtid_executed.is_some() {
+                    CursorType::Gtid
+                } else {
+                    CursorType::File
+                });
+            PersistedPosition {
+                position: BinlogPosition::new(cp.binlog_file, cp.binlog_pos),
+                schema_json: cp.schema_json,
+                gtid_set: cp.gtid_executed,
+                cursor_type,
+            }
         }))
     }
 
@@ -274,6 +291,8 @@ impl PositionStore for SidecarPositionStore {
                 binlog_file: position.position.file.clone(),
                 binlog_pos: position.position.pos,
                 schema_json: position.schema_json.clone(),
+                gtid_executed: position.gtid_set.clone(),
+                cursor_type: Some(position.cursor_type.as_str().to_string()),
                 updated_at: None,
             })
             .await
@@ -388,6 +407,12 @@ pub(crate) const REPLICATION_METRICS: &[MetricSpec] = &[
          0 while the snapshot is still running.",
     )
     .auto_register(),
+    MetricSpec::new("replication_gtid_enabled", MetricType::ObservableGaugeU64)
+        .description(
+            "1 when the stream is positioning by GTID auto-positioning (failover-safe) — on \
+             cold bootstrap or resume; 0 for binlog file+offset positioning.",
+        )
+        .auto_register(),
     MetricSpec::new(
         "replication_decode_errors_total",
         MetricType::ObservableCounterU64,
@@ -520,6 +545,9 @@ pub(crate) fn observe_replication_metric(
                 instrument.observe(m.bootstrap_complete(), &attributes);
             }))
         }
+        "replication_gtid_enabled" => ObserveMetricCallback::U64(Box::new(move |instrument| {
+            instrument.observe(m.gtid_enabled(), &attributes);
+        })),
         "replication_decode_errors_total" => {
             ObserveMetricCallback::U64(Box::new(move |instrument| {
                 instrument.observe(m.decode_errors_total(), &attributes);
@@ -604,7 +632,6 @@ fn replication_params_from_connector_params(
         "replication_ready_lag",
         data_components::cdc::DEFAULT_READY_LAG,
     )?;
-
     Ok(ReplicationParams {
         opts,
         server_id,

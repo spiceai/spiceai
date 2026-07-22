@@ -33,6 +33,7 @@ pub mod binlog;
 pub mod bootstrap;
 pub mod changes;
 pub mod config;
+pub mod gtid;
 pub mod metrics;
 pub mod resilience;
 pub mod rows;
@@ -47,7 +48,8 @@ use snafu::Snafu;
 
 use crate::cdc::{ChangeEnvelope, ChangesStream, NoOpCommitter, StreamError};
 
-pub use config::{BinlogPosition, ReplicationParams, derive_server_id, process_nonce};
+pub use config::{BinlogPosition, CursorType, ReplicationParams, derive_server_id, process_nonce};
+pub use gtid::GtidSet;
 pub use metrics::{Metrics as ReplicationMetrics, MetricsCollector as ReplicationMetricsCollector};
 
 #[derive(Debug, Snafu)]
@@ -138,6 +140,36 @@ pub enum Error {
          shutting down). Retry — a fresh shared connection will be established."
     ))]
     SharedSourceUnavailable { connection: String },
+
+    #[snafu(display("Failed to parse MySQL GTID set: {message}"))]
+    GtidParse { message: String },
+
+    #[snafu(display(
+        "Cannot resume MySQL replication for {dataset} ({database}.{table}): this dataset was \
+         bootstrapped with GTID auto-positioning, but the source server no longer reports \
+         `gtid_mode = ON` (it may have been reconfigured, or this is a different server without \
+         GTIDs). Resuming by file+offset instead would silently start from a server-local \
+         position that does not correspond to the applied GTID set. Either restore \
+         `gtid_mode = ON` on the source (or repoint at a GTID-capable server) to resume via GTID, \
+         or drop the accelerator's persisted state (its `spice_sys_mysql_binlog` row) to \
+         re-bootstrap from scratch. \
+         See: https://spiceai.org/docs/components/data-connectors/mysql"
+    ))]
+    GtidResumeUnavailable {
+        dataset: String,
+        database: String,
+        table: String,
+    },
+
+    #[snafu(display(
+        "MySQL replication for {dataset}: this dataset is positioning by GTID, but the source \
+         emitted an anonymous transaction (no GTID). This means the source's `gtid_mode` is not \
+         fully ON (e.g. ON_PERMISSIVE), so the applied GTID set cannot describe every \
+         transaction. Set `gtid_mode = ON` on the source, or drop the accelerator's persisted \
+         state to re-bootstrap by file+offset. \
+         See: https://spiceai.org/docs/components/data-connectors/mysql"
+    ))]
+    AnonymousTransactionUnderGtid { dataset: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -158,6 +190,16 @@ pub type StoreError = Box<dyn std::error::Error + Send + Sync>;
 pub struct PersistedPosition {
     pub position: BinlogPosition,
     pub schema_json: Option<String>,
+    /// Serialized executed [`GtidSet`] (`uuid:range` text) when positioning by
+    /// GTID; may be empty (`gtid_mode = ON` but no transactions applied yet).
+    /// `None` for file+offset positioning. This is the failover-safe resume
+    /// identity: unlike `position` it is server-independent, so a checkpoint
+    /// written against one primary resumes against a promoted replica via
+    /// `COM_BINLOG_DUMP_GTID`.
+    pub gtid_set: Option<String>,
+    /// The checkpoint's cursor type, stored explicitly rather than inferred
+    /// from `gtid_set` (an empty GTID set must still resume as GTID; see [`CursorType`])
+    pub cursor_type: CursorType,
 }
 
 /// Version tag for [`CheckpointMeta`] serialized into `schema_json`.

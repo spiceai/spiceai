@@ -110,7 +110,7 @@ use super::config::{BinlogPosition, ReplicationParams};
 use super::metrics::MetricsCollector;
 use super::rows::{build_change_batch, truncate_change};
 use super::{
-    Error, PersistedPosition, PositionStore, ReplicationStreamInput, Result,
+    CursorType, Error, GtidSet, PersistedPosition, PositionStore, ReplicationStreamInput, Result,
     check_resume_compatibility, encode_checkpoint_schema_json, stream_error,
 };
 use crate::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError, StreamError};
@@ -452,6 +452,8 @@ impl CommitChange for SnapshotBoundaryCommitter {
             let persisted = PersistedPosition {
                 position: slot.committed(),
                 schema_json: member.checkpoint_schema_json.clone(),
+                gtid_set: None,
+                cursor_type: CursorType::File,
             };
             if let Err(e) = member.position_store.save(&persisted).await {
                 tracing::warn!(dataset = %self.dataset, error = %e, "failed to persist shared mysql binlog snapshot head");
@@ -887,6 +889,8 @@ async fn resolve_start_position(
         let initial = PersistedPosition {
             position: head.clone(),
             schema_json: checkpoint_schema_json.map(ToString::to_string),
+            gtid_set: None,
+            cursor_type: CursorType::File,
         };
         if let Err(e) = position_store.save(&initial).await {
             tracing::warn!(dataset = %dataset_name, error = %e, "failed to persist initial binlog head");
@@ -1031,7 +1035,8 @@ async fn run_pump(source: Arc<SharedSource>) {
             continue 'reconnect;
         };
 
-        let mut stream = match open_binlog_stream(&params, &resume, &connection).await {
+        let mut stream =
+            match open_binlog_stream(&params, &resume, &connection, false, &GtidSet::new()).await {
             Ok(stream) => {
                 backoff.reset();
                 if reconnect_attempts > 0 {
@@ -1645,6 +1650,8 @@ async fn persist_all(source: &Arc<SharedSource>, last: &mut HashMap<MemberKey, B
         let persisted = PersistedPosition {
             position: committed.clone(),
             schema_json: member.checkpoint_schema_json.clone(),
+            gtid_set: None,
+            cursor_type: CursorType::File,
         };
         match member.position_store.save(&persisted).await {
             Ok(()) => {

@@ -21,6 +21,46 @@ use std::time::Duration;
 
 use crate::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
 
+/// The kind of cursor a persisted checkpoint resumes from. Stored explicitly
+/// with each checkpoint (never inferred from the presence of a GTID set): a
+/// GTID checkpoint with an empty executed set (`gtid_mode = ON`, zero
+/// transactions applied yet) must still reload as GTID, so an engine that maps
+/// an empty string to `NULL` on the round-trip cannot silently reclassify it as
+/// file — which would resume from a server-local offset unrelated to the GTID
+/// set and open a silent gap on failover.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorType {
+    /// File+offset positioning (`COM_BINLOG_DUMP`). Server-local; re-snapshots
+    /// on failover.
+    File,
+    /// GTID auto-positioning (`COM_BINLOG_DUMP_GTID`). Failover-safe.
+    Gtid,
+}
+
+impl CursorType {
+    /// The value persisted in the sidecar `cursor_type` column.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Gtid => "gtid",
+        }
+    }
+
+    /// Parse a stored `cursor_type` value. Returns `None` for an absent/unknown
+    /// value (a row that predates the column, or corrupt data); the sidecar
+    /// loader resolves that (unreleased-feature-only) case by inferring the type
+    /// from the persisted GTID set rather than propagating the `None`.
+    #[must_use]
+    pub fn from_stored(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "file" => Some(Self::File),
+            "gtid" => Some(Self::Gtid),
+            _ => None,
+        }
+    }
+}
+
 /// Parameters for a single dataset's binlog replication stream.
 ///
 /// Built by the connector from spicepod params; see

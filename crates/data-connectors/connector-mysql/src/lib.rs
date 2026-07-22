@@ -163,6 +163,7 @@ const PARAMETERS: &[ParameterSpec] = &[
              when one does; 'disabled' streams changes only; 'always' re-snapshots on every \
              start, discarding any persisted position. Default: auto.",
         )
+        .default("auto")
         .one_of_ignore_ascii_case(InitialSnapshotMode::VALUES)
         .help_link(MYSQL_DOCS),
     ParameterSpec::component("replication_checkpoint_interval")
@@ -186,6 +187,7 @@ const PARAMETERS: &[ParameterSpec] = &[
              (default) surfaces an actionable error; 'restart' drops the saved position and \
              re-snapshots the table. Default: error.",
         )
+        .default("error")
         .one_of_ignore_ascii_case(InvalidCheckpointBehavior::VALUES)
         .help_link(MYSQL_DOCS),
     ParameterSpec::component("replication_ready_lag")
