@@ -113,8 +113,8 @@ The request **blocks until the batch is applied** (ack). Debezium Server / Embed
 | 400 | Bad body / decode / apply failure |
 | 404 | Dataset not registered for CDC ingest (not ready or wrong `from:`) |
 | 403 | Write access required (auth) |
-| 503 | Stream stopped / channel full |
-| 504 | Apply timed out |
+| 503 | Change stream stopped (dataset unloaded or reloading) — retry once ready |
+| 504 | Timed out waiting for capacity (backpressure) or for the change to apply |
 
 ## Debezium Server sink
 

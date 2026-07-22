@@ -79,8 +79,9 @@ pub struct CdcIngestResponse {
         (status = 400, description = "Invalid body or format"),
         (status = 404, description = "Dataset not registered for CDC ingest"),
         (status = 403, description = "Write access required"),
-        (status = 504, description = "Apply timed out"),
-        (status = 503, description = "Ingest channel unavailable"),
+        (status = 504, description = "Timed out waiting for capacity or apply"),
+        (status = 503, description = "Change stream stopped (dataset unloaded or reloading)"),
+        (status = 501, description = "CDC ingest requires the debezium feature in this build"),
     )
 ))]
 pub(crate) async fn post(Path(name): Path<String>, headers: HeaderMap, body: Bytes) -> Response {

@@ -123,8 +123,10 @@ uuid.workspace = true
 zip = "8.3.0"
 tokio-stream.workspace = true
 
-# Avoid `xz` — it pulls `lzma-sys` which conflicts with DataFusion's `liblzma`.
-apache-avro = { version = "0.17", optional = true, default-features = false, features = [
+# Align on 0.21 (already pulled in via iceberg) so the binary carries one
+# apache-avro, not two majors. Default features off avoids `xz` (pulls
+# `lzma-sys`, which conflicts with DataFusion's `liblzma`).
+apache-avro = { version = "0.21", optional = true, default-features = false, features = [
     "bzip",
     "snappy",
     "zstandard",

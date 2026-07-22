@@ -66,7 +66,7 @@ pub enum Error {
     NotRegistered { dataset: String },
 
     #[snafu(display(
-        "CDC ingest for dataset '{dataset}' is not accepting events (channel full or stream stopped)"
+        "CDC ingest for dataset '{dataset}' is not accepting events: the change stream has stopped (dataset unloaded or reloading). Retry once the dataset is ready again"
     ))]
     ChannelClosed { dataset: String },
 
