@@ -870,11 +870,15 @@ async fn open_binlog_stream(
         // GTID auto-positioning: the server computes the start point from the
         // executed set (everything NOT in it is sent), so no filename/offset is
         // needed. This is what survives a failover — the set is
-        // server-independent.
+        // server-independent. An executed set that can't be represented on the
+        // wire fails loudly rather than silently under-reporting.
+        let gtid_set = gtid
+            .to_sids()
+            .map_err(|e| mysql_async::Error::Other(e.into()))?;
         conn.get_binlog_stream(
             BinlogStreamRequest::new(params.server_id)
                 .with_gtid()
-                .with_gtid_set(gtid.to_sids()),
+                .with_gtid_set(gtid_set),
         )
         .await
     } else {

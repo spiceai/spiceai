@@ -130,24 +130,29 @@ impl GtidSet {
     /// Convert to the `COM_BINLOG_DUMP_GTID` request representation.
     ///
     /// Each inclusive text range `[start, end]` becomes a half-open wire
-    /// interval `[start, end + 1)`. Zero-GNO ranges cannot occur (GNOs start at
-    /// 1) and are skipped defensively rather than sent as an invalid interval.
-    #[must_use]
-    pub fn to_sids(&self) -> Vec<Sid<'static>> {
+    /// interval `[start, end + 1)`. Any interval that cannot be represented on
+    /// the wire (only possible for a corrupt/hand-edited executed set — e.g. a
+    /// GNO beyond `i64::MAX` — since [`Self::parse`] rejects zero and a real
+    /// server never issues such values) is a hard error: dropping it would
+    /// silently under-report the applied set and make the source re-stream
+    /// already-applied transactions on resume. Fail loudly instead.
+    pub fn to_sids(&self) -> Result<Vec<Sid<'static>>, String> {
         self.intervals
             .iter()
             .filter(|(_, ranges)| !ranges.is_empty())
             .map(|(uuid, ranges)| {
-                let gno_intervals: Vec<GnoInterval> = ranges
+                let gno_intervals = ranges
                     .iter()
-                    .filter_map(|&(start, end)| {
+                    .map(|&(start, end)| {
                         // Inclusive [start, end] -> half-open [start, end + 1).
                         // `end` is a real GNO (<= i64::MAX in practice); saturate
                         // rather than wrap should it ever be u64::MAX.
-                        GnoInterval::check_and_new(start, end.saturating_add(1)).ok()
+                        GnoInterval::check_and_new(start, end.saturating_add(1)).map_err(|e| {
+                            format!("GTID interval {start}-{end} for source {uuid} is not representable on the wire: {e}")
+                        })
                     })
-                    .collect();
-                Sid::new(*uuid.as_bytes()).with_intervals(gno_intervals)
+                    .collect::<Result<Vec<GnoInterval>, String>>()?;
+                Ok(Sid::new(*uuid.as_bytes()).with_intervals(gno_intervals))
             })
             .collect()
     }
@@ -292,7 +297,7 @@ mod tests {
     #[test]
     fn to_sids_converts_inclusive_to_half_open() {
         let set = GtidSet::parse(&format!("{U1}:1-5")).expect("parse");
-        let sids = set.to_sids();
+        let sids = set.to_sids().expect("to_sids");
         assert_eq!(sids.len(), 1);
         let intervals = sids[0].intervals();
         assert_eq!(intervals.len(), 1);
@@ -303,9 +308,19 @@ mod tests {
     #[test]
     fn to_sids_round_trips_uuid_bytes() {
         let set = GtidSet::parse(&format!("{U1}:1")).expect("parse");
-        let sids = set.to_sids();
+        let sids = set.to_sids().expect("to_sids");
         let uuid = Uuid::parse_str(U1).expect("uuid");
         assert_eq!(sids[0].uuid(), *uuid.as_bytes());
+    }
+
+    #[test]
+    fn to_sids_errors_on_unrepresentable_interval() {
+        // A GNO at u64::MAX can only come from a corrupt/hand-edited set (a real
+        // server never issues it). `to_sids` must surface it as an error, not
+        // silently drop the interval and under-report the applied set.
+        let set = GtidSet::parse(&format!("{U1}:18446744073709551615")).expect("parse");
+        set.to_sids()
+            .expect_err("an unrepresentable GTID interval must error, not be dropped");
     }
 
     #[test]
