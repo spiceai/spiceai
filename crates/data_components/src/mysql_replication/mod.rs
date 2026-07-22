@@ -134,8 +134,10 @@ pub enum Error {
          bootstrapped with GTID auto-positioning, but the source server no longer reports \
          `gtid_mode = ON` (it may have been reconfigured, or this is a different server without \
          GTIDs). Resuming by file+offset instead would silently start from a server-local \
-         position that does not correspond to the applied GTID set. Restore `gtid_mode = ON` on \
-         the source to re-bootstrap by file+offset. \
+         position that does not correspond to the applied GTID set. Either restore \
+         `gtid_mode = ON` on the source (or repoint at a GTID-capable server) to resume via GTID, \
+         or drop the accelerator's persisted state (its `spice_sys_mysql_binlog` row) to \
+         re-bootstrap from scratch. \
          See: https://spiceai.org/docs/components/data-connectors/mysql"
     ))]
     GtidResumeUnavailable {

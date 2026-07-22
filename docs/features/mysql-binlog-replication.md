@@ -221,7 +221,7 @@ bootstrapped, Spice uses GTID positioning if the source runs with
 atomically with the snapshot head, extended per committed transaction, and
 persisted alongside the file position in the `spice_sys_mysql_binlog` sidecar
 (`gtid_executed` column, plus an explicit `file`|`gtid` `cursor_type` so the
-type is always known on resume, never inferred).
+type does not need to be inferred from the GTID set on resume).
 
 Because it's automatic and otherwise silent, Spice **logs the resolved
 positioning** at stream start so you can confirm a dataset is failover-safe:

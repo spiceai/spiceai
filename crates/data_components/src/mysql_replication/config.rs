@@ -48,8 +48,9 @@ impl CursorType {
     }
 
     /// Parse a stored `cursor_type` value. Returns `None` for an absent/unknown
-    /// value (a row that predates the column, or corrupt data) — the caller
-    /// treats that as an incompatible checkpoint rather than guessing a type.
+    /// value (a row that predates the column, or corrupt data); the sidecar
+    /// loader resolves that (unreleased-feature-only) case by inferring the type
+    /// from the persisted GTID set rather than propagating the `None`.
     #[must_use]
     pub fn from_stored(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {

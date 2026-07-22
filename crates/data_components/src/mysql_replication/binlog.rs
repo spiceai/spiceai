@@ -753,7 +753,6 @@ fn binlog_change_stream(
                             Err(super::err_to_stream(Error::AnonymousTransactionUnderGtid {
                                 dataset: dataset_name.clone(),
                             }))?;
-                            unreachable!();
                         }
                         txn = Some(TransactionBuffer::new());
                         current_txn_gtid = None;
