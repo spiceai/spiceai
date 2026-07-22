@@ -14,25 +14,27 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Share one `MySQL` binlog dump connection across multiple
-//! `refresh_mode: changes` datasets — the `MySQL` analog of
-//! [`crate::postgres_replication::shared`].
+//! Share one `MySQL` binlog dump connection across every
+//! `refresh_mode: changes` dataset on a connection — the `MySQL` analog of
+//! [`crate::postgres_replication::shared`], but **always on**.
 //!
 //! Unlike a Postgres publication, `MySQL`'s `COM_BINLOG_DUMP` has no
 //! server-side table filter: every subscriber receives the *entire* server
-//! binlog. So the per-dataset path opens one full-server dump per table and
-//! discards every other table's events, and N datasets cost N dumps + N
-//! `server_id`s. Sharing is implicit-by-group: datasets on the same
-//! `(host, port, user, database)` naming the same `mysql_replication_group`
-//! join a single *shared source* — one dump connection, one `server_id`, with
-//! decoded transactions routed by `(database, table)` to each member's
-//! accelerator sink. A group named by only one dataset degenerates to
-//! per-dataset behavior (single member). Datasets without a group keep their
-//! dedicated per-dataset stream.
+//! binlog. A dedicated per-dataset dump would therefore just duplicate the
+//! whole stream for no benefit, so there is no per-dataset path and no opt-in:
+//! this module is the sole streaming engine for MySQL CDC. Sharing is keyed by
+//! *connection identity* ([`SourceKey`]) — datasets that connect the same way
+//! (host, port, user, password, TLS, `server_id`) join a single *shared source*
+//! (one dump connection, one `server_id`), with decoded transactions routed by
+//! `(database, table)` to each member's accelerator sink. The database is not
+//! part of the key, so datasets on the same server but different databases still
+//! share. A single dataset is simply a shared source with one member; datasets
+//! that connect *differently* get their own source (see [`SourceKey`] for the
+//! per-dataset opt-out seam).
 //!
 //! # Consistency & ack model
 //!
-//! Identical at-least-once contract to the per-dataset path, made convergent by
+//! An at-least-once contract, made convergent by
 //! PK-based upsert. `MySQL` keeps no server-side cursor, so there is no slot to
 //! acknowledge: instead every member persists its *own* committed
 //! [`BinlogPosition`] into its own `spice_sys_mysql_binlog` sidecar row, and the
@@ -71,8 +73,8 @@ limitations under the License.
 //! not classify) is adopted only if the freshly-fetched source layout matches
 //! the event's column count ([`super::binlog::adopt_current_layout`]), else
 //! member-fatal; the count-match guard makes replaying pre-change row images
-//! self-fatal rather than mis-decoded. The per-dataset `Checkpointer`'s durable
-//! pre-adopt/replay-boundary machinery is intentionally *not* ported. Instead,
+//! self-fatal rather than mis-decoded. A durable pre-adopt/replay-boundary
+//! checkpoint machinery is intentionally *not* implemented in v1. Instead,
 //! safety across a detach/rejoin is guaranteed structurally: every (re)subscribe
 //! re-resolves the start position from the member's own sidecar and re-checks
 //! its persisted layout fingerprint against the current source layout, so a
@@ -134,15 +136,34 @@ const MEMBER_SEND_STALL_WARN: Duration = Duration::from_secs(5);
 /// `(database, table)` of a member's source table — the routing key.
 type MemberKey = (String, String);
 
-/// Identity of a shared dump. Datasets whose connection params and group
-/// produce the same key share one pump.
+/// Identity of a shared dump: the connection a dataset streams the binlog over.
+/// Every `refresh_mode: changes` dataset that connects the same way coalesces
+/// onto one pump for this key — no opt-in, no group label. The `MySQL` binlog
+/// dump is server-wide (no server-side table filter), so separate connections
+/// to the same server would just duplicate the stream; coalescing is always the
+/// right default. The database is deliberately NOT part of the key — datasets on
+/// the same server but different databases still share the one server-wide dump.
+///
+/// The key captures everything that makes two connections "the same way":
+/// host/port/user, password, and the full TLS config (`SslOpts`). Datasets that
+/// connect *differently* (e.g. a different `sslmode`, a different credential)
+/// simply produce a different key and get their own dump — so one can never
+/// silently ride another's transport or credentials, and there is nothing to
+/// reject at join time.
+///
+/// `server_id` is part of the key too: it defaults to a value derived from the
+/// connection identity (so datasets on one connection coalesce), but a user who
+/// sets *distinct* explicit `mysql_replication_server_id`s gets *distinct* keys
+/// — i.e. separate dedicated dumps. That is the per-dataset opt-out seam, built
+/// from existing config with no new mechanism and no second engine.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 struct SourceKey {
     host: String,
     port: u16,
     user: String,
-    database: String,
-    group: String,
+    pass: Option<String>,
+    ssl: Option<mysql_async::SslOpts>,
+    server_id: u32,
 }
 
 impl SourceKey {
@@ -151,9 +172,16 @@ impl SourceKey {
             host: params.opts.ip_or_hostname().to_string(),
             port: params.opts.tcp_port(),
             user: params.opts.user().unwrap_or_default().to_string(),
-            database: params.opts.db_name().unwrap_or_default().to_string(),
-            group: params.group.clone().unwrap_or_default(),
+            pass: params.opts.pass().map(ToString::to_string),
+            ssl: params.opts.ssl_opts().cloned(),
+            server_id: params.server_id,
         }
+    }
+
+    /// Short human-readable label for logs/errors (`host:port`). Never includes
+    /// the credential or TLS material.
+    fn label(&self) -> String {
+        format!("{}:{}", self.host, self.port)
     }
 }
 
@@ -412,6 +440,23 @@ struct SnapshotBoundaryCommitter {
 impl CommitChange for SnapshotBoundaryCommitter {
     async fn commit(&self) -> std::result::Result<(), CommitError> {
         self.source.ack.snapshot_finished(&self.key);
+        // Persist the captured head now that the snapshot is durably applied —
+        // the same contract as the per-dataset path's boundary committer.
+        // `persist_all` skips SNAPSHOTTING members, so without this the head is
+        // not persisted until the pump's next checkpoint tick; a crash in that
+        // window would needlessly re-snapshot. Running here (after every
+        // snapshot batch has been applied) makes the head durable immediately.
+        if let (Some(member), Some(slot)) =
+            (self.source.member(&self.key), self.source.ack.slot(&self.key))
+        {
+            let persisted = PersistedPosition {
+                position: slot.committed(),
+                schema_json: member.checkpoint_schema_json.clone(),
+            };
+            if let Err(e) = member.position_store.save(&persisted).await {
+                tracing::warn!(dataset = %self.dataset, error = %e, "failed to persist shared mysql binlog snapshot head");
+            }
+        }
         self.source.restart_requested.store(true, Ordering::Release);
         crate::cdc::log_committer_progress("mysql", &self.dataset, "snapshot-complete", None);
         Ok(())
@@ -510,7 +555,7 @@ impl SharedSource {
                 tracing::error!(
                     dataset = %member.dataset_name,
                     table = %format_member(key),
-                    group = %self.key.group,
+                    connection = %self.key.label(),
                     reason,
                     "shared mysql binlog member detached; its last applied position now pins the \
                      shared resume position for the whole group until the dataset rejoins or spiced \
@@ -522,7 +567,7 @@ impl SharedSource {
                 tracing::warn!(
                     dataset = %member.dataset_name,
                     table = %format_member(key),
-                    group = %self.key.group,
+                    connection = %self.key.label(),
                     reason,
                     "shared mysql binlog member detached and is being replaced by a new \
                      subscription (rejoin in progress)"
@@ -563,7 +608,7 @@ pub fn subscribe(input: ReplicationStreamInput) -> ChangesStream {
 
 async fn subscribe_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
     let key = SourceKey::from_params(&input.params);
-    let group = key.group.clone();
+    let connection = key.label();
 
     // A source can die (pump exit) between fetching it and acquiring its setup
     // lock; retry against a fresh registry entry.
@@ -576,7 +621,7 @@ async fn subscribe_inner(input: ReplicationStreamInput) -> Result<ChangesStream>
         }
         return attach_member(&source, input).await;
     }
-    Err(Error::SharedSourceUnavailable { group })
+    Err(Error::SharedSourceUnavailable { connection })
 }
 
 fn get_or_create_source(key: &SourceKey, params: &ReplicationParams) -> Arc<SharedSource> {
@@ -610,30 +655,13 @@ async fn attach_member(
         metrics,
     } = input;
     let member_key: MemberKey = (database.clone(), table.clone());
-    let group = source.key.group.clone();
+    let connection = source.key.label();
 
-    // All members share ONE dump connection built from the first subscriber's
-    // params, so their single `server_id` must agree (host/port/user/db are the
-    // registry key already). A divergent explicit `mysql_replication_server_id`
-    // would otherwise silently evict a slot-mate off the source.
-    if params.server_id != source.params.server_id {
-        return Err(Error::SharedConnectionParamsMismatch {
-            dataset: dataset_name,
-            group,
-            param: "mysql_replication_server_id",
-        });
-    }
-    // The whole group rides ONE dump connection built from the first
-    // subscriber's opts, and the `SourceKey` intentionally excludes the
-    // password — so reject a member whose password differs rather than
-    // silently authenticating it with a slot-mate's credential.
-    if params.opts.pass() != source.params.opts.pass() {
-        return Err(Error::SharedConnectionParamsMismatch {
-            dataset: dataset_name,
-            group,
-            param: "mysql_pass",
-        });
-    }
+    // No connection-param agreement check is needed: everything that must match
+    // for two datasets to safely share one dump — host, port, user, password,
+    // TLS config, and `server_id` — is part of the `SourceKey`. A dataset that
+    // differs in any of them produces a different key and gets its own dump, so
+    // it can never ride a slot-mate's transport, credential, or replica id.
 
     if let Some(existing) = source.member(&member_key) {
         if existing.sender.is_closed() {
@@ -642,7 +670,7 @@ async fn attach_member(
             return Err(Error::SharedTableAlreadySubscribed {
                 database,
                 table,
-                group,
+                connection,
             });
         }
     }
@@ -719,7 +747,7 @@ async fn attach_member(
     tracing::info!(
         dataset = %dataset_name,
         table = %format_member(&member_key),
-        group = %source.key.group,
+        connection = %source.key.label(),
         snapshot = snapshotting,
         rejoining,
         members = source.live_member_count(),
@@ -925,7 +953,7 @@ async fn try_finish_if_empty(source: &Arc<SharedSource>) -> bool {
 
 /// Send a fatal error to every member and terminate the source.
 async fn fatal_broadcast(source: &Arc<SharedSource>, message: String) {
-    tracing::error!(group = %source.key.group, "shared mysql binlog stream failed: {message}");
+    tracing::error!(connection = %source.key.label(), "shared mysql binlog stream failed: {message}");
     for (_, member) in source.live_members() {
         let _ = member
             .sender
@@ -966,7 +994,7 @@ struct Route {
 async fn run_pump(source: Arc<SharedSource>) {
     let shutdown_epoch = crate::cdc::shutdown_epoch();
     let params = source.params.clone();
-    let group = source.key.group.clone();
+    let connection = source.key.label();
     let mut backoff = super::resilience::StreamBackoff::default_for_stream();
     let mut reconnect_attempts: u32 = 0;
     let idle_tick = crate::cdc::heartbeat_interval(params.ready_lag)
@@ -987,13 +1015,13 @@ async fn run_pump(source: Arc<SharedSource>) {
     'reconnect: loop {
         if crate::cdc::shutdown_epoch() != shutdown_epoch {
             persist_all(&source, &mut last_persisted).await;
-            tracing::info!(group = %group, "runtime shutdown; releasing shared mysql binlog connection");
+            tracing::info!(connection = %connection, "runtime shutdown; releasing shared mysql binlog connection");
             finish_pump(&source);
             return;
         }
         source.reap_closed_members();
         if source.live_member_count() == 0 && try_finish_if_empty(&source).await {
-            tracing::info!(group = %group, "all members detached; shutting down shared mysql binlog stream");
+            tracing::info!(connection = %connection, "all members detached; shutting down shared mysql binlog stream");
             return;
         }
         source.restart_requested.store(false, Ordering::Release);
@@ -1003,11 +1031,11 @@ async fn run_pump(source: Arc<SharedSource>) {
             continue 'reconnect;
         };
 
-        let mut stream = match open_binlog_stream(&params, &resume, &group).await {
+        let mut stream = match open_binlog_stream(&params, &resume, &connection).await {
             Ok(stream) => {
                 backoff.reset();
                 if reconnect_attempts > 0 {
-                    tracing::info!(group = %group, attempts = reconnect_attempts, position = %resume, "shared mysql binlog connection resumed");
+                    tracing::info!(connection = %connection, attempts = reconnect_attempts, position = %resume, "shared mysql binlog connection resumed");
                     reconnect_attempts = 0;
                 }
                 // Connection starts at the shared min (<= every held member's
@@ -1020,7 +1048,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                 // The shared min was purged from the source. Surface it to every
                 // member; on reload/restart each member re-evaluates its own
                 // persisted position via `invalid_checkpoint_behavior`.
-                fatal_broadcast(&source, purged_position_error(&resume, &group).to_string()).await;
+                fatal_broadcast(&source, purged_position_error(&resume, &connection).to_string()).await;
                 break 'reconnect;
             }
             Err(e) if super::resilience::is_transient_mysql(&e) => {
@@ -1030,7 +1058,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                 reconnect_attempts = reconnect_attempts.saturating_add(1);
                 log_transient_reconnect(
                     reconnect_attempts,
-                    &group,
+                    &connection,
                     &e.to_string(),
                     backoff.next_delay().as_millis(),
                 );
@@ -1057,20 +1085,20 @@ async fn run_pump(source: Arc<SharedSource>) {
         'recv: loop {
             if crate::cdc::shutdown_epoch() != shutdown_epoch {
                 if let Err(e) = stream.close().await {
-                    tracing::debug!(group = %group, error = %e, "binlog close during shutdown");
+                    tracing::debug!(connection = %connection, error = %e, "binlog close during shutdown");
                 }
                 persist_all(&source, &mut last_persisted).await;
-                tracing::info!(group = %group, "runtime shutdown; released shared mysql binlog connection");
+                tracing::info!(connection = %connection, "runtime shutdown; released shared mysql binlog connection");
                 finish_pump(&source);
                 return;
             }
             if source.restart_requested.swap(false, Ordering::AcqRel) {
-                tracing::debug!(group = %group, "reconnecting shared mysql binlog stream to pick up membership change");
+                tracing::debug!(connection = %connection, "reconnecting shared mysql binlog stream to pick up membership change");
                 break 'recv;
             }
             source.reap_closed_members();
             if source.live_member_count() == 0 && try_finish_if_empty(&source).await {
-                tracing::info!(group = %group, "all members detached; shutting down shared mysql binlog stream");
+                tracing::info!(connection = %connection, "all members detached; shutting down shared mysql binlog stream");
                 return;
             }
 
@@ -1094,7 +1122,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                 reconnect_attempts = reconnect_attempts.saturating_add(1);
                 log_transient_reconnect(
                     reconnect_attempts,
-                    &group,
+                    &connection,
                     "server closed the binlog stream",
                     backoff.next_delay().as_millis(),
                 );
@@ -1107,7 +1135,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                         .ack
                         .flush_position()
                         .unwrap_or_else(|| current_file_pos(&current_file));
-                    fatal_broadcast(&source, purged_position_error(&resume, &group).to_string())
+                    fatal_broadcast(&source, purged_position_error(&resume, &connection).to_string())
                         .await;
                     break 'reconnect;
                 }
@@ -1119,7 +1147,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                     reconnect_attempts = reconnect_attempts.saturating_add(1);
                     log_transient_reconnect(
                         reconnect_attempts,
-                        &group,
+                        &connection,
                         &e.to_string(),
                         backoff.next_delay().as_millis(),
                     );
@@ -1291,7 +1319,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                             .await;
                         }
                         QueryKind::Xa => {
-                            tracing::warn!(group = %group, statement = %statement, "XA transaction observed on the shared binlog; XA transactions are not supported and their changes are ignored");
+                            tracing::warn!(connection = %connection, statement = %statement, "XA transaction observed on the shared binlog; XA transactions are not supported and their changes are ignored");
                         }
                         QueryKind::Statement => {
                             handle_statement(
@@ -1511,10 +1539,51 @@ async fn handle_statement(
                     DeliverOutcome::ShutdownAbandon => return,
                 }
             }
+            StatementKind::SchemaChange("ALTER TABLE") => {
+                // A compatible ALTER (e.g. ADD COLUMN) is adopted mid-stream by
+                // re-fetching the source layout and reconciling it against the
+                // dataset schema — the same behavior as the per-dataset path.
+                // Columns the source gained but the dataset does not declare are
+                // ignored; an ALTER that drops or retypes a *dataset* column
+                // cannot be adopted and is member-fatal. Adopting on the
+                // statement (not only on the next TableMap's column-count change)
+                // also catches type-only ALTERs that keep the column count.
+                let old_layout = { lock(&member.layout).layout.clone() };
+                match adopt_current_layout(
+                    &source.params,
+                    &mkey.0,
+                    &mkey.1,
+                    &member.schema,
+                    &old_layout,
+                    &member.primary_keys,
+                    &member.dataset_name,
+                )
+                .await
+                {
+                    Ok(AdoptedLayout {
+                        layout,
+                        column_map,
+                        pk_source_indexes,
+                    }) => {
+                        *lock(&member.layout) = Arc::new(MemberLayout {
+                            layout,
+                            column_map,
+                            pk_source_indexes,
+                        });
+                    }
+                    Err(e) => {
+                        member.metrics.inc_schema_mismatch_error();
+                        member_fatal(source, &mkey, format!(
+                            "ALTER TABLE on source table {}.{} (statement: {statement}) cannot be adopted mid-stream: {e}. Update the dataset schema to match the new table definition, or re-bootstrap by setting `mysql_replication_invalid_checkpoint_behavior: restart`.",
+                            mkey.0, mkey.1
+                        )).await;
+                    }
+                }
+            }
             StatementKind::SchemaChange(verb) => {
-                // ALTER is adopted on the following TableMap (column-count change);
-                // DROP/RENAME (and an ALTER that drops a dataset column) is fatal
-                // for this member. Only the affected member is torn down.
+                // DROP / RENAME / DROP DATABASE: the subscribed table no longer
+                // exists under this name — member-fatal. Only the affected member
+                // is torn down; the rest of the shared dump keeps running.
                 member.metrics.inc_schema_mismatch_error();
                 member_fatal(source, &mkey, format!(
                     "{verb} detected on source table {}.{} (statement: {statement}). Fix the source (or dataset) and re-bootstrap by setting `mysql_replication_invalid_checkpoint_behavior: restart`.",
@@ -1609,7 +1678,7 @@ async fn poll_head_and_heartbeat(
         None => match Conn::new(params.opts.clone()).await {
             Ok(conn) => side_conn.insert(conn),
             Err(e) => {
-                tracing::debug!(group = %source.key.group, error = %e, "shared head-poll connect failed");
+                tracing::debug!(connection = %source.key.label(), error = %e, "shared head-poll connect failed");
                 return;
             }
         },
@@ -1617,7 +1686,7 @@ async fn poll_head_and_heartbeat(
     let head = match super::setup::fetch_head_position(conn).await {
         Ok(head) => head,
         Err(e) => {
-            tracing::debug!(group = %source.key.group, error = %e, "shared head poll failed");
+            tracing::debug!(connection = %source.key.label(), error = %e, "shared head poll failed");
             *side_conn = None;
             return;
         }
@@ -1636,7 +1705,7 @@ async fn poll_head_and_heartbeat(
     let source_now_ms = match super::setup::fetch_source_now_ms(conn).await {
         Ok(ms) => ms,
         Err(e) => {
-            tracing::debug!(group = %source.key.group, error = %e, "shared source-clock query failed");
+            tracing::debug!(connection = %source.key.label(), error = %e, "shared source-clock query failed");
             *side_conn = None;
             return;
         }

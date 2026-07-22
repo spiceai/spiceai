@@ -558,26 +558,33 @@ pub(crate) fn observe_replication_metric(
 
 fn replication_params_from_connector_params(
     params: &Parameters,
-    dataset_name: &str,
+    // Every `refresh_mode: changes` dataset on a connection is coalesced onto one
+    // shared binlog dump keyed by connection identity, so `server_id` is derived
+    // from the connection (below), not the dataset — the dataset name is no
+    // longer needed here. Kept in the signature as the seam for a future
+    // per-dataset opt-out (which would key both `server_id` and the shared
+    // `SourceKey` on the dataset so it coalesces with nothing).
+    _dataset_name: &str,
 ) -> Result<ReplicationParams, String> {
     let opts = build_mysql_opts(params)?;
-    // Opt into a shared binlog dump when `mysql_replication_group` is set. All
-    // datasets on the same connection naming the same group share one dump and
-    // one `server_id`, so the id is derived from the GROUP name (not the dataset
-    // name) — every member computes the same id. An explicit
-    // `mysql_replication_server_id` still wins.
-    let group = optional_string(params, "replication_group")
-        .map(|g| g.trim().to_string())
-        .filter(|g| !g.is_empty());
+    // All `refresh_mode: changes` datasets on the same connection share one
+    // binlog dump under one `server_id` (the dump is server-wide), so the id is
+    // derived from the CONNECTION identity — every dataset on the same server
+    // computes the same id. An explicit `mysql_replication_server_id` still wins.
     let server_id = match optional_string(params, "replication_server_id") {
         Some(raw) => raw.trim().parse::<u32>().map_err(|e| {
             let user_param = params.user_param("replication_server_id");
             format!("parameter `{user_param}` must be a u32 server id, got {raw:?}: {e}")
         })?,
-        None => match &group {
-            Some(group) => derive_server_id(group, process_nonce()),
-            None => derive_server_id(dataset_name, process_nonce()),
-        },
+        None => {
+            let conn_identity = format!(
+                "{}:{}:{}",
+                opts.ip_or_hostname(),
+                opts.tcp_port(),
+                opts.user().unwrap_or_default()
+            );
+            derive_server_id(&conn_identity, process_nonce())
+        }
     };
     let snapshot_mode = parse_snapshot_mode(params)?;
     let checkpoint_interval = optional_duration(
@@ -606,8 +613,6 @@ fn replication_params_from_connector_params(
         checkpoint_interval,
         invalid_position_behavior,
         ready_lag,
-        shared: group.is_some(),
-        group,
     })
 }
 
@@ -919,35 +924,27 @@ mod tests {
     }
 
     #[test]
-    fn replication_group_enables_sharing_with_a_stable_shared_server_id() {
-        // Two different datasets in the SAME group must derive the SAME server_id
-        // (one shared dump connection); `shared` is set and `group` recorded.
-        let params = |ds: &str| {
-            let p = params_with(&[
-                ("host", "localhost"),
-                ("sslmode", "disabled"),
-                ("replication_group", "app"),
-            ]);
+    fn same_connection_derives_a_stable_shared_server_id() {
+        // Sharing is always-on and keyed by connection: two DIFFERENT datasets on
+        // the same connection derive the SAME server_id (they ride one shared
+        // binlog dump), regardless of dataset name.
+        let on_host = |ds: &str, host: &str| {
+            let p = params_with(&[("host", host), ("sslmode", "disabled")]);
             replication_params_from_connector_params(&p, ds).expect("valid params parse")
         };
-        let orders = params("orders");
-        let customers = params("customers");
-        assert!(orders.shared, "group set -> shared");
-        assert_eq!(orders.group.as_deref(), Some("app"));
+        let orders = on_host("orders", "localhost");
+        let customers = on_host("customers", "localhost");
         assert_eq!(
             orders.server_id, customers.server_id,
-            "members of the same group must share one server_id"
+            "datasets on the same connection must share one server_id"
         );
 
-        // No group -> per-dataset, distinct ids, not shared.
-        let p = params_with(&[("host", "localhost"), ("sslmode", "disabled")]);
-        let plain =
-            replication_params_from_connector_params(&p, "orders").expect("valid params parse");
-        assert!(!plain.shared);
-        assert!(plain.group.is_none());
+        // A different connection (different host) derives a different id, so it
+        // coalesces onto its own shared dump rather than colliding on the source.
+        let other = on_host("orders", "other-host");
         assert_ne!(
-            plain.server_id, orders.server_id,
-            "a grouped dataset derives its id from the group, not the dataset name"
+            orders.server_id, other.server_id,
+            "a different connection identity derives a different server_id"
         );
     }
 

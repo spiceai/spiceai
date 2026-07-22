@@ -16,10 +16,10 @@ limitations under the License.
 
 #![allow(clippy::expect_used)]
 //! Integration tests for *shared* `MySQL` binlog replication: multiple
-//! `refresh_mode: changes` datasets on the same connection naming the same
-//! `mysql_replication_group` multiplexed onto one binlog dump connection and one
-//! `server_id`, with decoded transactions routed per `(database, table)` to each
-//! member.
+//! `refresh_mode: changes` datasets on the same connection are automatically
+//! multiplexed onto one binlog dump connection and one `server_id` (no opt-in,
+//! no group label — sharing is keyed by connection identity), with decoded
+//! transactions routed per `(database, table)` to each member.
 //!
 //! Covers the acceptance criteria for the shared binlog connection (the `MySQL`
 //! analog of `postgres/replication_shared.rs`):
@@ -87,10 +87,12 @@ fn dataset_schema() -> SchemaRef {
     ]))
 }
 
-/// Shared-group params: `shared: true`, a named group, and — crucially — a
-/// `server_id` shared by every member (the shared dump rides one connection
-/// under one id; a divergent id is rejected by `attach_member`).
-fn shared_params(port: u16, group: &str, server_id: u32) -> ReplicationParams {
+/// Params for a shared-dump member. Sharing is always-on and keyed by
+/// connection identity, so every dataset built with the same `port`/user/pass/
+/// TLS and the same `server_id` coalesces onto one binlog dump. Tests pass one
+/// `server_id` per connection group; a distinct `server_id` (or port) yields a
+/// separate dump.
+fn shared_params(port: u16, server_id: u32) -> ReplicationParams {
     let opts = mysql_async::OptsBuilder::default()
         .ip_or_hostname("localhost")
         .tcp_port(port)
@@ -107,14 +109,11 @@ fn shared_params(port: u16, group: &str, server_id: u32) -> ReplicationParams {
         checkpoint_interval: Duration::from_secs(1),
         invalid_position_behavior: InvalidCheckpointBehavior::Error,
         ready_lag: Duration::from_secs(2),
-        shared: true,
-        group: Some(group.to_string()),
     }
 }
 
 fn stream_input(
     port: u16,
-    group: &str,
     server_id: u32,
     table: &str,
     store: Arc<dyn PositionStore>,
@@ -124,7 +123,7 @@ fn stream_input(
         .expect("dataset schema must serialize for checkpoint meta");
     ReplicationStreamInput {
         dataset_name: table.to_string(),
-        params: shared_params(port, group, server_id),
+        params: shared_params(port, server_id),
         schema,
         primary_keys: vec!["id".into()],
         database: "mysqldb".into(),
@@ -316,7 +315,6 @@ async fn shared_group_multiplexes_and_routes_per_table() -> Result<(), anyhow::E
     setup_table(&pool, "shared_a", &[(1, "a1"), (2, "a2")]).await?;
     setup_table(&pool, "shared_b", &[(1, "b1"), (2, "b2"), (3, "b3")]).await?;
 
-    let group = "mux";
     let server_id = 210_001;
     let store_a: Arc<dyn PositionStore> = Arc::new(MemoryPositionStore::default());
     let store_b: Arc<dyn PositionStore> = Arc::new(MemoryPositionStore::default());
@@ -324,7 +322,6 @@ async fn shared_group_multiplexes_and_routes_per_table() -> Result<(), anyhow::E
     // Two datasets join the SAME group -> one shared dump, per-member snapshot.
     let mut stream_a = start_replication_stream(stream_input(
         port,
-        group,
         server_id,
         "shared_a",
         Arc::clone(&store_a),
@@ -333,7 +330,6 @@ async fn shared_group_multiplexes_and_routes_per_table() -> Result<(), anyhow::E
 
     let mut stream_b = start_replication_stream(stream_input(
         port,
-        group,
         server_id,
         "shared_b",
         Arc::clone(&store_b),
@@ -383,7 +379,6 @@ async fn shared_group_late_join_snapshots_independently() -> Result<(), anyhow::
     setup_table(&pool, "late_a", &[(1, "a1"), (2, "a2")]).await?;
     setup_table(&pool, "late_b", &[(1, "b1"), (2, "b2")]).await?;
 
-    let group = "late";
     let server_id = 210_101;
     let store_a: Arc<dyn PositionStore> = Arc::new(MemoryPositionStore::default());
     let store_b: Arc<dyn PositionStore> = Arc::new(MemoryPositionStore::default());
@@ -391,7 +386,6 @@ async fn shared_group_late_join_snapshots_independently() -> Result<(), anyhow::
     // Only member a joins first and reaches Ready.
     let mut stream_a = start_replication_stream(stream_input(
         port,
-        group,
         server_id,
         "late_a",
         Arc::clone(&store_a),
@@ -406,7 +400,6 @@ async fn shared_group_late_join_snapshots_independently() -> Result<(), anyhow::
     // Member b joins late: it snapshots its own table on the running dump.
     let mut stream_b = start_replication_stream(stream_input(
         port,
-        group,
         server_id,
         "late_b",
         Arc::clone(&store_b),
@@ -441,7 +434,6 @@ async fn shared_group_restart_resumes_from_min_position() -> Result<(), anyhow::
     setup_table(&pool, "resume_a", &[(1, "a1"), (2, "a2")]).await?;
     setup_table(&pool, "resume_b", &[(1, "b1"), (2, "b2")]).await?;
 
-    let group = "resume";
     let store_a: Arc<dyn PositionStore> = Arc::new(MemoryPositionStore::default());
     let store_b: Arc<dyn PositionStore> = Arc::new(MemoryPositionStore::default());
 
@@ -450,7 +442,6 @@ async fn shared_group_restart_resumes_from_min_position() -> Result<(), anyhow::
     {
         let mut stream_a = start_replication_stream(stream_input(
             port,
-            group,
             210_201,
             "resume_a",
             Arc::clone(&store_a),
@@ -458,7 +449,6 @@ async fn shared_group_restart_resumes_from_min_position() -> Result<(), anyhow::
         drain_bootstrap(&mut stream_a, "run1 member a", &[1, 2]).await?;
         let mut stream_b = start_replication_stream(stream_input(
             port,
-            group,
             210_201,
             "resume_b",
             Arc::clone(&store_b),
@@ -501,14 +491,12 @@ async fn shared_group_restart_resumes_from_min_position() -> Result<(), anyhow::
     //            position and each member replays its own gap idempotently. ---
     let mut stream_a = start_replication_stream(stream_input(
         port,
-        group,
         210_202,
         "resume_a",
         Arc::clone(&store_a),
     ));
     let mut stream_b = start_replication_stream(stream_input(
         port,
-        group,
         210_202,
         "resume_b",
         Arc::clone(&store_b),
@@ -558,12 +546,10 @@ async fn shared_group_rejects_duplicate_source_table() -> Result<(), anyhow::Err
     let pool = common::get_mysql_conn(port)?;
     setup_table(&pool, "dup_a", &[(1, "a1")]).await?;
 
-    let group = "dup";
     let server_id = 210_301;
 
     let mut first = start_replication_stream(stream_input(
         port,
-        group,
         server_id,
         "dup_a",
         Arc::new(MemoryPositionStore::default()),
@@ -574,7 +560,6 @@ async fn shared_group_rejects_duplicate_source_table() -> Result<(), anyhow::Err
     // A second live subscription to the SAME table in the SAME group must error.
     let mut dup = start_replication_stream(stream_input(
         port,
-        group,
         server_id,
         "dup_a",
         Arc::new(MemoryPositionStore::default()),
@@ -583,10 +568,10 @@ async fn shared_group_rejects_duplicate_source_table() -> Result<(), anyhow::Err
         .await?
         .expect("duplicate subscription yields an item")
     else {
-        anyhow::bail!("a duplicate source table in a shared group must be rejected")
+        anyhow::bail!("a duplicate source table on the same connection must be rejected")
     };
     assert!(
-        err.to_string().contains("already subscribed"),
+        err.to_string().contains("already replicated by another dataset"),
         "error must name the duplicate-subscription cause, got: {err}"
     );
 

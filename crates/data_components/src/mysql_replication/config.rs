@@ -55,16 +55,6 @@ pub struct ReplicationParams {
     /// dataset stays not-ready and never serves stale data. User param
     /// `mysql_replication_ready_lag` (default 2s).
     pub ready_lag: Duration,
-    /// Whether this dataset opted into a shared binlog dump connection
-    /// (`mysql_replication_group` set). When `true` the stream is multiplexed
-    /// by [`super::shared`] instead of opening its own dump. Internal-only —
-    /// derived from `group.is_some()` by the connector, never a user boolean.
-    pub shared: bool,
-    /// The shared-connection group name (`mysql_replication_group`). All
-    /// datasets on the same connection naming the same group share one dump
-    /// connection and one `server_id`. `None` on the per-dataset path; the
-    /// group is a client-side coordination label with no server-side object.
-    pub group: Option<String>,
 }
 
 impl std::fmt::Debug for ReplicationParams {
@@ -80,8 +70,6 @@ impl std::fmt::Debug for ReplicationParams {
             .field("checkpoint_interval", &self.checkpoint_interval)
             .field("invalid_position_behavior", &self.invalid_position_behavior)
             .field("ready_lag", &self.ready_lag)
-            .field("shared", &self.shared)
-            .field("group", &self.group)
             .finish_non_exhaustive()
     }
 }

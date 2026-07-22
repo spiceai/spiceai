@@ -156,13 +156,6 @@ const PARAMETERS: &[ParameterSpec] = &[
              the dataset name and process.",
         )
         .help_link(MYSQL_DOCS),
-    ParameterSpec::component("replication_group")
-        .description(
-            "Opt into a shared binlog dump connection for `refresh_mode: changes`. Datasets on the \
-             same connection naming the same group share one dump connection and one server_id, \
-             with changes routed per table. Omit for a dedicated per-dataset connection.",
-        )
-        .help_link(MYSQL_DOCS),
     ParameterSpec::component("replication_initial_snapshot")
         .description(
             "When `refresh_mode: changes` loads the table's existing rows: 'auto' (default) \
