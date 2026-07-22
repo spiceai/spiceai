@@ -151,6 +151,48 @@ impl GtidSet {
             })
             .collect()
     }
+
+    /// The intersection of two executed sets: the sequences present in BOTH.
+    ///
+    /// Used by the shared binlog pump to compute a resume set across its members
+    /// — the GTIDs that *every* member has durably applied. Positioning a
+    /// `COM_BINLOG_DUMP_GTID` from this intersection re-sends any transaction a
+    /// member is still missing (members already ahead suppress the replay via
+    /// their own committed floor), the GTID analog of resuming from the minimum
+    /// file+offset across members. A UUID present in only one set, or ranges
+    /// that do not overlap, contribute nothing.
+    #[must_use]
+    pub fn intersect(&self, other: &Self) -> Self {
+        let mut out = Self::new();
+        for (uuid, a_ranges) in &self.intervals {
+            let Some(b_ranges) = other.intervals.get(uuid) else {
+                continue;
+            };
+            // Two-pointer sweep over sorted, coalesced, inclusive ranges. The
+            // output is naturally sorted and disjoint, so no re-coalescing.
+            let mut merged: Vec<Interval> = Vec::new();
+            let (mut i, mut j) = (0usize, 0usize);
+            while i < a_ranges.len() && j < b_ranges.len() {
+                let (a1, a2) = a_ranges[i];
+                let (b1, b2) = b_ranges[j];
+                let lo = a1.max(b1);
+                let hi = a2.min(b2);
+                if lo <= hi {
+                    merged.push((lo, hi));
+                }
+                // Advance whichever interval ends first (ties advance `a`).
+                if a2 <= b2 {
+                    i += 1;
+                } else {
+                    j += 1;
+                }
+            }
+            if !merged.is_empty() {
+                out.intervals.insert(*uuid, merged);
+            }
+        }
+        out
+    }
 }
 
 impl std::fmt::Display for GtidSet {
@@ -247,6 +289,37 @@ mod tests {
     fn parse_empty_is_empty_set() {
         assert!(GtidSet::parse("").expect("parse").is_empty());
         assert!(GtidSet::parse("   \n  ").expect("parse").is_empty());
+    }
+
+    #[test]
+    fn intersect_keeps_only_ranges_in_both() {
+        // Overlapping ranges on a shared UUID intersect to their overlap; a
+        // UUID present in only one set drops out entirely.
+        let a = GtidSet::parse(&format!("{U1}:1-10,{U2}:1-5")).expect("parse a");
+        let b = GtidSet::parse(&format!("{U1}:4-20")).expect("parse b");
+        assert_eq!(a.intersect(&b).to_string(), format!("{U1}:4-10"));
+        // Intersection is commutative.
+        assert_eq!(b.intersect(&a).to_string(), format!("{U1}:4-10"));
+    }
+
+    #[test]
+    fn intersect_handles_multi_range_and_gaps() {
+        // Split ranges intersect piecewise; non-overlapping ranges contribute
+        // nothing (the gap in `a` is preserved).
+        let a = GtidSet::parse(&format!("{U1}:1-5:8-12")).expect("parse a");
+        let b = GtidSet::parse(&format!("{U1}:3-9:11-20")).expect("parse b");
+        assert_eq!(a.intersect(&b).to_string(), format!("{U1}:3-5:8-9:11-12"));
+    }
+
+    #[test]
+    fn intersect_with_empty_or_disjoint_is_empty() {
+        let a = GtidSet::parse(&format!("{U1}:1-10")).expect("parse a");
+        // Empty set: the most-behind member drives resume from nothing.
+        assert!(a.intersect(&GtidSet::new()).is_empty());
+        assert!(GtidSet::new().intersect(&a).is_empty());
+        // Disjoint UUIDs share nothing.
+        let other = GtidSet::parse(&format!("{U2}:1-10")).expect("parse other");
+        assert!(a.intersect(&other).is_empty());
     }
 
     #[test]

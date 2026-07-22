@@ -228,14 +228,21 @@ const STREAMING: u8 = 0b100;
 struct AckSlot {
     committed: Mutex<BinlogPosition>,
     delivered: Mutex<BinlogPosition>,
+    /// Executed GTID set for this member, advanced in lockstep with `committed`
+    /// (folded on commit and on idle-credit), so it describes exactly the
+    /// transactions at or below the member's committed position. Empty when the
+    /// source is not GTID-positioning. The shared dump's GTID resume set is the
+    /// intersection of these across members (see [`AckTable::resume_gtid`]).
+    gtid: Mutex<GtidSet>,
     state: AtomicU8,
 }
 
 impl AckSlot {
-    fn new(at: BinlogPosition, snapshotting: bool) -> Self {
+    fn new(at: BinlogPosition, gtid_seed: GtidSet, snapshotting: bool) -> Self {
         Self {
             committed: Mutex::new(at.clone()),
             delivered: Mutex::new(at),
+            gtid: Mutex::new(gtid_seed),
             state: AtomicU8::new(LIVE | if snapshotting { SNAPSHOTTING } else { 0 }),
         }
     }
@@ -245,6 +252,16 @@ impl AckSlot {
     }
     fn delivered(&self) -> BinlogPosition {
         lock(&self.delivered).clone()
+    }
+
+    /// Fold a committed transaction's GTID into this member's executed set — run
+    /// as the member's committed position advances past the transaction, so the
+    /// set stays exactly in step with the durable cursor.
+    fn fold_gtid(&self, uuid: uuid::Uuid, gno: u64) {
+        lock(&self.gtid).add(uuid, gno);
+    }
+    fn gtid_snapshot(&self) -> GtidSet {
+        lock(&self.gtid).clone()
     }
 
     /// Advance this member's committed floor (monotonic-max).
@@ -285,18 +302,45 @@ impl AckTable {
     /// `at` may be below the stale held floor; the pump replays the gap
     /// idempotently. Held from here until a (re)connect promotes it.
     fn register(&self, key: &MemberKey, at: BinlogPosition, snapshotting: bool) {
+        self.register_with_gtid(key, at, GtidSet::new(), snapshotting);
+    }
+
+    /// [`Self::register`] carrying the resolved executed GTID seed (the source
+    /// head's set on cold start, or the member's persisted set on resume). A
+    /// reviving slot is RESET to `(at, gtid_seed)` — the sidecar is the source
+    /// of truth, so a stale in-memory floor/set is discarded.
+    fn register_with_gtid(
+        &self,
+        key: &MemberKey,
+        at: BinlogPosition,
+        gtid_seed: GtidSet,
+        snapshotting: bool,
+    ) {
         let held = LIVE | if snapshotting { SNAPSHOTTING } else { 0 };
         let mut members = write_lock(&self.members);
         match members.get(key) {
             Some(slot) => {
                 *lock(&slot.committed) = at.clone();
                 *lock(&slot.delivered) = at;
+                *lock(&slot.gtid) = gtid_seed;
                 slot.state.store(held, Ordering::Release);
             }
             None => {
-                members.insert(key.clone(), Arc::new(AckSlot::new(at, snapshotting)));
+                members.insert(key.clone(), Arc::new(AckSlot::new(at, gtid_seed, snapshotting)));
             }
         }
+    }
+
+    /// The shared dump's GTID resume set: the intersection of every member's
+    /// executed set — the GTIDs *all* members have applied. A
+    /// `COM_BINLOG_DUMP_GTID` from it re-sends any transaction some member still
+    /// needs (members ahead suppress via their committed floor), the GTID analog
+    /// of [`Self::flush_position`]'s minimum. `None` when there are no members.
+    fn resume_gtid(&self) -> Option<GtidSet> {
+        let members = read_lock(&self.members);
+        let mut iter = members.values();
+        let first = iter.next()?.gtid_snapshot();
+        Some(iter.fold(first, |acc, slot| acc.intersect(&slot.gtid_snapshot())))
     }
 
     /// The member's initial snapshot finished cleanly; it stays held until the
@@ -326,13 +370,19 @@ impl AckTable {
     /// Credit streaming members with no in-flight envelopes up to `upto` — the
     /// connection's in-order replay guarantees their routed changes below `upto`
     /// were already delivered. Held/detached members are never credited.
-    fn credit_idle(&self, upto: &BinlogPosition) {
+    fn credit_idle(&self, upto: &BinlogPosition, gtid: Option<(uuid::Uuid, u64)>) {
         for slot in read_lock(&self.members).values() {
             let s = slot.state.load(Ordering::Acquire);
             if s & (LIVE | STREAMING) == (LIVE | STREAMING) && slot.delivered() == slot.committed()
             {
                 slot.commit(upto);
                 slot.deliver(upto);
+                // An idle member's committed advances past this transaction, so
+                // its executed set gains the transaction's GTID too (idempotent
+                // — re-folding an already-present GTID is a no-op).
+                if let Some((uuid, gno)) = gtid {
+                    slot.fold_gtid(uuid, gno);
+                }
             }
         }
     }
@@ -382,12 +432,21 @@ struct SharedPositionCommitter {
     flush_to: BinlogPosition,
     dataset: String,
     source_commit_ts_ms: Option<i64>,
+    /// GTIDs of the transaction(s) this commit acks, folded into the member's
+    /// executed set on commit (in lockstep with `flush_to`) for failover-safe
+    /// resume. A `Vec` — not a single GTID — because [`Self::try_absorb`] may
+    /// coalesce several transactions' commits into one, and every one of their
+    /// GTIDs must still be folded. Empty when the source is not GTID-positioning.
+    gtids: Vec<(uuid::Uuid, u64)>,
 }
 
 #[async_trait]
 impl CommitChange for SharedPositionCommitter {
     async fn commit(&self) -> std::result::Result<(), CommitError> {
         self.slot.commit(&self.flush_to);
+        for &(uuid, gno) in &self.gtids {
+            self.slot.fold_gtid(uuid, gno);
+        }
         crate::cdc::log_committer_progress(
             "mysql",
             &self.dataset,
@@ -416,6 +475,9 @@ impl CommitChange for SharedPositionCommitter {
                     self.flush_to = other.flush_to.clone();
                     self.source_commit_ts_ms = other.source_commit_ts_ms;
                 }
+                // Every coalesced transaction's GTID must still fold, regardless
+                // of which commit has the higher position.
+                self.gtids.extend_from_slice(&other.gtids);
                 true
             }
             _ => false,
@@ -991,6 +1053,30 @@ struct Route {
     layout: Arc<MemberLayout>,
 }
 
+/// Whether the source uses GTID auto-positioning (`gtid_mode = ON`) for this
+/// shared dump — decided once at the source level (all members share the
+/// connection). Best-effort: any probe failure falls back to file+offset
+/// positioning.
+async fn detect_source_gtid(params: &ReplicationParams) -> bool {
+    match super::setup::connect(params).await {
+        Ok(mut conn) => {
+            let mode = super::setup::detect_gtid_mode(&mut conn)
+                .await
+                .ok()
+                .flatten();
+            let on = super::setup::gtid_mode_is_on(mode.as_deref());
+            if let Err(e) = conn.disconnect().await {
+                tracing::debug!(error = %e, "shared mysql gtid-detect disconnect");
+            }
+            on
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "shared mysql gtid-mode detection failed; using file+offset");
+            false
+        }
+    }
+}
+
 /// The shared pump: one binlog dump driving every member.
 #[expect(
     clippy::too_many_lines,
@@ -1007,6 +1093,12 @@ async fn run_pump(source: Arc<SharedSource>) {
         .min(params.checkpoint_interval)
         .min(IDLE_TICK_CAP);
     let mut side_conn: Option<Conn> = None;
+    // Positioning mode for this shared dump, decided once at the source level
+    // (all members share the connection, so all see the same `gtid_mode`): GTID
+    // auto-positioning when the source reports `gtid_mode = ON`, else
+    // file+offset. When on, the dump is opened with `COM_BINLOG_DUMP_GTID` from
+    // the intersection of members' executed sets, giving failover-safe resume.
+    let use_gtid = detect_source_gtid(&params).await;
     let mut last_persist_at = Instant::now();
     // Throttles the head-poll + readiness heartbeat. Emitted on BOTH the idle
     // branch and the event path: the server streams its own binlog heartbeats
@@ -1036,9 +1128,18 @@ async fn run_pump(source: Arc<SharedSource>) {
             // No members yet (raced a detach); loop to re-check / finish.
             continue 'reconnect;
         };
+        // GTID resume set: the intersection across members — the GTIDs every
+        // member has applied, so the dump re-sends anything any member still
+        // needs (ahead members suppress via their committed floor). Empty (⇒
+        // file+offset) when not GTID-positioning.
+        let resume_gtid = if use_gtid {
+            source.ack.resume_gtid().unwrap_or_default()
+        } else {
+            GtidSet::new()
+        };
 
         let mut stream =
-            match open_binlog_stream(&params, &resume, &connection, false, &GtidSet::new()).await {
+            match open_binlog_stream(&params, &resume, &connection, use_gtid, &resume_gtid).await {
             Ok(stream) => {
                 backoff.reset();
                 if reconnect_attempts > 0 {
@@ -1088,6 +1189,10 @@ async fn run_pump(source: Arc<SharedSource>) {
         let mut txn: FxHashMap<u64, Vec<RowsEventData<'static>>> = FxHashMap::default();
         let mut txn_open = false;
         let mut current_file = resume.file.clone();
+        // GTID of the transaction currently being read (captured at its
+        // `GtidEvent`, folded into members' executed sets at commit/idle-credit).
+        // `None` between transactions or when not GTID-positioning.
+        let mut current_txn_gtid: Option<(uuid::Uuid, u64)> = None;
 
         'recv: loop {
             if crate::cdc::shutdown_epoch() != shutdown_epoch {
@@ -1300,6 +1405,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                         &commit_pos,
                         event_timestamp,
                         shutdown_epoch,
+                        current_txn_gtid,
                     )
                     .await;
                 }
@@ -1322,6 +1428,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                                 &commit_pos,
                                 event_timestamp,
                                 shutdown_epoch,
+                                current_txn_gtid,
                             )
                             .await;
                         }
@@ -1337,6 +1444,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                                 event_end_pos,
                                 event_timestamp,
                                 shutdown_epoch,
+                                current_txn_gtid,
                             )
                             .await;
                             // Auto-commit DDL (TRUNCATE/ALTER/…) closes the GTID
@@ -1350,8 +1458,35 @@ async fn run_pump(source: Arc<SharedSource>) {
                         }
                     }
                 }
-                Some(EventData::GtidEvent(_) | EventData::AnonymousGtidEvent(_)) => {
+                Some(EventData::GtidEvent(gtid_event)) => {
+                    // A GTID event opens a transaction group ahead of its
+                    // BEGIN/statement. Capture the GTID so the commit (and the
+                    // idle-credit of members with no change) folds it into their
+                    // executed sets for failover-safe resume.
                     txn_open = true;
+                    current_txn_gtid =
+                        Some((uuid::Uuid::from_bytes(gtid_event.sid()), gtid_event.gno()));
+                }
+                Some(EventData::AnonymousGtidEvent(_)) => {
+                    // An anonymous transaction carries no GTID. Under GTID
+                    // positioning it must not happen (source not fully
+                    // `gtid_mode = ON`): the executed set could not describe it,
+                    // so fail the whole group loudly rather than persist a set
+                    // that silently omits transactions. Each member re-evaluates
+                    // its own persisted checkpoint on the next (re)subscribe.
+                    if use_gtid {
+                        fatal_broadcast(
+                            &source,
+                            Error::AnonymousTransactionUnderGtid {
+                                dataset: connection.clone(),
+                            }
+                            .to_string(),
+                        )
+                        .await;
+                        break 'reconnect;
+                    }
+                    txn_open = true;
+                    current_txn_gtid = None;
                 }
                 Some(_) | None => {}
             }
@@ -1362,7 +1497,7 @@ async fn run_pump(source: Arc<SharedSource>) {
             // its resume past foreign-table traffic.
             if !txn_open && event_end_pos >= MIN_VALID_EVENT_POS {
                 let pos = BinlogPosition::new(current_file.clone(), event_end_pos);
-                source.ack.credit_idle(&pos);
+                source.ack.credit_idle(&pos, current_txn_gtid);
             }
 
             if last_persist_at.elapsed() >= params.checkpoint_interval {
@@ -1413,6 +1548,7 @@ async fn deliver_commit(
     commit_pos: &BinlogPosition,
     event_timestamp: u32,
     shutdown_epoch: u64,
+    gtid: Option<(uuid::Uuid, u64)>,
 ) {
     let commit_ts = commit_ts_ms(event_timestamp);
     for (table_id, events) in txn {
@@ -1455,6 +1591,7 @@ async fn deliver_commit(
                 flush_to: commit_pos.clone(),
                 dataset: member.dataset_name.clone(),
                 source_commit_ts_ms: commit_ts,
+                gtids: gtid.into_iter().collect(),
             }),
             Box::new(rows),
             is_ready,
@@ -1468,7 +1605,7 @@ async fn deliver_commit(
             DeliverOutcome::ShutdownAbandon => return,
         }
     }
-    source.ack.credit_idle(commit_pos);
+    source.ack.credit_idle(commit_pos, gtid);
 }
 
 /// Route a statement affecting a subscribed table: TRUNCATE is applied as a
@@ -1482,6 +1619,7 @@ async fn handle_statement(
     event_end_pos: u64,
     event_timestamp: u32,
     shutdown_epoch: u64,
+    gtid: Option<(uuid::Uuid, u64)>,
 ) {
     // A statement can target any subscribed table; scan the live members.
     for (mkey, member) in source.live_members() {
@@ -1533,6 +1671,7 @@ async fn handle_statement(
                         flush_to: commit_pos.clone(),
                         dataset: member.dataset_name.clone(),
                         source_commit_ts_ms: commit_ts,
+                        gtids: gtid.into_iter().collect(),
                     }),
                     batch,
                     is_ready,
@@ -1772,7 +1911,7 @@ mod tests {
         let ack = AckTable::default();
         // Snapshotting member: held (LIVE | SNAPSHOTTING), not STREAMING.
         ack.register(&key("db", "a"), pos("binlog.000001", 100), true);
-        ack.credit_idle(&pos("binlog.000001", 900));
+        ack.credit_idle(&pos("binlog.000001", 900), None);
         assert_eq!(
             ack.committed(&key("db", "a")),
             Some(pos("binlog.000001", 100)),
@@ -1781,7 +1920,7 @@ mod tests {
         // Complete snapshot + promote, then credit.
         ack.snapshot_finished(&key("db", "a"));
         ack.promote_ready_members();
-        ack.credit_idle(&pos("binlog.000001", 900));
+        ack.credit_idle(&pos("binlog.000001", 900), None);
         assert_eq!(
             ack.committed(&key("db", "a")),
             Some(pos("binlog.000001", 900))
@@ -1864,7 +2003,7 @@ mod tests {
         ack.slot(&key("db", "a"))
             .expect("slot")
             .deliver(&pos("binlog.000001", 300));
-        ack.credit_idle(&pos("binlog.000001", 500));
+        ack.credit_idle(&pos("binlog.000001", 500), None);
 
         // `b` (idle) was credited to 500; `a` holds the floor at its committed
         // 100 because its outstanding delivery is not yet acked.
@@ -1886,7 +2025,7 @@ mod tests {
         assert_eq!(ack.flush_position(), Some(pos("binlog.000001", 300)));
 
         // `a` is idle again — a later idle credit advances everyone.
-        ack.credit_idle(&pos("binlog.000001", 600));
+        ack.credit_idle(&pos("binlog.000001", 600), None);
         assert_eq!(ack.flush_position(), Some(pos("binlog.000001", 600)));
     }
 
@@ -1927,33 +2066,45 @@ mod tests {
         ack.promote_ready_members();
         let slot = ack.slot(&key("db", "a")).expect("slot");
 
-        // `commit()` advances the member's committed floor to `flush_to`.
+        // `commit()` advances the member's committed floor to `flush_to` and
+        // folds its GTIDs into the member's executed set (lockstep with position).
+        let uuid = uuid::Uuid::from_u128(1);
         let committer = SharedPositionCommitter {
             slot: Arc::clone(&slot),
             flush_to: pos("binlog.000001", 500),
             dataset: "orders".into(),
             source_commit_ts_ms: Some(1),
+            gtids: vec![(uuid, 7)],
         };
         committer.commit().await.expect("commit");
         assert_eq!(slot.committed(), pos("binlog.000001", 500));
+        assert_eq!(slot.gtid_snapshot().to_string(), format!("{uuid}:7"));
 
         // `try_absorb` folds a later commit to the SAME slot, keeping the higher
-        // position (sound because commit is a monotonic-max).
+        // position (monotonic-max) AND accumulating both transactions' GTIDs so
+        // neither is dropped from the executed set.
         let mut first = SharedPositionCommitter {
             slot: Arc::clone(&slot),
             flush_to: pos("binlog.000001", 500),
             dataset: "orders".into(),
             source_commit_ts_ms: Some(1),
+            gtids: vec![(uuid, 8)],
         };
         let later = SharedPositionCommitter {
             slot: Arc::clone(&slot),
             flush_to: pos("binlog.000001", 900),
             dataset: "orders".into(),
             source_commit_ts_ms: Some(2),
+            gtids: vec![(uuid, 9)],
         };
         assert!(first.try_absorb(&later));
         assert_eq!(first.flush_to, pos("binlog.000001", 900));
         assert_eq!(first.source_commit_ts_ms, Some(2));
+        assert_eq!(first.gtids, vec![(uuid, 8), (uuid, 9)]);
+        // Committing the coalesced committer folds both GTIDs (7 already present
+        // ⇒ the set coalesces to 7-9).
+        first.commit().await.expect("commit");
+        assert_eq!(slot.gtid_snapshot().to_string(), format!("{uuid}:7-9"));
 
         // A committer for a DIFFERENT slot is never absorbed.
         let other = SharedPositionCommitter {
@@ -1961,6 +2112,7 @@ mod tests {
             flush_to: pos("binlog.000001", 999),
             dataset: "customers".into(),
             source_commit_ts_ms: Some(3),
+            gtids: Vec::new(),
         };
         assert!(!first.try_absorb(&other));
         assert_eq!(
@@ -2021,7 +2173,7 @@ mod tests {
                 s.spawn(move || {
                     let upto = pos("binlog.000001", N + 1000);
                     while !done.load(Ordering::Acquire) {
-                        ack.credit_idle(&upto);
+                        ack.credit_idle(&upto, None);
                     }
                 });
             }
