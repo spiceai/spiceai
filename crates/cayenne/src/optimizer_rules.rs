@@ -1585,7 +1585,7 @@ mod tests {
     };
     use crate::provider::CayenneAccelerationExec;
     use crate::provider::scan::ScanDynamicFilter;
-    use arrow::array::{Int32Array, Int64Array, StringArray};
+    use arrow::array::{Decimal128Array, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion::common::{JoinType, NullEquality};
@@ -1832,6 +1832,87 @@ mod tests {
                 .downcast_ref::<MaintainedAggregateExec>()
                 .is_some(),
             "AVG over an Int32 column must rewrite to the maintained aggregate"
+        );
+        Ok(())
+    }
+
+    /// `SUM`/`AVG` over a `Decimal128` money column (the CH-benCH
+    /// `SUM(ol_amount)` case, Postgres `NUMERIC(6, 2)`) must rewrite to the
+    /// maintained aggregate. Unlike the integer case, `DataFusion`'s decimal
+    /// coercion is exact (no cast over the input column), and the output types
+    /// are the widened decimal `SUM`/`AVG` return types, which the maintained
+    /// view must reproduce for the substitution to match.
+    #[test]
+    fn maintained_aggregate_rewriter_replaces_sum_avg_over_decimal128() -> DFResult<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("amt", DataType::Decimal128(6, 2), true),
+        ]));
+        let amounts = Decimal128Array::from(vec![Some(150_i128), Some(999), Some(-50)])
+            .with_precision_and_scale(6, 2)
+            .expect("valid decimal precision/scale");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![Some("a"), Some("a"), Some("b")])),
+                Arc::new(amounts),
+            ],
+        )
+        .expect("decimal test batch should be valid");
+
+        let registry = Arc::new(MaintainedAggregateRegistry::try_new(
+            &[MaintainedAggregateSpec {
+                filter: None,
+                group_by: vec!["name".to_string()],
+                aggregates: vec![
+                    MaintainedAggregateExpr {
+                        function: MaintainedAggregateFunction::Sum,
+                        column: Some("amt".to_string()),
+                    },
+                    MaintainedAggregateExpr {
+                        function: MaintainedAggregateFunction::Avg,
+                        column: Some("amt".to_string()),
+                    },
+                ],
+            }],
+            &schema,
+        )?);
+        registry.apply_insert_batches(1, std::slice::from_ref(&batch))?;
+        let memory = MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)?;
+        let cayenne_scan = Arc::new(CayenneAccelerationExec::new_with_maintained_aggregates(
+            memory, registry, 1,
+        )) as Arc<dyn ExecutionPlan>;
+
+        // DataFusion's decimal SUM/AVG coercion is exact: the aggregate input
+        // is the bare column, and the builder computes the widened decimal
+        // output types.
+        let aggregate_exprs = [("sum(amt)", sum_udaf()), ("avg(amt)", avg_udaf())]
+            .into_iter()
+            .map(|(alias, udaf)| {
+                AggregateExprBuilder::new(udaf, vec![col("amt", schema.as_ref())?])
+                    .schema(Arc::clone(&schema))
+                    .alias(alias.to_string())
+                    .build()
+                    .map(Arc::new)
+            })
+            .collect::<DFResult<Vec<_>>>()?;
+        let aggregate = Arc::new(AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(vec![(col("name", schema.as_ref())?, "name".to_string())]),
+            aggregate_exprs,
+            vec![None, None],
+            cayenne_scan,
+            Arc::clone(&schema),
+        )?) as Arc<dyn ExecutionPlan>;
+
+        let optimized = CayenneMaintainedAggregateRewriter::new()
+            .optimize(aggregate, &ConfigOptions::default())?;
+
+        assert!(
+            optimized
+                .downcast_ref::<MaintainedAggregateExec>()
+                .is_some(),
+            "SUM/AVG over a Decimal128 column must rewrite to the maintained aggregate"
         );
         Ok(())
     }

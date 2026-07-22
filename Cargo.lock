@@ -3538,6 +3538,7 @@ dependencies = [
  "datafusion-federation",
  "datafusion-functions",
  "datafusion-functions-aggregate",
+ "datafusion-functions-aggregate-common",
  "datafusion-physical-expr",
  "datafusion-physical-plan",
  "datafusion-pruning",
