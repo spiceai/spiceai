@@ -71,6 +71,14 @@ pub fn default_unnest_parameters(unnest_depth: usize) -> UnnestParameters {
     }
 }
 
+/// Converts a batch of `MongoDB` change-stream events into a CDC [`ChangeBatch`], applying the
+/// declared schema, primary keys, unnest parameters, and optional projection; returns `Ok(None)`
+/// when the events yield no rows.
+///
+/// # Errors
+///
+/// Returns an error if an event cannot be projected/unnested into the declared schema or the
+/// change batch cannot be built.
 pub fn change_events_to_change_batch(
     events: Vec<ChangeStreamEvent<Document>>,
     table_schema: &SchemaRef,
@@ -170,6 +178,12 @@ pub fn change_events_to_change_batch(
     build_change_batch(rows, table_schema, unnest_parameters, projection).map(Some)
 }
 
+/// Builds an empty all-null single-row truncate [`ChangeBatch`] for `table_schema` -- used to
+/// signal a collection drop/rename in the change stream.
+///
+/// # Errors
+///
+/// Returns an error if the null columns cannot be assembled into a record batch for the schema.
 pub fn truncate_change_batch(table_schema: &SchemaRef) -> Result<ChangeBatch> {
     let data_schema = nullable_clone(table_schema);
     let data_columns = table_schema
