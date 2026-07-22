@@ -20,6 +20,7 @@ use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
 use datafusion::datasource::TableProvider;
 use datafusion::{prelude::SessionContext, sql::TableReference};
+#[cfg(feature = "models")]
 use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
 use spicepod::vector::VectorStore;
 use std::sync::Arc;
@@ -30,6 +31,8 @@ use spicepod::semantic::Column;
 #[cfg(feature = "duckdb")]
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 
+#[cfg(feature = "elasticsearch")]
+use search::metadata::MetadataColumns;
 #[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
 use {
     crate::embeddings::construct_chunker,
@@ -40,12 +43,11 @@ use {
     search::index::{
         SearchIndex, VectorIndex, VectorScanTableProvider, chunking::ChunkedSearchIndex,
     },
-    search::metadata::{MetadataColumn, MetadataColumns},
+    search::metadata::MetadataColumn,
     snafu::ResultExt,
     spicepod::component::embeddings::EmbeddingChunkConfig,
     spicepod::semantic::MetadataType,
 };
-
 #[cfg(feature = "s3_vectors")]
 use {
     datafusion::common::ToDFSchema as _,
