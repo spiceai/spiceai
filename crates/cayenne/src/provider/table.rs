@@ -11396,24 +11396,24 @@ impl CayenneTableProvider {
         &self,
         stream: SendableRecordBatchStream,
         sort_columns: &[String],
+        task_ctx: &Arc<datafusion_execution::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        use datafusion_execution::TaskContext;
-
         if sort_columns.is_empty() {
             return Ok(stream);
         }
 
-        // Create a task context with default memory pool and runtime settings
-        // This will use the configured spill directory and compression settings
-        let task_ctx = Arc::new(TaskContext::default());
-
+        // Reuse the caller's task context — the bounded compaction/query memory
+        // pool (and spill dir) the rewrite scan already runs under. Building a
+        // fresh `TaskContext::default()` here would use an UNBOUNDED memory pool,
+        // so `SortExec` would never spill and a large default-on rewrite could OOM
+        // the process, bypassing the `runtime.query.memory_limit` contract.
         tracing::debug!(
             "Sorting data by columns {:?} for table {} using DataFusion SortExec with disk spilling support",
             sort_columns,
             self.table_metadata.table_name
         );
 
-        let sorted_stream = util::stream_utils::sort_stream(stream, sort_columns, &task_ctx)?;
+        let sorted_stream = util::stream_utils::sort_stream(stream, sort_columns, task_ctx)?;
 
         Ok(sorted_stream)
     }
@@ -11428,13 +11428,61 @@ impl CayenneTableProvider {
     /// reaching private compaction internals.
     #[must_use]
     pub fn effective_sort_columns_for_rewrite(&self) -> Vec<String> {
+        // Auto-observed columns feed a `SortExec` row-format merge whose
+        // `RowConverter` rejects `Map`/`Union`/nested types (e.g. a `Map` recorded
+        // from an `attrs['k'] = ...` filter). Restrict inferred layouts to scalar
+        // types the merge can encode so a hot unsortable column can't wedge every
+        // rewrite; explicit `sort_columns` remain the operator's responsibility.
+        fn is_row_sortable_type(dt: &DataType) -> bool {
+            match dt {
+                DataType::Boolean
+                | DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+                | DataType::Float16
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::Decimal128(..)
+                | DataType::Decimal256(..)
+                | DataType::Date32
+                | DataType::Date64
+                | DataType::Time32(_)
+                | DataType::Time64(_)
+                | DataType::Timestamp(..)
+                | DataType::Duration(_)
+                | DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Utf8View
+                | DataType::Binary
+                | DataType::LargeBinary
+                | DataType::BinaryView
+                | DataType::FixedSizeBinary(_) => true,
+                DataType::Dictionary(_, value) => is_row_sortable_type(value),
+                _ => false,
+            }
+        }
+
         if self.context.has_sort_columns() {
             return self.context.sort_columns().to_vec();
         }
-        self.filter_column_observations.top_columns(
-            super::predicate_stats::DEFAULT_AUTO_CLUSTER_TOP_K,
-            self.table_schema().as_ref(),
-        )
+        let schema = self.table_schema();
+        self.filter_column_observations
+            .top_columns(
+                super::predicate_stats::DEFAULT_AUTO_CLUSTER_TOP_K,
+                schema.as_ref(),
+            )
+            .into_iter()
+            .filter(|name| {
+                schema
+                    .field_with_name(name)
+                    .is_ok_and(|field| is_row_sortable_type(field.data_type()))
+            })
+            .collect()
     }
 
     /// Sort and rewrite data by reading from the current listing table, writing
@@ -11494,7 +11542,8 @@ impl CayenneTableProvider {
         let (stream, _) = self.visible_file_stream_for_rewrite(&ctx).await?;
 
         // Configured sort_columns win; default empty uses hottest observed filters (F4).
-        let sorted_stream = self.sort_stream_by_columns(stream, &rewrite_sort_columns)?;
+        let sorted_stream =
+            self.sort_stream_by_columns(stream, &rewrite_sort_columns, &ctx.task_ctx())?;
 
         // Write sorted data to a new snapshot directory. Because SortExec lazily
         // reads input files via DataSourceExec, writing to a separate directory
@@ -13832,7 +13881,7 @@ impl CayenneTableProvider {
                 auto_from_filters = !self.context.has_sort_columns(),
                 "Sorting compaction rewrite before writing consolidated output files"
             );
-            stream = self.sort_stream_by_columns(stream, &rewrite_sort_columns)?;
+            stream = self.sort_stream_by_columns(stream, &rewrite_sort_columns, &ctx.task_ctx())?;
         }
 
         // Compaction is the file-count reduction path. Ordinary appends shard
@@ -14200,10 +14249,24 @@ impl CayenneTableProvider {
         } else if !self.context.sort_columns().is_empty() {
             self.context.sort_columns().to_vec()
         } else {
-            let observed = self.filter_column_observations.top_columns(
-                super::predicate_stats::DEFAULT_AUTO_CLUSTER_TOP_K,
-                schema.as_ref(),
-            );
+            // Auto-observed columns only cluster if the Z-order encoder can key on
+            // them; `Decimal`, `Map`, and other types unsupported by
+            // `column_order_keys` collapse to the all-zero key (no clustering), so
+            // drop them and keep the primary-key fallback rather than writing an
+            // effectively unclustered cold run.
+            let observed: Vec<String> = self
+                .filter_column_observations
+                .top_columns(
+                    super::predicate_stats::DEFAULT_AUTO_CLUSTER_TOP_K,
+                    schema.as_ref(),
+                )
+                .into_iter()
+                .filter(|n| {
+                    schema
+                        .field_with_name(n)
+                        .is_ok_and(|f| super::zorder::is_zorder_clusterable(f.data_type()))
+                })
+                .collect();
             if observed.is_empty() {
                 self.table_metadata.primary_key.clone()
             } else {

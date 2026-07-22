@@ -192,6 +192,41 @@ fn column_order_keys(array: &dyn Array) -> DFResult<Vec<[u8; BYTES_PER_COLUMN]>>
     Ok(keys)
 }
 
+/// Whether [`column_order_keys`] can produce a non-trivial (non-all-zero) key
+/// for `data_type` — i.e. the Z-order curve can actually cluster on a column of
+/// this type. MUST stay in sync with the `match` arms in [`column_order_keys`]:
+/// any type not listed there collapses to the reserved all-zero key and so
+/// contributes no clustering (notably `Decimal*`, `Map`, and nested types).
+pub(crate) fn is_zorder_clusterable(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+            | DataType::Timestamp(_, _)
+            | DataType::Duration(_)
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::BinaryView
+    )
+}
+
 /// Compute the interleaved Z-order key for each row across `columns`.
 ///
 /// Returns a [`BinaryArray`] of `8 * columns.len()`-byte keys; sorting it
