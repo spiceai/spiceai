@@ -1579,7 +1579,17 @@ pub(crate) fn effective_query_memory_limit(
         // host RAM. It only ever LOWERS the default (an explicit
         // `runtime.query.memory_limit` short-circuits above and is never reduced).
         match duckdb_query_pool_cap {
-            Some(cap) => default_limit.min(cap),
+            Some(cap) => {
+                let capped = default_limit.min(cap);
+                if capped < default_limit {
+                    tracing::debug!(
+                        default_query_memory_bytes = default_limit,
+                        coordinated_query_memory_bytes = capped,
+                        "Query memory pool reduced below its default by the coordinated DuckDB accelerator budget, leaving room for each DuckDB instance's own memory_limit."
+                    );
+                }
+                capped
+            }
             None => default_limit,
         }
     })

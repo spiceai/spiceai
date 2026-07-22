@@ -280,7 +280,7 @@ mod tests {
     const GIB: u64 = 1024 * 1024 * 1024;
     const MIB: u64 = 1024 * 1024;
 
-    /// Whole-MiB floor — per-instance caps are floored so they match DuckDB's
+    /// Whole-MiB floor — per-instance caps are floored so they match `DuckDB`'s
     /// applied `SET memory_limit` (see `format_duckdb_memory_limit`).
     fn floor_mib(bytes: u64) -> u64 {
         (bytes / MIB) * MIB
@@ -354,7 +354,7 @@ mod tests {
     }
 
     /// Every published per-instance cap is whole-MiB aligned, so the warning and
-    /// the aggregate reservation exactly match DuckDB's floored `SET memory_limit`.
+    /// the aggregate reservation exactly match `DuckDB`'s floored `SET memory_limit`.
     #[test]
     fn per_instance_cap_is_mib_aligned() {
         let (total, base) = total_and_base();
