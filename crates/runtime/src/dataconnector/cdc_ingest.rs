@@ -145,20 +145,30 @@ impl CdcIngestHandle {
 
         let rows = batch.record.num_rows();
         let (result_tx, result_rx) = oneshot::channel();
-        // `send` waits for capacity, so a saturated channel would otherwise hang
-        // the request indefinitely — never reaching the ack timeout below and
-        // never returning the documented 503. Bound it with the same budget.
-        match tokio::time::timeout(timeout, self.tx.send(IngestWork { batch, result_tx })).await {
+        // Single end-to-end budget shared by both waits (channel backpressure +
+        // apply ack), so the request is bounded by `timeout` overall rather than
+        // up to 2× when the channel is near-saturated but still eventually
+        // accepts. `send` waits for capacity, so without a bound a saturated
+        // channel would hang the request indefinitely and never return 503.
+        let deadline = tokio::time::Instant::now() + timeout;
+        match tokio::time::timeout_at(deadline, self.tx.send(IngestWork { batch, result_tx })).await
+        {
             Ok(Ok(())) => {}
-            Ok(Err(_)) | Err(_) => {
+            Ok(Err(_)) => {
                 return ChannelClosedSnafu {
+                    dataset: dataset.to_string(),
+                }
+                .fail();
+            }
+            Err(_) => {
+                return ApplyTimeoutSnafu {
                     dataset: dataset.to_string(),
                 }
                 .fail();
             }
         }
 
-        match tokio::time::timeout(timeout, result_rx).await {
+        match tokio::time::timeout_at(deadline, result_rx).await {
             Ok(Ok(Ok(()))) => Ok(rows),
             Ok(Ok(Err(message))) => ApplyFailedSnafu {
                 dataset: dataset.to_string(),
