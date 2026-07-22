@@ -602,6 +602,55 @@ const CDC_DELETE_SUBBATCH_MAX_DEFAULT: usize = 2_048;
 const CDC_DELETE_SUBBATCH_MAX_MAX: usize = 65_536;
 const CAYENNE_CDC_SYNCHRONOUS_FALLBACK_WARNING_KEY_LIMIT: usize = 1024;
 
+/// Depth of the Stage-A → Stage-B handoff channel in `cdc_apply: pipelined` mode.
+/// Bounds the number of coalesced bursts in flight between recv+coalesce (Stage A)
+/// and validate+append (Stage B); when full, Stage A blocks on send — back-pressuring
+/// ONLY this table's prefetch channel, never the shared CDC reader for other tables.
+/// Kept shallow so worst-case RAM (depth × max coalesced burst bytes) stays bounded
+/// against the mem-tier cap.
+const CDC_PIPELINED_HANDOFF_DEPTH: usize = 2;
+
+/// One coalesced burst handed from Stage A (recv+coalesce) to Stage B
+/// (validate+append) in `cdc_apply: pipelined` mode. Owned + `Send` so it can cross
+/// the task boundary. `close_reason` is the tuning signal for which cap closed the
+/// burst (envelope/byte/age/stream-end), carried through so Stage B records it
+/// exactly as the inline path does.
+struct HandoffBurst {
+    burst: Vec<Result<cdc::ChangeEnvelope, cdc::StreamError>>,
+    close_reason: &'static str,
+}
+
+/// Owned inputs for [`RefreshTask::run_pipelined_memory_changes_stream`] (Stage A).
+/// Bundled to keep the call site readable; every field is moved in from
+/// `start_changes_stream_with_config` in the diverging pipelined branch.
+struct PipelinedChangesStream {
+    cdc_cfg: CdcConfig,
+    sql: Option<String>,
+    dataset_name: TableReference,
+    metric_labels: DatasetMetricLabels,
+    rx: tokio::sync::mpsc::Receiver<Result<cdc::ChangeEnvelope, cdc::StreamError>>,
+    reader_handle: tokio::task::JoinHandle<()>,
+    caching: Option<Weak<Caching>>,
+    ready_sender: Option<Arc<Notify>>,
+    initial_load_completed: Arc<AtomicBool>,
+    deferred_commits: Option<DeferredCommitQueue>,
+}
+
+/// Owned inputs for [`RefreshTask::run_stage_b_applier`] (Stage B). Stage B owns the
+/// apply-side state (its own `pending_finalize` / `pending_commit` / `write_ctx`) so
+/// nothing is borrowed from Stage A across the task boundary.
+struct StageBApplier {
+    handoff_rx: tokio::sync::mpsc::Receiver<HandoffBurst>,
+    sql: Option<String>,
+    dataset_name: TableReference,
+    metric_labels: DatasetMetricLabels,
+    caching: Option<Weak<Caching>>,
+    ready_sender: Option<Arc<Notify>>,
+    initial_load_completed: Arc<AtomicBool>,
+    deferred_commits: Option<DeferredCommitQueue>,
+    commit_timeout: Duration,
+}
+
 #[derive(Debug, Default)]
 struct BoundedWarningKeys {
     seen: std::collections::HashSet<String>,
@@ -1167,7 +1216,7 @@ fn overlay_cdc_apply_mode(
 
 impl RefreshTask {
     pub async fn start_changes_stream(
-        &self,
+        self: Arc<Self>,
         refresh: Arc<RwLock<Refresh>>,
         changes_stream: ChangesStream,
         caching: Option<Weak<Caching>>,
@@ -1194,7 +1243,7 @@ impl RefreshTask {
     /// Inner driver for [`Self::start_changes_stream`] with an explicit
     /// [`CdcConfig`]. Split out to simplify testing.
     async fn start_changes_stream_with_config(
-        &self,
+        self: Arc<Self>,
         cdc_cfg: CdcConfig,
         refresh: Arc<RwLock<Refresh>>,
         changes_stream: ChangesStream,
@@ -1327,6 +1376,30 @@ impl RefreshTask {
                 None
             }
         };
+
+        // Pipelined memory-tier apply (opt-in `cdc_apply: pipelined`, memory
+        // durability only — `deferred_commits.is_some()`): decouple recv+coalesce
+        // (Stage A, this task) from validate+append (Stage B, a spawned task) over a
+        // bounded handoff so a slow apply stops back-pressuring the shared CDC
+        // reader. Every other table — and the default `inline` mode — takes the
+        // byte-identical loop below. The moved locals are safe: this branch diverges
+        // (`return`), so the inline loop still owns them.
+        if cdc_cfg.apply_mode == CdcApplyMode::Pipelined && deferred_commits.is_some() {
+            return self
+                .run_pipelined_memory_changes_stream(PipelinedChangesStream {
+                    cdc_cfg,
+                    sql,
+                    dataset_name,
+                    metric_labels,
+                    rx,
+                    reader_handle,
+                    caching,
+                    ready_sender,
+                    initial_load_completed,
+                    deferred_commits,
+                })
+                .await;
+        }
 
         loop {
             // Time how long the apply loop blocks waiting for the next batch
@@ -1745,6 +1818,334 @@ impl RefreshTask {
                 // Shutdown in progress and reader did not exit cleanly —
                 // expected during teardown; nothing to escalate.
             }
+        }
+
+        Ok(())
+    }
+
+    /// Stage A of the pipelined memory-tier CDC apply (`cdc_apply: pipelined`):
+    /// recv + coalesce on THIS task, handing each coalesced burst to a spawned
+    /// Stage-B applier over a bounded channel, so a slow apply never blocks the
+    /// recv path (and thus never back-pressures the shared CDC reader). Stage B
+    /// owns validate+append + the source-slot ack; this task only drains the
+    /// prefetch channel. Same coalesce policy as the inline loop, minus the
+    /// finalize-join (finalize lives in Stage B).
+    async fn run_pipelined_memory_changes_stream(
+        self: Arc<Self>,
+        stream: PipelinedChangesStream,
+    ) -> crate::accelerated_table::Result<()> {
+        let PipelinedChangesStream {
+            cdc_cfg,
+            sql,
+            dataset_name,
+            metric_labels,
+            mut rx,
+            reader_handle,
+            caching,
+            ready_sender,
+            initial_load_completed,
+            deferred_commits,
+        } = stream;
+        let recv_wait_labels = metric_labels.dataset();
+
+        let (handoff_tx, handoff_rx) =
+            tokio::sync::mpsc::channel::<HandoffBurst>(CDC_PIPELINED_HANDOFF_DEPTH);
+
+        // Stage B: validate+append + ack, in source order, off the recv path.
+        let stage_b = {
+            let this = Arc::clone(&self);
+            tokio::spawn(this.run_stage_b_applier(StageBApplier {
+                handoff_rx,
+                sql: sql.clone(),
+                dataset_name: dataset_name.clone(),
+                metric_labels: metric_labels.clone(),
+                caching: caching.clone(),
+                ready_sender: ready_sender.clone(),
+                initial_load_completed: Arc::clone(&initial_load_completed),
+                deferred_commits: deferred_commits.clone(),
+                commit_timeout: cdc_cfg.commit_timeout,
+            }))
+        };
+
+        let mut carried_item: Option<Result<cdc::ChangeEnvelope, cdc::StreamError>> = None;
+        let mut last_cycle_start = Instant::now();
+        let mut stage_b_gone = false;
+
+        'stage_a: loop {
+            let from_carried = carried_item.is_some();
+            let recv_start = Instant::now();
+            let first = match carried_item.take() {
+                Some(item) => item,
+                None => match rx.recv().await {
+                    Some(item) => item,
+                    None => break 'stage_a, // reader done: clean end-of-stream
+                },
+            };
+            if !from_carried {
+                metrics::CDC_SOURCE_RECV_WAIT_MS.record(elapsed_ms(recv_start), recv_wait_labels);
+            }
+
+            let batch_first_received = Instant::now();
+            let mut burst: Vec<Result<cdc::ChangeEnvelope, cdc::StreamError>> =
+                Vec::with_capacity(8);
+            let mut burst_bytes = cdc_item_budget_bytes(&first);
+            burst.push(first);
+            let max_burst = cdc_cfg.max_coalesced_envelopes;
+            let max_burst_bytes = cdc_cfg.max_coalesced_bytes;
+            let mut channel_closed = false;
+
+            // Phase 1: non-blocking drain of what is already buffered.
+            while burst.len() < max_burst {
+                match rx.try_recv() {
+                    Ok(item) => {
+                        let item_bytes = cdc_item_budget_bytes(&item);
+                        if burst_bytes > 0
+                            && item_bytes > 0
+                            && burst_bytes.saturating_add(item_bytes) > max_burst_bytes
+                        {
+                            carried_item = Some(item);
+                            break;
+                        }
+                        burst_bytes = burst_bytes.saturating_add(item_bytes);
+                        burst.push(item);
+                    }
+                    Err(_) => break,
+                }
+            }
+            // Phase 2: optional linger window (only when configured).
+            if cdc_cfg.max_coalesce_age_ms > 0
+                && carried_item.is_none()
+                && burst.len() < max_burst
+                && burst_bytes < max_burst_bytes
+            {
+                let deadline =
+                    last_cycle_start + Duration::from_millis(cdc_cfg.max_coalesce_age_ms);
+                while burst.len() < max_burst && burst_bytes < max_burst_bytes {
+                    if self.runtime_status.is_shutdown() {
+                        break;
+                    }
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match tokio::time::timeout(remaining, rx.recv()).await {
+                        Ok(Some(item)) => {
+                            let item_bytes = cdc_item_budget_bytes(&item);
+                            if burst_bytes > 0
+                                && item_bytes > 0
+                                && burst_bytes.saturating_add(item_bytes) > max_burst_bytes
+                            {
+                                carried_item = Some(item);
+                                break;
+                            }
+                            burst_bytes = burst_bytes.saturating_add(item_bytes);
+                            burst.push(item);
+                        }
+                        Ok(None) => {
+                            channel_closed = true;
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+            metrics::CDC_COALESCE_BATCH_AGE_MS
+                .record(elapsed_ms(batch_first_received), recv_wait_labels);
+            last_cycle_start = Instant::now();
+
+            let close_reason = if burst.len() >= max_burst {
+                "envelope_cap"
+            } else if carried_item.is_some() || burst_bytes >= max_burst_bytes {
+                "byte_cap"
+            } else if channel_closed {
+                "stream_end"
+            } else if self.runtime_status.is_shutdown() {
+                "shutdown"
+            } else if cdc_cfg.max_coalesce_age_ms > 0 {
+                "age_deadline"
+            } else {
+                "drained"
+            };
+            metrics::CDC_COALESCE_FLUSH_TOTAL.add(1, &metric_labels.tagged("reason", close_reason));
+
+            // Hand off to Stage B. A full handoff blocks HERE — back-pressuring only
+            // this table's prefetch channel, never the shared reader for other
+            // tables. An error means Stage B exited (fatal apply).
+            if handoff_tx
+                .send(HandoffBurst { burst, close_reason })
+                .await
+                .is_err()
+            {
+                stage_b_gone = true;
+                break 'stage_a;
+            }
+            if channel_closed {
+                break 'stage_a;
+            }
+        }
+
+        // End-of-stream (or fatal): drop the last handoff sender so Stage B sees its
+        // channel close, drains its finalize, and returns. On fatal, also tear down
+        // the reader (Stage B owns no reader handle).
+        drop(handoff_tx);
+        if stage_b_gone {
+            rx.close();
+            reader_handle.abort();
+        }
+
+        // Join Stage B (it runs the post-loop finalize + commit drain). A panic
+        // there is surfaced loudly — otherwise the dataset would look healthy while
+        // apply has silently stopped.
+        let stage_b_result = match stage_b.await {
+            Ok(result) => result,
+            Err(e) if e.is_cancelled() => Ok(()),
+            Err(e) => {
+                if !self.runtime_status.is_shutdown() {
+                    let err_msg = format!("CDC pipelined apply task ended unexpectedly: {e}");
+                    tracing::error!("{err_msg} (dataset={dataset_name})");
+                    self.set_refresh_status(
+                        sql.as_deref(),
+                        status::ComponentStatus::error_with_message(err_msg),
+                    )
+                    .await;
+                }
+                Ok(())
+            }
+        };
+
+        // Reader teardown / end-of-stream reporting (mirrors the inline tail).
+        match reader_handle.await {
+            Ok(()) => {
+                if !self.runtime_status.is_shutdown() {
+                    tracing::warn!("Changes stream ended for dataset {dataset_name}");
+                }
+            }
+            Err(e) if e.is_cancelled() => {
+                tracing::debug!("CDC reader task for {dataset_name} was cancelled (likely shutdown)");
+            }
+            Err(e) if !self.runtime_status.is_shutdown() => {
+                let err_msg = format!("CDC reader task ended unexpectedly: {e}");
+                tracing::error!("{err_msg} (dataset={dataset_name})");
+                self.set_refresh_status(
+                    sql.as_deref(),
+                    status::ComponentStatus::error_with_message(err_msg),
+                )
+                .await;
+            }
+            Err(_) => {}
+        }
+
+        stage_b_result
+    }
+
+    /// Stage B of the pipelined memory-tier CDC apply: drain the bounded handoff and
+    /// validate+append each coalesced burst IN ORDER (serial), then run the same
+    /// post-loop finalize + source-commit drain as the inline path. Owns its own
+    /// `pending_finalize` / `pending_commit` / `write_ctx`; the source-slot ack is
+    /// enqueued only after this stage's apply produces the mem-tier epoch (never in
+    /// Stage A), preserving the durable-fence deferral.
+    async fn run_stage_b_applier(
+        self: Arc<Self>,
+        applier: StageBApplier,
+    ) -> crate::accelerated_table::Result<()> {
+        let StageBApplier {
+            mut handoff_rx,
+            sql,
+            dataset_name,
+            metric_labels,
+            caching,
+            ready_sender,
+            initial_load_completed,
+            deferred_commits,
+            commit_timeout,
+        } = applier;
+
+        let mut pending_finalize: Option<PendingFinalizeCommit> = None;
+        let mut pending_commit: Option<tokio::task::JoinHandle<Result<(), String>>> = None;
+        let write_ctx = SessionContext::new();
+        let write_session_state = write_ctx.state();
+
+        while let Some(HandoffBurst {
+            burst,
+            close_reason,
+        }) = handoff_rx.recv().await
+        {
+            let mut apply_context = ApplyContext {
+                refresh_sql: sql.as_deref(),
+                dataset_name: &dataset_name,
+                metric_labels: &metric_labels,
+                caching: caching.as_ref(),
+                ready_sender: ready_sender.as_ref(),
+                initial_load_completed: &initial_load_completed,
+                write_ctx: &write_ctx,
+                write_session_state: &write_session_state,
+                commit_timeout,
+                pending_finalize: &mut pending_finalize,
+                pending_commit: &mut pending_commit,
+                deferred_commits: deferred_commits.as_ref(),
+            };
+            if !self.apply_burst(&mut apply_context, burst, close_reason).await {
+                // Fatal apply: close the handoff so Stage A stops + tears down the
+                // reader, then break to the finalize drain below.
+                handoff_rx.close();
+                break;
+            }
+        }
+
+        // Post-loop drain (identical to the inline path): finish any pending
+        // finalize + run its side effects, then drain the last in-flight commit so
+        // the source offset is not left un-acked.
+        if let Some(pending) = pending_finalize.take() {
+            if let Some(error_message) = join_pending_finalize(
+                pending.finalize,
+                &dataset_name,
+                self.runtime_status.is_shutdown(),
+            )
+            .await
+            {
+                self.set_refresh_status(
+                    sql.as_deref(),
+                    status::ComponentStatus::error_with_message(error_message),
+                )
+                .await;
+            } else {
+                let mut context = ApplyContext {
+                    refresh_sql: sql.as_deref(),
+                    dataset_name: &dataset_name,
+                    metric_labels: &metric_labels,
+                    caching: caching.as_ref(),
+                    ready_sender: ready_sender.as_ref(),
+                    initial_load_completed: &initial_load_completed,
+                    write_ctx: &write_ctx,
+                    write_session_state: &write_session_state,
+                    commit_timeout,
+                    pending_finalize: &mut pending_finalize,
+                    pending_commit: &mut pending_commit,
+                    deferred_commits: deferred_commits.as_ref(),
+                };
+                self.run_finalize_side_effects(
+                    &mut context,
+                    pending.committers,
+                    pending.ready_after_finalize,
+                )
+                .await;
+            }
+        }
+
+        if let Some(prev) = pending_commit.take()
+            && let Some(error_message) = join_pending_commit(
+                prev,
+                &dataset_name,
+                self.runtime_status.is_shutdown(),
+                commit_timeout,
+            )
+            .await
+        {
+            self.set_refresh_status(
+                sql.as_deref(),
+                status::ComponentStatus::error_with_message(error_message),
+            )
+            .await;
         }
 
         Ok(())
@@ -5598,7 +5999,7 @@ mod tests {
 
     /// Run a changes stream with an explicit `CdcConfig`, bypassing the process-global `cdc_config()`
     async fn run_changes_stream_with_config(
-        task: &RefreshTask,
+        task: Arc<RefreshTask>,
         cfg: CdcConfig,
         stream: ChangesStream,
     ) -> crate::accelerated_table::Result<()> {
@@ -5637,7 +6038,7 @@ mod tests {
             .collect();
         let stream = make_delayed_changes_stream(items, Duration::from_millis(100));
 
-        run_changes_stream_with_config(&task, test_cdc_config(5_000), stream)
+        run_changes_stream_with_config(Arc::new(task), test_cdc_config(5_000), stream)
             .await
             .expect("changes stream should succeed");
 
@@ -5677,7 +6078,7 @@ mod tests {
             .collect();
         let stream = make_delayed_changes_stream(items, Duration::from_millis(100));
 
-        run_changes_stream_with_config(&task, test_cdc_config(0), stream)
+        run_changes_stream_with_config(Arc::new(task), test_cdc_config(0), stream)
             .await
             .expect("changes stream should succeed");
 
@@ -5755,7 +6156,7 @@ mod tests {
         .boxed();
 
         let join =
-            tokio::spawn(async move { run_changes_stream_with_config(&task, cfg, stream).await });
+            tokio::spawn(async move { run_changes_stream_with_config(Arc::new(task), cfg, stream).await });
 
         // The write must land far inside the 60s linger window. A 5s deadline is
         // generous for the immediate write yet nowhere near the buggy 60s wait.
@@ -5781,7 +6182,7 @@ mod tests {
     /// Counts every poll on the inner stream, and lets us pull on demand via
     /// an inner channel. This makes pipeline overlap directly observable.
     async fn run_changes_stream(
-        task: &RefreshTask,
+        task: Arc<RefreshTask>,
         stream: ChangesStream,
         ready_sender: Option<Arc<Notify>>,
         initial_load_completed: Arc<AtomicBool>,
@@ -5806,7 +6207,7 @@ mod tests {
             Ok(make_tracked_envelope(4, Arc::clone(&log), false)),
         ]);
 
-        run_changes_stream(&task, stream, None, Arc::new(AtomicBool::new(false)))
+        run_changes_stream(Arc::new(task), stream, None, Arc::new(AtomicBool::new(false)))
             .await
             .expect("start_changes_stream should succeed");
 
@@ -6111,7 +6512,7 @@ mod tests {
         };
 
         let stream = make_changes_stream(vec![Ok(mk(1)), Ok(mk(2)), Ok(mk(3))]);
-        run_changes_stream(&task, stream, None, Arc::new(AtomicBool::new(false)))
+        run_changes_stream(Arc::new(task), stream, None, Arc::new(AtomicBool::new(false)))
             .await
             .expect("start_changes_stream should succeed");
 
@@ -6156,7 +6557,7 @@ mod tests {
             Ok(make_tracked_envelope(2, Arc::clone(&log), false)),
         ]);
 
-        run_changes_stream(&task, stream, None, Arc::new(AtomicBool::new(false)))
+        run_changes_stream(Arc::new(task), stream, None, Arc::new(AtomicBool::new(false)))
             .await
             .expect("start_changes_stream should not propagate stream errors");
 
@@ -6546,7 +6947,7 @@ mod tests {
 
         let res = tokio::time::timeout(
             Duration::from_secs(5),
-            run_changes_stream(&task, stream, None, Arc::new(AtomicBool::new(false))),
+            run_changes_stream(Arc::new(task), stream, None, Arc::new(AtomicBool::new(false))),
         )
         .await
         .expect("must not hang on empty stream");
@@ -6615,7 +7016,7 @@ mod tests {
             Ok(make_tracked_envelope(3, Arc::clone(&log), false)),
         ]);
         run_changes_stream(
-            &task,
+            Arc::new(task),
             stream,
             Some(Arc::clone(&notify)),
             Arc::clone(&initial_load),
@@ -6726,7 +7127,7 @@ mod tests {
         let stream: ChangesStream = counting.boxed();
 
         let task_handle = tokio::spawn(async move {
-            run_changes_stream(&task, stream, None, Arc::new(AtomicBool::new(false))).await
+            run_changes_stream(Arc::new(task), stream, None, Arc::new(AtomicBool::new(false))).await
         });
 
         // Wait until the first write has started — that means the apply task
@@ -6813,7 +7214,7 @@ mod tests {
         let stream: ChangesStream = drop_signaling.boxed();
 
         let join = tokio::spawn(async move {
-            run_changes_stream(&task, stream, None, Arc::new(AtomicBool::new(false))).await
+            run_changes_stream(Arc::new(task), stream, None, Arc::new(AtomicBool::new(false))).await
         });
 
         // Wait for the first envelope to commit so we know the apply loop is

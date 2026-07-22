@@ -1295,7 +1295,7 @@ impl Refresher {
 
         let notifier = self.on_complete_notification.clone();
         let changes_task = async move {
-            let refresh_task = refresh_task_builder.build();
+            let refresh_task = Arc::new(refresh_task_builder.build());
             if let Err(err) = refresh_task
                 .start_changes_stream(
                     refresh,
