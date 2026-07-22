@@ -8,7 +8,7 @@ All criteria must be met for the connector to be considered Alpha. As Alpha sign
 
 | Connector                        | Alpha Quality | DRI Sign-off    |
 | -------------------------------- | ------------- | --------------- |
-| ADBC                             | ➖             |                 |
+| ADBC                             | ✅             | @lukekim        |
 | Azure BlobFS                     | ➖             |                 |
 | Clickhouse                       | ➖             |                 |
 | Cosmos DB (NoSQL)                | ✅             | @lukekim        |
@@ -23,13 +23,13 @@ All criteria must be met for the connector to be considered Alpha. As Alpha sign
 | DuckLake                         | ✅             | @sgrebnov       |
 | DynamoDB                         | ✅             | @krinart        |
 | File                             | ✅             | @peasee         |
-| FlightSQL                        | ➖             |                 |
+| FlightSQL                        | ✅             | @lukekim        |
 | FTP/SFTP                         | ➖             |                 |
 | GCS                              | ➖             |                 |
 | Git                              | ✅             | @lukekim        |
 | GitHub                           | ✅             | @peasee         |
 | Glue                             | ✅             | @kczimm         |
-| GraphQL                          | ➖             |                 |
+| GraphQL                          | ✅             | @peasee         |
 | HTTP/HTTPS                       | ➖             |                 |
 | Iceberg                          | ✅             | @phillipleblanc |
 | IMAP                             | ✅             | @peasee         |
@@ -39,12 +39,12 @@ All criteria must be met for the connector to be considered Alpha. As Alpha sign
 | MS SQL                           | ✅             | @peasee         |
 | MySQL                            | ✅             | @peasee         |
 | NFS                              | ➖             |                 |
-| ODBC                             | ➖             |                 |
+| ODBC                             | ✅             | @lukekim        |
 | Oracle                           | ✅             | @sgrebnov       |
 | PostgreSQL                       | ✅             | @Sevenannn      |
 | S3                               | ✅             | @Sevenannn      |
 | ScyllaDB                         | ➖             |                 |
-| Sharepoint                       | ➖             |                 |
+| Sharepoint                       | ✅             | @lukekim        |
 | SMB                              | ➖             |                 |
 | Snowflake                        | ✅             | @phillipleblanc |
 | Spark                            | ✅             | @ewgenius       |
