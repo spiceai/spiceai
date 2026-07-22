@@ -6218,6 +6218,102 @@ mod tests {
         );
     }
 
+    // -- Correctness: pipelined (Stage A/B) apply -----------------------------
+
+    /// Drive the PIPELINED apply path (Stage A recv+coalesce → bounded handoff →
+    /// Stage B in-order apply) directly. The production gate requires a real cayenne
+    /// memory-CDC provider (`deferred_commits.is_some()`), which the mock providers
+    /// here can't satisfy, so this bypasses the gate and calls
+    /// `run_pipelined_memory_changes_stream` directly — exercising the
+    /// provider-agnostic Stage A/B orchestration (the part C3a adds). The cayenne
+    /// memory-CDC apply itself is covered by the cayenne crate's sharded
+    /// equals-serial tests; the deferred-ack-through-pipeline is covered E2E.
+    async fn run_pipelined_changes_stream(
+        task: Arc<RefreshTask>,
+        mut stream: ChangesStream,
+        ready_sender: Option<Arc<Notify>>,
+        initial_load_completed: Arc<AtomicBool>,
+    ) -> crate::accelerated_table::Result<()> {
+        let cdc_cfg = CdcConfig {
+            apply_mode: CdcApplyMode::Pipelined,
+            ..CdcConfig::default()
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<cdc::ChangeEnvelope, cdc::StreamError>>(
+            cdc_cfg.prefetch_buffer,
+        );
+        let reader_handle = tokio::spawn(async move {
+            while let Some(item) = stream.next().await {
+                if tx.send(item).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let dataset_name = task.dataset_name.clone();
+        let metric_labels = task.dataset_metric_labels.clone();
+        task.run_pipelined_memory_changes_stream(PipelinedChangesStream {
+            cdc_cfg,
+            sql: None,
+            dataset_name,
+            metric_labels,
+            rx,
+            reader_handle,
+            caching: None,
+            ready_sender,
+            initial_load_completed,
+            deferred_commits: None,
+        })
+        .await
+    }
+
+    /// The pipelined path must apply + commit every envelope in source order and
+    /// lose none — the headline orchestration property (Stage B is a single
+    /// in-order consumer of the handoff).
+    #[tokio::test]
+    async fn pipelined_applies_envelopes_in_order() {
+        let task = Arc::new(make_refresh_task(make_mem_table() as Arc<dyn TableProvider>));
+        let log = CommitLog::new();
+        let stream = make_changes_stream(
+            (1..=8)
+                .map(|id| Ok(make_tracked_envelope(id, Arc::clone(&log), false)))
+                .collect(),
+        );
+
+        run_pipelined_changes_stream(task, stream, None, Arc::new(AtomicBool::new(false)))
+            .await
+            .expect("pipelined changes stream should succeed");
+
+        assert_eq!(
+            log.ids().await,
+            vec![1, 2, 3, 4, 5, 6, 7, 8],
+            "pipelined Stage A/B must apply + commit in source order with none lost"
+        );
+    }
+
+    /// Order + completeness must hold across MANY coalesced bursts and the bounded
+    /// handoff — a stream long enough to form multiple Stage-A bursts that queue
+    /// through the depth-bounded handoff to the single Stage-B applier.
+    #[tokio::test]
+    async fn pipelined_preserves_order_across_many_bursts() {
+        let task = Arc::new(make_refresh_task(make_mem_table() as Arc<dyn TableProvider>));
+        let log = CommitLog::new();
+        let n = 64_i32;
+        let stream = make_changes_stream(
+            (1..=n)
+                .map(|id| Ok(make_tracked_envelope(id, Arc::clone(&log), false)))
+                .collect(),
+        );
+
+        run_pipelined_changes_stream(task, stream, None, Arc::new(AtomicBool::new(false)))
+            .await
+            .expect("pipelined changes stream should succeed");
+
+        assert_eq!(
+            log.ids().await,
+            (1..=n).collect::<Vec<_>>(),
+            "order preserved + no loss across bursts and the bounded handoff"
+        );
+    }
+
     // -- Correctness: commit-after-write ordering -----------------------------
 
     /// Wraps a `TableProvider` and counts each `insert_into` call.
