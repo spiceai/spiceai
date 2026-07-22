@@ -1,0 +1,147 @@
+version: v1
+kind: Spicepod
+name: postgres-cayenne[file]-adaptive-cold-sf1000-orderline-only
+
+# DIAG (cold-stall): single-cold-table variant of `…-adaptive-cold-sf1000`. ONLY `order_line`
+# (the largest table) keeps the cold (datalake) tier + CDC (changes); the other high-volume tables
+# (district, customer, new_order, oorder, stock) are switched to `refresh_mode: full` (no CDC, no
+# cold promotion). This isolates whether the never-ready freeze is a CROSS-TABLE effect (multiple
+# concurrent cold promotions/CDC contending on the shared compaction runtime + deletion index) or a
+# SINGLE-TABLE issue in order_line's own promotion — and, if it still repros, yields clean
+# single-dataset scanpark traces (the aggregate scan counters == order_line's promotion scan, no
+# other cold scans to confound). REVERT before merge.
+
+postgres_connection_params: &postgres_params
+  pg_host: ${env:CHBENCH_PG_HOST}
+  pg_port: 5432
+  pg_db: chbench
+  pg_user: bench
+  pg_pass: bench
+  pg_sslmode: disable
+
+runtime:
+  flight:
+    ipc_compression: lz4_frame
+  caching:
+    sql_results:
+      enabled: false
+  task_history:
+    enabled: false
+  params:
+    cayenne_goal_replication_lag: '5s'
+    cayenne_goal_freshness: '30s'
+    cayenne_goal_query_latency: '10s'
+    cayenne_goal_qph: '5000'
+
+datasets:
+  # ------------------------------------------------------------------
+  # The ONE cold + CDC table under test: order_line (largest).
+  # ------------------------------------------------------------------
+  - from: postgres:order_line
+    name: order_line
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_order_line
+      pg_replication_initial_snapshot: 'true'
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      params:
+        cayenne_tuning: adaptive
+        cayenne_cdc_mem_tier_shards: '4'
+        cayenne_datalake_location: s3://benchmarks/cayenne-cold-sf1000-orderline-only/
+        cayenne_datalake_s3_auth: key
+        cayenne_datalake_s3_endpoint: ${secrets:S3_ENDPOINT}
+        cayenne_datalake_s3_key: ${secrets:S3_KEY}
+        cayenne_datalake_s3_secret: ${secrets:S3_SECRET}
+        cayenne_datalake_s3_allow_http: 'true'
+        cayenne_datalake_warm_max_bytes: '4294967296' # 4 GiB warm->cold promotion trigger
+        cayenne_datalake_target_file_size_mb: '750'
+        cayenne_datalake_promotion_interval_ms: '30000'
+
+  # ------------------------------------------------------------------
+  # Other high-volume tables: FULL refresh, NO cold tier, NO CDC — removes all cross-table cold /
+  # CDC contention so order_line is the only cold+changes table.
+  # ------------------------------------------------------------------
+  - from: postgres:district
+    name: district
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration: &cayenne_accel_full
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      params: &cayenne_params
+        cayenne_tuning: adaptive
+        cayenne_cdc_mem_tier_shards: '4'
+
+  - from: postgres:customer
+    name: customer
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration: *cayenne_accel_full
+
+  - from: postgres:new_order
+    name: new_order
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration: *cayenne_accel_full
+
+  - from: postgres:oorder
+    name: oorder
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration: *cayenne_accel_full
+
+  - from: postgres:stock
+    name: stock
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration: *cayenne_accel_full
+
+  # ------------------------------------------------------------------
+  # Low-volume + static reference tables: full refresh, no cold tier.
+  # ------------------------------------------------------------------
+  - from: postgres:warehouse
+    name: warehouse
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration: *cayenne_accel_full
+
+  - from: postgres:item
+    name: item
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration: *cayenne_accel_full
+
+  - from: postgres:region
+    name: region
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration: *cayenne_accel_full
+
+  - from: postgres:nation
+    name: nation
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration: *cayenne_accel_full
+
+  - from: postgres:supplier
+    name: supplier
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration: *cayenne_accel_full
