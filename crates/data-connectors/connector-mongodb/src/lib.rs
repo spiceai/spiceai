@@ -1136,3 +1136,13 @@ mod inferred_schema_tests {
         assert_eq!(details.table_bytes, None);
     }
 }
+
+// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_mongodb as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+runtime::register_data_connector!(
+    register_mongodb_connector,
+    MONGODB_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    MongoDBFactory
+);
