@@ -42,9 +42,6 @@ pub enum Error {
     ))]
     EmptyBody,
 
-    #[snafu(display("Skipping non-row Debezium op '{op}' is not supported in batch convert"))]
-    UnsupportedOp { op: String },
-
     #[snafu(display("Failed to convert Debezium change events to Arrow: {source}"))]
     Convert { source: super::arrow::Error },
 
