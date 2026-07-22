@@ -30,6 +30,7 @@ use crate::datafusion::query::QueryTracker;
 use crate::datafusion::query::error_code::ErrorCode;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
+use ballista_core::JobId;
 use ballista_core::extension::BallistaConfigGrpcEndpoint;
 use ballista_core::serde::protobuf::job_status;
 use ballista_core::serde::scheduler::PartitionLocation;
@@ -302,6 +303,11 @@ impl QueryHandle {
         self.cancel_token.clone()
     }
 
+    /// Ballista job id as the typed [`JobId`] expected by scheduler APIs.
+    fn ballista_job_id_typed(&self) -> JobId {
+        JobId::from(self.ballista_job_id.as_str())
+    }
+
     /// Polls the current status of the job.
     ///
     /// Returns the job status or an error if the status cannot be retrieved.
@@ -315,7 +321,7 @@ impl QueryHandle {
         let status = scheduler
             .state
             .task_manager
-            .get_job_status(&self.ballista_job_id)
+            .get_job_status(&self.ballista_job_id_typed())
             .await
             .map_err(|e| QueryHandleError::StatusError {
                 message: e.to_string(),
@@ -407,7 +413,7 @@ impl QueryHandle {
                     match event_result {
                         Ok(event) => {
                             // Only process events for our job
-                            if event.job_id != self.ballista_job_id {
+                            if event.job_id.as_str() != self.ballista_job_id {
                                 continue;
                             }
 
@@ -479,7 +485,7 @@ impl QueryHandle {
         let status = scheduler
             .state
             .task_manager
-            .get_job_status(&self.ballista_job_id)
+            .get_job_status(&self.ballista_job_id_typed())
             .await
             .map_err(|e| {
                 let err = QueryHandleError::StatusError {
@@ -523,7 +529,7 @@ impl QueryHandle {
             let status = scheduler
                 .state
                 .task_manager
-                .get_job_status(&self.ballista_job_id)
+                .get_job_status(&self.ballista_job_id_typed())
                 .await
                 .map_err(|e| {
                     let err = QueryHandleError::StatusError {
@@ -750,7 +756,7 @@ impl QueryHandle {
                     let already_terminal = match scheduler_for_cancel
                         .state
                         .task_manager
-                        .get_job_status(&cancel_job_id)
+                        .get_job_status(&JobId::from(cancel_job_id.as_str()))
                         .await
                     {
                         Ok(Some(job_status)) => match job_status.status {
@@ -787,7 +793,7 @@ impl QueryHandle {
                 let graph = scheduler
                     .state
                     .task_manager
-                    .get_job_execution_graph(&job_id)
+                    .get_job_execution_graph(&JobId::from(job_id.as_str()))
                     .await
                     .ok()
                     .flatten();
@@ -1004,6 +1010,10 @@ impl PartitionResultStream {
                 MAX_PARTITION_RETRIEVAL_MESSAGE_SIZE,
                 use_tls,
                 customize_endpoint,
+                3,          // io_retries_times
+                3000,       // io_retry_wait_time_ms
+                67_108_864, // initial_connection_window_size (64 MiB)
+                16_777_216, // initial_stream_window_size (16 MiB)
             )
             .await
             .map_err(|e| {
