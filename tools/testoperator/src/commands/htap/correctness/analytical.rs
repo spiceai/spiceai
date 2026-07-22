@@ -18,11 +18,14 @@ limitations under the License.
 //!
 //! Runs after the row-count gate (`correctness::verify_after_drain`) confirms
 //! convergence. Executes each CH-benCH analytical query against both the source
-//! Postgres and Spice, comparing results with the existing
+//! engine (Postgres or `MySQL`) and Spice, comparing results with the existing
 //! `validate_with_expected_batches` comparator (schema equivalence + 5%
 //! numeric tolerance).
 
 use std::sync::Arc;
+use std::time::Instant;
+
+use futures::StreamExt;
 
 use super::super::spice::SpiceClients;
 use super::compare;
@@ -36,7 +39,7 @@ use test_framework::anyhow;
 use test_framework::queries::validation::{
     QueryValidationFailReason, QueryValidationResult, validate_with_expected_batches,
 };
-use test_framework::queries::{QueryOverrides, get_chbench_test_queries};
+use test_framework::queries::{Query, QueryOverrides, get_chbench_test_queries};
 
 /// Number of rows of context printed on either side of an analytical-gate
 /// mismatch, from both the reference (source) and Spice result sets.
@@ -201,10 +204,22 @@ impl AnalyticalReport {
 
 /// Run every CH-benCH analytical query against both the source and Spice,
 /// comparing results.
+///
+/// Queries are streamed through [`StreamExt::buffer_unordered`] with a
+/// `concurrency` window (controllable, at least one and never more than the
+/// query count), so several queries run at once; each in-flight query runs the
+/// source and Spice sides *in parallel* (see [`evaluate_query`]).
+/// `buffer_unordered` frees a window slot the moment *any* query completes, so
+/// the next query is admitted immediately — a slow query never dams finished
+/// ones behind it in the window (unlike `buffered`, whose in-submission-order
+/// yielding causes head-of-line blocking and bursty dispatch). Results come
+/// back in completion order, so we re-sort by the original submission index to
+/// keep the returned report in query order.
 pub async fn verify_analytical_results(
     driver: Arc<dyn ChBenchDriver>,
     spice: &SpiceClients,
     query_overrides: Option<QueryOverrides>,
+    concurrency: usize,
 ) -> anyhow::Result<AnalyticalReport> {
     // All 22 CH-benCH analytical queries are executed and reported. q15 is
     // advisory (run but non-gating — see `ADVISORY_QUERIES`): its
@@ -215,185 +230,261 @@ pub async fn verify_analytical_results(
     // different number of rows even when both sums are numerically correct — a
     // query artifact, not an engine divergence, so it is surfaced but not gated.
     let queries = get_chbench_test_queries(query_overrides);
+    let n = queries.len();
+    // At least one in-flight query, and never more than the query count.
+    let workers = concurrency.clamp(1, n.max(1));
     println!(
-        "\nRunning analytical-query gate over {} queries",
-        queries.len()
+        "\nRunning analytical-query gate over {n} queries ({workers} concurrent, source+Spice in parallel per query)"
     );
 
-    let mut results = Vec::with_capacity(queries.len());
-    for query in &queries {
-        let sql = query.to_sql_with_inlined_params();
+    // Stream the queries through a `buffer_unordered(workers)` window: up to
+    // `workers` `evaluate_query` futures run concurrently, and a slot is freed as
+    // soon as *any* future completes (rolling concurrency — no head-of-line
+    // blocking). Because results arrive in completion order, each future carries
+    // its submission index so we can re-sort the collected report back into query
+    // order afterward. The futures are polled in place (not spawned), so they
+    // borrow `driver` and `spice` for the duration of this call — no
+    // `'static`/`Send` bound and no cloning of the clients.
+    let driver = &driver;
+    let overall = Instant::now();
+    let mut indexed: Vec<(usize, AnalyticalQueryResult)> =
+        futures::stream::iter(queries.iter().enumerate())
+            .map(|(idx, query)| async move {
+                // Logged when the query is admitted into the `buffer_unordered` window
+                // (only `workers` are in flight at once), so CI output shows exactly
+                // which queries started before a cancellation/timeout and which are
+                // still waiting for a slot.
+                println!("  [{}] dispatching (source + Spice)", query.name);
+                let started = Instant::now();
+                let result = evaluate_query(query, driver, spice).await;
+                println!(
+                    "  [{}] done in {:.1}s — {}",
+                    query.name,
+                    started.elapsed().as_secs_f64(),
+                    result.outcome.label()
+                );
+                (idx, result)
+            })
+            .buffer_unordered(workers)
+            .collect()
+            .await;
+    // Restore submission order for a deterministic, query-ordered report.
+    indexed.sort_by_key(|(idx, _)| *idx);
+    let results: Vec<AnalyticalQueryResult> =
+        indexed.into_iter().map(|(_, result)| result).collect();
+    println!(
+        "Analytical-query gate finished all {n} queries in {:.1}s",
+        overall.elapsed().as_secs_f64()
+    );
 
-        let expected = match driver.query_arrow(sql.as_ref()).await {
-            Ok(batches) => batches,
-            Err(e) => {
-                results.push(AnalyticalQueryResult {
-                    name: query.name.to_string(),
-                    outcome: Outcome::SourceError(e.to_string()),
-                    max_rel_delta: None,
-                });
-                continue;
-            }
-        };
+    Ok(AnalyticalReport { results })
+}
 
-        let actual = match spice.query_arrow(sql.as_ref()).await {
-            Ok(batches) => batches,
-            Err(e) => {
-                results.push(AnalyticalQueryResult {
-                    name: query.name.to_string(),
-                    outcome: Outcome::SpiceError(e.to_string()),
-                    max_rel_delta: None,
-                });
-                continue;
-            }
-        };
+/// Evaluate a single analytical query: run it against the source and Spice **in
+/// parallel**, then align, sort and compare the two result sets. Returns the
+/// per-query [`AnalyticalQueryResult`]; the advisory/gating classification
+/// happens later in [`AnalyticalReport`].
+async fn evaluate_query(
+    query: &Query,
+    driver: &Arc<dyn ChBenchDriver>,
+    spice: &SpiceClients,
+) -> AnalyticalQueryResult {
+    let name = query.name.to_string();
+    let sql = query.to_sql_with_inlined_params();
 
-        // Spice and the source connector emit different physical Arrow types
-        // for the same logical SQL columns (e.g. Cayenne stores timestamps as
-        // Microsecond while PG arrow streams produce Nanosecond; aggregate
-        // expressions return Int32 vs Decimal128(38,0)). Cast Spice columns
-        // to the source's per-column type so the string-based row comparator
-        // sees consistent encodings before comparing values.
-        // Columns to compare with relative float tolerance, captured pre-alignment
-        // (alignment casts actual to the source schema). Covers Spice floats and
-        // avg()/division emitted as different-scale decimals; sums/counts stay exact.
-        let approximate_cols = match (expected.first(), actual.first()) {
-            (Some(e0), Some(a0)) => compare::approximate_columns(e0, a0),
-            _ => Vec::new(),
-        };
+    // Run both engines concurrently — the two are independent and each pulls its
+    // own pooled connection, so there is no reason to serialize them. Each side
+    // is timed and its completion logged, so a hang (e.g. the CI job is canceled
+    // mid-gate with no report emitted) can be attributed to the source or the
+    // Spice side of a named query rather than the whole gate. If both error, the
+    // source error is reported (matching the previous sequential precedence,
+    // which checked the source first).
+    let (expected_res, actual_res) = tokio::join!(
+        async {
+            let t = Instant::now();
+            let r = driver.query_arrow(sql.as_ref()).await;
+            println!(
+                "  [{name}] source {} in {:.1}s",
+                if r.is_ok() { "ok" } else { "ERROR" },
+                t.elapsed().as_secs_f64()
+            );
+            r
+        },
+        async {
+            let t = Instant::now();
+            let r = spice.query_arrow(sql.as_ref()).await;
+            println!(
+                "  [{name}] Spice {} in {:.1}s",
+                if r.is_ok() { "ok" } else { "ERROR" },
+                t.elapsed().as_secs_f64()
+            );
+            r
+        }
+    );
 
-        let actual = match align_to_expected_schema(&actual, &expected) {
-            Ok(batches) => batches,
-            Err(e) => {
-                results.push(AnalyticalQueryResult {
-                    name: query.name.to_string(),
-                    outcome: Outcome::Fail(format!("schema align error: {e}")),
-                    max_rel_delta: None,
-                });
-                continue;
-            }
-        };
+    let expected = match expected_res {
+        Ok(batches) => batches,
+        Err(e) => {
+            return AnalyticalQueryResult {
+                name,
+                outcome: Outcome::SourceError(e.to_string()),
+                max_rel_delta: None,
+            };
+        }
+    };
 
-        // Several benchmark queries have non-deterministic row order. Sort both sides by every column so comparison is set-based.
-        let (expected_sorted, actual_sorted) = match sort_for_comparison(&expected, &actual) {
-            Ok(pair) => pair,
-            Err(e) => {
-                results.push(AnalyticalQueryResult {
-                    name: query.name.to_string(),
-                    outcome: Outcome::Fail(format!("sort error: {e}")),
-                    max_rel_delta: None,
-                });
-                continue;
-            }
-        };
+    let actual = match actual_res {
+        Ok(batches) => batches,
+        Err(e) => {
+            return AnalyticalQueryResult {
+                name,
+                outcome: Outcome::SpiceError(e.to_string()),
+                max_rel_delta: None,
+            };
+        }
+    };
 
-        let (outcome, max_rel_delta) = if total_rows(&expected_sorted) == 0
-            && total_rows(&actual_sorted) == 0
+    // Spice and the source connector emit different physical Arrow types
+    // for the same logical SQL columns (e.g. Cayenne stores timestamps as
+    // Microsecond while PG arrow streams produce Nanosecond; aggregate
+    // expressions return Int32 vs Decimal128(38,0)). Cast Spice columns
+    // to the source's per-column type so the string-based row comparator
+    // sees consistent encodings before comparing values.
+    // Columns to compare with relative float tolerance, captured pre-alignment
+    // (alignment casts actual to the source schema, erasing the signal). Covers
+    // Spice floats and avg()/division decimals whose scale is inflated past
+    // MONEY_SCALE (e.g. chbench_q1 avg_amount, where source and DataFusion both
+    // produce scale-6 NUMERIC and a 1-ULP rounding difference must not DIVERGE);
+    // exact sums/counts stay on the exact path.
+    let approximate_cols = match (expected.first(), actual.first()) {
+        (Some(e0), Some(a0)) => compare::approximate_columns(e0, a0),
+        _ => Vec::new(),
+    };
+
+    let actual = match align_to_expected_schema(&actual, &expected) {
+        Ok(batches) => batches,
+        Err(e) => {
+            return AnalyticalQueryResult {
+                name,
+                outcome: Outcome::Fail(format!("schema align error: {e}")),
+                max_rel_delta: None,
+            };
+        }
+    };
+
+    // Several benchmark queries have non-deterministic row order. Sort both sides by every column so comparison is set-based.
+    let (expected_sorted, actual_sorted) = match sort_for_comparison(&expected, &actual) {
+        Ok(pair) => pair,
+        Err(e) => {
+            return AnalyticalQueryResult {
+                name,
+                outcome: Outcome::Fail(format!("sort error: {e}")),
+                max_rel_delta: None,
+            };
+        }
+    };
+
+    let (outcome, max_rel_delta) = if total_rows(&expected_sorted) == 0
+        && total_rows(&actual_sorted) == 0
+    {
+        (Outcome::Pass, None)
+    } else {
+        match validate_with_expected_batches(query.name.as_ref(), &actual_sorted, &expected_sorted)
         {
-            (Outcome::Pass, None)
-        } else {
-            match validate_with_expected_batches(
-                query.name.as_ref(),
-                &actual_sorted,
-                &expected_sorted,
-            ) {
-                Ok(QueryValidationResult::Pass) => {
-                    // Structure, schema and row set agree within the string
-                    // comparator's tolerance. Now apply the tight, type-aware
-                    // numeric check (exact for integer/decimal, 0.1% for
-                    // float — including avg() that alignment cast to decimal)
-                    // and surface the magnitude either way.
-                    match (expected_sorted.first(), actual_sorted.first()) {
-                        (Some(e0), Some(a0)) => {
-                            let delta = compare::numeric_delta(e0, a0, &approximate_cols);
-                            if delta.exceeded {
-                                if let Some(row) = delta.worst_row {
-                                    let column = delta
-                                        .worst_col
-                                        .and_then(|c| e0.schema().fields().get(c).cloned())
-                                        .map(|f| f.name().clone());
-                                    print_mismatch_context(
-                                        query.name.as_ref(),
-                                        e0,
-                                        a0,
-                                        row,
-                                        column.as_deref(),
-                                    );
-                                }
-                                (
-                                    Outcome::Divergence(format!(
-                                        "numeric drift exceeds tolerance — {}",
-                                        delta.worst.as_deref().unwrap_or("(unknown cell)")
-                                    )),
-                                    Some(delta.max_rel_delta),
-                                )
-                            } else {
-                                (Outcome::Pass, Some(delta.max_rel_delta))
+            Ok(QueryValidationResult::Pass) => {
+                // Structure, schema and row set agree within the string
+                // comparator's tolerance. Now apply the tight, type-aware
+                // numeric check (exact for integer/decimal, 0.1% for
+                // float — including avg() that alignment cast to decimal)
+                // and surface the magnitude either way.
+                match (expected_sorted.first(), actual_sorted.first()) {
+                    (Some(e0), Some(a0)) => {
+                        let delta = compare::numeric_delta(e0, a0, &approximate_cols);
+                        if delta.exceeded {
+                            if let Some(row) = delta.worst_row {
+                                let column = delta
+                                    .worst_col
+                                    .and_then(|c| e0.schema().fields().get(c).cloned())
+                                    .map(|f| f.name().clone());
+                                print_mismatch_context(
+                                    query.name.as_ref(),
+                                    e0,
+                                    a0,
+                                    row,
+                                    column.as_deref(),
+                                );
                             }
+                            (
+                                Outcome::Divergence(format!(
+                                    "numeric drift exceeds tolerance — {}",
+                                    delta.worst.as_deref().unwrap_or("(unknown cell)")
+                                )),
+                                Some(delta.max_rel_delta),
+                            )
+                        } else {
+                            (Outcome::Pass, Some(delta.max_rel_delta))
                         }
-                        _ => (Outcome::Pass, None),
                     }
+                    _ => (Outcome::Pass, None),
                 }
-                Ok(QueryValidationResult::Fail(reason)) => {
-                    // Print the surrounding rows from both sides so a divergence
-                    // can be inspected in context rather than as a lone cell. A
-                    // `DataMismatch` carries the exact 1-based row and column of
-                    // the first disagreement; a count-type divergence (differing
-                    // row counts, or one engine returning no rows at all) has no
-                    // single cell, so center the window on the boundary where the
-                    // shorter (lex-sorted) side ends. `context_pair` synthesizes
-                    // an empty batch from the present side's schema when one side
-                    // has no batches, so a "source has rows, Spice has none" (or
-                    // vice-versa) divergence still shows the rows that *are*
-                    // there. `SchemaMismatch` has no comparable rows to show.
-                    if let Some((e0, a0)) = context_pair(&expected_sorted, &actual_sorted) {
-                        match &reason {
-                            QueryValidationFailReason::DataMismatch {
-                                row_number, column, ..
-                            } => print_mismatch_context(
+            }
+            Ok(QueryValidationResult::Fail(reason)) => {
+                // Print the surrounding rows from both sides so a divergence
+                // can be inspected in context rather than as a lone cell. A
+                // `DataMismatch` carries the exact 1-based row and column of
+                // the first disagreement; a count-type divergence (differing
+                // row counts, or one engine returning no rows at all) has no
+                // single cell, so center the window on the boundary where the
+                // shorter (lex-sorted) side ends. `context_pair` synthesizes
+                // an empty batch from the present side's schema when one side
+                // has no batches, so a "source has rows, Spice has none" (or
+                // vice-versa) divergence still shows the rows that *are*
+                // there. `SchemaMismatch` has no comparable rows to show.
+                if let Some((e0, a0)) = context_pair(&expected_sorted, &actual_sorted) {
+                    match &reason {
+                        QueryValidationFailReason::DataMismatch {
+                            row_number, column, ..
+                        } => print_mismatch_context(
+                            query.name.as_ref(),
+                            &e0,
+                            &a0,
+                            row_number.saturating_sub(1),
+                            Some(column),
+                        ),
+                        QueryValidationFailReason::RowCountMismatch { .. }
+                        | QueryValidationFailReason::NoAnswer
+                        | QueryValidationFailReason::NoExpectedAnswer
+                        | QueryValidationFailReason::NoExpectedAnswerAtScaleFactor => {
+                            print_mismatch_context(
                                 query.name.as_ref(),
                                 &e0,
                                 &a0,
-                                row_number.saturating_sub(1),
-                                Some(column),
-                            ),
-                            QueryValidationFailReason::RowCountMismatch { .. }
-                            | QueryValidationFailReason::NoAnswer
-                            | QueryValidationFailReason::NoExpectedAnswer
-                            | QueryValidationFailReason::NoExpectedAnswerAtScaleFactor => {
-                                print_mismatch_context(
-                                    query.name.as_ref(),
-                                    &e0,
-                                    &a0,
-                                    e0.num_rows().min(a0.num_rows()),
-                                    None,
-                                );
-                            }
-                            QueryValidationFailReason::SchemaMismatch
-                            | QueryValidationFailReason::ColumnLengthMismatch { .. } => {}
+                                e0.num_rows().min(a0.num_rows()),
+                                None,
+                            );
                         }
+                        QueryValidationFailReason::SchemaMismatch
+                        | QueryValidationFailReason::ColumnLengthMismatch { .. } => {}
                     }
-                    (
-                        Outcome::Divergence(format!(
-                            "{reason:?} (source rows={}, spice rows={})",
-                            total_rows(&expected_sorted),
-                            total_rows(&actual_sorted),
-                        )),
-                        None,
-                    )
                 }
-                Err(e) => (Outcome::Fail(e.to_string()), None),
+                (
+                    Outcome::Divergence(format!(
+                        "{reason:?} (source rows={}, spice rows={})",
+                        total_rows(&expected_sorted),
+                        total_rows(&actual_sorted),
+                    )),
+                    None,
+                )
             }
-        };
+            Err(e) => (Outcome::Fail(e.to_string()), None),
+        }
+    };
 
-        results.push(AnalyticalQueryResult {
-            name: query.name.to_string(),
-            outcome,
-            max_rel_delta,
-        });
+    AnalyticalQueryResult {
+        name,
+        outcome,
+        max_rel_delta,
     }
-
-    Ok(AnalyticalReport { results })
 }
 
 /// Build a target schema by taking each field from `actual` and replacing its
