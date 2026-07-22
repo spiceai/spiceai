@@ -27,7 +27,7 @@ use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use runtime_datafusion_index::IndexedTableProvider;
 use secrecy::ExposeSecret;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 use crate::accelerated_table::{self, AcceleratedTable};
 use crate::changes::{Indexes, index_change_envelope};
@@ -265,18 +265,9 @@ impl DataConnector for ElasticsearchFullTextConnector {
         &self,
         federated_table: Arc<FederatedTable>,
         dataset: &Dataset,
-        accelerated_table_provider: Arc<dyn TableProvider>,
-        accelerator_write_mutex: Arc<Mutex<()>>,
-        cpu_runtime: Option<tokio::runtime::Handle>,
     ) -> Option<ChangesStream> {
         self.with_indexed_stream(federated_table, |inner, table| {
-            inner.changes_stream(
-                table,
-                dataset,
-                Arc::clone(&accelerated_table_provider),
-                Arc::clone(&accelerator_write_mutex),
-                cpu_runtime.clone(),
-            )
+            inner.changes_stream(table, dataset)
         })
     }
 

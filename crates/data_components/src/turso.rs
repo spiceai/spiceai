@@ -1695,7 +1695,10 @@ impl TursoDeletionSink {
 
 #[async_trait]
 impl DeletionSink for TursoDeletionSink {
-    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    async fn delete_from(
+        &self,
+        _context: Arc<TaskContext>,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         // Build WHERE clause using SQLite dialect unparser
         let where_clause = if self.filters.is_empty() {
             String::new()

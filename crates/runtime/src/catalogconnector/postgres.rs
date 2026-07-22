@@ -20,14 +20,42 @@ limitations under the License.
 //! discovery via `information_schema` queries.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
+use crate::catalogconnector::postgres_accelerated::AcceleratedCatalogProvider;
 use crate::{Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams};
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use data_components::postgres::provider::PostgresCatalogProvider;
+use datafusion_table_providers::UnsupportedTypeAction;
 use datafusion_table_providers::postgres::PostgresTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Parses the `unsupported_type_action` dataset param threaded through the
+/// catalog's `dataset_params` (the same mechanism used by the Databricks and
+/// Unity Catalog catalog connectors to pass per-table dataset params). Absent
+/// a value, defaults to `String`, matching the direct `PostgreSQL` data
+/// connector's default (see `connector-postgres`). See #11728.
+fn parse_unsupported_type_action(
+    dataset_params: &HashMap<String, String>,
+) -> Result<UnsupportedTypeAction, String> {
+    match dataset_params.get("unsupported_type_action") {
+        None => Ok(UnsupportedTypeAction::String),
+        Some(value) => {
+            let trimmed = value.trim();
+            match trimmed.to_ascii_lowercase().as_str() {
+                "string" => Ok(UnsupportedTypeAction::String),
+                "error" => Ok(UnsupportedTypeAction::Error),
+                "warn" => Ok(UnsupportedTypeAction::Warn),
+                "ignore" => Ok(UnsupportedTypeAction::Ignore),
+                _ => Err(format!(
+                    "Invalid value '{trimmed}' for `unsupported_type_action`. Expected one of: error, warn, ignore, string."
+                )),
+            }
+        }
+    }
+}
 
 pub const PREFIX: &str = "pg";
 
@@ -76,23 +104,37 @@ impl CatalogConnector for PostgresCatalog {
     ) -> super::Result<Arc<dyn RefreshableCatalogProvider>> {
         let connector_component = ConnectorComponent::from(catalog);
 
+        let unsupported_type_action = parse_unsupported_type_action(&catalog.dataset_params)
+            .map_err(|message| super::Error::InvalidConfigurationNoSource {
+                connector: PREFIX.to_string(),
+                connector_component: connector_component.clone(),
+                message,
+            })?;
+
         let pool = PostgresConnectionPool::new(self.params.parameters.to_secret_map())
             .await
             .map_err(|e| super::Error::UnableToGetCatalogProvider {
                 connector: PREFIX.to_string(),
                 connector_component: connector_component.clone(),
                 source: Box::new(e),
-            })?;
+            })?
+            .with_unsupported_type_action(unsupported_type_action);
 
         let pool = Arc::new(pool);
-        let table_factory = Arc::new(PostgresTableFactory::new(Arc::clone(&pool)));
 
-        let catalog_provider = Arc::new(PostgresCatalogProvider::new(
-            catalog.name.clone(),
-            pool,
-            table_factory,
-            catalog.include.clone(),
-        ));
+        let catalog_provider: Arc<dyn RefreshableCatalogProvider> =
+            if catalog.acceleration.is_some() {
+                Arc::new(AcceleratedCatalogProvider::new(catalog, pool))
+            } else {
+                let table_factory = Arc::new(PostgresTableFactory::new(Arc::clone(&pool)));
+                Arc::new(PostgresCatalogProvider::new(
+                    catalog.name.clone(),
+                    pool,
+                    table_factory,
+                    catalog.include.clone(),
+                    catalog.exclude.clone(),
+                ))
+            };
 
         catalog_provider
             .refresh()
@@ -103,6 +145,6 @@ impl CatalogConnector for PostgresCatalog {
                 source: e,
             })?;
 
-        Ok(catalog_provider as Arc<dyn RefreshableCatalogProvider>)
+        Ok(catalog_provider)
     }
 }

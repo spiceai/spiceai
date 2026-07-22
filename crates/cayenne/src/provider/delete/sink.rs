@@ -52,7 +52,7 @@ use super::super::deletion_strategy::{
     Int64PkDeletionSnapshot, PkDeletionStrategyWithCache, RowConverterDeletionSnapshot,
 };
 use super::super::memory_account::CayenneMemoryAccount;
-use super::super::utils::convert_to_u64_box;
+use super::super::utils::{bytes_key, convert_to_u64_box, i64_key};
 use super::vector_io::DeletionVectorWriteResult;
 use super::vector_io::{
     DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter,
@@ -68,6 +68,7 @@ use crate::row_converter::RowConverter;
 use async_trait::async_trait;
 use data_components::delete::DeletionSink;
 use datafusion::datasource::listing::ListingTable;
+use datafusion::execution::TaskContext;
 use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -528,10 +529,7 @@ impl CayenneDeletionSink {
                         };
                         pending_pk_values.extend(projected_sink.extract_int64_pk_values(&batch)?);
                         if pending_pk_values.len() >= PK_DELETE_FLUSH_BATCH_SIZE {
-                            let row_keys = pending_pk_values
-                                .drain()
-                                .map(|pk| pk.to_be_bytes().to_vec().into_boxed_slice())
-                                .collect();
+                            let row_keys = pending_pk_values.drain().map(i64_key).collect();
                             let results = self
                                 .write_key_based_chunk_with_shared_sequence(
                                     row_keys,
@@ -547,10 +545,7 @@ impl CayenneDeletionSink {
                     }
                 }
                 if !pending_pk_values.is_empty() {
-                    let row_keys = pending_pk_values
-                        .into_iter()
-                        .map(|pk| pk.to_be_bytes().to_vec().into_boxed_slice())
-                        .collect();
+                    let row_keys = pending_pk_values.into_iter().map(i64_key).collect();
                     let results = self
                         .write_key_based_chunk_with_shared_sequence(row_keys, &mut delete_sequence)
                         .await?;
@@ -595,10 +590,7 @@ impl CayenneDeletionSink {
                             });
                         }
                         let rows = row_converter.convert_columns(&pk_columns)?;
-                        pending_row_keys.extend(
-                            rows.iter()
-                                .map(|row| row.as_ref().to_vec().into_boxed_slice()),
-                        );
+                        pending_row_keys.extend(rows.iter().map(|row| bytes_key(row.as_ref())));
                         if pending_row_keys.len() >= PK_DELETE_FLUSH_BATCH_SIZE {
                             let results = self
                                 .write_key_based_chunk_with_shared_sequence(
@@ -700,10 +692,7 @@ impl CayenneDeletionSink {
 
         let rows = row_converter.convert_columns(&pk_columns)?;
 
-        let row_keys: Vec<Box<[u8]>> = rows
-            .iter()
-            .map(|row| row.as_ref().to_vec().into_boxed_slice())
-            .collect();
+        let row_keys: Vec<Box<[u8]>> = rows.iter().map(|row| bytes_key(row.as_ref())).collect();
 
         Ok(row_keys)
     }
@@ -753,10 +742,7 @@ impl CayenneDeletionSink {
                     }
                     let mut delete_sequence = None;
                     let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
-                    let row_keys = pk_values
-                        .into_iter()
-                        .map(|pk| pk.to_be_bytes().to_vec().into_boxed_slice())
-                        .collect();
+                    let row_keys = pk_values.into_iter().map(i64_key).collect();
                     let results = self
                         .write_key_based_chunk_with_shared_sequence(row_keys, &mut delete_sequence)
                         .await?;
@@ -820,10 +806,7 @@ impl CayenneDeletionSink {
 
                         if pending_pk_values.len() >= PK_DELETE_FLUSH_BATCH_SIZE {
                             let chunk_values = std::mem::take(&mut pending_pk_values);
-                            let row_keys = chunk_values
-                                .into_iter()
-                                .map(|pk| pk.to_be_bytes().to_vec().into_boxed_slice())
-                                .collect();
+                            let row_keys = chunk_values.into_iter().map(i64_key).collect();
                             let results = self
                                 .write_key_based_chunk_with_shared_sequence(
                                     row_keys,
@@ -841,10 +824,7 @@ impl CayenneDeletionSink {
 
                 if !pending_pk_values.is_empty() {
                     let chunk_values = std::mem::take(&mut pending_pk_values);
-                    let row_keys = chunk_values
-                        .into_iter()
-                        .map(|pk| pk.to_be_bytes().to_vec().into_boxed_slice())
-                        .collect();
+                    let row_keys = chunk_values.into_iter().map(i64_key).collect();
                     let results = self
                         .write_key_based_chunk_with_shared_sequence(row_keys, &mut delete_sequence)
                         .await?;
@@ -1162,7 +1142,10 @@ impl CayenneDeletionSink {
 
 #[async_trait]
 impl DeletionSink for CayenneDeletionSink {
-    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    async fn delete_from(
+        &self,
+        _context: Arc<TaskContext>,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         // Acquire write lock (if provided) to prevent racing with concurrent inserts or catalog refreshes.
         // When called from within write_all_append (e.g. retention filters), the caller already
         // holds the lock, so write_lock is None to avoid deadlocking the non-reentrant mutex.

@@ -2889,13 +2889,7 @@ impl DataFusion {
                 },
             );
 
-            let changes_stream = source.changes_stream(
-                Arc::clone(&source_table_provider),
-                dataset,
-                Arc::clone(&accelerated_table_provider),
-                Arc::clone(&accelerator_write_mutex),
-                self.refresh_runtime().cloned(),
-            );
+            let changes_stream = source.changes_stream(Arc::clone(&source_table_provider), dataset);
 
             if let Some(changes_stream) = changes_stream {
                 accelerated_table_builder.changes_stream(changes_stream);
@@ -5330,7 +5324,6 @@ mod tests {
                 full_text_search: None,
                 check_availability: crate::component::dataset::CheckAvailability::Disabled,
                 on_schema_change: crate::component::dataset::OnSchemaChange::default(),
-                schema_inference: crate::component::dataset::SchemaInference::Standard,
             }
         }
 

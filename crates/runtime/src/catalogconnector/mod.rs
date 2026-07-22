@@ -121,6 +121,8 @@ pub mod mysql;
 pub mod oracle;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(feature = "postgres")]
+pub mod postgres_accelerated;
 #[cfg(feature = "snowflake")]
 pub mod snowflake;
 pub mod spice_cloud;

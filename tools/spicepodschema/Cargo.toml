@@ -19,13 +19,11 @@ spicepod = { path = "../../crates/spicepod", features = ["schemars"] }
 # Enable all data connector features for complete schema generation
 runtime = { path = "../../crates/runtime", features = [
     # All data connectors
-    "clickhouse",
     "databricks",
     "debezium",
     "delta_lake",
     "dremio",
     "duckdb",
-    "dynamodb",
     "flightsql",
     "ftp",
     "imap",
@@ -52,6 +50,7 @@ runtime = { path = "../../crates/runtime", features = [
 # Extracted connector crates (for linkme registration)
 connector-clickhouse = { path = "../../crates/data-connectors/connector-clickhouse" }
 connector-delta-lake = { path = "../../crates/data-connectors/connector-delta-lake" }
+connector-dynamodb = { path = "../../crates/data-connectors/connector-dynamodb" }
 connector-dremio = { path = "../../crates/data-connectors/connector-dremio" }
 connector-duckdb = { path = "../../crates/data-connectors/connector-duckdb" }
 connector-flightsql = { path = "../../crates/data-connectors/connector-flightsql" }

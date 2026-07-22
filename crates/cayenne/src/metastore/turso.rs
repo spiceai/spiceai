@@ -300,6 +300,19 @@ impl TursoMetastore {
         )
     ";
 
+    /// Schema for the `cayenne_pending_write_back` table (durable federated
+    /// write-back, #11838). See the `SQLite` `PENDING_WRITE_BACK_TABLE_DDL` doc
+    /// for semantics. Plain rowid table (Turso rejects `WITHOUT ROWID` in MVCC).
+    const PENDING_WRITE_BACK_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_pending_write_back (
+            table_id BLOB NOT NULL,
+            pk_bytes BLOB NOT NULL,
+            sequence_number BIGINT NOT NULL,
+            first_marked_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            PRIMARY KEY (table_id, pk_bytes)
+        )
+    ";
+
     /// Schema for the `cayenne_snapshot_sequence` table.
     ///
     /// Tracks the sequence number for each snapshot. This enables Iceberg-style
@@ -592,12 +605,13 @@ impl MetastoreBackend for TursoMetastore {
 
         // Create tables
         let schema_sql = format!(
-            "{}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
+            "{}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
             Self::TABLE_TABLE_DDL,
             Self::TABLE_NAME_UNIQUE_INDEX_DDL,
             Self::DELETE_FILE_TABLE_DDL,
             Self::PARTITION_TABLE_DDL,
             Self::INSERT_RECORD_TABLE_DDL,
+            Self::PENDING_WRITE_BACK_TABLE_DDL,
             Self::SNAPSHOT_SEQUENCE_TABLE_DDL,
             Self::TABLE_STATISTICS_DDL,
             Self::SNAPSHOT_FILE_STATISTICS_TABLE_DDL,

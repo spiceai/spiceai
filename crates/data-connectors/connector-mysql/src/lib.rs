@@ -479,9 +479,12 @@ async fn mysql_inferred_schema_metadata(
 }
 
 /// Enrich the provider's schema with `MySQL` metadata: column/table comments and
-/// source types (always), plus the inferred primary key / sizing when the
-/// dataset opts into `schema_inference: extended`. Mirrors the `PostgreSQL`
-/// connector's `enrich_with_postgres_metadata`.
+/// source types, plus the inferred primary key / sizing. Schema inference is
+/// always attempted. If the `information_schema` query fails (`Err`) it degrades to
+/// base column/type inference with an **info** log (see below); the best-effort
+/// sizing sub-query fails at debug level and still returns `Ok`, so a sizing-only
+/// gap may surface no info log. Mirrors the `PostgreSQL` connector's
+/// `enrich_with_postgres_metadata`.
 async fn enrich_with_mysql_metadata(
     pool: &Arc<MySQLConnectionPool>,
     dataset: &Dataset,
@@ -502,29 +505,33 @@ async fn enrich_with_mysql_metadata(
             }
         };
 
-    if dataset.schema_inference.is_extended() {
-        match mysql_inferred_schema_metadata(pool, table_reference).await {
-            Ok(inferred) => {
-                if !inferred.is_empty() {
-                    tracing::debug!(
-                        dataset = %dataset.name,
-                        source = %dataset.path(),
-                        primary_key = ?inferred.primary_key,
-                        row_count = ?inferred.row_count,
-                        table_bytes = ?inferred.table_bytes,
-                        "Inferred extended schema metadata from MySQL catalog"
-                    );
-                }
-                table_metadata.extend(inferred.to_metadata());
-            }
-            Err(error) => {
-                tracing::warn!(
+    // Always attempt maximum schema inference; degrade gracefully when the source
+    // blocks the catalog queries (commonly the connection user lacks access to
+    // information_schema), falling back to base column/type inference only.
+    match mysql_inferred_schema_metadata(pool, table_reference).await {
+        Ok(inferred) => {
+            if !inferred.is_empty() {
+                tracing::debug!(
                     dataset = %dataset.name,
                     source = %dataset.path(),
-                    error = %error,
-                    "Failed to infer extended schema from MySQL catalog; registering without inferred metadata"
+                    primary_key = ?inferred.primary_key,
+                    row_count = ?inferred.row_count,
+                    table_bytes = ?inferred.table_bytes,
+                    "Inferred schema metadata from MySQL catalog"
                 );
             }
+            table_metadata.extend(inferred.to_metadata());
+        }
+        Err(error) => {
+            // Graceful degradation, not a failure: the source blocked the catalog
+            // inference queries (commonly the connection user lacks information_schema
+            // access). Fall back to base column/type inference and log at info.
+            tracing::info!(
+                dataset = %dataset.name,
+                source = %dataset.path(),
+                error = %error,
+                "Schema inference degraded to base column/type inference (mysql): could not read information_schema, usually because the connection user lacks access. Primary key and sizing were not inferred; grant information_schema access for full inference."
+            );
         }
     }
 
@@ -596,9 +603,6 @@ impl DataConnector for MySQL {
         &self,
         federated_table: Arc<runtime::federated_table::FederatedTable>,
         dataset: &Dataset,
-        _accelerated_table_provider: Arc<dyn TableProvider>,
-        _accelerator_write_mutex: Arc<tokio::sync::Mutex<()>>,
-        _cpu_runtime: Option<tokio::runtime::Handle>,
     ) -> Option<data_components::cdc::ChangesStream> {
         Some(replication::build_changes_stream(
             &self.params,

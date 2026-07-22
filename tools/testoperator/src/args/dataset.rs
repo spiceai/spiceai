@@ -207,6 +207,9 @@ pub enum QueryOverridesArg {
     #[serde(rename = "scylladb")]
     #[value(name = "scylladb")]
     ScyllaDB,
+    #[serde(rename = "chbench-skip-slow")]
+    #[value(name = "chbench-skip-slow")]
+    ChbenchSkipSlow,
 }
 
 impl From<QuerySetArg> for QuerySet {
@@ -327,6 +330,7 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::Turso => QueryOverrides::Turso,
             QueryOverridesArg::BigQuery => QueryOverrides::BigQuery,
             QueryOverridesArg::ScyllaDB => QueryOverrides::ScyllaDB,
+            QueryOverridesArg::ChbenchSkipSlow => QueryOverrides::ChbenchSkipSlow,
         }
     }
 }

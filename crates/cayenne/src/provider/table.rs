@@ -150,6 +150,7 @@ use super::deletion_strategy::{
 };
 use super::memory_account::CayenneMemoryAccount;
 use super::staging_wal::PreparedStagedAppend;
+use super::utils::{bytes_key, i64_key};
 use super::vortex_format::PositionDeletionAccessPlanProvider;
 use arc_swap::ArcSwap;
 
@@ -456,7 +457,9 @@ impl CayenneCdcWrite {
                 // `AppendMutationWriter::write_prepared_stream`.
                 self.table.clear_cached_pk_keyset();
             } else {
-                self.table.record_file_pk_keys(&self.validated_file_keys);
+                let record_seq = self.table.sequence_high_water().await;
+                self.table
+                    .record_file_pk_keys(&self.validated_file_keys, record_seq);
             }
             // Live `num_rows` delta is inserted rows minus upsert replacements.
             // The staged path has no standalone deletes, so this remains a pure
@@ -642,10 +645,7 @@ fn deserialize_delete_keys_from_ipc(
                     rest.len()
                 )));
             }
-            Ok(rest
-                .chunks_exact(8)
-                .map(|chunk| chunk.to_vec().into_boxed_slice())
-                .collect())
+            Ok(rest.chunks_exact(8).map(bytes_key).collect())
         }
         // cycle-5 TASK 2a: LZ4-compressed Arrow IPC (composite keys).
         tombstone_format::COMPRESSED_IPC => deserialize_delete_keys_from_arrow_ipc(rest),
@@ -679,7 +679,7 @@ fn deserialize_delete_keys_from_arrow_ipc(
         row_keys.reserve(row_key_array.len());
         for row_index in 0..row_key_array.len() {
             if !row_key_array.is_null(row_index) {
-                row_keys.push(row_key_array.value(row_index).to_vec().into_boxed_slice());
+                row_keys.push(bytes_key(row_key_array.value(row_index)));
             }
         }
     }
@@ -1060,6 +1060,13 @@ pub struct CayenneTableProvider {
     pk_row_converter: Option<Arc<RowConverter>>,
     /// Indices of primary key columns in the table schema.
     pk_column_indices: Vec<usize>,
+    /// Durable federated write-back (#11838): when set, every committed write on
+    /// this table durably marks its primary keys in `cayenne_pending_write_back`
+    /// (inside the commit transaction) so a per-table delivery worker can
+    /// reconcile them to the federated source. Not persisted in `TableMetadata`;
+    /// derived from the acceleration settings and set via the builder, and shared
+    /// across writer clones (a plain in-memory `bool`, `Copy`).
+    durable_write_back: bool,
     /// Write lock to serialize insert operations and prevent concurrent write races.
     /// This ensures that:
     /// - Only one `insert()` runs at a time per table
@@ -1136,6 +1143,19 @@ pub struct CayenneTableProvider {
     /// `build_sharded_pk_index` / the sharded validate path; routed by
     /// `shard_of_pk` so a key co-locates with its tier segments + tombstones.
     sharded_pk_keyset_cache: Arc<ParkingMutex<Option<ShardedPkIndex>>>,
+    /// Per-key transaction OCC (`transaction_has_conflict`) trusts the Exact
+    /// keyset's per-key `sequence` stamps ONLY when this is `false`. Set `true`
+    /// whenever an event leaves the shared Exact keyset with a stale or missing
+    /// stamp that per-key validation would then wrongly trust — a dropped stamp
+    /// (`record_pk_keys_with_location`'s checked-out keyset), a stale-present key
+    /// after an upsert filter-DELETE (`PkKeysetInvalidatingDeletionSink`), or a
+    /// keys-published-with-no-sequence fallback (`publish_validated_file_keys`).
+    /// While `true`, `transaction_has_conflict` degrades to the conservative
+    /// per-table high-water check (over-abort, never a missed conflict). Cleared
+    /// only by `clear_cached_pk_keyset`, whose next rebuild floor-stamps every
+    /// key to the current high-water (or returns a Bloom, which also takes the
+    /// per-table fallback) — so a cleared flag can never uncover a stale keyset.
+    pk_keyset_occ_degraded: Arc<AtomicBool>,
     /// Table-global cold-tier (datalake) PK existence view: one bloom per live
     /// cold file, from the manifest's per-file `pk_bloom` blobs. Lets the
     /// CDC-upsert keyset rebuild fold cold-resident keys WITHOUT the O(cold-rows)
@@ -1356,10 +1376,11 @@ pub struct CayenneTableProvider {
     /// attestation is observed by scanning clones and invalidated for all on a write.
     current_sorted_snapshot: Arc<ArcSwap<Option<String>>>,
     /// Serializes mem-tier checkpoints (spills) for this table so a single
-    /// checkpoint is in flight at a time. The write path uses
-    /// `try_lock()` on this to detect "a checkpoint is already running" and take
-    /// the spill-then-fallback path rather than growing the tier unboundedly
-    /// (the OOM-safety guard). Shared across writer clones.
+    /// checkpoint is in flight at a time. The write path blocks on
+    /// `.lock().await`/`.lock_owned().await` when it needs a spill (the
+    /// OOM-safety guard), so a second writer simply waits for the in-flight
+    /// checkpoint to finish rather than racing it — natural backpressure, not
+    /// a try-lock-with-fallback. Shared across writer clones.
     mem_checkpoint_lock: Arc<tokio::sync::Mutex<()>>,
     /// Serializes the mem-tier *publish* (the `ArcSwap` swap + sequence
     /// reservation) across all writers — DECOUPLED from [`Self::listing_fence`]
@@ -1655,6 +1676,7 @@ pub struct CayenneTableProviderBuilder {
     cold_object_store_config: Option<crate::metadata::ObjectStoreConfig>,
     context: Option<Arc<CayenneContext>>,
     maintained_aggregates: Vec<MaintainedAggregateSpec>,
+    durable_write_back: bool,
 }
 
 struct PendingMaintainedAggregateInsert {
@@ -1732,6 +1754,7 @@ struct CayenneTableProviderOpenOptions {
     cold_object_store_config: Option<crate::metadata::ObjectStoreConfig>,
     context: Option<Arc<CayenneContext>>,
     maintained_aggregate_specs: Vec<MaintainedAggregateSpec>,
+    durable_write_back: bool,
 }
 
 impl CayenneTableProviderBuilder {
@@ -1747,6 +1770,7 @@ impl CayenneTableProviderBuilder {
             cold_object_store_config: None,
             context: None,
             maintained_aggregates: Vec::new(),
+            durable_write_back: false,
         }
     }
 
@@ -1810,6 +1834,14 @@ impl CayenneTableProviderBuilder {
         self
     }
 
+    /// Enable durable federated write-back (#11838): every committed write marks
+    /// its primary keys in `cayenne_pending_write_back` for the delivery worker.
+    #[must_use]
+    pub fn with_durable_write_back(mut self, enabled: bool) -> Self {
+        self.durable_write_back = enabled;
+        self
+    }
+
     /// Open an existing table by name.
     ///
     /// # Errors
@@ -1824,6 +1856,7 @@ impl CayenneTableProviderBuilder {
             cold_object_store_config: self.cold_object_store_config,
             context: self.context,
             maintained_aggregate_specs: self.maintained_aggregates,
+            durable_write_back: self.durable_write_back,
         };
 
         CayenneTableProvider::new_internal(table_name, self.catalog, self.runtime_env, options)
@@ -1846,6 +1879,7 @@ impl CayenneTableProviderBuilder {
             cold_object_store_config: self.cold_object_store_config,
             context: self.context,
             maintained_aggregate_specs: self.maintained_aggregates,
+            durable_write_back: self.durable_write_back,
         };
 
         CayenneTableProvider::new_internal(&table_name, self.catalog, self.runtime_env, options)
@@ -1928,6 +1962,42 @@ const BAKE_KEEP_RECENT_SNAPSHOTS: usize = 3;
 /// anchor for the adaptive [`Actuator::BakeDeletionIndexTrigger`] move; the live
 /// value is read per-trigger via `self.context.bake_deletion_index_trigger()`.
 pub(crate) const BAKE_DELETION_INDEX_TRIGGER: usize = 50_000;
+
+/// The two guards a mem-tier checkpoint holds, kept as a struct because their
+/// lifetimes differ: `_checkpoint` (`mem_checkpoint_lock`) spans the whole
+/// lifecycle — capture, encode, publish, clear, slot advance — serializing
+/// checkpoints; `write` is only capture-scoped. Callers keep the struct alive and
+/// pass only `write.take()` to `checkpoint_mem_tier_inner`, so the checkpoint guard
+/// is not accidentally released early.
+struct MemTierCheckpointGuards {
+    /// `mem_checkpoint_lock`, held for the whole checkpoint lifecycle (read only via `Drop`).
+    _checkpoint: tokio::sync::OwnedMutexGuard<()>,
+    /// N>1 capture `write_lock`; `checkpoint_mem_tier_inner` releases it right after
+    /// capture so the encode runs off `write_lock`. `None` at N==1 (capture is atomic).
+    write: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl MemTierCheckpointGuards {
+    fn new(
+        checkpoint: tokio::sync::OwnedMutexGuard<()>,
+        write: Option<tokio::sync::OwnedMutexGuard<()>>,
+    ) -> Self {
+        Self {
+            _checkpoint: checkpoint,
+            write,
+        }
+    }
+}
+
+/// Outcome of a best-effort [`CayenneTableProvider::try_checkpoint_mem_tier`].
+pub(crate) enum CheckpointAttempt {
+    /// A checkpoint ran; value is rows flushed (0 = nothing to flush, but the slot
+    /// advancer was still handled).
+    Completed(u64),
+    /// A capture lock was contended, so nothing was captured and the source slot
+    /// was NOT advanced. The caller retries next tick.
+    Busy,
+}
 
 /// Per-table threshold: number of orphan-eligible key-based deletion vectors
 /// (count of `cayenne_delete_file` rows, NOT masked rows) that must accumulate on
@@ -2233,15 +2303,16 @@ impl CayenneTableProvider {
             });
         }
 
-        // Step 3: flush. `checkpoint_mem_tier` requires `mem_checkpoint_lock`
-        // held by the caller; it also folds the inline corpus it shadows, and
-        // `checkpoint_inlined_data` then flushes whatever remains (no-op when
-        // the corpus is already empty — file mode, or just folded).
+        // Step 3: flush. This block already holds `write_lock` (acquired above) and
+        // takes `mem_checkpoint_lock`, then calls the caller-holds-both variant
+        // `checkpoint_mem_tier_holding_locks` (which must NOT re-acquire either lock —
+        // the public `checkpoint_mem_tier` would acquire them itself and deadlock
+        // here). It also folds the inline corpus it shadows, and
+        // `checkpoint_inlined_data` then flushes whatever remains (no-op when the
+        // corpus is already empty — file mode, or just folded).
         {
             let _mem_checkpoint_guard = self.mem_checkpoint_lock.lock().await;
-            // `evolve_schema_live` holds this table's `write_lock` (acquired above),
-            // so the checkpoint capture must not re-acquire it.
-            self.checkpoint_mem_tier_holding_write_lock().await?;
+            self.checkpoint_mem_tier_holding_locks().await?;
         }
         self.checkpoint_inlined_data().await?;
 
@@ -3310,7 +3381,7 @@ impl CayenneTableProvider {
                         Self::invalidate_list_files_cache(&runtime_env, &url);
                         ledger.lock().remove(&id);
                         last_listed.lock().remove(&id);
-                        tracing::info!(
+                        tracing::debug!(
                             target: "cayenne::compaction",
                             table_id = %table_id,
                             snapshot_id = %id,
@@ -4681,7 +4752,7 @@ impl CayenneTableProvider {
             // manifest is populated, delete file-by-file so a file referenced
             // in place by a live/protected snapshot survives; otherwise (legacy
             // / unpopulated) the whole dir is dead and removed wholesale.
-            tracing::info!(
+            tracing::debug!(
                 "Deleting old snapshot directory for table {}: {}",
                 table_id,
                 snapshot_id
@@ -4698,7 +4769,7 @@ impl CayenneTableProvider {
                 if fully_removed {
                     deleted_count += 1;
                 } else {
-                    tracing::info!(
+                    tracing::debug!(
                         "Kept old snapshot directory for table {table_id}: {snapshot_id} \
                          (files still referenced in place by a live snapshot)"
                     );
@@ -4711,7 +4782,7 @@ impl CayenneTableProvider {
         }
 
         if deleted_count > 0 {
-            tracing::info!(
+            tracing::debug!(
                 "Cleaned up {} old snapshot(s) for table {}",
                 deleted_count,
                 table_id
@@ -4775,6 +4846,7 @@ impl CayenneTableProvider {
             cold_object_store_config,
             context,
             maintained_aggregate_specs,
+            durable_write_back,
         } = options;
 
         let table_metadata = catalog.get_table(table_name).await?;
@@ -5006,6 +5078,7 @@ impl CayenneTableProvider {
             pk_deletion_strategy,
             pk_row_converter,
             pk_column_indices,
+            durable_write_back,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             visibility_lock: Arc::new(tokio::sync::Mutex::new(())),
             scan_state_lock: Arc::new(tokio::sync::RwLock::new(())),
@@ -5020,6 +5093,7 @@ impl CayenneTableProvider {
             )),
             pk_keyset_cache: Arc::new(ParkingMutex::new(None)),
             sharded_pk_keyset_cache: Arc::new(ParkingMutex::new(None)),
+            pk_keyset_occ_degraded: Arc::new(AtomicBool::new(false)),
             cold_pk_existence: Arc::new(ParkingMutex::new(None)),
             table_memory,
             inline_checkpoint_scheduled: Arc::new(AtomicBool::new(false)),
@@ -5209,6 +5283,107 @@ impl CayenneTableProvider {
     #[must_use]
     pub fn catalog(&self) -> &Arc<dyn MetadataCatalog> {
         &self.catalog
+    }
+
+    /// Durable federated write-back (#11838): whether committed writes on this
+    /// table mark their primary keys for reconciliation to the federated source.
+    #[must_use]
+    pub fn is_durable_write_back(&self) -> bool {
+        self.durable_write_back
+    }
+
+    /// The shared [`RuntimeEnv`] this provider was created with — carries the
+    /// object-store registrations (e.g. S3), memory pool, and caches. A caller
+    /// that scans this table outside the query engine (the write-back delivery
+    /// worker) must build its `SessionContext` from this env, not a fresh
+    /// default one, or object-store-backed reads fail.
+    #[must_use]
+    pub fn runtime_env(&self) -> Arc<RuntimeEnv> {
+        Arc::clone(self.context.runtime_env())
+    }
+
+    /// Downcast the metadata catalog to the concrete Cayenne catalog — the
+    /// write-back marker CRUD is a Cayenne-specific concern (not on the trait).
+    fn cayenne_catalog(&self) -> Option<&crate::CayenneCatalog> {
+        self.catalog
+            .as_any()
+            .downcast_ref::<crate::CayenneCatalog>()
+    }
+
+    /// List up to `limit` undelivered write-back markers (oldest commit first)
+    /// as `(pk_bytes, sequence_number)`. The `pk_bytes` are opaque `OwnedRow`
+    /// encodings — feed them back to [`Self::decode_pk_keys`] /
+    /// [`Self::clear_dirty_keys`].
+    ///
+    /// # Errors
+    /// Propagates the underlying metastore error.
+    pub async fn list_dirty_keys(&self, limit: usize) -> Result<Vec<(Vec<u8>, i64)>> {
+        let Some(catalog) = self.cayenne_catalog() else {
+            return Ok(Vec::new());
+        };
+        Ok(catalog
+            .list_pending_write_back(self.table_id(), limit)
+            .await?)
+    }
+
+    /// Compare-and-clear delivered write-back markers (see
+    /// [`crate::CayenneCatalog::clear_pending_write_back`]).
+    ///
+    /// # Errors
+    /// Propagates the underlying metastore error.
+    pub async fn clear_dirty_keys(&self, keys: &[(Vec<u8>, i64)]) -> Result<()> {
+        let Some(catalog) = self.cayenne_catalog() else {
+            return Ok(());
+        };
+        catalog
+            .clear_pending_write_back(self.table_id(), keys)
+            .await?;
+        Ok(())
+    }
+
+    /// Count undelivered write-back markers (backlog gauge).
+    ///
+    /// # Errors
+    /// Propagates the underlying metastore error.
+    pub async fn dirty_key_count(&self) -> Result<i64> {
+        let Some(catalog) = self.cayenne_catalog() else {
+            return Ok(0);
+        };
+        Ok(catalog.pending_write_back_count(self.table_id()).await?)
+    }
+
+    /// Decode marker `pk_bytes` (`RowConverter` `OwnedRow` encodings) back into
+    /// the primary-key column arrays, in key order — for the accelerator
+    /// point-scan filter and the source delivery key.
+    ///
+    /// # Errors
+    /// Returns an error if the table has no PK converter or the bytes are
+    /// malformed for its key schema.
+    pub fn decode_pk_keys(&self, pk_bytes: &[Vec<u8>]) -> Result<Vec<ArrayRef>> {
+        let converter = self
+            .pk_row_converter
+            .as_ref()
+            .ok_or_else(|| Error::Internal {
+                table: self.table_name().to_string(),
+                message: "decode_pk_keys requires a primary-key RowConverter".to_string(),
+            })?;
+        let rows = pk_bytes
+            .iter()
+            .map(|bytes| crate::row_converter::Row::from_encoded(bytes));
+        converter.convert_rows(rows).map_err(|e| Error::Internal {
+            table: self.table_name().to_string(),
+            message: format!("failed to decode write-back marker primary keys: {e}"),
+        })
+    }
+
+    /// The primary-key column names in key order (for the delivery adapter).
+    #[must_use]
+    pub fn pk_column_names(&self) -> Vec<String> {
+        let schema = self.table_schema();
+        self.pk_column_indices
+            .iter()
+            .filter_map(|&i| schema.fields().get(i).map(|f| f.name().clone()))
+            .collect()
     }
 
     /// Get the table metadata.
@@ -5408,9 +5583,17 @@ impl CayenneTableProvider {
         // `cdc_apply_fixed_cost_ms{phase="write"}` in the runtime apply loop). The
         // `cayenne_encode_acquire_wait_ms{class}` histogram inside `acquire_from`
         // carries the same signal without the table label; this one keys by table.
+        // Coupled writers (partition child tables, fed by a shared routing
+        // demux) bypass the budget entirely — parking a coupled write here
+        // deadlocks the demux against the permit holders (see `write_budget`
+        // module docs; spiceai/spiceai#11818).
         let encode_permit_wait_start = Instant::now();
-        let _encode_permits =
-            super::write_budget::acquire_encode_permits(encode_shards, write_class).await;
+        let _encode_permits = super::write_budget::acquire_encode_permits(
+            encode_shards,
+            write_class,
+            self.context.is_coupled_writer(),
+        )
+        .await;
         record_cayenne_write_phase(
             self.table_name(),
             "encode_permit_wait",
@@ -5434,13 +5617,17 @@ impl CayenneTableProvider {
         // regardless of `target_partitions` (see `snapshot_shard_count`).
         //
         // Delta writes additionally resolve a `cayenne_delta_encoding` level:
-        // under `auto` every delta encodes with a light scheme set (skipping the
+        // small fresh deltas encode with a light scheme set (skipping the
         // per-file BtrBlocks strategy search + FSST training that dominate
-        // encode cost) and is re-encoded properly when compaction folds it.
-        // Maintenance writes (compaction, rewrites, overwrites) always use the
-        // full default strategy. See `provider::delta_encoding`.
-        let encoding_level =
-            super::delta_encoding::effective_level(self.context.delta_encoding(), write_class);
+        // small-write encode cost) and are re-encoded properly when compaction
+        // folds them. Maintenance writes (compaction, rewrites, overwrites)
+        // always use the full default strategy. See `provider::delta_encoding`.
+        let encoding_level = super::delta_encoding::effective_level(
+            self.context.delta_encoding(),
+            write_class,
+            estimated_bytes,
+            target_size_bytes,
+        );
         let write_format = match super::delta_encoding::strategy_builder_for_level(encoding_level) {
             Some(strategy) => self.context.write_format_with_strategy(
                 strategy,
@@ -5504,7 +5691,7 @@ impl CayenneTableProvider {
 
         // Log when starting S3 upload process
         if is_s3_storage {
-            tracing::info!(
+            tracing::debug!(
                 "Starting S3 upload to snapshot {} for table {} (writer target file size: {})",
                 snapshot_id,
                 self.table_metadata.table_name,
@@ -5562,7 +5749,7 @@ impl CayenneTableProvider {
                         } else {
                             "calculating...".to_string()
                         };
-                        tracing::info!(
+                        tracing::debug!(
                             "S3 upload for {}: streamed {} in {:.1}s, {}",
                             table_name,
                             format_bytes(bytes_so_far),
@@ -5617,7 +5804,7 @@ impl CayenneTableProvider {
             } else {
                 "N/A".to_string()
             };
-            tracing::info!(
+            tracing::debug!(
                 "Completed S3 upload for {} to snapshot {}: {} rows across {} writer operation(s) ({}) in {:.1}s, {}",
                 self.table_metadata.table_name,
                 snapshot_id,
@@ -5979,6 +6166,7 @@ impl CayenneTableProvider {
             pk_deletion_strategy: self.pk_deletion_strategy.clone(),
             pk_row_converter: self.pk_row_converter.as_ref().map(Arc::clone),
             pk_column_indices: self.pk_column_indices.clone(),
+            durable_write_back: self.durable_write_back,
             write_lock: Arc::clone(&self.write_lock), // Shared across all clones for same table
             visibility_lock: Arc::clone(&self.visibility_lock),
             scan_state_lock: Arc::clone(&self.scan_state_lock),
@@ -5996,6 +6184,7 @@ impl CayenneTableProvider {
             ),
             pk_keyset_cache: Arc::clone(&self.pk_keyset_cache),
             sharded_pk_keyset_cache: Arc::clone(&self.sharded_pk_keyset_cache),
+            pk_keyset_occ_degraded: Arc::clone(&self.pk_keyset_occ_degraded),
             cold_pk_existence: Arc::clone(&self.cold_pk_existence),
             table_memory: Arc::clone(&self.table_memory),
             inline_checkpoint_scheduled: Arc::clone(&self.inline_checkpoint_scheduled),
@@ -6113,7 +6302,7 @@ impl CayenneTableProvider {
     /// sound compaction cutoff — a rewrite scan taken after this read sees every
     /// mutation `<= cutoff`, and mutations that arrive afterward (`> cutoff`) are
     /// carried forward rather than cleared.
-    async fn sequence_high_water(&self) -> i64 {
+    pub(crate) async fn sequence_high_water(&self) -> i64 {
         self.seq_allocator.lock().await.next - 1
     }
 
@@ -6430,6 +6619,12 @@ impl CayenneTableProvider {
                         "Skipping primary-key keyset cache because it exceeds the configured byte budget"
                     );
                     *self.pk_keyset_cache.lock() = None;
+                    // Full invalidation: the next access rebuilds a trustworthy
+                    // keyset (floor-stamped, or a Bloom that takes the per-table
+                    // fallback), so clear any degraded flag or it would stay stuck
+                    // `true` and force per-table OCC forever (over-abort). Same
+                    // reasoning as `clear_cached_pk_keyset`.
+                    self.pk_keyset_occ_degraded.store(false, Ordering::Release);
                     self.table_memory.set_keyset_bytes(0);
                     return;
                 }
@@ -6442,8 +6637,32 @@ impl CayenneTableProvider {
         self.table_memory.set_keyset_bytes(bytes);
     }
 
+    /// Degrade per-key transaction OCC to the conservative per-table high-water
+    /// check until the next keyset rebuild. Called when an event leaves the
+    /// shared Exact keyset with a stale or missing per-key sequence stamp (see
+    /// [`Self::pk_keyset_occ_degraded`]). Idempotent; never a correctness risk —
+    /// it can only turn a per-key check into an over-abort.
+    ///
+    /// `Release` (paired with the `Acquire` load in `transaction_has_conflict`):
+    /// the primary happens-before for this flag comes from the locks both the
+    /// setters and the reader hold (the `pk_keyset_cache` mutex at the drop site,
+    /// `write_lock` on the CDC-apply setters and the commit-time reader), but one
+    /// setter (`StagingReceipt::publish_validated_file_keys`'s no-sequence path)
+    /// runs outside those locks, so the flag carries its own release/acquire
+    /// ordering rather than relying on a lock being co-held in every case.
+    pub(crate) fn mark_pk_keyset_occ_degraded(&self) {
+        self.pk_keyset_occ_degraded.store(true, Ordering::Release);
+    }
+
     pub(crate) fn clear_cached_pk_keyset(&self) {
         *self.pk_keyset_cache.lock() = None;
+        // The keyset is gone: while it is `None`, `transaction_has_conflict`
+        // already takes the per-table fallback, and the next rebuild floor-stamps
+        // every key to the current high-water (`load_existing_keyset`) or returns
+        // a Bloom (also per-table fallback). Either way the stale stamps that set
+        // the degraded flag cannot survive, so clear it here. `Release` pairs with
+        // the `Acquire` load in `transaction_has_conflict` (see the setter above).
+        self.pk_keyset_occ_degraded.store(false, Ordering::Release);
         // Invalidate the N>1 sharded cache in lockstep — every event that
         // invalidates the single keyset (delete, compaction, snapshot rewrite,
         // recovery) equally invalidates the sharded view. At N=1 the sharded cache
@@ -6496,7 +6715,12 @@ impl CayenneTableProvider {
         }
     }
 
-    fn record_pk_keys_with_location(&self, keys: &PkDigestSet, location: &RowLocation) {
+    fn record_pk_keys_with_location(
+        &self,
+        keys: &PkDigestSet,
+        location: &RowLocation,
+        sequence: i64,
+    ) {
         if keys.is_empty() {
             return;
         }
@@ -6506,6 +6730,14 @@ impl CayenneTableProvider {
         // Take ownership so an over-budget Exact keyset can be replaced by a
         // bloom without a borrow conflict; the index is restored before return.
         let Some(mut index) = guard.take() else {
+            // The shared keyset is checked out by a concurrent writer, so this
+            // committed write's key stamps (and existence entries) are dropped on
+            // the floor. A later per-key OCC check against the eventually
+            // stored-back keyset would then miss this write (it is floor-stamped
+            // to the CONCURRENT writer's begin high-water, which is below this
+            // write's sequence) — a silent lost update. Degrade to the per-table
+            // fallback until the next rebuild floor-stamps past this sequence.
+            self.mark_pk_keyset_occ_degraded();
             return;
         };
 
@@ -6530,7 +6762,10 @@ impl CayenneTableProvider {
                             convert_to_bloom = true;
                             break;
                         }
-                        PkKeysetInsertOutcome::Updated | PkKeysetInsertOutcome::Inserted => {}
+                        PkKeysetInsertOutcome::Updated | PkKeysetInsertOutcome::Inserted => {
+                            // Stamp the key's last-commit sequence for per-key OCC.
+                            keyset.record_sequence(digest, sequence);
+                        }
                     }
                 }
             }
@@ -6559,7 +6794,11 @@ impl CayenneTableProvider {
                     max_bytes,
                     "Clearing primary-key keyset cache because the write would exceed the byte budget"
                 );
-                // `guard` already holds None from the take() above.
+                // `guard` already holds None from the take() above. Full
+                // invalidation → the next rebuild is trustworthy (floor-stamped or
+                // Bloom), so clear any degraded flag rather than leave it stuck
+                // `true` across the rebuild (see `clear_cached_pk_keyset`).
+                self.pk_keyset_occ_degraded.store(false, Ordering::Release);
                 self.table_memory.set_keyset_bytes(0);
                 return;
             }
@@ -6570,8 +6809,8 @@ impl CayenneTableProvider {
         self.table_memory.set_keyset_bytes(bytes);
     }
 
-    pub(crate) fn record_inlined_pk_keys(&self, keys: &PkDigestSet) {
-        self.record_pk_keys_with_location(keys, &RowLocation::Inlined);
+    pub(crate) fn record_inlined_pk_keys(&self, keys: &PkDigestSet, sequence: i64) {
+        self.record_pk_keys_with_location(keys, &RowLocation::Inlined, sequence);
     }
 
     /// Store the per-shard PK index back into the sharded cache after validation
@@ -6587,8 +6826,51 @@ impl CayenneTableProvider {
         self.table_memory.set_keyset_bytes(bytes);
     }
 
-    pub(crate) fn record_file_pk_keys(&self, keys: &PkDigestSet) {
-        self.record_pk_keys_with_location(keys, &RowLocation::FileUnlocated);
+    pub(crate) fn record_file_pk_keys(&self, keys: &PkDigestSet, sequence: i64) {
+        self.record_pk_keys_with_location(keys, &RowLocation::FileUnlocated, sequence);
+    }
+
+    /// Per-key optimistic-concurrency re-check for a transaction commit, run
+    /// under `write_lock`. Returns `true` (→ abort with a write conflict) iff a
+    /// key in the read footprint or the write-set was committed after the
+    /// transaction's begin high-water `stage_seq`.
+    ///
+    /// When per-key state is unavailable — an incomplete footprint (a read
+    /// without a bounded PK predicate) or a bloomed / cleared keyset — it falls
+    /// back to the conservative per-table check (`current_high_water !=
+    /// stage_seq`), which aborts on any concurrent commit to the table.
+    pub(crate) fn transaction_has_conflict(
+        &self,
+        stage_seq: i64,
+        footprint: &std::collections::HashSet<u128>,
+        footprint_complete: bool,
+        write_set: &PkDigestSet,
+        current_high_water: i64,
+    ) -> bool {
+        let guard = self.pk_keyset_cache.lock();
+        match guard.as_ref() {
+            // Trust the per-key stamps ONLY when the keyset is Exact, the
+            // footprint is fully bounded, AND the keyset is not degraded — a
+            // dropped / stale / unstamped entry (see `pk_keyset_occ_degraded`)
+            // would otherwise let this check miss a real conflict.
+            Some(CachedPkIndex::Exact(keyset))
+                if footprint_complete && !self.pk_keyset_occ_degraded.load(Ordering::Acquire) =>
+            {
+                let write_digests = write_set.iter_with_digest().map(|(digest, _)| digest);
+                footprint
+                    .iter()
+                    .copied()
+                    .chain(write_digests)
+                    .any(|digest| {
+                        keyset
+                            .sequence_by_digest(digest)
+                            .is_some_and(|seq| seq > stage_seq)
+                    })
+            }
+            // Bloom / cleared / degraded keyset, or an incomplete footprint:
+            // conservative per-table fallback.
+            _ => current_high_water != stage_seq,
+        }
     }
 
     /// Whether this table should capture file-local row positions for upsert
@@ -7138,7 +7420,7 @@ impl CayenneTableProvider {
                 &mut row_id_base,
             )
             .await?;
-            tracing::info!(
+            tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 cold_keys_folded = keyset.len().saturating_sub(keys_before),
@@ -7159,6 +7441,14 @@ impl CayenneTableProvider {
 
         // Finally fold in the un-checkpointed mem-tier keys (snapshotted at the top).
         Self::fold_mem_tier_keys_into_keyset(&mem_snapshots, pk_indices, converter, &mut keyset)?;
+
+        // Floor every rebuilt entry's per-key OCC sequence at the end-of-scan
+        // high-water. A commit that landed during the rebuild may not be
+        // reflected in the scanned keys, so any transaction that began before
+        // this rebuild must conservatively treat these keys as changed —
+        // stamping the end high-water makes the commit-time per-key check
+        // over-abort rather than miss the conflict (a silent lost update).
+        keyset.stamp_all_sequences_min(self.sequence_high_water().await);
 
         Ok(keyset)
     }
@@ -7690,6 +7980,27 @@ impl CayenneTableProvider {
         &self,
         stream: SendableRecordBatchStream,
     ) -> Result<PreparedInsertStream> {
+        self.prepare_stream_for_insert_inner(stream, false).await
+    }
+
+    /// Off-lock variant for conditional-commit staging: validates against a
+    /// **private** keyset (never taken from, nor stored back to, the shared PK
+    /// index cache), so it is safe to run WITHOUT holding `write_lock` while
+    /// ordinary writers concurrently update the shared cache. Optimistic
+    /// concurrency is re-checked at commit; a private keyset that is stale by
+    /// commit is caught there (the transaction's sequence gate aborts).
+    pub(crate) async fn prepare_stream_for_insert_offlock(
+        &self,
+        stream: SendableRecordBatchStream,
+    ) -> Result<PreparedInsertStream> {
+        self.prepare_stream_for_insert_inner(stream, true).await
+    }
+
+    async fn prepare_stream_for_insert_inner(
+        &self,
+        stream: SendableRecordBatchStream,
+        offlock: bool,
+    ) -> Result<PreparedInsertStream> {
         let Some(pk_indices) = self.primary_key_indices()? else {
             return Ok(PreparedInsertStream::immediate(stream));
         };
@@ -7708,7 +8019,13 @@ impl CayenneTableProvider {
         }
 
         let converter = self.build_pk_converter(&pk_indices)?;
-        let existing_keys = if let Some(existing_keys) = self.take_cached_pk_index() {
+        // Off-lock staging must NOT take/store the shared cache (it runs without
+        // `write_lock`); it builds a private keyset every time. The ordinary path
+        // reuses the shared cache and stores it back on finish.
+        let existing_keys = if offlock {
+            self.load_pk_index_for_validation(&pk_indices, &converter)
+                .await?
+        } else if let Some(existing_keys) = self.take_cached_pk_index() {
             tracing::trace!(
                 "prepare_stream_for_insert: reused {} cached existing keys for table {}",
                 existing_keys.len(),
@@ -7716,50 +8033,8 @@ impl CayenneTableProvider {
             );
             existing_keys
         } else {
-            // The full-table keyset rebuild is the dominant CDC-upsert cost for
-            // tables whose keyset exceeds the cache budget, yet it runs *before*
-            // the `vortex_write` phase timer and is otherwise invisible in
-            // per-phase telemetry. Time it explicitly (emitted only on a cache
-            // miss / cold rebuild) so retests attribute the cost correctly.
-            let keyset_rebuild_start = Instant::now();
-            // Resolve the datalake (cold) tier contribution first (rebuilds the
-            // cold PK existence bloom from the manifest, no object-store I/O).
-            // `Bloom` skips the cold scan; `Scan` forces a full rebuild (the
-            // warm-only checkpoint can't cover the incomplete-bloom case).
-            let cold_source = self.resolve_cold_keyset_source().await?;
-            let fold_cold = !matches!(cold_source, ColdKeysetSource::Bloom);
-            let allow_checkpoint = !matches!(cold_source, ColdKeysetSource::Scan);
-            // Fast path: reconstruct the index from the persisted bloom checkpoint
-            // (+ bounded post-checkpoint delta) and skip the full-table keyset
-            // scan. Falls back to the full scan on any miss/mismatch/corruption.
-            let existing_keys = if allow_checkpoint {
-                match self
-                    .try_load_persisted_pk_index(&pk_indices, &converter)
-                    .await
-                {
-                    Ok(Some(index)) => index,
-                    _ => CachedPkIndex::Exact(
-                        self.load_existing_keyset(&pk_indices, &converter, fold_cold)
-                            .await?,
-                    ),
-                }
-            } else {
-                CachedPkIndex::Exact(
-                    self.load_existing_keyset(&pk_indices, &converter, fold_cold)
-                        .await?,
-                )
-            };
-            record_cayenne_write_phase(
-                self.table_metadata.table_name.as_str(),
-                "keyset_rebuild",
-                keyset_rebuild_start,
-            );
-            tracing::debug!(
-                "prepare_stream_for_insert: loaded {} existing keys for table {}",
-                existing_keys.len(),
-                self.table_metadata.table_name
-            );
-            existing_keys
+            self.load_pk_index_for_validation(&pk_indices, &converter)
+                .await?
         };
 
         let on_conflict = self
@@ -7778,6 +8053,9 @@ impl CayenneTableProvider {
             existing_keys,
             on_conflict,
             Arc::clone(&post_validation),
+            // Ordinary path returns the keyset to the shared cache; off-lock
+            // staging drops its private keyset (never publishes it).
+            !offlock,
         );
 
         Ok(PreparedInsertStream::deferred(
@@ -7785,6 +8063,60 @@ impl CayenneTableProvider {
             post_validation,
             may_have_on_conflict_deletions,
         ))
+    }
+
+    /// Build a fresh PK existence index for validation from the persisted bloom
+    /// checkpoint (+ bounded delta) or, failing that, a full keyset scan. Does
+    /// not touch the shared cache — callers decide whether to store it back.
+    async fn load_pk_index_for_validation(
+        &self,
+        pk_indices: &[usize],
+        converter: &RowConverter,
+    ) -> Result<CachedPkIndex> {
+        // The full-table keyset rebuild is the dominant CDC-upsert cost for
+        // tables whose keyset exceeds the cache budget, yet it runs *before*
+        // the `vortex_write` phase timer and is otherwise invisible in
+        // per-phase telemetry. Time it explicitly (emitted only on a cache
+        // miss / cold rebuild) so retests attribute the cost correctly.
+        let keyset_rebuild_start = Instant::now();
+        // Resolve the datalake (cold) tier contribution first (rebuilds the
+        // cold PK existence bloom from the manifest, no object-store I/O).
+        // `Bloom` skips the cold scan; `Scan` forces a full rebuild (the
+        // warm-only checkpoint can't cover the incomplete-bloom case).
+        let cold_source = self.resolve_cold_keyset_source().await?;
+        let fold_cold = !matches!(cold_source, ColdKeysetSource::Bloom);
+        let allow_checkpoint = !matches!(cold_source, ColdKeysetSource::Scan);
+        // Fast path: reconstruct the index from the persisted bloom checkpoint
+        // (+ bounded post-checkpoint delta) and skip the full-table keyset
+        // scan. Falls back to the full scan on any miss/mismatch/corruption.
+        let existing_keys = if allow_checkpoint {
+            match self
+                .try_load_persisted_pk_index(pk_indices, converter)
+                .await
+            {
+                Ok(Some(index)) => index,
+                _ => CachedPkIndex::Exact(
+                    self.load_existing_keyset(pk_indices, converter, fold_cold)
+                        .await?,
+                ),
+            }
+        } else {
+            CachedPkIndex::Exact(
+                self.load_existing_keyset(pk_indices, converter, fold_cold)
+                    .await?,
+            )
+        };
+        record_cayenne_write_phase(
+            self.table_metadata.table_name.as_str(),
+            "keyset_rebuild",
+            keyset_rebuild_start,
+        );
+        tracing::debug!(
+            "prepare_stream_for_insert: loaded {} existing keys for table {}",
+            existing_keys.len(),
+            self.table_metadata.table_name
+        );
+        Ok(existing_keys)
     }
 
     /// Sharded analog of [`Self::prepare_stream_for_insert`] for the N>1 in-memory
@@ -8056,7 +8388,8 @@ impl CayenneTableProvider {
                     }
                     PkDeletionSnapshot::RowConverterBased { tombstones } => {
                         if tombstones.get(key.as_ref()).is_some() {
-                            let row_key = key.as_ref().to_vec().into_boxed_slice();
+                            // Box::from once, then clone for the dual-list push (file + inline).
+                            let row_key = bytes_key(key.as_ref());
                             deleted_row_keys.push(row_key.clone());
                             deleted_inlined_row_keys.push(row_key);
                             *reinserted_over_tombstone += 1;
@@ -8096,7 +8429,7 @@ impl CayenneTableProvider {
                         }
                     }
                     PkDeletionStrategyWithCache::RowConverterBased { .. } => {
-                        let row_key = key.as_ref().to_vec().into_boxed_slice();
+                        let row_key = bytes_key(key.as_ref());
                         deleted_row_keys.push(row_key.clone());
                         deleted_inlined_row_keys.push(row_key);
                     }
@@ -8200,7 +8533,7 @@ impl CayenneTableProvider {
                                         // `commit_on_conflict_deletions` catalog call without a second
                                         // re-encoding. This is one allocation per conflict row; the
                                         // arena-indexed key design discussed in iter 3 would amortize it.
-                                        let row_key = key.as_ref().to_vec().into_boxed_slice();
+                                        let row_key = bytes_key(key.as_ref());
                                         if is_inlined_conflict {
                                             deleted_inlined_row_keys.push(row_key);
                                         } else {
@@ -8293,7 +8626,7 @@ impl CayenneTableProvider {
                                 }
                             }
                             PkDeletionStrategyWithCache::RowConverterBased { .. } => {
-                                let row_key = key.as_ref().to_vec().into_boxed_slice();
+                                let row_key = bytes_key(key.as_ref());
                                 deleted_row_keys.push(row_key.clone());
                                 deleted_inlined_row_keys.push(row_key);
                             }
@@ -9482,12 +9815,9 @@ impl CayenneTableProvider {
         match &self.pk_deletion_strategy {
             // Int64 PK tables re-derive keys from the i64 PKs and ignore the
             // encoded row keys, so this allocates only when it must.
-            PkDeletionStrategyWithCache::Int64Pk { .. } => Cow::Owned(
-                deleted_pk_i64
-                    .iter()
-                    .map(|&pk| pk.to_be_bytes().to_vec().into_boxed_slice())
-                    .collect(),
-            ),
+            PkDeletionStrategyWithCache::Int64Pk { .. } => {
+                Cow::Owned(deleted_pk_i64.iter().map(|&pk| i64_key(pk)).collect())
+            }
             // RowConverter tables reuse the caller's keys verbatim: a borrowed
             // slice stays borrowed (no clone), an owned Vec is moved through.
             PkDeletionStrategyWithCache::RowConverterBased { .. } => deleted_row_keys,
@@ -9616,10 +9946,7 @@ impl CayenneTableProvider {
                     // which replays this delta under `rcu` against the live index —
                     // so no `load_full` of the deletion snapshot here.
                     for (&delete_sequence, pks) in &pure_by_seq {
-                        let row_keys = pks
-                            .iter()
-                            .map(|pk| pk.to_be_bytes().to_vec().into_boxed_slice())
-                            .collect::<Vec<_>>();
+                        let row_keys = pks.iter().copied().map(i64_key).collect::<Vec<_>>();
                         if let Some(results) = self
                             .write_key_deletion_vectors(delete_sequence, row_keys)
                             .await?
@@ -9629,10 +9956,7 @@ impl CayenneTableProvider {
                         }
                     }
                     for (&delete_sequence, pks) in &reinsert_by_seq {
-                        let row_keys = pks
-                            .iter()
-                            .map(|pk| pk.to_be_bytes().to_vec().into_boxed_slice())
-                            .collect::<Vec<_>>();
+                        let row_keys = pks.iter().copied().map(i64_key).collect::<Vec<_>>();
                         if let Some(results) = self
                             .write_key_deletion_vectors(delete_sequence, row_keys)
                             .await?
@@ -11122,7 +11446,7 @@ impl CayenneTableProvider {
             return Ok(());
         }
 
-        tracing::info!(
+        tracing::debug!(
             "Sorting and rewriting data for table {} by columns {:?}",
             self.table_metadata.table_name,
             self.context.sort_columns()
@@ -11294,7 +11618,7 @@ impl CayenneTableProvider {
         // Old snapshot directories are cleaned up in the background
         self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
 
-        tracing::info!(
+        tracing::debug!(
             "Rewrote {} rows in {} sorted chunk(s) for table {}",
             total_rows,
             chunk_count,
@@ -11678,7 +12002,7 @@ impl CayenneTableProvider {
         let mut orphaned_ids: Vec<String> = Vec::with_capacity(missing.len());
         for m in missing {
             if m.sequence_number <= floor {
-                tracing::info!(
+                tracing::warn!(
                     table_id,
                     path = %m.path,
                     sequence = m.sequence_number,
@@ -12281,7 +12605,7 @@ impl CayenneTableProvider {
             return Ok(false);
         };
 
-        tracing::info!(
+        tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             tier = candidate.tier.as_str(),
@@ -12298,7 +12622,7 @@ impl CayenneTableProvider {
         self.rewrite_current_snapshot_for_compaction_tracked()
             .await?;
 
-        tracing::info!(
+        tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             tier = candidate.tier.as_str(),
@@ -12376,7 +12700,7 @@ impl CayenneTableProvider {
             SnapshotMaintenanceTrigger::ProtectedSnapshotCount {
                 protected_snapshot_count,
                 trigger_count,
-            } => tracing::info!(
+            } => tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 protected_snapshot_count,
@@ -12387,7 +12711,7 @@ impl CayenneTableProvider {
                 protected_snapshot_count,
                 oldest_snapshot_age,
                 trigger_age,
-            } => tracing::info!(
+            } => tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 protected_snapshot_count,
@@ -12398,7 +12722,7 @@ impl CayenneTableProvider {
             SnapshotMaintenanceTrigger::SmallFileCount {
                 number_picker_candidate_files: files,
                 compaction_trigger_files: trigger,
-            } => tracing::info!(
+            } => tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 small_files = files,
@@ -13462,7 +13786,7 @@ impl CayenneTableProvider {
         };
 
         if self.context.has_sort_columns() {
-            tracing::info!(
+            tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 sort_columns = ?self.context.sort_columns(),
@@ -13785,7 +14109,7 @@ impl CayenneTableProvider {
         // so the at-risk window (plan-build → plan-execute) closes naturally.
         self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
 
-        tracing::info!(
+        tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             rows = total_rows,
@@ -13844,17 +14168,25 @@ impl CayenneTableProvider {
     }
 
     /// Z-order (Morton) cluster a stream by appending a transient interleaved-bits
-    /// key column, sorting on it via the proven external `SortExec` path
-    /// (`util::stream_utils::sort_stream`, disk-spilling), then stripping the key.
-    /// Empty `clustering_indices` returns the stream unchanged.
+    /// key column, sorting on it in byte-bounded runs via
+    /// [`super::streaming::bounded_sort_stream`] (per-run `SortExec`:
+    /// pool-accounted, disk-spilling), then stripping the key. Bounding the
+    /// sort caps per-run memory and first-batch latency; Z-order ranges may
+    /// overlap across runs, which only weakens per-file min/max pruning
+    /// slightly — cold files advertise no ordering, so this is a
+    /// clustering-quality trade-off, not a correctness change. The run cap is
+    /// [`crate::metadata::VortexConfig::cold_clustering_run_size_bytes`],
+    /// measured on the augmented batches (key included — what `SortExec`
+    /// actually buffers). Empty `clustering_indices` returns the stream
+    /// unchanged.
     fn zorder_sort_stream(
         &self,
         stream: SendableRecordBatchStream,
         clustering_indices: Vec<usize>,
         task_ctx: &Arc<datafusion_execution::TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
+    ) -> SendableRecordBatchStream {
         if clustering_indices.is_empty() {
-            return Ok(stream);
+            return stream;
         }
         let original_schema = stream.schema();
         let augmented_schema = super::zorder::zorder_augmented_schema(&original_schema);
@@ -13865,19 +14197,19 @@ impl CayenneTableProvider {
             Arc::clone(&augmented_schema),
             augmented,
         ));
-        let sort_cols = vec![super::zorder::ZORDER_COLUMN_NAME.to_string()];
-        let sorted = util::stream_utils::sort_stream(augmented_stream, &sort_cols, task_ctx)
-            .map_err(|e| Error::Internal {
-                table: self.table_metadata.table_name.clone(),
-                message: format!("cold-tier Z-order sort failed: {e}"),
-            })?;
+        let sorted = super::streaming::bounded_sort_stream(
+            &self.table_metadata.table_name,
+            augmented_stream,
+            vec![super::zorder::ZORDER_COLUMN_NAME.to_string()],
+            task_ctx,
+            self.table_metadata
+                .vortex_config
+                .cold_clustering_run_size_bytes(),
+        );
         let orig = Arc::clone(&original_schema);
         let stripped = sorted
             .map(move |res| res.and_then(|b| super::zorder::strip_zorder_key_column(&b, &orig)));
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            original_schema,
-            stripped,
-        )))
+        Box::pin(RecordBatchStreamAdapter::new(original_schema, stripped))
     }
 
     /// Per-file row cap so a file's PK bloom (~10 bits/key) stays within
@@ -13977,7 +14309,7 @@ impl CayenneTableProvider {
             // fresh per-write `write_id` UUID, so sequential writes never collide
             // (flat layout, identical to the single-write path).
             let row_cap = Self::cold_file_row_cap();
-            let source = super::streaming::RowChunkedSource::new(Arc::clone(&schema), stream);
+            let source = super::streaming::ChunkedSource::new(Arc::clone(&schema), stream);
             let mut chunk_idx: usize = 0;
             while !source.is_exhausted() {
                 if chunk_idx == 1 {
@@ -13987,15 +14319,16 @@ impl CayenneTableProvider {
                         table = self.table_metadata.table_name.as_str(),
                         cold_file_row_cap = row_cap,
                         bloom_cap_bytes = COLD_PK_BLOOM_PER_FILE_MAX_BYTES,
-                        "Cold-tier promotion is splitting output into multiple row-bounded files to keep each file's PK bloom within the per-file cap"
+                        "Splitting the moved data into multiple row-bounded files to keep each file's PK bloom within the per-file cap"
                     );
                 }
-                let chunk_stream: SendableRecordBatchStream = Box::pin(source.next_chunk(row_cap));
+                let chunk_stream: SendableRecordBatchStream =
+                    Box::pin(source.next_chunk(super::streaming::ChunkCap::Rows(row_cap)));
                 tracing::debug!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
                     chunk_idx,
-                    "Datalake promotion: cold chunk upload starting"
+                    "Datalake write: chunk upload starting"
                 );
                 let chunk_start = Instant::now();
                 self.insert_stream_into_cold_dir(
@@ -14010,7 +14343,7 @@ impl CayenneTableProvider {
                     table = self.table_metadata.table_name.as_str(),
                     chunk_idx,
                     duration_ms = chunk_start.elapsed().as_millis(),
-                    "Datalake promotion: cold chunk upload complete"
+                    "Datalake write: chunk upload complete"
                 );
                 chunk_idx = chunk_idx.saturating_add(1);
             }
@@ -14018,7 +14351,7 @@ impl CayenneTableProvider {
             tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
-                "Datalake promotion: cold upload starting (single stream)"
+                "Datalake write: upload starting (single stream)"
             );
             self.insert_stream_into_cold_dir(
                 session_state.as_ref(),
@@ -14441,7 +14774,7 @@ impl CayenneTableProvider {
                 warm_files,
                 max_bytes = vc.cold_tier_warm_max_bytes,
                 max_files = vc.cold_tier_warm_max_files,
-                "Datalake promotion skipped; warm tier below thresholds"
+                "Datalake tiering evaluation completed; no tier transition required"
             );
             return Ok(false);
         }
@@ -14450,9 +14783,12 @@ impl CayenneTableProvider {
         tracing::info!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
+            source_tier = "warm",
+            target_tier = "datalake",
+            clustering = "z_order",
             warm_bytes,
             warm_files,
-            "Promoting warm tier to datalake store (Z-order clustered graduation)"
+            "Moving warm-tier data to the datalake (Z-order clustered)"
         );
 
         // Exclude writers for the whole graduation (mirrors begin_overwrite).
@@ -14466,7 +14802,7 @@ impl CayenneTableProvider {
         {
             return Err(Error::Internal {
                 table: self.table_metadata.table_name.clone(),
-                message: "Timed out draining in-flight staged writes before datalake promotion; warm tier left intact (next tick retries)"
+                message: "Timed out draining in-flight staged writes before moving data to the datalake; warm tier left intact (next cycle retries)"
                     .to_string(),
             });
         }
@@ -14500,7 +14836,7 @@ impl CayenneTableProvider {
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
                     %error,
-                    "Carry-forward classification failed; skipping this promotion pass (next tick retries)"
+                    "Carry-forward classification failed; skipping this data move (next cycle retries)"
                 );
                 return Ok(false);
             }
@@ -14538,13 +14874,13 @@ impl CayenneTableProvider {
         tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
-            "Datalake promotion: visible cross-tier stream planned"
+            "Planned the cross-tier read stream for the data move"
         );
 
         // Z-order cluster for a read-optimized cold layout.
         let clustering = self.resolve_cold_clustering_indices();
         let task_ctx = ctx.task_ctx();
-        let stream = self.zorder_sort_stream(stream, clustering, &task_ctx)?;
+        let stream = self.zorder_sort_stream(stream, clustering, &task_ctx);
 
         // Write the clustered, deletes-applied rows to the cold object store.
         let (cold_files, total_rows) = self
@@ -14560,7 +14896,7 @@ impl CayenneTableProvider {
             table = self.table_metadata.table_name.as_str(),
             files = cold_files.len(),
             total_rows,
-            "Datalake promotion: cold store write complete"
+            "Datalake write complete"
         );
         if cold_files.is_empty() && dirty_cold.is_empty() {
             // Nothing rewritten and nothing to drop. Gate on files-written, not
@@ -14612,7 +14948,7 @@ impl CayenneTableProvider {
         tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
-            "Datalake promotion: committing cold manifest + snapshot flip under fence"
+            "Committing the datalake manifest + snapshot flip under fence"
         );
         {
             let _fence = self.listing_fence.write().await;
@@ -14630,7 +14966,7 @@ impl CayenneTableProvider {
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 %error,
-                "Failed to prune stale manifest rows after cold-tier promotion"
+                "Failed to prune stale manifest rows after moving data to the datalake"
             );
         }
         self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
@@ -14657,7 +14993,7 @@ impl CayenneTableProvider {
         // files selected for rewrite — lower is better.
         let rewritten_datalake_files = dirty_cold.len();
         let datalake_rewrite_selectivity = if prior_cold_len == 0 {
-            "n/a (first promotion, no existing datalake files)".to_string()
+            "n/a (first move, no existing datalake files)".to_string()
         } else {
             #[expect(
                 clippy::cast_precision_loss,
@@ -14671,6 +15007,8 @@ impl CayenneTableProvider {
         tracing::info!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
+            source_tier = "warm",
+            target_tier = "datalake",
             datalake_rewrite_selectivity = %datalake_rewrite_selectivity,
             warm_files,
             warm_bytes,
@@ -14680,7 +15018,7 @@ impl CayenneTableProvider {
             written_bytes,
             total_rows,
             duration_ms = u64::try_from(promotion_start.elapsed().as_millis()).unwrap_or(u64::MAX),
-            "Datalake-tier promotion committed"
+            "Moved warm-tier data to the datalake"
         );
         Ok(true)
     }
@@ -14980,7 +15318,7 @@ impl CayenneTableProvider {
             PROTECTED_TIER_GROWTH,
         );
 
-        tracing::info!(
+        tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             input_count = inputs.len(),
@@ -15210,10 +15548,10 @@ impl CayenneTableProvider {
             // the Phase-1 capture detects every such interleaving.
             if self.get_current_snapshot_id() != snapshot_at_capture {
                 drop(fence);
-                tracing::info!(
+                tracing::debug!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
-                    "Subset-merge in-memory publish skipped: the table snapshot was replaced mid-pass (overwrite/promotion); discarding the merged output"
+                    "Subset-merge in-memory publish skipped: the table snapshot was replaced mid-pass (overwrite or datalake move); discarding the merged output"
                 );
                 self.retire_snapshot_dirs(std::iter::once(new_snapshot_id.as_str()));
                 self.sweep_retired_snapshot_dirs();
@@ -15251,7 +15589,7 @@ impl CayenneTableProvider {
             self.evict_compaction_input_pages(&old_ids).await;
         }
 
-        tracing::info!(
+        tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             merged_inputs = inputs.len(),
@@ -15546,7 +15884,7 @@ impl CayenneTableProvider {
         // one selected file, so it is a real sequence.
         let prefix_cutoff = cutoff;
 
-        tracing::info!(
+        tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             input_count = selected.len(),
@@ -15766,10 +16104,10 @@ impl CayenneTableProvider {
             // pre-overwrite row set, and pruning would gut the fresh index.
             if self.get_current_snapshot_id() != snapshot_at_capture {
                 drop(fence);
-                tracing::info!(
+                tracing::debug!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
-                    "Seq-prefix bake in-memory publish skipped: the table snapshot was replaced mid-pass (overwrite/promotion); discarding the merged output"
+                    "Seq-prefix bake in-memory publish skipped: the table snapshot was replaced mid-pass (overwrite or datalake move); discarding the merged output"
                 );
                 self.retire_snapshot_dirs(std::iter::once(new_snapshot_id.as_str()));
                 self.sweep_retired_snapshot_dirs();
@@ -15789,7 +16127,7 @@ impl CayenneTableProvider {
         }
 
         if clean_prefix_holds {
-            tracing::info!(
+            tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 merged_inputs = selected.len(),
@@ -16539,13 +16877,13 @@ impl CayenneTableProvider {
             Arc::clone(&self.seq_allocator),
         );
 
-        let deleted_count =
-            sink.delete_from()
-                .await
-                .map_err(|err| CatalogError::InvalidOperation {
-                    message: "Failed to execute retention filters.".to_string(),
-                    source: err,
-                })?;
+        let deleted_count = sink
+            .delete_from(Arc::new(datafusion_execution::TaskContext::default()))
+            .await
+            .map_err(|err| CatalogError::InvalidOperation {
+                message: "Failed to execute retention filters.".to_string(),
+                source: err,
+            })?;
 
         // Refresh deletion cache after applying retention filters
         if deleted_count > 0 {
@@ -18923,7 +19261,7 @@ impl CayenneTableProvider {
         // `write_lock`, so the checkpoint capture must NOT re-acquire it (tokio
         // mutexes are not reentrant). The apply has not yet fanned out its shard
         // appends at spill time, so the capture is already atomic regardless.
-        self.checkpoint_mem_tier_holding_write_lock().await?;
+        self.checkpoint_mem_tier_holding_locks().await?;
         Ok(())
     }
 
@@ -19047,7 +19385,7 @@ impl CayenneTableProvider {
         // Reached only via `wait_for_budget_or_spill` from this table's own apply
         // (it self-spills as a backstop), which holds this table's `write_lock`, so
         // the capture must not re-acquire it.
-        self.checkpoint_mem_tier_holding_write_lock().await?;
+        self.checkpoint_mem_tier_holding_locks().await?;
         Ok(false)
     }
 
@@ -20027,44 +20365,117 @@ impl CayenneTableProvider {
         Ok(epoch)
     }
 
-    /// Checkpoint the in-memory CDC tier: encode the retained corpus to a durable
-    /// Vortex snapshot, clear the tier, then — and ONLY then — fire the
-    /// [`SlotAdvancer`] callback so the runtime advances the source slot to cover
-    /// every batch in the flushed epoch (the slot-deferral correctness contract).
+    /// GUARANTEED acquisition of `mem_checkpoint_lock` plus the N>1 capture
+    /// `write_lock`. Fast path when no writer is active; otherwise a fair queued
+    /// `write -> mem` fallback that cannot starve and cannot invert against the
+    /// spill/promotion (which hold `write_lock`, then await `mem_checkpoint_lock`).
+    async fn acquire_capture_locks_blocking(&self) -> MemTierCheckpointGuards {
+        let checkpoint = self.mem_checkpoint_lock_for_writer().lock_owned().await;
+        if self.mem_tier.shard_count() == 1 {
+            return MemTierCheckpointGuards::new(checkpoint, None);
+        }
+        // Fast path: take `write_lock` without queueing, never blocking on it while
+        // holding `mem_checkpoint_lock`.
+        if let Ok(write) = self.write_lock_arc().try_lock_owned() {
+            return MemTierCheckpointGuards::new(checkpoint, Some(write));
+        }
+        // Contended: drop `mem_checkpoint_lock` (avoiding the mem -> blocking-write
+        // inversion) and re-acquire in fair `write -> mem` order. This holds
+        // `write_lock` across the `mem_checkpoint_lock` wait, so a concurrent encode
+        // can briefly stall applies — bounded by one encode, and only on guaranteed
+        // callers off the hot path. `try_lock`-only cannot guarantee progress and a
+        // retry loop can starve; fair queued `write -> mem` is the only guaranteed,
+        // non-starving, deadlock-free shape.
+        drop(checkpoint);
+        let write = self.write_lock_arc().lock_owned().await;
+        let checkpoint = self.mem_checkpoint_lock_for_writer().lock_owned().await;
+        MemTierCheckpointGuards::new(checkpoint, Some(write))
+    }
+
+    /// BEST-EFFORT acquisition: `try_lock` both locks and give up (`None`) the
+    /// moment either is contended — never blocking, never stalling applies. Used by
+    /// the size-triggered periodic checkpoint that still has age headroom; it
+    /// retries next tick (and the write-path spill drains under sustained load).
+    fn try_acquire_capture_locks(&self) -> Option<MemTierCheckpointGuards> {
+        let Ok(checkpoint) = self.mem_checkpoint_lock_for_writer().try_lock_owned() else {
+            return None;
+        };
+        if self.mem_tier.shard_count() == 1 {
+            return Some(MemTierCheckpointGuards::new(checkpoint, None));
+        }
+        match self.write_lock_arc().try_lock_owned() {
+            Ok(write) => Some(MemTierCheckpointGuards::new(checkpoint, Some(write))),
+            // `checkpoint` drops here — never held while blocking on `write_lock`.
+            Err(_) => None,
+        }
+    }
+
+    /// Checkpoint the in-memory CDC tier to a durable Vortex snapshot, publish it,
+    /// clear the captured tier prefix, and only then advance the source slot.
+    /// GUARANTEED: waits (fairly) for the capture locks, so it always makes
+    /// progress. The complete lifecycle is serialized on `mem_checkpoint_lock` so
+    /// two snapshots can never encode the same captured corpus.
     ///
-    /// For the key/Int64 strategies this runs the durable encode + metastore
-    /// commit OUTSIDE the listing fence and takes the fence only for the cheap
-    /// in-memory visibility swap (two-phase; see the body), so concurrent CDC
-    /// appends do not stall on the checkpoint. The position-based strategy keeps
-    /// encode+swap under one held fence (it appends to the current snapshot). The
-    /// corpus comes from the RAM tier and the post-fence tail advances the slot
-    /// rather than clearing inline metastore rows.
+    /// # Errors
     ///
-    /// On ANY error before the durable fence commits, the slot is NOT advanced
-    /// (the deferred committers stay queued) and the error propagates up so the
-    /// refresh status flips to Error and the stream replays from the slot
-    /// (correctness item #4 — a failed checkpoint never advances).
+    /// Returns an error if snapshot encoding, metadata commit, visibility publish,
+    /// or tier clearing fails. The source slot is not advanced on failure.
     #[doc(hidden)]
     pub async fn checkpoint_mem_tier(&self) -> Result<u64> {
-        // Public entry: the caller does NOT hold `write_lock` (background tick,
-        // explicit/test checkpoints). At N>1 the all-shards-atomic capture must
-        // acquire `write_lock` so it sees all-of-an-apply's N shard appends or none
-        // (the torn-capture guard, §3.4 Fix 3); at N==1 a single `ArcSwap` store is
-        // atomic, so no `write_lock` is needed and the path is byte-identical.
-        self.checkpoint_mem_tier_inner(true).await
+        let mut guards = self.acquire_capture_locks_blocking().await;
+        // Keep `guards` alive so `mem_checkpoint_lock` spans the whole lifecycle;
+        // pass only the capture-scoped `write` guard to `inner`.
+        let write = guards.write.take();
+        self.checkpoint_mem_tier_inner(write).await
     }
 
-    /// `checkpoint_mem_tier` for callers that ALREADY hold this table's
-    /// `write_lock` (the inline-spill path inside an apply, and `evolve_schema_live`).
-    /// Such a caller has excluded every other apply, and at inline-spill time the
-    /// current apply has not yet fanned out its shard appends — so the capture is
-    /// already atomic and re-acquiring `write_lock` here would deadlock (tokio
-    /// mutexes are not reentrant). Identical otherwise.
-    pub(crate) async fn checkpoint_mem_tier_holding_write_lock(&self) -> Result<u64> {
-        self.checkpoint_mem_tier_inner(false).await
+    /// BEST-EFFORT counterpart to [`Self::checkpoint_mem_tier`]: returns
+    /// [`CheckpointAttempt::Busy`] instead of blocking when the capture locks are
+    /// contended. `Busy` never advances the source slot and is never reported as a
+    /// completed checkpoint.
+    async fn try_checkpoint_mem_tier(&self) -> Result<CheckpointAttempt> {
+        let Some(mut guards) = self.try_acquire_capture_locks() else {
+            return Ok(CheckpointAttempt::Busy);
+        };
+        // Keep `guards` alive across `inner`; pass only the `write` guard.
+        let write = guards.write.take();
+        let rows = self.checkpoint_mem_tier_inner(write).await?;
+        Ok(CheckpointAttempt::Completed(rows))
     }
 
-    async fn checkpoint_mem_tier_inner(&self, acquire_write_lock_for_capture: bool) -> Result<u64> {
+    /// Checkpoint for a caller that already holds `write_lock`, but does not hold
+    /// `mem_checkpoint_lock` (cold promotion). Serializing here prevents promotion
+    /// from recapturing a tier whose background checkpoint is still encoding.
+    async fn checkpoint_mem_tier_holding_write_lock(&self) -> Result<u64> {
+        let _checkpoint_guard = self.mem_checkpoint_lock_for_writer().lock_owned().await;
+        self.checkpoint_mem_tier_holding_locks().await
+    }
+
+    /// Checkpoint for a caller that already holds both `write_lock` and
+    /// `mem_checkpoint_lock` (write-path spill and schema evolution).
+    async fn checkpoint_mem_tier_holding_locks(&self) -> Result<u64> {
+        self.checkpoint_mem_tier_inner(None).await
+    }
+
+    /// `owned_capture_write_lock` decides who releases `write_lock` after the
+    /// all-shards-atomic capture — it is NOT a request to hold it longer:
+    ///
+    /// - `Some(guard)` — the capture is the ONLY reason `write_lock` was taken
+    ///   (the public background-tick / seal path acquired it just for the capture).
+    ///   This method OWNS the guard and drops it the instant capture completes, so
+    ///   the durable encode runs off `write_lock` and concurrent CDC applies flow
+    ///   in parallel. Only ever `Some` at N>1 (at N==1 the single-shard capture is
+    ///   atomic without `write_lock`).
+    /// - `None` — the CALLER already holds `write_lock` for a larger operation and
+    ///   keeps holding it across this checkpoint (write-path spill inside an apply,
+    ///   `evolve_schema_live`, cold promotion). This method has no guard to manage;
+    ///   the caller's lock stays held (those callers already exclude applies, so
+    ///   there is no off-lock parallelism to gain — and the guard is not ours to
+    ///   drop).
+    async fn checkpoint_mem_tier_inner(
+        &self,
+        mut owned_capture_write_lock: Option<tokio::sync::OwnedMutexGuard<()>>,
+    ) -> Result<u64> {
         // Memory mode (`mode: memory`) never checkpoints to Vortex — the mem-tier
         // is the permanent in-RAM store, so this is a no-op.
         if self.is_memory_resident_mode() {
@@ -20116,14 +20527,9 @@ impl CayenneTableProvider {
         // With no lock-across-await on the apply side, the clear's index-order
         // acquisition cannot form a cycle with an apply.
         //
-        // When the caller already holds `write_lock` (the inline-spill / `evolve_schema`
-        // path, `acquire_write_lock_for_capture == false`), this is `None` and the
-        // caller's lock correctly stays held through the whole checkpoint.
-        let mut capture_write_guard = if acquire_write_lock_for_capture && n > 1 {
-            Some(self.write_lock.lock().await)
-        } else {
-            None
-        };
+        // `owned_capture_write_lock` is Some only for the public N>1 path. A caller
+        // using `checkpoint_mem_tier_holding_locks` owns its write guard outside
+        // this method, so it passes None and retains that lock for its operation.
         let (shard_snapshots, flushed_counts, snapshot, durable_epoch, reserved_snapshot_sequence) = {
             // Acquire all shard publish locks in index order (deadlock-free).
             let mut guards = Vec::with_capacity(n);
@@ -20238,8 +20644,9 @@ impl CayenneTableProvider {
         // `snapshot_sequence`, which pins the ordering invariant — a post-capture
         // apply reserves strictly above it and its new segment is preserved by the
         // clear's `retain_after`. A no-op when the caller holds `write_lock`
-        // (spill/evolve): `capture_write_guard` is None.
-        drop(capture_write_guard.take());
+        // (spill/evolve/promotion): `owned_capture_write_lock` is None and the
+        // caller's guard stays held for the rest of its operation.
+        drop(owned_capture_write_lock.take());
         // Emptiness must be judged on the REAL captured shard snapshots, not the
         // synthetic union view: `union_snapshot_view` carries the cross-shard
         // tombstone union + the summed byte/row counts but ALWAYS has empty
@@ -20397,7 +20804,7 @@ impl CayenneTableProvider {
             .map(|b| b.get_array_memory_size() as u64)
             .fold(0u64, u64::saturating_add);
         let estimated_bytes = Some(estimated_flushed_bytes);
-        tracing::info!(
+        tracing::debug!(
             table = %self.table_metadata.table_name,
             rows = flushed_mem_rows,
             inlined_rows = total_rows.saturating_sub(flushed_mem_rows),
@@ -20734,28 +21141,27 @@ impl CayenneTableProvider {
             return Ok(0);
         }
         let n = self.mem_tier.shard_count();
-        // Single-drainer w.r.t. the bake: `mem_checkpoint_lock` is the same lock the
-        // periodic tick and the write-path spill hold around `checkpoint_mem_tier`,
-        // so a seal never races a checkpoint's `fire_slot_advancer`.
-        let _checkpoint = self.mem_checkpoint_lock.lock().await;
+        // A due seal must make progress even under sustained writes, so acquire the
+        // capture locks with the GUARANTEED fair path (not a skip): fast try, then a
+        // fair `write -> mem` queued fallback. Single-drainer w.r.t. the bake via
+        // `mem_checkpoint_lock`; the capture `write_lock` is released after capture.
+        let mut guards = self.acquire_capture_locks_blocking().await;
+        // Keep `guards` alive for the whole seal so `mem_checkpoint_lock` spans the
+        // lifecycle; take only the capture-scoped `write` guard.
+        let mut owned_capture_write_lock = guards.write.take();
 
         // === ALL-SHARDS-ATOMIC CAPTURE (mirrors `checkpoint_mem_tier_inner`) ===
         // At N>1 take `write_lock` so an apply's N shard appends are observed
         // ALL-OR-NONE (§3.4 Fix 3): a torn capture would let the MAX watermark ack an
         // apply_epoch not yet durable in every shard it touched → loss on crash. Then
         // all shard publish locks in index order (deadlock-free), mutually exclusive
-        // with every shard's append swap. Lock order is `mem_checkpoint → write →
-        // publish`, byte-identical to the checkpoint's, so a seal serializes cleanly
-        // against a bake (both on `mem_checkpoint_lock`) and reuses the checkpoint's
-        // exact, tested hierarchy. The durable encode/commit runs OUTSIDE these locks
-        // on the captured immutable snapshots, so concurrent applies keep flowing.
+        // with every shard's append swap. The coordinated helper above acquires the
+        // two outer locks without awaiting either while holding the other, so a seal
+        // serializes cleanly against a bake and a write-path spill. The durable
+        // encode/commit runs outside write_lock on the captured immutable snapshots,
+        // so concurrent applies keep flowing.
         // At N==1 no `write_lock` is taken (a single `ArcSwap` load is already atomic)
         // — byte-identical to the pre-sharding seal.
-        let mut capture_write_guard = if n > 1 {
-            Some(self.write_lock.lock().await)
-        } else {
-            None
-        };
         let (shard_snapshots, sealed_through, seal_epoch) = {
             let mut guards = Vec::with_capacity(n);
             for lock in self.mem_tier_publish_locks.iter() {
@@ -20770,7 +21176,7 @@ impl CayenneTableProvider {
             // Nothing to seal unless SOME shard has an active ingestion piece.
             if shard_snapshots.iter().all(|s| !s.has_unsealed_segments()) {
                 drop(guards);
-                drop(capture_write_guard.take());
+                drop(owned_capture_write_lock.take());
                 return Ok(0);
             }
             // Seal each shard's FULL current prefix. After this all-shards-atomic
@@ -20794,7 +21200,7 @@ impl CayenneTableProvider {
         // Release `write_lock` BEFORE the durable encode/commit so concurrent applies
         // run in parallel with the shadow write (the off-lock seal); everything below
         // reads only the captured immutable snapshots + the reserved seal sequence.
-        drop(capture_write_guard.take());
+        drop(owned_capture_write_lock.take());
 
         // === BUILD the union delta from the captured snapshots (off-lock) ===
         // Each shard's active piece as a delta view (tombstone/byte aggregates
@@ -21484,7 +21890,7 @@ impl CayenneTableProvider {
                 .store(stats.record_count, Ordering::Relaxed);
 
             if stats.entry_count > 0 {
-                tracing::info!(
+                tracing::debug!(
                     table = %self.table_metadata.table_name,
                     rows = stats.record_count,
                     segments = stats.entry_count,
@@ -21536,7 +21942,7 @@ impl CayenneTableProvider {
         } else {
             Vec::new()
         };
-        tracing::info!(
+        tracing::debug!(
             "Checkpointing {} inlined rows ({} batches) for table {}",
             total_rows,
             batches.len(),
@@ -21751,7 +22157,7 @@ impl CayenneTableProvider {
             return Ok(());
         };
 
-        tracing::info!(
+        tracing::debug!(
             table = %self.table_metadata.table_name,
             rows = stats.record_count,
             segments = stats.entry_count,
@@ -22034,7 +22440,7 @@ impl CayenneTableProvider {
                             self.table_metadata.table_name
                         )));
                     }
-                    row_keys.push(rows.row(row_index).as_ref().to_vec().into_boxed_slice());
+                    row_keys.push(bytes_key(rows.row(row_index).as_ref()));
                 }
                 Ok(ExtractedPrimaryKeys {
                     int64_pk: Vec::new(),
@@ -23767,6 +24173,33 @@ impl CayenneTableProvider {
         })
     }
 
+    /// Digest of the single primary-key point this scan's filters constrain, for
+    /// transaction read-footprint capture. Returns `None` unless the filters pin
+    /// every PK column to an equality literal (a partial-key or unbounded read),
+    /// which makes the caller fall back to per-table OCC. The digest is built
+    /// with the table's PK `RowConverter`, so it is bit-identical to the write
+    /// path's keyset digest for the same key.
+    fn footprint_digest_for(&self, filters: &[Expr]) -> Option<u128> {
+        if self.pk_column_indices.is_empty() {
+            return None;
+        }
+        let table_schema = self.table_schema();
+        let converter = self.build_pk_converter(&self.pk_column_indices).ok()?;
+        let mut pk_columns = Vec::with_capacity(self.pk_column_indices.len());
+        for &idx in &self.pk_column_indices {
+            let field = table_schema.field(idx);
+            let scalar = filters
+                .iter()
+                .find_map(|f| pk_scalar_for(f, field.name()))?;
+            // Cast to the PK column's stored type so the encoded digest matches
+            // the write path's (e.g. `id = '5'` against an Int64 PK column).
+            let casted = scalar.cast_to(field.data_type()).ok()?;
+            pk_columns.push(casted.to_array_of_size(1).ok()?);
+        }
+        let rows = converter.convert_columns(&pk_columns).ok()?;
+        Some(pk_digest(&rows.row(0).owned()))
+    }
+
     /// Returns `true` when scan filters are selective enough that byte-range
     /// file-group fan-out is wasted work: point equality on every PK column,
     /// or (single-column Int64 PK only) a small `IN` list or tight `BETWEEN`.
@@ -23893,6 +24326,39 @@ fn pk_column_equals_literal(expr: &Expr, pk_name: &str) -> bool {
                 || pk_column_equals_literal(&bin.right, pk_name)
         }
         _ => false,
+    }
+}
+
+/// Extract the equality-literal `ScalarValue` constraining `pk_name` from a
+/// conjunctive filter (`pk_name = <lit>`, either operand order, `Cast`-wrapped
+/// column or literal, recursing through `AND`). `None` if `pk_name` is not
+/// pinned to a single literal — the caller then marks the read footprint
+/// incomplete. Mirrors [`pk_column_equals_literal`], returning the value.
+fn pk_scalar_for(expr: &Expr, pk_name: &str) -> Option<ScalarValue> {
+    match expr {
+        Expr::BinaryExpr(bin) if bin.op == Operator::Eq => {
+            if matches_column(&bin.left, pk_name) {
+                literal_scalar(&bin.right)
+            } else if matches_column(&bin.right, pk_name) {
+                literal_scalar(&bin.left)
+            } else {
+                None
+            }
+        }
+        Expr::BinaryExpr(bin) if bin.op == Operator::And => {
+            pk_scalar_for(&bin.left, pk_name).or_else(|| pk_scalar_for(&bin.right, pk_name))
+        }
+        _ => None,
+    }
+}
+
+/// The innermost literal `ScalarValue` of `expr`, unwrapping `Cast`/`TryCast`.
+fn literal_scalar(expr: &Expr) -> Option<ScalarValue> {
+    match expr {
+        Expr::Literal(scalar, _) => Some(scalar.clone()),
+        Expr::Cast(c) => literal_scalar(&c.expr),
+        Expr::TryCast(c) => literal_scalar(&c.expr),
+        _ => None,
     }
 }
 
@@ -24119,6 +24585,19 @@ impl TableProvider for CayenneTableProvider {
         // after the warm store already claimed the per-env slot.
         if let Some(ref cold_config) = self.cold_object_store_config {
             Self::register_object_store_if_needed(state.runtime_env(), cold_config);
+        }
+
+        // Transaction read-footprint capture: when a transaction is active for
+        // this table, record the primary keys this scan reads — extracted from
+        // the pushed-down PK equality predicate — so per-key OCC can re-check
+        // only those keys at commit. A scan without a bounded full-PK predicate
+        // marks the footprint incomplete, forcing the commit to fall back to the
+        // conservative per-table OCC check.
+        if let Some(txn) = active_transaction(state, self.table_id()) {
+            match self.footprint_digest_for(filters) {
+                Some(digest) => txn.record_read_keys(self.table_id(), [digest]),
+                None => txn.mark_footprint_incomplete(self.table_id()),
+            }
         }
 
         // End-to-end data-file integrity: when enabled, verify each manifest
@@ -24805,7 +25284,7 @@ impl TableProvider for CayenneTableProvider {
         let is_s3 = self.table_metadata.path.starts_with("s3://");
 
         if is_s3 {
-            tracing::info!(
+            tracing::debug!(
                 "Cayenne insert_into called for S3 table {} (overwrite: {:?})",
                 self.table_metadata.table_name,
                 overwrite
@@ -24932,6 +25411,49 @@ impl TableProvider for CayenneTableProvider {
             .build()?;
 
         let source_plan = state.create_physical_plan(&plan).await?;
+
+        // Transaction: `UpdateExec` runs delete + insert, and its delete leg
+        // publishes deletion vectors immediately — that breaks atomicity (a
+        // rollback would lose rows, and even a successful commit exposes a torn
+        // "row missing" window between the delete and the insert publish). When a
+        // transaction is active for this table, run only the insert (upsert)
+        // leg: the staged upsert supersedes each prior row by primary key, and
+        // the executor applies those deletions atomically under the fence at
+        // COMMIT.
+        if active_transaction(state, self.table_id()).is_some() {
+            // The staged upsert supersedes by primary key, so a reassigned PK
+            // column would leave the prior row in place. Reject it (v1 supports
+            // value updates only).
+            for (col, _) in &assignments {
+                if self.metadata().primary_key.iter().any(|pk| pk == col) {
+                    return Err(datafusion_common::DataFusionError::Execution(format!(
+                        "transaction UPDATE cannot reassign primary-key column '{col}'"
+                    )));
+                }
+            }
+            // Coalesce the read side to a single partition before staging. A
+            // `DataSinkExec` requires single-partition input, which the physical
+            // optimizer normally guarantees by inserting a `CoalescePartitionsExec`.
+            // The transaction-staging plan built here, however, is executed
+            // DIRECTLY (write-back sinks run it via `collect` without re-optimizing),
+            // so a multi-partition source — a union of the file branch and the
+            // in-memory CDC tier branch, as produced for CDC/`changes`-mode data —
+            // would otherwise have every partition but 0 silently dropped by the
+            // sink, staging zero rows (a lost update). Point-lookup file scans are
+            // already single-partition, so this is a no-op there.
+            let source_plan: Arc<dyn ExecutionPlan> = if source_plan
+                .properties()
+                .output_partitioning()
+                .partition_count()
+                > 1
+            {
+                Arc::new(CoalescePartitionsExec::new(source_plan))
+            } else {
+                source_plan
+            };
+            return self.insert_into(state, source_plan, InsertOp::Append).await;
+        }
+
         let session_state = state
             .as_any()
             .downcast_ref::<datafusion::execution::SessionState>()
@@ -24948,6 +25470,31 @@ impl TableProvider for CayenneTableProvider {
             session_state,
             filters,
         )))
+    }
+}
+
+/// The transaction active for `table_id` on this session's request context, iff
+/// `table_id` is a registered participant.
+///
+/// Reads the transaction from the [`runtime_request_context::RequestContext`]
+/// typed extension on the session config — the same context the query builder
+/// installed for this request — so it matches what the sink resolves at
+/// execution time. If a transaction is active but this table is NOT a
+/// participant, it flags `unregistered_read` (fail-closed: the commit aborts)
+/// and returns `None` so the read/write is not routed into the transaction.
+fn active_transaction(
+    state: &dyn Session,
+    table_id: &str,
+) -> Option<super::transaction::CayenneTransaction> {
+    let txn = state
+        .config()
+        .get_extension::<runtime_request_context::RequestContext>()?
+        .extension::<super::transaction::CayenneTransaction>()?;
+    if txn.is_participant(table_id) {
+        Some(txn)
+    } else {
+        txn.mark_unregistered_read();
+        None
     }
 }
 
@@ -25172,7 +25719,7 @@ impl CayenneTableProvider {
             filters: filters.to_vec(),
         };
         let deleted = sink
-            .delete_from()
+            .delete_from(Arc::new(datafusion_execution::TaskContext::default()))
             .await
             .map_err(datafusion_common::DataFusionError::External)?;
         Ok(Some(deleted))
@@ -25692,7 +26239,7 @@ impl super::compaction::ColdTierPromotionRunner for CayenneTableProvider {
                 tracing::debug!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
-                    "Cold-tier promotion tick graduated the warm tier to the cold object store"
+                    "Tiering tick moved warm-tier data to the datalake"
                 );
             }
             Ok(false) => {}
@@ -25700,7 +26247,7 @@ impl super::compaction::ColdTierPromotionRunner for CayenneTableProvider {
                 tracing::warn!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
-                    "Cold-tier promotion tick failed (warm tier left intact; retry next tick): {e}"
+                    "Tiering tick failed to move data to the datalake (warm tier left intact; next cycle retries): {e}"
                 );
             }
         }
@@ -25758,6 +26305,10 @@ impl super::compaction::MemTierCheckpointRunner for CayenneTableProvider {
         // tier, so this is purely to avoid contending the lock with the write
         // path when there is nothing to do.
         let mut fired_outcome: &'static str = "fired";
+        // Guaranteed unless a size-triggered checkpoint still has age headroom (set
+        // below). Deadline-driven firings (age-due, critical pressure,
+        // flush-every-tick, due seal) stay guaranteed so they cannot be starved.
+        let mut best_effort = false;
         {
             // Whole-tier gate (SUM/oldest across shards, never per-shard): a
             // checkpoint is always all-shards-atomic (§3.4 Fix 2), so the trigger
@@ -25813,15 +26364,16 @@ impl super::compaction::MemTierCheckpointRunner for CayenneTableProvider {
             }
             if min_flush > 0 && !pressure_bypass {
                 let size_ready = resident >= min_flush;
-                if !size_ready && !self.mem_tier_age_cap_reached_whole_tier() {
+                let age_reached = self.mem_tier_age_cap_reached_whole_tier();
+                if !size_ready && !age_reached {
                     // Not worth a full bake yet. Advance the source slot CHEAPLY via
                     // a SEAL if the active ingestion piece has aged past the seal
                     // cadence (`cdc_mem_tier_seal_age_ms`) — this bounds
                     // replication/freshness lag to the seal cadence WITHOUT the
                     // read amplification of a faster full checkpoint (a seal writes
-                    // an unpublished inline shadow, no Vortex snapshot). The seal
-                    // takes `mem_checkpoint_lock` itself (single-drainer vs the bake),
-                    // so it is NOT pre-held here.
+                    // an unpublished inline shadow, no Vortex snapshot). A due seal
+                    // acquires `mem_checkpoint_lock` itself with the GUARANTEED fair
+                    // path (single-drainer vs the bake), so it is NOT pre-held here.
                     if self.seal_due() {
                         match self.seal_mem_tier_durable().await {
                             Ok(_) => emit_tick("sealed"),
@@ -25839,24 +26391,45 @@ impl super::compaction::MemTierCheckpointRunner for CayenneTableProvider {
                     }
                     return;
                 }
+                // Reaches the checkpoint below. A size-triggered checkpoint that has
+                // NOT yet hit its age deadline is best-effort — it has slack (it will
+                // retry, or the age deadline later forces a guaranteed pass), so it
+                // must not stall applies. An age-due checkpoint stays guaranteed.
+                best_effort = size_ready && !age_reached;
             }
         }
-        // Serialize against the write-path spill and the event-driven
-        // checkpoints (all take this lock) so two checkpoints for one table can
-        // never run concurrently. A blocking `lock()` (not `try_lock`) is correct:
-        // if a spill is mid-flight, this tick simply waits and then finds an
-        // empty/smaller tier — it never races the clear.
-        let _guard = self.mem_checkpoint_lock.lock().await;
-        // Re-check under the lock: a concurrent write-path spill may have drained
-        // the tier while this tick waited. Skip so the `fired*` outcomes count
-        // only ticks that actually checkpoint. (Deliberately NOT keyed on the
-        // checkpoint returning `Ok(0)`: the tombstones-only path also returns 0
-        // rows yet does real durable work, including the slot-advancer fire.)
-        if self.mem_tier.is_empty() {
-            emit_tick("skipped_empty");
-            return;
-        }
-        if let Err(e) = self.checkpoint_mem_tier().await {
+        // `checkpoint_mem_tier` serializes its complete capture -> publish
+        // lifecycle. A spill may drain the tier between the cheap early check and
+        // lock acquisition; the checkpoint's empty-tier path is an idempotent
+        // no-op (and may re-fire a late slot committer), so that race is safe.
+        // Size-triggered-with-headroom → best-effort (never stalls applies; skips on
+        // contention and retries next tick). Every deadline-driven firing uses the
+        // guaranteed path so it cannot be starved under sustained writes.
+        if best_effort {
+            match self.try_checkpoint_mem_tier().await {
+                Ok(CheckpointAttempt::Completed(rows)) => {
+                    tracing::trace!(
+                        target: "cayenne::mem_tier",
+                        table = %self.table_metadata.table_name,
+                        rows,
+                        "Best-effort mem-tier checkpoint completed"
+                    );
+                    emit_tick(fired_outcome);
+                }
+                // A capture lock is contended (an in-flight checkpoint holds
+                // `mem_checkpoint_lock`, or a writer/promotion holds `write_lock`):
+                // skip and retry next tick; the write-path spill drains under load.
+                Ok(CheckpointAttempt::Busy) => emit_tick("skipped_busy"),
+                Err(e) => {
+                    emit_tick("failed");
+                    tracing::warn!(
+                        target: "cayenne::mem_tier",
+                        table = %self.table_metadata.table_name,
+                        "Periodic mem-tier checkpoint failed (deferred slot ack not advanced; will retry next tick): {e}"
+                    );
+                }
+            }
+        } else if let Err(e) = self.checkpoint_mem_tier().await {
             // A failed checkpoint must NOT advance the slot — `checkpoint_mem_tier`
             // already guarantees that (the advancer fires only post-fence). The
             // deferred committers stay queued and the next tick retries; surface
@@ -26396,7 +26969,8 @@ mod tests {
     fn test_tombstone_packed_i64_roundtrip_and_compact() {
         let keys: Vec<Box<[u8]>> = [1_i64, -7, i64::MAX, 0, 42]
             .iter()
-            .map(|pk| pk.to_be_bytes().to_vec().into_boxed_slice())
+            .copied()
+            .map(i64_key)
             .collect();
         let blob = serialize_delete_keys_to_ipc(&keys, /* is_int64_pk */ true)
             .expect("serialize packed i64");
@@ -26435,10 +27009,7 @@ mod tests {
     /// reader (never colliding with the `0x00`/`0x01` tags).
     #[test]
     fn test_tombstone_legacy_uncompressed_ipc_still_decodes() {
-        let keys: Vec<Box<[u8]>> = [10_i64, 20, 30]
-            .iter()
-            .map(|pk| pk.to_be_bytes().to_vec().into_boxed_slice())
-            .collect();
+        let keys: Vec<Box<[u8]>> = [10_i64, 20, 30].iter().copied().map(i64_key).collect();
         // Reproduce the exact pre-cycle-5 encoding: uncompressed Arrow IPC of a
         // single `row_key` BinaryArray, no prefix tag.
         let array = BinaryArray::from_iter_values(keys.iter().map(std::convert::AsRef::as_ref));
@@ -28051,6 +28622,176 @@ mod tests {
         }
         ids.sort_unstable();
         ids
+    }
+
+    // ── Off-lock staged upsert (`begin_staged_upsert_occ`) ──
+
+    /// Build a file-mode provider with an `id` primary key and `on_conflict:
+    /// upsert` — the shape the off-lock staged-upsert path targets.
+    async fn build_staged_upsert_provider(
+        ctx: &SessionContext,
+        name: &str,
+    ) -> (CayenneTableProvider, TempDir, SchemaRef) {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog init");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let vortex_config = VortexConfig::default();
+        let context = CayenneContext::new(&vortex_config, ctx.runtime_env(), name);
+        let options = CreateTableOptions {
+            table_name: name.to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config,
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .with_context(context)
+            .create(options)
+            .await
+            .expect("table created");
+        (provider, temp_dir, schema)
+    }
+
+    fn id_name_batch(schema: &SchemaRef, ids: &[i64], names: &[&str]) -> RecordBatch {
+        use arrow::array::StringArray;
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(Int64Array::from(ids.to_vec())),
+                Arc::new(StringArray::from(names.to_vec())),
+            ],
+        )
+        .expect("valid id/name batch")
+    }
+
+    /// A staged upsert is invisible to scans until `commit`, then fully visible.
+    #[tokio::test]
+    async fn staged_upsert_invisible_until_commit() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, schema) = build_staged_upsert_provider(&ctx, "su_commit").await;
+
+        let stream = single_batch_stream(id_name_batch(&schema, &[1, 2], &["alice", "bob"]));
+        let token = provider.transaction_write_token().await;
+        let staged = provider
+            .begin_staged_upsert_occ(token, stream, 1)
+            .await
+            .expect("begin staged upsert");
+        assert_eq!(staged.row_count(), 2);
+
+        // The catalog is untouched until commit, so the staged rows are
+        // observably invisible to scans.
+        assert!(
+            scan_sorted_ids(&provider).await.is_empty(),
+            "staged rows must be invisible before commit"
+        );
+
+        let rows = staged
+            .commit(std::collections::HashSet::new(), true)
+            .await
+            .expect("commit staged upsert");
+        assert_eq!(rows, 2);
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1, 2],
+            "rows are visible after commit"
+        );
+    }
+
+    /// Rolling back a staged upsert leaves nothing visible (catalog untouched).
+    #[tokio::test]
+    async fn staged_upsert_rollback_discards() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, schema) = build_staged_upsert_provider(&ctx, "su_rollback").await;
+
+        let stream = single_batch_stream(id_name_batch(&schema, &[1, 2], &["alice", "bob"]));
+        let token = provider.transaction_write_token().await;
+        let staged = provider
+            .begin_staged_upsert_occ(token, stream, 1)
+            .await
+            .expect("begin staged upsert");
+        staged.rollback().await.expect("rollback staged upsert");
+
+        assert!(
+            scan_sorted_ids(&provider).await.is_empty(),
+            "rollback must leave nothing visible"
+        );
+    }
+
+    /// A staged upsert supersedes the prior version of a conflicting PK (no
+    /// duplicate) and adds new PKs, all published atomically on commit.
+    #[tokio::test]
+    async fn staged_upsert_supersedes_existing_pk() {
+        use arrow::array::StringArray;
+        let ctx = SessionContext::new();
+        let (provider, _tmp, schema) = build_staged_upsert_provider(&ctx, "su_conflict").await;
+
+        // Committed initial state: id=1 -> alice.
+        insert_batch(&provider, id_name_batch(&schema, &[1], &["alice"])).await;
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1]);
+
+        // Stage an upsert: id=1 -> alice2 (supersede), id=3 -> carol (new).
+        let stream = single_batch_stream(id_name_batch(&schema, &[1, 3], &["alice2", "carol"]));
+        let token = provider.transaction_write_token().await;
+        let staged = provider
+            .begin_staged_upsert_occ(token, stream, 1)
+            .await
+            .expect("begin staged upsert");
+
+        // Pre-commit state is unchanged.
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1],
+            "pre-commit state must be unchanged"
+        );
+
+        staged
+            .commit(std::collections::HashSet::new(), true)
+            .await
+            .expect("commit staged upsert");
+
+        // Exactly one id=1 (superseded, not duplicated) plus the new id=3.
+        assert_eq!(scan_sorted_ids(&provider).await, vec![1, 3]);
+
+        // The surviving id=1 carries the staged (new) value.
+        let batches = read_all(&ctx, &provider, "su_conflict").await;
+        let mut got = std::collections::BTreeMap::new();
+        for b in &batches {
+            let ids = b
+                .column(b.schema().index_of("id").expect("id col"))
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id Int64");
+            let names = b
+                .column(b.schema().index_of("name").expect("name col"))
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("name Utf8");
+            for i in 0..b.num_rows() {
+                got.insert(ids.value(i), names.value(i).to_string());
+            }
+        }
+        assert_eq!(
+            got.get(&1).map(String::as_str),
+            Some("alice2"),
+            "conflicting id=1 must reflect the staged value"
+        );
+        assert_eq!(got.get(&3).map(String::as_str), Some("carol"));
     }
 
     /// Crash-recovery exactly-once (correctness item #5, gates promotion past
@@ -31580,7 +32321,7 @@ mod tests {
         let ctx = SessionContext::new();
         let vortex_config = VortexConfig {
             // The source's declared distribution key (e.g. a Postgres partition
-            // key applied by extended schema inference) clusters files by it.
+            // key applied by schema inference) clusters files by it.
             shard_key_columns: vec!["tenant_id".to_string()],
             ..VortexConfig::default()
         };
@@ -36692,6 +37433,289 @@ mod tests {
         );
     }
 
+    /// A cold-promotion mem-tier checkpoint serializes with any in-flight mem-tier
+    /// checkpoint. A checkpoint holds `mem_checkpoint_lock` across its whole
+    /// capture -> encode -> publish -> clear lifecycle, so while one is in flight a
+    /// promotion that has already taken `write_lock` must block on
+    /// `mem_checkpoint_lock` before it captures, rather than recapturing the same
+    /// not-yet-cleared corpus (which would publish a duplicate copy). Once the
+    /// in-flight checkpoint completes, promotion proceeds and captures the tier
+    /// exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn promotion_checkpoint_waits_for_inflight_mem_checkpoint() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "promotion_checkpoint_serialization",
+            ctx.runtime_env(),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                cdc_mem_tier_shards: 4,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(schema, &[1, 2, 3], &[10, 20, 30])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed sharded RAM tier");
+        let provider = Arc::new(provider);
+
+        // Represents checkpoint A after capture: it retains checkpoint ownership
+        // throughout its off-write-lock encode and eventual publish/clear.
+        let in_flight_checkpoint = provider.mem_checkpoint_lock_for_writer().lock_owned().await;
+
+        let promotion_provider = Arc::clone(&provider);
+        let (write_locked_tx, write_locked_rx) = tokio::sync::oneshot::channel();
+        let mut promotion_checkpoint = tokio::spawn(async move {
+            let _write_guard = promotion_provider.write_lock_arc().lock_owned().await;
+            let _ = write_locked_tx.send(());
+            promotion_provider
+                .checkpoint_mem_tier_holding_write_lock()
+                .await
+        });
+
+        write_locked_rx
+            .await
+            .expect("promotion-style checkpoint acquired write lock");
+        // Promotion now holds `write_lock` and is attempting `mem_checkpoint_lock`,
+        // which the in-flight checkpoint still holds. It must stay blocked: a bounded
+        // join attempt must TIME OUT rather than complete. This is a bounded wait, not
+        // a readiness sleep — with the fix a correct promotion never finishes while the
+        // lock is held, so the timeout is expected to elapse.
+        let still_blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            &mut promotion_checkpoint,
+        )
+        .await;
+        assert!(
+            still_blocked.is_err(),
+            "promotion must wait for the in-flight checkpoint instead of recapturing its mem-tier corpus"
+        );
+
+        drop(in_flight_checkpoint);
+        let flushed = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            &mut promotion_checkpoint,
+        )
+        .await
+        .expect("promotion checkpoint does not deadlock")
+        .expect("join promotion checkpoint")
+        .expect("promotion checkpoint succeeds");
+        assert_eq!(
+            flushed, 3,
+            "the serialized promotion captures the tier once"
+        );
+        assert_eq!(
+            query_count_star(&ctx, &provider, "promotion_checkpoint_serialization").await,
+            3,
+            "checkpoint serialization preserves exactly one copy of every key"
+        );
+    }
+
+    /// The GUARANTEED `checkpoint_mem_tier` fair-queues behind an ordinary writer
+    /// (one holding only `write_lock`, not `mem_checkpoint_lock`): its fast
+    /// `try_lock(write)` fails, so it falls back to a fair `write -> mem` wait and
+    /// BLOCKS until the writer releases, then acquires and flushes. Proves the
+    /// guaranteed path makes progress under contention without starving.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn guaranteed_checkpoint_waits_behind_ordinary_writer_then_flushes() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "guaranteed_ckpt_waits_writer",
+            ctx.runtime_env(),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                // N>1 so the capture actually takes `write_lock`.
+                cdc_mem_tier_shards: 4,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(schema, &[1, 2, 3], &[10, 20, 30])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed sharded RAM tier");
+        let provider = Arc::new(provider);
+
+        // An ORDINARY writer holds only `write_lock` (not `mem_checkpoint_lock`).
+        let write_guard = provider.write_lock_arc().lock_owned().await;
+
+        let ckpt_provider = Arc::clone(&provider);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut checkpoint = tokio::spawn(async move {
+            // Signal the task is scheduled before the "blocked" assertion, so it
+            // cannot pass vacuously (an unscheduled task would also time out).
+            let _ = started_tx.send(());
+            ckpt_provider.checkpoint_mem_tier().await
+        });
+        started_rx.await.expect("checkpoint task started");
+
+        // Must block: `try_lock(write)` fails, so it fair-queues on `write_lock`.
+        let blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(250), &mut checkpoint).await;
+        assert!(
+            blocked.is_err(),
+            "guaranteed checkpoint must wait behind the writer's write_lock"
+        );
+
+        // Release the writer; the checkpoint acquires (fair) and flushes once.
+        drop(write_guard);
+        let flushed = tokio::time::timeout(std::time::Duration::from_secs(10), &mut checkpoint)
+            .await
+            .expect("checkpoint does not deadlock")
+            .expect("join checkpoint")
+            .expect("checkpoint succeeds");
+        assert_eq!(
+            flushed, 3,
+            "the checkpoint flushes the seeded rows once released"
+        );
+        assert_eq!(
+            query_count_star(&ctx, &provider, "guaranteed_ckpt_waits_writer").await,
+            3,
+            "exactly the three seeded keys are durable"
+        );
+    }
+
+    /// The BEST-EFFORT `try_checkpoint_mem_tier` returns `Busy` when `write_lock`
+    /// is contended and does NOT advance the source slot (the advancer never
+    /// fires). Proves a skip is not mistaken for a completed durable checkpoint.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn best_effort_checkpoint_returns_busy_without_advancing_slot() {
+        struct CountingAdvancer(Arc<std::sync::atomic::AtomicU64>);
+        #[async_trait::async_trait]
+        impl crate::provider::mem_tier::SlotAdvancer for CountingAdvancer {
+            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "best_effort_busy",
+            ctx.runtime_env(),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                cdc_mem_tier_shards: 4,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let advances = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(Arc::new(CountingAdvancer(Arc::clone(&advances))));
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(schema, &[1, 2, 3], &[10, 20, 30])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed sharded RAM tier");
+        let provider = Arc::new(provider);
+
+        // Contend `write_lock`, then the best-effort checkpoint must skip.
+        let write_guard = provider.write_lock_arc().lock_owned().await;
+        let attempt = provider
+            .try_checkpoint_mem_tier()
+            .await
+            .expect("try checkpoint returns Ok");
+        assert!(
+            matches!(attempt, super::CheckpointAttempt::Busy),
+            "contended write_lock must yield Busy, not a completed checkpoint"
+        );
+        assert_eq!(
+            advances.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a Busy skip must not advance the source slot"
+        );
+        drop(write_guard);
+    }
+
+    /// A due seal uses the GUARANTEED acquisition: it fair-queues behind an
+    /// ordinary writer, then completes and advances durability (fires the slot
+    /// advancer). Proves the seal cannot be starved and honors its durability
+    /// cadence under contention.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn seal_waits_behind_ordinary_writer_then_advances_durability() {
+        struct CountingAdvancer(Arc<std::sync::atomic::AtomicU64>);
+        #[async_trait::async_trait]
+        impl crate::provider::mem_tier::SlotAdvancer for CountingAdvancer {
+            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "seal_waits_writer",
+            ctx.runtime_env(),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                cdc_mem_tier_shards: 4,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let advances = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(Arc::new(CountingAdvancer(Arc::clone(&advances))));
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let _ = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(schema, &[1, 2, 3], &[10, 20, 30])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed unsealed segments");
+        let provider = Arc::new(provider);
+
+        let write_guard = provider.write_lock_arc().lock_owned().await;
+        let seal_provider = Arc::clone(&provider);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut seal = tokio::spawn(async move {
+            // Signal the task is scheduled before the "blocked" assertion (avoids a
+            // vacuous pass).
+            let _ = started_tx.send(());
+            seal_provider.seal_mem_tier_durable().await
+        });
+        started_rx.await.expect("seal task started");
+
+        // Must block: the guaranteed seal fair-queues behind the writer.
+        let blocked = tokio::time::timeout(std::time::Duration::from_millis(250), &mut seal).await;
+        assert!(
+            blocked.is_err(),
+            "due seal must fair-queue behind the writer's write_lock"
+        );
+
+        drop(write_guard);
+        let sealed = tokio::time::timeout(std::time::Duration::from_secs(10), &mut seal)
+            .await
+            .expect("seal does not deadlock")
+            .expect("join seal")
+            .expect("seal succeeds");
+        assert_eq!(sealed, 3, "the seal shadows the three seeded rows");
+        assert!(
+            advances.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the seal advances durability (fires the slot advancer)"
+        );
+    }
+
     /// Off-fence checkpoint correctness guard: the two-phase `checkpoint_mem_tier`
     /// runs the encode + `BEGIN IMMEDIATE` commit OUTSIDE the listing fence and
     /// takes the fence only for the in-memory swap. A CDC append that interleaves
@@ -36862,13 +37886,7 @@ mod tests {
 
             let checkpoint_provider = Arc::clone(&provider);
             let checkpoint = tokio::spawn(async move {
-                // Mirror the production caller: hold `mem_checkpoint_lock` so
-                // checkpoints serialize among themselves, exactly like
-                // `spill_mem_tier` / the periodic tick.
-                let _guard = checkpoint_provider
-                    .mem_checkpoint_lock_for_writer()
-                    .lock_owned()
-                    .await;
+                // The public entry serializes the complete checkpoint lifecycle.
                 checkpoint_provider.checkpoint_mem_tier().await
             });
 
@@ -36912,13 +37930,10 @@ mod tests {
 
         // Drain any survivor epoch the last concurrent round left in RAM, then
         // re-assert durability after reopen.
-        {
-            let _g = provider.mem_checkpoint_lock_for_writer().lock_owned().await;
-            provider
-                .checkpoint_mem_tier()
-                .await
-                .expect("final drain checkpoint");
-        }
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("final drain checkpoint");
         let reopened = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
             .open("mem_ckpt_upsert_race")
             .await
@@ -36996,10 +38011,7 @@ mod tests {
             .expect("update keys");
 
         // 4. Drain to durable; assert no over-count (RAM+durable view AND on reopen).
-        {
-            let _g = provider.mem_checkpoint_lock_for_writer().lock_owned().await;
-            provider.checkpoint_mem_tier().await.expect("final drain");
-        }
+        provider.checkpoint_mem_tier().await.expect("final drain");
         let count = query_count_star(&ctx, &provider, &table).await;
         let pairs = collect_id_value_pairs(&ctx, &provider, &table).await;
         let uniq: std::collections::HashSet<i64> = pairs.iter().map(|(id, _)| *id).collect();
@@ -37329,8 +38341,16 @@ mod tests {
         // then a fresh tiny segment lands, leaving a NON-empty tier far below
         // the cap — exactly the state a redundant writer-side checkpoint would
         // needlessly re-encode.
+        // This test owns the checkpoint guard directly (modelling an in-flight
+        // background op), so it calls the lock-held body. Single-shard (default
+        // `cdc_mem_tier_shards`) means the capture is atomic, so `None` is correct.
+        assert_eq!(
+            provider.mem_tier.shard_count(),
+            1,
+            "inner(None) here relies on the single-shard (no write_lock) capture path"
+        );
         let flushed = provider
-            .checkpoint_mem_tier()
+            .checkpoint_mem_tier_inner(None)
             .await
             .expect("in-flight checkpoint drains the seed");
         assert_eq!(flushed, 4096, "the in-flight flush drained the seed rows");
@@ -42291,5 +43311,132 @@ mod tests {
         // Empty input is handled defensively (callers early-return, but stay safe).
         let empty = CayenneTableProvider::partition_memory_batches(Vec::new(), 8);
         assert_eq!(total(&empty), 0);
+    }
+
+    /// Regression (cluster α — P0-2 / P0-3 / P2-2): a stale, dropped, or
+    /// unstamped per-key OCC entry must never let `transaction_has_conflict`
+    /// miss a concurrent commit. When the keyset is marked degraded
+    /// (`mark_pk_keyset_occ_degraded` — set by a checked-out-keyset stamp drop,
+    /// an upsert filter-DELETE stale-present entry, or a no-sequence publish),
+    /// the check MUST fall back to the conservative per-table high-water
+    /// comparison (over-abort, never a missed conflict). `clear_cached_pk_keyset`
+    /// resets the flag because its next rebuild floor-stamps the keyset.
+    #[tokio::test]
+    async fn transaction_has_conflict_degraded_keyset_falls_back_to_per_table() {
+        use arrow::array::{ArrayRef, Int64Array};
+        use arrow::datatypes::DataType;
+        use std::collections::HashSet;
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "occ_degraded_fallback",
+            ctx.runtime_env(),
+            VortexConfig::default(),
+        )
+        .await;
+
+        // One PK row (id = 1) and its digest via a standalone Int64 RowConverter.
+        // `transaction_has_conflict` only compares digests, so the encoding path
+        // is irrelevant as long as the keyset entry and the footprint share the
+        // SAME digest (guaranteed here by using one `pk_digest` for both).
+        let converter =
+            RowConverter::new(vec![SortField::new(DataType::Int64)]).expect("valid converter");
+        let key_column: ArrayRef = Arc::new(Int64Array::from(vec![1_i64]));
+        let rows = converter
+            .convert_columns(&[key_column])
+            .expect("convert key column");
+        let key = rows.row(0).owned();
+        let digest = crate::provider::pk_index::pk_digest(&key);
+
+        // Install an Exact keyset stamping id=1 at sequence 5. A concurrent
+        // commit to a DIFFERENT key then advances the table high-water to 7
+        // WITHOUT touching id=1's stamp — the stale-stamp shape that a dropped /
+        // stale-present / unstamped entry leaves behind.
+        let mut keyset = CachedPkKeyset::with_capacity(1);
+        keyset.insert(key.clone(), RowLocation::FileUnlocated);
+        keyset.record_sequence(digest, 5);
+        provider.store_cached_pk_index(CachedPkIndex::Exact(keyset));
+
+        let footprint: HashSet<u128> = HashSet::from([digest]);
+        let empty_write_set = crate::provider::pk_index::PkDigestSet::with_capacity(0);
+        let stage_seq = 5_i64;
+        let current_high_water = 7_i64; // a concurrent commit advanced it
+
+        // Consistent keyset (not degraded): per-key OCC correctly sees id=1
+        // unchanged (stamp 5 <= begin token 5) and admits the commit — the
+        // per-key win over a per-table token that would abort on ANY commit.
+        assert!(
+            !provider.transaction_has_conflict(
+                stage_seq,
+                &footprint,
+                true,
+                &empty_write_set,
+                current_high_water,
+            ),
+            "a consistent Exact keyset must trust the per-key stamp (id=1 unchanged)"
+        );
+
+        // Degrade the keyset: the per-key stamp is now untrustworthy, so the
+        // check MUST fall back to per-table OCC and abort (high-water 7 != 5).
+        provider.mark_pk_keyset_occ_degraded();
+        assert!(
+            provider.transaction_has_conflict(
+                stage_seq,
+                &footprint,
+                true,
+                &empty_write_set,
+                current_high_water,
+            ),
+            "a degraded keyset must fall back to per-table OCC and detect the \
+             concurrent commit (high-water 7 != begin 5) — never miss it"
+        );
+
+        // `clear_cached_pk_keyset` resets the flag. To isolate *that* effect,
+        // re-install a NON-degraded Exact keyset shaped like an incremental
+        // delta-update (which records only the incoming key's stamp and does NOT
+        // floor-stamp) — id=1 still at 5. With the flag now clear, the divergent
+        // scenario (stage 5, stamp 5, high-water 7) returns to the per-key answer
+        // (no conflict), proving per-key trust is restored — it was `true` (the
+        // fallback) only because the flag was set.
+        provider.clear_cached_pk_keyset();
+        let mut delta_updated = CachedPkKeyset::with_capacity(1);
+        delta_updated.insert(key.clone(), RowLocation::FileUnlocated);
+        delta_updated.record_sequence(digest, 5);
+        provider.store_cached_pk_index(CachedPkIndex::Exact(delta_updated));
+        assert!(
+            !provider.transaction_has_conflict(
+                stage_seq,
+                &footprint,
+                true,
+                &empty_write_set,
+                current_high_water,
+            ),
+            "clear_cached_pk_keyset must reset the degraded flag so a non-degraded \
+             Exact keyset is trusted per-key again (id=1 unchanged at stamp 5)"
+        );
+
+        // Faithfulness check: a REAL `clear_cached_pk_keyset` rebuild goes through
+        // `load_existing_keyset`, which floor-stamps every key to the end-of-scan
+        // high-water (`stamp_all_sequences_min(sequence_high_water())`). Model that
+        // by floor-stamping id=1 to the high-water (7). The same transaction then
+        // correctly CONFLICTS via the per-key stamp (7 > begin 5) — the production
+        // rebuild is conservative (over-abort), so clearing the flag never lets a
+        // real post-rebuild commit miss a concurrent write.
+        let mut floor_stamped = CachedPkKeyset::with_capacity(1);
+        floor_stamped.insert(key, RowLocation::FileUnlocated);
+        floor_stamped.record_sequence(digest, 5);
+        floor_stamped.stamp_all_sequences_min(current_high_water);
+        provider.store_cached_pk_index(CachedPkIndex::Exact(floor_stamped));
+        assert!(
+            provider.transaction_has_conflict(
+                stage_seq,
+                &footprint,
+                true,
+                &empty_write_set,
+                current_high_water,
+            ),
+            "a floor-stamped rebuild (the production clear->load_existing_keyset \
+             path) must still conflict the stage_seq=5 txn against high-water 7"
+        );
     }
 }

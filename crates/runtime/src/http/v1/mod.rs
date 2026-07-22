@@ -42,8 +42,9 @@ use crate::{
     datafusion::{
         DataFusion,
         query::{
-            Error as QueryError, QueryBuilder, is_cancellation_error, is_timeout_error,
-            json_array_writer, schema_has_union_columns, write_to_json_string, write_to_json_value,
+            Error as QueryError, QueryBuilder, TransactionError, is_cancellation_error,
+            is_timeout_error, json_array_writer, run_transaction, schema_has_union_columns,
+            transaction_statements, write_to_json_string, write_to_json_value,
         },
     },
     egress::EgressAccount,
@@ -61,7 +62,7 @@ use bytes::Bytes;
 use cache::result::CacheStatus;
 use csv::Writer;
 use datafusion::common::ParamValues;
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion::execution::{SendableRecordBatchStream, memory_pool::MemoryPool};
 use headers_accept::Accept;
 use http::{
     HeaderValue,
@@ -180,9 +181,9 @@ impl ResponseMetadata {
     }
 }
 
-/// Gets all possible media types from a `Accept` header.
-pub(crate) fn accept_header_types(accept: &TypedHeader<Accept>) -> Vec<String> {
-    accept.0.media_types().map(ToString::to_string).collect()
+/// Gets all possible media types from a `Accept` header without allocating.
+pub(crate) fn accept_header_types(accept: &TypedHeader<Accept>) -> impl Iterator<Item = &str> + '_ {
+    accept.0.media_types().map(AsRef::<str>::as_ref)
 }
 
 impl ResponseMimeType {
@@ -202,8 +203,7 @@ impl ResponseMimeType {
     pub fn from_accept_header(accept: Option<&TypedHeader<Accept>>) -> ResponseMimeType {
         accept.map_or(ResponseMimeType::default(), |header| {
             accept_header_types(header)
-                .iter()
-                .find_map(|h| match h.as_str() {
+                .find_map(|h| match h {
                     "application/json" => Some(ResponseMimeType::Json),
                     "application/vnd.spiceai.nsql.v1+json" => Some(ResponseMimeType::VndNsqlJsonV1),
                     "application/vnd.spiceai.sql.v1+json" => Some(ResponseMimeType::VndSqlJsonV1),
@@ -255,6 +255,12 @@ pub async fn sql_to_http_response(
     format: ResponseMimeType,
     read_only: bool,
 ) -> Response {
+    // A `BEGIN … COMMIT` body is run by the shared transaction orchestrator
+    // rather than the ordinary single-statement path.
+    if let Some(statements) = transaction_statements(&sql) {
+        return transaction_to_http_response(df, statements, parameters, read_only, format).await;
+    }
+
     // Capture the query memory pool before `df` is moved into the builder, so a
     // streamed body can charge its egress buffers against the pool the query ran
     // under (see `EgressAccount`).
@@ -274,9 +280,20 @@ pub async fn sql_to_http_response(
         }
     };
 
-    let cache_status = query_res.cache_status;
-    let mut data_stream = query_res.data;
+    query_stream_to_http_response(query_res.data, query_res.cache_status, format, memory_pool).await
+}
 
+/// Converts a query stream to the requested HTTP response format.
+///
+/// Default JSON responses stream batch-by-batch. Formats that require complete
+/// result metadata, and JSON schemas containing union columns, use the buffered
+/// response path.
+async fn query_stream_to_http_response(
+    mut data_stream: SendableRecordBatchStream,
+    cache_status: CacheStatus,
+    format: ResponseMimeType,
+    memory_pool: Arc<dyn MemoryPool>,
+) -> Response {
     // Stream only the default JSON format with non-union columns; csv/plain/vnd
     // buffer via `to_http_response`, and union columns (which the arrow-json array
     // writer can't render) fall back to the buffered JSON path. Streamability is a
@@ -300,6 +317,59 @@ pub async fn sql_to_http_response(
     let account = EgressAccount::register(&memory_pool, "http_egress");
     let body = Body::from_stream(json_array_body_stream(first, data_stream, account));
     (StatusCode::OK, headers, body).into_response()
+}
+
+/// Run a `BEGIN … COMMIT` body through the shared transaction orchestrator
+/// and shape the outcome (or error) into an HTTP response.
+async fn transaction_to_http_response(
+    df: Arc<DataFusion>,
+    statements: Vec<String>,
+    parameters: Option<ParamValues>,
+    read_only: bool,
+    format: ResponseMimeType,
+) -> Response {
+    match run_transaction(&df, &statements, parameters, read_only).await {
+        Ok(outcome) => match outcome.result {
+            // Return the final statement's result (for the canonical gate+write
+            // shape, the write's row-count summary).
+            Some((batches, cache_status)) => {
+                to_http_response(batches, cache_status, format, ResponseMetadata::empty())
+                    .await
+                    .into_response()
+            }
+            None => (StatusCode::OK, "COMMIT").into_response(),
+        },
+        Err(error) => transaction_error_to_response(error),
+    }
+}
+
+/// Map a [`TransactionError`] to the HTTP response the `/v1/sql` path returns.
+fn transaction_error_to_response(error: TransactionError) -> Response {
+    match error {
+        TransactionError::Rejected(message) => sql_error_response(message, SqlErrorKind::General),
+        TransactionError::Plan(e) | TransactionError::Stream(e) => {
+            sql_error_response(e.to_string(), SqlErrorKind::of_datafusion_error(&e))
+        }
+        TransactionError::Query(e) => {
+            sql_error_response(e.to_string(), SqlErrorKind::of_query_error(&e))
+        }
+        TransactionError::Conflict { table } => {
+            // Optimistic-concurrency conflict: a participant was committed to
+            // between this transaction's start and commit. Retryable — map to
+            // 409 so the client can re-run at the newest committed state.
+            (
+                StatusCode::CONFLICT,
+                format!(
+                    "transaction write conflict on '{table}': a participant table changed since the transaction started; retry"
+                ),
+            )
+                .into_response()
+        }
+        TransactionError::Publish(message) => sql_error_response(
+            format!("transaction publish failed: {message}"),
+            SqlErrorKind::General,
+        ),
+    }
 }
 
 /// Classifies a query error for HTTP status mapping: client-initiated
@@ -498,11 +568,8 @@ fn attach_cache_headers(
         headers.insert("X-Cache", val);
     }
 
-    if let Some(val) = results_cache_status
-        .to_header_string()
-        .and_then(|v| v.parse().ok())
-    {
-        headers.insert("Results-Cache-Status", val);
+    if let Some(val) = results_cache_status.to_header_string() {
+        headers.insert("Results-Cache-Status", HeaderValue::from_static(val));
     }
 
     // Surface the cache scope so callers can tell whether a MISS came
@@ -653,7 +720,13 @@ mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::scalar::ScalarValue;
     use std::sync::Arc;
+
+    use crate::{
+        dataaccelerator::AcceleratorEngineRegistry, datafusion::builder::DataFusionBuilder,
+        status::RuntimeStatus,
+    };
 
     /// `/v1/sql` must let clients distinguish outcomes by status code: a
     /// `runtime.query.timeout` expiry maps to 504 Gateway Timeout, a
@@ -702,6 +775,47 @@ mod tests {
             SqlErrorKind::of_datafusion_error(&stream_cancel),
         );
         assert_eq!(response.status().as_u16(), 499);
+    }
+
+    #[test]
+    fn transaction_statements_requires_begin_and_commit() {
+        assert_eq!(
+            transaction_statements("BEGIN; SELECT 1; COMMIT"),
+            Some(vec!["SELECT 1".to_string()])
+        );
+        assert!(transaction_statements("SELECT 1; SELECT 2").is_none());
+        assert!(transaction_statements("BEGIN; COMMIT").is_none());
+    }
+
+    #[tokio::test]
+    async fn transaction_executes_bound_parameters_and_returns_final_result() {
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                tokio::runtime::Handle::current(),
+            )
+            .build(),
+        );
+        let parameters = ParamValues::from(vec![
+            ScalarValue::Int64(Some(41)),
+            ScalarValue::Int64(Some(42)),
+        ]);
+
+        let response = sql_to_http_response(
+            df,
+            Arc::from("BEGIN; SELECT $1 AS ignored; SELECT $2 AS value; COMMIT"),
+            Some(parameters),
+            ResponseMimeType::Json,
+            false,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("transaction response body should be readable");
+        assert_eq!(body.as_ref(), br#"[{"value":42}]"#);
     }
 
     #[test]
