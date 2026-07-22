@@ -59,6 +59,12 @@ pub struct ReplicationParams {
     pub snapshot_on_resume: bool,
     pub temporary_slot: bool,
     pub status_interval: Duration,
+    /// Lag-based readiness threshold: the dataset is marked Ready once its
+    /// replication lag (now minus the newest applied commit's source time)
+    /// falls below this, so a snapshotting or backlog-draining dataset stays
+    /// not-ready and never serves stale data. User param
+    /// `pg_replication_ready_lag` (default 2s).
+    pub ready_lag: Duration,
     /// Rows per emitted snapshot batch during initial bootstrap.
     pub bootstrap_batch_size: usize,
     /// `true` when the slot name was explicitly configured
