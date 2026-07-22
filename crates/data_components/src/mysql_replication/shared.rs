@@ -514,12 +514,7 @@ impl CommitChange for SnapshotBoundaryCommitter {
         if let (Some(member), Some(slot)) =
             (self.source.member(&self.key), self.source.ack.slot(&self.key))
         {
-            let persisted = PersistedPosition {
-                position: slot.committed(),
-                schema_json: member.checkpoint_schema_json.clone(),
-                gtid_set: None,
-                cursor_type: CursorType::File,
-            };
+            let persisted = persisted_for(&member, &slot);
             if let Err(e) = member.position_store.save(&persisted).await {
                 tracing::warn!(dataset = %self.dataset, error = %e, "failed to persist shared mysql binlog snapshot head");
             }
@@ -547,6 +542,10 @@ struct MemberHandle {
     position_store: Arc<dyn PositionStore>,
     /// Versioned checkpoint meta persisted alongside the position.
     checkpoint_schema_json: Option<String>,
+    /// The cursor type this member persists (`Gtid` when the source is
+    /// GTID-positioning, else `File`), decided at attach. Written into every
+    /// checkpoint so a resume reloads the correct positioning mode.
+    cursor_type: CursorType,
 }
 
 /// One shared dump source: registry entry + pump state.
@@ -774,8 +773,21 @@ async fn attach_member(
     // which would silently scramble columns. There is no blind held-floor
     // fast-path (the per-dataset `Checkpointer`'s replay-boundary machinery that
     // would make one safe is intentionally out of v1 scope).
+    // GTID auto-positioning is used whenever the source reports gtid_mode = ON
+    // (all members share the connection, so all agree). Failover-safe; decides
+    // the member's cursor type at bootstrap and drives the shared dump.
+    let use_gtid = super::setup::gtid_mode_is_on(
+        super::setup::detect_gtid_mode(&mut conn)
+            .await?
+            .as_deref(),
+    );
+    let cursor_type = if use_gtid {
+        CursorType::Gtid
+    } else {
+        CursorType::File
+    };
     let rejoining = lock(&source.detached).remove(&member_key);
-    let (floor, snapshotting): (BinlogPosition, bool) = resolve_start_position(
+    let (floor, gtid_seed, snapshotting): (BinlogPosition, GtidSet, bool) = resolve_start_position(
         &mut conn,
         &params,
         &position_store,
@@ -783,6 +795,9 @@ async fn attach_member(
         checkpoint_schema_json.as_deref(),
         &layout_fingerprint,
         &dataset_name,
+        &database,
+        &table,
+        use_gtid,
     )
     .await?;
     if let Err(e) = conn.disconnect().await {
@@ -790,7 +805,9 @@ async fn attach_member(
     }
 
     let (sender, receiver) = mpsc::channel(DEFAULT_MEMBER_CHANNEL_CAPACITY);
-    source.ack.register(&member_key, floor, snapshotting);
+    source
+        .ack
+        .register_with_gtid(&member_key, floor, gtid_seed, snapshotting);
     lock(&source.members).insert(
         member_key.clone(),
         Arc::new(MemberHandle {
@@ -807,6 +824,7 @@ async fn attach_member(
             ready_lag: params.ready_lag,
             position_store: Arc::clone(&position_store),
             checkpoint_schema_json: checkpoint_schema_json.clone(),
+            cursor_type,
         }),
     );
     metrics.mark_member_attached();
@@ -894,7 +912,15 @@ async fn attach_member(
 }
 
 /// Resolve a fresh (non-rejoin) member's start position, applying
-/// `invalid_checkpoint_behavior` per member. Returns `(floor, snapshotting)`.
+/// `invalid_checkpoint_behavior` per member. Returns
+/// `(floor, gtid_seed, snapshotting)`. `gtid_seed` is the executed GTID set to
+/// seed the member's ack from (empty when the dump is file-positioning);
+/// `use_gtid` is the source's current mode (all members share it).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "resolve threads the member's identity, checkpoint meta, and source \
+              mode; bundling into a struct would only relocate the argument list"
+)]
 async fn resolve_start_position(
     conn: &mut Conn,
     params: &ReplicationParams,
@@ -903,7 +929,10 @@ async fn resolve_start_position(
     checkpoint_schema_json: Option<&str>,
     layout_fingerprint: &str,
     dataset_name: &str,
-) -> Result<(BinlogPosition, bool)> {
+    database: &str,
+    table: &str,
+    use_gtid: bool,
+) -> Result<(BinlogPosition, GtidSet, bool)> {
     let persisted = position_store
         .load()
         .await
@@ -911,7 +940,8 @@ async fn resolve_start_position(
             message: e.to_string(),
         })?;
 
-    let resume: Option<BinlogPosition> = match persisted {
+    // `Some((position, gtid_seed))` to resume, `None` to (re)snapshot.
+    let resume: Option<(BinlogPosition, GtidSet)> = match persisted {
         Some(_) if params.snapshot_mode == InitialSnapshotMode::Always => None,
         Some(persisted) => {
             if check_resume_compatibility(
@@ -929,39 +959,87 @@ async fn resolve_start_position(
                 )
                 .await?;
                 None
-            } else if super::setup::binlog_file_exists(conn, &persisted.position.file).await? {
-                Some(persisted.position)
             } else {
-                apply_invalid_checkpoint(params, position_store, dataset_name, "binlog purged")
-                    .await?;
-                None
+                match persisted.cursor_type {
+                    // GTID resume: the server computes the start point from the
+                    // executed set, so no binlog-file pre-check. A checkpoint
+                    // bootstrapped by GTID cannot silently downgrade to
+                    // file+offset (that would resume from a server-local offset
+                    // unrelated to the applied set) — if the source no longer
+                    // reports `gtid_mode = ON`, that is a hard error.
+                    CursorType::Gtid => {
+                        if !use_gtid {
+                            return Err(Error::GtidResumeUnavailable {
+                                dataset: dataset_name.to_string(),
+                                database: database.to_string(),
+                                table: table.to_string(),
+                            });
+                        }
+                        match GtidSet::parse(persisted.gtid_set.as_deref().unwrap_or_default()) {
+                            Ok(set) => Some((persisted.position, set)),
+                            Err(_) => {
+                                apply_invalid_checkpoint(
+                                    params,
+                                    position_store,
+                                    dataset_name,
+                                    "corrupt persisted GTID set",
+                                )
+                                .await?;
+                                None
+                            }
+                        }
+                    }
+                    CursorType::File => {
+                        if super::setup::binlog_file_exists(conn, &persisted.position.file).await? {
+                            Some((persisted.position, GtidSet::new()))
+                        } else {
+                            apply_invalid_checkpoint(
+                                params,
+                                position_store,
+                                dataset_name,
+                                "binlog purged",
+                            )
+                            .await?;
+                            None
+                        }
+                    }
+                }
             }
         }
         None => None,
     };
 
-    if let Some(position) = resume {
-        tracing::info!(dataset = %dataset_name, position = %position, "shared mysql binlog: resuming from persisted position");
-        return Ok((position, false));
+    if let Some((position, gtid_seed)) = resume {
+        tracing::info!(dataset = %dataset_name, position = %position, gtid = %use_gtid, "shared mysql binlog: resuming from persisted position");
+        return Ok((position, gtid_seed, false));
     }
 
-    // No usable position: capture the head first (so the snapshot overlap
-    // replays idempotently) and either snapshot from it or (snapshot disabled)
-    // stream from it after persisting it up front.
-    let head = super::setup::fetch_head_position(conn).await?;
+    // No usable position: capture the head (and its executed GTID set, when
+    // GTID-positioning) first so the snapshot overlap replays idempotently, then
+    // either snapshot from it or (snapshot disabled) stream from it after
+    // persisting it up front.
+    let (head, head_gtid) = if use_gtid {
+        super::setup::fetch_head_and_gtid(conn).await?
+    } else {
+        (super::setup::fetch_head_position(conn).await?, GtidSet::new())
+    };
     if params.snapshot_mode == InitialSnapshotMode::Disabled {
         let initial = PersistedPosition {
             position: head.clone(),
             schema_json: checkpoint_schema_json.map(ToString::to_string),
-            gtid_set: None,
-            cursor_type: CursorType::File,
+            gtid_set: use_gtid.then(|| head_gtid.to_string()),
+            cursor_type: if use_gtid {
+                CursorType::Gtid
+            } else {
+                CursorType::File
+            },
         };
         if let Err(e) = position_store.save(&initial).await {
             tracing::warn!(dataset = %dataset_name, error = %e, "failed to persist initial binlog head");
         }
-        Ok((head, false))
+        Ok((head, head_gtid, false))
     } else {
-        Ok((head, true))
+        Ok((head, head_gtid, true))
     }
 }
 
@@ -1770,6 +1848,20 @@ async fn deliver_to_member(
     }
 }
 
+/// Build a member's [`PersistedPosition`] from its ack slot — capturing the
+/// executed GTID set + cursor type when GTID-positioning (so a resume reloads
+/// the same mode), else a plain file+offset checkpoint. Shared by `persist_all`
+/// and the snapshot-boundary committer so both write identical checkpoint shape.
+fn persisted_for(member: &MemberHandle, slot: &AckSlot) -> PersistedPosition {
+    PersistedPosition {
+        position: slot.committed(),
+        schema_json: member.checkpoint_schema_json.clone(),
+        gtid_set: (member.cursor_type == CursorType::Gtid)
+            .then(|| slot.gtid_snapshot().to_string()),
+        cursor_type: member.cursor_type,
+    }
+}
+
 /// Persist each member's own committed position to its own sidecar (skipping
 /// no-op writes). The shared resume is the min across these on restart.
 async fn persist_all(source: &Arc<SharedSource>, last: &mut HashMap<MemberKey, BinlogPosition>) {
@@ -1788,12 +1880,7 @@ async fn persist_all(source: &Arc<SharedSource>, last: &mut HashMap<MemberKey, B
         if last.get(&key) == Some(&committed) {
             continue;
         }
-        let persisted = PersistedPosition {
-            position: committed.clone(),
-            schema_json: member.checkpoint_schema_json.clone(),
-            gtid_set: None,
-            cursor_type: CursorType::File,
-        };
+        let persisted = persisted_for(&member, &slot);
         match member.position_store.save(&persisted).await {
             Ok(()) => {
                 member.metrics.inc_checkpoint_persist();
