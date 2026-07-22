@@ -294,7 +294,7 @@ struct SpawnedTable {
 /// configuration error.
 #[derive(Debug, Snafu)]
 #[snafu(display(
-    "Catalog '{catalog}': no tables are eligible for CDC acceleration ({excluded} excluded by include/exclude filters, {skipped} skipped for lacking a usable REPLICA IDENTITY). Ensure the target schema(s) contain tables with a primary key, a UNIQUE NOT NULL index set as REPLICA IDENTITY USING INDEX, or REPLICA IDENTITY FULL, and that the catalog's `include`/`exclude` patterns match them. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
+    "Catalog '{catalog}': no tables are eligible for CDC acceleration ({excluded} excluded by include/exclude filters, {skipped} skipped for lacking a usable REPLICA IDENTITY). Give each table a usable CDC key -- a primary key (which REPLICA IDENTITY DEFAULT or FULL then keys on), or a UNIQUE NOT NULL index set as REPLICA IDENTITY USING INDEX -- and ensure the catalog's `include`/`exclude` patterns match them. Note that REPLICA IDENTITY FULL without a primary key is still skipped. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
 ))]
 pub(crate) struct NoEligibleTablesError {
     catalog: String,
