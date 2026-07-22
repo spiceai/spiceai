@@ -276,16 +276,21 @@ pub fn default_slot_name(dataset_name: &str) -> String {
 /// that distinguishes one spiced instance from another sharing the same source
 /// database). Factored out as a pure function — the instance identity is passed
 /// in rather than read from the environment — so its determinism and
-/// uniqueness properties can be unit-tested without mutating process-global env
-/// vars. Guarantees, for the resulting slot name:
+/// distinctness properties can be unit-tested without mutating process-global
+/// env vars. For the resulting slot name:
 ///
-///   - deterministic/stable: identical `(dataset_name, instance_id)` always
-///     produces the identical name, so a restart of the same instance resumes
-///     its existing replication slot rather than orphaning one;
-///   - unique per instance: two instances (distinct `instance_id`) pointed at
-///     the same catalog get distinct names, so they never collide on one
-///     physical Postgres slot (which permits a single consumer);
-///   - unique per dataset/catalog: distinct `dataset_name`s get distinct names.
+///   - deterministic/stable (a strict guarantee): identical `(dataset_name,
+///     instance_id)` always produces the identical name, so a restart of the
+///     same instance resumes its existing replication slot rather than
+///     orphaning one;
+///   - distinct per instance (in practice, not a strict guarantee): two
+///     instances (distinct `instance_id`) pointed at the same catalog get
+///     different names, so they don't share one physical Postgres slot (which
+///     permits a single consumer). The instance identity is folded into a short
+///     8-hex hash, so a collision is possible but astronomically unlikely;
+///   - distinct per dataset/catalog (same caveat): distinct `dataset_name`s get
+///     different names, disambiguated by a 6-hex hash of the full name so that
+///     names sharing a truncated prefix still differ.
 fn slot_name_for(dataset_name: &str, instance_id: &str) -> String {
     let instance_hash = xxh3_short_hash(instance_id);
     let dataset_hash = xxh3_short_hash_prefix(dataset_name, DATASET_HASH_LEN);
