@@ -1288,11 +1288,11 @@ impl Https {
 }
 
 /// Returns true if the supplied connector parameters indicate a
-/// User-facing OAuth2 parameter names (before the connector `http_` prefix).
-/// Setting any of these signals the user intends OAuth2 on a dynamic JSON API
+/// User-facing `OAuth2` parameter names (before the connector `http_` prefix).
+/// Setting any of these signals the user intends `OAuth2` on a dynamic JSON API
 /// endpoint. Kept as one list so the routing gate ([`params_indicate_dynamic_api`])
 /// and the resolver ([`Https::resolve_oauth2_auth`]) can't drift — if they did,
-/// an OAuth2 param without `auth_token_url` would route to the listing connector
+/// an `OAuth2` param without `auth_token_url` would route to the listing connector
 /// and its config would be silently ignored instead of failing validation.
 const OAUTH_PARAM_KEYS: &[&str] = &[
     "auth_token_url",
@@ -1306,7 +1306,7 @@ const OAUTH_PARAM_KEYS: &[&str] = &[
     "auth_header_format",
 ];
 
-/// Returns true if any OAuth2 parameter is set to a non-empty value.
+/// Returns true if any `OAuth2` parameter is set to a non-empty value.
 fn any_oauth_param_set(params: &Parameters) -> bool {
     OAUTH_PARAM_KEYS.iter().any(|key| {
         params
