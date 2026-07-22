@@ -263,10 +263,10 @@ impl PositionStore for SidecarPositionStore {
         // MongoDB sidecar: an unreadable checkpoint re-bootstraps rather than
         // wedging the dataset.
         Ok(self.sys.get().await.map(|cp| {
-            // The type is always written by this connector; the absent case can
-            // only arise from a pre-release dev checkpoint (the column didn't
-            // exist). Resolve it here from the GTID set rather than propagating
-            // an `Option` through resume.
+            // The type is always written by this connector, so a missing value
+            // is not expected (the feature has never shipped — no legacy rows).
+            // Resolve it defensively from the GTID set rather than propagating an
+            // `Option` through resume.
             let cursor_type = cp
                 .cursor_type
                 .as_deref()
