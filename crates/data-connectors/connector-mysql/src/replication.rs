@@ -39,6 +39,8 @@ use data_components::mysql_replication::{
 use datafusion::sql::TableReference;
 use futures::StreamExt;
 use mysql_async::{Opts, OptsBuilder, SslOpts};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use opentelemetry::KeyValue;
 use runtime::component::dataset::Dataset;
 use runtime::dataaccelerator::spice_sys::{
@@ -469,9 +471,9 @@ pub(crate) const REPLICATION_METRICS: &[MetricSpec] = &[
         MetricType::ObservableGaugeU64,
     )
     .description(
-        "1 while this dataset is an attached member of its shared binlog group (or on the \
-         per-dataset path), 0 once detached. A detached member holds the group's shared resume \
-         position back, so this is the unambiguous signal for which dataset stalled the group.",
+        "1 while this dataset is an attached member of its shared binlog group, 0 once \
+         detached. A detached member holds the group's shared resume position back, so this \
+         is the unambiguous signal for which dataset stalled the group.",
     )
     .auto_register(),
 ];
@@ -609,11 +611,27 @@ fn replication_params_from_connector_params(
             format!("parameter `{user_param}` must be a u32 server id, got {raw:?}: {e}")
         })?,
         None => {
+            // Derive from the FULL connection identity that the shared-source
+            // key coalesces on — host/port/user PLUS password and TLS config —
+            // not just host/port/user. Two datasets that differ only by
+            // password or `sslmode` get distinct shared-source keys and thus
+            // separate binlog dumps; they must therefore also get distinct
+            // server_ids, because MySQL drops a replication connection whose
+            // server_id collides with another's (dump thrashing otherwise).
+            // `SslOpts`/`&str` both hash, so the same tuple that keys the
+            // source keys the id. `DefaultHasher::new()` is fixed-seed, so the
+            // derivation stays deterministic within a process (equal
+            // connections coalesce); cross-process variance is supplied by
+            // `process_nonce()` and is harmless (MySQL keeps no id state).
+            let mut hasher = DefaultHasher::new();
+            opts.pass().hash(&mut hasher);
+            opts.ssl_opts().hash(&mut hasher);
             let conn_identity = format!(
-                "{}:{}:{}",
+                "{}:{}:{}:{:x}",
                 opts.ip_or_hostname(),
                 opts.tcp_port(),
-                opts.user().unwrap_or_default()
+                opts.user().unwrap_or_default(),
+                hasher.finish()
             );
             derive_server_id(&conn_identity, process_nonce())
         }
@@ -976,6 +994,38 @@ mod tests {
         assert_ne!(
             orders.server_id, other.server_id,
             "a different connection identity derives a different server_id"
+        );
+    }
+
+    #[test]
+    fn differing_credentials_or_tls_derive_distinct_server_ids() {
+        // The shared-source key coalesces on host/port/user PLUS password and
+        // TLS config, so connections that differ only on the credential or the
+        // TLS mode run SEPARATE binlog dumps — and must therefore derive
+        // DISTINCT server_ids, or the two dumps would collide on the source
+        // (MySQL drops a replication connection with a duplicate server_id).
+        let derive = |pairs: &[(&str, &str)]| {
+            replication_params_from_connector_params(&params_with(pairs), "orders")
+                .expect("valid params parse")
+                .server_id
+        };
+
+        let base = derive(&[("host", "localhost"), ("pass", "pw1"), ("sslmode", "disabled")]);
+
+        // Different password, same host/port/user.
+        let other_pass =
+            derive(&[("host", "localhost"), ("pass", "pw2"), ("sslmode", "disabled")]);
+        assert_ne!(
+            base, other_pass,
+            "a different password must derive a different server_id"
+        );
+
+        // TLS on vs off, same credentials.
+        let with_tls =
+            derive(&[("host", "localhost"), ("pass", "pw1"), ("sslmode", "required")]);
+        assert_ne!(
+            base, with_tls,
+            "a different TLS mode must derive a different server_id"
         );
     }
 

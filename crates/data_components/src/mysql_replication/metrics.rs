@@ -63,10 +63,10 @@ pub struct MetricsCollector {
     checkpoint_persists: AtomicU64,
     checkpoint_persist_errors: AtomicU64,
     /// Shared-binlog membership liveness: `1` while this dataset is an attached
-    /// member of a shared dump (`super::shared`), `0` once detached. `1` for a
-    /// non-shared (per-dataset) stream, which is always "attached" to its own
-    /// connection. A detached member holds the shared resume position back, so
-    /// this is the unambiguous signal for *which* dataset stalled the group.
+    /// member of a shared dump (`super::shared`), `0` once detached.
+    /// Initialized to `1` — a member starts attached to its group. A detached
+    /// member holds the shared resume position back, so this is the
+    /// unambiguous signal for *which* dataset stalled the group.
     member_attached: AtomicU64,
 }
 
@@ -76,8 +76,8 @@ impl MetricsCollector {
         Arc::new(Self {
             bootstrap_rows_expected: AtomicU64::new(u64::MAX),
             lag_bytes: AtomicU64::new(u64::MAX),
-            // A per-dataset stream is always attached to its own connection;
-            // the shared path flips this to 0 on detach.
+            // A member starts attached to its shared dump; the shared path
+            // flips this to 0 on detach.
             member_attached: AtomicU64::new(1),
             ..Self::default()
         })
@@ -303,8 +303,7 @@ impl Metrics {
             .checkpoint_persist_errors
             .load(Ordering::Relaxed)
     }
-    /// `1` while attached to the shared dump (or on the per-dataset path), `0`
-    /// once detached from a shared dump.
+    /// `1` while attached to the shared dump, `0` once detached from it.
     #[must_use]
     pub fn member_attached(&self) -> u64 {
         self.collector.member_attached.load(Ordering::Relaxed)
