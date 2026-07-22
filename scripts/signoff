@@ -24,6 +24,7 @@
 #   scripts/signoff -f              Sign off even with a dirty/unpushed tree
 #   scripts/signoff --no-verify     Sign off without running the checks (honor system)
 #   scripts/signoff status          Show the sign-off status of HEAD
+#   scripts/signoff mine            Show attestation status for all your open PRs
 #   scripts/signoff check           Show whether trunk requires sign-off
 #   scripts/signoff install         Configure the trunk ruleset (maintainers)
 #   scripts/signoff install --yes   Apply the ruleset change (default is a dry-run)
@@ -89,6 +90,15 @@ readonly ACTIONS_INTEGRATION_ID=15368
 
 readonly OK="✓"
 readonly NO="✗"
+
+# Colors for `mine`'s human-facing report only — every other command's output
+# stays plain text (docs/scripts may grep it). Respects NO_COLOR and piping.
+if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != "dumb" ]]; then
+  readonly C_RED=$'\033[31m' C_GREEN=$'\033[32m' C_YELLOW=$'\033[33m' \
+    C_DIM=$'\033[2m' C_BOLD=$'\033[1m' C_RESET=$'\033[0m'
+else
+  readonly C_RED='' C_GREEN='' C_YELLOW='' C_DIM='' C_BOLD='' C_RESET=''
+fi
 
 debug() { [[ -n "$DEBUG" ]] && echo "debug: $*" >&2 || true; }
 info()  { echo "$*" >&2; }
@@ -657,6 +667,102 @@ cmd_status() {
   fi
 }
 
+# Truncate to at most `n` display columns, adding an ellipsis when cut.
+truncate_str() {
+  local s="$1" n="$2"
+  if (( ${#s} > n )); then
+    printf '%s…' "${s:0:$((n - 1))}"
+  else
+    printf '%s' "$s"
+  fi
+}
+
+# One line per PR: colored icon, PR number, in-flight Remote Sign-off run id
+# (blank-padded when there isn't one, so the title column stays aligned), and
+# the title (truncated to the terminal width). A non-empty `run_id` means a
+# Remote Sign-off is currently queued/in_progress on this branch — that run
+# is necessarily for the branch's current tip, since it checks out the ref
+# live rather than a fixed SHA.
+print_pr_row() {
+  local number="$1" title="$2" state="$3" run_id="$4" width="$5"
+  local icon room run_col
+
+  if [[ -n "$run_id" ]]; then
+    icon="${C_YELLOW}⟳${C_RESET}"
+    run_col="${C_YELLOW}$(printf '%-12s' "$run_id")${C_RESET}"
+  else
+    case "$state" in
+      success)       icon="${C_GREEN}${OK}${C_RESET}" ;;
+      pending)       icon="${C_YELLOW}…${C_RESET}" ;;
+      failure|error) icon="${C_RED}${NO}${C_RESET}" ;;   # a sign-off attempt ran and failed
+      *)             icon="${C_DIM}○${C_RESET}" ;;       # none: never attempted
+    esac
+    run_col="$(printf '%-12s' '')"
+  fi
+
+  room=$(( width - 22 ))  # icon(1) + space + "#NNNNN"(6) + space + run id(12) + 2 spaces
+  (( room < 20 )) && room=20
+  printf '%s %-6s %s %s\n' "$icon" "#${number}" "$run_col" "$(truncate_str "$title" "$room")"
+}
+
+# List the sign-off/attestation status of every open PR authored by the
+# authenticated user, one row per PR, including whether a Remote Sign-off run
+# is currently in flight for that PR's branch.
+cmd_mine() {
+  require_tools
+  require_jq
+
+  local repo prs count
+  repo=$(repo_slug)
+
+  prs=$(gh pr list --repo "$repo" --author @me --state open \
+    --json number,title,headRefName,headRefOid) \
+    || fail "failed to list your open PRs on ${repo} (auth/rate-limit/network?)"
+  count=$(jq 'length' <<<"$prs")
+  if [[ "$count" -eq 0 ]]; then
+    echo "${C_DIM}No open PRs authored by you on ${repo}.${C_RESET}"
+    return 0
+  fi
+
+  # Fetch in-flight Remote Sign-off runs once for all PRs, not once per PR.
+  # Match on displayTitle, not headBranch: a workflow_dispatch run's headBranch
+  # is the ref it was dispatched *against* (always trunk here — cmd_remote
+  # doesn't pass --ref), not the `branch` input. signoff.yml's `run-name:
+  # Remote Sign-off (${{ inputs.branch }})` puts the actual branch in the
+  # title instead, so we match on that exact string.
+  local remote_runs
+  remote_runs=$(gh run list --repo "$repo" --workflow signoff.yml \
+    --json displayTitle,status,databaseId --limit 50) || remote_runs="[]"
+
+  local width
+  width=$(tput cols 2>/dev/null) || width=100
+
+  echo "${C_BOLD}${repo}${C_RESET} — ${count} open PR(s)"
+  echo
+
+  local i pr number title branch sha combined state run_id
+  for ((i = 0; i < count; i++)); do
+    pr=$(jq -c ".[$i]" <<<"$prs")
+    number=$(jq -r '.number' <<<"$pr")
+    title=$(jq -r '.title' <<<"$pr")
+    branch=$(jq -r '.headRefName' <<<"$pr")
+    sha=$(jq -r '.headRefOid' <<<"$pr")
+
+    combined=$(gh api "repos/${repo}/commits/${sha}/status" 2>/dev/null) || combined='{}'
+    state=$(jq -r "first(.statuses[]? | select(.context==\"${STATUS_CONTEXT}\") | .state) // \"none\"" <<<"$combined")
+
+    run_id=$(jq -r --arg title "Remote Sign-off (${branch})" \
+      '[.[] | select(.displayTitle == $title and (.status == "in_progress" or .status == "queued"))][0].databaseId // empty' \
+      <<<"$remote_runs")
+
+    print_pr_row "$number" "$title" "$state" "$run_id" "$width"
+  done
+
+  echo
+  echo "${C_DIM}○ not attested   ${NO} attestation failed   … pending   ⟳ remote sign-off running   ${OK} attested${C_RESET}"
+  echo "${C_DIM}Sign off with: make signoff  (or: scripts/signoff remote)${C_RESET}"
+}
+
 # Resolve the ruleset id for TARGET_BRANCH by name. `first(...)` returns a single
 # id inside jq — avoids `head`, which SIGPIPEs the writer under pipefail.
 ruleset_id() {
@@ -820,6 +926,7 @@ Developers:
   scripts/signoff -f           Sign off even with a dirty/unpushed tree
   scripts/signoff --no-verify  Sign off without running checks (honor system)
   scripts/signoff status       Show the sign-off status of HEAD
+  scripts/signoff mine         Show attestation status for all your open PRs
 
 Maintainers:
   scripts/signoff check        Show whether '${TARGET_BRANCH}' requires sign-off
@@ -849,6 +956,7 @@ main() {
     -f|--force|--no-verify) cmd_signoff "$@" ;;
     remote)   shift; cmd_remote "$@" ;;
     status)   shift; cmd_status "$@" ;;
+    mine)     shift; cmd_mine "$@" ;;
     check)    shift; cmd_check "$@" ;;
     install)  shift; cmd_install "$@" ;;
     version|--version) echo "signoff ${VERSION}" ;;
