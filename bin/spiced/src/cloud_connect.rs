@@ -42,7 +42,9 @@ use runtime_cloud_connect::handlers::{QueryResult, RuntimeHandle};
 use runtime_cloud_connect::{CloudConnect, identity::IdentityStore};
 
 /// Read the optional `cloud-endpoint` override file written by
-/// `spice connect <code> --endpoint <url>`.
+/// `spice connect <code> --endpoint <url>`. This overrides the cloud
+/// **enroll** endpoint (state plane); the gateway (stream) address comes
+/// from the enroll response.
 fn read_endpoint_override(config_dir: &Path) -> Option<String> {
     let path = config_dir.join("cloud-endpoint");
     std::fs::read_to_string(path)
@@ -57,7 +59,7 @@ fn build_config(runtime_version: &str) -> CloudConnectConfig {
     if std::env::var_os("SPICE_CLOUD_ENDPOINT").is_none()
         && let Some(override_endpoint) = read_endpoint_override(&config.config_dir)
     {
-        config.endpoint = override_endpoint;
+        config.enroll_endpoint = override_endpoint;
     }
     config
 }
@@ -93,8 +95,8 @@ pub async fn maybe_start(runtime_version: &str, runtime: Arc<Runtime>) -> Option
     }
 
     tracing::info!(
-        "Spice Cloud Connect: enabled, endpoint={} mode={}",
-        config.endpoint,
+        "Spice Cloud Connect: enabled, enroll_endpoint={} mode={}",
+        config.enroll_endpoint,
         if has_identity { "identity" } else { "adopt" }
     );
 

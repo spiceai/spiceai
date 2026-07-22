@@ -231,12 +231,15 @@ fn id_result(ids: &[i64], truncated: bool) -> QueryResult {
 }
 
 fn config_with(
-    endpoint: String,
+    gateway_endpoint: String,
     identity_path: std::path::PathBuf,
     config_dir: std::path::PathBuf,
 ) -> CloudConnectConfig {
     CloudConnectConfig {
-        endpoint,
+        // The enroll endpoint is never contacted in these tests (identity
+        // is pre-seeded), but must be a valid URL.
+        enroll_endpoint: "http://127.0.0.1:9".to_string(),
+        gateway_endpoint: Some(gateway_endpoint),
         ca_cert_pem: None,
         insecure: true,
         identity_path,
@@ -246,6 +249,7 @@ fn config_with(
         runtime_version: "v0.0.0-test".to_string(),
         heartbeat_interval: Duration::from_secs(30),
         telemetry_interval: Duration::from_mins(1),
+        renewal_lead: Duration::from_secs(12 * 60 * 60),
     }
 }
 
@@ -256,6 +260,7 @@ fn preseed_identity(path: &std::path::Path) {
         private_key_pem: "UNIT-TEST-KEY".to_string(),
         public_key_pem: "UNIT-TEST-PUB".to_string(),
         ca_bundle_pem: String::new(),
+        gateway_addr: String::new(),
         not_after_unix: 0,
     };
     IdentityStore::store(path, &identity).unwrap();

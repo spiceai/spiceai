@@ -87,9 +87,10 @@ pub struct ConnectArgs {
     #[arg(value_name = "TARGET")]
     pub target: Option<String>,
 
-    /// Override the Spice Cloud Connect endpoint. Defaults to
-    /// `https://cloud.spice.ai`. Also configurable via
-    /// `SPICE_CLOUD_ENDPOINT`.
+    /// Override the Spice Cloud enroll endpoint the runtime presents its
+    /// adoption code to. Defaults to `https://cloud.spice.ai`. Also
+    /// configurable via `SPICE_CLOUD_ENDPOINT`. The gateway (stream)
+    /// address is issued by the enroll response, not configured here.
     #[arg(long, value_name = "URL")]
     pub endpoint: Option<String>,
 }
@@ -238,6 +239,9 @@ fn print_status() -> Result<()> {
         println!("Spice Cloud Connect: adopted");
         println!("  identifier:  {}", id.identifier);
         println!("  identity:    {}", identity_path.display());
+        if !id.gateway_addr.is_empty() {
+            println!("  gateway:     {}", id.gateway_addr);
+        }
         println!("  expiry:      {expiry}");
         return Ok(());
     }
@@ -254,7 +258,7 @@ fn print_status() -> Result<()> {
         let mask = mask_code(preview);
         println!("  code (masked):   {mask}");
         println!(
-            "  start `spiced` to send the code to {} and finish adoption.",
+            "  start `spiced` to enroll with {} and finish adoption.",
             resolved_endpoint(&pending_path)
         );
         return Ok(());
