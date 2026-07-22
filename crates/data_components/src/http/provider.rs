@@ -4087,7 +4087,8 @@ mod tests {
             .expect("allowlisted before auth configured")
             .with_auth(Arc::new(CustomHeaderAuthenticator(HeaderName::from_static(
                 "x-shopify-access-token",
-            ))) as Arc<dyn super::super::auth::HttpAuthenticator>);
+            )))
+                as Arc<dyn super::super::auth::HttpAuthenticator>);
         let filters = vec![Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::Column(Column::from_name("request_headers"))),
             op: Operator::Eq,
