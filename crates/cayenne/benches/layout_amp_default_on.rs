@@ -62,16 +62,22 @@ impl Rng {
 
 /// Bytes touched under zone-map prune (full file when max >= threshold).
 fn bytes_touched(order: &[usize], values: &[f64], threshold: f64, files: usize) -> usize {
-    let rows_per_file = order.len() / files;
+    let n = order.len();
     let mut touched = 0usize;
     for file in 0..files {
-        let slice = &order[file * rows_per_file..(file + 1) * rows_per_file];
+        // Balanced partition covering EVERY row: the `n % files` remainder is
+        // spread one-per-file across the leading slices, so no rows are dropped
+        // (a fixed `n / files` slice width would skip the last `n % files` rows
+        // and skew the amp math).
+        let start = file * n / files;
+        let end = (file + 1) * n / files;
+        let slice = &order[start..end];
         let mut max = f64::NEG_INFINITY;
         for &row in slice {
             max = max.max(values[row]);
         }
         if max >= threshold {
-            touched = touched.saturating_add(rows_per_file);
+            touched = touched.saturating_add(slice.len());
         }
     }
     touched

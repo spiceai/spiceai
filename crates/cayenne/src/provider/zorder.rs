@@ -192,11 +192,15 @@ fn column_order_keys(array: &dyn Array) -> DFResult<Vec<[u8; BYTES_PER_COLUMN]>>
     Ok(keys)
 }
 
-/// Whether [`column_order_keys`] can produce a non-trivial (non-all-zero) key
-/// for `data_type` — i.e. the Z-order curve can actually cluster on a column of
-/// this type. MUST stay in sync with the `match` arms in [`column_order_keys`]:
-/// any type not listed there collapses to the reserved all-zero key and so
-/// contributes no clustering (notably `Decimal*`, `Map`, and nested types).
+/// Whether `data_type` has a dedicated value-encoding arm in
+/// [`column_order_keys`], so its Z-order keys vary with the column's values and
+/// the curve can cluster on it. A type without an arm falls to the catch-all and
+/// maps *every* value to the reserved all-zero key — no clustering is ever
+/// possible — which is exactly what this guard excludes (notably `Decimal*`,
+/// `Map`, and nested types). A supported type may still encode an individual
+/// value (e.g. `0` / `false`) to the all-zero key; that is expected and does not
+/// change whether the type can cluster. MUST stay in sync with the `match` arms
+/// in [`column_order_keys`].
 pub(crate) fn is_zorder_clusterable(data_type: &DataType) -> bool {
     matches!(
         data_type,
