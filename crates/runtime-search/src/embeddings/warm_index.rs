@@ -45,6 +45,7 @@ use search::metadata::MetadataColumns;
 /// When the index is chunked, `engine_index`'s primary key must already be augmented
 /// with the chunk key.
 #[must_use]
+#[expect(clippy::too_many_arguments)]
 pub fn with_memory_warm_index(
     tbl: &TableReference,
     engine_index: Arc<dyn VectorIndex>,
@@ -76,7 +77,7 @@ pub fn with_memory_warm_index(
         metadata_columns,
         embedder,
         Arc::clone(embed_udf),
-        model_name.clone(),
+        model_name.to_owned(),
         memory_metric,
     ) {
         Ok(memory_index) => Arc::new(memory_index) as Arc<dyn VectorIndex>,

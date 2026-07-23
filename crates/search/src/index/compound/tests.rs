@@ -791,6 +791,7 @@ mod warm_memory {
     use crate::index::memory::{MemoryDistanceMetric, MemoryVectorIndex};
     use crate::metadata::MetadataColumns;
     use arrow::array::{FixedSizeListArray, Float32Array, Float64Array};
+    use datafusion_expr::{Volatility, create_udf};
     use llms::embeddings::{Embed, EmbeddingInput};
 
     const DIM: i32 = 3;
@@ -829,7 +830,14 @@ mod warm_memory {
             vec![Field::new("id", DataType::Int64, false)],
             MetadataColumns::none(),
             Arc::new(ByteEmbed),
-            DIM,
+            Arc::new(create_udf(
+                "embed",
+                vec![],
+                arrow_schema::DataType::Null,
+                Volatility::Volatile,
+                Arc::new(|_| unimplemented!()),
+            )),
+            "model_name".to_string(),
             MemoryDistanceMetric::Cosine,
         )
         .expect("valid memory index")
