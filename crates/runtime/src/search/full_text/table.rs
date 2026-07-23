@@ -82,21 +82,20 @@ pub(crate) fn build_full_text_database_index(
 
     // `derived_store_fields` outlives the borrow below only when no override is supplied.
     let derived_store_fields;
-    let store_fields: &[String] = match store_fields_override {
-        Some(store_fields) => store_fields,
-        None => {
-            derived_store_fields = columns
-                .iter()
-                .filter_map(|c| {
-                    if c.as_vector_metadata() == Some(MetadataType::NonFilterable) {
-                        Some(c.name.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-            derived_store_fields.as_slice()
-        }
+    let store_fields: &[String] = if let Some(store_fields) = store_fields_override {
+        store_fields
+    } else {
+        derived_store_fields = columns
+            .iter()
+            .filter_map(|c| {
+                if c.as_vector_metadata() == Some(MetadataType::NonFilterable) {
+                    Some(c.name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        derived_store_fields.as_slice()
     };
 
     FullTextDatabaseIndex::try_new(
@@ -128,14 +127,14 @@ fn register_index(
 ///
 /// Expects at least one [`Column`] to have a full text search column configured.
 pub(crate) fn add_full_text_search_to_table(
-    inner_table_provider: Arc<dyn TableProvider>,
+    inner_table_provider: &Arc<dyn TableProvider>,
     columns: &[Column],
     tbl: &TableReference,
 ) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
     let index =
-        build_full_text_database_index(Arc::clone(&inner_table_provider), columns, tbl, None)?;
+        build_full_text_database_index(Arc::clone(inner_table_provider), columns, tbl, None)?;
     Ok(register_index(
-        &inner_table_provider,
+        inner_table_provider,
         Arc::new(index) as Arc<dyn Index + Send + Sync>,
     ))
 }

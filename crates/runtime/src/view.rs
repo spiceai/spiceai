@@ -156,7 +156,7 @@ pub(crate) async fn prepare_view(
     // Configure full-text search
     if view.has_full_text_column() {
         tbl_provider = Arc::new(add_full_text_search_to_table(
-            tbl_provider,
+            &tbl_provider,
             &view.columns,
             &view.name,
         )?) as Arc<dyn TableProvider>;
