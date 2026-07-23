@@ -990,8 +990,7 @@ fn init_metrics(
     // telemetry level rather than under any single exporter because
     // OpenTelemetry 0.31's SDK does not support per-reader name transforms.
     // Character/length validity is enforced at spicepod parse time via
-    // `validate_metric_prefix` (OTel instrument name syntax). Empty prefixes
-    // are a no-op and are skipped here.
+    // `validate_metric_prefix` (OTel instrument name syntax).
     if let Some(prefix) = metric_prefix.filter(|p| !p.is_empty()) {
         validate_metric_prefix(&prefix)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;

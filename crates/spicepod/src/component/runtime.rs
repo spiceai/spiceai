@@ -451,11 +451,10 @@ pub struct TelemetryConfig {
     ///
     /// Validated against the `OpenTelemetry` instrument name syntax so prefixed
     /// names stay valid for OTLP backends and remain sanitizable to Prometheus
-    /// legacy names (`[a-zA-Z_:][a-zA-Z0-9_:]*`). An empty string is treated as
-    /// no prefix. Non-empty values must start with an ASCII letter, contain only
-    /// ASCII letters, digits, `_`, `.`, `-`, or `/`, and be at most
-    /// [`METRIC_PREFIX_MAX_LEN`] characters. A trailing `.` or `_` is
-    /// recommended (e.g. `spiceai.`).
+    /// legacy names (`[a-zA-Z_:][a-zA-Z0-9_:]*`). Must start with an ASCII
+    /// letter, contain only ASCII letters, digits, `_`, `.`, `-`, or `/`, and
+    /// be at most [`METRIC_PREFIX_MAX_LEN`] characters. A trailing `.` or `_`
+    /// is recommended (e.g. `spiceai.`).
     /// See: <https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetrymetric_prefix>
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metric_prefix: Option<String>,
@@ -492,7 +491,6 @@ impl Default for TelemetryConfig {
 /// name syntax so `{prefix}{instrument}` stays a valid metric name for OTLP
 /// and maps cleanly through Prometheus name sanitization.
 ///
-/// An empty prefix is accepted (no-op: instrument names are already non-empty).
 /// Non-empty prefixes must (mirroring the `OTel` Metrics API / SDK):
 /// - start with an ASCII alphabetic character
 /// - contain only ASCII alphanumeric characters, `_`, `.`, `-`, or `/`
@@ -503,7 +501,6 @@ impl Default for TelemetryConfig {
 ///
 /// Returns a user-facing error describing the violation and how to fix it.
 pub fn validate_metric_prefix(prefix: &str) -> Result<(), String> {
-    // Empty prefix is a no-op — metric instrument names themselves are non-empty.
     if prefix.is_empty() {
         return Ok(());
     }
@@ -513,9 +510,7 @@ pub fn validate_metric_prefix(prefix: &str) -> Result<(), String> {
     // (UTF-8 byte length can exceed the limit even when char count does not).
     if !prefix.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
         return Err(format!(
-            "Invalid 'runtime.telemetry.metric_prefix' value '{prefix}': must start with an ASCII letter (A-Z or a-z). \
-             Example: 'spiceai.'. \
-             See: https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetrymetric_prefix"
+            "Invalid 'runtime.telemetry.metric_prefix' value '{prefix}': must start with an ASCII letter (A-Z or a-z). Example: 'spiceai.'. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetrymetric_prefix"
         ));
     }
 
@@ -523,10 +518,7 @@ pub fn validate_metric_prefix(prefix: &str) -> Result<(), String> {
         !c.is_ascii_alphanumeric() && !METRIC_PREFIX_ALLOWED_NON_ALPHANUMERIC.contains(c)
     }) {
         return Err(format!(
-            "Invalid 'runtime.telemetry.metric_prefix' value '{prefix}': contains invalid character {invalid:?}. \
-             Allowed characters are ASCII letters, digits, '_', '.', '-', and '/'. \
-             Example: 'spiceai.'. \
-             See: https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetrymetric_prefix"
+            "Invalid 'runtime.telemetry.metric_prefix' value '{prefix}': contains invalid character {invalid:?}. Allowed characters are ASCII letters, digits, '_', '.', '-', and '/'. Example: 'spiceai.'. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetrymetric_prefix"
         ));
     }
 
@@ -534,9 +526,7 @@ pub fn validate_metric_prefix(prefix: &str) -> Result<(), String> {
     let char_len = prefix.chars().count();
     if char_len > METRIC_PREFIX_MAX_LEN {
         return Err(format!(
-            "Invalid 'runtime.telemetry.metric_prefix' value '{prefix}': length {char_len} exceeds the maximum of {METRIC_PREFIX_MAX_LEN} characters. \
-             Shorten the prefix so prefixed metric names stay within the OpenTelemetry 255-character instrument name limit. \
-             See: https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetrymetric_prefix"
+            "Invalid 'runtime.telemetry.metric_prefix' value '{prefix}': length {char_len} exceeds the maximum of {METRIC_PREFIX_MAX_LEN} characters. Shorten the prefix so prefixed metric names stay within the OpenTelemetry 255-character instrument name limit. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetrymetric_prefix"
         ));
     }
 
@@ -2264,8 +2254,7 @@ datasets:
         "#;
         let runtime: Runtime = yaml::from_str(yaml).expect("empty metric_prefix must parse");
         assert_eq!(runtime.telemetry.metric_prefix.as_deref(), Some(""));
-        validate_metric_prefix("")
-            .expect("empty metric_prefix is a no-op and must be valid");
+        validate_metric_prefix("").expect("empty metric_prefix must be valid");
     }
 
     #[test]
