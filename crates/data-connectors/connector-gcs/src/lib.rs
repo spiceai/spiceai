@@ -301,3 +301,13 @@ pub const CONNECTOR_NAME: &str = "gcs";
 pub fn factory() -> Arc<dyn DataConnectorFactory> {
     GoogleCloudStorageFactory::new_arc()
 }
+
+// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_gcs as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+runtime::register_data_connector!(
+    register_gcs_connector,
+    GCS_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    GoogleCloudStorageFactory
+);

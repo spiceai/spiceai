@@ -27,17 +27,76 @@ use tokio::sync::SetOnce;
 
 use app::spicepod::component::runtime::{
     ClientAuthMode as SpicepodClientAuthMode, Runtime as SpicepodRuntime, TelemetryConfig,
+    validate_metric_prefix,
 };
 use app::{App, AppBuilder};
 use clap::{ArgAction, Parser, ValueEnum};
 // Force-linkage for connectors that self-register via `register_data_connector!` (the linkme
 // distributed slice). A crate contributes its slice entry only when it is actually linked, and a
-// plain Cargo dependency is not enough — the linker drops the unreferenced static — so every such
-// connector needs a `use <crate> as _;` line in this block. `register_all()` then registers them
-// at startup; no explicit `register_connector_factory` call is required for these. (Currently just
-// DynamoDB; the other extracted connectors move onto this pattern in a follow-up.)
+// plain Cargo dependency is not enough -- the linker drops the unreferenced static -- so every
+// connector needs a `use <crate> as _;` line here. `register_all()` then registers them at
+// startup; no explicit `register_connector_factory` call is needed (except secondary-name aliases,
+// handled in `register_external_connectors`).
+use connector_abfs as _;
+#[cfg(feature = "adbc")]
+use connector_adbc as _;
+#[cfg(feature = "clickhouse")]
+use connector_clickhouse as _;
+#[cfg(feature = "cosmosdb")]
+use connector_cosmosdb as _;
+#[cfg(feature = "databricks")]
+use connector_databricks as _;
+#[cfg(feature = "delta_lake")]
+use connector_delta_lake as _;
+#[cfg(feature = "dremio")]
+use connector_dremio as _;
+#[cfg(feature = "duckdb")]
+use connector_duckdb as _;
+use connector_ducklake as _;
 #[cfg(feature = "dynamodb")]
 use connector_dynamodb as _;
+#[cfg(feature = "elasticsearch")]
+use connector_elasticsearch as _;
+#[cfg(feature = "flightsql")]
+use connector_flightsql as _;
+#[cfg(feature = "ftp")]
+use connector_ftp as _;
+use connector_gcs as _;
+use connector_git as _;
+use connector_github as _;
+use connector_glue as _;
+use connector_graphql as _;
+#[cfg(feature = "imap")]
+use connector_imap as _;
+#[cfg(feature = "kafka")]
+use connector_kafka as _;
+#[cfg(feature = "mongodb")]
+use connector_mongodb as _;
+#[cfg(feature = "mssql")]
+use connector_mssql as _;
+#[cfg(feature = "mysql")]
+use connector_mysql as _;
+#[cfg(feature = "nfs")]
+use connector_nfs as _;
+#[cfg(feature = "odbc")]
+use connector_odbc as _;
+#[cfg(feature = "oracle")]
+use connector_oracle as _;
+#[cfg(feature = "postgres")]
+use connector_postgres as _;
+#[cfg(feature = "scylladb")]
+use connector_scylladb as _;
+#[cfg(feature = "sftp")]
+use connector_sftp as _;
+#[cfg(feature = "sharepoint")]
+use connector_sharepoint as _;
+#[cfg(feature = "smb")]
+use connector_smb as _;
+#[cfg(feature = "snowflake")]
+use connector_snowflake as _;
+#[cfg(feature = "spark")]
+use connector_spark as _;
+use connector_spiceai as _;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
@@ -71,187 +130,28 @@ mod log_capture;
 mod spiced_tracing;
 mod tls;
 
-/// Registers all external data connectors with the runtime.
+/// Registers the connector *aliases* — secondary names that reuse an existing connector's
+/// factory under a different prefix (`abfss`, `gs`) or a legacy name.
 ///
-/// This function must be called during runtime initialization to make the
-/// extracted connector crates available. Unlike the built-in connectors in
-/// the runtime crate, external connectors are not automatically registered
-/// via the `linkme` distributed slice pattern.
+/// The connectors themselves self-register into the `linkme` `DATA_CONNECTOR_REGISTRATIONS`
+/// slice via `register_data_connector!` and are force-linked by the `use connector_* as _;`
+/// block at the top of this module, so `runtime::dataconnector::register_all()` registers them
+/// at startup. Only these alias/legacy names, which map a second string to the same factory,
+/// need an explicit registration here.
 pub async fn register_external_connectors() {
     use runtime::dataconnector::register_connector_factory;
 
-    // Always-compiled connectors (no feature gate)
-    register_connector_factory(
-        connector_graphql::CONNECTOR_NAME,
-        connector_graphql::factory(),
-    )
-    .await;
-
-    register_connector_factory(connector_abfs::CONNECTOR_NAME, connector_abfs::factory()).await;
-    // Also register the "abfss" prefix (secure variant uses the same factory)
-    register_connector_factory("abfss", connector_abfs::factory()).await;
-
-    register_connector_factory(connector_gcs::CONNECTOR_NAME, connector_gcs::factory()).await;
-    // Also register the "gs" prefix alias for GCS
-    register_connector_factory("gs", connector_gcs::factory()).await;
-
-    register_connector_factory(connector_glue::CONNECTOR_NAME, connector_glue::factory()).await;
-
-    register_connector_factory(
-        connector_ducklake::CONNECTOR_NAME,
-        connector_ducklake::factory(),
-    )
-    .await;
-    register_connector_factory(connector_git::CONNECTOR_NAME, connector_git::factory()).await;
-    register_connector_factory(
-        connector_github::CONNECTOR_NAME,
-        connector_github::factory(),
-    )
-    .await;
-    register_connector_factory(
-        connector_spiceai::CONNECTOR_NAME,
-        connector_spiceai::factory(),
-    )
-    .await;
-    // Also register the legacy "spiceai" prefix
+    // Connectors self-register into the linkme slice (`register_data_connector!`) and are
+    // force-linked via the `use connector_* as _;` block at the top of this module; `register_all()`
+    // registers them at startup. Only secondary names that reuse a connector's factory under a
+    // different prefix stay explicit here -- they are intentionally not separate schema entries:
+    register_connector_factory("abfss", connector_abfs::factory()).await; // secure alias of abfs
+    register_connector_factory("gs", connector_gcs::factory()).await; // alias of gcs
     register_connector_factory(
         connector_spiceai::LEGACY_CONNECTOR_NAME,
         connector_spiceai::legacy_factory(),
     )
     .await;
-
-    // Feature-gated connectors
-
-    #[cfg(feature = "clickhouse")]
-    register_connector_factory(
-        connector_clickhouse::CONNECTOR_NAME,
-        connector_clickhouse::factory(),
-    )
-    .await;
-
-    #[cfg(feature = "cosmosdb")]
-    register_connector_factory(
-        connector_cosmosdb::CONNECTOR_NAME,
-        connector_cosmosdb::factory(),
-    )
-    .await;
-
-    #[cfg(feature = "adbc")]
-    register_connector_factory(connector_adbc::CONNECTOR_NAME, connector_adbc::factory()).await;
-
-    #[cfg(feature = "kafka")]
-    register_connector_factory(connector_kafka::CONNECTOR_NAME, connector_kafka::factory()).await;
-
-    #[cfg(feature = "databricks")]
-    register_connector_factory(
-        connector_databricks::CONNECTOR_NAME,
-        connector_databricks::factory(),
-    )
-    .await;
-
-    #[cfg(feature = "delta_lake")]
-    register_connector_factory(
-        connector_delta_lake::CONNECTOR_NAME,
-        connector_delta_lake::factory(),
-    )
-    .await;
-
-    #[cfg(feature = "dremio")]
-    register_connector_factory(
-        connector_dremio::CONNECTOR_NAME,
-        connector_dremio::factory(),
-    )
-    .await;
-
-    #[cfg(feature = "duckdb")]
-    register_connector_factory(
-        connector_duckdb::CONNECTOR_NAME,
-        connector_duckdb::factory(),
-    )
-    .await;
-
-    #[cfg(feature = "elasticsearch")]
-    register_connector_factory(
-        connector_elasticsearch::CONNECTOR_NAME,
-        connector_elasticsearch::factory(),
-    )
-    .await;
-
-    #[cfg(feature = "flightsql")]
-    register_connector_factory(
-        connector_flightsql::CONNECTOR_NAME,
-        connector_flightsql::factory(),
-    )
-    .await;
-
-    #[cfg(feature = "ftp")]
-    register_connector_factory(connector_ftp::CONNECTOR_NAME, connector_ftp::factory()).await;
-
-    #[cfg(feature = "imap")]
-    register_connector_factory(connector_imap::CONNECTOR_NAME, connector_imap::factory()).await;
-
-    #[cfg(feature = "mongodb")]
-    register_connector_factory(
-        connector_mongodb::CONNECTOR_NAME,
-        connector_mongodb::factory(),
-    )
-    .await;
-
-    #[cfg(feature = "mssql")]
-    register_connector_factory(connector_mssql::CONNECTOR_NAME, connector_mssql::factory()).await;
-
-    #[cfg(feature = "mysql")]
-    register_connector_factory(connector_mysql::CONNECTOR_NAME, connector_mysql::factory()).await;
-
-    #[cfg(feature = "nfs")]
-    register_connector_factory(connector_nfs::CONNECTOR_NAME, connector_nfs::factory()).await;
-
-    #[cfg(feature = "odbc")]
-    register_connector_factory(connector_odbc::CONNECTOR_NAME, connector_odbc::factory()).await;
-
-    #[cfg(feature = "oracle")]
-    register_connector_factory(
-        connector_oracle::CONNECTOR_NAME,
-        connector_oracle::factory(),
-    )
-    .await;
-
-    #[cfg(feature = "postgres")]
-    register_connector_factory(
-        connector_postgres::CONNECTOR_NAME,
-        connector_postgres::factory(),
-    )
-    .await;
-
-    #[cfg(feature = "scylladb")]
-    register_connector_factory(
-        connector_scylladb::CONNECTOR_NAME,
-        connector_scylladb::factory(),
-    )
-    .await;
-
-    #[cfg(feature = "sftp")]
-    register_connector_factory(connector_sftp::CONNECTOR_NAME, connector_sftp::factory()).await;
-
-    #[cfg(feature = "sharepoint")]
-    register_connector_factory(
-        connector_sharepoint::CONNECTOR_NAME,
-        connector_sharepoint::factory(),
-    )
-    .await;
-
-    #[cfg(feature = "smb")]
-    register_connector_factory(connector_smb::CONNECTOR_NAME, connector_smb::factory()).await;
-
-    #[cfg(feature = "snowflake")]
-    register_connector_factory(
-        connector_snowflake::CONNECTOR_NAME,
-        connector_snowflake::factory(),
-    )
-    .await;
-
-    #[cfg(feature = "spark")]
-    register_connector_factory(connector_spark::CONNECTOR_NAME, connector_spark::factory()).await;
 }
 
 #[derive(Debug, Snafu)]
@@ -1090,7 +990,11 @@ fn init_metrics(
     // on-demand OTLP, OTEL push). The prefix is intentionally placed at the
     // telemetry level rather than under any single exporter because
     // OpenTelemetry 0.31's SDK does not support per-reader name transforms.
+    // Character/length validity is enforced at spicepod parse time via
+    // `validate_metric_prefix` (OTel instrument name syntax).
     if let Some(prefix) = metric_prefix.filter(|p| !p.is_empty()) {
+        validate_metric_prefix(&prefix)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         tracing::info!(prefix = %prefix, "OTEL metrics name prefix enabled");
         provider_builder = provider_builder.with_view(
             move |instrument: &opentelemetry_sdk::metrics::Instrument| {

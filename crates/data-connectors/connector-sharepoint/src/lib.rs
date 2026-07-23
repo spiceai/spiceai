@@ -1041,3 +1041,13 @@ mod tests {
         assert!(url_extension("sharepoint://drives/id").is_none());
     }
 }
+
+// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_sharepoint as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+runtime::register_data_connector!(
+    register_sharepoint_connector,
+    SHAREPOINT_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    SharepointFactory
+);

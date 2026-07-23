@@ -60,6 +60,8 @@ const MYSQL_E2E_PORT: u16 = 13322;
 const MYSQL_E2E_CAYENNE_PORT: u16 = 13323;
 #[cfg(not(target_os = "windows"))]
 const MYSQL_E2E_RESTART_PORT: u16 = 13321;
+#[cfg(not(target_os = "windows"))]
+const MYSQL_E2E_GTID_PORT: u16 = 13330;
 
 /// The accelerator engine a run of the e2e exercises.
 struct EngineConfig {
@@ -529,6 +531,139 @@ async fn mysql_binlog_replication_restart_resume_cayenne() -> Result<(), anyhow:
                     scalar_i64(&rt, "SELECT count(*) FROM repl_orders WHERE o_id = 100").await?,
                     1,
                     "originally-replicated rows must survive the restart"
+                );
+                drop(rt);
+            }
+
+            pool.disconnect().await?;
+            Ok(())
+        })
+        .await
+}
+
+/// GTID auto-positioning resume: on a `gtid_mode = ON` source,
+/// the connector bootstraps a GTID cursor and, after a process restart, resumes
+/// via `COM_BINLOG_DUMP_GTID` from the persisted executed set with no
+/// duplicates or gaps. If GTID resume were broken (e.g. the dump-request set or
+/// the empty-set round-trip), run 2 would error or diverge, failing this test.
+/// Cursor-type persistence itself is unit-tested per engine in
+/// `runtime::dataaccelerator::spice_sys::mysql_binlog`.
+#[cfg(not(target_os = "windows"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_binlog_replication_gtid_resume_cayenne() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,runtime=debug,data_components::mysql_replication=debug,info",
+    ));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let port = MYSQL_E2E_GTID_PORT;
+            let _container = common::start_mysql_gtid_docker_container(port)
+                .await
+                .map_err(|e| anyhow!("start gtid container: {e}"))?;
+
+            let pool = common::get_mysql_conn(port)?;
+            exec(&pool, DDL_STATEMENTS[1]).await?; // repl_orders
+            exec(&pool, SEED_STATEMENTS[1]).await?; // 4 rows
+
+            // The source must actually be issuing GTIDs, else this test would
+            // silently exercise the file+offset path instead.
+            let gtid_mode = {
+                let mut conn = pool.get_conn().await?;
+                conn.query_first::<String, _>("SELECT @@GLOBAL.gtid_mode")
+                    .await?
+                    .ok_or_else(|| anyhow!("gtid_mode query returned no row"))?
+            };
+            assert_eq!(gtid_mode, "ON", "container must run with gtid_mode = ON");
+
+            let temp_dir = tempfile::tempdir()?;
+            let data_dir = temp_dir.path().join("cayenne");
+            std::fs::create_dir_all(&data_dir)?;
+            let accel_params = HashMap::from([
+                (
+                    "cayenne_file_path".to_string(),
+                    data_dir.display().to_string(),
+                ),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    temp_dir.path().join("metadata.db").display().to_string(),
+                ),
+            ]);
+            // Distinct server_ids so the two runs never collide on the source
+            // replica id (a real process restart reuses the derived id, but
+            // sequential runs here overlap briefly).
+            let make_rt = |server_id: &str| {
+                let mut params = mysql_params(port);
+                params.insert(
+                    "mysql_replication_server_id".to_string(),
+                    server_id.to_string(),
+                );
+                let engine = EngineConfig {
+                    engine: "cayenne",
+                    mode: spicepod::acceleration::Mode::File,
+                    accel_params: accel_params.clone(),
+                };
+                let ds = make_dataset(&DATASETS[1], &params, &engine);
+                AppBuilder::new("mysql_replication_gtid").with_dataset(ds)
+            };
+
+            configure_test_datafusion();
+
+            // ---- Run 1: cold bootstrap by GTID, then shut down. ----
+            {
+                let rt = Arc::new(
+                    Runtime::builder()
+                        .with_app(make_rt("42011").build())
+                        .build()
+                        .await,
+                );
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_secs(90)) => {
+                        return Err(anyhow!("run 1: timed out loading"));
+                    }
+                    () = Arc::clone(&rt).load_components() => {}
+                }
+                runtime_ready_check(&rt).await;
+                wait_for_scalar_i64(&rt, "SELECT count(*) FROM repl_orders", 4).await?;
+                drop(rt);
+            }
+
+            // ---- Gap: a change made while no runtime is streaming. ----
+            exec(
+                &pool,
+                "INSERT INTO repl_orders (o_id, o_p_id, o_qty, o_status) VALUES (999, 1, 5, 'gap')",
+            )
+            .await?;
+
+            // ---- Run 2: resume from the persisted GTID set. ----
+            {
+                let rt = Arc::new(
+                    Runtime::builder()
+                        .with_app(make_rt("42012").build())
+                        .build()
+                        .await,
+                );
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_secs(90)) => {
+                        return Err(anyhow!("run 2: timed out loading"));
+                    }
+                    () = Arc::clone(&rt).load_components() => {}
+                }
+                runtime_ready_check(&rt).await;
+
+                // GTID resume replays the gap insert (no gap) and the original
+                // snapshot rows survive (no re-snapshot, no duplicates).
+                wait_for_scalar_i64(&rt, "SELECT count(*) FROM repl_orders", 5).await?;
+                assert_eq!(
+                    scalar_i64(&rt, "SELECT o_qty FROM repl_orders WHERE o_id = 999").await?,
+                    5,
+                    "the change made while down must replay after GTID resume"
+                );
+                assert_eq!(
+                    scalar_i64(&rt, "SELECT count(*) FROM repl_orders WHERE o_id = 100").await?,
+                    1,
+                    "originally-replicated rows must survive the GTID resume"
                 );
                 drop(rt);
             }

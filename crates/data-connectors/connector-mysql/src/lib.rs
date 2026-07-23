@@ -163,6 +163,7 @@ const PARAMETERS: &[ParameterSpec] = &[
              when one does; 'disabled' streams changes only; 'always' re-snapshots on every \
              start, discarding any persisted position. Default: auto.",
         )
+        .default("auto")
         .one_of_ignore_ascii_case(InitialSnapshotMode::VALUES)
         .help_link(MYSQL_DOCS),
     ParameterSpec::component("replication_checkpoint_interval")
@@ -186,6 +187,7 @@ const PARAMETERS: &[ParameterSpec] = &[
              (default) surfaces an actionable error; 'restart' drops the saved position and \
              re-snapshots the table. Default: error.",
         )
+        .default("error")
         .one_of_ignore_ascii_case(InvalidCheckpointBehavior::VALUES)
         .help_link(MYSQL_DOCS),
     ParameterSpec::component("replication_ready_lag")
@@ -858,3 +860,13 @@ pub const CONNECTOR_NAME: &str = "mysql";
 pub fn factory() -> Arc<dyn DataConnectorFactory> {
     MySQLFactory::new_arc()
 }
+
+// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_mysql as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+runtime::register_data_connector!(
+    register_mysql_connector,
+    MYSQL_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    MySQLFactory
+);

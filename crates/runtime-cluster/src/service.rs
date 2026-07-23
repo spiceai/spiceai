@@ -31,6 +31,7 @@ limitations under the License.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use app::App;
@@ -183,6 +184,23 @@ struct CommitResult {
     failed: Vec<(Assignment, Error)>,
 }
 
+/// Outcome of a [`PartitionService::reconcile_all`] cycle, used by the periodic
+/// scheduler task to decide whether to open the first-assignment gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileOutcome {
+    /// The cycle ran its assignment pass with at least one connected executor,
+    /// so any unassigned partitions were distributed and the store now reflects
+    /// each executor's authoritative share (which may legitimately be empty when
+    /// there were no pending partitions). Only this outcome should open the
+    /// `allocate_initial_partitions` gate.
+    Assigned,
+    /// The cycle never reached its assignment pass — either no accelerated
+    /// partitioned tables exist, or no executors were connected during the
+    /// cycle. Opening the gate here would hand a connecting executor a share
+    /// before the scheduler has had a chance to distribute to it.
+    NoAssignment,
+}
+
 /// Shared partition infrastructure for discovery and assignment operations.
 ///
 /// Holds the [`PartitionStore`], executor registry, and app reference. Public methods are `seed_table`, `reconcile_table`,
@@ -192,6 +210,12 @@ pub struct PartitionService {
     pub partition_store: Arc<PartitionStore>,
     pub executor_registry: Arc<ExecutorRegistry>,
     pub app: Arc<RwLock<Option<Arc<App>>>>,
+    /// Set once the scheduler has completed its first assignment cycle. Until
+    /// then `allocate_initial_partitions` returns `Unavailable` so a connecting
+    /// executor waits for its fair share rather than loading an empty snapshot —
+    /// CDC/Changes-mode accelerations (e.g. Cayenne) only load partition data at
+    /// their initial snapshot and have no re-load path once assigned later.
+    first_assignment_complete: Arc<AtomicBool>,
 }
 
 impl PartitionService {
@@ -205,7 +229,24 @@ impl PartitionService {
             partition_store,
             executor_registry,
             app,
+            first_assignment_complete: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Whether the scheduler has completed its first assignment cycle.
+    ///
+    /// Gates `allocate_initial_partitions`: an executor waits until this is
+    /// `true` so its initial snapshot loads its assigned partitions.
+    #[must_use]
+    pub fn is_first_assignment_complete(&self) -> bool {
+        self.first_assignment_complete.load(Ordering::Acquire)
+    }
+
+    /// Mark the first assignment cycle as complete. Idempotent; called by the
+    /// periodic assignment task after its first `reconcile_all` succeeds.
+    pub fn mark_first_assignment_complete(&self) {
+        self.first_assignment_complete
+            .store(true, Ordering::Release);
     }
 
     fn config_from_app(app: &App) -> AssignmentConfig {
@@ -322,14 +363,20 @@ impl PartitionService {
     ///
     /// Used by the periodic partition-management background task.
     ///
+    /// Returns [`ReconcileOutcome::Assigned`] only when partitions were actually
+    /// distributed to connected executors this cycle; every no-op path (no app,
+    /// no partitioned tables, no connected executors) returns
+    /// [`ReconcileOutcome::NoAssignment`] so the caller does not prematurely open
+    /// the first-assignment gate.
+    ///
     /// # Errors
     ///
     /// Returns an error if the partition store refresh or executor notification fails.
     /// Per-table diff failures are logged and skipped rather than propagated.
-    pub async fn reconcile_all(&self, ops: &dyn PartitionOperations) -> Result<()> {
+    pub async fn reconcile_all(&self, ops: &dyn PartitionOperations) -> Result<ReconcileOutcome> {
         let Some(app) = self.app.read().await.clone() else {
             tracing::warn!("App not initialized, skipping partition discovery");
-            return Ok(());
+            return Ok(ReconcileOutcome::NoAssignment);
         };
         let config = Self::config_from_app(&app);
 
@@ -379,7 +426,7 @@ impl PartitionService {
         }
 
         if reconciled_tables.is_empty() {
-            return Ok(());
+            return Ok(ReconcileOutcome::NoAssignment);
         }
 
         self.partition_store
@@ -392,7 +439,7 @@ impl PartitionService {
             for table in &reconciled_tables {
                 self.record_partitions_count_for_table(table);
             }
-            return Ok(());
+            return Ok(ReconcileOutcome::NoAssignment);
         }
 
         let result = self
@@ -407,7 +454,7 @@ impl PartitionService {
         for table in &reconciled_tables {
             self.record_partitions_count_for_table(table);
         }
-        result
+        result.map(|()| ReconcileOutcome::Assigned)
     }
 
     /// Step 1: query the source via `ops`, diff against the store, and apply the diff.
