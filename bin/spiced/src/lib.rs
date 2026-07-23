@@ -27,6 +27,7 @@ use tokio::sync::SetOnce;
 
 use app::spicepod::component::runtime::{
     ClientAuthMode as SpicepodClientAuthMode, Runtime as SpicepodRuntime, TelemetryConfig,
+    validate_metric_prefix,
 };
 use app::{App, AppBuilder};
 use clap::{ArgAction, Parser, ValueEnum};
@@ -988,7 +989,13 @@ fn init_metrics(
     // on-demand OTLP, OTEL push). The prefix is intentionally placed at the
     // telemetry level rather than under any single exporter because
     // OpenTelemetry 0.31's SDK does not support per-reader name transforms.
+    // Character/length validity is enforced at spicepod parse time via
+    // `validate_metric_prefix` (OTel instrument name syntax).
     if let Some(prefix) = metric_prefix.filter(|p| !p.is_empty()) {
+        // Defense in depth: spicepod load already validates, but reject here
+        // if an invalid prefix reaches metrics init through another path.
+        validate_metric_prefix(&prefix)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         tracing::info!(prefix = %prefix, "OTEL metrics name prefix enabled");
         provider_builder = provider_builder.with_view(
             move |instrument: &opentelemetry_sdk::metrics::Instrument| {
