@@ -35,6 +35,8 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+// Only `CdcIngestResponse` (below, same cfg) derives `Serialize`.
+#[cfg(any(feature = "debezium", feature = "openapi"))]
 use serde::Serialize;
 use serde_json::json;
 
