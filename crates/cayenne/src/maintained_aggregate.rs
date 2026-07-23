@@ -29,13 +29,15 @@ use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch, new_empty_array};
-use arrow_schema::{DataType, FieldRef, SchemaRef};
+use arrow::datatypes::Decimal128Type;
+use arrow_schema::{DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DataType, FieldRef, SchemaRef};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::logical_expr::ColumnarValue;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
+use datafusion_functions_aggregate_common::utils::DecimalAverager;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions::{CastExpr, Column, Literal};
 use datafusion_physical_expr::{Distribution, OrderingRequirements};
@@ -78,15 +80,22 @@ pub enum MaintainedAggregateFunction {
     /// SQL `COUNT(*)` or `COUNT(column)`.
     Count,
     /// SQL `SUM(column)` over the signed-integer (`Int8`..`Int64`),
-    /// unsigned-integer (`UInt8`..`UInt64`), or floating-point
-    /// (`Float32`/`Float64`) families. Narrower widths widen losslessly to the
-    /// `BIGINT`/`Float64` sum output, matching `DataFusion`'s `SUM` output type.
+    /// unsigned-integer (`UInt8`..`UInt64`), floating-point
+    /// (`Float32`/`Float64`), or `Decimal128` families. Narrower integer/float
+    /// widths widen losslessly to the `BIGINT`/`Float64` sum output, matching
+    /// `DataFusion`'s `SUM` output type; `Decimal128(p, s)` sums its `i128`
+    /// backing values exactly and widens the precision to
+    /// `Decimal128(min(38, p + 10), s)` (`DataFusion`'s decimal `SUM` output).
     Sum,
     /// SQL `AVG(column)` over the signed-integer (`Int8`..`Int64`),
-    /// unsigned-integer (`UInt8`..`UInt64`), or floating-point
-    /// (`Float32`/`Float64`) families. The output is always `Float64` (matching
-    /// `DataFusion`'s `AVG` output type); integer inputs fold their running sum
-    /// exactly into an `i128` accumulator, floats into an `f64` one.
+    /// unsigned-integer (`UInt8`..`UInt64`), floating-point
+    /// (`Float32`/`Float64`), or non-negative-scale `Decimal128` families.
+    /// Integer/float inputs output `Float64` (matching `DataFusion`'s `AVG`
+    /// output type); integer inputs fold their running sum exactly into an
+    /// `i128` accumulator, floats into an `f64` one. `Decimal128(p, s)` inputs
+    /// output `Decimal128(min(38, p + 4), min(38, s + 4))` (`DataFusion`'s
+    /// decimal `AVG` output), folding the exact `i128` backing-value sum and
+    /// dividing down to the output scale only when served.
     Avg,
     /// SQL `MIN(column)` over signed/unsigned integers, `Date32`/`Date64`,
     /// `Timestamp`, and `Decimal128`. Unlike `SUM` (which widens to `BIGINT`),
@@ -191,6 +200,15 @@ enum AggregateOutputType {
     Int64,
     UInt64,
     Float64,
+    /// `SUM`/`AVG` over a `Decimal128` input. Unlike the fixed widened outputs
+    /// above, the output precision/scale depend on the input type (`SUM(p, s)`
+    /// -> `(min(38, p + 10), s)`; `AVG(p, s)` -> `(min(38, p + 4),
+    /// min(38, s + 4))`, `DataFusion`'s decimal output types), so the resolved
+    /// parameters are carried here.
+    Decimal128 {
+        precision: u8,
+        scale: i8,
+    },
     /// The output type equals the aggregate's input column type — `MIN`/`MAX`,
     /// which preserve type rather than widen. The concrete `DataType` lives on
     /// the [`ResolvedAggregateExpr`]'s resolved column, so field matching for
@@ -204,6 +222,9 @@ impl AggregateOutputType {
             Self::Count | Self::Int64 => field.data_type() == &DataType::Int64,
             Self::UInt64 => field.data_type() == &DataType::UInt64,
             Self::Float64 => field.data_type() == &DataType::Float64,
+            Self::Decimal128 { precision, scale } => {
+                field.data_type() == &DataType::Decimal128(precision, scale)
+            }
             // Matched against the input column type in
             // `ResolvedAggregateExpr::output_matches_field`, never here.
             Self::SameAsInput => false,
@@ -244,6 +265,23 @@ enum AggregateAccumulator {
         value: Option<f64>,
         non_null_count: u64,
     },
+    /// `SUM` over a `Decimal128(p, s)` column. The output keeps the input scale
+    /// (only the precision widens, to `min(38, p + 10)`), so the running sum is
+    /// the exact `i128` backing-value sum — exactly invertible on the retract
+    /// path, like the integer sums. `precision`/`scale` are the *output* type
+    /// parameters, carried so the served scalar is typed exactly. Unlike
+    /// `SumInt64`'s `Option<i64>`, the SQL-`NULL` state is encoded as
+    /// `non_null_count == 0` rather than an `Option<i128>`: an `Option<i128>`
+    /// has no niche, and its extra 16 aligned bytes would grow *every*
+    /// [`AggregateAccumulator`] (the enum takes the largest variant's size)
+    /// for all views, decimal or not.
+    SumDecimal128 {
+        column_index: usize,
+        value: i128,
+        non_null_count: u64,
+        precision: u8,
+        scale: i8,
+    },
     AvgFloat64 {
         column_index: usize,
         sum: f64,
@@ -258,6 +296,21 @@ enum AggregateAccumulator {
         column_index: usize,
         sum: i128,
         count: i64,
+    },
+    /// `AVG` over a `Decimal128(p, sum_scale)` column. The running sum is the
+    /// exact `i128` backing-value sum at the *input* scale (exactly invertible
+    /// on the retract path, like [`Self::AvgInt128`]); only when served is it
+    /// rescaled to `target_scale` and divided by the count — by `DataFusion`'s
+    /// own `DecimalAverager`, so the quotient (truncation, precision
+    /// validation, overflow behavior) is identical to a base-table re-scan by
+    /// construction.
+    AvgDecimal128 {
+        column_index: usize,
+        sum: i128,
+        count: i64,
+        sum_scale: i8,
+        target_precision: u8,
+        target_scale: i8,
     },
     /// SQL `MIN(column)`: the smallest live value in the group, read as the
     /// first key of a retraction-capable ordered multiset.
@@ -1184,6 +1237,32 @@ impl ResolvedAggregateExpr {
                 MaintainedAggregateFunction::Sum | MaintainedAggregateFunction::Avg,
                 Some(data_type),
             ) if is_maintainable_float(data_type) => AggregateOutputType::Float64,
+            // SQL `SUM(Decimal128(p, s))` keeps the scale and widens the
+            // precision to `min(38, p + 10)` (DataFusion's decimal SUM output
+            // type), so the running sum is the exact `i128` backing-value sum —
+            // the common CDC money-column case (Postgres `NUMERIC(6, 2)` ->
+            // arrow `Decimal128(6, 2)`). `Decimal256` (i256 backing) stays a
+            // follow-up and falls to the catch-all below.
+            (MaintainedAggregateFunction::Sum, Some(&DataType::Decimal128(precision, scale))) => {
+                AggregateOutputType::Decimal128 {
+                    precision: DECIMAL128_MAX_PRECISION.min(precision.saturating_add(10)),
+                    scale,
+                }
+            }
+            // SQL `AVG(Decimal128(p, s))` outputs `Decimal128(min(38, p + 4),
+            // min(38, s + 4))` (DataFusion's decimal AVG output type). Restricted
+            // to non-negative input scales: the serve-time quotient is computed
+            // by DataFusion's `DecimalAverager`, whose `10^scale` factors are
+            // only meaningful for `s >= 0`. A negative-scale decimal falls to
+            // the catch-all.
+            (MaintainedAggregateFunction::Avg, Some(&DataType::Decimal128(precision, scale)))
+                if scale >= 0 =>
+            {
+                AggregateOutputType::Decimal128 {
+                    precision: DECIMAL128_MAX_PRECISION.min(precision.saturating_add(4)),
+                    scale: DECIMAL128_MAX_SCALE.min(scale.saturating_add(4)),
+                }
+            }
             (
                 MaintainedAggregateFunction::Sum
                 | MaintainedAggregateFunction::Avg
@@ -1334,6 +1413,36 @@ impl AggregateAccumulator {
                     non_null_count: 0,
                 }
             }
+            (
+                MaintainedAggregateFunction::Sum,
+                AggregateOutputType::Decimal128 { precision, scale },
+                Some(column),
+            ) => Self::SumDecimal128 {
+                column_index: column.index,
+                value: 0,
+                non_null_count: 0,
+                precision,
+                scale,
+            },
+            (
+                MaintainedAggregateFunction::Avg,
+                AggregateOutputType::Decimal128 { precision, scale },
+                Some(column),
+            ) => {
+                let DataType::Decimal128(_, sum_scale) = column.data_type else {
+                    return Err(DataFusionError::Internal(format!(
+                        "invalid maintained aggregate accumulator state: {expr:?}"
+                    )));
+                };
+                Self::AvgDecimal128 {
+                    column_index: column.index,
+                    sum: 0,
+                    count: 0,
+                    sum_scale,
+                    target_precision: precision,
+                    target_scale: scale,
+                }
+            }
             (MaintainedAggregateFunction::Avg, AggregateOutputType::Float64, Some(column))
                 if column.data_type.is_signed_integer()
                     || column.data_type.is_unsigned_integer() =>
@@ -1459,6 +1568,36 @@ impl AggregateAccumulator {
                 if !batch.column(*column_index).is_null(row) {
                     let scalar = ScalarValue::try_from_array(batch.column(*column_index), row)?;
                     let delta = scalar_as_i128(&scalar)?;
+                    *sum = sum.checked_add(delta).ok_or_else(avg_overflow)?;
+                    *count = count.checked_add(1).ok_or_else(count_overflow)?;
+                }
+                false
+            }
+            Self::SumDecimal128 {
+                column_index,
+                value,
+                non_null_count,
+                ..
+            } => {
+                if !batch.column(*column_index).is_null(row) {
+                    let scalar = ScalarValue::try_from_array(batch.column(*column_index), row)?;
+                    let delta = scalar_as_decimal_i128(&scalar)?;
+                    let next_value = value.checked_add(delta).ok_or_else(sum_overflow)?;
+                    let next_count = non_null_count.checked_add(1).ok_or_else(count_overflow)?;
+                    *value = next_value;
+                    *non_null_count = next_count;
+                }
+                false
+            }
+            Self::AvgDecimal128 {
+                column_index,
+                sum,
+                count,
+                ..
+            } => {
+                if !batch.column(*column_index).is_null(row) {
+                    let scalar = ScalarValue::try_from_array(batch.column(*column_index), row)?;
+                    let delta = scalar_as_decimal_i128(&scalar)?;
                     *sum = sum.checked_add(delta).ok_or_else(avg_overflow)?;
                     *count = count.checked_add(1).ok_or_else(count_overflow)?;
                 }
@@ -1594,6 +1733,42 @@ impl AggregateAccumulator {
                 }
                 false
             }
+            Self::SumDecimal128 {
+                value,
+                non_null_count,
+                ..
+            } => {
+                if let Some(scalar) = input
+                    && !scalar.is_null()
+                {
+                    let delta = scalar_as_decimal_i128(scalar)?;
+                    let remaining = value.checked_sub(delta).ok_or_else(sum_overflow)?;
+                    let next_count = non_null_count
+                        .checked_sub(1)
+                        .ok_or_else(retract_underflow)?;
+                    if next_count == 0 && remaining != 0 {
+                        return Err(retract_underflow());
+                    }
+                    *value = remaining;
+                    *non_null_count = next_count;
+                }
+                false
+            }
+            Self::AvgDecimal128 { sum, count, .. } => {
+                if let Some(scalar) = input
+                    && !scalar.is_null()
+                {
+                    let delta = scalar_as_decimal_i128(scalar)?;
+                    let remaining = sum.checked_sub(delta).ok_or_else(retract_underflow)?;
+                    let next_count = count.checked_sub(1).ok_or_else(retract_underflow)?;
+                    if next_count == 0 && remaining != 0 {
+                        return Err(retract_underflow());
+                    }
+                    *sum = if next_count == 0 { 0 } else { remaining };
+                    *count = next_count;
+                }
+                false
+            }
             // `MIN`/`MAX` retract identically — remove the captured live value
             // from the ordered multiset; the extremum falls back to the next
             // value automatically. A null contributed nothing, so it retracts
@@ -1625,6 +1800,20 @@ impl AggregateAccumulator {
             Self::SumFloat64 { value, .. } => {
                 scalar_for_field(field, Some(ScalarValue::Float64(*value)))
             }
+            Self::SumDecimal128 {
+                value,
+                non_null_count,
+                precision,
+                scale,
+                ..
+            } => {
+                // `non_null_count == 0` encodes SQL `NULL` (see the variant doc).
+                let value = (*non_null_count != 0).then_some(*value);
+                scalar_for_field(
+                    field,
+                    Some(ScalarValue::Decimal128(value, *precision, *scale)),
+                )
+            }
             Self::AvgFloat64 { sum, count, .. } => {
                 if *count == 0 {
                     scalar_for_field(field, Some(ScalarValue::Float64(None)))
@@ -1649,6 +1838,41 @@ impl AggregateAccumulator {
                     let sum_f64 = *sum as f64;
                     scalar_for_field(field, Some(ScalarValue::Float64(Some(sum_f64 / count_f64))))
                 }
+            }
+            Self::AvgDecimal128 {
+                sum,
+                count,
+                sum_scale,
+                target_precision,
+                target_scale,
+                ..
+            } => {
+                // DataFusion's own sum/count -> decimal quotient (rescale to
+                // the output scale, truncate toward zero, validate precision),
+                // so the maintained result is structurally identical to what a
+                // base-table re-scan computes — including erroring the query
+                // with DataFusion's "Arithmetic Overflow in `AvgAccumulator`"
+                // when the rescale or output precision overflows.
+                let avg = if *count == 0 {
+                    None
+                } else {
+                    Some(
+                        DecimalAverager::<Decimal128Type>::try_new(
+                            *sum_scale,
+                            *target_precision,
+                            *target_scale,
+                        )?
+                        .avg(*sum, i128::from(*count))?,
+                    )
+                };
+                scalar_for_field(
+                    field,
+                    Some(ScalarValue::Decimal128(
+                        avg,
+                        *target_precision,
+                        *target_scale,
+                    )),
+                )
             }
             // The stored extremum is already the exact input-typed scalar, so
             // `scalar_for_field` passes it through; an empty index yields a typed
@@ -1893,6 +2117,17 @@ fn scalar_as_i128(scalar: &ScalarValue) -> DataFusionResult<i128> {
         ScalarValue::UInt16(Some(v)) => Ok(i128::from(*v)),
         ScalarValue::UInt8(Some(v)) => Ok(i128::from(*v)),
         _ => Err(type_mismatch("an integer", scalar)),
+    }
+}
+
+/// Extract a non-null `Decimal128` input scalar's `i128` backing value. The
+/// column carries one fixed scale, so maintained `SUM`/`AVG` fold the backing
+/// values directly: at a shared scale, decimal addition IS integer addition on
+/// the backing values, exactly invertible on the retract path.
+fn scalar_as_decimal_i128(scalar: &ScalarValue) -> DataFusionResult<i128> {
+    match scalar {
+        ScalarValue::Decimal128(Some(v), _, _) => Ok(*v),
+        _ => Err(type_mismatch("a decimal128", scalar)),
     }
 }
 
@@ -3252,6 +3487,362 @@ mod tests {
             "MIN exposes the next-smallest amount"
         );
         Ok(())
+    }
+
+    // --- decimal SUM/AVG (Postgres NUMERIC → arrow Decimal128, the CDC money
+    // column case). Column layout for these tests:
+    //   name (Utf8)            -> GROUP BY key
+    //   amt  (Decimal128(6,2)) -> SUM/AVG target
+    //   pk   (Int64)           -> PRIMARY KEY (pk_columns = [2])
+
+    fn decimal_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("amt", DataType::Decimal128(6, 2), true),
+            Field::new("pk", DataType::Int64, false),
+        ]))
+    }
+
+    /// Rows are `(group, raw backing value at scale 2, pk)`.
+    fn decimal_batch(rows: &[(&str, Option<i128>, i64)]) -> RecordBatch {
+        let amounts = Decimal128Array::from(rows.iter().map(|(_, a, _)| *a).collect::<Vec<_>>())
+            .with_precision_and_scale(6, 2)
+            .expect("valid decimal precision/scale");
+        RecordBatch::try_new(
+            decimal_schema(),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(n, _, _)| Some(*n)).collect::<Vec<_>>(),
+                )),
+                Arc::new(amounts),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(_, _, pk)| *pk).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("decimal batch should be valid")
+    }
+
+    fn decimal_sum_avg_spec() -> MaintainedAggregateSpec {
+        MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Sum,
+                    column: Some("amt".to_string()),
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Avg,
+                    column: Some("amt".to_string()),
+                },
+            ],
+        }
+    }
+
+    /// Serve `SUM(amt)`/`AVG(amt) GROUP BY name` through a real `DataFusion`
+    /// `AggregateExec` (so the output field types are `DataFusion`'s own decimal
+    /// `SUM`/`AVG` return types, not ones this module computed for itself) and
+    /// return `group -> (sum raw, avg raw)` backing values, skipping NULLs.
+    #[expect(clippy::type_complexity, reason = "test helper return map")]
+    fn decimal_sum_avg_by_name(
+        registry: &MaintainedAggregateRegistry,
+        epoch: u64,
+    ) -> DataFusionResult<BTreeMap<String, (Option<i128>, Option<i128>)>> {
+        let schema = decimal_schema();
+        let input = MemorySourceConfig::try_new_exec(
+            &[vec![decimal_batch(&[])]],
+            Arc::clone(&schema),
+            None,
+        )?;
+        let aggregate_exprs = [("sum(amt)", sum_udaf()), ("avg(amt)", avg_udaf())]
+            .into_iter()
+            .map(|(alias, udaf)| {
+                AggregateExprBuilder::new(udaf, vec![col("amt", schema.as_ref())?])
+                    .schema(Arc::clone(&schema))
+                    .alias(alias.to_string())
+                    .build()
+                    .map(Arc::new)
+            })
+            .collect::<DataFusionResult<Vec<_>>>()?;
+        let aggregate = AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(vec![(col("name", schema.as_ref())?, "name".to_string())]),
+            aggregate_exprs,
+            vec![None, None],
+            input,
+            schema,
+        )?;
+        // DataFusion's decimal SUM/AVG output types, computed by DataFusion.
+        assert_eq!(
+            aggregate.schema().field(1).data_type(),
+            &DataType::Decimal128(16, 2),
+            "sum(Decimal128(6, 2)) widens precision by 10"
+        );
+        assert_eq!(
+            aggregate.schema().field(2).data_type(),
+            &DataType::Decimal128(10, 6),
+            "avg(Decimal128(6, 2)) widens precision and scale by 4"
+        );
+        let result = registry
+            .batch_for_aggregate(&aggregate, epoch)?
+            .expect("registry should be fresh");
+        let names = as_string_array(result.column(0))?;
+        let sums = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("sum(amt) is Decimal128");
+        let avgs = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("avg(amt) is Decimal128");
+        let mut out = BTreeMap::new();
+        for row in 0..result.num_rows() {
+            out.insert(
+                names.value(row).to_string(),
+                (
+                    (!sums.is_null(row)).then(|| sums.value(row)),
+                    (!avgs.is_null(row)).then(|| avgs.value(row)),
+                ),
+            );
+        }
+        Ok(out)
+    }
+
+    /// `SUM`/`AVG` over a `Decimal128` money column (Postgres `NUMERIC(6, 2)`,
+    /// the CH-benCH `SUM(ol_amount)` case) must (a) be accepted at registry
+    /// construction and (b) serve exact values through a real `DataFusion`
+    /// aggregate, whose decimal output types the maintained view must
+    /// reproduce. Before decimal support this failed dataset registration with
+    /// "Sum maintained aggregate does not support column type Decimal128(6, 2)".
+    #[test]
+    fn maintains_sum_avg_over_decimal128() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[decimal_sum_avg_spec()],
+            &decimal_schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        // a: 1.50 + 9.99 + NULL; b: -0.50.
+        registry.apply_insert_batches(
+            1,
+            &[decimal_batch(&[
+                ("a", Some(150), 1),
+                ("a", Some(999), 2),
+                ("a", None, 3),
+                ("b", Some(-50), 4),
+            ])],
+        )?;
+        let by_name = decimal_sum_avg_by_name(&registry, 1)?;
+        // a: SUM = 11.49 (raw 1149 at scale 2); AVG = 11.49 / 2 = 5.745000
+        // (raw 1149 * 10^4 / 2 = 5_745_000 at scale 6) — NULL contributes nothing.
+        assert_eq!(by_name.get("a"), Some(&(Some(1149), Some(5_745_000))));
+        // b: SUM = -0.50; AVG = -0.500000.
+        assert_eq!(by_name.get("b"), Some(&(Some(-50), Some(-500_000))));
+        Ok(())
+    }
+
+    /// The decimal `AVG` quotient truncates toward zero — exactly `DataFusion`'s
+    /// `DecimalAverager` (`div_wrapping`), not floor: `0.04 / 3` is `0.013333`
+    /// and `-0.04 / 3` is `-0.013333` (floor would give `-0.013334`).
+    #[test]
+    fn avg_over_decimal128_truncates_toward_zero_like_datafusion() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[decimal_sum_avg_spec()],
+            &decimal_schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        registry.apply_insert_batches(
+            1,
+            &[decimal_batch(&[
+                ("pos", Some(1), 1),
+                ("pos", Some(1), 2),
+                ("pos", Some(2), 3),
+                ("neg", Some(-1), 4),
+                ("neg", Some(-1), 5),
+                ("neg", Some(-2), 6),
+            ])],
+        )?;
+        let by_name = decimal_sum_avg_by_name(&registry, 1)?;
+        assert_eq!(by_name.get("pos"), Some(&(Some(4), Some(13_333))));
+        assert_eq!(by_name.get("neg"), Some(&(Some(-4), Some(-13_333))));
+        Ok(())
+    }
+
+    /// Decimal `SUM`/`AVG` must retract exactly (the `i128` backing-value sum
+    /// is exactly invertible): in-place update, delete, retracting the final
+    /// non-null contribution restoring SQL `NULL` while a null-valued row keeps
+    /// the group alive, and dropping the group with its last row.
+    #[test]
+    fn retracts_decimal128_sum_avg_by_pk() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[decimal_sum_avg_spec()],
+            &decimal_schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        // a: 1.50(pk1) + 2.50(pk2) + NULL(pk3).
+        registry.apply_insert_batches(
+            1,
+            &[decimal_batch(&[
+                ("a", Some(150), 1),
+                ("a", Some(250), 2),
+                ("a", None, 3),
+            ])],
+        )?;
+        // UPDATE pk2 in place (retract-old-then-apply-new): 2.50 -> 0.25.
+        registry.apply_insert_batches(2, &[decimal_batch(&[("a", Some(25), 2)])])?;
+        assert_eq!(
+            decimal_sum_avg_by_name(&registry, 2)?.get("a"),
+            Some(&(Some(175), Some(875_000))),
+            "1.50 + 0.25 = 1.75; AVG = 0.875000"
+        );
+        // DELETE pk1, then pk2: only the NULL row remains, so the group stays
+        // alive and both aggregates restore SQL NULL.
+        registry.apply_pk_deletes(3, &decimal_batch(&[("", None, 1)]).project(&[2])?)?;
+        registry.apply_pk_deletes(4, &decimal_batch(&[("", None, 2)]).project(&[2])?)?;
+        assert_eq!(
+            decimal_sum_avg_by_name(&registry, 4)?.get("a"),
+            Some(&(None, None)),
+            "all non-null contributions retracted -> SQL NULL"
+        );
+        // DELETE pk3 (the NULL row): the group is now empty and disappears.
+        registry.apply_pk_deletes(5, &decimal_batch(&[("", None, 3)]).project(&[2])?)?;
+        assert_eq!(decimal_sum_avg_by_name(&registry, 5)?.get("a"), None);
+        Ok(())
+    }
+
+    /// A decimal `SUM` whose exact `i128` running sum overflows fails the apply
+    /// pass (the registry falls safe to stale) instead of silently wrapping.
+    #[test]
+    fn sum_over_decimal128_overflow_fails_safe_to_stale() -> DataFusionResult<()> {
+        let wide_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("amt", DataType::Decimal128(38, 0), true),
+        ]));
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec![],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Sum,
+                column: Some("amt".to_string()),
+            }],
+        };
+        let registry = MaintainedAggregateRegistry::try_new(&[spec], &wide_schema)?;
+        // 10^38 - 1 is the largest Decimal128(38, 0) value; two of them exceed
+        // i128::MAX (~1.7 * 10^38), so the second insert must fail, not wrap.
+        let max_decimal = 10_i128.pow(38) - 1;
+        let wide_batch = || {
+            RecordBatch::try_new(
+                Arc::clone(&wide_schema),
+                vec![
+                    Arc::new(StringArray::from(vec![Some("a")])),
+                    Arc::new(
+                        Decimal128Array::from(vec![Some(max_decimal)])
+                            .with_precision_and_scale(38, 0)
+                            .expect("valid decimal precision/scale"),
+                    ),
+                ],
+            )
+            .expect("test batch should be valid")
+        };
+        registry.apply_insert_batches(1, &[wide_batch()])?;
+        assert!(registry.apply_insert_batches(2, &[wide_batch()]).is_err());
+        Ok(())
+    }
+
+    /// A maintained `AVG(Decimal128)` whose serve-time rescale overflows errors
+    /// the query — exactly what `DataFusion`'s `DecimalAverager` does for a
+    /// base-table scan of the same data, so this is not a divergence.
+    #[test]
+    fn avg_over_decimal128_result_overflow_errors_like_datafusion() -> DataFusionResult<()> {
+        let wide_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("amt", DataType::Decimal128(38, 0), true),
+        ]));
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec![],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Avg,
+                column: Some("amt".to_string()),
+            }],
+        };
+        let registry =
+            MaintainedAggregateRegistry::try_new(std::slice::from_ref(&spec), &wide_schema)?;
+        // The running sum (10^37) fits i128, but the serve-time rescale to the
+        // AVG output scale multiplies by 10^4 and overflows.
+        let big_batch = RecordBatch::try_new(
+            Arc::clone(&wide_schema),
+            vec![
+                Arc::new(StringArray::from(vec![Some("a")])),
+                Arc::new(
+                    Decimal128Array::from(vec![Some(10_i128.pow(37))])
+                        .with_precision_and_scale(38, 0)
+                        .expect("valid decimal precision/scale"),
+                ),
+            ],
+        )
+        .expect("test batch should be valid");
+        registry.apply_insert_batches(1, &[big_batch])?;
+        let out_schema = Arc::new(Schema::new(vec![Field::new(
+            "avg(amt)",
+            DataType::Decimal128(38, 4),
+            true,
+        )]));
+        let error = registry
+            .batch_for_spec(&spec, 1, out_schema)
+            .expect_err("serve-time rescale must overflow");
+        // DataFusion's own `DecimalAverager` error — the maintained serve fails
+        // with exactly what a base-table re-scan of the same data raises.
+        assert!(
+            error
+                .to_string()
+                .contains("Arithmetic Overflow in AvgAccumulator"),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    /// `AVG` over a negative-scale decimal stays unsupported (the serve-time
+    /// rescale is only meaningful for non-negative input scales), while `SUM` —
+    /// which keeps the input scale — accepts it.
+    #[test]
+    fn avg_over_negative_scale_decimal128_is_rejected() {
+        let neg_scale_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("amt", DataType::Decimal128(6, -2), true),
+        ]));
+        let avg_spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec![],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Avg,
+                column: Some("amt".to_string()),
+            }],
+        };
+        let error = MaintainedAggregateRegistry::try_new(&[avg_spec], &neg_scale_schema)
+            .expect_err("negative-scale decimal AVG is unsupported");
+        assert!(
+            error
+                .to_string()
+                .contains("does not support column type Decimal128(6, -2)"),
+            "unexpected error: {error}"
+        );
+
+        let sum_spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec![],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Sum,
+                column: Some("amt".to_string()),
+            }],
+        };
+        MaintainedAggregateRegistry::try_new(&[sum_spec], &neg_scale_schema)
+            .expect("negative-scale decimal SUM keeps the input scale and is supported");
     }
 
     /// Postgres `INTEGER` → arrow `Int32`, the common CDC case (not `BIGINT` →

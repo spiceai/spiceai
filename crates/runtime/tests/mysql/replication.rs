@@ -39,7 +39,7 @@ use async_trait::async_trait;
 use data_components::cdc::{ChangeEnvelope, ChangesStream, StreamError};
 use data_components::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
 use data_components::mysql_replication::{
-    PersistedPosition, PositionStore, ReplicationMetricsCollector, ReplicationParams,
+    CursorType, PersistedPosition, PositionStore, ReplicationMetricsCollector, ReplicationParams,
     ReplicationStreamInput, StoreError, encode_checkpoint_schema_json, start_replication_stream,
 };
 use futures::StreamExt;
@@ -442,6 +442,8 @@ async fn purged_position_behavior() -> Result<(), anyhow::Error> {
     let stale = PersistedPosition {
         position: data_components::mysql_replication::BinlogPosition::new("binlog.999999", 4),
         schema_json: Some(stale_meta),
+        gtid_set: None,
+        cursor_type: CursorType::File,
     };
 
     // Default behavior (`error`): the stream surfaces an actionable error.
