@@ -625,7 +625,7 @@ impl SharedSource {
             if stalls_group {
                 tracing::error!(
                     dataset = %member.dataset_name,
-                    table = %format_member(key),
+                    source_table = %format_member(key),
                     connection = %self.key.label(),
                     reason,
                     "shared mysql binlog member detached; its last applied position now pins the \
@@ -637,7 +637,7 @@ impl SharedSource {
             } else {
                 tracing::warn!(
                     dataset = %member.dataset_name,
-                    table = %format_member(key),
+                    source_table = %format_member(key),
                     connection = %self.key.label(),
                     reason,
                     "shared mysql binlog member detached and is being replaced by a new \
@@ -796,12 +796,14 @@ async fn attach_member(
     if use_gtid {
         tracing::info!(
             dataset = %dataset_name,
-            "MySQL replication for {member_label}: GTID auto-positioning active (failover-safe resume)."
+            source_table = %member_label,
+            "MySQL replication: GTID auto-positioning active."
         );
     } else {
         tracing::warn!(
             dataset = %dataset_name,
-            "MySQL replication for {member_label}: file+offset positioning (gtid_mode is `{}`, not `ON`); resume is not failover-safe - a source failover forces a full re-snapshot.",
+            source_table = %member_label,
+            "MySQL replication: file+offset positioning (gtid_mode is `{}`, not `ON`); resume is not failover-safe - a source failover forces a full re-snapshot.",
             gtid_mode.as_deref().unwrap_or("unavailable")
         );
     }
@@ -850,7 +852,7 @@ async fn attach_member(
 
     tracing::info!(
         dataset = %dataset_name,
-        table = %format_member(&member_key),
+        source_table = %format_member(&member_key),
         connection = %source.key.label(),
         snapshot = snapshotting,
         rejoining,
@@ -1275,15 +1277,14 @@ async fn run_pump(source: Arc<SharedSource>) {
                 stream
             }
             Err(e) if super::resilience::is_purged_position_error(&e) => {
-                // The shared min was purged from the source. Surface it to every
-                // member; on reload/restart each member re-evaluates its own
-                // persisted position via `invalid_checkpoint_behavior`.
-                fatal_broadcast(
-                    &source,
-                    purged_position_error(&resume, &connection).to_string(),
-                )
-                .await;
-                break 'reconnect;
+                // The shared min was purged from the source. Honor
+                // `invalid_position_behavior`: re-snapshot in place (restart) or
+                // broadcast the fatal purge error (error).
+                match handle_purged_position(&source, &params, use_gtid, &resume, &connection).await
+                {
+                    PurgeOutcome::Rebootstrapped => continue 'reconnect,
+                    PurgeOutcome::Fatal => break 'reconnect,
+                }
             }
             Err(e) if super::resilience::is_transient_mysql(&e) => {
                 for (_, m) in source.live_members() {
@@ -1373,12 +1374,12 @@ async fn run_pump(source: Arc<SharedSource>) {
                         .ack
                         .flush_position()
                         .unwrap_or_else(|| current_file_pos(&current_file));
-                    fatal_broadcast(
-                        &source,
-                        purged_position_error(&resume, &connection).to_string(),
-                    )
-                    .await;
-                    break 'reconnect;
+                    match handle_purged_position(&source, &params, use_gtid, &resume, &connection)
+                        .await
+                    {
+                        PurgeOutcome::Rebootstrapped => continue 'reconnect,
+                        PurgeOutcome::Fatal => break 'reconnect,
+                    }
                 }
                 Err(e) if super::resilience::is_transient_mysql(&e) => {
                     for (_, m) in source.live_members() {
@@ -1924,6 +1925,171 @@ fn persisted_for(member: &MemberHandle, slot: &AckSlot) -> PersistedPosition {
 /// growing; deduping on position alone would then stop persisting and let the
 /// crash-replay window grow without bound.
 type PersistIdentity = (BinlogPosition, Option<String>);
+
+/// Outcome of handling a purged shared-resume position: the pump either
+/// re-snapshotted its members in place and should reconnect, or gave up and
+/// broadcast a fatal error.
+enum PurgeOutcome {
+    Rebootstrapped,
+    Fatal,
+}
+
+/// The shared resume position was purged from the source. Honor
+/// `invalid_position_behavior`:
+///   - `Error` (default): broadcast the fatal purge error — the dataset stays
+///     errored until the operator intervenes (widen `binlog_expire_logs_seconds`
+///     or switch to `restart`).
+///   - `Restart`: re-snapshot every live member in place from the current head.
+///     The runtime holds one long-lived `ChangesStream` and never re-subscribes,
+///     so recovery is delivered THROUGH each member's live channel rather than
+///     by re-running `resolve_start_position` — see [`rebootstrap_member`]. This
+///     is what makes `restart` actually recover a purged position instead of
+///     being a no-op that only takes effect on a full process restart.
+async fn handle_purged_position(
+    source: &Arc<SharedSource>,
+    params: &ReplicationParams,
+    use_gtid: bool,
+    resume: &BinlogPosition,
+    connection: &str,
+) -> PurgeOutcome {
+    match params.invalid_position_behavior {
+        InvalidCheckpointBehavior::Restart => {
+            tracing::warn!(
+                connection = %connection,
+                position = %resume,
+                "shared mysql binlog resume position was purged; invalid_checkpoint_behavior=restart, re-snapshotting all members from the current head"
+            );
+            match rebootstrap_all_for_restart(source, params, use_gtid).await {
+                Ok(()) => PurgeOutcome::Rebootstrapped,
+                Err(e) => {
+                    fatal_broadcast(
+                        source,
+                        format!("mysql binlog re-snapshot after a purged position failed: {e}"),
+                    )
+                    .await;
+                    PurgeOutcome::Fatal
+                }
+            }
+        }
+        InvalidCheckpointBehavior::Error => {
+            fatal_broadcast(
+                source,
+                purged_position_error(resume, connection).to_string(),
+            )
+            .await;
+            PurgeOutcome::Fatal
+        }
+    }
+}
+
+/// Re-snapshot every live member from a single freshly-captured head. Capturing
+/// the head once keeps all members aligned on one valid resume point, so the
+/// next `open_binlog_stream` opens from it (the purged position is discarded).
+async fn rebootstrap_all_for_restart(
+    source: &Arc<SharedSource>,
+    params: &ReplicationParams,
+    use_gtid: bool,
+) -> Result<()> {
+    let mut conn = super::setup::connect(params).await?;
+    let (head, head_gtid) = if use_gtid {
+        super::setup::fetch_head_and_gtid(&mut conn).await?
+    } else {
+        (
+            super::setup::fetch_head_position(&mut conn).await?,
+            GtidSet::new(),
+        )
+    };
+    if let Err(e) = conn.disconnect().await {
+        tracing::debug!(error = %e, "re-snapshot head-fetch disconnect");
+    }
+    for (key, member) in source.live_members() {
+        if member.sender.is_closed() {
+            continue;
+        }
+        rebootstrap_member(source, params, &key, &member, &head, &head_gtid).await?;
+    }
+    Ok(())
+}
+
+/// Re-snapshot one member in place after its resume position was purged and
+/// `invalid_position_behavior = Restart`. Drops the purged checkpoint first (a
+/// crash mid-rebootstrap must cold-start, never resume a half-applied snapshot),
+/// resets the slot to `head` held `SNAPSHOTTING`, then pushes a fresh
+/// truncate → snapshot → boundary through the member's LIVE channel — the same
+/// bootstrap it received at cold start, delivered mid-stream because the runtime
+/// holds a single `ChangesStream` and never re-subscribes. The boundary's
+/// [`SnapshotBoundaryCommitter`] clears `SNAPSHOTTING`, persists the new head,
+/// and requests the reconnect that promotes the member back to streaming.
+async fn rebootstrap_member(
+    source: &Arc<SharedSource>,
+    params: &ReplicationParams,
+    key: &MemberKey,
+    member: &Arc<MemberHandle>,
+    head: &BinlogPosition,
+    head_gtid: &GtidSet,
+) -> Result<()> {
+    if let Err(e) = member.position_store.clear().await {
+        tracing::warn!(dataset = %member.dataset_name, error = %e, "failed to clear purged mysql binlog checkpoint before re-snapshot");
+    }
+    // Reset to head, held SNAPSHOTTING so `persist_all`/promotion skip it until
+    // the boundary lands — identical to a cold-start member.
+    source
+        .ack
+        .register_with_gtid(key, head.clone(), head_gtid.clone(), true);
+
+    let ml = lock(&member.layout).clone();
+    let dropped = "changes stream receiver dropped during re-snapshot";
+    let truncate = super::truncate_envelope(&member.schema, &member.primary_keys, &ml.column_map)?;
+    if member.sender.send(Ok(truncate)).await.is_err() {
+        source.detach_member(key, dropped, true);
+        return Ok(());
+    }
+
+    let mut snapshot = super::bootstrap::snapshot_stream(super::bootstrap::SnapshotInput {
+        params: params.clone(),
+        layout: ml.layout.clone(),
+        schema: Arc::clone(&member.schema),
+        primary_keys: member.primary_keys.clone(),
+        column_map: ml.column_map.clone(),
+        database: key.0.clone(),
+        table: key.1.clone(),
+        dataset_name: member.dataset_name.clone(),
+        metrics: Arc::clone(&member.metrics),
+    });
+    while let Some(item) = snapshot.next().await {
+        let failed = item.is_err();
+        if member.sender.send(item).await.is_err() {
+            source.detach_member(key, dropped, true);
+            return Ok(());
+        }
+        if failed {
+            // Snapshot errored; leave the member SNAPSHOTTING with no boundary so
+            // it cannot falsely advance. The error is now visible downstream.
+            return Ok(());
+        }
+    }
+
+    let schema_mismatch = |e: crate::cdc::ChangeBatchError| Error::SchemaMismatch {
+        message: e.to_string(),
+    };
+    let (_, boundary_batch, _) = crate::cdc::build_heartbeat_envelope(&member.schema, None, false)
+        .map_err(schema_mismatch)?
+        .into_parts()
+        .map_err(schema_mismatch)?;
+    let boundary = ChangeEnvelope::from_parts(
+        Box::new(SnapshotBoundaryCommitter {
+            source: Arc::clone(source),
+            key: key.clone(),
+            dataset: member.dataset_name.clone(),
+        }),
+        boundary_batch,
+        false,
+    );
+    if member.sender.send(Ok(boundary)).await.is_err() {
+        source.detach_member(key, dropped, true);
+    }
+    Ok(())
+}
 
 /// Persist each member's own committed position to its own sidecar (skipping
 /// no-op writes). The shared resume is the min across these on restart.

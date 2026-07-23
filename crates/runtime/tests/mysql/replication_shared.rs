@@ -729,3 +729,106 @@ async fn shared_group_single_dataset_streams_snapshot_and_changes() -> Result<()
     pool.disconnect().await?;
     Ok(())
 }
+
+/// A purged resume position with `invalid_checkpoint_behavior: restart` must
+/// re-snapshot the member in place instead of fatally erroring. Regression test
+/// for issue #11968 (restart was a no-op): the running pump's purge handler now
+/// honors `invalid_position_behavior` rather than always broadcasting the fatal
+/// purge error and stopping.
+#[tokio::test(flavor = "multi_thread")]
+async fn shared_group_purged_position_restart_re_snapshots() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::mysql_replication=debug,info"));
+
+    let port = MYSQL_SHARED_PORT + 6;
+    let _container = common::start_mysql_docker_container(port).await?;
+    let pool = common::get_mysql_conn(port)?;
+    setup_table(&pool, "purge_a", &[(1, "a1"), (2, "a2")]).await?;
+
+    let store: Arc<dyn PositionStore> = Arc::new(MemoryPositionStore::default());
+    let mut input = stream_input(port, 210_601, "purge_a", Arc::clone(&store));
+    // The behavior under test: recover a purged position by re-snapshotting.
+    input.params.invalid_position_behavior = InvalidCheckpointBehavior::Restart;
+
+    let mut stream = start_replication_stream(input);
+    drain_bootstrap(&mut stream, "purge member", &[1, 2]).await?;
+    wait_for_ready(&mut stream, "purge member readiness").await?;
+
+    // Commit one live change: the member's COMMITTED floor now sits inside the
+    // current binlog file (the one we will purge).
+    exec(&pool, "INSERT INTO purge_a VALUES (3, 'a3')").await?;
+    expect_single_change(&mut stream, "pre-purge insert", "c", 3).await?;
+
+    // Rotate the binlog twice (data between each) so the floor lands in an OLD
+    // file, then advance the DUMP past that file by reading — but NOT committing
+    // — the newer rows. Reading without committing keeps `flush_position` pinned
+    // at the old file while the dump thread moves into the newest file, so the
+    // old files are released and can be purged.
+    exec(&pool, "FLUSH BINARY LOGS").await?;
+    exec(&pool, "INSERT INTO purge_a VALUES (4, 'a4')").await?;
+    exec(&pool, "FLUSH BINARY LOGS").await?;
+    exec(&pool, "INSERT INTO purge_a VALUES (5, 'a5')").await?;
+    let _uncommitted_4 = next_change_envelope(&mut stream, "read 4 (uncommitted)").await?;
+    let _uncommitted_5 = next_change_envelope(&mut stream, "read 5 (uncommitted)").await?;
+
+    // Purge every binlog before the current one — the floor's file is now gone.
+    let current_file: String = {
+        let mut conn = pool.get_conn().await?;
+        let logs: Vec<mysql_async::Row> = conn.query("SHOW BINARY LOGS").await?;
+        logs.last()
+            .and_then(|r| r.get::<String, _>(0))
+            .ok_or_else(|| anyhow::anyhow!("SHOW BINARY LOGS returned no rows"))?
+    };
+    exec(&pool, &format!("PURGE BINARY LOGS TO '{current_file}'")).await?;
+
+    // Force the pump to reconnect by killing the dump thread; on reconnect it
+    // re-opens from the (now purged) committed floor — the running-pump purge
+    // path that used to fatal regardless of `invalid_position_behavior`.
+    {
+        let mut conn = pool.get_conn().await?;
+        let ids: Vec<u64> = conn
+            .query(
+                "SELECT id FROM information_schema.processlist \
+                 WHERE command IN ('Binlog Dump', 'Binlog Dump GTID')",
+            )
+            .await?;
+        for id in ids {
+            // The thread may already be exiting; ignore KILL races.
+            let _ = conn.query_drop(format!("KILL {id}")).await;
+        }
+    }
+
+    // Restart recovery: the member re-snapshots in place from the current head —
+    // a truncate barrier, then the full current table [1..=5], then the boundary.
+    // Idle heartbeats may interleave before the truncate; skip them.
+    let deadline = std::time::Instant::now() + Duration::from_mins(2);
+    loop {
+        let env = next_envelope(&mut stream, "await re-snapshot truncate").await?;
+        let ops = ops_of(&env);
+        if ops == vec!["t".to_string()] {
+            env.commit().await?;
+            break;
+        }
+        anyhow::ensure!(
+            num_rows(&env) == 0,
+            "unexpected envelope {ops:?} before the re-snapshot truncate barrier"
+        );
+        env.commit().await?;
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "purged position never triggered a re-snapshot (restart no-op regression)"
+        );
+    }
+    let snap = next_change_envelope(&mut stream, "re-snapshot rows").await?;
+    let mut ids = ids_of(&snap);
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec![1, 2, 3, 4, 5],
+        "re-snapshot must reflect the current source state"
+    );
+    snap.commit().await?;
+
+    drop(stream);
+    pool.disconnect().await?;
+    Ok(())
+}
