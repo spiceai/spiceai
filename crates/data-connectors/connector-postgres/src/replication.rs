@@ -654,6 +654,12 @@ fn replication_params_from_connector_params(
     let shared = explicit_slot.is_some();
     let (slot_name, publication_name) = match explicit_slot {
         Some(slot) => {
+            config::validate_replication_slot_name(&slot).map_err(|reason| {
+                format!(
+                    "parameter `{}` {reason}",
+                    params.user_param("replication_slot")
+                )
+            })?;
             let publication = optional_string(params, "publication")
                 .unwrap_or_else(|| config::publication_name_for_slot(&slot));
             (slot, publication)
@@ -1147,5 +1153,44 @@ mod tests {
                     "parameter `pg_replication_bootstrap_batch_size` must be a positive integer, got \"many\""
                 )
         );
+    }
+
+    fn replication_connection_params(slot: Option<&str>) -> Parameters {
+        let mut entries = vec![
+            ("host".to_string(), SecretString::from("localhost")),
+            ("user".to_string(), SecretString::from("spice")),
+            ("db".to_string(), SecretString::from("spice")),
+        ];
+        if let Some(slot) = slot {
+            entries.push(("replication_slot".to_string(), SecretString::from(slot)));
+        }
+        Parameters::new(entries, "pg", crate::PARAMETERS)
+    }
+
+    // Regression for #11999: hyphenated slot names must fail at param parse
+    // time, not later when Postgres rejects CREATE_REPLICATION_SLOT.
+    #[test]
+    fn replication_params_rejects_invalid_slot_name() {
+        let params =
+            replication_connection_params(Some("scp-onboarding-realtime-analytics-prod-us-east-1"));
+        let err = replication_params_from_connector_params(&params, "hits")
+            .expect_err("hyphenated slot must be rejected");
+        assert!(
+            err.starts_with("parameter `pg_replication_slot` must contain only lowercase"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains("invalid character '-'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn replication_params_accepts_valid_explicit_slot_name() {
+        let params = replication_connection_params(Some("spice_hits_cdc"));
+        let parsed = replication_params_from_connector_params(&params, "hits")
+            .expect("valid slot must parse");
+        assert_eq!(parsed.slot_name, "spice_hits_cdc");
+        assert!(parsed.shared);
     }
 }
