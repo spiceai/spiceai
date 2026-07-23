@@ -56,7 +56,7 @@ use futures::{StreamExt, stream};
 use opentelemetry::KeyValue;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_datafusion_index::{
-    INDEXED_INNER, Index, IndexedTableProvider, InnerProviderFn, find_concrete_table_provider_with,
+    INDEXED_INNER, IndexedTableProvider, InnerProviderFn, find_concrete_table_provider_with,
 };
 use runtime_metrics::acceleration as metrics;
 use runtime_search::embeddings::table::EmbeddingTable;

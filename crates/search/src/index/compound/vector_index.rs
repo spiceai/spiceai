@@ -80,6 +80,10 @@ impl CompoundVectorIndex {
             read_mode,
         }
     }
+
+    pub fn primary(&self) -> &Arc<dyn VectorIndex> {
+        &self.primary
+    }
 }
 
 impl VectorIndex for CompoundVectorIndex {
@@ -171,10 +175,6 @@ impl SearchIndex for CompoundVectorIndex {
 
     fn primary_fields(&self) -> Vec<Field> {
         self.primary.primary_fields()
-    }
-
-    async fn delete_warm_by_keys(&self, keys: RecordBatch) -> DataFusionResult<()> {
-        self.primary.delete_by_keys(keys).await
     }
 
     async fn write(

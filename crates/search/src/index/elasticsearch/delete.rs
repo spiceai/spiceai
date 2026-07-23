@@ -20,6 +20,11 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use elasticsearch::Elasticsearch;
 use serde_json::{Value, json};
 
+/// Chunk size for `_delete_by_query` requests — keeps each request's `bool.should` clause count
+/// comfortably under Elasticsearch's default `indices.query.bool.max_clause_count` (1024) and
+/// request-size limits, regardless of how many keys the caller is deleting in one call.
+const DELETE_CHUNK_ROWS: usize = 512;
+
 /// Deletes every document whose `key_columns` match a row of `keys` — an exact-key delete when
 /// `key_columns` is every `primary_key` column, a prefix delete when it's a strict subset (the
 /// chunked-index case). Elasticsearch's `_delete_by_query` filters by field value directly, so
@@ -28,7 +33,11 @@ use serde_json::{Value, json};
 /// Only reads `key_columns` from `keys`, ignoring any other column present — `keys` may be
 /// shaped by [`runtime_datafusion_index::Index::required_columns`] (a superset of the primary
 /// key) rather than the primary key alone, since that's what the default
-/// [`runtime_datafusion_index::Index::delete_by_predicate`] resolves against.
+/// [`runtime_datafusion_index::Index::resolve_delete_keys`] resolves against.
+///
+/// Issues one `_delete_by_query` request per [`DELETE_CHUNK_ROWS`]-row slice of `keys` rather
+/// than a single request for the whole batch, so a large delete can't build an unbounded
+/// `bool.should` clause list.
 ///
 /// Shared by [`super::ElasticsearchIndex`] and [`super::ElasticsearchTextIndex`], which both
 /// address documents the same way (client + index name + primary key columns).
@@ -38,14 +47,21 @@ pub async fn delete_by_keys(
     key_columns: &[String],
     keys: &RecordBatch,
 ) -> DataFusionResult<()> {
-    let Some(query) = build_or_of_row_term_queries(key_columns, keys)? else {
-        return Ok(());
-    };
+    let mut offset = 0;
+    while offset < keys.num_rows() {
+        let len = DELETE_CHUNK_ROWS.min(keys.num_rows() - offset);
+        let chunk = keys.slice(offset, len);
+        offset += len;
 
-    client
-        .delete_by_query(es_index, &query)
-        .await
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let Some(query) = build_or_of_row_term_queries(key_columns, &chunk)? else {
+            continue;
+        };
+
+        client
+            .delete_by_query(es_index, &query)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    }
 
     Ok(())
 }

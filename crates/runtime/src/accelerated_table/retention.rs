@@ -18,7 +18,8 @@ use std::{sync::Arc, time::SystemTime};
 
 use crate::{
     accelerated_table::{
-        DataRetentionFilter, Retention, refresh, refresh_task::collect_indexes_from_provider,
+        DataRetentionFilter, Retention, refresh,
+        refresh_task::{collect_indexes_from_provider, indexes_from_federated},
     },
     component::dataset::TimeFormat,
     datafusion::{
@@ -26,6 +27,8 @@ use crate::{
         filter_converter::{TimestampFilterConvert, create_timestamp_filter_convert},
         is_spice_internal_dataset,
     },
+    federated_table::FederatedTable,
+    search::util::{EMBEDDING_INNER, METADATA_ENRICHED_INNER},
 };
 use arrow::array::{RecordBatch, UInt64Array};
 use cache::Caching;
@@ -36,36 +39,81 @@ use datafusion::{
     prelude::{Expr, SessionContext},
     sql::TableReference,
 };
-use runtime_datafusion_index::{Index, IndexedTableProvider, resolve_keys_matching_predicate};
+use runtime_datafusion_index::{
+    INDEXED_INNER, Index, InnerProviderFn, resolve_keys_matching_predicate,
+};
 use runtime_object_store::registry::default_runtime_env;
-use runtime_search::embeddings::table::EmbeddingTable;
-use search::index::{SearchIndex, as_search_index};
+use search::index::compound::{CompoundSearchIndex, CompoundVectorIndex};
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 
-/// Strips `IndexedTableProvider`/`EmbeddingTable` wrapper layers so the actual accelerator
-/// delete below bypasses `IndexedTableProvider::delete_from`'s index-aware handling — retention
-/// needs the *warm-only* index scope (see [`SearchIndex::delete_warm_by_keys`]), which is a
-/// different policy than that generic path's full/both-scope delete.
-fn strip_index_wrappers(provider: &Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
-    let mut current = Arc::clone(provider);
-    loop {
-        if let Some(indexed) = current.downcast_ref::<IndexedTableProvider>() {
-            current = indexed.get_underlying();
-            continue;
-        }
-        if let Some(embedding) = current.downcast_ref::<EmbeddingTable>() {
-            current = Arc::clone(embedding.get_underlying_ref());
-            continue;
-        }
-        break;
+/// The wrapper layers stripped by [`strip_index_wrapper_layers`] below. Deliberately narrower
+/// than `search::util::DEFAULT_INNER_FNS`: it excludes `ACCELERATED_INNER` (which resolves to the
+/// *federated/source* table, not the accelerator — peeling it here would redirect a delete to the
+/// wrong table entirely) and the Iceberg/federated-adaptor accessors (source-side wrappers that
+/// never wrap an accelerator's raw provider; `IcebergDeletionProvider` in particular has real
+/// delete semantics of its own, not a passthrough, so it must never be silently skipped).
+const INDEX_WRAPPER_INNER_FNS: &[InnerProviderFn] =
+    &[INDEXED_INNER, EMBEDDING_INNER, METADATA_ENRICHED_INNER];
+
+/// Strips `IndexedTableProvider`/`EmbeddingTable`/`MetadataEnrichedTableProvider` wrapper layers
+/// so the actual accelerator delete below bypasses `IndexedTableProvider::delete_from`'s
+/// index-aware handling — retention needs the *warm-only* index scope (see
+/// [`warm_delete_target`]), which is a different policy than that generic path's full/both-scope
+/// delete.
+fn strip_index_wrapper_layers(tbl: &Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
+    let mut current = Arc::clone(tbl);
+    while let Some(inner) = INDEX_WRAPPER_INNER_FNS
+        .iter()
+        .find_map(|f| f(current.as_ref()))
+    {
+        current = Arc::clone(inner);
     }
     current
+}
+
+/// Resolves the index a retention delete should actually hit: for a compound (fallback-composed)
+/// index, only the primary/warm side — retention trims the local warm window and must not reach
+/// into the independently-managed secondary/fallback index's own lifecycle. `SearchIndex` itself
+/// has no notion of "warm" (that's a compound-specific concept), so this downcasts explicitly
+/// rather than dispatching through the trait. Every other index has just one backing store, so
+/// the index itself is the target.
+fn warm_delete_target(index: &Arc<dyn Index + Send + Sync>) -> Arc<dyn Index + Send + Sync> {
+    if let Some(compound) = index.as_any().downcast_ref::<CompoundSearchIndex>() {
+        return Arc::clone(compound.primary()) as Arc<dyn Index + Send + Sync>;
+    }
+    if let Some(compound) = index.as_any().downcast_ref::<CompoundVectorIndex>() {
+        return Arc::clone(compound.primary()) as Arc<dyn Index + Send + Sync>;
+    }
+    Arc::clone(index)
+}
+
+/// Collects every index attached to this dataset, from both sides of the accelerated table.
+///
+/// An external-store vector/search index (e.g. S3 Vectors, Elasticsearch) is only ever attached
+/// via `IndexedTableProvider` on the *federated/read* side (`EmbeddingConnector::wrap_table` wraps
+/// the source connector, not the accelerator) — `collect_indexes_from_provider(accelerator)` alone
+/// finds nothing for these, so retention would silently skip their warm-index cleanup. The
+/// `DuckDB` vector engine is the opposite: it wraps the *accelerator* itself
+/// (`wrap_accelerator_with_duckdb_vector_indexes`), not the federated side. Both are checked here,
+/// deduplicating by pointer identity (mirroring `collect_indexes_from_provider`'s own dedup) in
+/// case an index is ever reachable through both paths.
+fn collect_all_indexes(
+    accelerator: &Arc<dyn TableProvider>,
+    federated: &FederatedTable,
+) -> Vec<Arc<dyn Index + Send + Sync>> {
+    let mut seen = std::collections::HashSet::new();
+    collect_indexes_from_provider(Arc::clone(accelerator))
+        .into_iter()
+        .chain(indexes_from_federated(federated))
+        .filter(|index| seen.insert(Arc::as_ptr(index).cast::<()>()))
+        .collect()
 }
 
 pub(crate) async fn apply_retention_filters_once(
     dataset_name: &TableReference,
     accelerator: &Arc<dyn TableProvider>,
+    federated: &FederatedTable,
     expr: Expr,
     io_runtime: &Handle,
 ) -> datafusion::error::Result<u64> {
@@ -89,36 +137,33 @@ pub(crate) async fn apply_retention_filters_once(
         default_runtime_env(io_runtime.clone()),
     );
 
-    // Resolve each attached index's matching rows (projected to its own required columns)
-    // *before* the delete below runs — the predicate is evaluated by scanning `accelerator`'s
-    // current (pre-delete) rows, so there is nothing left to resolve once they're gone. The
-    // actual per-index delete happens after the accelerator delete succeeds (best-effort, see
-    // below). Only indexes recognized by `as_search_index` support the warm-only scope retention
-    // needs, so resolution is skipped for anything else.
-    let indexes = collect_indexes_from_provider(Arc::clone(accelerator));
-    let mut warm_deletes: Vec<(&dyn SearchIndex, RecordBatch)> = Vec::new();
+    // Resolve each attached index's matching rows (projected to the warm-delete target's own
+    // required columns) *before* the delete below runs — the predicate is evaluated by scanning
+    // `accelerator`'s current (pre-delete) rows, so there is nothing left to resolve once they're
+    // gone. The actual per-index delete happens after the accelerator delete succeeds
+    // (best-effort, see below).
+    let indexes = collect_all_indexes(accelerator, federated);
+    let mut warm_deletes: Vec<(Arc<dyn Index + Send + Sync>, RecordBatch)> = Vec::new();
     for index in &indexes {
-        let Some(search_index) = as_search_index(index) else {
-            continue;
-        };
+        let target = warm_delete_target(index);
         match resolve_keys_matching_predicate(
             accelerator,
             &ctx.state(),
             vec![expr.clone()],
-            &index.required_columns(),
+            &target.required_columns(),
         )
         .await
         {
-            Ok(keys) if keys.num_rows() > 0 => warm_deletes.push((search_index, keys)),
+            Ok(keys) if keys.num_rows() > 0 => warm_deletes.push((target, keys)),
             Ok(_) => {}
             Err(e) => tracing::warn!(
                 "[retention] Failed to resolve keys for index '{}' (skipping its warm-index cleanup this cycle): {e}",
-                index.name()
+                target.name()
             ),
         }
     }
 
-    let raw_accelerator = strip_index_wrappers(accelerator);
+    let raw_accelerator = strip_index_wrapper_layers(accelerator);
     let plan = match raw_accelerator.delete_from(&ctx.state(), vec![expr]).await {
         Ok(plan) => plan,
         Err(e) => {
@@ -142,11 +187,11 @@ pub(crate) async fn apply_retention_filters_once(
             .map_or(0, |v| v.values().first().copied().unwrap_or(0))
     });
 
-    for (search_index, keys) in warm_deletes {
-        if let Err(e) = search_index.delete_warm_by_keys(keys).await {
+    for (target, keys) in warm_deletes {
+        if let Err(e) = target.delete_by_keys(keys).await {
             tracing::error!(
                 "[retention] Index '{}' failed to delete warm entries (best-effort, continuing): {e}",
-                search_index.name()
+                target.name()
             );
         }
     }
@@ -161,6 +206,7 @@ impl super::AcceleratedTable {
     pub(crate) async fn start_retention_check(
         dataset_name: TableReference,
         accelerator: Arc<dyn TableProvider>,
+        federated: Arc<FederatedTable>,
         retention: Retention,
         caching: Option<Arc<Caching>>,
         io_runtime: Handle,
@@ -259,8 +305,14 @@ impl super::AcceleratedTable {
                 continue;
             };
 
-            if let Ok(num_records) =
-                apply_retention_filters_once(&dataset_name, &accelerator, expr, &io_runtime).await
+            if let Ok(num_records) = apply_retention_filters_once(
+                &dataset_name,
+                &accelerator,
+                &federated,
+                expr,
+                &io_runtime,
+            )
+            .await
                 && num_records > 0
                 && let Some(cache_provider) = caching.as_ref()
                 && let Err(e) = cache_provider.invalidate_for_table(dataset_name.clone())
@@ -405,6 +457,7 @@ mod tests {
             MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created");
 
         let accelerator = Arc::new(mem_table) as Arc<dyn TableProvider>;
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
 
         // Create retention configuration
         let retention_delete_expr = retention_sql.map(|sql| {
@@ -434,6 +487,7 @@ mod tests {
         let retention_task = tokio::spawn(AcceleratedTable::start_retention_check(
             dataset_name.clone(),
             Arc::clone(&accelerator),
+            Arc::clone(&federated),
             retention,
             caching,
             Handle::current(),
@@ -538,26 +592,46 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
-    async fn strip_index_wrappers_unwraps_indexed_table_provider() {
+    #[test]
+    fn test_strip_index_wrapper_layers_unwraps_all_known_layers() {
+        use data_components::MetadataEnrichedTableProvider;
         use runtime_datafusion_index::IndexedTableProvider;
 
-        let batch = create_test_data();
-        let schema = batch.schema();
         let mem_table: Arc<dyn TableProvider> = Arc::new(
-            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+            MemTable::try_new(create_test_schema(), vec![]).expect("mem table should be created"),
         );
+
+        // IndexedTableProvider alone.
         let wrapped: Arc<dyn TableProvider> =
             Arc::new(IndexedTableProvider::new(Arc::clone(&mem_table)));
-
-        let stripped = strip_index_wrappers(&wrapped);
         assert!(
-            stripped.downcast_ref::<MemTable>().is_some(),
+            strip_index_wrapper_layers(&wrapped)
+                .downcast_ref::<MemTable>()
+                .is_some(),
             "stripping an IndexedTableProvider must yield the underlying MemTable"
         );
 
+        // MetadataEnrichedTableProvider nested inside an IndexedTableProvider (the shape
+        // `table_provider_with_spicepod_metadata` produces).
+        let metadata_enriched: Arc<dyn TableProvider> =
+            Arc::new(MetadataEnrichedTableProvider::new(
+                Arc::clone(&mem_table),
+                std::collections::HashMap::from([("key".to_string(), "value".to_string())]),
+            ));
+        let wrapped_with_metadata: Arc<dyn TableProvider> =
+            Arc::new(IndexedTableProvider::new(metadata_enriched));
+        assert!(
+            strip_index_wrapper_layers(&wrapped_with_metadata)
+                .downcast_ref::<MemTable>()
+                .is_some(),
+            "stripping must peel through a nested MetadataEnrichedTableProvider layer"
+        );
+
         // A provider with no wrapper layers is returned unchanged.
-        let unwrapped_stripped = strip_index_wrappers(&mem_table);
-        assert!(unwrapped_stripped.downcast_ref::<MemTable>().is_some());
+        assert!(
+            strip_index_wrapper_layers(&mem_table)
+                .downcast_ref::<MemTable>()
+                .is_some()
+        );
     }
 }

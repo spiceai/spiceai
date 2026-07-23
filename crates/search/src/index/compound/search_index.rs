@@ -29,9 +29,9 @@ use runtime_datafusion_index::Index;
 use crate::index::{SearchIndex, VectorIndex};
 
 use super::{
-    CompoundReadMode, CompoundVectorIndex, Error, compound_delete_by_keys,
-    compound_on_write_start, compound_required_columns, compound_write,
-    fallback::fallback_on_empty_plan, validate_compatibility,
+    CompoundReadMode, CompoundVectorIndex, Error, compound_delete_by_keys, compound_on_write_start,
+    compound_required_columns, compound_write, fallback::fallback_on_empty_plan,
+    validate_compatibility,
 };
 
 /// A [`SearchIndex`] that writes through to two compatible underlying indexes and serves
@@ -63,6 +63,9 @@ impl CompoundSearchIndex {
             secondary,
             read_mode,
         })
+    }
+    pub fn primary(&self) -> &Arc<dyn SearchIndex> {
+        &self.primary
     }
 }
 
@@ -126,12 +129,6 @@ impl SearchIndex for CompoundSearchIndex {
 
     fn primary_fields(&self) -> Vec<Field> {
         self.primary.primary_fields()
-    }
-
-    async fn delete_warm_by_keys(&self, keys: RecordBatch) -> DataFusionResult<()> {
-        // Warm-only: retention trims the local/primary index and must not reach into the
-        // independently-managed secondary/fallback index.
-        self.primary.delete_by_keys(keys).await
     }
 
     async fn write(

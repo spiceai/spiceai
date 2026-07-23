@@ -117,14 +117,14 @@ impl Index for NativeVectorIndex {
 
     // Co-located: the embedding lives in the accelerated table row itself, so it disappears
     // for free when the accelerator deletes the row — `delete_by_keys` stays the default no-op.
-    // Override `delete_by_predicate` too so a delete doesn't pay for a pointless resolve scan.
-    async fn delete_by_predicate(
+    // Override `resolve_delete_keys` too so a delete doesn't pay for a pointless resolve scan.
+    async fn resolve_delete_keys(
         &self,
         _table: &std::sync::Arc<dyn datafusion::catalog::TableProvider>,
         _session: &dyn datafusion::catalog::Session,
         _filters: Vec<datafusion::prelude::Expr>,
-    ) -> Result<(), DataFusionError> {
-        Ok(())
+    ) -> Result<Option<RecordBatch>, DataFusionError> {
+        Ok(None)
     }
 
     fn as_any(&self) -> &dyn Any {

@@ -34,7 +34,7 @@ use datafusion::physical_plan::collect;
 ///
 /// This is a read against `table`'s *current* state — callers deleting rows must run it before
 /// the matching rows are actually removed, otherwise there is nothing left to resolve. Used by
-/// [`crate::Index::delete_by_predicate`]'s default to bridge a predicate-only delete (retention,
+/// [`crate::Index::resolve_delete_keys`]'s default to bridge a predicate-only delete (retention,
 /// an ad hoc SQL `DELETE`) down to the primary-key-based [`crate::Index::delete_by_keys`] every
 /// backend actually implements; `key_columns` is typically [`crate::Index::required_columns`].
 ///

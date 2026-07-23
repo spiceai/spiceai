@@ -291,7 +291,7 @@ impl FullTextDatabaseIndex {
                 INDEX_UNIQUE_FIELD_NAME,
             )
             .context(InvalidIndexingSnafu {
-                context: "An error occured creating the a unique column for the full text search index".to_string(),
+                context: "An error occurred creating the unique column for the full text search index".to_string(),
             })?]
         } else {
             vec![keys.clone()]

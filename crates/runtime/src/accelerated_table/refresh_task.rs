@@ -237,7 +237,7 @@ pub(crate) fn collect_indexes_from_provider(
 ///
 /// Uses `try_table_provider_sync` to avoid blocking when the federated provider is deferred
 /// (e.g. during schema evolution). If the provider is not yet available, returns an empty list.
-fn indexes_from_federated(
+pub(crate) fn indexes_from_federated(
     federated: &FederatedTable,
 ) -> Vec<Arc<dyn runtime_datafusion_index::Index + Send + Sync>> {
     let Some(root) = federated.try_table_provider_sync() else {
@@ -1036,6 +1036,7 @@ impl RefreshTask {
             retention::apply_retention_filters_once(
                 &self.dataset_name,
                 &self.accelerator,
+                &self.federated,
                 retention_sql_delete_expr,
                 &self.io_runtime,
             )

@@ -19,10 +19,7 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use arrow_schema::Field;
 use async_trait::async_trait;
-use datafusion::{
-    error::{DataFusionError, Result as DataFusionResult},
-    logical_expr::LogicalPlan,
-};
+use datafusion::{error::DataFusionError, logical_expr::LogicalPlan};
 use runtime_datafusion_index::Index;
 
 pub mod chunking;
@@ -78,21 +75,6 @@ pub trait SearchIndex: Index + std::fmt::Debug + Send + Sync + 'static {
     fn as_vector_index(self: Arc<Self>) -> Option<Arc<dyn VectorIndex>> {
         None
     }
-
-    /// Delete index entries by primary key, scoped to the *warm* side only.
-    ///
-    /// For a plain (non-compound) index this is identical to [`Index::delete_by_keys`] — there is
-    /// only one backing store. [`compound::CompoundSearchIndex`]/[`compound::CompoundVectorIndex`]
-    /// override this to remove entries from the primary/warm index only, leaving the
-    /// secondary/fallback index's independent lifecycle untouched.
-    ///
-    /// Used by retention, which trims the local warm window and must not reach into an
-    /// externally-managed fallback index. CDC-sourced deletes and direct SQL deletes use the full
-    /// [`Index::delete_by_keys`] instead, since those represent the authoritative source row being
-    /// gone and must keep every composed store consistent.
-    async fn delete_warm_by_keys(&self, keys: RecordBatch) -> DataFusionResult<()> {
-        self.delete_by_keys(keys).await
-    }
 }
 
 /// Extracts the derived column names from a vector index implementation.
@@ -131,7 +113,7 @@ pub fn derived_columns_from_vector_index(
 /// reconstruct an `Arc` sharing the original allocation from a bare `&dyn Any`). Callers that
 /// hold the original `Arc<dyn Index>` alive for the duration of the borrow — e.g. iterating a
 /// `Vec<Arc<dyn Index + Send + Sync>>` collected off a provider chain — only need a borrowed
-/// `&dyn SearchIndex` to call `primary_fields()`/`delete_warm_by_keys()` etc., so this returns
+/// `&dyn SearchIndex` to call `primary_fields()`/`query_table_provider()` etc., so this returns
 /// one instead of attempting to manufacture an `Arc`.
 ///
 /// Mirrors [`derived_columns_from_vector_index`]'s manual downcast list — extend both together

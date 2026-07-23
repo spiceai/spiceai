@@ -808,27 +808,6 @@ async fn delete_by_keys_hits_both_primary_and_secondary() {
 }
 
 #[tokio::test]
-async fn delete_warm_by_keys_hits_only_primary() {
-    let events = Arc::new(Mutex::new(vec![]));
-    let primary = MockIndex::new("primary", &events);
-    let secondary = MockIndex::new("secondary", &events);
-    let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
-
-    idx.delete_warm_by_keys(delete_keys_batch(3))
-        .await
-        .expect("delete_warm_by_keys succeeds");
-
-    let events = events.lock().expect("event log mutex").clone();
-    assert!(events.contains(&"primary:delete_by_keys:3".to_string()));
-    assert!(
-        !events
-            .iter()
-            .any(|e| e.starts_with("secondary:delete_by_keys")),
-        "warm-only delete must not reach the secondary/fallback index: {events:?}"
-    );
-}
-
-#[tokio::test]
 async fn vector_delete_by_keys_hits_both_primary_and_secondary() {
     let events = Arc::new(Mutex::new(vec![]));
     let mut primary = MockIndex::new("primary", &events);
@@ -850,33 +829,4 @@ async fn vector_delete_by_keys_hits_both_primary_and_secondary() {
     let events = events.lock().expect("event log mutex").clone();
     assert!(events.contains(&"primary:delete_by_keys:1".to_string()));
     assert!(events.contains(&"secondary:delete_by_keys:1".to_string()));
-}
-
-#[tokio::test]
-async fn vector_delete_warm_by_keys_hits_only_primary() {
-    let events = Arc::new(Mutex::new(vec![]));
-    let mut primary = MockIndex::new("primary", &events);
-    primary.dimension = Some(4);
-    let mut secondary = MockIndex::new("secondary", &events);
-    secondary.dimension = Some(4);
-
-    let idx = CompoundVectorIndex::try_new(
-        Arc::new(primary) as Arc<dyn VectorIndex>,
-        Arc::new(secondary) as Arc<dyn VectorIndex>,
-        CompoundReadMode::PrimaryOnly,
-    )
-    .expect("compatible vector indexes");
-
-    idx.delete_warm_by_keys(delete_keys_batch(1))
-        .await
-        .expect("delete_warm_by_keys succeeds");
-
-    let events = events.lock().expect("event log mutex").clone();
-    assert!(events.contains(&"primary:delete_by_keys:1".to_string()));
-    assert!(
-        !events
-            .iter()
-            .any(|e| e.starts_with("secondary:delete_by_keys")),
-        "warm-only delete must not reach the secondary/fallback index: {events:?}"
-    );
 }
