@@ -519,7 +519,16 @@ impl RuntimeBuilder {
         // recommended. An explicit `runtime.query.memory_limit` / per-dataset
         // `duckdb_memory_limit` always overrides. See `accelerator_memory_budget`.
         let duckdb_budget_inputs = duckdb_budget_inputs(self.app.as_ref());
-        let duckdb_query_pool_cap = {
+        let has_duckdb_instances = duckdb_budget_inputs.num_unset_instances > 0
+            || duckdb_budget_inputs.num_explicit_instances > 0;
+        let duckdb_query_pool_cap = if !has_duckdb_instances {
+            // No DuckDB accelerators (or the duckdb feature isn't compiled in): skip
+            // the cgroup/host memory probes and the planner entirely — the plan would
+            // NoOp anyway. Clear any previously-published budget so a hot-reload that
+            // removed all DuckDB accelerators doesn't leave a stale reservation.
+            crate::accelerator_memory_budget::publish_duckdb_budget(0, 0);
+            None
+        } else {
             let cayenne_active = compaction_memory_fraction.is_some();
             let total_memory = crate::resource_monitor::get_total_memory();
             // DuckDB's own default memory_limit is ~80% of HOST RAM (not the cgroup
