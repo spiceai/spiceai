@@ -17,9 +17,15 @@ limitations under the License.
 use std::{
     fmt::Display,
     sync::{Arc, OnceLock},
+    time::{Duration, SystemTime},
 };
 
 use parking_lot::Mutex;
+
+pub mod config;
+pub use config::{
+    DEFAULT_READY_LAG, InitialSnapshotMode, InvalidCheckpointBehavior, heartbeat_interval,
+};
 
 use arrow::error::ArrowError;
 use arrow::{
@@ -586,21 +592,86 @@ impl CommitChange for NoOpCommitter {
     }
 }
 
-/// Construct an empty [`ChangeEnvelope`] whose only job is to flip
-/// `is_dataset_ready=true`. The batch contains zero rows and uses a no-op
-/// committer.
+/// Emit one uniform log line when a CDC committer durably acks source progress,
+/// showing the source-commit timestamp of the data it commits and the
+/// end-to-end lag (`now − source_commit_ts_ms`). Every connector's committer
+/// calls this so `refresh_mode: changes` freshness and lag-based readiness can
+/// be verified from the logs with a single filter (`spice_cdc::commit`).
 ///
-/// Connectors should emit one of these envelopes once they consider
-/// themselves caught up to the source if no real change events are available
-/// to carry the ready signal. See the [`ChangesStream`] documentation for the
-/// readiness contract.
-pub fn build_ready_signal_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope, ChangeBatchError> {
+/// `source_commit_ts_ms` is `None` for snapshot-boundary / no-timestamp commits
+/// (lag is then reported as `None`).
+/// Convert a [`SystemTime`] to milliseconds since the Unix epoch, or `None` if it
+/// predates the epoch or overflows `i64`.
+#[must_use]
+pub fn system_time_to_unix_ms(t: SystemTime) -> Option<i64> {
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+}
+
+/// Current wall-clock time as milliseconds since the Unix epoch, or `None` if the
+/// clock is unavailable.
+#[must_use]
+pub fn now_unix_ms() -> Option<i64> {
+    system_time_to_unix_ms(SystemTime::now())
+}
+
+/// Replication lag in milliseconds: wall-clock now minus the source-commit
+/// timestamp, clamped to `>= 0`. `None` when the source timestamp is unknown or
+/// the clock is unavailable. Shared by the `spice_cdc::*` log lines and the lag
+/// gauge so every CDC connector computes lag identically.
+#[must_use]
+pub fn replication_lag_ms(source_commit_ts_ms: Option<i64>) -> Option<i64> {
+    match (now_unix_ms(), source_commit_ts_ms) {
+        (Some(now), Some(ts)) => Some(now.saturating_sub(ts).max(0)),
+        _ => None,
+    }
+}
+
+pub fn log_committer_progress(
+    connector: &str,
+    dataset: &str,
+    position: &str,
+    source_commit_ts_ms: Option<i64>,
+) {
+    let lag_ms = replication_lag_ms(source_commit_ts_ms);
+    tracing::debug!(
+        target: "spice_cdc::commit",
+        connector,
+        dataset,
+        position,
+        source_commit_ts_ms = ?source_commit_ts_ms,
+        lag_ms = ?lag_ms,
+        "CDC committer acked source position"
+    );
+}
+
+/// Construct a zero-row "heartbeat" [`ChangeEnvelope`] stamped with a
+/// source-attested `source_commit_ts_ms` and carrying `is_dataset_ready`.
+///
+/// CDC connectors emit these to keep **lag-based readiness** live on an idle
+/// source: a caught-up but quiet source has no rows to carry a freshness
+/// timestamp, so without a heartbeat its measured lag would climb forever and
+/// the dataset would never flip Ready. Periodically emitting a zero-row
+/// envelope stamped with the source's own clock (a Postgres keepalive time, a
+/// `MongoDB` cluster time, a `MySQL` server clock) lets the runtime observe
+/// `now - source_commit_ts_ms` and mark the dataset Ready once that lag is
+/// within the connector's `ready_lag`.
+///
+/// The batch has zero rows and a no-op committer — idle progress is
+/// acknowledged through the connector's own keepalive/position handling, not
+/// through this envelope's committer.
+pub fn build_heartbeat_envelope(
+    schema: &SchemaRef,
+    source_commit_ts_ms: Option<i64>,
+    is_dataset_ready: bool,
+) -> Result<ChangeEnvelope, ChangeBatchError> {
     // Normalize fields to all-nullable so this empty barrier batch's struct type
     // matches the truncate/snapshot/live change batches it coalesces with. The
     // dataset schema may declare non-null columns (e.g. a `nullable: false`
     // primary key in the spicepod), but every other change batch uses the
     // nullable schema; without this, concat fails ("arrays of different data
-    // types") when the ready signal is coalesced with real data.
+    // types") when the heartbeat is coalesced with real data.
     let nullable_schema = Schema::new(
         schema
             .fields()
@@ -632,13 +703,47 @@ pub fn build_ready_signal_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope,
         vec![op_array, Arc::new(pk_list), Arc::new(data_struct)],
     )
     .context(ArrowSnafu)?;
-    let batch = ChangeBatch::try_new(record)?;
+    let batch = ChangeBatch::try_new(record)?.with_source_commit_ts_ms(source_commit_ts_ms);
 
     Ok(ChangeEnvelope::new(
         Box::new(NoOpCommitter),
         batch,
-        true, // is_dataset_ready
+        is_dataset_ready,
     ))
+}
+
+/// Construct an empty [`ChangeEnvelope`] whose only job is to flip
+/// `is_dataset_ready=true`. The batch contains zero rows and uses a no-op
+/// committer.
+///
+/// For sources with a binary caught-up-or-not readiness signal (e.g. Kafka
+/// consumer lag reaching zero). Sources with a continuous freshness clock use
+/// [`build_heartbeat_envelope`] with [`source_commit_within_ready_lag`] for
+/// lag-based readiness instead. See the [`ChangesStream`] documentation for
+/// the readiness contract.
+pub fn build_ready_signal_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope, ChangeBatchError> {
+    build_heartbeat_envelope(schema, None, true)
+}
+
+/// Lag-based readiness predicate shared by CDC connectors: returns `true` when
+/// `source_commit_ts_ms` is within `ready_lag` of now (wall clock). `None` (the
+/// connector has no upstream timestamp yet) is **not** ready — there is no
+/// freshness signal proving the stream has caught up. A source clock slightly
+/// ahead of ours (small skew) clamps to zero lag and reads as ready.
+///
+/// This is the single definition of "caught up" behind every connector's
+/// `{connector}_replication_ready_lag`: connectors stamp each envelope's
+/// `is_dataset_ready` with it (mirroring `DynamoDB`'s poll-cycle lag gate), and a
+/// [`build_heartbeat_envelope`] on an idle source carries the same verdict.
+#[must_use]
+pub fn source_commit_within_ready_lag(
+    source_commit_ts_ms: Option<i64>,
+    ready_lag: Duration,
+) -> bool {
+    let Some(lag_ms) = replication_lag_ms(source_commit_ts_ms) else {
+        return false;
+    };
+    u128::from(lag_ms.unsigned_abs()) < ready_lag.as_millis()
 }
 
 /// The Arrow schema that represents a `ChangeEvent`
@@ -1198,5 +1303,84 @@ mod deferred_tests {
             env.change_batch().expect("already built").record.num_rows(),
             0
         );
+    }
+
+    // ----- lag-based readiness helpers -----
+
+    #[test]
+    fn source_commit_within_ready_lag_gates_on_freshness() {
+        let now = now_unix_ms().expect("clock available");
+        let lag = Duration::from_secs(2);
+
+        // A commit 500ms in the past is within a 2s window -> caught up.
+        assert!(source_commit_within_ready_lag(Some(now - 500), lag));
+        // A commit 5s in the past is beyond the window -> still behind.
+        assert!(!source_commit_within_ready_lag(Some(now - 5_000), lag));
+        // No upstream timestamp is never ready: there is no freshness proof.
+        assert!(!source_commit_within_ready_lag(None, lag));
+        // A source clock slightly ahead of ours (small skew) clamps to zero lag
+        // and reads as ready rather than flapping.
+        assert!(source_commit_within_ready_lag(Some(now + 500), lag));
+    }
+
+    #[test]
+    fn source_commit_within_ready_lag_is_strict_at_the_boundary() {
+        // `ready_lag` of zero can never be satisfied (lag is always >= 0 and the
+        // comparison is strict `<`), so a zero threshold never marks Ready.
+        let now = now_unix_ms().expect("clock available");
+        assert!(!source_commit_within_ready_lag(
+            Some(now),
+            Duration::from_secs(0)
+        ));
+    }
+
+    #[test]
+    fn replication_lag_ms_clamps_and_handles_missing_ts() {
+        // No source timestamp -> no lag signal.
+        assert_eq!(replication_lag_ms(None), None);
+
+        let now = now_unix_ms().expect("clock available");
+        // A past commit reports a non-negative lag in the expected ballpark.
+        let lag = replication_lag_ms(Some(now - 1_000)).expect("some lag");
+        assert!((900..=60_000).contains(&lag), "unexpected lag: {lag}");
+
+        // A future commit (source clock ahead) clamps to zero, never negative.
+        assert_eq!(replication_lag_ms(Some(now + 10_000)), Some(0));
+    }
+
+    #[test]
+    fn heartbeat_envelope_is_empty_stamps_ts_and_propagates_ready_flag() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let ts = now_unix_ms().expect("clock available");
+
+        for ready in [true, false] {
+            let env = build_heartbeat_envelope(&schema, Some(ts), ready)
+                .expect("heartbeat envelope builds");
+            assert_eq!(env.is_dataset_ready(), ready);
+            let batch = env.change_batch().expect("already built");
+            assert_eq!(batch.record.num_rows(), 0, "heartbeat carries no rows");
+            assert!(
+                batch.is_heartbeat(),
+                "zero-row stamped batch is a heartbeat"
+            );
+            assert_eq!(
+                batch.source_commit_ts_ms(),
+                Some(ts),
+                "heartbeat carries the source-attested clock"
+            );
+        }
+    }
+
+    #[test]
+    fn heartbeat_envelope_builds_for_non_null_primary_key_schema() {
+        // A `nullable: false` column must not break the coalesce with real
+        // change batches: the heartbeat normalizes fields to nullable.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let env = build_heartbeat_envelope(&schema, None, false)
+            .expect("heartbeat builds with non-null columns");
+        assert_eq!(env.change_batch().expect("built").record.num_rows(), 0);
     }
 }

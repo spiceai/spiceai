@@ -32,6 +32,7 @@ limitations under the License.
 pub mod binlog;
 pub mod bootstrap;
 pub mod config;
+pub mod gtid;
 pub mod metrics;
 pub mod resilience;
 pub mod rows;
@@ -46,13 +47,12 @@ use snafu::Snafu;
 
 use crate::cdc::{
     ChangeEnvelope, ChangesStream, CommitChange, CommitError, NoOpCommitter, StreamError,
-    build_ready_signal_envelope,
+    build_heartbeat_envelope,
 };
 
-pub use config::{
-    BinlogPosition, InvalidPositionBehavior, ReplicationParams, SnapshotMode, derive_server_id,
-    process_nonce,
-};
+use crate::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
+pub use config::{BinlogPosition, CursorType, ReplicationParams, derive_server_id, process_nonce};
+pub use gtid::GtidSet;
 pub use metrics::{Metrics as ReplicationMetrics, MetricsCollector as ReplicationMetricsCollector};
 
 #[derive(Debug, Snafu)]
@@ -125,6 +125,36 @@ pub enum Error {
 
     #[snafu(display("{message}"))]
     StalePosition { message: String },
+
+    #[snafu(display("Failed to parse MySQL GTID set: {message}"))]
+    GtidParse { message: String },
+
+    #[snafu(display(
+        "Cannot resume MySQL replication for {dataset} ({database}.{table}): this dataset was \
+         bootstrapped with GTID auto-positioning, but the source server no longer reports \
+         `gtid_mode = ON` (it may have been reconfigured, or this is a different server without \
+         GTIDs). Resuming by file+offset instead would silently start from a server-local \
+         position that does not correspond to the applied GTID set. Either restore \
+         `gtid_mode = ON` on the source (or repoint at a GTID-capable server) to resume via GTID, \
+         or drop the accelerator's persisted state (its `spice_sys_mysql_binlog` row) to \
+         re-bootstrap from scratch. \
+         See: https://spiceai.org/docs/components/data-connectors/mysql"
+    ))]
+    GtidResumeUnavailable {
+        dataset: String,
+        database: String,
+        table: String,
+    },
+
+    #[snafu(display(
+        "MySQL replication for {dataset}: this dataset is positioning by GTID, but the source \
+         emitted an anonymous transaction (no GTID). This means the source's `gtid_mode` is not \
+         fully ON (e.g. ON_PERMISSIVE), so the applied GTID set cannot describe every \
+         transaction. Set `gtid_mode = ON` on the source, or drop the accelerator's persisted \
+         state to re-bootstrap by file+offset. \
+         See: https://spiceai.org/docs/components/data-connectors/mysql"
+    ))]
+    AnonymousTransactionUnderGtid { dataset: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -145,6 +175,16 @@ pub type StoreError = Box<dyn std::error::Error + Send + Sync>;
 pub struct PersistedPosition {
     pub position: BinlogPosition,
     pub schema_json: Option<String>,
+    /// Serialized executed [`GtidSet`] (`uuid:range` text) when positioning by
+    /// GTID; may be empty (`gtid_mode = ON` but no transactions applied yet).
+    /// `None` for file+offset positioning. This is the failover-safe resume
+    /// identity: unlike `position` it is server-independent, so a checkpoint
+    /// written against one primary resumes against a promoted replica via
+    /// `COM_BINLOG_DUMP_GTID`.
+    pub gtid_set: Option<String>,
+    /// The checkpoint's cursor type, stored explicitly rather than inferred
+    /// from `gtid_set` (an empty GTID set must still resume as GTID; see [`CursorType`])
+    pub cursor_type: CursorType,
 }
 
 /// Version tag for [`CheckpointMeta`] serialized into `schema_json`.
@@ -469,6 +509,22 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
         );
     }
 
+    // Positioning is always automatic: prefer GTID auto-positioning
+    // (failover-safe) when the source supports it, else file+offset. There is
+    // no user knob — GTID is used whenever the source reports `gtid_mode = ON`.
+    // A dataset's cursor type is fixed at bootstrap and the persisted
+    // checkpoint's *stored* type is authoritative on resume (never inferred).
+    // The resolved type is surfaced via tracing (see below) so an operator can
+    // confirm whether a dataset is failover-safe.
+    // Observed `@@GLOBAL.gtid_mode`, kept so the fallback WARN can name the
+    // actual value (`OFF`, `ON_PERMISSIVE`, …); `None` = the server doesn't
+    // support MySQL GTIDs at all (MariaDB / pre-GTID MySQL).
+    let gtid_mode_observed = setup::detect_gtid_mode(&mut conn).await?;
+    let gtid_on = setup::gtid_mode_is_on(gtid_mode_observed.as_deref());
+    // Cursor type for a cold start (no checkpoint) or a re-snapshot: GTID iff
+    // the server currently supports it.
+    let cold_start_use_gtid = gtid_on;
+
     // 2. Load the persisted position and pick the start path.
     //
     // Binlog row images are positional. Resuming against a different source
@@ -486,88 +542,183 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
     let layout_fingerprint = layout.fingerprint();
     let checkpoint_schema_json = encode_checkpoint_schema_json(schema_json.as_deref(), &layout);
 
-    let resume_position = match persisted {
-        Some(persisted) if params.snapshot_mode == SnapshotMode::Always => {
-            tracing::info!(
-                dataset = %dataset_name,
-                position = %persisted.position,
-                "`snapshot_mode: always`: running the initial snapshot despite a persisted \
-                 binlog position"
-            );
-            None
-        }
-        Some(persisted) => {
-            if let Err(drift) = check_resume_compatibility(
-                persisted.schema_json.as_deref(),
-                schema_json.as_deref(),
-                &layout_fingerprint,
-            ) {
-                match params.invalid_position_behavior {
-                    InvalidPositionBehavior::Error => {
-                        return StalePositionSnafu {
-                            message: format!(
-                                "cannot resume mysql binlog for {dataset_name} from {}: {drift}. Replaying historical row images against the current source layout would mis-map columns. Set `mysql_replication_invalid_position_behavior: rebootstrap` to drop the saved position and re-snapshot the table.",
-                                persisted.position
-                            ),
-                        }
-                        .fail();
+    // Resume plan. A persisted checkpoint's *stored* cursor type is
+    // authoritative on resume (read from the sidecar, never inferred from
+    // whether a GTID set is present): the dataset keeps the type it was
+    // bootstrapped with. A GTID checkpoint whose server can no longer do GTID
+    // is a hard error (never a silent downgrade to file+offset, which would
+    // resume from a server-local position unrelated to the applied GTID set); a
+    // file checkpoint keeps resuming file+offset even when the server now
+    // supports GTID (no implicit upgrade). `use_gtid` is the resolved mode.
+    //
+    // `resume_position` is the file+offset to resume from (`None` = snapshot);
+    // `resume_gtid` is the executed GTID set to auto-position from, set only
+    // when resuming via GTID.
+    let (resume_position, resume_gtid, use_gtid): (Option<BinlogPosition>, Option<GtidSet>, bool) =
+        match persisted {
+            Some(persisted) if params.snapshot_mode == InitialSnapshotMode::Always => {
+                tracing::info!(
+                    dataset = %dataset_name,
+                    position = %persisted.position,
+                    "`snapshot_mode: always`: running the initial snapshot despite a persisted binlog position"
+                );
+                (None, None, cold_start_use_gtid)
+            }
+            Some(persisted) => {
+                // The checkpoint's cursor type is stored, not inferred, so an
+                // empty GTID set (`gtid_mode = ON`, zero txns yet) still resumes
+                // as GTID and a mis-typed resume can never silently open a
+                // failover gap.
+                let cursor = persisted.cursor_type;
+
+                // A GTID-bootstrapped dataset cannot keep its cursor type if the
+                // server no longer supports GTID — hard error, never a silent
+                // file+offset downgrade.
+                if cursor == CursorType::Gtid && !gtid_on {
+                    return GtidResumeUnavailableSnafu {
+                        dataset: dataset_name.clone(),
+                        database: database.clone(),
+                        table: table.clone(),
                     }
-                    InvalidPositionBehavior::Rebootstrap => {
-                        tracing::warn!(
-                            dataset = %dataset_name,
-                            position = %persisted.position,
-                            drift = %drift,
-                            "persisted binlog checkpoint is incompatible with the current source layout / dataset schema; rebootstrap behavior enabled, falling back to a fresh snapshot"
-                        );
-                        if let Err(e) = position_store.clear().await {
-                            tracing::warn!(
-                                dataset = %dataset_name,
-                                error = %e,
-                                "failed to clear the incompatible binlog position; the subsequent bootstrap will overwrite it"
-                            );
-                        }
-                        None
-                    }
+                    .fail();
                 }
-            } else if setup::binlog_file_exists(&mut conn, &persisted.position.file).await? {
-                Some(persisted.position)
-            } else {
-                match params.invalid_position_behavior {
-                    InvalidPositionBehavior::Error => {
-                        return StalePositionSnafu {
-                            message: format!(
-                                "persisted binlog position {} is no longer on the server \
-                                 (binary logs were purged). Set \
-                                 `mysql_replication_invalid_position_behavior: rebootstrap` to \
-                                 drop the saved position and re-snapshot the table, or increase \
-                                 `binlog_expire_logs_seconds` on the source.",
-                                persisted.position
-                            ),
+
+                // Layout/schema drift is a same-type concern → honors
+                // `invalid_position_behavior`.
+                if let Err(drift) = check_resume_compatibility(
+                    persisted.schema_json.as_deref(),
+                    schema_json.as_deref(),
+                    &layout_fingerprint,
+                ) {
+                    match params.invalid_position_behavior {
+                        InvalidCheckpointBehavior::Error => {
+                            return StalePositionSnafu {
+                                message: format!(
+                                    "cannot resume mysql binlog for {dataset_name} from {}: {drift}. Replaying historical row images against the current source layout would mis-map columns. Set `mysql_replication_invalid_checkpoint_behavior: restart` to drop the saved position and re-snapshot the table.",
+                                    persisted.position
+                                ),
+                            }
+                            .fail();
                         }
-                        .fail();
-                    }
-                    InvalidPositionBehavior::Rebootstrap => {
-                        tracing::warn!(
-                            dataset = %dataset_name,
-                            position = %persisted.position,
-                            "persisted binlog position was purged from the source; rebootstrap \
-                             behavior enabled, falling back to a fresh snapshot"
-                        );
-                        if let Err(e) = position_store.clear().await {
+                        InvalidCheckpointBehavior::Restart => {
                             tracing::warn!(
                                 dataset = %dataset_name,
-                                error = %e,
-                                "failed to clear the stale binlog position; the subsequent \
-                                 bootstrap will overwrite it"
+                                position = %persisted.position,
+                                drift = %drift,
+                                "persisted binlog checkpoint is incompatible with the current source layout / dataset schema; rebootstrap behavior enabled, falling back to a fresh snapshot"
                             );
+                            clear_position(&position_store, &dataset_name).await;
+                            (None, None, cold_start_use_gtid)
                         }
-                        None
+                    }
+                } else {
+                    match cursor {
+                        // GTID resume: the server computes the start point from
+                        // the executed set, so no binlog-file-existence pre-check.
+                        // A stored *empty* set is legitimate (`Some("")` → empty
+                        // set: `gtid_mode = ON` with zero txns applied yet). A
+                        // *missing* set (`None`) or an unparseable one is a
+                        // corrupt/incomplete checkpoint — not a known-empty set —
+                        // so it must not silently resume from the start of the
+                        // source's binlogs; it honors `invalid_position_behavior`.
+                        CursorType::Gtid => {
+                            let parsed = match persisted.gtid_set.as_deref() {
+                                Some(raw) => GtidSet::parse(raw)
+                                    .map_err(|m| format!("persisted GTID set is corrupt ({m})")),
+                                None => Err("persisted checkpoint is marked GTID but has no \
+                                             executed set (corrupt or incomplete)"
+                                    .to_string()),
+                            };
+                            match parsed {
+                                Ok(set) => (Some(persisted.position), Some(set), true),
+                                Err(detail) => match params.invalid_position_behavior {
+                                    InvalidCheckpointBehavior::Error => {
+                                        return GtidParseSnafu {
+                                            message: format!(
+                                                "cannot resume mysql binlog for {dataset_name}: {detail}. Set `mysql_replication_invalid_checkpoint_behavior: restart` to re-snapshot."
+                                            ),
+                                        }
+                                        .fail();
+                                    }
+                                    InvalidCheckpointBehavior::Restart => {
+                                        tracing::warn!(
+                                            dataset = %dataset_name,
+                                            reason = %detail,
+                                            "GTID checkpoint unusable; restart behavior enabled, falling back to a fresh snapshot"
+                                        );
+                                        clear_position(&position_store, &dataset_name).await;
+                                        (None, None, cold_start_use_gtid)
+                                    }
+                                },
+                            }
+                        }
+                        CursorType::File => {
+                            if setup::binlog_file_exists(&mut conn, &persisted.position.file)
+                                .await?
+                            {
+                                (Some(persisted.position), None, false)
+                            } else {
+                                match params.invalid_position_behavior {
+                                    InvalidCheckpointBehavior::Error => {
+                                        return StalePositionSnafu {
+                                            message: format!(
+                                                "persisted binlog position {} is no longer on the server \
+                                                 (binary logs were purged). Set \
+                                                 `mysql_replication_invalid_checkpoint_behavior: restart` to \
+                                                 drop the saved position and re-snapshot the table, or increase \
+                                                 `binlog_expire_logs_seconds` on the source.",
+                                                persisted.position
+                                            ),
+                                        }
+                                        .fail();
+                                    }
+                                    InvalidCheckpointBehavior::Restart => {
+                                        tracing::warn!(
+                                            dataset = %dataset_name,
+                                            position = %persisted.position,
+                                            "persisted binlog position was purged from the source; restart behavior enabled, falling back to a fresh snapshot"
+                                        );
+                                        clear_position(&position_store, &dataset_name).await;
+                                        (None, None, cold_start_use_gtid)
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
-        }
-        None => None,
-    };
+            None => (None, None, cold_start_use_gtid),
+        };
+
+    // Surface the resolved cursor type so an operator can confirm whether the
+    // dataset is failover-safe — GTID positioning is automatic and otherwise
+    // silent, and a file+offset fallback that only bites at failover is the one
+    // dangerous outcome of this design. `use_gtid` is the whole knob: there is
+    // no user param.
+    metrics.set_gtid_enabled(use_gtid);
+    if use_gtid {
+        tracing::info!(
+            dataset = %dataset_name,
+            "mysql replication for {database}.{table}: GTID auto-positioning active (failover-safe resume)"
+        );
+    } else if gtid_on {
+        // Server supports GTID but this dataset is on a file checkpoint written
+        // before GTID (no implicit upgrade). Re-bootstrap to adopt GTID.
+        tracing::warn!(
+            dataset = %dataset_name,
+            "mysql replication for {database}.{table}: file+offset positioning (resuming a pre-GTID checkpoint though the source now reports gtid_mode = ON) — resume is NOT failover-safe; a source promotion will force a full re-snapshot. Re-bootstrap the dataset to adopt GTID auto-positioning."
+        );
+    } else if let Some(mode) = &gtid_mode_observed {
+        tracing::warn!(
+            dataset = %dataset_name,
+            "mysql replication for {database}.{table}: file+offset positioning (source gtid_mode is '{mode}', not 'ON') — resume is NOT failover-safe; a source promotion will force a full re-snapshot. Set gtid_mode = ON on the source to get failover-safe GTID auto-positioning."
+        );
+    } else {
+        tracing::warn!(
+            dataset = %dataset_name,
+            "mysql replication for {database}.{table}: file+offset positioning (this server does not support GTIDs) — resume is NOT failover-safe; a source promotion will force a full re-snapshot. Use a GTID-capable MySQL 8.0+ source with gtid_mode = ON for failover-safe resume."
+        );
+    }
 
     // 3. Assemble the per-path prelude, then hand everything to one binlog
     //    stream:
@@ -576,29 +727,53 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
     //      - snapshot:    truncate barrier → snapshot rows → ready signal
     //                     carrying the head-position commit; stream from the
     //                     captured head.
-    let (start, prelude): (BinlogPosition, ChangesStream) = if let Some(position) = resume_position
+    // The executed GTID set the binlog stream seeds from and extends as it
+    // commits. Empty when not using GTID positioning.
+    let (start, gtid_seed, prelude): (BinlogPosition, GtidSet, ChangesStream) = if let Some(
+        position,
+    ) =
+        resume_position
     {
-        // Resume: no snapshot. Signal readiness immediately — on a quiet
-        // source the first binlog event may be arbitrarily far away.
+        // Resume: no snapshot. Readiness is lag-based — the binlog stream marks
+        // the dataset Ready once it has caught up to the source head (see
+        // `binlog::start_binlog_stream` and `mysql_replication_ready_lag`), so a
+        // quiet source whose first event is far away stays not-ready until a
+        // heartbeat confirms it is caught up.
         if let Err(e) = conn.disconnect().await {
             tracing::debug!(dataset = %dataset_name, error = %e, "setup connection disconnect");
         }
         tracing::info!(
             dataset = %dataset_name,
             position = %position,
+            gtid = use_gtid,
             "mysql replication: resuming binlog stream from persisted position; skipping snapshot"
         );
         metrics.mark_bootstrap_complete();
-        let ready = ready_envelope(&schema)?;
-        (position, Box::pin(stream::once(async move { Ok(ready) })))
+        (
+            position,
+            resume_gtid.unwrap_or_default(),
+            Box::pin(stream::empty::<
+                std::result::Result<ChangeEnvelope, StreamError>,
+            >()),
+        )
     } else {
-        // Cold start: capture the binlog head BEFORE any snapshot so the
-        // overlap replays idempotently.
-        let head = setup::fetch_head_position(&mut conn).await?;
+        // Cold start: capture the binlog head (and, under GTID, the executed
+        // set) BEFORE any snapshot so the overlap replays idempotently.
+        let (head, head_gtid) = setup::fetch_head_and_gtid(&mut conn).await?;
+        // The GTID seed persisted with the cold-start boundary, and handed to
+        // the stream to extend. `None`/empty when not positioning by GTID.
+        let seed = if use_gtid { head_gtid } else { GtidSet::new() };
+        let checkpoint_gtid = use_gtid.then(|| seed.to_string());
+        // Stored explicitly so an empty GTID seed still reloads as GTID.
+        let checkpoint_cursor_type = if use_gtid {
+            CursorType::Gtid
+        } else {
+            CursorType::File
+        };
         // Seed snapshot progress from the source's approximate row count
         // (`information_schema.TABLES`) so operators get a progress signal;
         // best-effort — absence just leaves the metric unset.
-        if params.snapshot_mode != SnapshotMode::Never {
+        if params.snapshot_mode != InitialSnapshotMode::Disabled {
             match setup::fetch_approx_row_count(&mut conn, &database, &table).await {
                 Ok(Some(expected)) => metrics.set_bootstrap_rows_expected(expected),
                 Ok(None) => {}
@@ -611,11 +786,11 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
             tracing::debug!(dataset = %dataset_name, error = %e, "setup connection disconnect");
         }
 
-        if params.snapshot_mode == SnapshotMode::Never {
+        if params.snapshot_mode == InitialSnapshotMode::Disabled {
             tracing::info!(
                 dataset = %dataset_name,
                 position = %head,
-                "mysql replication: `snapshot_mode: never` — streaming changes from the \
+                "mysql replication: `initial_snapshot: disabled` — streaming changes from the \
                  current binlog head without snapshotting existing rows"
             );
             metrics.mark_bootstrap_complete();
@@ -625,6 +800,8 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
             let initial = PersistedPosition {
                 position: head.clone(),
                 schema_json: checkpoint_schema_json.clone(),
+                gtid_set: checkpoint_gtid.clone(),
+                cursor_type: checkpoint_cursor_type,
             };
             if let Err(e) = position_store.save(&initial).await {
                 tracing::warn!(
@@ -634,8 +811,15 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
                      checkpoint will re-attach at the then-current head"
                 );
             }
-            let ready = ready_envelope(&schema)?;
-            (head, Box::pin(stream::once(async move { Ok(ready) })))
+            // Readiness is lag-based; the binlog stream marks the dataset Ready
+            // once it has caught up to the head captured above.
+            (
+                head,
+                seed,
+                Box::pin(stream::empty::<
+                    std::result::Result<ChangeEnvelope, StreamError>,
+                >()),
+            )
         } else {
             // Lead with a TRUNCATE envelope so a re-bootstrap over a
             // persistent accelerator clears rows deleted on the source while
@@ -654,36 +838,43 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
                 metrics: Arc::clone(&metrics),
             });
 
-            // The captured head position commits piggy-backed on the
-            // ready-signal envelope, after the runtime has durably applied
-            // the whole snapshot. A crash before then leaves the sidecar
-            // empty, so the next start re-bootstraps from scratch.
-            let (_, ready_batch, is_ready) =
-                ready_envelope(&schema)?
-                    .into_parts()
-                    .map_err(|e| Error::BuildReadySignal {
-                        message: e.to_string(),
-                    })?;
-            let ready = ChangeEnvelope::from_parts(
+            // The captured head position is persisted by a zero-row
+            // snapshot-boundary envelope's committer, after the runtime has
+            // durably applied the whole snapshot. A crash before then leaves
+            // the sidecar empty, so the next start re-bootstraps from scratch.
+            // The envelope is NOT ready-signalling (`false`): readiness is
+            // lag-based and comes from the binlog stream once it catches up to
+            // `head`, so a large snapshot's replay backlog keeps the dataset
+            // not-ready until it drains.
+            let (_, boundary_batch, _) = build_heartbeat_envelope(&schema, None, false)
+                .map_err(|e| Error::SchemaMismatch {
+                    message: e.to_string(),
+                })?
+                .into_parts()
+                .map_err(|e| Error::SchemaMismatch {
+                    message: e.to_string(),
+                })?;
+            let boundary = ChangeEnvelope::from_parts(
                 Box::new(InitialPositionCommitter {
                     store: Arc::clone(&position_store),
                     position: PersistedPosition {
                         position: head.clone(),
                         schema_json: checkpoint_schema_json.clone(),
+                        gtid_set: checkpoint_gtid.clone(),
+                        cursor_type: checkpoint_cursor_type,
                     },
+                    dataset: dataset_name.clone(),
                 }),
-                ready_batch,
-                is_ready,
+                boundary_batch,
+                false,
             );
 
-            (
-                head,
-                Box::pin(
-                    stream::once(async move { Ok(truncate) })
-                        .chain(snapshot)
-                        .chain(stream::once(async move { Ok(ready) })),
-                ),
-            )
+            let snapshot_prelude: ChangesStream = Box::pin(
+                stream::once(async move { Ok(truncate) })
+                    .chain(snapshot)
+                    .chain(stream::once(async move { Ok(boundary) })),
+            );
+            (head, seed, snapshot_prelude)
         }
     };
 
@@ -702,16 +893,11 @@ async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
         // layout fingerprint), not the bare Arrow schema — resume needs both.
         schema_json: checkpoint_schema_json,
         metrics,
+        use_gtid,
+        gtid_seed,
     });
 
     Ok(Box::pin(prelude.chain(binlog)))
-}
-
-/// Empty ready-signal envelope (no-op committer).
-fn ready_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope> {
-    build_ready_signal_envelope(schema).map_err(|e| Error::SchemaMismatch {
-        message: e.to_string(),
-    })
 }
 
 /// A single-row `op="t"` envelope with a no-op committer, emitted ahead of a
@@ -732,6 +918,8 @@ fn truncate_envelope(
 struct InitialPositionCommitter {
     store: Arc<dyn PositionStore>,
     position: PersistedPosition,
+    /// Dataset name, for the committer-progress log line.
+    dataset: String,
 }
 
 #[async_trait]
@@ -740,7 +928,28 @@ impl CommitChange for InitialPositionCommitter {
         self.store
             .save(&self.position)
             .await
-            .map_err(|source| CommitError::UnableToCommitChange { source })
+            .map_err(|source| CommitError::UnableToCommitChange { source })?;
+        // Snapshot-boundary commit: no source-commit timestamp, so lag is `None`.
+        crate::cdc::log_committer_progress(
+            "mysql",
+            &self.dataset,
+            &self.position.position.to_string(),
+            None,
+        );
+        Ok(())
+    }
+}
+
+/// Drop the persisted position so the next start re-bootstraps from a clean
+/// seed. Failures are logged, not fatal — the subsequent bootstrap overwrites
+/// the row regardless.
+async fn clear_position(store: &Arc<dyn PositionStore>, dataset_name: &str) {
+    if let Err(e) = store.clear().await {
+        tracing::warn!(
+            dataset = %dataset_name,
+            error = %e,
+            "failed to clear the incompatible binlog position; the subsequent bootstrap will overwrite it"
+        );
     }
 }
 

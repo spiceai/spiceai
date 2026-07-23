@@ -30,10 +30,11 @@ use std::time::Duration;
 use async_stream::try_stream;
 use async_trait::async_trait;
 use data_components::cdc::{ChangesStream, StreamError};
+use data_components::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
 use data_components::mysql_replication::{
-    BinlogPosition, InvalidPositionBehavior, NoopPositionStore, PersistedPosition, PositionStore,
+    BinlogPosition, CursorType, NoopPositionStore, PersistedPosition, PositionStore,
     ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
-    SnapshotMode, StoreError, derive_server_id, process_nonce, start_replication_stream,
+    StoreError, derive_server_id, process_nonce, start_replication_stream,
 };
 use datafusion::sql::TableReference;
 use futures::StreamExt;
@@ -261,9 +262,30 @@ impl PositionStore for SidecarPositionStore {
         // `MySqlBinlogSys::get` swallows read errors into `None`, matching the
         // MongoDB sidecar: an unreadable checkpoint re-bootstraps rather than
         // wedging the dataset.
-        Ok(self.sys.get().await.map(|cp| PersistedPosition {
+        let Some(cp) = self.sys.get().await else {
+            return Ok(None);
+        };
+        // `cursor_type` is written as exactly `file`/`gtid`. Distinguish:
+        //   - present + valid → use it;
+        //   - present + unparseable → corrupt row; error rather than guess (a
+        //     GTID dataset must not silently downgrade to file+offset);
+        //   - absent (`None`) → the column didn't exist (unreleased-feature dev
+        //     row, never a shipped one), so infer defensively from the GTID set.
+        let cursor_type = match cp.cursor_type.as_deref() {
+            Some(raw) => CursorType::from_stored(raw).ok_or_else(|| -> StoreError {
+                format!(
+                    "persisted cursor_type {raw:?} is not 'file' or 'gtid' (corrupt checkpoint)"
+                )
+                .into()
+            })?,
+            None if cp.gtid_executed.is_some() => CursorType::Gtid,
+            None => CursorType::File,
+        };
+        Ok(Some(PersistedPosition {
             position: BinlogPosition::new(cp.binlog_file, cp.binlog_pos),
             schema_json: cp.schema_json,
+            gtid_set: cp.gtid_executed,
+            cursor_type,
         }))
     }
 
@@ -273,6 +295,8 @@ impl PositionStore for SidecarPositionStore {
                 binlog_file: position.position.file.clone(),
                 binlog_pos: position.position.pos,
                 schema_json: position.schema_json.clone(),
+                gtid_executed: position.gtid_set.clone(),
+                cursor_type: Some(position.cursor_type.as_str().to_string()),
                 updated_at: None,
             })
             .await
@@ -387,6 +411,12 @@ pub(crate) const REPLICATION_METRICS: &[MetricSpec] = &[
          0 while the snapshot is still running.",
     )
     .auto_register(),
+    MetricSpec::new("replication_gtid_enabled", MetricType::ObservableGaugeU64)
+        .description(
+            "1 when the stream is positioning by GTID auto-positioning (failover-safe) — on \
+             cold bootstrap or resume; 0 for binlog file+offset positioning.",
+        )
+        .auto_register(),
     MetricSpec::new(
         "replication_decode_errors_total",
         MetricType::ObservableCounterU64,
@@ -509,6 +539,9 @@ pub(crate) fn observe_replication_metric(
                 instrument.observe(m.bootstrap_complete(), &attributes);
             }))
         }
+        "replication_gtid_enabled" => ObserveMetricCallback::U64(Box::new(move |instrument| {
+            instrument.observe(m.gtid_enabled(), &attributes);
+        })),
         "replication_decode_errors_total" => {
             ObserveMetricCallback::U64(Box::new(move |instrument| {
                 instrument.observe(m.decode_errors_total(), &attributes);
@@ -554,23 +587,7 @@ fn replication_params_from_connector_params(
         })?,
         None => derive_server_id(dataset_name, process_nonce()),
     };
-    let snapshot_mode = match optional_string(params, "replication_snapshot_mode")
-        .as_deref()
-        .map(str::trim)
-    {
-        None | Some("") => SnapshotMode::Auto,
-        Some(value) => match value.to_ascii_lowercase().as_str() {
-            "auto" => SnapshotMode::Auto,
-            "never" => SnapshotMode::Never,
-            "always" => SnapshotMode::Always,
-            other => {
-                let user_param = params.user_param("replication_snapshot_mode");
-                return Err(format!(
-                    "parameter `{user_param}` must be 'auto', 'never', or 'always', got {other:?}"
-                ));
-            }
-        },
-    };
+    let snapshot_mode = parse_snapshot_mode(params)?;
     let checkpoint_interval = optional_duration(
         params,
         "replication_checkpoint_interval",
@@ -582,24 +599,12 @@ fn replication_params_from_connector_params(
         DEFAULT_BOOTSTRAP_BATCH_SIZE,
         MAX_BOOTSTRAP_BATCH_SIZE,
     )?;
-    let invalid_position_behavior =
-        match optional_string(params, "replication_invalid_position_behavior")
-            .as_deref()
-            .map(str::trim)
-        {
-            None | Some("") => InvalidPositionBehavior::Error,
-            Some(value) => match value.to_ascii_lowercase().as_str() {
-                "error" => InvalidPositionBehavior::Error,
-                "rebootstrap" => InvalidPositionBehavior::Rebootstrap,
-                other => {
-                    let user_param = params.user_param("replication_invalid_position_behavior");
-                    return Err(format!(
-                        "parameter `{user_param}` must be 'error' or 'rebootstrap', got {other:?}"
-                    ));
-                }
-            },
-        };
-
+    let invalid_position_behavior = parse_invalid_checkpoint_behavior(params)?;
+    let ready_lag = optional_duration(
+        params,
+        "replication_ready_lag",
+        data_components::cdc::DEFAULT_READY_LAG,
+    )?;
     Ok(ReplicationParams {
         opts,
         server_id,
@@ -607,6 +612,7 @@ fn replication_params_from_connector_params(
         bootstrap_batch_size,
         checkpoint_interval,
         invalid_position_behavior,
+        ready_lag,
     })
 }
 
@@ -772,6 +778,55 @@ fn optional_usize_in_range(
     }
 }
 
+/// Parse an optional enum-valued parameter. Returns `Ok(None)` when the key is
+/// absent or empty; `Ok(Some(v))` when a recognized (case-insensitive) value
+/// maps via `map`; and an `Err` naming the user-facing parameter otherwise.
+fn optional_enum<T>(
+    params: &Parameters,
+    key: &str,
+    expected: &str,
+    map: impl Fn(&str) -> Option<T>,
+) -> Result<Option<T>, String> {
+    let Some(raw) = optional_string(params, key) else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    map(&trimmed.to_ascii_lowercase()).map(Some).ok_or_else(|| {
+        let user_param = params.user_param(key);
+        format!("parameter `{user_param}` must be {expected}, got {trimmed:?}")
+    })
+}
+
+/// Resolve the initial-snapshot mode from `mysql_replication_initial_snapshot`
+/// (`auto|always|disabled`). Defaults to [`InitialSnapshotMode::Auto`] when unset.
+fn parse_snapshot_mode(params: &Parameters) -> Result<InitialSnapshotMode, String> {
+    Ok(optional_enum(
+        params,
+        "replication_initial_snapshot",
+        "'auto', 'always', or 'disabled'",
+        InitialSnapshotMode::from_canonical,
+    )?
+    .unwrap_or_default())
+}
+
+/// Resolve the invalid-checkpoint behavior from
+/// `mysql_replication_invalid_checkpoint_behavior` (`error|restart`).
+/// Defaults to [`InvalidCheckpointBehavior::Error`] when unset.
+fn parse_invalid_checkpoint_behavior(
+    params: &Parameters,
+) -> Result<InvalidCheckpointBehavior, String> {
+    Ok(optional_enum(
+        params,
+        "replication_invalid_checkpoint_behavior",
+        "'error' or 'restart'",
+        InvalidCheckpointBehavior::from_canonical,
+    )?
+    .unwrap_or_default())
+}
+
 fn extract_primary_keys(provider: &Arc<dyn datafusion::datasource::TableProvider>) -> Vec<String> {
     use datafusion::common::Constraint;
     let Some(constraints) = provider.constraints() else {
@@ -851,13 +906,14 @@ mod tests {
         ]);
         let repl = replication_params_from_connector_params(&params, "orders")
             .expect("valid params parse");
-        assert_eq!(repl.snapshot_mode, SnapshotMode::Auto);
+        assert_eq!(repl.snapshot_mode, InitialSnapshotMode::Auto);
         assert_eq!(repl.bootstrap_batch_size, DEFAULT_BOOTSTRAP_BATCH_SIZE);
         assert_eq!(repl.checkpoint_interval, DEFAULT_CHECKPOINT_INTERVAL);
         assert_eq!(
             repl.invalid_position_behavior,
-            InvalidPositionBehavior::Error
+            InvalidCheckpointBehavior::Error
         );
+        assert_eq!(repl.ready_lag, data_components::cdc::DEFAULT_READY_LAG);
         assert!(
             repl.server_id >= 100_000,
             "derived id clears reserved range"
@@ -888,44 +944,63 @@ mod tests {
     }
 
     #[test]
-    fn invalid_position_behavior_parses_strictly() {
-        let params = params_with(&[("replication_invalid_position_behavior", "rebootstrap")]);
-        let repl = replication_params_from_connector_params(&params, "orders")
-            .expect("valid params parse");
-        assert_eq!(
-            repl.invalid_position_behavior,
-            InvalidPositionBehavior::Rebootstrap
-        );
-
-        let params = params_with(&[("replication_invalid_position_behavior", "reboot")]);
-        let err = replication_params_from_connector_params(&params, "orders")
-            .expect_err("typo must error");
-        assert!(err.contains("'error' or 'rebootstrap'"), "got: {err}");
-    }
-
-    #[test]
-    fn snapshot_mode_parses_strictly() {
+    fn initial_snapshot_parses_strictly() {
         for (raw, expected) in [
-            ("auto", SnapshotMode::Auto),
-            ("never", SnapshotMode::Never),
-            ("ALWAYS", SnapshotMode::Always),
+            ("auto", InitialSnapshotMode::Auto),
+            ("disabled", InitialSnapshotMode::Disabled),
+            ("ALWAYS", InitialSnapshotMode::Always),
         ] {
-            let params = params_with(&[("replication_snapshot_mode", raw)]);
+            let params = params_with(&[("replication_initial_snapshot", raw)]);
             let repl = replication_params_from_connector_params(&params, "orders")
                 .expect("valid params parse");
             assert_eq!(repl.snapshot_mode, expected, "raw: {raw}");
         }
 
-        // A typo must error loudly, not silently fall back to `auto` —
-        // a misread `never` would otherwise snapshot a table the operator
-        // explicitly opted out of copying.
-        let params = params_with(&[("replication_snapshot_mode", "nevr")]);
+        let params = params_with(&[("replication_initial_snapshot", "yes")]);
         let err = replication_params_from_connector_params(&params, "orders")
             .expect_err("typo'd mode must error");
         assert!(
-            err.contains("mysql_replication_snapshot_mode"),
+            err.contains("mysql_replication_initial_snapshot")
+                && err.contains("'auto', 'always', or 'disabled'"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn invalid_checkpoint_behavior_parses_strictly() {
+        for (raw, expected) in [
+            ("error", InvalidCheckpointBehavior::Error),
+            ("RESTART", InvalidCheckpointBehavior::Restart),
+        ] {
+            let params = params_with(&[("replication_invalid_checkpoint_behavior", raw)]);
+            let repl = replication_params_from_connector_params(&params, "orders")
+                .expect("valid params parse");
+            assert_eq!(repl.invalid_position_behavior, expected, "raw: {raw}");
+        }
+
+        let params = params_with(&[("replication_invalid_checkpoint_behavior", "reboot")]);
+        let err = replication_params_from_connector_params(&params, "orders")
+            .expect_err("typo must error");
+        assert!(
+            err.contains("mysql_replication_invalid_checkpoint_behavior")
+                && err.contains("'error' or 'restart'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn ready_lag_parses_and_defaults() {
+        // Explicit duration is parsed.
+        let params = params_with(&[("replication_ready_lag", "500ms")]);
+        let repl = replication_params_from_connector_params(&params, "orders")
+            .expect("valid params parse");
+        assert_eq!(repl.ready_lag, std::time::Duration::from_millis(500));
+
+        // An unparseable duration errors, naming the user-facing parameter.
+        let params = params_with(&[("replication_ready_lag", "soon")]);
+        let err = replication_params_from_connector_params(&params, "orders")
+            .expect_err("unparseable duration must error");
+        assert!(err.contains("ready_lag"), "got: {err}");
     }
 
     #[test]
