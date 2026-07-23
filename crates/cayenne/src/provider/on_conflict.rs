@@ -778,6 +778,25 @@ impl OnConflictDeletions {
         .saturating_sub(reinserts);
         file_key_deletes + position_deletes.saturating_sub(file_key_deletes) + inline_key_deletes
     }
+
+    /// Merge `other`'s deletion lists into `self` (union). The trusted CDC apply
+    /// uses this to combine a shard's upsert-supersede tombstones with its folded
+    /// delete tombstones before issuing a single `append_to_shard`. The two sides
+    /// carry disjoint keys (the runtime net-coalescer nets each key to one
+    /// partition), so this is a plain concatenation; `reinserted_over_tombstone`
+    /// is summed.
+    pub(crate) fn merge(&mut self, mut other: OnConflictDeletions) {
+        for (path, rows) in other.delete_specs {
+            self.delete_specs.entry(path).or_default().extend(rows);
+        }
+        self.deleted_pk_i64.append(&mut other.deleted_pk_i64);
+        self.deleted_row_keys.append(&mut other.deleted_row_keys);
+        self.deleted_inlined_pk_i64
+            .append(&mut other.deleted_inlined_pk_i64);
+        self.deleted_inlined_row_keys
+            .append(&mut other.deleted_inlined_row_keys);
+        self.reinserted_over_tombstone += other.reinserted_over_tombstone;
+    }
 }
 
 /// `apply_on_conflict_deletions` performs all durable deletion-vector and

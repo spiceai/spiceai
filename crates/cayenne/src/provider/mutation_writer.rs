@@ -993,11 +993,20 @@ impl<'a> AppendMutationWriter<'a> {
         let sharded_index = if self.context.pk_conflict_detection() == PkConflictDetection::None {
             None
         } else {
-            Some(
-                self.table
-                    .build_sharded_pk_index(&pk_indices, &converter, n)
-                    .await?,
-            )
+            // Phase timer: the existence-index take-from-cache / rebuild. On an
+            // insert-only table this whole cost is what a trusted-op-signal fast
+            // path (C8) would elide, so surface it separately from validate/append.
+            let index_start = Instant::now();
+            let index = self
+                .table
+                .build_sharded_pk_index(&pk_indices, &converter, n)
+                .await?;
+            record_cayenne_write_phase(
+                self.table.table_name(),
+                "inmemory_index_build",
+                index_start,
+            );
+            Some(index)
         };
 
         // Whole-apply (whole-tier) OOM-safety: per-table byte cap spill + global

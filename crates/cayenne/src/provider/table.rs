@@ -229,6 +229,37 @@ pub struct CayenneCdcWrite {
     in_memory_epoch: Option<u64>,
 }
 
+/// Pre-classified CDC changes for one atomic memory-tier apply
+/// ([`CayenneTableProvider::apply_cdc_changes`]). The runtime coalescer nets each
+/// key in a burst to exactly ONE partition (the C8 disjoint-partition design), so
+/// the three batches are DISJOINT by key — and that disjointness is precisely what
+/// lets a single `(delete_seq < data_seq)` pair order them correctly with no
+/// intra-apply sequencing (a key in both `inserts` and `deletes` would be
+/// mis-ordered, since all deletes sort before all inserts).
+///
+/// - `inserts`: rows the source vouches are brand-new keys (trusted `Create`).
+///   Applied with NO existence probe and NO supersede tombstone; the redelivery
+///   dedup the probe used to provide is handled upstream by the runtime LSN fence.
+///   `None` when the source gives no trusted-new signal — everything then falls to
+///   `upserts`, the byte-identical legacy path.
+/// - `upserts`: rows that may already exist (`Update`/`Read`, or any op from an
+///   untrusted source). Probed against the existence index → append + supersede on
+///   hit (exactly today's behavior).
+/// - `deletes`: key removals, folded into the SAME apply as tombstones at the shared
+///   `delete_seq`, so inserts/upserts and deletes in one burst share one epoch, one
+///   `(delete_seq, data_seq)` pair, and one `source_position`.
+#[derive(Debug, Default)]
+pub struct CdcApplyBatch {
+    /// Trusted brand-new-key rows (fast path: no probe, no tombstone).
+    pub inserts: Option<RecordBatch>,
+    /// May-already-exist rows (probe path).
+    pub upserts: Option<RecordBatch>,
+    /// Key removals (tombstones), folded into the same atomic apply.
+    pub deletes: Option<RecordBatch>,
+    /// Source commit wall-clock time (ms), carried onto the segment as today.
+    pub source_commit_ts_ms: Option<i64>,
+}
+
 impl CayenneCdcWrite {
     pub(crate) fn completed(table: CayenneTableProvider, rows: u64) -> Self {
         Self {
@@ -5670,6 +5701,23 @@ impl CayenneTableProvider {
         self.is_cdc_memory_mode() && self.upsert_bloom_eligible()
     }
 
+    /// Whether this table can take the C8 trusted index-free apply
+    /// ([`Self::apply_cdc_changes`]): the same sharded memory-tier gate as the
+    /// probe path (`mem_tier_shards > 1`, CDC memory mode, an armed slot advancer,
+    /// no partition column) plus a key-based deletion strategy — the trusted path
+    /// supersedes upserts and deletes by KEY (unconditional tombstone), so a
+    /// position-based table (no key tombstone) is ineligible and must use the probe
+    /// path. The caller ALSO gates on the runtime trusted-op-signal signal; this
+    /// only reports cayenne-side capability.
+    #[must_use]
+    pub fn is_trusted_cdc_apply_eligible(&self) -> bool {
+        self.mem_tier_shard_count() > 1
+            && self.is_cdc_memory_mode()
+            && self.has_slot_advancer()
+            && self.metadata().partition_column.is_none()
+            && !self.pk_deletion_strategy.is_position_based()
+    }
+
     /// The per-table mem-tier checkpoint lock, for the write path to serialize
     /// spills (only one checkpoint in flight at a time — the OOM-safety guard).
     pub(crate) fn mem_checkpoint_lock_for_writer(&self) -> Arc<tokio::sync::Mutex<()>> {
@@ -9150,6 +9198,10 @@ impl CayenneTableProvider {
         //    rows across several shards (small multi-row txns) — take the inline
         //    branch below and skip the thread machinery, since there the spawn (not
         //    the validation) would bound apply throughput and thus lag.
+        // Phase timer: per-shard on-conflict VALIDATE (the PK encode + per-row
+        // `.owned()`/digest/dedup + existence probe). On an insert-only table this
+        // is the dominant probe cost a trusted-op-signal fast path (C8) would elide.
+        let validate_start = Instant::now();
         let mut per_shard_validated: Vec<(Vec<RecordBatch>, OnConflictDeletions, PkDigestSet)> = {
             // Below this many total rows a MULTI-shard apply still validates inline
             // instead of spawning a validation thread per shard: one scoped OS
@@ -9250,6 +9302,12 @@ impl CayenneTableProvider {
                 })?
             }
         };
+        record_cayenne_write_phase(self.table_name(), "inmemory_validate", validate_start);
+
+        // Phase timer: kept-key union + per-shard segment APPEND (the zero-copy
+        // Arc-move into the tier + index maintenance). C8 keeps this cost; it only
+        // removes the index_build + validate above for known-new inserts.
+        let append_start = Instant::now();
 
         // 3. Restore the per-shard existence index to the cache BEFORE the appends
         //    so each shard's `append_to_shard` can record its kept keys into that
@@ -9348,6 +9406,7 @@ impl CayenneTableProvider {
         // The per-shard `MemTier::epoch`s returned here are NOT the slot-ack axis at
         // N>1 (incommensurable); they are drained to surface append errors only.
         futures::future::try_join_all(append_futures).await?;
+        record_cayenne_write_phase(self.table_name(), "inmemory_append", append_start);
         // The relation and published epoch now agree. Registry maintenance can
         // remain asynchronous: scans at the new epoch fall back until it catches up.
         drop(ivm_visibility_guard);
@@ -9441,6 +9500,232 @@ impl CayenneTableProvider {
             on_conflict_deletions: combined,
             validated_keys,
         })
+    }
+
+    /// C8 trusted-source apply (index-free): the CDC source's op-signal is
+    /// authoritative (`cdc_op_signal_trusted`), so we act by KEY and never probe
+    /// or maintain the existence index — the whole point of the trusted path.
+    ///
+    /// - `inserts` (Create): appended, NO tombstone.
+    /// - `upserts` (Update/Read): appended + an UNCONDITIONAL key-tombstone that
+    ///   supersedes any prior version (correct by the mem-tier visibility rule — a
+    ///   tombstone hides prior versions and is a harmless no-op if the key was
+    ///   absent). Under trust an upsert is exactly "tombstone the old key + append
+    ///   the new row", so [`Self::cdc_delete_intents_from_batch`] builds the
+    ///   tombstone from the same keys.
+    /// - `deletes` (Delete): unconditional key-tombstone, no append.
+    ///
+    /// The partitions are DISJOINT by key (the runtime net-coalescer nets each key
+    /// to one partition), so a single `(delete_seq < data_seq)` pair orders them
+    /// with no intra-apply sequencing. All three land in ONE atomic apply: one
+    /// epoch, one `(delete_seq, data_seq)` pair, one `source_position`.
+    /// Reinsert-over-tombstone needs no probe: a Create in a later apply lands at a
+    /// `data_sequence` above any prior delete's `delete_sequence` (seqs are
+    /// globally monotone per apply), so it is visible. Redelivery dedup for Creates
+    /// (the only op without a tombstone) is the runtime LSN fence's job, upstream.
+    ///
+    /// Assumes memory-resident sharded mode (the caller gates on it); the existence
+    /// index is neither built nor consulted, so `record_keys` is empty and no
+    /// `build_sharded_pk_index` runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a prior write is still incomplete, if the PK shard-split
+    /// or delete-intent extraction fails, if an upsert partition has no key-based
+    /// deletion strategy to supersede by key, if the per-table memory cap spill
+    /// fails, or if any shard append fails.
+    pub async fn apply_cdc_changes(&self, changes: CdcApplyBatch) -> Result<CayenneCdcWrite> {
+        self.ensure_no_incomplete_write().await?;
+        let CdcApplyBatch {
+            inserts,
+            upserts,
+            deletes,
+            source_commit_ts_ms: _,
+        } = changes;
+
+        let n = self.mem_tier_shard_count().max(1);
+        let pk_indices = self.pk_column_indices.clone();
+        let converter = self.build_pk_converter(&pk_indices)?;
+
+        // Phase timer: off-lock PREPARE (shard-split of all three partitions +
+        // per-shard tombstone-key extraction). Pairs with "inmemory_append" and the
+        // whole-apply "cdc_path_inmemory_trusted" so the A/B shows where the
+        // trusted path's time goes (split/encode vs append) and what to optimize next.
+        let prepare_start = Instant::now();
+
+        // Split each present partition into `n` order-preserving shards. An absent
+        // (or empty) partition contributes no rows to any shard.
+        let insert_shards = match inserts.as_ref() {
+            Some(b) if b.num_rows() > 0 => {
+                Some(Self::split_batch_by_pk_shard(b, &pk_indices, &converter, n)?)
+            }
+            _ => None,
+        };
+        let upsert_shards = match upserts.as_ref() {
+            Some(b) if b.num_rows() > 0 => {
+                Some(Self::split_batch_by_pk_shard(b, &pk_indices, &converter, n)?)
+            }
+            _ => None,
+        };
+        let delete_shards = match deletes.as_ref() {
+            Some(b) if b.num_rows() > 0 => self.split_delete_batch_by_pk_shard(b, n)?,
+            _ => None,
+        };
+
+        // Build one per-shard append unit: batches to append (insert ⧺ upsert),
+        // merged tombstones (upsert-supersede ∪ delete), the shard's byte charge,
+        // and the shard's supersede count (upsert keys only — a pure CDC delete
+        // tombstones a row but must NOT inflate the live-row `superseded` delta,
+        // mirroring the standalone delete path's `superseded = 0`).
+        let mut units: Vec<(Vec<RecordBatch>, OnConflictDeletions, u64, u64)> =
+            Vec::with_capacity(n);
+        let mut total_bytes: u64 = 0;
+        let mut total_rows: u64 = 0;
+        for s in 0..n {
+            let mut batches: Vec<RecordBatch> = Vec::new();
+            let mut deletions = OnConflictDeletions::default();
+            let mut bytes: u64 = 0;
+            let mut superseded: u64 = 0;
+
+            if let Some(shards) = insert_shards.as_ref() {
+                let b = &shards[s];
+                if b.num_rows() > 0 {
+                    bytes = bytes.saturating_add(b.get_array_memory_size() as u64);
+                    total_rows = total_rows.saturating_add(b.num_rows() as u64);
+                    batches.push(b.clone());
+                }
+            }
+            if let Some(shards) = upsert_shards.as_ref() {
+                let b = &shards[s];
+                if b.num_rows() > 0 {
+                    // Unconditional supersede: tombstone the upsert keys (old
+                    // version) and append the new rows. A key-based deletion
+                    // strategy is required — without one we cannot supersede by key
+                    // and a blind append would DUPLICATE the row, so this is a hard
+                    // error rather than a silent skip (the trusted path is gated to
+                    // key-based tables upstream; this is defense in depth).
+                    let (d, keys, tomb_bytes) =
+                        self.cdc_delete_intents_from_batch(b)?.ok_or_else(|| {
+                            Error::DataValidation {
+                                table: self.table_metadata.table_name.clone(),
+                                message:
+                                    "Trusted CDC upsert requires a key-based deletion strategy to \
+                                     supersede by key; cannot apply without probing"
+                                        .to_string(),
+                            }
+                        })?;
+                    deletions.merge(d);
+                    superseded = superseded.saturating_add(keys);
+                    bytes = bytes.saturating_add(tomb_bytes);
+                    bytes = bytes.saturating_add(b.get_array_memory_size() as u64);
+                    total_rows = total_rows.saturating_add(b.num_rows() as u64);
+                    batches.push(b.clone());
+                }
+            }
+            if let Some(shards) = delete_shards.as_ref() {
+                let b = &shards[s];
+                if b.num_rows() > 0
+                    && let Some((d, _keys, tomb_bytes)) = self.cdc_delete_intents_from_batch(b)?
+                {
+                    // Pure delete: tombstone only, no append, no `superseded` bump.
+                    deletions.merge(d);
+                    bytes = bytes.saturating_add(tomb_bytes);
+                }
+            }
+
+            total_bytes = total_bytes.saturating_add(bytes);
+            units.push((batches, deletions, bytes, superseded));
+        }
+        record_cayenne_write_phase(self.table_name(), "trusted_prepare", prepare_start);
+
+        let write_guard = self.write_lock_arc().lock_owned().await;
+        let write_start = Instant::now();
+
+        // Whole-tier OOM safety: per-table byte cap spill (memory-resident mode
+        // errors on breach = backpressure). The trusted path is gated to
+        // memory-resident mode, so the process-global budget reserve is skipped
+        // (as in the probe path's memory-resident branch).
+        if self.mem_tier_per_table_cap_breached(total_bytes) {
+            let spill_start = Instant::now();
+            let spill_result = self.spill_mem_tier_if_cap_breached(total_bytes).await;
+            record_cayenne_write_phase(self.table_name(), "inmemory_spill", spill_start);
+            spill_result?;
+        }
+
+        // ONE shared apply epoch + ONE (delete, data) sequence pair for the whole
+        // burst (§3.4 Fix 1) — every shard segment stamps the same values, so
+        // inserts, upserts, and deletes are one atomic apply.
+        let append_start = Instant::now();
+        let apply_epoch = self
+            .mem_tier_apply_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let base_sequence = self.reserve_sequences_local(2).await?;
+        let reserved_sequences = (base_sequence, base_sequence + 1);
+        let ivm_visibility_guard = self.begin_maintained_aggregate_visibility_write();
+        let ivm_epoch = self.pre_bump_maintained_aggregate_epoch_for_concurrent_apply();
+
+        let empty_kept = PkDigestSet::default();
+        let append_futures = units.iter().enumerate().filter_map(
+            |(s, (batches, deletions, bytes, superseded))| {
+                let has_rows = batches.iter().any(|b| b.num_rows() > 0);
+                let has_deletions = !deletions.deleted_pk_i64.is_empty()
+                    || !deletions.deleted_row_keys.is_empty();
+                if !has_rows && !has_deletions {
+                    return None;
+                }
+                Some(self.append_to_shard(
+                    s,
+                    batches.clone(),
+                    deletions,
+                    *bytes,
+                    *superseded,
+                    Some(apply_epoch),
+                    &empty_kept,
+                    None,
+                    Some(reserved_sequences),
+                    true, // defer_maintained_aggregate — serial feed after join
+                ))
+            },
+        );
+        futures::future::try_join_all(append_futures).await?;
+        record_cayenne_write_phase(self.table_name(), "inmemory_append", append_start);
+        drop(ivm_visibility_guard);
+
+        // Serial IVM insert feed (one epoch, one enqueue) for the appended rows.
+        if let Some(epoch) = ivm_epoch {
+            let any_supersede = units.iter().any(|(_, _, _, superseded)| *superseded > 0);
+            if self.maintained_aggregates.supports_retraction() || !any_supersede {
+                let mut combined_batches: Vec<RecordBatch> = Vec::new();
+                for (batches, _, _, _) in &units {
+                    for batch in batches {
+                        if batch.num_rows() > 0 {
+                            combined_batches.push(batch.clone());
+                        }
+                    }
+                }
+                let pending = self
+                    .prepare_maintained_aggregate_insert_batches_at_epoch(
+                        Arc::new(combined_batches),
+                        epoch,
+                    )
+                    .unwrap_or(PendingMaintainedAggregateInsert {
+                        epoch,
+                        batches: Arc::new(Vec::new()),
+                    });
+                self.apply_maintained_aggregate_insert_batches(Some(pending))
+                    .await;
+            } else {
+                self.mark_maintained_aggregates_stale_at_epoch(epoch);
+            }
+        }
+
+        drop(write_guard);
+        record_cayenne_write_phase(self.table_name(), "cdc_path_inmemory_trusted", write_start);
+        Ok(CayenneCdcWrite::in_memory_staged(
+            self.clone_for_write_operations(),
+            total_rows,
+            apply_epoch,
+        ))
     }
 
     fn filter_validated_batch(

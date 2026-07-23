@@ -246,6 +246,21 @@ pub static CDC_COALESCE_OUTPUT_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// As-applied CDC row counts in the C8 trusted index-free apply, split by the net
+/// partition an `op` label carries: `insert` (trusted new key, no tombstone),
+/// `upsert` (unconditional key-tombstone + append), `delete` (tombstone only). Per
+/// dataset — sizes the workload shape (e.g. confirms an insert-heavy table is served
+/// by the fast path) and confirms the trusted path is exercised in an A/B.
+pub static CDC_TRUSTED_PARTITION_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("dataset_acceleration_cdc_trusted_partition_rows_total")
+        .with_description(
+            "As-applied CDC rows in the trusted index-free apply, split by net partition (op label).",
+        )
+        .with_unit("rows")
+        .build()
+});
+
 pub static CDC_APPLY_FIXED_COST_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     METER
         .f64_histogram("dataset_acceleration_cdc_apply_fixed_cost_ms")

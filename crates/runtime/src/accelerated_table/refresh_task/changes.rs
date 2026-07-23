@@ -29,7 +29,7 @@ use arrow_tools::record_batch::try_cast_to;
 use arrow_tools::schema_evolution::{self, EvolutionContext, SchemaEvolution, WideningPlan};
 use cache::Caching;
 #[cfg(not(windows))]
-use cayenne::{CayenneCdcWrite, CayenneTableProvider};
+use cayenne::{CayenneCdcWrite, CayenneTableProvider, CdcApplyBatch};
 use data_components::arrow::{IndexedMemTable, write::MemTable};
 use data_components::cdc::{self, ChangeBatch, ChangeOperation, ChangesStream};
 use data_components::index_maintenance::perform_index_maintenance;
@@ -2723,6 +2723,107 @@ impl RefreshTask {
             .map(|outcome| outcome.result)
     }
 
+    /// C8 trusted index-free apply of one net-coalesced burst (see
+    /// [`net_coalesce_trusted`] + `CayenneTableProvider::apply_cdc_changes`). Builds
+    /// the three disjoint partition batches with the same mid-stream schema evolution
+    /// + nullability cast the probe path uses, then issues one atomic apply. Records
+    /// the apply path + partition mix so the A/B can attribute the win and spot the
+    /// next bottleneck. Returns the in-memory epoch for the deferred-commit machinery,
+    /// exactly as the probe path does (no pending finalize — the RAM swap is synchronous).
+    #[cfg(not(windows))]
+    async fn apply_trusted_cdc(
+        &self,
+        change_batch: ChangeBatch,
+        partitions: TrustedPartitions,
+    ) -> crate::accelerated_table::Result<WriteChangeOutcome> {
+        let data_batch = change_batch.data_batch();
+        // Mid-stream schema evolution, exactly as the probe path (before any cast).
+        self.maybe_evolve_schema_for_cdc(&data_batch.schema()).await?;
+        let target_schema = self.accelerator.schema();
+
+        let build = |row_indices: &[usize],
+                     cast: bool|
+         -> crate::accelerated_table::Result<Option<RecordBatch>> {
+            if row_indices.is_empty() {
+                return Ok(None);
+            }
+            let selected = select_rows(&data_batch, row_indices)?;
+            if !cast {
+                return Ok(Some(selected));
+            }
+            // Promote nullability to match the accelerator schema (CDC sources emit
+            // nullable columns even for NOT NULL fields); type coercion is handled
+            // downstream, this only adjusts metadata — same as the probe path.
+            let selected = try_cast_to(selected, Arc::clone(&target_schema)).map_err(|e| {
+                crate::accelerated_table::Error::FailedToBuildRecordBatch {
+                    source: arrow::error::ArrowError::SchemaError(e.to_string()),
+                }
+            })?;
+            Ok(Some(selected))
+        };
+        // Inserts/upserts are APPENDED as rows, so they must match the accelerator
+        // schema (cast). Deletes are NOT appended — `apply_cdc_changes` extracts only
+        // the PK columns by name (and casts those to the table PK types internally),
+        // so casting the whole delete row to the non-nullable accelerator schema would
+        // wrongly fail on a WAL DELETE's null non-PK columns (e.g. `_bench_ts`). Pass
+        // deletes uncast — mirroring the probe path, where deletes take a separate
+        // key-only path (`write_cdc_delete_keys_in_memory`) that never casts the row.
+        let inserts = build(&partitions.inserts, true)?;
+        let upserts = build(&partitions.upserts, true)?;
+        let deletes = build(&partitions.deletes, false)?;
+
+        // Partition-mix metric (as-applied insert/upsert/delete rows) — sizes the
+        // workload shape per table and confirms the trusted path is exercised.
+        let rows_of = |b: &Option<RecordBatch>| {
+            b.as_ref()
+                .map_or(0u64, |b| u64::try_from(b.num_rows()).unwrap_or(u64::MAX))
+        };
+        metrics::CDC_TRUSTED_PARTITION_ROWS
+            .add(rows_of(&inserts), &self.dataset_metric_labels.tagged("op", "insert"));
+        metrics::CDC_TRUSTED_PARTITION_ROWS
+            .add(rows_of(&upserts), &self.dataset_metric_labels.tagged("op", "upsert"));
+        metrics::CDC_TRUSTED_PARTITION_ROWS
+            .add(rows_of(&deletes), &self.dataset_metric_labels.tagged("op", "delete"));
+        record_cdc_apply_path(&self.dataset_metric_labels, "trusted");
+
+        let Some(cayenne) = self.cayenne_accelerator() else {
+            return Err(crate::accelerated_table::Error::FailedToWriteData {
+                source: DataFusionError::Execution(
+                    "trusted CDC apply lost its Cayenne accelerator".to_string(),
+                ),
+            });
+        };
+        let cayenne_write = cayenne
+            .apply_cdc_changes(CdcApplyBatch {
+                inserts,
+                upserts,
+                deletes,
+                source_commit_ts_ms: change_batch.source_commit_ts_ms(),
+            })
+            .await
+            .map_err(DataFusionError::from)
+            .map_err(find_datafusion_root)
+            .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+
+        self.update_last_updated_at();
+        let in_memory_epoch = cayenne_write.in_memory_epoch();
+        cayenne_write
+            .finish()
+            .await
+            .map_err(DataFusionError::from)
+            .map_err(find_datafusion_root)
+            .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+
+        if let Some(ref callback) = self.on_stream_batch_process_callback {
+            let mut callback_guard = callback.lock().await;
+            let future = callback_guard();
+            future.await;
+        }
+
+        Ok(WriteChangeOutcome::new(WriteChangeResult::DataWritten, None)
+            .with_in_memory_epoch(in_memory_epoch))
+    }
+
     async fn write_change_with_context(
         &self,
         change_batch: ChangeBatch,
@@ -2730,6 +2831,24 @@ impl RefreshTask {
         session_state: &SessionState,
     ) -> crate::accelerated_table::Result<WriteChangeOutcome> {
         let dataset_name = self.dataset_name.clone();
+
+        // C8 trusted index-free apply (experimental, env-gated — see
+        // `cdc_trust_op_signal_enabled`). When the source op-signal is trusted and
+        // the table is eligible, net-coalesce the burst into disjoint
+        // insert/upsert/delete partitions and apply them in ONE atomic index-free
+        // apply (no existence probe). `net_coalesce_trusted` returns `None` for a
+        // no-PK or Truncate/Unknown-barrier burst, which falls through to the legacy
+        // probe path below. Checked before `group_into_sub_batches` so trusted bursts
+        // don't pay the legacy coalesce pass.
+        #[cfg(not(windows))]
+        if cdc_trust_op_signal_enabled()
+            && self
+                .cayenne_accelerator()
+                .is_some_and(CayenneTableProvider::is_trusted_cdc_apply_eligible)
+            && let Some(partitions) = net_coalesce_trusted(&change_batch)
+        {
+            return self.apply_trusted_cdc(change_batch, partitions).await;
+        }
 
         let sub_batches = group_into_sub_batches(&change_batch);
 
@@ -4035,6 +4154,145 @@ fn group_into_sub_batches(change_batch: &ChangeBatch) -> Vec<(ChangeOperationTyp
     out
 }
 
+/// C8 trusted-apply gate (experimental, env-only). `SPICE_CDC_TRUST_OP_SIGNAL=on`
+/// activates the index-free trusted CDC apply for eligible tables. Default OFF: the
+/// redelivery LSN fence is not yet wired, so this is safe ONLY for controlled A/B
+/// runs (verify `reconnects=0` and the row-count drain gate). Deliberately NOT a
+/// user config surface — it's a benchmarking escape hatch pending the fence +
+/// connector-capability gating that will make the trusted path an automatic default.
+#[cfg(not(windows))]
+fn cdc_trust_op_signal_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("SPICE_CDC_TRUST_OP_SIGNAL")
+            .map(|v| {
+                let v = v.trim();
+                v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true") || v == "1"
+            })
+            .unwrap_or(false)
+    });
+    *ENABLED
+}
+
+/// Disjoint per-key row-index partitions for the C8 trusted-source apply. Each key
+/// appears in EXACTLY ONE vec (its NET, last-op row), which is what lets
+/// `CayenneTableProvider::apply_cdc_changes` order the three with a single
+/// `(delete_seq < data_seq)` pair — see that method's disjointness contract.
+#[cfg(not(windows))]
+struct TrustedPartitions {
+    /// Rows whose key is brand-new in this burst (all ops Create) — appended with
+    /// no supersede tombstone (the fast path). The redelivery LSN fence is applied
+    /// to these upstream before the apply.
+    inserts: Vec<usize>,
+    /// Rows whose key may already exist (any Update/Read, or a Delete-then-Create
+    /// re-insert) — appended with an unconditional key-tombstone that supersedes any
+    /// prior version.
+    upserts: Vec<usize>,
+    /// Rows whose net op is Delete — tombstone only.
+    deletes: Vec<usize>,
+}
+
+/// Net-coalesce a CDC burst into three DISJOINT-by-key partitions for the trusted
+/// apply path, using the raw op-type (`ChangeBatch::op`, NOT the Create→Upsert
+/// collapsed `ChangeOperationType`). For each key, the LAST op in WAL order decides
+/// the net: mem-tier state is converged, so a key's endpoint after a burst is just
+/// its last op.
+///
+/// - last op `Delete` → `deletes`.
+/// - otherwise, all ops were `Create` (key is genuinely new) → `inserts` (no
+///   tombstone needed — nothing prior to hide).
+/// - otherwise (any `Update`/`Read`, OR a `Delete` earlier in the burst followed by
+///   a `Create` — a re-insert over a prior version) → `upserts`, which emits an
+///   unconditional key-tombstone to hide the prior version. Routing a
+///   Delete-then-Create key to `inserts` would leave the prior version visible
+///   (no tombstone) → a DUPLICATE, so `saw_non_create` (set by the Delete) forces
+///   it to `upserts`.
+///
+/// Returns `None` — signalling the caller to fall back to the legacy probe path —
+/// when the burst has no primary keys (can't net by key) or contains a
+/// `Truncate`/`Unknown` barrier (needs the legacy ordered handling).
+#[cfg(not(windows))]
+fn net_coalesce_trusted(change_batch: &ChangeBatch) -> Option<TrustedPartitions> {
+    let num_rows = change_batch.record.num_rows();
+    let mut inserts = Vec::new();
+    let mut upserts = Vec::new();
+    let mut deletes = Vec::new();
+    if num_rows == 0 {
+        return Some(TrustedPartitions {
+            inserts,
+            upserts,
+            deletes,
+        });
+    }
+
+    let data_batch = change_batch.data_batch();
+    let pk_column_names = change_batch.primary_keys(0);
+    let pk_col_indices: Vec<usize> = pk_column_names
+        .iter()
+        .filter_map(|name| data_batch.schema().index_of(name).ok())
+        .collect();
+    if pk_col_indices.is_empty() {
+        // No primary keys: cannot net by key → legacy path.
+        return None;
+    }
+
+    /// Per-key running net over the burst.
+    struct NetState {
+        last_row: usize,
+        last_is_delete: bool,
+        /// Set once any non-Create op (Update/Read/Delete) is seen for the key, so a
+        /// Delete-then-Create re-insert is routed to `upserts` (must tombstone the
+        /// prior version) rather than `inserts`.
+        saw_non_create: bool,
+    }
+
+    let mut by_key: HashMap<Vec<u8>, NetState, BuildHasherDefault<twox_hash::XxHash3_64>> =
+        HashMap::default();
+    for row_id in 0..num_rows {
+        let op = change_batch.op(row_id);
+        if matches!(
+            op,
+            ChangeOperation::Truncate | ChangeOperation::Unknown(_)
+        ) {
+            // Barrier op → the trusted fast path can't represent it; legacy handles it.
+            return None;
+        }
+        let is_create = matches!(op, ChangeOperation::Create);
+        let is_delete = matches!(op, ChangeOperation::Delete);
+        let key = encode_primary_key(&data_batch, &pk_col_indices, row_id);
+        let entry = by_key.entry(key).or_insert(NetState {
+            last_row: row_id,
+            last_is_delete: false,
+            saw_non_create: false,
+        });
+        entry.last_row = row_id;
+        entry.last_is_delete = is_delete;
+        if !is_create {
+            entry.saw_non_create = true;
+        }
+    }
+
+    for state in by_key.into_values() {
+        if state.last_is_delete {
+            deletes.push(state.last_row);
+        } else if state.saw_non_create {
+            upserts.push(state.last_row);
+        } else {
+            inserts.push(state.last_row);
+        }
+    }
+    // Deterministic within-partition order (keys are disjoint across partitions, so
+    // order only affects reproducibility, not correctness).
+    inserts.sort_unstable();
+    upserts.sort_unstable();
+    deletes.sort_unstable();
+
+    Some(TrustedPartitions {
+        inserts,
+        upserts,
+        deletes,
+    })
+}
+
 fn encode_primary_key(
     data_batch: &RecordBatch,
     pk_col_indices: &[usize],
@@ -5035,6 +5293,138 @@ mod tests {
         )
         .with_cdc_param_overrides(Some(Arc::new(cdc_params)))
         .build()
+    }
+
+    // ---- C8 net-coalescer (trusted disjoint partitions) ----
+
+    /// A burst where every op is Create → all rows land in `inserts` (the fast path),
+    /// none in upserts/deletes.
+    #[cfg(not(windows))]
+    #[test]
+    fn net_coalesce_all_creates_go_to_inserts() {
+        let cb = create_test_change_batch(
+            vec!["c", "c"],
+            &[vec!["id"], vec!["id"]],
+            vec![1, 2],
+            vec![Some("a"), Some("b")],
+        );
+        let p = net_coalesce_trusted(&cb).expect("keyed non-barrier burst nets");
+        assert_eq!(p.inserts, vec![0, 1]);
+        assert!(p.upserts.is_empty());
+        assert!(p.deletes.is_empty());
+    }
+
+    /// Update / Read (existence unknown) → `upserts` (unconditional supersede path).
+    #[cfg(not(windows))]
+    #[test]
+    fn net_coalesce_update_and_read_go_to_upserts() {
+        for op in ["u", "r"] {
+            let cb =
+                create_test_change_batch(vec![op], &[vec!["id"]], vec![7], vec![Some("x")]);
+            let p = net_coalesce_trusted(&cb).expect("nets");
+            assert_eq!(p.upserts, vec![0], "op {op} → upserts");
+            assert!(p.inserts.is_empty() && p.deletes.is_empty());
+        }
+    }
+
+    /// A net Delete → `deletes` (tombstone only).
+    #[cfg(not(windows))]
+    #[test]
+    fn net_coalesce_delete_goes_to_deletes() {
+        let cb = create_test_change_batch(vec!["d"], &[vec!["id"]], vec![3], vec![None]);
+        let p = net_coalesce_trusted(&cb).expect("nets");
+        assert_eq!(p.deletes, vec![0]);
+        assert!(p.inserts.is_empty() && p.upserts.is_empty());
+    }
+
+    /// Create-then-Update on ONE key nets to the LAST row, routed to `upserts`
+    /// (a non-Create op was seen). Only the last row survives (disjoint by key).
+    #[cfg(not(windows))]
+    #[test]
+    fn net_coalesce_create_then_update_same_key_is_upsert_last_row() {
+        let cb = create_test_change_batch(
+            vec!["c", "u"],
+            &[vec!["id"], vec!["id"]],
+            vec![1, 1],
+            vec![Some("v1"), Some("v2")],
+        );
+        let p = net_coalesce_trusted(&cb).expect("nets");
+        assert_eq!(p.upserts, vec![1], "last (update) row wins");
+        assert!(p.inserts.is_empty() && p.deletes.is_empty());
+    }
+
+    /// Create-then-Delete on ONE key nets to Delete.
+    #[cfg(not(windows))]
+    #[test]
+    fn net_coalesce_create_then_delete_same_key_is_delete() {
+        let cb = create_test_change_batch(
+            vec!["c", "d"],
+            &[vec!["id"], vec!["id"]],
+            vec![1, 1],
+            vec![Some("v1"), None],
+        );
+        let p = net_coalesce_trusted(&cb).expect("nets");
+        assert_eq!(p.deletes, vec![1]);
+        assert!(p.inserts.is_empty() && p.upserts.is_empty());
+    }
+
+    /// CRITICAL: Delete-then-Create (re-insert) on ONE key must route to `upserts`,
+    /// NOT `inserts` — the earlier Delete means a prior version may exist, so the
+    /// re-insert must carry an unconditional tombstone to hide it. Routing to
+    /// `inserts` (no tombstone) would leave the prior version visible = a DUPLICATE.
+    #[cfg(not(windows))]
+    #[test]
+    fn net_coalesce_delete_then_create_same_key_is_upsert_not_insert() {
+        let cb = create_test_change_batch(
+            vec!["d", "c"],
+            &[vec!["id"], vec!["id"]],
+            vec![1, 1],
+            vec![None, Some("reinserted")],
+        );
+        let p = net_coalesce_trusted(&cb).expect("nets");
+        assert_eq!(p.upserts, vec![1], "re-insert over a delete must be an upsert");
+        assert!(
+            p.inserts.is_empty(),
+            "must NOT fast-path a re-insert as a tombstone-free insert"
+        );
+        assert!(p.deletes.is_empty());
+    }
+
+    /// Distinct keys with distinct ops → three disjoint partitions.
+    #[cfg(not(windows))]
+    #[test]
+    fn net_coalesce_distinct_keys_partition_disjointly() {
+        let cb = create_test_change_batch(
+            vec!["c", "u", "d"],
+            &[vec!["id"], vec!["id"], vec!["id"]],
+            vec![1, 2, 3],
+            vec![Some("a"), Some("b"), None],
+        );
+        let p = net_coalesce_trusted(&cb).expect("nets");
+        assert_eq!(p.inserts, vec![0]);
+        assert_eq!(p.upserts, vec![1]);
+        assert_eq!(p.deletes, vec![2]);
+    }
+
+    /// No primary keys → `None` (caller falls back to the legacy probe path).
+    #[cfg(not(windows))]
+    #[test]
+    fn net_coalesce_no_pk_returns_none() {
+        let cb = create_test_change_batch(vec!["c"], &[vec![]], vec![1], vec![Some("a")]);
+        assert!(net_coalesce_trusted(&cb).is_none());
+    }
+
+    /// A Truncate barrier → `None` (legacy path handles it).
+    #[cfg(not(windows))]
+    #[test]
+    fn net_coalesce_truncate_barrier_returns_none() {
+        let cb = create_test_change_batch(
+            vec!["c", "t"],
+            &[vec!["id"], vec!["id"]],
+            vec![1, 2],
+            vec![Some("a"), None],
+        );
+        assert!(net_coalesce_trusted(&cb).is_none());
     }
 
     #[tokio::test]

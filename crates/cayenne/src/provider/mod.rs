@@ -133,7 +133,7 @@ pub use scan::CayenneAccelerationExec;
 pub use staged_upsert::{CayenneStagedUpsert, PreparedTxnCommit, TransactionWriteToken};
 pub use staging_wal::{CayenneStagedAppend, PartitionedWalObjectStore, PreparedStagedAppend};
 pub use table::{
-    CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder,
+    CayenneCdcWrite, CdcApplyBatch, CayenneTableProvider, CayenneTableProviderBuilder,
     PreparedAppendSnapshotPublish,
 };
 pub use transaction::{CayenneTransaction, TransactionCommit, TxnTable};
