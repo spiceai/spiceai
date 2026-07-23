@@ -732,7 +732,7 @@ async fn shared_group_single_dataset_streams_snapshot_and_changes() -> Result<()
 
 /// A purged resume position with `invalid_checkpoint_behavior: restart` must
 /// re-snapshot the member in place instead of fatally erroring — for BOTH the
-/// file+offset and GTID positioning paths (a purge surfaces as MySQL error 1236
+/// file+offset and GTID positioning paths (a purge surfaces as `MySQL` error 1236
 /// in both, and recovery captures the head differently per mode). Regression
 /// test for issue #11968 (restart was a no-op): the running pump's purge handler
 /// now honors `invalid_position_behavior` rather than always broadcasting the
@@ -750,7 +750,7 @@ async fn shared_group_purged_position_restart_re_snapshots_gtid() -> Result<(), 
 /// Drive the purged-position restart recovery on a fresh source. `gtid` selects
 /// the positioning mode (a `gtid_mode = ON` container vs the default file+offset
 /// container); the recovery assertions are identical because both purge errors
-/// are MySQL 1236 and both re-snapshot from the current head.
+/// are `MySQL` 1236 and both re-snapshot from the current head.
 async fn run_purged_position_restart(
     port: u16,
     server_id: u32,
