@@ -74,14 +74,22 @@ runs:
           echo "No changes to commit"
         else
           git commit -m "${PR_TITLE}"
-          if git ls-remote --exit-code --heads origin "${BRANCH_NAME}"; then
-            if [[ "$(git rev-parse --is-shallow-repository)" == "true" ]]; then
-              git fetch --unshallow origin
-            fi
-            git fetch origin "${BRANCH_NAME}"
-            git rebase -X theirs "origin/${BRANCH_NAME}"
+          # HEAD is already branched off the current trunk checkout (see `git checkout -b` above),
+          # and cargo test regenerates .snap files from scratch each run, so this commit is a
+          # complete, up-to-date replacement for whatever the existing branch (if any) held —
+          # there's nothing in the old branch worth preserving or rebasing onto. Reset the
+          # remote branch to point here instead of rebasing this commit backwards onto the old
+          # (possibly weeks-stale) branch tip, which previously forced trunk's entire commit
+          # history since the branch's fork point to be replayed nightly.
+          if git ls-remote --exit-code --heads origin "${BRANCH_NAME}" > /dev/null; then
+            # Explicit refspec so the remote-tracking ref is populated even though this is a
+            # shallow, single-ref checkout without a wildcard `origin/*` fetch config —
+            # `--force-with-lease` needs it to verify no one else pushed to the branch first.
+            git fetch origin "${BRANCH_NAME}:refs/remotes/origin/${BRANCH_NAME}"
+            git push --force-with-lease origin "HEAD:${BRANCH_NAME}"
+          else
+            git push origin "HEAD:${BRANCH_NAME}"
           fi
-          git push origin "HEAD:${BRANCH_NAME}"
 
           if [[ -n "${EXISTING_PR_NUMBER}" ]]; then
             PR_URL="$(gh pr view "${EXISTING_PR_NUMBER}" --json url --jq .url)"
