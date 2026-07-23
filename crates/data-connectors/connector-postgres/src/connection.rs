@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
      https://www.apache.org/licenses/LICENSE-2.0
 
-    10|Unless required by applicable law or agreed to in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -26,7 +26,6 @@ use std::str::FromStr;
 
 /// Connection identity for the CDC stream — same override rule as the read pool
 /// (`connection_string` overrides discrete host/user/db/…).
-#[derive(Debug)]
 pub(crate) struct PgConnectionIdentity {
     pub host: String,
     pub port: u16,
@@ -38,6 +37,19 @@ pub(crate) struct PgConnectionIdentity {
     pub database: String,
     pub sslmode: Option<String>,
     pub sslrootcert: Option<String>,
+}
+
+impl std::fmt::Debug for PgConnectionIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PgConnectionIdentity")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("database", &self.database)
+            .field("sslmode", &self.sslmode)
+            .field("sslrootcert", &self.sslrootcert)
+            .finish_non_exhaustive()
+    }
 }
 
 pub(crate) fn connection_identity_from_params(
@@ -69,6 +81,10 @@ fn connection_identity_from_connection_string(
     // then parse with `tokio_postgres::Config`.
     let (mut stripped, mut ssl_mode, mut ssl_rootcert, password) =
         parse_connection_string(connection_string);
+
+    // Validate the mode from the connection string before discrete overrides so
+    // a typo is attributed to `pg_connection_string`, not `pg_sslmode`.
+    validate_sslmode(&ssl_mode, &user_param)?;
 
     // Discrete sslmode/sslrootcert override the connection string (pool order).
     if let Some(mode) = optional_string(params, "sslmode") {
@@ -285,6 +301,21 @@ mod tests {
             err,
             "parameter `pg_connection_string` is missing user".to_string()
         );
+    }
+
+    #[test]
+    fn connection_string_invalid_sslmode_errors_on_connection_string_param() {
+        let params = params_with_pairs(&[(
+            "connection_string",
+            "host=db.internal dbname=csdb user=csuser sslmode=verify-ful",
+        )]);
+        let err = connection_identity_from_params(&params)
+            .expect_err("typo'd sslmode in connection_string must error");
+        assert!(
+            err.contains("pg_connection_string"),
+            "error should attribute to connection_string, got: {err}"
+        );
+        assert!(err.contains("verify-ful"), "got: {err}");
     }
 
     #[test]
