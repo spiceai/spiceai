@@ -731,21 +731,43 @@ async fn shared_group_single_dataset_streams_snapshot_and_changes() -> Result<()
 }
 
 /// A purged resume position with `invalid_checkpoint_behavior: restart` must
-/// re-snapshot the member in place instead of fatally erroring. Regression test
-/// for issue #11968 (restart was a no-op): the running pump's purge handler now
-/// honors `invalid_position_behavior` rather than always broadcasting the fatal
-/// purge error and stopping.
+/// re-snapshot the member in place instead of fatally erroring — for BOTH the
+/// file+offset and GTID positioning paths (a purge surfaces as MySQL error 1236
+/// in both, and recovery captures the head differently per mode). Regression
+/// test for issue #11968 (restart was a no-op): the running pump's purge handler
+/// now honors `invalid_position_behavior` rather than always broadcasting the
+/// fatal purge error and stopping.
 #[tokio::test(flavor = "multi_thread")]
-async fn shared_group_purged_position_restart_re_snapshots() -> Result<(), anyhow::Error> {
+async fn shared_group_purged_position_restart_re_snapshots_file() -> Result<(), anyhow::Error> {
+    run_purged_position_restart(MYSQL_SHARED_PORT + 6, 210_601, false).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shared_group_purged_position_restart_re_snapshots_gtid() -> Result<(), anyhow::Error> {
+    run_purged_position_restart(MYSQL_SHARED_PORT + 7, 210_701, true).await
+}
+
+/// Drive the purged-position restart recovery on a fresh source. `gtid` selects
+/// the positioning mode (a `gtid_mode = ON` container vs the default file+offset
+/// container); the recovery assertions are identical because both purge errors
+/// are MySQL 1236 and both re-snapshot from the current head.
+async fn run_purged_position_restart(
+    port: u16,
+    server_id: u32,
+    gtid: bool,
+) -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::mysql_replication=debug,info"));
 
-    let port = MYSQL_SHARED_PORT + 6;
-    let _container = common::start_mysql_docker_container(port).await?;
+    let _container = if gtid {
+        common::start_mysql_gtid_docker_container(port).await?
+    } else {
+        common::start_mysql_docker_container(port).await?
+    };
     let pool = common::get_mysql_conn(port)?;
     setup_table(&pool, "purge_a", &[(1, "a1"), (2, "a2")]).await?;
 
     let store: Arc<dyn PositionStore> = Arc::new(MemoryPositionStore::default());
-    let mut input = stream_input(port, 210_601, "purge_a", Arc::clone(&store));
+    let mut input = stream_input(port, server_id, "purge_a", Arc::clone(&store));
     // The behavior under test: recover a purged position by re-snapshotting.
     input.params.invalid_position_behavior = InvalidCheckpointBehavior::Restart;
 
