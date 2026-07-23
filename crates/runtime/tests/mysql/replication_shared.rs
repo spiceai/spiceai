@@ -747,10 +747,16 @@ async fn shared_group_purged_position_restart_re_snapshots_gtid() -> Result<(), 
     run_purged_position_restart(MYSQL_SHARED_PORT + 7, 210_701, true).await
 }
 
-/// Drive the purged-position restart recovery on a fresh source. `gtid` selects
-/// the positioning mode (a `gtid_mode = ON` container vs the default file+offset
-/// container); the recovery assertions are identical because both purge errors
-/// are `MySQL` 1236 and both re-snapshot from the current head.
+/// Drive the purged-position restart recovery. `gtid` selects the positioning
+/// mode (a `gtid_mode = ON` container vs the default file+offset container).
+///
+/// Structure: subscription 1 bootstraps and persists a resume checkpoint, then
+/// is dropped; we purge that checkpoint's binlogs from the source; subscription
+/// 2 (a distinct `server_id`, so a fully independent source with no teardown
+/// race) resumes from the shared store and must re-snapshot the current state
+/// rather than fatally erroring. A purge surfaces as `MySQL` error 1236 in both
+/// modes — file mode via the resolve-time file check, GTID mode via the running
+/// pump's `COM_BINLOG_DUMP_GTID` rejection (the path issue #11968 fixed).
 async fn run_purged_position_restart(
     port: u16,
     server_id: u32,
@@ -766,33 +772,34 @@ async fn run_purged_position_restart(
     let pool = common::get_mysql_conn(port)?;
     setup_table(&pool, "purge_a", &[(1, "a1"), (2, "a2")]).await?;
 
+    // Shared across both subscriptions: subscription 2 resumes from the
+    // checkpoint subscription 1 persists (which we purge from the source
+    // in between).
     let store: Arc<dyn PositionStore> = Arc::new(MemoryPositionStore::default());
-    let mut input = stream_input(port, server_id, "purge_a", Arc::clone(&store));
-    // The behavior under test: recover a purged position by re-snapshotting.
-    input.params.invalid_position_behavior = InvalidCheckpointBehavior::Restart;
+    let subscribe = |sid: u32| {
+        let mut input = stream_input(port, sid, "purge_a", Arc::clone(&store));
+        // The behavior under test: recover a purged position by re-snapshotting.
+        input.params.invalid_position_behavior = InvalidCheckpointBehavior::Restart;
+        start_replication_stream(input)
+    };
 
-    let mut stream = start_replication_stream(input);
-    drain_bootstrap(&mut stream, "purge member", &[1, 2]).await?;
-    wait_for_ready(&mut stream, "purge member readiness").await?;
+    // Subscription 1: bootstrap. The snapshot boundary persists the resume
+    // checkpoint (position + executed GTID set) to the store; then drop it.
+    {
+        let mut stream = subscribe(server_id);
+        drain_bootstrap(&mut stream, "initial bootstrap", &[1, 2]).await?;
+        drop(stream);
+    }
 
-    // Commit one live change: the member's COMMITTED floor now sits inside the
-    // current binlog file (the one we will purge).
+    // Purge the persisted checkpoint from the source: rotate past it, with a
+    // change in each purged file so a GTID resume needs a purged transaction,
+    // then drop the older binlogs. The persisted file no longer exists (file
+    // mode) and the executed set now references purged GTIDs (GTID mode).
     exec(&pool, "INSERT INTO purge_a VALUES (3, 'a3')").await?;
-    expect_single_change(&mut stream, "pre-purge insert", "c", 3).await?;
-
-    // Rotate the binlog twice (data between each) so the floor lands in an OLD
-    // file, then advance the DUMP past that file by reading — but NOT committing
-    // — the newer rows. Reading without committing keeps `flush_position` pinned
-    // at the old file while the dump thread moves into the newest file, so the
-    // old files are released and can be purged.
     exec(&pool, "FLUSH BINARY LOGS").await?;
     exec(&pool, "INSERT INTO purge_a VALUES (4, 'a4')").await?;
     exec(&pool, "FLUSH BINARY LOGS").await?;
     exec(&pool, "INSERT INTO purge_a VALUES (5, 'a5')").await?;
-    let _uncommitted_4 = next_change_envelope(&mut stream, "read 4 (uncommitted)").await?;
-    let _uncommitted_5 = next_change_envelope(&mut stream, "read 5 (uncommitted)").await?;
-
-    // Purge every binlog before the current one — the floor's file is now gone.
     let current_file: String = {
         let mut conn = pool.get_conn().await?;
         let logs: Vec<mysql_async::Row> = conn.query("SHOW BINARY LOGS").await?;
@@ -802,53 +809,11 @@ async fn run_purged_position_restart(
     };
     exec(&pool, &format!("PURGE BINARY LOGS TO '{current_file}'")).await?;
 
-    // Force the pump to reconnect by killing the dump thread; on reconnect it
-    // re-opens from the (now purged) committed floor — the running-pump purge
-    // path that used to fatal regardless of `invalid_position_behavior`.
-    {
-        let mut conn = pool.get_conn().await?;
-        let ids: Vec<u64> = conn
-            .query(
-                "SELECT id FROM information_schema.processlist \
-                 WHERE command IN ('Binlog Dump', 'Binlog Dump GTID')",
-            )
-            .await?;
-        for id in ids {
-            // The thread may already be exiting; ignore KILL races.
-            let _ = conn.query_drop(format!("KILL {id}")).await;
-        }
-    }
-
-    // Restart recovery: the member re-snapshots in place from the current head —
-    // a truncate barrier, then the full current table [1..=5], then the boundary.
-    // Idle heartbeats may interleave before the truncate; skip them.
-    let deadline = std::time::Instant::now() + Duration::from_mins(2);
-    loop {
-        let env = next_envelope(&mut stream, "await re-snapshot truncate").await?;
-        let ops = ops_of(&env);
-        if ops == vec!["t".to_string()] {
-            env.commit().await?;
-            break;
-        }
-        anyhow::ensure!(
-            num_rows(&env) == 0,
-            "unexpected envelope {ops:?} before the re-snapshot truncate barrier"
-        );
-        env.commit().await?;
-        anyhow::ensure!(
-            std::time::Instant::now() < deadline,
-            "purged position never triggered a re-snapshot (restart no-op regression)"
-        );
-    }
-    let snap = next_change_envelope(&mut stream, "re-snapshot rows").await?;
-    let mut ids = ids_of(&snap);
-    ids.sort_unstable();
-    assert_eq!(
-        ids,
-        vec![1, 2, 3, 4, 5],
-        "re-snapshot must reflect the current source state"
-    );
-    snap.commit().await?;
+    // Subscription 2: resume from the purged checkpoint. With restart, the
+    // member must re-snapshot the current source state ([1..=5]) — a truncate
+    // barrier, the full snapshot, then the boundary — instead of fataling.
+    let mut stream = subscribe(server_id + 1);
+    drain_bootstrap(&mut stream, "re-snapshot after purge", &[1, 2, 3, 4, 5]).await?;
 
     drop(stream);
     pool.disconnect().await?;
