@@ -465,10 +465,10 @@ pub struct TelemetryConfig {
 
 /// Maximum length for `runtime.telemetry.metric_prefix`.
 ///
-/// `OpenTelemetry` instrument names are capped at 255 characters. Spice's
-/// longest instrument names are ~56 characters today; reserve 64 so a
-/// configured prefix cannot push current (or near-term) names over the limit.
-pub const METRIC_PREFIX_MAX_LEN: usize = 255 - 64;
+/// Cap at a round power of two so namespaces stay short while leaving room
+/// under the `OpenTelemetry` 255-character instrument name limit for the
+/// base metric name (`prefix` + instrument ≤ 255).
+pub const METRIC_PREFIX_MAX_LEN: usize = 128;
 
 /// Non-alphanumeric characters allowed in `OpenTelemetry` instrument names
 /// (and therefore in `metric_prefix`). Matches the `OTel` Metrics API ABNF and
