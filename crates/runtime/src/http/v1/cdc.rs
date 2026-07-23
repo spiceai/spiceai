@@ -47,8 +47,9 @@ use axum::http::header;
 #[cfg(feature = "debezium")]
 use crate::dataconnector::cdc_ingest::{self, Error as IngestError};
 
-// Constructed by the debezium ingest path and referenced as the OpenAPI response
-// schema; absent when neither feature is enabled.
+// Present when either feature is set: the debezium ingest path constructs + returns
+// it, and the OpenAPI schema references it (compiled but not constructed under
+// `openapi` alone). Absent when neither feature is enabled.
 #[cfg(any(feature = "debezium", feature = "openapi"))]
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
