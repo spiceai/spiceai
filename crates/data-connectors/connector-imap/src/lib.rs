@@ -14,7 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-mod imap;
+// The imap provider module is exported (as it was in data_components) so its public
+// provider API stays reachable and its public items are treated as exported API by
+// clippy's avoid-breaking-exported-api. missing_errors_doc mirrors data_components.
+#![allow(clippy::missing_errors_doc)]
+
+pub mod imap;
 
 use crate::imap::{
     ImapTableProvider,

@@ -19,7 +19,7 @@ limitations under the License.
 // missing_errors_doc relaxation mirrors data_components/connector-git for moved code.
 #![allow(clippy::missing_errors_doc)]
 
-mod odbc;
+pub mod odbc;
 pub mod odbcconn;
 pub mod odbcpool;
 
