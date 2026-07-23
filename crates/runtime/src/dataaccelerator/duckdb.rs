@@ -2191,9 +2191,23 @@ mod tests {
         .build()
         .expect("to build dataset");
 
+        // Unique path so parallel DuckDB file-mode tests that share the default
+        // `accelerated_duckdb` filename cannot race this test's is_initialized check.
+        let unique_path = std::env::temp_dir().join(format!(
+            "duckdb_file_accelerator_init_{}.db",
+            std::process::id()
+        ));
+        if unique_path.exists() {
+            std::fs::remove_file(&unique_path).expect("stale test file should be removed");
+        }
+
         dataset.acceleration = Some(Acceleration {
             engine: Engine::DuckDB,
             mode: Mode::File,
+            params: HashMap::from([(
+                "duckdb_file".to_string(),
+                unique_path.to_string_lossy().to_string(),
+            )]),
             ..Default::default()
         });
 

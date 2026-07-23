@@ -28,6 +28,8 @@ pub mod compound;
 pub mod duckdb;
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;
+#[cfg(feature = "llms")]
+pub mod memory;
 pub mod native_vector;
 #[cfg(feature = "s3_vectors")]
 pub mod s3_vectors;
@@ -35,6 +37,11 @@ pub mod s3_vectors;
 pub mod vector_table;
 use crate::index::chunking::{ChunkedSearchIndex, ChunkedVectorIndex};
 use crate::index::compound::{CompoundSearchIndex, CompoundVectorIndex};
+#[cfg(feature = "llms")]
+pub(crate) mod write_util;
+use crate::index::chunking::ChunkedVectorIndex;
+#[cfg(feature = "llms")]
+pub use memory::MemoryVectorIndex;
 pub use native_vector::NativeVectorIndex;
 pub use vector_table::VectorScanTableProvider;
 
@@ -95,6 +102,10 @@ pub fn derived_columns_from_vector_index(
     }
     #[cfg(feature = "s3_vectors")]
     if let Some(vec) = index.as_any().downcast_ref::<S3Vector>() {
+        return Some(vec.derived_columns());
+    }
+    #[cfg(feature = "llms")]
+    if let Some(vec) = index.as_any().downcast_ref::<MemoryVectorIndex>() {
         return Some(vec.derived_columns());
     }
     if let Some(vec) = index.as_any().downcast_ref::<ChunkedVectorIndex>() {
@@ -162,13 +173,15 @@ pub fn as_search_index(index: &Arc<dyn Index + Send + Sync>) -> Option<&dyn Sear
 ///
 /// ## External-store model
 ///
-/// Embeddings are written to a dedicated external store (e.g. S3 Vectors, Elasticsearch)
-/// that is separate from the base/accelerated table. [`VectorIndex::list_table_provider`]
-/// returns a [`LogicalPlan`] that enumerates the store's contents (primary keys +
-/// embedding vectors), and [`VectorScanTableProvider`] left-joins the base table against
-/// that plan to expose the embedding column for table scans.
+/// Embeddings are written to a dedicated external store (e.g. S3 Vectors, Elasticsearch,
+/// or an in-RAM store) that is separate from the base/accelerated table.
+/// [`VectorIndex::list_table_provider`] returns a [`LogicalPlan`] that enumerates the
+/// store's contents (primary keys + embedding vectors), and [`VectorScanTableProvider`]
+/// left-joins the base table against that plan to expose the embedding column for table
+/// scans.
 ///
-/// Implementations: [`crate::index::s3_vectors::S3Vector`], [`crate::index::elasticsearch::ElasticsearchIndex`]
+/// Implementations: [`crate::index::s3_vectors::S3Vector`], [`crate::index::elasticsearch::ElasticsearchIndex`],
+/// [`crate::index::memory::MemoryVectorIndex`]
 ///
 /// ## Co-located model
 ///

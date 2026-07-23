@@ -63,7 +63,8 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub use connector_postgres_common::{
-    check_cdc_prerequisites, list_schemas, list_tables, primary_key_columns,
+    ReplicaIdentityOutcome, SkipReason, check_cdc_prerequisites, classify_replica_identity,
+    list_schemas, list_tables, primary_key_columns, replica_identity,
 };
 
 /// A single foreign key constraint discovered from `information_schema`.

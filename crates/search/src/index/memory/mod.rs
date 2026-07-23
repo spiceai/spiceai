@@ -1,0 +1,438 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! [`MemoryVectorIndex`] — an in-memory, external-store [`VectorIndex`].
+//!
+//! Follows the same storage model as [`crate::index::s3_vectors::S3Vector`]:
+//! `write()` embeds the search column and stores primary keys, metadata, and
+//! embedding vectors in the index's own store — here, RAM — while
+//! [`VectorIndex::list_table_provider`] and
+//! [`crate::index::SearchIndex::query_table_provider`] expose the store
+//! contents as `LogicalPlan`s. Nearest-neighbor search is brute-force exact
+//! k-NN over the SIMD distance kernels in `runtime-datafusion-udfs`.
+
+use std::{any::Any, sync::Arc};
+
+use arrow::array::{ArrayRef, BooleanArray, RecordBatch};
+use arrow::compute::filter;
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use async_trait::async_trait;
+use datafusion::{
+    datasource::{DefaultTableSource, TableProvider},
+    error::DataFusionError,
+    logical_expr::LogicalPlan,
+};
+use datafusion_expr::{LogicalPlanBuilder, ScalarUDF};
+use futures::future::try_join_all;
+use itertools::Itertools;
+use llms::embeddings::Embed;
+use parking_lot::RwLock;
+use runtime_datafusion_index::Index;
+use snafu::{ResultExt, Snafu, ensure};
+
+use crate::index::{
+    SearchIndex, VectorIndex, embedding_col,
+    memory::{
+        provider::{MemoryVectorListTable, MemoryVectorQueryTable},
+        store::MemoryVectorStore,
+    },
+    write_util,
+};
+use crate::metadata::{MetadataColumn, MetadataColumns};
+
+mod provider;
+mod store;
+
+#[derive(Snafu, Debug)]
+pub enum Error {
+    #[snafu(transparent)]
+    WriteUtil { source: write_util::Error },
+
+    #[snafu(display(
+        "Failed to create vector index '{index}' (memory): dimension must be positive, got {dimension}."
+    ))]
+    InvalidDimension { index: String, dimension: i32 },
+
+    #[snafu(display(
+        "Failed to create vector index '{index}' (memory): at least one primary key field is required."
+    ))]
+    NoPrimaryKeyField { index: String },
+
+    #[snafu(display(
+        "Cannot write to '{index}' index, as provided data has mismatch lengths. Embedding column '{column}' has {embedding_rows} rows, whilst the primary key has {primary_key_rows} rows."
+    ))]
+    LengthMismatch {
+        index: String,
+        column: String,
+        embedding_rows: usize,
+        primary_key_rows: usize,
+    },
+
+    #[snafu(display("Cannot write to '{index}' index, data does not have column '{column}'."))]
+    ColumnNotFound { index: String, column: String },
+
+    #[snafu(display(
+        "Cannot write to '{index}' index, an issue processing arrow records: {source}."
+    ))]
+    IssueWithArrowProcessing {
+        index: String,
+        source: arrow::error::ArrowError,
+    },
+}
+
+/// The distance metric used to score stored vectors against a query vector.
+///
+/// Score conventions match the other vector indexes (higher is better):
+/// `Cosine` scores with cosine similarity, `L2` with negated Euclidean
+/// distance, and `Dot` with the raw inner product.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MemoryDistanceMetric {
+    #[default]
+    Cosine,
+    L2,
+    Dot,
+}
+
+impl TryFrom<&str> for MemoryDistanceMetric {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "cosine" => Ok(Self::Cosine),
+            "l2" | "l2_norm" | "euclidean" | "l2sq" => Ok(Self::L2),
+            "ip" | "inner_product" | "dot" | "dot_product" | "max_inner_product" => Ok(Self::Dot),
+            other => Err(format!(
+                "Invalid memory vector distance metric '{other}'. Expected one of: cosine | l2 | dot."
+            )),
+        }
+    }
+}
+
+/// An in-memory, external-store [`VectorIndex`] with brute-force exact k-NN.
+///
+/// - `write()` embeds the search column via the held [`Embed`] model and
+///   upserts rows (keyed by formatted primary key — a re-written key replaces
+///   the stored row) into an Arrow-native in-RAM store.
+/// - [`VectorIndex::list_table_provider`] enumerates the store; the plan reads
+///   the store lazily at scan time, so rows written after plan construction
+///   are visible.
+/// - [`SearchIndex::query_table_provider`] embeds the query lazily at scan
+///   time and scores every stored row with SIMD distance kernels, ordered by
+///   descending [`SEARCH_SCORE_COLUMN_NAME`].
+#[derive(Debug, Clone)]
+pub struct MemoryVectorIndex {
+    embedded_column: String,
+    primary_key: Vec<Field>,
+    metadata_columns: MetadataColumns,
+    embedder: Arc<dyn Embed>,
+    embed_udf: Arc<ScalarUDF>,
+    model_name: String,
+    dimension: i32,
+    metric: MemoryDistanceMetric,
+    store: Arc<RwLock<MemoryVectorStore>>,
+}
+
+impl MemoryVectorIndex {
+    /// Create an empty index.
+    ///
+    /// `dimension` must match the vectors produced by `embedder`.
+    /// `query_scoring` is used to build query-time scoring plans.
+    /// Any metadata column named like the embedding column is ignored
+    /// (the embedding column is always stored).
+    pub fn try_new(
+        embedded_column: String,
+        primary_key: Vec<Field>,
+        metadata_columns: MetadataColumns,
+        embedder: Arc<dyn Embed>,
+        embed_udf: Arc<ScalarUDF>,
+        model_name: String,
+        metric: MemoryDistanceMetric,
+    ) -> Result<Self, Error> {
+        let dimension = embedder.size();
+        ensure!(
+            dimension > 0,
+            InvalidDimensionSnafu {
+                index: INDEX_NAME.to_string(),
+                dimension,
+            }
+        );
+        ensure!(
+            !primary_key.is_empty(),
+            NoPrimaryKeyFieldSnafu {
+                index: INDEX_NAME.to_string(),
+            }
+        );
+        let stored_schema =
+            stored_schema(&embedded_column, &primary_key, &metadata_columns, dimension);
+        Ok(Self {
+            embedded_column,
+            primary_key,
+            metadata_columns,
+            embedder,
+            embed_udf,
+            model_name,
+            dimension,
+            metric,
+            store: Arc::new(RwLock::new(MemoryVectorStore::new(stored_schema))),
+        })
+    }
+
+    /// Project the write-output batch down to the stored schema, dropping
+    /// rows that cannot be indexed (null primary key, or a null/invalid
+    /// embedding). Returns the filtered batch and its formatted keys.
+    fn batch_for_store(
+        &self,
+        output: &RecordBatch,
+        primary_keys: &[Option<String>],
+        embedding_vectors: &[Option<Vec<f32>>],
+    ) -> Result<(RecordBatch, Vec<String>), Error> {
+        let mut keys = Vec::with_capacity(primary_keys.len());
+        let mask: BooleanArray = primary_keys
+            .iter()
+            .zip(embedding_vectors.iter())
+            .map(|(key, vector)| {
+                let keep = match (key, vector) {
+                    (Some(key), Some(vector)) => {
+                        // All-zero / all-NaN vectors have no defined direction and
+                        // would corrupt similarity scores — skip them.
+                        let valid = !vector.iter().all(|&v| v == 0.0 || v.is_nan());
+                        if valid {
+                            keys.push(key.clone());
+                        } else {
+                            tracing::warn!(
+                                "Skipping record '{key}' for memory vector index '{INDEX_NAME}': Embedding vector is all zeroes or contains only invalid values"
+                            );
+                        }
+                        valid
+                    }
+                    (None, _) => {
+                        tracing::warn!(
+                            "Skipping a record for memory vector index '{INDEX_NAME}': the primary key is NULL"
+                        );
+                        false
+                    }
+                    (Some(_), None) => false, // NULL/empty search text — nothing to index.
+                };
+                Some(keep)
+            })
+            .collect();
+
+        let output_schema = output.schema();
+        let target_schema = Arc::clone(&self.store.read().stored_schema);
+        let mut columns = Vec::with_capacity(target_schema.fields().len());
+        for field in target_schema.fields() {
+            let Some((idx, _)) = output_schema.column_with_name(field.name()) else {
+                return ColumnNotFoundSnafu {
+                    index: INDEX_NAME.to_string(),
+                    column: field.name().clone(),
+                }
+                .fail();
+            };
+            let filtered: ArrayRef =
+                filter(output.column(idx), &mask).context(IssueWithArrowProcessingSnafu {
+                    index: INDEX_NAME.to_string(),
+                })?;
+            columns.push(filtered);
+        }
+        let batch = RecordBatch::try_new(target_schema, columns).context(
+            IssueWithArrowProcessingSnafu {
+                index: INDEX_NAME.to_string(),
+            },
+        )?;
+        Ok((batch, keys))
+    }
+}
+
+static INDEX_NAME: &str = "memory_vector_index";
+
+/// Build the stored schema: primary-key fields + metadata fields + the
+/// embedding column, alphabetically sorted by name (the order
+/// `VectorScanTableProvider` and the index's `write()` output use).
+fn stored_schema(
+    embedded_column: &str,
+    primary_key: &[Field],
+    metadata_columns: &MetadataColumns,
+    dimension: i32,
+) -> SchemaRef {
+    let embedding_column_name = embedding_col(embedded_column);
+    let fields = primary_key
+        .iter()
+        .map(|f| Arc::new(f.clone()))
+        .chain(
+            metadata_columns
+                .iter()
+                .filter(|c| c.name() != embedding_column_name)
+                .map(MetadataColumn::field),
+        )
+        .chain(std::iter::once(Arc::new(Field::new(
+            &embedding_column_name,
+            DataType::FixedSizeList(
+                Arc::new(Field::new_list_field(DataType::Float32, false)),
+                dimension,
+            ),
+            true,
+        ))))
+        .sorted_by(|a, b| a.name().cmp(b.name()))
+        .collect::<Vec<_>>();
+    Arc::new(Schema::new(fields))
+}
+
+#[async_trait]
+impl Index for MemoryVectorIndex {
+    fn name(&self) -> &'static str {
+        INDEX_NAME
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn required_columns(&self) -> Vec<String> {
+        let mut columns: Vec<_> = self
+            .primary_key
+            .iter()
+            .map(arrow_schema::Field::name)
+            .cloned()
+            .collect();
+        columns.push(self.embedded_column.clone());
+        columns.extend(
+            self.metadata_columns
+                .iter()
+                .filter(|c| c.name() != embedding_col(&self.embedded_column))
+                .map(|c| c.name().to_string()),
+        );
+        columns
+    }
+
+    async fn compute_index(
+        &self,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>, DataFusionError> {
+        let futs = batches
+            .into_iter()
+            .map(|rb| async { self.write(rb).await.map_err(DataFusionError::External) });
+        try_join_all(futs).await
+    }
+}
+
+#[async_trait]
+impl SearchIndex for MemoryVectorIndex {
+    fn search_column(&self) -> String {
+        self.embedded_column.clone()
+    }
+
+    fn primary_fields(&self) -> Vec<Field> {
+        self.primary_key.clone()
+    }
+
+    async fn write(
+        &self,
+        record: RecordBatch,
+    ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
+        let Some((embedded_column_idx, _)) = record
+            .schema()
+            .column_with_name(self.embedded_column.as_str())
+        else {
+            tracing::warn!(
+                "Cannot write to '{INDEX_NAME}' index, data does not have column '{}'.",
+                self.embedded_column
+            );
+            return Ok(record);
+        };
+
+        // All awaits happen before the store lock is taken (the lock is
+        // synchronous and must never be held across an await).
+        let embedding_vectors =
+            write_util::embed_column(&record, embedded_column_idx, Arc::clone(&self.embedder))
+                .await
+                .map_err(Error::from)?;
+        let primary_keys =
+            write_util::extract_and_format_primary_key(INDEX_NAME, &self.primary_key, &record)
+                .map_err(|e| Error::from(*e))?;
+
+        ensure!(
+            primary_keys.len() == embedding_vectors.len(),
+            LengthMismatchSnafu {
+                index: INDEX_NAME.to_string(),
+                column: self.embedded_column.clone(),
+                embedding_rows: embedding_vectors.len(),
+                primary_key_rows: primary_keys.len(),
+            }
+        );
+
+        let updated = write_util::update_embedding_column_in_batch(
+            &record,
+            &self.embedded_column,
+            &embedding_vectors,
+            self.dimension,
+        )
+        .map_err(|e| Error::from(*e))?;
+
+        // Because of limitations of `DFSchema::logically_equivalent_names_and_types` and its
+        // use in `MemTable`, this must be in the same order as outputted by
+        // `VectorScanTableProvider`.
+        let output =
+            write_util::sort_columns_alphabetically(updated).map_err(|e| Error::from(*e))?;
+
+        let (store_batch, keys) =
+            self.batch_for_store(&output, &primary_keys, &embedding_vectors)?;
+        self.store.write().upsert(store_batch, keys)?;
+
+        Ok(output)
+    }
+
+    fn as_vector_index(self: Arc<Self>) -> Option<Arc<dyn VectorIndex>> {
+        Some(self as Arc<dyn VectorIndex>)
+    }
+
+    fn query_table_provider(&self, query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
+        Ok(LogicalPlanBuilder::scan(
+            "tbl",
+            Arc::new(DefaultTableSource::new(
+                Arc::new(MemoryVectorQueryTable::new(
+                    INDEX_NAME.to_string(),
+                    Arc::clone(&self.store),
+                    Arc::clone(&self.embed_udf),
+                    self.model_name.clone(),
+                    query.to_string(),
+                    self.metric,
+                    embedding_col(&self.embedded_column),
+                )) as Arc<dyn TableProvider>,
+            )),
+            None,
+        )?
+        .build()?
+        .into())
+    }
+}
+
+impl VectorIndex for MemoryVectorIndex {
+    fn dimension(&self) -> i32 {
+        self.dimension
+    }
+
+    fn list_table_provider(&self) -> Result<LogicalPlan, DataFusionError> {
+        LogicalPlanBuilder::scan(
+            "tbl",
+            Arc::new(DefaultTableSource::new(
+                Arc::new(MemoryVectorListTable::new(Arc::clone(&self.store)))
+                    as Arc<dyn TableProvider>,
+            )),
+            None,
+        )?
+        .build()
+    }
+}

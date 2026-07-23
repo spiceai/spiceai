@@ -23,6 +23,7 @@ license-file.workspace = true
 description = "PostgreSQL data connector for Spice.ai runtime"
 
 [dependencies]
+linkme.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
 data_components = { path = "../../data_components", features = ["postgres"] }

@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 pub mod catalogs;
+pub mod cdc;
 pub mod chat;
 pub mod datasets;
 pub mod embeddings;

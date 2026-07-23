@@ -170,10 +170,14 @@ const PARAMETERS: &[ParameterSpec] = &[
     ),
     ParameterSpec::component("replication_initial_snapshot")
         .description(
-            "Whether to take an initial snapshot of the table's existing rows on first \
-             connection, before streaming WAL changes. Default: true.",
+            "When `refresh_mode: changes` first loads the table's existing rows: 'auto' \
+             (default) snapshots a freshly-created replication slot and resumes an existing one \
+             without a snapshot (a non-persistent accelerator still re-snapshots on every start); \
+             'disabled' streams WAL changes only; 'always' snapshots on every start, including \
+             slot resume. The legacy booleans 'true'/'false' map to 'auto'/'disabled'. \
+             Default: auto.",
         )
-        .default("true"),
+        .default("auto"),
     ParameterSpec::component("replication_temporary_slot")
         .description(
             "If true, create a temporary replication slot that is dropped when the \
@@ -186,6 +190,14 @@ const PARAMETERS: &[ParameterSpec] = &[
              Default: 10s.",
         )
         .default("10s"),
+    ParameterSpec::component("replication_ready_lag")
+        .description(
+            "For `refresh_mode: changes`, the dataset is marked Ready once its \
+             replication lag (now minus the newest applied commit's source time) \
+             falls below this. It stays not-ready while snapshotting or draining a \
+             backlog on resume, so it never serves stale data. Default: 2s.",
+        )
+        .default("2s"),
     ParameterSpec::component("replication_bootstrap_batch_size")
         .description(
             "Rows per emitted batch during the initial replication snapshot. \
@@ -1660,3 +1672,13 @@ mod inferred_schema_tests {
         assert_eq!(unknown.normalize(Some(10_000)).distinct_count, None);
     }
 }
+
+// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_postgres as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+runtime::register_data_connector!(
+    register_postgres_connector,
+    POSTGRES_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    PostgresFactory
+);

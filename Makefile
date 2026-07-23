@@ -61,16 +61,21 @@ ci:
 	make -C bin/spice
 	make -C bin/spiced
 
-# Local CI attestation ("developer sign-off"). Target-lints changed crates,
-# then full lint + unit tests, then posts a `signoff` commit status on HEAD so
-# the PR can enter the merge queue. See scripts/signoff and docs/dev/ci_signoff.md.
+# Local CI attestation ("developer sign-off"). Skips Rust lint/build/tests when
+# the branch has no Rust-affecting files vs trunk (.rs, Cargo.toml/lock,
+# rust-toolchain*, .cargo/*); otherwise target-lints changed crates, then full
+# lint + unit tests. Posts a `signoff` commit status on HEAD so the PR can enter
+# the merge queue. See scripts/signoff and docs/dev/ci_signoff.md.
 .PHONY: signoff
 signoff:
 	@./scripts/signoff
 
-# Dispatch the Remote Sign-off workflow for the current branch (self-hosted).
-# Supports Git and JJ via scripts/signoff remote. Targeted pre-lint always
-# diffs against trunk.
+# Remote sign-off for the current branch: probe lab SSH hosts (192.168.1.100,
+# 192.168.1.101) for a Git checkout at $HOME/dev/spice2 and run scripts/signoff
+# there when available; otherwise dispatch the self-hosted GitHub Actions
+# signoff.yml workflow. Supports Git and JJ via scripts/signoff remote. Skips
+# Rust lint/build/tests when the branch has no Rust-affecting files vs trunk
+# (same as local signoff).
 .PHONY: signoff-remote
 signoff-remote:
 	@./scripts/signoff remote
@@ -131,9 +136,15 @@ ifneq ($(strip $(PACKAGES)),)
 _LINT_PKG_FLAGS := $(foreach p,$(PACKAGES),-p $(p))
 _LINT_WORKSPACE_FLAGS := $(_LINT_PKG_FLAGS)
 _FMT_FLAGS := $(_LINT_PKG_FLAGS)
+# Scoped runs rely on cargo's default target selection (the package's lib
+# and/or bins — the same set --lib --bins names): an explicit --lib is a fatal
+# `no library targets found` on bin-only packages (e.g. testoperator), which
+# breaks the targeted pre-lint that scripts/signoff derives for such branches.
+_LINT_TARGET_FLAGS :=
 else
 _LINT_WORKSPACE_FLAGS := --workspace --exclude libnfs --exclude lopdf --exclude ttf-parser --exclude pdf-extract
 _FMT_FLAGS := --all
+_LINT_TARGET_FLAGS := --lib --bins
 endif
 # Apply FEATURES if provided, otherwise default to hardcoded features only for workspace-wide linting
 ifneq ($(strip $(FEATURES)),)
@@ -153,7 +164,7 @@ lint-rust:
 	## Crate-layering guard (fast, no compile): no crate may depend on a higher tier. See docs/dev/crate_layering.md
 	python3 scripts/check_crate_layers.py
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going --lib --bins $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going $(_LINT_TARGET_FLAGS) $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -188,7 +199,7 @@ lint-rust:
 lint-rust-fix:
 	cargo fmt $(_FMT_FLAGS)
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --fix --allow-dirty $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) $(_LINT_TARGET_FLAGS) --fix --allow-dirty $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
