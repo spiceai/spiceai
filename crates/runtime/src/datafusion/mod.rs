@@ -3433,10 +3433,16 @@ impl DataFusion {
     /// engine as the registration/restart path — then rebind the registered provider to
     /// the evolved schema so the pending write (and future reads) see the new column.
     ///
-    /// Returns `Ok(Some(evolved_schema))` when an evolution was applied (the caller must
-    /// rebuild its batch against this schema, since [`verify_schema`] is exact-positional),
-    /// or `Ok(None)` when nothing was evolved — no acceleration, a `block`/`fail` policy,
-    /// a non-sink source (the rebind is sink-specific), an engine without in-place
+    /// Returns `Ok(Some(schema))` when the caller must rebuild its batch against `schema`
+    /// before writing, since [`verify_schema`] is exact-positional. That covers two cases:
+    /// an evolution was just applied, or the change was `Identical` — the live schema is
+    /// already a superset (e.g. a serialized concurrent export already evolved it, or the
+    /// incoming columns added nothing new) and the batch must still match its canonical
+    /// field order. `Some` therefore means "rebuild against this schema", not strictly
+    /// "evolved now".
+    ///
+    /// Returns `Ok(None)` when nothing was evolved — no acceleration, a `block`/`fail`
+    /// policy, a non-sink source (the rebind is sink-specific), an engine without in-place
     /// evolution, an `Incompatible` change, or a change the policy does not permit. In
     /// every `Ok(None)` case the caller's write proceeds unchanged and rejects the batch
     /// exactly as it does today.

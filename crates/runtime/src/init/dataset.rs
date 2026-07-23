@@ -296,10 +296,13 @@ impl Runtime {
     /// dataset's `on_schema_change` policy. This is the entrypoint the OpenTelemetry
     /// metrics ingest path uses to admit new metric dimensions.
     ///
-    /// Returns `Ok(Some(evolved))` when an evolution was applied (the caller rebuilds its
-    /// batch against `evolved`), or `Ok(None)` when nothing was evolved — unknown dataset,
-    /// no acceleration, a `block`/`fail` policy, or an unsupported/incompatible change. In
-    /// every `Ok(None)` case the caller's write proceeds unchanged.
+    /// Returns `Ok(Some(schema))` when the caller must rebuild its batch against `schema`
+    /// before writing — either because an evolution was just applied, or because the
+    /// accelerator schema is already a superset (e.g. a concurrent writer evolved it, or
+    /// the change was a no-op) and the batch must still match its canonical field order.
+    /// Returns `Ok(None)` when nothing was evolved — unknown dataset, no acceleration, a
+    /// `block`/`fail` policy, or an unsupported/incompatible change. In every `Ok(None)`
+    /// case the caller's write proceeds unchanged.
     pub async fn evolve_accelerated_schema_for_write(
         self: &Arc<Self>,
         table_ref: &TableReference,
