@@ -511,15 +511,9 @@ pub fn validate_metric_prefix(prefix: &str) -> Result<(), String> {
         );
     }
 
-    if prefix.len() > METRIC_PREFIX_MAX_LEN {
-        return Err(format!(
-            "Invalid 'runtime.telemetry.metric_prefix' value '{prefix}': length {} exceeds the maximum of {METRIC_PREFIX_MAX_LEN} characters. \
-             Shorten the prefix so prefixed metric names stay within the OpenTelemetry 255-character instrument name limit. \
-             See: https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetrymetric_prefix",
-            prefix.len()
-        ));
-    }
-
+    // Check character validity before length so non-ASCII input reports the
+    // actionable "invalid character" error instead of a misleading length error
+    // (UTF-8 byte length can exceed the limit even when char count does not).
     if prefix.starts_with(|c: char| !c.is_ascii_alphabetic()) {
         return Err(format!(
             "Invalid 'runtime.telemetry.metric_prefix' value '{prefix}': must start with an ASCII letter (A-Z or a-z). \
@@ -535,6 +529,16 @@ pub fn validate_metric_prefix(prefix: &str) -> Result<(), String> {
             "Invalid 'runtime.telemetry.metric_prefix' value '{prefix}': contains invalid character {invalid:?}. \
              Allowed characters are ASCII letters, digits, '_', '.', '-', and '/'. \
              Example: 'spiceai.'. \
+             See: https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetrymetric_prefix"
+        ));
+    }
+
+    // Character count (not UTF-8 bytes) matches the OpenTelemetry ABNF limit.
+    let char_len = prefix.chars().count();
+    if char_len > METRIC_PREFIX_MAX_LEN {
+        return Err(format!(
+            "Invalid 'runtime.telemetry.metric_prefix' value '{prefix}': length {char_len} exceeds the maximum of {METRIC_PREFIX_MAX_LEN} characters. \
+             Shorten the prefix so prefixed metric names stay within the OpenTelemetry 255-character instrument name limit. \
              See: https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetrymetric_prefix"
         ));
     }
@@ -2305,7 +2309,7 @@ datasets:
     #[test]
     fn test_metric_prefix_too_long_rejected() {
         let too_long = format!("{}{}", "a", "x".repeat(METRIC_PREFIX_MAX_LEN));
-        assert_eq!(too_long.len(), METRIC_PREFIX_MAX_LEN + 1);
+        assert_eq!(too_long.chars().count(), METRIC_PREFIX_MAX_LEN + 1);
         let yaml = format!(
             r#"
             telemetry:
@@ -2317,6 +2321,22 @@ datasets:
         assert!(
             err.to_string().contains("exceeds the maximum"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_metric_prefix_non_ascii_reports_invalid_character_not_length() {
+        // Multi-byte UTF-8 must fail on character validity, not a misleading
+        // byte-length overflow (🚀 is 4 UTF-8 bytes).
+        let err = validate_metric_prefix("spiceai🚀.")
+            .expect_err("non-ASCII metric_prefix must be rejected");
+        assert!(
+            err.contains("invalid character"),
+            "expected invalid-character error, got: {err}"
+        );
+        assert!(
+            !err.contains("exceeds the maximum"),
+            "non-ASCII must not be reported as a length error: {err}"
         );
     }
 
