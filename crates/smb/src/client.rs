@@ -357,7 +357,7 @@ impl SmbClient {
 
         update_preauth_hash(&mut preauth_hash, &packet[4..]);
 
-        let (resp_hdr, _resp_body) = self.send_recv(&mut packet).await?;
+        let (resp_hdr, _resp_body, mut resp_raw) = self.send_recv_raw(&mut packet).await?;
         if NtStatus::from_u32(resp_hdr.status).is_error() {
             tracing::warn!(target: "smb", "auth failed: 0x{:08X}", resp_hdr.status);
             return Err(io::Error::new(
@@ -376,6 +376,19 @@ impl SmbClient {
         // exchange fails verification.
         let signing_key = auth::derive_signing_key(&session_base_key, &preauth_hash);
         tracing::debug!(target: "smb", "authenticated, signing key derived");
+
+        // The server signs the final SESSION_SETUP response with the key it
+        // just derived. When the response is marked signed, verify it before
+        // trusting the session — a mismatch means the two sides disagree on
+        // the key or the auth-completing response was tampered with in
+        // transit ([MS-SMB2] §3.2.5.5.3).
+        if resp_hdr.flags & SMB2_FLAGS_SIGNED != 0 && !verify_signature(&mut resp_raw, &signing_key)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "final SESSION_SETUP response signature verification failed",
+            ));
+        }
 
         self.session_id = resp_hdr.session_id;
         let transact = neg_resp.max_transact_size;
@@ -1620,15 +1633,18 @@ mod tests {
     const TEST_SESSION_ID: u64 = 0x0102_0304_0506_0708;
     const TEST_TREE_ID: u32 = 99;
 
-    /// How the mock server treats the signed TREE_CONNECT exchange.
+    /// How the mock server deviates (or not) from a well-behaved server.
     #[derive(Clone, Copy)]
     enum TreeConnectBehavior {
-        /// Sign the response with the spec-derived key (well-behaved server).
+        /// Sign every response with the spec-derived key (well-behaved server).
         SignCorrectly,
-        /// Sign, then flip a bit in the signature (tampered response).
+        /// Sign the TREE_CONNECT response, then flip a bit in its signature.
         CorruptSignature,
-        /// Send the response without the SIGNED flag or signature.
+        /// Send the TREE_CONNECT response without the SIGNED flag or signature.
         OmitSignature,
+        /// Corrupt the signature on the final (STATUS_SUCCESS) SESSION_SETUP
+        /// response and stop — the client must abort before TREE_CONNECT.
+        CorruptFinalSetupSignature,
     }
 
     async fn read_frame(stream: &mut TcpStream) -> Vec<u8> {
@@ -1810,6 +1826,12 @@ mod tests {
         // A real server signs the final session-setup response with the key
         // it just derived — proof that the key cannot include this response.
         sign_message(&mut resp, &signing_key);
+        if matches!(behavior, TreeConnectBehavior::CorruptFinalSetupSignature) {
+            resp[48] ^= 0xFF; // flip bits in the first signature byte
+            write_frame(&mut stream, &resp).await;
+            // The client rejects this response and never sends TREE_CONNECT.
+            return false;
+        }
         write_frame(&mut stream, &resp).await;
 
         // ── TREE_CONNECT (first signed request/response exchange) ──
@@ -1824,7 +1846,11 @@ mod tests {
         tree_body[2] = 1; // ShareType: disk
         let mut resp = build_response(&req_hdr, 0, TEST_SESSION_ID, &tree_body);
         match behavior {
-            TreeConnectBehavior::SignCorrectly => sign_message(&mut resp, &signing_key),
+            // CorruptFinalSetupSignature returned above, before TREE_CONNECT.
+            TreeConnectBehavior::SignCorrectly
+            | TreeConnectBehavior::CorruptFinalSetupSignature => {
+                sign_message(&mut resp, &signing_key);
+            }
             TreeConnectBehavior::CorruptSignature => {
                 sign_message(&mut resp, &signing_key);
                 resp[48] ^= 0xFF; // flip bits in the first signature byte
@@ -1903,6 +1929,31 @@ mod tests {
             client_sig_ok,
             "client request signature should still verify"
         );
+    }
+
+    /// Negative control: the final (STATUS_SUCCESS) SESSION_SETUP response is
+    /// signed by the server with the freshly derived key; a tampered
+    /// signature there must abort the session before any operation runs.
+    #[tokio::test]
+    async fn tampered_final_session_setup_signature_is_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let port = listener.local_addr().expect("mock server addr").port();
+        let server = tokio::spawn(run_mock_server(
+            listener,
+            TreeConnectBehavior::CorruptFinalSetupSignature,
+        ));
+
+        let Err(err) = connect_client(port).await else {
+            panic!("tampered final SESSION_SETUP signature must abort the session")
+        };
+        assert!(
+            err.to_string()
+                .contains("final SESSION_SETUP response signature verification failed"),
+            "unexpected error: {err}"
+        );
+        let _ = server.await.expect("mock server task");
     }
 
     /// Negative control: once signing is established, an unsigned response
