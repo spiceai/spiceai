@@ -1167,8 +1167,6 @@ mod tests {
         Parameters::new(entries, "pg", crate::PARAMETERS)
     }
 
-    // Regression for #11999: hyphenated slot names must fail at param parse
-    // time, not later when Postgres rejects CREATE_REPLICATION_SLOT.
     #[test]
     fn replication_params_rejects_invalid_slot_name() {
         let params =

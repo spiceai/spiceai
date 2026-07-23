@@ -738,7 +738,6 @@ mod tests {
                 .expect_err("too long")
                 .contains("must be at most")
         );
-        // Issue #11999: hyphens are invalid (common in DNS-style names).
         let hyphen_err =
             validate_replication_slot_name("scp-onboarding-realtime-analytics-prod-us-east-1")
                 .expect_err("hyphen");
