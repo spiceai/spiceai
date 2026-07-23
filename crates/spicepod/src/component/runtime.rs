@@ -512,15 +512,20 @@ pub fn validate_metric_prefix(prefix: &str) -> Result<(), String> {
     // Check character validity before length so non-ASCII input reports the
     // actionable "invalid character" error instead of a misleading length error
     // (UTF-8 byte length can exceed the limit even when char count does not).
-    if !prefix.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
+    if !prefix
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic())
+    {
         return Err(format!(
             "Invalid 'runtime.telemetry.metric_prefix' value {prefix:?}: must start with an ASCII letter (A-Z or a-z). Example: 'spiceai.'. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetrymetric_prefix"
         ));
     }
 
-    if let Some(invalid) = prefix.chars().find(|c| {
-        !c.is_ascii_alphanumeric() && !METRIC_PREFIX_ALLOWED_NON_ALPHANUMERIC.contains(c)
-    }) {
+    if let Some(invalid) = prefix
+        .chars()
+        .find(|c| !c.is_ascii_alphanumeric() && !METRIC_PREFIX_ALLOWED_NON_ALPHANUMERIC.contains(c))
+    {
         return Err(format!(
             "Invalid 'runtime.telemetry.metric_prefix' value {prefix:?}: contains invalid character {invalid:?}. Allowed characters are ASCII letters, digits, '_', '.', '-', and '/'. Example: 'spiceai.'. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetrymetric_prefix"
         ));
@@ -2285,8 +2290,7 @@ datasets:
         "#
             );
             let result: Result<Runtime, _> = yaml::from_str(&yaml);
-            let err = result
-                .expect_err("metric_prefix with invalid characters must fail to parse");
+            let err = result.expect_err("metric_prefix with invalid characters must fail to parse");
             assert!(
                 err.to_string().contains("invalid character"),
                 "unexpected error for '{invalid}': {err}"
@@ -2345,13 +2349,7 @@ datasets:
     #[test]
     fn test_validate_metric_prefix_accepts_otel_charset() {
         let max_len = "a".repeat(METRIC_PREFIX_MAX_LEN);
-        for valid in [
-            "spiceai.",
-            "spiceai_",
-            "a",
-            "A-B/c_d.e",
-            max_len.as_str(),
-        ] {
+        for valid in ["spiceai.", "spiceai_", "a", "A-B/c_d.e", max_len.as_str()] {
             validate_metric_prefix(valid)
                 .unwrap_or_else(|e| panic!("expected '{valid}' to be valid: {e}"));
         }
