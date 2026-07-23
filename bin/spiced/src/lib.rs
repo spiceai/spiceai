@@ -991,9 +991,10 @@ fn init_metrics(
     // OpenTelemetry 0.31's SDK does not support per-reader name transforms.
     // Character/length validity is enforced at spicepod parse time via
     // `validate_metric_prefix` (OTel instrument name syntax).
-    if let Some(prefix) = metric_prefix.filter(|p| !p.is_empty()) {
+    if let Some(prefix) = metric_prefix {
         // Defense in depth: spicepod load already validates, but reject here
-        // if an invalid prefix reaches metrics init through another path.
+        // if an invalid (including empty) prefix reaches metrics init through
+        // another path. Do not skip empty strings — they are invalid.
         validate_metric_prefix(&prefix)
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         tracing::info!(prefix = %prefix, "OTEL metrics name prefix enabled");
