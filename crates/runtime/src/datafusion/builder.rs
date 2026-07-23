@@ -2106,6 +2106,33 @@ mod tests {
         }
     }
 
+    /// A non-zero external (`DuckDB`) reservation is subtracted from BOTH the tier
+    /// remainder and its query-light float, so the tier can only shrink — it can't
+    /// reclaim externally-reserved memory — and `query + external + tier + headroom`
+    /// never exceeds host RAM.
+    #[test]
+    fn coordinated_tier_budget_reserves_external_bytes() {
+        for gib in [16_u64, 64, 256, 1024] {
+            let total = gib << 30;
+            let headroom = total / MEM_TIER_HEADROOM_FRACTION;
+            let query_pool = total / 10; // query-light: the tier would otherwise float up
+            let external = total / 2; // a sizeable co-resident DuckDB reservation
+
+            let with_ext = coordinated_mem_tier_budget(total, query_pool, 0, external);
+            let no_ext = coordinated_mem_tier_budget(total, query_pool, 0, 0);
+
+            assert!(
+                with_ext <= no_ext,
+                "gib={gib}: an external reservation must never grow the tier"
+            );
+            let sum = query_pool + external + with_ext + headroom;
+            assert!(
+                sum <= total,
+                "gib={gib}: overcommit — query={query_pool} external={external} tier={with_ext} headroom={headroom} sum={sum} > total={total}"
+            );
+        }
+    }
+
     /// Verifies that the default analyzer rules are in the expected order.
     ///
     /// If this test fails, `DataFusion` has modified the default analyzer rules and `AnalyzerRulesBuilder::build()` should be updated.
