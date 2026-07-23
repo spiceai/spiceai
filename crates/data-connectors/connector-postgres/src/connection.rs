@@ -237,9 +237,8 @@ mod tests {
 
     #[test]
     fn parse_connection_string_extracts_password_and_defaults_sslmode() {
-        let (conn_str, ssl_mode, cert_path, password) = parse_connection_string(
-            "host=localhost user=postgres password=secret dbname=mydb",
-        );
+        let (conn_str, ssl_mode, cert_path, password) =
+            parse_connection_string("host=localhost user=postgres password=secret dbname=mydb");
         assert_eq!(conn_str.trim(), "host=localhost user=postgres dbname=mydb");
         assert_eq!(ssl_mode, "verify-full");
         assert!(cert_path.is_none());

@@ -962,7 +962,10 @@ mod tests {
         assert_eq!(repl.user, "csuser");
         assert_eq!(repl.database, "csdb");
         assert_eq!(repl.sslmode, config::SslMode::VerifyFull);
-        assert_eq!(secrecy::ExposeSecret::expose_secret(&repl.password), "secret");
+        assert_eq!(
+            secrecy::ExposeSecret::expose_secret(&repl.password),
+            "secret"
+        );
     }
 
     #[test]
