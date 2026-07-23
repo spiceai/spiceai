@@ -758,7 +758,7 @@ pub struct DataFusion {
     datafusion_ref: iceberg_ddl::SharedDataFusionRef,
     accelerated_tables: TokioRwLock<HashSet<TableReference>>,
     caching: Arc<Caching>,
-    /// Per-dataset locks serializing write-time schema evolution + rebind (the OTel
+    /// Per-dataset locks serializing write-time schema evolution + rebind (the `OTel`
     /// metric-dimension path). Keyed by table reference so concurrent exports for the
     /// same metric can't race the `ALTER … ADD COLUMN` + re-registration; distinct
     /// metrics evolve concurrently. Get-or-inserted lazily on first evolution.
