@@ -669,7 +669,7 @@ fn read_only_scan_freshness() -> std::time::Duration {
         // A set-but-invalid value is a misconfiguration; warn (don't silently
         // swallow it) before falling back, mirroring `parse_env_u64`.
         Ok(raw) => raw.trim().parse::<u64>().unwrap_or_else(|_| {
-            tracing::warn!("Ignoring invalid CAYENNE_SCAN_VIEW_FRESHNESS_MS='{raw}': expected a non-negative integer (milliseconds); using default {DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS} ms.");
+            tracing::warn!("Ignoring invalid CAYENNE_SCAN_VIEW_FRESHNESS_MS={raw:?}: expected a non-negative integer (milliseconds); using default {DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS} ms.");
             DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS
         }),
     };

@@ -1185,13 +1185,21 @@ impl ScanViewCache {
         }
     }
 
-    /// The `latest_complete` view iff it was captured within `lag` of `now` — the
-    /// read-current serve check. The caller additionally gates on the structural
-    /// version so a stale-tolerant scan is never served a pre-schema-evolution view.
-    /// Records the access (`last_access`) so a served view is not idle-evicted.
-    fn servable_within_lag(&mut self, now: Instant, lag: Duration) -> Option<Arc<ScanView>> {
+    /// The `latest_complete` view iff it is servable for a read-current scan: captured
+    /// within `lag` of `now` AND at the current structural generation (so a
+    /// stale-tolerant scan is never served a pre-schema-evolution view). Records the
+    /// access (`last_access`) ONLY on a true serve — a within-lag-but-obsolete view is
+    /// NOT refreshed, so the evictor can still drop it and release its pinned dirs.
+    fn servable_within_lag(
+        &mut self,
+        now: Instant,
+        lag: Duration,
+        structural: u64,
+    ) -> Option<Arc<ScanView>> {
         let current = self.latest_complete.as_mut()?;
-        (now.duration_since(current.captured_at) <= lag).then(|| {
+        let servable = now.duration_since(current.captured_at) <= lag
+            && current.view.structural_version == structural;
+        servable.then(|| {
             current.last_access = now;
             Arc::clone(&current.view)
         })
@@ -19804,9 +19812,7 @@ impl CayenneTableProvider {
             let structural = self.structural_version.current();
             let mut cache = self.scan_view_cache.lock();
             cache.drain_completed();
-            if let Some(view) = cache.servable_within_lag(now, freshness)
-                && view.structural_version == structural
-            {
+            if let Some(view) = cache.servable_within_lag(now, freshness, structural) {
                 return Ok(view);
             }
             // Miss (nothing fresh enough, or superseded by a schema-evolve): fall
