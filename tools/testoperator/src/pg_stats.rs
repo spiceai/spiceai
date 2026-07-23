@@ -60,6 +60,27 @@ pub struct PgStatSample {
     /// source's WAL head keeps advancing. The two diverging is itself a strong
     /// "sender is blocked on us" signal; this is the truth for drain/caught-up.
     pub slot_retained_bytes: BTreeMap<String, i64>,
+    /// Per-walsender (`application_name`, else pid) DECODE backlog:
+    /// `pg_current_wal_lsn() - sent_lsn`. Large/growing => that walsender's logical
+    /// decode is behind (source decode-bound) — distinct from client-ack lag below.
+    /// In a multi-slot config, the N entries show whether the decode load is balanced
+    /// across walsenders or concentrated on one (e.g. order_line's dedicated sender).
+    pub walsender_write_minus_sent_bytes: BTreeMap<String, i64>,
+    /// Per-walsender client-ack lag: `sent_lsn - flush_lsn` (sent to us but not yet
+    /// flushed/acked). Large while `write_minus_sent` is small => the CLIENT (or its
+    /// deferred ack) trails, not the walsender.
+    pub walsender_sent_minus_flush_bytes: BTreeMap<String, i64>,
+    /// Per-slot reorder-buffer spill to disk (`pg_stat_replication_slots`, PG14+).
+    /// `spill_bytes > 0` => `logical_decoding_work_mem` is too small for this slot's
+    /// transactions, forcing decode to re-read from disk (a decode slowdown with a
+    /// one-GUC fix).
+    pub slot_spill_bytes: BTreeMap<String, i64>,
+    pub slot_spill_txns: BTreeMap<String, i64>,
+    /// Per-slot cumulative bytes decoded+sent by logical decoding
+    /// (`pg_stat_replication_slots.total_bytes`). Δ/Δt = per-slot decode throughput —
+    /// the direct measure of whether multi-slot parallelizes decode (aggregate across
+    /// slots exceeding the single-slot ceiling) and whether each slot keeps pace.
+    pub slot_total_bytes: BTreeMap<String, i64>,
 }
 
 /// Background sampler of source Postgres stats. Mirrors `MetricsScraper`: spawn a
@@ -236,6 +257,48 @@ impl PgStatsScraper {
                 let slot: String = r.get("slot_name");
                 let retained: i64 = r.get("retained");
                 s.slot_retained_bytes.insert(slot, retained);
+            }
+        }
+
+        // Per-walsender send/flush positions: the DECODE backlog (write - sent) vs the
+        // client-ack lag (sent - flush). Distinguishes "walsender is behind on decode"
+        // from "client trails". `application_name` (else pid) keys the N walsenders of a
+        // multi-slot config so we can see if the decode load is balanced. pg_lsn
+        // subtraction -> int8, clamped, like the slot query above.
+        if let Ok(rows) = client
+            .query(
+                "SELECT coalesce(nullif(application_name,''), pid::text) AS app, \
+                 GREATEST((pg_current_wal_lsn() - sent_lsn), 0)::int8 AS write_minus_sent, \
+                 GREATEST((sent_lsn - flush_lsn), 0)::int8 AS sent_minus_flush \
+                 FROM pg_stat_replication WHERE sent_lsn IS NOT NULL",
+                &[],
+            )
+            .await
+        {
+            for r in &rows {
+                let app: String = r.get("app");
+                let wms: i64 = r.get("write_minus_sent");
+                let smf: i64 = r.get("sent_minus_flush");
+                s.walsender_write_minus_sent_bytes.insert(app.clone(), wms);
+                s.walsender_sent_minus_flush_bytes.insert(app, smf);
+            }
+        }
+
+        // Reorder-buffer spill + cumulative decoded bytes per logical slot
+        // (pg_stat_replication_slots, PG14+; best-effort — absent on older servers).
+        if let Ok(rows) = client
+            .query(
+                "SELECT slot_name, spill_txns::int8 AS sp_txns, spill_bytes::int8 AS sp_bytes, \
+                 total_bytes::int8 AS tot_bytes FROM pg_stat_replication_slots",
+                &[],
+            )
+            .await
+        {
+            for r in &rows {
+                let slot: String = r.get("slot_name");
+                s.slot_spill_txns.insert(slot.clone(), r.get("sp_txns"));
+                s.slot_spill_bytes.insert(slot.clone(), r.get("sp_bytes"));
+                s.slot_total_bytes.insert(slot, r.get("tot_bytes"));
             }
         }
 
