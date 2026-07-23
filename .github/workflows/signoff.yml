@@ -34,7 +34,7 @@ on:
         description: 'Run the branch-scoped targeted pre-lint (currently unreliable on this runner; leave off unless debugging it)'
         required: false
         type: boolean
-        default: false
+        default: true
 
 concurrency:
   group: signoff-${{ github.event.inputs.branch }}
