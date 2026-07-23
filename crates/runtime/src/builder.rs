@@ -1333,7 +1333,7 @@ fn emit_duckdb_memory_budget_warning(
             duckdb_unset_instances = n,
             duckdb_per_instance_bytes = plan.per_instance_cap_bytes,
             duckdb_unset_instance_paths = ?inputs.unset_instance_labels,
-            "Detected potential memory over-commit from DuckDB accelerators and automatically capped memory to fit the {total_h} available to this process: {n} DuckDB instance(s) without an explicit duckdb_memory_limit — each would otherwise default to ~{duckdb_default_h} (~80% of RAM) — are capped at {per_instance_h} each, and the query pool at {query_h}. To customize, set runtime.query.memory_limit and/or per-dataset duckdb_memory_limit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
+            "Detected potential memory over-commit from DuckDB accelerators and automatically capped memory to fit the {total_h} available to this process: {n} DuckDB instance(s) without an explicit duckdb_memory_limit — each would otherwise default to ~80% of host RAM (about {duckdb_default_h} here, or more in a container where DuckDB sees the host's RAM rather than this process's cgroup limit) — are capped at {per_instance_h} each, and the query pool at {query_h}. To customize, set runtime.query.memory_limit and/or per-dataset duckdb_memory_limit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
         );
     }
 }

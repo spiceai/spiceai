@@ -762,24 +762,38 @@ impl DataFusionBuilder {
 
         // After the compaction carve, `effective_memory_limit` is the query memory
         // pool size. Coordinate the off-pool Cayenne in-memory CDC tier budget
-        // against it (and the carved compaction pool) so the three never sum past
-        // host RAM. `set_compaction_runtime` installs `mem_tier_budget_bytes`
+        // against it, the carved compaction pool, AND any external accelerator
+        // reservation (e.g. co-resident DuckDB instance ceilings) so they never sum
+        // past host RAM. `set_compaction_runtime` installs `mem_tier_budget_bytes`
         // instead of the old, isolation-sized `get_total_memory() / 4`.
         let query_memory_pool_bytes = effective_memory_limit;
         let mem_tier_budget_bytes = cayenne_active.then(|| {
             let total_memory = crate::resource_monitor::get_total_memory();
+            let external_reservation_bytes =
+                crate::accelerator_memory_budget::duckdb_total_reservation_bytes();
             let budget = coordinated_mem_tier_budget(
                 total_memory,
                 query_memory_pool_bytes,
                 compaction_memory_bytes.unwrap_or(0),
-                crate::accelerator_memory_budget::duckdb_total_reservation_bytes(),
+                external_reservation_bytes,
             );
-            if self.memory_limit.is_some() && budget <= total_memory / MEM_TIER_FLOOR_FRACTION {
+            // The tier floor (host/32) can exceed the coordinated remainder when the
+            // query pool + compaction + external (DuckDB) reservations leave too
+            // little room; the clamp then installs `floor > remainder`, a deliberate
+            // small over-commit so a nonzero global cap always exists (memory mode
+            // then leans on per-table caps + spill). Warn whenever that binds —
+            // whether from an explicit runtime.query.memory_limit OR from a large
+            // co-resident DuckDB accelerator reservation (which can now trigger it
+            // even when runtime.query.memory_limit is unset).
+            if budget <= total_memory / MEM_TIER_FLOOR_FRACTION
+                && (self.memory_limit.is_some() || external_reservation_bytes > 0)
+            {
                 tracing::warn!(
                     query_memory_pool_bytes,
                     total_memory,
+                    external_reservation_bytes,
                     mem_tier_budget_bytes = budget,
-                    "Cayenne in-memory CDC ingestion has limited memory on this host because runtime.query.memory_limit reserves most of it for queries, so ingestion will spill to disk more often. Consider lowering runtime.query.memory_limit to give in-memory CDC more room."
+                    "Cayenne in-memory CDC ingestion has limited memory on this host: the query pool, compaction pool, and co-resident DuckDB accelerator reservations leave little room for in-memory CDC, so ingestion spills to disk more often and combined memory ceilings may slightly exceed host RAM. Consider lowering runtime.query.memory_limit or per-dataset duckdb_memory_limit to give in-memory CDC more room."
                 );
             }
             budget
