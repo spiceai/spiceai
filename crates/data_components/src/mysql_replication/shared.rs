@@ -625,7 +625,6 @@ impl SharedSource {
             if stalls_group {
                 tracing::error!(
                     dataset = %member.dataset_name,
-                    source_table = %format_member(key),
                     connection = %self.key.label(),
                     reason,
                     "shared mysql binlog member detached; its last applied position now pins the \
@@ -637,7 +636,6 @@ impl SharedSource {
             } else {
                 tracing::warn!(
                     dataset = %member.dataset_name,
-                    source_table = %format_member(key),
                     connection = %self.key.label(),
                     reason,
                     "shared mysql binlog member detached and is being replaced by a new \
@@ -658,10 +656,6 @@ impl SharedSource {
             self.detach_member(&key, "changes stream receiver dropped", true);
         }
     }
-}
-
-fn format_member(key: &MemberKey) -> String {
-    format!("{}.{}", key.0, key.1)
 }
 
 /// Entry point: subscribe one dataset to its shared dump source. Mirrors the
@@ -792,17 +786,14 @@ async fn attach_member(
     // the operational consequence. GTID is auto-on whenever the source reports
     // `gtid_mode = ON`; anything else (OFF, ON_PERMISSIVE, or unreadable) falls
     // back to file+offset, which cannot survive a source failover/promotion.
-    let member_label = format_member(&member_key);
     if use_gtid {
         tracing::info!(
             dataset = %dataset_name,
-            source_table = %member_label,
             "MySQL replication: GTID auto-positioning active."
         );
     } else {
         tracing::warn!(
             dataset = %dataset_name,
-            source_table = %member_label,
             "MySQL replication: file+offset positioning (gtid_mode is `{}`, not `ON`); resume is not failover-safe - a source failover forces a full re-snapshot.",
             gtid_mode.as_deref().unwrap_or("unavailable")
         );
@@ -852,7 +843,6 @@ async fn attach_member(
 
     tracing::info!(
         dataset = %dataset_name,
-        source_table = %format_member(&member_key),
         connection = %source.key.label(),
         snapshot = snapshotting,
         rejoining,
