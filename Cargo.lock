@@ -4504,6 +4504,7 @@ dependencies = [
  "arrow-buffer",
  "async-stream",
  "async-trait",
+ "criterion 0.7.0",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
