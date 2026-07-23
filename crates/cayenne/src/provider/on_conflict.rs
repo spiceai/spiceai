@@ -384,6 +384,18 @@ pub(crate) struct InlineAwareDeletionSink {
     pub(crate) filters: Vec<Expr>,
 }
 
+/// `true` when the delete targets every row — an empty filter list, or every
+/// filter being the always-true literal `true` (a TRUNCATE / `DELETE … WHERE
+/// TRUE`, which the CDC truncate path emits as `vec![lit(true)]`).
+pub(crate) fn is_delete_all(filters: &[Expr]) -> bool {
+    filters.iter().all(|filter| {
+        matches!(
+            filter,
+            Expr::Literal(datafusion_common::ScalarValue::Boolean(Some(true)), _)
+        )
+    })
+}
+
 pub(crate) struct PkKeysetInvalidatingDeletionSink {
     pub(crate) table: CayenneTableProvider,
     pub(crate) inner: Arc<dyn DeletionSink>,
@@ -502,11 +514,27 @@ impl DeletionSink for InlineAwareDeletionSink {
             }
         }
 
-        let deleted = inlined_deleted.checked_add(file_deleted).ok_or_else(|| {
+        let mut deleted = inlined_deleted.checked_add(file_deleted).ok_or_else(|| {
             Box::new(datafusion_common::DataFusionError::Execution(
                 "Deleted row count overflowed u64".to_string(),
             )) as Box<dyn std::error::Error + Send + Sync>
         })?;
+
+        // Delete-all (TRUNCATE / `DELETE … WHERE TRUE`): the file/inline sink
+        // above tombstones only durable file rows and catalog-inlined data, and
+        // cannot enumerate keys — so un-checkpointed rows still resident in the
+        // in-memory CDC mem-tier survive and keep showing up in scans (#11987).
+        // Discard them wholesale here, under the `write_lock` held above so no
+        // concurrent CDC apply mutates the tier. Skipped for per-key deletes,
+        // which land their own key tombstones across every tier.
+        if is_delete_all(&self.filters) {
+            let purged = self
+                .table
+                .purge_mem_tier_all()
+                .await
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+            deleted = deleted.saturating_add(purged);
+        }
 
         if deleted > 0 {
             // Keyset clear-on-delete avoidance (cycle-4 incremental lever) — see

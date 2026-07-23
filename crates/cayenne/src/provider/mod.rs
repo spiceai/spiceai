@@ -96,6 +96,7 @@ pub(crate) mod on_conflict;
 pub(crate) mod overwrite;
 pub mod partitioned_wal;
 pub(crate) mod pk_index;
+pub(crate) mod predicate_stats;
 pub(crate) mod query_admission;
 pub(crate) mod retention;
 pub(crate) mod scan;
@@ -120,8 +121,10 @@ pub use compaction::{
 pub use context::CayenneContext;
 pub use mem_tier::SlotAdvancer;
 pub use mem_tier_budget::{
-    global_mem_tier_total, global_mem_tier_used, set_global_mem_tier_bytes,
-    update_global_mem_tier_total,
+    clear_global_mem_tier_pool_account, global_mem_tier_pool_account_bytes, global_mem_tier_total,
+    global_mem_tier_used, release_bytes as release_global_mem_tier_bytes,
+    set_global_mem_tier_bytes, set_global_mem_tier_pool_account,
+    try_reserve_bytes as try_reserve_global_mem_tier_bytes, update_global_mem_tier_total,
 };
 pub use on_conflict::PreparedOnConflictDeletionPublish;
 pub use overwrite::PreparedOverwrite;
@@ -132,7 +135,7 @@ pub use scan::CayenneAccelerationExec;
 pub use staged_upsert::{CayenneStagedUpsert, PreparedTxnCommit, TransactionWriteToken};
 pub use staging_wal::{CayenneStagedAppend, PartitionedWalObjectStore, PreparedStagedAppend};
 pub use table::{
-    CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder,
+    CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder, LastSmallFileCompactPath,
     PreparedAppendSnapshotPublish,
 };
 pub use transaction::{CayenneTransaction, TransactionCommit, TxnTable};
