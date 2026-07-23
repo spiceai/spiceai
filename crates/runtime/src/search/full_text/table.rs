@@ -119,7 +119,7 @@ pub(crate) async fn add_elasticsearch_fts_to_table(
     inner_table_provider: Arc<dyn TableProvider>,
     columns: &[spicepod::semantic::Column],
     tbl: &datafusion::sql::TableReference,
-    fts_params: &crate::search::full_text::elasticsearch::ElasticsearchFtsParams,
+    fts_params: &runtime_search::store_params::elasticsearch::ElasticsearchFtsConfig,
 ) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
     use runtime_datafusion_index::Index;
     let index =
@@ -146,7 +146,7 @@ pub(crate) async fn build_elasticsearch_text_index(
     inner_table_provider: Arc<dyn TableProvider>,
     columns: &[spicepod::semantic::Column],
     tbl: &datafusion::sql::TableReference,
-    fts_params: &crate::search::full_text::elasticsearch::ElasticsearchFtsParams,
+    fts_params: &runtime_search::store_params::elasticsearch::ElasticsearchFtsConfig,
 ) -> Result<
     Arc<search::index::elasticsearch::ElasticsearchTextIndex>,
     Box<dyn std::error::Error + Send + Sync>,
@@ -154,11 +154,14 @@ pub(crate) async fn build_elasticsearch_text_index(
     use crate::component::column::full_text_search_config;
     use crate::component::dataset::FullTextSearchDatasetConfig;
     use crate::embeddings::index::elasticsearch::{
-        ElasticsearchIndexWriteMaintenance, ensure_index_with_text_mapping, get_fts_client,
-        normalize_es_data_type, parse_index_settings_from_map, parse_write_options_from_map,
+        ElasticsearchIndexWriteMaintenance, ensure_index_with_text_mapping, normalize_es_data_type,
     };
     use arrow_schema::Field;
+    use runtime_search::store_params::elasticsearch::{
+        build_client_options, build_write_options, merge_index_settings,
+    };
     use search::index::elasticsearch::ElasticsearchTextIndex;
+    use secrecy::ExposeSecret;
 
     let Some(FullTextSearchDatasetConfig {
         search_fields,
@@ -171,7 +174,34 @@ pub(crate) async fn build_elasticsearch_text_index(
         )));
     };
 
-    let client = get_fts_client(&fts_params.params)?;
+    let endpoint = fts_params.params.endpoint.as_deref().ok_or_else(|| {
+        Box::<dyn std::error::Error + Send + Sync>::from(
+            "Missing required parameter 'endpoint' for Elasticsearch FTS.",
+        )
+    })?;
+    let client_options = build_client_options(
+        fts_params.params.client_timeout,
+        fts_params.params.connect_timeout,
+        None,
+        None,
+    );
+    let client: Arc<dyn elasticsearch::Elasticsearch> = Arc::new(
+        elasticsearch::Client::new_with_options(
+            endpoint,
+            fts_params
+                .params
+                .user
+                .as_ref()
+                .map(ExposeSecret::expose_secret),
+            fts_params
+                .params
+                .pass
+                .as_ref()
+                .map(ExposeSecret::expose_secret),
+            &client_options,
+        )
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?,
+    );
 
     // Normalize LargeUtf8 → Utf8 in the source schema (ES always returns Utf8).
     // Also mark all fields as nullable — ES text search results may not include
@@ -223,8 +253,17 @@ pub(crate) async fn build_elasticsearch_text_index(
         })
         .collect::<Result<Vec<_>, Box<dyn std::error::Error + Send + Sync>>>()?;
 
-    let index_settings = parse_index_settings_from_map(&fts_params.params)?;
-    let write_options = parse_write_options_from_map(&fts_params.params)?;
+    let index_settings = merge_index_settings(
+        fts_params.params.index_settings.as_ref(),
+        fts_params.params.number_of_shards,
+        fts_params.params.number_of_replicas,
+        fts_params.params.refresh_interval.as_deref(),
+    );
+    let write_options = build_write_options(
+        fts_params.params.bulk_load_refresh_interval.as_deref(),
+        fts_params.params.force_merge_after_write,
+        fts_params.params.force_merge_segments,
+    )?;
     let write_maintenance = Arc::new(ElasticsearchIndexWriteMaintenance::new(write_options));
 
     // Ensure the ES index exists with text mappings for all search fields.
@@ -254,7 +293,7 @@ pub(crate) async fn build_elasticsearch_text_index(
         search_fields,
         primary_key: pk_fields,
         source_schema: Arc::clone(&source_schema),
-        batch_write_rows: fts_params.batch_write_rows,
+        batch_write_rows: fts_params.params.batch_write_rows,
         write_maintenance: Arc::clone(&write_maintenance),
     }))
 }
@@ -267,9 +306,13 @@ mod tests {
 
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::catalog::MemTable;
+    use runtime_parameters::typed::TypedParams as _;
+    use runtime_search::store_params::elasticsearch::{
+        ElasticsearchFtsConfig, ElasticsearchFtsParams,
+    };
+    use secrecy::SecretString;
     use spicepod::semantic::{Column, FullTextSearchConfig};
-
-    use crate::search::full_text::elasticsearch::ElasticsearchFtsParams;
+    use tokio::sync::RwLock;
 
     #[tokio::test]
     async fn add_elasticsearch_fts_errors_when_row_id_missing() {
@@ -284,10 +327,19 @@ mod tests {
             Column::new("body")
                 .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("missing_id")),
         ];
-        let fts_params = ElasticsearchFtsParams {
-            params: HashMap::from([("endpoint".to_string(), "http://localhost:9200".to_string())]),
+        let params = ElasticsearchFtsParams::try_from_params(
+            "Elasticsearch full-text search test",
+            HashMap::from([(
+                "elasticsearch_endpoint".to_string(),
+                SecretString::from("http://localhost:9200".to_string()),
+            )]),
+            &Arc::new(RwLock::new(runtime_secrets::Secrets::default())),
+        )
+        .await
+        .expect("FTS parameters should be valid");
+        let fts_params = ElasticsearchFtsConfig {
+            params,
             es_index: "docs".to_string(),
-            batch_write_rows: 1000,
         };
         let table_ref = datafusion::sql::TableReference::parse_str("docs");
 
