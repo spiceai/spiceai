@@ -264,7 +264,8 @@ impl SegmentTombstones {
 
     /// The deleted `Int64Pk` keys in this segment (empty for the row-key strategy).
     /// Test-only since the merged-scan-deletions lockstep that consumed it in
-    /// production was retired with the scan-view maintainer switch.
+    /// production was retired when the per-scan merge memos gave way to the
+    /// demand-driven scan-view cache.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "used only by mem-tier tombstone tests")

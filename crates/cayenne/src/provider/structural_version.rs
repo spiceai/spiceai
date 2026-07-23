@@ -70,14 +70,15 @@ impl StructuralVersion {
         }
     }
 
-    /// The version a scan must be served at or after. A scan reads this at start,
-    /// then runs only on a bundle stamped `>=` the returned value.
+    /// The current structural generation. The demand cache reads this at capture,
+    /// folds it into the `ScanViewKey`, and (on the read-current fast path) compares
+    /// it so a stale-tolerant serve is never a pre-evolution bundle.
     ///
-    /// May observe an ODD (in-flight) value; the builder never publishes an odd
-    /// version, so a scan that reads an odd `v` simply waits for the next even
-    /// bundle `>= v` (i.e. the post-event bundle). `Acquire` so a scan that
-    /// observes a forced bump also observes the writer's data swaps that preceded
-    /// it (release/acquire with the guard's increments).
+    /// May observe an ODD (in-flight) value; the demand capture only keys on an even,
+    /// validated generation (`read_validated_async` retries an odd/torn read), so an
+    /// odd `v` observed here simply forces a rebuild rather than being trusted.
+    /// `Acquire` so an observer of a forced bump also observes the writer's data swaps
+    /// that preceded it (release/acquire with the guard's increments).
     pub(crate) fn current(&self) -> u64 {
         self.version.load(Ordering::Acquire)
     }
