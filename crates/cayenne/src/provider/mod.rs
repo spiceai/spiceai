@@ -96,6 +96,7 @@ pub(crate) mod on_conflict;
 pub(crate) mod overwrite;
 pub mod partitioned_wal;
 pub(crate) mod pk_index;
+pub(crate) mod predicate_stats;
 pub(crate) mod query_admission;
 pub(crate) mod retention;
 pub(crate) mod scan;

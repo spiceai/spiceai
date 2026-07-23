@@ -139,6 +139,10 @@ name = "zorder_clustering"
 
 [[bench]]
 harness = false
+name = "layout_amp_default_on"
+
+[[bench]]
+harness = false
 name = "metastore_operations"
 
 [[bench]]
