@@ -969,6 +969,32 @@ mod tests {
     }
 
     #[test]
+    fn uri_connection_string_flows_into_replication_params() {
+        let params = Parameters::new(
+            vec![
+                (
+                    "connection_string".to_string(),
+                    SecretString::from("postgresql://csuser:secret@db.internal:5433/csdb"),
+                ),
+                ("host".to_string(), SecretString::from("ignored")),
+            ],
+            "pg",
+            crate::PARAMETERS,
+        );
+        let repl = replication_params_from_connector_params(&params, "hits")
+            .expect("URI connection_string should parse for CDC");
+        assert_eq!(repl.host, "db.internal");
+        assert_eq!(repl.port, 5433);
+        assert_eq!(repl.user, "csuser");
+        assert_eq!(repl.database, "csdb");
+        assert_eq!(repl.sslmode, config::SslMode::VerifyFull);
+        assert_eq!(
+            secrecy::ExposeSecret::expose_secret(&repl.password),
+            "secret"
+        );
+    }
+
+    #[test]
     fn optional_bool_recognizes_true_and_false_tokens() {
         for v in ["true", "TRUE", "1", "yes", "Y", " true "] {
             assert_eq!(

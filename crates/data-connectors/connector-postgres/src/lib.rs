@@ -98,9 +98,12 @@ const POSTGRES_DOCS: &str = "https://spiceai.org/docs/components/data-connectors
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("connection_string")
         .description(
-            "Full libpq-style connection string. Overrides other connection params if set.",
+            "Full libpq-style connection string (key=value or postgres:// URI). Overrides other connection params if set.",
         )
-        .examples(&["host=db.example.com port=5432 dbname=app user=ro sslmode=require"])
+        .examples(&[
+            "host=db.example.com port=5432 dbname=app user=ro sslmode=require",
+            "postgresql://ro@db.example.com:5432/app?sslmode=require",
+        ])
         .help_link(POSTGRES_DOCS)
         .secret(),
     ParameterSpec::component("user")

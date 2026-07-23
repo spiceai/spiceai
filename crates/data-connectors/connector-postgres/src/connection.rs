@@ -17,9 +17,12 @@ limitations under the License.
 //! Resolve Postgres connection identity for CDC using the same rules as
 //! `PostgresConnectionPool` in `datafusion-table-providers`.
 //!
-//! [`parse_connection_string`] mirrors the pool helper (libpq key=value,
-//! default `sslmode=verify-full`) with a deliberate `split_once` improvement
-//! so values containing `=` are not truncated.
+//! Accepts both libpq key=value strings (pool-aligned via
+//! [`parse_connection_string`], with `split_once` so values containing `=` are
+//! preserved) and `postgres://` / `postgresql://` URIs. URIs are peeled for
+//! `sslmode` / `sslrootcert` then parsed with [`tokio_postgres::Config`] — the
+//! read pool still only understands key=value today, but CDC must honor the URI
+//! form used in docs and secrets.
 
 use runtime::parameters::{ExposedParamLookup, Parameters};
 use std::fmt::Write as _;
@@ -76,16 +79,44 @@ fn connection_identity_from_connection_string(
     connection_string: &str,
 ) -> Result<PgConnectionIdentity, String> {
     let user_param = params.user_param("connection_string").to_string();
+    let trimmed = connection_string.trim();
 
-    // Same steps as `PostgresConnectionPool::new_inner` when `connection_string`
-    // is set: peel password/sslmode/sslrootcert, build a stripped libpq string,
-    // then parse with `tokio_postgres::Config`.
-    let (mut stripped, mut ssl_mode, mut ssl_rootcert, password) =
-        parse_connection_string(connection_string);
+    let (config, mut ssl_mode, mut ssl_rootcert, password) = if is_postgres_uri(trimmed) {
+        // Peel sslmode/sslrootcert before Config parse: tokio_postgres rejects
+        // verify-* / unknown options like sslrootcert.
+        let (stripped_uri, ssl_mode, ssl_rootcert) = peel_uri_ssl_params(trimmed)?;
+        validate_sslmode(&ssl_mode, &user_param)?;
+        let config = tokio_postgres::Config::from_str(stripped_uri.as_str())
+            .map_err(|e| format!("invalid `{user_param}`: {e}"))?;
+        let password = config
+            .get_password()
+            .map(|p| String::from_utf8_lossy(p).into_owned());
+        (config, ssl_mode, ssl_rootcert, password)
+    } else {
+        // Same steps as `PostgresConnectionPool::new_inner` for key=value:
+        // peel password/sslmode/sslrootcert, build a stripped libpq string,
+        // then parse with `tokio_postgres::Config`.
+        let (mut stripped, ssl_mode, ssl_rootcert, password) =
+            parse_connection_string(trimmed);
+        validate_sslmode(&ssl_mode, &user_param)?;
 
-    // Validate the mode from the connection string before discrete overrides so
-    // a typo is attributed to `pg_connection_string`, not `pg_sslmode`.
-    validate_sslmode(&ssl_mode, &user_param)?;
+        // tokio_postgres Config only accepts disable/prefer/require; verify-*
+        // map to require for the Config string, while the full token is kept
+        // for TLS.
+        let mode_for_config = match ssl_mode.trim().to_ascii_lowercase().as_str() {
+            "disable" => "disable",
+            "prefer" => "prefer",
+            _ => "require",
+        };
+        let _ = write!(stripped, "sslmode={mode_for_config} ");
+
+        let config = tokio_postgres::Config::from_str(stripped.as_str())
+            .map_err(|e| format!("invalid `{user_param}`: {e}"))?;
+        (config, ssl_mode, ssl_rootcert, password)
+    };
+
+    // Validate / normalize before discrete overrides so a typo is attributed
+    // to `pg_connection_string`, not `pg_sslmode`.
     ssl_mode = ssl_mode.trim().to_string();
 
     // Discrete sslmode/sslrootcert override the connection string (pool order).
@@ -97,18 +128,16 @@ fn connection_identity_from_connection_string(
         ssl_rootcert = Some(cert);
     }
 
-    // tokio_postgres Config only accepts disable/prefer/require; verify-* map
-    // to require for the Config string, while the full token is kept for TLS.
-    let mode_for_config = match ssl_mode.as_str() {
-        "disable" => "disable",
-        "prefer" => "prefer",
-        _ => "require",
-    };
-    let _ = write!(stripped, "sslmode={mode_for_config} ");
+    identity_from_config(config, password, ssl_mode, ssl_rootcert, &user_param)
+}
 
-    let config = tokio_postgres::Config::from_str(stripped.as_str())
-        .map_err(|e| format!("invalid `{user_param}`: {e}"))?;
-
+fn identity_from_config(
+    config: tokio_postgres::Config,
+    password: Option<String>,
+    ssl_mode: String,
+    ssl_rootcert: Option<String>,
+    user_param: &str,
+) -> Result<PgConnectionIdentity, String> {
     let host = match config.get_hosts().first() {
         Some(tokio_postgres::config::Host::Tcp(host)) => host.clone(),
         Some(tokio_postgres::config::Host::Unix(path)) => {
@@ -140,10 +169,94 @@ fn connection_identity_from_connection_string(
         user,
         password: password.unwrap_or_default(),
         database,
-        // Always set: `parse_connection_string` defaults to `verify-full` when
-        // the string omits sslmode (same as the pool).
+        // Always set: parsers default to `verify-full` when sslmode is omitted
+        // (same as the pool for key=value).
         sslmode: Some(ssl_mode),
         sslrootcert: ssl_rootcert,
+    })
+}
+
+fn is_postgres_uri(connection_string: &str) -> bool {
+    let lower = connection_string.as_bytes();
+    const POSTGRES: &[u8] = b"postgres://";
+    const POSTGRESQL: &[u8] = b"postgresql://";
+    starts_with_ignore_ascii_case(lower, POSTGRESQL)
+        || starts_with_ignore_ascii_case(lower, POSTGRES)
+}
+
+fn starts_with_ignore_ascii_case(haystack: &[u8], prefix: &[u8]) -> bool {
+    haystack.len() >= prefix.len()
+        && haystack[..prefix.len()]
+            .iter()
+            .zip(prefix.iter())
+            .all(|(a, b)| a.to_ascii_lowercase() == *b)
+}
+
+/// Strip `sslmode` / `sslrootcert` from a Postgres URI query so
+/// [`tokio_postgres::Config`] can parse the remainder. Defaults `sslmode` to
+/// `verify-full` when omitted (aligned with the key=value path).
+fn peel_uri_ssl_params(uri: &str) -> Result<(String, String, Option<String>), String> {
+    let mut ssl_mode = "verify-full".to_string();
+    let mut ssl_rootcert: Option<String> = None;
+
+    let Some((base, query)) = uri.split_once('?') else {
+        return Ok((uri.to_string(), ssl_mode, ssl_rootcert));
+    };
+
+    let mut kept: Vec<&str> = Vec::new();
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match name {
+            "sslmode" => {
+                ssl_mode = percent_decode_query_component(value)?;
+            }
+            "sslrootcert" => {
+                ssl_rootcert = Some(percent_decode_query_component(value)?);
+            }
+            _ => kept.push(pair),
+        }
+    }
+
+    let stripped = if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", kept.join("&"))
+    };
+    Ok((stripped, ssl_mode, ssl_rootcert))
+}
+
+fn percent_decode_query_component(input: &str) -> Result<String, String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).map_err(|_| {
+                    format!("invalid percent-encoding in connection string query: {input:?}")
+                })?;
+                let decoded = u8::from_str_radix(hex, 16).map_err(|_| {
+                    format!("invalid percent-encoding in connection string query: {input:?}")
+                })?;
+                out.push(decoded);
+                i += 3;
+            }
+            b'%' => {
+                return Err(format!(
+                    "invalid percent-encoding in connection string query: {input:?}"
+                ));
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).map_err(|_| {
+        format!("invalid UTF-8 after percent-decoding connection string query: {input:?}")
     })
 }
 
@@ -351,5 +464,72 @@ mod tests {
         assert_eq!(identity.database, "app");
         assert_eq!(identity.password, "pw");
         assert!(identity.sslmode.is_none());
+    }
+
+    #[test]
+    fn uri_connection_string_parses_identity() {
+        let params = params_with_pairs(&[(
+            "connection_string",
+            "postgresql://csuser:secret@db.internal:5433/csdb",
+        )]);
+        let identity =
+            connection_identity_from_params(&params).expect("URI connection_string should parse");
+        assert_eq!(identity.host, "db.internal");
+        assert_eq!(identity.port, 5433);
+        assert_eq!(identity.user, "csuser");
+        assert_eq!(identity.database, "csdb");
+        assert_eq!(identity.password, "secret");
+        assert_eq!(identity.sslmode.as_deref(), Some("verify-full"));
+    }
+
+    #[test]
+    fn uri_connection_string_sslmode_and_rootcert_query() {
+        let params = params_with_pairs(&[(
+            "connection_string",
+            "postgresql://csuser:secret@db.internal:5433/csdb?sslmode=require&sslrootcert=%2Fca%2Fpem",
+        )]);
+        let identity =
+            connection_identity_from_params(&params).expect("URI with ssl query should parse");
+        assert_eq!(identity.sslmode.as_deref(), Some("require"));
+        assert_eq!(identity.sslrootcert.as_deref(), Some("/ca/pem"));
+    }
+
+    #[test]
+    fn uri_connection_string_percent_encoded_password() {
+        let params = params_with_pairs(&[(
+            "connection_string",
+            "postgresql://csuser:p%3Dass@db.internal:5432/csdb",
+        )]);
+        let identity =
+            connection_identity_from_params(&params).expect("percent-encoded password should parse");
+        assert_eq!(identity.password, "p=ass");
+    }
+
+    #[test]
+    fn uri_connection_string_invalid_sslmode_errors_on_connection_string_param() {
+        let params = params_with_pairs(&[(
+            "connection_string",
+            "postgresql://csuser:secret@db.internal:5432/csdb?sslmode=verify-ful",
+        )]);
+        let err = connection_identity_from_params(&params)
+            .expect_err("typo'd sslmode in URI must error");
+        assert!(
+            err.contains("pg_connection_string"),
+            "error should attribute to connection_string, got: {err}"
+        );
+        assert!(err.contains("verify-ful"), "got: {err}");
+    }
+
+    #[test]
+    fn discrete_sslmode_overrides_uri_connection_string() {
+        let params = params_with_pairs(&[
+            (
+                "connection_string",
+                "postgresql://csuser:secret@db.internal:5432/csdb?sslmode=require",
+            ),
+            ("sslmode", "disable"),
+        ]);
+        let identity = connection_identity_from_params(&params).expect("valid params should parse");
+        assert_eq!(identity.sslmode.as_deref(), Some("disable"));
     }
 }
