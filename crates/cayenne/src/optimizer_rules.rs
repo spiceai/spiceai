@@ -1003,8 +1003,7 @@ fn build_side_memory_estimate(plan: &dyn ExecutionPlan, build_rows: usize) -> Op
     let payload_bytes = row_width.saturating_mul(build_rows);
     // Saturating mul then divide: (payload * 5) / 2 ≈ 2.5× payload.
     Some(
-        payload_bytes
-            .saturating_mul(HASH_JOIN_BUILD_SIDE_OVERHEAD_NUM)
+        payload_bytes.saturating_mul(HASH_JOIN_BUILD_SIDE_OVERHEAD_NUM)
             / HASH_JOIN_BUILD_SIDE_OVERHEAD_DEN,
     )
 }
@@ -3093,15 +3092,12 @@ mod tests {
     /// must catch this case even though the row count is below
     /// `sort_merge_min_rows`.
     /// Direct coverage of the 2.5× HT overhead in [`build_side_memory_estimate`].
-    /// Schema is three Int64 columns (8 B each) so row_width is exactly 24.
+    /// Schema is three Int64 columns (8 B each) so `row_width` is exactly 24.
     #[test]
     fn build_side_memory_estimate_applies_two_point_five_ht_overhead() {
         let schema = order_line_schema();
-        let plan = cayenne_file_exec_with_num_rows(
-            &schema,
-            "order_line.vortex",
-            Precision::Exact(1_000),
-        );
+        let plan =
+            cayenne_file_exec_with_num_rows(&schema, "order_line.vortex", Precision::Exact(1_000));
         let estimated = build_side_memory_estimate(plan.as_ref(), 1_000)
             .expect("known fixed-width schema must estimate");
         // payload = 1000 × 24 = 24_000; with 5/2 overhead → 60_000.

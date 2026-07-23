@@ -134,7 +134,7 @@ use roaring::RoaringBitmap;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::task;
 use vortex_datafusion::VortexFormat;
@@ -11981,7 +11981,9 @@ impl CayenneTableProvider {
 
         // Full re-encode into a fresh snapshot with the concurrent-append guard.
         // Also folds protected snapshots and clears deletion caches.
-        let committed = self.rewrite_current_snapshot_for_compaction_tracked().await?;
+        let committed = self
+            .rewrite_current_snapshot_for_compaction_tracked()
+            .await?;
         if committed {
             self.record_small_file_compact_path(LastSmallFileCompactPath::Full);
         }
@@ -11999,9 +12001,7 @@ impl CayenneTableProvider {
     #[doc(hidden)]
     #[must_use]
     pub fn last_small_file_compact_path(&self) -> LastSmallFileCompactPath {
-        LastSmallFileCompactPath::from_u8(
-            self.last_small_file_compact_path.load(Ordering::Acquire),
-        )
+        LastSmallFileCompactPath::from_u8(self.last_small_file_compact_path.load(Ordering::Acquire))
     }
 
     /// Whether the small-file candidate can be rewritten as a subset (hardlink
@@ -12043,8 +12043,7 @@ impl CayenneTableProvider {
         let generation_before = self.current_dir_generation.load(Ordering::Relaxed);
         let snapshot_id_before = old_snapshot_id.clone();
 
-        let picked: std::collections::HashSet<&str> =
-            candidate.paths.iter().copied().collect();
+        let picked: std::collections::HashSet<&str> = candidate.paths.iter().copied().collect();
         let unpicked: Vec<&str> = files
             .iter()
             .map(|(path, _)| path.as_str())
@@ -12100,18 +12099,15 @@ impl CayenneTableProvider {
         };
         let deletion_snapshot = self.pk_deletion_snapshot();
         let pk_indices = self.pk_column_indices.clone();
-        let with_deletes =
-            match self.apply_deletion_filter(plan, &pk_indices, &deletion_snapshot) {
-                Ok(p) => p,
-                Err(source) => {
-                    cleanup_all.await;
-                    return Err(Error::DataFusion { source });
-                }
-            };
-        let stream = match datafusion_physical_plan::execute_stream(
-            with_deletes,
-            state.task_ctx(),
-        ) {
+        let with_deletes = match self.apply_deletion_filter(plan, &pk_indices, &deletion_snapshot) {
+            Ok(p) => p,
+            Err(source) => {
+                cleanup_all.await;
+                return Err(Error::DataFusion { source });
+            }
+        };
+        let stream = match datafusion_physical_plan::execute_stream(with_deletes, state.task_ctx())
+        {
             Ok(s) => s,
             Err(source) => {
                 cleanup_all.await;
@@ -12270,17 +12266,16 @@ impl CayenneTableProvider {
             let store = Arc::clone(&config.store);
             let table_name = self.table_name().to_string();
             for basename in basenames {
-                let source =
-                    ObjectStorePath::from(format!("{}{basename}", source_prefix.as_ref()));
-                let target =
-                    ObjectStorePath::from(format!("{}{basename}", target_prefix.as_ref()));
-                store.copy(&source, &target).await.map_err(|source| {
-                    Error::ObjectStore {
+                let source = ObjectStorePath::from(format!("{}{basename}", source_prefix.as_ref()));
+                let target = ObjectStorePath::from(format!("{}{basename}", target_prefix.as_ref()));
+                store
+                    .copy(&source, &target)
+                    .await
+                    .map_err(|source| Error::ObjectStore {
                         operation: "subset compaction copy file",
                         table: table_name.clone(),
                         source,
-                    }
-                })?;
+                    })?;
             }
             return Ok(());
         }
@@ -13111,7 +13106,9 @@ impl CayenneTableProvider {
 
         if let Some(trigger) = maintenance_trigger {
             self.log_snapshot_maintenance_trigger(trigger);
-            let committed = self.rewrite_current_snapshot_for_compaction_tracked().await?;
+            let committed = self
+                .rewrite_current_snapshot_for_compaction_tracked()
+                .await?;
             if committed {
                 self.record_small_file_compact_path(LastSmallFileCompactPath::Full);
             }
@@ -13191,7 +13188,9 @@ impl CayenneTableProvider {
             }
         }
 
-        let committed = self.rewrite_current_snapshot_for_compaction_tracked().await?;
+        let committed = self
+            .rewrite_current_snapshot_for_compaction_tracked()
+            .await?;
         if committed {
             self.record_small_file_compact_path(LastSmallFileCompactPath::Full);
         }

@@ -964,31 +964,24 @@ async fn compact_current_after_seed_then_more_preserves_all_rows(
     // maintenance already consolidated during the inserts (common when the
     // threshold is crossed mid-seed). Both are correct; the invariant is
     // row-count preservation + a bounded file count.
-    match wait_until_current_snapshot_compacts(
-        &table,
-        &fixture,
-        "two_phase_compact",
-        files_before,
-    )
-    .await?
+    if let Some((snap_after, files_after)) =
+        wait_until_current_snapshot_compacts(&table, &fixture, "two_phase_compact", files_before)
+            .await?
     {
-        Some((snap_after, files_after)) => {
-            assert_ne!(snap_after, snap_before);
-            assert!(
-                files_after < files_before,
-                "explicit phase-B compact must reduce file count ({files_before} → {files_after})"
-            );
-        }
-        None => {
-            // Post-write already drained the backlog; require only that the
-            // snapshot is not still holding every phase-B append as its own file.
-            let total_appends = usize::try_from(seed_batches + more).expect("fits");
-            assert!(
-                files_before < total_appends,
-                "without an explicit compact, post-write must have consolidated \
-                 below {total_appends} files (found {files_before})"
-            );
-        }
+        assert_ne!(snap_after, snap_before);
+        assert!(
+            files_after < files_before,
+            "explicit phase-B compact must reduce file count ({files_before} → {files_after})"
+        );
+    } else {
+        // Post-write already drained the backlog; require only that the
+        // snapshot is not still holding every phase-B append as its own file.
+        let total_appends = usize::try_from(seed_batches + more).expect("fits");
+        assert!(
+            files_before < total_appends,
+            "without an explicit compact, post-write must have consolidated \
+             below {total_appends} files (found {files_before})"
+        );
     }
     assert_eq!(count_rows(&ctx, "two_phase_compact").await, expected);
     Ok(())

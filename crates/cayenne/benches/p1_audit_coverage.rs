@@ -64,9 +64,9 @@ use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
 use datafusion::prelude::SessionContext;
+use datafusion_common::Result as DFResult;
 use datafusion_common::Statistics;
 use datafusion_common::stats::Precision;
-use datafusion_common::Result as DFResult;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
@@ -302,11 +302,7 @@ async fn current_snap(catalog: &dyn MetadataCatalog, table_name: &str) -> String
 
 async fn reseed_small_files(fx: &mut CompactFixture, batches: i64) {
     for _ in 0..batches {
-        let n = insert_batch(
-            &fx.table,
-            make_batch(&fx.schema, fx.next_id, fx.small_rows),
-        )
-        .await;
+        let n = insert_batch(&fx.table, make_batch(&fx.schema, fx.next_id, fx.small_rows)).await;
         assert_eq!(n as i64, fx.small_rows);
         fx.next_id += fx.small_rows;
     }
@@ -326,11 +322,7 @@ async fn drive_to_path(
             break;
         }
         let step = Instant::now();
-        let _ = fx
-            .table
-            .maybe_compact_small_files()
-            .await
-            .expect("compact");
+        let _ = fx.table.maybe_compact_small_files().await.expect("compact");
         wall += step.elapsed();
         tokio::task::yield_now().await;
     }
@@ -351,15 +343,17 @@ async fn drive_to_path(
 /// Timed compact pass after files are already seeded.
 async fn timed_maybe_compact(
     fx: &CompactFixture,
-) -> (bool, LastSmallFileCompactPath, std::time::Duration, u64, u64) {
+) -> (
+    bool,
+    LastSmallFileCompactPath,
+    std::time::Duration,
+    u64,
+    u64,
+) {
     let snap_before = current_snap(fx.catalog.as_ref(), &fx.table_name).await;
     let bytes_before = snapshot_vortex_bytes(&fx.data_path, &fx.table_id, &snap_before).await;
     let t0 = Instant::now();
-    let committed = fx
-        .table
-        .maybe_compact_small_files()
-        .await
-        .expect("compact");
+    let committed = fx.table.maybe_compact_small_files().await.expect("compact");
     let wall = t0.elapsed();
     let path = fx.table.last_small_file_compact_path();
     let snap_after = current_snap(fx.catalog.as_ref(), &fx.table_name).await;
@@ -376,11 +370,11 @@ fn bench_subset_vs_full_compact(c: &mut Criterion) {
     // --- Subset lane ---
     let mut subset_fx = rt.block_on(setup_compact_fixture("subset_bench", true));
     {
-        let (wall, bytes_before, bytes_after) =
-            rt.block_on(drive_to_path(&mut subset_fx, LastSmallFileCompactPath::Subset));
-        eprintln!(
-            "p1 subset path assert OK: wall={wall:?} bytes {bytes_before} → {bytes_after}"
-        );
+        let (wall, bytes_before, bytes_after) = rt.block_on(drive_to_path(
+            &mut subset_fx,
+            LastSmallFileCompactPath::Subset,
+        ));
+        eprintln!("p1 subset path assert OK: wall={wall:?} bytes {bytes_before} → {bytes_after}");
         // Re-seed so timed loop has work.
         rt.block_on(reseed_small_files(&mut subset_fx, 12));
     }
@@ -421,9 +415,7 @@ fn bench_subset_vs_full_compact(c: &mut Criterion) {
     {
         let (wall, bytes_before, bytes_after) =
             rt.block_on(drive_to_path(&mut full_fx, LastSmallFileCompactPath::Full));
-        eprintln!(
-            "p1 full path assert OK: wall={wall:?} bytes {bytes_before} → {bytes_after}"
-        );
+        eprintln!("p1 full path assert OK: wall={wall:?} bytes {bytes_before} → {bytes_after}");
         rt.block_on(reseed_small_files(&mut full_fx, 12));
     }
 
@@ -460,7 +452,10 @@ fn bench_subset_vs_full_compact(c: &mut Criterion) {
         b.iter(|| {
             let total = black_box(10_u64 * 1024 * 1024);
             let candidate = black_box(1_u64 * 1024 * 1024);
-            let ratio = total.saturating_mul(100).checked_div(candidate).unwrap_or(0);
+            let ratio = total
+                .saturating_mul(100)
+                .checked_div(candidate)
+                .unwrap_or(0);
             assert_eq!(ratio, 1000);
             black_box(ratio)
         });
@@ -577,13 +572,11 @@ fn cayenne_scan_with_rows(schema: &SchemaRef, path: &str, rows: usize) -> Arc<dy
         e_tag: None,
         version: None,
     });
-    let config = FileScanConfigBuilder::new(
-        ObjectStoreUrl::parse("file:///").expect("url"),
-        source,
-    )
-    .with_file_group(FileGroup::new(vec![file]))
-    .with_statistics(Statistics::new_unknown(schema).with_num_rows(Precision::Exact(rows)))
-    .build();
+    let config =
+        FileScanConfigBuilder::new(ObjectStoreUrl::parse("file:///").expect("url"), source)
+            .with_file_group(FileGroup::new(vec![file]))
+            .with_statistics(Statistics::new_unknown(schema).with_num_rows(Precision::Exact(rows)))
+            .build();
     let data_source = DataSourceExec::from_data_source(config);
     Arc::new(CayenneAccelerationExec::new(data_source))
 }

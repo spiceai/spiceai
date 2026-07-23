@@ -63,7 +63,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
-use parking_lot::{Mutex as ParkingMutex, RwLock};
+use parking_lot::RwLock;
 use tokio::sync::Notify;
 
 /// How long a writer whose reservation was refused waits in
@@ -211,7 +211,7 @@ static BUDGET_RELEASED: LazyLock<Notify> = LazyLock::new(Notify::new);
 /// memory mode is active. The dynamic re-partition sampler **subtracts** this
 /// consumer from `pool.reserved()` so the host envelope is not double-counted
 /// (the tier already has its own coordinated host slice).
-static POOL_ACCOUNT: LazyLock<RwLock<Option<ParkingMutex<MemoryReservation>>>> =
+static POOL_ACCOUNT: LazyLock<RwLock<Option<MemoryReservation>>> =
     LazyLock::new(|| RwLock::new(None));
 
 /// Register (or replace) the query-pool consumer that mirrors mem-tier `used`.
@@ -220,7 +220,7 @@ static POOL_ACCOUNT: LazyLock<RwLock<Option<ParkingMutex<MemoryReservation>>>> =
 /// account tracks `used` once reserves begin.
 pub fn set_global_mem_tier_pool_account(pool: &Arc<dyn MemoryPool>) {
     let reservation = MemoryConsumer::new("cayenne:mem_tier").register(pool);
-    *POOL_ACCOUNT.write() = Some(ParkingMutex::new(reservation));
+    *POOL_ACCOUNT.write() = Some(reservation);
     // Seed from current `used` so a late install after warm CDC still reflects
     // resident state (usually 0 at startup).
     let used = global_mem_tier_used().unwrap_or(0);
@@ -237,7 +237,7 @@ pub fn set_global_mem_tier_pool_account(pool: &Arc<dyn MemoryPool>) {
 pub fn clear_global_mem_tier_pool_account() {
     let mut guard = POOL_ACCOUNT.write();
     if let Some(res) = guard.take() {
-        res.lock().resize(0);
+        res.resize(0);
     }
 }
 
@@ -248,17 +248,26 @@ pub fn clear_global_mem_tier_pool_account() {
 #[must_use]
 pub fn global_mem_tier_pool_account_bytes() -> Option<usize> {
     let guard = POOL_ACCOUNT.read();
-    guard.as_ref().map(|res| res.lock().size())
+    guard.as_ref().map(MemoryReservation::size)
 }
 
 /// Sync the query-pool reservation to the latest `used` (infallible resize).
+///
+/// `MemoryReservation` is interior-mutable (`resize`/`size` take `&self` over an
+/// atomic), so it needs no inner lock. But `resize` is an *absolute* set — a
+/// load-then-grow/shrink read-modify-write on the shared pool counter — unlike
+/// egress's delta-based `grow`/`shrink` (individually atomic and composable). Two
+/// concurrent mirrors would lose an update and skew the pool's reserved bytes for
+/// every consumer, so serialize the set through the outer write guard (one lock,
+/// not a second inner mutex). The write is off the query hot path and no worse
+/// than the reserve/release serialization already inherent to the tier budget.
 fn sync_pool_account_to_used(used: u64) {
-    let guard = POOL_ACCOUNT.read();
+    let guard = POOL_ACCOUNT.write();
     let Some(res) = guard.as_ref() else {
         return;
     };
     let used_usize = usize::try_from(used).unwrap_or(usize::MAX);
-    res.lock().resize(used_usize);
+    res.resize(used_usize);
 }
 
 /// Install the process-global in-memory CDC tier byte budget. Called once at
@@ -436,6 +445,7 @@ pub(crate) async fn reserve_bytes_or_wait(bytes: u64, max_wait: Duration) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::Mutex as ParkingMutex;
 
     /// Serializes every test that mutates the process-global budget / pool
     /// account so parallel `cargo test` threads cannot interleave reserves.
@@ -670,10 +680,10 @@ mod tests {
 
         // Wait path with full budget (no concurrent release) — refuse after bound.
         let refused = {
-            let _guard = GLOBAL_BUDGET_TEST_LOCK.lock();
+            let guard = GLOBAL_BUDGET_TEST_LOCK.lock();
             // Re-assert full.
             assert_eq!(global_mem_tier_used(), Some(5_000));
-            drop(_guard);
+            drop(guard);
             // Call wait without holding the parking_lot guard across await.
             // Re-acquire by using try_reserve which is sync-refused.
             let _guard = GLOBAL_BUDGET_TEST_LOCK.lock();
@@ -682,11 +692,11 @@ mod tests {
         assert!(refused, "full budget must refuse");
 
         {
-            let _guard = GLOBAL_BUDGET_TEST_LOCK.lock();
+            let guard = GLOBAL_BUDGET_TEST_LOCK.lock();
             assert_eq!(global_mem_tier_pool_account_bytes(), Some(5_000));
             // Explicitly exercise reserve_bytes_or_wait success when room exists.
             release_bytes(5_000);
-            drop(_guard);
+            drop(guard);
         }
         {
             let ok = reserve_bytes_or_wait(500, Duration::from_millis(100)).await;
@@ -697,7 +707,7 @@ mod tests {
         }
     }
 
-    /// Sampler-facing contract: pool_reserved − mem_tier_account = query-only usage.
+    /// Sampler-facing contract: `pool_reserved` − `mem_tier_account` = query-only usage.
     #[test]
     fn pool_account_bytes_subtracts_cleanly_for_sampler() {
         use datafusion::execution::memory_pool::GreedyMemoryPool;
@@ -713,8 +723,8 @@ mod tests {
             assert!(try_reserve_bytes(2_500));
 
             let pool_reserved = u64::try_from(pool.reserved()).expect("fits u64");
-            let mem_tier = u64::try_from(global_mem_tier_pool_account_bytes().unwrap_or(0))
-                .expect("fits u64");
+            let mem_tier =
+                u64::try_from(global_mem_tier_pool_account_bytes().unwrap_or(0)).expect("fits u64");
             let query_only = pool_reserved.saturating_sub(mem_tier);
             assert_eq!(mem_tier, 2_500);
             assert_eq!(

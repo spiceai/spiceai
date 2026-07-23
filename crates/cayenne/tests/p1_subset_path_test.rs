@@ -45,7 +45,7 @@ fn batch(start: i64, n: i64) -> RecordBatch {
     let values: Vec<String> = ids
         .iter()
         .map(|i| {
-            let u = *i as u64;
+            let u = (*i).cast_unsigned();
             format!(
                 "v_{i:020}_{:016x}_{:016x}_{:016x}",
                 u.wrapping_mul(0x9E37_79B9_7F4A_7C15),
