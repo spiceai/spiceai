@@ -149,6 +149,8 @@ pub(crate) async fn create_local(model_id: &str) -> Result<Arc<dyn Chat>, anyhow
         None,
         None,
         None,
+        None,
+        true,
     )
     .await
     .map_err(anyhow::Error::from)?;

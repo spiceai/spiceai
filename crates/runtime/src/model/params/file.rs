@@ -27,7 +27,7 @@ pub const PARAMETERS: &[ParameterSpec] =
         { FILE_PARAM_LEN + PARAM_WITH_DEPRE_LEN },
     >(FILE_PARAMETERS, COMMON_MODEL_PARAMETERS_WITH_DEPRECATED);
 
-const FILE_PARAM_LEN: usize = 5;
+const FILE_PARAM_LEN: usize = 7;
 
 pub(crate) const FILE_PARAMETERS: [ParameterSpec; FILE_PARAM_LEN] = [
     ParameterSpec::runtime("chat_template").description(
@@ -46,4 +46,10 @@ pub(crate) const FILE_PARAMETERS: [ParameterSpec; FILE_PARAM_LEN] = [
         .description("This node's 0-indexed rank in the distributed `nodes` list. Rank 0 is the head and serves the API; other ranks are compute replicas."),
     ParameterSpec::runtime("nodes")
         .description("Comma-separated, rank-ordered node addresses for distributed inference (e.g. '10.0.0.1,10.0.0.2'). Identical on every node; only `node_rank` differs. The node count (world size) must be a power of two; the 'ring' backend requires exactly 2."),
+    ParameterSpec::runtime("context_length")
+        .description("Maximum context length, in tokens, for a locally served model. Sets the sequence length used to plan cross-device layer placement and KV-cache sizing; defaults to the engine default (4096) when unset. Larger values need proportionally more KV-cache memory."),
+    ParameterSpec::runtime("paged_attention")
+        .description("Enable PagedAttention for a locally served model. Defaults to 'true' (auto-enabled on CUDA/unix when the model supports it). Set to 'false' to force it off for architectures that implement dense (Eager) attention only and reject a PagedAttention config at load, such as the GLM-dsa GGUF.")
+        .default("true")
+        .one_of(&["true", "false"]),
 ];

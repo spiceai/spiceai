@@ -776,6 +776,8 @@ pub async fn create_local_model(
     generation_config: Option<&str>,
     chat_template_literal: Option<&str>,
     distributed: Option<DistributedConfig>,
+    context_length: Option<usize>,
+    paged_attention: bool,
 ) -> Result<Arc<dyn Chat>> {
     // Configure multi-node distributed (ring) inference before loading: the
     // loader reads `RING_CONFIG` from the environment while building the
@@ -803,6 +805,8 @@ pub async fn create_local_model(
         tokenizer_config.map(Path::new),
         generation_config.map(Path::new),
         chat_template_literal,
+        context_length,
+        paged_attention,
         ring_config,
     )
     .await

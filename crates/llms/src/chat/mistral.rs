@@ -91,6 +91,8 @@ impl MistralLlama {
         tokenizer_config: Option<&Path>,
         generation_config: Option<&Path>,
         chat_template_literal: Option<&str>,
+        context_length: Option<usize>,
+        paged_attention: bool,
         ring_config_path: Option<tempfile::TempPath>,
     ) -> Result<Self> {
         for weight in model_weights {
@@ -143,7 +145,7 @@ impl MistralLlama {
             .and_then(|p| p.as_path().extension())
             .and_then(|e| e.to_str());
 
-        let paged_attn_config = Self::paged_attention_config(&device);
+        let paged_attn_config = Self::paged_attention_config(&device, paged_attention);
         let paged_attn_requested = paged_attn_config.is_some();
         let pipeline = match extension {
             Some("ggml") => Self::load_ggml_pipeline(
@@ -151,6 +153,7 @@ impl MistralLlama {
                 &device,
                 &model_id,
                 chat_template_literal,
+                context_length,
                 paged_attn_config,
             )?,
             Some("gguf") => Self::load_gguf_pipeline(
@@ -158,6 +161,7 @@ impl MistralLlama {
                 &device,
                 &model_id,
                 chat_template_literal,
+                context_length,
                 paged_attn_config,
             )?,
             _ => Self::load_default_pipeline(
@@ -165,6 +169,7 @@ impl MistralLlama {
                 &device,
                 &model_id,
                 chat_template_literal,
+                context_length,
                 paged_attn_config,
             )?,
         };
@@ -204,6 +209,7 @@ impl MistralLlama {
         device: &Device,
         model_id: &str,
         chat_template_literal: Option<&str>,
+        context_length: Option<usize>,
         paged_attn_config: Option<mistralrs::PagedAttentionConfig>,
     ) -> Result<Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>> {
         let model_parts: Vec<&str> = model_id.split(':').collect();
@@ -222,7 +228,7 @@ impl MistralLlama {
             &ModelDType::Auto,
             device,
             true,
-            DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
+            DeviceMapSetting::Auto(Self::text_device_map_params(context_length)),
             None,
             paged_attn_config,
         )
@@ -234,6 +240,7 @@ impl MistralLlama {
         device: &Device,
         model_id: &str,
         chat_template_literal: Option<&str>,
+        context_length: Option<usize>,
         paged_attn_config: Option<mistralrs::PagedAttentionConfig>,
     ) -> Result<Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>> {
         // Note: GGUF supports chat templates in the file, but since GGML/llama.cpp does
@@ -282,7 +289,7 @@ impl MistralLlama {
             &ModelDType::Auto,
             device,
             true,
-            DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
+            DeviceMapSetting::Auto(Self::text_device_map_params(context_length)),
             None,
             paged_attn_config,
         )
@@ -294,6 +301,7 @@ impl MistralLlama {
         device: &Device,
         model_id: &str,
         chat_template_literal: Option<&str>,
+        context_length: Option<usize>,
         paged_attn_config: Option<mistralrs::PagedAttentionConfig>,
     ) -> Result<Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>> {
         let tokenizer = paths.get_tokenizer_filename().to_string_lossy().to_string();
@@ -313,15 +321,26 @@ impl MistralLlama {
             &ModelDType::Auto,
             device,
             true,
-            DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
+            DeviceMapSetting::Auto(Self::text_device_map_params(context_length)),
             None,
             paged_attn_config,
         )
         .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
     }
 
-    fn paged_attention_config(device: &Device) -> Option<mistralrs::PagedAttentionConfig> {
-        if matches!(device, Device::Cpu) || !Self::paged_attention_supported() {
+    /// Build the mistral.rs PagedAttention config for a locally served model.
+    /// Paged attention is auto-enabled on CUDA/unix when supported; the operator
+    /// can force it off with the `paged_attention: false` model param (`enabled`).
+    ///
+    /// Some architectures — e.g. the GLM-dsa GGUF — implement dense (Eager)
+    /// attention only and reject a PagedAttention config at load. Those
+    /// deployments set `paged_attention: false` so the loader falls back to
+    /// Eager + NormalCache instead of failing.
+    fn paged_attention_config(
+        device: &Device,
+        enabled: bool,
+    ) -> Option<mistralrs::PagedAttentionConfig> {
+        if !enabled || matches!(device, Device::Cpu) || !Self::paged_attention_supported() {
             return None;
         }
 
@@ -336,6 +355,18 @@ impl MistralLlama {
 
     fn paged_attention_supported() -> bool {
         cfg!(all(feature = "cuda", target_family = "unix"))
+    }
+
+    /// Auto device-map params for text models, honoring an optional operator-set
+    /// context length (the `context_length` model param). Falls back to mistral.rs's
+    /// default sequence length (`DEFAULT_MAX_SEQ_LEN`, 4096) when unset. This value
+    /// sets the sequence length used to plan cross-device layer placement and to size
+    /// the KV cache, so it is the effective maximum context for the served model.
+    fn text_device_map_params(context_length: Option<usize>) -> AutoDeviceMapParams {
+        AutoDeviceMapParams::Text {
+            max_seq_len: context_length.unwrap_or(AutoDeviceMapParams::DEFAULT_MAX_SEQ_LEN),
+            max_batch_size: AutoDeviceMapParams::DEFAULT_MAX_BATCH_SIZE,
+        }
     }
 
     fn default_scheduler_config() -> mistralrs::SchedulerConfig {
@@ -465,7 +496,9 @@ impl MistralLlama {
             TokenSource::Literal(secret.expose_secret().to_string())
         });
 
-        let paged_attn_config = Self::paged_attention_config(&device);
+        // The `paged_attention` operator param is a file-model knob; HuggingFace
+        // loads keep the auto behavior (enabled on CUDA/unix when supported).
+        let paged_attn_config = Self::paged_attention_config(&device, true);
         let paged_attn_requested = paged_attn_config.is_some();
 
         let pipeline = loader?

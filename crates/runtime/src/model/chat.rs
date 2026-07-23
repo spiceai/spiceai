@@ -668,6 +668,8 @@ async fn file(
     let config_path = component.find_any_file_path(ModelFileType::Config);
     let generation_config = component.find_any_file_path(ModelFileType::GenerationConfig);
     let distributed = parse_distributed_config(params)?;
+    let context_length = parse_context_length(params)?;
+    let paged_attention = parse_paged_attention(params)?;
 
     let chat_template_literal = params.get("chat_template").expose().ok();
 
@@ -679,8 +681,55 @@ async fn file(
         generation_config.as_deref(),
         chat_template_literal,
         distributed,
+        context_length,
+        paged_attention,
     )
     .await
+}
+
+/// Parse the optional `context_length` model parameter (maximum sequence length,
+/// in tokens) for locally served models. Returns `None` when unset or empty, so
+/// the engine default applies. Rejects non-integer or zero values.
+#[cfg(feature = "models")]
+fn parse_context_length(params: &Parameters) -> Result<Option<usize>, LlmError> {
+    let Some(raw) = params.get("context_length").expose().ok() else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    match raw.parse::<usize>() {
+        Ok(n) if n > 0 => Ok(Some(n)),
+        _ => Err(LlmError::InvalidParamValueError {
+            param: "context_length".to_string(),
+            message: format!(
+                "Invalid value for `params.context_length`: '{raw}'. Expected a positive integer number of tokens."
+            ),
+        }),
+    }
+}
+
+/// Parse the boolean `paged_attention` model parameter. Defaults to `true`,
+/// preserving the engine's auto behavior (paged attention is enabled on
+/// CUDA/unix when the model supports it). Set `false` to force it off — needed
+/// for architectures that implement dense (Eager) attention only and reject a
+/// PagedAttention config at load (e.g. the GLM-dsa GGUF).
+#[cfg(feature = "models")]
+fn parse_paged_attention(params: &Parameters) -> Result<bool, LlmError> {
+    let Some(raw) = params.get("paged_attention").expose().ok() else {
+        return Ok(true);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "1" | "" => Ok(true),
+        "false" | "no" | "0" => Ok(false),
+        other => Err(LlmError::InvalidParamValueError {
+            param: "paged_attention".to_string(),
+            message: format!(
+                "Must be one of 'true', 'false', 'yes', 'no', '1', or '0', got '{other}'"
+            ),
+        }),
+    }
 }
 
 /// Parse the boolean `trust_pickle` model parameter. Defaults to `false`
