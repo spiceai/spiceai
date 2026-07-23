@@ -157,7 +157,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     // --- Logical replication (WAL streaming) ---
     ParameterSpec::component("replication_slot").description(
         "Name of the Postgres replication slot to create/reuse for this dataset. \
-         Must match [a-z0-9_]{1,63} (lowercase letters, digits, underscores only). \
+         Must match [a-z0-9_]{1,63} (lowercase letters, digits, underscores only) and \
+         must not be the reserved name `pg_conflict_detection`. \
          Defaults to `spice_<dataset>_<dataset-hash>_<instance-hash>`. Datasets on the \
          same connection that name the same slot SHARE it: one replication connection, \
          one publication, with decoded changes routed per table. Each Spice replica \

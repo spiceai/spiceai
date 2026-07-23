@@ -276,12 +276,12 @@ pub fn validate_replication_slot_name(name: &str) -> Result<(), String> {
     // overlong UTF-8 by bytes the same way the server would.
     if name.is_empty() {
         return Err(format!(
-            "must be 1 to {PG_IDENTIFIER_MAX_BYTES} characters matching [a-z0-9_], got {name:?}"
+            "must be 1 to {PG_IDENTIFIER_MAX_BYTES} bytes matching [a-z0-9_], got {name:?}"
         ));
     }
     if name.len() > PG_IDENTIFIER_MAX_BYTES {
         return Err(format!(
-            "must be at most {PG_IDENTIFIER_MAX_BYTES} characters, got {} characters in {name:?}",
+            "must be at most {PG_IDENTIFIER_MAX_BYTES} bytes, got {} bytes in {name:?}",
             name.len()
         ));
     }
