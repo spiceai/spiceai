@@ -2342,12 +2342,13 @@ datasets:
 
     #[test]
     fn test_validate_metric_prefix_accepts_otel_charset() {
+        let max_len = "a".repeat(METRIC_PREFIX_MAX_LEN);
         for valid in [
             "spiceai.",
             "spiceai_",
             "a",
             "A-B/c_d.e",
-            &"a".repeat(METRIC_PREFIX_MAX_LEN),
+            max_len.as_str(),
         ] {
             validate_metric_prefix(valid)
                 .unwrap_or_else(|e| panic!("expected '{valid}' to be valid: {e}"));
