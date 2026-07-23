@@ -38156,7 +38156,7 @@ mod tests {
         .await;
         provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
         let schema = Arc::clone(&provider.table_metadata.schema);
-        provider
+        let _ = provider
             .write_cdc_append_stream(
                 single_batch_stream(id_value_batch(schema, &[1, 2, 3], &[10, 20, 30])),
                 &ctx.task_ctx(),
@@ -38240,7 +38240,7 @@ mod tests {
         .await;
         provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
         let schema = Arc::clone(&provider.table_metadata.schema);
-        provider
+        let _ = provider
             .write_cdc_append_stream(
                 single_batch_stream(id_value_batch(schema, &[1, 2, 3], &[10, 20, 30])),
                 &ctx.task_ctx(),
@@ -38317,7 +38317,7 @@ mod tests {
         let advances = Arc::new(std::sync::atomic::AtomicU64::new(0));
         provider.install_slot_advancer(Arc::new(CountingAdvancer(Arc::clone(&advances))));
         let schema = Arc::clone(&provider.table_metadata.schema);
-        provider
+        let _ = provider
             .write_cdc_append_stream(
                 single_batch_stream(id_value_batch(schema, &[1, 2, 3], &[10, 20, 30])),
                 &ctx.task_ctx(),
@@ -38374,7 +38374,7 @@ mod tests {
         let advances = Arc::new(std::sync::atomic::AtomicU64::new(0));
         provider.install_slot_advancer(Arc::new(CountingAdvancer(Arc::clone(&advances))));
         let schema = Arc::clone(&provider.table_metadata.schema);
-        provider
+        let _ = provider
             .write_cdc_append_stream(
                 single_batch_stream(id_value_batch(schema, &[1, 2, 3], &[10, 20, 30])),
                 &ctx.task_ctx(),
@@ -38681,7 +38681,7 @@ mod tests {
         // 1. Insert KEYS NEW keys into the mem-tier. NOT checkpointed — they live only
         //    in RAM. The incremental keyset (grown on append) knows them.
         let v0: Vec<i64> = ids.iter().map(|k| k * 10).collect();
-        provider
+        let _ = provider
             .write_cdc_append_stream(
                 single_batch_stream(id_value_batch(Arc::clone(&schema), &ids, &v0)),
                 &ctx.task_ctx(),
@@ -38700,7 +38700,7 @@ mod tests {
         //    false-negative -> the upsert records no tombstone and the step-1 RAM rows
         //    survive alongside the step-3 rows.
         let v1: Vec<i64> = ids.iter().map(|k| 1_000_000 + k).collect();
-        provider
+        let _ = provider
             .write_cdc_append_stream(
                 single_batch_stream(id_value_batch(Arc::clone(&schema), &ids, &v1)),
                 &ctx.task_ctx(),
@@ -40895,7 +40895,7 @@ mod tests {
 
         // 1. Land key 1 durably, then compact — this persists the PK-index bloom
         //    checkpoint for the current snapshot (covering key 1 only).
-        provider
+        let _ = provider
             .write_cdc_append_stream(
                 single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[10])),
                 &ctx.task_ctx(),
@@ -40922,7 +40922,7 @@ mod tests {
 
         // 2. Land key 2 in the RAM mem-tier ONLY (no checkpoint): it is absent from
         //    the persisted bloom AND the durable snapshot — it lives only in RAM.
-        provider
+        let _ = provider
             .write_cdc_append_stream(
                 single_batch_stream(id_value_batch(Arc::clone(&schema), &[2], &[20])),
                 &ctx.task_ctx(),
@@ -40962,7 +40962,7 @@ mod tests {
         //    the fast path, then UPDATE key 2. The upsert must supersede the prior
         //    copy (found via the mem-tier fold), not leak it.
         provider.clear_cached_pk_keyset();
-        provider
+        let _ = provider
             .write_cdc_append_stream(
                 single_batch_stream(id_value_batch(Arc::clone(&schema), &[2], &[222])),
                 &ctx.task_ctx(),
