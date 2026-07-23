@@ -653,8 +653,8 @@ fn warn_if_low_disk_blocking(label: &str, path: &str) {
 /// read-your-writes; serving a recently-built `ScanView` within this lag lets
 /// concurrent analytical scans share one build (the demand cache's reuse lever) while
 /// staying far inside the freshness SLO. Read-write datasets ignore this and always
-/// use 0 (read-your-writes). Chosen to mirror the retired scan-view maintainer's 1 s
-/// refresh floor; tune as the A/B data lands.
+/// use 0 (read-your-writes). 1 s is a conservative bounded-staleness default, far
+/// inside the freshness SLO; tune as the A/B data lands.
 const DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS: u64 = 1000;
 
 /// The read-current lag applied to READ-ONLY Cayenne datasets:

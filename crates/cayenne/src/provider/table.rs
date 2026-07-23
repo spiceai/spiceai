@@ -1134,7 +1134,7 @@ enum ScanViewProbe {
 }
 
 /// Demand-driven cache of [`ScanView`] bundles, keyed by scan-visible identity.
-/// Replaces the background scan-view maintainer: a bundle is built only for a
+/// Replaces the per-scan merge-on-read memos: a bundle is built only for a
 /// version a scan actually queries (build-only-what's-queried), which relieves the
 /// per-version rebuild CPU that competed with the CDC apply under churn.
 ///
@@ -1484,9 +1484,9 @@ pub struct CayenneTableProvider {
     /// Demand-driven cache of [`ScanView`] bundles (see [`ScanViewCache`]). A bundle is
     /// built only for a version a scan actually queries — the merge + visible-segment
     /// computation is offloaded to `spawn_blocking` (D3) and deduplicated across
-    /// concurrent scans on the same state. Replaces the retired background maintainer +
-    /// its published `ArcSwapOption`, and the two per-scan `ArcSwapOption` memos before
-    /// it. Shared across `clone_for_write` clones. `parking_lot::Mutex` — decide under
+    /// concurrent scans on the same state. Retires the two per-scan `ArcSwapOption`
+    /// memos (`merged_scan_deletions`, `mem_tier_visible_memo`). Shared across
+    /// `clone_for_write` clones. `parking_lot::Mutex` — decide under
     /// the lock, await OUTSIDE it (never held across `.await`).
     scan_view_cache: Arc<ParkingMutex<ScanViewCache>>,
     /// A weak self-reference the cache uses to obtain an owned `Arc<Self>` for its
@@ -2592,9 +2592,9 @@ impl CayenneTableProvider {
         // Bracket the widen in the scan-view seqlock: unlike a fenced snapshot
         // publish, the all-shards mem-tier FLUSH below runs OFF the listing fence
         // (under `write_lock` + `mem_checkpoint_lock`), so at `cdc_mem_tier_shards > 1`
-        // a maintainer capture could observe some shards flushed and others not — a
-        // tear the fence cannot serialize. The seqlock makes the maintainer discard
-        // such a straddling capture. Held under `write_lock`, so no two forced events
+        // a scan-view capture could observe some shards flushed and others not — a
+        // tear the fence cannot serialize. The seqlock makes a straddling capture
+        // discard-and-retry. Held under `write_lock`, so no two forced events
         // overlap; dropped at fn end. Inert at N == 1 (single-shard capture is atomic).
         let _structural_guard = self.structural_version.begin_mutation();
 
@@ -2995,7 +2995,7 @@ impl CayenneTableProvider {
         new_listing_table: Arc<ListingTable>,
     ) {
         // No scan-view seqlock bracket needed: the caller holds `listing_fence.write()`
-        // and every step here is synchronous, while a maintainer capture holds
+        // and every step here is synchronous, while a scan-view capture holds
         // `listing_fence.read()` across its WHOLE capture — so the capture observes
         // this overwrite fully-before or fully-after, never a partial mix. Snapshot
         // publishing is additive: the monotonic `scan_input_version` bumps below
@@ -10129,10 +10129,10 @@ impl CayenneTableProvider {
         self.inlined_structural_epoch
             .fetch_add(1, Ordering::Release);
         self.inlined_generation.fetch_add(1, Ordering::Release);
-        // A structural bump changes what a scan sees (a retired-memo invalidation
-        // point), so wake the scan-view maintainer. This is the single funnel for
-        // inline mutations, checkpoint clears, overwrite, recovery, on-conflict, and
-        // deferred-snapshot publishes.
+        // A structural bump changes what a scan sees, so advance the scan-input version
+        // (the demand cache's ordering axis; the next read-your-writes capture re-keys
+        // over the new state). Single funnel for inline mutations, checkpoint clears,
+        // overwrite, recovery, on-conflict, and deferred-snapshot publishes.
         self.notify_scan_input_change();
     }
 
@@ -17800,9 +17800,9 @@ impl CayenneTableProvider {
             self.table_metadata.table_name,
             new_snapshot_id
         );
-        // The snapshot the scan reads (and the dirs the scan-view bundle pins)
-        // changed — wake the maintainer to re-capture over the new snapshot. Single
-        // funnel for compaction / overwrite / restore / catalog-refresh id flips.
+        // The snapshot the scan reads (and the dirs a cached scan-view bundle pins)
+        // changed — advance the scan-input version so the next capture re-keys over the
+        // new snapshot. Single funnel for compaction / overwrite / restore / catalog-refresh id flips.
         self.notify_scan_input_change();
     }
 
@@ -18025,9 +18025,9 @@ impl CayenneTableProvider {
             self.table_metadata.table_name
         );
 
-        // The file set the scan reads changed — wake the scan-view maintainer so it
-        // recomputes the bundle (and advances the freshness version) over the new
-        // files. Covers file-mode appends / compaction / overwrite listing rebuilds.
+        // The file set the scan reads changed — advance the scan-input version so the
+        // next capture re-keys and rebuilds over the new files. Covers file-mode
+        // appends / compaction / overwrite listing rebuilds.
         self.notify_scan_input_change();
 
         Ok(())
@@ -18067,8 +18067,8 @@ impl CayenneTableProvider {
         // its off-fence re-encode. See [`Self::current_dir_generation`].
         self.current_dir_generation.fetch_add(1, Ordering::Relaxed);
 
-        // Fence-held chokepoint where appended files become scan-visible — wake the
-        // scan-view maintainer (the delta-apply publish path that does not go through
+        // Fence-held chokepoint where appended files become scan-visible — advance the
+        // scan-input version (the delta-apply publish path that does not go through
         // `refresh_listing_table_under_held_fence`).
         self.notify_scan_input_change();
 
@@ -20238,7 +20238,7 @@ impl CayenneTableProvider {
                 );
             self.mem_tier.shard(0).store(Arc::new(next));
             // Memory-mode overwrite swaps the entire tier without a structural-epoch
-            // bump, so signal the scan-view maintainer to recompute the bundle.
+            // bump, so advance the scan-input version (the next capture re-keys over the new tier).
             self.notify_scan_input_change();
         }
         Ok(incoming_rows)
