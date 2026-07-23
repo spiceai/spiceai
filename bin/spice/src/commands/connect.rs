@@ -199,18 +199,18 @@ async fn stage_adoption_code(
     // Write the endpoint override BEFORE printing success. If the override
     // can't be persisted, roll the staged code back so adoption can't
     // proceed against the wrong control plane on the next `spiced` start.
-    if let Some(ep) = endpoint {
-        if let Err(e) = atomic_write_0600(&endpoint_path, ep.as_bytes()) {
-            // Best-effort rollback of the staged code; surface the
-            // original endpoint-write failure to the caller.
-            let _ = std::fs::remove_file(&pending_path);
-            return Err(crate::error::Error::CloudConnectIo {
-                message: format!(
-                    "write endpoint override {}: {e} (adoption code not staged)",
-                    endpoint_path.display()
-                ),
-            });
-        }
+    if let Some(ep) = endpoint
+        && let Err(e) = atomic_write_0600(&endpoint_path, ep.as_bytes())
+    {
+        // Best-effort rollback of the staged code; surface the
+        // original endpoint-write failure to the caller.
+        let _ = std::fs::remove_file(&pending_path);
+        return Err(crate::error::Error::CloudConnectIo {
+            message: format!(
+                "write endpoint override {}: {e} (adoption code not staged)",
+                endpoint_path.display()
+            ),
+        });
     }
 
     println!("Attaching this Spice Runtime to Spice Cloud Connect...");
