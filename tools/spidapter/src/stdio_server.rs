@@ -811,9 +811,11 @@ impl SpidapterHandler {
                 serde_json::Value::String(state.password().to_string()),
             ),
         ]);
-        if let RunState::Local(local_state) = &state
-            && let Some(ak) = &local_state.flight_api_key
-        {
+        // FlightSQL DoGet authenticates per-call, not via the handshake
+        // username/password, so the read config must carry a `Bearer` call
+        // header for both SCP (Spice Cloud) and local direct-ingest clusters.
+        // Key off `state.api_key()` rather than matching only `RunState::Local`.
+        if let Some(ak) = state.api_key() {
             read_db_kwargs.insert(
                 "adbc.flight.sql.rpc.call_header.authorization".to_string(),
                 serde_json::Value::String(format!("Bearer {ak}")),
@@ -1217,9 +1219,14 @@ impl Handler for SpidapterHandler {
                     serde_json::Value::String("spicebench.bench".to_string()),
                 ),
             ]);
-            if let RunState::Local(local_state) = &state
-                && let Some(ak) = &local_state.flight_api_key
-            {
+            // The FlightSQL ExecuteIngest DoPut authenticates per-call, not via
+            // the handshake username/password, so the write sink must carry a
+            // `Bearer` call header. This applies to both SCP (Spice Cloud) and
+            // local direct-ingest clusters, so key off `state.api_key()` rather
+            // than matching only `RunState::Local` — otherwise the SCP DoPut
+            // goes out unauthenticated and fails with `Unauthenticated;
+            // ExecuteIngest`.
+            if let Some(ak) = state.api_key() {
                 db_kwargs.insert(
                     "adbc.flight.sql.rpc.call_header.authorization".to_string(),
                     serde_json::Value::String(format!("Bearer {ak}")),
@@ -1341,9 +1348,11 @@ impl Handler for SpidapterHandler {
                 serde_json::Value::String(state.password().to_string()),
             ),
         ]);
-        if let RunState::Local(local_state) = &state
-            && let Some(ak) = &local_state.flight_api_key
-        {
+        // FlightSQL DoGet authenticates per-call, not via the handshake
+        // username/password, so the read config must carry a `Bearer` call
+        // header for both SCP (Spice Cloud) and local direct-ingest clusters.
+        // Key off `state.api_key()` rather than matching only `RunState::Local`.
+        if let Some(ak) = state.api_key() {
             read_db_kwargs.insert(
                 "adbc.flight.sql.rpc.call_header.authorization".to_string(),
                 serde_json::Value::String(format!("Bearer {ak}")),

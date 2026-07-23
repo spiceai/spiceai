@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use super::keys::extract_primary_keys;
-use crate::dynamodb::utils::scalar_to_attribute_value;
+use crate::utils::scalar_to_attribute_value;
 use arrow::array::{ArrayRef, RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use aws_sdk_dynamodb::Client as DbClient;
