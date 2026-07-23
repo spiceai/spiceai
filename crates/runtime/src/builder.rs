@@ -522,6 +522,14 @@ impl RuntimeBuilder {
         let duckdb_query_pool_cap = {
             let cayenne_active = compaction_memory_fraction.is_some();
             let total_memory = crate::resource_monitor::get_total_memory();
+            // DuckDB's own default memory_limit is ~80% of HOST RAM (not the cgroup
+            // limit), so project the un-coordinated ceiling from host memory —
+            // otherwise a container (host RAM > cgroup) would under-estimate it and
+            // skip coordination exactly where the OOM risk is highest.
+            let duckdb_default_per_instance =
+                crate::accelerator_memory_budget::duckdb_default_per_instance_bytes(
+                    crate::resource_monitor::get_host_memory(),
+                );
             let base_query_budget = crate::datafusion::builder::effective_query_memory_limit(
                 None,
                 cayenne_active,
@@ -530,6 +538,7 @@ impl RuntimeBuilder {
             );
             let plan = crate::accelerator_memory_budget::plan(
                 total_memory,
+                duckdb_default_per_instance,
                 base_query_budget,
                 memory_limit,
                 &duckdb_budget_inputs,
@@ -538,7 +547,12 @@ impl RuntimeBuilder {
                 plan.per_instance_cap_bytes,
                 plan.duckdb_reservation_bytes,
             );
-            emit_duckdb_memory_budget_warning(&plan, total_memory, &duckdb_budget_inputs);
+            emit_duckdb_memory_budget_warning(
+                &plan,
+                total_memory,
+                duckdb_default_per_instance,
+                &duckdb_budget_inputs,
+            );
             plan.query_pool_cap_bytes
         };
 
@@ -1277,6 +1291,7 @@ fn duckdb_budget_inputs(
 fn emit_duckdb_memory_budget_warning(
     plan: &crate::accelerator_memory_budget::AcceleratorMemoryPlan,
     total_memory: u64,
+    duckdb_default_per_instance: u64,
     inputs: &crate::accelerator_memory_budget::DuckDbBudgetInputs,
 ) {
     use crate::accelerator_memory_budget::PlanOutcome;
@@ -1290,7 +1305,9 @@ fn emit_duckdb_memory_budget_warning(
     let total_h = hb(total_memory);
     let query_h = hb(plan.effective_query_pool_bytes);
     let per_instance_h = hb(plan.per_instance_cap_bytes);
-    let duckdb_default_h = hb(total_memory.saturating_mul(80) / 100);
+    // DuckDB's own default is ~80% of HOST RAM (not the cgroup total) — the value the
+    // projection/decision used.
+    let duckdb_default_h = hb(duckdb_default_per_instance);
     let mixed = if inputs.has_mixed_instance {
         " One or more DuckDB instances have inconsistent duckdb_memory_limit across the datasets that share them (mixed set/unset, or different explicit values); because DuckDB's memory_limit is per-instance the last dataset created wins, so set it consistently on all datasets sharing an instance."
     } else {

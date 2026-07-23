@@ -60,9 +60,10 @@ const DUCKDB_COORD_QUERY_MIN_FRACTION: u64 = 4;
 /// over-commit, which is surfaced as a stronger warning).
 const DUCKDB_MIN_INSTANCE_CAP_BYTES: u64 = 128 * 1024 * 1024;
 
-/// `DuckDB`'s own default `memory_limit` as a fraction of RAM — used ONLY to project
-/// the un-coordinated ceiling for the warning. `DuckDB` reads *host* RAM (not the
-/// cgroup limit), so in a container this projection is a lower bound.
+/// `DuckDB`'s own default `memory_limit` as a fraction of the RAM it sees. Applied to
+/// HOST RAM (see [`duckdb_default_per_instance_bytes`]) — `DuckDB` sizes its default
+/// from host RAM, not the cgroup limit — so the coordinated projection stays accurate
+/// even in a container where host RAM exceeds the cgroup total.
 const DUCKDB_DEFAULT_MEMORY_PERCENT: u64 = 80;
 
 const MIB: u64 = 1024 * 1024;
@@ -189,9 +190,24 @@ impl AcceleratorMemoryPlan {
     }
 }
 
+/// `DuckDB`'s own default `memory_limit` for one un-limited instance — `~80%` of the
+/// RAM `DuckDB` sees. Computed from HOST RAM (pass `resource_monitor::get_host_memory`),
+/// NOT the cgroup total: `DuckDB` sizes its default from host RAM, so in a container the
+/// real per-instance ceiling can exceed the cgroup limit. The coordinated budget must
+/// project *this* value — using the (smaller) cgroup total would under-estimate the
+/// ceiling and wrongly no-op, leaving the container OOM risk this feature prevents.
+#[must_use]
+pub fn duckdb_default_per_instance_bytes(host_memory: u64) -> u64 {
+    host_memory.saturating_mul(DUCKDB_DEFAULT_MEMORY_PERCENT) / 100
+}
+
 /// Computes the coordinated memory plan.
 ///
-/// * `total_memory` — cgroup-aware total (from `resource_monitor::get_total_memory`).
+/// * `total_memory` — cgroup-aware total (from `resource_monitor::get_total_memory`);
+///   the ceiling everything must fit within.
+/// * `duckdb_default_per_instance` — `DuckDB`'s own default ceiling for one un-limited
+///   instance, from HOST RAM (see [`duckdb_default_per_instance_bytes`]) so the
+///   projection is correct in containers, not the cgroup total.
 /// * `base_query_budget` — what the query pool WOULD be with no `DuckDB` coordination,
 ///   i.e. `effective_query_memory_limit(None, cayenne_active, cdc, None)` — 90% of
 ///   RAM (non-Cayenne) or the reduced 70%-based Cayenne region. Splitting *this*
@@ -202,6 +218,7 @@ impl AcceleratorMemoryPlan {
 #[must_use]
 pub fn plan(
     total_memory: u64,
+    duckdb_default_per_instance: u64,
     base_query_budget: u64,
     query_explicit: Option<u64>,
     inputs: &DuckDbBudgetInputs,
@@ -213,10 +230,9 @@ pub fn plan(
     let base = base_query_budget;
 
     // Un-coordinated projection (each un-limited instance grabbing DuckDB's own
-    // ~80% default, on top of the query default / explicit limit and the honored
-    // explicit ceilings). This is what the warning quotes.
-    let duckdb_default_per_instance =
-        total_memory.saturating_mul(DUCKDB_DEFAULT_MEMORY_PERCENT) / 100;
+    // ~80%-of-HOST-RAM default, on top of the query default / explicit limit and the
+    // honored explicit ceilings). This is what the warning quotes and what the
+    // NoOp/coordination decision turns on.
     let projected_ceiling_bytes = query_explicit
         .unwrap_or(base)
         .saturating_add(sum_explicit)
@@ -316,6 +332,17 @@ mod tests {
     const GIB: u64 = 1024 * 1024 * 1024;
     const MIB: u64 = 1024 * 1024;
 
+    /// Bare-metal-equivalent `plan()` where host RAM == cgroup total, so `DuckDB`'s
+    /// per-instance default is `total * 80 / 100`.
+    fn plan_bare(
+        total: u64,
+        base: u64,
+        query: Option<u64>,
+        inputs: &DuckDbBudgetInputs,
+    ) -> AcceleratorMemoryPlan {
+        plan(total, total.saturating_mul(80) / 100, base, query, inputs)
+    }
+
     /// Whole-MiB floor — per-instance caps are floored so they match `DuckDB`'s
     /// applied `SET memory_limit` (see `format_duckdb_memory_limit`).
     fn floor_mib(bytes: u64) -> u64 {
@@ -340,7 +367,7 @@ mod tests {
     #[test]
     fn no_duckdb_is_noop() {
         let (total, base) = total_and_base();
-        let p = plan(total, base, None, &DuckDbBudgetInputs::default());
+        let p = plan_bare(total, base, None, &DuckDbBudgetInputs::default());
         assert_eq!(p.outcome, PlanOutcome::NoOp);
         assert_eq!(p.per_instance_cap_bytes, 0);
         assert_eq!(p.query_pool_cap_bytes, None);
@@ -349,9 +376,46 @@ mod tests {
 
     #[test]
     fn degenerate_host_is_noop() {
-        let p = plan(0, 0, None, &unset(3));
+        let p = plan_bare(0, 0, None, &unset(3));
         assert_eq!(p.outcome, PlanOutcome::NoOp);
         assert_eq!(p.per_instance_cap_bytes, 0);
+    }
+
+    /// Container case: `DuckDB` sizes its default `memory_limit` from HOST RAM, which
+    /// exceeds the cgroup limit. A small explicit query pool + one un-limited instance
+    /// projects to *fit* under a cgroup-based default (would wrongly NoOp) but
+    /// over-commits under the real host-based default — so coordination must engage.
+    #[test]
+    fn container_host_ram_default_engages_coordination() {
+        let cgroup_total = 16 * GIB;
+        let host_memory = 64 * GIB; // host >> cgroup (containerized)
+        let host_default = super::duckdb_default_per_instance_bytes(host_memory); // 51.2 GiB
+        let base = cgroup_total * 90 / 100;
+        let q = 2 * GIB; // small explicit query pool
+
+        let inputs = DuckDbBudgetInputs {
+            num_unset_instances: 1,
+            ..Default::default()
+        };
+
+        // Host-based (correct): projected = 2 + 51.2 = 53.2 GiB > 16 GiB cgroup → Applied.
+        let p = plan(cgroup_total, host_default, base, Some(q), &inputs);
+        assert_eq!(
+            p.outcome,
+            PlanOutcome::Applied,
+            "the host-RAM default must engage coordination in a container"
+        );
+        assert!(p.per_instance_cap_bytes > 0);
+
+        // Counterfactual: a cgroup-based default (16 GiB * 80% = 12.8 GiB) projects to
+        // 2 + 12.8 = 14.8 GiB ≤ 16 GiB and would wrongly NoOp — the bug host RAM fixes.
+        let cgroup_default = cgroup_total * 80 / 100;
+        let wrong = plan(cgroup_total, cgroup_default, base, Some(q), &inputs);
+        assert_eq!(
+            wrong.outcome,
+            PlanOutcome::NoOp,
+            "a cgroup-based default under-estimates and skips coordination"
+        );
     }
 
     /// A single un-limited instance (file or memory): query and `DuckDB` each get
@@ -359,7 +423,7 @@ mod tests {
     #[test]
     fn single_unset_instance_splits_in_half() {
         let (total, base) = total_and_base();
-        let p = plan(total, base, None, &unset(1));
+        let p = plan_bare(total, base, None, &unset(1));
         assert_eq!(p.outcome, PlanOutcome::Applied);
         assert_eq!(p.effective_query_pool_bytes, base / 2);
         assert_eq!(p.per_instance_cap_bytes, floor_mib(base - base / 2));
@@ -375,7 +439,7 @@ mod tests {
     fn n_unset_instances_split_equally() {
         let (total, base) = total_and_base();
         for n in [2_u32, 3, 5, 8] {
-            let p = plan(total, base, None, &unset(n));
+            let p = plan_bare(total, base, None, &unset(n));
             assert_eq!(p.outcome, PlanOutcome::Applied);
             let duckdb_half = base - p.effective_query_pool_bytes;
             assert_eq!(
@@ -395,7 +459,7 @@ mod tests {
     fn per_instance_cap_is_mib_aligned() {
         let (total, base) = total_and_base();
         for n in 1..=8_u32 {
-            let p = plan(total, base, None, &unset(n));
+            let p = plan_bare(total, base, None, &unset(n));
             assert_eq!(
                 p.per_instance_cap_bytes % MIB,
                 0,
@@ -422,7 +486,7 @@ mod tests {
             unset_instance_labels: vec!["db-unset".to_string()],
             ..Default::default()
         };
-        let p = plan(total, base, None, &inputs);
+        let p = plan_bare(total, base, None, &inputs);
         assert_eq!(p.outcome, PlanOutcome::Applied);
         // reservation = explicit + one capped instance
         assert_eq!(
@@ -443,7 +507,7 @@ mod tests {
             sum_explicit_bytes: GIB, // 1 GiB total, well under the 10% headroom
             ..Default::default()
         };
-        let p = plan(total, base, None, &inputs);
+        let p = plan_bare(total, base, None, &inputs);
         assert_eq!(p.outcome, PlanOutcome::NoOp);
         assert_eq!(p.per_instance_cap_bytes, 0);
         assert_eq!(p.query_pool_cap_bytes, None);
@@ -461,7 +525,7 @@ mod tests {
             num_unset_instances: 1,
             ..Default::default()
         };
-        let p = plan(total, base, Some(q), &inputs);
+        let p = plan_bare(total, base, Some(q), &inputs);
         assert_eq!(p.outcome, PlanOutcome::NoOp);
         assert_eq!(p.per_instance_cap_bytes, 0); // nothing capped
         assert_eq!(p.duckdb_reservation_bytes, total * 80 / 100);
@@ -477,7 +541,7 @@ mod tests {
             sum_explicit_bytes: 20 * GIB, // 90% (28.8) + 20 = 48.8 > 32 → over-commit
             ..Default::default()
         };
-        let p = plan(total, base, None, &inputs);
+        let p = plan_bare(total, base, None, &inputs);
         assert_eq!(p.outcome, PlanOutcome::Applied);
         assert_eq!(p.per_instance_cap_bytes, 0); // nothing to inject
         assert_eq!(p.effective_query_pool_bytes, base - 20 * GIB);
@@ -496,7 +560,7 @@ mod tests {
             sum_explicit_bytes: sum_explicit,
             ..Default::default()
         };
-        let p = plan(total, base, None, &inputs);
+        let p = plan_bare(total, base, None, &inputs);
         assert_eq!(p.outcome, PlanOutcome::Applied);
         assert_eq!(p.per_instance_cap_bytes, 0); // nothing to inject (all explicit)
         assert_eq!(p.effective_query_pool_bytes, GIB); // exactly base − Σexplicit
@@ -513,7 +577,7 @@ mod tests {
     fn explicit_query_is_honored() {
         let (total, base) = total_and_base();
         let q = 10 * GIB;
-        let p = plan(total, base, Some(q), &unset(2));
+        let p = plan_bare(total, base, Some(q), &unset(2));
         assert_eq!(p.outcome, PlanOutcome::Applied);
         assert_eq!(p.effective_query_pool_bytes, q);
         assert_eq!(p.query_pool_cap_bytes, None); // never override an explicit limit
@@ -526,7 +590,7 @@ mod tests {
     fn explicit_query_overcommits_flags_residual() {
         let (total, base) = total_and_base();
         let q = base; // query takes the whole splittable region
-        let p = plan(total, base, Some(q), &unset(2));
+        let p = plan_bare(total, base, Some(q), &unset(2));
         assert_eq!(p.outcome, PlanOutcome::Applied);
         assert_eq!(p.effective_query_pool_bytes, q);
         assert_eq!(p.query_pool_cap_bytes, None);
@@ -540,7 +604,7 @@ mod tests {
     fn tiny_host_many_instances_floors_and_flags() {
         let total = 2 * GIB;
         let base = total * 90 / 100;
-        let p = plan(total, base, None, &unset(64));
+        let p = plan_bare(total, base, None, &unset(64));
         assert_eq!(p.outcome, PlanOutcome::Applied);
         assert_eq!(p.per_instance_cap_bytes, DUCKDB_MIN_INSTANCE_CAP_BYTES);
         assert!(p.residual_overcommit);
@@ -552,7 +616,7 @@ mod tests {
     fn cayenne_base_splits_within_region() {
         let total = 64 * GIB;
         let base = total * 70 / 100; // Cayenne query region
-        let p = plan(total, base, None, &unset(2));
+        let p = plan_bare(total, base, None, &unset(2));
         assert_eq!(p.outcome, PlanOutcome::Applied);
         assert!(p.effective_query_pool_bytes + p.duckdb_reservation_bytes <= base);
         // ...and therefore leaves the Cayenne tier (host/5) + headroom (host/10) intact.
@@ -565,7 +629,7 @@ mod tests {
     fn applied_without_residual_never_overcommits_base() {
         let (total, base) = total_and_base();
         for n in 1..=16_u32 {
-            let p: AcceleratorMemoryPlan = plan(total, base, None, &unset(n));
+            let p: AcceleratorMemoryPlan = plan_bare(total, base, None, &unset(n));
             if p.outcome == PlanOutcome::Applied && !p.residual_overcommit {
                 assert!(
                     p.effective_query_pool_bytes + p.duckdb_reservation_bytes <= base,
