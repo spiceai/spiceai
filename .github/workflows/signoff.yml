@@ -30,11 +30,11 @@ on:
         description: 'Branch to sign off (must be pushed to origin)'
         required: true
         type: string
-      run_targeted_lint:
-        description: 'Run the branch-scoped targeted pre-lint (currently unreliable on this runner; leave off unless debugging it)'
+      skip_targeted_lint:
+        description: 'Skip the branch-scoped targeted pre-lint'
         required: false
         type: boolean
-        default: true
+        default: false
 
 concurrency:
   group: signoff-${{ github.event.inputs.branch }}
@@ -154,9 +154,7 @@ jobs:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-          # Targeted lint currently breaks signoffs on this runner; keep it off
-          # by default and let a dispatcher opt in via the run_targeted_lint input.
-          SIGNOFF_SKIP_TARGETED_LINT: ${{ inputs.run_targeted_lint && '' || '1' }}
+          SIGNOFF_SKIP_TARGETED_LINT: ${{ inputs.skip_targeted_lint }}
 
       - name: Show sccache stats
         if: env.SCCACHE_SETUP == 'true'
