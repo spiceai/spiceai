@@ -54,6 +54,13 @@ use axum::http::header;
 #[cfg(any(feature = "debezium", feature = "openapi"))]
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[cfg_attr(
+    not(feature = "debezium"),
+    expect(
+        dead_code,
+        reason = "constructed only on the debezium ingest path; still referenced by the OpenAPI schema and serialization derives"
+    )
+)]
 pub struct CdcIngestResponse {
     /// Number of change rows applied.
     pub applied: usize,
