@@ -3554,8 +3554,10 @@ mod tests {
             JoinType::Inner,
             NullEquality::NullEqualsNothing,
         ));
-        // ~240 MB build < 0.9 × 400 MiB ≈ 360 MiB gate, and below the full pool.
-        let config = config_with_cayenne_optimizer(None, Some(0.9), Some(400 * 1024 * 1024));
+        // ~240 MB raw build → ~600 MB with the 2.5× HT overhead, still under the
+        // 0.9 × 1 GiB ≈ 921 MiB absolute gate (and its full-pool fair share for a
+        // lone join), so the join keeps its non-spillable hash join.
+        let config = config_with_cayenne_optimizer(None, Some(0.9), Some(1024 * 1024 * 1024));
 
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
@@ -3586,9 +3588,10 @@ mod tests {
             make_join("c.vortex", "d.vortex"),
         ])
         .expect("union of two same-schema joins should be valid");
-        // Same 0.9 × 400 MiB config: each ~240 MB build is under the ~360 MiB
-        // absolute gate but over its 200 MiB fair share (pool / 2 joins).
-        let config = config_with_cayenne_optimizer(None, Some(0.9), Some(400 * 1024 * 1024));
+        // Same 0.9 × 1 GiB config: each ~600 MB build (240 MB × 2.5 HT overhead)
+        // is under the ~921 MiB absolute gate but over its 512 MiB fair share
+        // (pool / 2 joins), so only the fair-share term fires.
+        let config = config_with_cayenne_optimizer(None, Some(0.9), Some(1024 * 1024 * 1024));
 
         let optimized = optimize_anti_join_sort_merge_with_config(plan, &config);
 
