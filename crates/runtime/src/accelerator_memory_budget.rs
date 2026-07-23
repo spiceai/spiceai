@@ -249,20 +249,26 @@ pub fn plan(
     let query_floor = base / DUCKDB_COORD_QUERY_MIN_FRACTION;
 
     // Query target: honor an explicit limit; otherwise take a share of the
-    // splittable region (half when contested with un-limited instances, the whole
-    // remainder when every instance is explicit), floored so queries aren't starved.
+    // splittable region.
     let (query_target, query_pool_cap) = match query_explicit {
-        Some(q) => (q, None),
+        // Contested with un-limited instances: give the query pool ~half, floored so
+        // queries aren't starved — the un-limited instances (whose caps we DO control)
+        // absorb the squeeze instead.
         None if unset > 0 => {
             let target = (base_free.saturating_mul(DUCKDB_QUERY_SPLIT_PERCENT) / 100)
                 .max(query_floor)
                 .min(base);
             (target, Some(target))
         }
-        None => {
-            let target = base_free.max(query_floor).min(base);
-            (target, Some(target))
-        }
+        // All instances explicit: their ceilings are FIXED, so the query pool takes
+        // exactly what they leave (base − Σexplicit) — even below the query floor —
+        // rather than being forced up to the floor and thereby DELIBERATELY
+        // over-committing. When Σexplicit ≥ base, `base_free` is 0 and the query pool
+        // is squeezed to nothing; `residual_overcommit` below then flags the genuine
+        // case (the explicit ceilings alone exceed the query region). The n==0
+        // warning reports the reduced query pool so a very small value is surfaced.
+        None => (base_free, Some(base_free)),
+        Some(q) => (q, None),
     };
 
     // Per-instance cap: equal split of whatever the query target and honored
@@ -476,6 +482,29 @@ mod tests {
         assert_eq!(p.per_instance_cap_bytes, 0); // nothing to inject
         assert_eq!(p.effective_query_pool_bytes, base - 20 * GIB);
         assert_eq!(p.query_pool_cap_bytes, Some(base - 20 * GIB));
+    }
+
+    /// All instances explicit with ceilings summing to just under `base`: the query
+    /// pool shrinks to exactly what they leave (BELOW the query floor) and the plan
+    /// FITS, rather than being forced to the floor and deliberately over-committing.
+    #[test]
+    fn all_explicit_near_base_shrinks_query_below_floor_without_overcommit() {
+        let (total, base) = total_and_base();
+        let sum_explicit = base - GIB; // base_free = 1 GiB, well below the base/4 floor
+        let inputs = DuckDbBudgetInputs {
+            num_explicit_instances: 3,
+            sum_explicit_bytes: sum_explicit,
+            ..Default::default()
+        };
+        let p = plan(total, base, None, &inputs);
+        assert_eq!(p.outcome, PlanOutcome::Applied);
+        assert_eq!(p.per_instance_cap_bytes, 0); // nothing to inject (all explicit)
+        assert_eq!(p.effective_query_pool_bytes, GIB); // exactly base − Σexplicit
+        assert!(
+            !p.residual_overcommit,
+            "fits by shrinking the query pool below the floor"
+        );
+        assert!(p.effective_query_pool_bytes + p.duckdb_reservation_bytes <= base);
     }
 
     /// An explicit query limit is honored verbatim (never auto-reduced); the unset
