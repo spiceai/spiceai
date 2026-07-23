@@ -39,7 +39,6 @@ use crate::index::chunking::{ChunkedSearchIndex, ChunkedVectorIndex};
 use crate::index::compound::{CompoundSearchIndex, CompoundVectorIndex};
 #[cfg(feature = "llms")]
 pub(crate) mod write_util;
-use crate::index::chunking::ChunkedVectorIndex;
 #[cfg(feature = "llms")]
 pub use memory::MemoryVectorIndex;
 pub use native_vector::NativeVectorIndex;

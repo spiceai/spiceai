@@ -19,7 +19,7 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use runtime_datafusion_index::Index;
 
 use crate::index::s3_vectors::S3Vector;
-use crate::index::s3_vectors::write::extract_and_format_primary_key;
+use crate::index::write_util::extract_and_format_primary_key;
 
 /// Deletes exact keys from `index`. `keys` must have every column of `index.primary_key`
 /// (extras are ignored — only `index.primary_key`'s own columns are read from `keys`).
