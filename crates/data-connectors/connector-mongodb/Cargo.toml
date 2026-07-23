@@ -46,5 +46,12 @@ tracing.workspace = true
 [features]
 default = []
 
+[dev-dependencies]
+criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
+
+[[bench]]
+name = "mongodb_change_stream"
+harness = false
+
 [lints]
 workspace = true
