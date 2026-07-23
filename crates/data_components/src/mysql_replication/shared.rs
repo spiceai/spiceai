@@ -1946,8 +1946,8 @@ async fn handle_purged_position(
         InvalidCheckpointBehavior::Restart => {
             tracing::warn!(
                 connection = %connection,
-                position = %resume,
-                "shared mysql binlog resume position was purged; invalid_checkpoint_behavior=restart, re-snapshotting all members from the current head"
+                purged_position = %resume,
+                "shared mysql binlog resume position was purged; invalid_checkpoint_behavior=restart, re-snapshotting all members from the current source head"
             );
             match rebootstrap_all_for_restart(source, params, use_gtid).await {
                 Ok(()) => PurgeOutcome::Rebootstrapped,
@@ -1992,6 +1992,11 @@ async fn rebootstrap_all_for_restart(
     if let Err(e) = conn.disconnect().await {
         tracing::debug!(error = %e, "re-snapshot head-fetch disconnect");
     }
+    tracing::info!(
+        connection = %source.key.label(),
+        new_head = %head,
+        "re-snapshotting shared mysql binlog members from the current source head"
+    );
     for (key, member) in source.live_members() {
         if member.sender.is_closed() {
             continue;
