@@ -781,13 +781,30 @@ async fn attach_member(
     // GTID auto-positioning is used whenever the source reports gtid_mode = ON
     // (all members share the connection, so all agree). Failover-safe; decides
     // the member's cursor type at bootstrap and drives the shared dump.
-    let use_gtid =
-        super::setup::gtid_mode_is_on(super::setup::detect_gtid_mode(&mut conn).await?.as_deref());
+    let gtid_mode = super::setup::detect_gtid_mode(&mut conn).await?;
+    let use_gtid = super::setup::gtid_mode_is_on(gtid_mode.as_deref());
     let cursor_type = if use_gtid {
         CursorType::Gtid
     } else {
         CursorType::File
     };
+    // Surface the positioning mode and — when GTID is unavailable — WHY, plus
+    // the operational consequence. GTID is auto-on whenever the source reports
+    // `gtid_mode = ON`; anything else (OFF, ON_PERMISSIVE, or unreadable) falls
+    // back to file+offset, which cannot survive a source failover/promotion.
+    let member_label = format_member(&member_key);
+    if use_gtid {
+        tracing::info!(
+            dataset = %dataset_name,
+            "MySQL replication for {member_label}: GTID auto-positioning active (failover-safe resume)."
+        );
+    } else {
+        tracing::warn!(
+            dataset = %dataset_name,
+            "MySQL replication for {member_label}: file+offset positioning (gtid_mode is `{}`, not `ON`); resume is not failover-safe - a source failover forces a full re-snapshot.",
+            gtid_mode.as_deref().unwrap_or("unavailable")
+        );
+    }
     let rejoining = lock(&source.detached).remove(&member_key);
     let (floor, gtid_seed, snapshotting): (BinlogPosition, GtidSet, bool) = resolve_start_position(
         &mut conn,
@@ -838,11 +855,6 @@ async fn attach_member(
         snapshot = snapshotting,
         rejoining,
         members = source.live_member_count(),
-        // GTID on/off is decided by the source's `gtid_mode` and drives the
-        // cursor type; surface it here so every join (cold or resume) shows
-        // whether failover-safe GTID positioning is active.
-        gtid = use_gtid,
-        cursor = %cursor_type.as_str(),
         "dataset joined shared mysql binlog group"
     );
 
@@ -1728,6 +1740,10 @@ async fn deliver_commit(
 /// Route a statement affecting a subscribed table: TRUNCATE is applied as a
 /// change; a schema-change DDL is member-fatal (adoption happens on the next
 /// `TableMap` for compatible changes).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each arg is a distinct piece of binlog-event context"
+)]
 async fn handle_statement(
     source: &Arc<SharedSource>,
     statement: &str,
