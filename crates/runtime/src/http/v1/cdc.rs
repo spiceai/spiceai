@@ -32,7 +32,7 @@ use axum::{
     Json,
     body::Bytes,
     extract::Path,
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
@@ -42,9 +42,18 @@ use super::require_write_access;
 
 #[cfg(feature = "debezium")]
 use crate::dataconnector::cdc_ingest::{self, Error as IngestError};
+#[cfg(feature = "debezium")]
+use axum::http::header;
 
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[cfg_attr(
+    not(feature = "debezium"),
+    expect(
+        dead_code,
+        reason = "constructed only on the debezium ingest path; still referenced by the OpenAPI schema and serialization derives"
+    )
+)]
 pub struct CdcIngestResponse {
     /// Number of change rows applied.
     pub applied: usize,
@@ -92,13 +101,13 @@ pub(crate) async fn post(Path(name): Path<String>, headers: HeaderMap, body: Byt
     #[cfg(not(feature = "debezium"))]
     {
         let _ = (name, headers, body);
-        return (
+        (
             StatusCode::NOT_IMPLEMENTED,
             Json(json!({
                 "message": "CDC ingest requires the debezium feature to be enabled in this spiced build"
             })),
         )
-            .into_response();
+            .into_response()
     }
 
     #[cfg(feature = "debezium")]
