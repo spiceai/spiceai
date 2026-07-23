@@ -346,7 +346,7 @@ impl GitHubTableArgs for PullRequestTableArgs {
                     r#"
             {{
                 repository(owner: "{owner}", name: "{name}") {{
-                    pullRequests(first: {page_size}) {{
+                    pullRequests(first: {page_size}, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{
                         pageInfo {{
                             hasNextPage
                             endCursor
@@ -554,7 +554,7 @@ fn gql_schema(comments_type: &PullRequestCommentType) -> SchemaRef {
 #[cfg(test)]
 mod tests {
     use super::{PullRequestCommentType, PullRequestTableArgs};
-    use crate::GitHubQueryMode;
+    use crate::{GitHubQueryMode, GitHubTableArgs};
     use app::AppBuilder;
     use runtime::builder::RuntimeBuilder;
     use runtime::component::dataset::builder::DatasetBuilder;
@@ -637,5 +637,18 @@ mod tests {
         let mut a = args(PullRequestCommentType::All, 1_000);
         a.max_comments_fetched = 2_000;
         assert!(a.check_node_limit().is_err());
+    }
+
+    #[test]
+    fn auto_mode_query_orders_by_updated_at_desc() {
+        // Deterministic UPDATED_AT-descending order is the prerequisite for
+        // watermark-based early-exit pagination on append refreshes.
+        let a = args(PullRequestCommentType::None, 25);
+        let params = a.get_graphql_values();
+        let query = params.query.as_ref();
+        assert!(
+            query.contains("orderBy: {field: UPDATED_AT, direction: DESC}"),
+            "auto-mode pull_requests query must order by UPDATED_AT DESC, got:\n{query}"
+        );
     }
 }
