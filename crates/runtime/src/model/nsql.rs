@@ -702,6 +702,8 @@ fn dataset_search_function_availability(
 }
 
 fn is_vector_search_index(kind: &str) -> bool {
+    // `"CompoundVectorIndex"` is how `compound_index_kind` reports a vector-composing
+    // `CompoundSearchIndex`; without it here, such a compound would never match a column.
     matches!(
         kind,
         "NativeVectorIndex"
@@ -710,6 +712,7 @@ fn is_vector_search_index(kind: &str) -> bool {
             | "s3_vector_index"
             | "ChunkedSearchIndex"
             | "ChunkedVectorIndex"
+            | "CompoundVectorIndex"
     )
 }
 

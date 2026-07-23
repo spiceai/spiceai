@@ -225,7 +225,7 @@ pub(crate) async fn add_compound_fts_to_table(
         Ok(index) => index,
         Err(source) => {
             tracing::warn!(
-                "Not adding a warm full-text search index for dataset {tbl}: {source} Full-text searches will be served by Elasticsearch directly."
+                "Not adding a warm full-text search index for dataset {tbl}: {source}. Full-text searches will be served by Elasticsearch directly."
             );
             return Ok(register_index(
                 &inner_table_provider,
@@ -242,7 +242,7 @@ pub(crate) async fn add_compound_fts_to_table(
         Ok(compound) => compound,
         Err(source) => {
             tracing::warn!(
-                "Not adding a warm full-text search index for dataset {tbl}: {source} Full-text searches will be served by Elasticsearch directly."
+                "Not adding a warm full-text search index for dataset {tbl}: {source}. Full-text searches will be served by Elasticsearch directly."
             );
             return Ok(register_index(
                 &inner_table_provider,

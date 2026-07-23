@@ -52,12 +52,12 @@ pub async fn as_es_text_candidate_generations(
     df: Arc<dyn QueryEngine>,
     tbl: TableReference,
 ) -> Result<Vec<Arc<dyn CandidateGeneration>>, search::generation::Error> {
-    use crate::candidate::elasticsearch_text::ElasticsearchTextSearchCandidate;
+    use crate::candidate::udtf_text::UdtfTextSearchCandidate;
 
     let mut generators = vec![];
     for idx in indexes {
         for field in &idx.search_fields {
-            generators.push(Arc::new(ElasticsearchTextSearchCandidate::new(
+            generators.push(Arc::new(UdtfTextSearchCandidate::new(
                 field.clone(),
                 Arc::clone(&df),
                 tbl.clone(),
@@ -80,11 +80,10 @@ pub async fn as_compound_text_candidate_generations(
     df: Arc<dyn QueryEngine>,
     tbl: TableReference,
 ) -> Result<Vec<Arc<dyn CandidateGeneration>>, search::generation::Error> {
-    use crate::candidate::elasticsearch_text::ElasticsearchTextSearchCandidate;
+    use crate::candidate::udtf_text::UdtfTextSearchCandidate;
 
-    Ok(vec![Arc::new(ElasticsearchTextSearchCandidate::new(
-        search_column,
-        df,
-        tbl,
-    )) as Arc<dyn CandidateGeneration>])
+    Ok(vec![
+        Arc::new(UdtfTextSearchCandidate::new(search_column, df, tbl))
+            as Arc<dyn CandidateGeneration>,
+    ])
 }
