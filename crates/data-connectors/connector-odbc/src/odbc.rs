@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::odbcconn::ODBCDbConnectionPool;
 use async_trait::async_trait;
 use data_components::function_support::FunctionSupport;
 use datafusion::{
@@ -21,7 +22,6 @@ use datafusion::{
     sql::{TableReference, unparser::dialect::Dialect},
 };
 use datafusion_table_providers::sql::sql_provider_datafusion::{SqlTable, expr::Engine};
-use db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
 use snafu::prelude::*;
 use std::sync::Arc;
 

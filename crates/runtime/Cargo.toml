@@ -375,7 +375,7 @@ s3_vectors = [
     "search/s3_vectors",
     "runtime-search/s3_vectors",
 ]
-scylladb = ["db_connection_pool/scylladb"]
+scylladb = []
 sftp = ["runtime-object-store/sftp"]
 sharepoint = ["data_components/sharepoint"]
 smb = ["runtime-object-store/smb"]

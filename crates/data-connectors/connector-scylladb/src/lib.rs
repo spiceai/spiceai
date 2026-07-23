@@ -32,10 +32,10 @@ limitations under the License.
 pub mod scylladb;
 
 use crate::scylladb::ScyllaDbTableFactory;
+use crate::scylladb::pool::ScyllaDbConnectionPool;
 use async_trait::async_trait;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
-use db_connection_pool::scylladbpool::ScyllaDbConnectionPool;
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{

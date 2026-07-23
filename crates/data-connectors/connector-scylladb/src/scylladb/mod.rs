@@ -26,7 +26,9 @@ limitations under the License.
 //!
 //! Non-key filters and complex expressions are evaluated locally by `DataFusion`.
 
+pub mod conn;
 mod cql_dialect;
+pub mod pool;
 pub mod table_schema;
 
 use std::{fmt, sync::Arc};

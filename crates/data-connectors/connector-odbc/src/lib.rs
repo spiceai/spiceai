@@ -14,9 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// odbcpool/odbcconn are exported (as they were in db_connection_pool) so clippy's
+// avoid-breaking-exported-api treats their public API items as exported; the
+// missing_errors_doc relaxation mirrors data_components/connector-git for moved code.
+#![allow(clippy::missing_errors_doc)]
+
 mod odbc;
+pub mod odbcconn;
+pub mod odbcpool;
 
 use crate::odbc::ODBCTableFactory;
+use crate::odbcconn::ODBCDbConnectionPool;
+use crate::odbcpool::ODBCPool;
 use async_trait::async_trait;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
@@ -24,8 +33,6 @@ use datafusion::sql::unparser::dialect::{
     CustomDialect, CustomDialectBuilder, DateFieldExtractStyle, DefaultDialect, Dialect,
     IntervalStyle, MySqlDialect, PostgreSqlDialect, SqliteDialect,
 };
-use db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
-use db_connection_pool::odbcpool::ODBCPool;
 use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
@@ -44,9 +51,7 @@ pub enum Error {
     #[snafu(display(
         "Failed to setup the ODBC connection pool. Verify the ODBC connection details are valid, and try again. {source}"
     ))]
-    UnableToCreateODBCConnectionPool {
-        source: db_connection_pool::odbcpool::Error,
-    },
+    UnableToCreateODBCConnectionPool { source: crate::odbcpool::Error },
     #[snafu(display(
         "Missing required parameter: {param}. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
     ))]

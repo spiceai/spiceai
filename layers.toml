@@ -76,10 +76,14 @@ charset = ["connector-imap"]
 imap = ["connector-imap"]
 mailparse = ["connector-imap"]
 
-# NOTE: scylla is intentionally NOT restricted here. The ScyllaDB provider moved
-# into connector-scylladb, but the ScyllaDbConnectionPool still lives in the shared
-# db_connection_pool crate (behind its `scylladb` feature), exactly like odbc-api.
-# So scylla is a shared pool driver, not a connector-confined one.
+# scylla now lives only in connector-scylladb (provider + pool + connection all moved
+# out of data_components / db_connection_pool), like clickhouse-rs.
+scylla = ["connector-scylladb"]
+
+# odbc-api + arrow-odbc now live only in connector-odbc (provider + pool + connection
+# all moved out of data_components / db_connection_pool), like clickhouse-rs.
+odbc-api = ["connector-odbc"]
+arrow-odbc = ["connector-odbc"]
 
 # Path-prefix rules (checked after per-crate overrides, in order).
 [[rules]]

@@ -4583,16 +4583,26 @@ dependencies = [
 name = "connector-odbc"
 version = "2.2.0-unstable"
 dependencies = [
+ "arrow",
+ "arrow-odbc",
+ "async-stream",
  "async-trait",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
- "db_connection_pool",
+ "dyn-clone",
+ "futures",
  "linkme",
+ "odbc-api",
  "paste",
  "runtime",
+ "secrecy",
+ "sha2 0.10.9",
  "snafu",
+ "tokio",
+ "tokio-util",
  "tracing",
+ "util",
 ]
 
 [[package]]
@@ -4648,11 +4658,12 @@ name = "connector-scylladb"
 version = "2.2.0-unstable"
 dependencies = [
  "arrow",
+ "async-stream",
  "async-trait",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
- "db_connection_pool",
+ "futures",
  "linkme",
  "ns_lookup",
  "paste",
@@ -6779,19 +6790,14 @@ name = "db_connection_pool"
 version = "2.2.0-unstable"
 dependencies = [
  "arrow",
- "arrow-odbc",
  "async-stream",
  "async-trait",
  "datafusion",
  "datafusion-table-providers",
- "dyn-clone",
  "futures",
- "odbc-api",
  "pkcs8",
- "scylla",
  "secrecy",
  "serde_json",
- "sha2 0.10.9",
  "snafu",
  "snowflake-api",
  "tokio",
