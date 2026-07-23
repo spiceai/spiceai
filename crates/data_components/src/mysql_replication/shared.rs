@@ -156,7 +156,7 @@ type MemberKey = (String, String);
 /// sets *distinct* explicit `mysql_replication_server_id`s gets *distinct* keys
 /// — i.e. separate dedicated dumps. That is the per-dataset opt-out seam, built
 /// from existing config with no new mechanism and no second engine.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct SourceKey {
     host: String,
     port: u16,
@@ -164,6 +164,24 @@ struct SourceKey {
     pass: Option<String>,
     ssl: Option<mysql_async::SslOpts>,
     server_id: u32,
+}
+
+// Manual, credential-redacting `Debug`: the key holds the password and full TLS
+// material, so a derived `Debug` risks leaking secrets into logs or a panic
+// message. Print only the safe connection label + `server_id`, and the mere
+// presence (not value) of a password / TLS config. For log lines prefer
+// [`SourceKey::label`].
+impl std::fmt::Debug for SourceKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceKey")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("pass", &self.pass.as_ref().map(|_| "<redacted>"))
+            .field("ssl", &self.ssl.as_ref().map(|_| "<redacted>"))
+            .field("server_id", &self.server_id)
+            .finish()
+    }
 }
 
 impl SourceKey {
