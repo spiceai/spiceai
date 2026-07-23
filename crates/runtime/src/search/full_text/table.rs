@@ -170,9 +170,10 @@ pub(crate) async fn add_elasticsearch_fts_to_table(
 /// Adds a compound (write-through + fallback) full-text search index to `inner_table_provider`:
 /// a warm local Tantivy tier in front of the external Elasticsearch tier.
 ///
-/// Writes fan out to both tiers; reads serve from the warm Tantivy index and fall back to
-/// Elasticsearch on empty results ([`CompoundReadMode::FallbackToSecondary`]). Only the compound
-/// index is registered, so discovery resolves to it ahead of the concrete indexes.
+/// Writes fan out to both tiers; reads serve from the warm Tantivy index, falling back to
+/// Elasticsearch on empty results only when `on_zero_results` is
+/// [`ZeroResultsAction::UseSource`] (mirrors the accelerator→source fallback setting). Only the
+/// compound index is registered, so discovery resolves to it ahead of the concrete indexes.
 ///
 /// Scope and graceful degradation:
 ///  - **Multi-column full-text search** is out of scope: one [`CompoundSearchIndex`] keys on a
@@ -190,7 +191,9 @@ pub(crate) async fn add_compound_fts_to_table(
     columns: &[spicepod::semantic::Column],
     tbl: &datafusion::sql::TableReference,
     fts_params: &crate::search::full_text::elasticsearch::ElasticsearchFtsParams,
+    on_zero_results: &crate::component::dataset::acceleration::ZeroResultsAction,
 ) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
+    use crate::component::dataset::acceleration::ZeroResultsAction;
     use search::index::SearchIndex;
     use search::index::compound::{CompoundReadMode, CompoundSearchIndex};
 
@@ -234,10 +237,17 @@ pub(crate) async fn add_compound_fts_to_table(
         }
     };
 
+    // Mirrors the accelerator→source `on_zero_results` setting: only fall back to the
+    // Elasticsearch secondary on an empty warm-tier result when the dataset opted in.
+    let read_mode = match on_zero_results {
+        ZeroResultsAction::ReturnEmpty => CompoundReadMode::PrimaryOnly,
+        ZeroResultsAction::UseSource => CompoundReadMode::FallbackToSecondary,
+    };
+
     let compound = match CompoundSearchIndex::try_new(
         Arc::new(warm_index) as Arc<dyn SearchIndex>,
         Arc::clone(&es_index) as Arc<dyn SearchIndex>,
-        CompoundReadMode::FallbackToSecondary,
+        read_mode,
     ) {
         Ok(compound) => compound,
         Err(source) => {
