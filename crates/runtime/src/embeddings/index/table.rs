@@ -461,51 +461,47 @@ async fn wrap_table_as_index_elasticsearch(
         )
         .await?;
 
-        provider = match chunking {
-            Some(chunking) => {
-                tracing::debug!(
-                    "[Elasticsearch][table={tbl}] Chunking column {}",
-                    es_index.embedded_column
-                );
-                // The Elasticsearch chunked query plan omits the chunk key column, so the
-                // fallback projection from a warm in-memory index onto Elasticsearch results
-                // cannot be built — serve reads from Elasticsearch directly.
-                tracing::debug!(
-                    "Not adding an in-memory warm vector index for table {tbl}: chunking is enabled on the Elasticsearch vector engine."
-                );
-                es_index.primary_key =
-                    ChunkedSearchIndex::augment_primary_key(es_index.primary_key);
+        provider = if let Some(chunking) = chunking {
+            tracing::debug!(
+                "[Elasticsearch][table={tbl}] Chunking column {}",
+                es_index.embedded_column
+            );
+            // The Elasticsearch chunked query plan omits the chunk key column, so the
+            // fallback projection from a warm in-memory index onto Elasticsearch results
+            // cannot be built — serve reads from Elasticsearch directly.
+            tracing::debug!(
+                "Not adding an in-memory warm vector index for table {tbl}: chunking is enabled on the Elasticsearch vector engine."
+            );
+            es_index.primary_key = ChunkedSearchIndex::augment_primary_key(es_index.primary_key);
 
-                construct_chunked_vector_index(
-                    provider,
-                    embedding_models,
-                    chunking,
-                    Arc::new(es_index) as Arc<dyn SearchIndex>,
-                    config.model.as_str(),
-                    file_format,
-                )
-                .await?
-            }
-            None => {
-                // Unlike S3 Vectors, the Elasticsearch list & query plans do not expose
-                // metadata columns, so the warm index must not store any — otherwise the
-                // fallback projection onto the Elasticsearch results cannot be built.
-                let vector_index = with_memory_warm_index(
-                    tbl,
-                    Arc::new(es_index.clone()) as Arc<dyn VectorIndex>,
-                    MetadataColumns::none(),
-                    Arc::clone(&es_index.compute_query),
-                    &embed_udf,
-                    &config.model,
-                    es_index.similarity.as_str(),
-                    on_zero_results,
-                );
+            construct_chunked_vector_index(
+                provider,
+                embedding_models,
+                chunking,
+                Arc::new(es_index) as Arc<dyn SearchIndex>,
+                config.model.as_str(),
+                file_format,
+            )
+            .await?
+        } else {
+            // Unlike S3 Vectors, the Elasticsearch list & query plans do not expose
+            // metadata columns, so the warm index must not store any — otherwise the
+            // fallback projection onto the Elasticsearch results cannot be built.
+            let vector_index = with_memory_warm_index(
+                tbl,
+                Arc::new(es_index.clone()) as Arc<dyn VectorIndex>,
+                MetadataColumns::none(),
+                Arc::clone(&es_index.compute_query),
+                &embed_udf,
+                &config.model,
+                es_index.similarity.as_str(),
+                on_zero_results,
+            );
 
-                provider.underlying = Arc::new(
-                    VectorScanTableProvider::try_new(provider.underlying, &vector_index).boxed()?,
-                ) as Arc<dyn TableProvider>;
-                provider.add_index(vector_index as Arc<dyn Index>)
-            }
+            provider.underlying = Arc::new(
+                VectorScanTableProvider::try_new(provider.underlying, &vector_index).boxed()?,
+            ) as Arc<dyn TableProvider>;
+            provider.add_index(vector_index as Arc<dyn Index>)
         };
     }
 
