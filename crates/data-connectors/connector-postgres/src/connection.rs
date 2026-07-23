@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,8 +17,9 @@ limitations under the License.
 //! Resolve Postgres connection identity for CDC using the same rules as
 //! `PostgresConnectionPool` in `datafusion-table-providers`.
 //!
-//! Keep [`parse_connection_string`] in sync with
-//! `datafusion_table_providers::sql::db_connection_pool::postgrespool`.
+//! [`parse_connection_string`] mirrors the pool helper (libpq key=value,
+//! default `sslmode=verify-full`) with a deliberate `split_once` improvement
+//! so values containing `=` are not truncated.
 
 use runtime::parameters::{ExposedParamLookup, Parameters};
 use std::fmt::Write as _;
@@ -85,11 +86,12 @@ fn connection_identity_from_connection_string(
     // Validate the mode from the connection string before discrete overrides so
     // a typo is attributed to `pg_connection_string`, not `pg_sslmode`.
     validate_sslmode(&ssl_mode, &user_param)?;
+    ssl_mode = ssl_mode.trim().to_string();
 
     // Discrete sslmode/sslrootcert override the connection string (pool order).
     if let Some(mode) = optional_string(params, "sslmode") {
         validate_sslmode(&mode, &params.user_param("sslmode").to_string())?;
-        ssl_mode = mode;
+        ssl_mode = mode.trim().to_string();
     }
     if let Some(cert) = optional_string(params, "sslrootcert") {
         ssl_rootcert = Some(cert);
@@ -148,8 +150,10 @@ fn connection_identity_from_connection_string(
 /// Parses a connection string into components, extracting `sslmode`, `sslrootcert`,
 /// and `password` separately so they can be handled by the caller.
 ///
-/// Keep in sync with `datafusion-table-providers`
-/// `sql::db_connection_pool::postgrespool::parse_connection_string`.
+/// Mirrors `datafusion-table-providers`
+/// `sql::db_connection_pool::postgrespool::parse_connection_string`, except this
+/// uses [`str::split_once`] so values that contain `=` (e.g. some passwords)
+/// are preserved rather than truncated.
 fn parse_connection_string(
     pg_connection_string: &str,
 ) -> (String, String, Option<String>, Option<String>) {
@@ -160,21 +164,21 @@ fn parse_connection_string(
 
     let str_params: Vec<&str> = pg_connection_string.split_whitespace().collect();
     for param in str_params {
-        let param = param.split('=').collect::<Vec<&str>>();
-        if let (Some(&name), Some(&value)) = (param.first(), param.get(1)) {
-            match name {
-                "sslmode" => {
-                    ssl_mode = value.to_string();
-                }
-                "sslrootcert" => {
-                    ssl_rootcert_path = Some(value.to_string());
-                }
-                "password" => {
-                    password = Some(value.to_string());
-                }
-                _ => {
-                    let _ = write!(connection_string, "{name}={value} ");
-                }
+        let Some((name, value)) = param.split_once('=') else {
+            continue;
+        };
+        match name {
+            "sslmode" => {
+                ssl_mode = value.to_string();
+            }
+            "sslrootcert" => {
+                ssl_rootcert_path = Some(value.to_string());
+            }
+            "password" => {
+                password = Some(value.to_string());
+            }
+            _ => {
+                let _ = write!(connection_string, "{name}={value} ");
             }
         }
     }
@@ -183,7 +187,7 @@ fn parse_connection_string(
 }
 
 fn validate_sslmode(mode: &str, user_param: &str) -> Result<(), String> {
-    match mode.to_lowercase().as_str() {
+    match mode.trim().to_ascii_lowercase().as_str() {
         "disable" | "require" | "prefer" | "verify-ca" | "verify-full" => Ok(()),
         _ => Err(format!(
             "parameter `{user_param}` must be one of disable, prefer, require, verify-ca, verify-full, got {mode:?}"
@@ -233,6 +237,19 @@ mod tests {
             "pg",
             crate::PARAMETERS,
         )
+    }
+
+    #[test]
+    fn parse_connection_string_preserves_equals_in_password() {
+        let (conn_str, _, _, password) =
+            parse_connection_string("host=localhost user=postgres password=a=b=c dbname=mydb");
+        assert_eq!(conn_str.trim(), "host=localhost user=postgres dbname=mydb");
+        assert_eq!(password.as_deref(), Some("a=b=c"));
+    }
+
+    #[test]
+    fn validate_sslmode_trims_whitespace() {
+        assert!(validate_sslmode(" require ", "pg_sslmode").is_ok());
     }
 
     #[test]
