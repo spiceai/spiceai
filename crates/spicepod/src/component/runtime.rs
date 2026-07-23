@@ -514,7 +514,7 @@ pub fn validate_metric_prefix(prefix: &str) -> Result<(), String> {
     // Check character validity before length so non-ASCII input reports the
     // actionable "invalid character" error instead of a misleading length error
     // (UTF-8 byte length can exceed the limit even when char count does not).
-    if prefix.starts_with(|c: char| !c.is_ascii_alphabetic()) {
+    if !prefix.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
         return Err(format!(
             "Invalid 'runtime.telemetry.metric_prefix' value '{prefix}': must start with an ASCII letter (A-Z or a-z). \
              Example: 'spiceai.'. \

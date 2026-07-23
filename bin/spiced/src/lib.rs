@@ -995,10 +995,8 @@ fn init_metrics(
         // Defense in depth: spicepod load already validates, but reject here
         // if an invalid (including empty) prefix reaches metrics init through
         // another path. Do not skip empty strings — they are invalid.
-        validate_metric_prefix(&prefix).map_err(|e| {
-            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
-                as Box<dyn std::error::Error>
-        })?;
+        validate_metric_prefix(&prefix)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         tracing::info!(prefix = %prefix, "OTEL metrics name prefix enabled");
         provider_builder = provider_builder.with_view(
             move |instrument: &opentelemetry_sdk::metrics::Instrument| {
