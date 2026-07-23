@@ -28,13 +28,16 @@ limitations under the License.
 //! The request blocks until the change batch is applied to the accelerator
 //! (ack), so Debezium Server / Embedded sinks can commit offsets safely.
 
+#[cfg(feature = "debezium")]
+use axum::http::header;
 use axum::{
     Json,
     body::Bytes,
     extract::Path,
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+#[cfg(any(feature = "debezium", feature = "openapi"))]
 use serde::Serialize;
 use serde_json::json;
 
@@ -43,6 +46,7 @@ use super::require_write_access;
 #[cfg(feature = "debezium")]
 use crate::dataconnector::cdc_ingest::{self, Error as IngestError};
 
+#[cfg(any(feature = "debezium", feature = "openapi"))]
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct CdcIngestResponse {
@@ -92,13 +96,13 @@ pub(crate) async fn post(Path(name): Path<String>, headers: HeaderMap, body: Byt
     #[cfg(not(feature = "debezium"))]
     {
         let _ = (name, headers, body);
-        return (
+        (
             StatusCode::NOT_IMPLEMENTED,
             Json(json!({
                 "message": "CDC ingest requires the debezium feature to be enabled in this spiced build"
             })),
         )
-            .into_response();
+            .into_response()
     }
 
     #[cfg(feature = "debezium")]
