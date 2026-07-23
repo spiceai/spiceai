@@ -104,6 +104,7 @@ pub(crate) mod sink;
 pub(crate) mod staged_upsert;
 pub(crate) mod staging_wal;
 pub(crate) mod streaming;
+pub(crate) mod structural_version;
 pub(crate) mod table;
 pub(crate) mod transaction;
 pub(crate) mod tuning;

@@ -648,6 +648,29 @@ fn warn_if_low_disk_blocking(label: &str, path: &str) {
     );
 }
 
+/// Default read-current freshness (bounded staleness), in ms, for READ-ONLY Cayenne
+/// datasets. Read-only datasets take no user DML, so a scan need not be
+/// read-your-writes; serving a recently-built `ScanView` within this lag lets
+/// concurrent analytical scans share one build (the demand cache's reuse lever) while
+/// staying far inside the freshness SLO. Read-write datasets ignore this and always
+/// use 0 (read-your-writes). Chosen to mirror the retired scan-view maintainer's 1 s
+/// refresh floor; tune as the A/B data lands.
+const DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS: u64 = 1000;
+
+/// The read-current lag applied to READ-ONLY Cayenne datasets:
+/// [`DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS`], overridable via the
+/// `CAYENNE_SCAN_VIEW_FRESHNESS_MS` environment variable (a process-wide operational
+/// knob, not per-table data config, so it stays out of `configuration_matches`).
+/// Setting it to `0` opts read-only datasets back into read-your-writes (the A/B
+/// no-reuse baseline). Never affects read-write datasets, which always use 0.
+fn read_only_scan_freshness() -> std::time::Duration {
+    let ms = std::env::var("CAYENNE_SCAN_VIEW_FRESHNESS_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS);
+    std::time::Duration::from_millis(ms)
+}
+
 fn apply_refresh_mode_defaults(
     config: &mut cayenne::metadata::VortexConfig,
     acceleration: &Acceleration,
@@ -2078,12 +2101,29 @@ impl CayenneAccelerator {
                 && acceleration.refresh_mode == Some(RefreshMode::Changes)
         });
 
+        // Default per-scan freshness, derived from the dataset's `access` mode. A
+        // read-only dataset takes no user DML (writes require BOTH a ReadWrite API key
+        // and `access: read_write`), so its data only moves via refresh/CDC — already
+        // eventually-consistent within the freshness SLO. Serving a recently-built
+        // ScanView within a bounded lag therefore stays in-contract AND lets concurrent
+        // analytical scans share one build (the demand cache's cross-query reuse lever).
+        // A read-write dataset (or any source we cannot prove read-only) uses 0 =
+        // read-your-writes, so a scan always sees its own writes.
+        let default_scan_freshness = match source
+            .as_any()
+            .downcast_ref::<crate::component::dataset::Dataset>()
+        {
+            Some(dataset) if !dataset.access().allows_write() => read_only_scan_freshness(),
+            _ => std::time::Duration::ZERO,
+        };
+
         // Create CayenneTableProvider with object store for S3 Express One Zone
         let mut builder = CayenneTableProviderBuilder::new(catalog, runtime_env)
             .with_context(context)
             .with_retention_filters(retention_filters)
             .with_maintained_aggregates(maintained_aggregate_specs)
-            .with_durable_write_back(durable_write_back);
+            .with_durable_write_back(durable_write_back)
+            .with_default_scan_freshness(default_scan_freshness);
         if let Some(retention_builder) = time_retention_filter_builder {
             builder = builder.with_time_retention_filter_builder(retention_builder);
         }
@@ -2187,6 +2227,10 @@ impl CayenneAccelerator {
 
         tracing::debug!("create_cayenne_table_provider: table {table_name} created successfully");
         let provider = Arc::new(cayenne_table);
+        // Initialize the demand scan-view cache (weak self-reference for its
+        // `spawn_blocking` builds + the periodic eviction sweep that releases idle
+        // cached views' pinned snapshot dirs for GC). Must run once, after `Arc::new`.
+        provider.init_scan_view_cache();
         // Publish the real, in-use compaction semaphore for the occupancy gauges
         // (idempotent across the fleet — every table shares this one semaphore).
         publish_compaction_semaphore_for_metrics(
@@ -3700,6 +3744,7 @@ impl PartitionCreator for CayennePartitionCreator {
 
         let partition_provider = Arc::new(cayenne_table);
         partition_provider.spawn_background_compaction(Arc::clone(&self.compaction_semaphore));
+        partition_provider.init_scan_view_cache();
         Ok(Partition {
             partition_values,
             table_provider: partition_provider,
@@ -3797,6 +3842,7 @@ impl PartitionCreator for CayennePartitionCreator {
 
             let partition_provider = Arc::new(cayenne_table);
             partition_provider.spawn_background_compaction(Arc::clone(&self.compaction_semaphore));
+            partition_provider.init_scan_view_cache();
             result.push(Partition {
                 partition_values,
                 table_provider: partition_provider,
