@@ -560,6 +560,19 @@ impl MistralLlama {
             truncate_sequence: false,
             max_tool_rounds: None,
             tool_dispatch_url: None,
+            // mistral.rs v0.9.0 agentic / code-execution / shell / files features:
+            // Spice does not use them, so opt out with defaults.
+            enable_code_execution: false,
+            enable_shell: false,
+            shell_options: None,
+            code_execution_permission: None,
+            code_execution_approval_notifier: None,
+            agent_permission: None,
+            agent_approval_handler: None,
+            agent_approval_notifier: None,
+            session_id: None,
+            files: None,
+            input_files: Vec::new(),
         }))
     }
 
@@ -830,6 +843,21 @@ fn stream_from_response(
                 MistralResponse::Embeddings{..} => {
                     yield Err(OpenAIError::ApiError(ApiError {
                         message: "Embeddings response is not supported in chat".to_string(),
+                        r#type: None,
+                        param: None,
+                        code: None,
+                    }));
+                }
+                // mistral.rs v0.9.0 agentic / diffusion / file responses: Spice does
+                // not enable those features on the chat path (agent_permission/files
+                // are None), so they should not occur here. Surface an error rather
+                // than panic if the engine ever emits one.
+                MistralResponse::AgenticToolCallProgress { .. }
+                | MistralResponse::BlockDenoisingProgress(_)
+                | MistralResponse::AgenticToolApprovalRequired { .. }
+                | MistralResponse::File(_) => {
+                    yield Err(OpenAIError::ApiError(ApiError {
+                        message: "Unsupported response type for chat completions".to_string(),
                         r#type: None,
                         param: None,
                         code: None,

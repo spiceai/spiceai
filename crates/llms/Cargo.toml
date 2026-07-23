@@ -43,8 +43,8 @@ tracing.workspace = true
 tracing-futures.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 
-mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "d9366f59ca6709ec769c384411bdf64878285b82", optional = true } # branch: lukim/spiceai-v0.9.0 (mistral.rs v0.9.0 upgrade; refresh to merged SHA)
-mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "d9366f59ca6709ec769c384411bdf64878285b82", package = "mistralrs-core", optional = true } # branch: lukim/spiceai-v0.9.0 (mistral.rs v0.9.0 upgrade; refresh to merged SHA)
+mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "c104af1340b05a22095157858de9598fbf12ebc8", optional = true } # branch: lukim/spiceai-v0.9.0 (mistral.rs v0.9.0 upgrade; refresh to merged SHA)
+mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "c104af1340b05a22095157858de9598fbf12ebc8", package = "mistralrs-core", optional = true } # branch: lukim/spiceai-v0.9.0 (mistral.rs v0.9.0 upgrade; refresh to merged SHA)
 rand.workspace = true
 
 tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", optional = true, rev = "5fc06d6341e153c6be6036ef549509e20c210934", features = [
