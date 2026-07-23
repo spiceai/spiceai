@@ -46,6 +46,15 @@ use connector_mysql as _;
 use connector_oracle as _;
 // #[expect(unused_imports)]
 // use runtime::dataconnector::odbc as _;
+use connector_abfs as _;
+use connector_cosmosdb as _;
+use connector_databricks as _;
+use connector_ducklake as _;
+use connector_elasticsearch as _;
+use connector_gcs as _;
+use connector_git as _;
+use connector_github as _;
+use connector_glue as _;
 use connector_postgres as _;
 use connector_scylladb as _;
 use connector_sftp as _;
@@ -53,6 +62,7 @@ use connector_sharepoint as _;
 use connector_smb as _;
 use connector_snowflake as _;
 use connector_spark as _;
+use connector_spiceai as _;
 #[expect(unused_imports)]
 use runtime::dataconnector::s3 as _;
 #[expect(unused_imports)]
@@ -258,10 +268,10 @@ mod tests {
     use super::*;
 
     /// Spot-check drift guard: connectors that self-register into the `linkme` slice must appear
-    /// in the generated schema. This catches a broken force-linkage (`use connector_* as _;`) or a
-    /// connector silently dropping out of `.schema/spicepod.schema.json`. `dynamodb` is checked
-    /// specifically because it is the first connector extracted into its own crate while keeping
-    /// slice registration; extend this list as more connectors adopt the pattern.
+    /// in the generated schema. This catches a broken force-linkage (`use connector_* as _;` in
+    /// this module) or a connector silently dropping out of `.schema/spicepod.schema.json`. The
+    /// sampled connectors span always-linked and feature-gated `connector-*` crates that register
+    /// via `register_data_connector!`; extend the list as more connectors adopt the pattern.
     #[test]
     fn documents_slice_registered_connectors() {
         let names: Vec<String> = collect_data_connectors()
@@ -269,9 +279,11 @@ mod tests {
             .map(|c| c.name)
             .collect();
         assert!(!names.is_empty(), "no data connectors were collected");
-        assert!(
-            names.iter().any(|n| n == "dynamodb"),
-            "connector 'dynamodb' missing from the generated schema; collected: {names:?}"
-        );
+        for expected in ["dynamodb", "postgres", "clickhouse", "mysql", "graphql"] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "connector '{expected}' missing from the generated schema; collected: {names:?}"
+            );
+        }
     }
 }
