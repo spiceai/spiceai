@@ -807,13 +807,30 @@ impl ClientDriver {
                 send_unsupported(tx, &cmd.command_id, "DeleteManifest").await;
             }
             proto::control_message::Body::GetStatus(cmd) => {
-                send_unsupported(tx, &cmd.command_id, "GetStatus").await;
+                // Standalone status probe: the namespace/kind/name targeting
+                // fields are empty for standalone instances (they address a
+                // workload in a cluster), so they're ignored here — the whole
+                // runtime's readiness is reported. The status document is a
+                // JSON object, so it's JSON-encoded into payload_json.
+                let r = self.runtime.get_status().await;
+                reply_with(tx, &cmd.command_id, r).await;
             }
             proto::control_message::Body::Drain(cmd) => {
                 send_unsupported(tx, &cmd.command_id, "Drain").await;
             }
             proto::control_message::Body::Pause(cmd) => {
                 send_unsupported(tx, &cmd.command_id, "Pause").await;
+            }
+            proto::control_message::Body::GetPodLogs(cmd) => {
+                match self.runtime.get_pod_logs(cmd.tail_lines).await {
+                    // The log text rides verbatim in payload_json (a raw
+                    // string, not JSON-encoded) per the gateway contract.
+                    Ok(logs) => send_result_text(tx, &cmd.command_id, logs).await,
+                    Err(err) => {
+                        send_result(tx, &cmd.command_id, false, &err, serde_json::Value::Null)
+                            .await;
+                    }
+                }
             }
         }
 
@@ -1139,6 +1156,25 @@ async fn send_result(
     };
     if let Err(err) = tx.send(msg).await {
         tracing::warn!("Cloud Connect: failed to send CommandResult: {err}");
+    }
+}
+
+/// Send a successful `CommandResult` whose `payload_json` is raw text rather
+/// than a JSON value. `GetPodLogs` uses this: the log blob is returned
+/// verbatim (the gateway relays `payload_json` straight through as text), so
+/// it must NOT be JSON-encoded/quoted the way [`send_result`] would.
+async fn send_result_text(tx: &mpsc::Sender<proto::ClientMessage>, command_id: &str, text: String) {
+    let msg = proto::ClientMessage {
+        body: Some(proto::client_message::Body::Result(proto::CommandResult {
+            command_id: command_id.to_string(),
+            success: true,
+            error: String::new(),
+            payload_json: text,
+            result_arrow_ipc: Vec::new(),
+        })),
+    };
+    if let Err(err) = tx.send(msg).await {
+        tracing::warn!("Cloud Connect: failed to send GetPodLogs CommandResult: {err}");
     }
 }
 

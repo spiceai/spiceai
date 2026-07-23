@@ -34,6 +34,7 @@ limitations under the License.
 //!    Spice.ai Cloud authentication headers.
 
 use std::path::PathBuf;
+use std::process::Stdio;
 
 use crate::commands::add::{AddArgs, execute_add_or_connect};
 use crate::context::RuntimeContext;
@@ -123,7 +124,7 @@ pub async fn execute(ctx: &RuntimeContext, args: ConnectArgs) -> Result<()> {
     };
 
     if runtime_cloud_connect::is_valid_adoption_code(target) {
-        return stage_adoption_code(target, args.endpoint.as_deref());
+        return stage_adoption_code(ctx, target, args.endpoint.as_deref()).await;
     }
 
     // An input that clearly looks like an adoption code but fails validation
@@ -155,7 +156,11 @@ fn execute_subcommand(cmd: &ConnectCommand) -> Result<()> {
     }
 }
 
-fn stage_adoption_code(code: &str, endpoint: Option<&str>) -> Result<()> {
+async fn stage_adoption_code(
+    ctx: &RuntimeContext,
+    code: &str,
+    endpoint: Option<&str>,
+) -> Result<()> {
     let pending_path =
         runtime_cloud_connect::config::CloudConnectConfig::default_pending_adopt_code_path();
     if let Some(parent) = pending_path.parent() {
@@ -206,17 +211,40 @@ fn stage_adoption_code(code: &str, endpoint: Option<&str>) -> Result<()> {
                 ),
             });
         }
-        println!(
-            "Adoption code stored at {}.\nStart `spiced` (or restart if already running) to begin adoption.",
-            pending_path.display()
-        );
-        println!("Endpoint override stored at {}.", endpoint_path.display());
-    } else {
-        println!(
-            "Adoption code stored at {}.\nStart `spiced` (or restart if already running) to begin adoption.",
-            pending_path.display()
-        );
     }
+
+    println!("Attaching this Spice Runtime to Spice Cloud Connect...");
+
+    ctx.ensure_local_runtime_supported()?;
+
+    // Auto-install runtime if not present
+    if !ctx.is_runtime_installed() {
+        tracing::info!("Spice.ai runtime is not installed. Installing now...");
+        crate::commands::install::execute(ctx, &crate::commands::install::InstallArgs::default())
+            .await?;
+    }
+
+    // Start spiced in the foreground — inheriting stdio and forwarding
+    // signals — exactly as `spice run` does, so the user sees the runtime
+    // logs and adoption progress and can Ctrl-C to stop it. The staged
+    // adoption code drives the connection on startup.
+    let mut cmd = tokio::process::Command::from(ctx.get_run_cmd(&[], None)?);
+    cmd.stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| crate::error::Error::CloudConnectIo {
+            message: format!("Failed to start spiced: {e}"),
+        })?;
+
+    let status = crate::commands::run::run_with_signal_forwarding(&mut child).await?;
+
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+
     Ok(())
 }
 

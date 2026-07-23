@@ -120,12 +120,22 @@ pub struct CloudConnectConfig {
 }
 
 impl CloudConnectConfig {
-    /// Resolve `$SPICE_CONFIG_DIR` to its canonical location.
+    /// Resolve the Cloud Connect config directory to its canonical location.
     ///
     /// Precedence:
-    /// 1. `$SPICE_CONFIG_DIR` env var
-    /// 2. `~/.spice`
-    /// 3. Current directory (fallback)
+    /// 1. `$SPICE_CONFIG_DIR` env var (explicit override)
+    /// 2. `./.spice` — a `.spice` directory in the current working
+    ///    directory (the `spiced` instance's working directory)
+    ///
+    /// This deliberately does **not** fall back to the global `~/.spice`.
+    /// Adoption state (the pending code, `identity.json`, and the
+    /// `cloud-endpoint` override) is per-`spiced`-instance: several `spiced`
+    /// processes can run on one machine and each must adopt into Spice Cloud
+    /// independently. A shared `~/.spice` would make one machine present as a
+    /// single runtime and let one instance's adoption clobber another's, so
+    /// the state is scoped to the working directory instead. The `spiced`
+    /// binary itself still installs to the shared `~/.spice/bin` — only this
+    /// per-instance state is local.
     #[must_use]
     pub fn default_config_dir() -> PathBuf {
         if let Ok(dir) = std::env::var("SPICE_CONFIG_DIR")
@@ -133,10 +143,8 @@ impl CloudConnectConfig {
         {
             return PathBuf::from(dir);
         }
-        if let Some(home) = dirs::home_dir() {
-            return home.join(".spice");
-        }
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        cwd.join(".spice")
     }
 
     /// Resolve the canonical identity file path for the current
@@ -242,6 +250,31 @@ mod tests {
         assert_eq!(dir, PathBuf::from("/tmp/spice-test"));
         unsafe {
             std::env::remove_var("SPICE_CONFIG_DIR");
+        }
+    }
+
+    #[test]
+    fn default_config_dir_is_local_not_global_when_env_unset() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        // SAFETY: tests gate env-var mutations behind a mutex.
+        unsafe {
+            std::env::remove_var("SPICE_CONFIG_DIR");
+        }
+        let dir = CloudConnectConfig::default_config_dir();
+        // Adoption state must be scoped to the instance's working directory
+        // (`./.spice`), never the machine-global `~/.spice`, so that multiple
+        // spiced instances on one host adopt independently.
+        assert_eq!(dir.file_name(), Some(std::ffi::OsStr::new(".spice")));
+        let expected = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(".spice");
+        assert_eq!(dir, expected);
+        if let Some(home) = dirs::home_dir() {
+            assert_ne!(
+                dir,
+                home.join(".spice"),
+                "adoption config dir must not resolve to the global ~/.spice"
+            );
         }
     }
 
