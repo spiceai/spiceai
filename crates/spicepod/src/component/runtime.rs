@@ -453,8 +453,10 @@ pub struct TelemetryConfig {
     /// names stay valid for OTLP backends and remain sanitizable to Prometheus
     /// legacy names (`[a-zA-Z_:][a-zA-Z0-9_:]*`). Must start with an ASCII
     /// letter, contain only ASCII letters, digits, `_`, `.`, `-`, or `/`, and
-    /// be at most [`METRIC_PREFIX_MAX_LEN`] characters. A trailing `.` or `_`
-    /// is recommended (e.g. `spiceai.`).
+    /// be at most [`METRIC_PREFIX_MAX_LEN`] characters (128; ≥127 characters of
+    /// headroom remain under the 255-char `OpenTelemetry` instrument name
+    /// limit for the base metric name). A trailing `.` or `_` is recommended
+    /// (e.g. `spiceai.`).
     /// See: <https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetrymetric_prefix>
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metric_prefix: Option<String>,
@@ -465,9 +467,10 @@ pub struct TelemetryConfig {
 
 /// Maximum length for `runtime.telemetry.metric_prefix`.
 ///
-/// Cap at a round power of two so namespaces stay short while leaving room
-/// under the `OpenTelemetry` 255-character instrument name limit for the
-/// base metric name (`prefix` + instrument ≤ 255).
+/// Cap at a round power of two so namespaces stay short. Prefixed names must
+/// still fit the `OpenTelemetry` 255-character instrument name limit
+/// (`prefix` + base metric name ≤ 255), so 128 leaves ≥127 characters of
+/// headroom for the base name.
 pub const METRIC_PREFIX_MAX_LEN: usize = 128;
 
 /// Non-alphanumeric characters allowed in `OpenTelemetry` instrument names
@@ -494,8 +497,9 @@ impl Default for TelemetryConfig {
 /// Non-empty prefixes must (mirroring the `OTel` Metrics API / SDK):
 /// - start with an ASCII alphabetic character
 /// - contain only ASCII alphanumeric characters, `_`, `.`, `-`, or `/`
-/// - have length ≤ [`METRIC_PREFIX_MAX_LEN`] (leaves headroom under the
-///   255-char `OTel` instrument name limit)
+/// - have length ≤ [`METRIC_PREFIX_MAX_LEN`] (128; leaves ≥127 characters of
+///   headroom under the 255-char `OTel` instrument name limit for the base
+///   metric name)
 ///
 /// # Errors
 ///
