@@ -4727,20 +4727,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "connector-snowflake-native"
-version = "2.2.0-unstable"
-dependencies = [
- "async-trait",
- "data_components",
- "datafusion",
- "datafusion-table-providers",
- "db_connection_pool",
- "runtime",
- "snafu",
- "snowflake-api",
-]
-
-[[package]]
 name = "connector-spark"
 version = "2.2.0-unstable"
 dependencies = [
@@ -17079,6 +17065,9 @@ dependencies = [
  "datafusion-expr",
  "datafusion-federation",
  "datafusion-functions-json",
+ "duration-parse",
+ "elasticsearch",
+ "fundu",
  "futures",
  "insta",
  "itertools 0.14.0",
@@ -17087,11 +17076,14 @@ dependencies = [
  "rayon",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
+ "runtime-parameters",
  "runtime-proto",
  "runtime-query-engine",
  "runtime-request-context",
+ "runtime-secrets",
  "schemars 1.2.1",
  "search",
+ "secrecy",
  "serde",
  "serde_json",
  "snafu",
