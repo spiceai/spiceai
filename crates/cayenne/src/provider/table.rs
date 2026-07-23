@@ -1087,7 +1087,7 @@ struct CompletedScanView {
     /// read-current (lag > 0) path (`now - captured_at <= lag` ⇒ servable).
     captured_at: Instant,
     /// When this slot was last SERVED (a read-current within-lag serve or a
-    /// read-your-writes exact-key hit). Drives idle eviction: the background sweep
+    /// read-your-writes exact-key hit); seeded at promotion time. Drives idle eviction: the background sweep
     /// drops the view only after it has gone unserved for the idle window, so a view
     /// still being reused — including a read-your-writes exact-key hit that stays
     /// valid regardless of age — is retained, not dropped mid-reuse.
@@ -1178,7 +1178,11 @@ impl ScanViewCache {
                     key: done.key,
                     order: done.order,
                     captured_at: done.captured_at,
-                    last_access: done.captured_at,
+                    // Seed last-access at PROMOTION time (not `captured_at`): a build
+                    // slower than the idle window would otherwise be promoted already
+                    // "stale" and evicted on the next tick before any scan could reuse
+                    // it. Serves refresh it from here.
+                    last_access: Instant::now(),
                     view: Arc::clone(view),
                 });
             }
