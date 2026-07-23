@@ -664,10 +664,15 @@ const DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS: u64 = 1000;
 /// Setting it to `0` opts read-only datasets back into read-your-writes (the A/B
 /// no-reuse baseline). Never affects read-write datasets, which always use 0.
 fn read_only_scan_freshness() -> std::time::Duration {
-    let ms = std::env::var("CAYENNE_SCAN_VIEW_FRESHNESS_MS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS);
+    let ms = match std::env::var("CAYENNE_SCAN_VIEW_FRESHNESS_MS") {
+        Err(_) => DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS,
+        // A set-but-invalid value is a misconfiguration; warn (don't silently
+        // swallow it) before falling back, mirroring `parse_env_u64`.
+        Ok(raw) => raw.trim().parse::<u64>().unwrap_or_else(|_| {
+            tracing::warn!("Ignoring invalid CAYENNE_SCAN_VIEW_FRESHNESS_MS='{raw}': expected a non-negative integer (milliseconds); using default {DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS} ms.");
+            DEFAULT_READ_ONLY_SCAN_FRESHNESS_MS
+        }),
+    };
     std::time::Duration::from_millis(ms)
 }
 

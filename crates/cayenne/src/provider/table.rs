@@ -936,9 +936,10 @@ struct VisibleMemTierSegment {
 /// This is the raw INPUT to the KDI merge + visible-segment computation
 /// ([`CayenneTableProvider::build_scan_view`]); a [`ScanView`] pairs a
 /// `RawScanInput` with that computed output. Extracting it out of the `scan()`
-/// prologue lets the scan-view maintainer (a per-table background builder)
-/// capture the same consistent state OFF the query path and publish a merged
-/// bundle every version change, instead of every concurrent scan recomputing it.
+/// prologue lets the demand-driven [`ScanViewCache`] capture the same consistent
+/// state and build the merged bundle OFF the query path (`spawn_blocking`), once
+/// per distinct scan-visible identity, instead of every concurrent scan recomputing
+/// it — with concurrent scans on that identity sharing one build.
 ///
 /// Consistency is STRUCTURAL: every field is captured against one fence-held
 /// moment, so the file snapshot, the mem-tier shards, the file-side deletion
@@ -1085,6 +1086,12 @@ struct CompletedScanView {
     /// When the underlying state was captured — the staleness reference for the
     /// read-current (lag > 0) path (`now - captured_at <= lag` ⇒ servable).
     captured_at: Instant,
+    /// When this slot was last SERVED (a read-current within-lag serve or a
+    /// read-your-writes exact-key hit). Drives idle eviction: the background sweep
+    /// drops the view only after it has gone unserved for the idle window, so a view
+    /// still being reused — including a read-your-writes exact-key hit that stays
+    /// valid regardless of age — is retained, not dropped mid-reuse.
+    last_access: Instant,
     view: Arc<ScanView>,
 }
 
@@ -1171,6 +1178,7 @@ impl ScanViewCache {
                     key: done.key,
                     order: done.order,
                     captured_at: done.captured_at,
+                    last_access: done.captured_at,
                     view: Arc::clone(view),
                 });
             }
@@ -1180,19 +1188,25 @@ impl ScanViewCache {
     /// The `latest_complete` view iff it was captured within `lag` of `now` — the
     /// read-current serve check. The caller additionally gates on the structural
     /// version so a stale-tolerant scan is never served a pre-schema-evolution view.
-    fn servable_within_lag(&self, now: Instant, lag: Duration) -> Option<Arc<ScanView>> {
-        self.latest_complete.as_ref().and_then(|current| {
-            (now.duration_since(current.captured_at) <= lag).then(|| Arc::clone(&current.view))
+    /// Records the access (`last_access`) so a served view is not idle-evicted.
+    fn servable_within_lag(&mut self, now: Instant, lag: Duration) -> Option<Arc<ScanView>> {
+        let current = self.latest_complete.as_mut()?;
+        (now.duration_since(current.captured_at) <= lag).then(|| {
+            current.last_access = now;
+            Arc::clone(&current.view)
         })
     }
 
     /// Probe for an exact identity: serve a completed view, await an in-flight build,
     /// or report a miss. Used by the read-your-writes (lag == 0) path and the
-    /// read-current MISS path.
-    fn find_by_key(&self, key: &ScanViewKey) -> ScanViewProbe {
-        if let Some(current) = &self.latest_complete
+    /// read-current MISS path. Records the access (`last_access`) on a hit so a view
+    /// still being reused (an exact-key hit is valid regardless of age) is not
+    /// idle-evicted.
+    fn find_by_key(&mut self, key: &ScanViewKey) -> ScanViewProbe {
+        if let Some(current) = self.latest_complete.as_mut()
             && current.key == *key
         {
+            current.last_access = Instant::now();
             return ScanViewProbe::Hit(Arc::clone(&current.view));
         }
         if let Some(entry) = self.in_flight.iter().find(|entry| entry.key == *key) {
@@ -19668,20 +19682,23 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Background sweep that DROPS a cached `latest_complete` view once it has aged past
-    /// this dataset's freshness bound — even when NO query is running. A completed view
+    /// Background sweep that DROPS a cached `latest_complete` view once it has gone
+    /// UNSERVED for the idle window — even when NO query is running. A completed view
     /// holds its capture's [`SnapshotScanRef`], pinning the snapshot dirs it reads; on a
     /// table that was queried once and then went idle, that reference would otherwise
     /// keep those dirs alive forever, blocking compaction GC. The demand cache only
     /// refreshes `latest_complete` on a scan miss, so with no scans nothing would ever
     /// release it — hence a timer rather than piggybacking on the query path.
     ///
-    /// It only evicts views that are ALREADY non-servable (age > `default_scan_freshness`,
-    /// so a fresh scan would rebuild anyway), so eviction never costs a reusable view. An
-    /// in-flight build (and a query currently executing, which cloned its own `Arc`) is
-    /// untouched — dropping the cache's reference just lets the dirs free once the last
-    /// user finishes. Holds only a `Weak<Self>`, so it never pins the provider and exits
-    /// on the first tick after the table is torn down.
+    /// It evicts on IDLE TIME (`now - last_access`), not age-since-capture, so a view
+    /// still being reused is retained rather than dropped mid-reuse — including a
+    /// read-your-writes (`freshness == 0`) exact-key hit, which stays valid regardless
+    /// of the view's age as long as the scan-visible state has not moved. Only a view
+    /// that has not been served for `max(default_scan_freshness, SCAN_VIEW_EVICTION_INTERVAL)`
+    /// is dropped. An in-flight build (and a query currently executing, which cloned its
+    /// own `Arc`) is untouched — dropping the cache's reference just lets the dirs free
+    /// once the last user finishes. Holds only a `Weak<Self>`, so it never pins the
+    /// provider and exits on the first tick after the table is torn down.
     async fn run_scan_view_evictor(weak: std::sync::Weak<Self>) {
         loop {
             tokio::time::sleep(Self::SCAN_VIEW_EVICTION_INTERVAL).await;
@@ -19695,17 +19712,21 @@ impl CayenneTableProvider {
 
     /// One eviction step (the body of [`Self::run_scan_view_evictor`], factored out so
     /// it is testable without the timer): drain completed builds, then drop
-    /// `latest_complete` iff it has aged past `default_scan_freshness` — i.e. it is
-    /// already non-servable, so a fresh scan would rebuild anyway and dropping it costs
-    /// no reusable view, it only releases the snapshot dirs its capture pinned.
+    /// `latest_complete` iff it has not been SERVED within the idle window
+    /// (`max(default_scan_freshness, SCAN_VIEW_EVICTION_INTERVAL)`). Keying on
+    /// last-access (not age) keeps a still-reused view — e.g. a read-your-writes
+    /// exact-key hit, valid at any age while the state is unchanged — instead of
+    /// dropping it mid-reuse; an idle view's pinned snapshot dirs are released for GC.
     fn evict_stale_scan_view(&self, now: Instant) {
-        let ttl = self.default_scan_freshness;
+        let idle_window = self
+            .default_scan_freshness
+            .max(Self::SCAN_VIEW_EVICTION_INTERVAL);
         let mut cache = self.scan_view_cache.lock();
         cache.drain_completed();
         if cache
             .latest_complete
             .as_ref()
-            .is_some_and(|current| now.duration_since(current.captured_at) > ttl)
+            .is_some_and(|current| now.duration_since(current.last_access) > idle_window)
         {
             cache.latest_complete = None;
         }
@@ -39373,12 +39394,20 @@ mod tests {
             "a completed view must be cached before eviction"
         );
 
-        // The view was captured a moment ago, so at `now` its age exceeds the `0`
-        // freshness bound: the sweep evicts it, dropping the cache's Arc.
+        // A sweep NOW must NOT evict: the view was just served (last_access ~ now), so
+        // it is within the idle window — a still-reused view is retained, not dropped.
         provider.evict_stale_scan_view(Instant::now());
         assert!(
+            provider.scan_view_cache.lock().latest_complete.is_some(),
+            "a just-served view is within the idle window and must be retained"
+        );
+
+        // A sweep far in the future (past the idle window with no intervening serve)
+        // evicts it, releasing its pinned snapshot dirs.
+        provider.evict_stale_scan_view(Instant::now() + Duration::from_hours(1));
+        assert!(
             provider.scan_view_cache.lock().latest_complete.is_none(),
-            "an aged-out cached view must be evicted, releasing its pinned snapshot dirs"
+            "an idle (long-unserved) cached view must be evicted, releasing its pinned snapshot dirs"
         );
 
         // Eviction must not break correctness: the next scan rebuilds the current state.

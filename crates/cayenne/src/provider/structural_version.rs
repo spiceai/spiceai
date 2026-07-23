@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 //! A seqlock-style version gate for FORCED structural table events whose mutation
-//! runs OFF the listing fence and could otherwise tear a straddling maintainer
+//! runs OFF the listing fence and could otherwise tear a straddling scan-view
 //! capture. Today the sole wired writer is **live schema-evolution** (its all-shards
 //! mem-tier flush runs off-fence — see `begin_mutation` at the widen site); the
 //! primitive is deliberately general so other off-fence discontinuities can adopt it.
@@ -26,9 +26,9 @@ limitations under the License.
 //! serializes their capture, so they advance only the additive `scan_input_version`
 //! and are served bounded-stale. Only an off-fence discontinuity that would make a
 //! previously-computed scan view semantically WRONG (not merely stale) advances this.
-//! This lets the scan-view maintainer publish bounded-stale bundles freely for
-//! everything else while GUARANTEEING that a post-schema-evolve scan never runs on a
-//! pre-evolution bundle.
+//! This lets the demand-driven scan-view cache serve bounded-stale views freely for
+//! everything else while GUARANTEEING that a scan capture straddling a schema-evolve
+//! is discarded and retried rather than built into a pre-evolution bundle.
 //!
 //! Protocol (odd = mutation in flight, even = stable), a versioned seqlock:
 //! - Forced-event writer: [`StructuralVersion::begin_mutation`] bumps the counter
@@ -36,12 +36,14 @@ limitations under the License.
 //!   Forced events are serialized by the provider `write_lock`, so at most one
 //!   guard is live at a time — the odd/even pair is a generation MARKER, not a
 //!   mutual-exclusion mechanism.
-//! - Builder (seqlock reader): [`StructuralVersion::read_validated`] captures an
-//!   even `v0`, runs the build, and returns the output stamped with `v0` ONLY if
-//!   the counter is still `v0` afterwards — so a build that raced a forced event
-//!   is DISCARDED rather than published as a torn or pre-event view.
-//! - Scan gate: [`StructuralVersion::current`] gives the version a scan requires;
-//!   the scan runs only on a bundle stamped `>=` it, else waits for a republish.
+//! - Demand capture (seqlock reader): [`StructuralVersion::read_validated_async`]
+//!   (and the sync [`StructuralVersion::read_validated`] reference impl) captures an
+//!   even `v0`, runs the capture, and returns the output stamped with `v0` ONLY if
+//!   the counter is still `v0` afterwards — so a capture that raced a forced event
+//!   is DISCARDED and retried rather than built into a torn or pre-event view.
+//! - Key generation: [`StructuralVersion::current`] is folded into the demand cache's
+//!   `ScanViewKey`, so a live schema-evolution mints a fresh identity (a read-current
+//!   fast-path serve is gated on it); there is no wait/republish gate.
 //!
 //! The primitive lives here — not smeared across the mutation call sites — with
 //! its own loom model, so the concurrency proof is local and audited once. See
