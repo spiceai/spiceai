@@ -1001,11 +1001,14 @@ fn build_side_memory_estimate(plan: &dyn ExecutionPlan, build_rows: usize) -> Op
         })?;
 
     let payload_bytes = row_width.saturating_mul(build_rows);
-    // Saturating mul then divide: (payload * 5) / 2 ≈ 2.5× payload.
-    Some(
-        payload_bytes.saturating_mul(HASH_JOIN_BUILD_SIDE_OVERHEAD_NUM)
-            / HASH_JOIN_BUILD_SIDE_OVERHEAD_DEN,
-    )
+    // (payload * 5) / 2 ≈ 2.5× payload, computed in u128 so a saturated payload
+    // stays monotonic: a plain usize `* 5` would saturate to usize::MAX and then
+    // HALVE on `/ 2`, dropping the estimate for extreme/unknown row counts. Clamp
+    // back to usize::MAX. (`usize as u128` is always lossless; std has no
+    // `From<usize>` for the platform-dependent usize.)
+    let estimated = payload_bytes as u128 * HASH_JOIN_BUILD_SIDE_OVERHEAD_NUM as u128
+        / HASH_JOIN_BUILD_SIDE_OVERHEAD_DEN as u128;
+    Some(usize::try_from(estimated).unwrap_or(usize::MAX))
 }
 
 fn estimated_arrow_width(data_type: &DataType) -> Option<usize> {

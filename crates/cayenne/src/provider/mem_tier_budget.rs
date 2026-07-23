@@ -445,15 +445,20 @@ pub(crate) async fn reserve_bytes_or_wait(bytes: u64, max_wait: Duration) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use parking_lot::Mutex as ParkingMutex;
+    use tokio::sync::Mutex as AsyncMutex;
 
     /// Serializes every test that mutates the process-global budget / pool
-    /// account so parallel `cargo test` threads cannot interleave reserves.
-    static GLOBAL_BUDGET_TEST_LOCK: LazyLock<ParkingMutex<()>> =
-        LazyLock::new(|| ParkingMutex::new(()));
+    /// account so parallel test threads cannot interleave reserves. Async-aware
+    /// (`tokio::sync::Mutex`) so `#[tokio::test]` cases can hold it ACROSS their
+    /// `.await`s — a `parking_lot` guard cannot be, which would force a
+    /// drop-before-await window where a concurrent test could mutate the
+    /// process-global budget.
+    static GLOBAL_BUDGET_TEST_LOCK: LazyLock<AsyncMutex<()>> =
+        LazyLock::new(|| AsyncMutex::new(()));
 
     fn with_global_budget_lock<R>(f: impl FnOnce() -> R) -> R {
-        let _guard = GLOBAL_BUDGET_TEST_LOCK.lock();
+        // Sync tests run off any runtime, so blocking_lock cannot deadlock.
+        let _guard = GLOBAL_BUDGET_TEST_LOCK.blocking_lock();
         // Always start from a clean unset budget so tests are order-independent.
         set_global_mem_tier_bytes(0);
         let result = f();
@@ -653,58 +658,37 @@ mod tests {
     async fn pool_account_tracks_reserve_bytes_or_wait() {
         use datafusion::execution::memory_pool::GreedyMemoryPool;
 
-        let pool = {
-            let _guard = GLOBAL_BUDGET_TEST_LOCK.lock();
-            set_global_mem_tier_bytes(0);
-            set_global_mem_tier_bytes(5_000);
-            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1_000_000));
-            set_global_mem_tier_pool_account(&pool);
-            pool
-        };
+        // Async-aware guard held across the WHOLE test — including the
+        // reserve_bytes_or_wait await — so no concurrent global-budget test can
+        // interleave a mutation into this test's process-global state.
+        let _guard = GLOBAL_BUDGET_TEST_LOCK.lock().await;
+        set_global_mem_tier_bytes(0);
+        set_global_mem_tier_bytes(5_000);
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1_000_000));
+        set_global_mem_tier_pool_account(&pool);
 
-        // Hold the lock across the whole async test body via a sync block for
-        // each step (start_paused waits must not hold a parking_lot guard).
-        {
-            let _guard = GLOBAL_BUDGET_TEST_LOCK.lock();
-            assert!(
-                // Fast path: budget has room — no wait.
-                try_reserve_bytes(1_200),
-                "fit request must succeed immediately"
-            );
-            assert_eq!(global_mem_tier_pool_account_bytes(), Some(1_200));
-            assert_eq!(pool.reserved(), 1_200);
+        // Fast path: budget has room — no wait.
+        assert!(
+            try_reserve_bytes(1_200),
+            "fit request must succeed immediately"
+        );
+        assert_eq!(global_mem_tier_pool_account_bytes(), Some(1_200));
+        assert_eq!(pool.reserved(), 1_200);
 
-            assert!(try_reserve_bytes(3_800));
-            assert_eq!(global_mem_tier_pool_account_bytes(), Some(5_000));
-        }
+        assert!(try_reserve_bytes(3_800));
+        assert_eq!(global_mem_tier_pool_account_bytes(), Some(5_000));
 
-        // Wait path with full budget (no concurrent release) — refuse after bound.
-        let refused = {
-            let guard = GLOBAL_BUDGET_TEST_LOCK.lock();
-            // Re-assert full.
-            assert_eq!(global_mem_tier_used(), Some(5_000));
-            drop(guard);
-            // Call wait without holding the parking_lot guard across await.
-            // Re-acquire by using try_reserve which is sync-refused.
-            let _guard = GLOBAL_BUDGET_TEST_LOCK.lock();
-            !try_reserve_bytes(1)
-        };
-        assert!(refused, "full budget must refuse");
+        // Wait path with a full budget: a sync-refused reserve (budget full).
+        assert_eq!(global_mem_tier_used(), Some(5_000));
+        assert!(!try_reserve_bytes(1), "full budget must refuse");
 
-        {
-            let guard = GLOBAL_BUDGET_TEST_LOCK.lock();
-            assert_eq!(global_mem_tier_pool_account_bytes(), Some(5_000));
-            // Explicitly exercise reserve_bytes_or_wait success when room exists.
-            release_bytes(5_000);
-            drop(guard);
-        }
-        {
-            let ok = reserve_bytes_or_wait(500, Duration::from_millis(100)).await;
-            let _guard = GLOBAL_BUDGET_TEST_LOCK.lock();
-            assert!(ok, "wait path with free budget must succeed");
-            assert_eq!(global_mem_tier_pool_account_bytes(), Some(500));
-            set_global_mem_tier_bytes(0);
-        }
+        // reserve_bytes_or_wait success once room exists mirrors into the account.
+        assert_eq!(global_mem_tier_pool_account_bytes(), Some(5_000));
+        release_bytes(5_000);
+        let ok = reserve_bytes_or_wait(500, Duration::from_millis(100)).await;
+        assert!(ok, "wait path with free budget must succeed");
+        assert_eq!(global_mem_tier_pool_account_bytes(), Some(500));
+        set_global_mem_tier_bytes(0);
     }
 
     /// Sampler-facing contract: `pool_reserved` − `mem_tier_account` = query-only usage.
@@ -739,13 +723,10 @@ mod tests {
     /// success as `try_reserve_bytes` — it must return immediately, not park.
     #[tokio::test(start_paused = true)]
     async fn reserve_bytes_or_wait_is_noop_when_unset() {
-        {
-            let _guard = GLOBAL_BUDGET_TEST_LOCK.lock();
-            set_global_mem_tier_bytes(0);
-        }
+        let _guard = GLOBAL_BUDGET_TEST_LOCK.lock().await;
+        set_global_mem_tier_bytes(0);
         let ok = reserve_bytes_or_wait(1_000_000, Duration::from_millis(1500)).await;
         assert!(ok);
-        let _guard = GLOBAL_BUDGET_TEST_LOCK.lock();
         set_global_mem_tier_bytes(0);
     }
 
