@@ -14656,6 +14656,27 @@ impl CayenneTableProvider {
             "cold-promotion",
         );
 
+        // FIX (cold-stall): cap CONCURRENT cold promotions process-wide. The never-ready freeze is a
+        // CROSS-TABLE effect — a single table's promotion completes fine, but several concurrent
+        // promotions' scans contend and hit the drain lost-wake. This permit is acquired FIRST, before
+        // `compaction_lock` and `write_lock`, so a promotion QUEUED on it holds no table lock and does
+        // NOT block its table's CDC/ingest while it waits. Global (all tables share one limiter);
+        // default 1 = fully serialize, tunable via `CAYENNE_MAX_CONCURRENT_COLD_PROMOTIONS`.
+        static COLD_PROMOTION_LIMIT: std::sync::LazyLock<tokio::sync::Semaphore> =
+            std::sync::LazyLock::new(|| {
+                let permits = std::env::var("CAYENNE_MAX_CONCURRENT_COLD_PROMOTIONS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .filter(|&n| n >= 1)
+                    .unwrap_or(1);
+                tokio::sync::Semaphore::new(permits)
+            });
+        stall.phase("await-promotion-permit");
+        let Ok(_promo_permit) = COLD_PROMOTION_LIMIT.acquire().await else {
+            // Semaphore is never closed in practice; treat a closed limiter as "skip this tick".
+            return Ok(false);
+        };
+
         // Lock order matches compaction: `compaction_lock` before `write_lock`.
         // A position-delete compaction path may briefly try `write_lock` first, but
         // it uses `try_lock` on `compaction_lock`; if promotion owns the compaction
