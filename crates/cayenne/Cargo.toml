@@ -402,6 +402,10 @@ name = "compaction_write_amplification"
 
 [[bench]]
 harness = false
+name = "p1_audit_coverage"
+
+[[bench]]
+harness = false
 name = "scan_under_write_attribution"
 
 [[bench]]
