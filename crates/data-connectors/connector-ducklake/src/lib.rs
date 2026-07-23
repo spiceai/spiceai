@@ -448,3 +448,13 @@ pub const CONNECTOR_NAME: &str = "ducklake";
 pub fn factory() -> Arc<dyn DataConnectorFactory> {
     DuckLakeFactory::new_arc()
 }
+
+// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_ducklake as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+runtime::register_data_connector!(
+    register_ducklake_connector,
+    DUCKLAKE_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    DuckLakeFactory
+);
