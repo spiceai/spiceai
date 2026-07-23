@@ -388,7 +388,6 @@ async fn mysql_binlog_replication_end_to_end() -> Result<(), anyhow::Error> {
 /// additionally exercises the `spice_sys_mysql_binlog` position sidecar.
 #[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "https://github.com/spiceai/spiceai/issues/11987"]
 async fn mysql_binlog_replication_end_to_end_cayenne() -> Result<(), anyhow::Error> {
     let temp_dir = tempfile::tempdir()?;
     let data_dir = temp_dir.path().join("cayenne");

@@ -45,8 +45,10 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use app::AppBuilder;
 use data_components::postgres::provider::check_cdc_prerequisites;
 use datafusion::assert_batches_eq;
+use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use runtime::Runtime;
-use secrecy::ExposeSecret;
+use runtime::status::ComponentStatus;
+use secrecy::{ExposeSecret, SecretString};
 use spicepod::{
     component::catalog::{
         Catalog, CatalogAcceleration, CatalogAccelerationEngine, CatalogRefreshMode,
@@ -171,7 +173,72 @@ fn accelerated_pg_catalog_excluding_items(port: usize) -> Catalog {
     catalog
 }
 
-async fn start_runtime(catalog: Catalog) -> Result<Arc<Runtime>, anyhow::Error> {
+/// Same as [`accelerated_pg_catalog`], but including only `orders` -- validates
+/// the `include` filter's positive form: a table that doesn't match `include`
+/// is never synthesized (absent from the catalog's namespace), the mirror of
+/// [`accelerated_pg_catalog_excluding_items`].
+fn accelerated_pg_catalog_including_only_orders(port: usize) -> Catalog {
+    let mut catalog = accelerated_pg_catalog(port);
+    catalog.include = vec!["public.orders".to_string()];
+    catalog
+}
+
+/// Seed only tables that CANNOT be CDC-accelerated: `REPLICA IDENTITY NOTHING`
+/// and a keyless `DEFAULT` table. A catalog pointed here discovers tables but
+/// finds none eligible -- the fail-loud path
+/// (`test_catalog_acceleration_fails_loudly_when_no_tables_eligible`).
+async fn seed_only_ineligible_tables(port: usize) -> Result<(), anyhow::Error> {
+    let pool = common::get_postgres_connection_pool(port, None).await?;
+    let conn = pool
+        .connect_direct()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    conn.conn
+        .simple_query(
+            "CREATE TABLE ri_nothing (id INT PRIMARY KEY, name TEXT NOT NULL); \
+             ALTER TABLE ri_nothing REPLICA IDENTITY NOTHING; \
+             INSERT INTO ri_nothing VALUES (1, 'a'), (2, 'b'); \
+             CREATE TABLE ri_keyless (name TEXT NOT NULL); \
+             INSERT INTO ri_keyless VALUES ('a'), ('b');",
+        )
+        .await?;
+
+    Ok(())
+}
+
+/// Create a `LOGIN` role WITHOUT the `REPLICATION` privilege and return a
+/// connection pool authenticating as it, for exercising the
+/// replication-privilege prerequisite branch of `check_cdc_prerequisites`.
+async fn pool_for_non_replication_role(
+    port: usize,
+) -> Result<PostgresConnectionPool, anyhow::Error> {
+    let admin = common::get_postgres_connection_pool(port, None).await?;
+    let conn = admin
+        .connect_direct()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // New roles default to NOREPLICATION NOSUPERUSER; make that explicit.
+    conn.conn
+        .simple_query("CREATE ROLE norepl LOGIN PASSWORD 'norepl_pw' NOSUPERUSER NOREPLICATION;")
+        .await?;
+
+    let mut params: HashMap<String, SecretString> = get_pg_params(port);
+    params.insert("pg_user".to_string(), SecretString::from("norepl"));
+    params.insert("pg_pass".to_string(), SecretString::from("norepl_pw"));
+
+    let pool = PostgresConnectionPool::new(params)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to build non-replication-role pool: {e}"))?;
+    Ok(pool)
+}
+
+/// Build a runtime with `catalog` and run component loading to completion, but
+/// WITHOUT asserting the runtime became ready. Used by the fail-loud test: a
+/// catalog that correctly fails to load leaves the runtime not-ready by design,
+/// so [`runtime_ready_check`] (which [`start_runtime`] runs) would panic before
+/// the test could observe the catalog's Error status.
+async fn build_and_load_runtime(catalog: Catalog) -> Result<Arc<Runtime>, anyhow::Error> {
     register_test_connectors().await;
     let app = AppBuilder::new("postgres_catalog_changes_test")
         .with_catalog(catalog)
@@ -186,6 +253,11 @@ async fn start_runtime(catalog: Catalog) -> Result<Arc<Runtime>, anyhow::Error> 
         () = Arc::clone(&rt).load_components() => {}
     }
 
+    Ok(rt)
+}
+
+async fn start_runtime(catalog: Catalog) -> Result<Arc<Runtime>, anyhow::Error> {
+    let rt = build_and_load_runtime(catalog).await?;
     runtime_ready_check(&rt).await;
     Ok(rt)
 }
@@ -574,6 +646,145 @@ async fn test_catalog_acceleration_using_index_cdc_converges() -> Result<(), any
                 "USING INDEX CDC never converged: count={:?} (expected 2), updated_name={:?} (expected \"x2\")",
                 query_i64(&rt, &count_sql).await,
                 query_string(&rt, &updated_sql).await,
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// The `include` filter's positive form: a catalog that includes only
+/// `public.orders` synthesizes that table and nothing else -- `items`, though
+/// eligible, is never synthesized and is absent from the catalog namespace.
+/// Mirror of `test_catalog_acceleration_respects_exclude_filter`.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_catalog_acceleration_respects_include_filter() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,info,runtime::catalogconnector=debug",
+    ));
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+
+            seed_tables(port).await?;
+
+            let rt = start_runtime(accelerated_pg_catalog_including_only_orders(port)).await?;
+
+            wait_for_table_ready(&rt, "orders").await?;
+
+            let items_result = run_query(
+                &rt,
+                &format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.items"),
+            )
+            .await;
+            anyhow::ensure!(
+                items_result.is_err(),
+                "table {CATALOG_NAME}.public.items is not in the include set and should be \
+                absent, but the query succeeded"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// A catalog whose every discovered table is ineligible (`REPLICA IDENTITY
+/// NOTHING`, keyless `DEFAULT`) must fail loudly -- reaching an `Error` status
+/// with an actionable message -- rather than registering an empty catalog.
+/// Discovery is one-shot (auto-detecting tables added after startup is a
+/// non-goal), so zero eligible tables is a permanent configuration error.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_catalog_acceleration_fails_loudly_when_no_tables_eligible()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,info,runtime::catalogconnector=debug",
+    ));
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+
+            seed_only_ineligible_tables(port).await?;
+
+            // NOT `start_runtime`: the catalog is expected to fail to load, which
+            // leaves the runtime not-ready by design, so a readiness assertion
+            // would fire before we can observe the catalog's Error status.
+            let rt = build_and_load_runtime(accelerated_pg_catalog(port)).await?;
+
+            // The catalog must reach Error state -- fail loud, not register empty.
+            let errored = wait_until_true(Duration::from_mins(1), || {
+                let rt = Arc::clone(&rt);
+                async move {
+                    rt.status()
+                        .get_catalog_statuses()
+                        .get(CATALOG_NAME)
+                        .is_some_and(|s| matches!(s, ComponentStatus::Error(_)))
+                }
+            })
+            .await;
+            anyhow::ensure!(
+                errored,
+                "catalog with no eligible tables should reach Error state, got {:?}",
+                rt.status().get_catalog_statuses().get(CATALOG_NAME)
+            );
+
+            // And the error must carry an actionable message. An `Error(None)`
+            // (message-less) or any non-`Error` status is a failure here, not a
+            // case to skip -- the whole point is that the failure is loud AND
+            // explains itself.
+            match rt.status().get_catalog_statuses().get(CATALOG_NAME) {
+                Some(ComponentStatus::Error(Some(message))) => {
+                    anyhow::ensure!(
+                        message.contains("no tables are eligible"),
+                        "error message should be actionable, got: {message}"
+                    );
+                }
+                other => anyhow::bail!(
+                    "catalog should be in an Error state with an actionable message, got {other:?}"
+                ),
+            }
+
+            // The catalog's tables must not be queryable.
+            let query_result = run_query(
+                &rt,
+                &format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.ri_nothing"),
+            )
+            .await;
+            anyhow::ensure!(
+                query_result.is_err(),
+                "an ineligible-only catalog should register no queryable tables"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// `check_cdc_prerequisites` fails, naming the replication-privilege problem,
+/// when the connecting role lacks the `REPLICATION` attribute -- the second
+/// prerequisite branch, alongside the `wal_level` check.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_check_cdc_prerequisites_rejects_non_replication_role() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            // Needs wal_level=logical so the check gets PAST the wal_level gate
+            // and reaches the replication-privilege check.
+            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+
+            let pool = pool_for_non_replication_role(port).await?;
+
+            let result = check_cdc_prerequisites(&pool).await;
+            let err = result.expect_err("expected replication-privilege check to fail");
+            let message = err.to_string();
+            anyhow::ensure!(
+                message.contains("replication") && message.contains("norepl"),
+                "expected error naming the replication privilege and role, got: {message}"
             );
 
             Ok(())
