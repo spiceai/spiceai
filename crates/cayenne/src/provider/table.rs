@@ -21457,6 +21457,56 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    /// Discard EVERY in-memory CDC mem-tier row (all shards) for a delete-all
+    /// (TRUNCATE / `DELETE … WHERE TRUE`). Returns the count of visible rows
+    /// dropped so the caller can fold it into the delete's reported row count.
+    /// The caller MUST hold `write_lock` (as the delete sinks do), so no
+    /// concurrent CDC apply mutates the tier between the capture and the clear.
+    pub(crate) async fn purge_mem_tier_all(&self) -> Result<u64> {
+        if self.mem_tier.is_empty() {
+            return Ok(0);
+        }
+        // Capture each shard's full segment prefix under no append (write_lock held
+        // by the caller). Count the visible rows removed, and read the source-slot
+        // epoch to ack BEFORE the clear empties the segments.
+        let shard_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
+            .mem_tier
+            .shards()
+            .iter()
+            .map(ArcSwap::load_full)
+            .collect();
+        let flushed_counts: Vec<usize> = shard_snapshots.iter().map(|s| s.segments.len()).collect();
+        let mut removed_rows: u64 = 0;
+        for shard in &shard_snapshots {
+            if shard.is_empty() || shard.segments.is_empty() {
+                continue;
+            }
+            for batch in self.visible_mem_tier_batches(shard, None)? {
+                removed_rows = removed_rows.saturating_add(batch.num_rows() as u64);
+            }
+        }
+        // The source-slot epoch every discarded row is at/below — mirrors
+        // `checkpoint_mem_tier_inner` (MAX over shards of the per-apply
+        // `source_position`, falling back to the N==1 shard's `epoch` currency).
+        // The rows are DISCARDED, not made durable, so every deferred source
+        // committer at/below this epoch must still be released via the advancer
+        // below or the deferred-commit queue stalls the changes stream (#11644).
+        let durable_epoch = shard_snapshots
+            .iter()
+            .zip(flushed_counts.iter())
+            .filter_map(|(s, &c)| s.max_source_position_in_prefix(c))
+            .max();
+        let epoch =
+            durable_epoch.unwrap_or_else(|| shard_snapshots.first().map_or(0, |shard| shard.epoch));
+        // Clearing each shard's FULL prefix leaves an empty tier. `false`: the
+        // inline corpus is deleted by the caller's inline/file sink, not here, so
+        // this must not also run the checkpoint-time inline-metadata clear.
+        self.clear_flushed_mem_tier_state_all_shards(&flushed_counts, false)
+            .await?;
+        self.fire_slot_advancer(epoch).await;
+        Ok(removed_rows)
+    }
+
     /// Fire the installed [`SlotAdvancer`] for `durable_epoch`, if one is wired
     /// up (memory mode). A no-op in file mode / when the runtime did not install
     /// a handle.
@@ -28618,6 +28668,84 @@ mod tests {
         }
         ids.sort_unstable();
         ids
+    }
+
+    /// TRUNCATE / `DELETE … WHERE TRUE` on a `refresh_mode: changes` table must
+    /// discard rows still resident in the un-checkpointed in-memory CDC mem-tier.
+    #[tokio::test]
+    async fn truncate_purges_uncheckpointed_mem_tier_rows() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let vortex_config = VortexConfig {
+            // Memory-durability CDC path: appends land in the RAM mem-tier and are
+            // not flushed to a durable file, so only a mem-tier purge can clear them.
+            cdc_durability: crate::metadata::CdcDurability::Memory,
+            cdc_mem_tier_min_flush_bytes: 0,
+            ..VortexConfig::default()
+        };
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "truncate_mem_tier",
+            Arc::clone(&schema),
+            vortex_config,
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+        assert!(
+            provider.is_cdc_memory_mode(),
+            "precondition: table must run the in-memory CDC durability path"
+        );
+
+        // Append two un-checkpointed batches straight into the mem-tier.
+        let no_deletions = OnConflictDeletions::default();
+        let b1 = int64_id_batch(&[1, 2, 3]);
+        let bytes1 = b1.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![b1], &no_deletions, bytes1, 0)
+            .await
+            .expect("append batch 1");
+        let b2 = int64_id_batch(&[4, 5]);
+        let bytes2 = b2.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![b2], &no_deletions, bytes2, 0)
+            .await
+            .expect("append batch 2");
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1, 2, 3, 4, 5],
+            "precondition: the un-checkpointed mem-tier rows are visible to scans"
+        );
+
+        // TRUNCATE flows as `delete_from(WHERE TRUE)` (see refresh_task::changes).
+        let delete_plan = provider
+            .delete_from(&ctx.state(), vec![datafusion_expr::lit(true)])
+            .await
+            .expect("delete-all plan");
+        let results = datafusion::physical_plan::collect(delete_plan, ctx.task_ctx())
+            .await
+            .expect("delete-all executed");
+        let deleted = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .expect("uint64 count column")
+            .value(0);
+        assert_eq!(
+            deleted, 5,
+            "the delete-all count must include the 5 purged mem-tier rows"
+        );
+
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            Vec::<i64>::new(),
+            "no mem-tier row may survive a TRUNCATE / DELETE WHERE TRUE"
+        );
+        assert!(
+            provider.mem_tier.is_empty(),
+            "the mem-tier must be fully purged after the delete-all"
+        );
     }
 
     // ── Off-lock staged upsert (`begin_staged_upsert_occ`) ──
