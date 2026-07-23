@@ -3436,9 +3436,10 @@ impl DataFusion {
     /// Returns `Ok(Some(evolved_schema))` when an evolution was applied (the caller must
     /// rebuild its batch against this schema, since [`verify_schema`] is exact-positional),
     /// or `Ok(None)` when nothing was evolved — no acceleration, a `block`/`fail` policy,
-    /// an engine without in-place evolution, an `Incompatible` change, or a change the
-    /// policy does not permit. In every `Ok(None)` case the caller's write proceeds
-    /// unchanged and rejects the batch exactly as it does today.
+    /// a non-sink source (the rebind is sink-specific), an engine without in-place
+    /// evolution, an `Incompatible` change, or a change the policy does not permit. In
+    /// every `Ok(None)` case the caller's write proceeds unchanged and rejects the batch
+    /// exactly as it does today.
     ///
     /// Serialized per dataset (see `schema_evolve_locks`): the live provider schema is
     /// re-read *after* acquiring the lock, so two concurrent exports adding different
@@ -3455,6 +3456,16 @@ impl DataFusion {
         let policy = dataset.on_schema_change;
         // `block` (default) and `fail` keep today's reject behavior: never evolve on write.
         if matches!(policy, OnSchemaChange::Block | OnSchemaChange::Fail) {
+            return Ok(None);
+        }
+
+        // Write-time evolution rebinds the provider through `SinkConnector` (the
+        // `from: sink:` OTLP metric-dimension path). For any other source that rebind
+        // would swap the dataset's real connector for a no-op sink, silently disabling
+        // refresh and source reads. Restrict this path to sink datasets; every other
+        // source keeps today's reject behavior and evolves only via the registration/
+        // restart path against its actual connector.
+        if dataset.source() != SINK_DATACONNECTOR {
             return Ok(None);
         }
 
