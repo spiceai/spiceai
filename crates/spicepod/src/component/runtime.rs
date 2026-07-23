@@ -448,12 +448,35 @@ pub struct TelemetryConfig {
     /// `OpenTelemetry` 0.31's SDK does not support per-reader name transforms,
     /// so this knob is intentionally placed at the telemetry level rather
     /// than under any single exporter.
+    ///
+    /// Validated against the `OpenTelemetry` instrument name syntax so prefixed
+    /// names stay valid for OTLP backends and remain sanitizable to Prometheus
+    /// legacy names (`[a-zA-Z_:][a-zA-Z0-9_:]*`). Must start with an ASCII
+    /// letter, contain only ASCII letters, digits, `_`, `.`, `-`, or `/`, and
+    /// be at most [`METRIC_PREFIX_MAX_LEN`] characters (128; ≥127 characters of
+    /// headroom remain under the 255-char `OpenTelemetry` instrument name
+    /// limit for the base metric name). A trailing `.` or `_` is recommended
+    /// (e.g. `spiceai.`).
+    /// See: <https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetrymetric_prefix>
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metric_prefix: Option<String>,
     /// Optional configuration for pushing metrics to an OpenTelemetry collector
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub otel_exporter: Option<OtelExporterConfig>,
 }
+
+/// Maximum length for `runtime.telemetry.metric_prefix`.
+///
+/// Cap at a round power of two so namespaces stay short. Prefixed names must
+/// still fit the `OpenTelemetry` 255-character instrument name limit
+/// (`prefix` + base metric name ≤ 255), so 128 leaves ≥127 characters of
+/// headroom for the base name.
+pub const METRIC_PREFIX_MAX_LEN: usize = 128;
+
+/// Non-alphanumeric characters allowed in `OpenTelemetry` instrument names
+/// (and therefore in `metric_prefix`). Matches the `OTel` Metrics API ABNF and
+/// the Rust SDK's `INSTRUMENT_NAME_ALLOWED_NON_ALPHANUMERIC_CHARS`.
+const METRIC_PREFIX_ALLOWED_NON_ALPHANUMERIC: [char; 4] = ['_', '.', '-', '/'];
 
 impl Default for TelemetryConfig {
     fn default() -> Self {
@@ -465,6 +488,58 @@ impl Default for TelemetryConfig {
             otel_exporter: None,
         }
     }
+}
+
+/// Validate `runtime.telemetry.metric_prefix` against OpenTelemetry instrument
+/// name syntax so `{prefix}{instrument}` stays a valid metric name for OTLP
+/// and maps cleanly through Prometheus name sanitization.
+///
+/// Non-empty prefixes must (mirroring the `OTel` Metrics API / SDK):
+/// - start with an ASCII alphabetic character
+/// - contain only ASCII alphanumeric characters, `_`, `.`, `-`, or `/`
+/// - have length ≤ [`METRIC_PREFIX_MAX_LEN`] (128; leaves ≥127 characters of
+///   headroom under the 255-char `OTel` instrument name limit for the base
+///   metric name)
+///
+/// # Errors
+///
+/// Returns a user-facing error describing the violation and how to fix it.
+pub fn validate_metric_prefix(prefix: &str) -> Result<(), String> {
+    if prefix.is_empty() {
+        return Ok(());
+    }
+
+    // Check character validity before length so non-ASCII input reports the
+    // actionable "invalid character" error instead of a misleading length error
+    // (UTF-8 byte length can exceed the limit even when char count does not).
+    if !prefix
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic())
+    {
+        return Err(format!(
+            "Invalid 'runtime.telemetry.metric_prefix' value {prefix:?}: must start with an ASCII letter (A-Z or a-z). Example: 'spiceai.'. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetrymetric_prefix"
+        ));
+    }
+
+    if let Some(invalid) = prefix
+        .chars()
+        .find(|c| !c.is_ascii_alphanumeric() && !METRIC_PREFIX_ALLOWED_NON_ALPHANUMERIC.contains(c))
+    {
+        return Err(format!(
+            "Invalid 'runtime.telemetry.metric_prefix' value {prefix:?}: contains invalid character {invalid:?}. Allowed characters are ASCII letters, digits, '_', '.', '-', and '/'. Example: 'spiceai.'. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetrymetric_prefix"
+        ));
+    }
+
+    // Character count (not UTF-8 bytes) matches the OpenTelemetry ABNF limit.
+    let char_len = prefix.chars().count();
+    if char_len > METRIC_PREFIX_MAX_LEN {
+        return Err(format!(
+            "Invalid 'runtime.telemetry.metric_prefix' value {prefix:?}: length {char_len} exceeds the maximum of {METRIC_PREFIX_MAX_LEN} characters. Shorten the prefix so prefixed metric names stay within the OpenTelemetry 255-character instrument name limit. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetrymetric_prefix"
+        ));
+    }
+
+    Ok(())
 }
 
 /// Configuration for the MCP (Model Context Protocol) HTTP endpoint.
@@ -1239,6 +1314,10 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             if !sql_results_explicit {
                 caching.sql_results = Some(results_cache.into());
             }
+        }
+
+        if let Some(prefix) = &deserializer.telemetry.metric_prefix {
+            validate_metric_prefix(prefix)?;
         }
 
         Ok(Runtime {
@@ -2164,6 +2243,125 @@ datasets:
         "#;
         let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.telemetry.metric_prefix.as_deref(), Some("spiceai."));
+    }
+
+    #[test]
+    fn test_metric_prefix_underscore_separator_accepted() {
+        let yaml = r#"
+            telemetry:
+                metric_prefix: "spiceai_"
+        "#;
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert_eq!(runtime.telemetry.metric_prefix.as_deref(), Some("spiceai_"));
+    }
+
+    #[test]
+    fn test_metric_prefix_empty_accepted() {
+        let yaml = r#"
+            telemetry:
+                metric_prefix: ""
+        "#;
+        let runtime: Runtime = yaml::from_str(yaml).expect("empty metric_prefix must parse");
+        assert_eq!(runtime.telemetry.metric_prefix.as_deref(), Some(""));
+        validate_metric_prefix("").expect("empty metric_prefix must be valid");
+    }
+
+    #[test]
+    fn test_metric_prefix_leading_digit_rejected() {
+        let yaml = r#"
+            telemetry:
+                metric_prefix: "1spice."
+        "#;
+        let result: Result<Runtime, _> = yaml::from_str(yaml);
+        let err = result.expect_err("leading digit metric_prefix must fail to parse");
+        assert!(
+            err.to_string().contains("must start with an ASCII letter"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_metric_prefix_invalid_characters_rejected() {
+        for invalid in ["spice ai.", "spiceai:", "spiceai@", "spiceai🚀."] {
+            let yaml = format!(
+                r#"
+            telemetry:
+                metric_prefix: "{invalid}"
+        "#
+            );
+            let result: Result<Runtime, _> = yaml::from_str(&yaml);
+            let err = result.expect_err("metric_prefix with invalid characters must fail to parse");
+            assert!(
+                err.to_string().contains("invalid character"),
+                "unexpected error for '{invalid}': {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_metric_prefix_too_long_rejected() {
+        let too_long = format!("{}{}", "a", "x".repeat(METRIC_PREFIX_MAX_LEN));
+        assert_eq!(too_long.chars().count(), METRIC_PREFIX_MAX_LEN + 1);
+        let yaml = format!(
+            r#"
+            telemetry:
+                metric_prefix: "{too_long}"
+        "#
+        );
+        let result: Result<Runtime, _> = yaml::from_str(&yaml);
+        let err = result.expect_err("overlong metric_prefix must fail to parse");
+        assert!(
+            err.to_string().contains("exceeds the maximum"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_metric_prefix_non_ascii_reports_invalid_character_not_length() {
+        // Multi-byte UTF-8 must fail on character validity, not a misleading
+        // byte-length overflow (🚀 is 4 UTF-8 bytes).
+        let err = validate_metric_prefix("spiceai🚀.")
+            .expect_err("non-ASCII metric_prefix must be rejected");
+        assert!(
+            err.contains("invalid character"),
+            "expected invalid-character error, got: {err}"
+        );
+        assert!(
+            !err.contains("exceeds the maximum"),
+            "non-ASCII must not be reported as a length error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_metric_prefix_error_keeps_control_chars_on_one_line() {
+        let err = validate_metric_prefix("spice\nai.")
+            .expect_err("control characters in metric_prefix must be rejected");
+        assert!(
+            !err.contains('\n'),
+            "error must stay on one line when prefix contains newlines: {err:?}"
+        );
+        assert!(
+            err.contains("spice\\nai."),
+            "prefix must be debug-escaped in the error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_metric_prefix_accepts_otel_charset() {
+        let max_len = "a".repeat(METRIC_PREFIX_MAX_LEN);
+        for valid in ["spiceai.", "spiceai_", "a", "A-B/c_d.e", max_len.as_str()] {
+            validate_metric_prefix(valid)
+                .unwrap_or_else(|e| panic!("expected '{valid}' to be valid: {e}"));
+        }
+    }
+
+    #[test]
+    fn test_validate_metric_prefix_rejects_prometheus_colon() {
+        // Prometheus reserves ':' for recording rules; OTel instrument syntax
+        // also disallows it. Keep both backends happy by rejecting colons.
+        let err = validate_metric_prefix("spice:ai.")
+            .expect_err("colon in metric_prefix must be rejected");
+        assert!(err.contains("invalid character"));
     }
 
     #[test]
