@@ -14,26 +14,29 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::parameters::ParameterSpec;
+use runtime_parameters::TypedParams;
+use secrecy::SecretString;
 
-const MODEL2VEC_PARAM_LEN: usize = 6;
-
-pub const PARAMETERS: &[ParameterSpec] = &MODEL2VEC_PARAMETERS;
-
-pub(crate) const MODEL2VEC_PARAMETERS: [ParameterSpec; MODEL2VEC_PARAM_LEN] = [
-    // runtime (no prefix) to match docs and preserve backward compatibility.
-    ParameterSpec::runtime("hf_token")
-        .secret()
-        .description("The Hugging Face access token."),
-    ParameterSpec::runtime("subfolder")
-        .description("The subfolder within the Hugging Face repo containing the model."),
-    ParameterSpec::runtime("normalize")
-        .description("Whether to normalize the embedding output.")
-        .one_of(&["true", "false"]),
-    ParameterSpec::runtime("parallelism")
-        .description("The number of threads to use for parallel inference."),
-    ParameterSpec::runtime("embed_max_token_length")
-        .description("The maximum token length for embedding input."),
-    ParameterSpec::runtime("embed_custom_batch_size")
-        .description("The custom batch size for embedding inference."),
-];
+/// Parameters for `from: model2vec` embedding models.
+#[derive(TypedParams)]
+#[params(prefix = "model2vec")]
+pub struct Model2VecEmbeddingParams {
+    /// The Hugging Face access token.
+    #[param(runtime, autoload_secret)]
+    pub hf_token: Option<SecretString>,
+    /// The subfolder within the Hugging Face repo containing the model.
+    #[param(runtime)]
+    pub subfolder: Option<String>,
+    /// Whether to normalize the embedding output.
+    #[param(runtime)]
+    pub normalize: Option<bool>,
+    /// The number of threads to use for parallel inference.
+    #[param(runtime)]
+    pub parallelism: Option<usize>,
+    /// The maximum token length for embedding input.
+    #[param(runtime)]
+    pub embed_max_token_length: Option<usize>,
+    /// The custom batch size for embedding inference.
+    #[param(runtime)]
+    pub embed_custom_batch_size: Option<usize>,
+}

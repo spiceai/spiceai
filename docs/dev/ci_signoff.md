@@ -20,8 +20,9 @@ Previously every PR push ran the whole suite — lint, build, unit tests,
 integration tests, E2E — and then the merge queue ran much of it *again* on
 merge. That is slow feedback and a lot of duplicated CI. With sign-off:
 
-- **Fast local feedback.** `make signoff` runs lint + unit tests on your
-  hardware, which is typically faster than waiting for a remote runner.
+- **Fast local feedback.** `make signoff` target-lints changed crates first,
+  then runs full lint + unit tests on your hardware — faster fail-first than a
+  remote runner, and faster than workspace lint alone when a change is wrong.
 - **No duplicated CI.** The full suite runs once, in the queue, on the merged
   commit — not on every push and again on merge.
 - **Same safety.** Nothing reaches `trunk` without the full suite passing on the
@@ -51,8 +52,16 @@ From a clean Git checkout or JJ workspace, with your branch/bookmark pushed
 and up to date:
 
 ```bash
-make signoff          # runs `make lint-rust` + `make build-cli nextest`, then attests
+make signoff          # targeted crate lint → full lint + unit tests, then attests
 ```
+
+`make signoff` first diffs the branch against `trunk`. If that diff has no
+Rust-affecting files (`.rs`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain*`,
+`.cargo/*`), Rust lint/build/unit tests are skipped and the sign-off status is
+still posted (docs/YAML/script-only changes). Otherwise it maps changed files to
+workspace crates, runs `make lint-rust PACKAGES="…"` for fast fail-first
+feedback, then the full `make lint-rust` and `make build-cli nextest` gate. Set
+`SIGNOFF_SKIP_TARGETED_LINT=1` to skip the scoped pre-lint.
 
 On success it posts a `signoff` commit status on your current `HEAD`. If the
 **Attestation** check already ran and failed before the sign-off existed, the
@@ -107,6 +116,43 @@ scripts/signoff status        # does HEAD have its own sign-off?
 scripts/signoff --help        # full usage
 ```
 
+### Remote sign-off (lab SSH host or self-hosted runner)
+
+When you can't (or don't want to) run the checks on your machine:
+
+```bash
+make signoff-remote                 # current branch
+```
+
+`make signoff-remote` first probes lab hosts over SSH (`192.168.1.100`,
+`192.168.1.101` by default; override with `SIGNOFF_SSH_HOSTS`). The first host
+that answers and has a Git checkout at `$HOME/dev/spice2` is used: it fetches
+your pushed branch into that clone and runs `scripts/signoff -f` there (same
+checks and Rust-skip behavior as local). Override the remote path with an
+absolute path only: `SIGNOFF_SSH_REPO=/absolute/path` (`~` is not expanded).
+
+If no SSH host is usable, it falls back to dispatching the **Remote Sign-off**
+GitHub Actions workflow on a self-hosted runner:
+
+```bash
+gh workflow run signoff.yml -f branch=<your-branch>
+gh run watch --workflow signoff.yml
+```
+
+The Actions workflow:
+
+1. Checks out your branch (full history) and fetches `trunk`
+2. Target-lints crates touched by the branch vs `trunk` (GitHub compare API as a
+   fallback when merge-base isn't available), or skips Rust checks when the
+   branch has no Rust-affecting files
+3. Runs full `make lint-rust` + `make build-cli nextest` when Rust is affected
+4. Posts pending → success/failure `signoff` statuses, then re-runs
+   **Attestation** if needed
+
+Requires write access to the repository (same as local sign-off — fork
+contributors still need a maintainer to sign off). The lab SSH path also needs
+SSH key access to the host and `gh` auth on that machine.
+
 ### Jujutsu workspaces
 
 `make signoff` also works in non-colocated JJ workspaces (where there is a
@@ -152,7 +198,8 @@ merge queue is still the real gate.
 
 | Stage | Trigger | Checks |
 | --- | --- | --- |
-| Local | `make signoff` | `make lint-rust`, `make build-cli nextest` |
+| Local | `make signoff` | skip Rust if no Rust-affecting files in the branch diff; else targeted `make lint-rust PACKAGES=…`, full `make lint-rust`, `make build-cli nextest` |
+| Remote | `make signoff-remote` | same checks via lab SSH (`$HOME/dev/spice2` on 192.168.1.100/101) if reachable, else self-hosted `signoff.yml`; posts `signoff` |
 | Pull request | `pull_request` | **Attestation** (validates the sign-off, or auto-passes a pure revert) + PR hygiene; merge-queue check names report lightweight skipped/passthrough results |
 | Merge queue | `merge_group` | the full required suite (below) + advisory niche checks |
 

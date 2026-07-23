@@ -19,15 +19,12 @@ arrow-array.workspace = true
 arrow-buffer.workspace = true
 arrow-flight.workspace = true
 arrow-row.workspace = true
+arrow-schema = { workspace = true, features = ["serde"] }
 arrow_tools = { path = "../arrow_tools" }
 async-stream.workspace = true
 async-trait.workspace = true
-aws-config = { workspace = true, optional = true }
 aws-credential-types.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
-aws-sdk-dynamodb = { workspace = true, optional = true }
-aws-sdk-dynamodbstreams = { workspace = true, optional = true }
-aws-smithy-async = { workspace = true, optional = true }
 azure_core = { version = "0.31.0", optional = true }
 azure_data_cosmos = { version = "0.30.0", default-features = false, features = [
     "hmac_rust",
@@ -40,7 +37,7 @@ bigdecimal = { workspace = true, optional = true }
 bytes.workspace = true
 charset = { workspace = true, optional = true }
 chrono.workspace = true
-clickhouse-rs = { workspace = true, optional = true }
+connector-postgres-common = { path = "../data-connectors/connector-postgres-common", optional = true }
 dashmap = "6.1"
 dataformat-json = { path = "../dataformat-json" }
 datafusion.workspace = true
@@ -57,7 +54,6 @@ duckdb = { workspace = true, features = [
     "vtab-arrow",
     "appender-arrow",
 ], optional = true }
-dynamodb-streams = { path = "../dynamodb-streams", optional = true }
 flight_client = { path = "../flight_client" }
 futures.workspace = true
 git2 = { workspace = true }
@@ -127,6 +123,15 @@ uuid.workspace = true
 zip = "8.3.0"
 tokio-stream.workspace = true
 
+# Align on 0.21 (already pulled in via iceberg) so the binary carries one
+# apache-avro, not two majors. Default features off avoids `xz` (pulls
+# `lzma-sys`, which conflicts with DataFusion's `liblzma`).
+apache-avro = { version = "0.21", optional = true, default-features = false, features = [
+    "bzip",
+    "snappy",
+    "zstandard",
+] }
+
 [target.'cfg(windows)'.dependencies]
 rdkafka = { workspace = true, features = ["cmake-build"], optional = true }
 
@@ -137,14 +142,13 @@ adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "datafusion-table-providers/
 # upstream `impl SQLExecutor for SqlTable`, which is gated behind
 # `datafusion-table-providers/federation`.
 federation = ["datafusion-table-providers/federation"]
-clickhouse = ["dep:clickhouse-rs", "federation"]
 cosmosdb = ["dep:azure_core", "dep:azure_data_cosmos"]
 databricks = [
     "delta_lake",
     "spark_connect",
     "datafusion-table-providers/federation",
 ]
-debezium = ["dep:rdkafka"]
+debezium = ["dep:rdkafka", "dep:apache-avro"]
 default = []
 delta_lake = ["dep:delta_kernel"]
 elasticsearch = ["dep:elasticsearch"]
@@ -153,13 +157,6 @@ duckdb = [
     "db_connection_pool/duckdb",
     "datafusion-table-providers/duckdb",
     "datafusion-table-providers/duckdb-federation",
-]
-dynamodb = [
-    "dep:aws-config",
-    "dep:aws-sdk-dynamodb",
-    "dep:aws-sdk-dynamodbstreams",
-    "dep:aws-smithy-async",
-    "dep:dynamodb-streams",
 ]
 flightsql = []
 imap = ["dep:charset", "dep:imap", "dep:mailparse"]
@@ -179,6 +176,7 @@ postgres = [
     "dep:native-tls",
     "dep:postgres-native-tls",
     "dep:postgres-protocol",
+    "dep:connector-postgres-common",
     "federation",
     "datafusion-table-providers/postgres",
     "datafusion-table-providers/postgres-federation",

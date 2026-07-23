@@ -192,6 +192,45 @@ fn column_order_keys(array: &dyn Array) -> DFResult<Vec<[u8; BYTES_PER_COLUMN]>>
     Ok(keys)
 }
 
+/// Whether `data_type` has a dedicated value-encoding arm in
+/// [`column_order_keys`], so its Z-order keys vary with the column's values and
+/// the curve can cluster on it. A type without an arm falls to the catch-all and
+/// maps *every* value to the reserved all-zero key — no clustering is ever
+/// possible — which is exactly what this guard excludes (notably `Decimal*`,
+/// `Map`, and nested types). A supported type may still encode an individual
+/// value (e.g. `0` / `false`) to the all-zero key; that is expected and does not
+/// change whether the type can cluster. MUST stay in sync with the `match` arms
+/// in [`column_order_keys`].
+pub(crate) fn is_zorder_clusterable(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+            | DataType::Timestamp(_, _)
+            | DataType::Duration(_)
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::BinaryView
+    )
+}
+
 /// Compute the interleaved Z-order key for each row across `columns`.
 ///
 /// Returns a [`BinaryArray`] of `8 * columns.len()`-byte keys; sorting it

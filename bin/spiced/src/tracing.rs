@@ -85,6 +85,7 @@ const INTERNAL_COMPONENTS: &[&str] = &[
     "runtime",
     "secrets",
     "data_components",
+    "cayenne",
     "cache",
     "extensions",
     "spice_cloud",

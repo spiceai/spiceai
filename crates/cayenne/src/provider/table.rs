@@ -150,6 +150,7 @@ use super::deletion_strategy::{
 };
 use super::memory_account::CayenneMemoryAccount;
 use super::staging_wal::PreparedStagedAppend;
+use super::utils::{bytes_key, i64_key};
 use super::vortex_format::PositionDeletionAccessPlanProvider;
 use arc_swap::ArcSwap;
 
@@ -644,10 +645,7 @@ fn deserialize_delete_keys_from_ipc(
                     rest.len()
                 )));
             }
-            Ok(rest
-                .chunks_exact(8)
-                .map(|chunk| chunk.to_vec().into_boxed_slice())
-                .collect())
+            Ok(rest.chunks_exact(8).map(bytes_key).collect())
         }
         // cycle-5 TASK 2a: LZ4-compressed Arrow IPC (composite keys).
         tombstone_format::COMPRESSED_IPC => deserialize_delete_keys_from_arrow_ipc(rest),
@@ -681,7 +679,7 @@ fn deserialize_delete_keys_from_arrow_ipc(
         row_keys.reserve(row_key_array.len());
         for row_index in 0..row_key_array.len() {
             if !row_key_array.is_null(row_index) {
-                row_keys.push(row_key_array.value(row_index).to_vec().into_boxed_slice());
+                row_keys.push(bytes_key(row_key_array.value(row_index)));
             }
         }
     }
@@ -1586,6 +1584,11 @@ pub struct CayenneTableProvider {
     /// this state when a scan captured the same [`maintained_aggregate_epoch`]
     /// as its physical shard snapshots and the registry is fresh at that epoch.
     maintained_aggregates: Arc<MaintainedAggregateRegistry>,
+    /// Default-on filter-column hit histogram (F4). Scans record which columns
+    /// appear in pushdown filters; when `sort_columns` is empty, compaction
+    /// sorts the rewrite by the hottest observed columns so zone maps prune
+    /// selective queries without spicepod setup. Shared across clones.
+    filter_column_observations: super::predicate_stats::SharedFilterColumnObservations,
     /// Visibility epoch for the maintained aggregate registry. Advanced under
     /// the same write barriers that publish scan-visible table changes.
     maintained_aggregate_epoch: Arc<AtomicU64>,
@@ -3383,7 +3386,7 @@ impl CayenneTableProvider {
                         Self::invalidate_list_files_cache(&runtime_env, &url);
                         ledger.lock().remove(&id);
                         last_listed.lock().remove(&id);
-                        tracing::info!(
+                        tracing::debug!(
                             target: "cayenne::compaction",
                             table_id = %table_id,
                             snapshot_id = %id,
@@ -4754,7 +4757,7 @@ impl CayenneTableProvider {
             // manifest is populated, delete file-by-file so a file referenced
             // in place by a live/protected snapshot survives; otherwise (legacy
             // / unpopulated) the whole dir is dead and removed wholesale.
-            tracing::info!(
+            tracing::debug!(
                 "Deleting old snapshot directory for table {}: {}",
                 table_id,
                 snapshot_id
@@ -4771,7 +4774,7 @@ impl CayenneTableProvider {
                 if fully_removed {
                     deleted_count += 1;
                 } else {
-                    tracing::info!(
+                    tracing::debug!(
                         "Kept old snapshot directory for table {table_id}: {snapshot_id} \
                          (files still referenced in place by a live snapshot)"
                     );
@@ -4784,7 +4787,7 @@ impl CayenneTableProvider {
         }
 
         if deleted_count > 0 {
-            tracing::info!(
+            tracing::debug!(
                 "Cleaned up {} old snapshot(s) for table {}",
                 deleted_count,
                 table_id
@@ -5169,6 +5172,9 @@ impl CayenneTableProvider {
             orphan_dv_sweep_scheduled: Arc::new(AtomicBool::new(false)),
             post_write_maintenance: Arc::new(PostWriteMaintenance::default()),
             maintained_aggregates,
+            filter_column_observations: Arc::new(
+                super::predicate_stats::FilterColumnObservations::new(),
+            ),
             maintained_aggregate_epoch: Arc::new(AtomicU64::new(0)),
             maintained_aggregate_visibility_sequence: Arc::new(AtomicU64::new(0)),
             maintained_aggregate_tx,
@@ -5619,17 +5625,13 @@ impl CayenneTableProvider {
         // regardless of `target_partitions` (see `snapshot_shard_count`).
         //
         // Delta writes additionally resolve a `cayenne_delta_encoding` level:
-        // small fresh deltas encode with a light scheme set (skipping the
-        // per-file BtrBlocks strategy search + FSST training that dominate
-        // small-write encode cost) and are re-encoded properly when compaction
-        // folds them. Maintenance writes (compaction, rewrites, overwrites)
-        // always use the full default strategy. See `provider::delta_encoding`.
-        let encoding_level = super::delta_encoding::effective_level(
-            self.context.delta_encoding(),
-            write_class,
-            estimated_bytes,
-            target_size_bytes,
-        );
+        // under `auto` every delta encodes with a light scheme set (skipping the
+        // per-file BtrBlocks strategy search + FSST training that dominates
+        // encode cost) and is re-encoded properly when compaction folds it.
+        // Maintenance writes (compaction, rewrites, overwrites) always use the
+        // full default strategy. See `provider::delta_encoding`.
+        let encoding_level =
+            super::delta_encoding::effective_level(self.context.delta_encoding(), write_class);
         let write_format = match super::delta_encoding::strategy_builder_for_level(encoding_level) {
             Some(strategy) => self.context.write_format_with_strategy(
                 strategy,
@@ -5693,7 +5695,7 @@ impl CayenneTableProvider {
 
         // Log when starting S3 upload process
         if is_s3_storage {
-            tracing::info!(
+            tracing::debug!(
                 "Starting S3 upload to snapshot {} for table {} (writer target file size: {})",
                 snapshot_id,
                 self.table_metadata.table_name,
@@ -5751,7 +5753,7 @@ impl CayenneTableProvider {
                         } else {
                             "calculating...".to_string()
                         };
-                        tracing::info!(
+                        tracing::debug!(
                             "S3 upload for {}: streamed {} in {:.1}s, {}",
                             table_name,
                             format_bytes(bytes_so_far),
@@ -5806,7 +5808,7 @@ impl CayenneTableProvider {
             } else {
                 "N/A".to_string()
             };
-            tracing::info!(
+            tracing::debug!(
                 "Completed S3 upload for {} to snapshot {}: {} rows across {} writer operation(s) ({}) in {:.1}s, {}",
                 self.table_metadata.table_name,
                 snapshot_id,
@@ -6241,6 +6243,7 @@ impl CayenneTableProvider {
             orphan_dv_sweep_scheduled: Arc::clone(&self.orphan_dv_sweep_scheduled),
             post_write_maintenance: Arc::clone(&self.post_write_maintenance),
             maintained_aggregates: Arc::clone(&self.maintained_aggregates),
+            filter_column_observations: Arc::clone(&self.filter_column_observations),
             maintained_aggregate_epoch: Arc::clone(&self.maintained_aggregate_epoch),
             maintained_aggregate_visibility_sequence: Arc::clone(
                 &self.maintained_aggregate_visibility_sequence,
@@ -7422,7 +7425,7 @@ impl CayenneTableProvider {
                 &mut row_id_base,
             )
             .await?;
-            tracing::info!(
+            tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 cold_keys_folded = keyset.len().saturating_sub(keys_before),
@@ -8390,7 +8393,8 @@ impl CayenneTableProvider {
                     }
                     PkDeletionSnapshot::RowConverterBased { tombstones } => {
                         if tombstones.get(key.as_ref()).is_some() {
-                            let row_key = key.as_ref().to_vec().into_boxed_slice();
+                            // Box::from once, then clone for the dual-list push (file + inline).
+                            let row_key = bytes_key(key.as_ref());
                             deleted_row_keys.push(row_key.clone());
                             deleted_inlined_row_keys.push(row_key);
                             *reinserted_over_tombstone += 1;
@@ -8430,7 +8434,7 @@ impl CayenneTableProvider {
                         }
                     }
                     PkDeletionStrategyWithCache::RowConverterBased { .. } => {
-                        let row_key = key.as_ref().to_vec().into_boxed_slice();
+                        let row_key = bytes_key(key.as_ref());
                         deleted_row_keys.push(row_key.clone());
                         deleted_inlined_row_keys.push(row_key);
                     }
@@ -8534,7 +8538,7 @@ impl CayenneTableProvider {
                                         // `commit_on_conflict_deletions` catalog call without a second
                                         // re-encoding. This is one allocation per conflict row; the
                                         // arena-indexed key design discussed in iter 3 would amortize it.
-                                        let row_key = key.as_ref().to_vec().into_boxed_slice();
+                                        let row_key = bytes_key(key.as_ref());
                                         if is_inlined_conflict {
                                             deleted_inlined_row_keys.push(row_key);
                                         } else {
@@ -8627,7 +8631,7 @@ impl CayenneTableProvider {
                                 }
                             }
                             PkDeletionStrategyWithCache::RowConverterBased { .. } => {
-                                let row_key = key.as_ref().to_vec().into_boxed_slice();
+                                let row_key = bytes_key(key.as_ref());
                                 deleted_row_keys.push(row_key.clone());
                                 deleted_inlined_row_keys.push(row_key);
                             }
@@ -9816,12 +9820,9 @@ impl CayenneTableProvider {
         match &self.pk_deletion_strategy {
             // Int64 PK tables re-derive keys from the i64 PKs and ignore the
             // encoded row keys, so this allocates only when it must.
-            PkDeletionStrategyWithCache::Int64Pk { .. } => Cow::Owned(
-                deleted_pk_i64
-                    .iter()
-                    .map(|&pk| pk.to_be_bytes().to_vec().into_boxed_slice())
-                    .collect(),
-            ),
+            PkDeletionStrategyWithCache::Int64Pk { .. } => {
+                Cow::Owned(deleted_pk_i64.iter().map(|&pk| i64_key(pk)).collect())
+            }
             // RowConverter tables reuse the caller's keys verbatim: a borrowed
             // slice stays borrowed (no clone), an owned Vec is moved through.
             PkDeletionStrategyWithCache::RowConverterBased { .. } => deleted_row_keys,
@@ -9950,10 +9951,7 @@ impl CayenneTableProvider {
                     // which replays this delta under `rcu` against the live index —
                     // so no `load_full` of the deletion snapshot here.
                     for (&delete_sequence, pks) in &pure_by_seq {
-                        let row_keys = pks
-                            .iter()
-                            .map(|pk| pk.to_be_bytes().to_vec().into_boxed_slice())
-                            .collect::<Vec<_>>();
+                        let row_keys = pks.iter().copied().map(i64_key).collect::<Vec<_>>();
                         if let Some(results) = self
                             .write_key_deletion_vectors(delete_sequence, row_keys)
                             .await?
@@ -9963,10 +9961,7 @@ impl CayenneTableProvider {
                         }
                     }
                     for (&delete_sequence, pks) in &reinsert_by_seq {
-                        let row_keys = pks
-                            .iter()
-                            .map(|pk| pk.to_be_bytes().to_vec().into_boxed_slice())
-                            .collect::<Vec<_>>();
+                        let row_keys = pks.iter().copied().map(i64_key).collect::<Vec<_>>();
                         if let Some(results) = self
                             .write_key_deletion_vectors(delete_sequence, row_keys)
                             .await?
@@ -11393,25 +11388,114 @@ impl CayenneTableProvider {
     ///
     /// # Errors
     ///
-    /// Returns an error if sorting fails or if configured sort columns don't exist.
-    fn sort_stream(&self, stream: SendableRecordBatchStream) -> Result<SendableRecordBatchStream> {
-        use datafusion_execution::TaskContext;
+    /// Returns an error only if the sort execution itself fails. Columns missing
+    /// from the stream schema (or otherwise unparseable) are skipped with a
+    /// warning and the stream is returned unsorted (see
+    /// `util::stream_utils::sort_stream`) — never surfaced as an error.
+    fn sort_stream_by_columns(
+        &self,
+        stream: SendableRecordBatchStream,
+        sort_columns: &[String],
+        task_ctx: &Arc<datafusion_execution::TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        if sort_columns.is_empty() {
+            return Ok(stream);
+        }
 
-        // Create a task context with default memory pool and runtime settings
-        // This will use the configured spill directory and compression settings
-        let task_ctx = Arc::new(TaskContext::default());
-
+        // Reuse the caller's task context — the bounded compaction/query memory
+        // pool (and spill dir) the rewrite scan already runs under. Building a
+        // fresh `TaskContext::default()` here would use an UNBOUNDED memory pool,
+        // so `SortExec` would never spill and a large default-on rewrite could OOM
+        // the process, bypassing the `runtime.query.memory_limit` contract.
         tracing::debug!(
-            "Sorting refresh data by columns {:?} for table {} using DataFusion SortExec with disk spilling support",
-            self.context.sort_columns(),
+            "Sorting data by columns {:?} for table {} using DataFusion SortExec with disk spilling support",
+            sort_columns,
             self.table_metadata.table_name
         );
 
-        // Use the common stream sorting utility
-        let sorted_stream =
-            util::stream_utils::sort_stream(stream, self.context.sort_columns(), &task_ctx)?;
+        let sorted_stream = util::stream_utils::sort_stream(stream, sort_columns, task_ctx)?;
 
         Ok(sorted_stream)
+    }
+
+    /// Effective sort columns for a snapshot rewrite under default settings.
+    ///
+    /// Operator-configured `sort_columns` always win. When empty (the default),
+    /// returns the hottest filter columns observed on scans so compaction can
+    /// cluster cold files without spicepod setup (F4 adaptive layout).
+    ///
+    /// Public so integration tests can assert the default-on policy without
+    /// reaching private compaction internals.
+    #[must_use]
+    pub fn effective_sort_columns_for_rewrite(&self) -> Vec<String> {
+        // Auto-observed columns feed a `SortExec` row-format merge whose
+        // `RowConverter` rejects `Map`/`Union`/nested types (e.g. a `Map` recorded
+        // from an `attrs['k'] = ...` filter). Restrict inferred layouts to scalar
+        // types the merge can encode so a hot unsortable column can't wedge every
+        // rewrite; explicit `sort_columns` remain the operator's responsibility.
+        fn is_row_sortable_type(dt: &DataType) -> bool {
+            match dt {
+                DataType::Boolean
+                | DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+                | DataType::Float16
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::Decimal128(..)
+                | DataType::Decimal256(..)
+                | DataType::Date32
+                | DataType::Date64
+                | DataType::Time32(_)
+                | DataType::Time64(_)
+                | DataType::Timestamp(..)
+                | DataType::Duration(_)
+                | DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Utf8View
+                | DataType::Binary
+                | DataType::LargeBinary
+                | DataType::BinaryView
+                | DataType::FixedSizeBinary(_) => true,
+                DataType::Dictionary(_, value) => is_row_sortable_type(value),
+                _ => false,
+            }
+        }
+
+        if self.context.has_sort_columns() {
+            return self.context.sort_columns().to_vec();
+        }
+        let schema = self.table_schema();
+        let observed = self.filter_column_observations.top_columns(
+            super::predicate_stats::DEFAULT_AUTO_CLUSTER_TOP_K,
+            schema.as_ref(),
+        );
+        if observed.is_empty() {
+            // No filters observed yet — don't invent a sort key; the warm rewrite
+            // just compacts unsorted until a hot column is seen.
+            return Vec::new();
+        }
+        let sortable: Vec<String> = observed
+            .into_iter()
+            .filter(|name| {
+                schema
+                    .field_with_name(name)
+                    .is_ok_and(|field| is_row_sortable_type(field.data_type()))
+            })
+            .collect();
+        if sortable.is_empty() {
+            // Hot columns were observed but none are row-sortable (e.g. all
+            // `Map`): fall back to the primary key so the rewrite still gets a
+            // safe, deterministic clustering key instead of no clustering at all
+            // (mirrors the cold-tier fallback in `resolve_cold_clustering_indices`).
+            return self.table_metadata.primary_key.clone();
+        }
+        sortable
     }
 
     /// Sort and rewrite data by reading from the current listing table, writing
@@ -11456,10 +11540,12 @@ impl CayenneTableProvider {
             return Ok(());
         }
 
-        tracing::info!(
-            "Sorting and rewriting data for table {} by columns {:?}",
+        let rewrite_sort_columns = self.effective_sort_columns_for_rewrite();
+        tracing::debug!(
+            "Sorting and rewriting data for table {} by columns {:?} (auto_from_filters={})",
             self.table_metadata.table_name,
-            self.context.sort_columns()
+            rewrite_sort_columns,
+            !self.context.has_sort_columns()
         );
 
         // Create a session context and scan the logical table view to get all
@@ -11468,8 +11554,9 @@ impl CayenneTableProvider {
         let ctx = self.create_session_context();
         let (stream, _) = self.visible_file_stream_for_rewrite(&ctx).await?;
 
-        // Sort the stream using our existing sort logic
-        let sorted_stream = self.sort_stream(stream)?;
+        // Configured sort_columns win; default empty uses hottest observed filters (F4).
+        let sorted_stream =
+            self.sort_stream_by_columns(stream, &rewrite_sort_columns, &ctx.task_ctx())?;
 
         // Write sorted data to a new snapshot directory. Because SortExec lazily
         // reads input files via DataSourceExec, writing to a separate directory
@@ -11628,7 +11715,7 @@ impl CayenneTableProvider {
         // Old snapshot directories are cleaned up in the background
         self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
 
-        tracing::info!(
+        tracing::debug!(
             "Rewrote {} rows in {} sorted chunk(s) for table {}",
             total_rows,
             chunk_count,
@@ -12012,7 +12099,7 @@ impl CayenneTableProvider {
         let mut orphaned_ids: Vec<String> = Vec::with_capacity(missing.len());
         for m in missing {
             if m.sequence_number <= floor {
-                tracing::info!(
+                tracing::warn!(
                     table_id,
                     path = %m.path,
                     sequence = m.sequence_number,
@@ -12615,7 +12702,7 @@ impl CayenneTableProvider {
             return Ok(false);
         };
 
-        tracing::info!(
+        tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             tier = candidate.tier.as_str(),
@@ -12632,7 +12719,7 @@ impl CayenneTableProvider {
         self.rewrite_current_snapshot_for_compaction_tracked()
             .await?;
 
-        tracing::info!(
+        tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             tier = candidate.tier.as_str(),
@@ -12710,7 +12797,7 @@ impl CayenneTableProvider {
             SnapshotMaintenanceTrigger::ProtectedSnapshotCount {
                 protected_snapshot_count,
                 trigger_count,
-            } => tracing::info!(
+            } => tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 protected_snapshot_count,
@@ -12721,7 +12808,7 @@ impl CayenneTableProvider {
                 protected_snapshot_count,
                 oldest_snapshot_age,
                 trigger_age,
-            } => tracing::info!(
+            } => tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 protected_snapshot_count,
@@ -12732,7 +12819,7 @@ impl CayenneTableProvider {
             SnapshotMaintenanceTrigger::SmallFileCount {
                 number_picker_candidate_files: files,
                 compaction_trigger_files: trigger,
-            } => tracing::info!(
+            } => tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 small_files = files,
@@ -13795,14 +13882,19 @@ impl CayenneTableProvider {
             )
         };
 
-        if self.context.has_sort_columns() {
-            tracing::info!(
+        // Configured sort_columns win; otherwise (default empty) sort by the
+        // hottest observed filter columns so selective scans prune zone maps
+        // without spicepod setup (F4 adaptive cold layout).
+        let rewrite_sort_columns = self.effective_sort_columns_for_rewrite();
+        if !rewrite_sort_columns.is_empty() {
+            tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
-                sort_columns = ?self.context.sort_columns(),
+                sort_columns = ?rewrite_sort_columns,
+                auto_from_filters = !self.context.has_sort_columns(),
                 "Sorting compaction rewrite before writing consolidated output files"
             );
-            stream = self.sort_stream(stream)?;
+            stream = self.sort_stream_by_columns(stream, &rewrite_sort_columns, &ctx.task_ctx())?;
         }
 
         // Compaction is the file-count reduction path. Ordinary appends shard
@@ -14119,7 +14211,7 @@ impl CayenneTableProvider {
         // so the at-risk window (plan-build → plan-execute) closes naturally.
         self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
 
-        tracing::info!(
+        tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             rows = total_rows,
@@ -14158,8 +14250,9 @@ impl CayenneTableProvider {
     }
 
     /// Resolve the cold-tier clustering columns to schema indices:
-    /// `cayenne_datalake_clustering_columns` → else `cayenne_sort_columns` → else the
-    /// primary key. Returns the indices that exist in the schema (empty = no
+    /// `cayenne_datalake_clustering_columns` → else `cayenne_sort_columns` →
+    /// else hottest observed filter columns (F4 default-on) → else the primary
+    /// key. Returns the indices that exist in the schema (empty = no
     /// clustering, promotion writes unsorted).
     fn resolve_cold_clustering_indices(&self) -> Vec<usize> {
         let schema = self.table_schema();
@@ -14169,11 +14262,43 @@ impl CayenneTableProvider {
         } else if !self.context.sort_columns().is_empty() {
             self.context.sort_columns().to_vec()
         } else {
-            self.table_metadata.primary_key.clone()
+            // Auto-observed columns only cluster if the Z-order encoder can key on
+            // them; `Decimal`, `Map`, and other types unsupported by
+            // `column_order_keys` collapse to the all-zero key (no clustering), so
+            // drop them and keep the primary-key fallback rather than writing an
+            // effectively unclustered cold run.
+            let observed: Vec<String> = self
+                .filter_column_observations
+                .top_columns(
+                    super::predicate_stats::DEFAULT_AUTO_CLUSTER_TOP_K,
+                    schema.as_ref(),
+                )
+                .into_iter()
+                .filter(|n| {
+                    schema
+                        .field_with_name(n)
+                        .is_ok_and(|f| super::zorder::is_zorder_clusterable(f.data_type()))
+                })
+                .collect();
+            if observed.is_empty() {
+                self.table_metadata.primary_key.clone()
+            } else {
+                observed
+            }
         };
         names
             .iter()
-            .filter_map(|n| schema.index_of(n).ok())
+            .filter_map(|n| {
+                // Resolve an exact field name first; else parse the extended
+                // `col [ASC|DESC] [NULLS ...]` syntax that `sort_columns` accepts
+                // (direction is irrelevant to the Z-order curve) so a configured
+                // `sort_columns: ["amount DESC"]` still clusters cold files rather
+                // than being silently dropped by a literal-name lookup.
+                schema.index_of(n.trim()).ok().or_else(|| {
+                    util::stream_utils::parse_sort_entry(n)
+                        .and_then(|(col, _)| schema.index_of(col).ok())
+                })
+            })
             .collect()
     }
 
@@ -14329,7 +14454,7 @@ impl CayenneTableProvider {
                         table = self.table_metadata.table_name.as_str(),
                         cold_file_row_cap = row_cap,
                         bloom_cap_bytes = COLD_PK_BLOOM_PER_FILE_MAX_BYTES,
-                        "Cold-tier promotion is splitting output into multiple row-bounded files to keep each file's PK bloom within the per-file cap"
+                        "Splitting the moved data into multiple row-bounded files to keep each file's PK bloom within the per-file cap"
                     );
                 }
                 let chunk_stream: SendableRecordBatchStream =
@@ -14338,7 +14463,7 @@ impl CayenneTableProvider {
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
                     chunk_idx,
-                    "Datalake promotion: cold chunk upload starting"
+                    "Datalake write: chunk upload starting"
                 );
                 let chunk_start = Instant::now();
                 self.insert_stream_into_cold_dir(
@@ -14353,7 +14478,7 @@ impl CayenneTableProvider {
                     table = self.table_metadata.table_name.as_str(),
                     chunk_idx,
                     duration_ms = chunk_start.elapsed().as_millis(),
-                    "Datalake promotion: cold chunk upload complete"
+                    "Datalake write: chunk upload complete"
                 );
                 chunk_idx = chunk_idx.saturating_add(1);
             }
@@ -14361,7 +14486,7 @@ impl CayenneTableProvider {
             tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
-                "Datalake promotion: cold upload starting (single stream)"
+                "Datalake write: upload starting (single stream)"
             );
             self.insert_stream_into_cold_dir(
                 session_state.as_ref(),
@@ -14784,7 +14909,7 @@ impl CayenneTableProvider {
                 warm_files,
                 max_bytes = vc.cold_tier_warm_max_bytes,
                 max_files = vc.cold_tier_warm_max_files,
-                "Datalake promotion skipped; warm tier below thresholds"
+                "Datalake tiering evaluation completed; no tier transition required"
             );
             return Ok(false);
         }
@@ -14793,9 +14918,12 @@ impl CayenneTableProvider {
         tracing::info!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
+            source_tier = "warm",
+            target_tier = "datalake",
+            clustering = "z_order",
             warm_bytes,
             warm_files,
-            "Promoting warm tier to datalake store (Z-order clustered graduation)"
+            "Moving warm-tier data to the datalake (Z-order clustered)"
         );
 
         // Exclude writers for the whole graduation (mirrors begin_overwrite).
@@ -14809,7 +14937,7 @@ impl CayenneTableProvider {
         {
             return Err(Error::Internal {
                 table: self.table_metadata.table_name.clone(),
-                message: "Timed out draining in-flight staged writes before datalake promotion; warm tier left intact (next tick retries)"
+                message: "Timed out draining in-flight staged writes before moving data to the datalake; warm tier left intact (next cycle retries)"
                     .to_string(),
             });
         }
@@ -14843,7 +14971,7 @@ impl CayenneTableProvider {
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
                     %error,
-                    "Carry-forward classification failed; skipping this promotion pass (next tick retries)"
+                    "Carry-forward classification failed; skipping this data move (next cycle retries)"
                 );
                 return Ok(false);
             }
@@ -14881,7 +15009,7 @@ impl CayenneTableProvider {
         tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
-            "Datalake promotion: visible cross-tier stream planned"
+            "Planned the cross-tier read stream for the data move"
         );
 
         // Z-order cluster for a read-optimized cold layout.
@@ -14903,7 +15031,7 @@ impl CayenneTableProvider {
             table = self.table_metadata.table_name.as_str(),
             files = cold_files.len(),
             total_rows,
-            "Datalake promotion: cold store write complete"
+            "Datalake write complete"
         );
         if cold_files.is_empty() && dirty_cold.is_empty() {
             // Nothing rewritten and nothing to drop. Gate on files-written, not
@@ -14955,7 +15083,7 @@ impl CayenneTableProvider {
         tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
-            "Datalake promotion: committing cold manifest + snapshot flip under fence"
+            "Committing the datalake manifest + snapshot flip under fence"
         );
         {
             let _fence = self.listing_fence.write().await;
@@ -14973,7 +15101,7 @@ impl CayenneTableProvider {
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 %error,
-                "Failed to prune stale manifest rows after cold-tier promotion"
+                "Failed to prune stale manifest rows after moving data to the datalake"
             );
         }
         self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
@@ -15000,7 +15128,7 @@ impl CayenneTableProvider {
         // files selected for rewrite — lower is better.
         let rewritten_datalake_files = dirty_cold.len();
         let datalake_rewrite_selectivity = if prior_cold_len == 0 {
-            "n/a (first promotion, no existing datalake files)".to_string()
+            "n/a (first move, no existing datalake files)".to_string()
         } else {
             #[expect(
                 clippy::cast_precision_loss,
@@ -15014,6 +15142,8 @@ impl CayenneTableProvider {
         tracing::info!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
+            source_tier = "warm",
+            target_tier = "datalake",
             datalake_rewrite_selectivity = %datalake_rewrite_selectivity,
             warm_files,
             warm_bytes,
@@ -15023,7 +15153,7 @@ impl CayenneTableProvider {
             written_bytes,
             total_rows,
             duration_ms = u64::try_from(promotion_start.elapsed().as_millis()).unwrap_or(u64::MAX),
-            "Datalake-tier promotion committed"
+            "Moved warm-tier data to the datalake"
         );
         Ok(true)
     }
@@ -15323,7 +15453,7 @@ impl CayenneTableProvider {
             PROTECTED_TIER_GROWTH,
         );
 
-        tracing::info!(
+        tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             input_count = inputs.len(),
@@ -15553,10 +15683,10 @@ impl CayenneTableProvider {
             // the Phase-1 capture detects every such interleaving.
             if self.get_current_snapshot_id() != snapshot_at_capture {
                 drop(fence);
-                tracing::info!(
+                tracing::debug!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
-                    "Subset-merge in-memory publish skipped: the table snapshot was replaced mid-pass (overwrite/promotion); discarding the merged output"
+                    "Subset-merge in-memory publish skipped: the table snapshot was replaced mid-pass (overwrite or datalake move); discarding the merged output"
                 );
                 self.retire_snapshot_dirs(std::iter::once(new_snapshot_id.as_str()));
                 self.sweep_retired_snapshot_dirs();
@@ -15594,7 +15724,7 @@ impl CayenneTableProvider {
             self.evict_compaction_input_pages(&old_ids).await;
         }
 
-        tracing::info!(
+        tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             merged_inputs = inputs.len(),
@@ -15889,7 +16019,7 @@ impl CayenneTableProvider {
         // one selected file, so it is a real sequence.
         let prefix_cutoff = cutoff;
 
-        tracing::info!(
+        tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             input_count = selected.len(),
@@ -16109,10 +16239,10 @@ impl CayenneTableProvider {
             // pre-overwrite row set, and pruning would gut the fresh index.
             if self.get_current_snapshot_id() != snapshot_at_capture {
                 drop(fence);
-                tracing::info!(
+                tracing::debug!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
-                    "Seq-prefix bake in-memory publish skipped: the table snapshot was replaced mid-pass (overwrite/promotion); discarding the merged output"
+                    "Seq-prefix bake in-memory publish skipped: the table snapshot was replaced mid-pass (overwrite or datalake move); discarding the merged output"
                 );
                 self.retire_snapshot_dirs(std::iter::once(new_snapshot_id.as_str()));
                 self.sweep_retired_snapshot_dirs();
@@ -16132,7 +16262,7 @@ impl CayenneTableProvider {
         }
 
         if clean_prefix_holds {
-            tracing::info!(
+            tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 merged_inputs = selected.len(),
@@ -20809,7 +20939,7 @@ impl CayenneTableProvider {
             .map(|b| b.get_array_memory_size() as u64)
             .fold(0u64, u64::saturating_add);
         let estimated_bytes = Some(estimated_flushed_bytes);
-        tracing::info!(
+        tracing::debug!(
             table = %self.table_metadata.table_name,
             rows = flushed_mem_rows,
             inlined_rows = total_rows.saturating_sub(flushed_mem_rows),
@@ -21895,7 +22025,7 @@ impl CayenneTableProvider {
                 .store(stats.record_count, Ordering::Relaxed);
 
             if stats.entry_count > 0 {
-                tracing::info!(
+                tracing::debug!(
                     table = %self.table_metadata.table_name,
                     rows = stats.record_count,
                     segments = stats.entry_count,
@@ -21947,7 +22077,7 @@ impl CayenneTableProvider {
         } else {
             Vec::new()
         };
-        tracing::info!(
+        tracing::debug!(
             "Checkpointing {} inlined rows ({} batches) for table {}",
             total_rows,
             batches.len(),
@@ -22162,7 +22292,7 @@ impl CayenneTableProvider {
             return Ok(());
         };
 
-        tracing::info!(
+        tracing::debug!(
             table = %self.table_metadata.table_name,
             rows = stats.record_count,
             segments = stats.entry_count,
@@ -22445,7 +22575,7 @@ impl CayenneTableProvider {
                             self.table_metadata.table_name
                         )));
                     }
-                    row_keys.push(rows.row(row_index).as_ref().to_vec().into_boxed_slice());
+                    row_keys.push(bytes_key(rows.row(row_index).as_ref()));
                 }
                 Ok(ExtractedPrimaryKeys {
                     int64_pk: Vec::new(),
@@ -24579,6 +24709,16 @@ impl TableProvider for CayenneTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        // F4 default-on layout: record which columns this scan filters on so
+        // background compaction can cluster cold files without spicepod setup.
+        // Cheap (mutex + HashMap bump); empty filters are a no-op. Skipped when
+        // `sort_columns` is configured: observations are never consulted then
+        // (warm rewrite and cold clustering both use the configured columns), so
+        // recording would be pure hot-path overhead.
+        if !self.context.has_sort_columns() {
+            self.filter_column_observations.record_filters(filters);
+        }
+
         // Register object store with the session's runtime env if configured for S3 Express One Zone.
         // This ensures the session can access S3 when the underlying ListingTable reads data.
         if let Some(ref config) = self.object_store_config {
@@ -25289,7 +25429,7 @@ impl TableProvider for CayenneTableProvider {
         let is_s3 = self.table_metadata.path.starts_with("s3://");
 
         if is_s3 {
-            tracing::info!(
+            tracing::debug!(
                 "Cayenne insert_into called for S3 table {} (overwrite: {:?})",
                 self.table_metadata.table_name,
                 overwrite
@@ -26244,7 +26384,7 @@ impl super::compaction::ColdTierPromotionRunner for CayenneTableProvider {
                 tracing::debug!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
-                    "Cold-tier promotion tick graduated the warm tier to the cold object store"
+                    "Tiering tick moved warm-tier data to the datalake"
                 );
             }
             Ok(false) => {}
@@ -26252,7 +26392,7 @@ impl super::compaction::ColdTierPromotionRunner for CayenneTableProvider {
                 tracing::warn!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
-                    "Cold-tier promotion tick failed (warm tier left intact; retry next tick): {e}"
+                    "Tiering tick failed to move data to the datalake (warm tier left intact; next cycle retries): {e}"
                 );
             }
         }
@@ -26974,7 +27114,8 @@ mod tests {
     fn test_tombstone_packed_i64_roundtrip_and_compact() {
         let keys: Vec<Box<[u8]>> = [1_i64, -7, i64::MAX, 0, 42]
             .iter()
-            .map(|pk| pk.to_be_bytes().to_vec().into_boxed_slice())
+            .copied()
+            .map(i64_key)
             .collect();
         let blob = serialize_delete_keys_to_ipc(&keys, /* is_int64_pk */ true)
             .expect("serialize packed i64");
@@ -27013,10 +27154,7 @@ mod tests {
     /// reader (never colliding with the `0x00`/`0x01` tags).
     #[test]
     fn test_tombstone_legacy_uncompressed_ipc_still_decodes() {
-        let keys: Vec<Box<[u8]>> = [10_i64, 20, 30]
-            .iter()
-            .map(|pk| pk.to_be_bytes().to_vec().into_boxed_slice())
-            .collect();
+        let keys: Vec<Box<[u8]>> = [10_i64, 20, 30].iter().copied().map(i64_key).collect();
         // Reproduce the exact pre-cycle-5 encoding: uncompressed Arrow IPC of a
         // single `row_key` BinaryArray, no prefix tag.
         let array = BinaryArray::from_iter_values(keys.iter().map(std::convert::AsRef::as_ref));
@@ -32328,7 +32466,7 @@ mod tests {
         let ctx = SessionContext::new();
         let vortex_config = VortexConfig {
             // The source's declared distribution key (e.g. a Postgres partition
-            // key applied by extended schema inference) clusters files by it.
+            // key applied by schema inference) clusters files by it.
             shard_key_columns: vec!["tenant_id".to_string()],
             ..VortexConfig::default()
         };

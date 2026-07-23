@@ -37,6 +37,9 @@ pub struct MetricsCollector {
     /// known-empty source table.
     bootstrap_rows_expected: AtomicU64,
     bootstrap_complete: AtomicU64,
+    /// `1` when the stream is positioning by GTID auto-positioning
+    /// (failover-safe), `0` for file+offset. Set once at stream start.
+    gtid_enabled: AtomicU64,
     /// Byte offset of the most recently committed (acked) binlog position.
     committed_pos: AtomicU64,
     /// Numeric suffix of the committed binlog file (`binlog.000042` → 42);
@@ -94,6 +97,10 @@ impl MetricsCollector {
     }
     pub fn set_bootstrap_rows_expected(&self, n: u64) {
         self.bootstrap_rows_expected.store(n, Ordering::Relaxed);
+    }
+    pub fn set_gtid_enabled(&self, enabled: bool) {
+        self.gtid_enabled
+            .store(u64::from(enabled), Ordering::Relaxed);
     }
 
     /// Record the acked (committed-to-sidecar-visible) binlog position.
@@ -183,6 +190,10 @@ impl Metrics {
     #[must_use]
     pub fn bootstrap_complete(&self) -> u64 {
         self.collector.bootstrap_complete.load(Ordering::Relaxed)
+    }
+    #[must_use]
+    pub fn gtid_enabled(&self) -> u64 {
+        self.collector.gtid_enabled.load(Ordering::Relaxed)
     }
     #[must_use]
     pub fn bootstrap_rows_expected(&self) -> Option<u64> {

@@ -904,7 +904,7 @@ impl Query {
         // the Ballista job id so it can be addressed across schedulers.
         let ballista_job_id = if mode == DistributedSubmitMode::Resume {
             scheduler
-                .recover_job(job_id)
+                .recover_job(&ballista_core::JobId::from(job_id))
                 .await
                 .map_err(|e| Error::JobSubmissionFailed {
                     message: e.to_string(),
@@ -1826,8 +1826,9 @@ fn attach_query_tracker_to_stream(
             }
         }
 
-        runtime_metrics::telemetry::track_bytes_returned(num_output_bytes, &request_context.to_dimensions());
-        runtime_metrics::telemetry::track_rows_returned(num_records, &request_context.to_dimensions());
+        let dims = request_context.to_dimensions();
+        runtime_metrics::telemetry::track_bytes_returned(num_output_bytes, &dims);
+        runtime_metrics::telemetry::track_rows_returned(num_records, &dims);
 
         tracker
             .schema(schema_copy)
@@ -2043,9 +2044,10 @@ fn attach_physical_plan_metrics_to_stream(
         let mut totals = PhysicalPlanMetricsTotals::default();
         collect_physical_plan_metrics(physical_plan.as_ref(), &mut totals);
 
-        runtime_metrics::telemetry::track_produced_spills(totals.produced_spills, &request_context.to_dimensions());
-        runtime_metrics::telemetry::track_spilled_bytes(totals.spilled_bytes, &request_context.to_dimensions());
-        runtime_metrics::telemetry::track_spilled_rows(totals.spilled_rows, &request_context.to_dimensions());
+        let dims = request_context.to_dimensions();
+        runtime_metrics::telemetry::track_produced_spills(totals.produced_spills, &dims);
+        runtime_metrics::telemetry::track_spilled_bytes(totals.spilled_bytes, &dims);
+        runtime_metrics::telemetry::track_spilled_rows(totals.spilled_rows, &dims);
 
         if let Some(ctx) = plan_capture.as_ref() {
             let elapsed_ms = ctx.query_start.elapsed().as_secs_f64() * 1000.0;
