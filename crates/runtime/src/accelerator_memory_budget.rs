@@ -383,7 +383,7 @@ mod tests {
 
     /// Container case: `DuckDB` sizes its default `memory_limit` from HOST RAM, which
     /// exceeds the cgroup limit. A small explicit query pool + one un-limited instance
-    /// projects to *fit* under a cgroup-based default (would wrongly NoOp) but
+    /// projects to *fit* under a cgroup-based default (would wrongly `NoOp`) but
     /// over-commits under the real host-based default — so coordination must engage.
     #[test]
     fn container_host_ram_default_engages_coordination() {
