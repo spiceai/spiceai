@@ -46,6 +46,7 @@ use datafusion::{
     prelude::Expr,
 };
 use futures::TryStreamExt;
+use futures::future::try_join_all;
 use graphql_parser::query::{Definition, InlineFragment, OperationDefinition, Query, Selection};
 use serde_json::{Map, Value};
 use std::sync::Arc;
@@ -413,40 +414,29 @@ impl TableProvider for CommitsTableProvider {
             .await
             .map_err(DataFusionError::External)?;
 
-        let mut remaining = limit;
-        let mut batches = Vec::new();
+        // Fetch each ref's commits concurrently instead of serially. The refs are
+        // independent, and the GraphQL client bounds in-flight requests with its own
+        // shared semaphore, so this simply uses the concurrency budget the previous
+        // serial loop left idle. Order-preserving: try_join_all returns results in
+        // `refs` order and the final MemTable scan applies `limit`, so the surviving
+        // rows match the previous sequential early-break — at most refs x per-ref-limit
+        // rows are fetched before truncation (bounded: MAX_DYNAMIC_REF_SCAN_REFS x
+        // DYNAMIC_SCAN_PER_REF_COMMIT_LIMIT).
+        let per_ref_limit = limit.map_or(DYNAMIC_SCAN_PER_REF_COMMIT_LIMIT, |r| {
+            r.min(DYNAMIC_SCAN_PER_REF_COMMIT_LIMIT)
+        });
+        let ref_results = try_join_all(refs.iter().map(|git_ref| {
+            self.fetch_commits_for_ref(
+                &pushdown_filters,
+                &git_ref.qualified_name,
+                Some(per_ref_limit),
+            )
+        }))
+        .await
+        .map_err(DataFusionError::External)?;
 
-        for git_ref in refs {
-            let per_ref_limit = remaining.map_or(DYNAMIC_SCAN_PER_REF_COMMIT_LIMIT, |r| {
-                r.min(DYNAMIC_SCAN_PER_REF_COMMIT_LIMIT)
-            });
-            let ref_batches = self
-                .fetch_commits_for_ref(
-                    &pushdown_filters,
-                    &git_ref.qualified_name,
-                    Some(per_ref_limit),
-                )
-                .await
-                .map_err(DataFusionError::External)?;
-
-            let fetched_rows = ref_batches
-                .iter()
-                .map(arrow::array::RecordBatch::num_rows)
-                .sum::<usize>();
-
-            if fetched_rows == 0 {
-                continue;
-            }
-
-            batches.extend(ref_batches);
-
-            if let Some(remaining_rows) = remaining.as_mut() {
-                *remaining_rows = remaining_rows.saturating_sub(fetched_rows);
-                if *remaining_rows == 0 {
-                    break;
-                }
-            }
-        }
+        let batches: Vec<arrow::array::RecordBatch> =
+            ref_results.into_iter().flatten().collect();
 
         let table = MemTable::try_new(Arc::clone(&self.schema), vec![batches])?;
         table.scan(state, projection, filters, limit).await
