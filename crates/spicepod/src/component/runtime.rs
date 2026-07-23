@@ -451,10 +451,11 @@ pub struct TelemetryConfig {
     ///
     /// Validated against the `OpenTelemetry` instrument name syntax so prefixed
     /// names stay valid for OTLP backends and remain sanitizable to Prometheus
-    /// legacy names (`[a-zA-Z_:][a-zA-Z0-9_:]*`). Must be non-empty, start with
-    /// an ASCII letter, contain only ASCII letters, digits, `_`, `.`, `-`, or
-    /// `/`, and be at most [`METRIC_PREFIX_MAX_LEN`] characters. A trailing `.`
-    /// or `_` is recommended (e.g. `spiceai.`).
+    /// legacy names (`[a-zA-Z_:][a-zA-Z0-9_:]*`). An empty string is treated as
+    /// no prefix. Non-empty values must start with an ASCII letter, contain only
+    /// ASCII letters, digits, `_`, `.`, `-`, or `/`, and be at most
+    /// [`METRIC_PREFIX_MAX_LEN`] characters. A trailing `.` or `_` is
+    /// recommended (e.g. `spiceai.`).
     /// See: <https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetrymetric_prefix>
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metric_prefix: Option<String>,
@@ -491,24 +492,20 @@ impl Default for TelemetryConfig {
 /// name syntax so `{prefix}{instrument}` stays a valid metric name for OTLP
 /// and maps cleanly through Prometheus name sanitization.
 ///
-/// Rules (mirroring the `OTel` Metrics API / SDK):
-/// - non-empty
-/// - starts with an ASCII alphabetic character
-/// - subsequent characters are ASCII alphanumeric, `_`, `.`, `-`, or `/`
-/// - length ≤ [`METRIC_PREFIX_MAX_LEN`] (leaves headroom under the 255-char
-///   `OTel` instrument name limit)
+/// An empty prefix is accepted (no-op: instrument names are already non-empty).
+/// Non-empty prefixes must (mirroring the `OTel` Metrics API / SDK):
+/// - start with an ASCII alphabetic character
+/// - contain only ASCII alphanumeric characters, `_`, `.`, `-`, or `/`
+/// - have length ≤ [`METRIC_PREFIX_MAX_LEN`] (leaves headroom under the
+///   255-char `OTel` instrument name limit)
 ///
 /// # Errors
 ///
 /// Returns a user-facing error describing the violation and how to fix it.
 pub fn validate_metric_prefix(prefix: &str) -> Result<(), String> {
+    // Empty prefix is a no-op — metric instrument names themselves are non-empty.
     if prefix.is_empty() {
-        return Err(
-            "Invalid 'runtime.telemetry.metric_prefix': value must not be empty. \
-             Omit the field for no prefix, or set a non-empty prefix such as 'spiceai.'. \
-             See: https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetrymetric_prefix"
-                .to_string(),
-        );
+        return Ok(());
     }
 
     // Check character validity before length so non-ASCII input reports the
@@ -2260,17 +2257,15 @@ datasets:
     }
 
     #[test]
-    fn test_metric_prefix_empty_rejected() {
+    fn test_metric_prefix_empty_accepted() {
         let yaml = r#"
             telemetry:
                 metric_prefix: ""
         "#;
-        let result: Result<Runtime, _> = yaml::from_str(yaml);
-        let err = result.expect_err("empty metric_prefix must fail to parse");
-        assert!(
-            err.to_string().contains("must not be empty"),
-            "unexpected error: {err}"
-        );
+        let runtime: Runtime = yaml::from_str(yaml).expect("empty metric_prefix must parse");
+        assert_eq!(runtime.telemetry.metric_prefix.as_deref(), Some(""));
+        validate_metric_prefix("")
+            .expect("empty metric_prefix is a no-op and must be valid");
     }
 
     #[test]
