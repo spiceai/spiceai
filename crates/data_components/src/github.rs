@@ -1498,23 +1498,34 @@ impl GithubRestClient {
             page += 1;
         }
 
-        // Fetch logs for each run if requested
+        // Fetch logs for each run if requested. Downloads run concurrently in
+        // bounded chunks (mirroring fetch_files) instead of one serial request per
+        // run; the shared rate limiter still throttles overall throughput. Per-run
+        // failures stay non-fatal: that run gets an empty logs map, exactly as before,
+        // and the run_id key preserves the association regardless of completion order.
         let run_logs = if fetch_logs {
             let mut logs_map = std::collections::HashMap::new();
-            for run in &all_runs {
-                match self.fetch_workflow_run_logs(&owner, &repo, run.id).await {
-                    Ok(logs) => {
-                        logs_map.insert(run.id, logs);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to retrieve workflow logs for GitHub repository {}/{} run {}: {} The 'logs' column will be empty for this run.",
-                            owner,
-                            repo,
-                            run.id,
-                            e
-                        );
-                        logs_map.insert(run.id, std::collections::HashMap::new());
+            for chunk in all_runs.chunks(NUM_FILE_CONTENT_DOWNLOAD_WORKERS) {
+                let log_futures = chunk
+                    .iter()
+                    .map(|run| self.fetch_workflow_run_logs(&owner, &repo, run.id))
+                    .collect::<Vec<_>>();
+                // join_all preserves input order, so zip the results back with their runs.
+                for (run, result) in chunk.iter().zip(future::join_all(log_futures).await) {
+                    match result {
+                        Ok(logs) => {
+                            logs_map.insert(run.id, logs);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to retrieve workflow logs for GitHub repository {}/{} run {}: {} The 'logs' column will be empty for this run.",
+                                owner,
+                                repo,
+                                run.id,
+                                e
+                            );
+                            logs_map.insert(run.id, std::collections::HashMap::new());
+                        }
                     }
                 }
             }
