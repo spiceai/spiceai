@@ -163,6 +163,37 @@ struct MemberSchemaState {
     /// mid-stream column add is warned about exactly once (under `Block` the
     /// new column is dropped because the working schema stays fixed).
     known_columns: Option<HashSet<String>>,
+    /// The member registration this state was seeded from. Because the state
+    /// persists across reconnects and is keyed only by source `(schema, table)`,
+    /// a detach + re-subscribe for the same table with a *different* registered
+    /// schema / policy / primary keys (e.g. a config reload while the shared
+    /// pump keeps running) would otherwise reuse a tracker built on stale
+    /// assumptions and mis-shape the `ChangeBatch`. [`handle_relation`] rebuilds
+    /// the state whenever this no longer matches the current member.
+    seed: Option<MemberSeed>,
+}
+
+/// Fingerprint of the member registration a [`MemberSchemaState`] was built for.
+struct MemberSeed {
+    schema: SchemaRef,
+    policy: SchemaEvolutionPolicy,
+    primary_keys: Vec<String>,
+}
+
+impl MemberSeed {
+    fn of(member: &MemberHandle) -> Self {
+        Self {
+            schema: Arc::clone(&member.schema),
+            policy: member.policy,
+            primary_keys: member.primary_keys.clone(),
+        }
+    }
+
+    fn matches(&self, member: &MemberHandle) -> bool {
+        self.policy == member.policy
+            && self.primary_keys == member.primary_keys
+            && self.schema == member.schema
+    }
 }
 
 /// Pump-local map of per-member schema state, keyed like [`RouteMap`].
@@ -1716,6 +1747,17 @@ async fn handle_relation(
     // survives a transient disconnect rather than being dropped as a fresh
     // "first observation".
     let state = schema_state.entry(member_key.clone()).or_default();
+    // Guard the persistence against a re-subscribe: if this member was
+    // re-registered for the same source table with a different schema / policy /
+    // primary keys (config reload), the persisted tracker's assumptions are
+    // stale — rebuild the state from the current registration so it never
+    // mis-shapes the `ChangeBatch`.
+    if !state.seed.as_ref().is_some_and(|s| s.matches(&member)) {
+        *state = MemberSchemaState {
+            seed: Some(MemberSeed::of(&member)),
+            ..MemberSchemaState::default()
+        };
+    }
     let working_schema = if member.policy == SchemaEvolutionPolicy::Block {
         if let Err(e) = client::validate_relation_against_schema(
             &member.schema,
@@ -2243,6 +2285,115 @@ mod tests {
             working(&routes),
             vec!["id".to_string(), "name".to_string()],
             "adopted column survives a reconnect because schema_state persists across the WAL gap"
+        );
+    }
+
+    /// The persisted `schema_state` must not carry stale assumptions across a
+    /// re-subscribe: if the same source table is re-registered with a different
+    /// schema (config reload while the pump keeps running), the tracker is
+    /// rebuilt from the new registration rather than reusing the old widened
+    /// working schema.
+    #[tokio::test]
+    async fn handle_relation_rebuilds_state_on_resubscribe_with_changed_schema() {
+        use crate::postgres_replication::pgoutput::{Column, Relation};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let source = Arc::new(SharedSource::new(
+            SourceKey::from_params(&test_params()),
+            test_params(),
+        ));
+        let member_key: MemberKey = ("public".to_string(), "users".to_string());
+        // Keep receivers alive so the members' senders stay open for the test.
+        let mut keepalive = Vec::new();
+        let mut register = |schema: SchemaRef| {
+            let (sender, rx) = mpsc::channel(4);
+            keepalive.push(rx);
+            lock(&source.members).insert(
+                member_key.clone(),
+                Arc::new(MemberHandle {
+                    dataset_name: "users".into(),
+                    schema,
+                    primary_keys: vec!["id".into()],
+                    generated_columns: vec![],
+                    policy: SchemaEvolutionPolicy::AppendNewColumns,
+                    sender,
+                    metrics: ReplicationMetricsCollector::new(),
+                    ready_lag: crate::cdc::DEFAULT_READY_LAG,
+                }),
+            );
+            source.ack.register(&member_key, false);
+            source.ack.promote_ready_members();
+        };
+
+        let id_col = || Column {
+            is_key: true,
+            name: "id".into(),
+            type_oid: 23,
+            type_modifier: -1,
+        };
+        let text_col = |name: &str| Column {
+            is_key: false,
+            name: name.into(),
+            type_oid: 25,
+            type_modifier: -1,
+        };
+        let rel = |cols: Vec<Column>| Relation {
+            relation_id: 42,
+            namespace: "public".into(),
+            name: "users".into(),
+            replica_identity: b'd',
+            columns: cols,
+        };
+        let working = |routes: &RouteMap| -> Vec<String> {
+            routes
+                .get(&42)
+                .expect("route built")
+                .working_schema
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect()
+        };
+
+        let mut decoder = pgoutput::Decoder::new();
+        let mut routes = RouteMap::default();
+        let mut schema_state = MemberSchemaStates::default();
+
+        // First registration: schema [id]; adopt `name` mid-stream → [id, name].
+        register(Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])));
+        handle_relation(&source, &mut decoder, &mut routes, &mut schema_state, rel(vec![id_col()]))
+            .await;
+        handle_relation(
+            &source,
+            &mut decoder,
+            &mut routes,
+            &mut schema_state,
+            rel(vec![id_col(), text_col("name")]),
+        )
+        .await;
+        assert_eq!(working(&routes), vec!["id".to_string(), "name".to_string()]);
+
+        // Re-subscribe for the same table with a DIFFERENT registered schema
+        // ([id, email]). The stale tracker (which had adopted `name`) must be
+        // discarded and rebuilt from the new registration, so the first Relation
+        // is a fresh baseline that yields exactly the new schema — not the old
+        // widened [id, name] or a mash-up.
+        register(Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("email", DataType::Utf8, true),
+        ])));
+        handle_relation(
+            &source,
+            &mut decoder,
+            &mut routes,
+            &mut schema_state,
+            rel(vec![id_col(), text_col("email")]),
+        )
+        .await;
+        assert_eq!(
+            working(&routes),
+            vec!["id".to_string(), "email".to_string()],
+            "re-subscribe with a new schema rebuilds the tracker; the stale `name` adoption is dropped"
         );
     }
 
