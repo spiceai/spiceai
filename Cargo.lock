@@ -16818,7 +16818,6 @@ dependencies = [
 name = "runtime-component"
 version = "2.2.0-unstable"
 dependencies = [
- "app",
  "arrow",
  "arrow-schema",
  "data_components",
@@ -16831,7 +16830,6 @@ dependencies = [
  "serde",
  "snafu",
  "spicepod",
- "tokio",
  "tracing",
 ]
 
