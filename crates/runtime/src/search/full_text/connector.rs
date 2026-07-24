@@ -82,18 +82,15 @@ impl DataConnector for FullTextConnector {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        add_full_text_search_to_table(
-            self.inner_connector.read_provider(dataset).await?,
-            &dataset.columns,
-            &dataset.name,
-        )
-        .map(|idx| Arc::new(idx) as Arc<dyn TableProvider>)
-        .map_err(|e| DataConnectorError::InvalidConfiguration {
-            dataconnector: dataset.source().to_string(),
-            message: e.to_string(),
-            connector_component: dataset.into(),
-            source: e,
-        })
+        let inner = self.inner_connector.read_provider(dataset).await?;
+        add_full_text_search_to_table(&inner, &dataset.columns, &dataset.name)
+            .map(|idx| Arc::new(idx) as Arc<dyn TableProvider>)
+            .map_err(|e| DataConnectorError::InvalidConfiguration {
+                dataconnector: dataset.source().to_string(),
+                message: e.to_string(),
+                connector_component: dataset.into(),
+                source: e,
+            })
     }
 
     async fn read_write_provider(
@@ -102,7 +99,7 @@ impl DataConnector for FullTextConnector {
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         match self.inner_connector.read_write_provider(dataset).await {
             Some(Ok(inner)) => Some(
-                add_full_text_search_to_table(inner, &dataset.columns, &dataset.name)
+                add_full_text_search_to_table(&inner, &dataset.columns, &dataset.name)
                     .map(|idx| Arc::new(idx) as Arc<dyn TableProvider>)
                     .map_err(|e| DataConnectorError::InvalidConfiguration {
                         dataconnector: dataset.source().to_string(),
