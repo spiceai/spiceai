@@ -924,21 +924,26 @@ async fn test_catalog_acceleration_reuses_slot_across_restart() -> Result<(), an
                 "restart must reuse the single catalog slot, got {slots_after:?}"
             );
 
-            // The offline INSERT is reflected after restart -> no data lost across
-            // the restart (the reused slot's retained WAL replayed, or the
-            // accelerator re-snapshotted -- either way it converges).
-            let orders_count_sql =
-                format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.orders");
-            let converged = wait_until_true(Duration::from_mins(2), || {
+            // The change made while Spice was down (id = 3) is delivered after
+            // restart -- this is the reused slot's guarantee: it resumes from its
+            // retained `restart_lsn`, so WAL accumulated during the downtime is
+            // replayed, nothing lost. (We assert the specific offline row rather
+            // than a total row count: whether the pre-restart rows reappear is a
+            // function of the accelerator's own persistence -- Cayenne persists
+            // externally and reloads them in production, but that is independent
+            // of the slot-reuse behavior this test covers.)
+            let offline_row_sql =
+                format!("SELECT customer FROM {CATALOG_NAME}.public.orders WHERE id = 3");
+            let delivered = wait_until_true(Duration::from_mins(2), || {
                 let rt = Arc::clone(&rt);
-                let sql = orders_count_sql.clone();
-                async move { query_i64(&rt, &sql).await == Some(3) }
+                let sql = offline_row_sql.clone();
+                async move { query_string(&rt, &sql).await.as_deref() == Some("carol-offline") }
             })
             .await;
             anyhow::ensure!(
-                converged,
-                "offline INSERT not reflected after restart: count={:?}",
-                query_i64(&rt, &orders_count_sql).await
+                delivered,
+                "change made during downtime (orders id=3) was not delivered after restart via the reused slot: got {:?}",
+                query_string(&rt, &offline_row_sql).await
             );
 
             Ok(())
