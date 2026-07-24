@@ -29,6 +29,11 @@ limitations under the License.
 //! configuration without pulling in the runtime orchestrator — and it compiles in
 //! parallel with `runtime` rather than inside its single codegen unit.
 
+// Mirrors the same crate-level allow in `runtime` (these config-parsing fns moved
+// from there): the errors are self-describing SNAFU/parse errors documented by
+// their variants.
+#![allow(clippy::missing_errors_doc)]
+
 use datafusion::sql::sqlparser::{
     dialect::{Dialect, GenericDialect},
     tokenizer::{Token, Tokenizer},
