@@ -307,12 +307,15 @@ pub(crate) struct NoEligibleTablesError {
 /// another consumer. Because the slot name is derived purely from the catalog
 /// (see [`catalog_slot_name`]) and `PostgreSQL` permits a single consumer per
 /// slot, this means a second Spice instance (or process) is already streaming
-/// this catalog's changes. Surfaced after a bounded wait (see
-/// [`AcceleratedCatalogProvider::ensure_catalog_slot_available`]) so a fast
-/// self-restart -- where the server still shows the old, now-dead consumer as
-/// active until `wal_sender_timeout` -- resolves instead of false-failing. NOT
-/// mapped to a permanent error: the conflict is operational and can clear (the
-/// other consumer stops), so a later refresh recovers.
+/// this catalog's changes. Surfaced only after a bounded wait (see
+/// [`AcceleratedCatalogProvider::ensure_catalog_slot_available`]) that already
+/// absorbs the legitimate hand-off cases -- a fast self-restart, or a rolling
+/// deploy whose predecessor is shutting down -- by giving the server up to
+/// `wal_sender_timeout` to release a now-dead consumer's slot. If a *live*
+/// consumer still holds it past that window, `postgres.rs` maps this to a
+/// permanent configuration error (terminal ERROR status, no retry loop): running
+/// two instances against one catalog is a misconfiguration to surface loudly,
+/// not to silently keep retrying.
 #[derive(Debug, Snafu)]
 #[snafu(display(
     "Catalog '{catalog}': replication slot '{slot_name}' is already in use by {active_consumer} after waiting {waited_secs}s. Another Spice instance (or process) is already streaming this catalog's changes -- PostgreSQL permits only one consumer per replication slot. Ensure only one Spice instance accelerates this catalog, or stop the other consumer. Docs: https://spiceai.org/docs/components/data-connectors/postgres"

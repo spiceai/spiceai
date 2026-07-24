@@ -180,6 +180,11 @@ async fn slot_active(port: usize, slot_name: &str) -> Result<Option<bool>, anyho
 /// Lower the source's `wal_sender_timeout` so the catalog's bounded
 /// slot-in-use wait (sized from it) stays short in the fail-loud test. Applied
 /// via `ALTER SYSTEM` + reload, so it takes effect for walsenders started after.
+///
+/// `ALTER SYSTEM` cannot run inside a transaction block, and the simple-query
+/// protocol wraps a multi-statement string in one implicit transaction -- so the
+/// two statements are issued as separate queries rather than a single
+/// `";"`-joined one.
 async fn set_wal_sender_timeout(port: usize, value: &str) -> Result<(), anyhow::Error> {
     let pool = common::get_postgres_connection_pool(port, None).await?;
     let conn = pool
@@ -187,10 +192,9 @@ async fn set_wal_sender_timeout(port: usize, value: &str) -> Result<(), anyhow::
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     conn.conn
-        .simple_query(&format!(
-            "ALTER SYSTEM SET wal_sender_timeout = '{value}'; SELECT pg_reload_conf();"
-        ))
+        .simple_query(&format!("ALTER SYSTEM SET wal_sender_timeout = '{value}'"))
         .await?;
+    conn.conn.simple_query("SELECT pg_reload_conf()").await?;
     Ok(())
 }
 
