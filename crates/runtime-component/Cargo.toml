@@ -10,7 +10,6 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-app = { path = "../app" }
 arrow.workspace = true
 arrow-schema = { workspace = true, features = ["serde"] }
 data_components = { path = "../data_components", features = ["flightsql"] }
@@ -24,9 +23,6 @@ serde = { workspace = true, features = ["derive"] }
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tracing.workspace = true
-
-[dev-dependencies]
-tokio.workspace = true
 
 [lints]
 workspace = true

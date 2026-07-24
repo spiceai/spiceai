@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -458,9 +458,7 @@ impl DatasetSpec {
         }
     }
 
-    /// For [`Dataset`]s where the path in the `from` field is a [`TableReference`], parse and return the [`TableReference`].
-    ///
-    ///
+    /// For a [`DatasetSpec`] where the path in the `from` field is a [`TableReference`], parse and return the [`TableReference`].
     pub fn parse_path(
         &self,
         case_sensitive: bool,
@@ -703,7 +701,7 @@ impl DatasetSpec {
             .and_then(|fts| fts.engine.as_deref())
     }
 
-    /// Find any primary keys explicitly defined in the [`Dataset`]. Order of precedence:
+    /// Find any primary keys explicitly defined in the [`DatasetSpec`]. Order of precedence:
     ///  1. Primary key defined in `.columns[].embeddings[].row_id`
     ///  2. Primary key defined in `.columns[].full_text_search[].row_id`
     ///  3. Primary key defined in `.embeddings[].column_pk` (on the path to deprecation)
@@ -739,7 +737,7 @@ impl DatasetSpec {
     }
 }
 
-/// Summarizes all full-text search configuration for a given [`Dataset`] (compared to the column-level [`FullTextSearchConfig`]).
+/// Summarizes all full-text search configuration for a given [`DatasetSpec`] (compared to the column-level `FullTextSearchConfig`).
 pub struct FullTextSearchDatasetConfig {
     pub index_store: IndexStore,
     pub index_path: Option<String>,
