@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::github::{Error as GithubError, GithubRestClient};
 use async_trait::async_trait;
-use data_components::github::{Error as GithubError, GithubRestClient};
 use datafusion::{
     catalog::Session,
     common::Statistics,
@@ -99,7 +99,7 @@ impl WorkflowsTableProvider {
                 });
             } else if e
                 .downcast_ref::<GithubError>()
-                .is_some_and(data_components::github::Error::is_transient)
+                .is_some_and(crate::github::Error::is_transient)
             {
                 tracing::warn!(
                     "GitHub workflows provider initialization for {component} could not validate access because GitHub is temporarily unavailable: {e} The dataset will retry on the next query or refresh."
