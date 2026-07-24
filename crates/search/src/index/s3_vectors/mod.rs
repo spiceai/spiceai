@@ -50,6 +50,7 @@ use snafu::ResultExt;
 
 use crate::SEARCH_SCORE_COLUMN_NAME;
 use crate::index::s3_vectors::compute_query::EmbedQuery;
+use crate::index::write_util::extract_and_format_primary_key;
 use crate::index::{SearchIndex, VectorIndex, embedding_col};
 use crate::metadata::MetadataColumns;
 use datafusion::{
@@ -60,7 +61,6 @@ use datafusion::{
 };
 
 mod compute_query;
-mod delete;
 mod write;
 
 #[derive(Debug, Clone)]
@@ -385,7 +385,24 @@ impl Index for S3Vector {
     }
 
     async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {
-        delete::delete_by_keys(self, &keys).await
+        if !self.partition_by.is_empty() {
+            return Err(DataFusionError::NotImplemented(
+                "S3Vector delete is not yet supported for a partitioned vector index".to_string(),
+            ));
+        }
+
+        let key_strings: Vec<String> =
+            extract_and_format_primary_key(self.name(), &self.primary_key, &keys)
+                .map_err(|e| DataFusionError::External(Box::new(*e)))?
+                .into_iter()
+                .flatten()
+                .collect();
+
+        self.table
+            .delete_by_keys(key_strings)
+            .await
+            .boxed()
+            .map_err(|e| DataFusionError::External(e))
     }
 }
 

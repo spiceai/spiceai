@@ -19,7 +19,7 @@ use datafusion::common::ScalarValue;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use elasticsearch::Elasticsearch;
 use serde_json::{Value, json};
-
+use snafu::ResultExt;
 /// Chunk size for `_delete_by_query` requests — keeps each request's `bool.should` clause count
 /// comfortably under Elasticsearch's default `indices.query.bool.max_clause_count` (1024) and
 /// request-size limits, regardless of how many keys the caller is deleting in one call.
@@ -60,7 +60,8 @@ pub async fn delete_by_keys(
         client
             .delete_by_query(es_index, &query)
             .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            .boxed()
+            .map_err(DataFusionError::External)?;
     }
 
     Ok(())
