@@ -175,6 +175,7 @@ struct MemberSchemaState {
 
 /// Fingerprint of the member registration a [`MemberSchemaState`] was built for.
 struct MemberSeed {
+    dataset_name: String,
     schema: SchemaRef,
     policy: SchemaEvolutionPolicy,
     primary_keys: Vec<String>,
@@ -183,6 +184,7 @@ struct MemberSeed {
 impl MemberSeed {
     fn of(member: &MemberHandle) -> Self {
         Self {
+            dataset_name: member.dataset_name.clone(),
             schema: Arc::clone(&member.schema),
             policy: member.policy,
             primary_keys: member.primary_keys.clone(),
@@ -190,7 +192,11 @@ impl MemberSeed {
     }
 
     fn matches(&self, member: &MemberHandle) -> bool {
-        self.policy == member.policy
+        // `dataset_name` is included so a rename (same source table + schema)
+        // rebuilds the tracker — it embeds the dataset name in its warnings, so a
+        // reused tracker would misattribute schema-evolution logs to the old name.
+        self.dataset_name == member.dataset_name
+            && self.policy == member.policy
             && self.primary_keys == member.primary_keys
             && self.schema == member.schema
     }
@@ -1580,8 +1586,21 @@ async fn run_pump(source: Arc<SharedSource>) {
                                     heartbeat_ts_ms,
                                     member.ready_lag,
                                 );
+                                // Build the heartbeat against the member's CURRENT
+                                // working schema — which may have widened under
+                                // non-`Block` schema evolution (see
+                                // `handle_relation`) — so an idle heartbeat carries
+                                // the same schema `deliver_commit` builds data
+                                // batches against, never a stale narrower one.
+                                let heartbeat_schema = schema_state
+                                    .get(&member_key)
+                                    .and_then(|s| s.tracker.as_ref())
+                                    .map_or_else(
+                                        || Arc::clone(&member.schema),
+                                        |t| Arc::clone(t.working_schema()),
+                                    );
                                 match crate::cdc::build_heartbeat_envelope(
-                                    &member.schema,
+                                    &heartbeat_schema,
                                     heartbeat_ts_ms,
                                     is_ready,
                                 ) {

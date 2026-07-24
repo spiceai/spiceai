@@ -186,8 +186,9 @@ pub struct ReplicationStreamInput {
     /// [`SchemaEvolutionPolicy::Block`], a mid-stream source column add / lossless
     /// type widening is adopted into the member's working schema so subsequent
     /// `ChangeBatch`es carry the wider data struct (which the runtime apply loop
-    /// then reconciles against the accelerator). [`start_replication_stream_with_policy`]
-    /// sets this field.
+    /// then reconciles against the accelerator). Callers set this directly (the
+    /// connector maps the dataset's `on_schema_change`); [`start_replication_stream`]
+    /// consumes it as-is, and [`start_replication_stream_with_policy`] overrides it.
     pub policy: SchemaEvolutionPolicy,
 }
 
