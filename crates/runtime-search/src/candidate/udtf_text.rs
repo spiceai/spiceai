@@ -14,10 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! [`CandidateGeneration`] for Elasticsearch BM25 full-text search.
+//! [`CandidateGeneration`] that is index-opaque: it re-issues the `text_search()` UDTF and lets
+//! the UDTF's own index probe decide which index serves the query.
 //!
-//! Delegates to the `text_search()` UDTF, which routes to [`ElasticsearchTextIndex`]
-//! via the two-phase index probe added in the UDTF dispatcher.
+//! Originally written for Elasticsearch BM25 search, it is also used for the compound
+//! (write-through warm Tantivy + Elasticsearch fallback) full-text index — in that case the
+//! query may be served entirely from the warm Tantivy tier without ever reaching Elasticsearch,
+//! so this candidate must not be read as "always Elasticsearch".
 
 use std::sync::Arc;
 
@@ -30,23 +33,24 @@ use tonic::async_trait;
 use crate::udtf::{TEXT_SEARCH_UDTF_NAME, TextSearchTableFuncArgs};
 use runtime_query_engine::query_engine::QueryEngine;
 
-/// A [`CandidateGeneration`] that issues `text_search()` UDTF calls routed to
-/// Elasticsearch BM25 search for a single field on a single table.
-pub struct ElasticsearchTextSearchCandidate {
+/// A [`CandidateGeneration`] that issues `text_search()` UDTF calls for a single field on a
+/// single table. Which index actually serves the query (Elasticsearch, or a compound's warm
+/// Tantivy tier with Elasticsearch fallback) is resolved by the UDTF dispatcher, not here.
+pub struct UdtfTextSearchCandidate {
     /// The field (column) to search.
     field: String,
     df: Arc<dyn QueryEngine>,
     tbl: TableReference,
 }
 
-impl ElasticsearchTextSearchCandidate {
+impl UdtfTextSearchCandidate {
     pub fn new(field: String, df: Arc<dyn QueryEngine>, tbl: TableReference) -> Self {
         Self { field, df, tbl }
     }
 }
 
 #[async_trait]
-impl CandidateGeneration for ElasticsearchTextSearchCandidate {
+impl CandidateGeneration for UdtfTextSearchCandidate {
     #[expect(deprecated)] // DF54: TableFunctionImpl::call deferred (needs Session); see follow-up
     fn search(&self, query: String) -> Result<Arc<dyn TableProvider>, DataFusionError> {
         let udtf_args = TextSearchTableFuncArgs {
