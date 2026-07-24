@@ -2117,6 +2117,99 @@ mod tests {
         (source, probes)
     }
 
+    /// The ported schema-evolution wiring: under a non-`Block` policy, a
+    /// mid-stream source column add must be adopted into the member's working
+    /// schema (which `deliver_commit` then builds the `ChangeBatch` against), so
+    /// the runtime evolution layer sees the wider batch. A new column is adopted
+    /// only on the *second* Relation (the first establishes the baseline), so
+    /// this drives a baseline Relation then an ALTER-widened one.
+    #[tokio::test]
+    async fn handle_relation_adopts_mid_stream_column_add_into_working_schema() {
+        use crate::postgres_replication::pgoutput::{Column, Relation};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let source = Arc::new(SharedSource::new(
+            SourceKey::from_params(&test_params()),
+            test_params(),
+        ));
+        let member_key: MemberKey = ("public".to_string(), "users".to_string());
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let (sender, _rx) = mpsc::channel(4);
+        lock(&source.members).insert(
+            member_key.clone(),
+            Arc::new(MemberHandle {
+                dataset_name: "users".into(),
+                schema,
+                primary_keys: vec!["id".into()],
+                generated_columns: vec![],
+                policy: SchemaEvolutionPolicy::AppendNewColumns,
+                sender,
+                metrics: ReplicationMetricsCollector::new(),
+                ready_lag: crate::cdc::DEFAULT_READY_LAG,
+            }),
+        );
+        source.ack.register(&member_key, false);
+        source.ack.promote_ready_members();
+
+        let mut decoder = pgoutput::Decoder::new();
+        let mut routes = RouteMap::default();
+        let mut schema_state = MemberSchemaStates::default();
+
+        let id_col = || Column {
+            is_key: true,
+            name: "id".into(),
+            type_oid: 23,
+            type_modifier: -1,
+        };
+        let rel = |cols: Vec<Column>| Relation {
+            relation_id: 42,
+            namespace: "public".into(),
+            name: "users".into(),
+            replica_identity: b'd',
+            columns: cols,
+        };
+        let working = |routes: &RouteMap| -> Vec<String> {
+            routes
+                .get(&42)
+                .expect("route built")
+                .working_schema
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect()
+        };
+
+        // Baseline Relation: working schema unchanged (id only).
+        handle_relation(&source, &mut decoder, &mut routes, &mut schema_state, rel(vec![id_col()]))
+            .await;
+        assert_eq!(working(&routes), vec!["id".to_string()]);
+
+        // Mid-stream ALTER adds `name` (text): the shared pump must adopt it.
+        let name_col = Column {
+            is_key: false,
+            name: "name".into(),
+            type_oid: 25,
+            type_modifier: -1,
+        };
+        handle_relation(
+            &source,
+            &mut decoder,
+            &mut routes,
+            &mut schema_state,
+            rel(vec![id_col(), name_col]),
+        )
+        .await;
+        assert_eq!(
+            working(&routes),
+            vec!["id".to_string(), "name".to_string()],
+            "shared pump adopted the mid-stream column add under append_new_columns"
+        );
+    }
+
     /// Item 1: one boundary flush publishes every field to every member.
     #[test]
     fn flush_member_metrics_fans_all_fields_to_every_member() {

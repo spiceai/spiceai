@@ -921,6 +921,7 @@ async fn resume_with_stale_backlog_is_not_ready_until_caught_up() -> Result<(), 
         schema_name: "public".into(),
         table_name: "repl_users".into(),
         metrics: ReplicationMetricsCollector::new(),
+        policy: SchemaEvolutionPolicy::Block,
     };
 
     // Cold bootstrap, then let the caught-up source reach Ready. Committing the

@@ -91,8 +91,10 @@ fn input_for(port: u16, table: &str) -> ReplicationStreamInput {
     input_with_schema(port, table, dataset_schema())
 }
 
-/// A non-shared dataset on its own slot/publication (`shared: false`), for the
-/// mixed-mode coexistence test.
+/// A dataset on its own dedicated slot/publication (`shared: false`), for the
+/// mixed-mode coexistence test. Note `shared: false` now selects only
+/// slot/publication *naming* (a per-dataset slot), not a separate apply path —
+/// every dataset runs on the shared pump, this one just as a one-member source.
 fn independent_input(port: u16, table: &str) -> ReplicationStreamInput {
     let mut params = shared_params(port);
     params.slot_name = INDEP_SLOT.into();

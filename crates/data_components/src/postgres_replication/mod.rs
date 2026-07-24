@@ -234,10 +234,12 @@ pub fn start_replication_stream(input: ReplicationStreamInput) -> ChangesStream 
 /// non-widening changes surface a clear actionable error. See
 /// [`schema_evolution::RelationSchemaTracker`].
 ///
-/// Slot-sharing datasets (`input.params.shared`) are multiplexed onto a single
-/// replication connection by [`shared::subscribe`], which does not plumb the
-/// policy to the source layer; their schema-change handling is enforced by the
-/// runtime apply loop instead.
+/// Every dataset is served by the shared pump ([`shared::subscribe`]) — a
+/// dataset on its own slot is just a one-member source — so the policy is
+/// carried on [`ReplicationStreamInput`] and reconciled by the shared pump's
+/// per-member [`schema_evolution::RelationSchemaTracker`] for all datasets,
+/// slot-sharing or not. `input.params.shared` governs only slot/publication
+/// naming, not which pump runs.
 #[must_use]
 pub fn start_replication_stream_with_policy(
     mut input: ReplicationStreamInput,
