@@ -335,6 +335,46 @@ pub fn default_publication_name(dataset_name: &str) -> String {
     format!("{SLOT_PREFIX}{dataset}_{dataset_hash}_pub")
 }
 
+/// Slot-name prefix for a CDC-accelerated catalog's single shared replication
+/// slot. Distinct from the per-dataset `spice_` prefix so a catalog slot and a
+/// same-named dataset slot can never collide, and so catalog slots stay
+/// greppable.
+const CATALOG_SLOT_PREFIX: &str = "spice_catalog_";
+
+/// Max sanitized-catalog-name bytes in a catalog slot name:
+/// 63 − (14 prefix + 1 separator + 6 hash) = 42.
+const CATALOG_SLOT_NAME_PORTION_MAX: usize =
+    PG_IDENTIFIER_MAX_BYTES - CATALOG_SLOT_PREFIX.len() - 1 - DATASET_HASH_LEN;
+
+/// Build the shared replication-slot name for a CDC-accelerated catalog:
+/// `spice_catalog_{sanitized_catalog}_{catalog_hash}`.
+///
+/// Unlike [`default_slot_name`], this is derived PURELY from the catalog name
+/// with **no instance component**, which makes it:
+///
+///   - deterministic and stable -- the same catalog name always yields the same
+///     slot name, so a restart (or a reschedule of the catalog onto a different
+///     node) recomputes the identical name and *reuses* the existing replication
+///     slot rather than orphaning it and re-snapshotting from scratch;
+///   - independent of the Spice instance/host -- two nodes configured with the
+///     same catalog resolve to the same slot name. Since PostgreSQL permits only
+///     one consumer per slot, the catalog acceleration path fails loudly at
+///     startup when the slot is already actively held by another consumer (see
+///     `AcceleratedCatalogProvider::refresh`), rather than silently competing for
+///     it. No slot identity is persisted by Spice: the name is a pure function of
+///     the catalog name, and the durable state is the PostgreSQL slot itself.
+///
+/// `catalog_hash` is a short hash of the *full* catalog name so two long names
+/// that share a truncated sanitized prefix still produce distinct slot names.
+/// The sanitized portion is truncated to keep the identifier within Postgres'
+/// 63-byte limit.
+#[must_use]
+pub fn catalog_slot_name(catalog_name: &str) -> String {
+    let catalog_hash = xxh3_short_hash_prefix(catalog_name, DATASET_HASH_LEN);
+    let catalog = truncate_to_bytes(&sanitize(catalog_name), CATALOG_SLOT_NAME_PORTION_MAX);
+    format!("{CATALOG_SLOT_PREFIX}{catalog}_{catalog_hash}")
+}
+
 /// Truncate an ASCII identifier to at most `max_bytes` bytes. Our `sanitize`
 /// output is pure ASCII so byte-truncation = char-truncation; safe.
 fn truncate_to_bytes(s: &str, max_bytes: usize) -> String {
@@ -721,5 +761,59 @@ mod tests {
         let b = format!("{shared_prefix}_beta");
         assert_ne!(default_slot_name(&a), default_slot_name(&b));
         assert_ne!(default_publication_name(&a), default_publication_name(&b));
+    }
+
+    #[test]
+    fn catalog_slot_name_is_deterministic_and_instance_independent() {
+        // A catalog slot name is a pure function of the catalog name -- it reads
+        // no instance id / hostname / env at all -- so it is identical on every
+        // call, which is exactly what lets a restart (or a reschedule onto a
+        // different node) recompute the same name and reuse the existing slot.
+        let a = catalog_slot_name("my_pg");
+        let b = catalog_slot_name("my_pg");
+        assert_eq!(a, b);
+        assert!(a.starts_with("spice_catalog_my_pg_"), "got {a}");
+    }
+
+    #[test]
+    fn catalog_slot_name_omits_the_instance_suffix() {
+        // The whole point of PR-3: unlike `default_slot_name` (which folds in an
+        // 8-hex instance hash so two instances get different slots), the catalog
+        // slot name carries NO instance component, so it does not end in the
+        // instance hash `default_slot_name` appends.
+        let catalog = catalog_slot_name("orders");
+        let dataset = default_slot_name("orders");
+        assert_ne!(catalog, dataset);
+        assert!(!catalog.starts_with(SLOT_PREFIX), "got {catalog}");
+        assert!(catalog.starts_with(CATALOG_SLOT_PREFIX), "got {catalog}");
+    }
+
+    #[test]
+    fn catalog_slot_name_is_unique_per_catalog() {
+        assert_ne!(catalog_slot_name("one"), catalog_slot_name("two"));
+        // Truncation-collision guard: two long names sharing a truncated prefix
+        // still differ via the full-name hash.
+        let shared = "a".repeat(60);
+        assert_ne!(
+            catalog_slot_name(&format!("{shared}_alpha")),
+            catalog_slot_name(&format!("{shared}_beta"))
+        );
+    }
+
+    #[test]
+    fn catalog_slot_name_sanitizes_and_stays_within_postgres_limit() {
+        // Special characters are sanitized to `_`, and even a pathologically long
+        // catalog name stays within Postgres' 63-byte identifier limit.
+        let sanitized = catalog_slot_name("my-catalog.name");
+        assert!(!sanitized.contains('-') && !sanitized.contains('.'), "{sanitized}");
+
+        let long = catalog_slot_name(&"c".repeat(300));
+        assert!(
+            long.len() <= PG_IDENTIFIER_MAX_BYTES,
+            "catalog slot `{long}` exceeds {PG_IDENTIFIER_MAX_BYTES} bytes: {}",
+            long.len()
+        );
+        // The publication derived from it must also fit.
+        assert!(publication_name_for_slot(&long).len() <= PG_IDENTIFIER_MAX_BYTES);
     }
 }
