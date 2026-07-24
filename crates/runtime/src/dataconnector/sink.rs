@@ -35,6 +35,9 @@ use futures::Future;
 
 use super::{ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec};
 
+/// Connector name for the [`SinkConnector`], as it appears in a dataset's `from: sink:...`.
+pub const SINK_DATACONNECTOR: &str = "sink";
+
 /// A no-op connector that allows for Spice to act as a "sink" for data.
 ///
 /// Configure an accelerator to store data - the sink connector itself does nothing.
@@ -99,7 +102,7 @@ impl DataConnectorFactory for SinkConnectorFactory {
     }
 
     fn prefix(&self) -> &'static str {
-        "sink"
+        SINK_DATACONNECTOR
     }
 
     fn parameters(&self) -> &'static [ParameterSpec] {
