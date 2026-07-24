@@ -203,6 +203,10 @@ pub async fn list_views(
 ) -> Result<Vec<ViewRelation>> {
     let conn = pool.connect_direct().await.context(ConnectionFailedSnafu)?;
 
+    // 'v' = view, 'm' = materialized view, 'f' = foreign table -- the view-like
+    // relations `list_tables` omits. Bound to a named slice and passed by
+    // reference, matching `list_tables`' relkind pattern.
+    let relkinds: &[&str] = &["v", "m", "f"];
     let rows = conn
         .conn
         .query(
@@ -212,7 +216,7 @@ pub async fn list_views(
              AND c.relkind::text = ANY($2) \
              AND pg_catalog.has_table_privilege(c.oid, 'SELECT') \
              ORDER BY c.relname",
-            &[&schema_name, &(&["v", "m", "f"] as &[&str])],
+            &[&schema_name, &relkinds],
         )
         .await
         .context(QueryFailedSnafu)?;

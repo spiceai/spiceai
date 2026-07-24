@@ -334,14 +334,21 @@ struct SpawnedTable {
 /// configuration error.
 #[derive(Debug, Snafu)]
 #[snafu(display(
-    "Catalog '{catalog}': 0 of {discovered} discovered table(s) are eligible for CDC acceleration ({skipped} have no primary key or usable REPLICA IDENTITY; {excluded} excluded by include/exclude filters). Give each table a usable CDC key -- a primary key (which REPLICA IDENTITY DEFAULT or FULL then keys on), or a UNIQUE NOT NULL index set as REPLICA IDENTITY USING INDEX -- and ensure the catalog's `include`/`exclude` patterns match them. Note that REPLICA IDENTITY FULL without a primary key is still skipped. Docs: {DOCS_URL}"
+    "Catalog '{catalog}': 0 of {discovered} discovered table(s) are eligible for CDC acceleration ({skipped} have no primary key or usable REPLICA IDENTITY; {excluded} excluded by include/exclude filters).{views_note} Give each table a usable CDC key -- a primary key (which REPLICA IDENTITY DEFAULT or FULL then keys on), or a UNIQUE NOT NULL index set as REPLICA IDENTITY USING INDEX -- and ensure the catalog's `include`/`exclude` patterns match them. Note that REPLICA IDENTITY FULL without a primary key is still skipped. Docs: {DOCS_URL}"
 ))]
 pub(crate) struct NoEligibleTablesError {
     catalog: String,
     /// Total tables looked at (skipped + excluded here, since accelerated is 0).
+    /// Excludes view-like relations, which aren't tables -- so a schema of only
+    /// views yields `0 of 0`; `views_note` then explains where those relations
+    /// went (see [`AcceleratedCatalogProvider::refresh`]).
     discovered: usize,
     excluded: usize,
     skipped: usize,
+    /// Pre-rendered so the `Display` needs no conditional formatting: a leading-
+    /// space sentence naming any view-like relations found (so a `0 of 0`
+    /// only-views case isn't confusing), or empty when there were none.
+    views_note: String,
 }
 
 /// A catalog provider that CDC-accelerates every table it discovers (subject
@@ -690,11 +697,24 @@ impl RefreshableCatalogProvider for AcceleratedCatalogProvider {
         // leaves any previously-registered schemas intact. `postgres.rs` maps
         // this to a permanent configuration error (ERROR status, no retry loop).
         if summary.accelerated_total() == 0 {
+            // When the only relations in scope are view-like (a `0 of 0`
+            // discovered-tables case), say so explicitly -- otherwise the message
+            // reads as an empty schema when in fact views/matviews/foreign tables
+            // were found and simply can't be CDC-accelerated.
+            let views_note = if summary.views_not_replicated > 0 {
+                format!(
+                    " {} view-like relation(s) (views/materialized views/foreign tables) were found in scope but cannot be CDC-accelerated.",
+                    summary.views_not_replicated
+                )
+            } else {
+                String::new()
+            };
             return Err(Box::new(NoEligibleTablesError {
                 catalog: self.catalog_name.clone(),
                 discovered: summary.discovered_tables(),
                 excluded: summary.excluded,
                 skipped: summary.skipped,
+                views_note,
             }));
         }
 
@@ -1070,6 +1090,7 @@ mod tests {
             discovered: 5,
             excluded: 3,
             skipped: 2,
+            views_note: String::new(),
         }
         .to_string();
         assert!(err.contains("my_pg"), "{err}");
@@ -1080,5 +1101,22 @@ mod tests {
         assert!(err.contains("REPLICA IDENTITY"), "{err}");
         assert!(err.contains("USING INDEX"), "{err}");
         assert!(err.contains("https://spiceai.org/docs"), "{err}");
+    }
+
+    #[test]
+    fn no_eligible_tables_error_notes_view_like_relations_when_present() {
+        // The only-views case: 0 of 0 discovered *tables*, but view-like
+        // relations were found -- the message must explain that so it doesn't
+        // read as an empty schema.
+        let err = NoEligibleTablesError {
+            catalog: "my_pg".to_string(),
+            discovered: 0,
+            excluded: 0,
+            skipped: 0,
+            views_note: " 3 view-like relation(s) (views/materialized views/foreign tables) were found in scope but cannot be CDC-accelerated.".to_string(),
+        }
+        .to_string();
+        assert!(err.contains("0 of 0 discovered"), "{err}");
+        assert!(err.contains("3 view-like relation(s)"), "{err}");
     }
 }
