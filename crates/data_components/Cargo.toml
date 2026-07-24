@@ -71,7 +71,6 @@ imap = { workspace = true, optional = true }
 indexmap.workspace = true
 logos.workspace = true
 mysql_async = { workspace = true, optional = true }
-mongodb = { workspace = true, optional = true }
 mailparse = { workspace = true, optional = true }
 num_cpus = "1.16"
 object_store = { workspace = true }
@@ -161,7 +160,6 @@ duckdb = [
 flightsql = []
 imap = ["dep:charset", "dep:imap", "dep:mailparse"]
 kafka = ["dep:rdkafka"]
-mongodb = ["dep:mongodb", "datafusion-table-providers/mongodb"]
 mssql = ["dep:tiberius", "dep:tokio-util", "dep:bb8"]
 mysql = [
     "dep:mysql_async",
@@ -240,11 +238,6 @@ required-features = ["postgres"]
 harness = false
 name = "ack_table_bench"
 required-features = ["postgres"]
-
-[[bench]]
-harness = false
-name = "mongodb_change_stream"
-required-features = ["mongodb"]
 
 [[bench]]
 harness = false

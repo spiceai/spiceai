@@ -144,8 +144,6 @@ pub mod iceberg;
 pub mod inferred_schema;
 #[cfg(any(feature = "debezium", feature = "kafka"))]
 pub mod kafka;
-#[cfg(feature = "mongodb")]
-pub mod mongodb;
 #[cfg(feature = "mssql")]
 pub mod mssql;
 #[cfg(feature = "mysql")]
