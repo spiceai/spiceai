@@ -139,6 +139,10 @@ name = "zorder_clustering"
 
 [[bench]]
 harness = false
+name = "layout_amp_default_on"
+
+[[bench]]
+harness = false
 name = "metastore_operations"
 
 [[bench]]
@@ -403,6 +407,10 @@ name = "delta_encoding_sweep"
 [[bench]]
 harness = false
 name = "compaction_write_amplification"
+
+[[bench]]
+harness = false
+name = "p1_audit_coverage"
 
 [[bench]]
 harness = false

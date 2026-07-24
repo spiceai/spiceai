@@ -20,7 +20,9 @@ limitations under the License.
 //! discovery via `information_schema` queries.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
-use crate::catalogconnector::postgres_accelerated::AcceleratedCatalogProvider;
+use crate::catalogconnector::postgres_accelerated::{
+    AcceleratedCatalogProvider, NoEligibleTablesError,
+};
 use crate::{Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams};
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
@@ -136,14 +138,26 @@ impl CatalogConnector for PostgresCatalog {
                 ))
             };
 
-        catalog_provider
-            .refresh()
-            .await
-            .map_err(|e| super::Error::UnableToGetCatalogProvider {
-                connector: PREFIX.to_string(),
-                connector_component,
-                source: e,
-            })?;
+        catalog_provider.refresh().await.map_err(|e| {
+            // A catalog with zero eligible tables is a configuration problem
+            // that retrying can't resolve (discovery is one-shot), so surface it
+            // as a permanent configuration error -- catalog load stops with an
+            // ERROR status instead of retrying the empty discovery forever.
+            if e.downcast_ref::<NoEligibleTablesError>().is_some() {
+                super::Error::InvalidConfiguration {
+                    connector: PREFIX.to_string(),
+                    connector_component: connector_component.clone(),
+                    message: e.to_string(),
+                    source: e,
+                }
+            } else {
+                super::Error::UnableToGetCatalogProvider {
+                    connector: PREFIX.to_string(),
+                    connector_component: connector_component.clone(),
+                    source: e,
+                }
+            }
+        })?;
 
         Ok(catalog_provider)
     }
