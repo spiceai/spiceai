@@ -43,7 +43,7 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use http::Uri;
 use reqwest::{
     Client,
-    header::{AUTHORIZATION, CACHE_CONTROL, HeaderMap, HeaderName, HeaderValue},
+    header::{CACHE_CONTROL, HeaderMap, HeaderName, HeaderValue},
 };
 use runtime_rate_control::{Permit, RateController};
 use snafu::prelude::*;
@@ -618,9 +618,15 @@ impl HttpTableProvider {
                 message: format!("Invalid request_header_allowlist entry '{raw}': {e}"),
             })?;
             ensure!(
-                !(self.auth.is_some() && parsed == AUTHORIZATION),
+                !self
+                    .auth
+                    .as_ref()
+                    .is_some_and(|auth| auth.header_name() == parsed),
                 ConfigurationSnafu {
-                    message: "request_header_allowlist cannot include 'authorization' when HTTP authentication is configured. Remove 'authorization' from request_header_allowlist or disable HTTP authentication.".to_string()
+                    message: format!(
+                        "request_header_allowlist cannot include '{name}' when HTTP authentication is configured; that header carries the auth token. Remove '{name}' from request_header_allowlist or disable HTTP authentication.",
+                        name = parsed.as_str(),
+                    )
                 }
             );
             allowed_headers.insert(parsed);
@@ -714,8 +720,8 @@ impl HttpTableProvider {
     }
 
     /// Attach an [`HttpAuthenticator`](super::auth::HttpAuthenticator) that decorates
-    /// every outgoing data request (e.g. to apply a bearer token refreshed in the
-    /// background by [`RefreshTokenAuth`](super::auth::RefreshTokenAuth)).
+    /// every outgoing data request (e.g. to apply an access token refreshed in the
+    /// background by [`OAuth2Auth`](super::auth::OAuth2Auth)).
     #[must_use]
     pub fn with_auth(mut self, auth: Arc<dyn super::auth::HttpAuthenticator>) -> Self {
         self.auth = Some(auth);
@@ -3307,9 +3313,16 @@ impl HttpTableProvider {
                 });
             }
 
-            if self.auth.is_some() && header_name == AUTHORIZATION {
+            if self
+                .auth
+                .as_ref()
+                .is_some_and(|auth| auth.header_name() == header_name)
+            {
                 return Err(Error::FilterRejected {
-                    message: "The 'request_headers' object cannot set 'authorization' when HTTP authentication is configured. Remove 'authorization' from request_headers or disable HTTP authentication.".to_string(),
+                    message: format!(
+                        "The 'request_headers' object cannot set '{name}' when HTTP authentication is configured; that header carries the auth token. Remove '{name}' from request_headers or disable HTTP authentication.",
+                        name = header_name.as_str(),
+                    ),
                 });
             }
 
@@ -3372,6 +3385,7 @@ mod tests {
     use datafusion::common::Column;
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator, expr::InList};
     use datafusion::scalar::ScalarValue;
+    use reqwest::header::AUTHORIZATION;
     use std::sync::{Arc, atomic::AtomicUsize};
     use std::time::Duration;
     use url::Url;
@@ -3382,6 +3396,25 @@ mod tests {
     impl super::super::auth::HttpAuthenticator for TestAuthenticator {
         fn apply(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
             builder.header(AUTHORIZATION, "Bearer token")
+        }
+
+        fn header_name(&self) -> &reqwest::header::HeaderName {
+            &AUTHORIZATION
+        }
+    }
+
+    /// Authenticator that writes a non-standard header, to exercise the
+    /// configured-header-name conflict guards.
+    #[derive(Debug)]
+    struct CustomHeaderAuthenticator(reqwest::header::HeaderName);
+
+    impl super::super::auth::HttpAuthenticator for CustomHeaderAuthenticator {
+        fn apply(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+            builder.header(&self.0, "secret-token")
+        }
+
+        fn header_name(&self) -> &reqwest::header::HeaderName {
+            &self.0
         }
     }
 
@@ -4006,6 +4039,82 @@ mod tests {
                 assert!(message.contains("authorization"));
                 assert!(message.contains("HTTP authentication"));
                 assert!(!message.contains("secret"));
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enable_header_filters_guards_configured_auth_header_name() {
+        let auth = Arc::new(CustomHeaderAuthenticator(HeaderName::from_static(
+            "x-shopify-access-token",
+        )));
+
+        // Allowlisting the exact header the auth token occupies is rejected.
+        let err = base_provider()
+            .with_auth(Arc::clone(&auth) as Arc<dyn super::super::auth::HttpAuthenticator>)
+            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["x-shopify-access-token"])
+            .expect_err("allowlisting the configured auth header must be rejected");
+        match err {
+            Error::Configuration { message } => {
+                assert!(
+                    message.contains("x-shopify-access-token"),
+                    "message: {message}"
+                );
+                assert!(
+                    message.contains("HTTP authentication"),
+                    "message: {message}"
+                );
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+
+        // A different header name is unaffected — the guard is keyed on the
+        // configured name, not hard-coded to `authorization`.
+        base_provider()
+            .with_auth(auth as Arc<dyn super::super::auth::HttpAuthenticator>)
+            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["x-region"])
+            .expect("a non-auth header name should be allowlisted fine");
+    }
+
+    #[test]
+    fn request_headers_filter_rejects_configured_auth_header_name() {
+        // Allowlist the custom header before auth is configured, then attach an
+        // authenticator that uses it — a query-time filter must not be able to
+        // overwrite the auth token's header.
+        let provider = base_provider()
+            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["x-shopify-access-token"])
+            .expect("allowlisted before auth configured")
+            .with_auth(Arc::new(CustomHeaderAuthenticator(HeaderName::from_static(
+                "x-shopify-access-token",
+            )))
+                as Arc<dyn super::super::auth::HttpAuthenticator>);
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_headers"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some(r#"{"x-shopify-access-token":"secret"}"#.to_string())),
+                None,
+            )),
+        })];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("expected rejection of the configured auth header");
+        match err {
+            DataFusionError::Plan(message) => {
+                assert!(
+                    message.contains("x-shopify-access-token"),
+                    "message: {message}"
+                );
+                assert!(
+                    message.contains("HTTP authentication"),
+                    "message: {message}"
+                );
+                assert!(
+                    !message.contains("secret"),
+                    "must not leak the value: {message}"
+                );
             }
             other => panic!("Unexpected error: {other:?}"),
         }

@@ -535,7 +535,7 @@ pub fn classify_replica_identity(identity: &ReplicaIdentity) -> ReplicaIdentityO
 #[cfg(test)]
 mod tests {
     use super::{
-        ReplicaIdentity, ReplicaIdentityMode, ReplicaIdentityOutcome, SkipReason,
+        Error, ReplicaIdentity, ReplicaIdentityMode, ReplicaIdentityOutcome, SkipReason,
         accumulate_replica_identity, classify_replica_identity,
     };
 
@@ -683,5 +683,55 @@ mod tests {
             accumulate_replica_identity(ReplicaIdentityMode::Default, vec![(None, None, None)]);
         assert!(id.primary_key.is_empty());
         assert!(id.identity_index.is_empty());
+    }
+
+    #[test]
+    fn skip_reason_explanations_are_actionable() {
+        // Every skip reason drives a per-table warning, so each must name the
+        // property at fault (REPLICA IDENTITY) and a concrete fix the operator
+        // can apply.
+        for reason in [
+            SkipReason::NoReplicaIdentity,
+            SkipReason::KeylessDefault,
+            SkipReason::UnusableIdentityIndex,
+            SkipReason::FullWithoutKey,
+            SkipReason::UnknownMode,
+        ] {
+            let explanation = reason.explanation();
+            assert!(
+                explanation.contains("REPLICA IDENTITY"),
+                "{reason:?} explanation should name REPLICA IDENTITY: {explanation}"
+            );
+            assert!(
+                explanation.contains("primary key")
+                    || explanation.contains("USING INDEX")
+                    || explanation.contains("unique"),
+                "{reason:?} explanation should name a concrete fix: {explanation}"
+            );
+        }
+    }
+
+    #[test]
+    fn cdc_prerequisite_errors_are_actionable_with_docs_links() {
+        // The wal_level and replication-privilege errors are the first thing an
+        // operator hits when a source can't do CDC -- each must name the exact
+        // problem, the exact fix, and a docs link.
+        let wal = Error::WalLevelNotLogical {
+            wal_level: "replica".to_string(),
+        }
+        .to_string();
+        assert!(wal.contains("wal_level"), "{wal}");
+        assert!(wal.contains("logical"), "{wal}");
+        assert!(wal.contains("ALTER SYSTEM SET wal_level"), "{wal}");
+        assert!(wal.contains("https://spiceai.org/docs"), "{wal}");
+
+        let role = Error::MissingReplicationPrivilege {
+            role: "app_ro".to_string(),
+        }
+        .to_string();
+        assert!(role.contains("app_ro"), "{role}");
+        assert!(role.contains("replication"), "{role}");
+        assert!(role.contains("ALTER ROLE"), "{role}");
+        assert!(role.contains("https://spiceai.org/docs"), "{role}");
     }
 }

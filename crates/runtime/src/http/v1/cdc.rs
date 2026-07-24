@@ -48,6 +48,8 @@ use axum::http::header;
 
 #[cfg(feature = "debezium")]
 use crate::dataconnector::cdc_ingest::{self, Error as IngestError};
+#[cfg(feature = "debezium")]
+use axum::http::header;
 
 // Present when either feature is set: the debezium ingest path constructs + returns
 // it, and the OpenAPI schema references it (compiled but not constructed under
@@ -55,6 +57,13 @@ use crate::dataconnector::cdc_ingest::{self, Error as IngestError};
 #[cfg(any(feature = "debezium", feature = "openapi"))]
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[cfg_attr(
+    not(feature = "debezium"),
+    expect(
+        dead_code,
+        reason = "constructed only on the debezium ingest path; still referenced by the OpenAPI schema and serialization derives"
+    )
+)]
 pub struct CdcIngestResponse {
     /// Number of change rows applied.
     pub applied: usize,

@@ -134,14 +134,14 @@ use roaring::RoaringBitmap;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::task;
 use vortex_datafusion::VortexFormat;
 use vortex_datafusion::VortexSource;
 use vortex_datafusion::WriteShardConfig;
 
-use super::compaction::{FileEntry, pick_candidates};
+use super::compaction::{CompactionCandidate, FileEntry, pick_candidates};
 use super::context::CayenneContext;
 use super::deletion_index::{DeletionIndex, KeyDeletionIndex};
 use super::deletion_strategy::{
@@ -1241,6 +1241,32 @@ type TestPrePublishHook = Box<dyn FnOnce() -> futures::future::BoxFuture<'static
 ///
 /// Currently, the implementation uses a single `ListingTable` that scans the entire table
 /// directory. In a future optimization, this could be enhanced to manage multiple
+/// Path taken by the last successful current-snapshot small-file compaction.
+///
+/// Used by Criterion benches and integration tests to assert the subset vs full
+/// rewrite branch without scraping telemetry. `#[doc(hidden)]` — not a stable API.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum LastSmallFileCompactPath {
+    /// No successful small-file compact has run on this provider yet.
+    None = 0,
+    /// Subset rewrite: re-encode picker candidates only; hardlink unpicked.
+    Subset = 1,
+    /// Full snapshot re-encode (also folds protected snapshots).
+    Full = 2,
+}
+
+impl LastSmallFileCompactPath {
+    const fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Subset,
+            2 => Self::Full,
+            _ => Self::None,
+        }
+    }
+}
+
 /// `ListingTables` (one per virtual file) and union their results for better control
 /// over file-level operations.
 pub struct CayenneTableProvider {
@@ -1759,6 +1785,10 @@ pub struct CayenneTableProvider {
     /// Reset to 0 after a compaction rewrite. Conservative: can only cause
     /// extra listings, never missed compactions.
     new_files_since_last_compaction: Arc<AtomicUsize>,
+    /// Last successful current-snapshot small-file compact path
+    /// ([`LastSmallFileCompactPath`] as `u8`). Shared across writer clones so
+    /// benches/tests can assert subset vs full after any compact entry point.
+    last_small_file_compact_path: Arc<AtomicU8>,
     /// Monotonic *version stamp* for the current snapshot directory's file set
     /// (NOT a file count). Bumped by one on every current-dir publish in
     /// [`Self::publish_current_snapshot_files_changed_under_held_fence`]
@@ -2490,6 +2520,41 @@ const fn subset_merge_write_shape(
             session_target_partitions
         };
         (cap, Some(total_input_bytes))
+    }
+}
+
+/// Pure gate for the current-snapshot small-file **subset** rewrite (hardlink
+/// unpicked + re-encode only the picker candidate). Extracted so every branch
+/// is unit-testable without spinning a full provider.
+///
+/// Returns `true` only when all of:
+/// - not position-delete (position tombstones are file-path scoped),
+/// - no sort columns (subset hardlinks would break global sort attestation),
+/// - no protected snapshots (those are leveled by the protected-subset path;
+///   folding them is the full rewrite's job),
+/// - candidate is a proper subset with at least 2 paths (amp win + meaningful merge).
+#[must_use]
+const fn subset_rewrite_eligibility(
+    is_position_delete: bool,
+    has_sort_columns: bool,
+    protected_snapshot_count: usize,
+    candidate_paths: usize,
+    total_current_files: usize,
+) -> bool {
+    if is_position_delete || has_sort_columns || protected_snapshot_count > 0 {
+        return false;
+    }
+    candidate_paths < total_current_files && candidate_paths >= 2
+}
+
+/// Write-amplification ×100 (integer percent) of a full rewrite vs rewriting
+/// only the candidate: `100 * total_bytes / candidate_bytes`. Returns 0 when
+/// `candidate_bytes` is 0 (picker should not produce empty candidates; defensive).
+#[must_use]
+const fn subset_write_amp_x100(total_bytes: u64, candidate_bytes: u64) -> u64 {
+    match total_bytes.saturating_mul(100).checked_div(candidate_bytes) {
+        Some(ratio) => ratio,
+        None => 0,
     }
 }
 
@@ -5493,6 +5558,9 @@ impl CayenneTableProvider {
                 ResourceStarvationTracker::new(POSITION_COMPACTION_SKIP_WARN_AFTER),
             )),
             new_files_since_last_compaction: Arc::new(AtomicUsize::new(0)),
+            last_small_file_compact_path: Arc::new(AtomicU8::new(
+                LastSmallFileCompactPath::None as u8,
+            )),
             current_dir_generation: Arc::new(AtomicU64::new(0)),
             last_moved_snapshot_files: Arc::new(ParkingMutex::new(None)),
             compaction_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -6568,6 +6636,7 @@ impl CayenneTableProvider {
             snapshot_scan_refs: Arc::clone(&self.snapshot_scan_refs),
             position_compaction_skip_streak: Arc::clone(&self.position_compaction_skip_streak),
             new_files_since_last_compaction: Arc::clone(&self.new_files_since_last_compaction),
+            last_small_file_compact_path: Arc::clone(&self.last_small_file_compact_path),
             current_dir_generation: Arc::clone(&self.current_dir_generation),
             // Shared so a writer clone's move records the published files where the
             // (same-table) publish on any clone can delta-apply them.
@@ -12139,11 +12208,12 @@ impl CayenneTableProvider {
     /// (nothing accumulated, no qualifying small-file tier, lock busy, inflight
     /// staged append, or a concurrent-append abort).
     ///
-    // Long-term (not yet implemented): instead of re-encoding the
-    // whole snapshot and aborting on a concurrent append, re-encode only the
-    // picked small-file subset and hard-link (local) / `CopyObject` (S3) the
-    // un-picked settled files — and the concurrently-appended files — into the
-    // new dir.
+    // Subset rewrite (P1 write-amp): when the picker selects a proper subset of
+    // current-snapshot files, re-encode ONLY those and hard-link (local) /
+    // `CopyObject` (S3) the un-picked settled files into the new dir — see
+    // [`Self::rewrite_current_snapshot_small_file_subset`]. Falls back to full
+    // rewrite when position deletes, protected snapshots to fold, or the
+    // candidate covers every current file (no amp to save).
     #[doc(hidden)]
     pub async fn compact_current_snapshot_small_files(&self) -> Result<bool> {
         // A staged append is mid-finalization; files would be neither cleanly in
@@ -12213,6 +12283,9 @@ impl CayenneTableProvider {
             number_picker_candidate_files: candidate.paths.len(),
             compaction_trigger_files: cfg.trigger_files,
         });
+
+        let total_bytes: u64 = files.iter().map(|(_, sz)| *sz).sum();
+        let write_amp_x100 = subset_write_amp_x100(total_bytes, candidate.total_bytes);
         tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
@@ -12220,11 +12293,365 @@ impl CayenneTableProvider {
             picked_files = candidate.paths.len(),
             picked_bytes = candidate.total_bytes,
             total_files = files.len(),
+            total_bytes,
+            write_amp_x100,
             "Running current-snapshot small-file compaction"
         );
 
+        // Subset path when it is a real amp win and safe: key-delete, no
+        // protected snapshots to fold into this pass, candidate is a proper
+        // subset of current files. Otherwise full rewrite (also folds protected).
+        if self.can_subset_rewrite_current_small_files(&candidate, &files) {
+            match self
+                .rewrite_current_snapshot_small_file_subset(&candidate, &files)
+                .await
+            {
+                Ok(true) => {
+                    self.record_small_file_compact_path(LastSmallFileCompactPath::Subset);
+                    return Ok(true);
+                }
+                Ok(false) => {
+                    // Subset aborted (e.g. concurrent append); fall through to
+                    // full rewrite on the next trigger rather than forcing one
+                    // now while the fence is hot.
+                    tracing::debug!(
+                        target: "cayenne::compaction",
+                        table = self.table_metadata.table_name.as_str(),
+                        "Subset small-file rewrite no-op; will retry on next trigger"
+                    );
+                    return Ok(false);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "cayenne::compaction",
+                        table = self.table_metadata.table_name.as_str(),
+                        error = %e,
+                        "Subset small-file rewrite failed; falling back to full snapshot rewrite"
+                    );
+                    // Fall through to full rewrite.
+                }
+            }
+        }
+
         // Full re-encode into a fresh snapshot with the concurrent-append guard.
-        self.rewrite_current_snapshot_for_compaction_tracked().await
+        // Also folds protected snapshots and clears deletion caches.
+        let committed = self
+            .rewrite_current_snapshot_for_compaction_tracked()
+            .await?;
+        if committed {
+            self.record_small_file_compact_path(LastSmallFileCompactPath::Full);
+        }
+        Ok(committed)
+    }
+
+    fn record_small_file_compact_path(&self, path: LastSmallFileCompactPath) {
+        self.last_small_file_compact_path
+            .store(path as u8, Ordering::Release);
+    }
+
+    /// Path taken by the last successful current-snapshot small-file compact.
+    ///
+    /// `#[doc(hidden)]` for benches/tests that assert subset vs full rewrite.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn last_small_file_compact_path(&self) -> LastSmallFileCompactPath {
+        LastSmallFileCompactPath::from_u8(self.last_small_file_compact_path.load(Ordering::Acquire))
+    }
+
+    /// Whether the small-file candidate can be rewritten as a subset (hardlink
+    /// unpicked files) instead of a full-snapshot re-encode.
+    ///
+    /// Safe when: key-delete mode (position tables keep full rewrite), no
+    /// protected snapshots (those are leveled by the dedicated subset path;
+    /// folding them is the full rewrite's job), and the picker selected a
+    /// proper subset of current files (otherwise full rewrite is identical).
+    fn can_subset_rewrite_current_small_files(
+        &self,
+        candidate: &CompactionCandidate<&str>,
+        files: &[(String, u64)],
+    ) -> bool {
+        subset_rewrite_eligibility(
+            self.should_capture_positions() || self.pk_deletion_strategy.is_position_based(),
+            self.context.has_sort_columns(),
+            self.protected_snapshots.load().len(),
+            candidate.paths.len(),
+            files.len(),
+        )
+    }
+
+    /// Re-encode only the picker's small-file subset and hard-link/copy the
+    /// remaining settled current-snapshot files into a fresh snapshot, then
+    /// flip the current pointer. Leaves deletion indexes intact (unpicked files
+    /// may still need merge-on-read filtering).
+    ///
+    /// Callers must hold `compaction_lock` and satisfy
+    /// [`Self::can_subset_rewrite_current_small_files`]. Returns `Ok(false)` when
+    /// a concurrent append races the encode (generation fence).
+    async fn rewrite_current_snapshot_small_file_subset(
+        &self,
+        candidate: &CompactionCandidate<&str>,
+        files: &[(String, u64)],
+    ) -> Result<bool> {
+        let pass_start = Instant::now();
+        let old_snapshot_id = self.get_current_snapshot_id();
+        let generation_before = self.current_dir_generation.load(Ordering::Relaxed);
+        let snapshot_id_before = old_snapshot_id.clone();
+
+        let picked: std::collections::HashSet<&str> = candidate.paths.iter().copied().collect();
+        let unpicked: Vec<&str> = files
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .filter(|path| !picked.contains(*path))
+            .collect();
+        let picked_list: Vec<&str> = candidate.paths.clone();
+
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+        // Staging snapshot holding ONLY the candidate files so a normal snapshot
+        // scan reads just those bytes (no full-table re-read).
+        let staging_snapshot_id = format!("subset-src-{new_snapshot_id}");
+        let is_s3 = self.table_metadata.path.starts_with("s3://");
+
+        // Cleanup both dirs on any failure after creation.
+        let cleanup_all = async {
+            self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                .await;
+            self.cleanup_failed_compaction_snapshot(&staging_snapshot_id, is_s3)
+                .await;
+        };
+
+        // 1. Stage candidate files alone (hardlink/copy) for a tight scan.
+        if let Err(e) = self
+            .link_or_copy_snapshot_files(&old_snapshot_id, &staging_snapshot_id, &picked_list)
+            .await
+        {
+            cleanup_all.await;
+            return Err(e);
+        }
+
+        // 2. Hard-link unpicked settled files into the destination snapshot.
+        if let Err(e) = self
+            .link_or_copy_snapshot_files(&old_snapshot_id, &new_snapshot_id, &unpicked)
+            .await
+        {
+            cleanup_all.await;
+            return Err(e);
+        }
+
+        // 3. Scan the staging snapshot (candidates only) with deletion filter
+        //    and re-encode into the destination alongside the hardlinked files.
+        let ctx = self.create_compaction_session_context();
+        let state = ctx.state();
+        let plan = match self
+            .create_snapshot_scan_plan(&state, &staging_snapshot_id, None, &[], None)
+            .await
+        {
+            Ok(p) => p,
+            Err(source) => {
+                cleanup_all.await;
+                return Err(Error::DataFusion { source });
+            }
+        };
+        let deletion_snapshot = self.pk_deletion_snapshot();
+        let pk_indices = self.pk_column_indices.clone();
+        let with_deletes = match self.apply_deletion_filter(plan, &pk_indices, &deletion_snapshot) {
+            Ok(p) => p,
+            Err(source) => {
+                cleanup_all.await;
+                return Err(Error::DataFusion { source });
+            }
+        };
+        let stream = match datafusion_physical_plan::execute_stream(with_deletes, state.task_ctx())
+        {
+            Ok(s) => s,
+            Err(source) => {
+                cleanup_all.await;
+                return Err(Error::DataFusion { source });
+            }
+        };
+
+        let (target_partitions, estimated_bytes) = subset_merge_write_shape(
+            false,
+            state.config().target_partitions(),
+            candidate.total_bytes,
+        );
+        let write_result = self
+            .write_to_snapshot(
+                stream,
+                self.context.target_file_size_bytes(),
+                &new_snapshot_id,
+                target_partitions,
+                estimated_bytes,
+                super::delta_encoding::WriteClass::Maintenance,
+            )
+            .await;
+
+        // Staging dir is no longer needed after the encode.
+        self.cleanup_failed_compaction_snapshot(&staging_snapshot_id, is_s3)
+            .await;
+
+        let (_total_rows, _ops, _stats) = match write_result {
+            Ok(r) => r,
+            Err(e) => {
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Err(e);
+            }
+        };
+
+        if !is_s3 {
+            let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
+            if let Err(e) = Self::sync_snapshot_dir(&snapshot_dir).await {
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Err(Error::Catalog { source: e });
+            }
+            self.evict_compaction_output_pages(&new_snapshot_id).await;
+        }
+
+        // 4. Atomic publish: generation fence + pointer flip. Do NOT clear
+        //    deletion caches — unpicked files may still need merge-on-read.
+        let new_listing_table = {
+            let snapshot_dir_url = Self::snapshot_dir_url(
+                &self.table_metadata.path,
+                &self.table_metadata.table_id,
+                &new_snapshot_id,
+            );
+            Self::create_listing_table(
+                &snapshot_dir_url,
+                self.table_schema(),
+                self.context.file_format(),
+                &self.pk_deletion_strategy,
+            )?
+        };
+
+        {
+            let listing_guard = self.listing_fence.write().await;
+            let snapshot_id_now = self.get_current_snapshot_id();
+            if snapshot_id_now != snapshot_id_before {
+                drop(listing_guard);
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Ok(false);
+            }
+            let generation_now = self.current_dir_generation.load(Ordering::Relaxed);
+            if generation_now != generation_before {
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    generation_before,
+                    generation_now,
+                    "Aborting subset small-file rewrite: concurrent append during encode"
+                );
+                drop(listing_guard);
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Ok(false);
+            }
+
+            if let Err(e) = self
+                .catalog
+                .set_current_snapshot(&self.table_metadata.table_id, &new_snapshot_id)
+                .await
+            {
+                drop(listing_guard);
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Err(Error::Catalog { source: e });
+            }
+
+            self.listing_table.store(new_listing_table);
+            self.update_current_snapshot_id(&new_snapshot_id);
+            self.new_files_since_last_compaction
+                .store(0, Ordering::Release);
+            drop(listing_guard);
+        }
+
+        self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
+
+        telemetry::cayenne::track_compaction_duration(
+            pass_start.elapsed(),
+            &[
+                telemetry::KeyValue::new("table", self.table_metadata.table_name.clone()),
+                telemetry::KeyValue::new("kind", "subset_current"),
+                telemetry::KeyValue::new("result", "completed"),
+            ],
+        );
+        tracing::info!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            picked_files = candidate.paths.len(),
+            picked_bytes = candidate.total_bytes,
+            unpicked_files = unpicked.len(),
+            duration_ms = pass_start.elapsed().as_millis(),
+            "Completed subset current-snapshot small-file rewrite"
+        );
+        Ok(true)
+    }
+
+    /// Hard-link (local) or copy (S3 / cross-device) named basenames from
+    /// `source_snapshot_id` into `target_snapshot_id`. Creates the target dir.
+    ///
+    /// `#[doc(hidden)] pub` so integration tests can exercise the hardlink /
+    /// copy fallback without going through a full subset rewrite.
+    #[doc(hidden)]
+    pub async fn link_or_copy_snapshot_files(
+        &self,
+        source_snapshot_id: &str,
+        target_snapshot_id: &str,
+        basenames: &[&str],
+    ) -> Result<()> {
+        if basenames.is_empty() {
+            return Ok(());
+        }
+        if self.table_metadata.path.starts_with("s3://") {
+            let config = self.require_object_store()?;
+            let source_prefix = self
+                .snapshot_object_store_prefix(source_snapshot_id)?
+                .ok_or_else(|| Error::Internal {
+                    table: self.table_name().to_string(),
+                    message: "Missing source snapshot object-store prefix".to_string(),
+                })?;
+            let target_prefix = self
+                .snapshot_object_store_prefix(target_snapshot_id)?
+                .ok_or_else(|| Error::Internal {
+                    table: self.table_name().to_string(),
+                    message: "Missing target snapshot object-store prefix".to_string(),
+                })?;
+            let store = Arc::clone(&config.store);
+            let table_name = self.table_name().to_string();
+            for basename in basenames {
+                let source = ObjectStorePath::from(format!("{}{basename}", source_prefix.as_ref()));
+                let target = ObjectStorePath::from(format!("{}{basename}", target_prefix.as_ref()));
+                store
+                    .copy(&source, &target)
+                    .await
+                    .map_err(|source| Error::ObjectStore {
+                        operation: "subset compaction copy file",
+                        table: table_name.clone(),
+                        source,
+                    })?;
+            }
+            return Ok(());
+        }
+
+        let source_dir = self.snapshot_dir_path_for(source_snapshot_id);
+        let target_dir = self.snapshot_dir_path_for(target_snapshot_id);
+        Self::ensure_snapshot_dir_exists(&target_dir).await?;
+        for basename in basenames {
+            let source = source_dir.join(basename);
+            let destination = target_dir.join(basename);
+            if let Err(link_error) = tokio::fs::hard_link(&source, &destination).await {
+                tracing::debug!(
+                    table = self.table_name(),
+                    source = %source.display(),
+                    target = %destination.display(),
+                    %link_error,
+                    "Hard-link of compaction file unavailable; copying"
+                );
+                tokio::fs::copy(&source, &destination).await?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn schedule_post_write_compaction(&self) {
@@ -13033,15 +13460,23 @@ impl CayenneTableProvider {
 
         if let Some(trigger) = maintenance_trigger {
             self.log_snapshot_maintenance_trigger(trigger);
-            self.rewrite_current_snapshot_for_compaction_tracked()
+            let committed = self
+                .rewrite_current_snapshot_for_compaction_tracked()
                 .await?;
-            return Ok(true);
+            if committed {
+                self.record_small_file_compact_path(LastSmallFileCompactPath::Full);
+            }
+            return Ok(committed);
         }
 
+        // List CURRENT snapshot only with bare basenames — same shape as
+        // [`Self::compact_current_snapshot_small_files`]. Prefixing with
+        // `snapshot_id/` (as `list_compaction_candidate_files_with_sizes` does
+        // for the protected+current union) would break subset hardlink basenames
+        // and incorrectly inflate "total files" for the proper-subset gate.
+        // Full rewrite still folds protected snapshots via its own scan.
         let snapshot_id = self.get_current_snapshot_id();
-        let files = self
-            .list_compaction_candidate_files_with_sizes(&snapshot_id)
-            .await?;
+        let files = self.list_snapshot_files_with_sizes(&snapshot_id).await?;
 
         if files.len() < 2 {
             return Ok(false);
@@ -13056,6 +13491,8 @@ impl CayenneTableProvider {
             return Ok(false);
         };
 
+        let total_bytes: u64 = files.iter().map(|(_, sz)| *sz).sum();
+        let write_amp_x100 = subset_write_amp_x100(total_bytes, candidate.total_bytes);
         tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
@@ -13063,24 +13500,64 @@ impl CayenneTableProvider {
             picked_files = candidate.paths.len(),
             picked_bytes = candidate.total_bytes,
             total_files = files.len(),
+            total_bytes,
+            write_amp_x100,
             "Running tiered compaction pass"
         );
 
-        // `candidate.paths` identifies the files that triggered this pass and
-        // is used for tracing/metrics. The rewrite intentionally consolidates
-        // the full current snapshot so compaction preserves a single coherent
-        // snapshot boundary instead of mixing old and newly written file sets.
-        self.rewrite_current_snapshot_for_compaction_tracked()
+        // Subset rewrite when safe (key-delete, no protected, proper subset);
+        // otherwise full snapshot re-encode (folds protected + clears DVs).
+        if self.can_subset_rewrite_current_small_files(&candidate, &files) {
+            match self
+                .rewrite_current_snapshot_small_file_subset(&candidate, &files)
+                .await
+            {
+                Ok(true) => {
+                    self.record_small_file_compact_path(LastSmallFileCompactPath::Subset);
+                    tracing::debug!(
+                        target: "cayenne::compaction",
+                        table = self.table_metadata.table_name.as_str(),
+                        tier = candidate.tier.as_str(),
+                        duration_ms = pass_start.elapsed().as_millis(),
+                        "Completed tiered compaction pass (subset)"
+                    );
+                    return Ok(true);
+                }
+                Ok(false) => {
+                    tracing::debug!(
+                        target: "cayenne::compaction",
+                        table = self.table_metadata.table_name.as_str(),
+                        "Subset tiered rewrite no-op; retry next trigger"
+                    );
+                    return Ok(false);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "cayenne::compaction",
+                        table = self.table_metadata.table_name.as_str(),
+                        error = %e,
+                        "Subset tiered rewrite failed; falling back to full snapshot rewrite"
+                    );
+                }
+            }
+        }
+
+        let committed = self
+            .rewrite_current_snapshot_for_compaction_tracked()
             .await?;
+        if committed {
+            self.record_small_file_compact_path(LastSmallFileCompactPath::Full);
+        }
 
         tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             tier = candidate.tier.as_str(),
             duration_ms = pass_start.elapsed().as_millis(),
+            committed,
             "Completed tiered compaction pass"
         );
-        Ok(true)
+        Ok(committed)
     }
 
     /// List Vortex files in the current snapshot directory with their sizes.
@@ -22299,6 +22776,56 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    /// Discard EVERY in-memory CDC mem-tier row (all shards) for a delete-all
+    /// (TRUNCATE / `DELETE … WHERE TRUE`). Returns the count of visible rows
+    /// dropped so the caller can fold it into the delete's reported row count.
+    /// The caller MUST hold `write_lock` (as the delete sinks do), so no
+    /// concurrent CDC apply mutates the tier between the capture and the clear.
+    pub(crate) async fn purge_mem_tier_all(&self) -> Result<u64> {
+        if self.mem_tier.is_empty() {
+            return Ok(0);
+        }
+        // Capture each shard's full segment prefix under no append (write_lock held
+        // by the caller). Count the visible rows removed, and read the source-slot
+        // epoch to ack BEFORE the clear empties the segments.
+        let shard_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
+            .mem_tier
+            .shards()
+            .iter()
+            .map(ArcSwap::load_full)
+            .collect();
+        let flushed_counts: Vec<usize> = shard_snapshots.iter().map(|s| s.segments.len()).collect();
+        let mut removed_rows: u64 = 0;
+        for shard in &shard_snapshots {
+            if shard.is_empty() || shard.segments.is_empty() {
+                continue;
+            }
+            for batch in self.visible_mem_tier_batches(shard, None)? {
+                removed_rows = removed_rows.saturating_add(batch.num_rows() as u64);
+            }
+        }
+        // The source-slot epoch every discarded row is at/below — mirrors
+        // `checkpoint_mem_tier_inner` (MAX over shards of the per-apply
+        // `source_position`, falling back to the N==1 shard's `epoch` currency).
+        // The rows are DISCARDED, not made durable, so every deferred source
+        // committer at/below this epoch must still be released via the advancer
+        // below or the deferred-commit queue stalls the changes stream (#11644).
+        let durable_epoch = shard_snapshots
+            .iter()
+            .zip(flushed_counts.iter())
+            .filter_map(|(s, &c)| s.max_source_position_in_prefix(c))
+            .max();
+        let epoch =
+            durable_epoch.unwrap_or_else(|| shard_snapshots.first().map_or(0, |shard| shard.epoch));
+        // Clearing each shard's FULL prefix leaves an empty tier. `false`: the
+        // inline corpus is deleted by the caller's inline/file sink, not here, so
+        // this must not also run the checkpoint-time inline-metadata clear.
+        self.clear_flushed_mem_tier_state_all_shards(&flushed_counts, false)
+            .await?;
+        self.fire_slot_advancer(epoch).await;
+        Ok(removed_rows)
+    }
+
     /// Fire the installed [`SlotAdvancer`] for `durable_epoch`, if one is wired
     /// up (memory mode). A no-op in file mode / when the runtime did not install
     /// a handle.
@@ -27791,6 +28318,45 @@ mod tests {
         );
     }
 
+    /// Every branch of [`subset_rewrite_eligibility`] — the pure gate behind
+    /// the current-snapshot small-file subset rewrite (P1-1).
+    #[test]
+    fn subset_rewrite_eligibility_covers_all_gate_branches() {
+        // Happy path: key-delete, unsorted, no protected, proper subset ≥2.
+        assert!(subset_rewrite_eligibility(false, false, 0, 4, 10));
+        // Minimum candidate size (exactly 2) with one unpicked file.
+        assert!(subset_rewrite_eligibility(false, false, 0, 2, 3));
+
+        // Position-delete tables must full-rewrite.
+        assert!(!subset_rewrite_eligibility(true, false, 0, 4, 10));
+        // Sort columns need a full ordered rewrite.
+        assert!(!subset_rewrite_eligibility(false, true, 0, 4, 10));
+        // Protected snapshots are leveled by the protected-subset path.
+        assert!(!subset_rewrite_eligibility(false, false, 1, 4, 10));
+        assert!(!subset_rewrite_eligibility(false, false, 5, 4, 10));
+        // Candidate covers every current file — no amp win, use full rewrite.
+        assert!(!subset_rewrite_eligibility(false, false, 0, 10, 10));
+        // Candidate larger than files is impossible but must not enable subset.
+        assert!(!subset_rewrite_eligibility(false, false, 0, 11, 10));
+        // Single-file candidate is not a meaningful merge.
+        assert!(!subset_rewrite_eligibility(false, false, 0, 1, 10));
+        assert!(!subset_rewrite_eligibility(false, false, 0, 0, 10));
+        // Combined disqualifiers still false.
+        assert!(!subset_rewrite_eligibility(true, true, 3, 4, 10));
+    }
+
+    #[test]
+    fn subset_write_amp_x100_is_total_over_candidate_percent() {
+        // Full rewrite of 10 MiB when candidate is 1 MiB → 1000% amp (10×).
+        assert_eq!(subset_write_amp_x100(10 * 1024 * 1024, 1024 * 1024), 1000);
+        // Equal sizes → 100 (1×, no amp).
+        assert_eq!(subset_write_amp_x100(500, 500), 100);
+        // Defensive: zero candidate → 0 (no panic).
+        assert_eq!(subset_write_amp_x100(1_000, 0), 0);
+        // Zero total is a no-op rewrite ratio of 0.
+        assert_eq!(subset_write_amp_x100(0, 100), 0);
+    }
+
     #[test]
     fn protected_snapshot_size_tier_classifies_by_geometric_ceilings() {
         let base = 8 * 1024 * 1024; // 8 MiB
@@ -29319,6 +29885,84 @@ mod tests {
         }
         ids.sort_unstable();
         ids
+    }
+
+    /// TRUNCATE / `DELETE … WHERE TRUE` on a `refresh_mode: changes` table must
+    /// discard rows still resident in the un-checkpointed in-memory CDC mem-tier.
+    #[tokio::test]
+    async fn truncate_purges_uncheckpointed_mem_tier_rows() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let vortex_config = VortexConfig {
+            // Memory-durability CDC path: appends land in the RAM mem-tier and are
+            // not flushed to a durable file, so only a mem-tier purge can clear them.
+            cdc_durability: crate::metadata::CdcDurability::Memory,
+            cdc_mem_tier_min_flush_bytes: 0,
+            ..VortexConfig::default()
+        };
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "truncate_mem_tier",
+            Arc::clone(&schema),
+            vortex_config,
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+        assert!(
+            provider.is_cdc_memory_mode(),
+            "precondition: table must run the in-memory CDC durability path"
+        );
+
+        // Append two un-checkpointed batches straight into the mem-tier.
+        let no_deletions = OnConflictDeletions::default();
+        let b1 = int64_id_batch(&[1, 2, 3]);
+        let bytes1 = b1.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![b1], &no_deletions, bytes1, 0)
+            .await
+            .expect("append batch 1");
+        let b2 = int64_id_batch(&[4, 5]);
+        let bytes2 = b2.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![b2], &no_deletions, bytes2, 0)
+            .await
+            .expect("append batch 2");
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1, 2, 3, 4, 5],
+            "precondition: the un-checkpointed mem-tier rows are visible to scans"
+        );
+
+        // TRUNCATE flows as `delete_from(WHERE TRUE)` (see refresh_task::changes).
+        let delete_plan = provider
+            .delete_from(&ctx.state(), vec![datafusion_expr::lit(true)])
+            .await
+            .expect("delete-all plan");
+        let results = datafusion::physical_plan::collect(delete_plan, ctx.task_ctx())
+            .await
+            .expect("delete-all executed");
+        let deleted = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .expect("uint64 count column")
+            .value(0);
+        assert_eq!(
+            deleted, 5,
+            "the delete-all count must include the 5 purged mem-tier rows"
+        );
+
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            Vec::<i64>::new(),
+            "no mem-tier row may survive a TRUNCATE / DELETE WHERE TRUE"
+        );
+        assert!(
+            provider.mem_tier.is_empty(),
+            "the mem-tier must be fully purged after the delete-all"
+        );
     }
 
     // ── Off-lock staged upsert (`begin_staged_upsert_occ`) ──
