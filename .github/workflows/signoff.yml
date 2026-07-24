@@ -33,7 +33,7 @@
 # dispatch doesn't silently swap in unreviewed code.
 name: Remote Sign-off
 
-run-name: Remote Sign-off (${{ inputs.pr_number && format('PR #{0}', inputs.pr_number) || inputs.branch }})
+run-name: "Remote Sign-off (${{ inputs.pr_number && format('PR #{0}', inputs.pr_number) || inputs.branch }})"
 on:
   workflow_dispatch:
     inputs:
@@ -64,7 +64,7 @@ env:
 
 jobs:
   sign-off:
-    name: Sign off on ${{ inputs.pr_number && format('PR #{0}', inputs.pr_number) || github.event.inputs.branch }}
+    name: "Sign off on ${{ inputs.pr_number && format('PR #{0}', inputs.pr_number) || github.event.inputs.branch }}"
     runs-on: spiceai-macos
     permissions:
       contents: read
