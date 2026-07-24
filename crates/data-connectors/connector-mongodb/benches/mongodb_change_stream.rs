@@ -20,8 +20,8 @@ use std::hint::black_box;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use connector_mongodb::stream::{change_events_to_change_batch, default_unnest_parameters};
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
-use data_components::mongodb::stream::{change_events_to_change_batch, default_unnest_parameters};
 use mongodb::bson::{Document, doc, from_document};
 use mongodb::change_stream::event::ChangeStreamEvent;
 

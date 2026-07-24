@@ -14,13 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::cdc::{ChangeBatch, ChangeBatchError, changes_schema};
-use crate::schema_projection::SchemaProjection;
 use arrow::{
     array::{ArrayRef, ListArray, RecordBatch, StringArray, StructArray, new_null_array},
     datatypes::{Field, Schema, SchemaRef},
 };
 use arrow_buffer::OffsetBuffer;
+use data_components::cdc::{ChangeBatch, ChangeBatchError, changes_schema};
+use data_components::schema_projection::SchemaProjection;
 use datafusion_table_providers::mongodb::{
     Error as MongoDBError,
     projection::project_bson_document,
@@ -71,6 +71,14 @@ pub fn default_unnest_parameters(unnest_depth: usize) -> UnnestParameters {
     }
 }
 
+/// Converts a batch of `MongoDB` change-stream events into a CDC [`ChangeBatch`], applying the
+/// declared schema, primary keys, unnest parameters, and optional projection; returns `Ok(None)`
+/// when the events yield no rows.
+///
+/// # Errors
+///
+/// Returns an error if an event cannot be projected/unnested into the declared schema or the
+/// change batch cannot be built.
 pub fn change_events_to_change_batch(
     events: Vec<ChangeStreamEvent<Document>>,
     table_schema: &SchemaRef,
@@ -170,6 +178,12 @@ pub fn change_events_to_change_batch(
     build_change_batch(rows, table_schema, unnest_parameters, projection).map(Some)
 }
 
+/// Builds an empty all-null single-row truncate [`ChangeBatch`] for `table_schema` -- used to
+/// signal a collection drop/rename in the change stream.
+///
+/// # Errors
+///
+/// Returns an error if the null columns cannot be assembled into a record batch for the schema.
 pub fn truncate_change_batch(table_schema: &SchemaRef) -> Result<ChangeBatch> {
     let data_schema = nullable_clone(table_schema);
     let data_columns = table_schema
@@ -289,12 +303,25 @@ fn build_primary_keys_array<'a>(rows: impl Iterator<Item = &'a [String]>) -> Res
     ))
 }
 
+/// Maps this connector's concrete stream error to the connector-agnostic CDC contract
+/// error, tagging the `"MongoDB"` connector name and boxing itself as the cause — so the
+/// CDC contract (and the runtime) never names `MongoDB`-specific types while logs still
+/// identify the source connector.
+impl From<StreamError> for data_components::cdc::StreamError {
+    fn from(e: StreamError) -> Self {
+        data_components::cdc::StreamError::Connector {
+            connector: "MongoDB",
+            source: Box::new(e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cdc::ChangeOperation;
     use arrow::array::{Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use data_components::cdc::ChangeOperation;
     use mongodb::bson::{doc, from_document};
 
     fn schema() -> SchemaRef {
