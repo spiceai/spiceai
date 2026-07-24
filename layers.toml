@@ -70,6 +70,17 @@ mongodb = ["connector-mongodb", "spidapter"]
 aws-sdk-dynamodbstreams = ["connector-dynamodb", "dynamodb-streams"]
 aws-sdk-dynamodb = ["connector-dynamodb", "dynamodb-streams", "testoperator", "spidapter"]
 
+# Azure Cosmos DB provider (client + resilience + schema inference) moved out of
+# data_components into connector-cosmosdb. `azure_data_cosmos` is Cosmos-specific
+# and now lives only there. (`azure_core` is intentionally NOT confined — it is
+# shared by runtime/runtime-secrets for Azure Blob storage + Key Vault secrets.)
+azure_data_cosmos = ["connector-cosmosdb"]
+
+# SharePoint/OneDrive provider (Graph client + object-store + auth + table)
+# moved out of data_components into connector-sharepoint. The Microsoft Graph
+# SDK now lives only there.
+graph-rs-sdk = ["connector-sharepoint"]
+
 # Path-prefix rules (checked after per-crate overrides, in order).
 [[rules]]
 path_prefix = "bin/"
