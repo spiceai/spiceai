@@ -166,6 +166,8 @@ macro_rules! register_data_connector {
 // cosmosdb: moved to crates/data-connectors/connector-cosmosdb
 // #[cfg(feature = "cosmosdb")] pub mod cosmosdb;
 #[cfg(feature = "debezium")]
+pub mod cdc_ingest;
+#[cfg(feature = "debezium")]
 pub mod debezium;
 pub mod file;
 
@@ -173,7 +175,7 @@ pub mod file;
 // github: moved to crates/data-connectors/connector-github
 pub mod https;
 // kafka connector moved to crates/data-connectors/connector-kafka; module kept for debezium sidecar types
-#[cfg(feature = "kafka")]
+#[cfg(feature = "debezium")]
 pub mod kafka;
 pub mod localpod;
 pub mod memory;

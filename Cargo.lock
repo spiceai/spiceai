@@ -373,6 +373,8 @@ checksum = "36fa98bc79671c7981272d91a8753a928ff6a1cd8e4f20a44c45bd5d313840bf"
 dependencies = [
  "bigdecimal",
  "bon",
+ "bzip2",
+ "crc32fast",
  "digest 0.10.7",
  "log",
  "miniz_oxide",
@@ -383,6 +385,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "snap",
  "strum 0.27.2",
  "strum_macros 0.27.2",
  "thiserror 2.0.18",
@@ -3538,6 +3541,7 @@ dependencies = [
  "datafusion-federation",
  "datafusion-functions",
  "datafusion-functions-aggregate",
+ "datafusion-functions-aggregate-common",
  "datafusion-physical-expr",
  "datafusion-physical-plan",
  "datafusion-pruning",
@@ -4119,6 +4123,7 @@ checksum = "510ca239cf13b7f8d16a2b48f263de7b4f8c566f0af58d901031473c76afb1e3"
 name = "connector-abfs"
 version = "2.2.0-unstable"
 dependencies = [
+ "linkme",
  "object_store 0.13.2",
  "runtime",
  "secrecy",
@@ -4142,6 +4147,7 @@ dependencies = [
  "datafusion",
  "datafusion-table-providers",
  "futures",
+ "linkme",
  "parking_lot",
  "runtime",
  "secrecy",
@@ -4184,6 +4190,7 @@ dependencies = [
  "data_components",
  "datafusion",
  "datafusion-table-providers",
+ "linkme",
  "opentelemetry",
  "runtime",
  "runtime-api-types",
@@ -4280,6 +4287,7 @@ dependencies = [
  "datafusion",
  "datafusion-table-providers",
  "duckdb",
+ "linkme",
  "runtime",
  "snafu",
  "tokio",
@@ -4371,6 +4379,7 @@ dependencies = [
 name = "connector-gcs"
 version = "2.2.0-unstable"
 dependencies = [
+ "linkme",
  "object_store 0.13.2",
  "runtime",
  "snafu",
@@ -4386,6 +4395,7 @@ dependencies = [
  "data_components",
  "datafusion",
  "globset",
+ "linkme",
  "opentelemetry",
  "reqwest 0.13.4",
  "runtime",
@@ -4414,6 +4424,7 @@ dependencies = [
  "governor",
  "graphql-parser",
  "http 1.4.1",
+ "linkme",
  "reqwest 0.13.4",
  "runtime",
  "runtime-rate-control",
@@ -4433,6 +4444,7 @@ dependencies = [
 name = "connector-glue"
 version = "2.2.0-unstable"
 dependencies = [
+ "linkme",
  "runtime",
 ]
 
@@ -4483,6 +4495,7 @@ dependencies = [
  "datafusion",
  "fundu",
  "futures",
+ "linkme",
  "opentelemetry",
  "runtime",
  "runtime-api-types",
@@ -4500,8 +4513,11 @@ dependencies = [
 name = "connector-mongodb"
 version = "2.2.0-unstable"
 dependencies = [
+ "arrow",
+ "arrow-buffer",
  "async-stream",
  "async-trait",
+ "criterion 0.7.0",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
@@ -4612,6 +4628,7 @@ dependencies = [
  "datafusion-table-providers",
  "fundu",
  "futures",
+ "linkme",
  "opentelemetry",
  "runtime",
  "runtime-api-types",
@@ -4713,20 +4730,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "connector-snowflake-native"
-version = "2.2.0-unstable"
-dependencies = [
- "async-trait",
- "data_components",
- "datafusion",
- "datafusion-table-providers",
- "db_connection_pool",
- "runtime",
- "snafu",
- "snowflake-api",
-]
-
-[[package]]
 name = "connector-spark"
 version = "2.2.0-unstable"
 dependencies = [
@@ -4744,6 +4747,7 @@ dependencies = [
 name = "connector-spiceai"
 version = "2.2.0-unstable"
 dependencies = [
+ "linkme",
  "runtime",
 ]
 
@@ -5752,11 +5756,13 @@ dependencies = [
  "adbc_core",
  "adbc_driver_manager",
  "ahash 0.8.12",
+ "apache-avro",
  "arrow",
  "arrow-array",
  "arrow-buffer",
  "arrow-flight",
  "arrow-row",
+ "arrow-schema",
  "arrow_tools",
  "async-stream",
  "async-trait",
@@ -5807,7 +5813,6 @@ dependencies = [
  "insta",
  "logos",
  "mailparse",
- "mongodb",
  "mysql_async",
  "native-tls",
  "num_cpus",
@@ -17062,6 +17067,9 @@ dependencies = [
  "datafusion-expr",
  "datafusion-federation",
  "datafusion-functions-json",
+ "duration-parse",
+ "elasticsearch",
+ "fundu",
  "futures",
  "insta",
  "itertools 0.14.0",
@@ -17070,11 +17078,14 @@ dependencies = [
  "rayon",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
+ "runtime-parameters",
  "runtime-proto",
  "runtime-query-engine",
  "runtime-request-context",
+ "runtime-secrets",
  "schemars 1.2.1",
  "search",
+ "secrecy",
  "serde",
  "serde_json",
  "snafu",
@@ -17841,7 +17852,9 @@ dependencies = [
  "insta",
  "itertools 0.14.0",
  "llms",
+ "parking_lot",
  "runtime-datafusion-index",
+ "runtime-datafusion-udfs",
  "runtime-query-engine",
  "runtime-table-partition",
  "serde",
@@ -18926,13 +18939,22 @@ dependencies = [
 name = "spicepodschema"
 version = "2.2.0-unstable"
 dependencies = [
+ "connector-abfs",
  "connector-clickhouse",
+ "connector-cosmosdb",
+ "connector-databricks",
  "connector-delta-lake",
  "connector-dremio",
  "connector-duckdb",
+ "connector-ducklake",
  "connector-dynamodb",
+ "connector-elasticsearch",
  "connector-flightsql",
  "connector-ftp",
+ "connector-gcs",
+ "connector-git",
+ "connector-github",
+ "connector-glue",
  "connector-graphql",
  "connector-imap",
  "connector-mongodb",
@@ -18946,6 +18968,7 @@ dependencies = [
  "connector-smb",
  "connector-snowflake",
  "connector-spark",
+ "connector-spiceai",
  "regex",
  "runtime",
  "runtime-parameters",

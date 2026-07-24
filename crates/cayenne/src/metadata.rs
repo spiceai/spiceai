@@ -342,10 +342,9 @@ pub enum CompressionStrategy {
 ///
 /// zstd-style level scale (`cayenne_delta_encoding` param):
 ///
-/// - `auto` (default) — size-gated: a write smaller than a quarter of the
-///   target file size encodes at a light level (the file is transient by
-///   definition — compaction exists to fold it); larger or unknown-size
-///   writes use the full default encoding.
+/// - `auto` (default) — every delta write encodes at a light level: a delta
+///   is transient by definition (the tiered compactor folds it into a
+///   properly-encoded file), so it skips the full cascade regardless of size.
 /// - `0` — no compression (canonical arrays; cheapest encode).
 /// - `1`–`6` — progressively richer scheme sets. The cheap levels skip the
 ///   per-file encoder-strategy search and FSST symbol-table training.
@@ -363,14 +362,15 @@ pub enum CompressionStrategy {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub enum DeltaEncoding {
-    /// Size-gated: light for small deltas, full for large writes.
-    /// Local micro A/B (2026-06-06) was neutral on the
-    /// upsert/bulk lanes; the aggregate CPU-per-delta benefit targets
-    /// production-scale CDC and is to be validated there. Set the
-    /// param to `7` to opt out (pre-feature behavior).
+    /// `Auto` — light encoding for every delta write. Deltas are transient
+    /// (compaction re-encodes them at the full cascade), so the CDC hot path
+    /// skips the per-file encoder-strategy search + FSST symbol-table training
+    /// regardless of delta size. The SF1000 CH-benCHmark HTAP sweep validated
+    /// this at production scale: shedding checkpoint encode CPU lets the apply
+    /// loop keep up (it enables replication convergence where full-encode does
+    /// not, and gives the best analytic QPH on top of coalescing).
     ///
-    /// `Auto` — size-gated light encoding for small deltas. This is also what
-    /// pre-feature stored table configs deserialize to via
+    /// This is also what pre-feature stored table configs deserialize to via
     /// `#[serde(default)]`, so existing tables pick up the policy on upgrade
     /// (write-time only; existing data files are unaffected and a level
     /// change never forces a table re-create). Set the
@@ -752,11 +752,11 @@ pub struct VortexConfig {
     /// Defaults to Btrblocks
     pub compression_strategy: CompressionStrategy,
     /// Encoding effort for delta writes (fresh CDC/append snapshot files).
-    /// `auto` (default) size-gates: small deltas encode light and are folded
-    /// into properly-encoded files by compaction; explicit `0..=10` pins the
-    /// level (`7` = the full default cascade, the pre-feature behavior).
-    /// Maintenance writes (compaction, rewrites) always use the full default
-    /// encoding. See [`DeltaEncoding`].
+    /// `auto` (default) encodes every delta light (deltas are transient and
+    /// folded into properly-encoded files by compaction); explicit `0..=10`
+    /// pins the level (`7` = the full default cascade, the pre-feature
+    /// behavior). Maintenance writes (compaction, rewrites) always use the full
+    /// default encoding. See [`DeltaEncoding`].
     #[serde(default)]
     pub delta_encoding: DeltaEncoding,
     /// Maximum number of concurrent file uploads when writing multiple Vortex files.
@@ -1436,11 +1436,10 @@ impl Default for VortexConfig {
             // Shard key derives from the primary key unless overridden
             shard_key_columns: Vec::new(),
             compression_strategy: CompressionStrategy::default(),
-            // `auto`: size-gated light encoding for small deltas (re-encoded
-            // by compaction). Local micro A/B (2026-06-06) was neutral on the
-            // upsert/bulk lanes; the aggregate CPU-per-delta benefit targets
-            // production-scale CDC and is to be validated there. Set the
-            // param to `7` to opt out (pre-feature behavior).
+            // `auto`: light encoding for every delta (re-encoded by
+            // compaction). Validated at production scale by the SF1000
+            // CH-benCHmark HTAP sweep (frees apply CPU → convergence + QPH).
+            // Set the param to `7` to opt out (pre-feature behavior).
             delta_encoding: DeltaEncoding::default(),
             upload_concurrency: default_upload_concurrency(),
             write_concurrency: None,

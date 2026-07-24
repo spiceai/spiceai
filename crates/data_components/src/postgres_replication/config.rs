@@ -59,6 +59,12 @@ pub struct ReplicationParams {
     pub snapshot_on_resume: bool,
     pub temporary_slot: bool,
     pub status_interval: Duration,
+    /// Lag-based readiness threshold: the dataset is marked Ready once its
+    /// replication lag (now minus the newest applied commit's source time)
+    /// falls below this, so a snapshotting or backlog-draining dataset stays
+    /// not-ready and never serves stale data. User param
+    /// `pg_replication_ready_lag` (default 2s).
+    pub ready_lag: Duration,
     /// Rows per emitted snapshot batch during initial bootstrap.
     pub bootstrap_batch_size: usize,
     /// `true` when the slot name was explicitly configured
@@ -263,7 +269,30 @@ const PUB_DATASET_PORTION_MAX: usize =
 /// within Postgres' 63-byte limit.
 #[must_use]
 pub fn default_slot_name(dataset_name: &str) -> String {
-    let instance_hash = instance_hash();
+    slot_name_for(dataset_name, &resolve_instance_id())
+}
+
+/// Build the slot name for `dataset_name` scoped to `instance_id` (the value
+/// that distinguishes one spiced instance from another sharing the same source
+/// database). Factored out as a pure function — the instance identity is passed
+/// in rather than read from the environment — so its determinism and
+/// distinctness properties can be unit-tested without mutating process-global
+/// env vars. For the resulting slot name:
+///
+///   - deterministic/stable (a strict guarantee): identical `(dataset_name,
+///     instance_id)` always produces the identical name, so a restart of the
+///     same instance resumes its existing replication slot rather than
+///     orphaning one;
+///   - distinct per instance (in practice, not a strict guarantee): two
+///     instances (distinct `instance_id`) pointed at the same catalog get
+///     different names, so they don't share one physical Postgres slot (which
+///     permits a single consumer). The instance identity is folded into a short
+///     8-hex hash, so a collision is possible but astronomically unlikely;
+///   - distinct per dataset/catalog (same caveat): distinct `dataset_name`s get
+///     different names, disambiguated by a 6-hex hash of the full name so that
+///     names sharing a truncated prefix still differ.
+fn slot_name_for(dataset_name: &str, instance_id: &str) -> String {
+    let instance_hash = xxh3_short_hash(instance_id);
     let dataset_hash = xxh3_short_hash_prefix(dataset_name, DATASET_HASH_LEN);
     let dataset = truncate_to_bytes(&sanitize(dataset_name), SLOT_DATASET_PORTION_MAX);
     format!("{SLOT_PREFIX}{dataset}_{dataset_hash}_{instance_hash}")
@@ -283,15 +312,15 @@ pub fn publication_name_for_slot(slot_name: &str) -> String {
     format!("{base}_pub")
 }
 
-/// 8-hex-char hash identifying this spiced instance, derived from
-/// `SPICE_INSTANCE_ID` (falling back to the machine hostname). Deterministic
-/// across restarts of the same instance.
-fn instance_hash() -> String {
-    let instance = std::env::var("SPICE_INSTANCE_ID")
+/// The identity distinguishing this spiced instance from another sharing the
+/// same source database: `SPICE_INSTANCE_ID` if set, else the machine hostname,
+/// else `"unknown"`. Stable across restarts of the same instance, which is what
+/// keeps [`slot_name_for`] resuming the same replication slot on restart.
+fn resolve_instance_id() -> String {
+    std::env::var("SPICE_INSTANCE_ID")
         .ok()
         .or_else(|| hostname::get().ok().and_then(|h| h.into_string().ok()))
-        .unwrap_or_else(|| "unknown".to_string());
-    xxh3_short_hash(&instance)
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// Default publication is shared across replicas:
@@ -584,6 +613,50 @@ mod tests {
         let a2 = default_slot_name("users");
         assert_eq!(a1, a2);
         assert!(a1.starts_with("spice_users_"));
+    }
+
+    #[test]
+    fn slot_name_is_stable_across_restarts_of_the_same_instance() {
+        // A restart of the same spiced instance (same catalog name, same
+        // instance id) must resolve to the identical slot name, so CDC resumes
+        // the existing replication slot instead of orphaning it and forcing a
+        // fresh snapshot.
+        let before_restart = slot_name_for("my_catalog", "instance-a");
+        let after_restart = slot_name_for("my_catalog", "instance-a");
+        assert_eq!(before_restart, after_restart);
+    }
+
+    #[test]
+    fn slot_name_is_unique_per_instance_for_the_same_catalog() {
+        // Two spiced instances pointed at the SAME catalog on the same database
+        // must not collide on one physical replication slot -- Postgres permits
+        // a single consumer per slot, so a collision would have one instance
+        // steal the other's stream. Distinct instance ids => distinct slots.
+        let instance_a = slot_name_for("my_catalog", "instance-a");
+        let instance_b = slot_name_for("my_catalog", "instance-b");
+        assert_ne!(instance_a, instance_b);
+    }
+
+    #[test]
+    fn slot_name_is_unique_per_catalog_for_the_same_instance() {
+        // One spiced instance accelerating two different catalogs must give each
+        // its own slot.
+        let catalog_one = slot_name_for("catalog_one", "instance-a");
+        let catalog_two = slot_name_for("catalog_two", "instance-a");
+        assert_ne!(catalog_one, catalog_two);
+    }
+
+    #[test]
+    fn slot_name_stays_within_postgres_limit_for_any_instance_id() {
+        // The instance id is hashed to a fixed 8 chars, so even a pathologically
+        // long id can't push the slot name past Postgres' identifier limit.
+        let long_instance = "i".repeat(300);
+        let slot = slot_name_for("catalog", &long_instance);
+        assert!(
+            slot.len() <= PG_IDENTIFIER_MAX_BYTES,
+            "slot `{slot}` exceeds {PG_IDENTIFIER_MAX_BYTES} bytes: {}",
+            slot.len()
+        );
     }
 
     #[test]

@@ -30,6 +30,7 @@ use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, Row};
 
 use super::config::{BinlogPosition, ReplicationParams};
+use super::gtid::GtidSet;
 use super::{
     BinaryLoggingDisabledSnafu, ColumnMissingSnafu, ConnectSnafu, Error, Result, SetupQuerySnafu,
     SourceTableNotFoundSnafu, UnsupportedBinlogFormatSnafu, UnsupportedBinlogRowImageSnafu,
@@ -288,6 +289,102 @@ pub async fn fetch_head_position(conn: &mut Conn) -> Result<BinlogPosition> {
         (Some(file), Some(pos)) => Ok(BinlogPosition::new(file, pos)),
         _ => Err(Error::Decode {
             message: "binary log status row did not include File/Position".to_string(),
+        }),
+    }
+}
+
+/// The source's observed `@@GLOBAL.gtid_mode`, normalized (trimmed, uppercased)
+/// so it can be reported verbatim in logs and compared for the on/off decision.
+///
+/// `None` means the server does not support `MySQL`-format GTIDs at all —
+/// `MariaDB` and pre-GTID `MySQL` don't know the variable (server error `1193`,
+/// `ER_UNKNOWN_SYSTEM_VARIABLE`), which is not a fatal error — so callers can
+/// report "GTIDs unsupported" rather than a confusing literal value. Otherwise
+/// the value is the reported mode: only the exact `Some("ON")` enables GTID
+/// auto-positioning; `OFF` and the transitional `ON_PERMISSIVE`/`OFF_PERMISSIVE`
+/// states (a mixed topology can still emit anonymous transactions, which GTID
+/// auto-positioning cannot resume from) mean file+offset.
+pub async fn detect_gtid_mode(conn: &mut Conn) -> Result<Option<String>> {
+    match conn
+        .query_first::<Option<String>, _>("SELECT @@GLOBAL.gtid_mode")
+        .await
+    {
+        Ok(row) => Ok(row.flatten().map(|mode| mode.trim().to_ascii_uppercase())),
+        // 1193: ER_UNKNOWN_SYSTEM_VARIABLE (MariaDB / pre-GTID MySQL) — the
+        // variable does not exist, so GTIDs are unsupported here.
+        Err(mysql_async::Error::Server(ref e)) if e.code == 1193 => Ok(None),
+        Err(e) => Err(e).context(SetupQuerySnafu {
+            context: "SELECT @@GLOBAL.gtid_mode",
+        }),
+    }
+}
+
+/// Whether an observed [`detect_gtid_mode`] value enables GTID auto-positioning
+/// (exactly `ON`). `None` (GTIDs unsupported) is not on.
+#[must_use]
+pub fn gtid_mode_is_on(observed: Option<&str>) -> bool {
+    matches!(observed, Some(mode) if mode.eq_ignore_ascii_case("ON"))
+}
+
+/// The current binlog head together with the source's executed GTID set,
+/// captured atomically from a single `SHOW BINARY LOG STATUS` row (the
+/// `Executed_Gtid_Set` column). This pairing is the cold-start seed for
+/// GTID auto-positioning: file+offset drive the initial snapshot boundary while
+/// the GTID set becomes the durable, failover-safe resume identity.
+///
+/// The returned set is empty when the server reports no executed GTIDs (a
+/// freshly-reset GTID-enabled server), which is a valid starting point.
+pub async fn fetch_head_and_gtid(conn: &mut Conn) -> Result<(BinlogPosition, GtidSet)> {
+    let row = match conn.query_first::<Row, _>("SHOW BINARY LOG STATUS").await {
+        Ok(row) => row,
+        Err(e) if is_unknown_statement(&e) => conn
+            .query_first::<Row, _>("SHOW MASTER STATUS")
+            .await
+            .context(SetupQuerySnafu {
+                context: "SHOW MASTER STATUS",
+            })?,
+        Err(e) => {
+            return Err(e).context(SetupQuerySnafu {
+                context: "SHOW BINARY LOG STATUS",
+            });
+        }
+    };
+
+    let Some(row) = row else {
+        return BinaryLoggingDisabledSnafu.fail();
+    };
+
+    let file: Option<String> = row.get("File");
+    let pos: Option<u64> = row.get("Position");
+    let executed: Option<String> = row.get("Executed_Gtid_Set");
+    let gtid = match executed {
+        Some(raw) => GtidSet::parse(&raw).map_err(|message| Error::GtidParse { message })?,
+        None => GtidSet::new(),
+    };
+    match (file, pos) {
+        (Some(file), Some(pos)) => Ok((BinlogPosition::new(file, pos), gtid)),
+        _ => Err(Error::Decode {
+            message: "binary log status row did not include File/Position".to_string(),
+        }),
+    }
+}
+
+/// The source's current wall clock as Unix-epoch milliseconds, via `NOW(3)`
+/// (millisecond precision). Used to stamp idle readiness heartbeats with a
+/// source-attested time: a binlog HEARTBEAT event carries no usable clock, so
+/// lag-based readiness on a quiet source reads the source's own clock here
+/// rather than a local `now()`.
+pub async fn fetch_source_now_ms(conn: &mut Conn) -> Result<i64> {
+    let ms: Option<i64> = conn
+        .query_first("SELECT CAST(ROUND(UNIX_TIMESTAMP(NOW(3)) * 1000) AS SIGNED)")
+        .await
+        .context(SetupQuerySnafu {
+            context: "UNIX_TIMESTAMP(NOW(3))",
+        })?;
+    match ms {
+        Some(ms) => Ok(ms),
+        None => Err(Error::Decode {
+            message: "source clock query (UNIX_TIMESTAMP(NOW(3))) returned no row".to_string(),
         }),
     }
 }

@@ -223,6 +223,7 @@ datafusion-expr = "54.1.0"
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "0cb3781608b89f40c6585618ec3071f83345671a", features = ["sql"] } # spiceai-54
 datafusion-functions = "54.1.0"
 datafusion-functions-aggregate = "54.1.0"
+datafusion-functions-aggregate-common = "54.1.0"
 datafusion-functions-nested = "54.1.0"
 datafusion-functions-json = "0.54"
 datafusion-physical-expr = "54.1.0"
