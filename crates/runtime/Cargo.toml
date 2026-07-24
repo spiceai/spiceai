@@ -346,7 +346,7 @@ models = [
     "llms/local_llm",
     "llms/local_embed",
 ]
-mongodb = ["data_components/mongodb"]
+mongodb = [] # marker: gates the driver-free spice_sys/mongodb resume-token checkpoint; connector lives in connector-mongodb
 mssql = ["dep:tiberius", "data_components/mssql"]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "data_components/mysql"]
 nfs = ["runtime-object-store/nfs"]

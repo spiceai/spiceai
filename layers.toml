@@ -57,6 +57,9 @@ forbid = [["extension-utility", "runtime"]]
 # clickhouse-rs now lives only in connector-clickhouse (provider + pool + block
 # decoder all moved out of data_components / db_connection_pool / arrow_sql_gen).
 clickhouse-rs = ["connector-clickhouse"]
+# The mongodb driver moved out of data_components into connector-mongodb (runtime keeps it as a
+# dev-dep-exempt test dependency; the spice_sys/mongodb resume-token checkpoint stores JSON, no driver). spidapter is the MongoDB bench/adapter tool.
+mongodb = ["connector-mongodb", "spidapter"]
 
 # The DynamoDB AWS SDK drivers moved out of runtime + data_components into
 # connector-dynamodb. `dynamodb-streams` is the low-level streams client the

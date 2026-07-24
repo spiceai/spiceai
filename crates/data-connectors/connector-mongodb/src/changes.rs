@@ -14,17 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::stream::{
+    change_events_to_change_batch, default_unnest_parameters, nullable_clone, truncate_change_batch,
+};
 use async_stream::try_stream;
 use async_trait::async_trait;
-use data_components::{
-    cdc::{
-        ChangeEnvelope, ChangesStream, CommitChange, CommitError, NoOpCommitter, StreamError,
-        build_ready_signal_envelope, wrap_data_as_change_batch,
-    },
-    mongodb::stream::{
-        change_events_to_change_batch, default_unnest_parameters, nullable_clone,
-        truncate_change_batch,
-    },
+use data_components::cdc::{
+    ChangeEnvelope, ChangesStream, CommitChange, CommitError, NoOpCommitter, StreamError,
+    build_ready_signal_envelope, wrap_data_as_change_batch,
 };
 use datafusion::{
     arrow::datatypes::SchemaRef, datasource::TableProvider,
@@ -184,7 +181,7 @@ pub fn build_changes_stream(
             );
 
             let truncate = truncate_change_batch(&schema)
-                .map_err(StreamError::MongoDB)?;
+                .map_err(StreamError::from)?;
             yield ChangeEnvelope::new(Box::new(NoOpCommitter), truncate, false);
 
             // Use the same nullable schema that CDC event batches use (via nullable_clone
@@ -274,7 +271,7 @@ pub fn build_changes_stream(
                 &unnest_parameters,
                 projection.as_ref(),
             )
-            .map_err(StreamError::MongoDB)? {
+            .map_err(StreamError::from)? {
                 // MongoDB change-stream cluster time is whole seconds (BSON
                 // Timestamp), so the replication-lag signal here has ~1s
                 // granularity — fine for a multi-second tuner.
