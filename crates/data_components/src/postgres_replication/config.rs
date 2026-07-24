@@ -812,7 +812,10 @@ mod tests {
         // Special characters are sanitized to `_`, and even a pathologically long
         // catalog name stays within Postgres' 63-byte identifier limit.
         let sanitized = catalog_slot_name("my-catalog.name");
-        assert!(!sanitized.contains('-') && !sanitized.contains('.'), "{sanitized}");
+        assert!(
+            !sanitized.contains('-') && !sanitized.contains('.'),
+            "{sanitized}"
+        );
 
         let long = catalog_slot_name(&"c".repeat(300));
         assert!(

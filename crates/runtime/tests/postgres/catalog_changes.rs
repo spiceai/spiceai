@@ -948,8 +948,8 @@ async fn test_catalog_acceleration_reuses_slot_across_restart() -> Result<(), an
 /// first's stream. (A fast self-restart is distinguished from this by the
 /// bounded wait -- exercised by `test_catalog_acceleration_reuses_slot_across_restart`.)
 #[tokio::test(flavor = "multi_thread")]
-async fn test_catalog_acceleration_fails_loud_when_slot_already_active()
--> Result<(), anyhow::Error> {
+async fn test_catalog_acceleration_fails_loud_when_slot_already_active() -> Result<(), anyhow::Error>
+{
     let _tracing = init_tracing(Some(
         "integration=debug,info,runtime::catalogconnector=debug",
     ));
