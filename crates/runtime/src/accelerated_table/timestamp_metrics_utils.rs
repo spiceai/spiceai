@@ -241,6 +241,7 @@ fn int_to_ms(ts: i64, time_format: TimeFormat) -> Option<i64> {
     match time_format {
         TimeFormat::UnixSeconds => Some(ts * 1000),
         TimeFormat::UnixMillis => Some(ts),
+        TimeFormat::UnixNanos => Some(ts / 1_000_000),
         _ => None,
     }
 }
@@ -257,6 +258,7 @@ fn float_to_ms(ts: f64, time_format: TimeFormat) -> Option<i64> {
     match time_format {
         TimeFormat::UnixSeconds => Some((ts * 1000.0) as i64),
         TimeFormat::UnixMillis => Some(ts as i64),
+        TimeFormat::UnixNanos => Some((ts / 1_000_000.0) as i64),
         _ => None,
     }
 }
@@ -470,6 +472,49 @@ mod tests {
 
         let max_ts = perform_test(batch, Some(TimeFormat::UnixSeconds)).await;
         assert_eq!(max_ts, 2000 * 1000);
+    }
+
+    #[tokio::test]
+    async fn test_int64_unix_nanos() {
+        let batch = record_batch!((
+            "ts",
+            Int64,
+            [Some(1_000_000_000), Some(2_000_000_000), None]
+        ))
+        .expect("created batch");
+
+        let max_ts = perform_test(batch, Some(TimeFormat::UnixNanos)).await;
+
+        // 2_000_000_000 ns => 2000 ms
+        assert_eq!(max_ts, 2000);
+    }
+
+    #[tokio::test]
+    async fn test_uint64_unix_nanos() {
+        let batch = record_batch!((
+            "ts",
+            UInt64,
+            [Some(1_000_000_000), Some(2_000_000_000), None]
+        ))
+        .expect("created batch");
+
+        let max_ts = perform_test(batch, Some(TimeFormat::UnixNanos)).await;
+
+        assert_eq!(max_ts, 2000);
+    }
+
+    #[tokio::test]
+    async fn test_float64_unix_nanos() {
+        let batch = record_batch!((
+            "ts",
+            Float64,
+            [Some(1_000_000_000.0), Some(2_000_000_000.0), None]
+        ))
+        .expect("created batch");
+
+        let max_ts = perform_test(batch, Some(TimeFormat::UnixNanos)).await;
+
+        assert_eq!(max_ts, 2000);
     }
 
     #[tokio::test]
