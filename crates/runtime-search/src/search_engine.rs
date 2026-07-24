@@ -188,7 +188,9 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
     ) -> Option<Result<Vec<Arc<dyn CandidateGeneration>>>> {
         use crate::full_text::as_candidate_generations;
         #[cfg(feature = "elasticsearch")]
-        use crate::full_text::as_es_text_candidate_generations;
+        use crate::full_text::{
+            as_compound_text_candidate_generations, as_es_text_candidate_generations,
+        };
         use runtime_datafusion_index::IndexedTableProvider;
         use search::generation::text_search::index::FullTextDatabaseIndex;
 
@@ -200,6 +202,31 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         else {
             return Some(Ok(vec![]));
         };
+
+        // Compound (write-through) full-text index: a warm Tantivy primary paired with an
+        // external Elasticsearch secondary. Registered instead of the concrete indexes for
+        // single-column FTS datasets with an external store, so this must precede the concrete
+        // `FullTextDatabaseIndex` branch below. A `CompoundSearchIndex` may compose *vector*
+        // tiers, so only text compounds (those without a vector view) back FTS discovery.
+        #[cfg(feature = "elasticsearch")]
+        {
+            use search::index::compound::CompoundSearchIndex;
+            if let Some(compound) = indexed_table
+                .get_indexes::<CompoundSearchIndex>()
+                .into_iter()
+                .find(|c| Arc::new((*c).clone()).as_vector_index().is_none())
+            {
+                return Some(
+                    as_compound_text_candidate_generations(
+                        compound.search_column(),
+                        Arc::clone(&self.df),
+                        tbl.clone(),
+                    )
+                    .await
+                    .map_err(|source| Error::SearchGenerationError { source }),
+                );
+            }
+        }
 
         if let Some(fts) = indexed_table.get_index::<FullTextDatabaseIndex>() {
             return Some(

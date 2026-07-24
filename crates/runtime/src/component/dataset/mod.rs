@@ -187,6 +187,7 @@ pub enum TimeFormat {
     Timestamptz,
     UnixSeconds,
     UnixMillis,
+    UnixNanos,
     ISO8601,
     Date,
 }
@@ -196,6 +197,7 @@ impl From<spicepod_dataset::TimeFormat> for TimeFormat {
         match time_format {
             spicepod_dataset::TimeFormat::UnixSeconds => TimeFormat::UnixSeconds,
             spicepod_dataset::TimeFormat::UnixMillis => TimeFormat::UnixMillis,
+            spicepod_dataset::TimeFormat::UnixNanos => TimeFormat::UnixNanos,
             spicepod_dataset::TimeFormat::ISO8601 => TimeFormat::ISO8601,
             spicepod_dataset::TimeFormat::Timestamp => TimeFormat::Timestamp,
             spicepod_dataset::TimeFormat::Timestamptz => TimeFormat::Timestamptz,
