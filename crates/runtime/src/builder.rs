@@ -1332,7 +1332,7 @@ fn emit_duckdb_memory_budget_warning(
                 total_memory_bytes = total_memory,
                 query_pool_bytes = plan.effective_query_pool_bytes,
                 duckdb_explicit_bytes = inputs.sum_explicit_bytes,
-                "The explicit DuckDB accelerator memory limits plus the query pool over-commit host memory: they can exceed the {total_h} available to this process, risking an OOM kill under load. Lower the per-dataset duckdb_memory_limit values and/or runtime.query.memory_limit so combined ceilings fit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
+                "The explicit DuckDB accelerator memory limits plus the query pool exceed the coordinated memory budget and cut into the safety headroom below the {total_h} available to this process; combined ceilings may approach or exceed it and risk an OOM kill under load. Lower the per-dataset duckdb_memory_limit values and/or runtime.query.memory_limit so combined ceilings fit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
             );
         } else {
             tracing::warn!(
@@ -1350,7 +1350,7 @@ fn emit_duckdb_memory_budget_warning(
             duckdb_unset_instances = n,
             recommended_duckdb_memory_limit_bytes = plan.per_instance_cap_bytes,
             recommended_query_memory_limit_bytes = plan.effective_query_pool_bytes,
-            "DuckDB accelerator memory limits still over-commit host memory after auto-capping: {n} DuckDB instance(s) without an explicit duckdb_memory_limit plus the query pool can exceed the {total_h} available to this process, risking an OOM kill under load. Reduce the number of distinct DuckDB files, or set runtime.query.memory_limit: \"{query_h}\" and duckdb_memory_limit: \"{per_instance_h}\" on each DuckDB-accelerated dataset so combined ceilings fit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
+            "Even after auto-capping, the {n} DuckDB instance(s) without an explicit duckdb_memory_limit plus the query pool exceed the coordinated memory budget and cut into the safety headroom below the {total_h} available to this process; combined ceilings may approach or exceed it and risk an OOM kill under load. Reduce the number of distinct DuckDB files, or set runtime.query.memory_limit: \"{query_h}\" and duckdb_memory_limit: \"{per_instance_h}\" on each DuckDB-accelerated dataset so combined ceilings fit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
         );
     } else {
         tracing::warn!(
