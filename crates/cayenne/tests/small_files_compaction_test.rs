@@ -1006,7 +1006,8 @@ async fn compact_current_after_seed_then_more_preserves_all_rows(
         let total_appends = usize::try_from(seed_batches + more).expect("fits");
         assert!(
             files_before < total_appends,
-            "without an explicit compact, post-write must have consolidated              below {total_appends} files (found {files_before})"
+            "without an explicit compact, post-write must have consolidated \
+             below {total_appends} files (found {files_before})"
         );
     }
     assert_eq!(count_rows(&ctx, "two_phase_compact").await, expected);

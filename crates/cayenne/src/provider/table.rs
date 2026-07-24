@@ -201,7 +201,6 @@ const MAX_PK_SELECTIVE_INLIST_VALUES: usize = 32;
 /// Upper bound on PK `BETWEEN` span (inclusive) for selective scan fan-out control.
 const MAX_PK_SELECTIVE_RANGE_SPAN: i64 = 32;
 /// Maximum tombstone keys pushed into the Vortex scan predicate as `NOT IN`.
-/// Maximum tombstone keys pushed into the Vortex scan predicate as `NOT IN`.
 ///
 /// Raised from 256 → 2048 so sparse-to-moderate key-delete sets get Vortex
 /// chunk pruning (fewer rows decoded) without building an unbounded expression

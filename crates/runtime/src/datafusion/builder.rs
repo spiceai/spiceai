@@ -1620,15 +1620,15 @@ pub(crate) fn coordinated_mem_tier_budget(
     // headroom <= host` for ANY ceiling.
     //
     // Honesty under a tight explicit `runtime.query.memory_limit`: when the
-    // remainder is below the floor, prefer the remainder (possibly zero) over a
-    // floor that would make `query + compaction + tier + headroom > host`. The
+    // remainder is below the floor, yield to the remainder instead of a floor
+    // that would make `query + compaction + tier + headroom > host`. The
     // previous floor-wins path silently overcommitted the host and only warned;
-    // mem-tier then relied on spill/durable backstops. Returning `remainder`
-    // keeps the envelope honest — CDC spills more under a greedy query limit,
-    // which is the operator-visible contract.
+    // mem-tier then relied on spill/durable backstops. Returning `remainder.max(1)`
+    // keeps the envelope honest (and the budget installed — 0 would uninstall it)
+    // so every real append refuses and CDC spills under a greedy query limit.
     if remainder < floor {
-        // Keep a nonzero gate so the budget stays installed (0 uninstalls it);
-        // 1 byte means every real append refuses and CDC spills/falls back.
+        // Nonzero refuse-all gate: 1 byte means every real append refuses and
+        // CDC spills/falls back, without uninstalling the budget.
         return remainder.max(1);
     }
     let float_room = total_memory
