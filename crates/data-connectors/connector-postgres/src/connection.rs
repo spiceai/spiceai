@@ -89,9 +89,13 @@ fn connection_identity_from_connection_string(
         validate_sslmode(&ssl_mode, &user_param)?;
         let config = tokio_postgres::Config::from_str(stripped_uri.as_str())
             .map_err(|e| format!("invalid `{user_param}`: {e}"))?;
-        let password = config
-            .get_password()
-            .map(|p| String::from_utf8_lossy(p).into_owned());
+        let password = match config.get_password() {
+            Some(bytes) => Some(
+                String::from_utf8(bytes.to_vec())
+                    .map_err(|_| format!("invalid `{user_param}`: password is not valid UTF-8"))?,
+            ),
+            None => None,
+        };
         (config, ssl_mode, ssl_rootcert, password)
     } else {
         // Same steps as `PostgresConnectionPool::new_inner` for key=value:
@@ -362,7 +366,8 @@ mod tests {
 
     #[test]
     fn validate_sslmode_trims_whitespace() {
-        assert!(validate_sslmode(" require ", "pg_sslmode").is_ok());
+        validate_sslmode(" require ", "pg_sslmode")
+            .expect("whitespace around a valid sslmode should be accepted");
     }
 
     #[test]
