@@ -790,7 +790,11 @@ mod warm_memory {
     use crate::SEARCH_SCORE_COLUMN_NAME;
     use crate::index::memory::{MemoryDistanceMetric, MemoryVectorIndex};
     use crate::metadata::MetadataColumns;
-    use arrow::array::{FixedSizeListArray, Float32Array, Float64Array};
+    use arrow::array::{
+        FixedSizeListArray, Float32Array, Float32Builder, Float64Array, ListBuilder,
+    };
+    use datafusion::logical_expr::ColumnarValue;
+    use datafusion::scalar::ScalarValue;
     use datafusion_expr::{Volatility, create_udf};
     use llms::embeddings::{Embed, EmbeddingInput};
 
@@ -824,19 +828,40 @@ mod warm_memory {
         }
     }
 
+    /// A DataFusion UDF matching [`ByteEmbed`]/[`byte_vector`], for use as the query-time
+    /// `embed(text, model_name)` expression in [`crate::index::memory::MemoryVectorIndex`]'s
+    /// score plan. Unlike the write-time [`Embed`] trait, this is actually invoked whenever a
+    /// query is executed against a non-empty memory index, so it must produce real vectors
+    /// rather than a stub.
+    fn embed_udf() -> Arc<datafusion_expr::ScalarUDF> {
+        Arc::new(create_udf(
+            "embed",
+            vec![DataType::Utf8, DataType::Utf8],
+            DataType::List(Arc::new(Field::new_list_field(DataType::Float32, true))),
+            Volatility::Volatile,
+            Arc::new(|args: &[ColumnarValue]| {
+                let ColumnarValue::Scalar(ScalarValue::Utf8(Some(text))) = &args[0] else {
+                    return Err(DataFusionError::Execution(
+                        "test embed UDF expects a literal text argument".to_string(),
+                    ));
+                };
+                let mut builder = ListBuilder::new(Float32Builder::new());
+                builder.values().append_slice(&byte_vector(text));
+                builder.append(true);
+                Ok(ColumnarValue::Scalar(ScalarValue::List(Arc::new(
+                    builder.finish(),
+                ))))
+            }),
+        ))
+    }
+
     fn memory_index() -> MemoryVectorIndex {
         MemoryVectorIndex::try_new(
             "content".to_string(),
             vec![Field::new("id", DataType::Int64, false)],
             MetadataColumns::none(),
             Arc::new(ByteEmbed),
-            Arc::new(create_udf(
-                "embed",
-                vec![],
-                arrow_schema::DataType::Null,
-                Volatility::Volatile,
-                Arc::new(|_| unimplemented!()),
-            )),
+            embed_udf(),
             "model_name".to_string(),
             MemoryDistanceMetric::Cosine,
         )

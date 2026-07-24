@@ -210,6 +210,10 @@ mod tests {
                 "not exercised by with_memory_warm_index tests".to_string(),
             ))
         }
+
+        fn as_vector_index(self: Arc<Self>) -> Option<Arc<dyn VectorIndex>> {
+            Some(self as Arc<dyn VectorIndex>)
+        }
     }
 
     impl VectorIndex for PretendVectorIndex {
