@@ -59,7 +59,7 @@ pub struct FullTextDatabaseIndex {
 
     /// When `true`, `update_index` stages documents into the tantivy writer
     /// without committing, so a sink-driven full refresh or append commits
-    /// **once** in `on_write_complete` instead of once per record batch.
+    /// **once** for the whole write window, in `on_write_complete`.
     /// `on_write_start` sets it; `on_write_complete`/`on_write_failed` clear it.
     /// Defaults to `false`, so the CDC path — which drives `compute_index`
     /// directly without the sink lifecycle hooks — keeps committing per change.
@@ -170,9 +170,9 @@ impl Index for FullTextDatabaseIndex {
         let mut index_writer = self.writer.lock().await;
         self.defer_commit.store(false, Ordering::Release);
 
-        // Propagate a rollback failure instead of swallowing it: if the staged
-        // operations could not be discarded they may leak into a later commit and
-        // make a partial refresh visible, so the caller must be able to surface it.
+        // A rollback failure must reach the caller: staged operations that could not
+        // be discarded may leak into a later commit and make a partial refresh
+        // visible.
         index_writer
             .rollback()
             .map(|_| ())
