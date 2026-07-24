@@ -414,12 +414,15 @@ async fn test_catalog_acceleration_bootstraps_tables_with_primary_key() -> Resul
 }
 
 /// A view-like relation (view / materialized view) is not CDC-accelerable, so
-/// it must be handled with a "not replicated" warning rather than a
-/// REPLICA-IDENTITY error: the catalog still loads (its one eligible table
-/// accelerates and becomes Ready), and the views are simply absent from the
+/// it must be handled gracefully -- the accelerated catalog emits a "not
+/// replicated" warning (asserted at the unit level via `AccelerationSummary`;
+/// not asserted here because the runtime test harness drops worker-thread
+/// tracing) rather than a fatal REPLICA-IDENTITY error. This test validates the
+/// observable outcome: the catalog still loads (its one eligible table
+/// accelerates and becomes Ready) and the views are simply absent from the
 /// catalog's namespace (#11911).
 #[tokio::test(flavor = "multi_thread")]
-async fn test_catalog_acceleration_warns_on_views_and_excludes_them() -> Result<(), anyhow::Error> {
+async fn test_catalog_acceleration_excludes_views_and_still_loads() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
         "integration=debug,info,runtime::catalogconnector=debug",
     ));
