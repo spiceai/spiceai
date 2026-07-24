@@ -1672,15 +1672,57 @@ impl CayenneTableProvider {
         Ok(())
     }
 
-    /// Ensure no incomplete write is pending before starting a new write.
+    /// Ensure no incomplete write is pending before starting a new write, and
+    /// roll any recoverable one forward (or back) so the table is writable.
     ///
-    /// Checks for a leftover staging WAL, which indicates a previous staged
-    /// append was interrupted during the file-move phase. Returns an error to
-    /// block further writes until the inconsistency is resolved.
+    /// Runs on the pre-write gate (under `write_lock`) and at provider open. For
+    /// each leftover staging WAL it either self-heals — idempotently completing
+    /// the staged file move (roll FORWARD) or discarding an uncommitted staged
+    /// append (roll BACK) — or, for a genuinely ambiguous / torn write, refuses
+    /// and returns [`Error::IncompleteWrite`] so an operator can intervene.
+    ///
+    /// ## Why this can never double-publish or roll back a *committed* append (issue #12027)
+    ///
+    /// A `ProtectedSnapshot` (CDC-upsert) append deliberately leaves its staging
+    /// WAL on disk after finalize (`apply_under_held_barrier` clears the WAL only
+    /// for `CurrentSnapshot` targets), so under sustained write load the next
+    /// write routinely finds and rolls one of these WALs forward here. That is
+    /// steady-state cleanup, not torn-write recovery, and it is safe because of a
+    /// layered invariant — proven by
+    /// `issue_12027_recovery_rolls_committed_protected_snapshot_forward_exactly_once`:
+    ///
+    /// 1. **In-flight registration covers the entire live-finalize window.**
+    ///    `CayenneStagedAppend::prepare` registers the append in-flight *before*
+    ///    its WAL becomes discoverable, and only `finish()` (which runs *after*
+    ///    `apply_*` has completed the move), `rollback()`, or `Drop`
+    ///    (cancellation) clears it. The `staging_append_is_inflight` skip below
+    ///    therefore excludes any append whose finalize is still live — recovery
+    ///    only ever acts on an append whose finalize has already completed, been
+    ///    rolled back, or been abandoned.
+    /// 2. **`visibility_lock` serializes recovery's move against a concurrent
+    ///    finalize's move**, so even at the instant of hand-off there is no torn
+    ///    concurrent directory mutation (see the lock note below).
+    /// 3. **Roll-forward vs roll-back is decided by the DURABLE snapshot sequence,
+    ///    not the provider pointer.** A single-table CDC upsert commits its
+    ///    `snapshot_sequence` synchronously in Stage A
+    ///    (`commit_on_conflict_deletions_with_tombstone`), which runs *before*
+    ///    `finish()`. Since `not-in-flight ⟹ finish() ran (or the receipt was
+    ///    dropped)`, a *committed* upsert always has a durable sequence when
+    ///    recovery sees its WAL ⟹ it is always rolled FORWARD, never back. An
+    ///    append abandoned *before* its sequence commit has no durable sequence
+    ///    and is correctly rolled back (it published no rows).
+    /// 4. **The roll-forward move is idempotent.**
+    ///    `move_staged_files_to_snapshot` renames whatever is in the (uuid-named)
+    ///    `_staging/<id>/` dir into the target; once finalize has moved the files
+    ///    the staging dir is empty and recovery's move is a no-op — so re-running
+    ///    recovery any number of times neither duplicates rows nor loses them.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::IncompleteWrite`] if a staging WAL file is found.
+    /// Returns [`Error::IncompleteWrite`] when a leftover WAL cannot be safely
+    /// self-healed: its target current-snapshot has moved, WAL-listed files are
+    /// missing from both staging and the target snapshot, or the WAL removal
+    /// after a successful move fails.
     pub(crate) async fn ensure_no_incomplete_write(&self) -> Result<()> {
         if !self.staging_wal_present().load(Ordering::Acquire)
             && !self.staging_may_have_files().load(Ordering::Acquire)

@@ -398,17 +398,26 @@ impl CayenneCdcWrite {
                 //    replacement files' staging WAL is durable BEFORE it. Nothing
                 //    here changes that.
                 //  * `apply_under_held_barrier` (below) makes the replacement files
-                //    durable AND removes the staging WAL. If it fails, the tombstone
-                //    is STILL durable `published = 0`, the in-memory activation has
-                //    NOT run, and the staging WAL is still present — so there is NO
+                //    durable. For this protected-snapshot target it INTENTIONALLY
+                //    leaves the staging WAL on disk (it clears the WAL only for
+                //    `CurrentSnapshot` targets): the append is already durably
+                //    committed via its Stage-A `snapshot_sequence`, so the leftover
+                //    WAL is cleared by the next write's `ensure_no_incomplete_write`
+                //    recovery pass (an idempotent roll-FORWARD — see the invariant
+                //    documented there, proven safe against double-publish by issue
+                //    #12027), or at reopen. If the move fails, the tombstone is
+                //    STILL durable `published = 0`, the in-memory activation has NOT
+                //    run, and the staging WAL is still present — so there is NO
                 //    durable state to compensate (unlike the pre-b1★ flip-before-move
                 //    ordering, which had to revert a premature `published = 1`). We
                 //    simply propagate the error; reopen re-drives the move via
                 //    `ensure_no_incomplete_write` then activates the orphan tombstone
                 //    via `publish_orphan_inlined_deletes`. Applied exactly once.
-                //  * A crash AFTER the move (WAL gone, files durable) but BEFORE the
-                //    deferred durable flip lands: the tombstone is durable
-                //    `published = 0` with a durable replacement and NO WAL, so reopen's
+                //  * A crash AFTER the move but BEFORE the deferred durable flip
+                //    lands (once the leftover WAL has been rolled forward and
+                //    removed by a recovery pass — files durable, WAL gone): the
+                //    tombstone is durable `published = 0` with a durable replacement
+                //    and NO WAL, so reopen's
                 //    unconditional orphan sweep flips it `published = 1`. Old inline
                 //    copy hidden, replacement visible, applied once. The in-memory
                 //    `inlined_locally_published` entry is lost on crash, which is
@@ -418,10 +427,13 @@ impl CayenneCdcWrite {
                 //  before finish()" safe (correctness_audit.md §5 case 1); deferring
                 //  the flip merely widens that already-healed window by one batch.
                 // `publish_apply_move`: the staged-file MOVE into the snapshot dir
-                // (object-store / fs rename + parent-dir fsync) + staging-WAL
-                // removal + the list-files-cache delta-apply, all under the held
+                // (object-store / fs rename + parent-dir fsync), under the held
                 // fence. This is the real I/O of the publish — on EBS the dir
-                // fsync is a device flush.
+                // fsync is a device flush. (For this protected-snapshot target the
+                // move is all `apply_under_held_barrier` does: the staging-WAL
+                // removal and the current-snapshot list-files-cache delta-apply are
+                // `CurrentSnapshot`-only — the WAL is left for recovery to roll
+                // forward, and this overlay leaves the current pointer unchanged.)
                 let apply_move_start = Instant::now();
                 prepared_append.apply_under_held_barrier().await?;
                 record_cayenne_write_phase(
@@ -39838,6 +39850,116 @@ mod tests {
             collect_id_value_pairs(&ctx, &reopened, "cdc_upsert_recovery").await,
             vec![(1, 100)],
             "reopen recovery must make the prepared CDC upsert visible exactly once"
+        );
+    }
+
+    /// Count staging WALs (`_wal.json`) currently on disk under a table's data
+    /// directory. A protected-snapshot append leaves its WAL under
+    /// `<table>/<table_id>/_staging/<id>/_wal.json`; committed snapshots never
+    /// carry one. Used by the #12027 recovery test to assert that the append
+    /// leaves a recoverable WAL and that recovery clears it.
+    fn count_staging_wals(provider: &CayenneTableProvider) -> usize {
+        fn walk(dir: &std::path::Path, count: &mut usize) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, count);
+                } else if path.file_name().and_then(|name| name.to_str())
+                    == Some(crate::provider::constants::STAGING_WAL_FILENAME)
+                {
+                    *count += 1;
+                }
+            }
+        }
+        let table_dir = std::path::Path::new(&provider.table_metadata.path)
+            .join(&provider.table_metadata.table_id);
+        let mut count = 0;
+        walk(&table_dir, &mut count);
+        count
+    }
+
+    /// Issue #12027 — invariant proof: the `staging_wal` incomplete-append
+    /// recovery path (`ensure_no_incomplete_write`) rolls a durably-committed
+    /// protected-snapshot append FORWARD exactly once and is idempotent, so it
+    /// can never double-publish (duplicate rows) or roll back a legitimately
+    /// committed append — no matter how many times it runs.
+    ///
+    /// This is the steady-state shape the issue observed under sustained CDC
+    /// write load: a CDC upsert stages a protected snapshot and makes its
+    /// `snapshot_sequence` durable in Stage A, but Stage B
+    /// (`apply_under_held_barrier`) intentionally does NOT remove the
+    /// protected-snapshot staging WAL, leaving it for a subsequent write's
+    /// pre-write gate to recover. We reproduce that leftover-WAL state by driving
+    /// Stage A and then DROPPING the write before Stage B finalize (the append is
+    /// already durably committed), then invoke recovery directly, twice, and
+    /// assert: recovery succeeds both times (the second is a no-op), the leftover
+    /// WAL is cleared, and after reopen the committed row is visible EXACTLY once.
+    #[tokio::test]
+    async fn issue_12027_recovery_rolls_committed_protected_snapshot_forward_exactly_once() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) =
+            create_cdc_upsert_table("issue_12027_roll_forward", Arc::clone(&runtime_env)).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Stage A durably reserves + commits the protected-snapshot sequence and
+        // writes the staging WAL, returning an append that is pending finalize.
+        let write = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[100])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("cdc upsert should prepare (Stage A committed)");
+        assert!(write.has_pending_finalize());
+        // Drop BEFORE Stage B finalize: mirrors a finalize that never got to clear
+        // the WAL. The snapshot sequence is already durable, so this append is
+        // COMMITTED and must be rolled FORWARD by recovery — never back.
+        drop(write);
+
+        // The manufactured steady state: exactly one committed-but-unfinalized
+        // protected-snapshot append whose staging WAL is still on disk and is no
+        // longer flagged in-flight (the drop cleared the registration).
+        assert_eq!(
+            count_staging_wals(&provider),
+            1,
+            "a committed-but-unfinalized protected-snapshot append must leave exactly one staging WAL"
+        );
+
+        // Recovery, run twice. The first rolls the append forward (idempotent
+        // move + WAL removal); the second must be a clean no-op. Neither may
+        // error, duplicate, or roll back.
+        provider
+            .recover_incomplete_writes()
+            .await
+            .expect("first recovery rolls the committed append forward");
+        provider
+            .recover_incomplete_writes()
+            .await
+            .expect("second recovery is an idempotent no-op");
+
+        assert_eq!(
+            count_staging_wals(&provider),
+            0,
+            "recovery must clear the leftover staging WAL after rolling forward"
+        );
+
+        // Reopen re-establishes the protected-snapshot overlay from the durable
+        // catalog; the committed row must be present EXACTLY once. A recovery bug
+        // that double-published would surface here as a duplicate `(1, 100)`; one
+        // that rolled the committed append back would surface as an empty table.
+        let reopened = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
+            .open("issue_12027_roll_forward")
+            .await
+            .expect("reopen after recovery");
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &reopened, "issue_12027_roll_forward").await,
+            vec![(1, 100)],
+            "the committed upsert must be visible exactly once — recovery must \
+             neither double-publish nor roll back a durably-committed append"
         );
     }
 
