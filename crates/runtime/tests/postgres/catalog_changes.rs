@@ -43,7 +43,8 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use app::AppBuilder;
-use data_components::postgres::provider::check_cdc_prerequisites;
+use data_components::postgres::provider::{check_cdc_prerequisites, replication_slot_status};
+use data_components::postgres_replication::config::catalog_slot_name;
 use datafusion::assert_batches_eq;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use runtime::Runtime;

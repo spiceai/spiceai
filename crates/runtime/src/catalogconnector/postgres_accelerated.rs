@@ -328,8 +328,10 @@ pub(crate) struct SlotInUseError {
 
 /// How long to wait, beyond the server's `wal_sender_timeout`, for a slot that a
 /// crashed consumer still holds `active` to be released before concluding a
-/// different live consumer owns it.
-const SLOT_RELEASE_GRACE: Duration = Duration::from_secs(15);
+/// different live consumer owns it. PostgreSQL frees the slot within
+/// milliseconds of the walsender exiting (at ~`wal_sender_timeout`), so this is
+/// a small buffer for scheduling/poll granularity, not a second full timeout.
+const SLOT_RELEASE_GRACE: Duration = Duration::from_secs(5);
 /// Fallback wait budget when `wal_sender_timeout` is `0` (disabled), since then
 /// the server won't time out a dropped consumer on its own.
 const SLOT_WAIT_BUDGET_WHEN_TIMEOUT_DISABLED: Duration = Duration::from_secs(90);
@@ -337,7 +339,7 @@ const SLOT_WAIT_BUDGET_WHEN_TIMEOUT_DISABLED: Duration = Duration::from_secs(90)
 /// can't hang catalog startup indefinitely.
 const SLOT_WAIT_BUDGET_CAP: Duration = Duration::from_secs(180);
 /// How often to re-poll the slot's activity while waiting for it to free.
-const SLOT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const SLOT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A catalog provider that CDC-accelerates every table it discovers (subject
 /// to `include`/`exclude`), holding its own `PostgreSQL` connection directly
