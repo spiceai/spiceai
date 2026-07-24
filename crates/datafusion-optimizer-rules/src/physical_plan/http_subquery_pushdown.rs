@@ -572,7 +572,7 @@ async fn materialize_string_values(
 ) -> Result<Vec<String>, DataFusionError> {
     let batches = datafusion::physical_plan::collect(Arc::clone(plan), Arc::clone(context)).await?;
 
-    let mut seen = HashSet::new();
+    let mut seen: HashSet<&str> = HashSet::new();
     let mut values = Vec::new();
     for (batch_index, batch) in batches.iter().enumerate() {
         if batch.num_columns() <= col_index {
@@ -598,7 +598,7 @@ async fn materialize_string_values(
             };
 
         for val in string_iter.flatten() {
-            if seen.insert(val.to_string()) {
+            if seen.insert(val) {
                 if values.len() >= MAX_MATERIALIZED_VALUES {
                     return Err(DataFusionError::Plan(format!(
                         "HttpWithDeferredParamsExec: subquery produced more than {MAX_MATERIALIZED_VALUES} unique values, aborting pushdown"

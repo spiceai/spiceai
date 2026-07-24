@@ -118,8 +118,6 @@ pub type FieldMetadata = HashMap<String, HashMap<String, String>>;
 #[cfg(feature = "adbc")]
 pub mod adbc_helpers;
 pub mod arrow;
-#[cfg(feature = "cosmosdb")]
-pub mod cosmosdb;
 #[cfg(feature = "databricks")]
 pub mod databricks;
 #[cfg(feature = "debezium")]
@@ -168,8 +166,6 @@ pub mod schema_discovery;
 pub use datafusion_table_providers::schema_projection;
 pub mod sql_expr;
 
-#[cfg(feature = "sharepoint")]
-pub mod sharepoint;
 #[cfg(feature = "snowflake")]
 pub mod snowflake;
 #[cfg(feature = "spark_connect")]
@@ -181,14 +177,12 @@ pub mod sqlite;
 pub mod turso;
 pub mod unity_catalog;
 
-pub mod github;
 pub mod key_filter;
 pub mod pk_filter_expr;
 pub mod rate_limit;
 
 pub mod cdc;
 pub mod delete;
-pub mod graphql;
 pub mod http;
 pub mod index_maintenance;
 pub mod object;
