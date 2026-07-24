@@ -36,8 +36,8 @@ pub use runtime_component::dataset::{
     schema_inference,
 };
 // `validate_identifier` is used by `builder` via `super::validate_identifier`.
-use runtime_component::validate_identifier;
 use runtime_component::dataset::acceleration::Acceleration;
+use runtime_component::validate_identifier;
 
 /// `Arc<Runtime>`-bound wrapper over a [`DatasetSpec`]. Derefs to the spec so
 /// `dataset.acceleration`, `dataset.columns`, `dataset.refresh_sql()`, etc. keep

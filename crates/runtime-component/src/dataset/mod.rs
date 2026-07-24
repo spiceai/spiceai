@@ -746,5 +746,3 @@ pub struct FullTextSearchDatasetConfig {
     pub search_fields: Vec<String>,
     pub primary_key: Vec<String>,
 }
-
-

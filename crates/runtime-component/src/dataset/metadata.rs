@@ -100,4 +100,3 @@ impl DatasetSpec {
             && schema.fields().find(column).is_none()
     }
 }
-
