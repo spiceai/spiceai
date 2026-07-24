@@ -29,6 +29,18 @@ use super::{
     config::{ReplicationParams, SslMode},
 };
 
+/// Ceiling for pgoutput protocol negotiation (the worker negotiates the
+/// effective version down to server capability from here). Defaults to 2
+/// (in-progress transaction streaming). `SPICE_POSTGRES_MAX_PROTO_VERSION`
+/// overrides it — set `1` to force the pre-streaming v1 wire for an A/B
+/// comparison — clamped to `1..=2` (v3/v4 are not decoded yet).
+fn max_proto_version_ceiling() -> u8 {
+    std::env::var("SPICE_POSTGRES_MAX_PROTO_VERSION")
+        .ok()
+        .and_then(|v| v.trim().parse::<u8>().ok())
+        .map_or(2, |v| v.clamp(1, 2))
+}
+
 pub(crate) fn build_replication_config(
     params: &ReplicationParams,
     slot_name: &str,
@@ -90,7 +102,7 @@ pub(crate) fn build_replication_config(
         // is safe against older/managed servers. Streaming moves Postgres's
         // reorder buffer off its disk and into spiced (issue #12011). v3/v4 raise
         // this further once their decode lands.
-        proto_version: 2,
+        proto_version: max_proto_version_ceiling(),
         // Keep the crate default (~1 GiB) max_message_size so large TOAST-row
         // changes are never rejected; the reader allocates incrementally
         // regardless of this cap.
