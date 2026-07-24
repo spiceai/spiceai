@@ -84,6 +84,13 @@ pub(crate) fn build_replication_config(
         // common int/float/date/timestamp/numeric columns arrive binary, skipping
         // text formatting + reparsing on both ends. The decoder handles either tag.
         format: params.pg_output_format,
+        // Request pgoutput protocol v2 (in-progress transaction streaming) as the
+        // ceiling. The worker negotiates it down to what the server supports
+        // (>= 14) and falls back to v1 if the server rejects `streaming`, so this
+        // is safe against older/managed servers. Streaming moves Postgres's
+        // reorder buffer off its disk and into spiced (issue #12011). v3/v4 raise
+        // this further once their decode lands.
+        proto_version: 2,
         // Keep the crate default (~1 GiB) max_message_size so large TOAST-row
         // changes are never rejected; the reader allocates incrementally
         // regardless of this cap.

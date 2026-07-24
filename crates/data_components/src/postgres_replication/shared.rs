@@ -231,6 +231,77 @@ impl MemberSeed {
 /// Pump-local map of per-member schema state, keyed like [`RouteMap`].
 type MemberSchemaStates = FxHashMap<MemberKey, MemberSchemaState>;
 
+/// One streamed change buffered on the pump (pgoutput v2+): its immediate
+/// subtransaction xid (for savepoint-rollback truncation), the relation it
+/// targets (routing), and the raw pgoutput bytes with the subxid prefix intact
+/// — the consumer's decoder strips it (`PgChangeRows { streaming: true }`).
+struct StreamedChange {
+    subxid: u32,
+    relation_id: RelationId,
+    raw: Bytes,
+}
+
+/// A single in-progress (streamed) top-level transaction buffered in memory
+/// until its Stream Commit — the reorder buffer relocated from Postgres's disk
+/// into spiced (issue #12011). Changes are kept in arrival order across all
+/// relations and subtransactions so a Stream Abort of a subtransaction drops
+/// the contiguous suffix from that subxid onward, matching Postgres's
+/// truncate-to-offset savepoint-rollback semantics (aborting a savepoint
+/// discards it and every change made after it).
+struct StreamTxn {
+    changes: Vec<StreamedChange>,
+    /// Begin LSN of the transaction's first stream segment — feeds the ack cap
+    /// ([`AckTable::open_floor`]): Postgres must retain WAL from here until the
+    /// transaction commits.
+    first_lsn: u64,
+    /// Running total of buffered raw bytes (O(1) for the memory high-water metric).
+    bytes: usize,
+}
+
+impl StreamTxn {
+    fn new(first_lsn: u64) -> Self {
+        Self {
+            changes: Vec::new(),
+            first_lsn,
+            bytes: 0,
+        }
+    }
+
+    fn push(&mut self, change: StreamedChange) {
+        self.bytes += change.raw.len();
+        self.changes.push(change);
+    }
+
+    /// Discard the contiguous suffix beginning at the first change of `subxid`
+    /// (savepoint rollback: the aborted subtransaction and everything streamed
+    /// after it, including nested subtransactions). A subxid with no buffered
+    /// changes (empty savepoint) is a no-op.
+    fn abort_subxid(&mut self, subxid: u32) {
+        if let Some(from) = self.changes.iter().position(|c| c.subxid == subxid) {
+            let dropped: usize = self.changes[from..].iter().map(|c| c.raw.len()).sum();
+            self.bytes -= dropped;
+            self.changes.truncate(from);
+        }
+    }
+
+    /// Regroup the ordered changes into a per-relation buffer for delivery,
+    /// preserving each relation's internal order (cross-relation order is
+    /// irrelevant — each relation becomes its own `ChangeBatch`). Consumes the
+    /// transaction; the subxid tags have served their purpose (rollback) and the
+    /// raw bytes keep their subxid prefix for the consumer's streaming decode.
+    fn into_relation_buffer(self) -> TxnBuffer {
+        let mut buf = TxnBuffer::default();
+        for change in self.changes {
+            buf.entry(change.relation_id).or_default().push(change.raw);
+        }
+        buf
+    }
+}
+
+/// Pump-local map of open streamed transactions, keyed by top-level xid.
+/// Multiple can be open at once — under v2 their segments interleave.
+type OpenTxns = FxHashMap<u32, StreamTxn>;
+
 /// Default bounded per-member mailbox depth (envelopes), overridable via
 /// `pg_replication_member_channel_capacity`
 /// ([`ReplicationParams::member_channel_capacity`]). When one member's sink
@@ -560,10 +631,30 @@ impl AckSlot {
 /// so in steady state the read path is an uncontended atomic. The per-member
 /// `committed`/`delivered` atomics live behind the `Arc<AckSlot>`, so a committer
 /// advances its floor without touching this lock at all.
-#[derive(Default)]
 struct AckTable {
     members: RwLock<HashMap<MemberKey, Arc<AckSlot>>>,
     shared_flush: AtomicU64,
+    /// The begin LSN of the oldest still-open streamed (pgoutput v2+)
+    /// transaction, or `u64::MAX` when none is open. The reported flush LSN is
+    /// capped at this: with in-progress-transaction streaming, later
+    /// transactions can commit while an earlier one is still open, and acking
+    /// past that open transaction's begin would let Postgres recycle WAL a crash
+    /// would need to replay it — losing un-durable data. Maintained by the pump
+    /// (single writer) as open transactions start and finish; monotonically
+    /// non-decreasing (a new transaction's begin exceeds every open one, and the
+    /// oldest only rises as transactions commit), so capping never regresses the
+    /// ack. See [`Self::flush_lsn`] and [`Self::set_open_floor`].
+    open_floor: AtomicU64,
+}
+
+impl Default for AckTable {
+    fn default() -> Self {
+        Self {
+            members: RwLock::new(HashMap::new()),
+            shared_flush: AtomicU64::new(0),
+            open_floor: AtomicU64::new(u64::MAX),
+        }
+    }
 }
 
 impl AckTable {
@@ -673,7 +764,11 @@ impl AckTable {
             .map(|slot| slot.committed())
             .min();
         if let Some(floor) = floor {
-            advance_monotonic(&self.shared_flush, floor);
+            // Cap at the oldest still-open streamed transaction's begin LSN so we
+            // never ack past a transaction whose changes are not yet durable
+            // (see `open_floor`). `min` with `u64::MAX` (nothing open) is a no-op.
+            let capped = floor.min(self.open_floor.load(Ordering::Acquire));
+            advance_monotonic(&self.shared_flush, capped);
         }
         self.shared_flush.load(Ordering::Acquire)
     }
@@ -683,6 +778,14 @@ impl AckTable {
     /// hot commit/deliver paths read `STREAMING` off the cached `AckSlot`.
     fn is_streaming(&self, key: &MemberKey) -> bool {
         self.slot(key).is_some_and(|slot| slot.has(STREAMING))
+    }
+
+    /// Set the ack cap to the oldest open streamed transaction's begin LSN, or
+    /// `u64::MAX` when none is open. Pump-only (single writer); a plain store is
+    /// sufficient — no other task writes it, and `flush_lsn` reads it with
+    /// Acquire. See [`Self::open_floor`].
+    fn set_open_floor(&self, lsn: u64) {
+        self.open_floor.store(lsn, Ordering::Release);
     }
 }
 
@@ -1974,6 +2077,18 @@ async fn run_pump(source: Arc<SharedSource>) {
         // but never `commit`ted, so it pins this member's ack floor and the slot
         // replays it from `confirmed_flush_lsn` (applied idempotently).
         let mut eager_hold = EagerHold::default();
+        // In-progress transactions being streamed (pgoutput v2+), keyed by
+        // top-level xid; buffered until their Stream Commit. `stream_xid` is the
+        // xid of the segment currently open (between Stream Start and Stream
+        // Stop), which tells the decoder/peek helpers to expect the subxid
+        // prefix on change messages.
+        let mut open_txns: OpenTxns = OpenTxns::default();
+        let mut stream_xid: Option<u32> = None;
+        // Abandon any streamed transactions from a prior connection: Postgres
+        // re-streams from restart_lsn after a reconnect, so their buffers (and
+        // the ack cap they imposed) must be cleared or the cap would pin the ack
+        // forever.
+        source.ack.set_open_floor(u64::MAX);
 
         // Reader-timing accumulators (see `BoundaryMetrics` /
         // `flush_member_metrics`): summed per decoded event, fanned out to
@@ -2129,23 +2244,112 @@ async fn run_pump(source: Arc<SharedSource>) {
                     txn_open = true;
                     txn.clear();
                 }
-                ReplicationEvent::XLogData { data, wal_end, .. } => {
+                ReplicationEvent::XLogData {
+                    data,
+                    wal_start,
+                    wal_end,
+                    ..
+                } => {
                     max_wal_end = max_wal_end.max(wal_end.0);
-                    // Peek the message type to route WITHOUT decoding the tuple:
-                    // Relation/Truncate are fully decoded here (rare, and they
-                    // carry routing state — the relation cache / a relation-id
-                    // list); Insert/Update/Delete are only peeked for their
-                    // relation id and buffered raw, so the per-dataset consumer
-                    // pays the tuple decode + Arrow build off this shared task.
+                    // Inside a Stream Start/Stop bracket, change/relation messages
+                    // carry a subtransaction-xid prefix the decoder + peek helpers
+                    // must account for.
+                    let in_stream = stream_xid.is_some();
                     match pgoutput::message_type(&data) {
-                        // Relation and Truncate are fully decoded here (rare, and
-                        // they carry routing state — the relation cache / a
-                        // relation-id list). Clone the frame first so a TRUNCATE
-                        // can still buffer its raw bytes after the decoder consumes
-                        // `data` (O(1) Bytes refcount; R/T are rare).
+                        // ---- pgoutput v2+ stream control (transaction boundaries) ----
+                        Some(b'S') => match decoder.decode(data) {
+                            Ok(pgoutput::DecodedMessage::StreamStart { xid, .. }) => {
+                                stream_xid = Some(xid);
+                                open_txns
+                                    .entry(xid)
+                                    .or_insert_with(|| StreamTxn::new(wal_start.0));
+                                source.ack.set_open_floor(oldest_open_begin(&open_txns));
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                source.for_each_member_metrics(
+                                    ReplicationMetricsCollector::inc_decode_error,
+                                );
+                                fatal_broadcast(&source, format!("pgoutput decode failed: {e}"))
+                                    .await;
+                                break 'reconnect;
+                            }
+                        },
+                        // Stream Stop: the segment ends but the transaction stays
+                        // open (its buffer is retained until Stream Commit/Abort);
+                        // another transaction's segment may follow.
+                        Some(b'E') => {
+                            stream_xid = None;
+                        }
+                        Some(b'c') => match decoder.decode(data) {
+                            Ok(pgoutput::DecodedMessage::StreamCommit {
+                                xid,
+                                end_lsn,
+                                commit_ts,
+                                ..
+                            }) => {
+                                stream_xid = None;
+                                if let Some(open) = open_txns.remove(&xid) {
+                                    send_wait_us = deliver_commit(
+                                        &source,
+                                        &mut eager_hold,
+                                        eager_settings,
+                                        &decoder,
+                                        &routes,
+                                        open.into_relation_buffer(),
+                                        CommitBoundary {
+                                            end_lsn,
+                                            commit_time_micros: commit_ts,
+                                        },
+                                        true,
+                                    )
+                                    .await;
+                                }
+                                // Removing this txn may let the ack floor advance.
+                                source.ack.set_open_floor(oldest_open_begin(&open_txns));
+                                commit_watermark =
+                                    Some(client::pg_epoch_to_system_time(commit_ts));
+                                client.update_applied_lsn(Lsn(source.ack.flush_lsn()));
+                                should_flush = true;
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                source.for_each_member_metrics(
+                                    ReplicationMetricsCollector::inc_decode_error,
+                                );
+                                fatal_broadcast(&source, format!("pgoutput decode failed: {e}"))
+                                    .await;
+                                break 'reconnect;
+                            }
+                        },
+                        Some(b'a') => match decoder.decode(data) {
+                            Ok(pgoutput::DecodedMessage::StreamAbort { xid, subxid }) => {
+                                if subxid == xid {
+                                    // Whole transaction aborted: discard it, nothing
+                                    // was ever made visible.
+                                    open_txns.remove(&xid);
+                                } else if let Some(open) = open_txns.get_mut(&xid) {
+                                    // Savepoint rollback: drop only the aborted
+                                    // subtransaction's changes (and any streamed
+                                    // after it); the parent transaction continues.
+                                    open.abort_subxid(subxid);
+                                }
+                                source.ack.set_open_floor(oldest_open_begin(&open_txns));
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                source.for_each_member_metrics(
+                                    ReplicationMetricsCollector::inc_decode_error,
+                                );
+                                fatal_broadcast(&source, format!("pgoutput decode failed: {e}"))
+                                    .await;
+                                break 'reconnect;
+                            }
+                        },
+                        // ---- Relation / Truncate: fully decoded (routing state / relid list) ----
                         Some(b'R' | b'T') => {
                             let raw = data.clone();
-                            let msg = match decoder.decode(data) {
+                            let msg = match decoder.decode_message(data, in_stream) {
                                 Ok(msg) => msg,
                                 Err(e) => {
                                     source.for_each_member_metrics(
@@ -2171,21 +2375,37 @@ async fn run_pump(source: Arc<SharedSource>) {
                                     .await;
                                 }
                                 pgoutput::DecodedMessage::Truncate { relation_ids } => {
-                                    buffer_raw_truncate(&routes, &mut txn, &relation_ids, &raw);
+                                    match stream_xid.and_then(|xid| open_txns.get_mut(&xid)) {
+                                        Some(open) => buffer_streamed_truncate(
+                                            &routes,
+                                            open,
+                                            &relation_ids,
+                                            &raw,
+                                        ),
+                                        None => buffer_raw_truncate(
+                                            &routes,
+                                            &mut txn,
+                                            &relation_ids,
+                                            &raw,
+                                        ),
+                                    }
                                 }
                                 // A non-R/T body under an R/T tag is impossible
                                 // from a well-formed server; ignore.
                                 _ => {}
                             }
                         }
-                        // Insert/Update/Delete: peek the relation id to route +
-                        // meter, then buffer the raw bytes; the per-dataset
-                        // consumer pays the tuple decode + Arrow build off this
-                        // shared task.
+                        // ---- Insert/Update/Delete: peek the relation id to route +
+                        // meter, then buffer the raw bytes (deferred tuple decode). ----
                         Some(tag @ (b'I' | b'U' | b'D')) => {
-                            buffer_raw_change(&routes, &mut txn, tag, data);
+                            match stream_xid.and_then(|xid| open_txns.get_mut(&xid)) {
+                                Some(open) => {
+                                    buffer_streamed_change(&routes, open, tag, data);
+                                }
+                                None => buffer_raw_change(&routes, &mut txn, tag, data),
+                            }
                         }
-                        // Type / Origin / Message / Stream* — safe to ignore.
+                        // Type / Origin / Message — safe to ignore.
                         _ => {}
                     }
                 }
@@ -2206,6 +2426,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                             end_lsn: end_lsn.0,
                             commit_time_micros,
                         },
+                        false,
                     )
                     .await;
                     // The ack floor + freshness watermark are published to every
@@ -2225,7 +2446,11 @@ async fn run_pump(source: Arc<SharedSource>) {
                     // consolidated boundary flush below, not inline per event.
                     max_wal_end = max_wal_end.max(wal_end.0);
                     should_flush = true;
-                    if !txn_open {
+                    // Credit idle members only when nothing is buffered — neither a
+                    // non-streamed transaction nor any open streamed one. (The
+                    // `open_floor` cap in `flush_lsn` would hold the ack back even
+                    // if we credited, but gating here keeps `committed` honest.)
+                    if !txn_open && open_txns.is_empty() {
                         source.ack.credit_idle(wal_end.0);
                         // Idle heartbeat for lag-based readiness. `!txn_open`
                         // means the pump has caught up to the source head, so a
@@ -2599,6 +2824,68 @@ async fn handle_relation(
 /// read. A change for a relation with no streaming member is dropped, matching
 /// the eager path. The "change before Relation" invariant is still enforced at
 /// commit (`deliver_commit` fatals if the relation isn't cached).
+/// The begin LSN of the oldest open streamed transaction, or `u64::MAX` when
+/// none is open — the value the ack floor is capped at (see
+/// [`AckTable::open_floor`]).
+fn oldest_open_begin(open_txns: &OpenTxns) -> u64 {
+    open_txns
+        .values()
+        .map(|t| t.first_lsn)
+        .min()
+        .unwrap_or(u64::MAX)
+}
+
+/// Buffer a streamed (pgoutput v2+) Insert/Update/Delete into its open
+/// transaction, peeking the relation id + subtransaction xid from the streamed
+/// wire layout (no tuple decode). Mirrors [`buffer_raw_change`] but keys by
+/// transaction rather than by relation, and tags the change with its subxid for
+/// savepoint-rollback truncation. A change for an unrouted relation is dropped.
+fn buffer_streamed_change(routes: &RouteMap, txn: &mut StreamTxn, tag: u8, data: Bytes) {
+    let Some(relation_id) = pgoutput::relation_id_streamed(&data) else {
+        return;
+    };
+    let Some(subxid) = pgoutput::subxid(&data) else {
+        return;
+    };
+    let Some(Route { member, .. }) = routes.get(&relation_id) else {
+        return;
+    };
+    match tag {
+        b'I' => member.metrics.inc_insert(),
+        b'U' => member.metrics.inc_update(),
+        b'D' => member.metrics.inc_delete(),
+        _ => {}
+    }
+    txn.push(StreamedChange {
+        subxid,
+        relation_id,
+        raw: data,
+    });
+}
+
+/// Buffer a streamed TRUNCATE into its open transaction, one entry per routed
+/// relation (the relation list is already decoded). Mirrors
+/// [`buffer_raw_truncate`]; the raw bytes keep their subxid prefix for the
+/// consumer's streaming decode.
+fn buffer_streamed_truncate(
+    routes: &RouteMap,
+    txn: &mut StreamTxn,
+    relation_ids: &[RelationId],
+    data: &Bytes,
+) {
+    let subxid = pgoutput::subxid(data).unwrap_or_default();
+    for &relation_id in relation_ids {
+        if let Some(Route { member, .. }) = routes.get(&relation_id) {
+            member.metrics.inc_truncate();
+            txn.push(StreamedChange {
+                subxid,
+                relation_id,
+                raw: data.clone(),
+            });
+        }
+    }
+}
+
 fn buffer_raw_change(routes: &RouteMap, txn: &mut TxnBuffer, tag: u8, data: Bytes) {
     let Some(relation_id) = pgoutput::relation_id(&data) else {
         return;
@@ -2857,6 +3144,7 @@ async fn deliver_commit(
     routes: &RouteMap,
     txn: TxnBuffer,
     boundary: CommitBoundary,
+    streaming: bool,
 ) -> u64 {
     let commit_time = client::pg_epoch_to_system_time(boundary.commit_time_micros);
     // Unix-epoch ms for the per-batch replication-lag signal carried into the
@@ -2927,11 +3215,16 @@ async fn deliver_commit(
         // Build against the member's *working* schema (registered schema plus any
         // adopted mid-stream widening — see `handle_relation`), not the fixed
         // registered schema, so an adopted column reaches the accelerator.
+        // `streaming` buffered bytes carry a subxid prefix the consumer's decoder
+        // strips; non-streamed (Begin/Commit) bytes do not. Build against the
+        // member's *working* schema (registered schema plus any adopted mid-stream
+        // widening — see `handle_relation`), not the fixed registered schema.
         let rows = PgChangeRows::new(
             Arc::clone(working_schema),
             Arc::clone(rel),
             raw,
             commit_ts_ms,
+            streaming,
         );
         member.metrics.inc_transaction();
         // Lag-based readiness: this WAL envelope marks the dataset Ready only if
@@ -3999,6 +4292,85 @@ mod tests {
         ack.deliver(&key("b"), 200);
         ack.commit(&key("b"), 200);
         assert_eq!(ack.flush_lsn(), 200);
+    }
+
+    #[test]
+    fn open_floor_caps_flush_lsn_at_oldest_open_txn() {
+        // The v2-streaming data-loss guard: with in-progress-transaction
+        // streaming, a later transaction can commit while an earlier one is
+        // still open. Acking past the open transaction's begin LSN would let
+        // Postgres recycle WAL a crash would need — so the ack is capped.
+        let ack = AckTable::default();
+        ack.register(&key("t"), false);
+        ack.promote_ready_members();
+
+        // Transaction A opens at begin LSN 150 (still open); a later B commits
+        // at end LSN 300. The member's committed advances to 300, but the ack
+        // must hold at A's begin.
+        ack.set_open_floor(150);
+        ack.commit(&key("t"), 300);
+        assert_eq!(ack.flush_lsn(), 150);
+
+        // A commits: the cap lifts and the ack catches up to the applied LSN.
+        ack.set_open_floor(u64::MAX);
+        ack.commit(&key("t"), 400);
+        assert_eq!(ack.flush_lsn(), 400);
+    }
+
+    #[test]
+    fn stream_txn_abort_subxid_drops_contiguous_suffix() {
+        // Savepoint rollback discards the aborted subtransaction and everything
+        // streamed after it (nested savepoints included), matching Postgres's
+        // truncate-to-offset semantics.
+        let mk = |sub: u32, n: usize| StreamedChange {
+            subxid: sub,
+            relation_id: 1,
+            raw: Bytes::from(vec![0u8; n]),
+        };
+        let mut txn = StreamTxn::new(100);
+        txn.push(mk(10, 3)); // top-level xid
+        txn.push(mk(11, 5)); // savepoint s1
+        txn.push(mk(12, 7)); // nested savepoint s2
+        txn.push(mk(11, 2)); // more work after s2
+        assert_eq!(txn.changes.len(), 4);
+        assert_eq!(txn.bytes, 3 + 5 + 7 + 2);
+
+        // Roll back s1: drop from its first change (index 1) onward.
+        txn.abort_subxid(11);
+        assert_eq!(txn.changes.len(), 1);
+        assert_eq!(txn.changes[0].subxid, 10);
+        assert_eq!(txn.bytes, 3);
+
+        // Aborting an unknown/empty subxid is a no-op.
+        txn.abort_subxid(999);
+        assert_eq!(txn.changes.len(), 1);
+    }
+
+    #[test]
+    fn stream_txn_regroups_by_relation_preserving_order() {
+        let b = |s: &[u8]| Bytes::copy_from_slice(s);
+        let mut txn = StreamTxn::new(0);
+        txn.push(StreamedChange {
+            subxid: 1,
+            relation_id: 7,
+            raw: b(b"a"),
+        });
+        txn.push(StreamedChange {
+            subxid: 1,
+            relation_id: 8,
+            raw: b(b"b"),
+        });
+        txn.push(StreamedChange {
+            subxid: 1,
+            relation_id: 7,
+            raw: b(b"c"),
+        });
+        let buf = txn.into_relation_buffer();
+        assert_eq!(
+            buf.get(&7).map(Vec::as_slice),
+            Some(&[b(b"a"), b(b"c")][..])
+        );
+        assert_eq!(buf.get(&8).map(Vec::as_slice), Some(&[b(b"b")][..]));
     }
 
     #[test]

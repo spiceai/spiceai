@@ -281,13 +281,15 @@ fn decode_raw_changes_iter<'a>(
     relation: &Relation,
     raw: impl Iterator<Item = &'a bytes::Bytes>,
     capacity: usize,
+    streaming: bool,
 ) -> Result<Vec<DecodedChange>> {
     use super::pgoutput::{DecodedMessage, Decoder};
     let mut decoder = Decoder::new();
     // Lower bound on capacity (a PK-changing UPDATE grows the vec by one).
     let mut changes = Vec::with_capacity(capacity);
     for msg in raw {
-        match decoder.decode(msg.clone())? {
+        // `streaming` messages carry a 4-byte subxid prefix the decoder strips.
+        match decoder.decode_message(msg.clone(), streaming)? {
             DecodedMessage::Insert { tuple, .. } => changes.push(DecodedChange {
                 op: ChangeOp::Create,
                 row: tuple,
@@ -322,7 +324,7 @@ fn decode_raw_changes_iter<'a>(
 /// assert the raw path against the eager one.
 #[cfg(test)]
 fn decode_raw_changes(relation: &Relation, raw: &[bytes::Bytes]) -> Result<Vec<DecodedChange>> {
-    decode_raw_changes_iter(relation, raw.iter(), raw.len())
+    decode_raw_changes_iter(relation, raw.iter(), raw.len(), false)
 }
 
 /// The raw change messages of one or more committed transactions for a single
@@ -348,6 +350,10 @@ pub struct PgChangeRows {
     /// member mailbox lock.
     raw_chunks: Vec<Vec<bytes::Bytes>>,
     source_commit_ts_ms: Option<i64>,
+    /// Whether the buffered messages came from a streamed (pgoutput v2+)
+    /// transaction and therefore carry a subtransaction-xid prefix the decoder
+    /// must strip. Threaded to [`decode_raw_changes`] at build time.
+    streaming: bool,
     /// Precomputed `num_rows_hint` (upper bound) and `encoded_len` so the
     /// consumer's coalescing/metric reads are O(1) rather than rescanning `raw`.
     row_hint: usize,
@@ -361,6 +367,7 @@ impl PgChangeRows {
         relation: Arc<Relation>,
         raw: Vec<bytes::Bytes>,
         source_commit_ts_ms: Option<i64>,
+        streaming: bool,
     ) -> Self {
         // Computed once here (per commit-per-relation) so the metadata accessors
         // are O(1): the consumer calls them on the coalescing/metric hot path,
@@ -390,6 +397,7 @@ impl PgChangeRows {
             relation,
             raw_chunks: vec![raw],
             source_commit_ts_ms,
+            streaming,
             row_hint,
             byte_len,
         }
@@ -413,7 +421,13 @@ impl PgChangeRows {
     /// `Schema` (fields plus metadata) and per-column name comparison would be
     /// paid on every merge.
     pub(super) fn try_append(&mut self, mut other: Self) -> Option<Self> {
-        if !Arc::ptr_eq(&self.schema, &other.schema)
+        // Never merge a streamed (pgoutput v2+) transaction with a non-streamed
+        // one: their raw bytes have different framing (the streamed side carries
+        // a subxid prefix the decoder strips), so a single `streaming` flag can't
+        // decode a mixed `raw_chunks`. A large streamed txn and small non-streamed
+        // ones for the same table interleave, so this pair really does occur.
+        if self.streaming != other.streaming
+            || !Arc::ptr_eq(&self.schema, &other.schema)
             || !Arc::ptr_eq(&self.relation, &other.relation)
         {
             return Some(other);
@@ -500,6 +514,7 @@ impl ChangeRows for PgChangeRows {
             &self.relation,
             self.raw_chunks.iter().flatten(),
             self.row_hint,
+            self.streaming,
         )
         .map_err(|e| ChangeBatchError::DeferredBuild {
             message: e.to_string(),
@@ -3295,7 +3310,7 @@ mod raw_decode_tests {
             row: tuple(&["2", "b"]),
         });
 
-        let raw_changes = decode_raw_changes(&rel, &raw).expect("raw decode");
+        let raw_changes = decode_raw_changes(&rel, &raw, false).expect("raw decode");
         // insert + (delete-old-key + upsert-new) + delete
         assert_eq!(
             raw_changes.len(),
@@ -3331,7 +3346,7 @@ mod raw_decode_tests {
             row: TupleData { columns: vec![] },
         });
 
-        let raw_changes = decode_raw_changes(&rel, &raw).expect("raw decode");
+        let raw_changes = decode_raw_changes(&rel, &raw, false).expect("raw decode");
         // A non-PK update is a single upsert row (no delete-of-old-key).
         assert_eq!(
             raw_changes.len(),
@@ -3447,7 +3462,7 @@ mod raw_decode_tests {
     #[test]
     fn pgchangerows_metadata_is_answered_without_decoding() {
         // is_empty is exact; num_rows_hint is an upper bound (+1 per UPDATE).
-        let empty = PgChangeRows::new(schema(), relation(), vec![], Some(7));
+        let empty = PgChangeRows::new(schema(), relation(), vec![], Some(7), false);
         assert!(empty.is_empty());
         assert_eq!(empty.num_rows_hint(), 0);
 
@@ -3459,6 +3474,7 @@ mod raw_decode_tests {
                 raw_update(&["1", "a"], &["2", "b"]),
             ],
             Some(7),
+            false,
         );
         assert!(!rows.is_empty());
         // 2 messages + 1 (the UPDATE may split) = 3 upper bound; actual after
