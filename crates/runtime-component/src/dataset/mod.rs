@@ -96,7 +96,7 @@ pub enum Error {
         source: fundu::ParseError,
     },
 
-    #[snafu(display("Error parsing 'snapshots_batches` as integer: {source}"))]
+    #[snafu(display("Error parsing `snapshots_batches` as integer: {source}"))]
     UnableToParseSnapshotsBatches { source: std::num::ParseIntError },
 
     #[snafu(display("Error parsing `from` path {path} as table reference: {source}"))]

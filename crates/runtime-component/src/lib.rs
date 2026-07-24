@@ -32,7 +32,7 @@ limitations under the License.
 // The config-parsing functions return self-describing SNAFU/parse errors whose
 // variants document the failure modes, so a per-function `# Errors` section adds
 // no information.
-#![allow(clippy::missing_errors_doc)]
+#![expect(clippy::missing_errors_doc)]
 
 use datafusion::sql::sqlparser::{
     dialect::{Dialect, GenericDialect},
