@@ -4513,8 +4513,11 @@ dependencies = [
 name = "connector-mongodb"
 version = "2.2.0-unstable"
 dependencies = [
+ "arrow",
+ "arrow-buffer",
  "async-stream",
  "async-trait",
+ "criterion 0.7.0",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
@@ -5810,7 +5813,6 @@ dependencies = [
  "insta",
  "logos",
  "mailparse",
- "mongodb",
  "mysql_async",
  "native-tls",
  "num_cpus",
