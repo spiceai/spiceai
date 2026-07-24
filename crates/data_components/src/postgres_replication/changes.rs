@@ -80,54 +80,6 @@ impl ChangeOp {
     }
 }
 
-/// Buffer collecting `DecodedChange`s within a single transaction.
-pub struct TransactionBuffer {
-    pub begin_lsn: u64,
-    pub changes: Vec<DecodedChange>,
-}
-
-impl TransactionBuffer {
-    #[must_use]
-    pub fn new(begin_lsn: u64) -> Self {
-        Self {
-            begin_lsn,
-            changes: Vec::new(),
-        }
-    }
-
-    pub fn push_insert(&mut self, _relation: &Relation, tuple: TupleData) {
-        self.changes.push(DecodedChange {
-            op: ChangeOp::Create,
-            row: tuple,
-        });
-    }
-
-    pub fn push_update(&mut self, relation: &Relation, old: Option<TupleData>, new: TupleData) {
-        push_update_change(&mut self.changes, relation, old, new);
-    }
-
-    pub fn push_delete(&mut self, _relation: &Relation, old: TupleData) {
-        self.changes.push(DecodedChange {
-            op: ChangeOp::Delete,
-            row: old,
-        });
-    }
-
-    /// Record a TRUNCATE for the relation. Row payload is empty — the
-    /// accelerator path applies it as an unconditional delete-all.
-    pub fn push_truncate(&mut self, _relation: &Relation) {
-        self.changes.push(DecodedChange {
-            op: ChangeOp::Truncate,
-            row: TupleData { columns: vec![] },
-        });
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.changes.is_empty()
-    }
-}
-
 /// Resolve `Value::Unchanged` (`TOAST`ed columns omitted from an UPDATE's new
 /// tuple) by substituting the value from the old tuple, when `REPLICA
 /// IDENTITY FULL` provides one — for an *unchanged* column, the old value IS

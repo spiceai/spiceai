@@ -38,8 +38,8 @@ use arrow::array::{Array, AsArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use data_components::cdc::{ChangeEnvelope, ChangesStream};
 use data_components::postgres_replication::{
-    PgOutputFormat, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput, config,
-    start_replication_stream,
+    PgOutputFormat, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
+    SchemaEvolutionPolicy, config, start_replication_stream,
 };
 use futures::StreamExt;
 use secrecy::SecretString;
@@ -91,8 +91,10 @@ fn input_for(port: u16, table: &str) -> ReplicationStreamInput {
     input_with_schema(port, table, dataset_schema())
 }
 
-/// A non-shared dataset on its own slot/publication (`shared: false`), for the
-/// mixed-mode coexistence test.
+/// A dataset on its own dedicated slot/publication (`shared: false`), for the
+/// mixed-mode coexistence test. Note `shared: false` now selects only
+/// slot/publication *naming* (a per-dataset slot), not a separate apply path —
+/// every dataset runs on the shared pump, this one just as a one-member source.
 fn independent_input(port: u16, table: &str) -> ReplicationStreamInput {
     let mut params = shared_params(port);
     params.slot_name = INDEP_SLOT.into();
@@ -106,6 +108,7 @@ fn independent_input(port: u16, table: &str) -> ReplicationStreamInput {
         schema_name: "public".into(),
         table_name: table.to_string(),
         metrics: ReplicationMetricsCollector::new(),
+        policy: SchemaEvolutionPolicy::Block,
     }
 }
 
@@ -118,6 +121,7 @@ fn input_with_schema(port: u16, table: &str, schema: SchemaRef) -> ReplicationSt
         schema_name: "public".into(),
         table_name: table.to_string(),
         metrics: ReplicationMetricsCollector::new(),
+        policy: SchemaEvolutionPolicy::Block,
     }
 }
 
