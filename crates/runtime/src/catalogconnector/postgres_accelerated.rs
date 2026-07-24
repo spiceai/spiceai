@@ -254,7 +254,8 @@ impl AccelerationSummary {
     /// The single startup summary line, naming the shared slot and breaking the
     /// accelerated count down by acceleration kind. Closes with an explicit note
     /// that table discovery is one-shot (a documented non-goal: tables added to
-    /// the source after startup are not picked up until spice restarts).
+    /// the source after startup are not picked up until the Spice runtime is
+    /// restarted).
     fn summary_message(&self, catalog_name: &str, slot_name: &str) -> String {
         // Only mention views when there are some, so the common (view-free) case
         // stays terse.
@@ -267,7 +268,7 @@ impl AccelerationSummary {
             String::new()
         };
         format!(
-            "Catalog '{catalog_name}': accelerating {} table(s) via CDC ({} via primary key, {} via REPLICA IDENTITY USING INDEX, {} via REPLICA IDENTITY FULL; shared replication slot '{slot_name}'); {} table(s) excluded by include/exclude filters; {} table(s) skipped (no usable replica identity -- see warnings);{views_clause} tables are discovered once at startup -- tables added to the source afterward are not picked up until spice restarts.",
+            "Catalog '{catalog_name}': accelerating {} table(s) via CDC ({} via primary key, {} via REPLICA IDENTITY USING INDEX, {} via REPLICA IDENTITY FULL; shared replication slot '{slot_name}'); {} table(s) excluded by include/exclude filters; {} table(s) skipped (no usable replica identity -- see warnings);{views_clause} tables are discovered once at startup -- tables added to the source afterward are not picked up until the Spice runtime (spiced) is restarted.",
             self.accelerated_total(),
             self.primary_key,
             self.unique_index,
