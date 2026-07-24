@@ -148,10 +148,12 @@ type RouteMap = FxHashMap<RelationId, Route>;
 /// `FxHashMap` for the same hot-path reason as [`RouteMap`].
 type TxnBuffer = FxHashMap<RelationId, Vec<Bytes>>;
 
-/// Pump-local, per-member schema-evolution state. Rebuilt on every reconnect
-/// (mirrors the per-connection tracker the former dedicated path kept), so an
-/// adopted column is re-derived from the source `Relation` after each reconnect
-/// rather than persisted across the WAL gap.
+/// Pump-local, per-member schema-evolution state. Held in a map that PERSISTS
+/// across reconnects (see `run_pump`, matching the former dedicated path): an
+/// adopted mid-stream column add / lossless widening must survive a transient
+/// disconnect, or the first `Relation` after reconnect (a tracker "first
+/// observation") would fail to re-adopt it and silently drop the column's
+/// values. A removed member's entry is cleared in [`handle_relation`].
 #[derive(Default)]
 struct MemberSchemaState {
     /// Adopts mid-stream widening under a non-[`SchemaEvolutionPolicy::Block`]
@@ -1173,6 +1175,20 @@ async fn run_pump(source: Arc<SharedSource>) {
     // When the stream dropped (set as the inner loop breaks to reconnect); consumed
     // on the next successful connect to attribute the disconnected duration.
     let mut disconnect_at: Option<std::time::Instant> = None;
+    // Per-member schema-evolution state. PERSISTS across reconnects (declared
+    // OUTSIDE the reconnect loop, matching the former dedicated path). A
+    // mid-stream column add / lossless widening is adopted only on the *second*
+    // `Relation` for a member — the first is the baseline. If this were rebuilt
+    // per reconnect, the first `Relation` after a transient disconnect would be
+    // a fresh "first observation" and would NOT re-adopt an already-adopted
+    // column, silently dropping its values until the next schema change. Keeping
+    // the tracker (and its widened working schema) across reconnects means
+    // `handle_relation` reseeds each rebuilt route's `working_schema` from it, so
+    // an adopted column survives a reconnect; pre-evolution WAL replayed after a
+    // reconnect null-fills the (nullable) added column correctly. `routes` is
+    // still rebuilt per connection; a removed member's entry is cleared in
+    // `handle_relation`.
+    let mut schema_state: MemberSchemaStates = MemberSchemaStates::default();
 
     'reconnect: loop {
         if crate::cdc::shutdown_epoch() != shutdown_epoch {
@@ -1254,10 +1270,6 @@ async fn run_pump(source: Arc<SharedSource>) {
         // here (once, at Relation time) keeps the per-event route lookup a bare
         // `u32` hash — no `members` mutex, no `(String, String)` hash on the hot path.
         let mut routes: RouteMap = RouteMap::default();
-        // Per-member schema-evolution state, rebuilt each reconnect alongside
-        // `routes` (the source re-sends `Relation` messages after every
-        // reconnect, re-deriving any adopted widening — see `handle_relation`).
-        let mut schema_state: MemberSchemaStates = MemberSchemaStates::default();
         // Raw pgoutput change-message bytes, buffered per relation as the pump
         // routes them (no tuple decode on this shared task). The per-dataset
         // consumer decodes + builds them (see `PgChangeRows`).
@@ -2189,7 +2201,7 @@ mod tests {
         assert_eq!(working(&routes), vec!["id".to_string()]);
 
         // Mid-stream ALTER adds `name` (text): the shared pump must adopt it.
-        let name_col = Column {
+        let name_col = || Column {
             is_key: false,
             name: "name".into(),
             type_oid: 25,
@@ -2200,13 +2212,34 @@ mod tests {
             &mut decoder,
             &mut routes,
             &mut schema_state,
-            rel(vec![id_col(), name_col]),
+            rel(vec![id_col(), name_col()]),
         )
         .await;
         assert_eq!(
             working(&routes),
             vec!["id".to_string(), "name".to_string()],
             "shared pump adopted the mid-stream column add under append_new_columns"
+        );
+
+        // Simulate a transient reconnect: the pump rebuilds `routes` per
+        // connection but `schema_state` PERSISTS (declared outside the reconnect
+        // loop in run_pump). The first Relation after reconnect already carries
+        // `name` (the stream resumed past the ALTER) — a tracker "first
+        // observation" that on its own would NOT adopt an added column. The
+        // persisted tracker must keep the adoption so the column is not dropped.
+        routes.clear();
+        handle_relation(
+            &source,
+            &mut decoder,
+            &mut routes,
+            &mut schema_state,
+            rel(vec![id_col(), name_col()]),
+        )
+        .await;
+        assert_eq!(
+            working(&routes),
+            vec!["id".to_string(), "name".to_string()],
+            "adopted column survives a reconnect because schema_state persists across the WAL gap"
         );
     }
 
