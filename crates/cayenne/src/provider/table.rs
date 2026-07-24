@@ -39873,10 +39873,17 @@ mod tests {
     /// leaves a recoverable WAL and that recovery clears it.
     fn count_staging_wals(provider: &CayenneTableProvider) -> usize {
         fn walk(dir: &std::path::Path, count: &mut usize) {
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                return;
+            // A missing directory means no staging WALs live under it — a
+            // legitimate zero (e.g. the table dir before any staged write). Any
+            // OTHER read error must fail the test rather than silently undercount
+            // and let a real leftover WAL be misreported as 0.
+            let entries = match std::fs::read_dir(dir) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+                Err(e) => panic!("count_staging_wals: read_dir({}) failed: {e}", dir.display()),
             };
-            for entry in entries.flatten() {
+            for entry in entries {
+                let entry = entry.expect("count_staging_wals: read staging directory entry");
                 let path = entry.path();
                 if path.is_dir() {
                     walk(&path, count);
