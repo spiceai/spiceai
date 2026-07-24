@@ -148,6 +148,52 @@ async fn replication_slot_count(port: usize) -> Result<i64, anyhow::Error> {
     Ok(count)
 }
 
+/// All replication slot names on the source database, sorted -- used to assert a
+/// restart REUSES the catalog's deterministic slot (the set stays `[expected]`)
+/// rather than orphaning it and creating a second one.
+async fn replication_slot_names(port: usize) -> Result<Vec<String>, anyhow::Error> {
+    let pool = common::get_postgres_connection_pool(port, None).await?;
+    let conn = pool
+        .connect_direct()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let rows = conn
+        .conn
+        .query(
+            "SELECT slot_name FROM pg_replication_slots ORDER BY slot_name",
+            &[],
+        )
+        .await?;
+    Ok(rows.iter().map(|row| row.get(0)).collect())
+}
+
+/// Whether the named replication slot exists and is currently `active` (held by
+/// a live consumer). `None` when the slot does not exist.
+async fn slot_active(port: usize, slot_name: &str) -> Result<Option<bool>, anyhow::Error> {
+    let pool = common::get_postgres_connection_pool(port, None).await?;
+    let status = replication_slot_status(&pool, slot_name)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(status.map(|s| s.active))
+}
+
+/// Lower the source's `wal_sender_timeout` so the catalog's bounded
+/// slot-in-use wait (sized from it) stays short in the fail-loud test. Applied
+/// via `ALTER SYSTEM` + reload, so it takes effect for walsenders started after.
+async fn set_wal_sender_timeout(port: usize, value: &str) -> Result<(), anyhow::Error> {
+    let pool = common::get_postgres_connection_pool(port, None).await?;
+    let conn = pool
+        .connect_direct()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    conn.conn
+        .simple_query(&format!(
+            "ALTER SYSTEM SET wal_sender_timeout = '{value}'; SELECT pg_reload_conf();"
+        ))
+        .await?;
+    Ok(())
+}
+
 /// Build a `PostgreSQL` catalog with catalog-level CDC acceleration enabled.
 fn accelerated_pg_catalog(port: usize) -> Catalog {
     let mut catalog = Catalog::new("pg:postgres".to_string(), CATALOG_NAME.to_string());
@@ -786,6 +832,192 @@ async fn test_check_cdc_prerequisites_rejects_non_replication_role() -> Result<(
             anyhow::ensure!(
                 message.contains("replication") && message.contains("norepl"),
                 "expected error naming the replication privilege and role, got: {message}"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// Restart/recovery: the catalog's replication slot name is derived
+/// deterministically from the catalog and is INDEPENDENT of the Spice instance,
+/// so a restart -- even one that would reschedule onto a different host --
+/// recomputes the same name and REUSES the existing slot rather than orphaning
+/// it and creating a second. The slot persists across the shutdown, and a change
+/// made to the source while Spice is down is reflected after it comes back
+/// (#11850; feeds slot-lifecycle #12018).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_catalog_acceleration_reuses_slot_across_restart() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,info,runtime::catalogconnector=debug",
+    ));
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+
+            seed_tables(port).await?;
+
+            let expected_slot = catalog_slot_name(CATALOG_NAME);
+
+            // First run: bootstrap + stream.
+            let rt = start_runtime(accelerated_pg_catalog(port)).await?;
+            wait_for_table_ready(&rt, "orders").await?;
+
+            // Exactly one slot, named deterministically from the catalog (with no
+            // instance component).
+            let slots = replication_slot_names(port).await?;
+            anyhow::ensure!(
+                slots == vec![expected_slot.clone()],
+                "expected exactly one catalog slot '{expected_slot}', got {slots:?}"
+            );
+
+            // Shut the runtime down -- simulating a restart / reschedule.
+            rt.shutdown().await;
+            drop(rt);
+
+            // The slot must PERSIST across shutdown (it is not a temporary slot)
+            // and go inactive once the walsender exits -- that is what lets the
+            // restart resume it instead of re-creating it. Allow up to the
+            // server's wal_sender_timeout in case the connection isn't torn down
+            // gracefully.
+            let freed = wait_until_true(Duration::from_secs(90), || {
+                let slot = expected_slot.clone();
+                async move { matches!(slot_active(port, &slot).await, Ok(Some(false))) }
+            })
+            .await;
+            anyhow::ensure!(
+                freed,
+                "slot '{expected_slot}' never became inactive after shutdown"
+            );
+            let during_downtime = replication_slot_names(port).await?;
+            anyhow::ensure!(
+                during_downtime == vec![expected_slot.clone()],
+                "slot must persist across shutdown, got {during_downtime:?}"
+            );
+
+            // Mutate the source while Spice is down.
+            let pool = common::get_postgres_connection_pool(port, None).await?;
+            let conn = pool
+                .connect_direct()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            conn.conn
+                .simple_query("INSERT INTO orders (id, customer) VALUES (3, 'carol-offline');")
+                .await?;
+
+            // Restart with the SAME catalog config -> same deterministic slot.
+            let rt = start_runtime(accelerated_pg_catalog(port)).await?;
+            wait_for_table_ready(&rt, "orders").await?;
+
+            // Still exactly one slot, same name: the restart REUSED it. An
+            // instance-dependent name would have left the first orphaned and
+            // created a second here.
+            let slots_after = replication_slot_names(port).await?;
+            anyhow::ensure!(
+                slots_after == vec![expected_slot.clone()],
+                "restart must reuse the single catalog slot, got {slots_after:?}"
+            );
+
+            // The offline INSERT is reflected after restart -> no data lost across
+            // the restart (the reused slot's retained WAL replayed, or the
+            // accelerator re-snapshotted -- either way it converges).
+            let orders_count_sql =
+                format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.orders");
+            let converged = wait_until_true(Duration::from_mins(2), || {
+                let rt = Arc::clone(&rt);
+                let sql = orders_count_sql.clone();
+                async move { query_i64(&rt, &sql).await == Some(3) }
+            })
+            .await;
+            anyhow::ensure!(
+                converged,
+                "offline INSERT not reflected after restart: count={:?}",
+                query_i64(&rt, &orders_count_sql).await
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// Two Spice instances pointed at the same catalog resolve to the SAME
+/// deterministic slot name. `PostgreSQL` permits only one consumer per slot, so
+/// the second instance must FAIL LOUDLY rather than silently compete for the
+/// first's stream. (A fast self-restart is distinguished from this by the
+/// bounded wait -- exercised by `test_catalog_acceleration_reuses_slot_across_restart`.)
+#[tokio::test(flavor = "multi_thread")]
+async fn test_catalog_acceleration_fails_loud_when_slot_already_active()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,info,runtime::catalogconnector=debug",
+    ));
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+
+            seed_tables(port).await?;
+
+            // The second instance's slot-in-use wait is sized from
+            // wal_sender_timeout; lower it so the test fails fast. 10s stays well
+            // above the CDC keepalive round-trip, so instance A's own walsender is
+            // not killed, while bounding instance B's wait to ~15s.
+            set_wal_sender_timeout(port, "10s").await?;
+
+            let expected_slot = catalog_slot_name(CATALOG_NAME);
+
+            // Instance A acquires and actively holds the slot.
+            let rt_a = start_runtime(accelerated_pg_catalog(port)).await?;
+            wait_for_table_ready(&rt_a, "orders").await?;
+            anyhow::ensure!(
+                matches!(slot_active(port, &expected_slot).await?, Some(true)),
+                "instance A should hold the slot active"
+            );
+
+            // Instance B, same catalog -> same slot -> must fail loudly. Use
+            // build_and_load_runtime (no readiness assertion): B's catalog is
+            // expected to error, leaving its runtime not-ready by design.
+            let rt_b = build_and_load_runtime(accelerated_pg_catalog(port)).await?;
+            let errored = wait_until_true(Duration::from_mins(1), || {
+                let rt_b = Arc::clone(&rt_b);
+                async move {
+                    rt_b.status()
+                        .get_catalog_statuses()
+                        .get(CATALOG_NAME)
+                        .is_some_and(|s| matches!(s, ComponentStatus::Error(_)))
+                }
+            })
+            .await;
+            anyhow::ensure!(
+                errored,
+                "second instance should fail loudly on the in-use slot, got {:?}",
+                rt_b.status().get_catalog_statuses().get(CATALOG_NAME)
+            );
+            match rt_b.status().get_catalog_statuses().get(CATALOG_NAME) {
+                Some(ComponentStatus::Error(Some(message))) => {
+                    anyhow::ensure!(
+                        message.contains("already in use"),
+                        "error should name the in-use slot, got: {message}"
+                    );
+                }
+                other => anyhow::bail!(
+                    "second instance should be in an Error state with an actionable message, got {other:?}"
+                ),
+            }
+
+            // Instance A is unaffected -- still the single active consumer, still
+            // serving its accelerated tables.
+            anyhow::ensure!(
+                replication_slot_names(port).await? == vec![expected_slot.clone()],
+                "there must still be exactly one slot"
+            );
+            let count_sql = format!("SELECT COUNT(*) AS n FROM {CATALOG_NAME}.public.orders");
+            anyhow::ensure!(
+                query_i64(&rt_a, &count_sql).await == Some(2),
+                "instance A must keep serving its accelerated tables"
             );
 
             Ok(())

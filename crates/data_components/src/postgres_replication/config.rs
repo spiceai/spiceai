@@ -357,12 +357,12 @@ const CATALOG_SLOT_NAME_PORTION_MAX: usize =
 ///     node) recomputes the identical name and *reuses* the existing replication
 ///     slot rather than orphaning it and re-snapshotting from scratch;
 ///   - independent of the Spice instance/host -- two nodes configured with the
-///     same catalog resolve to the same slot name. Since PostgreSQL permits only
-///     one consumer per slot, the catalog acceleration path fails loudly at
+///     same catalog resolve to the same slot name. Since `PostgreSQL` permits
+///     only one consumer per slot, the catalog acceleration path fails loudly at
 ///     startup when the slot is already actively held by another consumer (see
 ///     `AcceleratedCatalogProvider::refresh`), rather than silently competing for
 ///     it. No slot identity is persisted by Spice: the name is a pure function of
-///     the catalog name, and the durable state is the PostgreSQL slot itself.
+///     the catalog name, and the durable state is the `PostgreSQL` slot itself.
 ///
 /// `catalog_hash` is a short hash of the *full* catalog name so two long names
 /// that share a truncated sanitized prefix still produce distinct slot names.
@@ -783,9 +783,16 @@ mod tests {
         // instance hash `default_slot_name` appends.
         let catalog = catalog_slot_name("orders");
         let dataset = default_slot_name("orders");
+        // Different from the per-dataset slot, and using the dedicated
+        // `spice_catalog_` prefix rather than the per-dataset `spice_` format.
+        // (`spice_catalog_` does start with `spice_`, so a `!starts_with(SLOT_PREFIX)`
+        // check would be wrong -- the distinguishing property is the catalog prefix.)
         assert_ne!(catalog, dataset);
-        assert!(!catalog.starts_with(SLOT_PREFIX), "got {catalog}");
         assert!(catalog.starts_with(CATALOG_SLOT_PREFIX), "got {catalog}");
+        // The per-dataset slot ends in the 8-hex instance hash; the catalog slot
+        // ends in a 6-hex catalog-name hash and has no instance component.
+        let catalog_suffix = catalog.rsplit_once('_').expect("has a suffix").1;
+        assert_eq!(catalog_suffix.len(), DATASET_HASH_LEN, "got {catalog}");
     }
 
     #[test]
