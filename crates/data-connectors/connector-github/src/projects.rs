@@ -18,7 +18,7 @@ use runtime::dataconnector::ConnectorComponent;
 
 use super::{GitHubTableArgs, GitHubTableGraphQLParams};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use data_components::graphql::{ErrorChecker, GraphQLContext, client::UnnestBehavior};
+use connector_graphql::graphql::{ErrorChecker, GraphQLContext, client::UnnestBehavior};
 use http::{HeaderMap, HeaderValue};
 use serde_json::Value;
 use std::sync::Arc;
@@ -55,7 +55,7 @@ impl GraphQLContext for ProjectsTableArgs {
                 );
 
                 // First check standard GitHub errors (rate limits, etc.)
-                data_components::github::error_checker(headers, response)?;
+                crate::github::error_checker(headers, response)?;
 
                 // GitHub bug: When the app doesn't have access to Projects v2, GitHub sometimes
                 // returns "Something went wrong while executing your query" instead of a proper
@@ -75,7 +75,7 @@ impl GraphQLContext for ProjectsTableArgs {
                                 tracing::error!(
                                     "GitHub returned a misleading projects error for {target}; treating it as a permissions failure"
                                 );
-                                return Err(data_components::graphql::Error::InvalidCredentialsOrPermissions {
+                                return Err(connector_graphql::graphql::Error::InvalidCredentialsOrPermissions {
                                 message: format!("Failed to access {target_kind} for {target}: GitHub reported an internal query error, which usually means the GitHub App lacks project read permissions. Verify the app has the required project access."),
                             });
                             }

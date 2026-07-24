@@ -59,7 +59,7 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 
 use super::url::DriveRef;
-use crate::resilient_http::read_bounded_error_body;
+use data_components::resilient_http::read_bounded_error_body;
 
 /// SharePoint cap on a single `PUT /content` is 4 MiB. We use a slightly lower
 /// threshold to leave headroom for request headers/overhead.
@@ -1336,8 +1336,8 @@ mod tests {
     //
     // Run the full suite (including ignored ones) via:
     //
-    //     cargo test --release -p data_components \
-    //         --features sharepoint,sharepoint-mock-host \
+    //     cargo test --release -p connector-sharepoint \
+    //         --features sharepoint-mock-host \
     //         --no-default-features \
     //         sharepoint::object_store::tests::mock_http -- --include-ignored
     #[cfg(feature = "sharepoint-mock-host")]
@@ -1510,7 +1510,7 @@ mod tests {
         }"#;
 
         #[test]
-        #[ignore = "graph-rs-sdk + reqwest debug-build async state machines blow the tokio worker stack; run with --release: cargo test --release -p data_components --features sharepoint,sharepoint-mock-host --no-default-features -- --ignored sharepoint::object_store::tests::mock_http"]
+        #[ignore = "graph-rs-sdk + reqwest debug-build async state machines blow the tokio worker stack; run with --release: cargo test --release -p connector-sharepoint --features sharepoint-mock-host -- --ignored sharepoint::object_store::tests::mock_http"]
         fn head_parses_drive_item_metadata() {
             run_async(async {
                 let (url, count, _captured) = start_mock(vec![MockResp::ok_json(HEAD_JSON)]).await;
