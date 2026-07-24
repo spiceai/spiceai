@@ -1237,7 +1237,7 @@ impl DataSink for CayennePartitionedAppendSink {
             // catalog pointers and safely recognizes these as committed if cleanup
             // is interrupted.
             for receipt in &prepared {
-                if let Err(error) = receipt.remove_deferred_snapshot_wal().await {
+                if let Err(error) = receipt.remove_committed_staging_wal().await {
                     tracing::warn!(
                         table_id = receipt.table_id(),
                         %error,
