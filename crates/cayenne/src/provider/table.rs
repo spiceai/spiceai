@@ -39905,7 +39905,10 @@ mod tests {
             let entries = match std::fs::read_dir(dir) {
                 Ok(entries) => entries,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-                Err(e) => panic!("count_staging_wals: read_dir({}) failed: {e}", dir.display()),
+                Err(e) => panic!(
+                    "count_staging_wals: read_dir({}) failed: {e}",
+                    dir.display()
+                ),
             };
             for entry in entries {
                 let entry = entry.expect("count_staging_wals: read staging directory entry");
