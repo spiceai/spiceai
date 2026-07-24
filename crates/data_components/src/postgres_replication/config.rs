@@ -243,6 +243,12 @@ impl SslMode {
 ///
 /// which keeps the final identifier under the limit.
 const PG_IDENTIFIER_MAX_BYTES: usize = 63;
+
+/// Reserved by `PostgreSQL` for the conflict-detection replication slot
+/// (`CONFLICT_DETECTION_SLOT` in `src/include/replication/slot.h`). Rejected
+/// the same way as `ReplicationSlotValidateNameInternal(..., allow_reserved_name=false)`.
+const CONFLICT_DETECTION_SLOT: &str = "pg_conflict_detection";
+
 const SLOT_PREFIX: &str = "spice_";
 const SLOT_HASH_LEN: usize = 8;
 const DATASET_HASH_LEN: usize = 6;
@@ -252,6 +258,50 @@ const SLOT_DATASET_PORTION_MAX: usize =
 /// Max sanitized-dataset bytes for a publication name: 63 − (6 + 1 + 6 + 1 + 3) = 46.
 const PUB_DATASET_PORTION_MAX: usize =
     PG_IDENTIFIER_MAX_BYTES - SLOT_PREFIX.len() - 1 - DATASET_HASH_LEN - 1 - 3;
+
+/// Validates a `PostgreSQL` replication slot name.
+///
+/// Mirrors `ReplicationSlotValidateNameInternal` in `PostgreSQL` `slot.c`:
+/// names must match `[a-z0-9_]{1,NAMEDATALEN-1}` (`NAMEDATALEN` is 64, so at
+/// most 63 bytes) and must not be the reserved conflict-detection slot
+/// (`pg_conflict_detection`).
+///
+/// # Errors
+///
+/// Returns a short reason suitable for prefixing with the user-facing parameter
+/// name, for example: parameter `pg_replication_slot` must be …
+pub fn validate_replication_slot_name(name: &str) -> Result<(), String> {
+    // Postgres uses `strlen` (byte length). Slot names are ASCII-only when
+    // valid, so byte length equals char length for accepted names; reject
+    // overlong UTF-8 by bytes the same way the server would.
+    if name.is_empty() {
+        return Err(format!(
+            "must be 1 to {PG_IDENTIFIER_MAX_BYTES} bytes matching [a-z0-9_], got {name:?}"
+        ));
+    }
+    if name.len() > PG_IDENTIFIER_MAX_BYTES {
+        return Err(format!(
+            "must be at most {PG_IDENTIFIER_MAX_BYTES} bytes, got {} bytes in {name:?}",
+            name.len()
+        ));
+    }
+    if let Some(invalid) = name
+        .chars()
+        .find(|c| !matches!(c, 'a'..='z' | '0'..='9' | '_'))
+    {
+        return Err(format!(
+            "must contain only lowercase letters, numbers, and underscores ([a-z0-9_]), \
+             found invalid character {invalid:?} in {name:?}"
+        ));
+    }
+    if name == CONFLICT_DETECTION_SLOT {
+        return Err(format!(
+            "must not use the reserved name {CONFLICT_DETECTION_SLOT:?} \
+             (reserved by PostgreSQL for conflict detection)"
+        ));
+    }
+    Ok(())
+}
 
 /// Build a default slot name:
 /// `spice_{sanitized_dataset}_{dataset_suffix}_{instance_suffix}`.
@@ -721,5 +771,72 @@ mod tests {
         let b = format!("{shared_prefix}_beta");
         assert_ne!(default_slot_name(&a), default_slot_name(&b));
         assert_ne!(default_publication_name(&a), default_publication_name(&b));
+    }
+
+    #[test]
+    fn validate_replication_slot_name_accepts_valid_names() {
+        for name in [
+            "a",
+            "spice_users",
+            "slot_1",
+            "9leading_digit_ok",
+            "a_b_c_012",
+            &"x".repeat(PG_IDENTIFIER_MAX_BYTES),
+        ] {
+            assert!(
+                validate_replication_slot_name(name).is_ok(),
+                "expected {name:?} to be valid"
+            );
+        }
+    }
+
+    // Mirrors ReplicationSlotValidateNameInternal in PostgreSQL slot.c
+    // (empty / too long / invalid char / reserved name).
+    #[test]
+    fn validate_replication_slot_name_rejects_postgres_invalid() {
+        assert!(
+            validate_replication_slot_name("")
+                .expect_err("empty")
+                .contains("must be 1 to")
+        );
+        let too_long = "a".repeat(PG_IDENTIFIER_MAX_BYTES + 1);
+        assert!(
+            validate_replication_slot_name(&too_long)
+                .expect_err("too long")
+                .contains("must be at most")
+        );
+        let hyphen_err =
+            validate_replication_slot_name("scp-onboarding-realtime-analytics-prod-us-east-1")
+                .expect_err("hyphen");
+        assert!(
+            hyphen_err.contains("invalid character '-'"),
+            "unexpected: {hyphen_err}"
+        );
+        for (name, needle) in [
+            ("MySlot", "invalid character 'M'"),
+            ("slot.name", "invalid character '.'"),
+            ("slot/name", "invalid character '/'"),
+            ("slot name", "invalid character ' '"),
+            (CONFLICT_DETECTION_SLOT, "reserved name"),
+        ] {
+            let err = validate_replication_slot_name(name).expect_err(name);
+            assert!(
+                err.contains(needle),
+                "for {name:?}: expected {needle:?} in {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_slot_names_pass_postgres_validation() {
+        for dataset in ["users", "public.orders", "my-dataset", "9leading", ""] {
+            let slot = default_slot_name(dataset);
+            validate_replication_slot_name(&slot)
+                .unwrap_or_else(|e| panic!("default slot `{slot}` for {dataset:?} invalid: {e}"));
+        }
+        let long = "a".repeat(120);
+        let slot = default_slot_name(&long);
+        validate_replication_slot_name(&slot)
+            .unwrap_or_else(|e| panic!("truncated default slot `{slot}` invalid: {e}"));
     }
 }
