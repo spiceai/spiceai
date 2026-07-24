@@ -918,12 +918,11 @@ impl PreparedStagedAppend {
     }
 
     /// Remove this append's staging WAL after its committed protected-snapshot
-    /// has been finalized (its replacement files are durably in the target
-    /// snapshot). Used both by the cross-partition coordinator — after the
-    /// coordinated multi-partition commit — and by the single-table CDC upsert
-    /// finalize (`CayenneCdcWrite::finish`), which must clear its own WAL because
-    /// `apply_under_held_barrier` removes the WAL only for `CurrentSnapshot`
-    /// targets (see issue #12027).
+    /// has been finalized (replacement files durably in the target snapshot).
+    /// Called by the cross-partition coordinator after its multi-partition
+    /// commit and by the single-table CDC upsert finalize (`CayenneCdcWrite::finish`),
+    /// since `apply_under_held_barrier` removes the WAL only for `CurrentSnapshot`
+    /// targets.
     ///
     /// Callers treat failure as best-effort recoverable maintenance: the append
     /// is already durably committed, so a failed WAL removal must NOT turn it
@@ -1690,18 +1689,14 @@ impl CayenneTableProvider {
     /// append (roll BACK) — or, for a genuinely ambiguous / torn write, refuses
     /// and returns [`Error::IncompleteWrite`] so an operator can intervene.
     ///
-    /// ## Why this can never double-publish or roll back a *committed* append (issue #12027)
+    /// ## Why this can never double-publish or roll back a *committed* append
     ///
-    /// The finalize path clears a committed append's staging WAL itself — the
-    /// single-table CDC upsert in `CayenneCdcWrite::finish` and the current-snapshot
-    /// path in `apply_under_barrier`, plus the cross-partition coordinator after its
-    /// commit — so in steady state recovery normally finds nothing. It still fires
-    /// for genuinely interrupted writes (a crash between the durable move and the
-    /// WAL removal), for the cross-partition coordinator's brief post-commit window,
-    /// and if a best-effort WAL removal fails. Even when it does roll a *committed*
-    /// `ProtectedSnapshot` append forward, that is safe because of a layered
-    /// invariant — proven by
-    /// `issue_12027_recovery_rolls_committed_protected_snapshot_forward_exactly_once`:
+    /// Finalize normally clears a committed append's WAL itself, so recovery
+    /// fires only for interrupted writes (a crash between the durable move and
+    /// the WAL removal), the cross-partition coordinator's brief post-commit
+    /// window, or a failed best-effort WAL removal. Even when it rolls a
+    /// *committed* `ProtectedSnapshot` append forward, a layered invariant keeps
+    /// that safe:
     ///
     /// 1. **In-flight registration covers the entire live-finalize window.**
     ///    `CayenneStagedAppend::prepare` registers the append in-flight *before*

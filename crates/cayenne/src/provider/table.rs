@@ -424,12 +424,10 @@ impl CayenneCdcWrite {
                 // `publish_apply_move`: the staged-file MOVE into the snapshot dir
                 // (object-store / fs rename + parent-dir fsync), under the held
                 // fence. This is the real I/O of the publish — on EBS the dir
-                // fsync is a device flush. (For this protected-snapshot target the
-                // move is all `apply_under_held_barrier` does — the current-snapshot
-                // list-files-cache delta-apply is `CurrentSnapshot`-only, and this
-                // overlay leaves the current pointer unchanged. The staging-WAL
-                // removal, also `CurrentSnapshot`-only in that method, is done
-                // explicitly for this path in the block right after the move.)
+                // fsync is a device flush. For this protected-snapshot target the
+                // move is all `apply_under_held_barrier` does (the list-files-cache
+                // delta-apply and staging-WAL removal are `CurrentSnapshot`-only);
+                // the WAL is removed for this path in the block right after.
                 let apply_move_start = Instant::now();
                 prepared_append.apply_under_held_barrier().await?;
                 record_cayenne_write_phase(
@@ -438,29 +436,14 @@ impl CayenneCdcWrite {
                     apply_move_start,
                 );
 
-                // Remove this single-table upsert's protected-snapshot staging
-                // WAL now that the move above has made the replacement files
-                // durable in the target snapshot. `apply_under_held_barrier`
-                // removes the WAL only for `CurrentSnapshot` targets — pre-#11803
-                // it removed unconditionally, but #11803 gated it so the
-                // cross-partition coordinator could hold the WAL across its
-                // multi-partition commit (and remove it explicitly afterward via
-                // `remove_committed_staging_wal`). The single-table upsert path
-                // never got a compensating removal, so it leaked the WAL for the
-                // next write's `ensure_no_incomplete_write` to roll forward —
-                // issue #12027 (recurring benign recoveries + a per-write pre-gate
-                // readdir under sustained CDC load). Clearing it here restores the
-                // pre-#11803 steady state for this path without touching the
-                // cross-partition coordinator (a different call site).
-                //
-                // Best-effort by design: this append is ALREADY durably committed
-                // (its `snapshot_sequence` landed synchronously in Stage A and its
-                // replacement files are now durable), so a failed WAL unlink must
-                // NOT fail the write. On failure the WAL stays on disk and the
-                // next write's recovery rolls it forward idempotently — the exact
-                // pre-fix behavior. Runs under the held visibility lock + listing
-                // fence, mirroring the `CurrentSnapshot` removal in
-                // `apply_under_barrier`.
+                // Remove this protected-snapshot append's staging WAL now that
+                // the move has made its replacement files durable in the target
+                // snapshot (`apply_under_held_barrier` removes the WAL only for
+                // `CurrentSnapshot` targets). Best-effort: the append is already
+                // durably committed (its `snapshot_sequence` is durable from Stage
+                // A), so a failed unlink must NOT fail the write — the leftover WAL
+                // is rolled forward idempotently by the next write's
+                // `ensure_no_incomplete_write`.
                 if let Err(error) = prepared_append.remove_committed_staging_wal().await {
                     tracing::debug!(
                         table = self.table.table_name(),
