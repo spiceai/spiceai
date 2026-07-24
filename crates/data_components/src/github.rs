@@ -1498,11 +1498,12 @@ impl GithubRestClient {
             page += 1;
         }
 
-        // Fetch logs for each run if requested. Downloads run concurrently in
-        // bounded chunks (mirroring fetch_files) instead of one serial request per
-        // run; the shared rate limiter still throttles overall throughput. Per-run
-        // failures stay non-fatal: that run gets an empty logs map, exactly as before,
-        // and the run_id key preserves the association regardless of completion order.
+        // Fetch logs for each run if requested. Each run's logs are downloaded
+        // concurrently in bounded chunks (mirroring fetch_files) instead of one
+        // serial request per run; the shared rate limiter still throttles overall
+        // throughput. Per-run failures stay non-fatal: that run gets an empty logs
+        // map, exactly as before, and the run_id key preserves the association
+        // regardless of completion order.
         let run_logs = if fetch_logs {
             let mut logs_map = std::collections::HashMap::new();
             for chunk in all_runs.chunks(NUM_FILE_CONTENT_DOWNLOAD_WORKERS) {
