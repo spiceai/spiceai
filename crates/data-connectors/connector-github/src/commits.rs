@@ -22,17 +22,14 @@ use super::{
     GitHubTableArgs, GitHubTableGraphQLParams, commits_inject_parameters, expr_to_match,
     filter_pushdown, inject_parameters, scalar_utf8_value,
 };
+use crate::github::{GithubRef, GithubRestClient, error_checker};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use data_components::{
-    github::{GithubRef, GithubRestClient, error_checker},
-    graphql::{
-        ErrorChecker, FilterPushdownResult, GraphQLContext, Result,
-        client::{
-            DuplicateBehavior, GraphQLClient, GraphQLQuery, UnnestBehavior,
-            unnest_json_object_to_depth,
-        },
-        provider::GraphQLTableProviderExec,
+use connector_graphql::graphql::{
+    ErrorChecker, FilterPushdownResult, GraphQLContext, Result,
+    client::{
+        DuplicateBehavior, GraphQLClient, GraphQLQuery, UnnestBehavior, unnest_json_object_to_depth,
     },
+    provider::GraphQLTableProviderExec,
 };
 use datafusion::{
     catalog::Session,
@@ -826,7 +823,7 @@ fn selected_ref_from_repository(
     match repository.get("selected_ref") {
         Some(Value::Object(selected_ref)) => Ok(Some(selected_ref)),
         Some(Value::Null) if repository.get("default_ref").is_some_and(Value::is_object) => {
-            Err(data_components::graphql::Error::ResourceNotFound {
+            Err(connector_graphql::graphql::Error::ResourceNotFound {
                 message: "GitHub commits ref was not found or is not accessible. Verify the requested ref exists and is readable.".to_string(),
             })
         }

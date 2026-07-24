@@ -20,11 +20,13 @@ use globset::GlobSet;
 use serde_json::Value;
 use snafu::{ResultExt, Snafu};
 
-use crate::{arrow::write::MemTable, graphql, rate_limit::RateLimiter};
 use arrow::{
     array::{ArrayRef, Int64Builder, RecordBatch, StringBuilder, TimestampMillisecondBuilder},
     datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
 };
+use connector_graphql::graphql;
+use data_components::arrow::write::MemTable;
+use data_components::rate_limit::RateLimiter;
 use datafusion::{
     catalog::Session,
     datasource::{TableProvider, TableType},

@@ -21,13 +21,11 @@ use super::{
     GitHubQueryMode, GitHubTableArgs, GitHubTableGraphQLParams, filter_pushdown, inject_parameters,
     search_inject_parameters,
 };
+use crate::github::error_checker;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use data_components::{
-    github::error_checker,
-    graphql::{
-        ErrorChecker, FilterPushdownResult, GraphQLContext, Result,
-        client::{GraphQLQuery, UnnestBehavior},
-    },
+use connector_graphql::graphql::{
+    ErrorChecker, FilterPushdownResult, GraphQLContext, Result,
+    client::{GraphQLQuery, UnnestBehavior},
 };
 use datafusion::{logical_expr::TableProviderFilterPushDown, prelude::Expr};
 use std::sync::Arc;
