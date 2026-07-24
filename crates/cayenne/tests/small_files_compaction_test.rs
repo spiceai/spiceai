@@ -921,18 +921,224 @@ async fn run_compaction(table: &Arc<CayenneTableProvider>) -> bool {
         .expect("compaction must succeed in tests")
 }
 
-// --- Warm-subset compaction (key-delete / append-only path) -------------------
+// --- Subset current-snapshot rewrite + link_or_copy (P1-1) --------------------
 //
-// `compact_current_snapshot_small_files` rewrites only the picker subset and
-// hardlinks unpicked files, keeping merge-on-read deletions intact.
+// Pure gate branches live in unit tests (`subset_rewrite_eligibility_*`).
+// Here we cover the production compact API (append-only tables, which the
+// small-file path was restored for) and the hardlink helper used by subset.
+
+/// On Linux, return the inode of `path`, or `None` if the file is missing.
+#[cfg(target_os = "linux")]
+fn file_inode(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| m.ino())
+}
+
+test_with_backends!(compact_current_after_seed_then_more_preserves_all_rows);
+async fn compact_current_after_seed_then_more_preserves_all_rows(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Two-phase compact: seed → compact → more small files → compact again.
+    // Covers the production `compact_current_snapshot_small_files` entry
+    // (including write_amp logging + subset/full dispatch) end-to-end.
+    let schema = pk_schema();
+    let (table, ctx, table_id) = build_table(
+        &fixture,
+        "two_phase_compact",
+        Arc::clone(&schema),
+        None,
+        aggressive_compaction_config(),
+    )
+    .await;
+
+    let small_rows: i64 = 1500;
+    let seed_batches = 12_i64;
+    for batch_idx in 0..seed_batches {
+        common::insert_batch(
+            &table,
+            make_batch(&schema, batch_idx * small_rows, small_rows),
+        )
+        .await?;
+    }
+    let Some((_snap_a, files_a)) = wait_until_current_snapshot_compacts(
+        &table,
+        &fixture,
+        "two_phase_compact",
+        usize::try_from(seed_batches).expect("fits"),
+    )
+    .await?
+    else {
+        panic!("phase-A compact must fire");
+    };
+    assert!(files_a < usize::try_from(seed_batches).expect("fits"));
+
+    let more = 10_i64;
+    for batch_idx in 0..more {
+        let start = seed_batches * small_rows + batch_idx * small_rows;
+        common::insert_batch(&table, make_batch(&schema, start, small_rows)).await?;
+    }
+    let expected = small_rows * (seed_batches + more);
+    assert_eq!(count_rows(&ctx, "two_phase_compact").await, expected);
+
+    let snap_before = fixture
+        .catalog
+        .get_table("two_phase_compact")
+        .await?
+        .current_snapshot_id;
+    let files_before = count_vortex_files(&fixture.data_path, &table_id, &snap_before).await;
+
+    // Phase B: either an explicit compact reduces the file count, or post-write
+    // maintenance already consolidated during the inserts (common when the
+    // threshold is crossed mid-seed). Both are correct; the invariant is
+    // row-count preservation + a bounded file count.
+    if let Some((snap_after, files_after)) =
+        wait_until_current_snapshot_compacts(&table, &fixture, "two_phase_compact", files_before)
+            .await?
+    {
+        assert_ne!(snap_after, snap_before);
+        assert!(
+            files_after < files_before,
+            "explicit phase-B compact must reduce file count ({files_before} → {files_after})"
+        );
+    } else {
+        // Post-write already drained the backlog; require only that the
+        // snapshot is not still holding every phase-B append as its own file.
+        let total_appends = usize::try_from(seed_batches + more).expect("fits");
+        assert!(
+            files_before < total_appends,
+            "without an explicit compact, post-write must have consolidated              below {total_appends} files (found {files_before})"
+        );
+    }
+    assert_eq!(count_rows(&ctx, "two_phase_compact").await, expected);
+    Ok(())
+}
+
+test_with_backends!(link_or_copy_snapshot_files_hardlinks_locally);
+async fn link_or_copy_snapshot_files_hardlinks_locally(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = pk_schema();
+    // Append-only so each insert lands as a current-snapshot vortex file.
+    let (table, _ctx, table_id) = build_table(
+        &fixture,
+        "link_copy",
+        Arc::clone(&schema),
+        None,
+        aggressive_compaction_config(),
+    )
+    .await;
+
+    common::insert_batch(&table, make_batch(&schema, 0, 1500)).await?;
+    let snapshot_id = fixture
+        .catalog
+        .get_table("link_copy")
+        .await?
+        .current_snapshot_id;
+    let src_dir = fixture.data_path.join(&table_id).join(&snapshot_id);
+    let mut entries = tokio::fs::read_dir(&src_dir).await?;
+    let mut basename = None;
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name();
+        let Some(s) = name.to_str() else {
+            continue;
+        };
+        if s.ends_with(".vortex") {
+            basename = Some(s.to_string());
+            break;
+        }
+    }
+    let basename = basename.expect("insert must create a vortex file");
+
+    // Empty basenames is a documented no-op.
+    table
+        .link_or_copy_snapshot_files(&snapshot_id, "empty-target", &[])
+        .await?;
+
+    let target_id = "link-target-snapshot";
+    table
+        .link_or_copy_snapshot_files(&snapshot_id, target_id, &[basename.as_str()])
+        .await?;
+
+    let target_path = fixture
+        .data_path
+        .join(&table_id)
+        .join(target_id)
+        .join(&basename);
+    assert!(
+        target_path.exists(),
+        "linked/copied file must exist at {}",
+        target_path.display()
+    );
+
+    #[cfg(target_os = "linux")]
+    {
+        let src_path = src_dir.join(&basename);
+        let src_ino = file_inode(&src_path).expect("src inode");
+        let dst_ino = file_inode(&target_path).expect("dst inode");
+        assert_eq!(
+            src_ino, dst_ino,
+            "local link_or_copy must hard-link (same inode), not only copy"
+        );
+    }
+
+    Ok(())
+}
+
+test_with_backends!(sorted_table_still_compacts_via_full_rewrite);
+async fn sorted_table_still_compacts_via_full_rewrite(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Sort columns disable subset eligibility (pure gate); full rewrite must
+    // still preserve rows.
+    let schema = pk_schema();
+    let (table, ctx, _table_id) = build_table(
+        &fixture,
+        "sorted_full_rewrite",
+        Arc::clone(&schema),
+        None,
+        aggressive_sorted_compaction_config(),
+    )
+    .await;
+
+    let batch_rows: i64 = 1500;
+    let batches = 12_i64;
+    for batch_idx in 0..batches {
+        common::insert_batch(
+            &table,
+            make_batch(&schema, batch_idx * batch_rows, batch_rows),
+        )
+        .await?;
+    }
+
+    let Some((_snap, files)) = wait_until_current_snapshot_compacts(
+        &table,
+        &fixture,
+        "sorted_full_rewrite",
+        usize::try_from(batches).expect("fits"),
+    )
+    .await?
+    else {
+        panic!("sorted table must still compact via full rewrite");
+    };
+    assert!(files < usize::try_from(batches).expect("fits"));
+    assert_eq!(
+        count_rows(&ctx, "sorted_full_rewrite").await,
+        batch_rows * batches
+    );
+    Ok(())
+}
+
+// --- Warm-subset + key-delete MoR (this PR) -----------------------------------
+//
+// Force DeletionMode::Key so subset rewrite engages (Auto→Position full-rewrites).
 
 test_with_backends!(warm_subset_preserves_key_deletes_and_rows);
 async fn warm_subset_preserves_key_deletes_and_rows(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Mirror `compaction_preserves_pk_upsert_semantics`, but force Key deletion
-    // mode so warm-subset (not position full-rewrite) runs, then DELETE one PK
-    // and compact again — MoR must keep the key hidden.
+    // Key-mode PK table: compact, DELETE one PK, re-seed, compact again.
+    // MoR must keep the deleted key hidden and the exact row total must match
+    // what we inserted after the delete.
     let schema = pk_schema();
     let (table, ctx, _table_id) = build_table(
         &fixture,
@@ -944,7 +1150,8 @@ async fn warm_subset_preserves_key_deletes_and_rows(
     .await;
 
     let batch_rows: i64 = 1500;
-    for batch_idx in 0..8_i64 {
+    let seed_batches = 8_i64;
+    for batch_idx in 0..seed_batches {
         common::insert_batch(
             &table,
             make_batch(&schema, batch_idx * batch_rows, batch_rows),
@@ -982,7 +1189,8 @@ async fn warm_subset_preserves_key_deletes_and_rows(
     let before = count_rows(&ctx, "warm_subset_deletes").await;
 
     // Seed more small files so the picker can fire again under pending MoR.
-    for batch_idx in 0..6_i64 {
+    let more_batches = 6_i64;
+    for batch_idx in 0..more_batches {
         common::insert_batch(
             &table,
             make_batch(&schema, 50_000 + batch_idx * batch_rows, batch_rows),
@@ -993,10 +1201,13 @@ async fn warm_subset_preserves_key_deletes_and_rows(
         let _ = run_compaction(&table).await;
     }
 
+    // Exact expected total: rows before re-seed + more_batches * batch_rows.
+    // (id=10 is already excluded from `before`.)
+    let expected = before + batch_rows * more_batches;
     let after = count_rows(&ctx, "warm_subset_deletes").await;
-    assert!(
-        after >= before,
-        "compaction must not resurrect or drop live rows (before={before}, after={after})"
+    assert_eq!(
+        after, expected,
+        "exact row total after re-seed + compact (before={before}, more={more_batches}*{batch_rows})"
     );
     assert_eq!(
         count_rows_matching(&ctx, "warm_subset_deletes", "id = 10").await,
@@ -1017,7 +1228,7 @@ async fn warm_subset_reduces_small_file_fanout(
         "warm_subset_fanout",
         Arc::clone(&schema),
         None,
-        // Append-only tables use key-path subset rewrite (no position mode).
+        // Append-only + Key mode → subset rewrite (no position full path).
         aggressive_key_deletion_compaction_config(),
     )
     .await;

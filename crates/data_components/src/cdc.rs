@@ -135,9 +135,6 @@ pub enum StreamError {
         /// The connector's concrete error, preserved as the chained cause.
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-    #[cfg(feature = "mongodb")]
-    /// Error from `MongoDB`, such as failure during change stream processing.
-    MongoDB(crate::mongodb::stream::StreamError),
 }
 
 impl std::error::Error for StreamError {
@@ -146,8 +143,6 @@ impl std::error::Error for StreamError {
             #[cfg(any(feature = "debezium", feature = "kafka"))]
             StreamError::Kafka(e) => Some(e),
             StreamError::Connector { source, .. } => Some(&**source),
-            #[cfg(feature = "mongodb")]
-            StreamError::MongoDB(e) => Some(e),
             // String-carrying variants have no underlying `Error` source.
             _ => None,
         }
@@ -176,8 +171,6 @@ impl std::fmt::Display for StreamError {
             StreamError::Connector { connector, source } => {
                 write!(f, "{connector} error: {source}")
             }
-            #[cfg(feature = "mongodb")]
-            StreamError::MongoDB(e) => write!(f, "MongoDB error: {e}"),
         }
     }
 }

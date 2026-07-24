@@ -1540,6 +1540,12 @@ impl DataFusion {
         let total_memory = crate::resource_monitor::get_total_memory();
         if let Some(mem_tier_budget_bytes) = self.mem_tier_budget_bytes {
             cayenne::set_global_mem_tier_bytes(mem_tier_budget_bytes);
+            // Mirror mem-tier `used` into the query MemoryPool so operators and
+            // the planner see CDC RAM as reserved (visibility). Hard bound stays
+            // the byte budget + spill path; the account is infallible resize.
+            // Install AFTER the budget so the seed reads used=0.
+            let rt = self.ctx.runtime_env();
+            cayenne::set_global_mem_tier_pool_account(&rt.memory_pool);
             tracing::info!(
                 mem_tier_budget_bytes,
                 query_memory_pool_bytes = self.query_memory_pool_bytes,
@@ -1554,7 +1560,6 @@ impl DataFusion {
             // reclaims it as the pool drains — never above the coordinated static
             // ceiling, so it cannot reintroduce overcommit. The critical-pressure
             // reactive spill drains the tier when the budget is lowered below resident.
-            let rt = self.ctx.runtime_env();
             let query_pool = Arc::downgrade(&rt.memory_pool);
             let compaction_pool = self
                 .compaction_runtime_env
@@ -1627,14 +1632,14 @@ impl DataFusion {
                 let Some(pool) = query_pool.upgrade() else {
                     break; // query ctx dropped (runtime teardown) — stop sampling
                 };
-                let pool_used = u64::try_from(pool.reserved()).unwrap_or(u64::MAX);
-                // Mem-tier bytes are reported into the query pool for honesty
-                // (CayenneMemoryAccount::set_mem_tier_bytes). Exclude them when
-                // computing the coordinated tier budget so the sampler cannot
-                // form a feedback loop: tier grows → pool_used up → budget
-                // shrinks → spill → pool down → budget grows.
-                let mem_tier_used = cayenne::global_mem_tier_used().unwrap_or(0);
-                let query_ops_used = pool_used.saturating_sub(mem_tier_used);
+                // Subtract the mem-tier pool mirror: that consumer is the tier
+                // itself, already sized by the coordinated host envelope. Counting
+                // it as "query usage" would double-penalize the tier on every tick.
+                let pool_reserved = u64::try_from(pool.reserved()).unwrap_or(u64::MAX);
+                let mem_tier_in_pool =
+                    u64::try_from(cayenne::global_mem_tier_pool_account_bytes().unwrap_or(0))
+                        .unwrap_or(0);
+                let pool_used = pool_reserved.saturating_sub(mem_tier_in_pool);
                 let compaction_used = compaction_pool
                     .as_ref()
                     .and_then(std::sync::Weak::upgrade)
@@ -1642,12 +1647,9 @@ impl DataFusion {
                 // Same coordinated partition as the static install (one tested
                 // definition of the no-overcommit invariant), but from LIVE pool
                 // usage, and never above the static ceiling so it can't overcommit.
-                let dynamic = builder::coordinated_mem_tier_budget(
-                    total_memory,
-                    query_ops_used,
-                    compaction_used,
-                )
-                .min(static_ceiling_bytes);
+                let dynamic =
+                    builder::coordinated_mem_tier_budget(total_memory, pool_used, compaction_used)
+                        .min(static_ceiling_bytes);
                 cayenne::update_global_mem_tier_total(dynamic);
             }
         });
