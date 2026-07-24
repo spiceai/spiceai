@@ -348,6 +348,11 @@ impl CayenneCdcWrite {
     pub async fn finish(self) -> Result<u64> {
         if let Some(prepared_append) = self.prepared_append {
             let publish_start = Instant::now();
+            // The best-effort staging-WAL removal on the protected-snapshot path
+            // below can fail without failing the (already-durable) write. Track
+            // that so we can re-arm the recovery flags after `finish()` clears
+            // them (see the re-arm after `finish()` below).
+            let mut staging_wal_removal_failed = false;
             let superseded_rows = if let Some(prepared_on_conflict) = self.prepared_on_conflict {
                 // Authoritative superseded-row count, captured at validation time.
                 // Do NOT recompute from `deleted_pk_i64`/`deleted_row_keys`: for an
@@ -445,6 +450,7 @@ impl CayenneCdcWrite {
                 // is rolled forward idempotently by the next write's
                 // `ensure_no_incomplete_write`.
                 if let Err(error) = prepared_append.remove_committed_staging_wal().await {
+                    staging_wal_removal_failed = true;
                     tracing::debug!(
                         table = self.table.table_name(),
                         target_snapshot = prepared_append.target_snapshot_id(),
@@ -474,6 +480,25 @@ impl CayenneCdcWrite {
                 0
             };
             let rows = prepared_append.finish().await?;
+            if staging_wal_removal_failed {
+                // `finish()` -> `mark_inflight_complete()` just cleared
+                // `staging_wal_present`/`staging_may_have_files` (this was the last
+                // in-flight append). But the committed staging WAL is still on disk
+                // -- its unlink failed above -- and for S3-backed tables
+                // `ensure_no_incomplete_write()` fast-paths out when both flags are
+                // clear, so without this re-arm the orphaned `_wal.json` would go
+                // permanently undiscovered, reintroducing the steady-state WAL
+                // accumulation this change fixes. Re-set both flags so the next
+                // write/open re-runs recovery and idempotently rolls the leftover
+                // WAL forward. Over-setting is safe: worst case is one extra
+                // recovery probe that finds nothing to do.
+                self.table
+                    .staging_wal_present()
+                    .store(true, Ordering::Release);
+                self.table
+                    .staging_may_have_files()
+                    .store(true, Ordering::Release);
+            }
             record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
             let retention_requested = self.table.has_retention_delete_filters();
             if retention_requested {
