@@ -108,6 +108,18 @@ impl Index for FullTextDatabaseIndex {
     async fn on_write_start(&self) -> Result<(), DataFusionError> {
         // Begin a deferred-commit window: subsequent `compute_index` calls stage
         // documents into the writer without committing until `on_write_complete`.
+        //
+        // Discard anything staged but never committed first. A previous window that
+        // was cancelled or aborted before `on_write_complete`/`on_write_failed` ran
+        // can leave uncommitted operations in the writer, and they would otherwise be
+        // swept into this window's commit. Taking the writer lock before setting the
+        // flag also keeps the reset and the flag store atomic w.r.t. `compute_index`.
+        let mut index_writer = self.writer.lock().await;
+        if let Err(e) = index_writer.rollback() {
+            tracing::warn!(
+                "Failed to discard stale staged full-text index operations at write start: {e}"
+            );
+        }
         self.defer_commit.store(true, Ordering::Release);
         Ok(())
     }
@@ -153,10 +165,14 @@ impl Index for FullTextDatabaseIndex {
         let mut index_writer = self.writer.lock().await;
         self.defer_commit.store(false, Ordering::Release);
 
-        if let Err(e) = index_writer.rollback() {
-            tracing::error!("Failed to rollback full-text index writer after failed write: {e}");
-        }
-        Ok(())
+        // Propagate a rollback failure instead of swallowing it: if the staged
+        // operations could not be discarded they may leak into a later commit and
+        // make a partial refresh visible, so the caller must be able to surface it.
+        index_writer
+            .rollback()
+            .map(|_| ())
+            .context(TextSearchIndexingSnafu)
+            .map_err(|e| DataFusionError::External(Box::new(e)))
     }
 }
 
