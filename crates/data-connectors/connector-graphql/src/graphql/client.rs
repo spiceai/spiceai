@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{graphql::InvalidPaginationRegexSnafu, rate_limit::RateLimiter};
 use runtime_rate_control::RateController;
 use token_provider::TokenProvider;
 use tokio::sync::Semaphore;
+use {crate::graphql::InvalidPaginationRegexSnafu, data_components::rate_limit::RateLimiter};
 
 use super::{
     ArrowInternalSnafu, Error, ErrorChecker, PAGE_RETRY_MAX_ATTEMPTS, ReqwestInternalSnafu, Result,
@@ -131,7 +131,7 @@ impl PageInfo {
     /// Example:
     /// ```rust
     /// use serde_json;
-    /// use data_components::graphql::client::PageInfo;
+    /// use connector_graphql::graphql::client::PageInfo;
     ///
     /// let info = serde_json::from_str(r#"{"hasNextPage": true, "endCursor": "cursor_abc"}"#).unwrap();
     /// assert_eq!(
@@ -186,7 +186,7 @@ impl PaginationArgument {
     ///
     /// Example:
     /// ```rust
-    /// use data_components::graphql::client::PaginationArgument;
+    /// use connector_graphql::graphql::client::PaginationArgument;
     /// assert_eq!(
     ///   PaginationArgument::Last(10).format_arguments(None),
     ///   "last: 10"
