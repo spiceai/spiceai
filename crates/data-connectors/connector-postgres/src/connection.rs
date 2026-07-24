@@ -84,7 +84,8 @@ fn connection_identity_from_connection_string(
     let (config, mut ssl_mode, mut ssl_rootcert, password) = if is_postgres_uri(trimmed) {
         // Peel sslmode/sslrootcert before Config parse: tokio_postgres rejects
         // verify-* / unknown options like sslrootcert.
-        let (stripped_uri, ssl_mode, ssl_rootcert) = peel_uri_ssl_params(trimmed)?;
+        let (stripped_uri, ssl_mode, ssl_rootcert) =
+            peel_uri_ssl_params(trimmed).map_err(|e| format!("invalid `{user_param}`: {e}"))?;
         validate_sslmode(&ssl_mode, &user_param)?;
         let config = tokio_postgres::Config::from_str(stripped_uri.as_str())
             .map_err(|e| format!("invalid `{user_param}`: {e}"))?;
@@ -127,11 +128,11 @@ fn connection_identity_from_connection_string(
         ssl_rootcert = Some(cert);
     }
 
-    identity_from_config(config, password, ssl_mode, ssl_rootcert, &user_param)
+    identity_from_config(&config, password, ssl_mode, ssl_rootcert, &user_param)
 }
 
 fn identity_from_config(
-    config: tokio_postgres::Config,
+    config: &tokio_postgres::Config,
     password: Option<String>,
     ssl_mode: String,
     ssl_rootcert: Option<String>,
@@ -176,9 +177,9 @@ fn identity_from_config(
 }
 
 fn is_postgres_uri(connection_string: &str) -> bool {
-    let lower = connection_string.as_bytes();
     const POSTGRES: &[u8] = b"postgres://";
     const POSTGRESQL: &[u8] = b"postgresql://";
+    let lower = connection_string.as_bytes();
     starts_with_ignore_ascii_case(lower, POSTGRESQL)
         || starts_with_ignore_ascii_case(lower, POSTGRES)
 }
@@ -517,6 +518,24 @@ mod tests {
             "error should attribute to connection_string, got: {err}"
         );
         assert!(err.contains("verify-ful"), "got: {err}");
+    }
+
+    #[test]
+    fn uri_connection_string_invalid_percent_encoding_errors_on_connection_string_param() {
+        let params = params_with_pairs(&[(
+            "connection_string",
+            "postgresql://csuser:secret@db.internal:5432/csdb?sslmode=require&sslrootcert=%ZZ",
+        )]);
+        let err = connection_identity_from_params(&params)
+            .expect_err("invalid percent-encoding in URI query must error");
+        assert!(
+            err.contains("pg_connection_string"),
+            "error should attribute to connection_string, got: {err}"
+        );
+        assert!(
+            err.contains("percent-encoding"),
+            "error should mention percent-encoding, got: {err}"
+        );
     }
 
     #[test]
