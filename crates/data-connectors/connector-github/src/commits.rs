@@ -435,8 +435,7 @@ impl TableProvider for CommitsTableProvider {
         .await
         .map_err(DataFusionError::External)?;
 
-        let batches: Vec<arrow::array::RecordBatch> =
-            ref_results.into_iter().flatten().collect();
+        let batches: Vec<arrow::array::RecordBatch> = ref_results.into_iter().flatten().collect();
 
         let table = MemTable::try_new(Arc::clone(&self.schema), vec![batches])?;
         table.scan(state, projection, filters, limit).await
