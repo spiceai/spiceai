@@ -60,6 +60,12 @@ const DUCKDB_COORD_QUERY_MIN_FRACTION: u64 = 4;
 /// over-commit, which is surfaced as a stronger warning).
 const DUCKDB_MIN_INSTANCE_CAP_BYTES: u64 = 128 * 1024 * 1024;
 
+/// Floor for the auto query-pool cap in the all-explicit case, so it can shrink well
+/// below `base / DUCKDB_COORD_QUERY_MIN_FRACTION` to fit fixed explicit ceilings but
+/// never reaches 0 — a 0-byte `GreedyMemoryPool` is unusable. When explicit ceilings
+/// leave less than this, the residual over-commit is surfaced in the warning.
+const DUCKDB_MIN_QUERY_POOL_BYTES: u64 = 256 * 1024 * 1024;
+
 /// `DuckDB`'s own default `memory_limit` as a fraction of the RAM it sees. Applied to
 /// HOST RAM (see [`duckdb_default_per_instance_bytes`]) — `DuckDB` sizes its default
 /// from host RAM, not the cgroup limit — so the coordinated projection stays accurate
@@ -277,13 +283,16 @@ pub fn plan(
             (target, Some(target))
         }
         // All instances explicit: their ceilings are FIXED, so the query pool takes
-        // exactly what they leave (base − Σexplicit) — even below the query floor —
-        // rather than being forced up to the floor and thereby DELIBERATELY
-        // over-committing. When Σexplicit ≥ base, `base_free` is 0 and the query pool
-        // is squeezed to nothing; `residual_overcommit` below then flags the genuine
-        // case (the explicit ceilings alone exceed the query region). The n==0
-        // warning reports the reduced query pool so a very small value is surfaced.
-        None => (base_free, Some(base_free)),
+        // what they leave (base − Σexplicit) — shrinking well below the query floor
+        // rather than being forced up to it and thereby DELIBERATELY over-committing
+        // — but never below `DUCKDB_MIN_QUERY_POOL_BYTES`, because a 0-byte query pool
+        // is unusable. When Σexplicit is large enough that this floor bumps the query
+        // pool above what fits (Σexplicit ≥ base), `residual_overcommit` below flags
+        // it and the n==0 warning reports the (small) reduced query pool.
+        None => {
+            let target = base_free.max(DUCKDB_MIN_QUERY_POOL_BYTES).min(base);
+            (target, Some(target))
+        }
         Some(q) => (q, None),
     };
 
@@ -569,6 +578,38 @@ mod tests {
             "fits by shrinking the query pool below the floor"
         );
         assert!(p.effective_query_pool_bytes + p.duckdb_reservation_bytes <= base);
+    }
+
+    /// All-explicit where the explicit ceilings meet/exceed the query region: the
+    /// query pool is floored at a usable minimum (never 0 — a 0-byte pool is
+    /// unusable) and the residual over-commit is flagged.
+    #[test]
+    fn all_explicit_exceeding_base_floors_query_pool_not_zero() {
+        let (total, base) = total_and_base();
+        let inputs = DuckDbBudgetInputs {
+            num_explicit_instances: 1,
+            sum_explicit_bytes: base, // base_free saturates to 0
+            ..Default::default()
+        };
+        let p = plan_bare(total, base, None, &inputs);
+        assert_eq!(p.outcome, PlanOutcome::Applied);
+        assert_eq!(p.per_instance_cap_bytes, 0);
+        assert_eq!(
+            p.effective_query_pool_bytes,
+            super::DUCKDB_MIN_QUERY_POOL_BYTES
+        );
+        assert_eq!(
+            p.query_pool_cap_bytes,
+            Some(super::DUCKDB_MIN_QUERY_POOL_BYTES)
+        );
+        assert!(
+            p.effective_query_pool_bytes > 0,
+            "query pool must never be capped to 0"
+        );
+        assert!(
+            p.residual_overcommit,
+            "explicit ceilings alone meet/exceed the query region"
+        );
     }
 
     /// An explicit query limit is honored verbatim (never auto-reduced); the unset
