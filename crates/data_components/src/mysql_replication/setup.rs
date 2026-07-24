@@ -369,6 +369,28 @@ pub async fn fetch_head_and_gtid(conn: &mut Conn) -> Result<(BinlogPosition, Gti
     }
 }
 
+/// The source's current executed GTID set (`@@GLOBAL.gtid_executed`).
+///
+/// Used on resume to validate a GTID checkpoint against the live source: the
+/// persisted set must be a subset of this (see [`GtidSet::is_subset_of`]). A
+/// reset/rebuilt source reports a set that no longer contains the checkpoint,
+/// which is how a source reset is detected before blindly resuming. Only
+/// called when the source reports `gtid_mode = ON`, so the variable always
+/// exists; an empty value (a freshly-reset GTID server) parses to the empty
+/// set.
+pub async fn fetch_executed_gtid_set(conn: &mut Conn) -> Result<GtidSet> {
+    let raw: Option<String> = conn
+        .query_first("SELECT @@GLOBAL.gtid_executed")
+        .await
+        .context(SetupQuerySnafu {
+            context: "SELECT @@GLOBAL.gtid_executed",
+        })?;
+    match raw {
+        Some(raw) => GtidSet::parse(&raw).map_err(|message| Error::GtidParse { message }),
+        None => Ok(GtidSet::new()),
+    }
+}
+
 /// The source's current wall clock as Unix-epoch milliseconds, via `NOW(3)`
 /// (millisecond precision). Used to stamp idle readiness heartbeats with a
 /// source-attested time: a binlog HEARTBEAT event carries no usable clock, so
