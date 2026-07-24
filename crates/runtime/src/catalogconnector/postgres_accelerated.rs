@@ -450,6 +450,11 @@ impl AcceleratedCatalogProvider {
 
         let start = tokio::time::Instant::now();
         let deadline = start + budget;
+        // Warn only once, when the wait begins -- the loop re-polls every
+        // `SLOT_POLL_INTERVAL`, so warning each iteration would emit up to
+        // hundreds of lines during a full conflict window. Subsequent polls log
+        // at debug.
+        let mut warned = false;
         loop {
             let status = replication_slot_status(&self.pool, &self.slot_name)
                 .await
@@ -471,12 +476,22 @@ impl AcceleratedCatalogProvider {
                             waited_secs: start.elapsed().as_secs(),
                         }));
                     }
-                    tracing::warn!(
-                        "Catalog '{}': replication slot '{}' is currently active; waiting up to {}s for it to free (a previous instance may still be shutting down) before failing.",
-                        self.catalog_name,
-                        self.slot_name,
-                        budget.as_secs(),
-                    );
+                    if warned {
+                        tracing::debug!(
+                            "Catalog '{}': replication slot '{}' still active; continuing to wait (up to {}s total).",
+                            self.catalog_name,
+                            self.slot_name,
+                            budget.as_secs(),
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Catalog '{}': replication slot '{}' is currently active; waiting up to {}s for it to free (a previous instance may still be shutting down) before failing.",
+                            self.catalog_name,
+                            self.slot_name,
+                            budget.as_secs(),
+                        );
+                        warned = true;
+                    }
                     tokio::time::sleep(SLOT_POLL_INTERVAL).await;
                 }
             }

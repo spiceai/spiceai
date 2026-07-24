@@ -998,9 +998,11 @@ async fn test_catalog_acceleration_fails_loud_when_slot_already_active() -> Resu
             );
             match rt_b.status().get_catalog_statuses().get(CATALOG_NAME) {
                 Some(ComponentStatus::Error(Some(message))) => {
+                    // Must be the in-use error AND name the specific slot, so the
+                    // assertion can't pass on some unrelated "already in use" text.
                     anyhow::ensure!(
-                        message.contains("already in use"),
-                        "error should name the in-use slot, got: {message}"
+                        message.contains("already in use") && message.contains(&expected_slot),
+                        "error should report slot '{expected_slot}' already in use, got: {message}"
                     );
                 }
                 other => anyhow::bail!(
