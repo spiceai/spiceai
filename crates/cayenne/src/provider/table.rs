@@ -201,7 +201,11 @@ const MAX_PK_SELECTIVE_INLIST_VALUES: usize = 32;
 /// Upper bound on PK `BETWEEN` span (inclusive) for selective scan fan-out control.
 const MAX_PK_SELECTIVE_RANGE_SPAN: i64 = 32;
 /// Maximum tombstone keys pushed into the Vortex scan predicate as `NOT IN`.
-const MAX_VORTEX_KEY_DELETE_PUSHDOWN: usize = 256;
+///
+/// Raised from 256 → 2048 so sparse-to-moderate key-delete sets get Vortex
+/// chunk pruning (fewer rows decoded) without building an unbounded expression
+/// tree. Dense MoR still falls through to the post-decode deletion filter.
+const MAX_VORTEX_KEY_DELETE_PUSHDOWN: usize = 2048;
 
 /// Result of a Cayenne CDC append write.
 ///
@@ -11869,8 +11873,417 @@ impl CayenneTableProvider {
             "Running current-snapshot small-file compaction"
         );
 
-        // Full re-encode into a fresh snapshot with the concurrent-append guard.
-        self.rewrite_current_snapshot_for_compaction_tracked().await
+        // Position-delete tables still need a full rewrite: tombstones are
+        // file-path scoped and cannot ride an unpicked hardlinked file set.
+        // Key-delete / append-only: rewrite only the picker subset and hardlink
+        // the rest (warm subset compaction — O(picked) write amp).
+        let uses_position_deletes =
+            self.should_capture_positions() || self.pk_deletion_strategy.is_position_based();
+        if uses_position_deletes || self.context.has_sort_columns() {
+            // Configured sort_columns need a full ordered rewrite to attest
+            // global sort; adaptive filter sort still applies on the subset path.
+            return self.rewrite_current_snapshot_for_compaction_tracked().await;
+        }
+
+        self.rewrite_current_snapshot_subset_for_compaction(
+            &snapshot_id,
+            &files,
+            &candidate,
+        )
+        .await
+    }
+
+    /// Warm-tier subset compaction: re-encode only `candidate.paths`, hardlink
+    /// (or copy) the unpicked current-snapshot files into a new snapshot dir,
+    /// and atomically repoint `current_snapshot_id` **without** clearing
+    /// merge-on-read deletions (unpicked files still need them).
+    ///
+    /// Concurrent append during encode aborts (same generation fence as full
+    /// rewrite). Protected snapshots are untouched — they remain on the
+    /// protected-subset path.
+    async fn rewrite_current_snapshot_subset_for_compaction(
+        &self,
+        snapshot_id: &str,
+        all_files: &[(String, u64)],
+        candidate: &super::compaction::CompactionCandidate<&str>,
+    ) -> Result<bool> {
+        let pass_start = Instant::now();
+        let result = self
+            .rewrite_current_snapshot_subset_for_compaction_inner(
+                snapshot_id,
+                all_files,
+                candidate,
+            )
+            .await;
+        let table = self.table_metadata.table_name.clone();
+        let result_label = if result.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        };
+        telemetry::cayenne::track_compaction_duration(
+            pass_start.elapsed(),
+            &[
+                telemetry::KeyValue::new("table", table.clone()),
+                telemetry::KeyValue::new("kind", "warm_subset"),
+                telemetry::KeyValue::new("result", result_label),
+            ],
+        );
+        if matches!(
+            &result,
+            Result::Err(Error::DataFusion {
+                source: DataFusionError::ResourcesExhausted(_)
+            })
+        ) {
+            telemetry::cayenne::track_compaction_memory_exhausted(&[
+                telemetry::KeyValue::new("table", table),
+                telemetry::KeyValue::new("kind", "warm_subset"),
+            ]);
+        }
+        result
+    }
+
+    async fn rewrite_current_snapshot_subset_for_compaction_inner(
+        &self,
+        snapshot_id: &str,
+        all_files: &[(String, u64)],
+        candidate: &super::compaction::CompactionCandidate<&str>,
+    ) -> Result<bool> {
+        let compaction_start = Instant::now();
+        let picked: std::collections::HashSet<&str> =
+            candidate.paths.iter().copied().collect();
+        let unpicked: Vec<&str> = all_files
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .filter(|name| !picked.contains(name))
+            .collect();
+
+        if picked.is_empty() {
+            return Ok(false);
+        }
+
+        let ctx = self.create_compaction_session_context();
+        let state = ctx.state();
+        let snapshot_id_before = self.get_current_snapshot_id();
+        if snapshot_id_before != snapshot_id {
+            // Current dir moved under us (replace/overwrite); retry next trigger.
+            return Ok(false);
+        }
+        let generation_before = self.current_dir_generation.load(Ordering::Relaxed);
+
+        // Scan ONLY the picked files in the current snapshot, with key-delete
+        // filter applied (bakes deletes for those files into the rewrite).
+        let plan = self
+            .create_snapshot_scan_plan_filtered_files(
+                &state,
+                snapshot_id,
+                &picked,
+            )
+            .await
+            .map_err(|source| Error::DataFusion { source })?;
+        let deletion_snapshot = self.pk_deletion_snapshot();
+        let pk_indices = self.pk_column_indices.clone();
+        let filtered = self
+            .apply_deletion_filter(plan, &pk_indices, &deletion_snapshot)
+            .map_err(|source| Error::DataFusion { source })?;
+        let mut stream =
+            datafusion_physical_plan::execute_stream(filtered, state.task_ctx())
+                .map_err(|source| Error::DataFusion { source })?;
+
+        // F4 adaptive layout: sort subset by hottest observed filter columns
+        // when no explicit sort_columns (caller already gated has_sort_columns).
+        let rewrite_sort_columns = self.effective_sort_columns_for_rewrite();
+        if !rewrite_sort_columns.is_empty() {
+            stream =
+                self.sort_stream_by_columns(stream, &rewrite_sort_columns, &ctx.task_ctx())?;
+        }
+
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+        let is_s3 = self.table_metadata.path.starts_with("s3://");
+        if !is_s3 {
+            let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
+            Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
+        }
+
+        let (target_partitions, estimated_bytes) = subset_merge_write_shape(
+            false,
+            state.config().target_partitions(),
+            candidate.total_bytes,
+        );
+        let target_size_bytes = self.context.target_file_size_bytes();
+        let write_result = self
+            .write_to_snapshot(
+                stream,
+                target_size_bytes,
+                &new_snapshot_id,
+                target_partitions,
+                estimated_bytes,
+                super::delta_encoding::WriteClass::Maintenance,
+            )
+            .await;
+
+        let (total_rows, _writer_ops, _stats_acc) = match write_result {
+            Ok(result) => result,
+            Err(e) => {
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Err(e);
+            }
+        };
+
+        // Carry unpicked files into the new snapshot (hardlink local / copy S3).
+        if let Err(e) = self
+            .carry_snapshot_files(snapshot_id, &new_snapshot_id, &unpicked)
+            .await
+        {
+            self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                .await;
+            return Err(e);
+        }
+
+        if !is_s3 {
+            let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
+            if let Err(e) = Self::sync_snapshot_dir(&snapshot_dir).await {
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Err(Error::Catalog { source: e });
+            }
+        }
+
+        // Author a complete manifest for the new dir (rewritten + carried).
+        if let Err(error) = self
+            .upsert_snapshot_manifest_from_listing(
+                &new_snapshot_id,
+                ManifestSequenceTag::PreserveOrUniform {
+                    min: 0,
+                    max: self.table_metadata.current_sequence_number,
+                },
+            )
+            .await
+        {
+            tracing::warn!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                %error,
+                new_snapshot_id = new_snapshot_id.as_str(),
+                "Failed to author warm-subset compaction manifest; scan falls back to listing"
+            );
+        }
+
+        let new_listing_table = self.build_overwrite_listing_table(&new_snapshot_id)?;
+
+        // Commit: pointer-only (keep MoR deletions). Generation fence aborts
+        // if a concurrent append landed during the off-fence encode.
+        {
+            let listing_guard = self.listing_fence.write().await;
+            let snapshot_id_now = self.get_current_snapshot_id();
+            if snapshot_id_now != snapshot_id_before {
+                drop(listing_guard);
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Ok(false);
+            }
+            let generation_now = self.current_dir_generation.load(Ordering::Relaxed);
+            if generation_now != generation_before {
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    generation_before,
+                    generation_now,
+                    "Aborting warm-subset compaction: concurrent append during re-encode"
+                );
+                drop(listing_guard);
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Ok(false);
+            }
+            if let Err(e) = self
+                .catalog
+                .set_current_snapshot(&self.table_metadata.table_id, &new_snapshot_id)
+                .await
+            {
+                drop(listing_guard);
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Err(Error::Catalog { source: e });
+            }
+            self.listing_table.store(new_listing_table);
+            self.update_current_snapshot_id(&new_snapshot_id);
+            // Intentionally do NOT clear deletion caches — unpicked files still
+            // hold rows that MoR must hide.
+            drop(listing_guard);
+        }
+
+        if let Err(error) = self.prune_snapshot_manifest_to(&new_snapshot_id).await {
+            tracing::warn!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                %error,
+                "Failed to prune stale snapshot manifest rows after warm-subset compaction"
+            );
+        }
+
+        self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
+
+        tracing::debug!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            rows = total_rows,
+            picked_files = candidate.paths.len(),
+            carried_files = unpicked.len(),
+            new_snapshot_id = new_snapshot_id.as_str(),
+            duration_ms = compaction_start.elapsed().as_millis(),
+            "Warm-subset snapshot compaction completed"
+        );
+
+        Ok(true)
+    }
+
+    /// Hardlink (local) or copy (S3) named files from `source_snapshot_id` into
+    /// `target_snapshot_id`. Used by warm-subset compaction to carry unpicked
+    /// settled files without re-encoding them.
+    async fn carry_snapshot_files(
+        &self,
+        source_snapshot_id: &str,
+        target_snapshot_id: &str,
+        file_names: &[&str],
+    ) -> Result<()> {
+        if file_names.is_empty() {
+            return Ok(());
+        }
+        if self.table_metadata.path.starts_with("s3://") {
+            let source_prefix = self
+                .snapshot_object_store_prefix(source_snapshot_id)?
+                .ok_or_else(|| Error::Internal {
+                    table: self.table_name().to_string(),
+                    message: "Missing source snapshot object-store prefix".to_string(),
+                })?;
+            let target_prefix = self
+                .snapshot_object_store_prefix(target_snapshot_id)?
+                .ok_or_else(|| Error::Internal {
+                    table: self.table_name().to_string(),
+                    message: "Missing target snapshot object-store prefix".to_string(),
+                })?;
+            let config = self.require_object_store()?;
+            let store = Arc::clone(&config.store);
+            for name in file_names {
+                let source = ObjectStorePath::from(format!("{}{name}", source_prefix.as_ref()));
+                let target = ObjectStorePath::from(format!("{}{name}", target_prefix.as_ref()));
+                store
+                    .copy(&source, &target)
+                    .await
+                    .map_err(|source| Error::ObjectStore {
+                        operation: "carry snapshot file",
+                        table: self.table_name().to_string(),
+                        source,
+                    })?;
+            }
+            return Ok(());
+        }
+
+        let source_dir = self.snapshot_dir_path_for(source_snapshot_id);
+        let target_dir = self.snapshot_dir_path_for(target_snapshot_id);
+        Self::ensure_snapshot_dir_exists(&target_dir).await?;
+        for name in file_names {
+            let source = source_dir.join(name);
+            let destination = target_dir.join(name);
+            if let Err(link_error) = tokio::fs::hard_link(&source, &destination).await {
+                tracing::debug!(
+                    table = self.table_name(),
+                    source = %source.display(),
+                    target = %destination.display(),
+                    %link_error,
+                    "Hard-link carry unavailable; copying immutable file"
+                );
+                tokio::fs::copy(&source, &destination).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Like [`Self::create_snapshot_scan_plan`], but only includes files whose
+    /// basename is in `file_names` (warm-subset compaction input).
+    async fn create_snapshot_scan_plan_filtered_files(
+        &self,
+        state: &dyn Session,
+        snapshot_id: &str,
+        file_names: &std::collections::HashSet<&str>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        use datafusion_datasource::file_groups::FileGroup;
+
+        let base_schema = self.table_schema();
+        let snapshot_dir_url = Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            &self.table_metadata.table_id,
+            snapshot_id,
+        );
+        let table_url = ListingTableUrl::parse(&snapshot_dir_url)?;
+        let options = Self::create_listing_options(
+            self.context.file_format(),
+            &self.pk_deletion_strategy,
+            state.config(),
+        );
+        let scan_schema = Self::snapshot_scan_schema(&base_schema, &options);
+
+        let SnapshotFilesForScan {
+            file_groups: partitioned_file_lists,
+            statistics: _,
+            grouped_by_partition,
+        } = self
+            .list_files_for_snapshot_scan(&SnapshotScanListingRequest {
+                state,
+                table_url: &table_url,
+                options: &options,
+                partition_filters: &[],
+                data_filters: &[],
+                snapshot_id,
+                limit: None,
+                scan_schema: Arc::clone(&scan_schema),
+            })
+            .await?;
+
+        let mut kept: Vec<PartitionedFile> = Vec::new();
+        for group in partitioned_file_lists {
+            for file in group.iter() {
+                let name = file
+                    .object_meta
+                    .location
+                    .filename()
+                    .unwrap_or_else(|| file.object_meta.location.as_ref());
+                if file_names.contains(name) {
+                    kept.push(file.clone());
+                }
+            }
+        }
+
+        if kept.is_empty() {
+            let projected_schema = project_schema(&scan_schema, None::<&Vec<usize>>)?;
+            return Ok(Arc::new(EmptyExec::new(projected_schema)));
+        }
+
+        let file_groups = FileGroup::new(kept).split_files(1);
+        let (file_groups, statistics) =
+            compute_all_files_statistics(file_groups, Arc::clone(&scan_schema), true, false)?;
+
+        let file_source = options
+            .format
+            .file_source(Self::snapshot_file_table_schema(&base_schema, &options));
+
+        options
+            .format
+            .create_physical_plan(
+                state,
+                FileScanConfigBuilder::new(table_url.object_store(), file_source)
+                    .with_file_groups(file_groups)
+                    .with_constraints(Constraints::default())
+                    .with_statistics(statistics)
+                    .with_projection_indices(None)?
+                    .with_limit(None)
+                    .with_output_ordering(Vec::new())
+                    .with_partitioned_by_file_group(grouped_by_partition)
+                    .build(),
+            )
+            .await
     }
 
     pub(crate) fn schedule_post_write_compaction(&self) {
@@ -20497,7 +20910,18 @@ impl CayenneTableProvider {
         self.apply_maintained_aggregate_delete_pending(maintained_aggregate_delete)
             .await;
 
+        // Report this table's mem-tier resident bytes into the query MemoryPool
+        // so planners / memory_limit see off-pool CDC RAM (growth still gated by
+        // the process-global MemTierBudget — resize is infallible).
+        self.sync_mem_tier_memory_account();
+
         Ok(epoch)
+    }
+
+    /// Push the live mem-tier byte total into [`CayenneMemoryAccount`].
+    fn sync_mem_tier_memory_account(&self) {
+        let bytes = usize::try_from(self.mem_tier.total_bytes()).unwrap_or(usize::MAX);
+        self.table_memory.set_mem_tier_bytes(bytes);
     }
 
     /// GUARANTEED acquisition of `mem_checkpoint_lock` plus the N>1 capture
@@ -20973,6 +21397,14 @@ impl CayenneTableProvider {
         // background checkpointer can keep the RAM tier drained without throttling
         // ingest. The position-based strategy appends to the CURRENT snapshot and
         // therefore must keep encode+swap atomic under one held fence (unchanged).
+        //
+        // CDC memory mode never reaches the position arm: `is_cdc_memory_mode()`
+        // requires `!is_position_based()`. The arm remains for residual pure
+        // position tables; encode stays under the fence (CURRENT-dir semantics).
+        debug_assert!(
+            !self.is_cdc_memory_mode() || !self.pk_deletion_strategy.is_position_based(),
+            "CDC memory mode must not use the position-based mem-tier checkpoint arm"
+        );
         let stats = if self.pk_deletion_strategy.is_position_based() {
             let _fence = self.listing_fence.write().await;
             let target_size_bytes = self.context.target_file_size_bytes();
@@ -21583,6 +22015,9 @@ impl CayenneTableProvider {
         // Release the flushed bytes of every shard back to the process-global budget
         // once; survivor bytes stay resident. Bump the structural epoch once.
         crate::provider::mem_tier_budget::release_bytes(released_total);
+        // Survivor bytes (if any) remain in the pool account; zero when fully
+        // drained so queries reclaim the reported budget.
+        self.sync_mem_tier_memory_account();
         self.bump_inlined_structural_epoch();
         if inlined_view_nonempty {
             self.clear_inlined_metadata_after_checkpoint().await?;

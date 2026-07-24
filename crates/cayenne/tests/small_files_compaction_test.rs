@@ -77,6 +77,15 @@ fn aggressive_sorted_compaction_config() -> VortexConfig {
     }
 }
 
+/// Same as [`aggressive_compaction_config`] but forces key-based deletion so
+/// warm-subset compaction (not the position full-rewrite path) is exercised.
+fn aggressive_key_deletion_compaction_config() -> VortexConfig {
+    VortexConfig {
+        deletion_mode: cayenne::metadata::DeletionMode::Key,
+        ..aggressive_compaction_config()
+    }
+}
+
 /// Build a batch of `n` rows whose ids start at `start` and whose values are
 /// derived strings. n must be > `INLINE_MAX_ROWS` (1024) to bypass inlining.
 fn make_batch(schema: &Arc<Schema>, start: i64, n: i64) -> RecordBatch {
@@ -155,6 +164,24 @@ async fn count_rows(ctx: &SessionContext, table_name: &str) -> i64 {
         .await
         .expect("count sql planned");
     let batches = df.collect().await.expect("count collected");
+    let merged =
+        arrow::compute::concat_batches(&batches[0].schema(), &batches).expect("concat batches");
+    merged
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count column")
+        .value(0)
+}
+
+async fn count_rows_matching(ctx: &SessionContext, table_name: &str, where_clause: &str) -> i64 {
+    let df = ctx
+        .sql(&format!(
+            "SELECT COUNT(*) FROM {table_name} WHERE {where_clause}"
+        ))
+        .await
+        .expect("count matching sql planned");
+    let batches = df.collect().await.expect("count matching collected");
     let merged =
         arrow::compute::concat_batches(&batches[0].schema(), &batches).expect("concat batches");
     merged
@@ -892,4 +919,144 @@ async fn run_compaction(table: &Arc<CayenneTableProvider>) -> bool {
         .maybe_compact_small_files()
         .await
         .expect("compaction must succeed in tests")
+}
+
+// --- Warm-subset compaction (key-delete / append-only path) -------------------
+//
+// `compact_current_snapshot_small_files` rewrites only the picker subset and
+// hardlinks unpicked files, keeping merge-on-read deletions intact.
+
+test_with_backends!(warm_subset_preserves_key_deletes_and_rows);
+async fn warm_subset_preserves_key_deletes_and_rows(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Mirror `compaction_preserves_pk_upsert_semantics`, but force Key deletion
+    // mode so warm-subset (not position full-rewrite) runs, then DELETE one PK
+    // and compact again — MoR must keep the key hidden.
+    let schema = pk_schema();
+    let (table, ctx, _table_id) = build_table(
+        &fixture,
+        "warm_subset_deletes",
+        Arc::clone(&schema),
+        Some("id"),
+        aggressive_key_deletion_compaction_config(),
+    )
+    .await;
+
+    let batch_rows: i64 = 1500;
+    for batch_idx in 0..8_i64 {
+        common::insert_batch(
+            &table,
+            make_batch(&schema, batch_idx * batch_rows, batch_rows),
+        )
+        .await?;
+    }
+
+    let mut compacted = false;
+    for _ in 0..4 {
+        if run_compaction(&table).await {
+            compacted = true;
+        }
+    }
+    assert!(
+        compacted,
+        "key-mode table should produce a warm-subset compaction candidate"
+    );
+
+    use datafusion::datasource::TableProvider;
+    use datafusion::prelude::{col, lit};
+    let filter = col("id").eq(lit(10_i64));
+    let plan = table
+        .delete_from(&ctx.state(), vec![filter])
+        .await
+        .expect("plan delete");
+    let _ = datafusion_physical_plan::collect(plan, ctx.task_ctx())
+        .await
+        .expect("run delete");
+
+    assert_eq!(
+        count_rows_matching(&ctx, "warm_subset_deletes", "id = 10").await,
+        0,
+        "delete must hide id=10"
+    );
+    let before = count_rows(&ctx, "warm_subset_deletes").await;
+
+    // Seed more small files so the picker can fire again under pending MoR.
+    for batch_idx in 0..6_i64 {
+        common::insert_batch(
+            &table,
+            make_batch(&schema, 50_000 + batch_idx * batch_rows, batch_rows),
+        )
+        .await?;
+    }
+    for _ in 0..4 {
+        let _ = run_compaction(&table).await;
+    }
+
+    let after = count_rows(&ctx, "warm_subset_deletes").await;
+    assert!(
+        after >= before,
+        "compaction must not resurrect or drop live rows (before={before}, after={after})"
+    );
+    assert_eq!(
+        count_rows_matching(&ctx, "warm_subset_deletes", "id = 10").await,
+        0,
+        "deleted key must remain hidden after warm-subset compaction (MoR kept)"
+    );
+
+    Ok(())
+}
+
+test_with_backends!(warm_subset_reduces_small_file_fanout);
+async fn warm_subset_reduces_small_file_fanout(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = pk_schema();
+    let (table, ctx, table_id) = build_table(
+        &fixture,
+        "warm_subset_fanout",
+        Arc::clone(&schema),
+        None,
+        // Append-only tables use key-path subset rewrite (no position mode).
+        aggressive_key_deletion_compaction_config(),
+    )
+    .await;
+
+    let batch_rows: i64 = 1500;
+    let batches = 12_i64;
+    for batch_idx in 0..batches {
+        common::insert_batch(
+            &table,
+            make_batch(&schema, batch_idx * batch_rows, batch_rows),
+        )
+        .await?;
+    }
+
+    let pre_snapshot = fixture
+        .catalog
+        .get_table("warm_subset_fanout")
+        .await?
+        .current_snapshot_id;
+    let pre_count = count_vortex_files(&fixture.data_path, &table_id, &pre_snapshot).await;
+
+    let Some((_snap, post_count)) = wait_until_current_snapshot_compacts(
+        &table,
+        &fixture,
+        "warm_subset_fanout",
+        usize::try_from(batches).expect("fits"),
+    )
+    .await?
+    else {
+        panic!("warm-subset compaction should fire");
+    };
+
+    assert!(
+        post_count < pre_count || post_count < usize::try_from(batches).expect("fits"),
+        "subset compact should reduce fan-out (pre={pre_count}, post={post_count})"
+    );
+    assert_eq!(
+        count_rows(&ctx, "warm_subset_fanout").await,
+        batch_rows * batches
+    );
+    Ok(())
 }

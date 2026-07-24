@@ -1628,6 +1628,13 @@ impl DataFusion {
                     break; // query ctx dropped (runtime teardown) — stop sampling
                 };
                 let pool_used = u64::try_from(pool.reserved()).unwrap_or(u64::MAX);
+                // Mem-tier bytes are reported into the query pool for honesty
+                // (CayenneMemoryAccount::set_mem_tier_bytes). Exclude them when
+                // computing the coordinated tier budget so the sampler cannot
+                // form a feedback loop: tier grows → pool_used up → budget
+                // shrinks → spill → pool down → budget grows.
+                let mem_tier_used = cayenne::global_mem_tier_used().unwrap_or(0);
+                let query_ops_used = pool_used.saturating_sub(mem_tier_used);
                 let compaction_used = compaction_pool
                     .as_ref()
                     .and_then(std::sync::Weak::upgrade)
@@ -1635,9 +1642,12 @@ impl DataFusion {
                 // Same coordinated partition as the static install (one tested
                 // definition of the no-overcommit invariant), but from LIVE pool
                 // usage, and never above the static ceiling so it can't overcommit.
-                let dynamic =
-                    builder::coordinated_mem_tier_budget(total_memory, pool_used, compaction_used)
-                        .min(static_ceiling_bytes);
+                let dynamic = builder::coordinated_mem_tier_budget(
+                    total_memory,
+                    query_ops_used,
+                    compaction_used,
+                )
+                .min(static_ceiling_bytes);
                 cayenne::update_global_mem_tier_total(dynamic);
             }
         });

@@ -1617,9 +1617,20 @@ pub(crate) fn coordinated_mem_tier_budget(
     // ceiling never lifts the result above `remainder` (the ceiling caps from above,
     // and `remainder` is computed with the single headroom), so the floating ceiling
     // preserves the #11449 no-overcommit invariant `query_pool + compaction + tier +
-    // headroom <= host` for ANY ceiling — subject to the same `remainder >= floor`
-    // PRECONDITION above: when the floor wins (`remainder < floor`) the clamp returns
-    // `floor > remainder` and the caller warns instead.
+    // headroom <= host` for ANY ceiling.
+    //
+    // Honesty under a tight explicit `runtime.query.memory_limit`: when the
+    // remainder is below the floor, prefer the remainder (possibly zero) over a
+    // floor that would make `query + compaction + tier + headroom > host`. The
+    // previous floor-wins path silently overcommitted the host and only warned;
+    // mem-tier then relied on spill/durable backstops. Returning `remainder`
+    // keeps the envelope honest — CDC spills more under a greedy query limit,
+    // which is the operator-visible contract.
+    if remainder < floor {
+        // Keep a nonzero gate so the budget stays installed (0 uninstalls it);
+        // 1 byte means every real append refuses and CDC spills/falls back.
+        return remainder.max(1);
+    }
     let float_room = total_memory
         .saturating_sub(query_pool_bytes)
         .saturating_sub(compaction_pool_bytes)
@@ -2005,13 +2016,18 @@ mod tests {
                 "the default partition does not float above the base ceiling"
             );
 
-            // A greedy pool that consumes all of host → tier floored, never 0.
+            // A greedy pool that consumes all of host → tier yields to the
+            // remainder (honest, no forced overcommit). Remainder is 0 after
+            // headroom, but we still install a 1-byte always-refuse gate so the
+            // global cap is never disabled (try_reserve fails → spill).
             let small = coordinated_mem_tier_budget(total, total, 0);
             assert_eq!(
-                small, floor,
-                "a greedy pool floors the tier (still a nonzero cap)"
+                small, 1,
+                "a greedy pool installs a 1-byte refuse-all gate (no host overcommit)"
             );
             assert!(small > 0, "the global aggregate cap must never be disabled");
+            // Floor is still the steady-state lower clamp when remainder allows.
+            let _ = floor;
         }
     }
 

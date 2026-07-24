@@ -41,6 +41,12 @@ pub(crate) struct CayenneMemoryAccount {
     keyset_bytes: AtomicUsize,
     deletion_bytes: AtomicUsize,
     cold_existence_bytes: AtomicUsize,
+    /// This table's share of the process-global in-memory CDC tier
+    /// (`cdc_durability: memory`). Reported into the query pool for honesty so
+    /// planners see RAM held off-pool by the mem-tier; growth is still gated by
+    /// [`super::mem_tier_budget`] (infallible resize — never fails a CDC append
+    /// because the pool is full if spill can free room).
+    mem_tier_bytes: AtomicUsize,
 }
 
 impl CayenneMemoryAccount {
@@ -53,6 +59,7 @@ impl CayenneMemoryAccount {
             keyset_bytes: AtomicUsize::new(0),
             deletion_bytes: AtomicUsize::new(0),
             cold_existence_bytes: AtomicUsize::new(0),
+            mem_tier_bytes: AtomicUsize::new(0),
         }
     }
 
@@ -61,7 +68,8 @@ impl CayenneMemoryAccount {
             .keyset_bytes
             .load(Ordering::Relaxed)
             .saturating_add(self.deletion_bytes.load(Ordering::Relaxed))
-            .saturating_add(self.cold_existence_bytes.load(Ordering::Relaxed));
+            .saturating_add(self.cold_existence_bytes.load(Ordering::Relaxed))
+            .saturating_add(self.mem_tier_bytes.load(Ordering::Relaxed));
         // `resize` is infallible (over-commits the greedy pool). See the type
         // docstring for why deletions must never fail-to-fit.
         self.reservation.lock().resize(total);
@@ -88,8 +96,15 @@ impl CayenneMemoryAccount {
         self.resize_to_total();
     }
 
-    /// Current total reserved bytes (keyset + deletions + cold existence). For
-    /// observability and tests.
+    /// Account this table's resident in-memory CDC tier bytes (process budget
+    /// still gates growth via [`super::mem_tier_budget`]).
+    pub(crate) fn set_mem_tier_bytes(&self, bytes: usize) {
+        self.mem_tier_bytes.store(bytes, Ordering::Relaxed);
+        self.resize_to_total();
+    }
+
+    /// Current total reserved bytes (keyset + deletions + cold existence +
+    /// mem-tier). For observability and tests.
     #[must_use]
     pub(crate) fn reserved_bytes(&self) -> usize {
         self.reservation.lock().size()
@@ -133,10 +148,17 @@ mod tests {
         account.set_cold_existence_bytes(100);
         assert_eq!(account.reserved_bytes(), 750);
 
+        // Mem-tier (CDC RAM) is also visible in the query pool.
+        account.set_mem_tier_bytes(250);
+        assert_eq!(account.reserved_bytes(), 1000);
+        assert_eq!(pool.reserved(), 1000);
+
         // Compaction clears the deletions; clearing the rest releases all.
         account.set_deletion_bytes(0);
-        assert_eq!(account.reserved_bytes(), 150);
+        assert_eq!(account.reserved_bytes(), 400);
         account.set_cold_existence_bytes(0);
+        assert_eq!(account.reserved_bytes(), 300);
+        account.set_mem_tier_bytes(0);
         assert_eq!(account.reserved_bytes(), 50);
         account.set_keyset_bytes(0);
         assert_eq!(account.reserved_bytes(), 0);

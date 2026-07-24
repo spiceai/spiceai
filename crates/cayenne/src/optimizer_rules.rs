@@ -986,7 +986,16 @@ fn build_side_memory_estimate(plan: &dyn ExecutionPlan, build_rows: usize) -> Op
             Some(acc.saturating_add(estimated_arrow_width(field.data_type())?))
         })?;
 
-    Some(row_width.saturating_mul(build_rows))
+    // Arrow payload width alone understates a hash-join build side: the table
+    // stores key hashes, entry pointers, and load-factor slack. A 2× factor is
+    // a conservative lower bound used for the sort-merge safety rewrite so we
+    // prefer SMJ before the true HT footprint exceeds the query pool.
+    const HASH_TABLE_OVERHEAD_FACTOR: usize = 2;
+    Some(
+        row_width
+            .saturating_mul(build_rows)
+            .saturating_mul(HASH_TABLE_OVERHEAD_FACTOR),
+    )
 }
 
 fn estimated_arrow_width(data_type: &DataType) -> Option<usize> {

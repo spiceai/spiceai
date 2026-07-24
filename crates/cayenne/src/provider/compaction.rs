@@ -23,13 +23,14 @@ limitations under the License.
 //!
 //! The picker buckets files by size into tiers — small, mid, large — and emits
 //! a [`CompactionCandidate`] when the smallest non-empty tier has enough files
-//! whose combined size is worth a rewrite. The current runner (in
-//! [`crate::provider::table`]) uses that candidate as an eligibility and
-//! observability signal, then atomically rewrites the entire current snapshot.
-//! The rewrite goes through `write_to_snapshot`, which honors `target_partitions`
+//! whose combined size is worth a rewrite. The warm-tier runner (in
+//! [`crate::provider::table`]) rewrites **only** `candidate.paths` for
+//! key-delete / append-only tables, hardlinking unpicked settled files into the
+//! new snapshot (warm subset compaction). Position-delete tables and tables with
+//! configured `sort_columns` still full-rewrite the current snapshot. The
+//! rewrite goes through `write_to_snapshot`, which honors `target_partitions`
 //! and the configured target file size, so a pass typically produces one or a
-//! small number of consolidated Vortex files rather than guaranteeing exactly
-//! one.
+//! small number of consolidated Vortex files for the picked tier.
 //!
 //! The module also owns [`BackgroundCompactor`], a per-table tokio task that
 //! periodically invokes the runner. The task is `Semaphore`-gated so a fleet of
