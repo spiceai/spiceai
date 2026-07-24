@@ -38,8 +38,8 @@ use arrow::array::{Array, AsArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use data_components::cdc::{ChangeEnvelope, ChangesStream};
 use data_components::postgres_replication::{
-    PgOutputFormat, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput, config,
-    start_replication_stream,
+    PgOutputFormat, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
+    SchemaEvolutionPolicy, config, start_replication_stream,
 };
 use futures::StreamExt;
 use secrecy::SecretString;
@@ -106,6 +106,7 @@ fn independent_input(port: u16, table: &str) -> ReplicationStreamInput {
         schema_name: "public".into(),
         table_name: table.to_string(),
         metrics: ReplicationMetricsCollector::new(),
+        policy: SchemaEvolutionPolicy::Block,
     }
 }
 
@@ -118,6 +119,7 @@ fn input_with_schema(port: u16, table: &str, schema: SchemaRef) -> ReplicationSt
         schema_name: "public".into(),
         table_name: table.to_string(),
         metrics: ReplicationMetricsCollector::new(),
+        policy: SchemaEvolutionPolicy::Block,
     }
 }
 
