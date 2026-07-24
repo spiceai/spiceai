@@ -114,12 +114,14 @@ impl Index for FullTextDatabaseIndex {
 
     async fn on_write_complete(&self) -> Result<(), DataFusionError> {
         // End the deferred-commit window with a single commit + reader reload for
-        // the whole refresh/append. Clear the flag first so a later CDC write (or a
-        // window that never started) is never stuck deferring. Committing when
-        // nothing was staged (e.g. an empty refresh) is a harmless no-op.
+        // the whole refresh/append. Take the writer lock *before* clearing the flag so
+        // no concurrent `compute_index` (e.g. the CDC path) can observe a cleared flag
+        // and commit the staged window before it is finalized here; clearing it under
+        // the lock also ensures a later CDC write is never stuck deferring. Committing
+        // when nothing was staged (e.g. an empty refresh) is a harmless no-op.
+        let mut index_writer = self.writer.lock().await;
         self.defer_commit.store(false, Ordering::Release);
 
-        let mut index_writer = self.writer.lock().await;
         let commit_result = index_writer
             .commit()
             .map(|_| ())
@@ -144,10 +146,13 @@ impl Index for FullTextDatabaseIndex {
 
     async fn on_write_failed(&self) -> Result<(), DataFusionError> {
         // Discard everything staged in the current window so a partial refresh is
-        // never committed, and reset the flag.
+        // never committed, and reset the flag. Take the writer lock *before* clearing
+        // the flag: otherwise a concurrent `compute_index` could observe the cleared
+        // flag, acquire the lock first, and commit the staged partial refresh — making
+        // a failed write visible to queries.
+        let mut index_writer = self.writer.lock().await;
         self.defer_commit.store(false, Ordering::Release);
 
-        let mut index_writer = self.writer.lock().await;
         if let Err(e) = index_writer.rollback() {
             tracing::error!("Failed to rollback full-text index writer after failed write: {e}");
         }
@@ -305,9 +310,12 @@ impl FullTextDatabaseIndex {
         let docs = parse_json_array(&index_schema, doc_json.as_str())
             .context(FailedToInsertDataIntoIndexSnafu)?;
 
-        let defer_commit = self.defer_commit.load(Ordering::Acquire);
-
         let mut index_writer = self.writer.lock().await;
+        // Read the deferral flag while holding the writer lock so the decision to
+        // commit is serialized with `on_write_complete`/`on_write_failed` closing the
+        // window. Reading it before acquiring the lock would allow this call to observe
+        // a cleared flag and commit a window the hooks have not finalized yet.
+        let defer_commit = self.defer_commit.load(Ordering::Acquire);
         // Deletion.
         for t in terms_to_delete {
             index_writer.delete_term(t);
@@ -889,15 +897,17 @@ mod tests {
         index.on_write_start().await.expect("on_write_start failed");
 
         index
-            .compute_index(vec![record_batch!(
-                ("id", Int32, [1, 2, 3]),
-                (
-                    "content",
-                    Utf8,
-                    ["apple banana", "dog elephant", "guitar harmonica"]
+            .compute_index(vec![
+                record_batch!(
+                    ("id", Int32, [1, 2, 3]),
+                    (
+                        "content",
+                        Utf8,
+                        ["apple banana", "dog elephant", "guitar harmonica"]
+                    )
                 )
-            )
-            .expect("Failed to create test batch")])
+                .expect("Failed to create test batch"),
+            ])
             .await
             .expect("compute_index failed");
 
@@ -946,11 +956,10 @@ mod tests {
         .expect("Failed to create FullTextDatabaseIndex");
 
         index
-            .compute_index(vec![record_batch!(
-                ("id", Int32, [1]),
-                ("content", Utf8, ["apple banana"])
-            )
-            .expect("Failed to create test batch")])
+            .compute_index(vec![
+                record_batch!(("id", Int32, [1]), ("content", Utf8, ["apple banana"]))
+                    .expect("Failed to create test batch"),
+            ])
             .await
             .expect("compute_index failed");
 
@@ -980,16 +989,21 @@ mod tests {
         index.on_write_start().await.expect("on_write_start failed");
 
         index
-            .compute_index(vec![record_batch!(
-                ("id", Int32, [1, 2]),
-                ("content", Utf8, ["apple banana", "dog elephant"])
-            )
-            .expect("Failed to create test batch")])
+            .compute_index(vec![
+                record_batch!(
+                    ("id", Int32, [1, 2]),
+                    ("content", Utf8, ["apple banana", "dog elephant"])
+                )
+                .expect("Failed to create test batch"),
+            ])
             .await
             .expect("compute_index failed");
 
         // The write failed: discard the staged window instead of committing it.
-        index.on_write_failed().await.expect("on_write_failed failed");
+        index
+            .on_write_failed()
+            .await
+            .expect("on_write_failed failed");
 
         let search_index = index
             .full_text_search_field_index("content")
