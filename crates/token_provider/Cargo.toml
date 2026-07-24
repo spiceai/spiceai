@@ -10,7 +10,7 @@ version.workspace = true
 
 [dependencies]
 chrono.workspace = true
-jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs"] }
 reqwest.workspace = true
 secrecy = { workspace = true, features = ["serde"] }
 serde.workspace = true
