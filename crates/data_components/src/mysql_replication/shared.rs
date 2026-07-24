@@ -1093,15 +1093,11 @@ async fn resolve_start_position(
                         }
                     }
                     CursorType::File => {
-                        let present = super::setup::binlog_file_exists(
-                            conn,
-                            &persisted.position.file,
-                        )
-                        .await?;
+                        let present =
+                            super::setup::binlog_file_exists(conn, &persisted.position.file)
+                                .await?;
                         match file_checkpoint_verdict(present) {
-                            CheckpointVerdict::Resume => {
-                                Some((persisted.position, GtidSet::new()))
-                            }
+                            CheckpointVerdict::Resume => Some((persisted.position, GtidSet::new())),
                             CheckpointVerdict::Unresumable(reason) => {
                                 apply_invalid_checkpoint(
                                     params,
