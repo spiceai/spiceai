@@ -630,20 +630,14 @@ fn replication_params_from_connector_params(
     params: &Parameters,
     dataset_name: &str,
 ) -> std::result::Result<ReplicationParams, String> {
-    let host = required_string(params, "host")?;
-    let port = optional_parse::<u16>(params, "port", 5432, "a port number (0-65535)")?;
-    let user = required_string(params, "user")?;
-    // Optional, mirroring the connection pool (`pg_pass` is `.secret()` but not
-    // `.required()`): the replication connection uses the same credentials as
-    // the bootstrap/pool connection against the same server, so a source that
-    // accepts a passwordless connection (e.g. `trust` auth) must not be forced
-    // to set `pg_pass` here when bootstrap already connected without one.
-    let password_str = optional_string(params, "pass").unwrap_or_default();
-    let database = required_string(params, "db")?;
-    let sslmode =
-        config::SslMode::from_str_strict(optional_string(params, "sslmode").as_deref())
-            .map_err(|reason| format!("parameter `{}` {reason}", params.user_param("sslmode")))?;
-    let sslrootcert = optional_string(params, "sslrootcert").map(std::path::PathBuf::from);
+    // Same override rule / parser as `PostgresConnectionPool` (see
+    // `crate::connection`): `pg_connection_string` wins over discrete
+    // `pg_host`/`pg_user`/`pg_db`/…; discrete `pg_sslmode` / `pg_sslrootcert`
+    // still override values embedded in the connection string.
+    let identity = crate::connection::connection_identity_from_params(params)?;
+    let sslmode = config::SslMode::from_str_strict(identity.sslmode.as_deref())
+        .map_err(|reason| format!("parameter `{}` {reason}", params.user_param("sslmode")))?;
+    let sslrootcert = identity.sslrootcert.map(std::path::PathBuf::from);
 
     // An explicitly-named slot is shareable: every dataset on the same
     // connection naming the same slot is multiplexed onto one replication
@@ -698,11 +692,11 @@ fn replication_params_from_connector_params(
     )?;
 
     Ok(ReplicationParams {
-        host,
-        port,
-        user,
-        password: SecretString::from(password_str),
-        database,
+        host: identity.host,
+        port: identity.port,
+        user: identity.user,
+        password: SecretString::from(identity.password),
+        database: identity.database,
         sslmode,
         sslrootcert,
         slot_name,
@@ -720,13 +714,6 @@ fn replication_params_from_connector_params(
         // still handles types Postgres emits as text.
         pg_output_format: PgOutputFormat::Binary,
     })
-}
-
-fn required_string(params: &Parameters, key: &str) -> std::result::Result<String, String> {
-    match params.get(key).expose() {
-        ExposedParamLookup::Present(v) => Ok(v.to_string()),
-        ExposedParamLookup::Absent(name) => Err(format!("missing required parameter `{name}`")),
-    }
 }
 
 fn optional_string(params: &Parameters, key: &str) -> Option<String> {
@@ -857,6 +844,7 @@ fn parse_initial_snapshot(params: &Parameters) -> std::result::Result<(bool, boo
 /// Parses an optional value via `FromStr`. An absent or empty value uses
 /// `default`; a parse failure is reported with the user-facing parameter name
 /// and `expected` description rather than silently substituting the default.
+#[cfg(test)]
 fn optional_parse<T>(
     params: &Parameters,
     key: &str,
@@ -954,6 +942,62 @@ mod tests {
 
     fn empty_params() -> Parameters {
         Parameters::new(vec![], "pg", crate::PARAMETERS)
+    }
+
+    // Regression for #11994: CDC must honor `pg_connection_string` the same way
+    // as the federated read pool (libpq key=value; default sslmode verify-full).
+    #[test]
+    fn connection_string_flows_into_replication_params() {
+        let params = Parameters::new(
+            vec![
+                (
+                    "connection_string".to_string(),
+                    SecretString::from(
+                        "host=db.internal port=5433 dbname=csdb user=csuser password=secret",
+                    ),
+                ),
+                ("host".to_string(), SecretString::from("ignored")),
+            ],
+            "pg",
+            crate::PARAMETERS,
+        );
+        let repl = replication_params_from_connector_params(&params, "hits")
+            .expect("valid connection_string should parse");
+        assert_eq!(repl.host, "db.internal");
+        assert_eq!(repl.port, 5433);
+        assert_eq!(repl.user, "csuser");
+        assert_eq!(repl.database, "csdb");
+        assert_eq!(repl.sslmode, config::SslMode::VerifyFull);
+        assert_eq!(
+            secrecy::ExposeSecret::expose_secret(&repl.password),
+            "secret"
+        );
+    }
+
+    #[test]
+    fn uri_connection_string_flows_into_replication_params() {
+        let params = Parameters::new(
+            vec![
+                (
+                    "connection_string".to_string(),
+                    SecretString::from("postgresql://csuser:secret@db.internal:5433/csdb"),
+                ),
+                ("host".to_string(), SecretString::from("ignored")),
+            ],
+            "pg",
+            crate::PARAMETERS,
+        );
+        let repl = replication_params_from_connector_params(&params, "hits")
+            .expect("URI connection_string should parse for CDC");
+        assert_eq!(repl.host, "db.internal");
+        assert_eq!(repl.port, 5433);
+        assert_eq!(repl.user, "csuser");
+        assert_eq!(repl.database, "csdb");
+        assert_eq!(repl.sslmode, config::SslMode::VerifyFull);
+        assert_eq!(
+            secrecy::ExposeSecret::expose_secret(&repl.password),
+            "secret"
+        );
     }
 
     #[test]

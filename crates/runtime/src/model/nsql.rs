@@ -664,10 +664,12 @@ fn runtime_indexes_from_provider(
                 .map(|index| {
                     let mut columns = index.required_columns();
                     columns.sort();
+                    let kind =
+                        compound_index_kind(&index).unwrap_or_else(|| index.name().to_string());
                     NsqlIndexContext {
                         name: Some(index.name().to_string()),
                         columns,
-                        kind: index.name().to_string(),
+                        kind,
                         source: "runtime_index".to_string(),
                     }
                 })
@@ -700,6 +702,8 @@ fn dataset_search_function_availability(
 }
 
 fn is_vector_search_index(kind: &str) -> bool {
+    // `"CompoundVectorIndex"` is how `compound_index_kind` reports a vector-composing
+    // `CompoundSearchIndex`; without it here, such a compound would never match a column.
     matches!(
         kind,
         "NativeVectorIndex"
@@ -708,11 +712,35 @@ fn is_vector_search_index(kind: &str) -> bool {
             | "s3_vector_index"
             | "ChunkedSearchIndex"
             | "ChunkedVectorIndex"
+            | "CompoundVectorIndex"
     )
 }
 
 fn is_full_text_search_index(kind: &str) -> bool {
-    matches!(kind, "full_text" | "elasticsearch_text_index")
+    // A `"CompoundSearchIndex"` kind is only ever a full-text compound here: a vector-composing
+    // `CompoundSearchIndex` is reclassified as `"CompoundVectorIndex"` by `compound_index_kind`
+    // before it reaches this matcher.
+    matches!(
+        kind,
+        "full_text" | "elasticsearch_text_index" | "CompoundSearchIndex"
+    )
+}
+
+/// Resolves the classification `kind` for a `CompoundSearchIndex`, whose [`Index::name`] is the
+/// same (`"CompoundSearchIndex"`) whether it composes vector or full-text tiers. Reports a
+/// vector-composing compound as `"CompoundVectorIndex"` (via [`SearchIndex::as_vector_index`]) so
+/// it is never misclassified as full-text; returns `None` for any other index, leaving the
+/// caller to use [`Index::name`].
+fn compound_index_kind(
+    index: &Arc<dyn runtime_datafusion_index::Index + Send + Sync>,
+) -> Option<String> {
+    use search::index::SearchIndex;
+    use search::index::compound::CompoundSearchIndex;
+
+    let compound = index.as_any().downcast_ref::<CompoundSearchIndex>()?;
+    Arc::new(compound.clone())
+        .as_vector_index()
+        .map(|_| "CompoundVectorIndex".to_string())
 }
 
 fn search_index_for_column(
