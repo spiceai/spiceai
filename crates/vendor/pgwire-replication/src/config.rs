@@ -420,14 +420,18 @@ pub struct ReplicationConfig {
     /// Default: 1 GiB
     pub max_message_size: usize,
 
-    /// pgoutput logical decoding protocol version requested in
-    /// `START_REPLICATION` (`proto_version '<n>'`).
+    /// The *maximum* pgoutput logical-decoding protocol version the consumer can
+    /// handle. The worker negotiates the effective version down to what the
+    /// connected server supports (see [`negotiate_proto_version`]): v2 (in-progress
+    /// transaction streaming) needs server >= 14, v3 (two-phase commit) >= 15,
+    /// v4 (parallel-apply streaming) >= 16, and v1 is the universal baseline. The
+    /// negotiated version is what appears in `START_REPLICATION`'s
+    /// `proto_version '<n>'`; `streaming 'true'` is added when it is >= 2.
     ///
-    /// `1` is the baseline every supported server speaks. Higher versions add
-    /// features (2: in-progress transaction streaming; 3: two-phase commit;
-    /// 4: parallel-apply streaming) whose extra message types the consumer
-    /// must be prepared to handle — leave at `1` unless the consumer decodes
-    /// them.
+    /// This is a *ceiling*, not a demand: set it to the highest version whose
+    /// extra message types the consumer decodes. On an older server the worker
+    /// requests less, and if the server rejects the requested version it falls
+    /// back to v1.
     ///
     /// Default: 1
     pub proto_version: u8,

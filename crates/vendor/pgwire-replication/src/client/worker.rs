@@ -131,6 +131,10 @@ pub struct WorkerState {
     progress: Arc<SharedProgress>,
     stop_rx: watch::Receiver<bool>,
     out: mpsc::Sender<std::result::Result<ReplicationEvent, PgWireError>>,
+    /// Server major version, parsed from the `server_version` ParameterStatus
+    /// during the startup handshake. Drives pgoutput protocol negotiation
+    /// (see [`negotiate_proto_version`]). `None` if the server never sent it.
+    server_major: Option<u32>,
 }
 
 impl WorkerState {
@@ -145,6 +149,7 @@ impl WorkerState {
             progress,
             stop_rx,
             out,
+            server_major: None,
         }
     }
 
@@ -176,20 +181,71 @@ impl WorkerState {
         write_startup_message(stream, 196_608, &params).await
     }
 
-    /// Start the logical replication stream.
+    /// Start the logical replication stream, negotiating the pgoutput protocol
+    /// version against the connected server and falling back on rejection.
+    ///
+    /// The effective version is the smaller of the consumer's ceiling
+    /// (`cfg.proto_version`) and the server's capability
+    /// ([`negotiate_proto_version`]). If the server rejects `START_REPLICATION`
+    /// at that version (a managed provider that reports a new-enough version but
+    /// disallows `streaming`, say), we step the requested version down one at a
+    /// time to the universal v1 baseline before giving up. The negotiated
+    /// version and every fallback are logged.
     async fn start_replication<S: AsyncRead + AsyncWrite + Unpin>(
         &self,
         stream: &mut S,
     ) -> Result<()> {
+        let mut proto = negotiate_proto_version(self.server_major, self.cfg.proto_version);
+        loop {
+            match self.issue_start_replication(stream, proto).await? {
+                StartOutcome::Streaming => {
+                    tracing::info!(
+                        proto_version = proto,
+                        streaming = proto >= 2,
+                        server_major = ?self.server_major,
+                        requested_max = self.cfg.proto_version,
+                        "logical replication started (pgoutput protocol v{proto})"
+                    );
+                    return Ok(());
+                }
+                StartOutcome::Rejected(err) if proto > 1 => {
+                    let next = proto - 1;
+                    tracing::warn!(
+                        rejected_proto = proto,
+                        fallback_proto = next,
+                        server_major = ?self.server_major,
+                        error = %err,
+                        "server rejected START_REPLICATION at pgoutput protocol v{proto}; \
+                         falling back to v{next}"
+                    );
+                    proto = next;
+                }
+                StartOutcome::Rejected(err) => return Err(err),
+            }
+        }
+    }
+
+    /// Issue one `START_REPLICATION` at the given protocol version and wait for
+    /// the outcome. On `CopyBothResponse` the stream is live; on `ErrorResponse`
+    /// the trailing `ReadyForQuery` is drained so the connection can be reused
+    /// for a lower-version retry.
+    async fn issue_start_replication<S: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        stream: &mut S,
+        proto: u8,
+    ) -> Result<StartOutcome> {
         // Escape single quotes in publication name
         let publication = self.cfg.publication.replace('\'', "''");
-        // pgoutput options. `binary 'true'` is only appended when requested;
-        // omitting it preserves the historical text-format wire and keeps the
-        // query identical to prior versions for text consumers.
+        // pgoutput options. `streaming 'true'` (proto >= 2) asks the server to
+        // stream in-progress transactions instead of spilling its reorder buffer
+        // to disk. `binary 'true'` is only appended when requested; omitting it
+        // preserves the historical text-format wire for text consumers.
         let mut options = format!(
-            "proto_version '{}', publication_names '{}', messages 'true'",
-            self.cfg.proto_version, publication,
+            "proto_version '{proto}', publication_names '{publication}', messages 'true'"
         );
+        if proto >= 2 {
+            options.push_str(", streaming 'true'");
+        }
         if matches!(self.cfg.format, crate::config::PgOutputFormat::Binary) {
             options.push_str(", binary 'true'");
         }
@@ -199,12 +255,20 @@ impl WorkerState {
         );
         write_query(stream, &sql).await?;
 
-        // Wait for CopyBothResponse
         loop {
             let msg = read_backend_message(stream).await?;
             match msg.tag {
-                b'W' => return Ok(()), // CopyBothResponse - ready to stream
-                b'E' => return Err(PgWireError::Server(parse_error_response(&msg.payload))),
+                b'W' => return Ok(StartOutcome::Streaming), // CopyBothResponse - live
+                b'E' => {
+                    let err = PgWireError::Server(parse_error_response(&msg.payload));
+                    // Drain to ReadyForQuery so a fallback attempt starts clean.
+                    loop {
+                        if read_backend_message(stream).await?.tag == b'Z' {
+                            break;
+                        }
+                    }
+                    return Ok(StartOutcome::Rejected(err));
+                }
                 // Notice / ParameterStatus / BackendKeyData / anything else: keep waiting.
                 _ => {}
             }
@@ -559,7 +623,18 @@ impl WorkerState {
                 }
                 b'E' => return Err(PgWireError::Server(parse_error_response(&msg.payload))),
                 b'Z' => return Ok(()), // ReadyForQuery - auth complete
-                // ParameterStatus / BackendKeyData / anything else - ignore
+                b'S' => {
+                    // ParameterStatus: capture `server_version` for pgoutput
+                    // protocol negotiation. Postgres always emits it during the
+                    // startup handshake, so we learn the version without an extra
+                    // round-trip.
+                    if let Some((key, value)) = parse_parameter_status(&msg.payload) {
+                        if key == "server_version" {
+                            self.server_major = parse_server_major(&value);
+                        }
+                    }
+                }
+                // BackendKeyData / anything else - ignore
                 _ => {}
             }
         }
@@ -694,6 +769,53 @@ fn parse_sasl_mechanisms(data: &[u8]) -> Vec<String> {
     }
 
     mechanisms
+}
+
+/// Outcome of one `START_REPLICATION` attempt.
+enum StartOutcome {
+    /// `CopyBothResponse` — the stream is live.
+    Streaming,
+    /// `ErrorResponse` — the server refused this protocol version; the trailing
+    /// `ReadyForQuery` has been drained so the connection can be reused.
+    Rejected(PgWireError),
+}
+
+/// Parse a `ParameterStatus` payload (`key\0value\0`) into its key and value.
+fn parse_parameter_status(payload: &[u8]) -> Option<(String, String)> {
+    let mut parts = payload.split(|&b| b == 0);
+    let key = parts.next()?;
+    let value = parts.next()?;
+    Some((
+        String::from_utf8_lossy(key).into_owned(),
+        String::from_utf8_lossy(value).into_owned(),
+    ))
+}
+
+/// Parse the major version from a `server_version` ParameterStatus value such as
+/// `"16.2"`, `"16beta1"`, or `"16.2 (Debian 16.2-1.pgdg120+2)"` — the leading
+/// integer. Postgres >= 10 uses a single-number major, and pre-10 `"9.6.x"`
+/// yields `9` (correctly below every streaming threshold).
+fn parse_server_major(version: &str) -> Option<u32> {
+    let digits: String = version
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
+/// Negotiate the effective pgoutput protocol version: the smaller of the
+/// consumer's `desired` ceiling and what the server supports. Streaming (v2)
+/// needs server >= 14, two-phase (v3) >= 15, parallel (v4) >= 16; an unknown or
+/// older server gets the universal v1 baseline. Never returns 0.
+fn negotiate_proto_version(server_major: Option<u32>, desired: u8) -> u8 {
+    let server_cap: u8 = match server_major {
+        Some(v) if v >= 16 => 4,
+        Some(v) if v >= 15 => 3,
+        Some(v) if v >= 14 => 2,
+        _ => 1,
+    };
+    desired.min(server_cap).max(1)
 }
 
 #[expect(
@@ -862,6 +984,42 @@ fn postgres_md5(password: &str, user: &str, salt: [u8; 4]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_major_parses_common_version_strings() {
+        assert_eq!(parse_server_major("16.2"), Some(16));
+        assert_eq!(parse_server_major("17"), Some(17));
+        assert_eq!(parse_server_major("16beta1"), Some(16));
+        assert_eq!(parse_server_major("16.2 (Debian 16.2-1.pgdg120+2)"), Some(16));
+        assert_eq!(parse_server_major("9.6.24"), Some(9));
+        assert_eq!(parse_server_major(""), None);
+        assert_eq!(parse_server_major("unknown"), None);
+    }
+
+    #[test]
+    fn parameter_status_splits_key_value() {
+        assert_eq!(
+            parse_parameter_status(b"server_version\016.2\0"),
+            Some(("server_version".to_string(), "16.2".to_string()))
+        );
+        assert_eq!(parse_parameter_status(b"no_value"), None);
+    }
+
+    #[test]
+    fn negotiate_caps_by_server_and_desired() {
+        // Desired ceiling honored when the server supports it.
+        assert_eq!(negotiate_proto_version(Some(16), 4), 4);
+        assert_eq!(negotiate_proto_version(Some(15), 4), 3);
+        assert_eq!(negotiate_proto_version(Some(14), 4), 2);
+        // Server older than v2-streaming (or unknown) is pinned to v1.
+        assert_eq!(negotiate_proto_version(Some(13), 4), 1);
+        assert_eq!(negotiate_proto_version(None, 4), 1);
+        // The consumer ceiling wins when it is the smaller bound.
+        assert_eq!(negotiate_proto_version(Some(16), 2), 2);
+        assert_eq!(negotiate_proto_version(Some(16), 1), 1);
+        // Never returns 0 even for a nonsensical desired.
+        assert_eq!(negotiate_proto_version(Some(16), 0), 1);
+    }
 
     #[test]
     fn parse_sasl_mechanisms_single() {
