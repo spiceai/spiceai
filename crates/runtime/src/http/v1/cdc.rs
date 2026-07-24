@@ -28,8 +28,6 @@ limitations under the License.
 //! The request blocks until the change batch is applied to the accelerator
 //! (ack), so Debezium Server / Embedded sinks can commit offsets safely.
 
-#[cfg(feature = "debezium")]
-use axum::http::header;
 use axum::{
     Json,
     body::Bytes,
