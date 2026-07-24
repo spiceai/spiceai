@@ -1711,7 +1711,10 @@ async fn handle_relation(
     // per-member `RelationSchemaTracker` adopts a mid-stream column add / lossless
     // type widening into the working schema, so the built `ChangeBatch` carries
     // the wider data struct — the runtime apply loop then reconciles it against
-    // the accelerator per the policy. The tracker is re-derived each reconnect.
+    // the accelerator per the policy. `schema_state` persists across reconnects
+    // (declared outside the reconnect loop in `run_pump`), so an adopted column
+    // survives a transient disconnect rather than being dropped as a fresh
+    // "first observation".
     let state = schema_state.entry(member_key.clone()).or_default();
     let working_schema = if member.policy == SchemaEvolutionPolicy::Block {
         if let Err(e) = client::validate_relation_against_schema(
