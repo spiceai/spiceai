@@ -33,6 +33,7 @@ use crate::datafusion::DataFusion;
 use crate::status::{ComponentStatus, RuntimeStatus};
 
 pub use runtime_cluster::scheduler_task_config::{ConfigError, PartitionAssignmentConfig};
+use runtime_cluster::service::ReconcileOutcome;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -108,7 +109,19 @@ impl PartitionAssignmentTask {
             }
         }
 
-        let mut interval = tokio::time::interval(self.interval);
+        // Defer the *first* assignment cycle by one full interval so executors
+        // have a window to connect before the scheduler distributes partitions.
+        // Assignment is scheduler-controlled (executors no longer allocate on
+        // connect via `allocate_initial_partitions`), so an executor that joins
+        // late — but within this window — is included in the initial fair
+        // distribution rather than being starved by peers that connected first.
+        // `tokio::time::interval` otherwise fires its first tick immediately.
+        tracing::info!(
+            delay_ms = self.interval.as_millis(),
+            "Deferring first partition assignment cycle to let executors connect"
+        );
+        let start = tokio::time::Instant::now() + self.interval;
+        let mut interval = tokio::time::interval_at(start, self.interval);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
@@ -185,10 +198,25 @@ impl PartitionAssignmentTask {
             return Ok(());
         }
 
-        service
+        let outcome = service
             .reconcile_all(self.df.as_ref())
             .await
-            .map_err(|e| Error::AssignmentCycle { source: e })
+            .map_err(|e| Error::AssignmentCycle { source: e })?;
+
+        // Only open the gate once a cycle has run its assignment pass with the
+        // executors connected during the startup window. `reconcile_all` returns
+        // `NoAssignment` when no executors were connected (or there were no
+        // partitioned tables), i.e. before the scheduler could distribute to any
+        // executor; opening the gate then would let a later-connecting executor
+        // proceed with an empty initial share — the exact failure the gate
+        // prevents. A subsequent cycle that runs the assignment pass will open it.
+        //
+        // Opening lets `allocate_initial_partitions` return each executor its
+        // assigned share so its initial snapshot loads the right partitions.
+        if outcome == ReconcileOutcome::Assigned {
+            service.mark_first_assignment_complete();
+        }
+        Ok(())
     }
 
     /// Seed partition metadata for all accelerated tables that don't have metadata yet.
