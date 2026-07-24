@@ -35,7 +35,6 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use serde::Serialize;
 use serde_json::json;
 
 use super::require_write_access;
@@ -44,7 +43,10 @@ use super::require_write_access;
 use crate::dataconnector::cdc_ingest::{self, Error as IngestError};
 #[cfg(feature = "debezium")]
 use axum::http::header;
+#[cfg(any(feature = "debezium", feature = "openapi"))]
+use serde::Serialize;
 
+#[cfg(any(feature = "debezium", feature = "openapi"))]
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[cfg_attr(
