@@ -93,10 +93,13 @@ const REPLICATION_SLOT_PARAM: &str = "pg_replication_slot";
 /// Matches `CatalogAccelerationEngine`'s only variant.
 const CAYENNE_ENGINE: &str = "cayenne";
 
-/// Docs link appended to every user-facing warning/error this module emits, so
-/// each one points at the same actionable reference (see item D of #11850:
-/// standardize messages on "primary key" / "REPLICA IDENTITY FULL / USING
-/// INDEX" and always include a docs link).
+/// Docs link appended to every user-facing warning and error this module emits
+/// (the skip warning, the REPLICA IDENTITY FULL warning, the view "not
+/// replicated" warning, and the no-eligible-tables error), so each points at the
+/// same actionable reference (see item D of #11850: standardize messages on
+/// "primary key" / "REPLICA IDENTITY FULL / USING INDEX" and always include a
+/// docs link). The purely informational USING INDEX acceleration line is not a
+/// warning/error and omits it.
 const DOCS_URL: &str = "https://spiceai.org/docs/components/data-connectors/postgres";
 
 fn table_is_selected(
@@ -562,7 +565,7 @@ impl AcceleratedCatalogProvider {
                     }
                     ReplicaIdentityOutcome::AccelerateFullReplicaIdentity { key } => {
                         tracing::warn!(
-                            "Catalog '{}': accelerating table {table_path} with REPLICA IDENTITY FULL (keyed by ({})) -- heavier than DEFAULT/USING INDEX: PostgreSQL logs the full old-row image on every UPDATE/DELETE. Prefer a primary key or USING INDEX where possible.",
+                            "Catalog '{}': accelerating table {table_path} with REPLICA IDENTITY FULL (keyed by ({})) -- heavier than DEFAULT/USING INDEX: PostgreSQL logs the full old-row image on every UPDATE/DELETE. Prefer a primary key or USING INDEX where possible. Docs: {DOCS_URL}",
                             self.catalog_name,
                             key.join(", "),
                         );
