@@ -96,8 +96,7 @@ fn connection_identity_from_connection_string(
         // Same steps as `PostgresConnectionPool::new_inner` for key=value:
         // peel password/sslmode/sslrootcert, build a stripped libpq string,
         // then parse with `tokio_postgres::Config`.
-        let (mut stripped, ssl_mode, ssl_rootcert, password) =
-            parse_connection_string(trimmed);
+        let (mut stripped, ssl_mode, ssl_rootcert, password) = parse_connection_string(trimmed);
         validate_sslmode(&ssl_mode, &user_param)?;
 
         // tokio_postgres Config only accepts disable/prefer/require; verify-*
@@ -500,8 +499,8 @@ mod tests {
             "connection_string",
             "postgresql://csuser:p%3Dass@db.internal:5432/csdb",
         )]);
-        let identity =
-            connection_identity_from_params(&params).expect("percent-encoded password should parse");
+        let identity = connection_identity_from_params(&params)
+            .expect("percent-encoded password should parse");
         assert_eq!(identity.password, "p=ass");
     }
 
@@ -511,8 +510,8 @@ mod tests {
             "connection_string",
             "postgresql://csuser:secret@db.internal:5432/csdb?sslmode=verify-ful",
         )]);
-        let err = connection_identity_from_params(&params)
-            .expect_err("typo'd sslmode in URI must error");
+        let err =
+            connection_identity_from_params(&params).expect_err("typo'd sslmode in URI must error");
         assert!(
             err.contains("pg_connection_string"),
             "error should attribute to connection_string, got: {err}"
