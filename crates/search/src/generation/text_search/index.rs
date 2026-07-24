@@ -114,12 +114,17 @@ impl Index for FullTextDatabaseIndex {
         // can leave uncommitted operations in the writer, and they would otherwise be
         // swept into this window's commit. Taking the writer lock before setting the
         // flag also keeps the reset and the flag store atomic w.r.t. `compute_index`.
+        // A rollback failure is fatal for the window: proceeding would let stale
+        // operations be swept into this window's commit and publish an incorrect
+        // index state, so surface the error and leave `defer_commit` unset (the
+        // writer keeps its per-write commit behavior rather than deferring on a
+        // writer in an unknown state).
         let mut index_writer = self.writer.lock().await;
-        if let Err(e) = index_writer.rollback() {
-            tracing::warn!(
-                "Failed to discard stale staged full-text index operations at write start: {e}"
-            );
-        }
+        index_writer
+            .rollback()
+            .map(|_| ())
+            .context(TextSearchIndexingSnafu)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
         self.defer_commit.store(true, Ordering::Release);
         Ok(())
     }
