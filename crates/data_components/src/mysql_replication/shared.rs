@@ -940,6 +940,48 @@ async fn attach_member(
     Ok(Box::pin(head.chain(ReceiverStream::new(receiver))))
 }
 
+/// Whether a persisted checkpoint can be restored against the live source, or
+/// must be discarded because the source no longer contains it (a reset,
+/// purge, or a different/rebuilt server). Pure so the reset-detection decision
+/// is unit-testable without a live `MySQL` — the caller supplies the live
+/// source state it fetched.
+#[derive(Debug, PartialEq, Eq)]
+enum CheckpointVerdict {
+    /// The checkpoint is consistent with the current source; resume from it.
+    Resume,
+    /// The source no longer contains the checkpoint; apply
+    /// `invalid_checkpoint_behavior`. Carries the operator-facing reason.
+    Unresumable(&'static str),
+}
+
+/// GTID verdict: the persisted executed set must be a subset of the source's
+/// current `@@gtid_executed`. A `RESET MASTER`, a rebuilt server (fresh
+/// `server_uuid`), or a different source reports a set that no longer contains
+/// the checkpoint — resuming would position `COM_BINLOG_DUMP_GTID` from a set
+/// the server cannot honor and silently serve pre-reset data.
+fn gtid_checkpoint_verdict(persisted: &GtidSet, source_executed: &GtidSet) -> CheckpointVerdict {
+    if persisted.is_subset_of(source_executed) {
+        CheckpointVerdict::Resume
+    } else {
+        CheckpointVerdict::Unresumable(
+            "the source's GTID history diverged from the checkpoint (RESET MASTER, a rebuilt server, or a different source); its executed set no longer contains the persisted position",
+        )
+    }
+}
+
+/// File+offset verdict: the persisted binlog file must still be present in the
+/// source's binary log index. A purge, or a reset whose binlog numbering
+/// restarted below the checkpoint's file, drops it.
+fn file_checkpoint_verdict(persisted_file_present: bool) -> CheckpointVerdict {
+    if persisted_file_present {
+        CheckpointVerdict::Resume
+    } else {
+        CheckpointVerdict::Unresumable(
+            "the persisted binlog file is no longer present on the source (purged, or a reset restarted binlog numbering)",
+        )
+    }
+}
+
 /// Resolve a fresh (non-rejoin) member's start position, applying
 /// `invalid_checkpoint_behavior` per member. Returns
 /// `(floor, gtid_seed, snapshotting)`. `gtid_seed` is the executed GTID set to
@@ -1019,7 +1061,25 @@ async fn resolve_start_position(
                                          (corrupt or incomplete)"),
                         };
                         match parsed {
-                            Ok(set) => Some((persisted.position, set)),
+                            Ok(set) => {
+                                // Validate the checkpoint is still real on THIS source:
+                                // its executed set must be a subset of the source's current `@@gtid_executed`.
+                                let source_executed =
+                                    super::setup::fetch_executed_gtid_set(conn).await?;
+                                match gtid_checkpoint_verdict(&set, &source_executed) {
+                                    CheckpointVerdict::Resume => Some((persisted.position, set)),
+                                    CheckpointVerdict::Unresumable(reason) => {
+                                        apply_invalid_checkpoint(
+                                            params,
+                                            position_store,
+                                            dataset_name,
+                                            reason,
+                                        )
+                                        .await?;
+                                        None
+                                    }
+                                }
+                            }
                             Err(reason) => {
                                 apply_invalid_checkpoint(
                                     params,
@@ -1033,17 +1093,21 @@ async fn resolve_start_position(
                         }
                     }
                     CursorType::File => {
-                        if super::setup::binlog_file_exists(conn, &persisted.position.file).await? {
-                            Some((persisted.position, GtidSet::new()))
-                        } else {
-                            apply_invalid_checkpoint(
-                                params,
-                                position_store,
-                                dataset_name,
-                                "binlog purged",
-                            )
-                            .await?;
-                            None
+                        let present =
+                            super::setup::binlog_file_exists(conn, &persisted.position.file)
+                                .await?;
+                        match file_checkpoint_verdict(present) {
+                            CheckpointVerdict::Resume => Some((persisted.position, GtidSet::new())),
+                            CheckpointVerdict::Unresumable(reason) => {
+                                apply_invalid_checkpoint(
+                                    params,
+                                    position_store,
+                                    dataset_name,
+                                    reason,
+                                )
+                                .await?;
+                                None
+                            }
                         }
                     }
                 }
@@ -1053,7 +1117,16 @@ async fn resolve_start_position(
     };
 
     if let Some((position, gtid_seed)) = resume {
-        tracing::info!(dataset = %dataset_name, position = %position, gtid = %use_gtid, "shared mysql binlog: resuming from persisted position");
+        // Report the cursor actually used. In GTID mode the pump ignores
+        // file+offset and positions purely from the executed set
+        // (`start_binlog_stream`), so logging `position=file:offset` there is
+        // misleading — surface the GTID set instead. File+offset positioning
+        // logs the file:offset it truly resumes from.
+        if use_gtid {
+            tracing::info!(dataset = %dataset_name, gtid_set = %gtid_seed, "shared mysql binlog: resuming from persisted GTID position");
+        } else {
+            tracing::info!(dataset = %dataset_name, position = %position, "shared mysql binlog: resuming from persisted file+offset position");
+        }
         return Ok((position, gtid_seed, false));
     }
 
@@ -1099,11 +1172,14 @@ async fn apply_invalid_checkpoint(
 ) -> Result<()> {
     match params.invalid_position_behavior {
         InvalidCheckpointBehavior::Error => super::StalePositionSnafu {
+            // `reason` describes the actual condition (layout/schema drift, a
+            // purged binlog file, or a GTID-history divergence/reset) — surface
+            // it verbatim rather than a fixed explanation, since this helper now
+            // covers all three.
             message: format!(
-                "cannot resume mysql binlog for {dataset_name} ({reason}). Replaying against the \
-                 current source layout would mis-map columns. Set \
-                 `mysql_replication_invalid_checkpoint_behavior: restart` to drop the saved \
-                 position and re-snapshot the table."
+                "cannot resume mysql binlog for {dataset_name}: {reason}. Resuming could serve \
+                 incorrect data. Set `mysql_replication_invalid_checkpoint_behavior: restart` to \
+                 drop the saved position and re-snapshot the table."
             ),
         }
         .fail(),
@@ -1275,7 +1351,13 @@ async fn run_pump(source: Arc<SharedSource>) {
             Ok(stream) => {
                 backoff.reset();
                 if reconnect_attempts > 0 {
-                    tracing::info!(connection = %connection, attempts = reconnect_attempts, position = %resume, "shared mysql binlog connection resumed");
+                    // In GTID mode the dump repositions from the shared executed
+                    // set, not `resume` (the file+offset floor) — report the set.
+                    if use_gtid {
+                        tracing::info!(connection = %connection, attempts = reconnect_attempts, gtid_set = %resume_gtid, "shared mysql binlog connection resumed");
+                    } else {
+                        tracing::info!(connection = %connection, attempts = reconnect_attempts, position = %resume, "shared mysql binlog connection resumed");
+                    }
                     reconnect_attempts = 0;
                 }
                 // Connection starts at the shared min (<= every held member's
@@ -2217,6 +2299,65 @@ mod tests {
     }
     fn pos(file: &str, p: u64) -> BinlogPosition {
         BinlogPosition::new(file, p)
+    }
+
+    const SRC_A: &str = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+    const SRC_B: &str = "5d1c0d8c-71ca-11e1-9e33-c80aa9429999";
+
+    fn gtids(raw: &str) -> GtidSet {
+        GtidSet::parse(raw).expect("parse gtid set")
+    }
+
+    #[test]
+    fn gtid_checkpoint_resumes_when_subset_of_source() {
+        // Normal restart: the source kept the checkpoint's history and grew.
+        let checkpoint = gtids(&format!("{SRC_A}:1-100"));
+        let source = gtids(&format!("{SRC_A}:1-150"));
+        assert_eq!(
+            gtid_checkpoint_verdict(&checkpoint, &source),
+            CheckpointVerdict::Resume
+        );
+        // An empty checkpoint (gtid_mode = ON, zero txns applied) always resumes.
+        assert_eq!(
+            gtid_checkpoint_verdict(&GtidSet::new(), &source),
+            CheckpointVerdict::Resume
+        );
+    }
+
+    #[test]
+    fn gtid_checkpoint_unresumable_after_reset_or_divergence() {
+        let checkpoint = gtids(&format!("{SRC_A}:1-100"));
+
+        // RESET MASTER / rebuilt server: source executed set under a new UUID.
+        let rebuilt = gtids(&format!("{SRC_B}:1-3"));
+        assert!(matches!(
+            gtid_checkpoint_verdict(&checkpoint, &rebuilt),
+            CheckpointVerdict::Unresumable(_)
+        ));
+
+        // Freshly reset GTID server with zero transactions applied.
+        let empty_source = GtidSet::new();
+        assert!(matches!(
+            gtid_checkpoint_verdict(&checkpoint, &empty_source),
+            CheckpointVerdict::Unresumable(_)
+        ));
+
+        // Divergence: same UUID, but the source is behind the checkpoint.
+        let behind = gtids(&format!("{SRC_A}:1-50"));
+        assert!(matches!(
+            gtid_checkpoint_verdict(&checkpoint, &behind),
+            CheckpointVerdict::Unresumable(_)
+        ));
+    }
+
+    #[test]
+    fn file_checkpoint_verdict_tracks_presence() {
+        assert_eq!(file_checkpoint_verdict(true), CheckpointVerdict::Resume);
+        // Purged, or a reset that restarted binlog numbering below the file.
+        assert!(matches!(
+            file_checkpoint_verdict(false),
+            CheckpointVerdict::Unresumable(_)
+        ));
     }
 
     #[test]
