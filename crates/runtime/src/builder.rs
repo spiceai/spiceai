@@ -1282,6 +1282,11 @@ fn duckdb_budget_inputs(
             inputs.unset_instance_labels.push(key);
         }
     }
+    // Deterministic warning output: `instances` is a `HashMap`, so its iteration
+    // order (and thus the pushed label order) varies run-to-run. Sort so identical
+    // Spicepods always log the same `duckdb_unset_instance_paths` list, keeping log
+    // analysis and alert dedup stable.
+    inputs.unset_instance_labels.sort();
     inputs
 }
 
