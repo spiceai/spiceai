@@ -204,7 +204,7 @@ const MAX_PK_SELECTIVE_RANGE_SPAN: i64 = 32;
 ///
 /// Raised from 256 → 2048 so sparse-to-moderate key-delete sets get Vortex
 /// chunk pruning (fewer rows decoded) without building an unbounded expression
-/// tree. Dense MoR still falls through to the post-decode deletion filter.
+/// tree. Dense `MoR` still falls through to the post-decode deletion filter.
 const MAX_VORTEX_KEY_DELETE_PUSHDOWN: usize = 2048;
 
 /// Result of a Cayenne CDC append write.
