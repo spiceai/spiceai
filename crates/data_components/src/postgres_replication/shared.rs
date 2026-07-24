@@ -2084,6 +2084,11 @@ async fn run_pump(source: Arc<SharedSource>) {
         // prefix on change messages.
         let mut open_txns: OpenTxns = OpenTxns::default();
         let mut stream_xid: Option<u32> = None;
+        // High-water mark of a single streamed transaction's buffered bytes —
+        // the reorder buffer relocated from Postgres's disk into spiced (issue
+        // #12011). Logged when it grows so the relocated buffering cost is
+        // observable (a promoted OTel gauge is a follow-up).
+        let mut stream_buf_high_water: usize = 0;
         // Abandon any streamed transactions from a prior connection: Postgres
         // re-streams from restart_lsn after a reconnect, so their buffers (and
         // the ack cap they imposed) must be cleared or the cap would pin the ack
@@ -2290,6 +2295,17 @@ async fn run_pump(source: Arc<SharedSource>) {
                             }) => {
                                 stream_xid = None;
                                 if let Some(open) = open_txns.remove(&xid) {
+                                    if open.bytes > stream_buf_high_water {
+                                        stream_buf_high_water = open.bytes;
+                                        tracing::info!(
+                                            slot = %slot_name,
+                                            xid,
+                                            buffered_bytes = open.bytes,
+                                            changes = open.changes.len(),
+                                            "new high-water for a single streamed Postgres \
+                                             transaction buffered in spiced (relocated reorder buffer)"
+                                        );
+                                    }
                                     send_wait_us = deliver_commit(
                                         &source,
                                         &mut eager_hold,
@@ -4548,10 +4564,19 @@ mod tests {
     /// commit/credit, `flush_lsn` = the eagerly-maintained floor). The
     /// differential test (below) asserts the new lock-free `AckTable` is
     /// byte-identical to this on every operation.
-    #[derive(Default)]
     struct Model {
         entries: HashMap<MemberKey, ModelEntry>,
         shared_flush: u64,
+        open_floor: u64,
+    }
+    impl Default for Model {
+        fn default() -> Self {
+            Self {
+                entries: HashMap::new(),
+                shared_flush: 0,
+                open_floor: u64::MAX,
+            }
+        }
     }
     #[derive(Clone, Copy)]
     struct ModelEntry {
@@ -4622,9 +4647,13 @@ mod tests {
                 e.streaming = false;
             }
         }
+        fn set_open_floor(&mut self, lsn: u64) {
+            self.open_floor = lsn;
+            self.recompute();
+        }
         fn recompute(&mut self) {
             if let Some(floor) = self.entries.values().map(|e| e.committed).min() {
-                self.shared_flush = self.shared_flush.max(floor);
+                self.shared_flush = self.shared_flush.max(floor.min(self.open_floor));
             }
         }
         fn flush_lsn(&self) -> u64 {
@@ -4657,7 +4686,7 @@ mod tests {
             for _ in 0..800 {
                 let m = usize::try_from(rng.below(MEMBERS)).expect("member index fits usize");
                 let k = &members[m];
-                match rng.below(7) {
+                match rng.below(8) {
                     0 => {
                         let snap = rng.below(2) == 0;
                         ack.register(k, snap);
@@ -4693,9 +4722,22 @@ mod tests {
                         ack.snapshot_finished(k);
                         model.snapshot_finished(k);
                     }
-                    _ => {
+                    6 => {
                         ack.detach(k);
                         model.detach(k);
+                    }
+                    _ => {
+                        // The v2-streaming ack cap: sometimes an open transaction
+                        // holds the floor below the min committed, sometimes it
+                        // lifts (u64::MAX). Both must compose identically with the
+                        // min-across-members floor.
+                        let floor = if rng.below(3) == 0 {
+                            u64::MAX
+                        } else {
+                            upto.saturating_sub(rng.below(80))
+                        };
+                        ack.set_open_floor(floor);
+                        model.set_open_floor(floor);
                     }
                 }
 
