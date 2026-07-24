@@ -1240,6 +1240,8 @@ impl DataSink for CayennePartitionedAppendSink {
                 if let Err(error) = receipt.remove_committed_staging_wal().await {
                     tracing::warn!(
                         table_id = receipt.table_id(),
+                        target_snapshot = receipt.target_snapshot_id(),
+                        staging_wal_path = %receipt.staging_wal_path().display(),
                         %error,
                         "Failed to remove committed partition staging WAL"
                     );

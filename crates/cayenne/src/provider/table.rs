@@ -447,6 +447,8 @@ impl CayenneCdcWrite {
                 if let Err(error) = prepared_append.remove_committed_staging_wal().await {
                     tracing::debug!(
                         table = self.table.table_name(),
+                        target_snapshot = prepared_append.target_snapshot_id(),
+                        staging_wal_path = %prepared_append.staging_wal_path().display(),
                         %error,
                         "Best-effort removal of a committed CDC upsert's staging WAL failed; the next write's recovery will roll it forward"
                     );
