@@ -26,7 +26,6 @@ use runtime_datafusion_index::{
 };
 use runtime_search::embeddings::table::EmbeddingTable;
 use runtime_search::table_provider_explorer::TableProviderExplorer;
-use runtime_table_partition::creator::AsAny;
 
 use crate::dataconnector::iceberg_cluster::IcebergClusterTableProvider;
 use data_components::iceberg::delete::IcebergDeletionProvider;
