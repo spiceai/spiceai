@@ -385,9 +385,16 @@ pub async fn fetch_executed_gtid_set(conn: &mut Conn) -> Result<GtidSet> {
         .context(SetupQuerySnafu {
             context: "SELECT @@GLOBAL.gtid_executed",
         })?;
+    // `@@GLOBAL.gtid_executed` always returns exactly one row (an empty *string*
+    // for a fresh GTID server — parsed to the empty set below). A *missing row*
+    // is an unexpected server/driver anomaly, not a known-empty set: treating it
+    // as empty would make every non-empty checkpoint fail the subset check and
+    // force a spurious re-snapshot, masking the real problem. Surface it instead.
     match raw {
         Some(raw) => GtidSet::parse(&raw).map_err(|message| Error::GtidParse { message }),
-        None => Ok(GtidSet::new()),
+        None => Err(Error::Decode {
+            message: "SELECT @@GLOBAL.gtid_executed returned no row".to_string(),
+        }),
     }
 }
 
