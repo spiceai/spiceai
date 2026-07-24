@@ -1828,7 +1828,10 @@ async fn handle_relation(
                 member_fatal(
                     source,
                     &member_key,
-                    format!("schema change for {} cannot be applied: {e}", member.dataset_name),
+                    format!(
+                        "schema change for {} cannot be applied: {e}",
+                        member.dataset_name
+                    ),
                 )
                 .await;
                 return;
@@ -2190,11 +2193,8 @@ mod tests {
             test_params(),
         ));
         let member_key: MemberKey = ("public".to_string(), "users".to_string());
-        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-            "id",
-            DataType::Int32,
-            false,
-        )]));
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         let (sender, _rx) = mpsc::channel(4);
         lock(&source.members).insert(
             member_key.clone(),
@@ -2241,8 +2241,14 @@ mod tests {
         };
 
         // Baseline Relation: working schema unchanged (id only).
-        handle_relation(&source, &mut decoder, &mut routes, &mut schema_state, rel(vec![id_col()]))
-            .await;
+        handle_relation(
+            &source,
+            &mut decoder,
+            &mut routes,
+            &mut schema_state,
+            rel(vec![id_col()]),
+        )
+        .await;
         assert_eq!(working(&routes), vec!["id".to_string()]);
 
         // Mid-stream ALTER adds `name` (text): the shared pump must adopt it.
@@ -2360,9 +2366,19 @@ mod tests {
         let mut schema_state = MemberSchemaStates::default();
 
         // First registration: schema [id]; adopt `name` mid-stream → [id, name].
-        register(Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])));
-        handle_relation(&source, &mut decoder, &mut routes, &mut schema_state, rel(vec![id_col()]))
-            .await;
+        register(Arc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )])));
+        handle_relation(
+            &source,
+            &mut decoder,
+            &mut routes,
+            &mut schema_state,
+            rel(vec![id_col()]),
+        )
+        .await;
         handle_relation(
             &source,
             &mut decoder,
