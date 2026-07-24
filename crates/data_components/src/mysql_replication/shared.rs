@@ -1176,11 +1176,14 @@ async fn apply_invalid_checkpoint(
 ) -> Result<()> {
     match params.invalid_position_behavior {
         InvalidCheckpointBehavior::Error => super::StalePositionSnafu {
+            // `reason` describes the actual condition (layout/schema drift, a
+            // purged binlog file, or a GTID-history divergence/reset) — surface
+            // it verbatim rather than a fixed explanation, since this helper now
+            // covers all three.
             message: format!(
-                "cannot resume mysql binlog for {dataset_name} ({reason}). Replaying against the \
-                 current source layout would mis-map columns. Set \
-                 `mysql_replication_invalid_checkpoint_behavior: restart` to drop the saved \
-                 position and re-snapshot the table."
+                "cannot resume mysql binlog for {dataset_name}: {reason}. Resuming could serve \
+                 incorrect data. Set `mysql_replication_invalid_checkpoint_behavior: restart` to \
+                 drop the saved position and re-snapshot the table."
             ),
         }
         .fail(),
