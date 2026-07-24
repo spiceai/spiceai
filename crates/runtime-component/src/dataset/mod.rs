@@ -406,11 +406,10 @@ impl std::fmt::Debug for DatasetSpec {
     }
 }
 
-// Custom PartialEq mirroring the runtime `Dataset`'s historical semantics: it
-// compares the user-meaningful config (ignoring the `app`/`runtime` handles,
-// which live on the wrapper) so the runtime can compare datasets like-for-like
-// across App reloads. NOTE: `schema`, `metadata`, `unsupported_type_action` and
-// `ready_state` are intentionally NOT compared (preserved from the original).
+// Two specs are equal when their identity-defining configuration matches, which
+// lets the runtime compare datasets like-for-like across App reloads. `schema`
+// (derived from `columns`), `metadata`, `unsupported_type_action`, and
+// `ready_state` are deliberately excluded from the comparison.
 impl PartialEq for DatasetSpec {
     fn eq(&self, other: &Self) -> bool {
         self.from == other.from

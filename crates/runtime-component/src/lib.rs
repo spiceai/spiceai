@@ -29,9 +29,9 @@ limitations under the License.
 //! configuration without pulling in the runtime orchestrator — and it compiles in
 //! parallel with `runtime` rather than inside its single codegen unit.
 
-// Mirrors the same crate-level allow in `runtime` (these config-parsing fns moved
-// from there): the errors are self-describing SNAFU/parse errors documented by
-// their variants.
+// The config-parsing functions return self-describing SNAFU/parse errors whose
+// variants document the failure modes, so a per-function `# Errors` section adds
+// no information.
 #![allow(clippy::missing_errors_doc)]
 
 use datafusion::sql::sqlparser::{

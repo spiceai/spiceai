@@ -93,9 +93,9 @@ impl std::fmt::Debug for Dataset {
     }
 }
 
-// Custom PartialEq (delegating to `DatasetSpec`) preserves the historical
-// semantics: ignore the `app`/`runtime` handles so the Runtime can compare
-// datasets like-for-like across App reloads.
+// Equality ignores the `app`/`runtime` handles — they are not part of a
+// dataset's identity — so the runtime can compare datasets like-for-like across
+// App reloads. It delegates to `DatasetSpec`'s configuration comparison.
 impl PartialEq for Dataset {
     fn eq(&self, other: &Self) -> bool {
         self.spec == other.spec
