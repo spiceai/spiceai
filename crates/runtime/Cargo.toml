@@ -137,6 +137,7 @@ runtime-checkpoint-duckdb = { path = "../runtime-checkpoint-duckdb", optional = 
 runtime-checkpoint-sqlite = { path = "../runtime-checkpoint-sqlite", optional = true }
 runtime-checkpoint-postgres = { path = "../runtime-checkpoint-postgres", optional = true }
 runtime-checkpoint-turso = { path = "../runtime-checkpoint-turso", optional = true }
+runtime-component = { path = "../runtime-component" }
 runtime-metrics = { path = "../runtime-metrics" }
 runtime-auth = { path = "../runtime-auth" }
 runtime-cluster = { path = "../runtime-cluster" }

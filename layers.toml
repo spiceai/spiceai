@@ -90,6 +90,14 @@ tier = "foundation"
 # Per-crate overrides win over rules.
 [override]
 runtime = "runtime"
+# Config-only component specs (DatasetSpec/CatalogSpec/ViewSpec + their config
+# submodules) carved out of the `runtime` crate body (Phase 6 PR 6.1, paired with
+# the PR 5.3 spec split). It names nothing from `runtime` (no Arc<Runtime>/App/
+# secrets/datafusion) so the Arc<Runtime> cycle is broken and it compiles in
+# parallel with `runtime`. Kept in the `runtime` tier per the Phase-6 carve model
+# (sibling runtime-* crates stay in-tier); its own deps are all shared-utility/
+# foundation, so it could equally sit in shared-utility.
+runtime-component = "runtime"
 # Extensions that sit above the runtime crate (depend on `runtime`).
 spice-cloud = "extension"
 tpc-extension = "extension"
