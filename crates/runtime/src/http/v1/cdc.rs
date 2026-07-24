@@ -39,18 +39,13 @@ use serde_json::json;
 
 use super::require_write_access;
 
-// Only used by `CdcIngestResponse`, which is itself gated to these features.
-#[cfg(any(feature = "debezium", feature = "openapi"))]
-use serde::Serialize;
-
-// `header` is only used by the debezium ingest path below.
 #[cfg(feature = "debezium")]
 use crate::dataconnector::cdc_ingest::{self, Error as IngestError};
 #[cfg(feature = "debezium")]
 use axum::http::header;
+#[cfg(any(feature = "debezium", feature = "openapi"))]
+use serde::Serialize;
 
-// Constructed only in the debezium path and type-referenced only by the openapi
-// schema; gate it to those features so it isn't dead code in a default build.
 #[cfg(any(feature = "debezium", feature = "openapi"))]
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
