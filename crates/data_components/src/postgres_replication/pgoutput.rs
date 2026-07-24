@@ -55,6 +55,28 @@ pub fn relation_id(data: &[u8]) -> Option<RelationId> {
     Some(u32::from_be_bytes(bytes))
 }
 
+/// The subtransaction xid prefixing a *streamed* (protocol v2+) change message,
+/// read from `data[1..5]` without decoding the tuple. Present on
+/// Insert/Update/Delete/Relation/Truncate messages that arrive inside a Stream
+/// Start/Stop bracket; callers MUST know they are in a stream (the message is
+/// not self-describing).
+#[must_use]
+pub fn subxid(data: &[u8]) -> Option<u32> {
+    let bytes: [u8; 4] = data.get(1..5)?.try_into().ok()?;
+    Some(u32::from_be_bytes(bytes))
+}
+
+/// The relation id of a *streamed* Insert/Update/Delete, read from `data[5..9]`
+/// (after the 1-byte tag and the 4-byte subtransaction-xid prefix) without
+/// decoding the tuple. The non-streamed counterpart is [`relation_id`]; the
+/// caller picks which based on whether it is inside a stream. Not valid for
+/// Truncate (whose body starts with a relation count, not a relation id).
+#[must_use]
+pub fn relation_id_streamed(data: &[u8]) -> Option<RelationId> {
+    let bytes: [u8; 4] = data.get(5..9)?.try_into().ok()?;
+    Some(u32::from_be_bytes(bytes))
+}
+
 /// A decoded pgoutput message, still in its "per-transaction" form.
 #[derive(Debug, Clone)]
 pub enum DecodedMessage {
@@ -85,8 +107,35 @@ pub enum DecodedMessage {
     Truncate {
         relation_ids: Vec<RelationId>,
     },
-    /// Ignored types (Type, Origin, Message, `StreamStart`, etc.) still get decoded
-    /// to a length so we can skip them safely.
+    /// Start of an in-progress transaction segment (pgoutput protocol v2+,
+    /// `streaming`). Change messages between this and the next `StreamStop`
+    /// belong to `xid` and carry a subtransaction-xid prefix. `first_segment`
+    /// is true only for the first segment of the transaction.
+    StreamStart {
+        xid: u32,
+        first_segment: bool,
+    },
+    /// End of the current in-progress transaction segment (protocol v2+).
+    /// Segments of different transactions interleave at this granularity.
+    StreamStop,
+    /// Commit of a streamed transaction (protocol v2+): its buffered changes
+    /// become visible and its `end_lsn` is ackable (subject to the ack floor).
+    StreamCommit {
+        xid: u32,
+        commit_lsn: u64,
+        end_lsn: u64,
+        commit_ts: i64,
+    },
+    /// Abort of a streamed transaction or one of its subtransactions
+    /// (protocol v2+). `xid == subxid` aborts the whole transaction; otherwise
+    /// only the subtransaction `subxid`'s changes are discarded. (Protocol v4
+    /// adds abort LSN/timestamp fields, ignored here.)
+    StreamAbort {
+        xid: u32,
+        subxid: u32,
+    },
+    /// Ignored types (Type, Origin, Message, two-phase prepare tags) — decoded
+    /// only enough to skip them safely.
     Other,
 }
 
@@ -197,7 +246,16 @@ impl Decoder {
     ///
     /// Takes the `XLogData` payload as an owned [`Bytes`]; tuple values are
     /// peeled out as zero-copy sub-slices of it (see [`Value`]).
-    pub fn decode(&mut self, mut buf: Bytes) -> Result<DecodedMessage> {
+    pub fn decode(&mut self, buf: Bytes) -> Result<DecodedMessage> {
+        self.decode_message(buf, false)
+    }
+
+    /// Decode one pgoutput message. When `in_stream` is true the message is part
+    /// of a streamed (protocol v2+) transaction segment, so the change messages
+    /// (`I`/`U`/`D`/`R`/`T`) carry a 4-byte subtransaction-xid prefix right after
+    /// the message-type byte, which is stripped here. The stream control messages
+    /// (`S`/`E`/`c`/`a`) carry their xid in the body and are never prefixed.
+    pub fn decode_message(&mut self, mut buf: Bytes, in_stream: bool) -> Result<DecodedMessage> {
         ensure!(
             buf.remaining() >= 1,
             PgOutputDecodeSnafu {
@@ -205,6 +263,19 @@ impl Decoder {
             }
         );
         let msg_type = buf.get_u8();
+        // Streamed change/relation messages are prefixed with the subtransaction
+        // xid (Postgres writes it whenever the transaction is being streamed).
+        // Strip it so the per-type decoders see the same layout as the
+        // non-streamed wire. Stream control messages carry no such prefix.
+        if in_stream && matches!(msg_type, b'I' | b'U' | b'D' | b'R' | b'T') {
+            ensure!(
+                buf.remaining() >= 4,
+                PgOutputDecodeSnafu {
+                    message: "short streamed message (missing xid prefix)".to_string()
+                }
+            );
+            let _subxid = buf.get_u32();
+        }
         match msg_type {
             b'B' => decode_begin(&mut buf),
             b'C' => decode_commit(&mut buf),
@@ -218,10 +289,12 @@ impl Decoder {
             b'U' => decode_update(&mut buf),
             b'D' => decode_delete(&mut buf),
             b'T' => decode_truncate(&mut buf),
-            // Type / Origin / Message / Stream* — safe to skip for our use case.
-            b'Y' | b'O' | b'M' | b'S' | b'E' | b'r' | b'l' | b'w' | b'c' | b'a' | b'p' => {
-                Ok(DecodedMessage::Other)
-            }
+            b'S' => decode_stream_start(&mut buf),
+            b'E' => Ok(DecodedMessage::StreamStop),
+            b'c' => decode_stream_commit(&mut buf),
+            b'a' => decode_stream_abort(&mut buf),
+            // Type / Origin / Message / two-phase prepare tags — safe to skip.
+            b'Y' | b'O' | b'M' | b'r' | b'l' | b'w' | b'p' => Ok(DecodedMessage::Other),
             other => PgOutputDecodeSnafu {
                 message: format!("unknown pgoutput message type: {}", other as char),
             }
@@ -419,6 +492,57 @@ fn decode_truncate(buf: &mut Bytes) -> Result<DecodedMessage> {
     Ok(DecodedMessage::Truncate { relation_ids })
 }
 
+fn decode_stream_start(buf: &mut Bytes) -> Result<DecodedMessage> {
+    ensure!(
+        buf.remaining() >= 4 + 1,
+        PgOutputDecodeSnafu {
+            message: "short Stream Start".to_string()
+        }
+    );
+    let xid = buf.get_u32();
+    let first_segment = buf.get_u8() == 1;
+    Ok(DecodedMessage::StreamStart {
+        xid,
+        first_segment,
+    })
+}
+
+fn decode_stream_commit(buf: &mut Bytes) -> Result<DecodedMessage> {
+    ensure!(
+        buf.remaining() >= 4 + 1 + 8 + 8 + 8,
+        PgOutputDecodeSnafu {
+            message: "short Stream Commit".to_string()
+        }
+    );
+    let xid = buf.get_u32();
+    let _flags = buf.get_u8();
+    let commit_lsn = buf.get_u64();
+    let end_lsn = buf.get_u64();
+    let commit_ts = buf.get_i64();
+    Ok(DecodedMessage::StreamCommit {
+        xid,
+        commit_lsn,
+        end_lsn,
+        commit_ts,
+    })
+}
+
+fn decode_stream_abort(buf: &mut Bytes) -> Result<DecodedMessage> {
+    // protocol v2/v3: xid + subxid. protocol v4 (streaming 'parallel') appends
+    // an abort LSN and timestamp; we only read what v2/v3 guarantees and leave
+    // any trailing v4 fields unread (harmless — the whole message is consumed by
+    // the caller's framing).
+    ensure!(
+        buf.remaining() >= 4 + 4,
+        PgOutputDecodeSnafu {
+            message: "short Stream Abort".to_string()
+        }
+    );
+    let xid = buf.get_u32();
+    let subxid = buf.get_u32();
+    Ok(DecodedMessage::StreamAbort { xid, subxid })
+}
+
 fn read_tuple(buf: &mut Bytes) -> Result<TupleData> {
     ensure!(
         buf.remaining() >= 2,
@@ -586,6 +710,97 @@ mod tests {
         assert_eq!(tuple.columns.len(), 2);
         assert!(matches!(tuple.columns[0], Some(Value::Text(ref s)) if s == "1"));
         assert!(matches!(tuple.columns[1], Some(Value::Text(ref s)) if s == "Alice"));
+    }
+
+    #[test]
+    fn decode_streamed_insert_strips_subxid_prefix() {
+        // A streamed Insert is the non-streamed Insert with a 4-byte subxid
+        // prefix after the tag byte. Decoded in-stream it must yield the same
+        // relation id + tuple as the non-streamed form decoded out-of-stream —
+        // the decoder is not self-describing, so the caller supplies the flag.
+        let plain = build_insert_fixture();
+        let mut streamed = vec![plain[0]]; // tag 'I'
+        streamed.extend_from_slice(&99u32.to_be_bytes()); // subxid prefix
+        streamed.extend_from_slice(&plain[1..]); // relid + tuple
+
+        // Peek helpers see the subxid and the shifted relation id.
+        assert_eq!(subxid(&streamed), Some(99));
+        assert_eq!(relation_id_streamed(&streamed), Some(42));
+        assert_eq!(relation_id(&plain), Some(42));
+
+        let streamed_msg = Decoder::new()
+            .decode_message(Bytes::from(streamed), true)
+            .expect("decode streamed insert");
+        let plain_msg = Decoder::new()
+            .decode_message(Bytes::from(plain), false)
+            .expect("decode plain insert");
+
+        let (
+            DecodedMessage::Insert {
+                relation_id: rs,
+                tuple: ts,
+            },
+            DecodedMessage::Insert {
+                relation_id: rp,
+                tuple: tp,
+            },
+        ) = (streamed_msg, plain_msg)
+        else {
+            panic!("expected two Inserts")
+        };
+        assert_eq!(rs, rp);
+        assert_eq!(rs, 42);
+        assert_eq!(ts.columns.len(), tp.columns.len());
+        assert!(matches!(ts.columns[1], Some(Value::Text(ref s)) if s == "Alice"));
+    }
+
+    #[test]
+    fn decode_stream_control_messages() {
+        let mut decoder = Decoder::new();
+
+        let mut s = vec![b'S'];
+        s.extend_from_slice(&77u32.to_be_bytes());
+        s.push(1); // first segment
+        assert!(matches!(
+            decoder.decode(Bytes::from(s)).expect("stream start"),
+            DecodedMessage::StreamStart {
+                xid: 77,
+                first_segment: true
+            }
+        ));
+
+        assert!(matches!(
+            decoder.decode(Bytes::from(vec![b'E'])).expect("stream stop"),
+            DecodedMessage::StreamStop
+        ));
+
+        let mut c = vec![b'c'];
+        c.extend_from_slice(&77u32.to_be_bytes());
+        c.push(0); // flags
+        c.extend_from_slice(&0x10u64.to_be_bytes()); // commit_lsn
+        c.extend_from_slice(&0x20u64.to_be_bytes()); // end_lsn
+        c.extend_from_slice(&5i64.to_be_bytes()); // commit_ts
+        assert!(matches!(
+            decoder.decode(Bytes::from(c)).expect("stream commit"),
+            DecodedMessage::StreamCommit {
+                xid: 77,
+                commit_lsn: 0x10,
+                end_lsn: 0x20,
+                commit_ts: 5
+            }
+        ));
+
+        // Subtransaction rollback: xid != subxid.
+        let mut a = vec![b'a'];
+        a.extend_from_slice(&77u32.to_be_bytes());
+        a.extend_from_slice(&78u32.to_be_bytes());
+        assert!(matches!(
+            decoder.decode(Bytes::from(a)).expect("stream abort"),
+            DecodedMessage::StreamAbort {
+                xid: 77,
+                subxid: 78
+            }
+        ));
     }
 
     #[test]

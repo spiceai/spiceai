@@ -303,11 +303,15 @@ fn decode_raw_changes_iter<'a>(
                 op: ChangeOp::Truncate,
                 row: TupleData { columns: vec![] },
             }),
-            // Begin/Commit/Relation/Other are never buffered as per-relation
-            // change messages; ignore defensively.
+            // Begin/Commit/Relation/Stream control/Other are never buffered as
+            // per-relation change messages; ignore defensively.
             DecodedMessage::Begin { .. }
             | DecodedMessage::Commit { .. }
             | DecodedMessage::Relation(_)
+            | DecodedMessage::StreamStart { .. }
+            | DecodedMessage::StreamStop
+            | DecodedMessage::StreamCommit { .. }
+            | DecodedMessage::StreamAbort { .. }
             | DecodedMessage::Other => {}
         }
     }
