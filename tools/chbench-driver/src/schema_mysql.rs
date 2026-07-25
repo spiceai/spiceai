@@ -26,6 +26,7 @@ use std::time::Instant;
 use mysql_async::prelude::Queryable;
 
 use crate::Result;
+use crate::watermark::{BenchTs, MUTATED_TABLES};
 
 /// Drop all CH-benCH tables.
 ///
@@ -118,7 +119,7 @@ pub async fn drop_tables(conn: &mut mysql_async::Conn) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if any table or `_bench_ts` column cannot be created.
-pub async fn create_tables(conn: &mut mysql_async::Conn) -> Result<()> {
+pub async fn create_tables(conn: &mut mysql_async::Conn, load_ts: BenchTs) -> Result<()> {
     let ddl_statements: &[(&str, &str)] = &[
         (
             "warehouse",
@@ -310,10 +311,10 @@ pub async fn create_tables(conn: &mut mysql_async::Conn) -> Result<()> {
             })?;
     }
 
-    // Add the _bench_ts column to all mutated TPC-C tables. DEFAULT stamps the
-    // seed rows and every INSERT; ON UPDATE stamps every UPDATE natively, so no
-    // triggers are needed (see `add_bench_ts_columns`).
-    add_bench_ts_columns(conn).await?;
+    // Add the _bench_ts column to all mutated TPC-C tables with a constant
+    // default of `load_ts`, so every seed row carries a known stamp and the
+    // initial watermarks need no scan (see `add_bench_ts_columns`).
+    add_bench_ts_columns(conn, load_ts).await?;
 
     Ok(())
 }
@@ -427,37 +428,22 @@ pub async fn ensure_bench_ts_index(conn: &mut mysql_async::Conn) -> Result<()> {
     Ok(())
 }
 
-/// Tables mutated by TPC-C transactions. `_bench_ts` is added only to these.
-/// `item`, `nation`, `region`, `supplier` are static reference tables.
-const MUTATED_TABLES: &[&str] = &[
-    "warehouse",
-    "district",
-    "customer",
-    "history",
-    "new_order",
-    "oorder",
-    "order_line",
-    "stock",
-];
-
-/// Add a `_bench_ts DATETIME(3)` column to all mutated TPC-C tables, stamped
-/// natively by the engine: `DEFAULT CURRENT_TIMESTAMP(3)` covers the seed rows
-/// and every INSERT, and `ON UPDATE CURRENT_TIMESTAMP(3)` covers every UPDATE.
+/// Add the `_bench_ts DATETIME(3)` column to all mutated TPC-C tables,
+/// defaulting to `load_ts`.
 ///
-/// Native column semantics replace the earlier per-row `BEFORE INSERT`/`BEFORE
-/// UPDATE` triggers: trigger dispatch is real per-row interpreter work in
-/// `MySQL`, on every write of the hottest tables in the workload. The one
-/// behavioral difference is that `ON UPDATE` stamps only rows whose values
-/// actually change — equivalent here, since every TPC-C update modifies data
-/// columns (balances, quantities, delivery dates).
-async fn add_bench_ts_columns(conn: &mut mysql_async::Conn) -> Result<()> {
+/// A constant default means every seed row carries exactly `load_ts`, so the
+/// initial watermark for each table is known without querying anything. The
+/// default is dropped once the load finishes (see
+/// [`strip_bench_ts_auto_stamping`]); from then on the driver binds the stamp
+/// on every mutating statement.
+async fn add_bench_ts_columns(conn: &mut mysql_async::Conn, load_ts: BenchTs) -> Result<()> {
+    let default = load_ts.mysql_literal();
     for table in MUTATED_TABLES {
         // Tables are freshly created by `create_tables`, so a plain ADD COLUMN
         // is safe (MySQL has no reliable ADD COLUMN IF NOT EXISTS on older
         // versions).
         let add_col = format!(
-            "ALTER TABLE {table} ADD COLUMN _bench_ts DATETIME(3) NOT NULL \
-             DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)"
+            "ALTER TABLE {table} ADD COLUMN _bench_ts DATETIME(3) NOT NULL DEFAULT {default}"
         );
         conn.query_drop(&add_col)
             .await
@@ -468,47 +454,86 @@ async fn add_bench_ts_columns(conn: &mut mysql_async::Conn) -> Result<()> {
     }
 
     println!(
-        "  added _bench_ts column to {} tables",
+        "  added _bench_ts column to {} tables (seed default {default})",
         MUTATED_TABLES.len()
     );
     Ok(())
 }
 
-/// Reconcile the `_bench_ts` stamping machinery of a database prepared by an
-/// older build (which used `BEFORE INSERT`/`BEFORE UPDATE` triggers and a
-/// column without `ON UPDATE`): ensure the column carries the native
-/// `DEFAULT`/`ON UPDATE` semantics, then drop the legacy triggers. Without
-/// this, dropping the triggers alone would leave UPDATEs unstamped, and
-/// keeping them would double-stamp every write.
+/// Strip every server-side `_bench_ts` stamping mechanism: the column default
+/// and any `ON UPDATE CURRENT_TIMESTAMP(3)` attribute.
 ///
-/// Both steps are idempotent and metadata-only. A fresh `prepare()` drops the
-/// tables (and their triggers) anyway; this matters for sources restored from
-/// an old template and reused via `--skip-prepare`.
+/// Run after the seed load (fresh path) and on `--skip-prepare` (where the
+/// source may be restored from a template built by an earlier schema that used
+/// a live default plus either triggers or `ON UPDATE`). The driver binds
+/// `_bench_ts` explicitly on every mutating statement, and a statement that
+/// forgets to must fail loudly on `NOT NULL` rather than silently write a
+/// stale stamp; a surviving server-side stamp would instead *overwrite* the
+/// driver's bound value, putting the stored maximum above the recorded
+/// watermark so the drain gate could never converge.
+///
+/// `ALGORITHM=INSTANT` is demanded explicitly: this must stay a metadata-only
+/// change, and if the server ever declined to do it in place we want a loud
+/// error, not a silent multi-hour rebuild of `order_line` at SF1000.
 ///
 /// # Errors
 ///
-/// Returns an error if the column cannot be modified or a trigger dropped.
-pub async fn reconcile_bench_ts(conn: &mut mysql_async::Conn) -> Result<()> {
+/// Returns an error if any column cannot be modified.
+pub async fn strip_bench_ts_auto_stamping(conn: &mut mysql_async::Conn) -> Result<()> {
     for table in MUTATED_TABLES {
-        let modify = format!(
-            "ALTER TABLE {table} MODIFY _bench_ts DATETIME(3) NOT NULL \
-             DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)"
-        );
-        conn.query_drop(&modify)
+        conn.query_drop(format!(
+            "ALTER TABLE {table} MODIFY _bench_ts DATETIME(3) NOT NULL, ALGORITHM=INSTANT"
+        ))
+        .await
+        .map_err(|source| crate::Error::MySql {
+            action: format!("strip _bench_ts default/ON UPDATE on {table}"),
+            source,
+        })?;
+    }
+    println!(
+        "  stripped server-side _bench_ts stamping on {} tables",
+        MUTATED_TABLES.len()
+    );
+    Ok(())
+}
+
+/// Drop every `_bench_ts` trigger an older build may have created.
+///
+/// Stamping lives in the driver, which binds `_bench_ts` on each mutating
+/// statement, so no trigger should exist. Required on the `--skip-prepare`
+/// path, not defensive: nothing is dropped or recreated there, so a source
+/// restored from a template seeded by an older build still carries its
+/// triggers, and a surviving `BEFORE UPDATE` trigger would overwrite the
+/// driver's bound value with `NOW(3)` — the stored stamp lands above the
+/// recorded watermark and the drain gate can never converge.
+///
+/// # Errors
+///
+/// Returns an error if the trigger list cannot be read or a trigger dropped.
+pub async fn drop_bench_ts_triggers(conn: &mut mysql_async::Conn) -> Result<()> {
+    let names: Vec<String> = conn
+        .query(
+            "SELECT TRIGGER_NAME FROM information_schema.TRIGGERS \
+             WHERE TRIGGER_SCHEMA = DATABASE() AND TRIGGER_NAME LIKE 'trg_bench_ts%'",
+        )
+        .await
+        .map_err(|source| crate::Error::MySql {
+            action: "list _bench_ts triggers".into(),
+            source,
+        })?;
+
+    if names.is_empty() {
+        return Ok(());
+    }
+
+    println!("  dropping {} legacy _bench_ts trigger(s)", names.len());
+    for name in names {
+        conn.query_drop(format!("DROP TRIGGER IF EXISTS {name}"))
             .await
             .map_err(|source| crate::Error::MySql {
-                action: format!("add ON UPDATE to {table}._bench_ts"),
+                action: format!("drop trigger {name}"),
                 source,
             })?;
-        for prefix in ["trg_bench_ts_ins", "trg_bench_ts_upd"] {
-            let drop = format!("DROP TRIGGER IF EXISTS {prefix}_{table}");
-            conn.query_drop(&drop)
-                .await
-                .map_err(|source| crate::Error::MySql {
-                    action: format!("drop trigger {prefix}_{table}"),
-                    source,
-                })?;
-        }
     }
     Ok(())
 }

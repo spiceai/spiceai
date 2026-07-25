@@ -106,14 +106,28 @@ prepared (`?`). This is the injection/quoting line; hold it in review.
   read-after-write sequential) — worst effort/reward; revisit only if needed.
 - **TCP_NODELAY** — `mysql_async` already enables it.
 
-## Interaction with the `_bench_ts` watermark design
+## In-memory `_bench_ts` watermarks (implemented on this branch)
 
-The driver-side watermark proposal (`docs/bench-ts-watermark.md` on
-`sgrebnov/0725-chbench-bench-ts-watermark`) also deletes the triggers but
-replaces engine stamping with driver-bound stamps and requires the column to
-carry **no** default and no `ON UPDATE`. If that lands, its reconcile step
-must additionally strip `ON UPDATE` from templates created by this build
-(one `ALTER … MODIFY` alongside its existing trigger cleanup).
+After the `order_line` index A/B measured a 7.7% tpmC cost, the driver-side
+watermark design (`docs/bench-ts-watermark.md`) was ported onto this branch
+for the MySQL path, with one deliberate deviation: **no `_bench_ts` index
+anywhere** — the delete-bearing `new_order` is answered by a plain scan
+(bounded at ~9k rows/warehouse ⇒ ~1s at SF1000), since index maintenance on
+hot write paths is the measured-expensive option. Mechanics: every mutating
+statement binds a driver-generated stamp pre-truncated to `DATETIME(3)`
+precision (`watermark::BenchTs`); each transaction folds it into per-table
+atomics (`watermark::Watermarks`) only after COMMIT; the probe's
+`max_bench_ts` is an atomic load for 7 of 8 tables. Seed rows get a constant
+column default (the load timestamp) which is dropped post-load so an unbound
+statement fails loudly on `NOT NULL`; `verify_prepared` strips any
+server-side stamping a restored template carries (`ON UPDATE`, defaults,
+triggers) and seeds the watermarks with one `MAX` scan per table, timed and
+logged. The drain gate gained a once-per-run three-way audit
+(driver watermark vs source `MAX` vs Spice) so a driver bookkeeping bug
+fails the gate instead of passing it. Verified by seven live-MySQL e2e tests
+(`tests/mysql_oltp.rs`), including watermark==source equality after a real
+workload and the drained-`new_order` case; fresh-seed SF10/100 throughput is
+unregressed. The Postgres path still scans (unchanged behavior).
 
 ## Planned experiments
 

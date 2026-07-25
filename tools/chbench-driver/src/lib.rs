@@ -27,10 +27,12 @@ pub mod rand;
 pub mod schema;
 pub mod schema_mysql;
 pub mod txn;
+pub mod watermark;
 
 pub use config::{ChBenchConfig, MysqlSourceConfig, PostgresSourceConfig};
 pub use metrics::OltpReport;
 pub use txn::TxnType;
+pub use watermark::{BenchTs, Watermarks};
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -103,6 +105,17 @@ pub enum Error {
         "Internal error: no column list registered for table {table} in csv_gen::TABLE_COLUMNS"
     ))]
     UnknownTable { table: String },
+
+    #[snafu(display(
+        "Internal error: table {table} has no _bench_ts watermark (not a mutated TPC-C table)"
+    ))]
+    UnknownWatermarkTable { table: String },
+
+    #[snafu(display(
+        "Internal error: the _bench_ts watermark for {table} was never seeded — \
+         prepare() or verify_prepared() must seed every mutated table before the workload starts"
+    ))]
+    UnseededWatermark { table: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -171,11 +184,25 @@ pub trait ChBenchDriver: Send + Sync {
     /// (e.g. small-table updates, high-volume inserts, deletes).
     fn probe_tables(&self) -> &[&str];
 
-    /// Read `MAX(_bench_ts)` from the *source* for a given table.
+    /// High-water mark of `_bench_ts` for `table`, in microseconds since the
+    /// Unix epoch, or `None` if the table is empty.
     ///
-    /// Returns microseconds since Unix epoch, or `None` if the table is empty
-    /// or the column doesn't exist.
+    /// The `MySQL` driver answers this from its own record of committed writes
+    /// (see [`crate::watermark`]) as an O(1) atomic load — a
+    /// `SELECT MAX(_bench_ts)` is a full scan (~48s on `order_line` at 300M
+    /// rows), which throttled the staleness probe and the drain gate to that
+    /// cadence. Tables with DELETEs cannot use a monotone watermark and are
+    /// answered from the source instead — see
+    /// [`crate::watermark::DELETE_BEARING_TABLES`] and
+    /// [`Self::max_bench_ts_exact`].
     async fn max_bench_ts(&self, table: &str) -> Result<Option<i64>>;
+
+    /// Authoritative `SELECT MAX(_bench_ts)` against the source.
+    ///
+    /// Expensive on large tables (a full scan) — call once per run for final
+    /// verification, never in a poll loop. This is what makes a driver
+    /// bookkeeping bug visible instead of letting it pass the drain gate.
+    async fn max_bench_ts_exact(&self, table: &str) -> Result<Option<i64>>;
 
     /// Read `COUNT(*)` from the *source* for a given table.
     async fn row_count(&self, table: &str) -> Result<i64>;
@@ -387,7 +414,14 @@ impl ChBenchDriver for PostgresChBenchDriver {
         schema::STALENESS_PROBE_TABLES
     }
 
+    /// The Postgres path still reads the source directly (the in-memory
+    /// watermark is a MySQL-driver optimization so far); `max_bench_ts` and
+    /// `max_bench_ts_exact` are therefore the same scan.
     async fn max_bench_ts(&self, table: &str) -> Result<Option<i64>> {
+        self.max_bench_ts_exact(table).await
+    }
+
+    async fn max_bench_ts_exact(&self, table: &str) -> Result<Option<i64>> {
         let query = format!("SELECT MAX(_bench_ts) FROM {table}");
         let rows = self
             .client
@@ -538,6 +572,9 @@ pub struct MysqlChBenchDriver {
     /// separate from the OLTP connections because the analytical-query gate
     /// needs Arrow output to compare against Spice results.
     arrow_client: OnceCell<Arc<MySQLConnectionPool>>,
+    /// Per-table `_bench_ts` high-water marks, shared with every OLTP terminal.
+    /// Seeded by `prepare` or `verify_prepared` before `run` spawns terminals.
+    watermarks: Arc<Watermarks>,
 }
 
 impl MysqlChBenchDriver {
@@ -564,6 +601,7 @@ impl MysqlChBenchDriver {
             source,
             opts,
             arrow_client: OnceCell::new(),
+            watermarks: Arc::new(Watermarks::new()),
         })
     }
 
@@ -625,13 +663,40 @@ impl MysqlChBenchDriver {
             SourceScaleMismatchSnafu { found, expected }
         );
         // The source may have been restored from a template built by an older
-        // build that stamped _bench_ts with triggers; reconcile it to the
-        // native DEFAULT/ON UPDATE column semantics.
-        schema_mysql::reconcile_bench_ts(&mut conn).await?;
+        // schema (live default plus triggers or ON UPDATE); strip every
+        // server-side stamping mechanism so nothing can overwrite the
+        // driver-bound stamps.
+        schema_mysql::strip_bench_ts_auto_stamping(&mut conn).await?;
+        schema_mysql::drop_bench_ts_triggers(&mut conn).await?;
         // Experiment gate (no-op unless enabled): must run here as well as in
         // create_indexes, because a template restore wipes the index and this
         // path never runs create_indexes.
         schema_mysql::ensure_bench_ts_index(&mut conn).await?;
+        drop(conn);
+
+        // Seed the watermarks from the source: the template's load timestamp is
+        // unknowable here, so this costs one MAX(_bench_ts) scan per mutated
+        // table — the only place that scan remains, bounded to once per run at
+        // startup. Timed and attributed so it is never mistaken for
+        // steady-state probe behaviour or for a hang. Must complete before
+        // `run` spawns terminals; `verify_prepared` is fully awaited before
+        // `run` is called, which guarantees it.
+        for table in watermark::MutatedTable::ALL {
+            let started = std::time::Instant::now();
+            let max = self.max_bench_ts_exact(table.as_str()).await?;
+            println!(
+                "  seeding watermarks from source (--skip-prepare): {} = {} ({:.1}s)",
+                table.as_str(),
+                max.map_or_else(|| "empty".to_string(), |v| v.to_string()),
+                started.elapsed().as_secs_f64(),
+            );
+            // An empty table has no maximum to seed; the first committed write
+            // sets the watermark, and until then `max_bench_ts` reports the
+            // sentinel as an error rather than a bogus zero.
+            if let Some(micros) = max {
+                self.watermarks.seed(table, micros);
+            }
+        }
         Ok(())
     }
 }
@@ -645,17 +710,31 @@ impl ChBenchDriver for MysqlChBenchDriver {
             self.config.warehouses,
         );
 
+        // Captured before the load and used as the `_bench_ts` column default,
+        // so every seed row carries exactly this value and the initial
+        // watermark is known without a scan.
+        let load_ts = BenchTs::now_mysql();
+
         let mut conn = self.new_conn().await?;
         schema_mysql::drop_tables(&mut conn).await?;
-        schema_mysql::create_tables(&mut conn).await?;
+        schema_mysql::create_tables(&mut conn, load_ts).await?;
         // load_all opens its own connections from `self.opts`; `conn` is only
         // used for the DDL before and after.
         loader_mysql::load_all(&self.opts, self.config.warehouses, self.config.seed).await?;
         // Build secondary indexes *after* the bulk load so InnoDB builds each
-        // B-tree once instead of maintaining it per seed row. (_bench_ts needs
-        // no post-load step: the column's DEFAULT/ON UPDATE stamps rows
-        // natively, with no triggers.)
+        // B-tree once instead of maintaining it per seed row.
         schema_mysql::create_indexes(&mut conn).await?;
+        // From here on the driver binds `_bench_ts` on every mutating
+        // statement: drop the seed default and make sure no legacy trigger
+        // survives to overwrite the bound value.
+        schema_mysql::strip_bench_ts_auto_stamping(&mut conn).await?;
+        schema_mysql::drop_bench_ts_triggers(&mut conn).await?;
+
+        // Seed every watermark from the load timestamp. Ordering invariant:
+        // this must complete before `run` spawns terminals, otherwise a
+        // terminal's post-commit update could be overwritten by this seed;
+        // `prepare` is fully awaited before `run` is called.
+        self.watermarks.seed_all(load_ts.micros());
 
         Ok(())
     }
@@ -694,6 +773,7 @@ impl ChBenchDriver for MysqlChBenchDriver {
             let opts = self.opts.clone();
             let stop = stop.clone();
             let rate_limiter = rate_limiter.clone();
+            let watermarks = Arc::clone(&self.watermarks);
 
             handles.push(tokio::spawn(async move {
                 run_terminal_mysql(
@@ -704,6 +784,7 @@ impl ChBenchDriver for MysqlChBenchDriver {
                     mix,
                     base_seed,
                     rate_limiter,
+                    &watermarks,
                 )
                 .await
             }));
@@ -741,6 +822,16 @@ impl ChBenchDriver for MysqlChBenchDriver {
     }
 
     async fn max_bench_ts(&self, table: &str) -> Result<Option<i64>> {
+        // Delete-bearing tables' true maximum can decrease, which a monotone
+        // watermark cannot follow — answer those from the source (a plain scan;
+        // new_order is bounded at ~9k rows per warehouse, so ~1s at SF1000).
+        if watermark::is_delete_bearing(table) {
+            return self.max_bench_ts_exact(table).await;
+        }
+        self.watermarks.get(table)
+    }
+
+    async fn max_bench_ts_exact(&self, table: &str) -> Result<Option<i64>> {
         let mut conn = self.new_conn().await?;
         let sql = format!("SELECT MAX(_bench_ts) FROM {table}");
         let value: Option<Option<chrono::NaiveDateTime>> =
@@ -797,6 +888,7 @@ impl ChBenchDriver for MysqlChBenchDriver {
 }
 
 /// Run a single `MySQL` OLTP terminal loop until cancelled.
+#[expect(clippy::too_many_arguments)]
 async fn run_terminal_mysql(
     terminal_id: usize,
     opts: mysql_async::Opts,
@@ -805,6 +897,7 @@ async fn run_terminal_mysql(
     mix: [u32; 5],
     base_seed: u64,
     rate_limiter: Option<Arc<OltpRateLimiter>>,
+    watermarks: &Watermarks,
 ) -> Result<metrics::OltpMetrics> {
     let mut conn = mysql_async::Conn::new(opts)
         .await
@@ -831,7 +924,7 @@ async fn run_terminal_mysql(
 
         let txn_type = txn::pick_txn_type(&mut rng, &mix);
 
-        match txn::mysql::execute(&mut conn, &mut rng, txn_type, &assignment).await {
+        match txn::mysql::execute(&mut conn, &mut rng, txn_type, &assignment, watermarks).await {
             Ok(()) => metrics.record_success(txn_type),
             Err(e) => {
                 metrics.record_abort();
