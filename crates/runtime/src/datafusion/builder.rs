@@ -402,7 +402,8 @@ pub struct DataFusionBuilder {
     cayenne_cdc_reservation_bytes: u64,
     /// Coordinated query-pool ceiling (bytes) when `DuckDB` file accelerators are
     /// present, computed by the Runtime builder's cgroup-aware budget so the query
-    /// pool + each `DuckDB` instance's own `memory_limit` can't over-commit host RAM.
+    /// pool + each `DuckDB` instance's own `memory_limit` can't over-commit the
+    /// memory available to this process (the cgroup limit in a container).
     /// Applied as a `min`-cap on the DEFAULT query pool only (an explicit
     /// `runtime.query.memory_limit` still wins). `None` = no `DuckDB` coordination.
     duckdb_query_pool_cap: Option<u64>,
@@ -631,7 +632,8 @@ impl DataFusionBuilder {
     /// Coordinated query-pool ceiling (bytes) when `DuckDB` file accelerators are
     /// present. Reduces ONLY the default query pool (via a `min`-cap in
     /// [`effective_query_memory_limit`]) so the query pool + each `DuckDB` instance's
-    /// own `memory_limit` can't over-commit host RAM. Set by the Runtime builder;
+    /// own `memory_limit` can't over-commit the memory available to this process
+    /// (the cgroup limit in a container). Set by the Runtime builder;
     /// `None` disables the reduction and an explicit `runtime.query.memory_limit`
     /// always wins.
     #[must_use]
@@ -764,8 +766,10 @@ impl DataFusionBuilder {
         // pool size. Coordinate the off-pool Cayenne in-memory CDC tier budget
         // against it, the carved compaction pool, AND any external accelerator
         // reservation (e.g. co-resident DuckDB instance ceilings) so they never sum
-        // past host RAM. `set_compaction_runtime` installs `mem_tier_budget_bytes`
-        // instead of the old, isolation-sized `get_total_memory() / 4`.
+        // past the memory available to this process — get_total_memory() is
+        // cgroup-aware, so in a container that is the cgroup limit, not host RAM.
+        // `set_compaction_runtime` installs `mem_tier_budget_bytes` instead of the
+        // old, isolation-sized `get_total_memory() / 4`.
         let query_memory_pool_bytes = effective_memory_limit;
         let mem_tier_budget_bytes = cayenne_active.then(|| {
             let total_memory = crate::resource_monitor::get_total_memory();
@@ -777,7 +781,7 @@ impl DataFusionBuilder {
                 compaction_memory_bytes.unwrap_or(0),
                 external_reservation_bytes,
             );
-            // The tier floor (host/32) can exceed the coordinated remainder when the
+            // The tier floor (available/32) can exceed the coordinated remainder when the
             // query pool + compaction + external (DuckDB) reservations leave too
             // little room; the clamp then installs `floor > remainder`, a deliberate
             // small over-commit so a nonzero global cap always exists (memory mode
@@ -793,7 +797,7 @@ impl DataFusionBuilder {
                     total_memory,
                     external_reservation_bytes,
                     mem_tier_budget_bytes = budget,
-                    "Cayenne in-memory CDC ingestion has limited memory on this host: the query pool, compaction pool, and co-resident DuckDB accelerator reservations leave little room for in-memory CDC, so ingestion spills to disk more often and combined memory ceilings may slightly exceed host RAM. Consider lowering runtime.query.memory_limit or per-dataset duckdb_memory_limit to give in-memory CDC more room."
+                    "Cayenne in-memory CDC ingestion has limited memory available: the query pool, compaction pool, and co-resident DuckDB accelerator reservations leave little room for in-memory CDC, so ingestion spills to disk more often and combined memory ceilings may slightly exceed the memory available to this process (the cgroup limit when running in a container). Consider lowering runtime.query.memory_limit or per-dataset duckdb_memory_limit to give in-memory CDC more room."
                 );
             }
             budget
