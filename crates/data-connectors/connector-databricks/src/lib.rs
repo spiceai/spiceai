@@ -43,7 +43,8 @@ use runtime::dataconnector::{
 };
 use runtime::parameters::{ParameterSpec, Parameters};
 use runtime::token_providers::databricks::{
-    AuthCredentials, DatabricksM2MTokenProvider, DatabricksU2MTokenProvider,
+    AUTH_MODE_DESCRIPTION, AUTH_MODES, AuthConfigError, AuthCredentials,
+    DatabricksM2MTokenProvider, DatabricksU2MTokenProvider,
 };
 use runtime_api_types::v1::ComponentType;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
@@ -179,6 +180,13 @@ pub const PARAMETERS: &[ParameterSpec] = &[
         .description("Timeout for establishing TCP/TLS connections to the Databricks API. Applies in 'sql_warehouse' mode. Accepts durations like '10s'. Default: 10s."),
     ParameterSpec::component("cluster_id").description("The ID of the compute cluster in Databricks to use for the query. Only valid when mode is spark_connect."),
     ParameterSpec::component("use_ssl").description("Use a TLS connection to connect to the Databricks Spark Connect endpoint.").default("true"),
+
+    // Databricks authentication
+    ParameterSpec::component("auth_mode")
+        .description(AUTH_MODE_DESCRIPTION)
+        .one_of_ignore_ascii_case(AUTH_MODES)
+        .default("auto")
+        .help_link(DATABRICKS_DOCS),
 
     // Databricks M2M Service Principal credentials
     ParameterSpec::component("client_id").description("The client ID of the Databricks service principal."),
@@ -503,41 +511,19 @@ impl Databricks {
     ///
     /// Returns an error if the authentication configuration is invalid.
     pub fn build_auth_credentials(params: &Parameters) -> Result<AuthCredentials<'_>> {
-        let token = params.get("token").ok();
-        let client_id = params.get("client_id").expose().ok();
-        let client_secret = params.get("client_secret").ok();
-
-        match (token, client_id, client_secret) {
-            (Some(token), None, None) => Ok(AuthCredentials::Token(token)),
-            (None, Some(client_id), None) => Ok(AuthCredentials::U2M(client_id)),
-            (None, Some(client_id), Some(client_secret)) => {
-                Ok(AuthCredentials::ServicePrincipal(client_id, client_secret))
-            }
-            (None, None, None) => {
-                InvalidConfigurationSnafu {
-                    message: "Missing `databricks_token` or `databricks_client_id` and `databricks_client_secret` parameters".to_string(),
+        // The catalog connector selects credentials from the same parameters, so the precedence
+        // between `databricks_auth_mode`, a token and service principal credentials lives in one
+        // place; only the error type differs.
+        runtime::token_providers::databricks::build_auth_credentials(params).map_err(|source| {
+            match source {
+                AuthConfigError::MissingParameter { parameter } => {
+                    MissingParameterSnafu { parameter }.build()
                 }
-                .fail()
-            }
-            (None, None, Some(_)) => {
-                MissingParameterSnafu {
-                    parameter: "databricks_client_id".to_string(),
+                AuthConfigError::InvalidConfiguration { message } => {
+                    InvalidConfigurationSnafu { message }.build()
                 }
-                .fail()
             }
-            (Some(_), Some(_), Some(_) | None) => {
-                InvalidConfigurationSnafu {
-                    message: "Choose either `databricks_token` or `databricks_client_id` and `databricks_client_secret`".to_string(),
-                }
-                .fail()
-            }
-            _ => {
-                InvalidConfigurationSnafu {
-                    message: "Invalid authentication configuration. Choose either `databricks_token` or `databricks_client_id` and `databricks_client_secret`".to_string(),
-                }
-                .fail()
-            }
-        }
+        })
     }
 
     #[cfg(feature = "spark")]
@@ -1781,8 +1767,60 @@ mod tests {
             "Databricks::build_auth_credentials should return an error"
         );
         if let Err(error) = result {
-            assert!(error.to_string().contains("Choose either `databricks_token` or `databricks_client_id` and `databricks_client_secret`"));
+            let message = error.to_string();
+            assert!(
+                message.contains("Both `databricks_token` and service principal credentials"),
+                "got: {message}"
+            );
+            assert!(
+                message.contains("databricks_auth_mode"),
+                "the error should offer `databricks_auth_mode` as the way out, got: {message}"
+            );
         }
+    }
+
+    /// Regression test for #11508: `databricks_client_secret` is a `secret` parameter, so it is
+    /// auto-loaded from the environment when the Spicepod omits it — which used to switch a U2M
+    /// dataset to machine-to-machine and fail with a service principal 401. Pinning the mode keeps
+    /// the connector on the flow the Spicepod asked for.
+    #[test]
+    fn test_build_auth_credentials_u2m_mode_ignores_ambient_client_secret() {
+        let params_vec = vec![
+            ("auth_mode".to_string(), SecretString::from("u2m")),
+            (
+                "client_id".to_string(),
+                SecretString::from("test_client_id"),
+            ),
+            (
+                "client_secret".to_string(),
+                SecretString::from("ambient_secret"),
+            ),
+        ];
+        let parameters = Parameters::new(params_vec, "databricks", PARAMETERS);
+
+        match Databricks::build_auth_credentials(&parameters) {
+            Ok(AuthCredentials::U2M(client_id)) => assert_eq!(client_id, "test_client_id"),
+            other => panic!("Expected U2M variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_auth_credentials_reports_invalid_auth_mode() {
+        let params_vec = vec![
+            ("auth_mode".to_string(), SecretString::from("oauth")),
+            (
+                "client_id".to_string(),
+                SecretString::from("test_client_id"),
+            ),
+        ];
+        let parameters = Parameters::new(params_vec, "databricks", PARAMETERS);
+
+        let error = Databricks::build_auth_credentials(&parameters)
+            .expect_err("an unknown `databricks_auth_mode` should be rejected");
+        assert!(
+            error.to_string().contains("auto, token, m2m, u2m"),
+            "got: {error}"
+        );
     }
 
     #[tokio::test]
