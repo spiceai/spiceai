@@ -63,7 +63,10 @@ impl PrefetchStream {
     fn new(mut input: SendableRecordBatchStream, depth: usize, handle: &Handle) -> Self {
         let schema = input.schema();
         // Bounded: producer blocks when `depth` batches are buffered (back-pressure).
-        let (tx, rx) = tokio::sync::mpsc::channel(depth.max(1));
+        // `depth` is always ≥ 1 here — depth 0 means "disabled", and the planner
+        // omits `PrefetchExec` entirely rather than constructing one (§6).
+        debug_assert!(depth >= 1, "PrefetchExec must not be built for depth 0");
+        let (tx, rx) = tokio::sync::mpsc::channel(depth);
         let drive = handle.spawn(async move {
             while let Some(item) = input.next().await {
                 // `is_err()` ⇒ consumer gone; stop producing.
@@ -151,7 +154,7 @@ Buffered depth `k` costs up to `k × (batch_size + embedded_columns × vector_by
 
 One knob, following `CLAUDE.md` (no booleans in user-facing config; conservative default):
 
-- `runtime.acceleration.refresh_prefetch_depth: Option<usize>` — batches a stage may run ahead. `None`/unset ⇒ default `1` (one batch ahead: overlaps adjacent stages at ~2× buffered memory, the safe default). `0` ⇒ disabled (today's behavior, an escape hatch). Larger values trade memory for deeper overlap. Mirrors the existing `Option<usize>` precedent of `runtime.dataset_load_parallelism` (`crates/spicepod/src/component/runtime.rs:43`).
+- `runtime.acceleration.refresh_prefetch_depth: Option<usize>` — batches a stage may run ahead. `None`/unset ⇒ default `1` (one batch ahead: overlaps adjacent stages at ~2× buffered memory, the safe default). `0` ⇒ disabled (today's behavior, an escape hatch) — at depth 0 no `PrefetchExec` is inserted at all, rather than one with a depth-1 channel. Larger values trade memory for deeper overlap. Mirrors the existing `Option<usize>` precedent of `runtime.dataset_load_parallelism` (`crates/spicepod/src/component/runtime.rs:43`).
 
 Alternative if named modes are preferred over a raw depth: an enum `refresh_pipelining: serial | pipelined` (default `serial` during rollout, then `pipelined`), with depth derived from available memory — keeps the door open to auto-tuning without a boolean. Recommend shipping the `usize` depth first (simpler, directly testable) and layering the enum later only if auto-tuning lands.
 

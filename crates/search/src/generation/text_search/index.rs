@@ -61,9 +61,18 @@ pub struct FullTextDatabaseIndex {
     /// without committing, so a sink-driven full refresh or append commits
     /// **once** for the whole write window, in `on_write_complete`.
     /// `on_write_start` sets it; `on_write_complete`/`on_write_failed` clear it.
-    /// Defaults to `false`, so the CDC path — which drives `compute_index`
-    /// directly without the sink lifecycle hooks — keeps committing per change.
     defer_commit: Arc<AtomicBool>,
+
+    /// Set when this index is also fed by a change-data-capture stream, which
+    /// drives `compute_index` outside the sink write lifecycle.
+    ///
+    /// A single [`tantivy::IndexWriter`] stages every pending operation together,
+    /// so a commit cannot be scoped to one caller's documents: committing inside a
+    /// deferred window would publish a partially-written refresh, and rolling the
+    /// window back would discard CDC documents staged alongside it. Deferral is
+    /// therefore disabled outright for a CDC-fed index — correctness over the
+    /// one-commit-per-refresh optimization.
+    cdc_attached: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for FullTextDatabaseIndex {
@@ -106,6 +115,13 @@ impl Index for FullTextDatabaseIndex {
     }
 
     async fn on_write_start(&self) -> Result<(), DataFusionError> {
+        // A CDC-fed index never defers: its change stream calls `compute_index`
+        // outside this lifecycle, and the shared writer cannot commit one caller's
+        // documents without also publishing (or, on rollback, discarding) the other's.
+        if self.cdc_attached.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
         // Begin a deferred-commit window: subsequent `compute_index` calls stage
         // documents into the writer without committing until `on_write_complete`.
         //
@@ -220,6 +236,7 @@ impl FullTextDatabaseIndex {
             primary_key: pks,
             reader,
             defer_commit: Arc::new(AtomicBool::new(false)),
+            cdc_attached: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -384,6 +401,14 @@ impl FullTextDatabaseIndex {
         self
     }
 
+    /// Record that a change-data-capture stream also writes to this index, which
+    /// permanently disables the deferred-commit window (see `cdc_attached`).
+    ///
+    /// Called when the change stream that includes this index is constructed.
+    pub fn mark_cdc_attached(&self) {
+        self.cdc_attached.store(true, Ordering::Release);
+    }
+
     #[must_use]
     pub fn underlying_table(&self) -> Arc<dyn TableProvider> {
         Arc::clone(&self.base_table)
@@ -404,6 +429,9 @@ impl FullTextDatabaseIndex {
             // tantivy writer (Arc::clone above), so both handles must observe a
             // single deferral state or a sink write window could desync.
             defer_commit: Arc::clone(&self.defer_commit),
+            // Shared for the same reason as `defer_commit`: both handles drive the
+            // same tantivy writer and must agree on whether deferral is allowed.
+            cdc_attached: Arc::clone(&self.cdc_attached),
         }
     }
 
@@ -1033,6 +1061,61 @@ mod tests {
         assert!(
             !results.contains("apple banana"),
             "on_write_failed must discard staged documents, got:\n{results}"
+        );
+    }
+
+    /// A CDC-fed index shares one tantivy writer with the sink write path, so it must
+    /// never defer: a window commit would publish a partial refresh, and a window
+    /// rollback would discard the change stream's documents.
+    #[tokio::test]
+    async fn test_cdc_attached_index_never_defers_commits() {
+        let index = FullTextDatabaseIndex::try_new(
+            create_test_table(),
+            vec!["content".to_string()],
+            Some(vec!["id".to_string()]),
+            None,
+            &["content".to_string()],
+        )
+        .expect("Failed to create FullTextDatabaseIndex");
+
+        index.mark_cdc_attached();
+
+        // Opening a window is a no-op for a CDC-fed index.
+        index.on_write_start().await.expect("on_write_start failed");
+
+        index
+            .compute_index(vec![
+                record_batch!(("id", Int32, [1]), ("content", Utf8, ["apple banana"]))
+                    .expect("Failed to create test batch"),
+            ])
+            .await
+            .expect("compute_index failed");
+
+        // Visible immediately, without waiting for on_write_complete.
+        {
+            let search_index = index
+                .full_text_search_field_index("content")
+                .expect("Failed to create FullTextSearchFieldIndex");
+            let results = search_and_format(&search_index, "apple").await;
+            assert!(
+                results.contains("apple banana"),
+                "a CDC-fed index must commit immediately even inside a write window, got:\n{results}"
+            );
+        }
+
+        // And a failed window must not discard those committed documents.
+        index
+            .on_write_failed()
+            .await
+            .expect("on_write_failed failed");
+
+        let search_index = index
+            .full_text_search_field_index("content")
+            .expect("Failed to create FullTextSearchFieldIndex");
+        let results = search_and_format(&search_index, "apple").await;
+        assert!(
+            results.contains("apple banana"),
+            "committed CDC documents must survive a failed write window, got:\n{results}"
         );
     }
 }
