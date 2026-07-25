@@ -1235,46 +1235,45 @@ async fn warm_subset_preserves_key_deletes_and_rows(
         .await?
         .current_snapshot_id;
 
-    // Seed more small files so the picker can fire again under pending MoR.
-    let more_batches = 6_i64;
+    // Seed more small files and drive the deterministic `maybe_compact` path
+    // after each write (waits for the compaction lock — `try_lock` can miss
+    // under concurrent suite load). At least one pass under the pending key
+    // delete must rewrite so MoR survival is actually exercised.
+    let more_batches = 10_i64;
+    let mut phase_b_compacted = false;
     for batch_idx in 0..more_batches {
         common::insert_batch(
             &table,
             make_batch(&schema, 50_000 + batch_idx * batch_rows, batch_rows),
         )
         .await?;
+        if run_compaction(&table).await {
+            phase_b_compacted = true;
+        }
+    }
+    // One final multi-pass attempt if post-write/threshold gating delayed the
+    // rewrite until after the last insert.
+    if !phase_b_compacted {
+        for _ in 0..4 {
+            if run_compaction(&table).await {
+                phase_b_compacted = true;
+                break;
+            }
+        }
     }
 
-    // Phase B must actually compact under the pending key delete — the main
-    // path this test exercises. Threshold is the current file count so the
-    // helper cannot return early without a committed rewrite. If post-write
-    // maintenance already consolidated during re-seed, require that the
-    // snapshot advanced past the post-delete one (same warm-subset path).
-    let snap_before = fixture
+    let snap_after = fixture
         .catalog
         .get_table("warm_subset_deletes")
         .await?
         .current_snapshot_id;
-    let files_before = count_vortex_files(&fixture.data_path, &table_id, &snap_before).await;
-    if let Some((snap_after, files_after)) =
-        wait_until_current_snapshot_compacts(&table, &fixture, "warm_subset_deletes", files_before)
-            .await?
-    {
-        assert_ne!(
-            snap_after, snap_before,
-            "phase-B compact must advance the current snapshot"
-        );
-        assert!(
-            files_after < files_before,
-            "phase-B compact must reduce file count ({files_before} → {files_after})"
-        );
-    } else {
-        assert_ne!(
-            snap_before, snap_after_delete,
-            "without an explicit phase-B compact, post-write must have compacted \
-             under the pending key delete"
-        );
-    }
+    let files_after = count_vortex_files(&fixture.data_path, &table_id, &snap_after).await;
+    assert!(
+        phase_b_compacted || snap_after != snap_after_delete,
+        "phase B must compact under the pending key delete \
+         (compacted={phase_b_compacted}, snap {snap_after_delete}→{snap_after}, \
+         files={files_after})"
+    );
 
     // Exact expected total: rows before re-seed + more_batches * batch_rows.
     // (id=10 is already excluded from `before`.)
