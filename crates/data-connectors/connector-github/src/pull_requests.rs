@@ -563,7 +563,11 @@ mod tests {
     /// construction. Cache a single shared instance so the unit tests don't
     /// spin up a tokio runtime per invocation.
     fn shared_component() -> ConnectorComponent {
-        static COMPONENT: OnceLock<ConnectorComponent> = OnceLock::new();
+        // The tokio runtime is cached alongside the component and never dropped:
+        // `RuntimeBuilder::build` defaults `io_runtime` to `Handle::current()`, so
+        // dropping the runtime that built it would leave the constructed `Runtime`
+        // holding handles to a dead tokio runtime.
+        static COMPONENT: OnceLock<(tokio::runtime::Runtime, ConnectorComponent)> = OnceLock::new();
         COMPONENT
             .get_or_init(|| {
                 let app = AppBuilder::new("test").build();
@@ -575,8 +579,9 @@ mod tests {
                     .with_runtime(Arc::new(spice_runtime))
                     .build()
                     .expect("to create dataset");
-                ConnectorComponent::from(&dataset)
+                (runtime, ConnectorComponent::from(&dataset))
             })
+            .1
             .clone()
     }
 
