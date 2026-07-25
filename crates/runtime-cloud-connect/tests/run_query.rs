@@ -14,10 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Integration tests for the `RunQuery` dispatch path.
+//! Integration tests for the `RunQuery`, `GetPodLogs`, and `GetStatus`
+//! dispatch paths.
 //!
 //! These exercise the cloud-connect client driver end-to-end against an
-//! in-process tonic mock server. They cover:
+//! in-process tonic mock server. `GetPodLogs` and `GetStatus` are covered
+//! here because they reuse the same mock-server / driver harness:
+//! `GetPodLogs` asserts the log text rides verbatim in `payload_json` (and an
+//! unavailable-logs runtime reports failure, not empty success); `GetStatus`
+//! asserts the payload is a JSON status document carrying `phase`/`reason`.
+//!
+//! For `RunQuery` they cover:
 //!
 //! - A RunQuery → CommandResult round-trip whose `payload_json` carries
 //!   only the `{row_count, truncated}` metadata, with the tabular rows
@@ -231,12 +238,15 @@ fn id_result(ids: &[i64], truncated: bool) -> QueryResult {
 }
 
 fn config_with(
-    endpoint: String,
+    gateway_endpoint: String,
     identity_path: std::path::PathBuf,
     config_dir: std::path::PathBuf,
 ) -> CloudConnectConfig {
     CloudConnectConfig {
-        endpoint,
+        // The enroll endpoint is never contacted in these tests (identity
+        // is pre-seeded), but must be a valid URL.
+        enroll_endpoint: "http://127.0.0.1:9".to_string(),
+        gateway_endpoint: Some(gateway_endpoint),
         ca_cert_pem: None,
         insecure: true,
         identity_path,
@@ -246,6 +256,7 @@ fn config_with(
         runtime_version: "v0.0.0-test".to_string(),
         heartbeat_interval: Duration::from_secs(30),
         telemetry_interval: Duration::from_mins(1),
+        renewal_lead: Duration::from_hours(12),
     }
 }
 
@@ -256,6 +267,7 @@ fn preseed_identity(path: &std::path::Path) {
         private_key_pem: "UNIT-TEST-KEY".to_string(),
         public_key_pem: "UNIT-TEST-PUB".to_string(),
         ca_bundle_pem: String::new(),
+        gateway_addr: String::new(),
         not_after_unix: 0,
     };
     IdentityStore::store(path, &identity).unwrap();
@@ -490,6 +502,221 @@ async fn run_query_failure_is_safe_and_audited() {
     assert_eq!(audit_payload["row_count"], 0);
     // Hash is still emitted even on error.
     assert!(audit_payload["sql_hash"].as_str().unwrap().len() == 64);
+    drop(state);
+
+    handle.shutdown().await;
+}
+
+/// A `GetPodLogs` command round-trips to a `CommandResult` whose
+/// `payload_json` carries the log text **verbatim** — a raw string, NOT a
+/// JSON-encoded/quoted value (the gateway relays `payload_json` through as
+/// text). The runtime's `tail_lines` argument is forwarded unchanged.
+#[tokio::test]
+async fn get_pod_logs_returns_verbatim_text_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let identity_path = dir.path().join("identity.json");
+    preseed_identity(&identity_path);
+
+    struct LogRuntime {
+        logs: String,
+        captured_tail: Mutex<Option<i64>>,
+    }
+    #[async_trait]
+    impl RuntimeHandle for LogRuntime {
+        async fn get_pod_logs(&self, tail_lines: i64) -> Result<String, String> {
+            *self.captured_tail.lock().await = Some(tail_lines);
+            Ok(self.logs.clone())
+        }
+    }
+
+    // Deliberately multi-line with characters JSON would escape (quotes,
+    // backslash) so a regression that JSON-encodes the payload is obvious.
+    let log_text = "2026-07-23T00:00:00Z  INFO spiced: started\n2026-07-23T00:00:01Z  WARN path=\"c:\\x\": retry\n";
+    let runtime = Arc::new(LogRuntime {
+        logs: log_text.to_string(),
+        captured_tail: Mutex::new(None),
+    });
+    let captured = Arc::clone(&runtime);
+    let runtime: Arc<dyn RuntimeHandle> = runtime;
+
+    let cmd = proto::ControlMessage {
+        body: Some(proto::control_message::Body::GetPodLogs(
+            proto::GetPodLogs {
+                command_id: "cmd-logs-1".to_string(),
+                namespace: String::new(),
+                name: String::new(),
+                kind: String::new(),
+                pod_name: String::new(),
+                tail_lines: 50,
+            },
+        )),
+    };
+    let mock = MockServer::new(vec![cmd]);
+    let mock_state = Arc::clone(&mock.state);
+    let addr = spawn_server(mock).await;
+
+    let cfg = config_with(
+        format!("http://{addr}"),
+        identity_path.clone(),
+        dir.path().to_path_buf(),
+    );
+    let handle = runtime_cloud_connect::CloudConnect::start(cfg, runtime)
+        .await
+        .expect("start")
+        .expect("started");
+
+    let mut saw_result = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if mock_state.lock().await.last_result.is_some() {
+            saw_result = true;
+            break;
+        }
+    }
+    assert!(saw_result, "CommandResult should arrive within 5s");
+
+    let state = mock_state.lock().await;
+    let result = state.last_result.clone().expect("result");
+    assert_eq!(result.command_id, "cmd-logs-1");
+    assert!(result.success, "error={}", result.error);
+    // The payload is the log text byte-for-byte — not JSON-quoted/escaped.
+    assert_eq!(result.payload_json, log_text);
+    assert!(result.result_arrow_ipc.is_empty());
+    drop(state);
+
+    // tail_lines was forwarded to the runtime unchanged.
+    assert_eq!(*captured.captured_tail.lock().await, Some(50));
+
+    handle.shutdown().await;
+}
+
+/// When the runtime has no log capture available (e.g. capture layer not
+/// installed), `GetPodLogs` returns `success: false` with an explanatory
+/// error rather than an empty success — the default `RuntimeHandle` impl.
+#[tokio::test]
+async fn get_pod_logs_unavailable_is_reported_as_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let identity_path = dir.path().join("identity.json");
+    preseed_identity(&identity_path);
+
+    // Bare handle: inherits the default get_pod_logs (returns Err).
+    struct BareRuntime;
+    #[async_trait]
+    impl RuntimeHandle for BareRuntime {}
+    let runtime: Arc<dyn RuntimeHandle> = Arc::new(BareRuntime);
+
+    let cmd = proto::ControlMessage {
+        body: Some(proto::control_message::Body::GetPodLogs(
+            proto::GetPodLogs {
+                command_id: "cmd-logs-2".to_string(),
+                namespace: String::new(),
+                name: String::new(),
+                kind: String::new(),
+                pod_name: String::new(),
+                tail_lines: 0,
+            },
+        )),
+    };
+    let mock = MockServer::new(vec![cmd]);
+    let mock_state = Arc::clone(&mock.state);
+    let addr = spawn_server(mock).await;
+
+    let cfg = config_with(
+        format!("http://{addr}"),
+        identity_path.clone(),
+        dir.path().to_path_buf(),
+    );
+    let handle = runtime_cloud_connect::CloudConnect::start(cfg, runtime)
+        .await
+        .expect("start")
+        .expect("started");
+
+    let mut saw_result = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if mock_state.lock().await.last_result.is_some() {
+            saw_result = true;
+            break;
+        }
+    }
+    assert!(saw_result);
+
+    let state = mock_state.lock().await;
+    let result = state.last_result.clone().unwrap();
+    assert!(!result.success);
+    assert!(!result.error.is_empty());
+    assert!(result.payload_json.is_empty());
+    drop(state);
+
+    handle.shutdown().await;
+}
+
+/// A `GetStatus` command round-trips to a `CommandResult` whose
+/// `payload_json` is a JSON status **document** (unlike GetPodLogs, which is
+/// raw text). The document must carry the top-level `phase`/`reason` the
+/// control plane parses.
+#[tokio::test]
+async fn get_status_returns_json_status_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let identity_path = dir.path().join("identity.json");
+    preseed_identity(&identity_path);
+
+    struct StatusRuntime;
+    #[async_trait]
+    impl RuntimeHandle for StatusRuntime {
+        async fn get_status(&self) -> Result<Value, String> {
+            Ok(serde_json::json!({
+                "phase": "Ready",
+                "reason": "2/2 components ready",
+                "ready": true,
+                "restart_pending": false,
+            }))
+        }
+    }
+    let runtime: Arc<dyn RuntimeHandle> = Arc::new(StatusRuntime);
+
+    let cmd = proto::ControlMessage {
+        body: Some(proto::control_message::Body::GetStatus(proto::GetStatus {
+            command_id: "cmd-status-1".to_string(),
+            // Standalone: targeting fields are empty and ignored by the runtime.
+            namespace: String::new(),
+            kind: String::new(),
+            name: String::new(),
+        })),
+    };
+    let mock = MockServer::new(vec![cmd]);
+    let mock_state = Arc::clone(&mock.state);
+    let addr = spawn_server(mock).await;
+
+    let cfg = config_with(
+        format!("http://{addr}"),
+        identity_path.clone(),
+        dir.path().to_path_buf(),
+    );
+    let handle = runtime_cloud_connect::CloudConnect::start(cfg, runtime)
+        .await
+        .expect("start")
+        .expect("started");
+
+    let mut saw_result = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if mock_state.lock().await.last_result.is_some() {
+            saw_result = true;
+            break;
+        }
+    }
+    assert!(saw_result);
+
+    let state = mock_state.lock().await;
+    let result = state.last_result.clone().unwrap();
+    assert_eq!(result.command_id, "cmd-status-1");
+    assert!(result.success, "error={}", result.error);
+    // payload_json is a JSON object (not raw text) with the parseable phase.
+    let doc: Value = serde_json::from_str(&result.payload_json).expect("status doc is JSON");
+    assert_eq!(doc["phase"], "Ready");
+    assert_eq!(doc["reason"], "2/2 components ready");
+    assert_eq!(doc["ready"], true);
     drop(state);
 
     handle.shutdown().await;
