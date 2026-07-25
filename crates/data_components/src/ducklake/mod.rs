@@ -62,6 +62,15 @@ pub fn configure_duckdb_httpfs(
     Ok(())
 }
 
+/// Whether a configured session token will be dropped rather than sent to `DuckDB`.
+///
+/// `SESSION_TOKEN` is only meaningful next to an explicit `KEY_ID`, so a token supplied
+/// without `aws_access_key_id` is ignored however the rest of the parameters are set —
+/// including the token-only case, which resolves no secret at all.
+fn session_token_is_ignored(s3: &DuckLakeS3Params) -> bool {
+    s3.session_token.is_some() && s3.access_key_id.is_none()
+}
+
 /// Builds the `CREATE SECRET` statement configuring `DuckDB`'s `httpfs` extension for
 /// S3 access, or `None` when no explicit S3 parameters are set (`DuckDB` then resolves
 /// credentials through its own `credential_chain` provider).
@@ -71,6 +80,15 @@ pub fn configure_duckdb_httpfs(
 /// usable; long-lived `AKIA…` credentials carry no token and are unaffected.
 #[must_use]
 pub fn build_ducklake_s3_secret_sql(s3: &DuckLakeS3Params) -> Option<String> {
+    // Warn before the early return below: a session token on its own is not an explicit
+    // credential, so a token-only configuration returns early and would never reach a
+    // check placed further down — the very case where the token is most silently dropped.
+    if session_token_is_ignored(s3) {
+        tracing::warn!(
+            "DuckLake: 'aws_session_token' provided without 'aws_access_key_id'. Set all three of 'aws_access_key_id', 'aws_secret_access_key', and 'aws_session_token' to use temporary credentials."
+        );
+    }
+
     let has_explicit_creds =
         s3.access_key_id.is_some() || s3.endpoint.is_some() || s3.region.is_some();
     if !has_explicit_creds {
@@ -103,11 +121,6 @@ pub fn build_ducklake_s3_secret_sql(s3: &DuckLakeS3Params) -> Option<String> {
             ));
         }
     } else {
-        if s3.session_token.is_some() {
-            tracing::warn!(
-                "DuckLake: 'aws_session_token' provided without 'aws_access_key_id'. Set all three of 'aws_access_key_id', 'aws_secret_access_key', and 'aws_session_token' to use temporary credentials."
-            );
-        }
         secret_parts.push("PROVIDER credential_chain".to_string());
     }
 
@@ -152,12 +165,62 @@ pub fn build_ducklake_attach_sql(
 
 #[cfg(test)]
 mod tests {
-    use super::{DuckLakeS3Params, build_ducklake_attach_sql, build_ducklake_s3_secret_sql};
+    use super::{
+        DuckLakeS3Params, build_ducklake_attach_sql, build_ducklake_s3_secret_sql,
+        session_token_is_ignored,
+    };
 
     #[test]
     fn s3_secret_sql_is_none_without_explicit_parameters() {
         assert_eq!(
             build_ducklake_s3_secret_sql(&DuckLakeS3Params::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_session_token_without_a_key_id_is_reported_ignored() {
+        // A token on its own resolves no secret at all, so this is the configuration
+        // whose token is dropped most quietly — it must still be flagged.
+        assert!(session_token_is_ignored(&DuckLakeS3Params {
+            session_token: Some("FwoSessionToken".to_string()),
+            ..DuckLakeS3Params::default()
+        }));
+
+        // …as must a token alongside other explicit parameters but still no key id.
+        assert!(session_token_is_ignored(&DuckLakeS3Params {
+            region: Some("us-east-1".to_string()),
+            session_token: Some("FwoSessionToken".to_string()),
+            ..DuckLakeS3Params::default()
+        }));
+    }
+
+    #[test]
+    fn a_usable_or_absent_session_token_is_not_reported_ignored() {
+        // Sent as SESSION_TOKEN next to the key id.
+        assert!(!session_token_is_ignored(&DuckLakeS3Params {
+            access_key_id: Some("ASIAEXAMPLE".to_string()),
+            secret_access_key: Some("secret".to_string()),
+            session_token: Some("FwoSessionToken".to_string()),
+            ..DuckLakeS3Params::default()
+        }));
+
+        // Nothing to ignore when no token was configured.
+        assert!(!session_token_is_ignored(&DuckLakeS3Params {
+            region: Some("us-east-1".to_string()),
+            ..DuckLakeS3Params::default()
+        }));
+    }
+
+    #[test]
+    fn a_session_token_alone_still_resolves_no_secret() {
+        // Warning aside, a token is not an explicit credential: DuckDB keeps using its
+        // own credential_chain rather than gaining a half-populated secret.
+        assert_eq!(
+            build_ducklake_s3_secret_sql(&DuckLakeS3Params {
+                session_token: Some("FwoSessionToken".to_string()),
+                ..DuckLakeS3Params::default()
+            }),
             None
         );
     }
