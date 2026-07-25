@@ -277,8 +277,8 @@ pub fn plan(
         // queries aren't starved — the un-limited instances (whose caps we DO control)
         // absorb the squeeze instead.
         None if unset > 0 => {
-            let preferred = (base_free.saturating_mul(DUCKDB_QUERY_SPLIT_PERCENT) / 100)
-                .max(query_floor);
+            let preferred =
+                (base_free.saturating_mul(DUCKDB_QUERY_SPLIT_PERCENT) / 100).max(query_floor);
             // Once every un-limited instance is squeezed to its own floor, the query
             // pool is the only remaining give. `fits` is the largest pool that still
             // leaves each of them that floor within `base`. When honoring the query
