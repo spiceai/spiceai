@@ -727,6 +727,20 @@ mod add {
 mod connect {
     use super::*;
 
+    /// Create a fake `spiced` binary under `$HOME/.spice/bin/spiced` that
+    /// exits 0 immediately. `spice connect <CODE>` now launches `spiced` in
+    /// the foreground; the stub lets the launch path run to completion
+    /// without a network install or a real, long-lived server process.
+    #[cfg(unix)]
+    fn install_fake_spiced(home: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let bin_dir = home.join(".spice").join("bin");
+        fs::create_dir_all(&bin_dir).expect("create fake .spice/bin");
+        let spiced = bin_dir.join("spiced");
+        fs::write(&spiced, "#!/bin/sh\nexit 0\n").expect("write fake spiced");
+        fs::set_permissions(&spiced, fs::Permissions::from_mode(0o755)).expect("chmod fake spiced");
+    }
+
     #[test]
     fn test_connect_help() {
         let mut cmd = spice_cmd();
@@ -743,21 +757,28 @@ mod connect {
     }
 
     /// `spice connect <CODE>` should stage the code at
-    /// `$SPICE_CONFIG_DIR/pending-adopt-code` and the subsequent
+    /// `$SPICE_CONFIG_DIR/pending-adopt-code`, print the attaching message,
+    /// launch `spiced` (here the fast-exit stub), and the subsequent
     /// `spice connect status` should report pending adoption.
+    #[cfg(unix)]
     #[test]
     fn test_connect_stage_code_and_status() {
         let dir = TempDir::new().expect("create temp config dir");
         let config_dir = dir.path();
+        let home = TempDir::new().expect("create temp home");
+        install_fake_spiced(home.path());
 
-        // Stage the code.
+        // Stage the code and launch (the stub) spiced.
         let mut cmd = spice_cmd();
-        cmd.env("SPICE_CONFIG_DIR", config_dir)
+        cmd.env("HOME", home.path())
+            .env("SPICE_CONFIG_DIR", config_dir)
             .arg("connect")
             .arg("SPICE-ADOPT-AAAA-BBBB")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Adoption code stored"));
+            .stdout(predicate::str::contains(
+                "Attaching this Spice Runtime to Spice Cloud Connect",
+            ));
 
         let pending = config_dir.join("pending-adopt-code");
         assert!(pending.exists(), "pending-adopt-code should be created");
@@ -812,11 +833,15 @@ mod connect {
 
     /// `spice connect forget` after `spice connect <CODE>` should clear
     /// the pending file.
+    #[cfg(unix)]
     #[test]
     fn test_connect_forget_clears_pending_code() {
         let dir = TempDir::new().expect("create temp config dir");
         let config_dir = dir.path();
+        let home = TempDir::new().expect("create temp home");
+        install_fake_spiced(home.path());
         spice_cmd()
+            .env("HOME", home.path())
             .env("SPICE_CONFIG_DIR", config_dir)
             .arg("connect")
             .arg("SPICE-ADOPT-AAAA-BBBB")

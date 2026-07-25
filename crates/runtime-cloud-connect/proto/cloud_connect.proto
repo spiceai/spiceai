@@ -59,6 +59,7 @@ message ControlMessage {
     GetStatus get_status = 22;
     Drain drain = 23;
     Pause pause = 24;
+    GetPodLogs get_pod_logs = 28;
   }
 }
 
@@ -199,4 +200,22 @@ message Drain {
 message Pause {
   string command_id = 1;
   bool paused = 2;
+}
+
+// GetPodLogs returns recent stdout/stderr of a spiced runtime. For
+// cluster (BYOC) instances the operator reads the logs from the customer
+// cluster's kube API. For a standalone spiced there is no pod: the runtime
+// returns its own recently-captured log lines. Either way the log text is
+// returned verbatim in CommandResult.payload_json (a raw string, not JSON).
+// Only `tail_lines` is meaningful for standalone; the namespace/kind/name/
+// pod_name fields address a workload in a cluster and are ignored otherwise.
+// Field numbers must stay identical to the ai-platform / operator copies of
+// this proto.
+message GetPodLogs {
+  string command_id = 1;
+  string namespace = 2;
+  string name = 3;
+  string kind = 4;
+  string pod_name = 5;
+  int64 tail_lines = 6;
 }
