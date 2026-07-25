@@ -35,7 +35,7 @@ const MIN_TOKEN_REFRESH_WAIT_SECS: u64 = 1;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to obtain Databricks service principal token for machine-to-machine authentication. {source} Machine-to-machine is used whenever `databricks_client_secret` is set, including when it is auto-loaded from the secret stores or the environment (`DATABRICKS_CLIENT_SECRET`, `SPICE_DATABRICKS_CLIENT_SECRET`); set `databricks_auth_mode: u2m` for user-to-machine OAuth instead."
+        "Failed to obtain Databricks service principal token for machine-to-machine authentication: {source}. Machine-to-machine is used whenever `databricks_client_secret` is set, including when it is auto-loaded from the secret stores or the environment (`DATABRICKS_CLIENT_SECRET`, `SPICE_DATABRICKS_CLIENT_SECRET`); set `databricks_auth_mode: u2m` for user-to-machine OAuth instead."
     ))]
     UnableToGetToken {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -376,9 +376,11 @@ use token_provider::registry::TokenProviderRegistry;
 ///
 /// The connector and catalog connector parameter specs share this list so that every accepted value
 /// is also a value [`build_auth_credentials`] dispatches on.
+#[cfg(feature = "databricks")]
 pub const AUTH_MODES: &[&str] = &["auto", "token", "m2m", "u2m"];
 
 /// The description both parameter specs use for `databricks_auth_mode`.
+#[cfg(feature = "databricks")]
 pub const AUTH_MODE_DESCRIPTION: &str = "The authentication mode to use: 'token' for a personal access token, 'm2m' for machine-to-machine service principal credentials, 'u2m' for user-to-machine OAuth, or 'auto' (default) to select from the credentials that are set. Set this explicitly to keep a credential auto-loaded from the environment from selecting another mode.";
 
 /// Which Databricks credential flow to use.
