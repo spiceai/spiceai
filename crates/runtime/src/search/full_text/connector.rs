@@ -166,6 +166,10 @@ impl DataConnector for FullTextConnector {
         self.inner_connector.supports_changes_stream()
     }
 
+    fn supports_durable_write_back_delivery(&self) -> bool {
+        self.inner_connector.supports_durable_write_back_delivery()
+    }
+
     fn changes_stream(
         &self,
         federated_table: Arc<FederatedTable>,

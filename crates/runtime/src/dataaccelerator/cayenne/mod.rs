@@ -67,7 +67,6 @@ use runtime_acceleration::snapshot::{AccelerationEngine, AccelerationLayout};
 use runtime_datafusion_index::{Index, IndexedTableProvider};
 use search::index::native_vector::NativeVectorIndex;
 use spicepod::acceleration as spicepod_acceleration;
-use spicepod::acceleration::WriteMode;
 
 /// Metadata key to identify the accelerator type in the schema metadata.
 const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
@@ -2072,11 +2071,13 @@ impl CayenneAccelerator {
         // (on_conflict with a non-`changes` refresh forces AcceleratorOnly). When
         // so configured, every committed write durably marks its PKs so the
         // delivery worker reconciles them to the federated source.
-        let durable_write_back = source.acceleration().is_some_and(|acceleration| {
-            acceleration.write_mode == WriteMode::WriteBack
-                && !acceleration.on_conflict.is_empty()
-                && acceleration.refresh_mode == Some(RefreshMode::Changes)
-        });
+        // `resolves_to_durable_write_back` is shared with the registration gate
+        // that requires the source connector to advertise a safe delivery
+        // primitive, so marking can never be switched on for a dataset the gate
+        // would have rejected.
+        let durable_write_back = source
+            .acceleration()
+            .is_some_and(Acceleration::resolves_to_durable_write_back);
 
         // Create CayenneTableProvider with object store for S3 Express One Zone
         let mut builder = CayenneTableProviderBuilder::new(catalog, runtime_env)
