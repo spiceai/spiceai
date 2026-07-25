@@ -333,10 +333,15 @@ impl DuckDBAccelerator {
                 if other_accel.engine != Engine::DuckDB {
                     return false;
                 }
+                let other_is_memory = matches!(other_accel.mode, Mode::Memory);
                 let same_instance = if self_is_memory {
-                    matches!(other_accel.mode, Mode::Memory)
+                    other_is_memory
                 } else {
-                    self.file_path(other.as_ref()).ok() == self_path
+                    // Memory-mode datasets live on the shared in-memory instance, but
+                    // `file_path` still resolves a path for them — without this guard a
+                    // memory-mode sibling could match a file instance's path and
+                    // wrongly suppress that instance's coordinated cap.
+                    !other_is_memory && self.file_path(other.as_ref()).ok() == self_path
                 };
                 same_instance && other_accel.params.contains_key("duckdb_memory_limit")
             })
@@ -740,7 +745,9 @@ impl DataAccelerator for DuckDBAccelerator {
         // `duckdb_memory_limit` on this dataset, apply the runtime-computed
         // per-instance cap (see `accelerator_memory_budget`) so this DuckDB
         // instance's ceiling — DuckDB's own default is ~80% of host RAM — plus the
-        // query pool and the other DuckDB instances can't over-commit host memory.
+        // query pool and the other DuckDB instances can't over-commit the memory
+        // available to this process (the cgroup limit in a container, which is what
+        // the coordinated budget is computed from).
         // Here `memory_limit` is the prefix-stripped `duckdb_memory_limit`; an
         // explicit value on THIS dataset always wins (the guard skips a present key).
         // Also skip when another dataset sharing this DuckDB instance set an explicit
