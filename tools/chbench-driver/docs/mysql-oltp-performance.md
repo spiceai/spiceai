@@ -51,26 +51,36 @@ Knobs: `CHBENCH_WAREHOUSES`, `CHBENCH_TERMINALS`, `CHBENCH_RATE`,
 **Local headline (same-sitting, fresh-seed, SF10 / 100 terminals / 30s, Docker
 on macOS): 79.3k → 131.2k tpmC (+65%), zero aborts.**
 
-## CI result (full HTAP run, all improvements)
+## CI results (full HTAP runs, in-cluster MySQL pod, live CDC)
 
-[Run 30170010535](https://github.com/spiceai/spiceai/actions/runs/30170010535/job/89709796991)
-— `htap benchmark tests`, spicepod `accelerated/mysql-cayenne[file]-adaptive.yaml`,
-in-cluster MySQL pod, **SF1000, 100 terminals, unlimited rate, 600s**, with
-spiced consuming the binlog (real CDC load) concurrently:
+Both runs: `htap benchmark tests`, spicepod
+`accelerated/mysql-cayenne[file]-adaptive.yaml`, SF1000, 100 terminals, spiced
+consuming the binlog concurrently.
 
-```
-OLTP Report (603.6s)
-  tpmC (NewOrder/min): 237,903
-  transactions: 5,323,717 committed, 0 aborted (0.00% abort rate)
-```
+| | trunk ([30158866659](https://github.com/spiceai/spiceai/actions/runs/30158866659/job/89698650797)) | this branch ([30170010535](https://github.com/spiceai/spiceai/actions/runs/30170010535/job/89709796991)) |
+|---|---|---|
+| rate / duration | capped 9,250 txn/s / 900s | **unlimited** / 600s |
+| tpmC | 233,710 | 237,903 |
+| actual txn/s | 8,660 — fell 6.4% short of its cap | 8,819 — natural ceiling |
+| aborts | 0 | 0 |
 
-~8.8k txn/s sustained for 10 minutes at zero aborts — comfortably above the
-249,750-tpmC-equivalent rate cap (9,250 txn/s) the SF1 scheduled dispatch asks
-for, and roughly 1.8x the local Docker-on-macOS ceiling, consistent with the
-round-trip analysis (the in-cluster pod's lower RTT amplifies the batching
-win). The template was a cache miss, so the source was seeded fresh at SF1000
-by this same branch's loader. No same-environment trunk baseline exists for
-this pod yet; the per-improvement attribution ladder below will produce one.
+**Interpretation: the pod, not the driver, is the CI bottleneck.** Both
+drivers converge on ~8.7–8.8k txn/s (~235k tpmC). Trunk could not sustain its
+requested 9,250 txn/s; the branch uncapped found the same ceiling (+1.8%,
+within cross-run noise — different durations, template hit vs miss). If the
+pod were latency-bound like the local setup, the branch's ~4x round-trip
+reduction would have moved throughput the way it did locally (+65%); it
+didn't, so the pod is saturated server-side under OLTP + binlog + CDC load.
+
+Consequences:
+- The generator now has ample headroom; raising CI tpmC further is a
+  **server-side** problem (pod CPU/IO/config), not a driver problem.
+- The per-improvement attribution ladder is meaningless against the pod
+  (server-bound flattens driver deltas) — run it on standard runners with the
+  Docker container, where RTT dominates.
+- The `order_line` index experiment's *cost* side is best measured on the pod
+  precisely **because** it is server-bound: added index maintenance there
+  translates directly into lost tpmC.
 
 ## Invariants preserved
 
