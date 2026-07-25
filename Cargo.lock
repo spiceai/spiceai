@@ -16583,6 +16583,7 @@ dependencies = [
  "runtime-checkpoint-sqlite",
  "runtime-checkpoint-turso",
  "runtime-cluster",
+ "runtime-component",
  "runtime-datafusion",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
@@ -16855,6 +16856,25 @@ dependencies = [
  "tracing",
  "util",
  "uuid 1.23.2",
+]
+
+[[package]]
+name = "runtime-component"
+version = "2.2.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow-schema",
+ "data_components",
+ "datafusion",
+ "datafusion-table-providers",
+ "fundu",
+ "globset",
+ "logos",
+ "runtime-acceleration",
+ "serde",
+ "snafu",
+ "spicepod",
+ "tracing",
 ]
 
 [[package]]

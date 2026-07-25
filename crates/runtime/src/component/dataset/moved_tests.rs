@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,100 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+//! Tests relocated from `runtime-component` (`dataset::metadata` and
+//! `dataset::declared_schema`) because they construct a full `Dataset` via
+//! `DatasetBuilder` + `Runtime`, which only exist in the `runtime` crate. They
+//! exercise the config methods (now on `DatasetSpec`) through the wrapper's `Deref`.
 
-use arrow::datatypes::Schema;
-use data_components::object::metadata::MetadataColumn;
-
-use super::Dataset;
-
-impl Dataset {
-    /// Returns which `ListingTable` metadata columns are enabled for this dataset.
-    #[must_use]
-    pub fn listing_table_metadata_columns(
-        &self,
-        url_prefix: impl Into<Arc<str>>,
-        schema: &Schema,
-    ) -> Option<Vec<MetadataColumn>> {
-        let needs_last_modified = self.needs_last_modified(schema);
-        // Handle the common case where no metadata columns are enabled
-        if !needs_last_modified && self.metadata.is_empty() {
-            return None;
-        }
-
-        let known_metadata_columns: &[&str] = &[
-            MetadataColumn::LastModified.name(),
-            MetadataColumn::Location(None).name(),
-            MetadataColumn::Size.name(),
-        ];
-        for (key, value) in &self.metadata {
-            // Only check "enabled" values — metadata can also contain arbitrary user-defined entries (e.g. instructions).
-            if value == "enabled" && !known_metadata_columns.contains(&key.as_str()) {
-                tracing::warn!(
-                    "Dataset {}: '{key}: enabled' is not a recognized listing table metadata column and will be ignored. If this is a custom metadata entry, no action is needed. Otherwise, supported listing table metadata columns are: {known_metadata_columns:?}",
-                    self.name
-                );
-            }
-        }
-
-        let mut columns = Vec::new();
-
-        if self.metadata_column_enabled(MetadataColumn::LastModified.name(), schema)
-            || needs_last_modified
-        {
-            columns.push(MetadataColumn::LastModified);
-        }
-
-        if self.metadata_column_enabled(MetadataColumn::Location(None).name(), schema) {
-            columns.push(MetadataColumn::Location(Some(url_prefix.into())));
-        }
-
-        if self.metadata_column_enabled(MetadataColumn::Size.name(), schema) {
-            columns.push(MetadataColumn::Size);
-        }
-
-        if columns.is_empty() {
-            None
-        } else {
-            Some(columns)
-        }
-    }
-
-    fn needs_last_modified(&self, schema: &Schema) -> bool {
-        let needs_last_modified_time_col = self
-            .time_column
-            .as_ref()
-            .is_some_and(|col| col == MetadataColumn::LastModified.name())
-            || self
-                .time_partition_column
-                .as_ref()
-                .is_some_and(|col| col == MetadataColumn::LastModified.name());
-
-        needs_last_modified_time_col
-            && schema
-                .fields()
-                .find(MetadataColumn::LastModified.name())
-                .is_none()
-    }
-
-    // Checks if the metadata column is enabled for the dataset and if it is not already present in the schema
-    fn metadata_column_enabled(&self, column: &str, schema: &Schema) -> bool {
-        self.metadata
-            .get(column)
-            .is_some_and(|val| val == "enabled")
-            && schema.fields().find(column).is_none()
-    }
-}
-
-#[cfg(test)]
-mod tests {
+mod metadata_tests {
     use std::{collections::HashMap, sync::Arc};
 
     use crate::{Runtime, builder::RuntimeBuilder, component::dataset::builder::DatasetBuilder};
     use app::{App, AppBuilder};
     use arrow::datatypes::{DataType, Field};
 
-    use super::*;
+    use arrow::datatypes::Schema;
+    use data_components::object::metadata::MetadataColumn;
 
     #[must_use]
     fn test_app() -> Arc<App> {
@@ -578,5 +498,63 @@ mod tests {
             .expect("to get columns");
         assert_eq!(columns.len(), 1);
         assert_eq!(columns[0], MetadataColumn::Location(Some("test".into())));
+    }
+}
+
+mod declared_schema_tests {
+    use crate::component::dataset::builder::DatasetBuilder;
+    use crate::component::dataset::declared_schema::declared_schema_for;
+    use app::AppBuilder;
+    use spicepod::semantic::Column;
+
+    async fn dataset_with_columns(cols: Vec<Column>) -> crate::component::dataset::Dataset {
+        let app = std::sync::Arc::new(AppBuilder::new("test").build());
+        let rt = std::sync::Arc::new(crate::Runtime::builder().build().await);
+        let mut ds = DatasetBuilder::try_new("test:tbl".to_string(), "tbl")
+            .expect("builder")
+            .with_app(app)
+            .with_runtime(rt)
+            .build()
+            .expect("dataset");
+        ds.columns = cols;
+        ds
+    }
+
+    #[tokio::test]
+    async fn empty_columns_returns_none() {
+        let ds = dataset_with_columns(vec![]).await;
+        assert!(declared_schema_for(&ds).expect("no error").is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_type_returns_none() {
+        let ds = dataset_with_columns(vec![
+            Column::new("id").with_type("bigint"),
+            Column::new("name"),
+        ])
+        .await;
+        assert!(declared_schema_for(&ds).expect("no error").is_none());
+    }
+
+    #[tokio::test]
+    async fn all_typed_returns_schema() {
+        let ds = dataset_with_columns(vec![
+            Column::new("id").with_type("bigint").with_nullable(false),
+            Column::new("name").with_type("text"),
+        ])
+        .await;
+        let schema = declared_schema_for(&ds).expect("no error").expect("some");
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "id");
+        assert!(!schema.field(0).is_nullable());
+        assert_eq!(schema.field(1).name(), "name");
+        assert!(schema.field(1).is_nullable());
+    }
+
+    #[tokio::test]
+    async fn invalid_type_returns_error() {
+        let ds = dataset_with_columns(vec![Column::new("bad").with_type("not_a_type")]).await;
+        let result = declared_schema_for(&ds);
+        assert!(result.is_err(), "expected error, got {result:?}");
     }
 }
