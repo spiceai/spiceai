@@ -228,6 +228,87 @@ async fn configured_sort_columns_override_observations() {
     );
 }
 
+/// An **inference-derived** sort order must NOT shadow observed filter columns.
+///
+/// This is the regression that made the default-on adaptive layout inert on every
+/// catalog-visible CDC deployment. Schema inference fills `cayenne_sort_columns`
+/// from the source's declared order — the primary key, for a PostgreSQL CDC table
+/// — so `sort_columns` is never empty in production, and every adaptive-layout
+/// gate asked only "is `sort_columns` empty?". The feature therefore never
+/// engaged, while every benchmark gate stayed green (CH-benCH's date predicates
+/// are near-tautological, so the suite cannot see layout quality).
+///
+/// Contrast `configured_sort_columns_override_observations`: an *explicit* sort
+/// order is operator intent and still wins. Only the *guess* yields.
+#[tokio::test]
+async fn inferred_sort_columns_yield_to_observations() {
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let runtime_env = Arc::new(RuntimeEnv::default());
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, false),
+        Field::new("amount", DataType::Int64, false),
+    ]));
+
+    // Exactly what schema inference produces for a PG CDC table: the primary key
+    // as the sort order, tagged as inferred rather than as operator intent.
+    let vortex_config = VortexConfig {
+        sort_columns: vec!["id".to_string()],
+        sort_columns_origin: cayenne::metadata::SortColumnsOrigin::Inferred,
+        ..VortexConfig::default()
+    };
+    let context = CayenneContext::new(
+        &vortex_config,
+        Arc::clone(&runtime_env),
+        "adaptive_layout_inferred",
+    );
+    let options = CreateTableOptions {
+        table_name: "t_inferred".to_string(),
+        schema,
+        primary_key: vec!["id".to_string()],
+        on_conflict: None,
+        base_path: fixture.data_path.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config,
+    };
+    let catalog_arc = Arc::clone(&fixture.catalog);
+    let catalog_arc: Arc<dyn MetadataCatalog> = catalog_arc;
+    let provider = Arc::new(
+        CayenneTableProviderBuilder::new(catalog_arc, runtime_env)
+            .with_context(context)
+            .create(options)
+            .await
+            .expect("create"),
+    );
+
+    // Before any scan there is nothing observed, so the inferred order is the
+    // best available key — it must still be used, not discarded.
+    assert_eq!(
+        provider.effective_sort_columns_for_rewrite(),
+        vec!["id".to_string()],
+        "with nothing observed yet, an inferred sort order is the correct fallback"
+    );
+
+    let ctx = SessionContext::new();
+    let state = ctx.state();
+    for _ in 0..20 {
+        let _plan = provider
+            .scan(&state, None, &[col("region").eq(lit("west"))], None)
+            .await
+            .expect("scan");
+    }
+
+    // Now that a hot filter column has been measured, evidence outranks the guess.
+    assert_eq!(
+        provider.effective_sort_columns_for_rewrite(),
+        vec!["region".to_string()],
+        "observed filter columns must outrank an INFERRED sort order (pre-fix this \
+         returned the inferred primary key, leaving the adaptive layout inert)"
+    );
+}
+
 /// Default-path sort-and-rewrite after filter observations clusters by the hot column.
 #[tokio::test]
 async fn sort_and_rewrite_uses_observed_filter_column() {

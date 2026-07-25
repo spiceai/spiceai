@@ -318,6 +318,28 @@ impl PartitionMetadata {
     }
 }
 
+/// Provenance of [`VortexConfig::sort_columns`] — whether the operator asked
+/// for that sort order or schema inference guessed it.
+///
+/// This exists because the two carry different authority. An explicit
+/// `cayenne_sort_columns` is a statement of intent and wins outright. An
+/// inference-derived value is a *fallback guess* — for PostgreSQL CDC tables it
+/// resolves to the primary key when the source has no `CLUSTER` or natural
+/// order, which is close to the worst clustering for range/date predicates. It
+/// must therefore rank below the hot filter columns actually observed on scans,
+/// or the guess permanently shadows the measurement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortColumnsOrigin {
+    /// Explicitly configured by the operator (or absent, in which case
+    /// `sort_columns` is empty and the distinction is moot). Authoritative.
+    #[default]
+    User,
+    /// Filled in by schema inference from the source's declared sort order.
+    /// A guess — outranked by observed filter columns.
+    Inferred,
+}
+
 /// Which compression strategy the table's FULL encoding tier uses — i.e.
 /// maintenance writes (compaction outputs, rewrites, overwrites) and delta
 /// writes that resolve to a full level (`7..=10`, or `auto` on large /
@@ -742,6 +764,19 @@ pub struct VortexConfig {
     pub target_vortex_file_size_mb: usize,
     /// Columns to sort data by on refresh operations (empty = no sorting)
     pub sort_columns: Vec<String>,
+    /// Where [`Self::sort_columns`] came from. `user` (an explicit
+    /// `cayenne_sort_columns`) is authoritative and outranks everything.
+    /// `inferred` means schema inference filled it from the source's declared
+    /// order — for a PostgreSQL CDC table that is usually just the primary key,
+    /// a *guess* about what queries will filter on. An inferred value therefore
+    /// ranks BELOW the hot filter columns actually observed on scans, so the
+    /// default-on adaptive layout can override a guess with evidence.
+    ///
+    /// Deliberately NOT compared by `configuration_matches`: it is provenance
+    /// about a value, not a data-affecting field. Comparing it would make every
+    /// existing table look config-changed on upgrade and trip the recreate path.
+    #[serde(default)]
+    pub sort_columns_origin: SortColumnsOrigin,
     /// Columns to hash-cluster rows by during intra-write sharding (the parallel
     /// encode fan-out). Empty = derive from the primary key (PK-hash clustering,
     /// the historical behavior); PK-less tables shard round-robin. Ignored for
@@ -1433,6 +1468,7 @@ impl Default for VortexConfig {
             target_vortex_file_size_mb: 256,
             // No sort columns by default
             sort_columns: Vec::new(),
+            sort_columns_origin: SortColumnsOrigin::default(),
             // Shard key derives from the primary key unless overridden
             shard_key_columns: Vec::new(),
             compression_strategy: CompressionStrategy::default(),

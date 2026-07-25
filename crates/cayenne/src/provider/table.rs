@@ -6062,6 +6062,22 @@ impl CayenneTableProvider {
         target_size_bytes: usize,
         estimated_bytes: Option<u64>,
     ) -> usize {
+        // A sorted write must go through ONE writer, or the global order is
+        // scattered across shard files and each file's zone maps span the whole
+        // range — forfeiting exactly the pruning the sort was for.
+        //
+        // KNOWN GAP (pre-existing, deliberately not fixed here): this asks the
+        // CONFIGURED list, but an adaptive (observed-filter) layout sorts the
+        // compaction rewrite too, with no configured columns — so that rewrite
+        // gets sharded and its clustering is diluted. The blunt fix (key off
+        // `effective_sort_columns_for_rewrite`) is wrong: this function also
+        // serves DELTA writes (`table.rs:5708`), which are NOT sorted, so it
+        // would serialize the CDC encode fan-out and regress ingest. The real fix
+        // threads `write_class` in so only maintenance writes force one shard.
+        // Until then the adaptive layout's clustering is per-shard-file rather
+        // than global — weaker pruning, but never a wrong `output_ordering`
+        // (the attestation in `rewrite_current_snapshot_for_compaction` declines
+        // to attest whenever the effective key is not the configured one).
         if self.context.has_sort_columns() {
             return 1;
         }
@@ -11489,9 +11505,17 @@ impl CayenneTableProvider {
 
     /// Effective sort columns for a snapshot rewrite under default settings.
     ///
-    /// Operator-configured `sort_columns` always win. When empty (the default),
-    /// returns the hottest filter columns observed on scans so compaction can
-    /// cluster cold files without spicepod setup (F4 adaptive layout).
+    /// Precedence: operator-configured `sort_columns` > hottest observed filter
+    /// columns > schema-inference-derived `sort_columns` > none.
+    ///
+    /// An *explicit* `cayenne_sort_columns` is a statement of intent and wins
+    /// outright. An *inference-derived* one is only a guess about what queries
+    /// will filter on — for a PostgreSQL CDC table it resolves to the primary
+    /// key, which is close to the worst clustering for range/date predicates —
+    /// so it must NOT shadow the filter columns actually observed on scans, or
+    /// the adaptive layout can never correct it. Inference-derived columns stay
+    /// as the last rung so a table that has not yet been queried still gets a
+    /// deterministic key instead of an unsorted rewrite.
     ///
     /// Public so integration tests can assert the default-on policy without
     /// reaching private compaction internals.
@@ -11536,7 +11560,8 @@ impl CayenneTableProvider {
             }
         }
 
-        if self.context.has_sort_columns() {
+        // Rung 1: an explicit operator sort order wins outright.
+        if self.context.sort_columns_are_authoritative() {
             return self.context.sort_columns().to_vec();
         }
         let schema = self.table_schema();
@@ -11545,9 +11570,12 @@ impl CayenneTableProvider {
             schema.as_ref(),
         );
         if observed.is_empty() {
-            // No filters observed yet — don't invent a sort key; the warm rewrite
-            // just compacts unsorted until a hot column is seen.
-            return Vec::new();
+            // Rung 3: nothing observed yet. Prefer an inference-derived key (the
+            // source's declared order) over an unsorted rewrite — it is a guess,
+            // but a deterministic one, and it keeps pre-observation behavior
+            // identical to what inference produced before the adaptive layout
+            // existed. Falls through to no clustering when inference gave none.
+            return self.context.inferred_sort_columns().to_vec();
         }
         let sortable: Vec<String> = observed
             .into_iter()
@@ -11559,9 +11587,14 @@ impl CayenneTableProvider {
             .collect();
         if sortable.is_empty() {
             // Hot columns were observed but none are row-sortable (e.g. all
-            // `Map`): fall back to the primary key so the rewrite still gets a
-            // safe, deterministic clustering key instead of no clustering at all
-            // (mirrors the cold-tier fallback in `resolve_cold_clustering_indices`).
+            // `Map`): fall back to an inference-derived key if there is one, else
+            // the primary key, so the rewrite still gets a safe, deterministic
+            // clustering key instead of no clustering at all (mirrors the
+            // cold-tier fallback in `resolve_cold_clustering_indices`).
+            let inferred = self.context.inferred_sort_columns();
+            if !inferred.is_empty() {
+                return inferred.to_vec();
+            }
             return self.table_metadata.primary_key.clone();
         }
         sortable
@@ -14633,15 +14666,28 @@ impl CayenneTableProvider {
                 }
             }
 
-            // [sound output_ordering attestation] When sort columns are
-            // configured this rewrite consolidated the entire snapshot into a
-            // single globally-sorted, non-overlapping run (the stream was
-            // sorted via `sort_stream` above and written by a single writer —
-            // see `snapshot_shard_count`). Attest THIS snapshot id as sorted so
-            // a subsequent `scan` may advertise `output_ordering` by the sort
-            // columns. MUST run AFTER `update_current_snapshot_id` (which
-            // clears the attestation) and under the held listing fence.
-            if self.context.has_sort_columns() {
+            // [sound output_ordering attestation] This rewrite consolidated the
+            // entire snapshot into a single globally-sorted, non-overlapping run
+            // (the stream was sorted via `sort_stream` above and written by a
+            // single writer — see `snapshot_shard_count`). Attest THIS snapshot
+            // id as sorted so a subsequent `scan` may advertise
+            // `output_ordering`. MUST run AFTER `update_current_snapshot_id`
+            // (which clears the attestation) and under the held listing fence.
+            //
+            // The scan advertises the ordering from `context.sort_columns()`
+            // (`create_snapshot_scan_plan_with_config`), so attest ONLY when the
+            // key this rewrite actually sorted by IS that list. When the adaptive
+            // layout overrode an inference-derived sort with observed filter
+            // columns, the physical order is the observed one — advertising the
+            // configured (primary-key) order would then be a FALSE ordering
+            // claim and DataFusion would elide a sort the data needs, returning
+            // mis-ordered results. Declining to attest costs only the ordering
+            // optimization on such snapshots; claiming a wrong order is a
+            // correctness bug. Recovering the optimization means storing the
+            // attested key alongside the id and advertising from it (follow-up).
+            if !rewrite_sort_columns.is_empty()
+                && rewrite_sort_columns == self.context.sort_columns()
+            {
                 self.current_sorted_snapshot
                     .store(Arc::new(Some(new_snapshot_id.clone())));
             }
@@ -14736,7 +14782,12 @@ impl CayenneTableProvider {
         let vc = &self.table_metadata.vortex_config;
         let names: Vec<String> = if !vc.cold_clustering_columns.is_empty() {
             vc.cold_clustering_columns.clone()
-        } else if !self.context.sort_columns().is_empty() {
+        } else if self.context.sort_columns_are_authoritative() {
+            // Only an EXPLICIT sort order outranks observed filters here. An
+            // inference-derived one (the primary key, for most CDC tables) drops
+            // below the observations and is picked up by the fallback chain
+            // further down, so the adaptive layout can cluster cold files for the
+            // workload instead of for a guess.
             self.context.sort_columns().to_vec()
         } else {
             // Auto-observed columns only cluster if the Z-order encoder can key on
@@ -14758,7 +14809,16 @@ impl CayenneTableProvider {
                 })
                 .collect();
             if observed.is_empty() {
-                self.table_metadata.primary_key.clone()
+                // Nothing observed yet: prefer an inference-derived order (the
+                // source's declared one) before falling back to the primary key,
+                // so a table that has not been queried yet still clusters the way
+                // the source suggests.
+                let inferred = self.context.inferred_sort_columns();
+                if inferred.is_empty() {
+                    self.table_metadata.primary_key.clone()
+                } else {
+                    inferred.to_vec()
+                }
             } else {
                 observed
             }
@@ -25238,11 +25298,16 @@ impl TableProvider for CayenneTableProvider {
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         // F4 default-on layout: record which columns this scan filters on so
         // background compaction can cluster cold files without spicepod setup.
-        // Cheap (mutex + HashMap bump); empty filters are a no-op. Skipped when
-        // `sort_columns` is configured: observations are never consulted then
-        // (warm rewrite and cold clustering both use the configured columns), so
-        // recording would be pure hot-path overhead.
-        if !self.context.has_sort_columns() {
+        // Cheap (mutex + HashMap bump); empty filters are a no-op.
+        //
+        // Skipped only when the sort order is AUTHORITATIVE (an explicit
+        // `cayenne_sort_columns`): observations are never consulted then, so
+        // recording would be pure hot-path overhead. An *inference-derived* sort
+        // order does NOT skip — observations outrank it, so they must be
+        // collected. Gating this on `has_sort_columns()` instead is what made the
+        // adaptive layout inert on every catalog-visible CDC deployment, since
+        // inference fills `cayenne_sort_columns` on all of them.
+        if !self.context.sort_columns_are_authoritative() {
             self.filter_column_observations.record_filters(filters);
         }
 
