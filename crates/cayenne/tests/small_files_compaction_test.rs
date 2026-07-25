@@ -37,6 +37,8 @@ use arrow::record_batch::RecordBatch;
 
 use cayenne::metadata::{CreateTableOptions, VortexConfig};
 use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use datafusion::datasource::TableProvider;
+use datafusion::prelude::{col, lit};
 
 use datafusion::prelude::SessionContext;
 use datafusion_table_providers::util::{
@@ -1171,8 +1173,6 @@ async fn warm_subset_preserves_key_deletes_and_rows(
         "key-mode table should produce a warm-subset compaction candidate"
     );
 
-    use datafusion::datasource::TableProvider;
-    use datafusion::prelude::{col, lit};
     let filter = col("id").eq(lit(10_i64));
     let plan = table
         .delete_from(&ctx.state(), vec![filter])
