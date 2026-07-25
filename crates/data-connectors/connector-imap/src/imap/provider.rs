@@ -47,7 +47,7 @@ const MAX_ID_SET_LEN: usize = 8 * 1024;
 /// columns, and the raw message backing `content`.
 ///
 /// The raw message is requested for every scan, including one whose table has no
-/// `content` column and therefore discards it — see #12046.
+/// `content` column and therefore discards it — see #12045.
 const FETCH_QUERY: &str = "(ENVELOPE BODY.PEEK[HEADER] BODY.PEEK[])";
 
 /// Which messages a scan asks the server for.
