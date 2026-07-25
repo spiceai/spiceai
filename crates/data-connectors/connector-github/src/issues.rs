@@ -124,7 +124,7 @@ impl GitHubTableArgs for IssuesTableArgs {
             GitHubQueryMode::Auto => format!(
                 r#"{{
                 repository(owner: "{owner}", name: "{name}") {{
-                    issues(first: 100) {{
+                    issues(first: 100, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{
                         pageInfo {{
                             hasNextPage
                             endCursor
@@ -232,4 +232,60 @@ fn gql_schema() -> SchemaRef {
             true,
         ),
     ]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use app::AppBuilder;
+    use runtime::builder::RuntimeBuilder;
+    use runtime::component::dataset::builder::DatasetBuilder;
+    use std::sync::OnceLock;
+
+    /// Building a `ConnectorComponent` requires a full runtime + app
+    /// construction. Cache a single shared instance so the unit tests don't
+    /// spin up a tokio runtime per invocation.
+    fn shared_component() -> ConnectorComponent {
+        // The tokio runtime is cached alongside the component and never dropped:
+        // `RuntimeBuilder::build` defaults `io_runtime` to `Handle::current()`, so
+        // dropping the runtime that built it would leave the constructed `Runtime`
+        // holding handles to a dead tokio runtime.
+        static COMPONENT: OnceLock<(tokio::runtime::Runtime, ConnectorComponent)> = OnceLock::new();
+        COMPONENT
+            .get_or_init(|| {
+                let app = AppBuilder::new("test").build();
+                let runtime = tokio::runtime::Runtime::new().expect("to create tokio runtime");
+                let spice_runtime = runtime.block_on(async { RuntimeBuilder::new().build().await });
+                let dataset = DatasetBuilder::try_new("github".to_string(), "test.issues")
+                    .expect("to create dataset builder")
+                    .with_app(Arc::new(app))
+                    .with_runtime(Arc::new(spice_runtime))
+                    .build()
+                    .expect("to create dataset");
+                (runtime, ConnectorComponent::from(&dataset))
+            })
+            .1
+            .clone()
+    }
+
+    fn auto_args() -> IssuesTableArgs {
+        IssuesTableArgs {
+            owner: "spiceai".to_string(),
+            repo: "spiceai".to_string(),
+            query_mode: GitHubQueryMode::Auto,
+            component: shared_component(),
+        }
+    }
+
+    #[test]
+    fn auto_mode_query_orders_by_updated_at_desc() {
+        // Deterministic UPDATED_AT-descending order is the prerequisite for
+        // watermark-based early-exit pagination on append refreshes.
+        let params = auto_args().get_graphql_values();
+        let query = params.query.as_ref();
+        assert!(
+            query.contains("issues(first: 100, orderBy: {field: UPDATED_AT, direction: DESC})"),
+            "auto-mode issues query must order by UPDATED_AT DESC, got:\n{query}"
+        );
+    }
 }
