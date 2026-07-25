@@ -1337,14 +1337,14 @@ fn emit_duckdb_memory_budget_warning(
                 total_memory_bytes = total_memory,
                 query_pool_bytes = plan.effective_query_pool_bytes,
                 duckdb_explicit_bytes = inputs.sum_explicit_bytes,
-                "The explicit DuckDB accelerator memory limits plus the query pool exceed the coordinated memory budget and cut into the safety headroom below the {total_h} available to this process; combined ceilings may approach or exceed it and risk an OOM kill under load. Lower the per-dataset duckdb_memory_limit values and/or runtime.query.memory_limit so combined ceilings fit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
+                "The explicit DuckDB accelerator memory limits plus the query memory limit exceed the coordinated memory budget and cut into the safety headroom below the {total_h} available to this process; combined ceilings may approach or exceed it and risk an OOM kill under load. Lower the per-dataset duckdb_memory_limit values and/or runtime.query.memory_limit so combined ceilings fit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
             );
         } else {
             tracing::warn!(
                 total_memory_bytes = total_memory,
                 query_pool_bytes = plan.effective_query_pool_bytes,
                 duckdb_explicit_bytes = inputs.sum_explicit_bytes,
-                "Reduced the DataFusion query pool to {query_h} so it plus the explicit DuckDB accelerator memory limits fit the {total_h} available to this process. To customize, set runtime.query.memory_limit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
+                "Reduced the DataFusion query memory limit to {query_h} so it plus the explicit DuckDB accelerator memory limits fit the {total_h} available to this process. To customize, set runtime.query.memory_limit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
             );
         }
     } else if plan.residual_overcommit {
@@ -1355,7 +1355,7 @@ fn emit_duckdb_memory_budget_warning(
             duckdb_unset_instances = n,
             recommended_duckdb_memory_limit_bytes = plan.per_instance_cap_bytes,
             recommended_query_memory_limit_bytes = plan.effective_query_pool_bytes,
-            "Even after auto-capping, the {n} DuckDB instance(s) without an explicit duckdb_memory_limit plus the query pool exceed the coordinated memory budget and cut into the safety headroom below the {total_h} available to this process; combined ceilings may approach or exceed it and risk an OOM kill under load. Reduce the number of distinct DuckDB files, or set runtime.query.memory_limit: \"{query_h}\" and duckdb_memory_limit: \"{per_instance_h}\" on each DuckDB-accelerated dataset so combined ceilings fit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
+            "Even after auto-capping, the {n} DuckDB instance(s) without an explicit duckdb_memory_limit plus the query memory limit exceed the coordinated memory budget and cut into the safety headroom below the {total_h} available to this process; combined ceilings may approach or exceed it and risk an OOM kill under load. Reduce the number of distinct DuckDB files, or set runtime.query.memory_limit: \"{query_h}\" and duckdb_memory_limit: \"{per_instance_h}\" on each DuckDB-accelerated dataset so combined ceilings fit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
         );
     } else {
         tracing::warn!(
@@ -1364,7 +1364,7 @@ fn emit_duckdb_memory_budget_warning(
             duckdb_unset_instances = n,
             duckdb_per_instance_bytes = plan.per_instance_cap_bytes,
             duckdb_unset_instance_paths = ?inputs.unset_instance_labels,
-            "Detected potential memory over-commit from DuckDB accelerators and automatically capped memory to fit the {total_h} available to this process: {n} DuckDB instance(s) without an explicit duckdb_memory_limit — each would otherwise default to ~80% of host RAM (about {duckdb_default_h} here, or more in a container where DuckDB sees the host's RAM rather than this process's cgroup limit) — are capped at {per_instance_h} each, and the query pool at {query_h}. To customize, set runtime.query.memory_limit and/or per-dataset duckdb_memory_limit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
+            "Detected potential memory over-commit from DuckDB accelerators and automatically capped memory to fit the {total_h} available to this process: {n} DuckDB instance(s) without an explicit duckdb_memory_limit — each would otherwise default to ~80% of host RAM (about {duckdb_default_h} here, or more in a container where DuckDB sees the host's RAM rather than this process's cgroup limit) — are capped at {per_instance_h} each, and the query memory limit at {query_h}. To customize, set runtime.query.memory_limit and/or per-dataset duckdb_memory_limit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
         );
     }
 }
