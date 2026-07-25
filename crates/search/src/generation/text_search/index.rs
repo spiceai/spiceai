@@ -95,6 +95,14 @@ impl Index for FullTextDatabaseIndex {
         }
         Ok(batches)
     }
+
+    fn write_complete_failure_is_fatal(&self) -> bool {
+        // Documents are only searchable once the tantivy writer commits them, and
+        // staged-but-uncommitted documents are discarded. A finalize that fails to
+        // commit therefore drops the write's documents while the underlying rows are
+        // already visible, so the write must not report success.
+        true
+    }
 }
 
 impl FullTextDatabaseIndex {
