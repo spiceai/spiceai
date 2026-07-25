@@ -310,10 +310,9 @@ pub async fn create_tables(conn: &mut mysql_async::Conn) -> Result<()> {
             })?;
     }
 
-    // Add the _bench_ts column (with default) to all mutated TPC-C tables so the
-    // seed rows are stamped by the column default. The BEFORE INSERT/UPDATE
-    // triggers are created *after* the load (see `create_triggers`) so they do
-    // not fire per-row during the bulk seed load.
+    // Add the _bench_ts column to all mutated TPC-C tables. DEFAULT stamps the
+    // seed rows and every INSERT; ON UPDATE stamps every UPDATE natively, so no
+    // triggers are needed (see `add_bench_ts_columns`).
     add_bench_ts_columns(conn).await?;
 
     Ok(())
@@ -371,17 +370,24 @@ const MUTATED_TABLES: &[&str] = &[
     "stock",
 ];
 
-/// Add a `_bench_ts DATETIME(3)` column defaulting to `CURRENT_TIMESTAMP(3)` to
-/// all mutated TPC-C tables. The default stamps the seed rows; the per-row
-/// triggers for live mutations are created separately by [`create_triggers`]
-/// *after* the load.
+/// Add a `_bench_ts DATETIME(3)` column to all mutated TPC-C tables, stamped
+/// natively by the engine: `DEFAULT CURRENT_TIMESTAMP(3)` covers the seed rows
+/// and every INSERT, and `ON UPDATE CURRENT_TIMESTAMP(3)` covers every UPDATE.
+///
+/// Native column semantics replace the earlier per-row `BEFORE INSERT`/`BEFORE
+/// UPDATE` triggers: trigger dispatch is real per-row interpreter work in
+/// `MySQL`, on every write of the hottest tables in the workload. The one
+/// behavioral difference is that `ON UPDATE` stamps only rows whose values
+/// actually change — equivalent here, since every TPC-C update modifies data
+/// columns (balances, quantities, delivery dates).
 async fn add_bench_ts_columns(conn: &mut mysql_async::Conn) -> Result<()> {
     for table in MUTATED_TABLES {
-        // Add column with default for seed data rows. Tables are freshly
-        // created by `create_tables`, so a plain ADD COLUMN is safe (MySQL
-        // has no reliable ADD COLUMN IF NOT EXISTS on older versions).
+        // Tables are freshly created by `create_tables`, so a plain ADD COLUMN
+        // is safe (MySQL has no reliable ADD COLUMN IF NOT EXISTS on older
+        // versions).
         let add_col = format!(
-            "ALTER TABLE {table} ADD COLUMN _bench_ts DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)"
+            "ALTER TABLE {table} ADD COLUMN _bench_ts DATETIME(3) NOT NULL \
+             DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)"
         );
         conn.query_drop(&add_col)
             .await
@@ -398,64 +404,41 @@ async fn add_bench_ts_columns(conn: &mut mysql_async::Conn) -> Result<()> {
     Ok(())
 }
 
-/// Create the `_bench_ts` `BEFORE INSERT` and `BEFORE UPDATE` triggers on all
-/// mutated TPC-C tables. Called *after* the bulk load so the triggers do not
-/// fire per-row during the seed load — the seed rows are already stamped by
-/// the column default (see [`add_bench_ts_columns`]).
+/// Reconcile the `_bench_ts` stamping machinery of a database prepared by an
+/// older build (which used `BEFORE INSERT`/`BEFORE UPDATE` triggers and a
+/// column without `ON UPDATE`): ensure the column carries the native
+/// `DEFAULT`/`ON UPDATE` semantics, then drop the legacy triggers. Without
+/// this, dropping the triggers alone would leave UPDATEs unstamped, and
+/// keeping them would double-stamp every write.
 ///
-/// `MySQL` cannot combine INSERT and UPDATE into a single trigger, so two
-/// triggers are created per table. `NOW(3)` provides millisecond wall-clock
-/// timing per row.
+/// Both steps are idempotent and metadata-only. A fresh `prepare()` drops the
+/// tables (and their triggers) anyway; this matters for sources restored from
+/// an old template and reused via `--skip-prepare`.
 ///
 /// # Errors
 ///
-/// Returns an error if any trigger cannot be created.
-pub async fn create_triggers(conn: &mut mysql_async::Conn) -> Result<()> {
+/// Returns an error if the column cannot be modified or a trigger dropped.
+pub async fn reconcile_bench_ts(conn: &mut mysql_async::Conn) -> Result<()> {
     for table in MUTATED_TABLES {
-        // Attach the INSERT trigger (idempotent via DROP IF EXISTS + CREATE).
-        let ins_trigger = format!("trg_bench_ts_ins_{table}");
-        let drop_ins = format!("DROP TRIGGER IF EXISTS {ins_trigger}");
-        conn.query_drop(&drop_ins)
-            .await
-            .map_err(|source| crate::Error::MySql {
-                action: format!("drop trigger {ins_trigger}"),
-                source,
-            })?;
-
-        let create_ins = format!(
-            "CREATE TRIGGER {ins_trigger} BEFORE INSERT ON {table} FOR EACH ROW SET NEW._bench_ts = NOW(3)"
+        let modify = format!(
+            "ALTER TABLE {table} MODIFY _bench_ts DATETIME(3) NOT NULL \
+             DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)"
         );
-        conn.query_drop(&create_ins)
+        conn.query_drop(&modify)
             .await
             .map_err(|source| crate::Error::MySql {
-                action: format!("create trigger {ins_trigger}"),
+                action: format!("add ON UPDATE to {table}._bench_ts"),
                 source,
             })?;
-
-        // Attach the UPDATE trigger (idempotent via DROP IF EXISTS + CREATE).
-        let upd_trigger = format!("trg_bench_ts_upd_{table}");
-        let drop_upd = format!("DROP TRIGGER IF EXISTS {upd_trigger}");
-        conn.query_drop(&drop_upd)
-            .await
-            .map_err(|source| crate::Error::MySql {
-                action: format!("drop trigger {upd_trigger}"),
-                source,
-            })?;
-
-        let create_upd = format!(
-            "CREATE TRIGGER {upd_trigger} BEFORE UPDATE ON {table} FOR EACH ROW SET NEW._bench_ts = NOW(3)"
-        );
-        conn.query_drop(&create_upd)
-            .await
-            .map_err(|source| crate::Error::MySql {
-                action: format!("create trigger {upd_trigger}"),
-                source,
-            })?;
+        for prefix in ["trg_bench_ts_ins", "trg_bench_ts_upd"] {
+            let drop = format!("DROP TRIGGER IF EXISTS {prefix}_{table}");
+            conn.query_drop(&drop)
+                .await
+                .map_err(|source| crate::Error::MySql {
+                    action: format!("drop trigger {prefix}_{table}"),
+                    source,
+                })?;
+        }
     }
-
-    println!(
-        "  added _bench_ts triggers to {} tables",
-        MUTATED_TABLES.len()
-    );
     Ok(())
 }

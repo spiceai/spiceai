@@ -19,15 +19,18 @@ limitations under the License.
 //!
 //! Unlike the Postgres path, there is no `PreparedStatements` struct: `mysql_async`
 //! auto-prepares and caches statements per connection when a `&str` is passed to
-//! the `exec_*` family, so every transaction issues its SQL text directly. The SQL
-//! is the same as the Postgres statements in [`super::prepared`], with `$N`
-//! placeholders rewritten to positional `?` and Postgres-only dialect translated to
-//! `MySQL` (`NOW(3)`, `ON DUPLICATE KEY UPDATE`, per-statement execution instead of
-//! `batch_execute`, etc.).
+//! the `exec_*` family, so every transaction issues its SQL text directly.
 //!
-//! TPC-C logic, RNG call order, transaction boundaries, and control flow match the
-//! Postgres implementations so that a given seed produces a comparable workload.
+//! TPC-C logic, RNG call order, transaction boundaries, and the rows
+//! read/locked/written match the Postgres implementations in [`super::prepared`]
+//! and siblings, so a given seed produces a comparable workload. The *statement
+//! shapes* deliberately do not: to cut client-server round trips — the dominant
+//! cost for this driver — per-line-item reads are batched into `IN`-list
+//! SELECTs and consecutive writes share a round trip as `;`-separated
+//! multi-statement batches (`mysql_async` always negotiates
+//! `CLIENT_MULTI_STATEMENTS`).
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use ::rand::{Rng, RngExt};
@@ -209,68 +212,103 @@ async fn run_new_order(
     })?;
 
     // 6-9. Process order lines in two phases (similar to BenchBase-style batching):
-    //   Phase 1: Sequential reads (SELECT item + SELECT stock FOR UPDATE)
-    //   Phase 2: Per-row writes (UPDATE stock + INSERT order_line)
+    //   Phase 1: Batched reads — one item SELECT for all lines, one stock
+    //            SELECT ... FOR UPDATE per supply warehouse (a single one in the
+    //            ~99% all-local case) — instead of two round trips per line.
+    //   Phase 2: Batched writes — all stock UPDATEs in one multi-statement round
+    //            trip, then one multi-row order_line INSERT.
     #[expect(clippy::cast_sign_loss)]
     let mut writes: Vec<LineWrite> = Vec::with_capacity(ol_cnt as usize);
 
     // The stock district column (s_dist_01..s_dist_10) selected depends on d_id.
     let s_dist_col = format!("s_dist_{d_id:02}");
 
-    // Phase 1: reads — SELECT item + SELECT stock FOR UPDATE per item.
+    // 1% rollback case (spec 2.4.1.4): the last line carries an invalid item id.
+    // Detected up front now that reads are batched (the per-line read loop used
+    // to hit it mid-loop). Roll back explicitly — mysql_async does not issue a
+    // ROLLBACK when a transaction handle is merely dropped, so relying on drop
+    // could leave the transaction open on the connection.
+    if items.iter().any(|&(ol_i_id, ..)| ol_i_id < 0) {
+        tx.rollback().await.map_err(|source| crate::Error::MySql {
+            action: "new_order: rollback".into(),
+            source,
+        })?;
+        return Ok(());
+    }
+
+    // Phase 1a: one round trip fetches every item of the order. Duplicate ids
+    // inside IN (...) are harmless — the server returns each matching row once.
+    // i_name/i_data are selected and discarded, as TPC-C requires reading them.
+    let placeholders = vec!["?"; items.len()].join(", ");
+    let item_sql =
+        format!("SELECT i_id, i_price, i_name, i_data FROM item WHERE i_id IN ({placeholders})");
+    let item_params: Vec<Value> = items.iter().map(|&(id, ..)| Value::from(id)).collect();
+    let item_rows: Vec<(i32, Decimal, String, String)> = tx
+        .exec(&item_sql, item_params)
+        .await
+        .map_err(|source| crate::Error::MySql {
+            action: "new_order: select items".into(),
+            source,
+        })?;
+    let prices: HashMap<i32, Decimal> = item_rows
+        .into_iter()
+        .map(|(i_id, i_price, _i_name, _i_data)| (i_id, i_price))
+        .collect();
+
+    // Phase 1b: one round trip locks and reads every stock row of the order —
+    // local and remote alike — via a row-constructor IN list, which MySQL 8.0
+    // executes as range accesses on the (s_w_id, s_i_id) primary key
+    // (EXPLAIN: type=range, key=PRIMARY). Locks are taken in PK scan order,
+    // unlike the per-line loop, which acquired them in random line order — the
+    // more deadlock-prone pattern. Grouping items by warehouse into per-warehouse
+    // single-column IN statements measured the same tpmC (within run noise) and
+    // needs ~15 more lines, so the uniform single statement wins.
+    // s_data is selected and discarded, as TPC-C requires reading it.
+    let placeholders = vec!["(?, ?)"; items.len()].join(", ");
+    let stock_sql = format!(
+        "SELECT s_w_id, s_i_id, s_quantity, s_data, {s_dist_col} FROM stock \
+         WHERE (s_w_id, s_i_id) IN ({placeholders}) FOR UPDATE"
+    );
+    let stock_params: Vec<Value> = items
+        .iter()
+        .flat_map(|&(ol_i_id, ol_supply_w_id, _, _)| {
+            [Value::from(ol_supply_w_id), Value::from(ol_i_id)]
+        })
+        .collect();
+    let stock_rows: Vec<(i32, i32, i32, String, String)> = tx
+        .exec(&stock_sql, stock_params)
+        .await
+        .map_err(|source| crate::Error::MySql {
+            action: "new_order: select stock".into(),
+            source,
+        })?;
+    let stock: HashMap<(i32, i32), (i32, String)> = stock_rows
+        .into_iter()
+        .map(|(s_w_id, s_i_id, s_quantity, _s_data, ol_dist_info)| {
+            ((s_w_id, s_i_id), (s_quantity, ol_dist_info))
+        })
+        .collect();
+
     for (ol_number_0, &(ol_i_id, ol_supply_w_id, ol_quantity, remote)) in items.iter().enumerate() {
         let ol_number = i32::try_from(ol_number_0).unwrap_or(0) + 1;
 
-        // Check for rollback item — explicitly roll back and return. Mirrors the
-        // Postgres new_order path; mysql_async does not issue a ROLLBACK when a
-        // transaction handle is merely dropped, so relying on drop could leave
-        // the transaction open on the connection.
-        if ol_i_id < 0 {
-            tx.rollback().await.map_err(|source| crate::Error::MySql {
-                action: "new_order: rollback".into(),
-                source,
-            })?;
-            return Ok(());
-        }
-
-        // SELECT item
-        let item_row: Option<(Decimal, String, String)> = tx
-            .exec_first(
-                "SELECT i_price, i_name, i_data FROM item WHERE i_id = ?",
-                (ol_i_id,),
-            )
-            .await
-            .map_err(|source| crate::Error::MySql {
-                action: "new_order: select item".into(),
-                source,
-            })?;
-        let Some((i_price, _i_name, _i_data)) = item_row else {
+        let Some(&i_price) = prices.get(&ol_i_id) else {
             return Err(crate::Error::Arrow {
                 action: "new_order".into(),
                 message: "item row not found".into(),
             });
         };
-
-        // SELECT stock FOR UPDATE (the s_dist column varies with d_id, so build the SQL).
-        let stock_sql = format!(
-            "SELECT s_quantity, s_data, {s_dist_col} FROM stock \
-             WHERE s_i_id = ? AND s_w_id = ? FOR UPDATE"
-        );
-        let stock_row: Option<(i32, String, String)> = tx
-            .exec_first(&stock_sql, (ol_i_id, ol_supply_w_id))
-            .await
-            .map_err(|source| crate::Error::MySql {
-                action: "new_order: select stock".into(),
-                source,
-            })?;
-        let Some((mut s_quantity, _s_data, ol_dist_info)) = stock_row else {
+        // Duplicate line items see the same pre-transaction stock value, exactly
+        // as the per-line reads did (all reads preceded all writes already).
+        let Some(&(base_s_quantity, ref ol_dist_info)) = stock.get(&(ol_supply_w_id, ol_i_id))
+        else {
             return Err(crate::Error::Arrow {
                 action: "new_order".into(),
                 message: "stock row not found".into(),
             });
         };
 
-        s_quantity -= ol_quantity;
+        let mut s_quantity = base_s_quantity - ol_quantity;
         if s_quantity < 10 {
             s_quantity += 91;
         }
@@ -289,32 +327,41 @@ async fn run_new_order(
             ol_supply_w_id,
             ol_number,
             ol_amount,
-            ol_dist_info,
+            ol_dist_info: ol_dist_info.clone(),
         });
     }
 
-    // Phase 2: writes. MySQL rejects multi-statement text in a single call by
-    // default, so each UPDATE/INSERT is issued as its own statement, preserving
-    // the Postgres write order (all stock UPDATEs, then all order_line INSERTs).
+    // Phase 2: writes. All stock UPDATEs share one round trip as a
+    // multi-statement batch (mysql_async always negotiates
+    // CLIENT_MULTI_STATEMENTS). Every interpolated value is an integer, so
+    // literal SQL carries no quoting concerns. The write order (all stock
+    // UPDATEs, then the order_line INSERT) matches the Postgres path.
+    let mut stock_batch = String::with_capacity(writes.len() * 170);
     for w in &writes {
-        tx.exec_drop(
-            "UPDATE stock SET s_quantity = ?, s_ytd = s_ytd + ?, \
-             s_order_cnt = s_order_cnt + 1, s_remote_cnt = s_remote_cnt + ? \
-             WHERE s_i_id = ? AND s_w_id = ?",
-            (
-                w.s_quantity,
-                w.ol_quantity,
-                w.remote,
-                w.ol_i_id,
-                w.ol_supply_w_id,
-            ),
-        )
+        if let Err(e) = write!(
+            &mut stock_batch,
+            "UPDATE stock SET s_quantity = {}, s_ytd = s_ytd + {}, \
+             s_order_cnt = s_order_cnt + 1, s_remote_cnt = s_remote_cnt + {} \
+             WHERE s_i_id = {} AND s_w_id = {};",
+            w.s_quantity, w.ol_quantity, w.remote, w.ol_i_id, w.ol_supply_w_id,
+        ) {
+            eprintln!("Failed to format stock UPDATE batch SQL: {e}");
+        }
+    }
+    tx.query_iter(&stock_batch)
         .await
         .map_err(|source| crate::Error::MySql {
             action: "new_order: update stock".into(),
             source,
+        })?
+        // Every statement's result set must be drained before the connection is
+        // reusable; drop_result drains all of them.
+        .drop_result()
+        .await
+        .map_err(|source| crate::Error::MySql {
+            action: "new_order: drain stock update results".into(),
+            source,
         })?;
-    }
 
     // Single INSERT with all order-line rows (one INSERT with N value tuples),
     // mirroring the Postgres batched multi-row INSERT.
@@ -410,63 +457,64 @@ async fn run_payment(
             source,
         })?;
 
-    // 1. UPDATE warehouse
-    tx.exec_drop(
-        "UPDATE warehouse SET w_ytd = w_ytd + ? WHERE w_id = ?",
-        (h_amount, w_id),
-    )
-    .await
-    .map_err(|source| crate::Error::MySql {
-        action: "payment: update warehouse".into(),
-        source,
-    })?;
-
-    // 2. SELECT warehouse
-    let w_row: Option<(String, String, String, String, String, String)> = tx
-        .exec_first(
-            "SELECT w_street_1, w_street_2, w_city, w_state, w_zip, w_name \
-             FROM warehouse WHERE w_id = ?",
-            (w_id,),
-        )
+    // 1. UPDATE warehouse + district YTD in one multi-statement round trip
+    //    (mysql_async always negotiates CLIENT_MULTI_STATEMENTS). Warehouse
+    //    before district, preserving the per-statement lock order. h_amount is
+    //    an exact Decimal that formats as a plain numeric literal and the ids
+    //    are integers, so literal SQL carries no quoting concerns.
+    let ytd_batch = format!(
+        "UPDATE warehouse SET w_ytd = w_ytd + {h_amount} WHERE w_id = {w_id};\
+         UPDATE district SET d_ytd = d_ytd + {h_amount} WHERE d_w_id = {w_id} AND d_id = {d_id}"
+    );
+    tx.query_iter(&ytd_batch)
         .await
         .map_err(|source| crate::Error::MySql {
-            action: "payment: select warehouse".into(),
+            action: "payment: update warehouse and district ytd".into(),
+            source,
+        })?
+        .drop_result()
+        .await
+        .map_err(|source| crate::Error::MySql {
+            action: "payment: drain ytd update results".into(),
             source,
         })?;
-    let Some((_, _, _, _, _, w_name)) = w_row else {
-        return Err(crate::Error::Arrow {
-            action: "payment".into(),
-            message: "warehouse row not found".into(),
-        });
-    };
 
-    // 3. UPDATE district
-    tx.exec_drop(
-        "UPDATE district SET d_ytd = d_ytd + ? WHERE d_w_id = ? AND d_id = ?",
-        (h_amount, w_id, d_id),
-    )
-    .await
-    .map_err(|source| crate::Error::MySql {
-        action: "payment: update district".into(),
-        source,
-    })?;
-
-    // 4. SELECT district
-    let d_row: Option<(String, String, String, String, String, String)> = tx
+    // 2. SELECT warehouse + district display fields in one joined round trip.
+    //    The street/city/state/zip fields are read and discarded, as TPC-C
+    //    requires reading them. Decoded as a typed tuple (like the trunk
+    //    per-table reads) so a column-list drift fails loudly instead of
+    //    silently yielding a wrong or empty name.
+    #[expect(clippy::type_complexity)]
+    let wd_row: Option<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    )> = tx
         .exec_first(
-            "SELECT d_street_1, d_street_2, d_city, d_state, d_zip, d_name \
-             FROM district WHERE d_w_id = ? AND d_id = ?",
+            "SELECT w_street_1, w_street_2, w_city, w_state, w_zip, w_name, \
+                    d_street_1, d_street_2, d_city, d_state, d_zip, d_name \
+             FROM warehouse, district \
+             WHERE w_id = ? AND d_w_id = w_id AND d_id = ?",
             (w_id, d_id),
         )
         .await
         .map_err(|source| crate::Error::MySql {
-            action: "payment: select district".into(),
+            action: "payment: select warehouse and district".into(),
             source,
         })?;
-    let Some((_, _, _, _, _, d_name)) = d_row else {
+    let Some((_, _, _, _, _, w_name, _, _, _, _, _, d_name)) = wd_row else {
         return Err(crate::Error::Arrow {
             action: "payment".into(),
-            message: "district row not found".into(),
+            message: "warehouse/district row not found".into(),
         });
     };
 

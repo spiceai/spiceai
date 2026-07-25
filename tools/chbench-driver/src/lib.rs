@@ -624,6 +624,10 @@ impl MysqlChBenchDriver {
             found == expected,
             SourceScaleMismatchSnafu { found, expected }
         );
+        // The source may have been restored from a template built by an older
+        // build that stamped _bench_ts with triggers; reconcile it to the
+        // native DEFAULT/ON UPDATE column semantics.
+        schema_mysql::reconcile_bench_ts(&mut conn).await?;
         Ok(())
     }
 }
@@ -643,10 +647,11 @@ impl ChBenchDriver for MysqlChBenchDriver {
         // load_all opens its own connections from `self.opts`; `conn` is only
         // used for the DDL before and after.
         loader_mysql::load_all(&self.opts, self.config.warehouses, self.config.seed).await?;
-        // Build secondary indexes and attach the _bench_ts triggers *after* the
-        // bulk load so neither is maintained per-row during the seed load.
+        // Build secondary indexes *after* the bulk load so InnoDB builds each
+        // B-tree once instead of maintaining it per seed row. (_bench_ts needs
+        // no post-load step: the column's DEFAULT/ON UPDATE stamps rows
+        // natively, with no triggers.)
         schema_mysql::create_indexes(&mut conn).await?;
-        schema_mysql::create_triggers(&mut conn).await?;
 
         Ok(())
     }
