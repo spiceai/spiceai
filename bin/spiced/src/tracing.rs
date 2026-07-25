@@ -157,6 +157,33 @@ fn should_include_otel_location(is_release_build: bool, verbosity: &LogVerbosity
     }
 }
 
+/// Build the Cloud Connect log-capture layer, or `None` when Cloud Connect
+/// is not configured for this instance.
+///
+/// When present, the layer mirrors console output into a bounded in-memory
+/// ring buffer (ANSI stripped) that the `GetPodLogs` control message reads.
+/// It is added *alongside* the terminal `fmt` layer, so normal logging is
+/// unchanged. The same `task_history` exclusion as the console layer is
+/// applied so span-only records don't pollute the log tail.
+fn cloud_connect_log_capture_layer<S>() -> Option<Box<dyn Layer<S> + Send + Sync>>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    if !crate::cloud_connect::is_configured() {
+        return None;
+    }
+    let ring = crate::log_capture::install(crate::log_capture::DEFAULT_CAPACITY);
+    Some(
+        fmt::layer()
+            .with_ansi(false)
+            .with_writer(ring)
+            .with_filter(filter::filter_fn(|metadata| {
+                metadata.target() != "task_history"
+            }))
+            .boxed(),
+    )
+}
+
 pub(crate) async fn init_tracing(
     app: Option<&Arc<App>>,
     config: Option<&TracingConfig>,
@@ -169,13 +196,16 @@ pub(crate) async fn init_tracing(
     if let Some(app) = app.as_ref()
         && !app.runtime.task_history.enabled
     {
-        let subscriber = tracing_subscriber::registry().with(filter).with(
-            fmt::layer()
-                .with_ansi(true)
-                .with_filter(filter::filter_fn(|metadata| {
-                    metadata.target() != "task_history"
-                })),
-        );
+        let subscriber = tracing_subscriber::registry()
+            .with(filter)
+            .with(
+                fmt::layer()
+                    .with_ansi(true)
+                    .with_filter(filter::filter_fn(|metadata| {
+                        metadata.target() != "task_history"
+                    })),
+            )
+            .with(cloud_connect_log_capture_layer());
 
         tracing::subscriber::set_global_default(subscriber)?;
 
@@ -196,7 +226,8 @@ pub(crate) async fn init_tracing(
                 .with_filter(filter::filter_fn(|metadata| {
                     metadata.target() != "task_history"
                 })),
-        );
+        )
+        .with(cloud_connect_log_capture_layer());
 
     tracing::subscriber::set_global_default(subscriber)?;
     LogTracer::init()?;
