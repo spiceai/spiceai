@@ -115,9 +115,9 @@ while :; do
     d_rlt=$(( $(get "$cur" innodb_row_lock_time) - $(get "$prev" innodb_row_lock_time) ))
     hist=$(get "$cur" history_list)
     ckpt_age_gb=$(awk -v l="$(get "$cur" lsn)" -v c="$(get "$cur" checkpoint)" 'BEGIN{printf "%.2f", (l-c)/1073741824}')
-    dirty_pct=$(awk -v d="$(get "$cur" innodb_buffer_pool_pages_dirty)" -v t="$(get "$cur" innodb_buffer_pool_pages_total)" 'BEGIN{printf "%.1f", t>0 ? 100*d/t : 0}')
-    cores=$(awk -v dt="$d_ticks" -v clk="$clk" -v s="$dt" 'BEGIN{printf "%.1f", (clk>0 && s>0) ? dt/clk/s : 0}')
-    cpu_pct=$(awk -v c="$cores" -v n="$ncpu" 'BEGIN{printf "%.0f", n>0 ? 100*c/n : 0}')
+    dirty_pct=$(awk -v d="$(get "$cur" innodb_buffer_pool_pages_dirty)" -v t="$(get "$cur" innodb_buffer_pool_pages_total)" 'BEGIN{printf "%.1f", (t>0 ? 100*d/t : 0)}')
+    cores=$(awk -v dt="$d_ticks" -v clk="$clk" -v s="$dt" 'BEGIN{printf "%.1f", ((clk>0 && s>0) ? dt/clk/s : 0)}')
+    cpu_pct=$(awk -v c="$cores" -v n="$ncpu" 'BEGIN{printf "%.0f", (n>0 ? 100*c/n : 0)}')
     line="$(date +%H:%M:%S),$cores,$cpu_pct,$(get "$cur" threads_running),$(( d_commit / dt )),$(( d_rows / dt )),$d_bcu,$d_bcd,$d_bpw,$d_lw,$d_rlw,$d_rlt,$hist,$ckpt_age_gb,$dirty_pct"
     echo "$line" | tee -a "$OUT"
     awk -v c="$cpu_pct" -v m="$max_cpu" 'BEGIN{exit !(c>m)}' && max_cpu=$cpu_pct
