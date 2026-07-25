@@ -301,7 +301,7 @@ fn apply_inferred_sort(
     acceleration.params.insert(key.to_string(), value);
     // Mark the value as inference-derived so Cayenne can rank it correctly.
     //
-    // This is a GUESS, not a statement of intent: for a PostgreSQL CDC table
+    // This is a GUESS, not a statement of intent: for a `PostgreSQL` CDC table
     // `inferred.sort_columns` falls back to the primary key when the source
     // declares no `CLUSTER`/natural order, and primary-key-major order is close
     // to the worst clustering for the range/date predicates analytical queries
@@ -312,9 +312,10 @@ fn apply_inferred_sort(
     // catalog. Tagging the provenance lets the engine keep this as the
     // pre-observation fallback while letting measured filters win.
     if engine == Engine::Cayenne {
-        acceleration
-            .params
-            .insert("cayenne_sort_columns_origin".to_string(), "inferred".to_string());
+        acceleration.params.insert(
+            "cayenne_sort_columns_origin".to_string(),
+            "inferred".to_string(),
+        );
     }
     true
 }
@@ -946,7 +947,7 @@ mod tests {
     ///
     /// Regression test for the adaptive cold layout being inert on every
     /// catalog-visible CDC deployment: inference fills `cayenne_sort_columns`
-    /// (with the primary key, for a PostgreSQL CDC table) on essentially every
+    /// (with the primary key, for a `PostgreSQL` CDC table) on essentially every
     /// such dataset, and every gate in the adaptive-layout path asked only "is
     /// `sort_columns` empty?" — so an untagged value silently disabled the
     /// feature everywhere while leaving all benchmark gates green.
@@ -957,7 +958,13 @@ mod tests {
             sort_columns: vec![sort("id", false)],
             ..InferredSchema::default()
         };
-        apply_inferred_schema(&mut acc, &inferred, &schema(&["id"]), "ds", RefreshMode::Changes);
+        apply_inferred_schema(
+            &mut acc,
+            &inferred,
+            &schema(&["id"]),
+            "ds",
+            RefreshMode::Changes,
+        );
         assert_eq!(
             acc.params.get("cayenne_sort_columns").map(String::as_str),
             Some("id")

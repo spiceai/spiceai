@@ -232,7 +232,7 @@ async fn configured_sort_columns_override_observations() {
 ///
 /// This is the regression that made the default-on adaptive layout inert on every
 /// catalog-visible CDC deployment. Schema inference fills `cayenne_sort_columns`
-/// from the source's declared order — the primary key, for a PostgreSQL CDC table
+/// from the source's declared order — the primary key, for a `PostgreSQL` CDC table
 /// — so `sort_columns` is never empty in production, and every adaptive-layout
 /// gate asked only "is `sort_columns` empty?". The feature therefore never
 /// engaged, while every benchmark gate stayed green (CH-benCH's date predicates

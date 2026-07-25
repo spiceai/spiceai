@@ -1360,8 +1360,10 @@ impl CayenneAccelerator {
             // shadow the hot filter columns observed on scans — see
             // `SortColumnsOrigin`. Unrecognized values fall back to the
             // conservative `user`, which preserves pre-existing behavior.
-            if let Some(origin) = acceleration.params.get("cayenne_sort_columns_origin")
-                    .or_else(|| acceleration.params.get("sort_columns_origin"))
+            if let Some(origin) = acceleration
+                .params
+                .get("cayenne_sort_columns_origin")
+                .or_else(|| acceleration.params.get("sort_columns_origin"))
                 && origin.trim().eq_ignore_ascii_case("inferred")
             {
                 config.sort_columns_origin = cayenne::metadata::SortColumnsOrigin::Inferred;
@@ -2462,7 +2464,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("sort_columns")
             .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
         ParameterSpec::component("sort_columns_origin")
-            .description("Provenance of 'sort_columns', set internally by schema inference — operators do not set this. 'user' (default) means the sort order was configured explicitly and is authoritative. 'inferred' means schema inference filled it from the source's declared order (the primary key, for most CDC tables), which is a guess and is outranked by the filter columns actually observed on scans, so the adaptive layout can cluster for the real workload.")
+            .description("Provenance of 'sort_columns'. Normally set by schema inference rather than by hand: 'user' (the default when absent) means the sort order was configured explicitly and is authoritative, while 'inferred' means schema inference filled it from the source's declared order (the primary key, for most CDC tables), which is a guess and is outranked by the filter columns actually observed on scans, so the adaptive layout can cluster for the real workload. Setting it explicitly is supported and is useful for reproducing the inferred configuration in a benchmark or test.")
             .one_of(&["user", "inferred"]),
         ParameterSpec::component("shard_key_columns")
             .description("Comma-separated list of columns to hash-cluster rows by during intra-write sharding (the parallel encode fan-out), e.g. 'tenant_id'. When unset, the shard key derives from the primary key (PK-hash clustering); tables without a primary key shard round-robin. Schema inference fills this from the source's declared partition/shard key when the user leaves it unset. Ignored for sorted tables: sort_columns forces a single serial writer."),

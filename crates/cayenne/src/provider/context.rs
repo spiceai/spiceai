@@ -444,7 +444,7 @@ impl CayenneContext {
     /// than a schema-inference guess.
     ///
     /// Only an authoritative sort order may shadow the hot filter columns
-    /// observed on scans. An inferred order (the PostgreSQL CDC default, which
+    /// observed on scans. An inferred order (the `PostgreSQL` CDC default, which
     /// resolves to the primary key) ranks *below* those observations, so the
     /// default-on adaptive layout can correct the guess.
     #[must_use]

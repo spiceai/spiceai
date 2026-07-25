@@ -11560,7 +11560,7 @@ impl CayenneTableProvider {
     ///
     /// An *explicit* `cayenne_sort_columns` is a statement of intent and wins
     /// outright. An *inference-derived* one is only a guess about what queries
-    /// will filter on — for a PostgreSQL CDC table it resolves to the primary
+    /// will filter on — for a `PostgreSQL` CDC table it resolves to the primary
     /// key, which is close to the worst clustering for range/date predicates —
     /// so it must NOT shadow the filter columns actually observed on scans, or
     /// the adaptive layout can never correct it. Inference-derived columns stay

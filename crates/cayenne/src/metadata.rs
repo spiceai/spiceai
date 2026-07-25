@@ -323,7 +323,7 @@ impl PartitionMetadata {
 ///
 /// This exists because the two carry different authority. An explicit
 /// `cayenne_sort_columns` is a statement of intent and wins outright. An
-/// inference-derived value is a *fallback guess* — for PostgreSQL CDC tables it
+/// inference-derived value is a *fallback guess* — for `PostgreSQL` CDC tables it
 /// resolves to the primary key when the source has no `CLUSTER` or natural
 /// order, which is close to the worst clustering for range/date predicates. It
 /// must therefore rank below the hot filter columns actually observed on scans,
@@ -767,7 +767,7 @@ pub struct VortexConfig {
     /// Where [`Self::sort_columns`] came from. `user` (an explicit
     /// `cayenne_sort_columns`) is authoritative and outranks everything.
     /// `inferred` means schema inference filled it from the source's declared
-    /// order — for a PostgreSQL CDC table that is usually just the primary key,
+    /// order — for a `PostgreSQL` CDC table that is usually just the primary key,
     /// a *guess* about what queries will filter on. An inferred value therefore
     /// ranks BELOW the hot filter columns actually observed on scans, so the
     /// default-on adaptive layout can override a guess with evidence.

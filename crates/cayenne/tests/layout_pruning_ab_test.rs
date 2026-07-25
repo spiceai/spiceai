@@ -317,8 +317,12 @@ async fn pruning_ab_inferred_vs_authoritative_sort() {
          ~{:.1}% selective l_shipdate window) ===",
         f64::from(PROBE_WINDOW_DAYS) * 100.0 / f64::from(DATE_SPAN_DAYS)
     );
-    println!("  BEFORE (origin=User,     pre-fix): sort_key={before_key:?} files_scanned={before_files} rows={before_rows}");
-    println!("  AFTER  (origin=Inferred, post-fix): sort_key={after_key:?} files_scanned={after_files} rows={after_rows}");
+    println!(
+        "  BEFORE (origin=User,     pre-fix): sort_key={before_key:?} files_scanned={before_files} rows={before_rows}"
+    );
+    println!(
+        "  AFTER  (origin=Inferred, post-fix): sort_key={after_key:?} files_scanned={after_files} rows={after_rows}"
+    );
     if after_files > 0 {
         #[expect(clippy::cast_precision_loss, reason = "file counts are small")]
         let ratio = before_files as f64 / after_files as f64;
@@ -331,7 +335,10 @@ async fn pruning_ab_inferred_vs_authoritative_sort() {
         before_rows, after_rows,
         "both layouts must return identical results for the same predicate"
     );
-    assert!(before_rows > 0, "probe must match some rows to be meaningful");
+    assert!(
+        before_rows > 0,
+        "probe must match some rows to be meaningful"
+    );
 
     // PRECONDITION GATE. Pruning is a per-file property, so a table that lands in
     // a single file has no pruning to measure and both arms would trivially read
