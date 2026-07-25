@@ -211,6 +211,19 @@ pub trait CommitChange {
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         None
     }
+
+    /// Whether [`Self::commit`] is statically known to do nothing — there is no
+    /// source position, token, or checkpoint to acknowledge. Consumers may run
+    /// or drop such a committer at any point without ordering or durability
+    /// constraints; the runtime relies on this to keep zero-row readiness
+    /// heartbeats out of the CDC write/durability path (see
+    /// [`ChangeEnvelope::is_no_op_heartbeat`]). Defaults to `false`
+    /// (conservative: assume the commit has effects, preserving ordering); only
+    /// genuinely effect-free committers such as [`NoOpCommitter`] should
+    /// override this to `true`.
+    fn is_no_op(&self) -> bool {
+        false
+    }
 }
 
 /// Destination-passing-style source of the change rows carried by a
@@ -502,6 +515,23 @@ impl ChangeEnvelope {
         self.change_batch.is_heartbeat()
     }
 
+    /// Whether this envelope is a pure readiness heartbeat: a zero-row change
+    /// batch whose committer is a no-op ([`CommitChange::is_no_op`]).
+    ///
+    /// CDC connectors emit these ([`build_heartbeat_envelope`],
+    /// [`build_ready_signal_envelope`]) only to carry `is_dataset_ready` and a
+    /// source freshness timestamp; they hold no data and acknowledge no source
+    /// position, so a consumer may honor the ready flag and drop the envelope
+    /// without writing, committing, or forcing any durability transition. A
+    /// zero-row envelope whose committer has real effects (e.g. a `MySQL`
+    /// snapshot-boundary envelope that persists the initial resume token) is
+    /// NOT a heartbeat under this predicate and must keep normal
+    /// durability-then-commit ordering.
+    #[must_use]
+    pub fn is_no_op_heartbeat(&self) -> bool {
+        self.change_committer.is_no_op() && self.is_heartbeat()
+    }
+
     pub async fn commit(self) -> Result<(), CommitError> {
         self.change_committer.commit().await
     }
@@ -582,6 +612,10 @@ pub struct NoOpCommitter;
 impl CommitChange for NoOpCommitter {
     async fn commit(&self) -> Result<(), CommitError> {
         Ok(())
+    }
+
+    fn is_no_op(&self) -> bool {
+        true
     }
 }
 
@@ -1375,5 +1409,63 @@ mod deferred_tests {
         let env = build_heartbeat_envelope(&schema, None, false)
             .expect("heartbeat builds with non-null columns");
         assert_eq!(env.change_batch().expect("built").record.num_rows(), 0);
+    }
+
+    /// A committer whose `commit` happens to do nothing here but does NOT
+    /// override `is_no_op` — modeling a real committer (resume-token persist,
+    /// snapshot-boundary ack) attached to a zero-row envelope.
+    struct PositionCommitter;
+
+    #[async_trait]
+    impl CommitChange for PositionCommitter {
+        async fn commit(&self) -> Result<(), CommitError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn no_op_heartbeat_predicate_identifies_strippable_readiness_envelopes() {
+        assert!(NoOpCommitter.is_no_op());
+        assert!(
+            !PositionCommitter.is_no_op(),
+            "is_no_op must default to false: assume a commit has effects"
+        );
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+        // Connector idle heartbeats and ready signals: zero rows + no-op
+        // committer -> safe to drop from the write/durability path (#12007).
+        let heartbeat = build_heartbeat_envelope(&schema, now_unix_ms(), true)
+            .expect("heartbeat envelope builds");
+        assert!(heartbeat.is_no_op_heartbeat());
+        let ready = build_ready_signal_envelope(&schema).expect("ready envelope builds");
+        assert!(ready.is_no_op_heartbeat());
+
+        // A zero-row envelope re-wrapped with a REAL committer (the MySQL
+        // snapshot-boundary pattern) must NOT be treated as a heartbeat: its
+        // commit persists source progress and needs durability-then-commit
+        // ordering.
+        let (_, boundary_batch, _) = build_heartbeat_envelope(&schema, None, false)
+            .expect("boundary batch builds")
+            .into_parts()
+            .expect("already built");
+        let boundary = ChangeEnvelope::new(Box::new(PositionCommitter), boundary_batch, false);
+        assert!(boundary.is_heartbeat(), "zero-row batch");
+        assert!(
+            !boundary.is_no_op_heartbeat(),
+            "a real committer disqualifies the envelope from heartbeat stripping"
+        );
+
+        // A row-bearing (deferred, not yet built) envelope with a no-op
+        // committer is not a heartbeat either.
+        let rows = MockRows {
+            result: None,
+            builds: Arc::new(AtomicUsize::new(0)),
+            rows_hint: 1,
+            empty: false,
+            ts: None,
+        };
+        let data_bearing = deferred(rows, false);
+        assert!(!data_bearing.is_no_op_heartbeat());
     }
 }
