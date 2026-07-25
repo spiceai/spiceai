@@ -161,7 +161,6 @@ s3_vectors = { path = "../s3_vectors", optional = true }
 scheduler = { path = "../scheduler" }
 schemars.workspace = true
 scopeguard = "1.2.0"
-scylla = { workspace = true, optional = true }
 search = { path = "../search", default-features = false, features = [
     "text_search",
 ], optional = false }
@@ -333,7 +332,7 @@ rate-control = []
 wasm-functions = ["runtime-datafusion-udfs/wasm-functions"]
 wasm-functions-compile = ["runtime-datafusion-udfs/wasm-functions-compile"]
 iceberg-write = []
-imap = ["data_components/imap"]
+imap = []
 kafka = ["data_components/kafka"]
 keyring-secret-store = ["runtime-secrets/keyring-secret-store"]
 mcp = ["dep:rmcp", "runtime-tools/mcp", "tools/mcp"]
@@ -376,7 +375,7 @@ s3_vectors = [
     "search/s3_vectors",
     "runtime-search/s3_vectors",
 ]
-scylladb = ["db_connection_pool/scylladb", "data_components/scylladb"]
+scylladb = []
 sftp = ["runtime-object-store/sftp"]
 sharepoint = []
 smb = ["runtime-object-store/smb"]

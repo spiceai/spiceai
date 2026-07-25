@@ -23,11 +23,19 @@ limitations under the License.
 //! incremental builds - changes to this connector only require rebuilding
 //! this crate, not the entire runtime.
 
+// The scylladb provider module is exported (as it was in data_components) so that its
+// public API items are treated as exported API by clippy's avoid-breaking-exported-api,
+// matching the original crate. The missing_errors_doc relaxation mirrors data_components
+// and connector-git for the moved provider code.
+#![allow(clippy::missing_errors_doc)]
+
+pub mod scylladb;
+
+use crate::scylladb::ScyllaDbTableFactory;
+use crate::scylladb::pool::ScyllaDbConnectionPool;
 use async_trait::async_trait;
 use data_components::Read;
-use data_components::scylladb::ScyllaDbTableFactory;
 use datafusion::datasource::TableProvider;
-use db_connection_pool::scylladbpool::ScyllaDbConnectionPool;
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
