@@ -1256,13 +1256,9 @@ async fn warm_subset_preserves_key_deletes_and_rows(
         .await?
         .current_snapshot_id;
     let files_before = count_vortex_files(&fixture.data_path, &table_id, &snap_before).await;
-    if let Some((snap_after, files_after)) = wait_until_current_snapshot_compacts(
-        &table,
-        &fixture,
-        "warm_subset_deletes",
-        files_before,
-    )
-    .await?
+    if let Some((snap_after, files_after)) =
+        wait_until_current_snapshot_compacts(&table, &fixture, "warm_subset_deletes", files_before)
+            .await?
     {
         assert_ne!(
             snap_after, snap_before,
@@ -1336,13 +1332,9 @@ async fn warm_subset_reduces_small_file_fanout(
     // Threshold is `pre_count` so the helper cannot return early without a
     // real reduction (or an explicit compact commit that then must still
     // show `post_count < pre_count` below).
-    let Some((post_snap, post_count)) = wait_until_current_snapshot_compacts(
-        &table,
-        &fixture,
-        "warm_subset_fanout",
-        pre_count,
-    )
-    .await?
+    let Some((post_snap, post_count)) =
+        wait_until_current_snapshot_compacts(&table, &fixture, "warm_subset_fanout", pre_count)
+            .await?
     else {
         panic!("warm-subset compaction should fire");
     };
