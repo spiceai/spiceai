@@ -53,6 +53,29 @@ for r in "${ranges[@]}"; do
   if [[ "$r" == *-* ]]; then n=$(( n + ${r#*-} - ${r%-*} + 1 )); else n=$(( n + 1 )); fi
 done
 echo "cpus_allowed_count=$n"
+# Host-wide per-CPU busy jiffies grouped by the node'\''s pinned cpusets
+# (/proc/stat in the container shows the whole node). Group ranges must match
+# the pinning in .github/workflows/testoperator_run_htap.yml (spiced,
+# testoperator) and the statefulset MYSQLD_CPUSET. Unpinned pods (kubelet,
+# agents) float across all CPUs, so treat small idle-time values as noise.
+awk '\''
+function inlist(n, spec,  i, m, parts, ab) {
+  m = split(spec, parts, ",")
+  for (i = 1; i <= m; i++) {
+    if (index(parts[i], "-")) { split(parts[i], ab, "-"); if (n >= ab[1]+0 && n <= ab[2]+0) return 1 }
+    else if (n == parts[i]+0) return 1
+  }
+  return 0
+}
+/^cpu[0-9]/ {
+  n = substr($1, 4) + 0
+  busy = $2 + $3 + $4 + $7 + $8 + $9
+  if (inlist(n, "0-31,64-95")) sp += busy
+  else if (inlist(n, "32-39,96-103")) to += busy
+  else my += busy
+}
+END { print "spiced_grp_ticks=" sp; print "testop_grp_ticks=" to; print "mysql_grp_ticks=" my }
+'\'' /proc/stat
 mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -N -e "SHOW GLOBAL STATUS WHERE Variable_name IN (
   '\''Com_commit'\'','\''Threads_running'\'',
   '\''Binlog_cache_use'\'','\''Binlog_cache_disk_use'\'',
@@ -76,11 +99,15 @@ get() { # get <key> from $1 (the sample text)
 }
 
 echo "profiling $POD (context $CTX) every ${INTERVAL}s for ${DURATION}s -> $OUT"
-echo "ts,cpu_cores,cpu_pct_of_cpuset,threads_running,commits_per_s,rows_written_per_s,binlog_cache_use_d,binlog_cache_disk_use_d,bp_wait_free_d,log_waits_d,row_lock_waits_d,row_lock_ms_d,history_list,checkpoint_age_gb,dirty_pages_pct" > "$OUT"
+echo "ts,cpu_cores,cpu_pct_of_cpuset,spiced_grp_cores,spiced_grp_pct,testop_grp_cores,testop_grp_pct,threads_running,commits_per_s,rows_written_per_s,binlog_cache_use_d,binlog_cache_disk_use_d,bp_wait_free_d,log_waits_d,row_lock_waits_d,row_lock_ms_d,history_list,checkpoint_age_gb,dirty_pages_pct" > "$OUT"
+
+# Logical-CPU counts of the pinned groups; must track the ranges in IN_POD.
+SPICED_GRP_CPUS=64
+TESTOP_GRP_CPUS=16
 
 prev="" prev_t=0
 start=$(date +%s)
-max_cpu=0; max_ckpt=0; max_hist=0; spills=0; waitfree=0; logwaits=0
+max_cpu=0; max_testop=0; max_ckpt=0; max_hist=0; spills=0; waitfree=0; logwaits=0
 while :; do
   now=$(date +%s)
   (( now - start >= DURATION )) && break
@@ -92,6 +119,7 @@ while :; do
   # feed empty values into the arithmetic below. Skip the tick instead.
   complete=1
   for k in cpu_ticks clk_tck cpus_allowed_count com_commit \
+           spiced_grp_ticks testop_grp_ticks \
            innodb_buffer_pool_pages_total lsn checkpoint; do
     [ -n "$(get "$cur" "$k")" ] || { complete=0; break; }
   done
@@ -118,9 +146,16 @@ while :; do
     dirty_pct=$(awk -v d="$(get "$cur" innodb_buffer_pool_pages_dirty)" -v t="$(get "$cur" innodb_buffer_pool_pages_total)" 'BEGIN{printf "%.1f", (t>0 ? 100*d/t : 0)}')
     cores=$(awk -v dt="$d_ticks" -v clk="$clk" -v s="$dt" 'BEGIN{printf "%.1f", ((clk>0 && s>0) ? dt/clk/s : 0)}')
     cpu_pct=$(awk -v c="$cores" -v n="$ncpu" 'BEGIN{printf "%.0f", (n>0 ? 100*c/n : 0)}')
-    line="$(date +%H:%M:%S),$cores,$cpu_pct,$(get "$cur" threads_running),$(( d_commit / dt )),$(( d_rows / dt )),$d_bcu,$d_bcd,$d_bpw,$d_lw,$d_rlw,$d_rlt,$hist,$ckpt_age_gb,$dirty_pct"
+    d_sp=$(( $(get "$cur" spiced_grp_ticks) - $(get "$prev" spiced_grp_ticks) ))
+    d_to=$(( $(get "$cur" testop_grp_ticks) - $(get "$prev" testop_grp_ticks) ))
+    sp_cores=$(awk -v d="$d_sp" -v clk="$clk" -v s="$dt" 'BEGIN{printf "%.1f", ((clk>0 && s>0) ? d/clk/s : 0)}')
+    sp_pct=$(awk -v c="$sp_cores" -v n="$SPICED_GRP_CPUS" 'BEGIN{printf "%.0f", (n>0 ? 100*c/n : 0)}')
+    to_cores=$(awk -v d="$d_to" -v clk="$clk" -v s="$dt" 'BEGIN{printf "%.1f", ((clk>0 && s>0) ? d/clk/s : 0)}')
+    to_pct=$(awk -v c="$to_cores" -v n="$TESTOP_GRP_CPUS" 'BEGIN{printf "%.0f", (n>0 ? 100*c/n : 0)}')
+    line="$(date +%H:%M:%S),$cores,$cpu_pct,$sp_cores,$sp_pct,$to_cores,$to_pct,$(get "$cur" threads_running),$(( d_commit / dt )),$(( d_rows / dt )),$d_bcu,$d_bcd,$d_bpw,$d_lw,$d_rlw,$d_rlt,$hist,$ckpt_age_gb,$dirty_pct"
     echo "$line" | tee -a "$OUT"
     awk -v c="$cpu_pct" -v m="$max_cpu" 'BEGIN{exit !(c>m)}' && max_cpu=$cpu_pct
+    awk -v c="$to_pct" -v m="$max_testop" 'BEGIN{exit !(c>m)}' && max_testop=$to_pct
     awk -v c="$ckpt_age_gb" -v m="$max_ckpt" 'BEGIN{exit !(c>m)}' && max_ckpt=$ckpt_age_gb
     (( hist > max_hist )) && max_hist=$hist
     spills=$(( spills + d_bcd )); waitfree=$(( waitfree + d_bpw )); logwaits=$(( logwaits + d_lw ))
@@ -132,6 +167,7 @@ done
 echo ""
 echo "=== summary ($OUT) ==="
 echo "peak mysqld CPU: ${max_cpu}% of its cpuset  -> ~100% supports the CPU-allocation idea; well below 100% points at locks/flushing"
+echo "peak testoperator-group CPU: ${max_testop}% of its 16 logical CPUs -> well below 100% means cores can be donated to MySQL without hurting generation"
 echo "binlog cache disk spills: ${spills}          -> >0 sustained supports raising binlog_cache_size"
 echo "buffer-pool wait-free stalls: ${waitfree}    -> >0 supports raising innodb_io_capacity/page_cleaners"
 echo "redo log waits: ${logwaits}                  -> >0 supports larger redo / io_capacity"
