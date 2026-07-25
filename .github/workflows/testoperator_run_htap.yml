@@ -68,7 +68,7 @@ on:
         default: false
         type: boolean
       spiced_env:
-        description: 'Extra environment variables for the spiced process under test, one SPICE_KEY=VALUE or SPICED_KEY=VALUE per line (e.g. SPICE_CAYENNE_EAGER_NDV=true). A handful of reserved SPICE*/SPICED* names owned by this workflow or testoperator (SPICED_COMMIT, SPICED_BIN, SPICED_ENV_INPUT, SPICED_KEEP_ALIVE) are rejected. Applied only to the benchmark run, never to template seeding, so it never invalidates the cached CH-benCH template. Do not put secrets here: values are echoed into the job summary.'
+        description: 'Extra environment variables for the benchmark run, one SPICE_KEY=VALUE, SPICED_KEY=VALUE (spiced config) or CHBENCH_KEY=VALUE (chbench-driver knobs, e.g. CHBENCH_EXPERIMENT_BENCH_TS_INDEX=1) per line. A handful of reserved SPICE*/SPICED* names owned by this workflow or testoperator (SPICED_COMMIT, SPICED_BIN, SPICED_ENV_INPUT, SPICED_KEEP_ALIVE) are rejected. Applied only to the benchmark run, never to template seeding, so it never invalidates the cached CH-benCH template. Do not put secrets here: values are echoed into the job summary.'
         required: false
         default: ''
         type: string
@@ -265,12 +265,15 @@ jobs:
           # is parsed, not just as inert data.
           SPICED_ENV_INPUT: ${{ github.event.inputs.spiced_env }}
         run: |
-          # Allowlist SPICE_* / SPICED_* (underscore required, so e.g. SPICEAI_* or bare
-          # SPICE/SPICED don't slip through) — covers both naming conventions used across
-          # the codebase, e.g. SPICE_CAYENNE_EAGER_NDV, SPICED_METRICS_ADDR — so a
-          # dispatcher can never overwrite reserved runner/Actions variables (GITHUB_*,
-          # RUNNER_*, ACTIONS_*, PATH, HOME, ...) or otherwise alter the runner
-          # environment outside spiced's own config.
+          # Allowlist SPICE_* / SPICED_* / CHBENCH_* (underscore required, so e.g.
+          # SPICEAI_* or bare SPICE/SPICED don't slip through) — SPICE_/SPICED_ cover both
+          # naming conventions used across the codebase (e.g. SPICE_CAYENNE_EAGER_NDV,
+          # SPICED_METRICS_ADDR), and CHBENCH_ covers the chbench-driver's own knobs
+          # (e.g. CHBENCH_EXPERIMENT_BENCH_TS_INDEX), which run inside testoperator and
+          # read the same job env. Prefix-bound either way, so a dispatcher can never
+          # overwrite reserved runner/Actions variables (GITHUB_*, RUNNER_*, ACTIONS_*,
+          # PATH, HOME, ...) or otherwise alter the runner environment outside
+          # spiced/driver config.
           #
           # A few SPICE_*/SPICED_* names ARE reserved even though they match that prefix:
           # they're owned by this workflow (provenance, internal plumbing) rather than
@@ -290,14 +293,14 @@ jobs:
             for r in $reserved_names; do
               [ "$key" = "$r" ] && reserved=1 && break
             done
-            if [[ "$line" != *"="* ]] || [[ ! "$key" =~ ^SPICED?_[A-Za-z0-9_]+$ ]] || [ "$reserved" = "1" ]; then
+            if [[ "$line" != *"="* ]] || [[ ! "$key" =~ ^(SPICED?|CHBENCH)_[A-Za-z0-9_]+$ ]] || [ "$reserved" = "1" ]; then
               # Workflow-command values must have %, CR, LF escaped (%25/%0D/%0A) or an
               # untrusted line containing them could corrupt the log or smuggle in
               # additional workflow commands.
               escaped="${line//%/%25}"
               escaped="${escaped//$'\r'/%0D}"
               escaped="${escaped//$'\n'/%0A}"
-              echo "::error::Invalid spiced_env entry (must be SPICE_KEY=VALUE or SPICED_KEY=VALUE, and KEY must not be a reserved name): ${escaped}"
+              echo "::error::Invalid spiced_env entry (must be SPICE_KEY=VALUE, SPICED_KEY=VALUE or CHBENCH_KEY=VALUE, and KEY must not be a reserved name): ${escaped}"
               exit 1
             fi
             printf '%s\n' "$line" >> "$GITHUB_ENV"
