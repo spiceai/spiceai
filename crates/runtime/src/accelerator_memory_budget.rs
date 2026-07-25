@@ -277,9 +277,25 @@ pub fn plan(
         // queries aren't starved — the un-limited instances (whose caps we DO control)
         // absorb the squeeze instead.
         None if unset > 0 => {
-            let target = (base_free.saturating_mul(DUCKDB_QUERY_SPLIT_PERCENT) / 100)
-                .max(query_floor)
-                .min(base);
+            let preferred = (base_free.saturating_mul(DUCKDB_QUERY_SPLIT_PERCENT) / 100)
+                .max(query_floor);
+            // Once every un-limited instance is squeezed to its own floor, the query
+            // pool is the only remaining give. `fits` is the largest pool that still
+            // leaves each of them that floor within `base`. When honoring the query
+            // floor would push past `base` but `fits` would not, shrink below the
+            // floor to land inside the budget — the same trade the all-explicit
+            // branch makes. Only when `fits` is unusably small (or shrinking wouldn't
+            // avoid the over-commit anyway) is the preferred share kept, so a
+            // hopeless pod doesn't get a starved query pool AND an over-commit.
+            let fits = base
+                .saturating_sub(sum_explicit)
+                .saturating_sub(DUCKDB_MIN_INSTANCE_CAP_BYTES.saturating_mul(unset));
+            let target = if fits < preferred && fits >= DUCKDB_MIN_QUERY_POOL_BYTES {
+                fits
+            } else {
+                preferred
+            }
+            .min(base);
             (target, Some(target))
         }
         // All instances explicit: their ceilings are FIXED, so the query pool takes
@@ -637,6 +653,37 @@ mod tests {
         assert_eq!(p.query_pool_cap_bytes, None);
         assert_eq!(p.per_instance_cap_bytes, DUCKDB_MIN_INSTANCE_CAP_BYTES); // floored
         assert!(p.residual_overcommit);
+    }
+
+    /// Large explicit ceilings alongside ONE un-limited instance: honoring the base/4
+    /// query floor would over-commit, but a split that fits exists (query pool below
+    /// the floor + the un-limited instance at its own floor). Take it instead of
+    /// deliberately over-committing.
+    #[test]
+    fn explicit_plus_unset_shrinks_query_below_floor_to_fit() {
+        let (total, base) = total_and_base();
+        // Leaves exactly the per-instance floor once the query pool shrinks to fit,
+        // while base/4 (the query floor) is far larger than what actually remains.
+        let sum_explicit = base - 2 * GIB;
+        let inputs = DuckDbBudgetInputs {
+            num_unset_instances: 1,
+            num_explicit_instances: 1,
+            sum_explicit_bytes: sum_explicit,
+            unset_instance_labels: vec!["db-unset".to_string()],
+            ..Default::default()
+        };
+        let p = plan_bare(total, base, None, &inputs);
+        assert_eq!(p.outcome, PlanOutcome::Applied);
+        assert!(
+            p.effective_query_pool_bytes < base / 4,
+            "query pool should shrink below the floor to fit"
+        );
+        assert_eq!(p.per_instance_cap_bytes, DUCKDB_MIN_INSTANCE_CAP_BYTES);
+        assert!(
+            !p.residual_overcommit,
+            "a fitting split exists, so nothing should be over-committed"
+        );
+        assert!(p.effective_query_pool_bytes + p.duckdb_reservation_bytes <= base);
     }
 
     /// Many un-limited instances on a small host ⇒ the per-instance floor binds and
