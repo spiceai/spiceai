@@ -30,7 +30,11 @@
 #   gh workflow run signoff.yml -f pr_number=<PR number>
 # The PR's head commit (not the mutable branch) is what gets checked out and
 # signed off, pinned at resolve time, so a push to the fork branch after you
-# dispatch doesn't silently swap in unreviewed code.
+# dispatch doesn't silently swap in unreviewed code. The fork is fetched as a
+# second git remote rather than passed to actions/checkout's `repository:` —
+# that input repoints "origin" at whatever repo it's given, which would
+# misdirect every `gh`-based repo lookup in scripts/signoff (status posts,
+# PR/run lookups) at the fork instead of this repo.
 name: Remote Sign-off
 
 run-name: "Remote Sign-off (${{ inputs.pr_number && format('PR #{0}', inputs.pr_number) || inputs.branch }})"
@@ -79,13 +83,6 @@ jobs:
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # For a fork PR, actions/checkout below points the local "origin" remote
-      # at the fork so gh's usual git-remote repo inference (used throughout
-      # scripts/signoff via `gh repo view`) would otherwise resolve to the
-      # fork instead of this repo. GH_REPO pins every `gh` call in this job —
-      # status posts, PR/run lookups, dispatch — to this repo regardless of
-      # what "origin" points at.
-      GH_REPO: ${{ github.repository }}
       # Drive remote-specific behavior in scripts/signoff (pending status,
       # "via remote" description, GitHub compare fallback, step summary).
       SIGNOFF_REMOTE_RUN: '1'
@@ -158,34 +155,74 @@ jobs:
             exit 1
           fi
 
+          if [[ "$checkout_repo" == "$BASE_REPO" ]]; then
+            is_fork=false
+          else
+            is_fork=true
+          fi
+
           echo "checkout_repo=${checkout_repo}" >> "$GITHUB_OUTPUT"
           echo "checkout_ref=${checkout_ref}" >> "$GITHUB_OUTPUT"
+          echo "is_fork=${is_fork}" >> "$GITHUB_OUTPUT"
           echo "Triggered by: ${{ github.actor }}"
           echo "Targeted pre-lint base: trunk (fixed)"
 
       - name: Check out branch/PR
+        # Same-repo case only — never pass a `repository:` override here. Doing
+        # so would repoint the local "origin" remote at whatever repo we pass,
+        # which breaks every `gh` call in scripts/signoff that infers the repo
+        # from "origin" (status posts, PR/run lookups) — they'd silently target
+        # that other repo instead of this one. The fork case below keeps
+        # "origin" pointed at this repo and fetches the fork as a second,
+        # separate remote instead.
+        if: steps.resolve.outputs.is_fork != 'true'
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          repository: ${{ steps.resolve.outputs.checkout_repo }}
           ref: ${{ steps.resolve.outputs.checkout_ref }}
           # Full history so local merge-base with trunk works when trunk is present.
           # scripts/signoff still falls back to the GitHub compare API if needed.
           fetch-depth: 0
-          # Defense in depth for the fork case: nothing checked out here should
-          # be able to read a persisted git credential back out of .git/config.
-          # gh/git operations in this job authenticate via GH_TOKEN/GH_REPO env
-          # instead, so this doesn't affect them.
+
+      - name: Check out this repo (fork PR)
+        # Establishes "origin" == this repo and full history, same as the
+        # step above. The actual PR content is fetched from the fork and
+        # checked out over this in the next step; ref is left at whatever
+        # triggered this workflow_dispatch since it's immediately replaced.
+        if: steps.resolve.outputs.is_fork == 'true'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          # Defense in depth: the next step pulls in fork-authored code, which
+          # shouldn't be able to read a persisted git credential back out of
+          # .git/config. `gh`/git operations in this job authenticate via
+          # GH_TOKEN instead, so this doesn't affect them.
           persist-credentials: false
+
+      - name: Fetch and check out fork head commit
+        if: steps.resolve.outputs.is_fork == 'true'
+        env:
+          FORK_REPO: ${{ steps.resolve.outputs.checkout_repo }}
+          FORK_SHA: ${{ steps.resolve.outputs.checkout_ref }}
+        run: |
+          set -euo pipefail
+          echo "Fetching ${FORK_SHA} from fork ${FORK_REPO} ('origin' stays $(git remote get-url origin))…"
+          git remote add fork-source "https://github.com/${FORK_REPO}.git"
+          # No --depth: a shallow fetch here would leave HEAD with no known
+          # parents, breaking the local `git merge-base HEAD origin/trunk`
+          # below (and scripts/signoff's own diffing). A full fetch is cheap
+          # in practice — this fork shares almost all of its object history
+          # with the "Check out this repo" step's already-fetched origin.
+          git fetch --no-tags fork-source "$FORK_SHA"
+          git checkout --detach "$FORK_SHA"
+          git remote remove fork-source
+          echo "Checked out: $(git rev-parse HEAD)"
 
       - name: Fetch trunk for targeted pre-lint
         run: |
           set -euo pipefail
-          echo "Fetching trunk from ${{ github.repository }} for targeted pre-lint merge-base…"
-          # Fetch trunk from this repo explicitly by URL rather than the
-          # "origin" remote — for a fork PR, checkout above pointed "origin"
-          # at the fork, which may have a stale or missing trunk ref.
-          git fetch --no-tags "https://github.com/${{ github.repository }}" "trunk:refs/remotes/origin/trunk" \
-            || git fetch --no-tags "https://github.com/${{ github.repository }}" trunk
+          echo "Fetching origin/trunk for targeted pre-lint merge-base…"
+          git fetch --no-tags origin "trunk:refs/remotes/origin/trunk" \
+            || git fetch --no-tags origin trunk
           echo "HEAD: $(git rev-parse --short HEAD)"
           echo "merge-base with origin/trunk: $(git merge-base HEAD origin/trunk 2>/dev/null | cut -c1-12 || echo 'n/a (API fallback)')"
 
