@@ -111,8 +111,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use bytes::Bytes;
 
 use super::{
-    Error, ReplicationMetricsCollector, ReplicationStreamInput, Result, bootstrap,
-    changes::PgChangeRows, client, config::ReplicationParams, pgoutput, resilience, slot,
+    Error, ReplicationMetricsCollector, ReplicationStreamInput, Result, SchemaEvolutionPolicy,
+    bootstrap, changes::PgChangeRows, client, config::ReplicationParams, pgoutput, resilience,
+    schema_evolution::RelationSchemaTracker, slot,
 };
 use rustc_hash::FxHashMap;
 
@@ -127,6 +128,12 @@ struct Route {
     key: MemberKey,
     member: Arc<MemberHandle>,
     slot: Arc<AckSlot>,
+    /// The member's *current* working schema: its registered schema plus any
+    /// mid-stream widening adopted by the per-member [`RelationSchemaTracker`]
+    /// (see [`handle_relation`]). Under [`SchemaEvolutionPolicy::Block`] this is
+    /// just the registered `member.schema`. `deliver_commit` builds each
+    /// `PgChangeRows` against this so an adopted column reaches the accelerator.
+    working_schema: SchemaRef,
 }
 
 /// Per-connection routing table: relation id -> resolved [`Route`]. `FxHashMap`
@@ -140,6 +147,63 @@ type RouteMap = FxHashMap<RelationId, Route>;
 /// Per-transaction buffer of raw pgoutput change bytes, keyed by relation id.
 /// `FxHashMap` for the same hot-path reason as [`RouteMap`].
 type TxnBuffer = FxHashMap<RelationId, Vec<Bytes>>;
+
+/// Pump-local, per-member schema-evolution state. Held in a map that PERSISTS
+/// across reconnects (see `run_pump`, matching the former dedicated path): an
+/// adopted mid-stream column add / lossless widening must survive a transient
+/// disconnect, or the first `Relation` after reconnect (a tracker "first
+/// observation") would fail to re-adopt it and silently drop the column's
+/// values. A removed member's entry is cleared in [`handle_relation`].
+#[derive(Default)]
+struct MemberSchemaState {
+    /// Adopts mid-stream widening under a non-[`SchemaEvolutionPolicy::Block`]
+    /// policy; `None` under `Block`, where the working schema is fixed.
+    tracker: Option<RelationSchemaTracker>,
+    /// `Block`-mode observability only: the source column set last seen, so a
+    /// mid-stream column add is warned about exactly once (under `Block` the
+    /// new column is dropped because the working schema stays fixed).
+    known_columns: Option<HashSet<String>>,
+    /// The member registration this state was seeded from. Because the state
+    /// persists across reconnects and is keyed only by source `(schema, table)`,
+    /// a detach + re-subscribe for the same table with a *different* registered
+    /// schema / policy / primary keys (e.g. a config reload while the shared
+    /// pump keeps running) would otherwise reuse a tracker built on stale
+    /// assumptions and mis-shape the `ChangeBatch`. [`handle_relation`] rebuilds
+    /// the state whenever this no longer matches the current member.
+    seed: Option<MemberSeed>,
+}
+
+/// Fingerprint of the member registration a [`MemberSchemaState`] was built for.
+struct MemberSeed {
+    dataset_name: String,
+    schema: SchemaRef,
+    policy: SchemaEvolutionPolicy,
+    primary_keys: Vec<String>,
+}
+
+impl MemberSeed {
+    fn of(member: &MemberHandle) -> Self {
+        Self {
+            dataset_name: member.dataset_name.clone(),
+            schema: Arc::clone(&member.schema),
+            policy: member.policy,
+            primary_keys: member.primary_keys.clone(),
+        }
+    }
+
+    fn matches(&self, member: &MemberHandle) -> bool {
+        // `dataset_name` is included so a rename (same source table + schema)
+        // rebuilds the tracker — it embeds the dataset name in its warnings, so a
+        // reused tracker would misattribute schema-evolution logs to the old name.
+        self.dataset_name == member.dataset_name
+            && self.policy == member.policy
+            && self.primary_keys == member.primary_keys
+            && self.schema == member.schema
+    }
+}
+
+/// Pump-local map of per-member schema state, keyed like [`RouteMap`].
+type MemberSchemaStates = FxHashMap<MemberKey, MemberSchemaState>;
 
 /// Default bounded per-member delivery queue depth (envelopes), overridable via
 /// `pg_replication_member_channel_capacity`
@@ -233,8 +297,20 @@ struct MemberHandle {
     /// pgoutput `Relation` messages by Postgres design; tolerated during
     /// schema validation and applied as NULL.
     generated_columns: Vec<String>,
+    /// The dataset's `on_schema_change` policy. Drives the per-member
+    /// [`RelationSchemaTracker`] in [`handle_relation`]: under a non-`Block`
+    /// policy a mid-stream source column add / lossless type widening is adopted
+    /// into the member's working schema (the runtime apply loop then reconciles
+    /// the wider batch against the accelerator). Under `Block` the schema is
+    /// fixed and a new source column is validated-then-dropped with a warning.
+    policy: SchemaEvolutionPolicy,
     sender: mpsc::Sender<std::result::Result<ChangeEnvelope, StreamError>>,
     metrics: Arc<ReplicationMetricsCollector>,
+    /// Lag-based readiness threshold for this member's dataset. WAL envelopes
+    /// and idle keepalive heartbeats are flagged `is_dataset_ready` when their
+    /// source-commit time is within this of now, so the dataset becomes Ready
+    /// only once it has caught up to the source head.
+    ready_lag: std::time::Duration,
 }
 
 /// `LIVE`: the member is attached and routing to it is allowed. Cleared on
@@ -452,6 +528,13 @@ impl AckTable {
         }
         self.shared_flush.load(Ordering::Acquire)
     }
+
+    /// Whether `key`'s member has been promoted to the streaming phase (past its
+    /// initial snapshot). Cold-path only (idle-heartbeat readiness gating); the
+    /// hot commit/deliver paths read `STREAMING` off the cached `AckSlot`.
+    fn is_streaming(&self, key: &MemberKey) -> bool {
+        self.slot(key).is_some_and(|slot| slot.has(STREAMING))
+    }
 }
 
 /// Key-addressed conveniences for tests, mirroring the production paths that
@@ -470,10 +553,6 @@ impl AckTable {
         if let Some(slot) = self.slot(key) {
             slot.deliver(lsn);
         }
-    }
-
-    fn is_streaming(&self, key: &MemberKey) -> bool {
-        self.slot(key).is_some_and(|slot| slot.has(STREAMING))
     }
 
     fn committed(&self, key: &MemberKey) -> u64 {
@@ -505,12 +584,23 @@ fn advance_monotonic(flush: &AtomicU64, to: u64) {
 struct SharedLsnCommitter {
     slot: Arc<AckSlot>,
     flush_to: u64,
+    /// Member dataset name, for the committer-progress log line.
+    dataset: String,
+    /// Source-commit timestamp (ms since the Unix epoch) of the batch this
+    /// commit acks; `None` when the transaction carried no commit time.
+    source_commit_ts_ms: Option<i64>,
 }
 
 #[async_trait]
 impl CommitChange for SharedLsnCommitter {
     async fn commit(&self) -> std::result::Result<(), CommitError> {
         self.slot.commit(self.flush_to);
+        crate::cdc::log_committer_progress(
+            "postgres",
+            &self.dataset,
+            &format!("lsn={}", self.flush_to),
+            self.source_commit_ts_ms,
+        );
         Ok(())
     }
 
@@ -788,6 +878,7 @@ async fn attach_member(
         schema_name,
         table_name,
         metrics,
+        policy,
     } = input;
     let member_key: MemberKey = (schema_name.clone(), table_name.clone());
 
@@ -868,8 +959,10 @@ async fn attach_member(
             schema: Arc::clone(&schema),
             primary_keys: primary_keys.clone(),
             generated_columns: setup.generated_columns.clone(),
+            policy,
             sender,
             metrics: Arc::clone(&metrics),
+            ready_lag: params.ready_lag,
         }),
     );
     // Membership liveness is now observable (`dataset_postgres_replication_member_attached`):
@@ -962,12 +1055,13 @@ async fn attach_member(
         Box::pin(snapshot.chain(bootstrap_finished))
     } else {
         metrics.mark_bootstrap_complete();
-        let envelope = crate::cdc::build_ready_signal_envelope(&schema).map_err(|e| {
-            Error::SchemaMismatch {
-                message: e.to_string(),
-            }
-        })?;
-        Box::pin(stream::once(async move { Ok(envelope) }))
+        // Readiness is lag-based: a resuming member becomes Ready via lag-gated
+        // WAL envelopes and the pump's keepalive heartbeats (see `deliver_commit`
+        // and `run_pump`'s KeepAlive handling), not an immediate resume-time
+        // ready signal that could mark a still-behind member Ready.
+        Box::pin(stream::empty::<
+            std::result::Result<ChangeEnvelope, StreamError>,
+        >())
     };
 
     Ok(Box::pin(head.chain(ReceiverStream::new(receiver))))
@@ -1108,9 +1202,30 @@ async fn run_pump(source: Arc<SharedSource>) {
     let publication_name = params.publication_name.clone();
     let mut backoff = resilience::Backoff::default_for_stream();
     let mut reconnect_attempts: u32 = 0;
+    // Throttle idle-heartbeat fan-out: keepalives arrive in bursts (one per
+    // chunk of filtered/unrelated WAL the slot decodes), so emit at most one
+    // heartbeat round per `heartbeat_every`. The per-keepalive `credit_idle`
+    // ACK is unaffected. Members share the slot's connection params, so the
+    // interval is derived from the source's ready_lag.
+    let heartbeat_every = crate::cdc::heartbeat_interval(params.ready_lag);
+    let mut last_heartbeat_at: Option<std::time::Instant> = None;
     // When the stream dropped (set as the inner loop breaks to reconnect); consumed
     // on the next successful connect to attribute the disconnected duration.
     let mut disconnect_at: Option<std::time::Instant> = None;
+    // Per-member schema-evolution state. PERSISTS across reconnects (declared
+    // OUTSIDE the reconnect loop, matching the former dedicated path). A
+    // mid-stream column add / lossless widening is adopted only on the *second*
+    // `Relation` for a member — the first is the baseline. If this were rebuilt
+    // per reconnect, the first `Relation` after a transient disconnect would be
+    // a fresh "first observation" and would NOT re-adopt an already-adopted
+    // column, silently dropping its values until the next schema change. Keeping
+    // the tracker (and its widened working schema) across reconnects means
+    // `handle_relation` reseeds each rebuilt route's `working_schema` from it, so
+    // an adopted column survives a reconnect; pre-evolution WAL replayed after a
+    // reconnect null-fills the (nullable) added column correctly. `routes` is
+    // still rebuilt per connection; a removed member's entry is cleared in
+    // `handle_relation`.
+    let mut schema_state: MemberSchemaStates = MemberSchemaStates::default();
 
     'reconnect: loop {
         if crate::cdc::shutdown_epoch() != shutdown_epoch {
@@ -1376,7 +1491,14 @@ async fn run_pump(source: Arc<SharedSource>) {
                             };
                             match msg {
                                 pgoutput::DecodedMessage::Relation(rel) => {
-                                    handle_relation(&source, &mut decoder, &mut routes, rel).await;
+                                    handle_relation(
+                                        &source,
+                                        &mut decoder,
+                                        &mut routes,
+                                        &mut schema_state,
+                                        rel,
+                                    )
+                                    .await;
                                 }
                                 pgoutput::DecodedMessage::Truncate { relation_ids } => {
                                     buffer_raw_truncate(&routes, &mut txn, &relation_ids, &raw);
@@ -1420,7 +1542,11 @@ async fn run_pump(source: Arc<SharedSource>) {
                     client.update_applied_lsn(Lsn(source.ack.flush_lsn()));
                     should_flush = true;
                 }
-                ReplicationEvent::KeepAlive { wal_end, .. } => {
+                ReplicationEvent::KeepAlive {
+                    wal_end,
+                    server_time_micros,
+                    ..
+                } => {
                     // Accumulate the server WAL end; the per-member fan-out
                     // (server_wal_end + confirmed_flush) happens once in the
                     // consolidated boundary flush below, not inline per event.
@@ -1428,6 +1554,85 @@ async fn run_pump(source: Arc<SharedSource>) {
                     should_flush = true;
                     if !txn_open {
                         source.ack.credit_idle(wal_end.0);
+                        // Idle heartbeat for lag-based readiness. `!txn_open`
+                        // means the pump has caught up to the source head, so a
+                        // streaming member with a drained channel is caught up
+                        // too. Fan out a zero-row heartbeat stamped with the
+                        // source-attested keepalive clock via NON-BLOCKING
+                        // try_send: a member whose bounded queue is full is
+                        // behind, so dropping its heartbeat is both harmless (a
+                        // later keepalive re-sends) and correct, and — the fix
+                        // for the reverted #11554 heartbeat regression — a slow
+                        // member can never block this fan-out and starve another
+                        // member's Ready signal. Only streaming members (promoted
+                        // past their snapshot) are eligible; a still-snapshotting
+                        // member has not caught up. `server_time_micros` is
+                        // Postgres-epoch microseconds; 0 marks a synthetic
+                        // keepalive, which we skip.
+                        if server_time_micros > 0
+                            && last_heartbeat_at.is_none_or(|at| at.elapsed() >= heartbeat_every)
+                        {
+                            last_heartbeat_at = Some(std::time::Instant::now());
+                            let heartbeat_ts_ms =
+                                client::pg_epoch_to_system_time(server_time_micros)
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .ok()
+                                    .and_then(|d| i64::try_from(d.as_millis()).ok());
+                            for (member_key, member) in source.live_members() {
+                                if !source.ack.is_streaming(&member_key) {
+                                    continue;
+                                }
+                                let is_ready = crate::cdc::source_commit_within_ready_lag(
+                                    heartbeat_ts_ms,
+                                    member.ready_lag,
+                                );
+                                // Build the heartbeat against the member's CURRENT
+                                // working schema — which may have widened under
+                                // non-`Block` schema evolution (see
+                                // `handle_relation`) — so an idle heartbeat carries
+                                // the same schema `deliver_commit` builds data
+                                // batches against, never a stale narrower one.
+                                let heartbeat_schema = schema_state
+                                    .get(&member_key)
+                                    .and_then(|s| s.tracker.as_ref())
+                                    .map_or_else(
+                                        || Arc::clone(&member.schema),
+                                        |t| Arc::clone(t.working_schema()),
+                                    );
+                                match crate::cdc::build_heartbeat_envelope(
+                                    &heartbeat_schema,
+                                    heartbeat_ts_ms,
+                                    is_ready,
+                                ) {
+                                    Ok(heartbeat) => {
+                                        // Log the idle heartbeat (per member) so
+                                        // lag-based readiness can be verified from
+                                        // the logs (target spice_cdc::heartbeat).
+                                        let heartbeat_lag_ms =
+                                            crate::cdc::replication_lag_ms(heartbeat_ts_ms);
+                                        tracing::debug!(
+                                            target: "spice_cdc::heartbeat",
+                                            connector = "postgres",
+                                            dataset = %member.dataset_name,
+                                            source_commit_ts_ms = ?heartbeat_ts_ms,
+                                            is_dataset_ready = is_ready,
+                                            lag_ms = ?heartbeat_lag_ms,
+                                            "CDC idle heartbeat emitted"
+                                        );
+                                        // Drop-if-full / drop-if-closed: never
+                                        // block the pump on a slow member.
+                                        let _ = member.sender.try_send(Ok(heartbeat));
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            dataset = %member.dataset_name,
+                                            error = %e,
+                                            "failed to build shared Postgres CDC heartbeat envelope; skipping"
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                     client.update_applied_lsn(Lsn(source.ack.flush_lsn()));
                 }
@@ -1512,6 +1717,7 @@ async fn handle_relation(
     source: &Arc<SharedSource>,
     decoder: &mut pgoutput::Decoder,
     routes: &mut RouteMap,
+    schema_state: &mut MemberSchemaStates,
     rel: pgoutput::Relation,
 ) {
     let member_key: MemberKey = (rel.namespace.clone(), rel.name.clone());
@@ -1519,6 +1725,7 @@ async fn handle_relation(
         // No member for this table (e.g. publication membership left over from
         // a removed dataset). Its changes are dropped (never routed).
         routes.remove(&rel.relation_id);
+        schema_state.remove(&member_key);
         tracing::debug!(
             table = %format_member(&member_key),
             slot = %source.key.slot_name,
@@ -1546,31 +1753,122 @@ async fn handle_relation(
         );
         return;
     }
-    if let Err(e) = client::validate_relation_against_schema(
-        &member.schema,
-        &rel,
-        &member.primary_keys,
-        &member.generated_columns,
-    ) {
-        member.metrics.inc_schema_mismatch_error();
-        routes.remove(&rel.relation_id);
-        member_fatal(
-            source,
-            &member_key,
-            format!("schema mismatch for {}: {e}", member.dataset_name),
-        )
-        .await;
-        return;
+
+    // Reconcile the Relation against the member's working schema, mirroring the
+    // former per-dataset path so slot-consolidated datasets keep their schema
+    // evolution. Under `block` the schema is fixed (validate, then warn if the
+    // source added a column whose values are being dropped). Otherwise a
+    // per-member `RelationSchemaTracker` adopts a mid-stream column add / lossless
+    // type widening into the working schema, so the built `ChangeBatch` carries
+    // the wider data struct — the runtime apply loop then reconciles it against
+    // the accelerator per the policy. `schema_state` persists across reconnects
+    // (declared outside the reconnect loop in `run_pump`), so an adopted column
+    // survives a transient disconnect rather than being dropped as a fresh
+    // "first observation".
+    let state = schema_state.entry(member_key.clone()).or_default();
+    // Guard the persistence against a re-subscribe: if this member was
+    // re-registered for the same source table with a different schema / policy /
+    // primary keys (config reload), the persisted tracker's assumptions are
+    // stale — rebuild the state from the current registration so it never
+    // mis-shapes the `ChangeBatch`.
+    if !state.seed.as_ref().is_some_and(|s| s.matches(&member)) {
+        *state = MemberSchemaState {
+            seed: Some(MemberSeed::of(&member)),
+            ..MemberSchemaState::default()
+        };
     }
+    let working_schema = if member.policy == SchemaEvolutionPolicy::Block {
+        if let Err(e) = client::validate_relation_against_schema(
+            &member.schema,
+            &rel,
+            &member.primary_keys,
+            &member.generated_columns,
+        ) {
+            member.metrics.inc_schema_mismatch_error();
+            routes.remove(&rel.relation_id);
+            member_fatal(
+                source,
+                &member_key,
+                format!("schema mismatch for {}: {e}", member.dataset_name),
+            )
+            .await;
+            return;
+        }
+        // Observability-only (behavior unchanged under `block`): a mid-stream
+        // column add is silently dropped — say so loudly once per change.
+        client::warn_on_new_relation_columns(
+            &rel,
+            &mut state.known_columns,
+            &member.dataset_name,
+            &member.metrics,
+        );
+        Arc::clone(&member.schema)
+    } else {
+        // PK columns must exist and be part of the replica identity for every
+        // policy — UPDATE/DELETE cannot route without them. (The tracker does
+        // not re-check this.)
+        if let Err(e) = client::validate_relation_primary_keys(&rel, &member.primary_keys) {
+            member.metrics.inc_schema_mismatch_error();
+            routes.remove(&rel.relation_id);
+            member_fatal(
+                source,
+                &member_key,
+                format!("schema mismatch for {}: {e}", member.dataset_name),
+            )
+            .await;
+            return;
+        }
+        let tracker = state.tracker.get_or_insert_with(|| {
+            RelationSchemaTracker::new(
+                Arc::clone(&member.schema),
+                member.policy,
+                member.dataset_name.clone(),
+                member.primary_keys.clone(),
+            )
+        });
+        match tracker.observe_relation(&rel) {
+            Ok(observation) => {
+                let widened = observation.schema_changed;
+                let working = Arc::clone(tracker.working_schema());
+                if widened {
+                    member.metrics.inc_schema_evolution();
+                    tracing::info!(
+                        dataset = %member.dataset_name,
+                        "adopted source schema change: {}",
+                        observation.summary
+                    );
+                }
+                working
+            }
+            Err(e) => {
+                member.metrics.inc_schema_evolution_rejected();
+                member.metrics.inc_schema_mismatch_error();
+                routes.remove(&rel.relation_id);
+                member_fatal(
+                    source,
+                    &member_key,
+                    format!(
+                        "schema change for {} cannot be applied: {e}",
+                        member.dataset_name
+                    ),
+                )
+                .await;
+                return;
+            }
+        }
+    };
+
     decoder.apply_declared_primary_keys(rel.relation_id, &member.primary_keys);
-    // Cache the resolved handle + ack slot alongside the key so the per-event
-    // path skips the `members` lock + string hash (see `buffer_raw_change`).
+    // Cache the resolved handle + ack slot + current working schema alongside the
+    // key so the per-event path skips the `members` lock + string hash (see
+    // `buffer_raw_change`) and `deliver_commit` builds against the working schema.
     routes.insert(
         rel.relation_id,
         Route {
             key: member_key,
             member,
             slot,
+            working_schema,
         },
     );
 }
@@ -1733,6 +2031,7 @@ async fn deliver_commit(
             key: member_key,
             member,
             slot,
+            working_schema,
         }) = routes.get(&relation_id)
         else {
             continue;
@@ -1768,17 +2067,25 @@ async fn deliver_commit(
         // unmergeable unchanged-TOAST column) then surfaces as a `StreamError` on
         // this dataset's stream at consume time rather than a pump-side
         // `member_fatal`, isolating it to the one dataset.
-        let rows = PgChangeRows::new(Arc::clone(&member.schema), rel.clone(), raw, commit_ts_ms);
+        // Build against the member's *working* schema (registered schema plus any
+        // adopted mid-stream widening — see `handle_relation`), not the fixed
+        // registered schema, so an adopted column reaches the accelerator.
+        let rows = PgChangeRows::new(Arc::clone(working_schema), rel.clone(), raw, commit_ts_ms);
         member.metrics.inc_transaction();
-        // Readiness was already signaled by the member's snapshot / ready
-        // envelope at subscribe time, so WAL envelopes never need to carry it.
+        // Lag-based readiness: this WAL envelope marks the dataset Ready only if
+        // its source commit time is within the member's `ready_lag` of now, i.e.
+        // the member has caught up to the source head. A backlog (post-snapshot
+        // gap replay, resume catch-up) keeps the dataset not-ready until closed.
+        let is_ready = crate::cdc::source_commit_within_ready_lag(commit_ts_ms, member.ready_lag);
         let envelope = ChangeEnvelope::new_from_rows(
             Box::new(SharedLsnCommitter {
                 slot: Arc::clone(slot),
                 flush_to: end_lsn,
+                dataset: member.dataset_name.clone(),
+                source_commit_ts_ms: commit_ts_ms,
             }),
             Box::new(rows),
-            false,
+            is_ready,
         );
         slot.deliver(end_lsn);
         match deliver_to_member(
@@ -1849,6 +2156,7 @@ mod tests {
             shared: true,
             member_channel_capacity: DEFAULT_MEMBER_CHANNEL_CAPACITY,
             pg_output_format: crate::postgres_replication::PgOutputFormat::Binary,
+            ready_lag: crate::cdc::DEFAULT_READY_LAG,
         }
     }
 
@@ -1877,13 +2185,251 @@ mod tests {
                     schema: Arc::clone(&schema),
                     primary_keys: vec![],
                     generated_columns: vec![],
+                    policy: SchemaEvolutionPolicy::Block,
                     sender,
                     metrics: Arc::clone(&metrics),
+                    ready_lag: crate::cdc::DEFAULT_READY_LAG,
                 }),
             );
             probes.push((member_key, metrics, receiver));
         }
         (source, probes)
+    }
+
+    /// The ported schema-evolution wiring: under a non-`Block` policy, a
+    /// mid-stream source column add must be adopted into the member's working
+    /// schema (which `deliver_commit` then builds the `ChangeBatch` against), so
+    /// the runtime evolution layer sees the wider batch. A new column is adopted
+    /// only on the *second* Relation (the first establishes the baseline), so
+    /// this drives a baseline Relation then an ALTER-widened one.
+    #[tokio::test]
+    async fn handle_relation_adopts_mid_stream_column_add_into_working_schema() {
+        use crate::postgres_replication::pgoutput::{Column, Relation};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let source = Arc::new(SharedSource::new(
+            SourceKey::from_params(&test_params()),
+            test_params(),
+        ));
+        let member_key: MemberKey = ("public".to_string(), "users".to_string());
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let (sender, _rx) = mpsc::channel(4);
+        lock(&source.members).insert(
+            member_key.clone(),
+            Arc::new(MemberHandle {
+                dataset_name: "users".into(),
+                schema,
+                primary_keys: vec!["id".into()],
+                generated_columns: vec![],
+                policy: SchemaEvolutionPolicy::AppendNewColumns,
+                sender,
+                metrics: ReplicationMetricsCollector::new(),
+                ready_lag: crate::cdc::DEFAULT_READY_LAG,
+            }),
+        );
+        source.ack.register(&member_key, false);
+        source.ack.promote_ready_members();
+
+        let mut decoder = pgoutput::Decoder::new();
+        let mut routes = RouteMap::default();
+        let mut schema_state = MemberSchemaStates::default();
+
+        let id_col = || Column {
+            is_key: true,
+            name: "id".into(),
+            type_oid: 23,
+            type_modifier: -1,
+        };
+        let rel = |cols: Vec<Column>| Relation {
+            relation_id: 42,
+            namespace: "public".into(),
+            name: "users".into(),
+            replica_identity: b'd',
+            columns: cols,
+        };
+        let working = |routes: &RouteMap| -> Vec<String> {
+            routes
+                .get(&42)
+                .expect("route built")
+                .working_schema
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect()
+        };
+
+        // Baseline Relation: working schema unchanged (id only).
+        handle_relation(
+            &source,
+            &mut decoder,
+            &mut routes,
+            &mut schema_state,
+            rel(vec![id_col()]),
+        )
+        .await;
+        assert_eq!(working(&routes), vec!["id".to_string()]);
+
+        // Mid-stream ALTER adds `name` (text): the shared pump must adopt it.
+        let name_col = || Column {
+            is_key: false,
+            name: "name".into(),
+            type_oid: 25,
+            type_modifier: -1,
+        };
+        handle_relation(
+            &source,
+            &mut decoder,
+            &mut routes,
+            &mut schema_state,
+            rel(vec![id_col(), name_col()]),
+        )
+        .await;
+        assert_eq!(
+            working(&routes),
+            vec!["id".to_string(), "name".to_string()],
+            "shared pump adopted the mid-stream column add under append_new_columns"
+        );
+
+        // Simulate a transient reconnect: the pump rebuilds `routes` per
+        // connection but `schema_state` PERSISTS (declared outside the reconnect
+        // loop in run_pump). The first Relation after reconnect already carries
+        // `name` (the stream resumed past the ALTER) — a tracker "first
+        // observation" that on its own would NOT adopt an added column. The
+        // persisted tracker must keep the adoption so the column is not dropped.
+        routes.clear();
+        handle_relation(
+            &source,
+            &mut decoder,
+            &mut routes,
+            &mut schema_state,
+            rel(vec![id_col(), name_col()]),
+        )
+        .await;
+        assert_eq!(
+            working(&routes),
+            vec!["id".to_string(), "name".to_string()],
+            "adopted column survives a reconnect because schema_state persists across the WAL gap"
+        );
+    }
+
+    /// The persisted `schema_state` must not carry stale assumptions across a
+    /// re-subscribe: if the same source table is re-registered with a different
+    /// schema (config reload while the pump keeps running), the tracker is
+    /// rebuilt from the new registration rather than reusing the old widened
+    /// working schema.
+    #[tokio::test]
+    async fn handle_relation_rebuilds_state_on_resubscribe_with_changed_schema() {
+        use crate::postgres_replication::pgoutput::{Column, Relation};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let source = Arc::new(SharedSource::new(
+            SourceKey::from_params(&test_params()),
+            test_params(),
+        ));
+        let member_key: MemberKey = ("public".to_string(), "users".to_string());
+        // Keep receivers alive so the members' senders stay open for the test.
+        let mut keepalive = Vec::new();
+        let mut register = |schema: SchemaRef| {
+            let (sender, rx) = mpsc::channel(4);
+            keepalive.push(rx);
+            lock(&source.members).insert(
+                member_key.clone(),
+                Arc::new(MemberHandle {
+                    dataset_name: "users".into(),
+                    schema,
+                    primary_keys: vec!["id".into()],
+                    generated_columns: vec![],
+                    policy: SchemaEvolutionPolicy::AppendNewColumns,
+                    sender,
+                    metrics: ReplicationMetricsCollector::new(),
+                    ready_lag: crate::cdc::DEFAULT_READY_LAG,
+                }),
+            );
+            source.ack.register(&member_key, false);
+            source.ack.promote_ready_members();
+        };
+
+        let id_col = || Column {
+            is_key: true,
+            name: "id".into(),
+            type_oid: 23,
+            type_modifier: -1,
+        };
+        let text_col = |name: &str| Column {
+            is_key: false,
+            name: name.into(),
+            type_oid: 25,
+            type_modifier: -1,
+        };
+        let rel = |cols: Vec<Column>| Relation {
+            relation_id: 42,
+            namespace: "public".into(),
+            name: "users".into(),
+            replica_identity: b'd',
+            columns: cols,
+        };
+        let working = |routes: &RouteMap| -> Vec<String> {
+            routes
+                .get(&42)
+                .expect("route built")
+                .working_schema
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect()
+        };
+
+        let mut decoder = pgoutput::Decoder::new();
+        let mut routes = RouteMap::default();
+        let mut schema_state = MemberSchemaStates::default();
+
+        // First registration: schema [id]; adopt `name` mid-stream → [id, name].
+        register(Arc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )])));
+        handle_relation(
+            &source,
+            &mut decoder,
+            &mut routes,
+            &mut schema_state,
+            rel(vec![id_col()]),
+        )
+        .await;
+        handle_relation(
+            &source,
+            &mut decoder,
+            &mut routes,
+            &mut schema_state,
+            rel(vec![id_col(), text_col("name")]),
+        )
+        .await;
+        assert_eq!(working(&routes), vec!["id".to_string(), "name".to_string()]);
+
+        // Re-subscribe for the same table with a DIFFERENT registered schema
+        // ([id, email]). The stale tracker (which had adopted `name`) must be
+        // discarded and rebuilt from the new registration, so the first Relation
+        // is a fresh baseline that yields exactly the new schema — not the old
+        // widened [id, name] or a mash-up.
+        register(Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("email", DataType::Utf8, true),
+        ])));
+        handle_relation(
+            &source,
+            &mut decoder,
+            &mut routes,
+            &mut schema_state,
+            rel(vec![id_col(), text_col("email")]),
+        )
+        .await;
+        assert_eq!(
+            working(&routes),
+            vec!["id".to_string(), "email".to_string()],
+            "re-subscribe with a new schema rebuilds the tracker; the stale `name` adoption is dropped"
+        );
     }
 
     /// Item 1: one boundary flush publishes every field to every member.
@@ -2126,6 +2672,8 @@ mod tests {
         let committer = SharedLsnCommitter {
             slot: ack.slot(&key("a")).expect("slot registered"),
             flush_to: 42,
+            dataset: "test".to_string(),
+            source_commit_ts_ms: None,
         };
         assert!(committer.supports_deferral());
         committer.commit().await.expect("commit");

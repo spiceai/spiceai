@@ -53,6 +53,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+mod connection;
 mod replication;
 
 #[derive(Debug, Snafu)]
@@ -97,9 +98,12 @@ const POSTGRES_DOCS: &str = "https://spiceai.org/docs/components/data-connectors
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("connection_string")
         .description(
-            "Full libpq-style connection string. Overrides other connection params if set.",
+            "Full libpq-style connection string (key=value or postgres:// URI). Overrides other connection params if set.",
         )
-        .examples(&["host=db.example.com port=5432 dbname=app user=ro sslmode=require"])
+        .examples(&[
+            "host=db.example.com port=5432 dbname=app user=ro sslmode=require",
+            "postgresql://ro@db.example.com:5432/app?sslmode=require",
+        ])
         .help_link(POSTGRES_DOCS)
         .secret(),
     ParameterSpec::component("user")
@@ -157,6 +161,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     // --- Logical replication (WAL streaming) ---
     ParameterSpec::component("replication_slot").description(
         "Name of the Postgres replication slot to create/reuse for this dataset. \
+         Must match [a-z0-9_]{1,63} (lowercase letters, digits, underscores only) and \
+         must not be the reserved name `pg_conflict_detection`. \
          Defaults to `spice_<dataset>_<dataset-hash>_<instance-hash>`. Datasets on the \
          same connection that name the same slot SHARE it: one replication connection, \
          one publication, with decoded changes routed per table. Each Spice replica \
@@ -170,10 +176,14 @@ const PARAMETERS: &[ParameterSpec] = &[
     ),
     ParameterSpec::component("replication_initial_snapshot")
         .description(
-            "Whether to take an initial snapshot of the table's existing rows on first \
-             connection, before streaming WAL changes. Default: true.",
+            "When `refresh_mode: changes` first loads the table's existing rows: 'auto' \
+             (default) snapshots a freshly-created replication slot and resumes an existing one \
+             without a snapshot (a non-persistent accelerator still re-snapshots on every start); \
+             'disabled' streams WAL changes only; 'always' snapshots on every start, including \
+             slot resume. The legacy booleans 'true'/'false' map to 'auto'/'disabled'. \
+             Default: auto.",
         )
-        .default("true"),
+        .default("auto"),
     ParameterSpec::component("replication_temporary_slot")
         .description(
             "If true, create a temporary replication slot that is dropped when the \
@@ -186,6 +196,14 @@ const PARAMETERS: &[ParameterSpec] = &[
              Default: 10s.",
         )
         .default("10s"),
+    ParameterSpec::component("replication_ready_lag")
+        .description(
+            "For `refresh_mode: changes`, the dataset is marked Ready once its \
+             replication lag (now minus the newest applied commit's source time) \
+             falls below this. It stays not-ready while snapshotting or draining a \
+             backlog on resume, so it never serves stale data. Default: 2s.",
+        )
+        .default("2s"),
     ParameterSpec::component("replication_bootstrap_batch_size")
         .description(
             "Rows per emitted batch during the initial replication snapshot. \
@@ -1660,3 +1678,13 @@ mod inferred_schema_tests {
         assert_eq!(unknown.normalize(Some(10_000)).distinct_count, None);
     }
 }
+
+// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_postgres as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+runtime::register_data_connector!(
+    register_postgres_connector,
+    POSTGRES_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    PostgresFactory
+);

@@ -27,12 +27,24 @@ limitations under the License.
 //! bare Arrow schema JSON object; the replication layer treats those as
 //! unknown layout and refuses unsafe resume.
 //!
+//! `gtid_executed` holds the source's executed GTID set for failover-safe
+//! resume (`COM_BINLOG_DUMP_GTID`); it is `NULL` for file+offset positioning.
+//! `cursor_type` (`file`|`gtid`) records the checkpoint's positioning type
+//! explicitly, so resume never has to *infer* it from whether `gtid_executed`
+//! is set — an empty GTID set (`gtid_mode = ON`, zero transactions yet) must
+//! still reload as `gtid`, and an engine that maps an empty string to `NULL`
+//! must not silently reclassify it as `file`. Both columns were added after the
+//! initial schema, so each is created lazily via `ALTER TABLE ... ADD COLUMN`
+//! on tables that predate it.
+//!
 //! ```sql
 //! CREATE TABLE spice_sys_mysql_binlog (
 //!     dataset_name TEXT PRIMARY KEY,
 //!     binlog_file TEXT NOT NULL,
 //!     binlog_pos BIGINT NOT NULL,
 //!     schema_json TEXT,
+//!     gtid_executed TEXT,
+//!     cursor_type TEXT,
 //!     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 //!     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 //! );
@@ -71,6 +83,17 @@ pub struct MySqlBinlogCheckpoint {
     /// Optional serialized Arrow schema snapshot for detecting drift between
     /// runs.
     pub schema_json: Option<String>,
+    /// Optional executed GTID set (`uuid:range` text) for failover-safe resume
+    /// via `COM_BINLOG_DUMP_GTID`. `None` for file+offset positioning; may be an
+    /// empty string when `gtid_mode = ON` but no transactions have committed.
+    pub gtid_executed: Option<String>,
+    /// The checkpoint's positioning type (`file`|`gtid`), stored explicitly so
+    /// resume doesn't need to infer it from `gtid_executed`. `Option` only
+    /// because the column is nullable; this connector always writes it (the
+    /// feature has never shipped, so there are no legacy typeless checkpoints),
+    /// and the sidecar loader defensively resolves any `None` read by inferring
+    /// the type from `gtid_executed`.
+    pub cursor_type: Option<String>,
     /// When the row was last updated. Populated by the database layer on read.
     pub updated_at: Option<std::time::SystemTime>,
 }
@@ -90,6 +113,13 @@ impl MySqlBinlogSys {
         })
     }
 
+    #[cfg_attr(
+        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        expect(
+            clippy::unused_async,
+            reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
+        )
+    )]
     pub async fn get(&self) -> Option<MySqlBinlogCheckpoint> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
@@ -147,6 +177,13 @@ impl MySqlBinlogSys {
         .await
     }
 
+    #[cfg_attr(
+        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        expect(
+            clippy::unused_async,
+            reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
+        )
+    )]
     async fn upsert_once(
         &self,
         #[cfg_attr(
@@ -181,6 +218,13 @@ impl MySqlBinlogSys {
         }
     }
 
+    #[cfg_attr(
+        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        expect(
+            clippy::unused_async,
+            reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
+        )
+    )]
     pub async fn delete(&self) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]

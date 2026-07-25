@@ -291,6 +291,39 @@ impl Runtime {
             .collect()
     }
 
+    /// Resolve the accelerated dataset named `table_ref` and, if a write carrying new
+    /// columns (`target_schema`) arrives, evolve its accelerator schema in place per the
+    /// dataset's `on_schema_change` policy. This is the entrypoint the OpenTelemetry
+    /// metrics ingest path uses to admit new metric dimensions.
+    ///
+    /// Returns `Ok(Some(schema))` when the caller must rebuild its batch against `schema`
+    /// before writing — either because an evolution was just applied, or because the
+    /// accelerator schema is already a superset (e.g. a concurrent writer evolved it, or
+    /// the change was a no-op) and the batch must still match its canonical field order.
+    /// Returns `Ok(None)` when nothing was evolved — unknown dataset, no acceleration, a
+    /// `block`/`fail` policy, or an unsupported/incompatible change. In every `Ok(None)`
+    /// case the caller's write proceeds unchanged.
+    pub async fn evolve_accelerated_schema_for_write(
+        self: &Arc<Self>,
+        table_ref: &TableReference,
+        target_schema: &arrow_schema::SchemaRef,
+    ) -> std::result::Result<Option<arrow_schema::SchemaRef>, crate::datafusion::Error> {
+        let Some(app) = self.read_app().await else {
+            return Ok(None);
+        };
+        let Some(dataset) = Arc::clone(self)
+            .get_valid_datasets(&app, LogErrors(false))
+            .into_iter()
+            .find(|ds| &ds.name == table_ref)
+        else {
+            return Ok(None);
+        };
+
+        self.df
+            .evolve_and_rebind_accelerated_schema(&dataset, self.secrets(), target_schema)
+            .await
+    }
+
     #[expect(clippy::result_large_err)]
     fn datasets_iter(self: Arc<Self>, app: &Arc<App>) -> impl Iterator<Item = Result<Dataset>> {
         app.datasets
@@ -579,6 +612,8 @@ impl Runtime {
     ///
     /// Used for datasets synthesized at runtime (e.g. by catalog-level
     /// acceleration) rather than declared in the Spicepod `datasets:` list.
+    // Only the PostgreSQL catalog connector synthesizes datasets today.
+    #[cfg(feature = "postgres")]
     pub(crate) async fn load_synthesized_dataset(self: Arc<Self>, ds: Arc<Dataset>) {
         // Throttle accelerator init to the same `dataset_load_parallelism` budget
         // `load_dataset` enforces. Catalog-level acceleration spawns one

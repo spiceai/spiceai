@@ -90,6 +90,7 @@ use tower_http::limit::RequestBodyLimitLayer;
         v1::datasets::get,
         v1::datasets::acceleration,
         v1::datasets::refresh,
+        v1::cdc::post,
         v1::catalogs::get,
         v1::ready::get,
         v1::status::get,
@@ -336,6 +337,7 @@ pub(crate) fn routes(
         .route("/v1/catalogs", get(v1::catalogs::get))
         .route("/v1/functions", get(v1::functions::list))
         .route("/v1/datasets", get(v1::datasets::get))
+        .route("/v1/datasets/{name}/cdc", post(v1::cdc::post))
         .route(
             "/v1/datasets/{name}/acceleration/refresh",
             post(v1::datasets::refresh),

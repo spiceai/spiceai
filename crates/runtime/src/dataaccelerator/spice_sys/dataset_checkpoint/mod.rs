@@ -150,6 +150,13 @@ impl DatasetCheckpoint {
         Arc::new(self)
     }
 
+    #[cfg_attr(
+        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        expect(
+            clippy::unused_async,
+            reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
+        )
+    )]
     async fn init(connection: &AccelerationConnection) -> Result<()> {
         // First create the initial table
         #[cfg(any(
@@ -232,6 +239,13 @@ impl DatasetCheckpoint {
         Ok(std::sync::Arc::new(schema))
     }
 
+    #[cfg_attr(
+        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        expect(
+            clippy::unused_async,
+            reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
+        )
+    )]
     pub async fn exists(&self) -> bool {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
@@ -262,6 +276,13 @@ impl DatasetCheckpoint {
         }
     }
 
+    #[cfg_attr(
+        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        expect(
+            clippy::unused_async,
+            reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
+        )
+    )]
     pub async fn last_checkpoint_time(&self) -> Result<Option<SystemTime>> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
@@ -295,6 +316,13 @@ impl DatasetCheckpoint {
         )),
         expect(unused_variables)
     )]
+    #[cfg_attr(
+        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        expect(
+            clippy::unused_async,
+            reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
+        )
+    )]
     pub async fn checkpoint(&self, schema: &SchemaRef, refresh_sql: Option<&str>) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
@@ -327,6 +355,13 @@ impl DatasetCheckpoint {
         }
     }
 
+    #[cfg_attr(
+        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        expect(
+            clippy::unused_async,
+            reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
+        )
+    )]
     pub async fn get_schema(&self) -> Result<Option<SchemaRef>> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
@@ -349,6 +384,13 @@ impl DatasetCheckpoint {
         }
     }
 
+    #[cfg_attr(
+        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        expect(
+            clippy::unused_async,
+            reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
+        )
+    )]
     pub async fn get_refresh_sql(&self) -> Result<Option<String>> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
@@ -372,6 +414,13 @@ impl DatasetCheckpoint {
     }
 
     /// Deletes the checkpoint for this dataset so the next refresh treats it as a fresh table.
+    #[cfg_attr(
+        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        expect(
+            clippy::unused_async,
+            reason = "async only when an async accelerator backend is compiled in; DuckDB helpers are synchronous"
+        )
+    )]
     pub async fn delete(&self) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]

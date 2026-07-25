@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
+use data_components::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
 use data_components::inferred_schema::InferredSchema;
 use data_components::mysql_replication::{ReplicationMetrics, ReplicationMetricsCollector};
 use datafusion::datasource::TableProvider;
@@ -155,14 +156,15 @@ const PARAMETERS: &[ParameterSpec] = &[
              the dataset name and process.",
         )
         .help_link(MYSQL_DOCS),
-    ParameterSpec::component("replication_snapshot_mode")
+    ParameterSpec::component("replication_initial_snapshot")
         .description(
             "When `refresh_mode: changes` loads the table's existing rows: 'auto' (default) \
-             snapshots when no resumable binlog position exists; 'never' streams changes only; \
-             'always' re-snapshots on every start.",
+             snapshots when no resumable binlog position exists and resumes without a snapshot \
+             when one does; 'disabled' streams changes only; 'always' re-snapshots on every \
+             start, discarding any persisted position. Default: auto.",
         )
         .default("auto")
-        .one_of_ignore_ascii_case(&["auto", "never", "always"])
+        .one_of_ignore_ascii_case(InitialSnapshotMode::VALUES)
         .help_link(MYSQL_DOCS),
     ParameterSpec::component("replication_checkpoint_interval")
         .description(
@@ -179,14 +181,23 @@ const PARAMETERS: &[ParameterSpec] = &[
         )
         .default("8192")
         .help_link(MYSQL_DOCS),
-    ParameterSpec::component("replication_invalid_position_behavior")
+    ParameterSpec::component("replication_invalid_checkpoint_behavior")
         .description(
             "What to do when the persisted binlog position was purged from the source: 'error' \
-             (default) surfaces an actionable error; 'rebootstrap' drops the saved position and \
-             re-snapshots the table.",
+             (default) surfaces an actionable error; 'restart' drops the saved position and \
+             re-snapshots the table. Default: error.",
         )
         .default("error")
-        .one_of_ignore_ascii_case(&["error", "rebootstrap"])
+        .one_of_ignore_ascii_case(InvalidCheckpointBehavior::VALUES)
+        .help_link(MYSQL_DOCS),
+    ParameterSpec::component("replication_ready_lag")
+        .description(
+            "For `refresh_mode: changes`, the dataset is marked Ready once its replication lag \
+             (now minus the newest applied commit's binlog-header timestamp) falls below this. It \
+             stays not-ready while snapshotting or draining a backlog on resume, so it never serves \
+             stale data. Default: 2s.",
+        )
+        .default("2s")
         .help_link(MYSQL_DOCS),
 ];
 
@@ -849,3 +860,13 @@ pub const CONNECTOR_NAME: &str = "mysql";
 pub fn factory() -> Arc<dyn DataConnectorFactory> {
     MySQLFactory::new_arc()
 }
+
+// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_mysql as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+runtime::register_data_connector!(
+    register_mysql_connector,
+    MYSQL_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    MySQLFactory
+);
