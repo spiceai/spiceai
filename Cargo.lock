@@ -4395,20 +4395,26 @@ dependencies = [
 name = "connector-git"
 version = "2.2.0-unstable"
 dependencies = [
+ "arrow",
  "async-trait",
+ "dashmap",
  "data_components",
  "datafusion",
+ "git2",
  "globset",
  "linkme",
  "opentelemetry",
+ "regex",
  "reqwest 0.13.4",
  "runtime",
  "runtime-api-types",
  "runtime-metrics",
  "secrecy",
  "snafu",
+ "tempfile",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -4489,11 +4495,14 @@ dependencies = [
 name = "connector-imap"
 version = "2.2.0-unstable"
 dependencies = [
+ "arrow",
  "async-trait",
+ "charset",
  "data_components",
  "datafusion",
  "imap",
  "linkme",
+ "mailparse",
  "paste",
  "regex",
  "runtime",
@@ -4608,15 +4617,26 @@ dependencies = [
 name = "connector-odbc"
 version = "2.2.0-unstable"
 dependencies = [
+ "arrow",
+ "arrow-odbc",
+ "async-stream",
  "async-trait",
  "data_components",
  "datafusion",
- "db_connection_pool",
+ "datafusion-table-providers",
+ "dyn-clone",
+ "futures",
  "linkme",
+ "odbc-api",
  "paste",
  "runtime",
+ "secrecy",
+ "sha2 0.10.9",
  "snafu",
+ "tokio",
+ "tokio-util",
  "tracing",
+ "util",
 ]
 
 [[package]]
@@ -4672,10 +4692,13 @@ dependencies = [
 name = "connector-scylladb"
 version = "2.2.0-unstable"
 dependencies = [
+ "arrow",
+ "async-stream",
  "async-trait",
  "data_components",
  "datafusion",
- "db_connection_pool",
+ "datafusion-table-providers",
+ "futures",
  "linkme",
  "ns_lookup",
  "paste",
@@ -5805,7 +5828,6 @@ dependencies = [
  "bigdecimal",
  "brotli",
  "bytes",
- "charset",
  "chrono",
  "connector-postgres-common",
  "criterion 0.7.0",
@@ -5824,7 +5846,6 @@ dependencies = [
  "flate2",
  "flight_client",
  "futures",
- "git2",
  "globset",
  "hash-index",
  "http 1.4.1",
@@ -5834,11 +5855,9 @@ dependencies = [
  "iceberg-datafusion",
  "iceberg-storage-opendal",
  "iceberg_test_utils",
- "imap",
  "indexmap 2.14.0",
  "insta",
  "logos",
- "mailparse",
  "mysql_async",
  "native-tls",
  "num_cpus",
@@ -5861,7 +5880,6 @@ dependencies = [
  "rustc-hash 2.1.2",
  "s3_vectors",
  "s3_vectors_metadata_filter",
- "scylla",
  "secrecy",
  "serde",
  "serde_json",
@@ -6803,19 +6821,14 @@ name = "db_connection_pool"
 version = "2.2.0-unstable"
 dependencies = [
  "arrow",
- "arrow-odbc",
  "async-stream",
  "async-trait",
  "datafusion",
  "datafusion-table-providers",
- "dyn-clone",
  "futures",
- "odbc-api",
  "pkcs8",
- "scylla",
  "secrecy",
  "serde_json",
- "sha2 0.10.9",
  "snafu",
  "snowflake-api",
  "tokio",
@@ -16590,7 +16603,6 @@ dependencies = [
  "scheduler",
  "schemars 1.2.1",
  "scopeguard",
- "scylla",
  "search",
  "secrecy",
  "serde",

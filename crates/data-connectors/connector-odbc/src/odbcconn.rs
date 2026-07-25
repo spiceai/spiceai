@@ -491,7 +491,6 @@ mod tests {
     // This test crudely validates that parameters are being received by the ODBC driver.
     // Requires SQLite ODBC driver to be installed: `apt install libsqliteodbc` or equivalent.
     #[ignore = "Requires SQLite ODBC driver"]
-    #[cfg(feature = "odbc")]
     #[tokio::test]
     async fn test_bind_parameters() -> Result<()> {
         // It is possible to connect to the SQLite driver without an underlying file
