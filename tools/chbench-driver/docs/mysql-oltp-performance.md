@@ -1,6 +1,6 @@
 # MySQL OLTP Generator Performance
 
-**Status:** implemented on `sgrebnov/0725-mysql-oltp-tpmc`; local results below, CI (HTAP dispatch) validation pending
+**Status:** implemented on `sgrebnov/0725-mysql-oltp-tpmc`; validated locally and in a full CI HTAP run (see results)
 **Scope:** `tools/chbench-driver` (MySQL path only)
 **Goal:** raise the tpmC the OLTP generator can push into a MySQL source, so the HTAP benchmark's CDC input rate is limited by the server — not the driver. The Postgres path already generates enough.
 
@@ -48,8 +48,29 @@ Knobs: `CHBENCH_WAREHOUSES`, `CHBENCH_TERMINALS`, `CHBENCH_RATE`,
 | `_bench_ts`: 16 `BEFORE INSERT/UPDATE` triggers replaced with native `DEFAULT / ON UPDATE CURRENT_TIMESTAMP(3)` (`src/schema_mysql.rs`, `src/lib.rs`); `verify_prepared` reconciles trigger-era templates | — | neutral locally; removes per-row trigger dispatch server-side |
 | `mysql_async` `stmt_cache_size` 32 → 256 (`src/config.rs`) — workload has 40+ distinct statements/connection | — | neutral locally; removes re-`PREPARE`s, matters more at higher RTT |
 
-**Headline (same-sitting, fresh-seed, SF10 / 100 terminals / 30s, Docker on macOS):
-79.3k → 131.2k tpmC (+65%), zero aborts.**
+**Local headline (same-sitting, fresh-seed, SF10 / 100 terminals / 30s, Docker
+on macOS): 79.3k → 131.2k tpmC (+65%), zero aborts.**
+
+## CI result (full HTAP run, all improvements)
+
+[Run 30170010535](https://github.com/spiceai/spiceai/actions/runs/30170010535/job/89709796991)
+— `htap benchmark tests`, spicepod `accelerated/mysql-cayenne[file]-adaptive.yaml`,
+in-cluster MySQL pod, **SF1000, 100 terminals, unlimited rate, 600s**, with
+spiced consuming the binlog (real CDC load) concurrently:
+
+```
+OLTP Report (603.6s)
+  tpmC (NewOrder/min): 237,903
+  transactions: 5,323,717 committed, 0 aborted (0.00% abort rate)
+```
+
+~8.8k txn/s sustained for 10 minutes at zero aborts — comfortably above the
+249,750-tpmC-equivalent rate cap (9,250 txn/s) the SF1 scheduled dispatch asks
+for, and roughly 1.8x the local Docker-on-macOS ceiling, consistent with the
+round-trip analysis (the in-cluster pod's lower RTT amplifies the batching
+win). The template was a cache miss, so the source was seeded fresh at SF1000
+by this same branch's loader. No same-environment trunk baseline exists for
+this pod yet; the per-improvement attribution ladder below will produce one.
 
 ## Invariants preserved
 
@@ -84,12 +105,33 @@ carry **no** default and no `ON UPDATE`. If that lands, its reconcile step
 must additionally strip `ON UPDATE` from templates created by this build
 (one `ALTER … MODIFY` alongside its existing trigger cleanup).
 
-## Next steps
+## Planned experiments
 
-- Validate on CI via the HTAP dispatch with a `mysql*` spicepod and empty
-  `rate` (unlimited); driver builds from the branch, spiced from trunk.
-- Watch `reconcile_bench_ts` on the template-restore (`--skip-prepare`) path —
-  first exercise outside local runs.
+**1. `_bench_ts` index on `order_line`.** `SELECT MAX(_bench_ts)` on
+`order_line` is a full clustered scan (~2 min at SF1000 in CI), throttling the
+staleness probe; an index fixes the read but adds secondary-index maintenance
+to the hottest write table (monotonic inserts hit the rightmost page; delivery
+re-stamps move entries). Plan: env-gate the index behind
+`CHBENCH_EXPERIMENT_BENCH_TS_INDEX=1` in **two** sites — `create_indexes`
+(fresh-seed path) *and* `verify_prepared` (checked via
+`information_schema.STATISTICS`; required because the template restore is a
+cold data-dir copy that wipes indexes, and `--skip-prepare` never runs
+`create_indexes`). The shared template stays pristine — the index is built
+per run, before terminals start, with the build duration logged. Compare A/B
+same-runner: tpmC + abort rate (cost) vs probe latency / staleness sample
+count (benefit). Keep the index only if the tpmC cost is ≲3%; note B's
+buffer-pool warmup bias from the build scan when reading results.
+
+**2. Per-improvement tpmC attribution.** A stacked ladder of refs (no runtime
+flags): trunk+test → +stmt cache → +new_order batching → +payment merging →
++ON UPDATE (= this branch). Run all five sequentially in one job on the same
+runner (driver-only: container + benchmark test, ~10 min/ref), 3 repeats,
+medians; full HTAP runs only for the two endpoints. Statement-cache first
+(interacts with statement shapes), trigger replacement last (most
+CPU-environment-sensitive).
+
+## Follow-ups
+
 - `.github/actions/setup-chbench-mysql`: `--log-bin-trust-function-creators`
   is no longer needed once this lands (harmless meanwhile).
 - Optional: a Postgres twin of the benchmark test for same-host comparisons.
