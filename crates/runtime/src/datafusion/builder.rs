@@ -2009,26 +2009,31 @@ mod tests {
             );
 
             // A moderate query pool at the default 70% partition stays at/under the
-            // BASE ceiling (the float only helps when the pool is sized down).
+            // BASE ceiling (the float only helps when the pool is sized down) and
+            // at/above the floor (remainder still allows the lower clamp).
             let pre_carve = total.saturating_mul(CAYENNE_QUERY_MEMORY_PERCENT) / 100;
             let moderate = coordinated_mem_tier_budget(total, pre_carve, 0);
             assert!(
                 moderate <= base_ceiling,
                 "the default partition does not float above the base ceiling"
             );
+            assert!(
+                moderate >= floor,
+                "when remainder allows, the tier budget stays at/above the floor"
+            );
 
             // A greedy pool that consumes all of host → tier yields to the
             // remainder (honest, no forced overcommit). Remainder is 0 after
             // headroom, but we still install a 1-byte always-refuse gate so the
-            // global cap is never disabled (try_reserve fails → spill).
+            // global cap is never disabled (try_reserve fails → spill). The
+            // meaningful claim here is the refuse-all gate, not "no host
+            // overcommit" via the floor — the pool already consumes `total`.
             let small = coordinated_mem_tier_budget(total, total, 0);
             assert_eq!(
                 small, 1,
-                "a greedy pool installs a 1-byte refuse-all gate (no host overcommit)"
+                "a greedy pool installs a 1-byte refuse-all gate rather than the host/32 floor"
             );
             assert!(small > 0, "the global aggregate cap must never be disabled");
-            // Floor is still the steady-state lower clamp when remainder allows.
-            let _ = floor;
         }
     }
 

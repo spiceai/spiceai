@@ -25,12 +25,13 @@ limitations under the License.
 //! a [`CompactionCandidate`] when the smallest non-empty tier has enough files
 //! whose combined size is worth a rewrite. The warm-tier runner (in
 //! [`crate::provider::table`]) rewrites **only** `candidate.paths` for
-//! key-delete / append-only tables, hardlinking unpicked settled files into the
-//! new snapshot (warm subset compaction). Position-delete tables and tables with
-//! configured `sort_columns` still full-rewrite the current snapshot. The
-//! rewrite goes through `write_to_snapshot`, which honors `target_partitions`
-//! and the configured target file size, so a pass typically produces one or a
-//! small number of consolidated Vortex files for the picked tier.
+//! key-delete / append-only tables, and carries unpicked settled files into the
+//! new snapshot via hardlink (local FS) or copy (S3 / cross-device) — warm subset
+//! compaction. Position-delete tables and tables with configured `sort_columns`
+//! still full-rewrite the current snapshot. The rewrite goes through
+//! `write_to_snapshot`, which honors `target_partitions` and the configured
+//! target file size, so a pass typically produces one or a small number of
+//! consolidated Vortex files for the picked tier.
 //!
 //! The module also owns [`BackgroundCompactor`], a per-table tokio task that
 //! periodically invokes the runner. The task is `Semaphore`-gated so a fleet of
