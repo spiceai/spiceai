@@ -133,6 +133,50 @@ same-runner: tpmC + abort rate (cost) vs probe latency / staleness sample
 count (benefit). Keep the index only if the tpmC cost is ≲3%; note B's
 buffer-pool warmup bias from the build scan when reading results.
 
+**Result (2026-07-25): the index costs 7.7% tpmC — do not adopt permanently.**
+Same node, same day, both arms freshly seeded at SF1000, 100 terminals,
+unlimited rate, 600s, serialized:
+
+| | A — no index ([30170010535](https://github.com/spiceai/spiceai/actions/runs/30170010535)) | B — index ([30174992679](https://github.com/spiceai/spiceai/actions/runs/30174992679)) |
+|---|---|---|
+| tpmC | 237,903 | **219,649 (−7.7%)** |
+| txn/s | 8,819 | 8,144 |
+| aborts | 0 | 0 |
+
+The cost mechanism matches the prediction: mysqld ran at 77–81% of its cpuset
+during OLTP, so the index maintenance (rightmost-page appends per `order_line`
+insert; entry delete+insert per delivery re-stamp) directly displaced
+transaction work on a CPU-saturated server. The gate stays in the tree as a
+measurement tool; the `_bench_ts` watermark design remains the proper fix for
+probe freshness (same benefit, ~zero write cost).
+
+## Pod profiling findings (run 30174992679, OLTP window)
+
+Captured with `scripts/profile-mysql-pod.sh` (10s ticks, 55 OLTP ticks).
+Node `spice-dev-large-1`, 64 physical cores: spiced pinned to 32
+(`0-31,64-95`), testoperator 8 (`32-39,96-103`), mysqld 24
+(`MYSQLD_CPUSET=40-63,104-127`).
+
+| Signal | Reading | Verdict |
+|---|---|---|
+| mysqld CPU | avg 77%, peak 81% of its 48 threads | effectively CPU-saturated — CPU allocation is a live lever |
+| testoperator group | avg 30%, peak 36% of 16 threads | can donate 2 physical cores safely; 4 is borderline |
+| spiced group | avg 85% of 64 threads | hottest component on the node; MySQL gains will push spiced toward its own ceiling |
+| purge history list | peaked at 1.18M undo records | **purge is drowning** at ~138k rows/s — strongest new signal; raise `innodb_purge_threads` 4→8 |
+| bp wait-free / redo log waits | 0 / 0; checkpoint age rode 12.8 GB of 16 GB | no foreground flush stalls — `io_capacity=200` is hygiene, not the first move (idle/seed phases did show heavy checkpoint debt) |
+| row-lock waits | ~34k waits, ~3,900s total (~7 of 100 terminals blocked at any instant) | real but secondary |
+| binlog cache spills | 0.45% of transactions | bump `binlog_cache_size` to 1M; sub-1% effect |
+
+**Next server-side batch (flags reversible, one A/B vs 237.9k):**
+`innodb_purge_threads=8`; `MYSQLD_CPUSET` +2 cores from testoperator
+(testoperator `32-37,96-101`, mysql `38-63,102-127` — coordinated with the
+workflow's `TESTOP_PREFIX`); `innodb_adaptive_hash_index=OFF`;
+`performance_schema=OFF`; `innodb_io_capacity=10000` /
+`io_capacity_max=20000` / `page_cleaners=16`; `binlog_cache_size=1M`.
+Rejected for now: MySQL 9.x (no OLTP gain expected, `mysql_native_password`
+removed, innovation-track churn); 8.4 LTS later — its modernized InnoDB
+defaults are effectively this flag batch, so the batch de-risks the upgrade.
+
 **2. Per-improvement tpmC attribution.** A stacked ladder of refs (no runtime
 flags): trunk+test → +stmt cache → +new_order batching → +payment merging →
 +ON UPDATE (= this branch). Run all five sequentially in one job on the same
