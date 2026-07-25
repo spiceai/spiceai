@@ -22,7 +22,7 @@ use datafusion::{
     catalog::{Session, TableProvider},
     datasource::TableType,
     error::Result as DataFusionResult,
-    logical_expr::Expr,
+    logical_expr::{Expr, TableProviderFilterPushDown},
     physical_plan::ExecutionPlan,
 };
 use mailparse::{ParsedMail, dateparse, parse_mail};
@@ -32,8 +32,28 @@ use data_components::arrow::write::MemTable;
 
 use super::{
     EmailMessage, Error, FailedToLogoutSnafu, FailedToParseHeaderSnafu, FetchMessagesSnafu,
-    GetMailboxStatusSnafu, ImapTableProvider,
+    GetMailboxStatusSnafu, ImapTableProvider, SearchMessagesSnafu, search,
 };
+
+/// Longest identifier set to send in a single fetch.
+///
+/// A match set that alternates rather than running contiguously can compact into
+/// an identifier set past a server's command-line limit. Fetching the whole
+/// mailbox instead is slower but always valid, and the filters are re-applied
+/// above the scan either way.
+const MAX_ID_SET_LEN: usize = 8 * 1024;
+
+/// The message attributes every scan needs: the envelope for the header columns,
+/// and the raw body when `content` is part of the table.
+const FETCH_QUERY: &str = "(ENVELOPE BODY.PEEK[HEADER] BODY.PEEK[])";
+
+/// Which messages a scan asks the server for.
+enum FetchSet {
+    /// UIDs, used whenever a subset was resolved by `UID SEARCH`.
+    Uid(String),
+    /// Sequence numbers, used for the unnarrowed `1:N` fetch of the mailbox.
+    Sequence(String),
+}
 
 fn decode(value: &[u8]) -> String {
     match String::from_utf8(value.to_vec()) {
@@ -183,6 +203,27 @@ impl TableProvider for ImapTableProvider {
         TableType::Base
     }
 
+    /// Report the filters the mailbox can narrow with `SEARCH`.
+    ///
+    /// Always `Inexact`: `SEARCH` matches on the calendar day of the `Date:`
+    /// header, so the server returns a superset of the rows the filter keeps and
+    /// `DataFusion` has to apply it exactly on top.
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        Ok(filters
+            .iter()
+            .map(|filter| {
+                if search::search_criteria([*filter]).is_some() {
+                    TableProviderFilterPushDown::Inexact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
+    }
+
     async fn scan(
         &self,
         state: &dyn Session,
@@ -192,60 +233,97 @@ impl TableProvider for ImapTableProvider {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let mut session = self.session.connect()?;
 
-        let status = session
-            .status(self.session.mailbox(), "(MESSAGES)")
-            .context(GetMailboxStatusSnafu)?;
-        let message_count = if let Some(limit) = limit {
-            limit.min(status.exists as usize)
+        // Let the server pick the candidate messages where the filters allow it,
+        // so refresh cost tracks new mail rather than mailbox size (#11548).
+        //
+        // The narrowed path addresses messages by UID: a concurrent `EXPUNGE`
+        // renumbers sequence numbers, so a set resolved by `SEARCH` could name
+        // different messages by the time the fetch runs. UIDs never change.
+        let fetch = if let Some(criteria) = search::search_criteria(filters) {
+            // `limit` is deliberately ignored here. Reporting the filters as
+            // `Inexact` leaves a filter above this scan, so some of the messages
+            // fetched will be discarded — capping the fetch at `limit` could then
+            // yield fewer rows than the query asked for while matching messages
+            // were left in the mailbox. Returning more rows than `limit` is
+            // always allowed; returning fewer than are available is not.
+            let mut uids: Vec<u32> = session
+                .uid_search(&criteria)
+                .context(SearchMessagesSnafu { criteria })?
+                .into_iter()
+                .collect();
+            uids.sort_unstable();
+
+            search::id_set(&uids)
+                .map(|set| {
+                    if set.len() > MAX_ID_SET_LEN {
+                        search::ALL_MESSAGES.to_string()
+                    } else {
+                        set
+                    }
+                })
+                .map(FetchSet::Uid)
         } else {
-            status.exists as usize
-        };
-
-        let fetch_messages = session
-            .fetch(
-                format!("1:{message_count}"),
-                "(ENVELOPE BODY.PEEK[HEADER] BODY.PEEK[])",
-            )
-            .context(FetchMessagesSnafu)?;
-        let mut messages = vec![];
-
-        for i in 0..fetch_messages.len() {
-            let message = fetch_messages.get(i).ok_or(Error::MessageNotFound {})?;
-            let envelope = message.envelope().ok_or(Error::EnvelopeNotFound {
-                segment: "envelope".to_string(),
-            })?;
-            let subject = envelope.subject.as_ref().map(|v| decode(v));
-            let date = parse_date_millis(&decode(envelope.date.as_ref().ok_or(
-                Error::EnvelopeNotFound {
-                    segment: "date".to_string(),
-                },
-            )?))
-            .context(FailedToParseHeaderSnafu)?;
-            let message_id = envelope.message_id.as_ref().map(|v| decode(v));
-            let in_reply_to = envelope.in_reply_to.as_ref().map(|v| decode(v));
-            let message_froms = parse_addreses_from_envelope!(envelope, from);
-            let message_tos = parse_addreses_from_envelope!(envelope, to);
-            let message_ccs = parse_addreses_from_envelope!(envelope, cc);
-            let message_blind_ccs = parse_addreses_from_envelope!(envelope, bcc);
-            let message_reply_tos = parse_addreses_from_envelope!(envelope, reply_to);
-            let body = if self.fetch_content {
-                message.body().as_ref().map(|v| extract_text_body(v))
+            let status = session
+                .status(self.session.mailbox(), "(MESSAGES)")
+                .context(GetMailboxStatusSnafu)?;
+            let message_count = if let Some(limit) = limit {
+                limit.min(status.exists as usize)
             } else {
-                None
+                status.exists as usize
             };
 
-            messages.push(EmailMessage {
-                date,
-                subject,
-                from: message_froms,
-                to: message_tos,
-                cc: message_ccs,
-                bcc: message_blind_ccs,
-                reply_to: message_reply_tos,
-                message_id,
-                in_reply_to,
-                body,
-            });
+            (message_count > 0).then(|| FetchSet::Sequence(format!("1:{message_count}")))
+        };
+
+        let mut messages = vec![];
+
+        // An empty mailbox, or no message matching the filters, means there is
+        // nothing to ask for — and `1:0` is not a valid identifier set.
+        if let Some(fetch) = fetch {
+            let fetch_messages = match fetch {
+                FetchSet::Uid(uids) => session.uid_fetch(uids, FETCH_QUERY),
+                FetchSet::Sequence(sequence_set) => session.fetch(sequence_set, FETCH_QUERY),
+            }
+            .context(FetchMessagesSnafu)?;
+
+            for i in 0..fetch_messages.len() {
+                let message = fetch_messages.get(i).ok_or(Error::MessageNotFound {})?;
+                let envelope = message.envelope().ok_or(Error::EnvelopeNotFound {
+                    segment: "envelope".to_string(),
+                })?;
+                let subject = envelope.subject.as_ref().map(|v| decode(v));
+                let date = parse_date_millis(&decode(envelope.date.as_ref().ok_or(
+                    Error::EnvelopeNotFound {
+                        segment: "date".to_string(),
+                    },
+                )?))
+                .context(FailedToParseHeaderSnafu)?;
+                let message_id = envelope.message_id.as_ref().map(|v| decode(v));
+                let in_reply_to = envelope.in_reply_to.as_ref().map(|v| decode(v));
+                let message_froms = parse_addreses_from_envelope!(envelope, from);
+                let message_tos = parse_addreses_from_envelope!(envelope, to);
+                let message_ccs = parse_addreses_from_envelope!(envelope, cc);
+                let message_blind_ccs = parse_addreses_from_envelope!(envelope, bcc);
+                let message_reply_tos = parse_addreses_from_envelope!(envelope, reply_to);
+                let body = if self.fetch_content {
+                    message.body().as_ref().map(|v| extract_text_body(v))
+                } else {
+                    None
+                };
+
+                messages.push(EmailMessage {
+                    date,
+                    subject,
+                    from: message_froms,
+                    to: message_tos,
+                    cc: message_ccs,
+                    bcc: message_blind_ccs,
+                    reply_to: message_reply_tos,
+                    message_id,
+                    in_reply_to,
+                    body,
+                });
+            }
         }
 
         session.logout().context(FailedToLogoutSnafu)?; // good IMAP etiquette to not leave the session open
