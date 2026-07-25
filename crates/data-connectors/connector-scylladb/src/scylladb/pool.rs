@@ -23,7 +23,7 @@ use datafusion_table_providers::sql::db_connection_pool::{
 use scylla::client::session::Session;
 use snafu::Snafu;
 
-use crate::dbconnection::scylladbconn::ScyllaDbConnection;
+use crate::scylladb::conn::ScyllaDbConnection;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
