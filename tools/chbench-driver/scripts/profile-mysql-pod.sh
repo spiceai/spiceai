@@ -71,7 +71,7 @@ function inlist(n, spec,  i, m, parts, ab) {
   n = substr($1, 4) + 0
   busy = $2 + $3 + $4 + $7 + $8 + $9
   if (inlist(n, "0-31,64-95")) sp += busy
-  else if (inlist(n, "32-39,96-103")) to += busy
+  else if (inlist(n, "32-37,96-101")) to += busy
   else my += busy
 }
 END { print "spiced_grp_ticks=" sp; print "testop_grp_ticks=" to; print "mysql_grp_ticks=" my }
@@ -103,7 +103,7 @@ echo "ts,cpu_cores,cpu_pct_of_cpuset,spiced_grp_cores,spiced_grp_pct,testop_grp_
 
 # Logical-CPU counts of the pinned groups; must track the ranges in IN_POD.
 SPICED_GRP_CPUS=64
-TESTOP_GRP_CPUS=16
+TESTOP_GRP_CPUS=12
 
 prev="" prev_t=0
 start=$(date +%s)
