@@ -678,6 +678,13 @@ mod tests {
         ) -> Option<(Vec<&'a T>, Arc<dyn datafusion::datasource::TableProvider>)> {
             None
         }
+
+        fn not_ready_error(
+            &self,
+            _tbl: &Arc<dyn datafusion::datasource::TableProvider>,
+        ) -> Option<datafusion::error::DataFusionError> {
+            None
+        }
     }
 
     fn fields(names: &[&str]) -> Vec<String> {
