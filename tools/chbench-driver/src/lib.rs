@@ -628,6 +628,10 @@ impl MysqlChBenchDriver {
         // build that stamped _bench_ts with triggers; reconcile it to the
         // native DEFAULT/ON UPDATE column semantics.
         schema_mysql::reconcile_bench_ts(&mut conn).await?;
+        // Experiment gate (no-op unless enabled): must run here as well as in
+        // create_indexes, because a template restore wipes the index and this
+        // path never runs create_indexes.
+        schema_mysql::ensure_bench_ts_index(&mut conn).await?;
         Ok(())
     }
 }

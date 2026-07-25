@@ -354,6 +354,76 @@ pub async fn create_indexes(conn: &mut mysql_async::Conn) -> Result<()> {
             })?;
     }
 
+    ensure_bench_ts_index(conn).await?;
+
+    Ok(())
+}
+
+/// Name of the experimental `_bench_ts` index on `order_line`.
+const BENCH_TS_INDEX: &str = "idx_ol_bench_ts";
+
+/// Experiment (`CHBENCH_EXPERIMENT_BENCH_TS_INDEX=1`): index
+/// `order_line(_bench_ts)` so the staleness probe's `SELECT MAX(_bench_ts)`
+/// becomes a rightmost-leaf read instead of a full clustered scan (~2 minutes
+/// at SF1000). The open question the experiment answers is the write-path
+/// cost: every `order_line` INSERT appends to the index's rightmost page, and
+/// every delivery UPDATE re-stamps `_bench_ts`, moving its entry — measured
+/// as a tpmC delta against a run without the index. No-op unless the
+/// environment variable is set.
+///
+/// Called from two places so both source-preparation paths are covered:
+/// [`create_indexes`] (fresh seed) and `verify_prepared` (`--skip-prepare`).
+/// The latter matters because a template restore is a cold data-dir copy —
+/// any index a previous run built is gone, and `create_indexes` never runs on
+/// that path. Building per run also keeps the shared template pristine. The
+/// build is idempotent (checked via `information_schema.STATISTICS`) and
+/// completes before `run` spawns terminals, so it never overlaps the
+/// measured workload; the logged duration makes a minutes-long build at
+/// large scale factors attributable rather than looking like a hang.
+///
+/// # Errors
+///
+/// Returns an error if the index presence check or the build fails.
+pub async fn ensure_bench_ts_index(conn: &mut mysql_async::Conn) -> Result<()> {
+    if !std::env::var("CHBENCH_EXPERIMENT_BENCH_TS_INDEX").is_ok_and(|v| v == "1") {
+        return Ok(());
+    }
+
+    let present: Option<i64> = conn
+        .exec_first(
+            "SELECT COUNT(*) FROM information_schema.STATISTICS \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'order_line' \
+               AND INDEX_NAME = ?",
+            (BENCH_TS_INDEX,),
+        )
+        .await
+        .map_err(|source| crate::Error::MySql {
+            action: format!("check for index {BENCH_TS_INDEX}"),
+            source,
+        })?;
+    if present.unwrap_or(0) > 0 {
+        println!("  experiment: {BENCH_TS_INDEX} already present");
+        return Ok(());
+    }
+
+    println!(
+        "  experiment: building {BENCH_TS_INDEX} on order_line (_bench_ts) — \
+         a full index build, takes minutes at large scale factors"
+    );
+    let started = std::time::Instant::now();
+    conn.query_drop(format!(
+        "CREATE INDEX {BENCH_TS_INDEX} ON order_line (_bench_ts)"
+    ))
+    .await
+    .map_err(|source| crate::Error::MySql {
+        action: format!("create index {BENCH_TS_INDEX}"),
+        source,
+    })?;
+    println!(
+        "  experiment: {BENCH_TS_INDEX} built in {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
+
     Ok(())
 }
 

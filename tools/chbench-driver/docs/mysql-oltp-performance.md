@@ -121,13 +121,14 @@ must additionally strip `ON UPDATE` from templates created by this build
 `order_line` is a full clustered scan (~2 min at SF1000 in CI), throttling the
 staleness probe; an index fixes the read but adds secondary-index maintenance
 to the hottest write table (monotonic inserts hit the rightmost page; delivery
-re-stamps move entries). Plan: env-gate the index behind
-`CHBENCH_EXPERIMENT_BENCH_TS_INDEX=1` in **two** sites — `create_indexes`
-(fresh-seed path) *and* `verify_prepared` (checked via
-`information_schema.STATISTICS`; required because the template restore is a
-cold data-dir copy that wipes indexes, and `--skip-prepare` never runs
-`create_indexes`). The shared template stays pristine — the index is built
-per run, before terminals start, with the build duration logged. Compare A/B
+re-stamps move entries). **Implemented**: `CHBENCH_EXPERIMENT_BENCH_TS_INDEX=1`
+gates `idx_ol_bench_ts` in **two** sites — `create_indexes` (fresh-seed path)
+*and* `verify_prepared` (checked via `information_schema.STATISTICS`; required
+because the template restore is a cold data-dir copy that wipes indexes, and
+`--skip-prepare` never runs `create_indexes`). The shared template stays
+pristine — the index is built per run, before terminals start, with the build
+duration logged; with it, `EXPLAIN SELECT MAX(_bench_ts) FROM order_line`
+reports `Select tables optimized away`. Compare A/B
 same-runner: tpmC + abort rate (cost) vs probe latency / staleness sample
 count (benefit). Keep the index only if the tpmC cost is ≲3%; note B's
 buffer-pool warmup bias from the build scan when reading results.
