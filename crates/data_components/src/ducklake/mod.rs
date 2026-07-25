@@ -33,6 +33,10 @@ pub struct DuckLakeS3Params {
     pub region: Option<String>,
     pub access_key_id: Option<String>,
     pub secret_access_key: Option<String>,
+    /// Session token accompanying temporary (STS) credentials. `DuckDB` rejects
+    /// temporary `ASIA…` keys without it, because `SigV4` only validates when the
+    /// token is sent alongside the key and secret.
+    pub session_token: Option<String>,
     pub endpoint: Option<String>,
     pub allow_http: bool,
 }
@@ -51,10 +55,26 @@ pub fn configure_duckdb_httpfs(
     conn.execute("INSTALL httpfs", [])?;
     conn.execute("LOAD httpfs", [])?;
 
+    if let Some(secret_sql) = build_ducklake_s3_secret_sql(s3) {
+        conn.execute(&secret_sql, [])?;
+    }
+
+    Ok(())
+}
+
+/// Builds the `CREATE SECRET` statement configuring `DuckDB`'s `httpfs` extension for
+/// S3 access, or `None` when no explicit S3 parameters are set (`DuckDB` then resolves
+/// credentials through its own `credential_chain` provider).
+///
+/// Values are escaped for single-quoted literals. `SESSION_TOKEN` is emitted whenever a
+/// session token is configured, which is what makes temporary (STS) `ASIA…` credentials
+/// usable; long-lived `AKIA…` credentials carry no token and are unaffected.
+#[must_use]
+pub fn build_ducklake_s3_secret_sql(s3: &DuckLakeS3Params) -> Option<String> {
     let has_explicit_creds =
         s3.access_key_id.is_some() || s3.endpoint.is_some() || s3.region.is_some();
     if !has_explicit_creds {
-        return Ok(());
+        return None;
     }
 
     let region = s3.region.as_deref().unwrap_or("us-east-1");
@@ -76,7 +96,18 @@ pub fn configure_duckdb_httpfs(
                 "DuckLake: 'aws_access_key_id' provided without 'aws_secret_access_key'. Both must be set for S3 authentication."
             );
         }
+        if let Some(session_token) = &s3.session_token {
+            secret_parts.push(format!(
+                "SESSION_TOKEN '{}'",
+                session_token.replace('\'', "''")
+            ));
+        }
     } else {
+        if s3.session_token.is_some() {
+            tracing::warn!(
+                "DuckLake: 'aws_session_token' provided without 'aws_access_key_id'. Set all three of 'aws_access_key_id', 'aws_secret_access_key', and 'aws_session_token' to use temporary credentials."
+            );
+        }
         secret_parts.push("PROVIDER credential_chain".to_string());
     }
 
@@ -88,13 +119,10 @@ pub fn configure_duckdb_httpfs(
         secret_parts.push("URL_STYLE 'path'".to_string());
     }
 
-    let secret_sql = format!(
+    Some(format!(
         "CREATE OR REPLACE SECRET __ducklake_s3 ({})",
         secret_parts.join(", ")
-    );
-    conn.execute(&secret_sql, [])?;
-
-    Ok(())
+    ))
 }
 
 /// Builds the `ATTACH` statement used to attach a `DuckLake` catalog in `DuckDB`.
@@ -124,7 +152,84 @@ pub fn build_ducklake_attach_sql(
 
 #[cfg(test)]
 mod tests {
-    use super::build_ducklake_attach_sql;
+    use super::{DuckLakeS3Params, build_ducklake_attach_sql, build_ducklake_s3_secret_sql};
+
+    #[test]
+    fn s3_secret_sql_is_none_without_explicit_parameters() {
+        assert_eq!(
+            build_ducklake_s3_secret_sql(&DuckLakeS3Params::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn s3_secret_sql_includes_session_token_for_temporary_credentials() {
+        let sql = build_ducklake_s3_secret_sql(&DuckLakeS3Params {
+            region: Some("us-east-1".to_string()),
+            access_key_id: Some("ASIAEXAMPLE".to_string()),
+            secret_access_key: Some("secret".to_string()),
+            session_token: Some("FwoSessionToken".to_string()),
+            endpoint: None,
+            allow_http: false,
+        })
+        .expect("explicit credentials should produce a secret");
+
+        assert_eq!(
+            sql,
+            "CREATE OR REPLACE SECRET __ducklake_s3 (TYPE s3, REGION 'us-east-1', USE_SSL true, PROVIDER config, KEY_ID 'ASIAEXAMPLE', SECRET 'secret', SESSION_TOKEN 'FwoSessionToken')"
+        );
+    }
+
+    #[test]
+    fn s3_secret_sql_omits_session_token_when_unset() {
+        let sql = build_ducklake_s3_secret_sql(&DuckLakeS3Params {
+            region: Some("us-east-1".to_string()),
+            access_key_id: Some("AKIAEXAMPLE".to_string()),
+            secret_access_key: Some("secret".to_string()),
+            session_token: None,
+            endpoint: None,
+            allow_http: false,
+        })
+        .expect("explicit credentials should produce a secret");
+
+        assert!(
+            !sql.contains("SESSION_TOKEN"),
+            "long-lived credentials must not carry a session token: {sql}"
+        );
+    }
+
+    #[test]
+    fn s3_secret_sql_escapes_session_token() {
+        let sql = build_ducklake_s3_secret_sql(&DuckLakeS3Params {
+            region: Some("us-east-1".to_string()),
+            access_key_id: Some("ASIAEXAMPLE".to_string()),
+            secret_access_key: Some("secret".to_string()),
+            session_token: Some("tok'en".to_string()),
+            endpoint: None,
+            allow_http: false,
+        })
+        .expect("explicit credentials should produce a secret");
+
+        assert!(
+            sql.contains("SESSION_TOKEN 'tok''en'"),
+            "session token must be escaped for a single-quoted literal: {sql}"
+        );
+    }
+
+    #[test]
+    fn s3_secret_sql_falls_back_to_credential_chain_without_a_key() {
+        let sql = build_ducklake_s3_secret_sql(&DuckLakeS3Params {
+            region: Some("us-east-1".to_string()),
+            session_token: Some("FwoSessionToken".to_string()),
+            ..DuckLakeS3Params::default()
+        })
+        .expect("an explicit region should produce a secret");
+
+        assert!(
+            sql.contains("PROVIDER credential_chain") && !sql.contains("SESSION_TOKEN"),
+            "a session token without a key id must not be sent: {sql}"
+        );
+    }
 
     #[test]
     fn attach_sql_without_migration_is_unchanged() {
