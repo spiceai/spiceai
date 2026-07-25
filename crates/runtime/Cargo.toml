@@ -349,6 +349,7 @@ models = [
 ]
 mongodb = [] # marker: gates the driver-free spice_sys/mongodb resume-token checkpoint; connector lives in connector-mongodb
 mssql = ["dep:tiberius", "data_components/mssql"]
+mssql-kerberos-unix = ["data_components/mssql-kerberos-unix"]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "data_components/mysql"]
 nfs = ["runtime-object-store/nfs"]
 odbc = []
