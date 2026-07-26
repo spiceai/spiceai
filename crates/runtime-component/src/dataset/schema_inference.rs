@@ -299,6 +299,24 @@ fn apply_inferred_sort(
     };
 
     acceleration.params.insert(key.to_string(), value);
+    // Mark the value as inference-derived so Cayenne can rank it correctly.
+    //
+    // This is a GUESS, not a statement of intent: for a `PostgreSQL` CDC table
+    // `inferred.sort_columns` falls back to the primary key when the source
+    // declares no `CLUSTER`/natural order, and primary-key-major order is close
+    // to the worst clustering for the range/date predicates analytical queries
+    // actually use. Cayenne's default-on adaptive layout is supposed to cluster
+    // by the filter columns it observes on scans — but every one of its gates
+    // asks "is `sort_columns` empty?", so writing this param unmarked silently
+    // disabled that feature on every deployment where inference can read the
+    // catalog. Tagging the provenance lets the engine keep this as the
+    // pre-observation fallback while letting measured filters win.
+    if engine == Engine::Cayenne {
+        acceleration.params.insert(
+            "cayenne_sort_columns_origin".to_string(),
+            "inferred".to_string(),
+        );
+    }
     true
 }
 
@@ -913,6 +931,80 @@ mod tests {
         assert_eq!(
             acc.params.get("cayenne_sort_columns").map(String::as_str),
             Some("created_at, id")
+        );
+        // ...and it must be tagged as a guess, not as operator intent — see
+        // `cayenne_inferred_sort_is_tagged_as_inferred`.
+        assert_eq!(
+            acc.params
+                .get("cayenne_sort_columns_origin")
+                .map(String::as_str),
+            Some("inferred")
+        );
+    }
+
+    /// An inference-derived Cayenne sort order must be tagged `inferred`, so the
+    /// engine ranks it BELOW the filter columns observed on scans.
+    ///
+    /// Regression test for the adaptive cold layout being inert on every
+    /// catalog-visible CDC deployment: inference fills `cayenne_sort_columns`
+    /// (with the primary key, for a `PostgreSQL` CDC table) on essentially every
+    /// such dataset, and every gate in the adaptive-layout path asked only "is
+    /// `sort_columns` empty?" — so an untagged value silently disabled the
+    /// feature everywhere while leaving all benchmark gates green.
+    #[test]
+    fn cayenne_inferred_sort_is_tagged_as_inferred() {
+        let mut acc = accel(Engine::Cayenne);
+        let inferred = InferredSchema {
+            sort_columns: vec![sort("id", false)],
+            ..InferredSchema::default()
+        };
+        apply_inferred_schema(
+            &mut acc,
+            &inferred,
+            &schema(&["id"]),
+            "ds",
+            RefreshMode::Changes,
+        );
+        assert_eq!(
+            acc.params.get("cayenne_sort_columns").map(String::as_str),
+            Some("id")
+        );
+        assert_eq!(
+            acc.params
+                .get("cayenne_sort_columns_origin")
+                .map(String::as_str),
+            Some("inferred"),
+            "inference must tag its own sort order so observed filters can outrank it"
+        );
+    }
+
+    /// A user-configured sort order is authoritative and must NOT be tagged
+    /// `inferred`: inference declines to touch the param, so no origin marker is
+    /// written and the engine default (`user`) applies.
+    #[test]
+    fn user_configured_cayenne_sort_is_not_tagged_inferred() {
+        let mut acc = accel(Engine::Cayenne);
+        acc.params
+            .insert("cayenne_sort_columns".to_string(), "amount".to_string());
+        let inferred = InferredSchema {
+            sort_columns: vec![sort("id", false)],
+            ..InferredSchema::default()
+        };
+        apply_inferred_schema(
+            &mut acc,
+            &inferred,
+            &schema(&["id", "amount"]),
+            "ds",
+            RefreshMode::Changes,
+        );
+        assert_eq!(
+            acc.params.get("cayenne_sort_columns").map(String::as_str),
+            Some("amount"),
+            "inference must not overwrite an explicit sort order"
+        );
+        assert!(
+            !acc.params.contains_key("cayenne_sort_columns_origin"),
+            "an explicit sort order must stay authoritative (no `inferred` tag)"
         );
     }
 
