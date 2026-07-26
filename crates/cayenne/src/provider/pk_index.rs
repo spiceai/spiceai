@@ -740,9 +740,7 @@ impl CachedPkIndex {
 /// One pass, memory bounded by `max_bytes`: the rebuild never materializes an
 /// over-budget exact keyset only to re-shard it (`ShardedPkIndex::from_exact`)
 /// or throw it away for blooms — the O(table-rows) second pass and unbounded
-/// allocation that stalled the first CDC apply after a large initial snapshot
-/// for the whole benchmark run (SF1000 `order_line`: ~300 M keys ≈ tens of GB
-/// built, re-sharded, then discarded, all inside the apply loop).
+/// allocation that stalled the first CDC apply after a large initial snapshot.
 ///
 /// `max_bytes: None` never degrades — `on_conflict: do-nothing` needs an exact
 /// answer (a bloom false positive would wrongly drop a genuinely new row).
