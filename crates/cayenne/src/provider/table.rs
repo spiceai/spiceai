@@ -26353,6 +26353,7 @@ impl CayenneTableProvider {
             PkKeysetInvalidatingDeletionSink {
                 table: self.clone_for_write(),
                 inner: sink,
+                filters: filters.to_vec(),
             },
         ))))
     }
@@ -26374,6 +26375,7 @@ impl CayenneTableProvider {
             PkKeysetInvalidatingDeletionSink {
                 table: self.clone_for_write(),
                 inner: sink,
+                filters: filters.to_vec(),
             },
         ))))
     }
@@ -29537,6 +29539,137 @@ mod tests {
         assert!(
             provider.mem_tier.is_empty(),
             "the mem-tier must be fully purged after the delete-all"
+        );
+    }
+
+    /// A table with no primary key has `pk_deletion_strategy: PositionBased`, so
+    /// every delete leaves `delete_from` through the deletion-vector arm and never
+    /// reaches `InlineAwareDeletionSink`. Position deletes address
+    /// `(file, file-local position)` pairs and mem-tier rows live in no file, so
+    /// the delete-all must purge the tier from the other sink too — in
+    /// `mode: memory` the mem-tier is the permanent store, so otherwise the table
+    /// can never be emptied. Regression test for #12072.
+    #[tokio::test]
+    async fn truncate_purges_mem_tier_rows_on_a_table_without_a_primary_key() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        // `mode: memory` shape (see `apply_memory_mode_overrides`): the mem-tier is
+        // the permanent in-RAM store and nothing is ever encoded to Vortex.
+        let vortex_config = VortexConfig {
+            memory_mode: true,
+            cdc_mem_tier_shards: 1,
+            ..VortexConfig::default()
+        };
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "truncate_mem_tier_no_pk",
+            Arc::clone(&schema),
+            vortex_config,
+            // No primary key — this is what selects the position-based arm.
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+        assert!(
+            provider.pk_deletion_strategy.is_position_based(),
+            "precondition: a PK-less table must use the position-based strategy"
+        );
+
+        // Write through the real memory-mode path (`append` refresh).
+        let b1 = int64_id_batch(&[1, 2, 3]);
+        let bytes1 = b1.get_array_memory_size() as u64;
+        provider
+            .write_batches_memory_mode(vec![b1], bytes1, false)
+            .await
+            .expect("memory-mode append 1");
+        let b2 = int64_id_batch(&[4, 5]);
+        let bytes2 = b2.get_array_memory_size() as u64;
+        provider
+            .write_batches_memory_mode(vec![b2], bytes2, false)
+            .await
+            .expect("memory-mode append 2");
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1, 2, 3, 4, 5],
+            "precondition: the mem-tier rows are visible to scans"
+        );
+
+        let delete_plan = provider
+            .delete_from(&ctx.state(), vec![datafusion_expr::lit(true)])
+            .await
+            .expect("delete-all plan");
+        let results = datafusion::physical_plan::collect(delete_plan, ctx.task_ctx())
+            .await
+            .expect("delete-all executed");
+        let deleted = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .expect("uint64 count column")
+            .value(0);
+        assert_eq!(
+            deleted, 5,
+            "the delete-all count must include the 5 purged mem-tier rows"
+        );
+
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            Vec::<i64>::new(),
+            "no mem-tier row may survive a TRUNCATE / DELETE WHERE TRUE"
+        );
+        assert!(
+            provider.mem_tier.is_empty(),
+            "the mem-tier must be fully purged after the delete-all"
+        );
+    }
+
+    /// The purge is gated on the delete being a tautology: a filtered delete
+    /// through the same position-based sink must NOT discard the whole tier.
+    /// (Filtered deletes not reaching mem-tier rows is #12008; what matters here
+    /// is that the delete-all fix cannot over-delete.)
+    #[tokio::test]
+    async fn filtered_delete_does_not_purge_the_mem_tier_without_a_primary_key() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let vortex_config = VortexConfig {
+            memory_mode: true,
+            cdc_mem_tier_shards: 1,
+            ..VortexConfig::default()
+        };
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "filtered_delete_mem_tier_no_pk",
+            Arc::clone(&schema),
+            vortex_config,
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        let batch = int64_id_batch(&[1, 2, 3]);
+        let bytes = batch.get_array_memory_size() as u64;
+        provider
+            .write_batches_memory_mode(vec![batch], bytes, false)
+            .await
+            .expect("memory-mode append");
+
+        let delete_plan = provider
+            .delete_from(
+                &ctx.state(),
+                vec![datafusion_expr::col("id").eq(datafusion_expr::lit(2_i64))],
+            )
+            .await
+            .expect("filtered delete plan");
+        datafusion::physical_plan::collect(delete_plan, ctx.task_ctx())
+            .await
+            .expect("filtered delete executed");
+
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1, 2, 3],
+            "a filtered delete must not purge the whole mem-tier"
         );
     }
 
