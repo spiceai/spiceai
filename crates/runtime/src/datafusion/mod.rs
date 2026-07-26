@@ -40,6 +40,7 @@ use crate::dataaccelerator::{self, BootstrapStatus};
 use crate::dataaccelerator::{AcceleratorEngineRegistry, get_acceleration_layout};
 use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
+use crate::dataconnector::sink::SINK_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::datafusion::query::{Query, registry::QueryCancelRegistry};
@@ -567,6 +568,51 @@ fn engine_to_acceleration_engine(engine: Engine) -> Option<AccelerationEngine> {
     }
 }
 
+/// The write destination selected for an accelerated, writable dataset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceleratedWriteMode {
+    /// Writes go only to the local accelerator (source is read-only or discards writes).
+    AcceleratorOnly,
+    /// Writes commit to the accelerator first, then reconcile to the federated source.
+    WriteBack,
+    /// Writes go to the federated source; the accelerator catches up via refresh (default).
+    WriteThrough,
+}
+
+/// Decide where an accelerated dataset's writes should go, given its source connector,
+/// access mode, `on_conflict`/CDC configuration, and configured write mode.
+///
+/// The `sink` connector is special: it discards writes and disables refresh, so its
+/// accelerator is never fed by a refresh cycle. Routing sink writes through the default
+/// `WriteThrough` path sends every row to the discarding sink and leaves the accelerated
+/// table stuck "loading initial data" forever — so accelerated `sink:` datasets must write
+/// directly to the accelerator instead.
+fn select_accelerated_write_mode(
+    source: &str,
+    allows_write: bool,
+    has_on_conflict: bool,
+    has_changes_refresh: bool,
+    configured_write_mode: spicepod::acceleration::WriteMode,
+) -> AcceleratedWriteMode {
+    // on_conflict without CDC means the source may be read-only; writes go to the accelerator.
+    if has_on_conflict && !has_changes_refresh {
+        return AcceleratedWriteMode::AcceleratorOnly;
+    }
+
+    if !allows_write {
+        return AcceleratedWriteMode::WriteThrough;
+    }
+
+    if source == SINK_DATACONNECTOR {
+        return AcceleratedWriteMode::AcceleratorOnly;
+    }
+
+    match configured_write_mode {
+        spicepod::acceleration::WriteMode::WriteBack => AcceleratedWriteMode::WriteBack,
+        spicepod::acceleration::WriteMode::WriteThrough => AcceleratedWriteMode::WriteThrough,
+    }
+}
+
 /// Remap constraint column indices from the source schema to the refresh schema.
 ///
 /// When `refresh_sql` selects a subset or reordered set of columns, the primary key
@@ -712,6 +758,11 @@ pub struct DataFusion {
     datafusion_ref: iceberg_ddl::SharedDataFusionRef,
     accelerated_tables: TokioRwLock<HashSet<TableReference>>,
     caching: Arc<Caching>,
+    /// Per-dataset locks serializing write-time schema evolution + rebind (the `OTel`
+    /// metric-dimension path). Keyed by table reference so concurrent exports for the
+    /// same metric can't race the `ALTER … ADD COLUMN` + re-registration; distinct
+    /// metrics evolve concurrently. Get-or-inserted lazily on first evolution.
+    schema_evolve_locks: TokioRwLock<HashMap<TableReference, Arc<tokio::sync::Mutex<()>>>>,
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
     deferred_tables: TokioRwLock<HashMap<String, DeferredTableRegistration>>,
     deferred_catalogs: TokioRwLock<HashMap<String, Arc<DeferredCatalogProvider>>>,
@@ -1540,6 +1591,12 @@ impl DataFusion {
         let total_memory = crate::resource_monitor::get_total_memory();
         if let Some(mem_tier_budget_bytes) = self.mem_tier_budget_bytes {
             cayenne::set_global_mem_tier_bytes(mem_tier_budget_bytes);
+            // Mirror mem-tier `used` into the query MemoryPool so operators and
+            // the planner see CDC RAM as reserved (visibility). Hard bound stays
+            // the byte budget + spill path; the account is infallible resize.
+            // Install AFTER the budget so the seed reads used=0.
+            let rt = self.ctx.runtime_env();
+            cayenne::set_global_mem_tier_pool_account(&rt.memory_pool);
             tracing::info!(
                 mem_tier_budget_bytes,
                 query_memory_pool_bytes = self.query_memory_pool_bytes,
@@ -1554,7 +1611,6 @@ impl DataFusion {
             // reclaims it as the pool drains — never above the coordinated static
             // ceiling, so it cannot reintroduce overcommit. The critical-pressure
             // reactive spill drains the tier when the budget is lowered below resident.
-            let rt = self.ctx.runtime_env();
             let query_pool = Arc::downgrade(&rt.memory_pool);
             let compaction_pool = self
                 .compaction_runtime_env
@@ -1627,7 +1683,14 @@ impl DataFusion {
                 let Some(pool) = query_pool.upgrade() else {
                     break; // query ctx dropped (runtime teardown) — stop sampling
                 };
-                let pool_used = u64::try_from(pool.reserved()).unwrap_or(u64::MAX);
+                // Subtract the mem-tier pool mirror: that consumer is the tier
+                // itself, already sized by the coordinated host envelope. Counting
+                // it as "query usage" would double-penalize the tier on every tick.
+                let pool_reserved = u64::try_from(pool.reserved()).unwrap_or(u64::MAX);
+                let mem_tier_in_pool =
+                    u64::try_from(cayenne::global_mem_tier_pool_account_bytes().unwrap_or(0))
+                        .unwrap_or(0);
+                let pool_used = pool_reserved.saturating_sub(mem_tier_in_pool);
                 let compaction_used = compaction_pool
                     .as_ref()
                     .and_then(std::sync::Weak::upgrade)
@@ -1635,9 +1698,13 @@ impl DataFusion {
                 // Same coordinated partition as the static install (one tested
                 // definition of the no-overcommit invariant), but from LIVE pool
                 // usage, and never above the static ceiling so it can't overcommit.
-                let dynamic =
-                    builder::coordinated_mem_tier_budget(total_memory, pool_used, compaction_used)
-                        .min(static_ceiling_bytes);
+                let dynamic = builder::coordinated_mem_tier_budget(
+                    total_memory,
+                    pool_used,
+                    compaction_used,
+                    crate::accelerator_memory_budget::duckdb_total_reservation_bytes(),
+                )
+                .min(static_ceiling_bytes);
                 cayenne::update_global_mem_tier_total(dynamic);
             }
         });
@@ -2920,24 +2987,29 @@ impl DataFusion {
         // on_conflict forces accelerator-only writes when CDC is not in use. With CDC
         // (refresh_mode: changes), on_conflict is for WAL UPDATE upsert routing only and
         // does not override the write destination — writes follow write_mode instead.
-        if has_on_conflict && !has_changes_refresh {
-            accelerated_table_builder.write_to_accelerator_only();
-        } else if dataset.access().allows_write() {
-            match acceleration_settings.write_mode {
-                spicepod::acceleration::WriteMode::WriteBack => {
-                    accelerated_table_builder.write_back();
-                }
-                spicepod::acceleration::WriteMode::WriteThrough => {
-                    // Source-sync write; the accelerator catches up through the refresh
-                    // mechanism (WAL replication for `refresh_mode: changes`, periodic
-                    // refresh otherwise). `WriteMode::WriteThrough` is the default builder
-                    // state, so no method call is required here.
-                    //
-                    // Note: this is intentionally *not* the dual atomic write path
-                    // (`builder.dual_write()`). That path is reserved for the Iceberg
-                    // federated catalog cache use case where no refresh stream propagates
-                    // writes to the accelerator. See spiceai/spiceai#10960.
-                }
+        match select_accelerated_write_mode(
+            dataset.source(),
+            dataset.access().allows_write(),
+            has_on_conflict,
+            has_changes_refresh,
+            acceleration_settings.write_mode,
+        ) {
+            AcceleratedWriteMode::AcceleratorOnly => {
+                accelerated_table_builder.write_to_accelerator_only();
+            }
+            AcceleratedWriteMode::WriteBack => {
+                accelerated_table_builder.write_back();
+            }
+            AcceleratedWriteMode::WriteThrough => {
+                // Source-sync write; the accelerator catches up through the refresh
+                // mechanism (WAL replication for `refresh_mode: changes`, periodic
+                // refresh otherwise). `WriteMode::WriteThrough` is the default builder
+                // state, so no method call is required here.
+                //
+                // Note: this is intentionally *not* the dual atomic write path
+                // (`builder.dual_write()`). That path is reserved for the Iceberg
+                // federated catalog cache use case where no refresh stream propagates
+                // writes to the accelerator. See spiceai/spiceai#10960.
             }
         }
 
@@ -3368,6 +3440,205 @@ impl DataFusion {
             .checkpoint(&plan.evolved_schema, refresh_sql.as_deref())
             .await?;
         Ok(())
+    }
+
+    /// Write-time schema evolution for an accelerated dataset (the OpenTelemetry
+    /// metric-dimension path). When an incoming write carries new columns beyond the
+    /// stored accelerator schema, evolve the accelerator table in place per the dataset's
+    /// `on_schema_change` policy — reusing the same classifier + `evolve_table_schema`
+    /// engine as the registration/restart path — then rebind the registered provider to
+    /// the evolved schema so the pending write (and future reads) see the new column.
+    ///
+    /// Returns `Ok(Some(schema))` when the caller must rebuild its batch against `schema`
+    /// before writing, since [`verify_schema`] is exact-positional. That covers two cases:
+    /// an evolution was just applied, or the change was `Identical` — the live schema is
+    /// already a superset (e.g. a serialized concurrent export already evolved it, or the
+    /// incoming columns added nothing new) and the batch must still match its canonical
+    /// field order. `Some` therefore means "rebuild against this schema", not strictly
+    /// "evolved now".
+    ///
+    /// Returns `Ok(None)` when nothing was evolved — no acceleration, a `block`/`fail`
+    /// policy, a non-sink source (the rebind is sink-specific), an engine without in-place
+    /// evolution, an `Incompatible` change, or a change the policy does not permit. In
+    /// every `Ok(None)` case the caller's write proceeds unchanged and rejects the batch
+    /// exactly as it does today.
+    ///
+    /// Serialized per dataset (see `schema_evolve_locks`): the live provider schema is
+    /// re-read *after* acquiring the lock, so two concurrent exports adding different
+    /// columns each observe the other's addition and evolve monotonically.
+    pub(crate) async fn evolve_and_rebind_accelerated_schema(
+        &self,
+        dataset: &Arc<Dataset>,
+        secrets: Arc<TokioRwLock<Secrets>>,
+        target_schema: &SchemaRef,
+    ) -> Result<Option<SchemaRef>> {
+        let Some(acceleration) = dataset.acceleration.as_ref() else {
+            return Ok(None);
+        };
+        let policy = dataset.on_schema_change;
+        // `block` (default) and `fail` keep today's reject behavior: never evolve on write.
+        if matches!(policy, OnSchemaChange::Block | OnSchemaChange::Fail) {
+            return Ok(None);
+        }
+
+        // Write-time evolution rebinds the provider through `SinkConnector` (the
+        // `from: sink:` OTLP metric-dimension path). For any other source that rebind
+        // would swap the dataset's real connector for a no-op sink, silently disabling
+        // refresh and source reads. Restrict this path to sink datasets; every other
+        // source keeps today's reject behavior and evolves only via the registration/
+        // restart path against its actual connector.
+        if dataset.source() != SINK_DATACONNECTOR {
+            return Ok(None);
+        }
+
+        let dataset_name = dataset.name.to_string();
+
+        if !engine_supports_in_place_evolution(acceleration.engine) {
+            SCHEMA_EVOLUTION_FAILED.add(
+                1,
+                &schema_evolution_labels(&dataset_name, "unknown", "engine_unsupported"),
+            );
+            tracing::warn!(
+                dataset = %dataset.name,
+                "New metric dimension(s) arrived, but the '{engine}' acceleration engine does not support in-place schema evolution; the new columns are not applied",
+                engine = acceleration.engine,
+            );
+            return Ok(None);
+        }
+
+        // Serialize evolution + rebind for this dataset so concurrent writes can't race
+        // the ALTER and re-registration. Distinct datasets keep independent locks.
+        let lock = {
+            let mut locks = self.schema_evolve_locks.write().await;
+            Arc::clone(
+                locks
+                    .entry(dataset.name.clone())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        let _guard = lock.lock().await;
+
+        // Re-read the live provider schema *under the lock* so a serialized second export
+        // classifies against the first's already-applied evolution.
+        let provider = self.get_table_provider(&dataset.name).await?;
+        let current = provider.schema();
+        let constraint_columns =
+            dataset_constraint_columns(dataset, provider.constraints(), &current);
+        let ctx = EvolutionContext {
+            constraint_columns: &constraint_columns,
+        };
+
+        match arrow_tools::schema_evolution::classify(&current, target_schema, &ctx) {
+            // Another export already evolved to a superset (or nothing changed): the
+            // caller rebuilds against `current`, which is a no-op.
+            SchemaEvolution::Identical => Ok(Some(current)),
+            SchemaEvolution::Incompatible { reason } => {
+                SCHEMA_EVOLUTION_FAILED.add(
+                    1,
+                    &schema_evolution_labels(&dataset_name, "incompatible", "otel_write"),
+                );
+                tracing::warn!(
+                    dataset = %dataset.name,
+                    "Incoming metric schema change cannot be applied to the acceleration in place ({reason}); the new data is not applied",
+                );
+                Ok(None)
+            }
+            SchemaEvolution::Widening(plan) => {
+                let kind = widening_plan_kind(&plan);
+                let change = plan.describe();
+                SCHEMA_EVOLUTION_DETECTED.add(
+                    1,
+                    &schema_evolution_labels(&dataset_name, kind, "otel_write"),
+                );
+
+                if !evolution_allowed(policy, &plan) {
+                    SCHEMA_EVOLUTION_FAILED.add(
+                        1,
+                        &schema_evolution_labels(&dataset_name, kind, "blocked_by_policy"),
+                    );
+                    tracing::warn!(
+                        dataset = %dataset.name,
+                        "Incoming metric schema change detected ({change}), but `on_schema_change: {policy}` does not permit it; the new data is not applied. Set `on_schema_change: sync_all_columns` to evolve type/nullability changes",
+                    );
+                    return Ok(None);
+                }
+
+                let Ok(cp) = DatasetCheckpoint::try_new(
+                    dataset.as_ref(),
+                    self.accelerator_engine_registry(),
+                    OpenOption::OpenExisting,
+                )
+                .await
+                else {
+                    SCHEMA_EVOLUTION_FAILED.add(
+                        1,
+                        &schema_evolution_labels(&dataset_name, kind, "apply_error"),
+                    );
+                    tracing::warn!(
+                        dataset = %dataset.name,
+                        "Failed to open the acceleration checkpoint for write-time schema evolution ({change}); the new data is not applied",
+                    );
+                    return Ok(None);
+                };
+
+                if let Err(e) = self
+                    .evolve_accelerated_table_schema(dataset, acceleration, &cp, &plan)
+                    .await
+                {
+                    SCHEMA_EVOLUTION_FAILED.add(
+                        1,
+                        &schema_evolution_labels(&dataset_name, kind, "apply_error"),
+                    );
+                    tracing::warn!(
+                        dataset = %dataset.name,
+                        "Failed to apply write-time schema evolution ({change}): {e}; the new data is not applied. A retry (or restart) re-attempts the idempotent evolution",
+                    );
+                    emit_schema_evolution_event(&dataset_name, "apply_error", &change, true);
+                    return Ok(None);
+                }
+
+                // Engine table + checkpoint now carry the evolved schema. Rebind the
+                // registered provider so it re-opens the (evolved) engine table and reports
+                // the new column — the same sink re-registration `ensure_sink_dataset` uses.
+                // Do NOT route through `reload_accelerated_dataset`: it awaits a refresh
+                // completion notifier that never fires for a sink dataset.
+                let sink_connector = Arc::new(SinkConnector::new(Arc::clone(&plan.evolved_schema)))
+                    as Arc<dyn DataConnector>;
+                let read_provider = sink_connector
+                    .read_provider(dataset.as_ref())
+                    .await
+                    .context(UnableToResolveTableProviderSnafu)?;
+                let federated_table = FederatedTable::new_unchecked(read_provider);
+                // Discard the readiness notifier: sink datasets never fire it, and the
+                // provider is registered synchronously before this returns.
+                let _ = self
+                    .register_accelerated_table(
+                        Arc::clone(dataset),
+                        sink_connector,
+                        federated_table,
+                        secrets,
+                        BootstrapStatus::none(),
+                        None,
+                    )
+                    .await?;
+
+                // The table schema changed; cached logical plans are obsolete.
+                self.clear_cached_plans().await;
+
+                SCHEMA_EVOLUTION_APPLIED.add(
+                    1,
+                    &schema_evolution_labels(&dataset_name, kind, "otel_write"),
+                );
+                emit_schema_evolution_event(&dataset_name, "applied", &change, false);
+                tracing::info!(
+                    dataset = %dataset.name,
+                    "Applied write-time schema evolution to the '{engine}' acceleration: {change}",
+                    engine = acceleration.engine,
+                );
+
+                Ok(Some(Arc::clone(&plan.evolved_schema)))
+            }
+        }
     }
 
     /// Attempt to synchronize refreshes with the parent table for localpod accelerated tables.
@@ -5040,6 +5311,84 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn accelerated_sink_dataset_writes_to_accelerator_only() {
+        // Regression: the `sink` connector discards writes and disables refresh, so an
+        // accelerated `sink:` dataset must write directly to the accelerator — otherwise the
+        // default WriteThrough path sends data to the discarding sink and the table never
+        // completes its initial load (stuck "Acceleration not ready; loading initial data").
+        for configured in [
+            spicepod::acceleration::WriteMode::WriteThrough,
+            spicepod::acceleration::WriteMode::WriteBack,
+        ] {
+            assert_eq!(
+                select_accelerated_write_mode(SINK_DATACONNECTOR, true, false, false, configured),
+                AcceleratedWriteMode::AcceleratorOnly,
+                "accelerated sink dataset (configured={configured:?}) must write accelerator-only"
+            );
+        }
+    }
+
+    #[test]
+    fn non_sink_write_mode_selection_is_unchanged() {
+        // A normal federated source keeps its configured write mode.
+        assert_eq!(
+            select_accelerated_write_mode(
+                "postgres",
+                true,
+                false,
+                false,
+                spicepod::acceleration::WriteMode::WriteThrough,
+            ),
+            AcceleratedWriteMode::WriteThrough,
+        );
+        assert_eq!(
+            select_accelerated_write_mode(
+                "postgres",
+                true,
+                false,
+                false,
+                spicepod::acceleration::WriteMode::WriteBack,
+            ),
+            AcceleratedWriteMode::WriteBack,
+        );
+
+        // on_conflict without CDC forces accelerator-only regardless of source.
+        assert_eq!(
+            select_accelerated_write_mode(
+                "postgres",
+                true,
+                true,
+                false,
+                spicepod::acceleration::WriteMode::WriteThrough,
+            ),
+            AcceleratedWriteMode::AcceleratorOnly,
+        );
+        // on_conflict *with* CDC does not force accelerator-only.
+        assert_eq!(
+            select_accelerated_write_mode(
+                "postgres",
+                true,
+                true,
+                true,
+                spicepod::acceleration::WriteMode::WriteThrough,
+            ),
+            AcceleratedWriteMode::WriteThrough,
+        );
+
+        // A read-only dataset stays WriteThrough even for a sink source (no writes routed).
+        assert_eq!(
+            select_accelerated_write_mode(
+                SINK_DATACONNECTOR,
+                false,
+                false,
+                false,
+                spicepod::acceleration::WriteMode::WriteThrough,
+            ),
+            AcceleratedWriteMode::WriteThrough,
+        );
+    }
+
     fn streaming_broadcast_test_batch(value: i32) -> RecordBatch {
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
@@ -5300,30 +5649,32 @@ mod tests {
         async fn create_test_dataset(time_column: Option<String>) -> Dataset {
             let runtime = crate::Runtime::builder().build().await;
             Dataset {
-                from: "test".to_string(),
-                name: TableReference::bare("test_dataset"),
-                access: AccessMode::Read,
-                params: HashMap::new(),
-                metadata: HashMap::new(),
-                columns: vec![],
-                schema: None,
-                has_metadata_table: false,
-                replication: None,
-                time_column,
-                time_format: None,
-                time_partition_column: None,
-                time_partition_format: None,
-                acceleration: None,
-                embeddings: vec![],
+                spec: crate::component::dataset::DatasetSpec {
+                    from: "test".to_string(),
+                    name: TableReference::bare("test_dataset"),
+                    access: AccessMode::Read,
+                    params: HashMap::new(),
+                    metadata: HashMap::new(),
+                    columns: vec![],
+                    schema: None,
+                    has_metadata_table: false,
+                    replication: None,
+                    time_column,
+                    time_format: None,
+                    time_partition_column: None,
+                    time_partition_format: None,
+                    acceleration: None,
+                    embeddings: vec![],
+                    unsupported_type_action: None,
+                    ready_state: ReadyState::OnRegistration,
+                    metrics: Metrics::default(),
+                    vectors: None,
+                    full_text_search: None,
+                    check_availability: crate::component::dataset::CheckAvailability::Disabled,
+                    on_schema_change: crate::component::dataset::OnSchemaChange::default(),
+                },
                 app: Arc::new(app::App::default()),
-                unsupported_type_action: None,
-                ready_state: ReadyState::OnRegistration,
-                metrics: Metrics::default(),
                 runtime: Arc::new(runtime),
-                vectors: None,
-                full_text_search: None,
-                check_availability: crate::component::dataset::CheckAvailability::Disabled,
-                on_schema_change: crate::component::dataset::OnSchemaChange::default(),
             }
         }
 

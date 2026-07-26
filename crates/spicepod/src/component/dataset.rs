@@ -40,6 +40,7 @@ pub enum TimeFormat {
     Timestamptz,
     UnixSeconds,
     UnixMillis,
+    UnixNanos,
     #[serde(rename = "ISO8601")]
     ISO8601,
     Date,
@@ -56,6 +57,7 @@ impl<'de> serde::Deserialize<'de> for TimeFormat {
             "timestamptz" => Ok(TimeFormat::Timestamptz),
             "unix_seconds" => Ok(TimeFormat::UnixSeconds),
             "unix_millis" => Ok(TimeFormat::UnixMillis),
+            "unix_nanos" => Ok(TimeFormat::UnixNanos),
             "iso8601" => Ok(TimeFormat::ISO8601),
             "date" => Ok(TimeFormat::Date),
             _ => Err(serde::de::Error::unknown_variant(
@@ -65,6 +67,7 @@ impl<'de> serde::Deserialize<'de> for TimeFormat {
                     "timestamptz",
                     "unix_seconds",
                     "unix_millis",
+                    "unix_nanos",
                     "ISO8601",
                     "date",
                 ],
@@ -707,6 +710,15 @@ mod tests {
         ";
         let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(dataset.time_format, Some(TimeFormat::UnixMillis));
+
+        // Mixed case Unix_Nanos
+        let yaml = r"
+            name: test
+            from: test
+            time_format: Unix_Nanos
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.time_format, Some(TimeFormat::UnixNanos));
 
         // Mixed case Timestamptz
         let yaml = r"

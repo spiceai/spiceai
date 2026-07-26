@@ -130,6 +130,14 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         Ok(searchable_tables)
     }
 
+    /// The error a scan of `tbl` would fail with because its data is not loaded
+    /// yet, or `None` when it can be searched. An unknown table is reported as
+    /// scannable so the existing not-found handling still owns that error.
+    async fn not_ready_error(&self, tbl: &TableReference) -> Option<DataFusionError> {
+        let table_provider = self.df.get_table(tbl).await?;
+        self.explorer.not_ready_error(&table_provider)
+    }
+
     async fn embedding_columns_from_table(&self, tbl: &TableReference) -> Option<Vec<String>> {
         let table_provider = self.df.get_table(tbl).await?;
         let mut embedding_columns: HashSet<String> = HashSet::default();
@@ -196,7 +204,9 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
     ) -> Option<Result<Vec<Arc<dyn CandidateGeneration>>>> {
         use crate::full_text::as_candidate_generations;
         #[cfg(feature = "elasticsearch")]
-        use crate::full_text::as_es_text_candidate_generations;
+        use crate::full_text::{
+            as_compound_text_candidate_generations, as_es_text_candidate_generations,
+        };
         use runtime_datafusion_index::IndexedTableProvider;
         use search::generation::text_search::index::FullTextDatabaseIndex;
 
@@ -208,6 +218,31 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         else {
             return Some(Ok(vec![]));
         };
+
+        // Compound (write-through) full-text index: a warm Tantivy primary paired with an
+        // external Elasticsearch secondary. Registered instead of the concrete indexes for
+        // single-column FTS datasets with an external store, so this must precede the concrete
+        // `FullTextDatabaseIndex` branch below. A `CompoundSearchIndex` may compose *vector*
+        // tiers, so only text compounds (those without a vector view) back FTS discovery.
+        #[cfg(feature = "elasticsearch")]
+        {
+            use search::index::compound::CompoundSearchIndex;
+            if let Some(compound) = indexed_table
+                .get_indexes::<CompoundSearchIndex>()
+                .into_iter()
+                .find(|c| Arc::new((*c).clone()).as_vector_index().is_none())
+            {
+                return Some(
+                    as_compound_text_candidate_generations(
+                        compound.search_column(),
+                        Arc::clone(&self.df),
+                        tbl.clone(),
+                    )
+                    .await
+                    .map_err(|source| Error::SearchGenerationError { source }),
+                );
+            }
+        }
 
         if let Some(fts) = indexed_table.get_index::<FullTextDatabaseIndex>() {
             return Some(
@@ -511,6 +546,22 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
 
                 async move {
                     let request_context = RequestContext::current(AsyncMarker::new().await);
+
+                    // A dataset still loading its initial data cannot serve a search. Check
+                    // before building the plan: the query text is embedded during logical
+                    // optimization, so reaching this at physical planning instead would mean
+                    // paying for an embedding round trip only to be rejected. An explicitly
+                    // requested dataset is an error; when searching every searchable dataset,
+                    // skip it rather than failing the whole request — mirroring how an
+                    // unsearchable dataset is handled below.
+                    if let Some(not_ready) = self.not_ready_error(&tbl).await {
+                        if explicit_datasets_requested {
+                            return Err(Error::DataFusionError { source: not_ready });
+                        }
+                        tracing::debug!("Excluding dataset {tbl} from search: {not_ready}");
+                        return Ok((tbl.clone(), None));
+                    }
+
                     let embedding_columns = self.embedding_columns_from_table(&tbl).await.unwrap_or_default();
                     let mut generators: Vec<Arc<dyn CandidateGeneration>> = Vec::with_capacity(embedding_columns.len());
                     for (i, col) in embedding_columns.iter().enumerate() {

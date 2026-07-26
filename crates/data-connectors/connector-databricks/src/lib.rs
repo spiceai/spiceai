@@ -24,28 +24,18 @@ limitations under the License.
 //! incremental builds.
 
 use async_trait::async_trait;
+use data_components::Read;
 #[cfg(feature = "spark")]
 use data_components::databricks::DatabricksSparkConnect;
 use data_components::databricks::sql_warehouse::DatabricksMetrics;
 use data_components::databricks::{DatabricksDelta, DatabricksSqlWarehouse, sql_warehouse};
-use data_components::delta_lake::DeltaTableFactory;
-use data_components::unity_catalog::credential_vending::VendedDeltaTableFactory;
-use data_components::unity_catalog::provider::{
-    ReadTableProviderFactory, UCTableProviderFactory, UnityCatalogProvider,
-};
-use data_components::unity_catalog::{
-    CatalogId, Endpoint, UCTable, UnityCatalog as UnityCatalogClient,
-};
-use data_components::{Read, RefreshableCatalogProvider};
+use data_components::unity_catalog::{Endpoint, UnityCatalog as UnityCatalogClient};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::sql::TableReference;
 use opentelemetry::KeyValue;
-use runtime::Runtime;
-use runtime::catalogconnector::{CatalogConnector, Error as CatalogError, Result as CatalogResult};
 use runtime::component::ComponentInitialization;
-use runtime::component::catalog::Catalog;
 use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
@@ -53,12 +43,12 @@ use runtime::dataconnector::{
 };
 use runtime::parameters::{ParameterSpec, Parameters};
 use runtime::token_providers::databricks::{
-    AuthCredentials, DatabricksM2MTokenProvider, DatabricksU2MTokenProvider,
+    AUTH_MODE_DESCRIPTION, AUTH_MODES, AuthConfigError, AuthCredentials,
+    DatabricksM2MTokenProvider, DatabricksU2MTokenProvider,
 };
 use runtime_api_types::v1::ComponentType;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_rate_control::RateController;
-use runtime_secrets::get_params_with_secrets;
 use secrecy::ExposeSecret;
 use secrecy::SecretString;
 use snafu::prelude::*;
@@ -191,6 +181,13 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("cluster_id").description("The ID of the compute cluster in Databricks to use for the query. Only valid when mode is spark_connect."),
     ParameterSpec::component("use_ssl").description("Use a TLS connection to connect to the Databricks Spark Connect endpoint.").default("true"),
 
+    // Databricks authentication
+    ParameterSpec::component("auth_mode")
+        .description(AUTH_MODE_DESCRIPTION)
+        .one_of_ignore_ascii_case(AUTH_MODES)
+        .default("auto")
+        .help_link(DATABRICKS_DOCS),
+
     // Databricks M2M Service Principal credentials
     ParameterSpec::component("client_id").description("The client ID of the Databricks service principal."),
     ParameterSpec::component("client_secret").secret().description("The client secret of the Databricks service principal."),
@@ -204,6 +201,11 @@ pub const PARAMETERS: &[ParameterSpec] = &[
         .secret(),
     ParameterSpec::component("aws_secret_access_key")
         .description("The AWS secret access key to use for S3 storage.")
+        .secret(),
+    ParameterSpec::component("aws_session_token")
+        .description(
+            "The AWS session token to use for S3 storage. Required with temporary (STS) credentials.",
+        )
         .secret(),
     ParameterSpec::component("aws_endpoint")
         .description("The AWS endpoint to use for S3 storage.")
@@ -514,41 +516,19 @@ impl Databricks {
     ///
     /// Returns an error if the authentication configuration is invalid.
     pub fn build_auth_credentials(params: &Parameters) -> Result<AuthCredentials<'_>> {
-        let token = params.get("token").ok();
-        let client_id = params.get("client_id").expose().ok();
-        let client_secret = params.get("client_secret").ok();
-
-        match (token, client_id, client_secret) {
-            (Some(token), None, None) => Ok(AuthCredentials::Token(token)),
-            (None, Some(client_id), None) => Ok(AuthCredentials::U2M(client_id)),
-            (None, Some(client_id), Some(client_secret)) => {
-                Ok(AuthCredentials::ServicePrincipal(client_id, client_secret))
-            }
-            (None, None, None) => {
-                InvalidConfigurationSnafu {
-                    message: "Missing `databricks_token` or `databricks_client_id` and `databricks_client_secret` parameters".to_string(),
+        // The catalog connector selects credentials from the same parameters, so the precedence
+        // between `databricks_auth_mode`, a token and service principal credentials lives in one
+        // place; only the error type differs.
+        runtime::token_providers::databricks::build_auth_credentials(params).map_err(|source| {
+            match source {
+                AuthConfigError::MissingParameter { parameter } => {
+                    MissingParameterSnafu { parameter }.build()
                 }
-                .fail()
-            }
-            (None, None, Some(_)) => {
-                MissingParameterSnafu {
-                    parameter: "databricks_client_id".to_string(),
+                AuthConfigError::InvalidConfiguration { message } => {
+                    InvalidConfigurationSnafu { message }.build()
                 }
-                .fail()
             }
-            (Some(_), Some(_), Some(_) | None) => {
-                InvalidConfigurationSnafu {
-                    message: "Choose either `databricks_token` or `databricks_client_id` and `databricks_client_secret`".to_string(),
-                }
-                .fail()
-            }
-            _ => {
-                InvalidConfigurationSnafu {
-                    message: "Invalid authentication configuration. Choose either `databricks_token` or `databricks_client_id` and `databricks_client_secret`".to_string(),
-                }
-                .fail()
-            }
-        }
+        })
     }
 
     #[cfg(feature = "spark")]
@@ -676,10 +656,6 @@ impl Databricks {
             .map_err(|err| Error::UnableToGetToken {
                 source: Box::new(err),
             })
-    }
-
-    pub(crate) fn read_provider(&self) -> Arc<dyn Read> {
-        Arc::clone(&self.read_provider)
     }
 
     /// Validates that a Unity Catalog table is of a supported type and that
@@ -843,56 +819,6 @@ async fn reserve_databricks_rate_controller<S: std::hash::BuildHasher>(
         .reserve_shared_rate_controller(&base_url, &rate_control, dataset, CONNECTOR_NAME)
         .await
         .map(Some)
-}
-
-async fn shared_databricks_catalog_rate_controller(
-    params: &Parameters,
-    runtime: &Arc<Runtime>,
-    catalog: &Catalog,
-) -> CatalogResult<Option<Arc<RateController>>> {
-    let endpoint = params.get("endpoint").expose().ok_or_else(|p| {
-        CatalogError::InvalidConfigurationNoSource {
-            connector: CONNECTOR_NAME.to_string(),
-            connector_component: ConnectorComponent::from(catalog),
-            message: format!("A required parameter was missing: {}", p.0),
-        }
-    })?;
-    let base_url = databricks_rate_control_url(endpoint).map_err(|source| {
-        CatalogError::InvalidConfigurationNoSource {
-            connector: CONNECTOR_NAME.to_string(),
-            connector_component: ConnectorComponent::from(catalog),
-            message: source.to_string(),
-        }
-    })?;
-    let connector_component = ConnectorComponent::from(catalog);
-    let rate_control = http_rate_control::resolve_config_for_component(
-        params,
-        Some(&catalog.app.runtime.params),
-        &connector_component,
-        CONNECTOR_NAME,
-    )
-    .map_err(|source| CatalogError::UnableToGetCatalogProvider {
-        connector: CONNECTOR_NAME.to_string(),
-        connector_component: ConnectorComponent::from(catalog),
-        source: source.into(),
-    })?;
-
-    runtime
-        .http_rate_control_registry()
-        .shared_rate_controller_for_component(
-            &base_url,
-            &rate_control,
-            catalog.app.name.as_str(),
-            &connector_component,
-            CONNECTOR_NAME,
-        )
-        .await
-        .map(|shared| shared.controller)
-        .map_err(|source| CatalogError::UnableToGetCatalogProvider {
-            connector: CONNECTOR_NAME.to_string(),
-            connector_component: ConnectorComponent::from(catalog),
-            source: source.into(),
-        })
 }
 
 // ============================================================================
@@ -1418,344 +1344,6 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
 }
 
 // ============================================================================
-// Catalog Connector
-// ============================================================================
-
-pub const CATALOG_PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::component("endpoint")
-        .required()
-        .secret()
-        .description("The endpoint of the Databricks instance."),
-    ParameterSpec::component("token")
-        .secret()
-        .description("The personal access token used to authenticate against the DataBricks API."),
-    ParameterSpec::component("credential_vending")
-        .description("When set to 'enabled' (requires 'mode' to be 'delta_lake'), short-lived storage credentials for each table are fetched from the Unity Catalog credential vending API instead of using static storage credentials. Defaults to 'disabled'."),
-    ParameterSpec::runtime("mode")
-        .description("The execution mode for querying against Databricks.")
-        .default("spark_connect"),
-    ParameterSpec::runtime("client_timeout")
-        .description("HTTP client request timeout. In 'delta_lake' mode, applies to the object store client. In 'sql_warehouse' mode, applies per-HTTP-call (statement submit, status poll, chunk fetch) — set to the longest expected single call, not total query duration. Accepts durations like '30s' or '5m'. Default: 30s."),
-    ParameterSpec::runtime("connect_timeout")
-        .description("Timeout for establishing TCP/TLS connections to the Databricks API. Applies in 'sql_warehouse' mode. Accepts durations like '10s'. Default: 10s."),
-    ParameterSpec::component("cluster_id").description("The ID of the compute cluster in Databricks to use for the query. Only valid when mode is spark_connect."),
-    ParameterSpec::component("use_ssl").description("Use a TLS connection to connect to the Databricks Spark Connect endpoint.").default("true"),
-    ParameterSpec::component("sql_warehouse_id")
-        .secret()
-        .description("The SQL Warehouse ID to use when 'mode' is set to 'sql_warehouse'"),
-    ParameterSpec::runtime("max_concurrent_requests")
-        .description("Maximum number of concurrent HTTP requests to the Databricks endpoint. Also controls the SQL Warehouse API request semaphore in sql_warehouse mode.")
-        .default("8"),
-    ParameterSpec::runtime("requests_per_second_limit")
-        .description("Maximum number of HTTP requests per second to the Databricks endpoint. Overrides runtime.params.http_requests_per_second_limit when set."),
-    ParameterSpec::runtime("requests_per_minute_limit")
-        .description("Maximum number of HTTP requests per minute to the Databricks endpoint. Overrides runtime.params.http_requests_per_minute_limit when set."),
-    ParameterSpec::runtime("rate_control_jitter_min")
-        .description("Minimum random delay added before Databricks HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_min when set. Accepts durations such as '5ms' or '0ms'. Defaults to 5ms when a request-rate limit is configured, otherwise 0ms."),
-    ParameterSpec::runtime("rate_control_jitter_max")
-        .description("Maximum random delay added before Databricks HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_max when set. Accepts durations such as '10ms' or '0ms'. Defaults to 10ms when a request-rate limit is configured, otherwise 0ms."),
-
-    // Databricks M2M Service Principal credentials
-    ParameterSpec::component("client_id").description("The client ID of the Databricks service principal."),
-    ParameterSpec::component("client_secret").secret().description("The client secret of the Databricks service principal."),
-
-    // S3 storage options
-    ParameterSpec::component("aws_region")
-        .description("The AWS region to use for S3 storage.")
-        .secret(),
-    ParameterSpec::component("aws_access_key_id")
-        .description("The AWS access key ID to use for S3 storage.")
-        .secret(),
-    ParameterSpec::component("aws_secret_access_key")
-        .description("The AWS secret access key to use for S3 storage.")
-        .secret(),
-    ParameterSpec::component("aws_endpoint")
-        .description("The AWS endpoint to use for S3 storage.")
-        .secret(),
-
-    // Azure storage options
-    ParameterSpec::component("azure_storage_account_name")
-        .description("The storage account to use for Azure storage.")
-        .secret(),
-    ParameterSpec::component("azure_storage_account_key")
-        .description("The storage account key to use for Azure storage.")
-        .secret(),
-    ParameterSpec::component("azure_storage_client_id")
-        .description("The service principal client id for accessing the storage account.")
-        .secret(),
-    ParameterSpec::component("azure_storage_client_secret")
-        .description("The service principal client secret for accessing the storage account.")
-        .secret(),
-    ParameterSpec::component("azure_storage_sas_key")
-        .description("The shared access signature key for accessing the storage account.")
-        .secret(),
-    ParameterSpec::component("azure_storage_endpoint")
-        .description("The endpoint for the Azure Blob storage account.")
-        .secret(),
-
-    // GCS storage options
-    ParameterSpec::component("google_service_account")
-        .description("Filesystem path to the Google service account JSON key file.")
-        .secret(),
-];
-
-/// Databricks Unity Catalog connector.
-#[derive(Clone)]
-pub struct DatabricksCatalog {
-    params: Parameters,
-    initialization: ComponentInitialization,
-}
-
-impl DatabricksCatalog {
-    #[must_use]
-    pub fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
-        let component_initialization = match Databricks::build_auth_credentials(&params.parameters)
-        {
-            Ok(AuthCredentials::U2M(_)) => ComponentInitialization::OnTrigger,
-            _ => ComponentInitialization::default(),
-        };
-
-        Arc::new(Self {
-            params: params.parameters,
-            initialization: component_initialization,
-        })
-    }
-}
-
-#[async_trait]
-impl CatalogConnector for DatabricksCatalog {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    async fn refreshable_catalog_provider(
-        self: Arc<Self>,
-        runtime: Arc<Runtime>,
-        catalog: &Catalog,
-    ) -> CatalogResult<Arc<dyn RefreshableCatalogProvider>> {
-        let Some(catalog_id) = catalog.catalog_id.clone() else {
-            return Err(CatalogError::InvalidConfigurationNoSource {
-                connector: "databricks".into(),
-                message: "A Catalog Name is required for the Databricks Unity Catalog. For details, visit: https://spiceai.org/docs/components/catalogs/databricks#from".into(),
-                connector_component: ConnectorComponent::from(catalog)
-            });
-        };
-
-        let endpoint = self.params.get("endpoint").expose().ok_or_else(|p| {
-            CatalogError::InvalidConfigurationNoSource {
-                connector: "databricks".into(),
-                message: format!("A required parameter was missing: {}. For details, visit: https://spiceai.org/docs/components/catalogs/databricks#params", p.0),
-                connector_component: ConnectorComponent::from(catalog)
-            }
-        })?;
-
-        let auth_credentials =
-            Databricks::build_auth_credentials(&self.params).map_err(|source| {
-                CatalogError::UnableToGetCatalogProvider {
-                    connector: "databricks".to_string(),
-                    source: source.into(),
-                    connector_component: ConnectorComponent::from(catalog),
-                }
-            })?;
-
-        let token_provider: Arc<dyn TokenProvider> = match auth_credentials {
-            AuthCredentials::Token(token) => Arc::new(StaticTokenProvider::new(token.clone())),
-            AuthCredentials::ServicePrincipal(client_id, client_secret) => {
-                Databricks::get_m2m_token_provider(
-                    endpoint,
-                    client_id,
-                    client_secret,
-                    &runtime.token_provider_registry(),
-                )
-                .await
-                .map_err(|source| CatalogError::UnableToGetCatalogProvider {
-                    connector: "databricks".to_string(),
-                    source: source.into(),
-                    connector_component: ConnectorComponent::from(catalog),
-                })?
-            }
-            AuthCredentials::U2M(client_id) => Databricks::get_u2m_token_provider(
-                endpoint,
-                client_id,
-                &runtime.token_provider_registry(),
-            )
-            .await
-            .map_err(|source| CatalogError::UnableToGetCatalogProvider {
-                connector: "databricks".to_string(),
-                source: source.into(),
-                connector_component: ConnectorComponent::from(catalog),
-            })?,
-        };
-
-        // Copy the catalog params into the dataset params, and allow user to override
-        let mut dataset_params: HashMap<String, SecretString> =
-            get_params_with_secrets(runtime.secrets(), &catalog.params).await;
-
-        let secret_dataset_params =
-            get_params_with_secrets(runtime.secrets(), &catalog.dataset_params).await;
-
-        for (key, value) in secret_dataset_params {
-            dataset_params.insert(key, value);
-        }
-
-        let params = Parameters::try_new(
-            "connector databricks",
-            dataset_params.into_iter().collect(),
-            "databricks",
-            runtime.secrets(),
-            CATALOG_PARAMETERS,
-        )
-        .await
-        .map_err(|source| CatalogError::InternalWithSource {
-            connector: "databricks".to_string(),
-            connector_component: ConnectorComponent::from(catalog),
-            source,
-        })?;
-
-        let rate_controller =
-            shared_databricks_catalog_rate_controller(&params, &runtime, catalog).await?;
-
-        let unity_catalog = UnityCatalogClient::new_with_rate_controller(
-            Endpoint(endpoint.to_string()),
-            Some(Arc::clone(&token_provider)),
-            None,
-            rate_controller.clone(),
-        )
-        .map_err(|source| CatalogError::UnableToGetCatalogProvider {
-            connector: "databricks".to_string(),
-            source: Box::new(source),
-            connector_component: ConnectorComponent::from(catalog),
-        })?;
-        let client = Arc::new(unity_catalog);
-
-        let mode = self.params.get("mode").expose().ok();
-        let credential_vending = match params.get("credential_vending").expose().ok() {
-            Some("enabled") => true,
-            None | Some("disabled") => false,
-            Some(other) => {
-                return Err(CatalogError::InvalidConfigurationNoSource {
-                    connector: "databricks".into(),
-                    message: format!(
-                        "Invalid value '{other}' for 'databricks_credential_vending'. Valid values: 'enabled', 'disabled'."
-                    ),
-                    connector_component: ConnectorComponent::from(catalog),
-                });
-            }
-        };
-        if credential_vending && mode != Some("delta_lake") {
-            return Err(CatalogError::InvalidConfigurationNoSource {
-                connector: "databricks".into(),
-                message:
-                    "'databricks_credential_vending' is only supported when 'mode' is 'delta_lake'."
-                        .into(),
-                connector_component: ConnectorComponent::from(catalog),
-            });
-        }
-        let table_creator: Arc<dyn UCTableProviderFactory> = if mode == Some("delta_lake") {
-            if credential_vending {
-                Arc::new(VendedDeltaTableFactory::new(
-                    Arc::clone(&client),
-                    params.to_secret_map(),
-                    runtime.tokio_io_runtime(),
-                ))
-            } else {
-                Arc::new(ReadTableProviderFactory::new(
-                    Arc::new(DeltaTableFactory::new(
-                        params.to_secret_map(),
-                        runtime.tokio_io_runtime(),
-                    )) as Arc<dyn Read>,
-                    table_reference_creator_delta_lake,
-                ))
-            }
-        } else {
-            let shared_semaphore = if mode == Some("sql_warehouse") {
-                match (
-                    params.get("endpoint").expose().ok(),
-                    params.get("sql_warehouse_id").expose().ok(),
-                ) {
-                    (Some(endpoint), Some(warehouse_id)) => {
-                        let config =
-                            runtime::catalogconnector::databricks::build_sql_warehouse_config(
-                                &params,
-                            );
-                        Some(
-                            sql_warehouse::shared_request_semaphore(
-                                endpoint,
-                                warehouse_id,
-                                config.max_concurrent_requests,
-                            )
-                            .map_err(|source| {
-                                CatalogError::UnableToGetCatalogProvider {
-                                    connector: "databricks".to_string(),
-                                    source: source.into(),
-                                    connector_component: ConnectorComponent::from(catalog),
-                                }
-                            })?,
-                        )
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            };
-
-            let dataset_databricks = Databricks::new(
-                params,
-                runtime.tokio_io_runtime(),
-                runtime.token_provider_registry(),
-                shared_semaphore,
-                rate_controller,
-            )
-            .await
-            .map_err(|source| CatalogError::UnableToGetCatalogProvider {
-                connector: "databricks".to_string(),
-                source: source.into(),
-                connector_component: ConnectorComponent::from(catalog),
-            })?;
-
-            Arc::new(ReadTableProviderFactory::new(
-                dataset_databricks.read_provider(),
-                table_reference_creator_spark,
-            ))
-        };
-
-        let catalog_provider = UnityCatalogProvider::try_new(
-            client,
-            CatalogId(catalog_id),
-            table_creator,
-            catalog.include.clone(),
-        )
-        .await
-        .map_err(|e| CatalogError::UnableToGetCatalogProvider {
-            connector: "databricks".to_string(),
-            source: Box::new(e),
-            connector_component: ConnectorComponent::from(catalog),
-        })?;
-
-        Ok(Arc::new(catalog_provider) as Arc<dyn RefreshableCatalogProvider>)
-    }
-
-    fn initialization(&self) -> ComponentInitialization {
-        self.initialization
-    }
-}
-
-#[expect(clippy::unnecessary_wraps)]
-fn table_reference_creator_spark(uc_table: &UCTable) -> Option<TableReference> {
-    let table_reference = TableReference::Full {
-        catalog: uc_table.catalog_name.clone().into(),
-        schema: uc_table.schema_name.clone().into(),
-        table: uc_table.name.clone().into(),
-    };
-    Some(table_reference)
-}
-
-fn table_reference_creator_delta_lake(uc_table: &UCTable) -> Option<TableReference> {
-    let storage_location = uc_table.storage_location.as_deref()?;
-    Some(TableReference::bare(format!("{storage_location}/")))
-}
-
-// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1767,6 +1355,7 @@ mod tests {
         arrow::datatypes::{DataType, Field, Schema},
         datasource::MemTable,
     };
+    use runtime::Runtime;
     use runtime::component::dataset::builder::DatasetBuilder;
     use secrecy::ExposeSecret;
     use std::{
@@ -1780,6 +1369,48 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         sync::Mutex,
     };
+
+    /// Temporary (STS) credentials only authenticate when the session token travels with
+    /// the key and secret, so `databricks_aws_session_token` has to survive into the storage
+    /// options handed to the Delta Lake reader.
+    #[tokio::test]
+    async fn databricks_aws_session_token_reaches_delta_storage_options() {
+        let parameters = Parameters::try_new(
+            "connector databricks",
+            vec![
+                (
+                    "databricks_endpoint".to_string(),
+                    secrecy::SecretString::from("dbc-abcd.cloud.databricks.com"),
+                ),
+                (
+                    "databricks_aws_access_key_id".to_string(),
+                    secrecy::SecretString::from("ASIAEXAMPLE"),
+                ),
+                (
+                    "databricks_aws_secret_access_key".to_string(),
+                    secrecy::SecretString::from("secret"),
+                ),
+                (
+                    "databricks_aws_session_token".to_string(),
+                    secrecy::SecretString::from("FwoSessionToken"),
+                ),
+            ],
+            "databricks",
+            Arc::new(tokio::sync::RwLock::new(runtime::secrets::Secrets::new())),
+            PARAMETERS,
+        )
+        .await
+        .expect("temporary credential parameters should be accepted for databricks");
+
+        let storage_options = parameters.to_secret_map();
+        assert_eq!(
+            storage_options
+                .get("aws_session_token")
+                .map(ExposeSecret::expose_secret),
+            Some("FwoSessionToken"),
+            "session token must reach the Delta Lake storage options"
+        );
+    }
 
     #[test]
     fn databricks_parameters_include_http_rate_control() {
@@ -1795,24 +1426,6 @@ mod tests {
                     .iter()
                     .any(|parameter| parameter.name == parameter_name),
                 "missing Databricks data connector parameter {parameter_name}"
-            );
-        }
-    }
-
-    #[test]
-    fn databricks_catalog_parameters_include_http_rate_control() {
-        for parameter_name in [
-            "max_concurrent_requests",
-            "requests_per_second_limit",
-            "requests_per_minute_limit",
-            "rate_control_jitter_min",
-            "rate_control_jitter_max",
-        ] {
-            assert!(
-                CATALOG_PARAMETERS
-                    .iter()
-                    .any(|parameter| parameter.name == parameter_name),
-                "missing Databricks catalog connector parameter {parameter_name}"
             );
         }
     }
@@ -2201,8 +1814,60 @@ mod tests {
             "Databricks::build_auth_credentials should return an error"
         );
         if let Err(error) = result {
-            assert!(error.to_string().contains("Choose either `databricks_token` or `databricks_client_id` and `databricks_client_secret`"));
+            let message = error.to_string();
+            assert!(
+                message.contains("Both `databricks_token` and service principal credentials"),
+                "got: {message}"
+            );
+            assert!(
+                message.contains("databricks_auth_mode"),
+                "the error should offer `databricks_auth_mode` as the way out, got: {message}"
+            );
         }
+    }
+
+    /// Regression test for #11508: `databricks_client_secret` is a `secret` parameter, so it is
+    /// auto-loaded from the environment when the Spicepod omits it — which used to switch a U2M
+    /// dataset to machine-to-machine and fail with a service principal 401. Pinning the mode keeps
+    /// the connector on the flow the Spicepod asked for.
+    #[test]
+    fn test_build_auth_credentials_u2m_mode_ignores_ambient_client_secret() {
+        let params_vec = vec![
+            ("auth_mode".to_string(), SecretString::from("u2m")),
+            (
+                "client_id".to_string(),
+                SecretString::from("test_client_id"),
+            ),
+            (
+                "client_secret".to_string(),
+                SecretString::from("ambient_secret"),
+            ),
+        ];
+        let parameters = Parameters::new(params_vec, "databricks", PARAMETERS);
+
+        match Databricks::build_auth_credentials(&parameters) {
+            Ok(AuthCredentials::U2M(client_id)) => assert_eq!(client_id, "test_client_id"),
+            other => panic!("Expected U2M variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_auth_credentials_reports_invalid_auth_mode() {
+        let params_vec = vec![
+            ("auth_mode".to_string(), SecretString::from("oauth")),
+            (
+                "client_id".to_string(),
+                SecretString::from("test_client_id"),
+            ),
+        ];
+        let parameters = Parameters::new(params_vec, "databricks", PARAMETERS);
+
+        let error = Databricks::build_auth_credentials(&parameters)
+            .expect_err("an unknown `databricks_auth_mode` should be rejected");
+        assert!(
+            error.to_string().contains("auto, token, m2m, u2m"),
+            "got: {error}"
+        );
     }
 
     #[tokio::test]

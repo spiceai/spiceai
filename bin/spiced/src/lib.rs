@@ -27,6 +27,7 @@ use tokio::sync::SetOnce;
 
 use app::spicepod::component::runtime::{
     ClientAuthMode as SpicepodClientAuthMode, Runtime as SpicepodRuntime, TelemetryConfig,
+    validate_metric_prefix,
 };
 use app::{App, AppBuilder};
 use clap::{ArgAction, Parser, ValueEnum};
@@ -124,6 +125,7 @@ use yaml::Value;
 const TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE: &str = "Usage telemetry is anonymous and aggregated. In Spice.ai Open Source, setting runtime.telemetry.enabled: false in a Spicepod or passing --telemetry-enabled=false does not disable anonymous usage telemetry. To remove anonymous telemetry from an Open Source build, build from source without the anonymous_telemetry feature, or consider using Spice.ai Enterprise. Learn more at https://docs.spice.ai/docs/enterprise";
 
 mod cloud_connect;
+mod log_capture;
 #[path = "tracing.rs"]
 mod spiced_tracing;
 mod tls;
@@ -988,7 +990,11 @@ fn init_metrics(
     // on-demand OTLP, OTEL push). The prefix is intentionally placed at the
     // telemetry level rather than under any single exporter because
     // OpenTelemetry 0.31's SDK does not support per-reader name transforms.
+    // Character/length validity is enforced at spicepod parse time via
+    // `validate_metric_prefix` (OTel instrument name syntax).
     if let Some(prefix) = metric_prefix.filter(|p| !p.is_empty()) {
+        validate_metric_prefix(&prefix)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         tracing::info!(prefix = %prefix, "OTEL metrics name prefix enabled");
         provider_builder = provider_builder.with_view(
             move |instrument: &opentelemetry_sdk::metrics::Instrument| {

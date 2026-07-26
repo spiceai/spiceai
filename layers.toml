@@ -57,6 +57,9 @@ forbid = [["extension-utility", "runtime"]]
 # clickhouse-rs now lives only in connector-clickhouse (provider + pool + block
 # decoder all moved out of data_components / db_connection_pool / arrow_sql_gen).
 clickhouse-rs = ["connector-clickhouse"]
+# The mongodb driver moved out of data_components into connector-mongodb (runtime keeps it as a
+# dev-dep-exempt test dependency; the spice_sys/mongodb resume-token checkpoint stores JSON, no driver). spidapter is the MongoDB bench/adapter tool.
+mongodb = ["connector-mongodb", "spidapter"]
 
 # The DynamoDB AWS SDK drivers moved out of runtime + data_components into
 # connector-dynamodb. `dynamodb-streams` is the low-level streams client the
@@ -66,6 +69,34 @@ clickhouse-rs = ["connector-clickhouse"]
 # data_components would fail this guard.
 aws-sdk-dynamodbstreams = ["connector-dynamodb", "dynamodb-streams"]
 aws-sdk-dynamodb = ["connector-dynamodb", "dynamodb-streams", "testoperator", "spidapter"]
+
+# git2 now lives only in connector-git (the git provider moved out of data_components).
+git2 = ["connector-git"]
+
+# The IMAP driver stack (imap client + charset + mailparse) moved out of
+# data_components into connector-imap.
+charset = ["connector-imap"]
+imap = ["connector-imap"]
+mailparse = ["connector-imap"]
+
+# scylla now lives only in connector-scylladb (provider + pool + connection all moved
+# out of data_components / db_connection_pool), like clickhouse-rs.
+scylla = ["connector-scylladb"]
+
+# odbc-api + arrow-odbc now live only in connector-odbc (provider + pool + connection
+# all moved out of data_components / db_connection_pool), like clickhouse-rs.
+odbc-api = ["connector-odbc"]
+arrow-odbc = ["connector-odbc"]
+# Azure Cosmos DB provider (client + resilience + schema inference) moved out of
+# data_components into connector-cosmosdb. `azure_data_cosmos` is Cosmos-specific
+# and now lives only there. (`azure_core` is intentionally NOT confined — it is
+# shared by runtime/runtime-secrets for Azure Blob storage + Key Vault secrets.)
+azure_data_cosmos = ["connector-cosmosdb"]
+
+# SharePoint/OneDrive provider (Graph client + object-store + auth + table)
+# moved out of data_components into connector-sharepoint. The Microsoft Graph
+# SDK now lives only there.
+graph-rs-sdk = ["connector-sharepoint"]
 
 # Path-prefix rules (checked after per-crate overrides, in order).
 [[rules]]
@@ -87,6 +118,13 @@ tier = "foundation"
 # Per-crate overrides win over rules.
 [override]
 runtime = "runtime"
+# Config-only component specs (DatasetSpec/CatalogSpec/ViewSpec + their config
+# submodules) carved out of the `runtime` crate body. It names nothing from
+# `runtime` (no Arc<Runtime>/App/secrets/datafusion), so it compiles in parallel
+# with `runtime` rather than inside it. Kept in the `runtime` tier alongside the
+# other runtime-* crates; its own deps are all shared-utility/foundation, so it
+# could equally sit in shared-utility.
+runtime-component = "runtime"
 # Extensions that sit above the runtime crate (depend on `runtime`).
 spice-cloud = "extension"
 tpc-extension = "extension"

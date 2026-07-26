@@ -272,6 +272,74 @@ pub async fn check_cdc_prerequisites(pool: &PostgresConnectionPool) -> Result<()
     Ok(())
 }
 
+/// The activity status of a `PostgreSQL` replication slot, read from
+/// `pg_catalog.pg_replication_slots`. `active` is true while a consumer holds
+/// the slot; `active_pid` is that consumer's backend PID when the server exposes
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicationSlotStatus {
+    pub active: bool,
+    pub active_pid: Option<i32>,
+}
+
+/// Look up the status of the replication slot named `slot_name`, returning `None`
+/// if no such slot exists on the server.
+///
+/// Used by CDC catalog acceleration to decide, before it starts streaming,
+/// whether a slot with its deterministic name is already **actively** held by
+/// another consumer (fail loudly) versus merely present-and-inactive (safe to
+/// reuse on restart) versus absent (create fresh).
+///
+/// # Errors
+///
+/// Returns an error if a connection can't be obtained from `pool`, or the
+/// query fails.
+pub async fn replication_slot_status(
+    pool: &PostgresConnectionPool,
+    slot_name: &str,
+) -> Result<Option<ReplicationSlotStatus>> {
+    let conn = pool.connect_direct().await.context(ConnectionFailedSnafu)?;
+    let rows = conn
+        .conn
+        .query(
+            "SELECT active, active_pid FROM pg_catalog.pg_replication_slots WHERE slot_name = $1",
+            &[&slot_name],
+        )
+        .await
+        .context(QueryFailedSnafu)?;
+    Ok(rows.first().map(|row| ReplicationSlotStatus {
+        active: row.get(0),
+        active_pid: row.get(1),
+    }))
+}
+
+/// The server's `wal_sender_timeout` in milliseconds (`0` means disabled).
+///
+/// This bounds how long `PostgreSQL` keeps a slot marked `active` after its
+/// consumer's connection drops ungracefully, so the catalog acceleration path
+/// uses it to size how long it waits for a stale slot to free (e.g. after its
+/// own crash-restart) before deciding another live consumer holds it and failing
+/// loudly.
+///
+/// # Errors
+///
+/// Returns an error if a connection can't be obtained from `pool`, or the
+/// query fails.
+pub async fn wal_sender_timeout_ms(pool: &PostgresConnectionPool) -> Result<i64> {
+    let conn = pool.connect_direct().await.context(ConnectionFailedSnafu)?;
+    // `pg_settings.setting` for `wal_sender_timeout` is expressed in
+    // milliseconds (its `unit` is `ms`), so `::bigint` yields the raw ms value.
+    let row = conn
+        .conn
+        .query_one(
+            "SELECT setting::bigint FROM pg_catalog.pg_settings WHERE name = 'wal_sender_timeout'",
+            &[],
+        )
+        .await
+        .context(QueryFailedSnafu)?;
+    Ok(row.get(0))
+}
+
 /// A table's `PostgreSQL` `REPLICA IDENTITY` mode -- the per-table property that
 /// controls what the WAL carries in the *old tuple* of an `UPDATE`/`DELETE`,
 /// which is what any logical-replication consumer uses to identify the affected
@@ -535,7 +603,7 @@ pub fn classify_replica_identity(identity: &ReplicaIdentity) -> ReplicaIdentityO
 #[cfg(test)]
 mod tests {
     use super::{
-        ReplicaIdentity, ReplicaIdentityMode, ReplicaIdentityOutcome, SkipReason,
+        Error, ReplicaIdentity, ReplicaIdentityMode, ReplicaIdentityOutcome, SkipReason,
         accumulate_replica_identity, classify_replica_identity,
     };
 
@@ -683,5 +751,55 @@ mod tests {
             accumulate_replica_identity(ReplicaIdentityMode::Default, vec![(None, None, None)]);
         assert!(id.primary_key.is_empty());
         assert!(id.identity_index.is_empty());
+    }
+
+    #[test]
+    fn skip_reason_explanations_are_actionable() {
+        // Every skip reason drives a per-table warning, so each must name the
+        // property at fault (REPLICA IDENTITY) and a concrete fix the operator
+        // can apply.
+        for reason in [
+            SkipReason::NoReplicaIdentity,
+            SkipReason::KeylessDefault,
+            SkipReason::UnusableIdentityIndex,
+            SkipReason::FullWithoutKey,
+            SkipReason::UnknownMode,
+        ] {
+            let explanation = reason.explanation();
+            assert!(
+                explanation.contains("REPLICA IDENTITY"),
+                "{reason:?} explanation should name REPLICA IDENTITY: {explanation}"
+            );
+            assert!(
+                explanation.contains("primary key")
+                    || explanation.contains("USING INDEX")
+                    || explanation.contains("unique"),
+                "{reason:?} explanation should name a concrete fix: {explanation}"
+            );
+        }
+    }
+
+    #[test]
+    fn cdc_prerequisite_errors_are_actionable_with_docs_links() {
+        // The wal_level and replication-privilege errors are the first thing an
+        // operator hits when a source can't do CDC -- each must name the exact
+        // problem, the exact fix, and a docs link.
+        let wal = Error::WalLevelNotLogical {
+            wal_level: "replica".to_string(),
+        }
+        .to_string();
+        assert!(wal.contains("wal_level"), "{wal}");
+        assert!(wal.contains("logical"), "{wal}");
+        assert!(wal.contains("ALTER SYSTEM SET wal_level"), "{wal}");
+        assert!(wal.contains("https://spiceai.org/docs"), "{wal}");
+
+        let role = Error::MissingReplicationPrivilege {
+            role: "app_ro".to_string(),
+        }
+        .to_string();
+        assert!(role.contains("app_ro"), "{role}");
+        assert!(role.contains("replication"), "{role}");
+        assert!(role.contains("ALTER ROLE"), "{role}");
+        assert!(role.contains("https://spiceai.org/docs"), "{role}");
     }
 }

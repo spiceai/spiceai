@@ -53,15 +53,16 @@ limitations under the License.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use app::App;
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use data_components::postgres::provider::{
     ReplicaIdentityOutcome, check_cdc_prerequisites, classify_replica_identity, list_schemas,
-    list_tables, replica_identity,
+    list_tables, replica_identity, replication_slot_status, wal_sender_timeout_ms,
 };
-use data_components::postgres_replication::config::default_slot_name;
+use data_components::postgres_replication::config::catalog_slot_name;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::common::TableReference;
 use datafusion::common::utils::quote_identifier;
@@ -148,6 +149,201 @@ fn column_reference_string(key: &[String]) -> String {
     }
 }
 
+/// How a table's `REPLICA IDENTITY` lets it be CDC-accelerated -- the reporting
+/// counterpart of the eligible [`ReplicaIdentityOutcome`] variants. Carried so
+/// the startup summary and metrics can break accelerated tables down by the key
+/// that drives their upsert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccelerationKind {
+    /// `DEFAULT` + primary key.
+    PrimaryKey,
+    /// `USING INDEX`, keyed by the nominated unique index.
+    UniqueIndex,
+    /// `FULL` + primary key.
+    Full,
+}
+
+impl AccelerationKind {
+    /// The eligible outcome's kind, or `None` for `Skip`.
+    fn from_outcome(outcome: &ReplicaIdentityOutcome) -> Option<Self> {
+        match outcome {
+            ReplicaIdentityOutcome::AccelerateViaPrimaryKey { .. } => Some(Self::PrimaryKey),
+            ReplicaIdentityOutcome::AccelerateViaUniqueIndex { .. } => Some(Self::UniqueIndex),
+            ReplicaIdentityOutcome::AccelerateFullReplicaIdentity { .. } => Some(Self::Full),
+            ReplicaIdentityOutcome::Skip { .. } => None,
+        }
+    }
+
+    /// Stable metric-attribute value (never a display string).
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::PrimaryKey => "primary_key",
+            Self::UniqueIndex => "unique_index",
+            Self::Full => "full",
+        }
+    }
+}
+
+/// Widen a table count to the `u64` the metrics API takes, saturating rather
+/// than panicking (counts never approach `u64::MAX`; this only satisfies the
+/// no-`unwrap` lint without an `as` cast).
+fn count_as_u64(count: usize) -> u64 {
+    u64::try_from(count).unwrap_or(u64::MAX)
+}
+
+/// The per-catalog tally of how discovery resolved every table it looked at:
+/// accelerated (broken down by [`AccelerationKind`]), skipped for lacking a
+/// usable `REPLICA IDENTITY`, or excluded by `include`/`exclude`. Accumulated
+/// across schemas (see [`AccelerationSummary::add`]) into the startup summary
+/// log line and the catalog acceleration metrics, and used to fail loudly when
+/// nothing is eligible.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct AccelerationSummary {
+    primary_key: usize,
+    unique_index: usize,
+    full: usize,
+    skipped: usize,
+    excluded: usize,
+}
+
+impl AccelerationSummary {
+    fn record_accelerated(&mut self, kind: AccelerationKind) {
+        match kind {
+            AccelerationKind::PrimaryKey => self.primary_key += 1,
+            AccelerationKind::UniqueIndex => self.unique_index += 1,
+            AccelerationKind::Full => self.full += 1,
+        }
+    }
+
+    /// Total tables that will be CDC-accelerated (across all kinds).
+    fn accelerated_total(&self) -> usize {
+        self.primary_key + self.unique_index + self.full
+    }
+
+    /// Fold another schema's summary into this one.
+    fn add(&mut self, other: &Self) {
+        self.primary_key += other.primary_key;
+        self.unique_index += other.unique_index;
+        self.full += other.full;
+        self.skipped += other.skipped;
+        self.excluded += other.excluded;
+    }
+
+    /// The single startup summary line, naming the shared slot and breaking the
+    /// accelerated count down by acceleration kind.
+    fn summary_message(&self, catalog_name: &str, slot_name: &str) -> String {
+        format!(
+            "Catalog '{catalog_name}': accelerating {} table(s) via CDC ({} via primary key, {} via REPLICA IDENTITY USING INDEX, {} via REPLICA IDENTITY FULL; shared replication slot '{slot_name}'); {} table(s) excluded by include/exclude filters; {} table(s) skipped (no usable replica identity -- see warnings).",
+            self.accelerated_total(),
+            self.primary_key,
+            self.unique_index,
+            self.full,
+            self.excluded,
+            self.skipped,
+        )
+    }
+
+    /// Emit the catalog acceleration gauges (accelerated/skipped/excluded counts
+    /// and the by-kind breakdown) for `catalog_name`.
+    fn emit_metrics(&self, catalog_name: &str) {
+        use opentelemetry::KeyValue;
+        let category = |value: &'static str| {
+            [
+                KeyValue::new("catalog", catalog_name.to_string()),
+                KeyValue::new("category", value),
+            ]
+        };
+        runtime_metrics::catalogs::ACCELERATION_TABLES.record(
+            count_as_u64(self.accelerated_total()),
+            &category("accelerated"),
+        );
+        runtime_metrics::catalogs::ACCELERATION_TABLES
+            .record(count_as_u64(self.skipped), &category("skipped"));
+        runtime_metrics::catalogs::ACCELERATION_TABLES
+            .record(count_as_u64(self.excluded), &category("excluded"));
+
+        let kind = |k: AccelerationKind, n: usize| {
+            runtime_metrics::catalogs::ACCELERATION_TABLES_BY_KIND.record(
+                count_as_u64(n),
+                &[
+                    KeyValue::new("catalog", catalog_name.to_string()),
+                    KeyValue::new("kind", k.metric_label()),
+                ],
+            );
+        };
+        kind(AccelerationKind::PrimaryKey, self.primary_key);
+        kind(AccelerationKind::UniqueIndex, self.unique_index);
+        kind(AccelerationKind::Full, self.full);
+    }
+}
+
+/// A table already handed off to a background bootstrap/CDC task, tracked across
+/// refreshes: the dataset name it was registered under and how it is
+/// accelerated (so re-plans re-report its [`AccelerationKind`] without
+/// re-querying its replica identity).
+#[derive(Debug, Clone)]
+struct SpawnedTable {
+    dataset_name: String,
+    kind: AccelerationKind,
+}
+
+/// Discovery found no CDC-eligible table in the catalog. A hard, actionable
+/// startup error (see [`AcceleratedCatalogProvider::refresh`]): catalog
+/// discovery is one-shot (tables added after startup are a documented non-goal),
+/// so an empty result is a configuration problem to surface, not an empty
+/// catalog to register silently. `postgres.rs` maps this to a permanent
+/// configuration error.
+#[derive(Debug, Snafu)]
+#[snafu(display(
+    "Catalog '{catalog}': no tables are eligible for CDC acceleration ({excluded} excluded by include/exclude filters, {skipped} skipped for lacking a usable REPLICA IDENTITY). Give each table a usable CDC key -- a primary key (which REPLICA IDENTITY DEFAULT or FULL then keys on), or a UNIQUE NOT NULL index set as REPLICA IDENTITY USING INDEX -- and ensure the catalog's `include`/`exclude` patterns match them. Note that REPLICA IDENTITY FULL without a primary key is still skipped. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
+))]
+pub(crate) struct NoEligibleTablesError {
+    catalog: String,
+    excluded: usize,
+    skipped: usize,
+}
+
+/// The catalog's deterministic replication slot is already actively held by
+/// another consumer. Because the slot name is derived purely from the catalog
+/// (see [`catalog_slot_name`]) and `PostgreSQL` permits a single consumer per
+/// slot, this means a second Spice instance (or process) is already streaming
+/// this catalog's changes. Surfaced only after a bounded wait (see
+/// [`AcceleratedCatalogProvider::ensure_catalog_slot_available`]) that already
+/// absorbs the legitimate hand-off cases -- a fast self-restart, or a rolling
+/// deploy whose predecessor is shutting down -- by giving the server up to
+/// `wal_sender_timeout` to release a now-dead consumer's slot. If a *live*
+/// consumer still holds it past that window, `postgres.rs` maps this to a
+/// permanent configuration error (terminal ERROR status, no retry loop): running
+/// two instances against one catalog is a misconfiguration to surface loudly,
+/// not to silently keep retrying.
+#[derive(Debug, Snafu)]
+#[snafu(display(
+    "Catalog '{catalog}': replication slot '{slot_name}' is already in use by {active_consumer} after waiting {waited_secs}s. Another Spice instance (or process) is already streaming this catalog's changes -- PostgreSQL permits only one consumer per replication slot. Ensure only one Spice instance accelerates this catalog, or stop the other consumer. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
+))]
+pub(crate) struct SlotInUseError {
+    catalog: String,
+    slot_name: String,
+    /// Pre-rendered so the `Display` string needs no `Option` formatting, e.g.
+    /// `"PID 1234"` or `"an unknown backend"`.
+    active_consumer: String,
+    waited_secs: u64,
+}
+
+/// How long to wait, beyond the server's `wal_sender_timeout`, for a slot that a
+/// crashed consumer still holds `active` to be released before concluding a
+/// different live consumer owns it. `PostgreSQL` frees the slot within
+/// milliseconds of the walsender exiting (at ~`wal_sender_timeout`), so this is
+/// a small buffer for scheduling/poll granularity, not a second full timeout.
+const SLOT_RELEASE_GRACE: Duration = Duration::from_secs(5);
+/// Fallback wait budget when `wal_sender_timeout` is `0` (disabled), since then
+/// the server won't time out a dropped consumer on its own.
+const SLOT_WAIT_BUDGET_WHEN_TIMEOUT_DISABLED: Duration = Duration::from_secs(90);
+/// Upper bound on the slot-availability wait so a very large `wal_sender_timeout`
+/// can't hang catalog startup indefinitely.
+const SLOT_WAIT_BUDGET_CAP: Duration = Duration::from_mins(3);
+/// How often to re-poll the slot's activity while waiting for it to free.
+const SLOT_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
 /// A catalog provider that CDC-accelerates every table it discovers (subject
 /// to `include`/`exclude`), holding its own `PostgreSQL` connection directly
 /// rather than wrapping the plain federated catalog provider.
@@ -179,7 +375,7 @@ pub struct AcceleratedCatalogProvider {
     /// table `"c"` vs. schema `"a"`, table `"b.c"`), which would make one
     /// table reuse another's dataset name and silently route queries to the
     /// wrong accelerated table.
-    spawned: RwLock<HashMap<(String, String), String>>,
+    spawned: RwLock<HashMap<(String, String), SpawnedTable>>,
 }
 
 impl std::fmt::Debug for AcceleratedCatalogProvider {
@@ -193,7 +389,7 @@ impl std::fmt::Debug for AcceleratedCatalogProvider {
 impl AcceleratedCatalogProvider {
     #[must_use]
     pub fn new(catalog: &Catalog, pool: Arc<PostgresConnectionPool>) -> Self {
-        let slot_name = default_slot_name(&catalog.name);
+        let slot_name = catalog_slot_name(&catalog.name);
 
         // Seed from the catalog's connection params, then let `dataset_params`
         // override -- the same precedence other catalog connectors use (e.g.
@@ -213,6 +409,95 @@ impl AcceleratedCatalogProvider {
             exclude: catalog.exclude.clone().map(Arc::new),
             schemas: RwLock::new(HashMap::new()),
             spawned: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Fail loudly, before spawning anything, if this catalog's deterministic
+    /// replication slot is already **actively** held by another consumer.
+    ///
+    /// Because [`catalog_slot_name`] derives the slot name purely from the
+    /// catalog (no instance component), a second Spice instance pointed at the
+    /// same catalog resolves to the *same* slot -- and `PostgreSQL` permits only
+    /// one consumer per slot. So:
+    ///
+    ///   - slot absent -> return; the per-table replication path creates it;
+    ///   - slot present but inactive -> return; it is reused (a restart/reschedule
+    ///     resumes from its `restart_lsn`, no re-snapshot);
+    ///   - slot present and active -> another consumer holds it. But a fast
+    ///     self-restart after an ungraceful exit can *also* see the slot active
+    ///     (the server keeps the dead consumer's slot active until
+    ///     `wal_sender_timeout`), so we poll for a bounded window sized from the
+    ///     server's `wal_sender_timeout` before concluding a *different* live
+    ///     consumer owns it and returning [`SlotInUseError`].
+    ///
+    /// Only meaningful before this catalog owns the slot; callers guard on
+    /// "nothing spawned yet" so a periodic refresh never trips over *our own*
+    /// active slot.
+    async fn ensure_catalog_slot_available(
+        &self,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Size the wait from the server's wal_sender_timeout: that is how long it
+        // keeps a crashed consumer's slot marked active, so waiting that long
+        // (plus a grace) lets a self-restart reclaim its own slot before we treat
+        // it as taken. `0` disables the timeout, so fall back to a fixed window.
+        let timeout_ms = wal_sender_timeout_ms(&self.pool)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        let budget = if timeout_ms > 0 {
+            Duration::from_millis(u64::try_from(timeout_ms).unwrap_or(u64::MAX))
+                .saturating_add(SLOT_RELEASE_GRACE)
+                .min(SLOT_WAIT_BUDGET_CAP)
+        } else {
+            SLOT_WAIT_BUDGET_WHEN_TIMEOUT_DISABLED
+        };
+
+        let start = tokio::time::Instant::now();
+        let deadline = start + budget;
+        // Warn only once, when the wait begins -- the loop re-polls every
+        // `SLOT_POLL_INTERVAL`, so warning each iteration would emit up to
+        // hundreds of lines during a full conflict window. Subsequent polls log
+        // at debug.
+        let mut warned = false;
+        loop {
+            let status = replication_slot_status(&self.pool, &self.slot_name)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            match status {
+                // Absent (will be created) or present-but-inactive (safe to reuse).
+                None => return Ok(()),
+                Some(status) if !status.active => return Ok(()),
+                Some(status) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        let active_consumer = status.active_pid.map_or_else(
+                            || "an unknown backend".to_string(),
+                            |pid| format!("PID {pid}"),
+                        );
+                        return Err(Box::new(SlotInUseError {
+                            catalog: self.catalog_name.clone(),
+                            slot_name: self.slot_name.clone(),
+                            active_consumer,
+                            waited_secs: start.elapsed().as_secs(),
+                        }));
+                    }
+                    if warned {
+                        tracing::debug!(
+                            "Catalog '{}': replication slot '{}' still active; continuing to wait (up to {}s total).",
+                            self.catalog_name,
+                            self.slot_name,
+                            budget.as_secs(),
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Catalog '{}': replication slot '{}' is currently active; waiting up to {}s for it to free (a previous instance may still be shutting down) before failing.",
+                            self.catalog_name,
+                            self.slot_name,
+                            budget.as_secs(),
+                        );
+                        warned = true;
+                    }
+                    tokio::time::sleep(SLOT_POLL_INTERVAL).await;
+                }
+            }
         }
     }
 
@@ -300,8 +585,7 @@ impl AcceleratedCatalogProvider {
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
         let mut tables = HashMap::new();
-        let mut excluded = 0usize;
-        let mut skipped = 0usize;
+        let mut summary = AccelerationSummary::default();
         let mut to_spawn = Vec::new();
         for table_name in table_names {
             if !table_is_selected(
@@ -310,21 +594,24 @@ impl AcceleratedCatalogProvider {
                 self.include.as_deref(),
                 self.exclude.as_deref(),
             ) {
-                excluded += 1;
+                summary.excluded += 1;
                 continue;
             }
 
             // Already running from a previous refresh -- reuse it rather
             // than re-classifying and re-spawning a duplicate bootstrap/CDC
-            // task for a table `refresh()` already knows about.
+            // task for a table `refresh()` already knows about. Its stored
+            // acceleration kind is re-counted so re-plans keep the by-kind
+            // summary/metrics accurate without re-querying its replica identity.
             let spawn_key = (schema_name.to_string(), table_name.clone());
             let already_spawned = {
                 let guard = self.spawned.read();
                 guard.get(&spawn_key).cloned()
             };
 
-            let dataset_name = if let Some(dataset_name) = already_spawned {
-                dataset_name
+            let dataset_name = if let Some(spawned) = already_spawned {
+                summary.record_accelerated(spawned.kind);
+                spawned.dataset_name
             } else {
                 // Quote each component (only when required) so the per-table
                 // warnings below unambiguously identify the table and round-trip
@@ -346,9 +633,10 @@ impl AcceleratedCatalogProvider {
                 // the catalog still replicates. `DEFAULT` + primary key is the
                 // normal case and logs nothing (counted in the summary); the
                 // notable cases each get one line.
-                let key = match classify_replica_identity(&identity) {
+                let outcome = classify_replica_identity(&identity);
+                let key = match &outcome {
                     ReplicaIdentityOutcome::Skip { reason } => {
-                        skipped += 1;
+                        summary.skipped += 1;
                         tracing::warn!(
                             "Catalog '{}': skipping table {table_path}: {}. Exclude it via the catalog's `include`/`exclude` patterns to suppress this warning.",
                             self.catalog_name,
@@ -356,14 +644,14 @@ impl AcceleratedCatalogProvider {
                         );
                         continue;
                     }
-                    ReplicaIdentityOutcome::AccelerateViaPrimaryKey { key } => key,
+                    ReplicaIdentityOutcome::AccelerateViaPrimaryKey { key } => key.clone(),
                     ReplicaIdentityOutcome::AccelerateViaUniqueIndex { key } => {
                         tracing::info!(
                             "Catalog '{}': accelerating table {table_path} via its REPLICA IDENTITY unique index ({}).",
                             self.catalog_name,
                             key.join(", "),
                         );
-                        key
+                        key.clone()
                     }
                     ReplicaIdentityOutcome::AccelerateFullReplicaIdentity { key } => {
                         tracing::warn!(
@@ -371,16 +659,21 @@ impl AcceleratedCatalogProvider {
                             self.catalog_name,
                             key.join(", "),
                         );
-                        key
+                        key.clone()
                     }
                 };
+                // Skip returned above; every remaining outcome has a kind.
+                let Some(kind) = AccelerationKind::from_outcome(&outcome) else {
+                    continue;
+                };
+                summary.record_accelerated(kind);
 
                 // Build (validate) now; defer spawning to `refresh` so a later
                 // unbuildable table can't leave this one orphaned.
                 let (dataset_name, dataset) = self
                     .build_accelerated_dataset(schema_name, &table_name, &key)
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-                to_spawn.push((table_name.clone(), dataset_name.clone(), dataset));
+                to_spawn.push((table_name.clone(), dataset_name.clone(), kind, dataset));
                 dataset_name
             };
 
@@ -389,8 +682,7 @@ impl AcceleratedCatalogProvider {
 
         Ok(SchemaPlan {
             tables,
-            excluded,
-            skipped,
+            summary,
             to_spawn,
         })
     }
@@ -398,18 +690,23 @@ impl AcceleratedCatalogProvider {
 
 /// A validated, not-yet-spawned plan for one schema (see
 /// [`AcceleratedCatalogProvider::refresh`]): the `table_name -> dataset
-/// registration name` map for the schema provider, the number of tables
-/// `include`/`exclude` excluded, the number skipped for having no usable replica
-/// identity, and the datasets that are new this refresh and still need spawning.
+/// registration name` map for the schema provider, the schema's
+/// [`AccelerationSummary`] (accelerated-by-kind / skipped / excluded counts),
+/// and the datasets that are new this refresh and still need spawning.
 /// Classification + build completes for the whole catalog before any dataset is
 /// spawned, so a later unbuildable table can't leave earlier tables' bootstrap/
 /// CDC tasks running orphaned against a catalog that never registers.
 struct SchemaPlan {
     tables: HashMap<String, String>,
-    excluded: usize,
-    skipped: usize,
-    /// `(table_name, dataset_name, built dataset)` for each new table.
-    to_spawn: Vec<(String, String, crate::component::dataset::Dataset)>,
+    summary: AccelerationSummary,
+    /// `(table_name, dataset_name, acceleration kind, built dataset)` for each
+    /// new table.
+    to_spawn: Vec<(
+        String,
+        String,
+        AccelerationKind,
+        crate::component::dataset::Dataset,
+    )>,
 }
 
 #[async_trait]
@@ -423,6 +720,16 @@ impl RefreshableCatalogProvider for AcceleratedCatalogProvider {
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
+        // Before this catalog owns its shared slot, fail loudly if another live
+        // consumer already holds it (its deterministic name means a second Spice
+        // instance would otherwise silently compete for the single-consumer
+        // slot). Guarded to the pre-ownership window -- once we've spawned our own
+        // datasets, the slot is active because *we* hold it, so a periodic refresh
+        // must not re-run this check and trip over ourselves.
+        if self.spawned.read().is_empty() {
+            self.ensure_catalog_slot_available().await?;
+        }
+
         let schema_names = list_schemas(&self.pool)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
@@ -434,15 +741,26 @@ impl RefreshableCatalogProvider for AcceleratedCatalogProvider {
         // has been spawned, so it can't leave earlier tables' bootstrap/CDC tasks
         // running orphaned against a catalog that then never registers.
         let mut plans = Vec::new();
-        let mut included_tables = 0usize;
-        let mut excluded_tables = 0usize;
-        let mut skipped_tables = 0usize;
+        let mut summary = AccelerationSummary::default();
         for schema_name in &schema_names {
             let plan = self.plan_schema_provider(schema_name).await?;
-            included_tables += plan.tables.len();
-            excluded_tables += plan.excluded;
-            skipped_tables += plan.skipped;
+            summary.add(&plan.summary);
             plans.push((schema_name.clone(), plan));
+        }
+
+        // Fail loudly when nothing is eligible: catalog discovery is one-shot
+        // (auto-detecting tables added after startup is a documented non-goal),
+        // so an empty result is a configuration problem to surface -- not an
+        // empty catalog to register silently. Returned before spawning or
+        // swapping `self.schemas`, so a later refresh that transiently sees zero
+        // leaves any previously-registered schemas intact. `postgres.rs` maps
+        // this to a permanent configuration error (ERROR status, no retry loop).
+        if summary.accelerated_total() == 0 {
+            return Err(Box::new(NoEligibleTablesError {
+                catalog: self.catalog_name.clone(),
+                excluded: summary.excluded,
+                skipped: summary.skipped,
+            }));
         }
 
         // Phase 2: the whole catalog validated -- now spawn the new datasets
@@ -451,10 +769,11 @@ impl RefreshableCatalogProvider for AcceleratedCatalogProvider {
         // registration can no longer be left partially applied.
         let mut schemas = HashMap::new();
         for (schema_name, plan) in plans {
-            for (table_name, dataset_name, dataset) in plan.to_spawn {
-                self.spawned
-                    .write()
-                    .insert((schema_name.clone(), table_name), dataset_name);
+            for (table_name, dataset_name, kind, dataset) in plan.to_spawn {
+                self.spawned.write().insert(
+                    (schema_name.clone(), table_name),
+                    SpawnedTable { dataset_name, kind },
+                );
                 tokio::spawn(Arc::clone(&self.runtime).load_synthesized_dataset(Arc::new(dataset)));
             }
             schemas.insert(
@@ -471,13 +790,10 @@ impl RefreshableCatalogProvider for AcceleratedCatalogProvider {
             *guard = schemas;
         }
 
+        summary.emit_metrics(&self.catalog_name);
         tracing::info!(
-            "Catalog '{}': accelerating {included_tables} table{} via CDC (shared replication slot '{}'); {excluded_tables} table{} excluded by include/exclude filters; {skipped_tables} table{} skipped (no usable replica identity -- see warnings).",
-            self.catalog_name,
-            if included_tables == 1 { "" } else { "s" },
-            self.slot_name,
-            if excluded_tables == 1 { "" } else { "s" },
-            if skipped_tables == 1 { "" } else { "s" },
+            "{}",
+            summary.summary_message(&self.catalog_name, &self.slot_name)
         );
 
         Ok(())
@@ -604,5 +920,186 @@ mod tests {
         let shifted_left = synthesized_dataset_name("cat", "a_b", "c");
         let shifted_right = synthesized_dataset_name("cat", "a", "b_c");
         assert_ne!(shifted_left, shifted_right);
+    }
+
+    fn globset(patterns: &[&str]) -> GlobSet {
+        let mut builder = globset::GlobSetBuilder::new();
+        for pattern in patterns {
+            builder.add(globset::Glob::new(pattern).expect("valid glob"));
+        }
+        builder.build().expect("valid globset")
+    }
+
+    #[test]
+    fn table_is_selected_with_no_filters_selects_everything() {
+        assert!(table_is_selected("public", "orders", None, None));
+    }
+
+    #[test]
+    fn table_is_selected_honors_include() {
+        let include = globset(&["public.*"]);
+        assert!(table_is_selected("public", "orders", Some(&include), None));
+        // A table outside the include set is not selected.
+        assert!(!table_is_selected(
+            "reporting",
+            "orders",
+            Some(&include),
+            None
+        ));
+    }
+
+    #[test]
+    fn table_is_selected_honors_exclude() {
+        let exclude = globset(&["public.audit"]);
+        assert!(table_is_selected("public", "orders", None, Some(&exclude)));
+        assert!(!table_is_selected("public", "audit", None, Some(&exclude)));
+    }
+
+    #[test]
+    fn table_is_selected_exclude_wins_over_include() {
+        // A table matched by BOTH include and exclude is excluded -- exclude is
+        // the veto.
+        let include = globset(&["public.*"]);
+        let exclude = globset(&["public.audit"]);
+        assert!(table_is_selected(
+            "public",
+            "orders",
+            Some(&include),
+            Some(&exclude)
+        ));
+        assert!(!table_is_selected(
+            "public",
+            "audit",
+            Some(&include),
+            Some(&exclude)
+        ));
+    }
+
+    #[test]
+    fn acceleration_kind_maps_from_eligible_outcomes_only() {
+        use data_components::postgres::provider::SkipReason;
+        assert_eq!(
+            AccelerationKind::from_outcome(&ReplicaIdentityOutcome::AccelerateViaPrimaryKey {
+                key: vec!["id".to_string()],
+            }),
+            Some(AccelerationKind::PrimaryKey)
+        );
+        assert_eq!(
+            AccelerationKind::from_outcome(&ReplicaIdentityOutcome::AccelerateViaUniqueIndex {
+                key: vec!["uid".to_string()],
+            }),
+            Some(AccelerationKind::UniqueIndex)
+        );
+        assert_eq!(
+            AccelerationKind::from_outcome(
+                &ReplicaIdentityOutcome::AccelerateFullReplicaIdentity {
+                    key: vec!["id".to_string()],
+                }
+            ),
+            Some(AccelerationKind::Full)
+        );
+        assert_eq!(
+            AccelerationKind::from_outcome(&ReplicaIdentityOutcome::Skip {
+                reason: SkipReason::KeylessDefault,
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn acceleration_summary_counts_by_kind_and_total() {
+        let mut summary = AccelerationSummary::default();
+        summary.record_accelerated(AccelerationKind::PrimaryKey);
+        summary.record_accelerated(AccelerationKind::PrimaryKey);
+        summary.record_accelerated(AccelerationKind::UniqueIndex);
+        summary.record_accelerated(AccelerationKind::Full);
+        summary.skipped = 2;
+        summary.excluded = 1;
+
+        assert_eq!(summary.primary_key, 2);
+        assert_eq!(summary.unique_index, 1);
+        assert_eq!(summary.full, 1);
+        // Skipped/excluded do not count toward accelerated total.
+        assert_eq!(summary.accelerated_total(), 4);
+    }
+
+    #[test]
+    fn acceleration_summary_add_folds_every_field() {
+        let mut a = AccelerationSummary {
+            primary_key: 1,
+            unique_index: 2,
+            full: 3,
+            skipped: 4,
+            excluded: 5,
+        };
+        let b = AccelerationSummary {
+            primary_key: 10,
+            unique_index: 20,
+            full: 30,
+            skipped: 40,
+            excluded: 50,
+        };
+        a.add(&b);
+        assert_eq!(
+            a,
+            AccelerationSummary {
+                primary_key: 11,
+                unique_index: 22,
+                full: 33,
+                skipped: 44,
+                excluded: 55,
+            }
+        );
+    }
+
+    #[test]
+    fn acceleration_summary_detects_zero_eligible() {
+        // Only skipped/excluded tables => nothing eligible => the fail-loud path.
+        let summary = AccelerationSummary {
+            skipped: 3,
+            excluded: 2,
+            ..AccelerationSummary::default()
+        };
+        assert_eq!(summary.accelerated_total(), 0);
+    }
+
+    #[test]
+    fn acceleration_summary_message_reports_counts_and_slot() {
+        let summary = AccelerationSummary {
+            primary_key: 2,
+            unique_index: 1,
+            full: 1,
+            skipped: 2,
+            excluded: 3,
+        };
+        let message = summary.summary_message("my_pg", "spice_my_pg_slot");
+        assert!(message.contains("my_pg"), "{message}");
+        assert!(message.contains("spice_my_pg_slot"), "{message}");
+        assert!(
+            message.contains("4 table(s)"),
+            "accelerated total: {message}"
+        );
+        assert!(message.contains("2 via primary key"), "{message}");
+        assert!(
+            message.contains("1 via REPLICA IDENTITY USING INDEX"),
+            "{message}"
+        );
+        assert!(message.contains("1 via REPLICA IDENTITY FULL"), "{message}");
+        assert!(message.contains("3 table(s) excluded"), "{message}");
+        assert!(message.contains("2 table(s) skipped"), "{message}");
+    }
+
+    #[test]
+    fn no_eligible_tables_error_is_actionable_with_docs_link() {
+        let err = NoEligibleTablesError {
+            catalog: "my_pg".to_string(),
+            excluded: 3,
+            skipped: 2,
+        }
+        .to_string();
+        assert!(err.contains("my_pg"), "{err}");
+        assert!(err.contains("no tables are eligible"), "{err}");
+        assert!(err.contains("REPLICA IDENTITY"), "{err}");
+        assert!(err.contains("https://spiceai.org/docs"), "{err}");
     }
 }

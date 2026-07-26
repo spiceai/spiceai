@@ -19,8 +19,16 @@ limitations under the License.
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Default endpoint for the Spice Cloud control plane.
+/// Default enroll endpoint for the Spice Cloud control plane (state
+/// plane): the base URL the out-of-band HTTPS `/v1/cloud-connect/enroll`
+/// and `/v1/cloud-connect/renew` requests are made against. The gateway
+/// (stream) address is returned by the enroll response, not configured.
 pub const DEFAULT_ENDPOINT: &str = "https://cloud.spice.ai";
+
+/// Default lead time before the identity cert's `not_after` at which the
+/// client renews. The cloud issues 24h leaves, so a 12h lead yields the
+/// ~12h renewal cadence of the BYOC operator.
+pub const DEFAULT_RENEWAL_LEAD: Duration = Duration::from_hours(12);
 
 /// Default cadence for `Heartbeat` frames on an established stream.
 pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
@@ -44,9 +52,19 @@ pub const IDENTITY_FILE: &str = "identity.json";
 /// Runtime config for the Cloud Connect client.
 #[derive(Debug, Clone)]
 pub struct CloudConnectConfig {
-    /// gRPC endpoint, e.g. `https://cloud.spice.ai`. The path component
-    /// is ignored — only scheme + host + port are used.
-    pub endpoint: String,
+    /// Cloud enroll endpoint (state plane), e.g. `https://cloud.spice.ai`.
+    /// Base URL for the out-of-band HTTPS `/v1/cloud-connect/enroll` and
+    /// `/v1/cloud-connect/renew` requests. This is **not** the stream
+    /// endpoint: the gateway address for the mTLS `CloudConnect` stream
+    /// comes back in the enroll response and is persisted in the identity.
+    pub enroll_endpoint: String,
+
+    /// Optional explicit gateway (stream) endpoint override, e.g.
+    /// `https://connect.aws.spiceai.io:7320`. When `None` (the default),
+    /// the stream connects to the `gateway_addr` returned by the enroll
+    /// response and persisted in the identity. Mainly for tests and
+    /// self-hosted control planes.
+    pub gateway_endpoint: Option<String>,
 
     /// Optional PEM-encoded CA certificate to verify the server. When
     /// `None`, the system `WebPKI` roots are used. Mainly for self-hosted
@@ -54,9 +72,9 @@ pub struct CloudConnectConfig {
     pub ca_cert_pem: Option<String>,
 
     /// When `true`, TLS is **disabled entirely** and the runtime connects
-    /// to the control plane over a plaintext (h2c) channel — not merely
-    /// with certificate verification turned off. For local development
-    /// only; never enable against a real control plane. Defaults to `false`.
+    /// to the gateway over a plaintext (h2c) channel — not merely with
+    /// certificate verification turned off. For local development only;
+    /// never enable against a real control plane. Defaults to `false`.
     pub insecure: bool,
 
     /// Path to the on-disk identity file (typically
@@ -93,15 +111,31 @@ pub struct CloudConnectConfig {
     /// Cadence for `Telemetry` frames once a stream is established.
     /// Defaults to [`DEFAULT_TELEMETRY_INTERVAL`].
     pub telemetry_interval: Duration,
+
+    /// Lead time before the identity cert's `not_after` at which the
+    /// client renews (fresh keypair + CSR against `/renew`). Defaults to
+    /// [`DEFAULT_RENEWAL_LEAD`]; overridable so tests can exercise the
+    /// renewal loop without waiting hours.
+    pub renewal_lead: Duration,
 }
 
 impl CloudConnectConfig {
-    /// Resolve `$SPICE_CONFIG_DIR` to its canonical location.
+    /// Resolve the Cloud Connect config directory to its canonical location.
     ///
     /// Precedence:
-    /// 1. `$SPICE_CONFIG_DIR` env var
-    /// 2. `~/.spice`
-    /// 3. Current directory (fallback)
+    /// 1. `$SPICE_CONFIG_DIR` env var (explicit override)
+    /// 2. `./.spice` — a `.spice` directory in the current working
+    ///    directory (the `spiced` instance's working directory)
+    ///
+    /// This deliberately does **not** fall back to the global `~/.spice`.
+    /// Adoption state (the pending code, `identity.json`, and the
+    /// `cloud-endpoint` override) is per-`spiced`-instance: several `spiced`
+    /// processes can run on one machine and each must adopt into Spice Cloud
+    /// independently. A shared `~/.spice` would make one machine present as a
+    /// single runtime and let one instance's adoption clobber another's, so
+    /// the state is scoped to the working directory instead. The `spiced`
+    /// binary itself still installs to the shared `~/.spice/bin` — only this
+    /// per-instance state is local.
     #[must_use]
     pub fn default_config_dir() -> PathBuf {
         if let Ok(dir) = std::env::var("SPICE_CONFIG_DIR")
@@ -109,10 +143,8 @@ impl CloudConnectConfig {
         {
             return PathBuf::from(dir);
         }
-        if let Some(home) = dirs::home_dir() {
-            return home.join(".spice");
-        }
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        cwd.join(".spice")
     }
 
     /// Resolve the canonical identity file path for the current
@@ -136,18 +168,23 @@ impl CloudConnectConfig {
     /// 2. `$SPICE_CONFIG_DIR/pending-adopt-code` file.
     /// 3. None (rely on identity at `$SPICE_CONFIG_DIR/identity.json`).
     ///
-    /// Endpoint defaults to [`DEFAULT_ENDPOINT`]; override via the
-    /// `SPICE_CLOUD_ENDPOINT` env var.
+    /// The enroll endpoint defaults to [`DEFAULT_ENDPOINT`]; override via
+    /// the `SPICE_CLOUD_ENDPOINT` env var. The gateway (stream) endpoint
+    /// normally comes from the enroll response; the
+    /// `SPICE_CLOUD_GATEWAY_ENDPOINT` env var overrides it.
     #[must_use]
     pub fn from_env(runtime_version: impl Into<String>) -> Self {
         let config_dir = Self::default_config_dir();
         let identity_path = config_dir.join(IDENTITY_FILE);
         let pending_path = config_dir.join(PENDING_ADOPT_CODE_FILE);
 
-        let endpoint = std::env::var("SPICE_CLOUD_ENDPOINT")
+        let enroll_endpoint = std::env::var("SPICE_CLOUD_ENDPOINT")
             .ok()
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
+        let gateway_endpoint = std::env::var("SPICE_CLOUD_GATEWAY_ENDPOINT")
+            .ok()
+            .filter(|v| !v.is_empty());
 
         let (adoption_code, pending_adopt_code_path) = if let Ok(code) =
             std::env::var("SPICE_ADOPT_CODE")
@@ -179,7 +216,8 @@ impl CloudConnectConfig {
         };
 
         Self {
-            endpoint,
+            enroll_endpoint,
+            gateway_endpoint,
             ca_cert_pem: None,
             insecure: false,
             identity_path,
@@ -189,6 +227,7 @@ impl CloudConnectConfig {
             runtime_version: runtime_version.into(),
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             telemetry_interval: DEFAULT_TELEMETRY_INTERVAL,
+            renewal_lead: DEFAULT_RENEWAL_LEAD,
         }
     }
 }
@@ -215,13 +254,43 @@ mod tests {
     }
 
     #[test]
+    fn default_config_dir_is_local_not_global_when_env_unset() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        // SAFETY: tests gate env-var mutations behind a mutex.
+        unsafe {
+            std::env::remove_var("SPICE_CONFIG_DIR");
+        }
+        let dir = CloudConnectConfig::default_config_dir();
+        // Adoption state must be scoped to the instance's working directory
+        // (`./.spice`), never the machine-global `~/.spice`, so that multiple
+        // spiced instances on one host adopt independently.
+        assert_eq!(dir.file_name(), Some(std::ffi::OsStr::new(".spice")));
+        let expected = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(".spice");
+        assert_eq!(dir, expected);
+        if let Some(home) = dirs::home_dir() {
+            assert_ne!(
+                dir,
+                home.join(".spice"),
+                "adoption config dir must not resolve to the global ~/.spice"
+            );
+        }
+    }
+
+    #[test]
     fn from_env_uses_default_endpoint_when_unset() {
         let _guard = ENV_LOCK.lock().expect("env lock poisoned");
         unsafe {
             std::env::remove_var("SPICE_CLOUD_ENDPOINT");
+            std::env::remove_var("SPICE_CLOUD_GATEWAY_ENDPOINT");
             std::env::remove_var("SPICE_ADOPT_CODE");
         }
         let config = CloudConnectConfig::from_env("v0.0.0-test");
-        assert_eq!(config.endpoint, DEFAULT_ENDPOINT);
+        assert_eq!(config.enroll_endpoint, DEFAULT_ENDPOINT);
+        assert!(
+            config.gateway_endpoint.is_none(),
+            "gateway endpoint comes from the enroll response unless overridden"
+        );
     }
 }

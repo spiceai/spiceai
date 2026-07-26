@@ -20,7 +20,9 @@ limitations under the License.
 //! discovery via `information_schema` queries.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
-use crate::catalogconnector::postgres_accelerated::AcceleratedCatalogProvider;
+use crate::catalogconnector::postgres_accelerated::{
+    AcceleratedCatalogProvider, NoEligibleTablesError, SlotInUseError,
+};
 use crate::{Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams};
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
@@ -136,14 +138,31 @@ impl CatalogConnector for PostgresCatalog {
                 ))
             };
 
-        catalog_provider
-            .refresh()
-            .await
-            .map_err(|e| super::Error::UnableToGetCatalogProvider {
-                connector: PREFIX.to_string(),
-                connector_component,
-                source: e,
-            })?;
+        catalog_provider.refresh().await.map_err(|e| {
+            // Two classes of permanent (non-retryable) configuration problem,
+            // surfaced as a terminal ERROR status instead of retried forever:
+            //   - zero eligible tables (discovery is one-shot, so retrying the
+            //     empty discovery can't resolve it); and
+            //   - the catalog's replication slot already actively held by another
+            //     live consumer after the bounded wait (running two instances
+            //     against one catalog is a misconfiguration, not a transient).
+            if e.downcast_ref::<NoEligibleTablesError>().is_some()
+                || e.downcast_ref::<SlotInUseError>().is_some()
+            {
+                super::Error::InvalidConfiguration {
+                    connector: PREFIX.to_string(),
+                    connector_component: connector_component.clone(),
+                    message: e.to_string(),
+                    source: e,
+                }
+            } else {
+                super::Error::UnableToGetCatalogProvider {
+                    connector: PREFIX.to_string(),
+                    connector_component: connector_component.clone(),
+                    source: e,
+                }
+            }
+        })?;
 
         Ok(catalog_provider)
     }

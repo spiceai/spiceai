@@ -20,7 +20,7 @@ use crate::stream::StreamError as DynamoDBStreamError;
 use async_trait::async_trait;
 use data_components::cdc::{
     ChangeEnvelope, ChangesStream, CommitChange, CommitError, InitialSnapshotMode,
-    InvalidCheckpointBehavior,
+    InvalidCheckpointBehavior, NoOpCommitter,
 };
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
@@ -1106,14 +1106,6 @@ impl MetricsProvider for DynamoDBMetricsProvider {
             }
             _ => None,
         }
-    }
-}
-
-struct NoOpCommitter;
-#[async_trait]
-impl CommitChange for NoOpCommitter {
-    async fn commit(&self) -> Result<(), CommitError> {
-        Ok(())
     }
 }
 
