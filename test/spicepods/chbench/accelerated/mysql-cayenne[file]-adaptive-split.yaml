@@ -1,13 +1,15 @@
 version: v1
 kind: Spicepod
-name: mysql-cayenne[file]-adaptive-shared
+name: mysql-cayenne[file]-adaptive-split
 
-# Single-shared-binlog-group variant of mysql-cayenne[file]-adaptive: no explicit
-# per-dataset mysql_replication_server_id, so every `refresh_mode: changes` dataset
-# derives the same connection-identity server_id and coalesces onto ONE shared
-# binlog dump (one server-side Binlog Dump thread, one decode pass), instead of
-# the 7 per-dataset dumps the explicit distinct ids opt into. Exercises the shared
-# pump's routing/promotion under full CH-benCH load.
+# Per-dataset-dump (split) variant of mysql-cayenne[file]-adaptive: each
+# `refresh_mode: changes` dataset pins a distinct explicit
+# mysql_replication_server_id, which keys the shared-source registry so every
+# dataset gets its OWN binlog dump connection (7 server-side Binlog Dump
+# threads, 7 full-stream decodes). This is the per-dataset opt-out seam of the
+# shared engine; the base spicepod coalesces all datasets onto one shared dump.
+# Kept to compare topology cost (duplicate decode, per-table independence)
+# against the shared default.
 
 # Adaptive-tuning variant of the non-tuned postgres-cayenne[file] baseline. Instead of either
 # the static `auto` derivation (the baseline) or a hand-pinned -cdc-tuned-* config, every Cayenne
@@ -73,6 +75,7 @@ datasets:
     params:
       <<: *mysql_params
       mysql_replication_initial_snapshot: auto
+      mysql_replication_server_id: '1001'
     acceleration: &cayenne_accel
       enabled: true
       engine: cayenne
@@ -94,6 +97,7 @@ datasets:
     params:
       <<: *mysql_params
       mysql_replication_initial_snapshot: auto
+      mysql_replication_server_id: '1002'
     acceleration: *cayenne_accel
 
   - from: mysql:customer
@@ -101,6 +105,7 @@ datasets:
     params:
       <<: *mysql_params
       mysql_replication_initial_snapshot: auto
+      mysql_replication_server_id: '1003'
     acceleration: *cayenne_accel
 
   - from: mysql:new_order
@@ -108,6 +113,7 @@ datasets:
     params:
       <<: *mysql_params
       mysql_replication_initial_snapshot: auto
+      mysql_replication_server_id: '1004'
     acceleration: *cayenne_accel
 
   - from: mysql:oorder
@@ -115,6 +121,7 @@ datasets:
     params:
       <<: *mysql_params
       mysql_replication_initial_snapshot: auto
+      mysql_replication_server_id: '1005'
     acceleration: *cayenne_accel
 
   - from: mysql:order_line
@@ -122,6 +129,7 @@ datasets:
     params:
       <<: *mysql_params
       mysql_replication_initial_snapshot: auto
+      mysql_replication_server_id: '1006'
     acceleration: *cayenne_accel
 
   - from: mysql:stock
@@ -129,6 +137,7 @@ datasets:
     params:
       <<: *mysql_params
       mysql_replication_initial_snapshot: auto
+      mysql_replication_server_id: '1007'
     acceleration: *cayenne_accel
 
   # ---- Static reference tables (no OLTP mutations, full refresh) ----
