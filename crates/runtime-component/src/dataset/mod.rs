@@ -345,6 +345,10 @@ impl Display for CheckAvailability {
     }
 }
 
+/// Default cadence at which the availability monitor probes a non-accelerated
+/// dataset's source when `check_availability_interval` is not configured.
+pub const DEFAULT_CHECK_AVAILABILITY_INTERVAL: Duration = Duration::from_mins(1);
+
 /// Config-only core of a dataset — every declared field of a
 /// `runtime::component::dataset::Dataset` except the runtime handles
 /// (`app`/`runtime`). The runtime wrapper holds `Self` plus those handles and
@@ -377,6 +381,11 @@ pub struct DatasetSpec {
     pub vectors: Option<VectorStore>,
     pub full_text_search: Option<spicepod::fts::FtsStore>,
     pub check_availability: CheckAvailability,
+    /// Raw duration string controlling how often the availability monitor probes
+    /// this (non-accelerated) dataset's source. Parsed via
+    /// [`DatasetSpec::check_availability_interval`]; defaults to
+    /// [`DEFAULT_CHECK_AVAILABILITY_INTERVAL`] when unset or unparseable.
+    pub check_availability_interval: Option<String>,
 }
 
 impl std::fmt::Debug for DatasetSpec {
@@ -404,6 +413,10 @@ impl std::fmt::Debug for DatasetSpec {
             .field("vectors", &self.vectors)
             .field("full_text_search", &self.full_text_search)
             .field("check_availability", &self.check_availability)
+            .field(
+                "check_availability_interval",
+                &self.check_availability_interval,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -432,6 +445,7 @@ impl PartialEq for DatasetSpec {
             && self.vectors == other.vectors
             && self.full_text_search == other.full_text_search
             && self.check_availability == other.check_availability
+            && self.check_availability_interval == other.check_availability_interval
     }
 }
 
@@ -512,6 +526,28 @@ impl DatasetSpec {
             return acceleration.refresh_check_interval;
         }
         None
+    }
+
+    /// How often the availability monitor should probe this dataset's source.
+    ///
+    /// Falls back to [`DEFAULT_CHECK_AVAILABILITY_INTERVAL`] when the value is
+    /// unset or cannot be parsed (a warning is logged in the latter case).
+    #[must_use]
+    pub fn check_availability_interval(&self) -> Duration {
+        let Some(raw) = &self.check_availability_interval else {
+            return DEFAULT_CHECK_AVAILABILITY_INTERVAL;
+        };
+        match fundu::parse_duration(raw) {
+            Ok(duration) => duration,
+            Err(e) => {
+                tracing::warn!(
+                    "Unable to parse check_availability_interval '{raw}' for dataset {}: {e}. Using default of {}s.",
+                    self.name,
+                    DEFAULT_CHECK_AVAILABILITY_INTERVAL.as_secs()
+                );
+                DEFAULT_CHECK_AVAILABILITY_INTERVAL
+            }
+        }
     }
 
     #[must_use]

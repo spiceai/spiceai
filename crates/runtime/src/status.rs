@@ -325,6 +325,12 @@ impl RuntimeStatus {
         self.get_statuses_of_prefix("dataset:")
     }
 
+    /// Returns the current status of a single dataset, if registered.
+    #[must_use]
+    pub fn get_dataset_status(&self, dataset: &TableReference) -> Option<ComponentStatus> {
+        self.get_component_status(&format!("dataset:{dataset}"))
+    }
+
     /// Returns the status of all registered views.
     #[must_use]
     pub fn get_view_statuses(&self) -> HashMap<TableReference, ComponentStatus> {

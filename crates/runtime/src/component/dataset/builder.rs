@@ -66,6 +66,7 @@ pub struct DatasetBuilder {
     pub vectors: Option<VectorStore>,
     pub full_text_search: Option<FtsStore>,
     pub check_availability: CheckAvailability,
+    pub check_availability_interval: Option<String>,
 }
 
 impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
@@ -154,6 +155,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             vectors: dataset.vectors,
             full_text_search: dataset.full_text_search,
             check_availability: CheckAvailability::from(dataset.check_availability),
+            check_availability_interval: dataset.check_availability_interval,
         })
     }
 }
@@ -187,6 +189,7 @@ impl DatasetBuilder {
             vectors: None,
             full_text_search: None,
             check_availability: CheckAvailability::default(),
+            check_availability_interval: None,
         })
     }
 
@@ -295,6 +298,7 @@ impl DatasetBuilder {
                 vectors: self.vectors,
                 full_text_search: self.full_text_search,
                 check_availability: self.check_availability,
+                check_availability_interval: self.check_availability_interval,
             },
             app,
             runtime,
