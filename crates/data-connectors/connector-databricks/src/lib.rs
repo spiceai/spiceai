@@ -194,6 +194,11 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("aws_secret_access_key")
         .description("The AWS secret access key to use for S3 storage.")
         .secret(),
+    ParameterSpec::component("aws_session_token")
+        .description(
+            "The AWS session token to use for S3 storage. Required with temporary (STS) credentials.",
+        )
+        .secret(),
     ParameterSpec::component("aws_endpoint")
         .description("The AWS endpoint to use for S3 storage.")
         .secret(),
@@ -1378,6 +1383,48 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         sync::Mutex,
     };
+
+    /// Temporary (STS) credentials only authenticate when the session token travels with
+    /// the key and secret, so `databricks_aws_session_token` has to survive into the storage
+    /// options handed to the Delta Lake reader.
+    #[tokio::test]
+    async fn databricks_aws_session_token_reaches_delta_storage_options() {
+        let parameters = Parameters::try_new(
+            "connector databricks",
+            vec![
+                (
+                    "databricks_endpoint".to_string(),
+                    secrecy::SecretString::from("dbc-abcd.cloud.databricks.com"),
+                ),
+                (
+                    "databricks_aws_access_key_id".to_string(),
+                    secrecy::SecretString::from("ASIAEXAMPLE"),
+                ),
+                (
+                    "databricks_aws_secret_access_key".to_string(),
+                    secrecy::SecretString::from("secret"),
+                ),
+                (
+                    "databricks_aws_session_token".to_string(),
+                    secrecy::SecretString::from("FwoSessionToken"),
+                ),
+            ],
+            "databricks",
+            Arc::new(tokio::sync::RwLock::new(runtime::secrets::Secrets::new())),
+            PARAMETERS,
+        )
+        .await
+        .expect("temporary credential parameters should be accepted for databricks");
+
+        let storage_options = parameters.to_secret_map();
+        assert_eq!(
+            storage_options
+                .get("aws_session_token")
+                .map(ExposeSecret::expose_secret),
+            Some("FwoSessionToken"),
+            "session token must reach the Delta Lake storage options"
+        );
+    }
 
     #[test]
     fn databricks_parameters_include_http_rate_control() {
