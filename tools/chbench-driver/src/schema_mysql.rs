@@ -358,14 +358,10 @@ pub async fn create_indexes(conn: &mut mysql_async::Conn) -> Result<()> {
     Ok(())
 }
 
-/// Add the `_bench_ts DATETIME(3)` column to all mutated TPC-C tables,
-/// defaulting to `load_ts`.
-///
-/// A constant default means every seed row carries exactly `load_ts`, so the
-/// initial watermark for each table is known without querying anything. The
-/// default is dropped once the load finishes (see
-/// [`strip_bench_ts_auto_stamping`]); from then on the driver binds the stamp
-/// on every mutating statement.
+/// Add the `_bench_ts DATETIME(3)` column to all mutated TPC-C tables with a
+/// constant `load_ts` default, so every seed row carries a known stamp and the
+/// initial watermarks need no scan. The default is dropped after the load
+/// ([`strip_bench_ts_auto_stamping`]).
 async fn add_bench_ts_columns(conn: &mut mysql_async::Conn, load_ts: BenchTs) -> Result<()> {
     let default = load_ts.mysql_literal();
     for table in MUTATED_TABLES {
@@ -390,21 +386,10 @@ async fn add_bench_ts_columns(conn: &mut mysql_async::Conn, load_ts: BenchTs) ->
     Ok(())
 }
 
-/// Strip every server-side `_bench_ts` stamping mechanism: the column default
-/// and any `ON UPDATE CURRENT_TIMESTAMP(3)` attribute.
-///
-/// Run after the seed load (fresh path) and on `--skip-prepare` (where the
-/// source may be restored from a template built by an earlier schema that used
-/// a live default plus either triggers or `ON UPDATE`). The driver binds
-/// `_bench_ts` explicitly on every mutating statement, and a statement that
-/// forgets to must fail loudly on `NOT NULL` rather than silently write a
-/// stale stamp; a surviving server-side stamp would instead *overwrite* the
-/// driver's bound value, putting the stored maximum above the recorded
-/// watermark so the drain gate could never converge.
-///
-/// `ALGORITHM=INSTANT` is demanded explicitly: this must stay a metadata-only
-/// change, and if the server ever declined to do it in place we want a loud
-/// error, not a silent multi-hour rebuild of `order_line` at SF1000.
+/// Drop the `_bench_ts` seed default after the load: the driver binds the
+/// stamp on every mutating statement, and an unbound statement must fail on
+/// `NOT NULL` rather than silently write a stale value. `ALGORITHM=INSTANT`
+/// guarantees this stays metadata-only (errors instead of a table rebuild).
 ///
 /// # Errors
 ///

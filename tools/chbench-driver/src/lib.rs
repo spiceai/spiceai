@@ -698,10 +698,8 @@ impl ChBenchDriver for MysqlChBenchDriver {
         // loudly on NOT NULL instead of silently writing a stale stamp.
         schema_mysql::strip_bench_ts_auto_stamping(&mut conn).await?;
 
-        // Seed every watermark from the load timestamp. Ordering invariant:
-        // this must complete before `run` spawns terminals, otherwise a
-        // terminal's post-commit update could be overwritten by this seed;
-        // `prepare` is fully awaited before `run` is called.
+        // Every seed row carries load_ts, so the initial watermarks are known
+        // without a scan.
         self.watermarks.seed_all(load_ts.micros());
 
         Ok(())
@@ -797,11 +795,8 @@ impl ChBenchDriver for MysqlChBenchDriver {
             return self.max_bench_ts_exact(table).await;
         }
         match self.watermarks.get(table) {
-            // Still at the UNSEEDED sentinel: no committed write has touched
-            // this table yet (a --skip-prepare source probed early). Report
-            // "no value" so the freshness probe skips the sample instead of
-            // paying a MAX scan; the first committed transaction seeds the
-            // watermark, which under load happens within seconds.
+            // No committed write yet (--skip-prepare source probed early):
+            // report "no value" so the probe skips until the first commit.
             Err(Error::UnseededWatermark { .. }) => Ok(None),
             other => other,
         }
