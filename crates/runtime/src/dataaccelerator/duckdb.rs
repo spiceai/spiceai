@@ -278,7 +278,7 @@ impl DuckDBAccelerator {
         instance_usage
     }
 
-    fn spicepod_dataset_duckdb_file_path(
+    pub(crate) fn spicepod_dataset_duckdb_file_path(
         &self,
         dataset: &spicepod::component::dataset::Dataset,
     ) -> Option<String> {
@@ -301,6 +301,50 @@ impl DuckDBAccelerator {
         self.duckdb_factory
             .duckdb_file_path("accelerated_duckdb", &mut params)
             .ok()
+    }
+
+    /// Whether another initialized dataset sharing `source`'s `DuckDB` instance (same
+    /// resolved file path, or the shared in-memory instance) set an explicit
+    /// `duckdb_memory_limit`.
+    ///
+    /// `DuckDB`'s `memory_limit` is per-instance (the last dataset created wins), so
+    /// the coordinated auto-cap must NOT be injected for an un-limited dataset on such
+    /// an instance — doing so would clobber the sibling's explicit value. The planner
+    /// separately flags these mixed instances with a warning.
+    async fn instance_has_explicit_limit_sibling(&self, source: &dyn AccelerationSource) -> bool {
+        let Some(accel) = source.acceleration() else {
+            return false;
+        };
+        let self_is_memory = matches!(accel.mode, Mode::Memory);
+        let self_path = if self_is_memory {
+            None
+        } else {
+            self.file_path(source).ok()
+        };
+        source
+            .initialized_sources()
+            .await
+            .into_iter()
+            .filter(|other| other.name() != source.name())
+            .any(|other| {
+                let Some(other_accel) = other.acceleration() else {
+                    return false;
+                };
+                if other_accel.engine != Engine::DuckDB {
+                    return false;
+                }
+                let other_is_memory = matches!(other_accel.mode, Mode::Memory);
+                let same_instance = if self_is_memory {
+                    other_is_memory
+                } else {
+                    // Memory-mode datasets live on the shared in-memory instance, but
+                    // `file_path` still resolves a path for them — without this guard a
+                    // memory-mode sibling could match a file instance's path and
+                    // wrongly suppress that instance's coordinated cap.
+                    !other_is_memory && self.file_path(other.as_ref()).ok() == self_path
+                };
+                same_instance && other_accel.params.contains_key("duckdb_memory_limit")
+            })
     }
 
     pub(crate) fn default_connection_pool_size(storage: ResolvedAccelerationStorage) -> u32 {
@@ -696,6 +740,31 @@ impl DataAccelerator for DuckDBAccelerator {
 
             Some(make_on_refresh_write_handler(dataset_name, config))
         });
+
+        // Coordinated auto memory limit: when the operator did not set
+        // `duckdb_memory_limit` on this dataset, apply the runtime-computed
+        // per-instance cap (see `accelerator_memory_budget`) so this DuckDB
+        // instance's ceiling — DuckDB's own default is ~80% of host RAM — plus the
+        // query pool and the other DuckDB instances can't over-commit the memory
+        // available to this process (the cgroup limit in a container, which is what
+        // the coordinated budget is computed from).
+        // Here `memory_limit` is the prefix-stripped `duckdb_memory_limit`; an
+        // explicit value on THIS dataset always wins (the guard skips a present key).
+        // Also skip when another dataset sharing this DuckDB instance set an explicit
+        // limit: memory_limit is per-instance (last dataset created wins), so
+        // auto-capping an un-limited sibling there would clobber the explicit value.
+        if !cmd.options.contains_key("memory_limit")
+            && let Some(auto_limit) =
+                crate::accelerator_memory_budget::duckdb_auto_memory_limit_option()
+        {
+            let has_explicit_sibling = match source {
+                Some(src) => self.instance_has_explicit_limit_sibling(src).await,
+                None => false,
+            };
+            if !has_explicit_sibling {
+                cmd.options.insert("memory_limit".to_string(), auto_limit);
+            }
+        }
 
         Ok(create_table_provider(&self.duckdb_factory, &cmd, write_completion_handler).await?)
     }
