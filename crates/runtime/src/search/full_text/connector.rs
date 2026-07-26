@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
 use datafusion::datasource::TableProvider;
 use runtime_datafusion_index::IndexedTableProvider;
+use search::generation::text_search::index::FullTextDatabaseIndex;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -59,7 +60,19 @@ impl FullTextConnector {
         // This will process all `Index`s, including vector indexes if provided (i.e. from `EmbeddingConnector`).
         // This is required so that [`IndexedTableProvider`] can be unwrapped (i.e. [`IndexedTableProvider::get_underlying`])
         //  in both cases there is and isn't a `EmbeddingConnector` underneath.
-        let indexes = Indexes::new(indexed_table.get_all_indexes());
+        let all_indexes = indexed_table.get_all_indexes();
+
+        // A full-text index written by this change stream must not defer its commits
+        // to the sink write lifecycle: the two share one tantivy writer, so a window
+        // commit would publish a partial refresh and a window rollback would discard
+        // these change-stream documents.
+        for index in &all_indexes {
+            if let Some(full_text) = index.as_any().downcast_ref::<FullTextDatabaseIndex>() {
+                full_text.mark_cdc_attached();
+            }
+        }
+
+        let indexes = Indexes::new(all_indexes);
         let ft = Arc::new(FederatedTable::Immediate(indexed_table.get_underlying()));
 
         let stream = f(&self.inner_connector, ft)?;
