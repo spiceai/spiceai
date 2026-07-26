@@ -4539,6 +4539,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "charset",
+ "chrono",
  "data_components",
  "datafusion",
  "imap",
