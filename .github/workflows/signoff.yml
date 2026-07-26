@@ -35,6 +35,18 @@
 # that input repoints "origin" at whatever repo it's given, which would
 # misdirect every `gh`-based repo lookup in scripts/signoff (status posts,
 # PR/run lookups) at the fork instead of this repo.
+#
+# scripts/signoff and the setup-* composite actions below are also saved to
+# .trusted-ci/ from this repo *before* the fork's commit is checked out, and
+# every later step references those copies (steps.resolve.outputs.actions_dir
+# / signoff_bin) rather than the working tree. Otherwise a fork PR could ship
+# its own scripts/signoff that unconditionally posts "success", or a setup-*
+# action that exfiltrates this job's secrets — i.e. it could rig the very
+# checks meant to validate it. What's still (necessarily) untrusted: the
+# actual build/lint/test run — `make lint-rust`/`build-cli`/`nextest` still
+# execute against the fork's own Makefile/Cargo.toml/build.rs/tests, because
+# that's the code under review. That's inherent to CI-testing any PR's code
+# and isn't something pinning scripts/signoff can fix.
 name: Remote Sign-off
 
 run-name: "Remote Sign-off (${{ inputs.pr_number && format('PR #{0}', inputs.pr_number) || inputs.branch }})"
@@ -157,13 +169,22 @@ jobs:
 
           if [[ "$checkout_repo" == "$BASE_REPO" ]]; then
             is_fork=false
+            actions_dir="./.github/actions"
+            signoff_bin="scripts/signoff"
           else
             is_fork=true
+            # Point at copies saved by "Save trusted CI helpers (fork PR)"
+            # below, taken from this repo before the fork checkout overlays
+            # the working tree — see that step for why.
+            actions_dir="./.trusted-ci/actions"
+            signoff_bin=".trusted-ci/signoff"
           fi
 
           echo "checkout_repo=${checkout_repo}" >> "$GITHUB_OUTPUT"
           echo "checkout_ref=${checkout_ref}" >> "$GITHUB_OUTPUT"
           echo "is_fork=${is_fork}" >> "$GITHUB_OUTPUT"
+          echo "actions_dir=${actions_dir}" >> "$GITHUB_OUTPUT"
+          echo "signoff_bin=${signoff_bin}" >> "$GITHUB_OUTPUT"
           echo "Triggered by: ${{ github.actor }}"
           echo "Targeted pre-lint base: trunk (fixed)"
 
@@ -198,6 +219,29 @@ jobs:
           # GH_TOKEN instead, so this doesn't affect them.
           persist-credentials: false
 
+      - name: Save trusted CI helpers (fork PR)
+        # scripts/signoff decides pass/fail and posts the sign-off status;
+        # the setup-* composite actions below run with this job's secrets in
+        # scope (sccache/MinIO creds, etc.). Once the next step overlays the
+        # fork's commit onto the working tree, those paths would resolve to
+        # whatever the fork shipped instead — e.g. a fork could ship a
+        # scripts/signoff that unconditionally posts "success" regardless of
+        # whether checks passed, or a setup-rust action that exfiltrates
+        # secrets. Copying them out now, from this repo's checkout, and
+        # pointing later steps (via steps.resolve.outputs.actions_dir /
+        # signoff_bin) at these copies keeps the checks/decision/status-post
+        # logic trusted even though the code being built/linted/tested is the
+        # fork's. This directory is untracked, so the fork checkout below
+        # (which only touches tracked paths) leaves it alone.
+        if: steps.resolve.outputs.is_fork == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p .trusted-ci
+          cp -R .github/actions .trusted-ci/actions
+          cp scripts/signoff .trusted-ci/signoff
+          chmod +x .trusted-ci/signoff
+          echo "Saved trusted CI helpers from $(git rev-parse --short HEAD) to .trusted-ci/"
+
       - name: Fetch and check out fork head commit
         if: steps.resolve.outputs.is_fork == 'true'
         env:
@@ -227,10 +271,10 @@ jobs:
           echo "merge-base with origin/trunk: $(git merge-base HEAD origin/trunk 2>/dev/null | cut -c1-12 || echo 'n/a (API fallback)')"
 
       - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+        uses: ${{ steps.resolve.outputs.actions_dir }}/setup-rust
 
       - name: Set up Nextest
-        uses: ./.github/actions/setup-nextest
+        uses: ${{ steps.resolve.outputs.actions_dir }}/setup-nextest
 
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
@@ -244,25 +288,25 @@ jobs:
           region: us-west-1
 
       - name: Set up sccache
-        uses: ./.github/actions/setup-sccache
+        uses: ${{ steps.resolve.outputs.actions_dir }}/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Install Protoc
-        uses: ./.github/actions/install-protoc
+        uses: ${{ steps.resolve.outputs.actions_dir }}/install-protoc
 
       - name: Set up make
-        uses: ./.github/actions/setup-make
+        uses: ${{ steps.resolve.outputs.actions_dir }}/setup-make
 
       - name: Set up cc
-        uses: ./.github/actions/setup-cc
+        uses: ${{ steps.resolve.outputs.actions_dir }}/setup-cc
 
       - name: Sign off
         # -f: Actions checkouts have no @{push} upstream tracking, so the local
         # clean/pushed guards would otherwise refuse to run. The branch ref was
         # just checked out from origin, so HEAD is exactly the remote tip.
-        run: scripts/signoff -f
+        run: ${{ steps.resolve.outputs.signoff_bin }} -f
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
