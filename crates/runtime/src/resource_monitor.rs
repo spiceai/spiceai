@@ -82,6 +82,21 @@ pub fn get_total_memory() -> u64 {
     get_container_memory_limit().unwrap_or_else(|| system.total_memory())
 }
 
+/// Returns the host's total physical memory in bytes, IGNORING any cgroup/container
+/// limit.
+///
+/// Use this where a downstream component sizes itself from host RAM rather than the
+/// process's cgroup limit — notably `DuckDB`, whose own default `memory_limit` is ~80%
+/// of host RAM. In a container (host RAM > cgroup limit) that ceiling exceeds
+/// [`get_total_memory`], so the coordinated accelerator budget must project it from
+/// this value, not the cgroup total.
+#[must_use]
+pub(crate) fn get_host_memory() -> u64 {
+    let mut system = System::new();
+    system.refresh_memory();
+    system.total_memory()
+}
+
 impl ResourceMonitor {
     /// Creates a new resource monitor for the current process.
     ///
