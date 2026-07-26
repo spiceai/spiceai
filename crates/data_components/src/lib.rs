@@ -148,8 +148,6 @@ pub mod mssql;
 pub mod mysql;
 #[cfg(feature = "mysql")]
 pub mod mysql_replication;
-#[cfg(feature = "odbc")]
-pub mod odbc;
 #[cfg(feature = "oracle")]
 pub mod oracle;
 #[cfg(feature = "postgres")]
@@ -166,8 +164,6 @@ pub mod schema_discovery;
 /// `datafusion-table-providers` fork so providers defined there (`MongoDB`) can
 /// reuse it; re-exported here for the in-repo connectors (`DynamoDB`, Debezium).
 pub use datafusion_table_providers::schema_projection;
-#[cfg(feature = "scylladb")]
-pub mod scylladb;
 pub mod sql_expr;
 
 #[cfg(feature = "snowflake")]
@@ -181,7 +177,6 @@ pub mod sqlite;
 pub mod turso;
 pub mod unity_catalog;
 
-pub mod git;
 pub mod key_filter;
 pub mod pk_filter_expr;
 pub mod rate_limit;
@@ -189,8 +184,6 @@ pub mod rate_limit;
 pub mod cdc;
 pub mod delete;
 pub mod http;
-#[cfg(feature = "imap")]
-pub mod imap;
 pub mod index_maintenance;
 pub mod object;
 pub mod poly;

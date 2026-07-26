@@ -1237,9 +1237,11 @@ impl DataSink for CayennePartitionedAppendSink {
             // catalog pointers and safely recognizes these as committed if cleanup
             // is interrupted.
             for receipt in &prepared {
-                if let Err(error) = receipt.remove_deferred_snapshot_wal().await {
+                if let Err(error) = receipt.remove_committed_staging_wal().await {
                     tracing::warn!(
                         table_id = receipt.table_id(),
+                        target_snapshot = receipt.target_snapshot_id(),
+                        staging_wal_path = %receipt.staging_wal_path().display(),
                         %error,
                         "Failed to remove committed partition staging WAL"
                     );
