@@ -662,21 +662,10 @@ impl MysqlChBenchDriver {
             found == expected,
             SourceScaleMismatchSnafu { found, expected }
         );
-        // The source may have been restored from a template built by an older
-        // schema (live default plus triggers or ON UPDATE); strip every
-        // server-side stamping mechanism so nothing can overwrite the
-        // driver-bound stamps.
-        schema_mysql::strip_bench_ts_auto_stamping(&mut conn).await?;
-        schema_mysql::drop_bench_ts_triggers(&mut conn).await?;
-        drop(conn);
-
-        // Watermarks deliberately start unseeded here: scanning MAX(_bench_ts)
-        // per table cost ~3 minutes at SF1000, and under load every table's
-        // watermark is overwritten by its first committed transaction within
-        // seconds (workload stamps always exceed seed stamps). A table that is
-        // read before any commit touches it is seeded lazily by one scan in
-        // `max_bench_ts` instead.
-        println!("  watermarks start unseeded; each table seeds from its first committed write");
+        // No schema reconciliation is needed here: the CI template fingerprint
+        // includes the chbench-driver tree hash, so a --skip-prepare source was
+        // seeded by this exact code. Watermarks start unseeded (the freshness
+        // probe skips a table until its first committed write).
         Ok(())
     }
 }
@@ -705,10 +694,9 @@ impl ChBenchDriver for MysqlChBenchDriver {
         // B-tree once instead of maintaining it per seed row.
         schema_mysql::create_indexes(&mut conn).await?;
         // From here on the driver binds `_bench_ts` on every mutating
-        // statement: drop the seed default and make sure no legacy trigger
-        // survives to overwrite the bound value.
+        // statement: drop the seed default so an unbound statement fails
+        // loudly on NOT NULL instead of silently writing a stale stamp.
         schema_mysql::strip_bench_ts_auto_stamping(&mut conn).await?;
-        schema_mysql::drop_bench_ts_triggers(&mut conn).await?;
 
         // Seed every watermark from the load timestamp. Ordering invariant:
         // this must complete before `run` spawns terminals, otherwise a

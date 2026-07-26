@@ -311,8 +311,6 @@ jobs:
           # cores so they don't contend — not even via hyperthread siblings:
           #   spiced       -> cores 0-31  (logical CPUs 0-31,64-95   = 64 threads)
           #   testoperator -> cores 32-37 (logical CPUs 32-37,96-101 = 12 threads;
-          #     cores 38-39 donated to the chbench-mysql pod, which measured
-          #     CPU-saturated while testoperator sat at 30-36% of 8 cores)
           SPICED_BIN=/usr/local/bin/spiced
           TESTOP_PREFIX=""
           if [ "${{ github.event.inputs.runner_type }}" = "spiceai-dev-xlarge-runners" ] && command -v taskset >/dev/null 2>&1; then

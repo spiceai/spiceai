@@ -510,29 +510,4 @@ async fn a_stale_trigger_makes_the_watermark_disagree_with_the_source() {
     conn.query_drop("DROP TRIGGER IF EXISTS trg_bench_ts_upd_customer")
         .await
         .expect("drop the legacy trigger");
-
-    // And prove the reconcile path removes it: verify_prepared must clean up a
-    // template that still carries triggers.
-    conn.query_drop(
-        "CREATE TRIGGER trg_bench_ts_upd_customer BEFORE UPDATE ON customer \
-         FOR EACH ROW SET NEW._bench_ts = NOW(3)",
-    )
-    .await
-    .expect("recreate for the reconcile check");
-    driver
-        .verify_prepared()
-        .await
-        .expect("verify_prepared reconciles the source");
-    let left: Option<i64> = conn
-        .query_first(
-            "SELECT COUNT(*) FROM information_schema.TRIGGERS \
-             WHERE TRIGGER_SCHEMA = DATABASE() AND TRIGGER_NAME LIKE 'trg_bench_ts%'",
-        )
-        .await
-        .expect("count triggers");
-    assert_eq!(
-        left,
-        Some(0),
-        "verify_prepared must drop legacy _bench_ts triggers on the --skip-prepare path"
-    );
 }
