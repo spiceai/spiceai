@@ -17,7 +17,6 @@ use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
 use datafusion::datasource::TableProvider;
 use runtime_datafusion_index::IndexedTableProvider;
-use search::generation::text_search::index::FullTextDatabaseIndex;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -34,7 +33,7 @@ use crate::search::util::find_concrete_table_provider;
 use futures::StreamExt;
 use runtime_metrics::component::MetricsProvider;
 
-/// A [`DataConnector`] middleware that, for [`Dataset`]s needing full text search capabilies, creates a [`IndexedTableProvider`] using the underlying [`TableProvider`]s and a [`FullTextDatabaseIndex`]. If no full text search capabilities are needed it is not unnecessarily nested.
+/// A [`DataConnector`] middleware that, for [`Dataset`]s needing full text search capabilies, creates a [`IndexedTableProvider`] using the underlying [`TableProvider`]s and a [`FullTextDatabaseIndex`](search::generation::text_search::index::FullTextDatabaseIndex). If no full text search capabilities are needed it is not unnecessarily nested.
 #[derive(Debug)]
 pub struct FullTextConnector {
     inner_connector: Arc<dyn DataConnector>,
@@ -62,14 +61,16 @@ impl FullTextConnector {
         //  in both cases there is and isn't a `EmbeddingConnector` underneath.
         let all_indexes = indexed_table.get_all_indexes();
 
-        // A full-text index written by this change stream must not defer its commits
-        // to the sink write lifecycle: the two share one tantivy writer, so a window
-        // commit would publish a partial refresh and a window rollback would discard
-        // these change-stream documents.
+        // Tell every index that this change stream writes to it, so none of them batches
+        // work across the sink write lifecycle. A full-text index must not defer its
+        // commits, for instance: it shares one tantivy writer with the sink path, so a
+        // window commit would publish a partial refresh and a window rollback would
+        // discard these change-stream documents. Notify through the trait rather than
+        // downcasting to a concrete index — a composing index (e.g. the warm/external
+        // full-text compound, which is registered in place of its tiers) would not match
+        // any concrete type, and its inner indexes would never be told.
         for index in &all_indexes {
-            if let Some(full_text) = index.as_any().downcast_ref::<FullTextDatabaseIndex>() {
-                full_text.mark_cdc_attached();
-            }
+            index.on_cdc_attached();
         }
 
         let indexes = Indexes::new(all_indexes);

@@ -106,6 +106,13 @@ impl Index for CompoundSearchIndex {
         primary_result.and(secondary_result)
     }
 
+    fn on_cdc_attached(&self) {
+        // Both tiers are written by the change stream that wraps this compound, so both
+        // have to know that writes arrive outside the sink write lifecycle.
+        self.primary.on_cdc_attached();
+        self.secondary.on_cdc_attached();
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

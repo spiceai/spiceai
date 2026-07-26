@@ -163,6 +163,10 @@ impl Index for MockIndex {
         Ok(())
     }
 
+    fn on_cdc_attached(&self) {
+        self.record("on_cdc_attached");
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -479,16 +483,53 @@ async fn lifecycle_hooks_forward_to_both_indexes() {
     idx.on_write_start().await.expect("start");
     idx.on_write_complete().await.expect("complete");
     idx.on_write_failed().await.expect("failed");
+    idx.on_cdc_attached();
 
     let events = events.lock().expect("event log mutex").clone();
     for side in ["primary", "secondary"] {
-        for event in ["on_write_start", "on_write_complete", "on_write_failed"] {
+        for event in [
+            "on_write_start",
+            "on_write_complete",
+            "on_write_failed",
+            "on_cdc_attached",
+        ] {
             assert!(
                 events.contains(&format!("{side}:{event}")),
                 "missing {side}:{event} in {events:?}"
             );
         }
     }
+}
+
+/// A change stream that writes to a compound writes to both of its tiers, so both must be
+/// told — an index that only hears about the sink write lifecycle can batch work across a
+/// window that the change stream's writes do not belong to.
+#[test]
+fn cdc_attach_forwards_to_both_vector_tiers() {
+    let events = Arc::new(Mutex::new(vec![]));
+    let mut primary = MockIndex::new("primary", &events);
+    primary.dimension = Some(4);
+    let mut secondary = MockIndex::new("secondary", &events);
+    secondary.dimension = Some(4);
+
+    let idx = CompoundVectorIndex::try_new(
+        Arc::new(primary) as Arc<dyn VectorIndex>,
+        Arc::new(secondary) as Arc<dyn VectorIndex>,
+        CompoundReadMode::PrimaryOnly,
+    )
+    .expect("compatible vector indexes");
+
+    idx.on_cdc_attached();
+
+    let events = events.lock().expect("event log mutex").clone();
+    assert_eq!(
+        events,
+        vec![
+            "primary:on_cdc_attached".to_string(),
+            "secondary:on_cdc_attached".to_string()
+        ],
+        "both vector tiers must be notified: {events:?}"
+    );
 }
 
 #[tokio::test]

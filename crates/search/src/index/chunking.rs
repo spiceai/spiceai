@@ -99,6 +99,10 @@ impl Index for ChunkedSearchIndex {
         self.inner.on_write_complete().await
     }
 
+    fn on_cdc_attached(&self) {
+        self.inner.on_cdc_attached();
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -763,6 +767,10 @@ impl Index for ChunkedVectorIndex {
 
     async fn on_write_complete(&self) -> Result<(), DataFusionError> {
         self.inner.on_write_complete().await
+    }
+
+    fn on_cdc_attached(&self) {
+        self.inner.on_cdc_attached();
     }
 
     fn as_any(&self) -> &dyn Any {

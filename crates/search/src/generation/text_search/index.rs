@@ -195,6 +195,12 @@ impl Index for FullTextDatabaseIndex {
             .context(TextSearchIndexingSnafu)
             .map_err(|e| DataFusionError::External(Box::new(e)))
     }
+
+    /// Permanently disable the deferred-commit window: a change-data-capture stream writes
+    /// to this index outside the sink write lifecycle (see the `cdc_attached` field).
+    fn on_cdc_attached(&self) {
+        self.cdc_attached.store(true, Ordering::Release);
+    }
 }
 
 impl FullTextDatabaseIndex {
@@ -399,14 +405,6 @@ impl FullTextDatabaseIndex {
     #[must_use]
     pub fn as_arc_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
         self
-    }
-
-    /// Record that a change-data-capture stream also writes to this index, which
-    /// permanently disables the deferred-commit window (see `cdc_attached`).
-    ///
-    /// Called when the change stream that includes this index is constructed.
-    pub fn mark_cdc_attached(&self) {
-        self.cdc_attached.store(true, Ordering::Release);
     }
 
     #[must_use]
@@ -1078,7 +1076,7 @@ mod tests {
         )
         .expect("Failed to create FullTextDatabaseIndex");
 
-        index.mark_cdc_attached();
+        index.on_cdc_attached();
 
         // Opening a window is a no-op for a CDC-fed index.
         index.on_write_start().await.expect("on_write_start failed");
@@ -1116,6 +1114,72 @@ mod tests {
         assert!(
             results.contains("apple banana"),
             "committed CDC documents must survive a failed write window, got:\n{results}"
+        );
+    }
+
+    /// A warm full-text tier is registered inside a
+    /// [`CompoundSearchIndex`](crate::index::compound::CompoundSearchIndex), so the change
+    /// stream only ever notifies the compound. The notification has to reach the tier that
+    /// owns the tantivy writer, or it keeps deferring and a failed write window discards the
+    /// change stream's documents for good.
+    #[tokio::test]
+    async fn test_cdc_attached_compound_primary_never_defers_commits() {
+        use crate::index::compound::{CompoundReadMode, CompoundSearchIndex};
+
+        let new_tier = || {
+            FullTextDatabaseIndex::try_new(
+                create_test_table(),
+                vec!["content".to_string()],
+                Some(vec!["id".to_string()]),
+                None,
+                &["content".to_string()],
+            )
+            .expect("Failed to create FullTextDatabaseIndex")
+        };
+
+        // Keep a handle on the warm tier: it shares the tantivy writer and reader with the
+        // clone held by the compound, so searching it observes the compound's writes.
+        let warm = new_tier();
+        let compound = CompoundSearchIndex::try_new(
+            Arc::new(warm.clone()) as Arc<dyn SearchIndex>,
+            Arc::new(new_tier()) as Arc<dyn SearchIndex>,
+            CompoundReadMode::PrimaryOnly,
+        )
+        .expect("two full-text tiers over the same table are compatible");
+
+        compound.on_cdc_attached();
+
+        // A sink-driven refresh opens a write window on both tiers.
+        compound
+            .on_write_start()
+            .await
+            .expect("on_write_start failed");
+
+        // A change-stream document arrives while that window is open.
+        compound
+            .compute_index(vec![
+                record_batch!(("id", Int32, [1]), ("content", Utf8, ["apple banana"]))
+                    .expect("Failed to create test batch"),
+            ])
+            .await
+            .expect("compute_index failed");
+
+        // The refresh then fails, discarding whatever the window staged.
+        compound
+            .on_write_failed()
+            .await
+            .expect("on_write_failed failed");
+
+        warm.reader
+            .reload()
+            .expect("failed to reload the warm tier's reader");
+        let search_index = warm
+            .full_text_search_field_index("content")
+            .expect("Failed to create FullTextSearchFieldIndex");
+        let results = search_and_format(&search_index, "apple").await;
+        assert!(
+            results.contains("apple banana"),
+            "a change-stream document written through a compound must be committed, not staged in the failed window, got:\n{results}"
         );
     }
 }
