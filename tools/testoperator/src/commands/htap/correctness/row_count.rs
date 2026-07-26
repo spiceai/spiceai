@@ -101,7 +101,9 @@ impl Convergence {
     }
 }
 
-/// Three-way `MAX(_bench_ts)` check for one table, run once after convergence.
+/// Three-way `MAX(_bench_ts)` check for one table, run once when the drain
+/// loop ends — converged or timed out (a timed-out gate is exactly when the
+/// three-way comparison helps localize the cause).
 ///
 /// The drain loop's source-side maximum comes from the driver's in-memory
 /// watermark, which is a *claim* about what it committed. A bookkeeping bug there
@@ -271,7 +273,8 @@ impl CorrectnessReport {
             println!("  verdict: PASSED — all {} tables match", self.tables.len());
         } else {
             println!(
-                "  verdict: FAILED — {mismatches} table(s) mismatched{}",
+                "  verdict: FAILED — {mismatches} table(s) mismatched, {} audit failure(s){}",
+                audit_failures.len(),
                 if self.convergence.converged() {
                     String::new()
                 } else {
@@ -539,6 +542,11 @@ async fn audit_bench_ts(
     spice: &SpiceClients,
     tables: &[String],
 ) -> Vec<BenchTsAudit> {
+    // Both max_bench_ts and max_bench_ts_exact are fetched even where they
+    // resolve to the same scan (Postgres today; MySQL's delete-bearing
+    // new_order): the watermark-vs-source comparison is then vacuous by
+    // construction, and the duplicate scan is accepted — once per run, in the
+    // post-drain tail where it cannot affect any measured number.
     println!("\nAuditing MAX(_bench_ts) against the source (once per run)");
     let probes = tables.iter().map(|table| async move {
         let started = Instant::now();

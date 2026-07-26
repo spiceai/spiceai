@@ -137,7 +137,9 @@ async fn run_staleness_probe(
     // Ordered list of table names for consistent report output.
     let probe_table_names: Vec<String> = probe_tables.iter().map(|t| (*t).to_string()).collect();
 
-    // Wait briefly for initial data to be loaded and replicated before probing.
+    // Let CDC apply the first post-snapshot batches before sampling: the
+    // earliest gaps otherwise measure bootstrap catch-up rather than
+    // steady-state replication lag and land in the discard cap anyway.
     tokio::time::sleep(Duration::from_secs(30)).await;
 
     loop {

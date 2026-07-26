@@ -310,7 +310,7 @@ jobs:
           # cpu N and cpu 64+N), pin spiced and testoperator to whole physical
           # cores so they don't contend — not even via hyperthread siblings:
           #   spiced       -> cores 0-31  (logical CPUs 0-31,64-95   = 64 threads)
-          #   testoperator -> cores 32-37 (logical CPUs 32-37,96-101 = 12 threads;
+          #   testoperator -> cores 32-37 (logical CPUs 32-37,96-101 = 12 threads)
           SPICED_BIN=/usr/local/bin/spiced
           TESTOP_PREFIX=""
           if [ "${{ github.event.inputs.runner_type }}" = "spiceai-dev-xlarge-runners" ] && command -v taskset >/dev/null 2>&1; then

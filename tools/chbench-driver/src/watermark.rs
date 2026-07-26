@@ -55,8 +55,9 @@ use crate::Result;
 /// Tables mutated by TPC-C transactions. `_bench_ts` is added only to these;
 /// `item`, `nation`, `region`, and `supplier` are static reference tables.
 ///
-/// The single definition shared by the Postgres and `MySQL` schema modules and
-/// by [`Watermarks`], so the DDL and the registry cannot drift apart.
+/// Shared by the `MySQL` schema module and [`Watermarks`], so the DDL and the
+/// registry cannot drift apart. (The Postgres module still carries its own
+/// list; it converges here when its watermark port lands.)
 pub const MUTATED_TABLES: &[&str] = &[
     "warehouse",
     "district",

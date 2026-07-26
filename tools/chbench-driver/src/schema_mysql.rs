@@ -113,8 +113,8 @@ pub async fn drop_tables(conn: &mut mysql_async::Conn) -> Result<()> {
 }
 
 /// Create all 12 CH-benCH tables (9 TPC-C + 3 supplemental) and add the
-/// `_bench_ts` columns. Secondary indexes and triggers are created separately
-/// (see [`create_indexes`] and [`create_triggers`]) *after* the bulk load.
+/// `_bench_ts` columns. Secondary indexes are created separately
+/// ([`create_indexes`]) *after* the bulk load.
 ///
 /// # Errors
 ///

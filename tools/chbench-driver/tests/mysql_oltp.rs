@@ -276,13 +276,12 @@ async fn prepare_leaves_no_triggers_and_no_column_default() {
     }
 
     // The delete-bearing table is answered by a plain scan — deliberately no
-    // _bench_ts index anywhere (order_line's measured a 7.7% tpmC cost, and
+    // _bench_ts index anywhere (an order_line index measured a 7.7% tpmC cost;
     // new_order is bounded so its scan is cheap).
     let idx: Option<i64> = conn
         .query_first(
             "SELECT COUNT(*) FROM information_schema.STATISTICS \
-             WHERE TABLE_SCHEMA = DATABASE() AND COLUMN_NAME = '_bench_ts' \
-               AND INDEX_NAME <> 'idx_ol_bench_ts'",
+             WHERE TABLE_SCHEMA = DATABASE() AND COLUMN_NAME = '_bench_ts'",
         )
         .await
         .expect("check index");
