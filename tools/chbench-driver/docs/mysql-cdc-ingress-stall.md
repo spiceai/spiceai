@@ -74,6 +74,40 @@ Waterfall decomposition (run 30179041669), e.g. `customer`:
 - `stock` (second-biggest stream) crossed the 1,200s cap for a third of the
   watermark run (21 of 59 samples discarded, retained p99 534s).
 
+## Observation 5: staging-WAL recovery churn during snapshot ingest (build-correlated)
+
+Run [30174992679](https://github.com/spiceai/spiceai/actions/runs/30174992679)
+(spiced `5b4f2086ff`) logged **2,439** `cayenne::provider::staging_wal` warnings:
+
+```
+WARN cayenne::provider::staging_wal: Incomplete staged append detected — attempting automated recovery
+     table="order_line" wal_location=/tmp/…/order_line/…/_staging/…/_wal.json target_snapshot=… staged_files=1
+INFO cayenne::provider::staging_wal: Automated recovery from incomplete write succeeded; table is now writable
+```
+
+Distribution facts (from the run's `htap-run.log` artifact):
+
+- Every occurrence falls inside the **initial-snapshot ingest phase**
+  (22:01:06–22:09:21Z, ~8 min); zero during OLTP or drain.
+- Per table: customer 881, stock 768, order_line 541, oorder 162,
+  new_order 85, district 2 — roughly proportional to snapshot volume.
+- Front-loaded: 1,263 in the first minute, decaying to ~50/min.
+- Every recovery succeeded (`staged_files=1` each; table returned writable).
+
+**Build correlation:** the two later runs on spiced `f4cb86bd1e`
+([30179041669](https://github.com/spiceai/spiceai/actions/runs/30179041669),
+[30181168207](https://github.com/spiceai/spiceai/actions/runs/30181168207))
+logged **zero** such warnings under the same workload shape. So the churn is
+tied to the older spiced build (fixed on trunk in between, or
+timing-sensitive), and — importantly — it is **not the cause of the
+`order_line` ingress stall**, which occurred in the warning-free runs.
+
+Open sub-questions: what interrupts thousands of staged appends mid-write
+during snapshot ingest on `5b4f2086ff` (concurrent reopen? compaction racing
+the append path?); whether recovery discards and re-stages work (wasted
+ingest throughput during the churn window); and which trunk change between
+the two spiced commits made it disappear.
+
 ## Open questions
 
 1. Why 5–6 binlog connections when datasets nominally share a group? What maps
