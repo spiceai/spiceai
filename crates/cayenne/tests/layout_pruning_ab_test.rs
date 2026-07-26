@@ -20,12 +20,12 @@ limitations under the License.
 //! **How the two arms map to the two code paths.** The fix added
 //! [`SortColumnsOrigin`]; the arms select the semantics directly:
 //!
-//! - `User`     — an authoritative sort order always wins and observations are
-//!                never consulted. This is EXACTLY what the pre-fix code did with
-//!                an inference-filled `cayenne_sort_columns`, because it had no
-//!                way to tell a guess from operator intent. = **BEFORE**.
-//! - `Inferred` — the sort order is a guess; observed filter columns outrank it.
-//!                = **AFTER**.
+//! - `User` (= **BEFORE**) — an authoritative sort order always wins and
+//!   observations are never consulted. This is exactly what the pre-fix code did
+//!   with an inference-filled `cayenne_sort_columns`, because it had no way to
+//!   tell a guess from operator intent.
+//! - `Inferred` (= **AFTER**) — the sort order is a guess, so observed filter
+//!   columns outrank it.
 //!
 //! Same binary, same data, same queries — only the precedence differs, so the
 //! delta is attributable to the fix and nothing else.
@@ -62,7 +62,7 @@ const ROWS: usize = 1_000_000;
 /// Target Vortex file size for the rewrite. Deliberately small so the table
 /// spans MANY files: pruning is a per-file zone-map property, so a table that
 /// fits in one file has no pruning to measure at all (the first run of this test
-/// reported files_scanned=1 in both arms for exactly that reason). Production
+/// reported `files_scanned=1` in both arms for exactly that reason). Production
 /// uses 256 MB with tables far larger than one file; a small target with fewer
 /// rows is the scale-invariant proxy for that ratio.
 const TARGET_FILE_BYTES: usize = 512 * 1024;
@@ -72,7 +72,7 @@ const DATE_SPAN_DAYS: i32 = 2557;
 const PROBE_WINDOW_DAYS: i32 = 30;
 const PROBE_LO: i32 = 900;
 
-/// SplitMix64 so the generated data is identical across arms and across runs.
+/// `SplitMix64` so the generated data is identical across arms and across runs.
 struct SplitMix64(u64);
 
 impl SplitMix64 {
