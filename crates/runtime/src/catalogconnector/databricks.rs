@@ -24,7 +24,8 @@ use crate::component::catalog::Catalog;
 use crate::dataconnector::http_rate_control;
 use crate::dataconnector::parameters::ConnectorParams;
 use crate::token_providers::databricks::{
-    AuthCredentials, build_auth_credentials, get_m2m_token_provider, get_u2m_token_provider,
+    AUTH_MODE_DESCRIPTION, AUTH_MODES, AuthCredentials, build_auth_credentials,
+    get_m2m_token_provider, get_u2m_token_provider,
 };
 use async_trait::async_trait;
 use data_components::Read;
@@ -121,6 +122,12 @@ pub const PARAMETERS: &[ParameterSpec] = &[
         .description("Minimum random delay added before Databricks HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_min when set. Accepts durations such as '5ms' or '0ms'. Defaults to 5ms when a request-rate limit is configured, otherwise 0ms."),
     ParameterSpec::runtime("rate_control_jitter_max")
         .description("Maximum random delay added before Databricks HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_max when set. Accepts durations such as '10ms' or '0ms'. Defaults to 10ms when a request-rate limit is configured, otherwise 0ms."),
+
+    // Databricks authentication
+    ParameterSpec::component("auth_mode")
+        .description(AUTH_MODE_DESCRIPTION)
+        .one_of_ignore_ascii_case(AUTH_MODES)
+        .default("auto"),
 
     // Databricks M2M Service Principal credentials
     ParameterSpec::component("client_id").description("The client ID of the Databricks service principal."),
