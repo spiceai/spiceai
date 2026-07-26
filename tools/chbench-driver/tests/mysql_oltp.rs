@@ -250,8 +250,10 @@ async fn prepare_leaves_no_triggers_and_no_column_default() {
         "prepare() must leave no _bench_ts triggers, found {triggers:?}"
     );
 
-    // No default either: a statement that forgets to bind `_bench_ts` must fail
-    // loudly on NOT NULL rather than silently writing a stale stamp.
+    // The constant seed default stays after the load (live statements always
+    // bind _bench_ts, so it is never consulted again). It must be a constant,
+    // not a live expression: CURRENT_TIMESTAMP here would re-stamp rows behind
+    // the driver's back on any unbound INSERT.
     let defaults: Vec<(String, Option<String>)> = conn
         .query(
             "SELECT TABLE_NAME, COLUMN_DEFAULT FROM information_schema.COLUMNS \
@@ -266,9 +268,10 @@ async fn prepare_leaves_no_triggers_and_no_column_default() {
         "every mutated table needs a _bench_ts column"
     );
     for (table, default) in &defaults {
+        let d = default.as_deref().unwrap_or("");
         assert!(
-            default.is_none(),
-            "{table}._bench_ts must have no default after prepare, found {default:?}"
+            !d.to_ascii_uppercase().contains("CURRENT_TIMESTAMP"),
+            "{table}._bench_ts default must be a constant, found {default:?}"
         );
     }
 

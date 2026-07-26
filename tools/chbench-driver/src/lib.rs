@@ -188,10 +188,8 @@ pub trait ChBenchDriver: Send + Sync {
     /// Unix epoch, or `None` if the table is empty.
     ///
     /// The `MySQL` driver answers this from its own record of committed writes
-    /// (see [`crate::watermark`]) as an O(1) atomic load — a
-    /// `SELECT MAX(_bench_ts)` is a full scan (~48s on `order_line` at 300M
-    /// rows), which throttled the staleness probe and the drain gate to that
-    /// cadence. Tables with DELETEs cannot use a monotone watermark and are
+    /// (see [`crate::watermark`])  - a `SELECT MAX(_bench_ts)` scan is very expensive
+    /// on `MySQL` large tables. Tables with DELETEs cannot use a monotone watermark and are
     /// answered from the source instead — see
     /// [`crate::watermark::DELETE_BEARING_TABLES`] and
     /// [`Self::max_bench_ts_exact`].
@@ -693,10 +691,6 @@ impl ChBenchDriver for MysqlChBenchDriver {
         // Build secondary indexes *after* the bulk load so InnoDB builds each
         // B-tree once instead of maintaining it per seed row.
         schema_mysql::create_indexes(&mut conn).await?;
-        // From here on the driver binds `_bench_ts` on every mutating
-        // statement: drop the seed default so an unbound statement fails
-        // loudly on NOT NULL instead of silently writing a stale stamp.
-        schema_mysql::strip_bench_ts_auto_stamping(&mut conn).await?;
 
         // Every seed row carries load_ts, so the initial watermarks are known
         // without a scan.

@@ -360,8 +360,9 @@ pub async fn create_indexes(conn: &mut mysql_async::Conn) -> Result<()> {
 
 /// Add the `_bench_ts DATETIME(3)` column to all mutated TPC-C tables with a
 /// constant `load_ts` default, so every seed row carries a known stamp and the
-/// initial watermarks need no scan. The default is dropped after the load
-/// ([`strip_bench_ts_auto_stamping`]).
+/// initial watermarks need no scan. Live statements always bind `_bench_ts`
+/// explicitly, so the default is never consulted after the load; a forgotten
+/// binding is caught by the watermark-equals-source e2e test.
 async fn add_bench_ts_columns(conn: &mut mysql_async::Conn, load_ts: BenchTs) -> Result<()> {
     let default = load_ts.mysql_literal();
     for table in MUTATED_TABLES {
@@ -381,32 +382,6 @@ async fn add_bench_ts_columns(conn: &mut mysql_async::Conn, load_ts: BenchTs) ->
 
     println!(
         "  added _bench_ts column to {} tables (seed default {default})",
-        MUTATED_TABLES.len()
-    );
-    Ok(())
-}
-
-/// Drop the `_bench_ts` seed default after the load: the driver binds the
-/// stamp on every mutating statement, and an unbound statement must fail on
-/// `NOT NULL` rather than silently write a stale value. `ALGORITHM=INSTANT`
-/// guarantees this stays metadata-only (errors instead of a table rebuild).
-///
-/// # Errors
-///
-/// Returns an error if any column cannot be modified.
-pub async fn strip_bench_ts_auto_stamping(conn: &mut mysql_async::Conn) -> Result<()> {
-    for table in MUTATED_TABLES {
-        conn.query_drop(format!(
-            "ALTER TABLE {table} MODIFY _bench_ts DATETIME(3) NOT NULL, ALGORITHM=INSTANT"
-        ))
-        .await
-        .map_err(|source| crate::Error::MySql {
-            action: format!("strip _bench_ts default/ON UPDATE on {table}"),
-            source,
-        })?;
-    }
-    println!(
-        "  stripped server-side _bench_ts stamping on {} tables",
         MUTATED_TABLES.len()
     );
     Ok(())

@@ -76,12 +76,6 @@ pub const MUTATED_TABLES: &[&str] = &[
 /// and the newest, so deleting it drops the table's maximum. A [`Watermarks`]
 /// entry is monotone by construction and can never follow that down, so these
 /// tables are answered by [`crate::ChBenchDriver::max_bench_ts_exact`] instead.
-///
-/// That read is a plain scan — deliberately unindexed. `new_order` is bounded
-/// (~9k pending orders per warehouse; deliveries drain what new-orders enqueue),
-/// so the scan is ~1s at SF1000, while a `_bench_ts` index on the far larger,
-/// unbounded `order_line` measured a 7.7% tpmC cost — index maintenance on hot
-/// write paths is the expensive option, not the scan.
 pub const DELETE_BEARING_TABLES: &[&str] = &["new_order"];
 
 /// Whether `table`'s maximum `_bench_ts` must be read from the server rather

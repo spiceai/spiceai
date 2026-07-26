@@ -138,7 +138,7 @@ async fn run_staleness_probe(
     let probe_table_names: Vec<String> = probe_tables.iter().map(|t| (*t).to_string()).collect();
 
     // Wait briefly for initial data to be loaded and replicated before probing.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(30)).await;
 
     loop {
         if cancel.is_cancelled() {
