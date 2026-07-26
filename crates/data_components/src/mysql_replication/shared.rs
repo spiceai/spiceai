@@ -73,8 +73,13 @@ limitations under the License.
 //! not classify) is adopted only if the freshly-fetched source layout matches
 //! the event's column count ([`super::binlog::adopt_current_layout`]), else
 //! member-fatal; the count-match guard makes replaying pre-change row images
-//! self-fatal rather than mis-decoded. A durable pre-adopt/replay-boundary
-//! checkpoint machinery is intentionally *not* implemented in v1. Instead,
+//! self-fatal rather than mis-decoded. Because a fetched layout describes the
+//! source *now* rather than the event being decoded, every routed `TableMap` is
+//! additionally checked against the column types the event itself carries
+//! ([`super::binlog::layout_event_mismatch`]), which is what catches a
+//! same-column-count reorder adopted from ahead of the stream. A durable
+//! pre-adopt/replay-boundary checkpoint machinery is intentionally *not*
+//! implemented in v1. Instead,
 //! safety across a detach/rejoin is guaranteed structurally: every (re)subscribe
 //! re-resolves the start position from the member's own sidecar and re-checks
 //! its persisted layout fingerprint against the current source layout, so a
@@ -102,8 +107,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use super::binlog::{
     AdoptedLayout, MIN_VALID_EVENT_POS, QueryKind, StatementKind, adopt_current_layout,
     classify_query, classify_statement, commit_ts_ms, compute_pk_source_indexes,
-    log_transient_reconnect, open_binlog_stream, purged_position_error, readiness_heartbeat,
-    record_watermark,
+    layout_event_mismatch, log_transient_reconnect, open_binlog_stream, purged_position_error,
+    readiness_heartbeat, record_watermark,
 };
 use super::changes::{MemberLayout, MysqlChangeRows};
 use super::config::{BinlogPosition, ReplicationParams};
@@ -1586,6 +1591,21 @@ async fn run_pump(source: Arc<SharedSource>) {
                         let g = lock(&member.layout);
                         Arc::clone(&g)
                     };
+                    // Every decode is routed from here, so this is the one place
+                    // that can check the layout against the event describing the
+                    // row images it will decode. A layout adopted from
+                    // `information_schema` reflects the source *now*, which under
+                    // lag can be a later DDL than the events in flight (#11764);
+                    // fail this member closed rather than scramble its columns.
+                    if let Some(mismatch) = layout_event_mismatch(&layout.layout, &tme) {
+                        member.metrics.inc_schema_mismatch_error();
+                        routes.remove(&table_id);
+                        member_fatal(&source, &mkey, format!(
+                            "source table {}.{} does not match the shape of the changes being replicated: column {} (position {}) is `{}` in the table definition but the change events carry a different type there. This happens when the source applies more than one ALTER TABLE while replication is behind, so the table definition read for the first one already reflects the second. Let replication catch up before the next schema change, then re-bootstrap by setting `mysql_replication_invalid_checkpoint_behavior: restart`.",
+                            mkey.0, mkey.1, mismatch.column, mismatch.ordinal, mismatch.source_type
+                        )).await;
+                        continue 'recv;
+                    }
                     let tme = Arc::new(tme.into_owned());
                     routes.insert(
                         table_id,
