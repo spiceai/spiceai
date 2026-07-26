@@ -674,29 +674,13 @@ impl MysqlChBenchDriver {
         schema_mysql::ensure_bench_ts_index(&mut conn).await?;
         drop(conn);
 
-        // Seed the watermarks from the source: the template's load timestamp is
-        // unknowable here, so this costs one MAX(_bench_ts) scan per mutated
-        // table — the only place that scan remains, bounded to once per run at
-        // startup. Timed and attributed so it is never mistaken for
-        // steady-state probe behaviour or for a hang. Must complete before
-        // `run` spawns terminals; `verify_prepared` is fully awaited before
-        // `run` is called, which guarantees it.
-        for table in watermark::MutatedTable::ALL {
-            let started = std::time::Instant::now();
-            let max = self.max_bench_ts_exact(table.as_str()).await?;
-            println!(
-                "  seeding watermarks from source (--skip-prepare): {} = {} ({:.1}s)",
-                table.as_str(),
-                max.map_or_else(|| "empty".to_string(), |v| v.to_string()),
-                started.elapsed().as_secs_f64(),
-            );
-            // An empty table has no maximum to seed; the first committed write
-            // sets the watermark, and until then `max_bench_ts` reports the
-            // sentinel as an error rather than a bogus zero.
-            if let Some(micros) = max {
-                self.watermarks.seed(table, micros);
-            }
-        }
+        // Watermarks deliberately start unseeded here: scanning MAX(_bench_ts)
+        // per table cost ~3 minutes at SF1000, and under load every table's
+        // watermark is overwritten by its first committed transaction within
+        // seconds (workload stamps always exceed seed stamps). A table that is
+        // read before any commit touches it is seeded lazily by one scan in
+        // `max_bench_ts` instead.
+        println!("  watermarks start unseeded; each table seeds from its first committed write");
         Ok(())
     }
 }
@@ -828,7 +812,15 @@ impl ChBenchDriver for MysqlChBenchDriver {
         if watermark::is_delete_bearing(table) {
             return self.max_bench_ts_exact(table).await;
         }
-        self.watermarks.get(table)
+        match self.watermarks.get(table) {
+            // Still at the UNSEEDED sentinel: no committed write has touched
+            // this table yet (a --skip-prepare source probed early). Report
+            // "no value" so the freshness probe skips the sample instead of
+            // paying a MAX scan; the first committed transaction seeds the
+            // watermark, which under load happens within seconds.
+            Err(Error::UnseededWatermark { .. }) => Ok(None),
+            other => other,
+        }
     }
 
     async fn max_bench_ts_exact(&self, table: &str) -> Result<Option<i64>> {
