@@ -714,7 +714,6 @@ fn is_vector_search_index(kind: &str) -> bool {
             | "CompoundVectorIndex"
             | "ChunkedSearchIndex"
             | "ChunkedVectorIndex"
-            | "CompoundVectorIndex"
     )
 }
 
