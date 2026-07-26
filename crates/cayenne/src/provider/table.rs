@@ -7368,15 +7368,8 @@ impl CayenneTableProvider {
         Ok(ColdKeysetSource::Bloom)
     }
 
-    /// Rebuild the exact PK keyset from durable state.
-    ///
-    /// `fold_cold`: `true` scans the cold store to fold cold-resident keys into
-    /// the keyset (the exact path — `DoNothing`, or a cold file lacks a bloom);
-    /// `false` skips that O(cold-rows) scan because the cold contribution is
-    /// served by the [`ColdPkExistence`] bloom (`resolve_cold_keyset_source`).
-    /// Immaterial when the cold tier is disabled (the pass is a no-op).
-    /// Cold-rebuild the PK existence index in ONE bounded streaming pass:
-    /// every scanned key routes straight to its shard
+    /// Rebuild the PK existence index from durable state in ONE bounded
+    /// streaming pass: every scanned key routes straight to its shard
     /// ([`BoundedShardedPkIndexBuilder`]), and an upsert table whose exact
     /// keysets would exceed the byte budget degrades to bounded per-shard
     /// blooms mid-scan instead of materializing the over-budget keyset and
@@ -7385,6 +7378,12 @@ impl CayenneTableProvider {
     /// freshly-snapshotted table it starved the stream for the whole run).
     /// `shards == 1` serves the serial path; the caller unwraps the single
     /// shard.
+    ///
+    /// `fold_cold`: `true` scans the cold store to fold cold-resident keys into
+    /// the index (the exact path — `DoNothing`, or a cold file lacks a bloom);
+    /// `false` skips that O(cold-rows) scan because the cold contribution is
+    /// served by the [`ColdPkExistence`] bloom (`resolve_cold_keyset_source`).
+    /// Immaterial when the cold tier is disabled (the pass is a no-op).
     async fn load_existing_pk_index(
         &self,
         pk_indices: &[usize],
@@ -8237,8 +8236,10 @@ impl CayenneTableProvider {
                 .await
             {
                 Ok(Some(index)) => index,
-                _ => self.load_existing_pk_index_serial(pk_indices, converter, fold_cold)
-                    .await?,
+                _ => {
+                    self.load_existing_pk_index_serial(pk_indices, converter, fold_cold)
+                        .await?
+                }
             }
         } else {
             self.load_existing_pk_index_serial(pk_indices, converter, fold_cold)
@@ -8358,16 +8359,13 @@ impl CayenneTableProvider {
         }))
     }
 
-    /// Build the per-shard PK existence index (§2.3c) by reusing the existing
-    /// single-index machinery, then routing keys to `n` shards by
-    /// [`shard_of_pk`] on each key's `OwnedRow` bytes (§3.5).
-    ///
-    /// - Exact path: build the single keyset exactly as the serial path does
-    ///   (cache reuse or full rebuild), then [`ShardedPkIndex::from_exact`].
-    /// - Bloom path: a combined bloom CANNOT be split (its keys are
-    ///   unrecoverable), so when an over-budget upsert table falls back to a
-    ///   bloom we build `n` per-shard blooms by routing each loaded key. At
-    ///   `n == 1` the single bloom wraps directly.
+    /// Build the per-shard PK existence index (§2.3c): reuse the per-shard
+    /// cache when present, else rebuild via [`Self::load_existing_pk_index`],
+    /// which routes every key to its shard ([`shard_of_pk`] on the key's
+    /// `OwnedRow` bytes, §3.5) in one bounded streaming pass. At `n == 1` a
+    /// persisted checkpoint index (exact keyset or bloom — a combined bloom
+    /// CANNOT be split, so it is only usable unsharded) wraps directly with
+    /// no re-shard pass.
     async fn build_sharded_pk_index(
         &self,
         pk_indices: &[usize],

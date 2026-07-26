@@ -725,12 +725,6 @@ impl CachedPkIndex {
     }
 }
 
-/// The per-shard PK existence index — the sharded analog of [`CachedPkIndex`]
-/// (§2.3c). A key is owned by `shard_of_pk(OwnedRow bytes)` (§3.5), the SAME
-/// routing the tier append + reads use, so a key's existence entry co-locates
-/// with its segments and a shard validates only against its own keys. Either
-/// all-exact (one keyset per shard) or all-bloom (one bloom per shard), matching
-/// the source index's path.
 /// Streaming, budget-bounded builder for the cold PK-index rebuild
 /// (`load_existing_pk_index`). Routes every scanned key to its shard
 /// (`shard_of_pk`) as it arrives and, when a byte budget is set (upsert tables,
@@ -757,7 +751,9 @@ impl BoundedShardedPkIndexBuilder {
     pub(crate) fn new(shard_count: usize, max_bytes: Option<usize>) -> Self {
         let n = shard_count.max(1);
         Self {
-            shards: (0..n).map(|_| CachedPkKeyset::with_capacity(1024)).collect(),
+            shards: (0..n)
+                .map(|_| CachedPkKeyset::with_capacity(1024))
+                .collect(),
             blooms: None,
             max_bytes,
         }
@@ -859,6 +855,12 @@ impl BoundedShardedPkIndexBuilder {
     }
 }
 
+/// The per-shard PK existence index — the sharded analog of [`CachedPkIndex`]
+/// (§2.3c). A key is owned by `shard_of_pk(OwnedRow bytes)` (§3.5), the SAME
+/// routing the tier append + reads use, so a key's existence entry co-locates
+/// with its segments and a shard validates only against its own keys. Either
+/// all-exact (one keyset per shard) or all-bloom (one bloom per shard), matching
+/// the source index's path.
 pub(crate) enum ShardedPkIndex {
     Exact(Box<[CachedPkKeyset]>),
     Bloom(Box<[PkBloom]>),
@@ -872,6 +874,12 @@ impl ShardedPkIndex {
     /// blooms during `load_existing_keyset` / `try_load_persisted_pk_index`.
     pub(crate) fn from_exact(keyset: CachedPkKeyset, n: usize) -> Self {
         let n = n.max(1);
+        // At n == 1 every key routes to shard 0, so wrap the keyset directly —
+        // re-inserting each entry would be an O(rows) pass for nothing (the
+        // persisted-checkpoint load on the serial path takes this branch).
+        if n == 1 {
+            return Self::Exact(vec![keyset].into_boxed_slice());
+        }
         let mut shards: Vec<CachedPkKeyset> =
             (0..n).map(|_| CachedPkKeyset::with_capacity(0)).collect();
         // The position-delete capture set is table-global; every shard needs the

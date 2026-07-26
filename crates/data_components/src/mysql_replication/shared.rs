@@ -2719,6 +2719,7 @@ mod tests {
             &sender,
             Err(StreamError::External("x".to_string())),
             crate::cdc::shutdown_epoch(),
+            "test_dataset",
         )
         .await;
         assert!(matches!(outcome, DeliverOutcome::ReceiverGone));
