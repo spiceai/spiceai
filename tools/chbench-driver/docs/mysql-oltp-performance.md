@@ -82,6 +82,71 @@ Consequences:
   precisely **because** it is server-bound: added index maintenance there
   translates directly into lost tpmC.
 
+## Server-tuning A/B result (run 30179041669, 2026-07-26)
+
+First run after the pod tuning batch + CPU rebalance (helm revision 13:
+`purge_threads=8`, AHI OFF, `performance_schema=OFF`, `io_capacity`
+10000/20000, `page_cleaners=16`, `binlog_cache_size=1M`, `MYSQLD_CPUSET`
+38-63,102-127 = 26 cores; workflow pins testoperator to 32-37,96-101).
+Same shape as the baseline arm: SF1000, 100 terminals, unlimited rate, 600s,
+fresh seed, driver commit `ab7321526b` (pre-watermark).
+
+| | baseline (30170010535) | tuned (30179041669) |
+|---|---|---|
+| tpmC | 237,903 | **244,794 (+2.9%)** |
+| txn/s | 8,819 | 9,073 |
+| aborts | 0 | 0 |
+
+Profiler facts (10s ticks, 55 OLTP ticks; commit-counter basis ≈ 92% of
+driver txn/s in both runs since read-only transactions issue no COMMIT):
+
+- Rate shape: ~14k commits/s burst in the first seconds (empty delivery
+  queues, no undo backlog), sag to ~7.5k by minute 2-3, recovery to a stable
+  ~8.7k from minute 6 to the end.
+- mysqld: avg 74% / peak 82% of its 52 threads — ~19 physical cores of work,
+  the same absolute CPU as the pre-tuning run (77-81% of 48 threads).
+- Every tuned signal fixed: checkpoint age stayed **< 1 GB** during OLTP
+  (peak 8.82 GB across the whole window, incl. drain) vs riding 12.8 GB of
+  16 GB before; binlog cache spills **0** vs ~33/s; purge history list
+  **oscillated 70k-924k** (purge keeps catching up) vs a monotonic climb to
+  1.18M.
+- Unchanged: row-lock wait time ~60-77k lock-ms per 11s tick (~6.3s of
+  blocked time per second across 100 terminals, ~66ms per wait) — the
+  dominant remaining wait in both runs.
+- testoperator: avg ~40% / peak 68% of its reduced 12 threads — the 2-core
+  donation did not throttle generation, and there is no further slack.
+
+**Reading: the resource-side levers are exhausted at ~245k tpmC for this
+workload shape** — mysqld is not CPU-pegged, flushing/purge/binlog are clean,
+and the remaining wait is row-lock contention.
+
+## The bottleneck moved to the consumer (CDC apply)
+
+Facts from the same run's log and freshness report:
+
+- `order_line` initial snapshot completed 00:11:38 (300,016,966 rows, ~8 min
+  after registration); the OLTP workload started 00:11:41 — readiness gating
+  worked (`/v1/ready` waited for the snapshot).
+- Drain probe at +63s after OLTP: `rows src=324,516,463 spice=300,016,966` —
+  Spice's `order_line` count was still exactly the snapshot count, i.e.
+  **zero of the ~24.5M workload-written `order_line` rows were applied during
+  the 600s run**; `max_bench_ts` lag 1,446,826 ms and growing at wall speed.
+- spiced averaged 85-88% of its 64 threads during OLTP — the hottest
+  component on the node.
+- The freshness table shows the symptom: 2-4 samples per table for the run
+  (each probe cycle serialized behind multi-minute source `MAX` scans on this
+  pre-watermark build), `order_line` p99 = max = 1,050,001 ms from a single
+  retained sample — the gap exceeds the run duration because Spice's newest
+  `order_line` stamp still predated OLTP start (last seed row, ~10 min before
+  the workload began).
+- cayenne's adaptive tuner reacted (`compaction_interval_ms` adjustments
+  "replication-lag goal" at 00:07:35 and 00:22:58) but apply did not keep up.
+
+**Reading: the generator and source now outrun the consumer.** At ~9k txn/s
+of input, cayenne's CDC apply for the dominant table made no visible progress
+until the drain. Raising end-to-end HTAP throughput further is a
+spiced/cayenne apply-path investigation, not a source-side one.
+
 ## Invariants preserved
 
 Rows read/locked/written, values, transaction boundaries, RNG draw order (a
