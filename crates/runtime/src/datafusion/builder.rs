@@ -1647,7 +1647,7 @@ pub(crate) const MEM_TIER_FLOOR_FRACTION: u64 = 32;
 /// and `mod.rs` `get_total_memory()/4`) and sum to >100% of host. Sizing the tier
 /// as the host RAM left AFTER the query pool, the compaction pool, any memory
 /// reserved outside both by another subsystem (`external_reservation_bytes` — today
-/// a co-resident DuckDB accelerator's ceiling), and a headroom reserve is the missing
+/// a co-resident `DuckDB` accelerator's ceiling), and a headroom reserve is the missing
 /// cross-subsystem coordination. For the coordinated default inputs — a query pool
 /// sized to leave room (see [`effective_query_memory_limit`]) — it yields
 /// `query_pool + compaction + external + tier + headroom ≤ host`. While that
