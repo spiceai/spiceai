@@ -1727,6 +1727,16 @@ mod tests {
     }
 
     /// Helper to get the physical plan as a string for EXPLAIN output.
+    /// A `SessionContext` with `target_partitions` pinned, for EXPLAIN snapshot
+    /// tests. The default is the host's core count, which `RepartitionExec`
+    /// prints into the plan (`RoundRobinBatch(N)`) — a snapshot recorded that way
+    /// only matches machines with the same core count.
+    fn snapshot_session_context() -> SessionContext {
+        SessionContext::new_with_config(
+            datafusion::prelude::SessionConfig::new().with_target_partitions(4),
+        )
+    }
+
     async fn explain_plan(ctx: &SessionContext, sql: &str) -> String {
         let df = ctx.sql(sql).await.expect("failed to create dataframe");
         let plan = df
@@ -1751,7 +1761,7 @@ mod tests {
         )
         .expect("failed to create table");
 
-        let ctx = SessionContext::new();
+        let ctx = snapshot_session_context();
         ctx.register_table("test_table", Arc::new(table))
             .expect("failed to register table");
 
@@ -1855,7 +1865,7 @@ mod tests {
         )
         .expect("failed to create non-indexed table");
 
-        let ctx = SessionContext::new();
+        let ctx = snapshot_session_context();
         ctx.register_table("indexed_table", Arc::new(indexed_table))
             .expect("failed to register table");
         ctx.register_table("non_indexed_table", Arc::new(non_indexed_table))
