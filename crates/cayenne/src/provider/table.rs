@@ -201,7 +201,11 @@ const MAX_PK_SELECTIVE_INLIST_VALUES: usize = 32;
 /// Upper bound on PK `BETWEEN` span (inclusive) for selective scan fan-out control.
 const MAX_PK_SELECTIVE_RANGE_SPAN: i64 = 32;
 /// Maximum tombstone keys pushed into the Vortex scan predicate as `NOT IN`.
-const MAX_VORTEX_KEY_DELETE_PUSHDOWN: usize = 256;
+///
+/// Sized so sparse-to-moderate key-delete sets still get Vortex chunk pruning
+/// (fewer rows decoded) without building an unbounded expression tree. Dense
+/// `MoR` exceeds the bound and falls through to the post-decode deletion filter.
+const MAX_VORTEX_KEY_DELETE_PUSHDOWN: usize = 2048;
 
 /// Result of a Cayenne CDC append write.
 ///
@@ -21560,6 +21564,14 @@ impl CayenneTableProvider {
         // background checkpointer can keep the RAM tier drained without throttling
         // ingest. The position-based strategy appends to the CURRENT snapshot and
         // therefore must keep encode+swap atomic under one held fence (unchanged).
+        //
+        // CDC memory mode never reaches the position arm: `is_cdc_memory_mode()`
+        // requires `!is_position_based()`. The arm remains for residual pure
+        // position tables; encode stays under the fence (CURRENT-dir semantics).
+        debug_assert!(
+            !self.is_cdc_memory_mode() || !self.pk_deletion_strategy.is_position_based(),
+            "CDC memory mode must not use the position-based mem-tier checkpoint arm"
+        );
         let stats = if self.pk_deletion_strategy.is_position_based() {
             let _fence = self.listing_fence.write().await;
             let target_size_bytes = self.context.target_file_size_bytes();
