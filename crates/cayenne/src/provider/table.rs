@@ -11960,7 +11960,15 @@ impl CayenneTableProvider {
         // Pick over the CURRENT snapshot's files only (not the protected set):
         // this trigger is about current-dir small-file accumulation. If no tier
         // has enough small files, there is nothing to consolidate.
+        //
+        // Sample the snapshot pointer and the append fence BEFORE the listing
+        // (the contract `visible_file_stream_for_rewrite` documents): the listing
+        // walks the directory one `metadata()` await per entry (a paginated LIST
+        // on S3), so a publish can land mid-walk and be missed by it. Sampled
+        // first, that publish is always visible to the subset rewrite's commit
+        // guard, which then aborts instead of dropping the appended file.
         let snapshot_id = self.get_current_snapshot_id();
+        let generation_before = self.current_dir_generation.load(Ordering::Relaxed);
         let files = self.list_snapshot_files_with_sizes(&snapshot_id).await?;
         if files.len() < 2 {
             return Ok(false);
@@ -11999,7 +12007,12 @@ impl CayenneTableProvider {
         // subset of current files. Otherwise full rewrite (also folds protected).
         if self.can_subset_rewrite_current_small_files(&candidate, &files) {
             match self
-                .rewrite_current_snapshot_small_file_subset(&candidate, &files)
+                .rewrite_current_snapshot_small_file_subset(
+                    &candidate,
+                    &files,
+                    &snapshot_id,
+                    generation_before,
+                )
                 .await
             {
                 Ok(true) => {
@@ -12083,15 +12096,26 @@ impl CayenneTableProvider {
     /// Callers must hold `compaction_lock` and satisfy
     /// [`Self::can_subset_rewrite_current_small_files`]. Returns `Ok(false)` when
     /// a concurrent append races the encode (generation fence).
+    ///
+    /// `source_snapshot_id` and `generation_before` are the snapshot pointer and
+    /// [`Self::current_dir_generation`] the caller sampled BEFORE listing
+    /// `files`, and both must be sampled in that order — the same contract
+    /// [`Self::visible_file_stream_for_rewrite`] documents for the full rewrite.
+    /// This rewrite carries forward exactly `files - candidate.paths`, so a
+    /// current-dir publish concurrent with the caller's listing is absent from
+    /// `files`; sampling the fence here instead would observe that publish's bump
+    /// as the pre-state and let the commit guard pass, dropping the appended
+    /// file's rows. Sampling before the listing makes such a publish always
+    /// visible at commit, so the pass aborts rather than publishing a short
+    /// snapshot.
     async fn rewrite_current_snapshot_small_file_subset(
         &self,
         candidate: &CompactionCandidate<&str>,
         files: &[(String, u64)],
+        source_snapshot_id: &str,
+        generation_before: u64,
     ) -> Result<bool> {
         let pass_start = Instant::now();
-        let old_snapshot_id = self.get_current_snapshot_id();
-        let generation_before = self.current_dir_generation.load(Ordering::Relaxed);
-        let snapshot_id_before = old_snapshot_id.clone();
 
         let picked: std::collections::HashSet<&str> = candidate.paths.iter().copied().collect();
         let unpicked: Vec<&str> = files
@@ -12117,7 +12141,7 @@ impl CayenneTableProvider {
 
         // 1. Stage candidate files alone (hardlink/copy) for a tight scan.
         if let Err(e) = self
-            .link_or_copy_snapshot_files(&old_snapshot_id, &staging_snapshot_id, &picked_list)
+            .link_or_copy_snapshot_files(source_snapshot_id, &staging_snapshot_id, &picked_list)
             .await
         {
             cleanup_all.await;
@@ -12126,7 +12150,7 @@ impl CayenneTableProvider {
 
         // 2. Hard-link unpicked settled files into the destination snapshot.
         if let Err(e) = self
-            .link_or_copy_snapshot_files(&old_snapshot_id, &new_snapshot_id, &unpicked)
+            .link_or_copy_snapshot_files(source_snapshot_id, &new_snapshot_id, &unpicked)
             .await
         {
             cleanup_all.await;
@@ -12223,7 +12247,7 @@ impl CayenneTableProvider {
         {
             let listing_guard = self.listing_fence.write().await;
             let snapshot_id_now = self.get_current_snapshot_id();
-            if snapshot_id_now != snapshot_id_before {
+            if snapshot_id_now != source_snapshot_id {
                 drop(listing_guard);
                 self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
                     .await;
@@ -13171,7 +13195,12 @@ impl CayenneTableProvider {
         // for the protected+current union) would break subset hardlink basenames
         // and incorrectly inflate "total files" for the proper-subset gate.
         // Full rewrite still folds protected snapshots via its own scan.
+        //
+        // Snapshot pointer and append fence are sampled BEFORE the listing so a
+        // publish that lands mid-walk stays visible to the subset rewrite's
+        // commit guard — see `compact_current_snapshot_small_files`.
         let snapshot_id = self.get_current_snapshot_id();
+        let generation_before = self.current_dir_generation.load(Ordering::Relaxed);
         let files = self.list_snapshot_files_with_sizes(&snapshot_id).await?;
 
         if files.len() < 2 {
@@ -13205,7 +13234,12 @@ impl CayenneTableProvider {
         // otherwise full snapshot re-encode (folds protected + clears DVs).
         if self.can_subset_rewrite_current_small_files(&candidate, &files) {
             match self
-                .rewrite_current_snapshot_small_file_subset(&candidate, &files)
+                .rewrite_current_snapshot_small_file_subset(
+                    &candidate,
+                    &files,
+                    &snapshot_id,
+                    generation_before,
+                )
                 .await
             {
                 Ok(true) => {
@@ -27841,6 +27875,229 @@ mod tests {
         assert!(!subset_rewrite_eligibility(false, false, 0, 0, 10));
         // Combined disqualifiers still false.
         assert!(!subset_rewrite_eligibility(true, true, 3, 4, 10));
+    }
+
+    /// A two-file subset candidate over the first two of `files`, for tests that
+    /// exercise the subset rewrite itself rather than the picker's tier
+    /// thresholds. `files` must hold at least three entries so the candidate is a
+    /// proper subset (the gate `can_subset_rewrite_current_small_files` enforces).
+    fn subset_candidate_of_first_two(files: &[(String, u64)]) -> CompactionCandidate<&str> {
+        CompactionCandidate {
+            tier: crate::provider::compaction::Tier::Small,
+            paths: files
+                .iter()
+                .take(2)
+                .map(|(path, _)| path.as_str())
+                .collect(),
+            total_bytes: files.iter().take(2).map(|(_, size)| *size).sum(),
+        }
+    }
+
+    /// The subset rewrite carries forward exactly the files its caller listed, so
+    /// a current-dir publish that races that listing is in neither the carried
+    /// set nor — if the fence were sampled after the listing — the commit guard.
+    /// Regression test for #12074: the pass must abort rather than publish a
+    /// snapshot missing the appended file's rows.
+    #[tokio::test]
+    async fn subset_rewrite_aborts_on_an_append_that_raced_the_caller_listing() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let batch_of = |start: i64, n: i64| {
+            let ids: Vec<i64> = (start..start + n).collect();
+            // Pad the payload so each append settles as its own Small-tier file
+            // rather than being inlined.
+            let values: Vec<String> = ids.iter().map(|i| format!("v_{i:0400}")).collect();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(StringArray::from(values)),
+                ],
+            )
+            .expect("batch built")
+        };
+
+        let vortex_config = VortexConfig {
+            target_vortex_file_size_mb: 1,
+            // High trigger + no background pass: this test drives the subset
+            // rewrite directly, so no automatic compaction may rotate the
+            // snapshot underneath it.
+            compaction_trigger_files: 1_000,
+            compaction_background_interval_ms: 0,
+            compaction_max_files_per_pick: 2,
+            inline_max_rows: 0,
+            deletion_mode: crate::metadata::DeletionMode::Key,
+            ..VortexConfig::default()
+        };
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "subset_append_fence",
+            Arc::clone(&schema),
+            vortex_config,
+            // A primary key keeps the table off the position-delete strategy,
+            // which the subset gate excludes.
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        for i in 0..4 {
+            insert_batch(&provider, batch_of(i * 50, 50)).await;
+        }
+
+        // Sample exactly as the fixed callers do: snapshot pointer and append
+        // fence BEFORE the listing that feeds the rewrite.
+        let snapshot_id = provider.get_current_snapshot_id();
+        let generation_before = provider.current_dir_generation.load(Ordering::Relaxed);
+        let files = provider
+            .list_snapshot_files_with_sizes(&snapshot_id)
+            .await
+            .expect("listed current snapshot files");
+        assert!(
+            files.len() >= 3,
+            "need a proper subset to pick from, listed {} file(s)",
+            files.len()
+        );
+
+        // Build the candidate directly rather than through `pick_candidates`:
+        // the picker's tier/byte thresholds are covered by its own tests, and
+        // pinning the candidate here keeps this test about the append fence.
+        let candidate = subset_candidate_of_first_two(&files);
+        assert!(
+            provider.can_subset_rewrite_current_small_files(&candidate, &files),
+            "fixture must land on the subset path"
+        );
+
+        // The racing append: publishes a new file into the current dir and bumps
+        // the fence, exactly as one landing mid-listing would. Its rows are
+        // absent from `files`, so a rewrite that carried `files` forward and
+        // still committed would drop them.
+        insert_batch(&provider, batch_of(1_000, 50)).await;
+        let generation_after = provider.current_dir_generation.load(Ordering::Relaxed);
+        assert_ne!(
+            generation_before, generation_after,
+            "the racing append must bump the current-dir generation"
+        );
+
+        let committed = provider
+            .rewrite_current_snapshot_small_file_subset(
+                &candidate,
+                &files,
+                &snapshot_id,
+                generation_before,
+            )
+            .await
+            .expect("subset rewrite must abort cleanly, not error");
+        assert!(
+            !committed,
+            "the subset rewrite must abort when an append raced the listing"
+        );
+
+        // The decisive assertion: no row was lost. Both the pre-listing rows and
+        // the racing append's rows are still readable.
+        let ids = scan_sorted_ids(&provider).await;
+        let expected: Vec<i64> = (0..200).chain(1_000..1_050).collect();
+        assert_eq!(
+            ids, expected,
+            "every committed row must survive the aborted subset rewrite"
+        );
+    }
+
+    /// Counterpart to the abort case: with no append racing the listing the
+    /// subset rewrite must still commit, and the published snapshot must hold
+    /// every row (re-encoded candidates plus hard-linked unpicked files).
+    #[tokio::test]
+    async fn subset_rewrite_commits_and_preserves_every_row_without_a_race() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let batch_of = |start: i64, n: i64| {
+            let ids: Vec<i64> = (start..start + n).collect();
+            let values: Vec<String> = ids.iter().map(|i| format!("v_{i:0400}")).collect();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(StringArray::from(values)),
+                ],
+            )
+            .expect("batch built")
+        };
+
+        let vortex_config = VortexConfig {
+            target_vortex_file_size_mb: 1,
+            compaction_trigger_files: 1_000,
+            compaction_background_interval_ms: 0,
+            compaction_max_files_per_pick: 2,
+            inline_max_rows: 0,
+            deletion_mode: crate::metadata::DeletionMode::Key,
+            ..VortexConfig::default()
+        };
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "subset_commit_no_race",
+            Arc::clone(&schema),
+            vortex_config,
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        for i in 0..4 {
+            insert_batch(&provider, batch_of(i * 50, 50)).await;
+        }
+
+        let snapshot_id = provider.get_current_snapshot_id();
+        let generation_before = provider.current_dir_generation.load(Ordering::Relaxed);
+        let files = provider
+            .list_snapshot_files_with_sizes(&snapshot_id)
+            .await
+            .expect("listed current snapshot files");
+        assert!(
+            files.len() >= 3,
+            "need a proper subset to rewrite, listed {} file(s)",
+            files.len()
+        );
+        let candidate = subset_candidate_of_first_two(&files);
+        assert!(
+            provider.can_subset_rewrite_current_small_files(&candidate, &files),
+            "fixture must land on the subset path"
+        );
+
+        let committed = provider
+            .rewrite_current_snapshot_small_file_subset(
+                &candidate,
+                &files,
+                &snapshot_id,
+                generation_before,
+            )
+            .await
+            .expect("subset rewrite succeeds");
+        assert!(
+            committed,
+            "with no racing append the subset rewrite must commit"
+        );
+        assert_ne!(
+            provider.get_current_snapshot_id(),
+            snapshot_id,
+            "a committed subset rewrite must publish a new snapshot"
+        );
+
+        let ids = scan_sorted_ids(&provider).await;
+        assert_eq!(
+            ids,
+            (0..200).collect::<Vec<i64>>(),
+            "the subset rewrite must preserve every row"
+        );
     }
 
     #[test]
