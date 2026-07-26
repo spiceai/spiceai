@@ -59,7 +59,9 @@ fi
 my() { mysql -h "$MYH" -P "$MYP" -u "$MYU" -D "$MYDB" -N -B -e "$1"; }
 
 mysqlmajor=$(my "SELECT SUBSTRING_INDEX(VERSION(), '.', 1)")
-driver=$(git -C "$REPO_ROOT" rev-parse "HEAD:tools/chbench-driver" 2>/dev/null || echo nogit)
+# src/ only: docs/, scripts/, and tests/ cannot affect seeded data, so their
+# commits must not invalidate the cached template (a false miss = 40-min reseed).
+driver=$(git -C "$REPO_ROOT" rev-parse "HEAD:tools/chbench-driver/src" 2>/dev/null || echo nogit)
 # Filesystem-safe fingerprint: the supervisor uses it verbatim as a cache dir name.
 fp="sf${SF}-driver${driver}-mysql${mysqlmajor}"
 echo "template fingerprint: $fp"

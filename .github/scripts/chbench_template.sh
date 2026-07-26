@@ -33,7 +33,9 @@ fi
 
 psql_pg() { psql -h "$PGH" -p "$PGP" -U "$PGU" -d postgres -v ON_ERROR_STOP=1 -tAc "$1"; }
 pgmajor=$(psql_pg "SHOW server_version" | cut -d. -f1)
-driver=$(git -C "$REPO_ROOT" rev-parse "HEAD:tools/chbench-driver" 2>/dev/null || echo nogit)
+# src/ only: docs/, scripts/, and tests/ cannot affect seeded data, so their
+# commits must not invalidate the cached template (a false miss = 40-min reseed).
+driver=$(git -C "$REPO_ROOT" rev-parse "HEAD:tools/chbench-driver/src" 2>/dev/null || echo nogit)
 fp="sf=${SF} driver=${driver} pg${pgmajor}"
 echo "template fingerprint: $fp"
 
