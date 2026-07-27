@@ -17,8 +17,8 @@ limitations under the License.
 use async_trait::async_trait;
 use std::{any::Any, fmt::Debug};
 
-use datafusion::arrow::array::RecordBatch;
-use datafusion::error::Result;
+use datafusion::arrow::array::{BooleanArray, RecordBatch};
+use datafusion::error::{DataFusionError, Result};
 use snafu::prelude::*;
 
 pub mod analyzer;
@@ -49,6 +49,38 @@ pub trait Index: Debug + Send + Sync + 'static {
     /// "*_embedding" column) then modify the provided batches to include the computed column.
     async fn compute_index(&self, batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
         Ok(batches)
+    }
+
+    /// Maintain the index for one change-data-capture batch. `deleted` is a row-aligned
+    /// mask over `batch` marking the rows the source deleted (`ChangeBatch::deletion_mask`);
+    /// every other row is an upsert. Returns the batch with any computed index column, as
+    /// [`Index::compute_index`] does — the change stream reattaches the operation column to
+    /// the returned rows, so the row count and order must be preserved.
+    ///
+    /// The default upserts every row, ignoring `deleted`. That is correct only for an index
+    /// whose whole state is the column it computes into the batch it returns. An index that
+    /// keeps its own copy of the row — a full-text index, or an external vector store — must
+    /// override this to remove the deleted rows, or search keeps matching rows the dataset
+    /// no longer has.
+    ///
+    /// Wrapper implementations MUST forward this to the index they wrap: inheriting the
+    /// default silently drops the wrapped index's delete handling.
+    async fn compute_index_for_changes(
+        &self,
+        batch: RecordBatch,
+        deleted: &BooleanArray,
+    ) -> Result<RecordBatch> {
+        let _ = deleted;
+        let rows = batch.num_rows();
+        let computed = self.compute_index(vec![batch]).await?;
+        let [batch] = <[RecordBatch; 1]>::try_from(computed).map_err(|batches: Vec<_>| {
+            DataFusionError::Internal(format!(
+                "index {} returned {} batches for one {rows}-row change batch, expected 1",
+                self.name(),
+                batches.len(),
+            ))
+        })?;
+        Ok(batch)
     }
 
     /// Called before data is written via the [`TableSink`] path (full refresh or append).

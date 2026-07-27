@@ -37,7 +37,7 @@ mod vector_index;
 
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
+use arrow::array::{BooleanArray, RecordBatch};
 use arrow_schema::{ArrowError, Field, FieldRef, Schema};
 use datafusion::error::DataFusionError;
 use itertools::Itertools;
@@ -214,14 +214,44 @@ async fn compound_write(
     let primary_out = primary_result.context(PrimaryIndexWriteSnafu).boxed()?;
     let secondary_out = secondary_result.context(SecondaryIndexWriteSnafu).boxed()?;
 
-    if primary_out.num_rows() != secondary_out.num_rows() {
-        return WriteRowCountMismatchSnafu {
+    merge_tier_outputs(primary_out, &secondary_out).boxed()
+}
+
+/// Apply one change-data-capture batch to both indexes, forwarding the deletion mask so a tier
+/// that keeps its own copy of a row removes the rows the source deleted instead of re-indexing
+/// them as upserts. Outputs are merged as in [`compound_write`]. Both calls run concurrently
+/// and both are driven to completion even if one fails, so neither index is left mid-write.
+async fn compound_compute_index_for_changes(
+    primary: &dyn SearchIndex,
+    secondary: &dyn SearchIndex,
+    batch: RecordBatch,
+    deleted: &BooleanArray,
+) -> Result<RecordBatch, DataFusionError> {
+    let (primary_result, secondary_result) = futures::join!(
+        primary.compute_index_for_changes(batch.clone(), deleted),
+        secondary.compute_index_for_changes(batch, deleted)
+    );
+    let primary_out = primary_result?;
+    let secondary_out = secondary_result?;
+
+    merge_tier_outputs(primary_out, &secondary_out)
+        .map_err(|e| DataFusionError::External(Box::new(e)))
+}
+
+/// Merge the two tiers' outputs: the primary's columns win, and secondary columns not present on
+/// the primary output are appended (so columns derived by either index survive for downstream
+/// acceleration).
+fn merge_tier_outputs(
+    primary_out: RecordBatch,
+    secondary_out: &RecordBatch,
+) -> Result<RecordBatch, Error> {
+    ensure!(
+        primary_out.num_rows() == secondary_out.num_rows(),
+        WriteRowCountMismatchSnafu {
             primary_rows: primary_out.num_rows(),
             secondary_rows: secondary_out.num_rows(),
         }
-        .fail()
-        .boxed();
-    }
+    );
 
     let (schema, mut arrays, _) = primary_out.into_parts();
     let mut fields: Vec<FieldRef> = schema.fields().iter().cloned().collect();
@@ -239,7 +269,6 @@ async fn compound_write(
         arrays,
     )
     .context(MergeWriteOutputsSnafu)
-    .boxed()
 }
 
 /// Union of the two indexes' required columns, preserving the primary's order.

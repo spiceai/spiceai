@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{any::Any, sync::Arc};
 
-use arrow::array::RecordBatch;
+use arrow::array::{BooleanArray, RecordBatch};
 use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::{error::DataFusionError, logical_expr::LogicalPlan};
@@ -26,9 +26,9 @@ use runtime_datafusion_index::Index;
 use crate::index::{SearchIndex, VectorIndex};
 
 use super::{
-    CompoundReadMode, CompoundVectorIndex, Error, compound_on_write_start,
-    compound_required_columns, compound_write, fallback::fallback_on_empty_plan,
-    validate_compatibility,
+    CompoundReadMode, CompoundVectorIndex, Error, compound_compute_index_for_changes,
+    compound_on_write_start, compound_required_columns, compound_write,
+    fallback::fallback_on_empty_plan, validate_compatibility,
 };
 
 /// A [`SearchIndex`] that writes through to two compatible underlying indexes and serves
@@ -81,6 +81,20 @@ impl Index for CompoundSearchIndex {
             .into_iter()
             .map(|rb| async { self.write(rb).await.map_err(DataFusionError::External) });
         try_join_all(futs).await
+    }
+
+    async fn compute_index_for_changes(
+        &self,
+        batch: RecordBatch,
+        deleted: &BooleanArray,
+    ) -> Result<RecordBatch, DataFusionError> {
+        compound_compute_index_for_changes(
+            self.primary.as_ref(),
+            self.secondary.as_ref(),
+            batch,
+            deleted,
+        )
+        .await
     }
 
     async fn on_write_start(&self) -> Result<(), DataFusionError> {

@@ -47,16 +47,20 @@ pub async fn index_change_envelope(
     // stream before the accelerator consumes it). Offload the synchronous build
     // so a large deferred burst can't stall this async worker.
     let (change_committer, batch, is_dataset_ready) = envelope.into_parts_offloaded().await?;
-    let mut batches = vec![batch.data_batch()];
+    // The data batch carries row data alone. The mask is what tells an index which of those
+    // rows the source deleted, so an index holding its own copy of a row removes it instead
+    // of re-indexing it as an upsert.
+    let deleted = batch.deletion_mask();
+    let mut data_batch = batch.data_batch();
 
     for index in &indexes.0 {
-        batches = index
-            .compute_index(batches)
+        data_batch = index
+            .compute_index_for_changes(data_batch, &deleted)
             .await
             .map_err(|e| StreamError::External(e.to_string()))?;
     }
 
-    let new_change_batch = replace_change_batch_data(&batches[0], &batch)
+    let new_change_batch = replace_change_batch_data(&data_batch, &batch)
         .map_err(|e| StreamError::Arrow(e.to_string()))?;
 
     Ok(ChangeEnvelope::new(
@@ -70,18 +74,18 @@ pub async fn index_change_envelope(
 mod tests {
     use super::*;
     use arrow::{
-        array::{Int32Array, RecordBatch, StringArray},
+        array::{BooleanArray, Int32Array, RecordBatch, StringArray},
         datatypes::{DataType, Field, Schema},
     };
     use async_trait::async_trait;
     use data_components::cdc::{
-        ChangeEnvelope, CommitChange, CommitError, wrap_data_as_change_batch,
+        ChangeBatch, ChangeEnvelope, CommitChange, CommitError, wrap_data_as_change_batch,
     };
     use datafusion::catalog::TableProvider;
     use datafusion::error::{DataFusionError, Result as DataFusionResult};
     use runtime_datafusion_index::{Index, IndexedTableProvider};
     use std::any::Any;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     struct MockCommitChange;
 
@@ -97,6 +101,8 @@ mod tests {
         name: &'static str,
         should_fail: bool,
         add_column: bool,
+        /// The deletion mask of every change batch this index was given, in call order.
+        observed_masks: Arc<Mutex<Vec<Vec<Option<bool>>>>>,
     }
 
     impl MockIndex {
@@ -105,7 +111,15 @@ mod tests {
                 name,
                 should_fail: false,
                 add_column: false,
+                observed_masks: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        fn observed_masks(&self) -> Vec<Vec<Option<bool>>> {
+            self.observed_masks
+                .lock()
+                .expect("the observed-mask log is not poisoned")
+                .clone()
         }
 
         fn with_failure(mut self) -> Self {
@@ -159,6 +173,22 @@ mod tests {
             Ok(batches)
         }
 
+        async fn compute_index_for_changes(
+            &self,
+            batch: RecordBatch,
+            deleted: &BooleanArray,
+        ) -> DataFusionResult<RecordBatch> {
+            self.observed_masks
+                .lock()
+                .expect("the observed-mask log is not poisoned")
+                .push(deleted.iter().collect());
+
+            let batches = self.compute_index(vec![batch]).await?;
+            batches.into_iter().next().ok_or_else(|| {
+                DataFusionError::Execution("Mock index returned no batches".to_string())
+            })
+        }
+
         fn as_any(&self) -> &dyn Any {
             self
         }
@@ -210,6 +240,56 @@ mod tests {
             .expect("Failed to create change batch");
         let committer = Box::new(MockCommitChange);
         ChangeEnvelope::new(committer, change_batch, true)
+    }
+
+    /// A change envelope over [`create_test_data_batch`] whose rows carry `ops`, one per row.
+    fn change_envelope_with_ops(ops: &[&str]) -> ChangeEnvelope {
+        let data_batch = create_test_data_batch();
+        let record = wrap_data_as_change_batch(&data_batch.schema(), &data_batch)
+            .expect("Failed to create change batch")
+            .record;
+        let op_idx = record
+            .schema()
+            .index_of("op")
+            .expect("the change schema has an 'op' column");
+        let mut columns = record.columns().to_vec();
+        columns[op_idx] = Arc::new(StringArray::from(ops.to_vec()));
+        let record = RecordBatch::try_new(record.schema(), columns)
+            .expect("Failed to rebuild the change batch with the given operations");
+
+        ChangeEnvelope::new(
+            Box::new(MockCommitChange),
+            ChangeBatch::try_new(record).expect("Failed to create change batch"),
+            true,
+        )
+    }
+
+    /// Regression test for #12084: the change stream must tell each index which rows the source
+    /// deleted. Without the mask an index that keeps its own copy of a row (a full-text index)
+    /// re-indexes a deleted row as an upsert and keeps matching it after the row is gone.
+    #[tokio::test]
+    async fn test_index_change_envelope_forwards_the_deletion_mask() {
+        let index = Arc::new(MockIndex::new("mock_index"));
+        let indexes = Indexes::new(vec![Arc::clone(&index) as Arc<dyn Index + Send + Sync>]);
+
+        let result = index_change_envelope(Ok(change_envelope_with_ops(&["c", "d", "u"])), indexes)
+            .await
+            .expect("Expected successful result");
+
+        assert_eq!(
+            index.observed_masks(),
+            vec![vec![Some(false), Some(true), Some(false)]],
+            "the index must receive one mask aligned with the change batch's rows"
+        );
+        // The rows still ride the envelope the accelerator applies.
+        assert_eq!(
+            result
+                .change_batch()
+                .expect("built change batch")
+                .record
+                .num_rows(),
+            3
+        );
     }
 
     #[tokio::test]

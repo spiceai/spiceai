@@ -8,8 +8,8 @@ use crate::{
 
 use arrow::{
     array::{
-        Array, ArrayRef, FixedSizeListArray, FixedSizeListBuilder, Int32Builder, LargeStringArray,
-        ListArray, RecordBatch, StringArray, StringViewArray, UInt64Array,
+        Array, ArrayRef, BooleanArray, FixedSizeListArray, FixedSizeListBuilder, Int32Builder,
+        LargeStringArray, ListArray, RecordBatch, StringArray, StringViewArray, UInt64Array,
     },
     buffer::OffsetBuffer,
     compute::concat,
@@ -85,6 +85,22 @@ impl Index for ChunkedSearchIndex {
             .into_iter()
             .map(|rb| async { self.write(rb).await.map_err(DataFusionError::External) });
         try_join_all(futs).await
+    }
+
+    /// Deliberately does **not** forward the deletion mask to `inner`, and so keeps upserting
+    /// every row of a change batch (see [`Index::compute_index_for_changes`]).
+    ///
+    /// Chunking expands one base row into a document per chunk, keyed by primary key *and*
+    /// chunk id, and a delete carries no content to chunk: neither is a row-aligned mask
+    /// meaningful for `inner`'s rows, nor does a delete on the base key identify the chunk
+    /// documents to remove. A chunked index therefore keeps documents for rows the source
+    /// deleted until it can delete by key prefix — tracked in #12088.
+    async fn compute_index_for_changes(
+        &self,
+        batch: RecordBatch,
+        _deleted: &BooleanArray,
+    ) -> Result<RecordBatch, DataFusionError> {
+        self.write(batch).await.map_err(DataFusionError::External)
     }
 
     async fn on_write_start(&self) -> Result<(), DataFusionError> {
@@ -754,6 +770,21 @@ impl Index for ChunkedVectorIndex {
             Arc::clone(&self.chunker),
         )
         .compute_index(batches)
+        .await
+    }
+
+    /// Carries the same chunked-index limitation as
+    /// [`ChunkedSearchIndex::compute_index_for_changes`].
+    async fn compute_index_for_changes(
+        &self,
+        batch: RecordBatch,
+        deleted: &BooleanArray,
+    ) -> Result<RecordBatch, DataFusionError> {
+        ChunkedSearchIndex::new(
+            Arc::clone(&self.inner) as Arc<dyn SearchIndex>,
+            Arc::clone(&self.chunker),
+        )
+        .compute_index_for_changes(batch, deleted)
         .await
     }
 

@@ -29,7 +29,7 @@ pub use config::{
 
 use arrow::error::ArrowError;
 use arrow::{
-    array::{Array, ArrayRef, ListArray, RecordBatch, StringArray, StructArray},
+    array::{Array, ArrayRef, BooleanArray, ListArray, RecordBatch, StringArray, StructArray},
     datatypes::{DataType, Field, Schema, SchemaRef},
 };
 use arrow_buffer::OffsetBuffer;
@@ -958,6 +958,20 @@ impl ChangeBatch {
         primary_keys_col.value_length(row) > 0
     }
 
+    /// A row-aligned mask over [`Self::data_batch`] marking the rows this batch deletes.
+    ///
+    /// [`Self::data_batch`] carries the row data without the operation column, so a consumer
+    /// that keeps its own copy of a row — a search index, for instance — cannot tell a delete
+    /// from an upsert from the data alone, and would re-apply a deleted row as an upsert.
+    /// Only [`ChangeOperation::Delete`] is marked: `Truncate` and unknown operations are
+    /// applied through the accelerator's own durable path, not row by row.
+    #[must_use]
+    pub fn deletion_mask(&self) -> BooleanArray {
+        (0..self.record.num_rows())
+            .map(|row| Some(matches!(self.op(row), ChangeOperation::Delete)))
+            .collect()
+    }
+
     #[must_use]
     pub fn data(&self, row: usize) -> RecordBatch {
         let Some(data_col) = self
@@ -1164,6 +1178,59 @@ mod tests {
             .expect("data column is StructArray");
         assert_eq!(data_column.len(), 3);
         assert_eq!(data_column.num_columns(), 2);
+    }
+
+    /// A [`ChangeBatch`] whose rows carry `ops`, one per row, over a single `id` column.
+    fn change_batch_with_ops(ops: &[&str]) -> ChangeBatch {
+        let table_schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let ids: Vec<i32> = (0..ops.len())
+            .map(|row| i32::try_from(row).expect("row index fits in an i32"))
+            .collect();
+        let data = RecordBatch::try_new(
+            Arc::clone(&table_schema),
+            vec![Arc::new(Int32Array::from(ids))],
+        )
+        .expect("to create data batch");
+
+        let mut change_batch = wrap_data_as_change_batch(&table_schema, &data)
+            .expect("to create change batch")
+            .record;
+        let op_idx = change_batch
+            .schema()
+            .index_of("op")
+            .expect("the change schema has an 'op' column");
+        let mut columns = change_batch.columns().to_vec();
+        columns[op_idx] = Arc::new(StringArray::from(ops.to_vec()));
+        change_batch = RecordBatch::try_new(change_batch.schema(), columns)
+            .expect("to rebuild the change batch with the given operations");
+
+        ChangeBatch::try_new(change_batch).expect("to create change batch")
+    }
+
+    #[test]
+    fn deletion_mask_marks_only_delete_operations() {
+        // "c" create, "u" update, "d" delete, "r" read (snapshot), "t" truncate.
+        let mask = change_batch_with_ops(&["c", "d", "u", "d", "r", "t"]).deletion_mask();
+
+        assert_eq!(
+            mask.iter().collect::<Vec<_>>(),
+            vec![
+                Some(false),
+                Some(true),
+                Some(false),
+                Some(true),
+                Some(false),
+                Some(false),
+            ],
+            "only 'd' rows delete a row; 't' is applied through the accelerator's durable path"
+        );
+        assert_eq!(mask.null_count(), 0, "every row is classified");
+    }
+
+    #[test]
+    fn deletion_mask_of_an_empty_batch_is_empty() {
+        assert_eq!(change_batch_with_ops(&[]).deletion_mask().len(), 0);
     }
 }
 

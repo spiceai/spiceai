@@ -19,7 +19,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
+use arrow::array::{BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
@@ -154,6 +154,23 @@ impl Index for MockIndex {
             )));
         }
         Ok(())
+    }
+
+    async fn compute_index_for_changes(
+        &self,
+        batch: RecordBatch,
+        deleted: &BooleanArray,
+    ) -> Result<RecordBatch, DataFusionError> {
+        let marked = deleted
+            .iter()
+            .map(|row| match row {
+                Some(true) => "d",
+                _ => "u",
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        self.record(&format!("compute_index_for_changes:{marked}"));
+        self.write(batch).await.map_err(DataFusionError::External)
     }
 
     async fn on_write_failed(&self) -> Result<(), DataFusionError> {
@@ -438,6 +455,34 @@ async fn write_goes_to_both_and_merges_output_columns() {
     let events = events.lock().expect("event log mutex").clone();
     assert!(events.contains(&"primary:write".to_string()));
     assert!(events.contains(&"secondary:write".to_string()));
+}
+
+/// Regression test for #12084. The warm/external full-text compound is registered in place of
+/// its tiers, so a compound that swallowed the deletion mask would leave its tantivy tier
+/// upserting rows the source deleted — the very bug the mask exists to fix.
+#[tokio::test]
+async fn change_batches_forward_the_deletion_mask_to_both_tiers() {
+    let events = Arc::new(Mutex::new(vec![]));
+    let primary = MockIndex::new("primary", &events);
+    let secondary = MockIndex::new("secondary", &events);
+
+    let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
+    let out = idx
+        .compute_index_for_changes(
+            input_batch(3),
+            &BooleanArray::from(vec![false, true, false]),
+        )
+        .await
+        .expect("the change batch is applied");
+
+    assert_eq!(out.num_rows(), 3, "every row rides on to the accelerator");
+    let events = events.lock().expect("event log mutex").clone();
+    for tier in ["primary", "secondary"] {
+        assert!(
+            events.contains(&format!("{tier}:compute_index_for_changes:udu")),
+            "the {tier} tier must receive the batch's deletion mask, got: {events:?}"
+        );
+    }
 }
 
 #[tokio::test]

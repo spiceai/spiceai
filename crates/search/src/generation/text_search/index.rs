@@ -20,7 +20,10 @@ use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{any::Any, collections::HashSet, sync::Arc};
 
-use arrow::{array::RecordBatch, datatypes::DataType};
+use arrow::{
+    array::{Array, BooleanArray, RecordBatch},
+    datatypes::DataType,
+};
 use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::datasource::{DefaultTableSource, TableProvider};
@@ -66,6 +69,43 @@ fn index_merge_policy() -> LogMergePolicy {
     let mut policy = LogMergePolicy::default();
     policy.set_del_docs_ratio_before_merge(MAX_SUPERSEDED_DOCS_RATIO_PER_SEGMENT);
     policy
+}
+
+/// Writer operations built from a [`RecordBatch`] before the writer lock is taken: the terms whose
+/// documents are removed, and the documents added in their place (empty for a pure deletion).
+struct StagedOperations {
+    terms_to_delete: Vec<tantivy::Term>,
+    docs: Vec<TantivyDocument>,
+}
+
+impl StagedOperations {
+    /// Stage the deletions, then the insertions — the order a tantivy update requires.
+    fn stage(self, index_writer: &mut tantivy::IndexWriter) -> Result<(), super::Error> {
+        for term in self.terms_to_delete {
+            index_writer.delete_term(term);
+        }
+        for doc in self.docs {
+            index_writer.add_document(doc).context(IndexCreationSnafu)?;
+        }
+        Ok(())
+    }
+}
+
+/// Split a row-aligned deletion mask into the maximal runs of consecutive rows that share a
+/// kind, as `(offset, length, is_delete)` in row order. A null mask entry counts as an upsert:
+/// a change stream marks only the rows it deletes.
+fn same_kind_runs(deleted: &BooleanArray) -> Vec<(usize, usize, bool)> {
+    let mut runs: Vec<(usize, usize, bool)> = Vec::new();
+
+    for row in 0..deleted.len() {
+        let is_delete = deleted.is_valid(row) && deleted.value(row);
+        match runs.last_mut() {
+            Some((_, length, kind)) if *kind == is_delete => *length += 1,
+            _ => runs.push((row, 1, is_delete)),
+        }
+    }
+
+    runs
 }
 
 /// Perform a [`tantivy::IndexWriter::rollback`] and preserve the [`MergePolicy`] from `index_merge_policy`.
@@ -141,6 +181,28 @@ impl Index for FullTextDatabaseIndex {
             return Err(DataFusionError::External(Box::new(e)));
         }
         Ok(batches)
+    }
+
+    async fn compute_index_for_changes(
+        &self,
+        batch: RecordBatch,
+        deleted: &BooleanArray,
+    ) -> Result<RecordBatch, DataFusionError> {
+        // Misaligned lengths would classify rows against the wrong operations, indexing
+        // deleted rows and dropping live ones, so refuse the batch rather than guess.
+        if deleted.len() != batch.num_rows() {
+            return Err(DataFusionError::Internal(format!(
+                "the full-text index received a {}-row deletion mask for a {}-row change batch",
+                deleted.len(),
+                batch.num_rows(),
+            )));
+        }
+
+        if let Err(e) = self.apply_change_batch(&batch, deleted).await {
+            tracing::error!("Failed to update full text search index: {e}");
+            return Err(DataFusionError::External(Box::new(e)));
+        }
+        Ok(batch)
     }
 
     fn write_complete_failure_is_fatal(&self) -> bool {
@@ -355,53 +417,43 @@ impl FullTextDatabaseIndex {
             .collect())
     }
 
-    /// Update the underlying [`tantivy::Index`] with new data from [`RecordBatch`]s. Additional
-    /// columns present will be ignored.
+    /// Add the `INDEX_UNIQUE_FIELD_NAME` column that a multi-column primary key needs for
+    /// unique lookup in the [`tantivy::Index`], since both an update and a delete resolve to
+    /// [`tantivy::IndexWriter::delete_term`], which takes a single term.
+    fn with_unique_key_column(&self, rb: &[RecordBatch]) -> Result<Vec<RecordBatch>, super::Error> {
+        if self.primary_key.len() <= 1 {
+            return Ok(rb.to_vec());
+        }
+
+        rb.iter()
+            .map(|r| with_json_subset_column(r, &self.primary_key, INDEX_UNIQUE_FIELD_NAME))
+            .collect::<Result<Vec<RecordBatch>, _>>()
+            .context(InvalidIndexingSnafu {
+                context:
+                    "An error occured creating the a unique column for the full text search index"
+                        .to_string(),
+            })
+    }
+
+    /// Stage writer operations and publish them, unless a deferred-commit window is open.
     ///
-    /// If there is a multi-column primary key (as specified by [`Self::primary_key`]), an additional column is used in the [`tantivy::Index`] for unique lookup (required since updates = deletion -> insertion).
-    async fn update_index(&self, rb: &[RecordBatch]) -> Result<(), super::Error> {
-        // Construct column for `INDEX_UNIQUE_FIELD_NAME` if needed.
-        let rb = if self.primary_key.len() > 1 {
-            rb.iter()
-                .map(|r| with_json_subset_column(r, &self.primary_key, INDEX_UNIQUE_FIELD_NAME))
-                .collect::<Result<Vec<RecordBatch>, _>>()
-                .context(InvalidIndexingSnafu {
-                    context: "An error occured creating the a unique column for the full text search index".to_string(),
-                })?
-        } else {
-            rb.to_vec()
-        };
-
-        // Updates in tantivy are a deletion then insertion.
-        // Prepare documents to insert/delete with read lock.
-        let index_schema = self.reader.searcher().schema().clone();
-        let terms_to_delete = self.existing_terms_to_delete(&index_schema, &rb)?;
-        let doc_json = write_to_json_string(&rb).context(InvalidIndexingSnafu {
-            context: "Failed to write data to intermediate JSON string for indexing".to_string(),
-        })?;
-        let docs = parse_json_array(&index_schema, doc_json.as_str())
-            .context(FailedToInsertDataIntoIndexSnafu)?;
-
+    /// In a sink-driven full refresh or append, `on_write_start` has set `defer_commit`, so
+    /// operations are staged and the single commit happens once in `on_write_complete` — one
+    /// fsync barrier per refresh instead of one per record batch. Otherwise (the CDC path,
+    /// which drives the index outside the lifecycle hooks) commit immediately and reload the
+    /// reader so queries see the change. On failure, roll back to discard staged operations
+    /// so they don't leak into a later commit.
+    async fn write_to_index<F>(&self, stage: F) -> Result<(), super::Error>
+    where
+        F: FnOnce(&mut tantivy::IndexWriter) -> Result<(), super::Error> + Send,
+    {
         let mut index_writer = self.writer.lock().await;
         // Read the deferral flag while holding the writer lock so the decision to
         // commit is serialized with `on_write_complete`/`on_write_failed` closing the
         // window. Reading it before acquiring the lock would allow this call to observe
         // a cleared flag and commit a window the hooks have not finalized yet.
         let defer_commit = self.defer_commit.load(Ordering::Acquire);
-        // Deletion.
-        for t in terms_to_delete {
-            index_writer.delete_term(t);
-        }
-        // Insertion. In a sink-driven full refresh or append, `on_write_start` has
-        // set `defer_commit`, so documents are staged and the single commit happens
-        // once in `on_write_complete` — one fsync barrier per refresh instead of one
-        // per record batch. Otherwise (the CDC path, which drives `compute_index`
-        // directly without the lifecycle hooks) commit immediately. On failure,
-        // rollback to discard staged operations so they don't leak into a later commit.
-        let write_result = (|| {
-            for doc in docs {
-                index_writer.add_document(doc).context(IndexCreationSnafu)?;
-            }
+        let write_result = stage(&mut index_writer).and_then(|()| {
             if defer_commit {
                 Ok(())
             } else {
@@ -410,7 +462,7 @@ impl FullTextDatabaseIndex {
                     .map(|_| ())
                     .context(FailedToInsertDataIntoIndexSnafu)
             }
-        })();
+        });
         if let Err(e) = &write_result {
             tracing::warn!("Rolling back index writer after failed write: {e}");
             if let Err(rb_err) = rollback_writer(&mut index_writer) {
@@ -428,6 +480,83 @@ impl FullTextDatabaseIndex {
         self.reader.reload().boxed().context(InvalidIndexingSnafu {
             context: "Data successfully written to full-text index, but failed to update search path to reference the latest commit. Queries will be served from previous revision until the next update.".to_string(),
         })
+    }
+
+    /// Update the underlying [`tantivy::Index`] with new data from [`RecordBatch`]s. Additional
+    /// columns present will be ignored.
+    ///
+    /// If there is a multi-column primary key (as specified by [`Self::primary_key`]), an additional column is used in the [`tantivy::Index`] for unique lookup (required since updates = deletion -> insertion).
+    async fn update_index(&self, rb: &[RecordBatch]) -> Result<(), super::Error> {
+        let upsert = self.prepare_upsert(rb)?;
+        self.write_to_index(move |index_writer| upsert.stage(index_writer))
+            .await
+    }
+
+    /// The writer operations that upsert `rb`: remove each row's existing document, then add the
+    /// row as a new one. Prepared before the writer lock is taken, as a tantivy update is a
+    /// deletion followed by an insertion.
+    fn prepare_upsert(&self, rb: &[RecordBatch]) -> Result<StagedOperations, super::Error> {
+        let rb = self.with_unique_key_column(rb)?;
+        let index_schema = self.reader.searcher().schema().clone();
+        let terms_to_delete = self.existing_terms_to_delete(&index_schema, &rb)?;
+        let doc_json = write_to_json_string(&rb).context(InvalidIndexingSnafu {
+            context: "Failed to write data to intermediate JSON string for indexing".to_string(),
+        })?;
+        let docs = parse_json_array(&index_schema, doc_json.as_str())
+            .context(FailedToInsertDataIntoIndexSnafu)?;
+
+        Ok(StagedOperations {
+            terms_to_delete,
+            docs,
+        })
+    }
+
+    /// The writer operations that remove the documents for `rb`'s primary keys, leaving the rest
+    /// of the index untouched.
+    fn prepare_delete(&self, rb: &[RecordBatch]) -> Result<StagedOperations, super::Error> {
+        let rb = self.with_unique_key_column(rb)?;
+        let index_schema = self.reader.searcher().schema().clone();
+
+        Ok(StagedOperations {
+            terms_to_delete: self.existing_terms_to_delete(&index_schema, &rb)?,
+            docs: vec![],
+        })
+    }
+
+    /// Apply one change-data-capture batch, where `deleted` marks the rows the source deleted.
+    ///
+    /// The batch is split into maximal runs of consecutive same-kind rows, and the runs reach the
+    /// writer in source order, so the last operation on a primary key within the batch is the one
+    /// the index keeps: a batch that deletes a key and then creates it again ends with the new
+    /// document, and one that creates then deletes it ends with neither. tantivy applies a
+    /// deletion to the documents added before it, *including those added earlier in the same
+    /// commit*, so ordering the runs within one commit is what decides the outcome — and the
+    /// whole batch still costs the single commit an all-upsert batch costs.
+    async fn apply_change_batch(
+        &self,
+        batch: &RecordBatch,
+        deleted: &BooleanArray,
+    ) -> Result<(), super::Error> {
+        // Prepare every run before taking the writer lock, as the upsert path does.
+        let runs = same_kind_runs(deleted)
+            .into_iter()
+            .map(|(offset, length, is_delete)| {
+                let run = batch.slice(offset, length);
+                if is_delete {
+                    self.prepare_delete(slice::from_ref(&run))
+                } else {
+                    self.prepare_upsert(slice::from_ref(&run))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        self.write_to_index(move |index_writer| {
+            for run in runs {
+                run.stage(index_writer)?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     #[must_use]
@@ -1361,6 +1490,157 @@ mod tests {
         assert!(
             results.contains("apple banana"),
             "committed CDC documents must survive a failed write window, got:\n{results}"
+        );
+    }
+
+    /// Search the index's `content` field for `query`.
+    async fn search_content(index: &FullTextDatabaseIndex, query: &str) -> String {
+        let field_index = index
+            .full_text_search_field_index("content")
+            .expect("Failed to create FullTextSearchFieldIndex");
+        search_and_format(&field_index, query).await
+    }
+
+    #[test]
+    fn same_kind_runs_splits_where_the_kind_changes() {
+        assert_eq!(
+            same_kind_runs(&BooleanArray::from(vec![
+                false, false, true, false, true, true
+            ])),
+            vec![(0, 2, false), (2, 1, true), (3, 1, false), (4, 2, true)]
+        );
+        assert_eq!(
+            same_kind_runs(&BooleanArray::from(Vec::<bool>::new())),
+            vec![],
+            "an empty change batch has no runs to apply"
+        );
+        assert_eq!(
+            same_kind_runs(&BooleanArray::from(vec![Some(true), None, Some(false)])),
+            vec![(0, 1, true), (1, 2, false)],
+            "a null mask entry is an upsert: a change stream marks only the rows it deletes"
+        );
+    }
+
+    /// Regression test for #12084. A change batch that deletes a row must remove its document
+    /// rather than re-index it: the row is gone from the dataset, so an index that still matches
+    /// it returns a row the dataset no longer has.
+    #[tokio::test]
+    async fn cdc_delete_removes_the_document() {
+        let index = new_test_index();
+        index
+            .compute_index(vec![batch(&[1, 2], &["apple banana", "dog elephant"])])
+            .await
+            .expect("failed to compute_index");
+
+        index
+            .compute_index_for_changes(
+                batch(&[1], &["apple banana"]),
+                &BooleanArray::from(vec![true]),
+            )
+            .await
+            .expect("failed to apply the change batch");
+
+        let deleted = search_content(&index, "apple").await;
+        assert!(
+            !deleted.contains("apple banana"),
+            "the deleted row must no longer be searchable, got:\n{deleted}"
+        );
+        let kept = search_content(&index, "elephant").await;
+        assert!(
+            kept.contains("dog elephant"),
+            "a delete must not disturb the other rows, got:\n{kept}"
+        );
+    }
+
+    /// Within one change batch the last operation on a primary key decides the outcome: a delete
+    /// followed by a create leaves the newly created document in place.
+    #[tokio::test]
+    async fn cdc_delete_then_create_in_one_batch_keeps_the_document() {
+        let index = new_test_index();
+        index
+            .compute_index(vec![batch(&[1], &["apple banana"])])
+            .await
+            .expect("failed to compute_index");
+
+        index
+            .compute_index_for_changes(
+                batch(&[1, 1], &["apple banana", "cherry date"]),
+                &BooleanArray::from(vec![true, false]),
+            )
+            .await
+            .expect("failed to apply the change batch");
+
+        let recreated = search_content(&index, "cherry").await;
+        assert!(
+            recreated.contains("cherry date"),
+            "the row re-created after the delete must be searchable, got:\n{recreated}"
+        );
+        let superseded = search_content(&index, "apple").await;
+        assert!(
+            !superseded.contains("apple banana"),
+            "the superseded version must not remain, got:\n{superseded}"
+        );
+    }
+
+    /// The mirror of the case above: a create followed by a delete ends with neither.
+    #[tokio::test]
+    async fn cdc_create_then_delete_in_one_batch_removes_the_document() {
+        let index = new_test_index();
+
+        index
+            .compute_index_for_changes(
+                batch(&[7, 7], &["mango papaya", "mango papaya"]),
+                &BooleanArray::from(vec![false, true]),
+            )
+            .await
+            .expect("failed to apply the change batch");
+
+        let results = search_content(&index, "mango").await;
+        assert!(
+            !results.contains("mango papaya"),
+            "a row created and then deleted in one batch must not be searchable, got:\n{results}"
+        );
+    }
+
+    /// A change batch of upserts alone indexes every row, exactly as `compute_index` does.
+    #[tokio::test]
+    async fn cdc_upsert_only_batch_indexes_every_row() {
+        let index = new_test_index();
+
+        index
+            .compute_index_for_changes(
+                batch(&[1, 2], &["apple banana", "dog elephant"]),
+                &BooleanArray::from(vec![false, false]),
+            )
+            .await
+            .expect("failed to apply the change batch");
+
+        for (query, expected) in [("apple", "apple banana"), ("elephant", "dog elephant")] {
+            let results = search_content(&index, query).await;
+            assert!(
+                results.contains(expected),
+                "'{expected}' must be searchable after an upsert-only batch, got:\n{results}"
+            );
+        }
+    }
+
+    /// A mask that does not cover every row cannot be matched to operations, so the batch is
+    /// refused rather than applied against the wrong rows.
+    #[tokio::test]
+    async fn cdc_deletion_mask_must_cover_every_row() {
+        let index = new_test_index();
+
+        let err = index
+            .compute_index_for_changes(
+                batch(&[1, 2], &["apple banana", "dog elephant"]),
+                &BooleanArray::from(vec![true]),
+            )
+            .await
+            .expect_err("a mask that does not cover every row must be rejected");
+
+        assert!(
+            err.to_string().contains("deletion mask"),
+            "the error must name the mismatched mask, got: {err}"
         );
     }
 }
