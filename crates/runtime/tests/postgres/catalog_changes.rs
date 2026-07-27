@@ -867,8 +867,12 @@ async fn test_catalog_acceleration_fails_loudly_when_no_tables_eligible()
             // explains itself.
             match rt.status().get_catalog_statuses().get(CATALOG_NAME) {
                 Some(ComponentStatus::Error(Some(message))) => {
+                    // Actionable message: names the zero-eligible outcome and the
+                    // REPLICA IDENTITY fix (the exact count is dynamic, so match on
+                    // the stable phrasing rather than "0 of N").
                     anyhow::ensure!(
-                        message.contains("no tables are eligible"),
+                        message.contains("discovered table(s) are eligible for CDC acceleration")
+                            && message.contains("REPLICA IDENTITY"),
                         "error message should be actionable, got: {message}"
                     );
                 }
