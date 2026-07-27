@@ -201,7 +201,11 @@ const MAX_PK_SELECTIVE_INLIST_VALUES: usize = 32;
 /// Upper bound on PK `BETWEEN` span (inclusive) for selective scan fan-out control.
 const MAX_PK_SELECTIVE_RANGE_SPAN: i64 = 32;
 /// Maximum tombstone keys pushed into the Vortex scan predicate as `NOT IN`.
-const MAX_VORTEX_KEY_DELETE_PUSHDOWN: usize = 256;
+///
+/// Sized so sparse-to-moderate key-delete sets still get Vortex chunk pruning
+/// (fewer rows decoded) without building an unbounded expression tree. Dense
+/// `MoR` exceeds the bound and falls through to the post-decode deletion filter.
+const MAX_VORTEX_KEY_DELETE_PUSHDOWN: usize = 2048;
 
 /// Result of a Cayenne CDC append write.
 ///
@@ -348,6 +352,11 @@ impl CayenneCdcWrite {
     pub async fn finish(self) -> Result<u64> {
         if let Some(prepared_append) = self.prepared_append {
             let publish_start = Instant::now();
+            // The best-effort staging-WAL removal on the protected-snapshot path
+            // below can fail without failing the (already-durable) write. Track
+            // that so we can re-arm the recovery flags after `finish()` clears
+            // them (see the re-arm after `finish()` below).
+            let mut staging_wal_removal_failed = false;
             let superseded_rows = if let Some(prepared_on_conflict) = self.prepared_on_conflict {
                 // Authoritative superseded-row count, captured at validation time.
                 // Do NOT recompute from `deleted_pk_i64`/`deleted_row_keys`: for an
@@ -398,30 +407,36 @@ impl CayenneCdcWrite {
                 //    replacement files' staging WAL is durable BEFORE it. Nothing
                 //    here changes that.
                 //  * `apply_under_held_barrier` (below) makes the replacement files
-                //    durable AND removes the staging WAL. If it fails, the tombstone
-                //    is STILL durable `published = 0`, the in-memory activation has
-                //    NOT run, and the staging WAL is still present — so there is NO
-                //    durable state to compensate (unlike the pre-b1★ flip-before-move
-                //    ordering, which had to revert a premature `published = 1`). We
-                //    simply propagate the error; reopen re-drives the move via
+                //    durable, then we remove the staging WAL best-effort (the block
+                //    after it). If the MOVE fails, the tombstone is STILL durable
+                //    `published = 0`, the in-memory activation has NOT run, and the
+                //    staging WAL is still present — so there is NO durable state to
+                //    compensate (unlike the pre-b1★ flip-before-move ordering, which
+                //    had to revert a premature `published = 1`). We simply propagate
+                //    the error; reopen re-drives the move via
                 //    `ensure_no_incomplete_write` then activates the orphan tombstone
                 //    via `publish_orphan_inlined_deletes`. Applied exactly once.
-                //  * A crash AFTER the move (WAL gone, files durable) but BEFORE the
-                //    deferred durable flip lands: the tombstone is durable
-                //    `published = 0` with a durable replacement and NO WAL, so reopen's
-                //    unconditional orphan sweep flips it `published = 1`. Old inline
-                //    copy hidden, replacement visible, applied once. The in-memory
-                //    `inlined_locally_published` entry is lost on crash, which is
-                //    correct: it only ever advanced visibility PAST the durable flag,
-                //    so losing it cannot resurface a row (the orphan sweep republishes).
+                //  * A crash AFTER the move but BEFORE the deferred durable flip
+                //    lands — WAL either already removed here, or still present and
+                //    rolled forward + removed by the next recovery pass; both leave
+                //    files durable, WAL gone: the tombstone is durable
+                //    `published = 0` with a durable replacement and NO WAL, so
+                //    reopen's unconditional orphan sweep flips it `published = 1`.
+                //    Old inline copy hidden, replacement visible, applied once. The
+                //    in-memory `inlined_locally_published` entry is lost on crash,
+                //    which is correct: it only ever advanced visibility PAST the
+                //    durable flag, so losing it cannot resurface a row (the orphan
+                //    sweep republishes).
                 //  This is the SAME recovery mechanism that already makes "crash
                 //  before finish()" safe (correctness_audit.md §5 case 1); deferring
                 //  the flip merely widens that already-healed window by one batch.
                 // `publish_apply_move`: the staged-file MOVE into the snapshot dir
-                // (object-store / fs rename + parent-dir fsync) + staging-WAL
-                // removal + the list-files-cache delta-apply, all under the held
+                // (object-store / fs rename + parent-dir fsync), under the held
                 // fence. This is the real I/O of the publish — on EBS the dir
-                // fsync is a device flush.
+                // fsync is a device flush. For this protected-snapshot target the
+                // move is all `apply_under_held_barrier` does (the list-files-cache
+                // delta-apply and staging-WAL removal are `CurrentSnapshot`-only);
+                // the WAL is removed for this path in the block right after.
                 let apply_move_start = Instant::now();
                 prepared_append.apply_under_held_barrier().await?;
                 record_cayenne_write_phase(
@@ -429,6 +444,26 @@ impl CayenneCdcWrite {
                     "publish_apply_move",
                     apply_move_start,
                 );
+
+                // Remove this protected-snapshot append's staging WAL now that
+                // the move has made its replacement files durable in the target
+                // snapshot (`apply_under_held_barrier` removes the WAL only for
+                // `CurrentSnapshot` targets). Best-effort: the append is already
+                // durably committed (its `snapshot_sequence` is durable from Stage
+                // A), so a failed unlink must NOT fail the write — the leftover WAL
+                // is rolled forward idempotently by the next write's
+                // `ensure_no_incomplete_write`.
+                if let Err(error) = prepared_append.remove_committed_staging_wal().await {
+                    staging_wal_removal_failed = true;
+                    tracing::debug!(
+                        table = self.table.table_name(),
+                        target_snapshot = prepared_append.target_snapshot_id(),
+                        staging_wal_path = %prepared_append.staging_wal_path().display(),
+                        %error,
+                        "Best-effort removal of a committed CDC upsert's staging WAL failed; the next write's recovery will roll it forward"
+                    );
+                }
+
                 // `publish_deletion_apply`: the in-memory deletion-cache merge
                 // (`extend_max_conflicts` builds a new deletion index), the
                 // protected-snapshot RCU, the tombstone-delta enqueue (cycle-5
@@ -449,6 +484,25 @@ impl CayenneCdcWrite {
                 0
             };
             let rows = prepared_append.finish().await?;
+            if staging_wal_removal_failed {
+                // `finish()` -> `mark_inflight_complete()` just cleared
+                // `staging_wal_present`/`staging_may_have_files` (this was the last
+                // in-flight append). But the committed staging WAL is still on disk
+                // -- its unlink failed above -- and for S3-backed tables
+                // `ensure_no_incomplete_write()` fast-paths out when both flags are
+                // clear, so without this re-arm the orphaned `_wal.json` would go
+                // permanently undiscovered, reintroducing the steady-state WAL
+                // accumulation this change fixes. Re-set both flags so the next
+                // write/open re-runs recovery and idempotently rolls the leftover
+                // WAL forward. Over-setting is safe: worst case is one extra
+                // recovery probe that finds nothing to do.
+                self.table
+                    .staging_wal_present()
+                    .store(true, Ordering::Release);
+                self.table
+                    .staging_may_have_files()
+                    .store(true, Ordering::Release);
+            }
             record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
             let retention_requested = self.table.has_retention_delete_filters();
             if retention_requested {
@@ -6062,6 +6116,22 @@ impl CayenneTableProvider {
         target_size_bytes: usize,
         estimated_bytes: Option<u64>,
     ) -> usize {
+        // A sorted write must go through ONE writer, or the global order is
+        // scattered across shard files and each file's zone maps span the whole
+        // range — forfeiting exactly the pruning the sort was for.
+        //
+        // KNOWN GAP (pre-existing, deliberately not fixed here): this asks the
+        // CONFIGURED list, but an adaptive (observed-filter) layout sorts the
+        // compaction rewrite too, with no configured columns — so that rewrite
+        // gets sharded and its clustering is diluted. The blunt fix (key off
+        // `effective_sort_columns_for_rewrite`) is wrong: this function also
+        // serves DELTA writes (`table.rs:5708`), which are NOT sorted, so it
+        // would serialize the CDC encode fan-out and regress ingest. The real fix
+        // threads `write_class` in so only maintenance writes force one shard.
+        // Until then the adaptive layout's clustering is per-shard-file rather
+        // than global — weaker pruning, but never a wrong `output_ordering`
+        // (the attestation in `rewrite_current_snapshot_for_compaction` declines
+        // to attest whenever the effective key is not the configured one).
         if self.context.has_sort_columns() {
             return 1;
         }
@@ -11489,9 +11559,17 @@ impl CayenneTableProvider {
 
     /// Effective sort columns for a snapshot rewrite under default settings.
     ///
-    /// Operator-configured `sort_columns` always win. When empty (the default),
-    /// returns the hottest filter columns observed on scans so compaction can
-    /// cluster cold files without spicepod setup (F4 adaptive layout).
+    /// Precedence: operator-configured `sort_columns` > hottest observed filter
+    /// columns > schema-inference-derived `sort_columns` > none.
+    ///
+    /// An *explicit* `cayenne_sort_columns` is a statement of intent and wins
+    /// outright. An *inference-derived* one is only a guess about what queries
+    /// will filter on — for a `PostgreSQL` CDC table it resolves to the primary
+    /// key, which is close to the worst clustering for range/date predicates —
+    /// so it must NOT shadow the filter columns actually observed on scans, or
+    /// the adaptive layout can never correct it. Inference-derived columns stay
+    /// as the last rung so a table that has not yet been queried still gets a
+    /// deterministic key instead of an unsorted rewrite.
     ///
     /// Public so integration tests can assert the default-on policy without
     /// reaching private compaction internals.
@@ -11536,7 +11614,8 @@ impl CayenneTableProvider {
             }
         }
 
-        if self.context.has_sort_columns() {
+        // Rung 1: an explicit operator sort order wins outright.
+        if self.context.sort_columns_are_authoritative() {
             return self.context.sort_columns().to_vec();
         }
         let schema = self.table_schema();
@@ -11545,9 +11624,12 @@ impl CayenneTableProvider {
             schema.as_ref(),
         );
         if observed.is_empty() {
-            // No filters observed yet — don't invent a sort key; the warm rewrite
-            // just compacts unsorted until a hot column is seen.
-            return Vec::new();
+            // Rung 3: nothing observed yet. Prefer an inference-derived key (the
+            // source's declared order) over an unsorted rewrite — it is a guess,
+            // but a deterministic one, and it keeps pre-observation behavior
+            // identical to what inference produced before the adaptive layout
+            // existed. Falls through to no clustering when inference gave none.
+            return self.context.inferred_sort_columns().to_vec();
         }
         let sortable: Vec<String> = observed
             .into_iter()
@@ -11559,9 +11641,14 @@ impl CayenneTableProvider {
             .collect();
         if sortable.is_empty() {
             // Hot columns were observed but none are row-sortable (e.g. all
-            // `Map`): fall back to the primary key so the rewrite still gets a
-            // safe, deterministic clustering key instead of no clustering at all
-            // (mirrors the cold-tier fallback in `resolve_cold_clustering_indices`).
+            // `Map`): fall back to an inference-derived key if there is one, else
+            // the primary key, so the rewrite still gets a safe, deterministic
+            // clustering key instead of no clustering at all (mirrors the
+            // cold-tier fallback in `resolve_cold_clustering_indices`).
+            let inferred = self.context.inferred_sort_columns();
+            if !inferred.is_empty() {
+                return inferred.to_vec();
+            }
             return self.table_metadata.primary_key.clone();
         }
         sortable
@@ -14633,15 +14720,28 @@ impl CayenneTableProvider {
                 }
             }
 
-            // [sound output_ordering attestation] When sort columns are
-            // configured this rewrite consolidated the entire snapshot into a
-            // single globally-sorted, non-overlapping run (the stream was
-            // sorted via `sort_stream` above and written by a single writer —
-            // see `snapshot_shard_count`). Attest THIS snapshot id as sorted so
-            // a subsequent `scan` may advertise `output_ordering` by the sort
-            // columns. MUST run AFTER `update_current_snapshot_id` (which
-            // clears the attestation) and under the held listing fence.
-            if self.context.has_sort_columns() {
+            // [sound output_ordering attestation] This rewrite consolidated the
+            // entire snapshot into a single globally-sorted, non-overlapping run
+            // (the stream was sorted via `sort_stream` above and written by a
+            // single writer — see `snapshot_shard_count`). Attest THIS snapshot
+            // id as sorted so a subsequent `scan` may advertise
+            // `output_ordering`. MUST run AFTER `update_current_snapshot_id`
+            // (which clears the attestation) and under the held listing fence.
+            //
+            // The scan advertises the ordering from `context.sort_columns()`
+            // (`create_snapshot_scan_plan_with_config`), so attest ONLY when the
+            // key this rewrite actually sorted by IS that list. When the adaptive
+            // layout overrode an inference-derived sort with observed filter
+            // columns, the physical order is the observed one — advertising the
+            // configured (primary-key) order would then be a FALSE ordering
+            // claim and DataFusion would elide a sort the data needs, returning
+            // mis-ordered results. Declining to attest costs only the ordering
+            // optimization on such snapshots; claiming a wrong order is a
+            // correctness bug. Recovering the optimization means storing the
+            // attested key alongside the id and advertising from it (follow-up).
+            if !rewrite_sort_columns.is_empty()
+                && rewrite_sort_columns == self.context.sort_columns()
+            {
                 self.current_sorted_snapshot
                     .store(Arc::new(Some(new_snapshot_id.clone())));
             }
@@ -14736,7 +14836,12 @@ impl CayenneTableProvider {
         let vc = &self.table_metadata.vortex_config;
         let names: Vec<String> = if !vc.cold_clustering_columns.is_empty() {
             vc.cold_clustering_columns.clone()
-        } else if !self.context.sort_columns().is_empty() {
+        } else if self.context.sort_columns_are_authoritative() {
+            // Only an EXPLICIT sort order outranks observed filters here. An
+            // inference-derived one (the primary key, for most CDC tables) drops
+            // below the observations and is picked up by the fallback chain
+            // further down, so the adaptive layout can cluster cold files for the
+            // workload instead of for a guess.
             self.context.sort_columns().to_vec()
         } else {
             // Auto-observed columns only cluster if the Z-order encoder can key on
@@ -14758,7 +14863,16 @@ impl CayenneTableProvider {
                 })
                 .collect();
             if observed.is_empty() {
-                self.table_metadata.primary_key.clone()
+                // Nothing observed yet: prefer an inference-derived order (the
+                // source's declared one) before falling back to the primary key,
+                // so a table that has not been queried yet still clusters the way
+                // the source suggests.
+                let inferred = self.context.inferred_sort_columns();
+                if inferred.is_empty() {
+                    self.table_metadata.primary_key.clone()
+                } else {
+                    inferred.to_vec()
+                }
             } else {
                 observed
             }
@@ -21450,6 +21564,14 @@ impl CayenneTableProvider {
         // background checkpointer can keep the RAM tier drained without throttling
         // ingest. The position-based strategy appends to the CURRENT snapshot and
         // therefore must keep encode+swap atomic under one held fence (unchanged).
+        //
+        // CDC memory mode never reaches the position arm: `is_cdc_memory_mode()`
+        // requires `!is_position_based()`. The arm remains for residual pure
+        // position tables; encode stays under the fence (CURRENT-dir semantics).
+        debug_assert!(
+            !self.is_cdc_memory_mode() || !self.pk_deletion_strategy.is_position_based(),
+            "CDC memory mode must not use the position-based mem-tier checkpoint arm"
+        );
         let stats = if self.pk_deletion_strategy.is_position_based() {
             let _fence = self.listing_fence.write().await;
             let target_size_bytes = self.context.target_file_size_bytes();
@@ -25238,11 +25360,16 @@ impl TableProvider for CayenneTableProvider {
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         // F4 default-on layout: record which columns this scan filters on so
         // background compaction can cluster cold files without spicepod setup.
-        // Cheap (mutex + HashMap bump); empty filters are a no-op. Skipped when
-        // `sort_columns` is configured: observations are never consulted then
-        // (warm rewrite and cold clustering both use the configured columns), so
-        // recording would be pure hot-path overhead.
-        if !self.context.has_sort_columns() {
+        // Cheap (mutex + HashMap bump); empty filters are a no-op.
+        //
+        // Skipped only when the sort order is AUTHORITATIVE (an explicit
+        // `cayenne_sort_columns`): observations are never consulted then, so
+        // recording would be pure hot-path overhead. An *inference-derived* sort
+        // order does NOT skip — observations outrank it, so they must be
+        // collected. Gating this on `has_sort_columns()` instead is what made the
+        // adaptive layout inert on every catalog-visible CDC deployment, since
+        // inference fills `cayenne_sort_columns` on all of them.
+        if !self.context.sort_columns_are_authoritative() {
             self.filter_column_observations.record_filters(filters);
         }
 
@@ -39838,6 +39965,250 @@ mod tests {
             collect_id_value_pairs(&ctx, &reopened, "cdc_upsert_recovery").await,
             vec![(1, 100)],
             "reopen recovery must make the prepared CDC upsert visible exactly once"
+        );
+    }
+
+    /// Count staging WALs (`_wal.json`) currently on disk under a table's data
+    /// directory. A protected-snapshot append leaves its WAL under
+    /// `<table>/<table_id>/_staging/<id>/_wal.json`; committed snapshots never
+    /// carry one. Used by the #12027 recovery test to assert that the append
+    /// leaves a recoverable WAL and that recovery clears it.
+    fn count_staging_wals(provider: &CayenneTableProvider) -> usize {
+        fn walk(dir: &std::path::Path, count: &mut usize) {
+            // A missing directory means no staging WALs live under it — a
+            // legitimate zero (e.g. the table dir before any staged write). Any
+            // OTHER read error must fail the test rather than silently undercount
+            // and let a real leftover WAL be misreported as 0.
+            let entries = match std::fs::read_dir(dir) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+                Err(e) => panic!(
+                    "count_staging_wals: read_dir({}) failed: {e}",
+                    dir.display()
+                ),
+            };
+            for entry in entries {
+                let entry = entry.expect("count_staging_wals: read staging directory entry");
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, count);
+                } else if path.file_name().and_then(|name| name.to_str())
+                    == Some(crate::provider::constants::STAGING_WAL_FILENAME)
+                {
+                    *count += 1;
+                }
+            }
+        }
+        let table_dir = std::path::Path::new(&provider.table_metadata.path)
+            .join(&provider.table_metadata.table_id);
+        let mut count = 0;
+        walk(&table_dir, &mut count);
+        count
+    }
+
+    /// Issue #12027 — invariant proof: the `staging_wal` incomplete-append
+    /// recovery path (`ensure_no_incomplete_write`) rolls a durably-committed
+    /// protected-snapshot append FORWARD exactly once and is idempotent, so it
+    /// can never double-publish (duplicate rows) or roll back a legitimately
+    /// committed append — no matter how many times it runs.
+    ///
+    /// This is the steady-state shape the issue observed under sustained CDC
+    /// write load: a CDC upsert stages a protected snapshot and makes its
+    /// `snapshot_sequence` durable in Stage A, but Stage B
+    /// (`apply_under_held_barrier`) intentionally does NOT remove the
+    /// protected-snapshot staging WAL, leaving it for a subsequent write's
+    /// pre-write gate to recover. We reproduce that leftover-WAL state by driving
+    /// Stage A and then DROPPING the write before Stage B finalize (the append is
+    /// already durably committed), then invoke recovery directly, twice, and
+    /// assert: recovery succeeds both times (the second is a no-op), the leftover
+    /// WAL is cleared, and after reopen the committed row is visible EXACTLY once.
+    #[tokio::test]
+    async fn issue_12027_recovery_rolls_committed_protected_snapshot_forward_exactly_once() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) =
+            create_cdc_upsert_table("issue_12027_roll_forward", Arc::clone(&runtime_env)).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Stage A durably reserves + commits the protected-snapshot sequence and
+        // writes the staging WAL, returning an append that is pending finalize.
+        let write = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[100])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("cdc upsert should prepare (Stage A committed)");
+        assert!(write.has_pending_finalize());
+        // Drop BEFORE Stage B finalize: mirrors a finalize that never got to clear
+        // the WAL. The snapshot sequence is already durable, so this append is
+        // COMMITTED and must be rolled FORWARD by recovery — never back.
+        drop(write);
+
+        // The manufactured steady state: exactly one committed-but-unfinalized
+        // protected-snapshot append whose staging WAL is still on disk and is no
+        // longer flagged in-flight (the drop cleared the registration).
+        assert_eq!(
+            count_staging_wals(&provider),
+            1,
+            "a committed-but-unfinalized protected-snapshot append must leave exactly one staging WAL"
+        );
+
+        // Recovery, run twice. The first rolls the append forward (idempotent
+        // move + WAL removal); the second must be a clean no-op. Neither may
+        // error, duplicate, or roll back.
+        provider
+            .recover_incomplete_writes()
+            .await
+            .expect("first recovery rolls the committed append forward");
+        provider
+            .recover_incomplete_writes()
+            .await
+            .expect("second recovery is an idempotent no-op");
+
+        assert_eq!(
+            count_staging_wals(&provider),
+            0,
+            "recovery must clear the leftover staging WAL after rolling forward"
+        );
+
+        // Reopen re-establishes the protected-snapshot overlay from the durable
+        // catalog; the committed row must be present EXACTLY once. A recovery bug
+        // that double-published would surface here as a duplicate `(1, 100)`; one
+        // that rolled the committed append back would surface as an empty table.
+        let reopened = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
+            .open("issue_12027_roll_forward")
+            .await
+            .expect("reopen after recovery");
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &reopened, "issue_12027_roll_forward").await,
+            vec![(1, 100)],
+            "the committed upsert must be visible exactly once — recovery must \
+             neither double-publish nor roll back a durably-committed append"
+        );
+    }
+
+    /// Issue #12027 fix: a finalized single-table CDC upsert clears its own
+    /// protected-snapshot staging WAL, so steady-state writes do not accumulate
+    /// WALs for the next write's pre-gate to recover. `apply_under_held_barrier`
+    /// removes the WAL only for `CurrentSnapshot` targets; the protected-snapshot
+    /// (on-conflict) branch of `CayenneCdcWrite::finish` removes it explicitly.
+    /// Before the fix the conflicting second upsert left a WAL behind
+    /// (`count_staging_wals == 1`).
+    #[tokio::test]
+    async fn cdc_upsert_finish_removes_staging_wal() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) =
+            create_cdc_upsert_table("cdc_upsert_finish_clears_wal", Arc::clone(&runtime_env)).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // First upsert into an empty table: no conflict, so it stages a
+        // current-snapshot append (whose WAL `apply_under_barrier` already
+        // removes inline).
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[100])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("first upsert prepares")
+            .finish()
+            .await
+            .expect("first upsert finalizes");
+        assert_eq!(
+            count_staging_wals(&provider),
+            0,
+            "a finalized current-snapshot append must leave no staging WAL"
+        );
+
+        // Second upsert on the same key conflicts → protected-snapshot finalize,
+        // the path the fix clears. Before the fix this left one WAL behind.
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[200])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("second upsert prepares")
+            .finish()
+            .await
+            .expect("second upsert finalizes");
+        assert_eq!(
+            count_staging_wals(&provider),
+            0,
+            "a finalized protected-snapshot upsert must clear its own staging WAL \
+             instead of leaving it for the next write to recover"
+        );
+
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "cdc_upsert_finish_clears_wal").await,
+            vec![(1, 200)],
+            "the latest upsert wins with no duplication"
+        );
+    }
+
+    /// Issue #12027 fix — crash-window safety: now that a conflicting upsert's
+    /// finalize removes its staging WAL itself, a reopen with no intervening
+    /// batch must still apply the upsert exactly once via the open-time
+    /// orphan-tombstone sweep. The inline tombstone is durable `published = 0`
+    /// and its DURABLE `published = 1` flip is deferred to the next batch's
+    /// Stage-A transaction — which never comes here — so with the staging WAL
+    /// already gone, `ensure_no_incomplete_write` finds nothing and
+    /// `publish_orphan_inlined_deletes` (which keys off `published = 0` + a
+    /// durable replacement, NOT the WAL) is what hides the superseded row.
+    #[tokio::test]
+    async fn cdc_upsert_finalize_without_wal_reopens_via_orphan_tombstone_sweep() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) =
+            create_cdc_upsert_table("cdc_upsert_deferred_flip", Arc::clone(&runtime_env)).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Seed key 1 = 100.
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[100])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed prepares")
+            .finish()
+            .await
+            .expect("seed finalizes");
+
+        // Upsert key 1 = 200: conflicts, so finalize writes an inline tombstone
+        // durable `published = 0`, moves the replacement files, and removes the
+        // staging WAL — but leaves the durable tombstone flip deferred.
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[200])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("upsert prepares")
+            .finish()
+            .await
+            .expect("upsert finalizes");
+        assert_eq!(
+            count_staging_wals(&provider),
+            0,
+            "the conflicting upsert's finalize must clear its staging WAL"
+        );
+
+        // Reopen with no intervening batch: the deferred durable flip never
+        // landed and there is no WAL to recover, so the open-time orphan sweep
+        // alone must hide the old value.
+        let reopened = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
+            .open("cdc_upsert_deferred_flip")
+            .await
+            .expect("reopen after WAL-less finalize");
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &reopened, "cdc_upsert_deferred_flip").await,
+            vec![(1, 200)],
+            "after reopen the upsert must apply exactly once (old value hidden, new \
+             visible) even though its staging WAL was already removed and the durable \
+             tombstone flip was still deferred — the orphan-tombstone sweep heals it"
         );
     }
 

@@ -24,7 +24,7 @@ use scylla::client::session::Session;
 use snafu::prelude::*;
 use std::sync::Arc;
 
-use crate::key_filter;
+use data_components::key_filter;
 
 #[derive(Debug, Snafu)]
 pub enum Error {

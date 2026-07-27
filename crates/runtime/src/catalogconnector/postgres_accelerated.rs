@@ -53,15 +53,16 @@ limitations under the License.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use app::App;
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use data_components::postgres::provider::{
     ReplicaIdentityOutcome, check_cdc_prerequisites, classify_replica_identity, list_schemas,
-    list_tables, list_views, replica_identity,
+    list_tables, list_views, replica_identity, replication_slot_status, wal_sender_timeout_ms,
 };
-use data_components::postgres_replication::config::default_slot_name;
+use data_components::postgres_replication::config::catalog_slot_name;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::common::TableReference;
 use datafusion::common::utils::quote_identifier;
@@ -351,6 +352,47 @@ pub(crate) struct NoEligibleTablesError {
     views_note: String,
 }
 
+/// The catalog's deterministic replication slot is already actively held by
+/// another consumer. Because the slot name is derived purely from the catalog
+/// (see [`catalog_slot_name`]) and `PostgreSQL` permits a single consumer per
+/// slot, this means a second Spice instance (or process) is already streaming
+/// this catalog's changes. Surfaced only after a bounded wait (see
+/// [`AcceleratedCatalogProvider::ensure_catalog_slot_available`]) that already
+/// absorbs the legitimate hand-off cases -- a fast self-restart, or a rolling
+/// deploy whose predecessor is shutting down -- by giving the server up to
+/// `wal_sender_timeout` to release a now-dead consumer's slot. If a *live*
+/// consumer still holds it past that window, `postgres.rs` maps this to a
+/// permanent configuration error (terminal ERROR status, no retry loop): running
+/// two instances against one catalog is a misconfiguration to surface loudly,
+/// not to silently keep retrying.
+#[derive(Debug, Snafu)]
+#[snafu(display(
+    "Catalog '{catalog}': replication slot '{slot_name}' is already in use by {active_consumer} after waiting {waited_secs}s. Another Spice instance (or process) is already streaming this catalog's changes -- PostgreSQL permits only one consumer per replication slot. Ensure only one Spice instance accelerates this catalog, or stop the other consumer. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
+))]
+pub(crate) struct SlotInUseError {
+    catalog: String,
+    slot_name: String,
+    /// Pre-rendered so the `Display` string needs no `Option` formatting, e.g.
+    /// `"PID 1234"` or `"an unknown backend"`.
+    active_consumer: String,
+    waited_secs: u64,
+}
+
+/// How long to wait, beyond the server's `wal_sender_timeout`, for a slot that a
+/// crashed consumer still holds `active` to be released before concluding a
+/// different live consumer owns it. `PostgreSQL` frees the slot within
+/// milliseconds of the walsender exiting (at ~`wal_sender_timeout`), so this is
+/// a small buffer for scheduling/poll granularity, not a second full timeout.
+const SLOT_RELEASE_GRACE: Duration = Duration::from_secs(5);
+/// Fallback wait budget when `wal_sender_timeout` is `0` (disabled), since then
+/// the server won't time out a dropped consumer on its own.
+const SLOT_WAIT_BUDGET_WHEN_TIMEOUT_DISABLED: Duration = Duration::from_secs(90);
+/// Upper bound on the slot-availability wait so a very large `wal_sender_timeout`
+/// can't hang catalog startup indefinitely.
+const SLOT_WAIT_BUDGET_CAP: Duration = Duration::from_mins(3);
+/// How often to re-poll the slot's activity while waiting for it to free.
+const SLOT_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
 /// A catalog provider that CDC-accelerates every table it discovers (subject
 /// to `include`/`exclude`), holding its own `PostgreSQL` connection directly
 /// rather than wrapping the plain federated catalog provider.
@@ -396,7 +438,7 @@ impl std::fmt::Debug for AcceleratedCatalogProvider {
 impl AcceleratedCatalogProvider {
     #[must_use]
     pub fn new(catalog: &Catalog, pool: Arc<PostgresConnectionPool>) -> Self {
-        let slot_name = default_slot_name(&catalog.name);
+        let slot_name = catalog_slot_name(&catalog.name);
 
         // Seed from the catalog's connection params, then let `dataset_params`
         // override -- the same precedence other catalog connectors use (e.g.
@@ -416,6 +458,95 @@ impl AcceleratedCatalogProvider {
             exclude: catalog.exclude.clone().map(Arc::new),
             schemas: RwLock::new(HashMap::new()),
             spawned: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Fail loudly, before spawning anything, if this catalog's deterministic
+    /// replication slot is already **actively** held by another consumer.
+    ///
+    /// Because [`catalog_slot_name`] derives the slot name purely from the
+    /// catalog (no instance component), a second Spice instance pointed at the
+    /// same catalog resolves to the *same* slot -- and `PostgreSQL` permits only
+    /// one consumer per slot. So:
+    ///
+    ///   - slot absent -> return; the per-table replication path creates it;
+    ///   - slot present but inactive -> return; it is reused (a restart/reschedule
+    ///     resumes from its `restart_lsn`, no re-snapshot);
+    ///   - slot present and active -> another consumer holds it. But a fast
+    ///     self-restart after an ungraceful exit can *also* see the slot active
+    ///     (the server keeps the dead consumer's slot active until
+    ///     `wal_sender_timeout`), so we poll for a bounded window sized from the
+    ///     server's `wal_sender_timeout` before concluding a *different* live
+    ///     consumer owns it and returning [`SlotInUseError`].
+    ///
+    /// Only meaningful before this catalog owns the slot; callers guard on
+    /// "nothing spawned yet" so a periodic refresh never trips over *our own*
+    /// active slot.
+    async fn ensure_catalog_slot_available(
+        &self,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Size the wait from the server's wal_sender_timeout: that is how long it
+        // keeps a crashed consumer's slot marked active, so waiting that long
+        // (plus a grace) lets a self-restart reclaim its own slot before we treat
+        // it as taken. `0` disables the timeout, so fall back to a fixed window.
+        let timeout_ms = wal_sender_timeout_ms(&self.pool)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        let budget = if timeout_ms > 0 {
+            Duration::from_millis(u64::try_from(timeout_ms).unwrap_or(u64::MAX))
+                .saturating_add(SLOT_RELEASE_GRACE)
+                .min(SLOT_WAIT_BUDGET_CAP)
+        } else {
+            SLOT_WAIT_BUDGET_WHEN_TIMEOUT_DISABLED
+        };
+
+        let start = tokio::time::Instant::now();
+        let deadline = start + budget;
+        // Warn only once, when the wait begins -- the loop re-polls every
+        // `SLOT_POLL_INTERVAL`, so warning each iteration would emit up to
+        // hundreds of lines during a full conflict window. Subsequent polls log
+        // at debug.
+        let mut warned = false;
+        loop {
+            let status = replication_slot_status(&self.pool, &self.slot_name)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            match status {
+                // Absent (will be created) or present-but-inactive (safe to reuse).
+                None => return Ok(()),
+                Some(status) if !status.active => return Ok(()),
+                Some(status) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        let active_consumer = status.active_pid.map_or_else(
+                            || "an unknown backend".to_string(),
+                            |pid| format!("PID {pid}"),
+                        );
+                        return Err(Box::new(SlotInUseError {
+                            catalog: self.catalog_name.clone(),
+                            slot_name: self.slot_name.clone(),
+                            active_consumer,
+                            waited_secs: start.elapsed().as_secs(),
+                        }));
+                    }
+                    if warned {
+                        tracing::debug!(
+                            "Catalog '{}': replication slot '{}' still active; continuing to wait (up to {}s total).",
+                            self.catalog_name,
+                            self.slot_name,
+                            budget.as_secs(),
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Catalog '{}': replication slot '{}' is currently active; waiting up to {}s for it to free (a previous instance may still be shutting down) before failing.",
+                            self.catalog_name,
+                            self.slot_name,
+                            budget.as_secs(),
+                        );
+                        warned = true;
+                    }
+                    tokio::time::sleep(SLOT_POLL_INTERVAL).await;
+                }
+            }
         }
     }
 
@@ -670,6 +801,16 @@ impl RefreshableCatalogProvider for AcceleratedCatalogProvider {
         check_cdc_prerequisites(&self.pool)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        // Before this catalog owns its shared slot, fail loudly if another live
+        // consumer already holds it (its deterministic name means a second Spice
+        // instance would otherwise silently compete for the single-consumer
+        // slot). Guarded to the pre-ownership window -- once we've spawned our own
+        // datasets, the slot is active because *we* hold it, so a periodic refresh
+        // must not re-run this check and trip over ourselves.
+        if self.spawned.read().is_empty() {
+            self.ensure_catalog_slot_available().await?;
+        }
 
         let schema_names = list_schemas(&self.pool)
             .await

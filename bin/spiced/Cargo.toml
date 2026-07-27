@@ -157,6 +157,8 @@ distributed = ["runtime/distributed"]
 models = ["runtime/models"]
 mongodb = ["connector-mongodb", "runtime/mongodb"]
 mssql = ["connector-mssql", "runtime/mssql"]
+# Opt-in Kerberos integrated auth (GSSAPI) for MSSQL on Unix; not in `default`.
+mssql-kerberos-unix = ["mssql", "runtime/mssql-kerberos-unix"]
 mysql = ["connector-mysql", "runtime/mysql"]
 # nfs feature requires system libnfs library and connector-nfs crate
 nfs = ["connector-nfs", "runtime/nfs"]

@@ -37,6 +37,8 @@ use arrow::record_batch::RecordBatch;
 
 use cayenne::metadata::{CreateTableOptions, VortexConfig};
 use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use datafusion::datasource::TableProvider;
+use datafusion::prelude::{col, lit};
 
 use datafusion::prelude::SessionContext;
 use datafusion_table_providers::util::{
@@ -73,6 +75,15 @@ fn aggressive_compaction_config() -> VortexConfig {
 fn aggressive_sorted_compaction_config() -> VortexConfig {
     VortexConfig {
         sort_columns: vec!["id".to_string()],
+        ..aggressive_compaction_config()
+    }
+}
+
+/// Same as [`aggressive_compaction_config`] but forces key-based deletion so
+/// warm-subset compaction (not the position full-rewrite path) is exercised.
+fn aggressive_key_deletion_compaction_config() -> VortexConfig {
+    VortexConfig {
+        deletion_mode: cayenne::metadata::DeletionMode::Key,
         ..aggressive_compaction_config()
     }
 }
@@ -155,6 +166,24 @@ async fn count_rows(ctx: &SessionContext, table_name: &str) -> i64 {
         .await
         .expect("count sql planned");
     let batches = df.collect().await.expect("count collected");
+    let merged =
+        arrow::compute::concat_batches(&batches[0].schema(), &batches).expect("concat batches");
+    merged
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count column")
+        .value(0)
+}
+
+async fn count_rows_matching(ctx: &SessionContext, table_name: &str, where_clause: &str) -> i64 {
+    let df = ctx
+        .sql(&format!(
+            "SELECT COUNT(*) FROM {table_name} WHERE {where_clause}"
+        ))
+        .await
+        .expect("count matching sql planned");
+    let batches = df.collect().await.expect("count matching collected");
     let merged =
         arrow::compute::concat_batches(&batches[0].schema(), &batches).expect("concat batches");
     merged
@@ -1097,6 +1126,225 @@ async fn sorted_table_still_compacts_via_full_rewrite(
     assert!(files < usize::try_from(batches).expect("fits"));
     assert_eq!(
         count_rows(&ctx, "sorted_full_rewrite").await,
+        batch_rows * batches
+    );
+    Ok(())
+}
+
+// --- Warm-subset + key-delete MoR (this PR) -----------------------------------
+//
+// Warm-subset rewrite only engages for key-delete tables with NO protected
+// snapshots (upsert inserts publish protected snapshots and force the full
+// rewrite / protected-leveler path). Build a PK table without `OnConflict` so
+// appends accumulate many files in the *current* snapshot dir, then DELETE by
+// key and re-compact — MoR tombstones must survive the subset rewrite.
+
+/// Like [`build_table`] with a PK for key deletes, but no upsert so inserts
+/// stay append-only (files pile into the current snapshot; subset rewrite is
+/// eligible).
+async fn build_append_only_key_delete_table(
+    fixture: &common::TestFixture,
+    name: &str,
+    schema: Arc<Schema>,
+) -> (Arc<CayenneTableProvider>, SessionContext, String) {
+    let options = CreateTableOptions {
+        table_name: name.to_string(),
+        schema: Arc::clone(&schema),
+        primary_key: vec!["id".to_string()],
+        on_conflict: None,
+        base_path: fixture.data_path.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: aggressive_key_deletion_compaction_config(),
+    };
+
+    let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
+    let ctx = SessionContext::new();
+    let table = CayenneTableProvider::create_table(catalog_arc, options, ctx.runtime_env())
+        .await
+        .expect("create_table");
+    let table = Arc::new(table);
+    let table_id = fixture
+        .catalog
+        .get_table(name)
+        .await
+        .expect("get_table")
+        .table_id;
+    ctx.register_table(
+        name,
+        Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
+    )
+    .expect("register table");
+    (table, ctx, table_id)
+}
+
+test_with_backends!(warm_subset_preserves_key_deletes_and_rows);
+async fn warm_subset_preserves_key_deletes_and_rows(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Append-only key-mode PK table: compact, DELETE one PK, re-seed, compact
+    // again. MoR must keep the deleted key hidden and the exact row total must
+    // match what we inserted after the delete.
+    let schema = pk_schema();
+    let (table, ctx, table_id) =
+        build_append_only_key_delete_table(&fixture, "warm_subset_deletes", Arc::clone(&schema))
+            .await;
+
+    let batch_rows: i64 = 1500;
+    let seed_batches = 8_i64;
+    for batch_idx in 0..seed_batches {
+        common::insert_batch(
+            &table,
+            make_batch(&schema, batch_idx * batch_rows, batch_rows),
+        )
+        .await?;
+    }
+
+    let Some((_snap_a, files_a)) = wait_until_current_snapshot_compacts(
+        &table,
+        &fixture,
+        "warm_subset_deletes",
+        usize::try_from(seed_batches).expect("fits"),
+    )
+    .await?
+    else {
+        panic!("key-mode append-only table should produce a warm-subset compaction candidate");
+    };
+    assert!(
+        files_a < usize::try_from(seed_batches).expect("fits"),
+        "phase-A compact must reduce file count"
+    );
+
+    let filter = col("id").eq(lit(10_i64));
+    let plan = table
+        .delete_from(&ctx.state(), vec![filter])
+        .await
+        .expect("plan delete");
+    let _ = datafusion_physical_plan::collect(plan, ctx.task_ctx())
+        .await
+        .expect("run delete");
+
+    assert_eq!(
+        count_rows_matching(&ctx, "warm_subset_deletes", "id = 10").await,
+        0,
+        "delete must hide id=10"
+    );
+    let before = count_rows(&ctx, "warm_subset_deletes").await;
+    let snap_after_delete = fixture
+        .catalog
+        .get_table("warm_subset_deletes")
+        .await?
+        .current_snapshot_id;
+
+    // Seed more small files and drive the deterministic `maybe_compact` path
+    // after each write (waits for the compaction lock — `try_lock` can miss
+    // under concurrent suite load). At least one pass under the pending key
+    // delete must rewrite so MoR survival is actually exercised.
+    let more_batches = 10_i64;
+    let mut phase_b_compacted = false;
+    for batch_idx in 0..more_batches {
+        common::insert_batch(
+            &table,
+            make_batch(&schema, 50_000 + batch_idx * batch_rows, batch_rows),
+        )
+        .await?;
+        if run_compaction(&table).await {
+            phase_b_compacted = true;
+        }
+    }
+    // One final multi-pass attempt if post-write/threshold gating delayed the
+    // rewrite until after the last insert.
+    if !phase_b_compacted {
+        for _ in 0..4 {
+            if run_compaction(&table).await {
+                phase_b_compacted = true;
+                break;
+            }
+        }
+    }
+
+    let snap_after = fixture
+        .catalog
+        .get_table("warm_subset_deletes")
+        .await?
+        .current_snapshot_id;
+    let files_after = count_vortex_files(&fixture.data_path, &table_id, &snap_after).await;
+    assert!(
+        phase_b_compacted || snap_after != snap_after_delete,
+        "phase B must compact under the pending key delete \
+         (compacted={phase_b_compacted}, snap {snap_after_delete}→{snap_after}, \
+         files={files_after})"
+    );
+
+    // Exact expected total: rows before re-seed + more_batches * batch_rows.
+    // (id=10 is already excluded from `before`.)
+    let expected = before + batch_rows * more_batches;
+    let after = count_rows(&ctx, "warm_subset_deletes").await;
+    assert_eq!(
+        after, expected,
+        "exact row total after re-seed + compact (before={before}, more={more_batches}*{batch_rows})"
+    );
+    assert_eq!(
+        count_rows_matching(&ctx, "warm_subset_deletes", "id = 10").await,
+        0,
+        "deleted key must remain hidden after warm-subset compaction (MoR kept)"
+    );
+
+    Ok(())
+}
+
+test_with_backends!(warm_subset_reduces_small_file_fanout);
+async fn warm_subset_reduces_small_file_fanout(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = pk_schema();
+    let (table, ctx, table_id) = build_table(
+        &fixture,
+        "warm_subset_fanout",
+        Arc::clone(&schema),
+        None,
+        // Append-only + Key mode → subset rewrite (no position full path).
+        aggressive_key_deletion_compaction_config(),
+    )
+    .await;
+
+    let batch_rows: i64 = 1500;
+    let batches = 12_i64;
+    for batch_idx in 0..batches {
+        common::insert_batch(
+            &table,
+            make_batch(&schema, batch_idx * batch_rows, batch_rows),
+        )
+        .await?;
+    }
+
+    let pre_snapshot = fixture
+        .catalog
+        .get_table("warm_subset_fanout")
+        .await?
+        .current_snapshot_id;
+    let pre_count = count_vortex_files(&fixture.data_path, &table_id, &pre_snapshot).await;
+    assert!(
+        pre_count > 1,
+        "seed must leave more than one vortex file to compact (found {pre_count})"
+    );
+
+    // Threshold is `pre_count` so the helper cannot return early without a
+    // real reduction (or an explicit compact commit that then must still
+    // show `post_count < pre_count` below).
+    let Some((post_snap, post_count)) =
+        wait_until_current_snapshot_compacts(&table, &fixture, "warm_subset_fanout", pre_count)
+            .await?
+    else {
+        panic!("warm-subset compaction should fire");
+    };
+
+    assert_ne!(post_snap, pre_snapshot, "compact must advance the snapshot");
+    assert!(
+        post_count < pre_count,
+        "subset compact must strictly reduce fan-out (pre={pre_count}, post={post_count})"
+    );
+    assert_eq!(
+        count_rows(&ctx, "warm_subset_fanout").await,
         batch_rows * batches
     );
     Ok(())
