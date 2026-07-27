@@ -221,11 +221,21 @@ fn deletion_vector_write_parallelizes_files_and_coalesces_dir_sync() {
     // durability contract, 1/N the directory barriers.
     let write_body = extract_fn_body(DELETE_VECTOR_IO_SRC, "write")
         .expect("DeletionVectorWriter::write not found in delete/vector_io.rs");
+    // Accept either `join_all` or `try_join_all`: both poll every spec's write
+    // future concurrently (the property this guards). `write` uses `join_all`
+    // so that on error it waits for all sibling writers to finish before the
+    // cleanup unlinks their paths — `try_join_all` would short-circuit and let a
+    // still-running writer leak an orphan deletion vector past cleanup. What must
+    // never creep back is a serial `for … .await` loop over the specs.
+    // `contains("join_all")` alone already matches `try_join_all` (substring),
+    // but check both explicitly so the assertion visibly matches the "either is
+    // fine" intent above. A serial `for … .await` loop over the specs contains
+    // neither and correctly fails.
     assert!(
-        write_body.contains("try_join_all"),
+        write_body.contains("join_all") || write_body.contains("try_join_all"),
         "DeletionVectorWriter::write must write the batch's deletion-vector \
-         files concurrently (try_join_all) — serializing them re-introduces \
-         N fsync round-trips per batch on network-attached storage."
+         files concurrently (join_all/try_join_all) — serializing them \
+         re-introduces N fsync round-trips per batch on network-attached storage."
     );
     // Exactly two dir syncs in `write`: the one-time snapshot-parent sync
     // (first deletion vector for the snapshot) and the per-batch coalesced
@@ -780,6 +790,35 @@ fn staging_wal_local_writer_uses_single_open() {
          `AsyncWriteExt::write_all` to keep the fd through `sync_all`. If a \
          future refactor uses a different single-open primitive, update this \
          assertion accordingly."
+    );
+}
+
+#[test]
+fn remove_staging_wal_does_not_fsync_after_unlink() {
+    // The post-WAL-unlink staging-dir fsync (one ordering-tier `fsync(2)` on
+    // EVERY staged commit — append and delete-staged) was removed. It only
+    // persisted the WAL's *removal* (recovery hygiene): the durable commit
+    // boundary — the move-target dir fsync in `move_staging_files_local` —
+    // already fired BEFORE it, and the very next line `remove_dir`s the same
+    // directory without a sync, so persisting the inner unlink bought nothing
+    // end-to-end. A crash in its window self-heals: `ensure_no_incomplete_write`
+    // finds every WAL-listed file already in the target snapshot and re-drives
+    // the idempotent (now no-op) move, then removes the stale WAL. Dropping it
+    // saves a billed, capped barrier per staged commit on EBS/provisioned-IOPS.
+    //
+    // The recovery substrate (the WAL-content fsync + the post-rename
+    // staging-dir fsync at the top of `write_staging_wal_local`) is untouched —
+    // only this trailing barrier is gone. Lock the win.
+    let body = extract_fn_body(STAGING_WAL_SRC, "remove_staging_wal_for")
+        .expect("remove_staging_wal_for not found in staging_wal.rs");
+    let fsync_count = body.matches("sync_snapshot_dir").count();
+    assert_eq!(
+        fsync_count, 0,
+        "remove_staging_wal_for must not `sync_snapshot_dir` after the WAL \
+         unlink — the move-target dir fsync already made the commit durable and \
+         the unlink is recovery-hygiene only (a crash self-heals via the \
+         idempotent re-move). Found {fsync_count} call(s). If a durability \
+         barrier is genuinely required here, document why and update this assertion."
     );
 }
 

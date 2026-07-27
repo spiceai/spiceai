@@ -40,6 +40,7 @@ pub enum TimeFormat {
     Timestamptz,
     UnixSeconds,
     UnixMillis,
+    UnixNanos,
     #[serde(rename = "ISO8601")]
     ISO8601,
     Date,
@@ -56,6 +57,7 @@ impl<'de> serde::Deserialize<'de> for TimeFormat {
             "timestamptz" => Ok(TimeFormat::Timestamptz),
             "unix_seconds" => Ok(TimeFormat::UnixSeconds),
             "unix_millis" => Ok(TimeFormat::UnixMillis),
+            "unix_nanos" => Ok(TimeFormat::UnixNanos),
             "iso8601" => Ok(TimeFormat::ISO8601),
             "date" => Ok(TimeFormat::Date),
             _ => Err(serde::de::Error::unknown_variant(
@@ -65,6 +67,7 @@ impl<'de> serde::Deserialize<'de> for TimeFormat {
                     "timestamptz",
                     "unix_seconds",
                     "unix_millis",
+                    "unix_nanos",
                     "ISO8601",
                     "date",
                 ],
@@ -105,6 +108,8 @@ pub enum OnSchemaChange {
     AppendNewColumns,
     /// Keep the registered dataset schema synchronized with the projected source schema.
     SyncAllColumns,
+    /// Recreate the accelerated table with the new schema when a source schema change cannot be applied in place. Widening changes are still applied in place; otherwise the table is dropped and recreated. Recreation is destructive and only occurs with `refresh_mode: full`.
+    DropAndRecreate,
 }
 
 impl std::fmt::Display for OnSchemaChange {
@@ -114,6 +119,7 @@ impl std::fmt::Display for OnSchemaChange {
             OnSchemaChange::Fail => write!(f, "fail"),
             OnSchemaChange::AppendNewColumns => write!(f, "append_new_columns"),
             OnSchemaChange::SyncAllColumns => write!(f, "sync_all_columns"),
+            OnSchemaChange::DropAndRecreate => write!(f, "drop_and_recreate"),
         }
     }
 }
@@ -145,40 +151,6 @@ pub enum CheckAvailability {
     Auto,
     /// The dataset is not checked for availability.
     Disabled,
-}
-
-/// Selects the depth of source-schema inference.
-///
-/// Base column/type inference is always performed and required — this knob only
-/// controls whether the runtime *additionally* infers the table's primary key,
-/// secondary indexes, and sort/clustering columns to fill acceleration settings
-/// the user did not specify in the Spicepod.
-///
-/// Applies to all refresh modes. Only connectors that emit inferred-schema
-/// metadata (currently `PostgreSQL` and `MongoDB`) are affected; others treat
-/// `extended` as a no-op.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "schemars", derive(JsonSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum SchemaInference {
-    /// Base column/type inference only (default) — exactly as before. The column
-    /// schema is always inferred from the source; no primary-key/index/sort
-    /// detection is performed.
-    #[default]
-    Standard,
-    /// In addition to the base column schema, auto-detect and apply the primary
-    /// key, secondary indexes, and sort/clustering columns from the source when
-    /// they are not explicitly configured.
-    Extended,
-}
-
-impl std::fmt::Display for SchemaInference {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SchemaInference::Standard => write!(f, "standard"),
-            SchemaInference::Extended => write!(f, "extended"),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -264,15 +236,6 @@ pub struct Dataset {
     /// and report metrics. Dataset availability is only checked if the dataset is not accelerated.
     #[serde(default, skip_serializing_if = "is_default")]
     pub check_availability: CheckAvailability,
-
-    /// Controls the depth of source-schema inference (primary key, indexes, sort columns).
-    ///
-    /// Options: `standard` / `extended`. Defaults to `standard` (base column/type
-    /// inference only, exactly as before). When `extended`, the runtime additionally
-    /// fills any acceleration settings the user left unset using metadata inferred from
-    /// the source (currently the `PostgreSQL` and `MongoDB` connectors).
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub schema_inference: SchemaInference,
 }
 
 impl Nameable for Dataset {
@@ -308,7 +271,6 @@ impl Dataset {
             vectors: None,
             full_text_search: None,
             check_availability: CheckAvailability::default(),
-            schema_inference: SchemaInference::default(),
         }
     }
 
@@ -399,7 +361,6 @@ impl WithDependsOn<Dataset> for Dataset {
             vectors: self.vectors.clone(),
             full_text_search: self.full_text_search.clone(),
             check_availability: self.check_availability,
-            schema_inference: self.schema_inference,
         }
     }
 }
@@ -481,8 +442,6 @@ struct DatasetDeserializer {
     full_text_search: Option<FtsStore>,
     #[serde(default, skip_serializing_if = "is_default")]
     check_availability: CheckAvailability,
-    #[serde(default, skip_serializing_if = "is_default")]
-    schema_inference: SchemaInference,
 }
 
 #[expect(deprecated)]
@@ -536,7 +495,6 @@ impl TryFrom<DatasetDeserializer> for Dataset {
             vectors: deserializer.vectors,
             full_text_search: deserializer.full_text_search,
             check_availability: deserializer.check_availability,
-            schema_inference: deserializer.schema_inference,
         })
     }
 }
@@ -580,40 +538,29 @@ mod check_availability_tests {
 }
 
 #[cfg(test)]
-mod schema_inference_tests {
+mod schema_inference_removed_tests {
     use super::*;
     use yaml;
 
+    /// `schema_inference` was removed; because `DatasetDeserializer` denies unknown
+    /// fields, a Spicepod still specifying it must fail to parse rather than be
+    /// silently ignored. Guards the breaking-change behavior.
     #[test]
-    fn test_schema_inference_standard_by_default() {
-        let yaml = r"
-            name: test
-            from: postgres:public.orders
-        ";
-        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
-        assert_eq!(dataset.schema_inference, SchemaInference::Standard);
-    }
-
-    #[test]
-    fn test_schema_inference_extended_via_config() {
+    fn schema_inference_field_is_rejected() {
         let yaml = r"
             name: test
             from: postgres:public.orders
             schema_inference: extended
         ";
-        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
-        assert_eq!(dataset.schema_inference, SchemaInference::Extended);
-    }
-
-    #[test]
-    fn test_schema_inference_standard_via_config() {
-        let yaml = r"
-            name: test
-            from: postgres:public.orders
-            schema_inference: standard
-        ";
-        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
-        assert_eq!(dataset.schema_inference, SchemaInference::Standard);
+        let err = yaml::from_str::<Dataset>(yaml)
+            .expect_err("`schema_inference` must be rejected as an unknown field");
+        // Assert it failed for the RIGHT reason — the deny_unknown_fields rejection
+        // naming `schema_inference` — not some unrelated YAML/serde error.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown field") && msg.contains("schema_inference"),
+            "expected an unknown-field error naming `schema_inference`, got: {msg}"
+        );
     }
 }
 
@@ -717,6 +664,7 @@ mod tests {
             ("fail", OnSchemaChange::Fail),
             ("append_new_columns", OnSchemaChange::AppendNewColumns),
             ("sync_all_columns", OnSchemaChange::SyncAllColumns),
+            ("drop_and_recreate", OnSchemaChange::DropAndRecreate),
         ] {
             let yaml = format!(
                 r"
@@ -762,6 +710,15 @@ mod tests {
         ";
         let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(dataset.time_format, Some(TimeFormat::UnixMillis));
+
+        // Mixed case Unix_Nanos
+        let yaml = r"
+            name: test
+            from: test
+            time_format: Unix_Nanos
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.time_format, Some(TimeFormat::UnixNanos));
 
         // Mixed case Timestamptz
         let yaml = r"

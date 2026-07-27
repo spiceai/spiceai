@@ -14,7 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{fmt::Display, sync::Arc};
+use std::{
+    fmt::Display,
+    sync::{Arc, OnceLock},
+    time::{Duration, SystemTime},
+};
+
+use parking_lot::Mutex;
+
+pub mod config;
+pub use config::{
+    DEFAULT_READY_LAG, InitialSnapshotMode, InvalidCheckpointBehavior, heartbeat_interval,
+};
 
 use arrow::error::ArrowError;
 use arrow::{
@@ -91,6 +102,14 @@ pub enum ChangeBatchError {
     SchemaMismatch { detail: String, schema: SchemaRef },
     #[snafu(display("Failed to process change data capture update: {source}"))]
     Arrow { source: ArrowError },
+    #[snafu(display(
+        "Deferred change batch is no longer available: it was already consumed, \
+         or an earlier build attempt failed. If a build failed, the preceding \
+         'Failed to build deferred change batch' error carries the underlying cause"
+    ))]
+    DeferredBatchConsumed,
+    #[snafu(display("Failed to build deferred change batch: {message}"))]
+    DeferredBuild { message: String },
 }
 
 #[derive(Debug)]
@@ -106,15 +125,39 @@ pub enum StreamError {
     Arrow(String),
     /// External error not originating from `ChangesStream` core logic, such as index processing failure.
     External(String),
-    #[cfg(feature = "dynamodb")]
-    /// Error from `DynamoDB`, such as failure during streaming or subscription.
-    DynamoDB(crate::dynamodb::stream::StreamError),
-    #[cfg(feature = "mongodb")]
-    /// Error from `MongoDB`, such as failure during change stream processing.
-    MongoDB(crate::mongodb::stream::StreamError),
+    /// Error surfaced by a data-source connector's change stream: the connector
+    /// names itself (`connector`) and attaches its own concrete error as the boxed
+    /// `source` cause, keeping this CDC contract connector-agnostic.
+    Connector {
+        /// Static name of the connector that produced the error (e.g. `"DynamoDB"`),
+        /// so logs that print only `{err}` still identify the source connector.
+        connector: &'static str,
+        /// The connector's concrete error, preserved as the chained cause.
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
-impl std::error::Error for StreamError {}
+impl std::error::Error for StreamError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            #[cfg(any(feature = "debezium", feature = "kafka"))]
+            StreamError::Kafka(e) => Some(e),
+            StreamError::Connector { source, .. } => Some(&**source),
+            // String-carrying variants have no underlying `Error` source.
+            _ => None,
+        }
+    }
+}
+
+impl From<ChangeBatchError> for StreamError {
+    fn from(e: ChangeBatchError) -> Self {
+        // A change-batch build failure (including a deferred build) is not a
+        // core stream-transport error; surface it as an external error carrying
+        // the actionable message so the dataset's stream fails visibly rather
+        // than dropping the batch.
+        StreamError::External(e.to_string())
+    }
+}
 
 impl std::fmt::Display for StreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -125,10 +168,9 @@ impl std::fmt::Display for StreamError {
             StreamError::Flight(e) => write!(f, "Arrow Flight error: {e}"),
             StreamError::Arrow(e) => write!(f, "Arrow error: {e}"),
             StreamError::External(e) => write!(f, "External error: {e}"),
-            #[cfg(feature = "dynamodb")]
-            StreamError::DynamoDB(e) => write!(f, "DynamoDB error: {e}"),
-            #[cfg(feature = "mongodb")]
-            StreamError::MongoDB(e) => write!(f, "MongoDB error: {e}"),
+            StreamError::Connector { connector, source } => {
+                write!(f, "{connector} error: {source}")
+            }
         }
     }
 }
@@ -149,11 +191,257 @@ pub trait CommitChange {
     fn supports_deferral(&self) -> bool {
         false
     }
+
+    /// Fold `other` into `self`, returning whether it was absorbed. Used to
+    /// coalesce a run of consecutive commits that target the same stream
+    /// position into one before they are run (see the consumer's burst-apply and
+    /// deferred-checkpoint drain). An implementor MUST be **infallible** and
+    /// **order-insensitive** in [`Self::commit`] for this to be sound: absorbing
+    /// re-orders and drops intermediate commits, keeping only the folded result.
+    /// Order-sensitive or fallible committers (per-partition offsets, resume
+    /// tokens) MUST NOT override this — the default refuses to fold, so they stay
+    /// byte-identical.
+    fn try_absorb(&mut self, _other: &dyn CommitChange) -> bool {
+        false
+    }
+
+    /// Downcast hook enabling [`Self::try_absorb`] to recognise a compatible
+    /// sibling. Default `None` = "not coalesce-identifiable"; only committers
+    /// that override `try_absorb` need override this (to `Some(self)`).
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+
+    /// Whether [`Self::commit`] is statically known to do nothing — there is no
+    /// source position, token, or checkpoint to acknowledge. Consumers may run
+    /// or drop such a committer at any point without ordering or durability
+    /// constraints; the runtime relies on this to keep zero-row readiness
+    /// heartbeats out of the CDC write/durability path (see
+    /// [`ChangeEnvelope::is_no_op_heartbeat`]). Defaults to `false`
+    /// (conservative: assume the commit has effects, preserving ordering); only
+    /// genuinely effect-free committers such as [`NoOpCommitter`] should
+    /// override this to `true`.
+    fn is_no_op(&self) -> bool {
+        false
+    }
+}
+
+/// Destination-passing-style source of the change rows carried by a
+/// [`ChangeEnvelope`].
+///
+/// A CDC source that can render its wire format straight into Arrow (e.g.
+/// Postgres pgoutput) implements this so a multiplexed reader can *route* an
+/// event to the right dataset without paying the O(rows × columns) Arrow-typing
+/// and UTF-8 cost on its shared hot path: [`ChangeRows::build`] runs later, on
+/// the per-dataset consumer. An already-built [`ChangeBatch`] implements it
+/// trivially (blanket impl below) so existing connectors are unchanged.
+///
+/// The metadata methods (`num_rows_hint`, `encoded_len`, `source_commit_ts_ms`,
+/// `is_heartbeat`) MUST be answerable *without* building, so the consumer can
+/// make coalescing/metric decisions cheaply and pay the build only once.
+pub trait ChangeRows: Send {
+    /// Whether there are zero output rows. MUST be exact (never an over- or
+    /// under-estimate), so callers can safely branch or assert on it — e.g.
+    /// ready-signal / heartbeat detection, or skip-empty. Answerable without
+    /// building.
+    fn is_empty(&self) -> bool;
+
+    /// Upper bound on the number of output rows, for builder sizing, coalescing
+    /// counts, and metrics. MAY exceed the exact count (a primary-key-changing
+    /// UPDATE expands to two rows, which is only known precisely after
+    /// decoding); over-estimating affects pre-allocation only, never
+    /// correctness. Use [`Self::is_empty`], not `num_rows_hint() == 0`, when the
+    /// zero case must be exact.
+    fn num_rows_hint(&self) -> usize;
+
+    /// Best-effort encoded byte size, for the consumer's coalescing byte
+    /// budget, computed without building the Arrow batch (e.g. the buffered
+    /// wire size for a raw source).
+    fn encoded_len(&self) -> usize;
+
+    /// Newest source COMMIT timestamp among these rows (ms since the Unix
+    /// epoch), or `None` if the source provides none.
+    fn source_commit_ts_ms(&self) -> Option<i64>;
+
+    /// Whether these rows are a zero-row heartbeat carrying only a fresher
+    /// source timestamp (see [`ChangeBatch::is_heartbeat`]).
+    fn is_heartbeat(&self) -> bool;
+
+    /// Render the rows into a [`ChangeBatch`]. Consumes `self` — runs at most
+    /// once, off the source's hot path. Fallible: per-row value typing can fail
+    /// (e.g. an unmergeable unchanged-TOAST column under `REPLICA IDENTITY
+    /// DEFAULT`), and the failure MUST surface on the dataset's stream rather
+    /// than dropping or corrupting data.
+    fn build(self: Box<Self>) -> Result<ChangeBatch, ChangeBatchError>;
+}
+
+/// Trivial [`ChangeRows`] for an already-built batch: metadata reads the batch,
+/// `build` returns it. Keeps every existing (non-deferred) connector working
+/// through the same envelope interface.
+impl ChangeRows for ChangeBatch {
+    fn is_empty(&self) -> bool {
+        self.record.num_rows() == 0
+    }
+    fn num_rows_hint(&self) -> usize {
+        self.record.num_rows()
+    }
+    fn encoded_len(&self) -> usize {
+        self.record.get_array_memory_size()
+    }
+    fn source_commit_ts_ms(&self) -> Option<i64> {
+        self.source_commit_ts_ms
+    }
+    fn is_heartbeat(&self) -> bool {
+        ChangeBatch::is_heartbeat(self)
+    }
+    fn build(self: Box<Self>) -> Result<ChangeBatch, ChangeBatchError> {
+        Ok(*self)
+    }
+}
+
+/// Holds the change rows as a lazily-built batch: a [`ChangeRows`] source plus a
+/// one-time cache of the built [`ChangeBatch`].
+///
+/// Metadata queries are served from the source *without* building; the first
+/// `get`/`into_built` runs [`ChangeRows::build`] and caches the result. A build
+/// failure is terminal for the batch (the source is consumed); a retry reports
+/// the consumed source as an error rather than silently yielding no data.
+struct LazyChangeBatch {
+    built: OnceLock<ChangeBatch>,
+    /// `Some` until consumed by the first (successful or failed) build. The
+    /// mutex guards only the take/build handoff and is never held across an
+    /// `.await`. (The build itself is synchronous CPU work; a caller that runs
+    /// it on an async task still occupies that worker for the build's duration —
+    /// see the `build` doc — this just means the *lock* adds no await-blocking.)
+    source: Mutex<Option<Box<dyn ChangeRows>>>,
+}
+
+impl LazyChangeBatch {
+    fn from_rows(source: Box<dyn ChangeRows>) -> Self {
+        Self {
+            built: OnceLock::new(),
+            source: Mutex::new(Some(source)),
+        }
+    }
+
+    fn ready(batch: ChangeBatch) -> Self {
+        // Pre-populate `built` so an eagerly-built envelope (every non-deferred
+        // connector — Kafka/MongoDB/DynamoDB/Debezium/MySQL, ready signals) reads
+        // metadata and the batch itself lock-free via `built.get()`, never boxing
+        // the batch or dispatching through `source`.
+        let built = OnceLock::new();
+        let _ = built.set(batch);
+        Self {
+            built,
+            source: Mutex::new(None),
+        }
+    }
+
+    /// Return the built batch, running the deferred build on first access.
+    /// Idempotent: a second call returns the cached batch.
+    fn get(&self) -> Result<&ChangeBatch, ChangeBatchError> {
+        if let Some(batch) = self.built.get() {
+            return Ok(batch);
+        }
+        let mut source = self.source.lock();
+        // Another caller may have built it while we waited on the lock.
+        if let Some(batch) = self.built.get() {
+            return Ok(batch);
+        }
+        let src = source.take().context(DeferredBatchConsumedSnafu)?;
+        let batch = src.build()?;
+        // `set` cannot fail: we hold the source lock and re-checked `built` is
+        // empty above, so no other thread can have set it.
+        let _ = self.built.set(batch);
+        self.built.get().context(DeferredBatchConsumedSnafu)
+    }
+
+    /// Whether the batch is already built — an eager envelope, or a deferred
+    /// one whose build has already run — so [`Self::into_built`] and the
+    /// metadata accessors resolve without running a (possibly expensive)
+    /// deferred build. Lets callers skip a `spawn_blocking` offload they'd
+    /// only pay overhead for.
+    fn is_materialized(&self) -> bool {
+        self.built.get().is_some()
+    }
+
+    /// Consume into the owned built batch, building if needed.
+    fn into_built(self) -> Result<ChangeBatch, ChangeBatchError> {
+        if let Some(batch) = self.built.into_inner() {
+            return Ok(batch);
+        }
+        let src = self
+            .source
+            .into_inner()
+            .context(DeferredBatchConsumedSnafu)?;
+        src.build()
+    }
+
+    // No-build metadata accessors: read the built batch directly (lock-free) if
+    // present, else the not-yet-built source; the `default` covers the consumed
+    // state (post-failed-build). Kept as separate methods rather than a shared
+    // higher-order helper — the built and source branches borrow at different
+    // lifetimes, which a single `FnOnce(&dyn ChangeRows)` helper can't satisfy.
+
+    fn is_empty(&self) -> bool {
+        if let Some(b) = self.built.get() {
+            return b.record.num_rows() == 0;
+        }
+        // `is_some_and`, not `is_none_or`: a `None` source is only reachable
+        // after a failed deferred build (a successful build populates `built`
+        // and short-circuits above). That's an error state, not an empty batch —
+        // report not-empty so a caller can't treat a failed envelope as a
+        // skippable empty one and swallow the error.
+        self.source
+            .lock()
+            .as_deref()
+            .is_some_and(ChangeRows::is_empty)
+    }
+
+    fn num_rows_hint(&self) -> usize {
+        if let Some(b) = self.built.get() {
+            return b.record.num_rows();
+        }
+        self.source
+            .lock()
+            .as_deref()
+            .map_or(0, ChangeRows::num_rows_hint)
+    }
+
+    fn encoded_len(&self) -> usize {
+        if let Some(b) = self.built.get() {
+            return b.record.get_array_memory_size();
+        }
+        self.source
+            .lock()
+            .as_deref()
+            .map_or(0, ChangeRows::encoded_len)
+    }
+
+    fn source_commit_ts_ms(&self) -> Option<i64> {
+        if let Some(b) = self.built.get() {
+            return b.source_commit_ts_ms();
+        }
+        self.source
+            .lock()
+            .as_deref()
+            .and_then(ChangeRows::source_commit_ts_ms)
+    }
+
+    fn is_heartbeat(&self) -> bool {
+        if let Some(b) = self.built.get() {
+            return b.is_heartbeat();
+        }
+        self.source
+            .lock()
+            .as_deref()
+            .is_some_and(ChangeRows::is_heartbeat)
+    }
 }
 
 pub struct ChangeEnvelope {
     change_committer: Box<dyn CommitChange + Send + Sync>,
-    pub change_batch: ChangeBatch,
+    change_batch: LazyChangeBatch,
     is_dataset_ready: bool,
 }
 
@@ -166,22 +454,129 @@ impl ChangeEnvelope {
     ) -> Self {
         Self {
             change_committer,
-            change_batch,
+            change_batch: LazyChangeBatch::ready(change_batch),
             is_dataset_ready,
         }
+    }
+
+    /// Construct an envelope whose [`ChangeBatch`] is produced lazily from a
+    /// [`ChangeRows`] source the first time it is accessed (via
+    /// [`Self::change_batch`], [`Self::materialize`], or [`Self::into_parts`]),
+    /// rather than built up front.
+    ///
+    /// Use this from a multiplexed CDC source to keep the shared read/route
+    /// path free of per-row Arrow-typing cost; the build then runs on the
+    /// per-dataset consumer. `rows` must own its inputs.
+    #[must_use]
+    pub fn new_from_rows(
+        change_committer: Box<dyn CommitChange + Send + Sync>,
+        rows: Box<dyn ChangeRows>,
+        is_dataset_ready: bool,
+    ) -> Self {
+        Self {
+            change_committer,
+            change_batch: LazyChangeBatch::from_rows(rows),
+            is_dataset_ready,
+        }
+    }
+
+    /// Whether there are zero output rows, exactly, without forcing a build.
+    /// See [`ChangeRows::is_empty`].
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.change_batch.is_empty()
+    }
+
+    /// Upper-bound output-row count without forcing a build, for sizing/metrics.
+    /// See [`ChangeRows::num_rows_hint`].
+    #[must_use]
+    pub fn num_rows_hint(&self) -> usize {
+        self.change_batch.num_rows_hint()
+    }
+
+    /// Encoded byte size without forcing a build, for the consumer's coalescing
+    /// budget. See [`ChangeRows::encoded_len`].
+    #[must_use]
+    pub fn encoded_len(&self) -> usize {
+        self.change_batch.encoded_len()
+    }
+
+    /// Newest source commit timestamp (ms since Unix epoch) without forcing a
+    /// build. See [`ChangeRows::source_commit_ts_ms`].
+    #[must_use]
+    pub fn source_commit_ts_ms(&self) -> Option<i64> {
+        self.change_batch.source_commit_ts_ms()
+    }
+
+    /// Whether this is a zero-row heartbeat, without forcing a build. See
+    /// [`ChangeRows::is_heartbeat`].
+    #[must_use]
+    pub fn is_heartbeat(&self) -> bool {
+        self.change_batch.is_heartbeat()
+    }
+
+    /// Whether this envelope is a pure readiness heartbeat: a zero-row change
+    /// batch whose committer is a no-op ([`CommitChange::is_no_op`]).
+    ///
+    /// CDC connectors emit these ([`build_heartbeat_envelope`],
+    /// [`build_ready_signal_envelope`]) only to carry `is_dataset_ready` and a
+    /// source freshness timestamp; they hold no data and acknowledge no source
+    /// position, so a consumer may honor the ready flag and drop the envelope
+    /// without writing, committing, or forcing any durability transition. A
+    /// zero-row envelope whose committer has real effects (e.g. a `MySQL`
+    /// snapshot-boundary envelope that persists the initial resume token) is
+    /// NOT a heartbeat under this predicate and must keep normal
+    /// durability-then-commit ordering.
+    #[must_use]
+    pub fn is_no_op_heartbeat(&self) -> bool {
+        self.change_committer.is_no_op() && self.is_heartbeat()
     }
 
     pub async fn commit(self) -> Result<(), CommitError> {
         self.change_committer.commit().await
     }
 
-    #[must_use]
-    pub fn into_parts(self) -> (Box<dyn CommitChange + Send + Sync>, ChangeBatch, bool) {
-        (
-            self.change_committer,
-            self.change_batch,
-            self.is_dataset_ready,
-        )
+    /// Borrow the change batch, building a deferred batch on first access.
+    ///
+    /// Returns an error if the deferred build fails (e.g. a per-row value that
+    /// cannot be typed to the dataset schema); callers MUST surface it on the
+    /// dataset's changes stream rather than skipping the batch.
+    pub fn change_batch(&self) -> Result<&ChangeBatch, ChangeBatchError> {
+        self.change_batch.get()
+    }
+
+    /// Consume the envelope into its parts, building a deferred batch if needed.
+    ///
+    /// The build is synchronous CPU work — for a deferred envelope under a
+    /// large burst it can run well past the async runtime's ~100µs-per-await
+    /// budget. Prefer [`Self::into_parts_offloaded`] from an async task; reserve
+    /// this for synchronous contexts or already-materialized envelopes.
+    pub fn into_parts(
+        self,
+    ) -> Result<(Box<dyn CommitChange + Send + Sync>, ChangeBatch, bool), ChangeBatchError> {
+        let batch = self.change_batch.into_built()?;
+        Ok((self.change_committer, batch, self.is_dataset_ready))
+    }
+
+    /// [`Self::into_parts`] for async callers: a *deferred* envelope's
+    /// synchronous Arrow build is offloaded to a blocking thread so it cannot
+    /// stall the async worker (and, with it, `/health`) under a large burst.
+    ///
+    /// An already-materialized (eager) envelope resolves inline — its build is
+    /// a no-op, and `spawn_blocking` dispatch would only add overhead to that
+    /// hot path.
+    pub async fn into_parts_offloaded(
+        self,
+    ) -> Result<(Box<dyn CommitChange + Send + Sync>, ChangeBatch, bool), ChangeBatchError> {
+        if self.change_batch.is_materialized() {
+            return self.into_parts();
+        }
+        match tokio::task::spawn_blocking(move || self.into_parts()).await {
+            Ok(parts) => parts,
+            Err(join_err) => Err(ChangeBatchError::DeferredBuild {
+                message: format!("deferred CDC batch build task failed: {join_err}"),
+            }),
+        }
     }
 
     #[must_use]
@@ -192,7 +587,7 @@ impl ChangeEnvelope {
     ) -> Self {
         Self {
             change_committer,
-            change_batch,
+            change_batch: LazyChangeBatch::ready(change_batch),
             is_dataset_ready,
         }
     }
@@ -218,23 +613,92 @@ impl CommitChange for NoOpCommitter {
     async fn commit(&self) -> Result<(), CommitError> {
         Ok(())
     }
+
+    fn is_no_op(&self) -> bool {
+        true
+    }
 }
 
-/// Construct an empty [`ChangeEnvelope`] whose only job is to flip
-/// `is_dataset_ready=true`. The batch contains zero rows and uses a no-op
-/// committer.
+/// Emit one uniform log line when a CDC committer durably acks source progress,
+/// showing the source-commit timestamp of the data it commits and the
+/// end-to-end lag (`now − source_commit_ts_ms`). Every connector's committer
+/// calls this so `refresh_mode: changes` freshness and lag-based readiness can
+/// be verified from the logs with a single filter (`spice_cdc::commit`).
 ///
-/// Connectors should emit one of these envelopes once they consider
-/// themselves caught up to the source if no real change events are available
-/// to carry the ready signal. See the [`ChangesStream`] documentation for the
-/// readiness contract.
-pub fn build_ready_signal_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope, ChangeBatchError> {
+/// `source_commit_ts_ms` is `None` for snapshot-boundary / no-timestamp commits
+/// (lag is then reported as `None`).
+/// Convert a [`SystemTime`] to milliseconds since the Unix epoch, or `None` if it
+/// predates the epoch or overflows `i64`.
+#[must_use]
+pub fn system_time_to_unix_ms(t: SystemTime) -> Option<i64> {
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+}
+
+/// Current wall-clock time as milliseconds since the Unix epoch, or `None` if the
+/// clock is unavailable.
+#[must_use]
+pub fn now_unix_ms() -> Option<i64> {
+    system_time_to_unix_ms(SystemTime::now())
+}
+
+/// Replication lag in milliseconds: wall-clock now minus the source-commit
+/// timestamp, clamped to `>= 0`. `None` when the source timestamp is unknown or
+/// the clock is unavailable. Shared by the `spice_cdc::*` log lines and the lag
+/// gauge so every CDC connector computes lag identically.
+#[must_use]
+pub fn replication_lag_ms(source_commit_ts_ms: Option<i64>) -> Option<i64> {
+    match (now_unix_ms(), source_commit_ts_ms) {
+        (Some(now), Some(ts)) => Some(now.saturating_sub(ts).max(0)),
+        _ => None,
+    }
+}
+
+pub fn log_committer_progress(
+    connector: &str,
+    dataset: &str,
+    position: &str,
+    source_commit_ts_ms: Option<i64>,
+) {
+    let lag_ms = replication_lag_ms(source_commit_ts_ms);
+    tracing::debug!(
+        target: "spice_cdc::commit",
+        connector,
+        dataset,
+        position,
+        source_commit_ts_ms = ?source_commit_ts_ms,
+        lag_ms = ?lag_ms,
+        "CDC committer acked source position"
+    );
+}
+
+/// Construct a zero-row "heartbeat" [`ChangeEnvelope`] stamped with a
+/// source-attested `source_commit_ts_ms` and carrying `is_dataset_ready`.
+///
+/// CDC connectors emit these to keep **lag-based readiness** live on an idle
+/// source: a caught-up but quiet source has no rows to carry a freshness
+/// timestamp, so without a heartbeat its measured lag would climb forever and
+/// the dataset would never flip Ready. Periodically emitting a zero-row
+/// envelope stamped with the source's own clock (a Postgres keepalive time, a
+/// `MongoDB` cluster time, a `MySQL` server clock) lets the runtime observe
+/// `now - source_commit_ts_ms` and mark the dataset Ready once that lag is
+/// within the connector's `ready_lag`.
+///
+/// The batch has zero rows and a no-op committer — idle progress is
+/// acknowledged through the connector's own keepalive/position handling, not
+/// through this envelope's committer.
+pub fn build_heartbeat_envelope(
+    schema: &SchemaRef,
+    source_commit_ts_ms: Option<i64>,
+    is_dataset_ready: bool,
+) -> Result<ChangeEnvelope, ChangeBatchError> {
     // Normalize fields to all-nullable so this empty barrier batch's struct type
     // matches the truncate/snapshot/live change batches it coalesces with. The
     // dataset schema may declare non-null columns (e.g. a `nullable: false`
     // primary key in the spicepod), but every other change batch uses the
     // nullable schema; without this, concat fails ("arrays of different data
-    // types") when the ready signal is coalesced with real data.
+    // types") when the heartbeat is coalesced with real data.
     let nullable_schema = Schema::new(
         schema
             .fields()
@@ -266,13 +730,47 @@ pub fn build_ready_signal_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope,
         vec![op_array, Arc::new(pk_list), Arc::new(data_struct)],
     )
     .context(ArrowSnafu)?;
-    let batch = ChangeBatch::try_new(record)?;
+    let batch = ChangeBatch::try_new(record)?.with_source_commit_ts_ms(source_commit_ts_ms);
 
     Ok(ChangeEnvelope::new(
         Box::new(NoOpCommitter),
         batch,
-        true, // is_dataset_ready
+        is_dataset_ready,
     ))
+}
+
+/// Construct an empty [`ChangeEnvelope`] whose only job is to flip
+/// `is_dataset_ready=true`. The batch contains zero rows and uses a no-op
+/// committer.
+///
+/// For sources with a binary caught-up-or-not readiness signal (e.g. Kafka
+/// consumer lag reaching zero). Sources with a continuous freshness clock use
+/// [`build_heartbeat_envelope`] with [`source_commit_within_ready_lag`] for
+/// lag-based readiness instead. See the [`ChangesStream`] documentation for
+/// the readiness contract.
+pub fn build_ready_signal_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope, ChangeBatchError> {
+    build_heartbeat_envelope(schema, None, true)
+}
+
+/// Lag-based readiness predicate shared by CDC connectors: returns `true` when
+/// `source_commit_ts_ms` is within `ready_lag` of now (wall clock). `None` (the
+/// connector has no upstream timestamp yet) is **not** ready — there is no
+/// freshness signal proving the stream has caught up. A source clock slightly
+/// ahead of ours (small skew) clamps to zero lag and reads as ready.
+///
+/// This is the single definition of "caught up" behind every connector's
+/// `{connector}_replication_ready_lag`: connectors stamp each envelope's
+/// `is_dataset_ready` with it (mirroring `DynamoDB`'s poll-cycle lag gate), and a
+/// [`build_heartbeat_envelope`] on an idle source carries the same verdict.
+#[must_use]
+pub fn source_commit_within_ready_lag(
+    source_commit_ts_ms: Option<i64>,
+    ready_lag: Duration,
+) -> bool {
+    let Some(lag_ms) = replication_lag_ms(source_commit_ts_ms) else {
+        return false;
+    };
+    u128::from(lag_ms.unsigned_abs()) < ready_lag.as_millis()
 }
 
 /// The Arrow schema that represents a `ChangeEvent`
@@ -384,6 +882,20 @@ impl ChangeBatch {
         self.source_commit_ts_ms
     }
 
+    /// Whether this is a zero-row envelope — a keepalive/heartbeat carrying only a
+    /// `source_commit_ts_ms` to keep the idle lag gauge fresh, not an actual change.
+    /// No source currently emits these (the Postgres heartbeat fan-out was reverted),
+    /// so this is a defensive guard: consumers that derive *received/applied progress
+    /// frontiers* must exclude such envelopes, because they are stamped with the server
+    /// clock on a "keepalive ⇒ caught up" premise that is FALSE mid-backlog (keepalives
+    /// interleave between transactions) — counting them advances the frontier past data
+    /// not yet received/applied and corrupts the progress-rate ladder. It also correctly
+    /// excludes empty-transaction envelopes from the data frontier.
+    #[must_use]
+    pub fn is_heartbeat(&self) -> bool {
+        self.record.num_rows() == 0
+    }
+
     #[must_use]
     pub fn op(&self, row: usize) -> ChangeOperation {
         let Some(op_col) = self
@@ -423,6 +935,27 @@ impl ChangeBatch {
         }
 
         primary_keys
+    }
+
+    /// Whether `row` carries any primary key, without allocating the key list.
+    ///
+    /// [`Self::primary_keys`] materializes a `Vec<String>` (cloning every key)
+    /// just to return the names; callers that only need to know whether a row is
+    /// keyed (e.g. the CDC delete path partitioning keyed vs keyless rows) should
+    /// use this — it reads the list length straight off the `ListArray` offsets.
+    #[must_use]
+    pub fn has_primary_keys(&self, row: usize) -> bool {
+        let Some(primary_keys_col) = self
+            .record
+            .column(self.primary_keys_idx)
+            .as_any()
+            .downcast_ref::<ListArray>()
+        else {
+            unreachable!(
+                "The schema is validated to have a 'primary_keys' field which is a ListArray"
+            );
+        };
+        primary_keys_col.value_length(row) > 0
     }
 
     #[must_use]
@@ -631,5 +1164,308 @@ mod tests {
             .expect("data column is StructArray");
         assert_eq!(data_column.len(), 3);
         assert_eq!(data_column.num_columns(), 2);
+    }
+}
+
+#[cfg(test)]
+mod deferred_tests {
+    //! Behavior of a deferred (destination-passing) [`ChangeEnvelope`]: metadata
+    //! is answered without building, the build runs at most once on first
+    //! access, and a build failure surfaces as a typed error (never a dropped or
+    //! empty batch) that converts to a `StreamError` for the dataset's stream.
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow_array::Int32Array;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn sample_batch(rows: i32) -> ChangeBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let data = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from((0..rows).collect::<Vec<_>>()))],
+        )
+        .expect("data batch");
+        wrap_data_as_change_batch(&schema, &data).expect("wrap change batch")
+    }
+
+    /// A [`ChangeRows`] source whose build we can observe (count) and control
+    /// (succeed with a batch, or fail).
+    struct MockRows {
+        result: Option<ChangeBatch>,
+        builds: Arc<AtomicUsize>,
+        rows_hint: usize,
+        empty: bool,
+        ts: Option<i64>,
+    }
+
+    impl ChangeRows for MockRows {
+        fn is_empty(&self) -> bool {
+            self.empty
+        }
+        fn num_rows_hint(&self) -> usize {
+            self.rows_hint
+        }
+        fn encoded_len(&self) -> usize {
+            0
+        }
+        fn source_commit_ts_ms(&self) -> Option<i64> {
+            self.ts
+        }
+        fn is_heartbeat(&self) -> bool {
+            false
+        }
+        fn build(self: Box<Self>) -> Result<ChangeBatch, ChangeBatchError> {
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            self.result.ok_or(ChangeBatchError::DeferredBuild {
+                message: "mock build failure".to_string(),
+            })
+        }
+    }
+
+    fn deferred(rows: MockRows, ready: bool) -> ChangeEnvelope {
+        ChangeEnvelope::new_from_rows(Box::new(NoOpCommitter), Box::new(rows), ready)
+    }
+
+    #[test]
+    fn metadata_answered_without_building() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let env = deferred(
+            MockRows {
+                result: Some(sample_batch(3)),
+                builds: Arc::clone(&builds),
+                rows_hint: 3,
+                empty: false,
+                ts: Some(42),
+            },
+            false,
+        );
+        assert!(!env.is_empty());
+        assert_eq!(env.num_rows_hint(), 3);
+        assert_eq!(env.source_commit_ts_ms(), Some(42));
+        assert!(!env.is_heartbeat());
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            0,
+            "no-build metadata must not trigger the deferred build"
+        );
+    }
+
+    #[test]
+    fn change_batch_builds_once_and_caches() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let env = deferred(
+            MockRows {
+                result: Some(sample_batch(2)),
+                builds: Arc::clone(&builds),
+                rows_hint: 2,
+                empty: false,
+                ts: None,
+            },
+            false,
+        );
+        assert_eq!(env.change_batch().expect("build ok").record.num_rows(), 2);
+        // Second access returns the cached batch without rebuilding.
+        assert_eq!(env.change_batch().expect("cached").record.num_rows(), 2);
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "deferred build runs exactly once"
+        );
+    }
+
+    #[test]
+    fn into_parts_builds_deferred_batch() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let env = deferred(
+            MockRows {
+                result: Some(sample_batch(1)),
+                builds: Arc::clone(&builds),
+                rows_hint: 1,
+                empty: false,
+                ts: None,
+            },
+            true,
+        );
+        let (_committer, batch, ready) = env.into_parts().expect("into_parts builds ok");
+        assert_eq!(batch.record.num_rows(), 1);
+        assert!(ready);
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn deferred_build_failure_surfaces_as_typed_error() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let env = deferred(
+            MockRows {
+                result: None, // build fails
+                builds: Arc::clone(&builds),
+                rows_hint: 1,
+                empty: false,
+                ts: None,
+            },
+            false,
+        );
+        let err = env.change_batch().expect_err("build should fail");
+        assert!(
+            matches!(err, ChangeBatchError::DeferredBuild { .. }),
+            "build failure must be a typed ChangeBatchError, got {err:?}"
+        );
+        // The consumer converts it to a stream error surfaced on the dataset's
+        // stream — the batch is never silently dropped or applied empty.
+        let stream_err: StreamError = err.into();
+        assert!(matches!(stream_err, StreamError::External(_)));
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn eager_envelope_is_ready_and_reports_exact_metadata() {
+        // The blanket `ChangeRows for ChangeBatch` path: an eagerly-built
+        // envelope reports exact metadata and needs no deferred build.
+        let env = ChangeEnvelope::new(Box::new(NoOpCommitter), sample_batch(0), true);
+        assert!(env.is_empty(), "zero-row batch is empty");
+        assert_eq!(env.num_rows_hint(), 0);
+        assert!(env.is_dataset_ready());
+        assert_eq!(
+            env.change_batch().expect("already built").record.num_rows(),
+            0
+        );
+    }
+
+    // ----- lag-based readiness helpers -----
+
+    #[test]
+    fn source_commit_within_ready_lag_gates_on_freshness() {
+        let now = now_unix_ms().expect("clock available");
+        let lag = Duration::from_secs(2);
+
+        // A commit 500ms in the past is within a 2s window -> caught up.
+        assert!(source_commit_within_ready_lag(Some(now - 500), lag));
+        // A commit 5s in the past is beyond the window -> still behind.
+        assert!(!source_commit_within_ready_lag(Some(now - 5_000), lag));
+        // No upstream timestamp is never ready: there is no freshness proof.
+        assert!(!source_commit_within_ready_lag(None, lag));
+        // A source clock slightly ahead of ours (small skew) clamps to zero lag
+        // and reads as ready rather than flapping.
+        assert!(source_commit_within_ready_lag(Some(now + 500), lag));
+    }
+
+    #[test]
+    fn source_commit_within_ready_lag_is_strict_at_the_boundary() {
+        // `ready_lag` of zero can never be satisfied (lag is always >= 0 and the
+        // comparison is strict `<`), so a zero threshold never marks Ready.
+        let now = now_unix_ms().expect("clock available");
+        assert!(!source_commit_within_ready_lag(
+            Some(now),
+            Duration::from_secs(0)
+        ));
+    }
+
+    #[test]
+    fn replication_lag_ms_clamps_and_handles_missing_ts() {
+        // No source timestamp -> no lag signal.
+        assert_eq!(replication_lag_ms(None), None);
+
+        let now = now_unix_ms().expect("clock available");
+        // A past commit reports a non-negative lag in the expected ballpark.
+        let lag = replication_lag_ms(Some(now - 1_000)).expect("some lag");
+        assert!((900..=60_000).contains(&lag), "unexpected lag: {lag}");
+
+        // A future commit (source clock ahead) clamps to zero, never negative.
+        assert_eq!(replication_lag_ms(Some(now + 10_000)), Some(0));
+    }
+
+    #[test]
+    fn heartbeat_envelope_is_empty_stamps_ts_and_propagates_ready_flag() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let ts = now_unix_ms().expect("clock available");
+
+        for ready in [true, false] {
+            let env = build_heartbeat_envelope(&schema, Some(ts), ready)
+                .expect("heartbeat envelope builds");
+            assert_eq!(env.is_dataset_ready(), ready);
+            let batch = env.change_batch().expect("already built");
+            assert_eq!(batch.record.num_rows(), 0, "heartbeat carries no rows");
+            assert!(
+                batch.is_heartbeat(),
+                "zero-row stamped batch is a heartbeat"
+            );
+            assert_eq!(
+                batch.source_commit_ts_ms(),
+                Some(ts),
+                "heartbeat carries the source-attested clock"
+            );
+        }
+    }
+
+    #[test]
+    fn heartbeat_envelope_builds_for_non_null_primary_key_schema() {
+        // A `nullable: false` column must not break the coalesce with real
+        // change batches: the heartbeat normalizes fields to nullable.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let env = build_heartbeat_envelope(&schema, None, false)
+            .expect("heartbeat builds with non-null columns");
+        assert_eq!(env.change_batch().expect("built").record.num_rows(), 0);
+    }
+
+    /// A committer whose `commit` happens to do nothing here but does NOT
+    /// override `is_no_op` — modeling a real committer (resume-token persist,
+    /// snapshot-boundary ack) attached to a zero-row envelope.
+    struct PositionCommitter;
+
+    #[async_trait]
+    impl CommitChange for PositionCommitter {
+        async fn commit(&self) -> Result<(), CommitError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn no_op_heartbeat_predicate_identifies_strippable_readiness_envelopes() {
+        assert!(NoOpCommitter.is_no_op());
+        assert!(
+            !PositionCommitter.is_no_op(),
+            "is_no_op must default to false: assume a commit has effects"
+        );
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+        // Connector idle heartbeats and ready signals: zero rows + no-op
+        // committer -> safe to drop from the write/durability path (#12007).
+        let heartbeat = build_heartbeat_envelope(&schema, now_unix_ms(), true)
+            .expect("heartbeat envelope builds");
+        assert!(heartbeat.is_no_op_heartbeat());
+        let ready = build_ready_signal_envelope(&schema).expect("ready envelope builds");
+        assert!(ready.is_no_op_heartbeat());
+
+        // A zero-row envelope re-wrapped with a REAL committer (the MySQL
+        // snapshot-boundary pattern) must NOT be treated as a heartbeat: its
+        // commit persists source progress and needs durability-then-commit
+        // ordering.
+        let (_, boundary_batch, _) = build_heartbeat_envelope(&schema, None, false)
+            .expect("boundary batch builds")
+            .into_parts()
+            .expect("already built");
+        let boundary = ChangeEnvelope::new(Box::new(PositionCommitter), boundary_batch, false);
+        assert!(boundary.is_heartbeat(), "zero-row batch");
+        assert!(
+            !boundary.is_no_op_heartbeat(),
+            "a real committer disqualifies the envelope from heartbeat stripping"
+        );
+
+        // A row-bearing (deferred, not yet built) envelope with a no-op
+        // committer is not a heartbeat either.
+        let rows = MockRows {
+            result: None,
+            builds: Arc::new(AtomicUsize::new(0)),
+            rows_hint: 1,
+            empty: false,
+            ts: None,
+        };
+        let data_bearing = deferred(rows, false);
+        assert!(!data_bearing.is_no_op_heartbeat());
     }
 }

@@ -88,6 +88,8 @@ mod iceberg;
 mod iceberg_api;
 mod json;
 
+#[cfg(feature = "debezium")]
+mod cdc_ingest;
 mod cluster_tls_reload;
 #[cfg(feature = "kafka")]
 mod kafka;
@@ -104,6 +106,7 @@ mod mysql;
 mod odbc;
 #[cfg(feature = "oracle")]
 mod oracle;
+mod plan_capture;
 #[cfg(feature = "postgres")]
 mod postgres;
 mod prepared_statements;
@@ -146,9 +149,10 @@ mod utils;
 mod view;
 
 mod management;
-// MySQL is required for the rehydration tests
+// MySQL is required for the rehydration tests (source container); the
+// local-db verification covers whichever persistent engines are enabled.
 mod podswatcher;
-#[cfg(all(feature = "mysql", feature = "duckdb"))]
+#[cfg(all(feature = "mysql", any(feature = "duckdb", feature = "sqlite")))]
 mod rehydration;
 mod shutdown;
 

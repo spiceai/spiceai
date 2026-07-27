@@ -34,18 +34,21 @@ limitations under the License.
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use arrow::array::{Array, BinaryArray, Int64Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow_ipc::reader::FileReader;
+use arrow_ipc::writer::FileWriter;
 use arrow_schema::SchemaRef;
 use chrono::Utc;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use crate::metadata::{DeleteFile, DeletionType, TableMetadata};
+use crate::provider::utils::bytes_key;
 use crate::provider::{Error, Result};
 
 #[derive(Debug, Clone, Copy)]
@@ -54,12 +57,59 @@ struct KeyDeletionReadState {
     reinsert_sequence: Option<i64>,
 }
 
+/// A key-based deletion-vector whose catalog row exists but whose `.arrow` file is
+/// missing on disk. Reported (instead of erroring) by [`detect_deletion_type_and_read`]
+/// so the async loader can discriminate a self-healable orphan (the file-first
+/// orphaned-DV sweep unlinked the file but a crash interrupted the row removal)
+/// from genuine data loss, by comparing `sequence_number` against the
+/// surviving-sequence floor. Position-based DVs are never reported here.
+#[derive(Debug, Clone)]
+pub struct MissingKeyDeletionVector {
+    pub delete_file_id: String,
+    pub path: String,
+    pub sequence_number: i64,
+}
+
 /// Directory under the table snapshot where deletion vectors are stored.
 const DELETION_DIR_NAME: &str = "deletions";
 /// File extension used for deletion-vector files.
 const DELETION_FILE_EXTENSION: &str = "arrow";
 /// File format recorded in the catalog for deletion vectors.
 const DELETION_FILE_FORMAT: &str = "arrow_ipc";
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct TestWriterHook {
+    block_writers: std::sync::atomic::AtomicBool,
+    fail_writer_number: AtomicUsize,
+    writers_started: AtomicUsize,
+    writers_completed: AtomicUsize,
+}
+
+#[cfg(test)]
+struct TestWriterHookGuard(Arc<TestWriterHook>);
+
+#[cfg(test)]
+impl TestWriterHookGuard {
+    fn new(fail_writer_number: usize, block_writers: bool) -> Self {
+        let hook = Arc::new(TestWriterHook::default());
+        hook.fail_writer_number
+            .store(fail_writer_number, Ordering::Release);
+        hook.block_writers.store(block_writers, Ordering::Release);
+        Self(hook)
+    }
+
+    fn hook(&self) -> Arc<TestWriterHook> {
+        Arc::clone(&self.0)
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestWriterHookGuard {
+    fn drop(&mut self) {
+        self.0.block_writers.store(false, Ordering::Release);
+    }
+}
 
 /// Identifies rows for deletion using either position-based IDs or primary key-based keys.
 ///
@@ -166,8 +216,6 @@ pub struct DeletionVectorWriteResult {
     pub delete_file: DeleteFile,
     /// The deletion identifiers that were written (position-based or key-based).
     pub identifiers: DeletionIdentifier,
-    /// Filesystem path where the deletion-vector file was written.
-    pub path: PathBuf,
 }
 
 // ============================================================================
@@ -178,13 +226,106 @@ pub struct DeletionVectorWriteResult {
 #[derive(Debug)]
 pub struct DeletionVectorWriter<'a> {
     table: &'a TableMetadata,
+    #[cfg(test)]
+    test_hook: Option<Arc<TestWriterHook>>,
+}
+
+struct PendingBatchWrites {
+    remaining: AtomicUsize,
+    completed: tokio::sync::Notify,
+}
+
+struct PendingWriteCompletion(Arc<PendingBatchWrites>);
+
+impl Drop for PendingWriteCompletion {
+    fn drop(&mut self) {
+        if self.0.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.completed.notify_waiters();
+        }
+    }
+}
+
+struct UncommittedDeleteFilesGuard {
+    paths: Vec<PathBuf>,
+    pending: Arc<PendingBatchWrites>,
+    armed: bool,
+}
+
+impl UncommittedDeleteFilesGuard {
+    fn new(paths: Vec<PathBuf>) -> Self {
+        Self {
+            pending: Arc::new(PendingBatchWrites {
+                remaining: AtomicUsize::new(paths.len()),
+                completed: tokio::sync::Notify::new(),
+            }),
+            paths,
+            armed: true,
+        }
+    }
+
+    fn completion(&self) -> PendingWriteCompletion {
+        PendingWriteCompletion(Arc::clone(&self.pending))
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UncommittedDeleteFilesGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let paths = std::mem::take(&mut self.paths);
+        let pending = Arc::clone(&self.pending);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                while pending.remaining.load(Ordering::Acquire) != 0 {
+                    let notified = pending.completed.notified();
+                    if pending.remaining.load(Ordering::Acquire) != 0 {
+                        notified.await;
+                    }
+                }
+                cleanup_uncommitted_delete_paths(&paths).await;
+            });
+        } else {
+            std::thread::spawn(move || {
+                while pending.remaining.load(Ordering::Acquire) != 0 {
+                    std::thread::yield_now();
+                }
+                for path in paths {
+                    match std::fs::remove_file(path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "Failed to clean uncommitted deletion-vector file"
+                        ),
+                    }
+                }
+            });
+        }
+    }
 }
 
 impl<'a> DeletionVectorWriter<'a> {
     /// Create a new writer bound to the provided table metadata.
     #[must_use]
     pub fn new(table: &'a TableMetadata) -> Self {
-        Self { table }
+        Self {
+            table,
+            #[cfg(test)]
+            test_hook: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_test_hook(table: &'a TableMetadata, test_hook: Arc<TestWriterHook>) -> Self {
+        Self {
+            table,
+            test_hook: Some(test_hook),
+        }
     }
 
     /// Write deletion-vector files for the supplied specifications.
@@ -259,74 +400,126 @@ impl<'a> DeletionVectorWriter<'a> {
         // independent (one per spec, UUIDv7 filenames), so their writes + file
         // fsyncs overlap on the blocking pool — on network-attached storage
         // (EBS) this turns N serialized ~1 ms fsync round-trips into ~1 round
-        // of in-flight barriers. `try_join_all` preserves spec order in the
-        // returned results.
-        let write_futures = specs.into_iter().map(|spec| {
-            let file_path = Self::deletion_file_path(&deletion_dir);
-            let table_name = self.table.table_name.clone();
-            async move {
-                let (batch, schema, count, identifiers, source_data_file_path) =
-                    match spec.identifiers {
-                        DeletionIdentifier::PositionBased {
-                            file_path: source_file,
-                            mut row_ids,
-                            pre_sorted,
-                        } => {
-                            if pre_sorted {
-                                debug_assert!(
-                                    row_ids.windows(2).all(|w| w[0] < w[1]),
-                                    "pre_sorted=true but row_ids is not strictly increasing",
-                                );
-                            } else {
-                                row_ids.sort_unstable();
-                                row_ids.dedup();
+        // of in-flight barriers. `join_all` preserves spec order in the
+        // returned results. The cleanup guard owns every generated path until
+        // this method returns a complete result. If this future is cancelled,
+        // it waits for detached blocking writers before unlinking their paths.
+        let batch_paths = (0..specs.len())
+            .map(|_| Self::deletion_file_path(&deletion_dir))
+            .collect::<Vec<_>>();
+        let mut cleanup_guard = UncommittedDeleteFilesGuard::new(batch_paths.clone());
+        let write_futures =
+            specs
+                .into_iter()
+                .zip(batch_paths.iter().cloned())
+                .map(|(spec, file_path)| {
+                    let mut completion = Some(cleanup_guard.completion());
+                    let table_name = self.table.table_name.clone();
+                    #[cfg(test)]
+                    let test_hook = self.test_hook.as_ref().map(Arc::clone);
+                    async move {
+                        let (batch, schema, count, identifiers, source_data_file_path) = match spec
+                            .identifiers
+                        {
+                            DeletionIdentifier::PositionBased {
+                                file_path: source_file,
+                                mut row_ids,
+                                pre_sorted,
+                            } => {
+                                if pre_sorted {
+                                    debug_assert!(
+                                        row_ids.windows(2).all(|w| w[0] < w[1]),
+                                        "pre_sorted=true but row_ids is not strictly increasing",
+                                    );
+                                } else {
+                                    row_ids.sort_unstable();
+                                    row_ids.dedup();
+                                }
+                                let count = row_ids.len();
+                                let schema = position_based_deletion_schema();
+                                let batch = build_position_based_batch(&schema, &row_ids)?;
+                                (
+                                    batch,
+                                    schema,
+                                    count,
+                                    DeletionIdentifier::PositionBased {
+                                        file_path: source_file.clone(),
+                                        row_ids,
+                                        pre_sorted,
+                                    },
+                                    Some(source_file),
+                                )
                             }
-                            let count = row_ids.len();
-                            let schema = position_based_deletion_schema();
-                            let batch = build_position_based_batch(&schema, &row_ids)?;
-                            (
-                                batch,
-                                schema,
-                                count,
-                                DeletionIdentifier::PositionBased {
-                                    file_path: source_file.clone(),
-                                    row_ids,
-                                    pre_sorted,
-                                },
-                                Some(source_file),
-                            )
-                        }
-                        DeletionIdentifier::KeyBased(mut row_keys) => {
-                            // Sort and deduplicate keys
-                            row_keys.sort();
-                            row_keys.dedup();
-                            let count = row_keys.len();
-                            let schema = key_based_deletion_schema();
-                            let batch = build_key_based_batch(&schema, &row_keys)?;
-                            (
-                                batch,
-                                schema,
-                                count,
-                                DeletionIdentifier::KeyBased(row_keys),
-                                None,
-                            )
-                        }
-                    };
+                            DeletionIdentifier::KeyBased(mut row_keys) => {
+                                // Sort and deduplicate keys
+                                row_keys.sort();
+                                row_keys.dedup();
+                                let count = row_keys.len();
+                                let schema = key_based_deletion_schema();
+                                let batch = build_key_based_batch(&schema, &row_keys)?;
+                                (
+                                    batch,
+                                    schema,
+                                    count,
+                                    DeletionIdentifier::KeyBased(row_keys),
+                                    None,
+                                )
+                            }
+                        };
 
-                let file_size_bytes =
-                    write_deletion_file(&file_path, Arc::clone(&schema), batch, &table_name)
+                        // From this point the completion token is transferred into the
+                        // detached blocking writer. Any earlier `?` drops it here and
+                        // decrements the pending count, so cancellation cleanup cannot
+                        // wait forever for a writer that was never spawned.
+
+                        #[cfg(test)]
+                        let file_size_bytes = write_deletion_file(
+                            &file_path,
+                            Arc::clone(&schema),
+                            batch,
+                            &table_name,
+                            completion.take(),
+                            test_hook,
+                        )
+                        .await?;
+                        #[cfg(not(test))]
+                        let file_size_bytes = write_deletion_file(
+                            &file_path,
+                            Arc::clone(&schema),
+                            batch,
+                            &table_name,
+                            completion.take(),
+                        )
                         .await?;
 
-                Ok::<_, Error>((
-                    file_path,
-                    count,
-                    file_size_bytes,
-                    identifiers,
-                    source_data_file_path,
-                ))
-            }
-        });
-        let written = futures::future::try_join_all(write_futures).await?;
+                        Ok::<_, Error>((
+                            file_path,
+                            count,
+                            file_size_bytes,
+                            identifiers,
+                            source_data_file_path,
+                        ))
+                    }
+                });
+        let written: Vec<(PathBuf, usize, u64, DeletionIdentifier, Option<String>)> =
+            match futures::future::join_all(write_futures)
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()
+            {
+                Ok(written) => written,
+                Err(error) => {
+                    // Every write future owns a distinct UUID path. `join_all`
+                    // waits for all of them, so after one fails no sibling write is
+                    // still racing this cleanup. Remove every final-path artifact
+                    // from the failed logical batch before returning; otherwise a
+                    // later failure or task cancellation at a caller could leak
+                    // unreferenced deletion vectors indefinitely.
+                    cleanup_uncommitted_delete_paths(&batch_paths).await;
+                    cleanup_guard.disarm();
+                    return Err(error);
+                }
+            };
 
         // ONE coalesced deletions/-dir sync for the whole batch of files
         // (replaces the previous per-file parent-dir fsync): a directory fsync
@@ -363,10 +556,10 @@ impl<'a> DeletionVectorWriter<'a> {
             results.push(DeletionVectorWriteResult {
                 delete_file,
                 identifiers,
-                path: file_path,
             });
         }
 
+        cleanup_guard.disarm();
         Ok(results)
     }
 
@@ -416,8 +609,12 @@ pub fn detect_deletion_type_and_read(
     HashMap<String, RoaringBitmap>,
     HashMap<Box<[u8]>, i64>,
     HashMap<Box<[u8]>, i64>,
+    Vec<MissingKeyDeletionVector>,
 )> {
     let mut per_file_row_ids: HashMap<String, RoaringBitmap> = HashMap::new();
+    // Key-based DV rows whose `.arrow` file is missing — reported, not errored, so
+    // the async loader can self-heal provable orphans (see `MissingKeyDeletionVector`).
+    let mut missing_key_dvs: Vec<MissingKeyDeletionVector> = Vec::new();
     // Metadata-only publish: keep delete and reinsert sequence state in one map
     // while reading key-based vectors. This avoids cloning every key in the hot
     // read loop just to update a second map; the legacy return shape is derived
@@ -430,20 +627,36 @@ pub fn detect_deletion_type_and_read(
         file_count
     );
 
-    // Track overflow occurrences to log once at the end
-    let mut overflow_count: u64 = 0;
-    let mut first_overflow_id: Option<u64> = None;
-
     for delete_file in delete_files {
         let path = std::path::Path::new(&delete_file.path);
         tracing::debug!("detect_deletion_type_and_read: reading file {:?}", path);
 
-        let file = std::fs::File::open(path).map_err(|e| {
-            datafusion_common::DataFusionError::Execution(format!(
-                "Failed to open deletion vector file {}: {e}",
-                path.display()
-            ))
-        })?;
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            // A missing KEY-based DV file is tolerated and reported: the file-first
+            // orphaned-DV sweep unlinks the file before removing its catalog row, so
+            // a crash in that window leaves a discoverable dangling row. The async
+            // loader decides self-heal vs error against the floor. Position-based DVs
+            // (source_data_file_path = Some) are tied to a live data file, so a
+            // missing one is still a hard error.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && delete_file.source_data_file_path.is_none() =>
+            {
+                missing_key_dvs.push(MissingKeyDeletionVector {
+                    delete_file_id: delete_file.delete_file_id.clone(),
+                    path: delete_file.path.clone(),
+                    sequence_number: delete_file.sequence_number,
+                });
+                continue;
+            }
+            Err(e) => {
+                return Err(datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to open deletion vector file {}: {e}",
+                    path.display()
+                )));
+            }
+        };
 
         let reader = FileReader::try_new(file, None).map_err(|e| {
             datafusion_common::DataFusionError::Execution(format!(
@@ -486,7 +699,7 @@ pub fn detect_deletion_type_and_read(
 
                 for i in 0..row_key_array.len() {
                     if !row_key_array.is_null(i) {
-                        let key = row_key_array.value(i).to_vec().into_boxed_slice();
+                        let key = bytes_key(row_key_array.value(i));
                         let entry = key_row_state.entry(key).or_insert(KeyDeletionReadState {
                             delete_sequence: file_sequence,
                             reinsert_sequence: file_reinsert,
@@ -526,25 +739,18 @@ pub fn detect_deletion_type_and_read(
                 let bitmap = per_file_row_ids.entry(source_file).or_default();
                 let values = row_id_array.values();
                 for &row_id in values {
-                    if let Ok(row_id_u32) = u32::try_from(row_id) {
-                        bitmap.insert(row_id_u32);
-                    } else {
-                        if first_overflow_id.is_none() {
-                            first_overflow_id = Some(row_id);
-                        }
-                        overflow_count += 1;
-                    }
+                    let row_id_u32 = u32::try_from(row_id).map_err(|_| {
+                        datafusion_common::DataFusionError::Execution(format!(
+                            "Position deletion vector {} contains row ID {row_id}, which exceeds the supported maximum {}. Compact the table into files with at most {} rows before using position-based deletion.",
+                            path.display(),
+                            u32::MAX,
+                            u32::MAX
+                        ))
+                    })?;
+                    bitmap.insert(row_id_u32);
                 }
             }
         }
-    }
-
-    if overflow_count > 0 {
-        tracing::warn!(
-            "Skipped {} row ID(s) that exceed u32::MAX (first: {}) - table should be compacted",
-            overflow_count,
-            first_overflow_id.unwrap_or(0)
-        );
     }
 
     let mut deleted_row_keys: HashMap<Box<[u8]>, i64> = HashMap::with_capacity(key_row_state.len());
@@ -565,7 +771,12 @@ pub fn detect_deletion_type_and_read(
         file_count
     );
 
-    Ok((per_file_row_ids, deleted_row_keys, reinserted_row_keys))
+    Ok((
+        per_file_row_ids,
+        deleted_row_keys,
+        reinserted_row_keys,
+        missing_key_dvs,
+    ))
 }
 
 // ============================================================================
@@ -613,13 +824,28 @@ async fn write_deletion_file(
     schema: SchemaRef,
     batch: RecordBatch,
     table_name: &str,
+    completion: Option<PendingWriteCompletion>,
+    #[cfg(test)] test_hook: Option<Arc<TestWriterHook>>,
 ) -> Result<u64> {
     let output_path = file_path.to_path_buf();
     let table_name = table_name.to_string();
 
     tokio::task::spawn_blocking(move || -> Result<u64> {
-        use arrow::ipc::writer::FileWriter;
-
+        let _completion = completion;
+        #[cfg(test)]
+        if let Some(test_hook) = test_hook {
+            test_hook.writers_started.fetch_add(1, Ordering::AcqRel);
+            while test_hook.block_writers.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            if test_hook.fail_writer_number.load(Ordering::Acquire)
+                == test_hook.writers_completed.fetch_add(1, Ordering::AcqRel) + 1
+            {
+                return Err(Error::IoError {
+                    source: std::io::Error::other("injected deletion-vector writer failure"),
+                });
+            }
+        }
         // Crash-safe write. Ensure the deletion vector file content is durable
         // before we record a pointer to it in the catalog. A crash without
         // this sync could leave a zero-length or partial .arrow file while the
@@ -663,6 +889,22 @@ async fn write_deletion_file(
         table: table_name,
         source,
     })?
+}
+
+/// Best-effort removal of physical deletion-vector files that were written but
+/// never committed to the catalog.
+pub(crate) async fn cleanup_uncommitted_delete_paths(paths: &[PathBuf]) {
+    for path in paths {
+        if let Err(error) = tokio::fs::remove_file(path).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "Failed to remove an uncommitted deletion-vector file"
+            );
+        }
+    }
 }
 
 fn build_delete_file(
@@ -782,7 +1024,7 @@ mod tests {
         );
         assert_eq!(result.delete_file.format, DELETION_FILE_FORMAT);
 
-        let file = std::fs::File::open(&result.path).expect("open deletion file");
+        let file = std::fs::File::open(&result.delete_file.path).expect("open deletion file");
         let reader = FileReader::try_new(file, None).expect("create reader");
         let batches: Vec<_> = reader
             .into_iter()
@@ -818,5 +1060,105 @@ mod tests {
             .expect("write deletion vector");
 
         assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rejects_position_ids_above_bitmap_range() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let table_metadata = build_table_metadata(&temp_dir);
+        let writer = DeletionVectorWriter::new(&table_metadata);
+        let results = writer
+            .write(vec![DeletionVectorWriteSpec::new_position_based(
+                "large.vortex".to_string(),
+                vec![u64::from(u32::MAX) + 1],
+            )])
+            .await
+            .expect("write oversized position deletion vector");
+
+        let delete_files = results
+            .into_iter()
+            .map(|result| result.delete_file)
+            .collect();
+        let error = detect_deletion_type_and_read(delete_files)
+            .expect_err("oversized position must not be silently skipped");
+
+        assert!(
+            error.to_string().contains("exceeds the supported maximum"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn later_writer_failure_cleans_every_batch_path() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let table_metadata = build_table_metadata(&temp_dir);
+        let test_hook = TestWriterHookGuard::new(2, false);
+        let writer = DeletionVectorWriter::new_with_test_hook(&table_metadata, test_hook.hook());
+        writer
+            .write(vec![
+                DeletionVectorWriteSpec::new_position_based("first.vortex".to_string(), vec![1]),
+                DeletionVectorWriteSpec::new_position_based("second.vortex".to_string(), vec![2]),
+                DeletionVectorWriteSpec::new_position_based("third.vortex".to_string(), vec![3]),
+            ])
+            .await
+            .expect_err("injected later writer must fail the logical batch");
+
+        let deletion_dir = Path::new(&table_metadata.path)
+            .join(&table_metadata.current_snapshot_id)
+            .join(DELETION_DIR_NAME);
+        let entries = std::fs::read_dir(&deletion_dir)
+            .expect("read deletion directory after failure")
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("collect deletion directory entries");
+        assert!(entries.is_empty(), "failed batch leaked deletion vectors");
+    }
+
+    #[tokio::test]
+    async fn cancellation_waits_for_detached_writers_then_cleans_paths() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let table_metadata = build_table_metadata(&temp_dir);
+        let test_hook = TestWriterHookGuard::new(0, true);
+        let metadata = table_metadata.clone();
+        let task_hook = test_hook.hook();
+        let task = tokio::spawn(async move {
+            DeletionVectorWriter::new_with_test_hook(&metadata, task_hook)
+                .write(vec![
+                    DeletionVectorWriteSpec::new_position_based(
+                        "first.vortex".to_string(),
+                        vec![1],
+                    ),
+                    DeletionVectorWriteSpec::new_position_based(
+                        "second.vortex".to_string(),
+                        vec![2],
+                    ),
+                ])
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while test_hook.0.writers_started.load(Ordering::Acquire) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writers should reach the deterministic gate");
+        task.abort();
+        test_hook.0.block_writers.store(false, Ordering::Release);
+        let _ = task.await;
+
+        let deletion_dir = Path::new(&table_metadata.path)
+            .join(&table_metadata.current_snapshot_id)
+            .join(DELETION_DIR_NAME);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let empty =
+                    std::fs::read_dir(&deletion_dir).map_or(true, |entries| entries.count() == 0);
+                if empty {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancellation cleanup should remove every generated path");
     }
 }

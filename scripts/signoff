@@ -1,0 +1,1155 @@
+#!/usr/bin/env bash
+# Copyright 2024-2026 The Spice.ai OSS Authors
+#
+# scripts/signoff — Local CI attestation ("developer sign-off").
+#
+# Run the fast quality checks on your own machine, then attest to the exact
+# commit you pushed. On the pull request a single `Attestation` check validates
+# your sign-off and lets the PR into the merge queue, where the *full* suite of
+# tests and checks runs as the real gate.
+#
+# Pure reverts skip this entirely: a PR that only reverts commits already on the
+# base branch passes the Attestation check automatically (validated in pr.yml),
+# since the merge queue still re-runs the full suite on the merged result. See
+# docs/dev/ci_signoff.md ("Reverts are fast-tracked").
+#
+# This is Spice's take on 37signals' approach of moving CI back to developer
+# machines (https://world.hey.com/dhh/we-re-moving-continuous-integration-back-to-developer-machines-3ac6c611),
+# modeled on their open-source tool basecamp/gh-signoff. The twist: local
+# sign-off only gates *entry* to the merge queue — the queue still runs the
+# whole suite on the merged result, so a bad attestation can never reach trunk.
+#
+# Usage:
+#   scripts/signoff                 Run checks, then sign off on HEAD  (or: make signoff)
+#   scripts/signoff -f              Sign off even with a dirty/unpushed tree
+#   scripts/signoff --no-verify     Sign off without running the checks (honor system)
+#   scripts/signoff status          Show the sign-off status of HEAD
+#   scripts/signoff mine            Show attestation status for all your open PRs
+#   scripts/signoff check           Show whether trunk requires sign-off
+#   scripts/signoff install         Configure the trunk ruleset (maintainers)
+#   scripts/signoff install --yes   Apply the ruleset change (default is a dry-run)
+#
+# Environment:
+#   SIGNOFF_BRANCH    Branch/ruleset to target for install/check (default: trunk)
+#   SIGNOFF_REMOTE    Git remote to use in a JJ workspace (default: origin)
+#   SIGNOFF_ACTOR     Attribution login (remote workflow sets this to the
+#                     human who dispatched the run; defaults to gh/git user)
+#   SIGNOFF_REMOTE_RUN  Set by .github/workflows/signoff.yml — pending/failure
+#                     statuses, "via remote" description, GitHub step summary
+#   SIGNOFF_DEBUG     Set to any value for verbose debug logging
+#   SIGNOFF_SKIP_TARGETED_LINT  Set to any value to skip the branch-scoped pre-lint
+#   SIGNOFF_SSH_HOSTS Space-separated hosts for make signoff-remote (default:
+#                     192.168.1.100 192.168.1.101). First host that answers SSH
+#                     and has a Git checkout at $HOME/dev/spice2 is used;
+#                     otherwise falls back to GHA.
+#   SIGNOFF_SSH_REPO  Absolute path to the spice2 Git checkout on the SSH host
+#                     (default: $HOME/dev/spice2 on the remote). Must start with
+#                     / — ~ and relative paths are not expanded through SSH argv.
+#
+# Targeted pre-lint always diffs against trunk (not configurable).
+# When the branch has no Rust-affecting changes vs trunk (.rs, Cargo.toml,
+# Cargo.lock, rust-toolchain*, .cargo/*), Rust lint/build/tests are skipped
+# (both local and remote); the sign-off status is still posted.
+#
+# Remote alternative to local `make signoff`:
+#   make signoff-remote                  # SSH to a lab host if available, else GHA
+#   gh workflow run signoff.yml -f branch=<branch>
+
+set -euo pipefail
+
+readonly VERSION="1.3.0"
+# Default LAN lab hosts for `signoff remote` (SSH path). Overridable via env.
+readonly DEFAULT_SIGNOFF_SSH_HOSTS="192.168.1.100 192.168.1.101"
+# Fixed, not configurable: it must match the hardcoded context the Attestation
+# workflow (pr.yml) looks for, so an env override would silently break the gate.
+readonly STATUS_CONTEXT="signoff"
+readonly TARGET_BRANCH="${SIGNOFF_BRANCH:-trunk}"
+readonly TARGET_REMOTE="${SIGNOFF_REMOTE:-origin}"
+DEBUG="${SIGNOFF_DEBUG:-}"
+VCS=""
+JJ_REMOTE_URL=""
+# Packages excluded from workspace lint (must match Makefile lint-rust excludes).
+readonly LINT_EXCLUDED_PACKAGES="libnfs lopdf ttf-parser pdf-extract"
+
+# True when running under the Remote Sign-off workflow. Drives pending/failure
+# statuses, "via remote" descriptions, and the GitHub Actions step summary.
+# GITHUB_ACTIONS alone is not enough — other workflows must not inherit this.
+is_remote_run() { [[ -n "${SIGNOFF_REMOTE_RUN:-}" ]]; }
+
+# The single source of truth for the checks required to merge. `install` writes
+# exactly this list into the trunk ruleset's required status checks. Every name
+# here must be produced under the same name on both the PR head (to allow
+# queue entry) and `merge_group` (to gate the merged result).
+readonly REQUIRED_CHECKS=(
+  "Attestation"              # sign-off gate (pr.yml) — the PR's only quality check
+  "enforce-pull-with-spice"  # PR hygiene (enforce-pulls-with-spice.yml)
+  "Rust Lint"                # pr.yml
+  "Build and Test"           # pr.yml
+  "Build (release profile)"  # pr.yml
+  "Integration Tests (part 1)"
+  "Integration Tests (part 2)"
+  "Integration Tests (part 3)"
+  "ADBC Integration Tests"   # integration_adbc.yml
+  "Features Check"           # features.yml
+  "Check Rust Licenses"      # license_check.yml
+  "E2E Test CI"              # e2e_test_ci.yml (gate job)
+)
+# GitHub Actions app id — pins each required check to Actions so a hand-POSTed
+# commit status can't satisfy a required check (only `signoff` is a raw status).
+readonly ACTIONS_INTEGRATION_ID=15368
+
+# --- output helpers ----------------------------------------------------------
+
+readonly OK="✓"
+readonly NO="✗"
+
+# Colors for `mine`'s human-facing report only — every other command's output
+# stays plain text (docs/scripts may grep it). Respects NO_COLOR and piping.
+if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != "dumb" ]]; then
+  readonly C_RED=$'\033[31m' C_GREEN=$'\033[32m' C_YELLOW=$'\033[33m' \
+    C_DIM=$'\033[2m' C_BOLD=$'\033[1m' C_RESET=$'\033[0m'
+else
+  readonly C_RED='' C_GREEN='' C_YELLOW='' C_DIM='' C_BOLD='' C_RESET=''
+fi
+
+debug() { [[ -n "$DEBUG" ]] && echo "debug: $*" >&2 || true; }
+info()  { echo "$*" >&2; }
+fail()  { echo "${NO} $*" >&2; exit 1; }
+
+# Prefix each non-empty line of stdin with "$1" (for indented list output).
+bullet() { local prefix="$1" line; while IFS= read -r line; do [[ -n "$line" ]] && echo "${prefix}${line}"; done; }
+
+# --- preconditions -----------------------------------------------------------
+
+# Detect Git first so colocated JJ repositories retain the existing Git behavior.
+# Fall back to JJ for non-colocated workspaces, which intentionally have no .git
+# directory for Git or gh to discover.
+detect_vcs() {
+  if command -v git >/dev/null 2>&1 && git rev-parse --show-toplevel >/dev/null 2>&1; then
+    VCS="git"
+    return
+  fi
+
+  if command -v jj >/dev/null 2>&1 && jj root >/dev/null 2>&1; then
+    VCS="jj"
+    [[ "$TARGET_REMOTE" =~ ^[[:alnum:]_.:/-]+$ ]] \
+      || fail "invalid JJ remote name: '${TARGET_REMOTE}'"
+
+    local name url remotes
+    remotes=$(jj --color=never git remote list) \
+      || fail "could not list JJ remotes"
+    while read -r name url; do
+      if [[ "$name" == "$TARGET_REMOTE" ]]; then
+        JJ_REMOTE_URL="$url"
+        break
+      fi
+    done <<<"$remotes"
+    [[ -n "$JJ_REMOTE_URL" ]] \
+      || fail "JJ remote '${TARGET_REMOTE}' not found — add it with 'jj git remote add', or set SIGNOFF_REMOTE"
+    [[ "$JJ_REMOTE_URL" != -* ]] \
+      || fail "invalid URL for JJ remote '${TARGET_REMOTE}'"
+    return
+  fi
+
+  fail "not inside a Git checkout or JJ workspace"
+}
+
+# gh covers every path; Git is used in a Git checkout and JJ in a non-colocated
+# workspace. The default signoff flow parses JSON via `gh --jq`, not jq itself.
+require_tools() {
+  command -v gh >/dev/null 2>&1 || fail "GitHub CLI (gh) not found — install from https://cli.github.com"
+  detect_vcs
+  gh auth status >/dev/null 2>&1 || fail "not logged in to GitHub — run 'gh auth login'"
+}
+
+# Only the subcommands that parse JSON with the jq binary (status/check/install).
+require_jq() {
+  command -v jq >/dev/null 2>&1 || fail "jq not found — install from https://jqlang.github.io/jq"
+}
+
+# owner/repo of the current checkout, from the gh context. gh cannot infer a
+# repository from a non-colocated JJ workspace, so give it that workspace's
+# configured remote URL explicitly.
+repo_slug() {
+  if [[ "$VCS" == "jj" ]]; then
+    gh repo view "$JJ_REMOTE_URL" --json nameWithOwner --jq .nameWithOwner 2>/dev/null \
+      || fail "could not determine the GitHub repository from JJ remote '${TARGET_REMOTE}'"
+  else
+    gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null \
+      || fail "could not determine the GitHub repository — run this inside a clone of the repo"
+  fi
+}
+
+jj_revision_is_remote() {
+  local revision="$1" sha
+  sha=$(jj --color=never --no-pager log \
+    -r "${revision} & remote_bookmarks(remote=exact:\"${TARGET_REMOTE}\")" \
+    --no-graph -T 'commit_id') \
+    || fail "could not inspect JJ bookmarks on '${TARGET_REMOTE}'"
+  [[ -n "$sha" ]]
+}
+
+# A normal `jj commit` leaves an empty working-copy commit on top of the commit
+# that was bookmarked and pushed. Treat that parent as HEAD. If @ itself has a
+# bookmark, contains changes, or is already a remote bookmark, it is the commit
+# the developer is trying to attest instead.
+current_revision() {
+  local force="${1:-false}"
+  if [[ "$VCS" == "git" ]]; then
+    echo "HEAD"
+    return
+  fi
+
+  local at_bookmark at_empty
+  at_bookmark=$(jj --color=never --no-pager log -r '@ & bookmarks()' --no-graph -T 'commit_id') \
+    || fail "could not inspect JJ bookmarks"
+  at_empty=$(jj --color=never --no-pager log -r '@ & empty()' --no-graph -T 'commit_id') \
+    || fail "could not inspect the JJ working-copy commit"
+  if jj_revision_is_remote "@" || [[ -n "$at_bookmark" ]] || [[ -z "$at_empty" ]]; then
+    echo "@"
+    return
+  fi
+
+  local parent_count
+  parent_count=$(jj --color=never --no-pager log -r '@' --no-graph -T 'parents.len()') \
+    || fail "could not inspect the JJ working-copy parent"
+  if [[ "$parent_count" == "1" ]]; then
+    echo "@-"
+  elif $force; then
+    echo "@"
+  else
+    fail "empty JJ working-copy commit has ${parent_count} parents — select the commit to sign off, or pass -f"
+  fi
+}
+
+revision_sha() {
+  local revision="$1"
+  if [[ "$VCS" == "jj" ]]; then
+    jj --color=never --no-pager log -r "$revision" --no-graph -T 'commit_id'
+  else
+    git rev-parse "$revision"
+  fi
+}
+
+local_user_name() {
+  if [[ "$VCS" == "jj" ]]; then
+    jj config get user.name 2>/dev/null
+  else
+    git config user.name 2>/dev/null
+  fi
+}
+
+# Refuse to sign off on a tree that isn't exactly what's pushed: the attestation
+# is bound to a single commit SHA, so it must match the commit under review.
+ensure_clean_and_pushed() {
+  local revision="$1"
+  if [[ "$VCS" == "jj" ]]; then
+    jj_revision_is_remote "$revision" \
+      || fail "JJ revision ${revision} is not a bookmark tip on '${TARGET_REMOTE}' — bookmark and push it with 'jj git push', or pass -f"
+    return
+  fi
+
+  if [[ -n "$(git status --porcelain)" ]]; then
+    fail "working tree has uncommitted changes — commit or stash them, or pass -f"
+  fi
+  if ! git rev-parse --abbrev-ref '@{push}' >/dev/null 2>&1; then
+    fail "current branch has no upstream — push it first (git push -u origin HEAD), or pass -f"
+  fi
+  if [[ -n "$(git log '@{push}..' --oneline)" ]]; then
+    fail "branch has commits that aren't pushed — push them first, or pass -f"
+  fi
+  # ...and not behind either, so HEAD is exactly the pushed tip under review.
+  if [[ -n "$(git log 'HEAD..@{push}' --oneline)" ]]; then
+    fail "branch is behind its remote — pull the latest, then sign off (or pass -f)"
+  fi
+}
+
+# --- branch → package mapping (targeted pre-lint) ----------------------------
+
+# Targeted pre-lint always diffs against trunk (fixed, not configurable).
+readonly LINT_BASE_BRANCH="trunk"
+
+# Resolve trunk to a local git/jj ref usable with merge-base / jj diff.
+# Fails if the ref isn't present locally (caller may fall back to API).
+resolve_local_trunk_ref() {
+  if [[ "$VCS" == "jj" ]]; then
+    if jj --color=never --no-pager log \
+      -r "remote_bookmarks(exact:\"${LINT_BASE_BRANCH}\", remote=exact:\"${TARGET_REMOTE}\")" \
+      --no-graph -T 'commit_id' -n 1 >/dev/null 2>&1; then
+      echo "${LINT_BASE_BRANCH}@${TARGET_REMOTE}"
+      return 0
+    fi
+    if jj --color=never --no-pager log -r "bookmarks(exact:\"${LINT_BASE_BRANCH}\")" \
+      --no-graph -T 'commit_id' -n 1 >/dev/null 2>&1; then
+      echo "$LINT_BASE_BRANCH"
+      return 0
+    fi
+    return 1
+  fi
+
+  if git rev-parse --verify "refs/remotes/${TARGET_REMOTE}/${LINT_BASE_BRANCH}" >/dev/null 2>&1; then
+    echo "${TARGET_REMOTE}/${LINT_BASE_BRANCH}"
+    return 0
+  fi
+  if git rev-parse --verify "refs/heads/${LINT_BASE_BRANCH}" >/dev/null 2>&1; then
+    echo "$LINT_BASE_BRANCH"
+    return 0
+  fi
+  return 1
+}
+
+# GitHub compare API — works on shallow clones where merge-base is unavailable.
+# Prints one filename per line. Returns non-zero if the API call fails or the
+# compare is truncated beyond usefulness (caller skips targeted lint).
+github_compare_files() {
+  local head_sha="$1"
+  local repo payload
+
+  repo=$(repo_slug) || return 1
+
+  # three-dot compare: merge-base of trunk...head → head (same as a PR diff).
+  # GitHub caps the files list at 300; when truncated, skip targeted pre-lint
+  # rather than linting an incomplete package set.
+  # Emit: first line "true"/"false" (truncated), then one filename per line.
+  # Keep stderr so auth/rate-limit/network errors from `gh` are visible when
+  # the compare fallback fails (caller still degrades to full workspace lint).
+  payload=$(gh api "repos/${repo}/compare/${LINT_BASE_BRANCH}...${head_sha}" \
+    --jq '(.truncated // false | tostring), (.files[]?.filename // empty)') \
+    || return 1
+
+  local truncated rest
+  truncated="${payload%%$'\n'*}"
+  if [[ "$truncated" == "true" ]]; then
+    debug "GitHub compare is truncated (300+ files) — skipping targeted pre-lint"
+    return 1
+  fi
+  rest="${payload#*$'\n'}"
+  # When there are no files, payload is a single line ("false") and rest==payload.
+  if [[ "$rest" == "$payload" ]]; then
+    return 0
+  fi
+  printf '%s\n' "$rest"
+}
+
+# List paths changed on this branch relative to the merge-base with trunk.
+# With a dirty tree (signoff -f), includes uncommitted working-tree changes when
+# using local git. Falls back to the GitHub compare API on shallow clones
+# (remote sign-off).
+changed_files_vs_trunk() {
+  local revision="$1"
+  local base_ref base_sha head_sha files
+
+  if [[ "$VCS" == "jj" ]]; then
+    if base_ref=$(resolve_local_trunk_ref); then
+      # `jj diff --from A --to B` is the branch delta; working-copy edits on an
+      # empty @ parent are already in `revision` when current_revision selected @.
+      jj --color=never --no-pager diff --from "$base_ref" --to "$revision" --name-only
+      return 0
+    fi
+    debug "JJ trunk not local — trying GitHub compare API"
+    head_sha=$(revision_sha "$revision") || return 1
+    github_compare_files "$head_sha"
+    return
+  fi
+
+  if base_ref=$(resolve_local_trunk_ref) \
+    && base_sha=$(git merge-base HEAD "$base_ref" 2>/dev/null); then
+    # No second revision → working tree vs trunk (covers committed + dirty -f).
+    # Untracked files are invisible to `git diff` but still need package mapping
+    # under `scripts/signoff -f` (dirty tree).
+    {
+      git diff --name-only --diff-filter=ACDMRT "$base_sha"
+      git ls-files --others --exclude-standard
+    } | sort -u
+    return 0
+  fi
+
+  debug "merge-base with trunk unavailable (shallow clone?) — trying GitHub compare API"
+  head_sha=$(git rev-parse HEAD) || return 1
+  files=$(github_compare_files "$head_sha") || return 1
+  printf '%s\n' "$files"
+}
+
+# Map changed file paths (stdin, one per line) to workspace package names.
+# Uses `cargo metadata` so package names match what `-p` expects (including
+# nested members under crates/data-connectors/*).
+packages_for_changed_files() {
+  command -v cargo >/dev/null 2>&1 || fail "cargo not found — required for sign-off checks"
+  # Targeted pre-lint is an optional fail-fast step: without python3, skip it
+  # (return non-zero, caller tolerates) — the full workspace lint still runs.
+  if ! command -v python3 >/dev/null 2>&1; then
+    info "python3 not found — skipping targeted pre-lint (full workspace lint still runs)"
+    return 1
+  fi
+
+  local metadata files
+  # Read paths first — a heredoc would otherwise consume stdin for the program.
+  files=$(cat)
+  [[ -n "${files//[$'\t\n\r ']/}" ]] || return 0
+
+  # Keep stderr so cargo's own error (missing rustc, bad manifest, …) is visible.
+  metadata=$(cargo metadata --no-deps --format-version 1) \
+    || fail "cargo metadata failed — is this a Cargo workspace?"
+
+  # Paths + metadata via env (heredoc is the program source, not stdin data).
+  # Use a different env name than the readonly shell constant — bash rejects
+  # VAR=value command when VAR is readonly, even if the value is unchanged.
+  CHANGED_FILES="$files" PACKAGES_METADATA="$metadata" \
+    SIGNOFF_LINT_EXCLUDED="$LINT_EXCLUDED_PACKAGES" python3 <<'PY'
+import json, os
+from pathlib import Path
+
+meta = json.loads(os.environ["PACKAGES_METADATA"])
+excluded = set(os.environ.get("SIGNOFF_LINT_EXCLUDED", "").split())
+workspace_root = Path(meta["workspace_root"]).resolve()
+
+# Longest package root first so nested members (connector-postgres) win over
+# a parent path if both ever appeared (they shouldn't for exclusive members).
+packages = []
+for p in meta["packages"]:
+    name = p["name"]
+    if name in excluded:
+        continue
+    root = Path(p["manifest_path"]).resolve().parent
+    try:
+        root.relative_to(workspace_root)
+    except ValueError:
+        continue
+    packages.append((str(root) + os.sep, name))
+packages.sort(key=lambda x: len(x[0]), reverse=True)
+
+found = set()
+for raw in os.environ["CHANGED_FILES"].splitlines():
+    path = raw.strip()
+    if not path:
+        continue
+    # Normalize under the workspace for prefix matching. Trailing-sep roots
+    # avoid matching sibling packages that share a prefix (runtime vs
+    # runtime-auth).
+    abs_path = str((workspace_root / path).resolve())
+    for root, name in packages:
+        if abs_path == root.rstrip(os.sep) or abs_path.startswith(root):
+            found.add(name)
+            break
+
+for name in sorted(found):
+    print(name)
+PY
+}
+
+# Resolve workspace packages touched by the current branch vs trunk. Prints a
+# space-separated list, or nothing if there are no package changes.
+changed_workspace_packages() {
+  local revision="$1"
+  local files packages
+
+  info "Diff base for targeted pre-lint: ${LINT_BASE_BRANCH}"
+
+  if ! files=$(changed_files_vs_trunk "$revision"); then
+    info "Could not list changed files vs ${LINT_BASE_BRANCH} — skipping targeted pre-lint"
+    return 0
+  fi
+  if [[ -z "${files//[$'\t\n\r ']/}" ]]; then
+    debug "no changed files vs ${LINT_BASE_BRANCH}"
+    return 0
+  fi
+  debug "changed files:"$'\n'"$files"
+
+  packages=$(printf '%s\n' "$files" | packages_for_changed_files) || true
+  if [[ -z "${packages//[$'\t\n\r ']/}" ]]; then
+    debug "no workspace packages in the changed files"
+    return 0
+  fi
+
+  # Collapse newlines → spaces for `make PACKAGES=…`.
+  echo "$packages" | tr '\n' ' ' | sed 's/[[:space:]]*$//'
+}
+
+# Append a short markdown section to the GitHub Actions job summary (no-op
+# outside Actions, or when the summary file isn't writable).
+append_step_summary() {
+  local text="$1"
+  [[ -n "${GITHUB_STEP_SUMMARY:-}" ]] || return 0
+  printf '%s\n' "$text" >>"$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+}
+
+# Post a commit status for STATUS_CONTEXT. Used for pending/failure on remote
+# runs and the final success attestation.
+post_commit_status() {
+  local repo="$1" sha="$2" state="$3" description="$4"
+  description="${description:0:140}"
+  debug "posting ${STATUS_CONTEXT}=${state} on ${repo}@${sha}: ${description}"
+  gh api --method POST "repos/${repo}/statuses/${sha}" \
+    -f state="$state" \
+    -f context="${STATUS_CONTEXT}" \
+    -f "description=${description}" >/dev/null
+}
+
+# --- commands ----------------------------------------------------------------
+
+# True when the branch delta vs trunk can affect Rust lint/build/tests.
+# Matches .rs sources plus Cargo/toolchain config that can break those gates:
+#   *.rs, Cargo.toml, Cargo.lock, rust-toolchain[.toml], .cargo/*
+# Prints nothing. Exit 0 = has Rust-affecting changes (or unknown — run checks).
+# Exit 1 = no such paths in the changed set → safe to skip.
+# Unknown (diff unavailable) returns 0 so we never skip when we can't tell.
+branch_has_rust_changes() {
+  local revision="$1"
+  local files
+
+  if ! files=$(changed_files_vs_trunk "$revision"); then
+    debug "could not list changed files — assuming Rust changes (will run checks)"
+    return 0
+  fi
+  if [[ -z "${files//[$'\t\n\r ']/}" ]]; then
+    debug "no changed files vs ${LINT_BASE_BRANCH} — no Rust changes"
+    return 1
+  fi
+  # Paths that can change what cargo/clippy/fmt/nextest do (not docs/scripts alone).
+  if printf '%s\n' "$files" | grep -qE \
+      '(\.rs$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain(\.toml)?$|(^|/)\.cargo/)'; then
+    debug "Rust-affecting files present — will run Rust checks"
+    return 0
+  fi
+  debug "no Rust-affecting files in changed set — can skip Rust lint/build/tests"
+  return 1
+}
+
+# Run the same fast checks the old PR build ran: lint + build + unit tests.
+# The heavier suite (release build, integration, e2e, ...) runs in the merge
+# queue, so it deliberately isn't part of the local sign-off.
+#
+# Fail-fast order:
+#   0. Skip all Rust work when the branch has no Rust-affecting files vs trunk
+#   1. Targeted lint on packages touched by the branch (fast feedback)
+#   2. Full workspace lint (the real gate)
+#   3. CLI build + unit tests
+#
+# Sets SIGNOFF_CHECK_SUMMARY (short phrase for the commit-status description).
+# Output streams straight to the terminal — call this bare, never `$(run_checks)`,
+# which would capture make's stdout.
+run_checks() {
+  local revision="${1:-}"
+  local packages=""
+
+  # Non-Rust-only changes (docs, YAML, scripts, …): still attest, but skip the
+  # expensive lint/build/test gate. Unknown diffs fall through and run checks.
+  if [[ -n "$revision" ]] && ! branch_has_rust_changes "$revision"; then
+    info "No Rust-affecting files changed vs ${LINT_BASE_BRANCH} — skipping Rust lint, build, and unit tests"
+    append_step_summary "### Rust checks"$'\n'"Skipped (no \`.rs\` / Cargo / rust-toolchain / \`.cargo/\` files in the branch diff vs \`${LINT_BASE_BRANCH}\`)."$'\n'
+    SIGNOFF_CHECK_SUMMARY="no Rust changes (lint/test skipped)"
+    return 0
+  fi
+
+  if [[ -z "${SIGNOFF_SKIP_TARGETED_LINT:-}" && -n "$revision" ]]; then
+    packages=$(changed_workspace_packages "$revision" || true)
+  fi
+
+  if [[ -n "$packages" ]]; then
+    info "Targeted pre-lint for changed packages: ${packages}"
+    info "  (make lint-rust PACKAGES=\"${packages}\" FEATURES=)"
+    append_step_summary "### Targeted pre-lint"$'\n'"Packages: \`${packages}\`"$'\n'
+    # Package defaults only — workspace features (models, …) are not valid on
+    # every crate. FEATURES= clears any user-exported FEATURES so the Makefile
+    # does not reintroduce a workspace-only set. Full lint below still uses the
+    # complete feature set. Explicit `|| return` so failures short-circuit even
+    # when the caller has temporarily disabled `set -e` (see cmd_signoff).
+    make lint-rust PACKAGES="$packages" FEATURES= || return $?
+    info "Targeted pre-lint passed — running full workspace lint…"
+  else
+    info "No changed workspace packages detected (or targeted lint skipped) — running full workspace lint…"
+    append_step_summary "### Targeted pre-lint"$'\n'"Skipped (no changed workspace packages, or unavailable base/diff)."$'\n'
+  fi
+
+  info "Running Rust lint (make lint-rust)…"
+  # Clear PACKAGES/FEATURES so a user-exported env cannot scope or re-feature
+  # the full gate; empty values leave the Makefile on its workspace defaults.
+  make lint-rust PACKAGES= FEATURES= || return $?
+
+  info "Building the CLI and running unit tests (make build-cli nextest)…"
+  make build-cli nextest || return $?
+
+  SIGNOFF_CHECK_SUMMARY="lint+test passed"
+}
+
+# After a successful sign-off, the PR's `Attestation` job (pr.yml) only
+# re-evaluates the `signoff` commit status when its workflow run executes. If
+# that run already completed — e.g. sign-off happened after the PR's checks
+# ran — `Attestation` is stuck showing a stale failure until something
+# re-triggers it. Re-run that job instead of making the developer open or
+# refresh the PR by hand. `gh` is already required by require_tools() before
+# cmd_signoff can reach this point, but the check stays here so this function
+# remains correct if it's ever called on its own.
+refresh_attestation_check() {
+  local sha="$1" repo="$2"
+  local fallback="Open/refresh the PR and it will pick up the sign-off."
+  local run run_id run_status run_conclusion
+
+  if ! command -v gh >/dev/null 2>&1; then
+    info "  Install the GitHub CLI (https://cli.github.com) so signoff can auto-refresh the 'Attestation' check."
+    info "  ${fallback}"
+    return 0
+  fi
+
+  run=$(gh run list --repo "$repo" --commit "$sha" --workflow pr.yml --event pull_request \
+    --json databaseId,status,conclusion --jq 'first(.[]) | "\(.databaseId) \(.status) \(.conclusion)"' 2>/dev/null) \
+    || { debug "could not list 'pr' workflow runs for ${sha} on ${repo}"; info "  ${fallback}"; return 0; }
+
+  read -r run_id run_status run_conclusion <<<"$run"
+  # A missing run renders as an empty string, but an empty `--jq` match can
+  # also render as the literal word "null" for each field — check run_id
+  # looks like a real numeric database id rather than trusting non-emptiness.
+  if [[ ! "$run_id" =~ ^[0-9]+$ ]]; then
+    debug "no 'pr' workflow run found yet for ${sha} — nothing to refresh"
+    info "  ${fallback}"
+    return 0
+  fi
+  if [[ "$run_status" != "completed" ]]; then
+    info "  The 'Attestation' check (run ${run_id}) is still ${run_status} — it will evaluate the sign-off once it finishes."
+    return 0
+  fi
+  if [[ "$run_conclusion" == "success" ]]; then
+    debug "run ${run_id} already succeeded — nothing to refresh"
+    return 0
+  fi
+
+  # Not `--failed`: that only reruns jobs with conclusion=failure and no-ops
+  # on cancelled/skipped runs. Rerunning the whole run is fine here — on a
+  # `pull_request` event, pr.yml executes nothing but the Attestation job.
+  if gh run rerun "$run_id" --repo "$repo" >/dev/null 2>&1; then
+    echo "  Re-ran the 'Attestation' check (run ${run_id}) — it will turn green shortly."
+  else
+    info "  Could not auto-refresh the 'Attestation' check — ${fallback}"
+  fi
+}
+
+cmd_signoff() {
+  local force=false verify=true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f|--force)     force=true;  shift ;;
+      --no-verify)    verify=false; shift ;;
+      -h|--help)      cmd_help; exit 0 ;;
+      *)              fail "unknown option: $1 (see: scripts/signoff --help)" ;;
+    esac
+  done
+
+  require_tools
+
+  local revision sha user repo description start via elapsed
+  revision=$(current_revision "$force")
+  $force || ensure_clean_and_pushed "$revision"
+  sha=$(revision_sha "$revision") || fail "could not resolve ${revision}"
+  # Remote workflow passes the human who dispatched the run (SIGNOFF_ACTOR).
+  # Otherwise: `gh api user` needs a user-scoped token; under a CI GITHUB_TOKEN
+  # it 403s and can echo the error body to stdout, so accept its result only if
+  # it looks like a GitHub login. Then fall back to the CI actor (set in
+  # Actions) or the VCS-configured name (which may contain spaces — fine for a
+  # description).
+  user="${SIGNOFF_ACTOR:-}"
+  if [[ -z "$user" ]]; then
+    user=$(gh api user --jq .login 2>/dev/null || true)
+    if [[ ! "$user" =~ ^[A-Za-z0-9-]{1,39}$ ]]; then
+      user="${GITHUB_ACTOR:-$(local_user_name 2>/dev/null || true)}"
+    fi
+  fi
+  [[ -n "$user" ]] || user="unknown"
+  repo=$(repo_slug)
+  via=""
+  is_remote_run && via=" via remote"
+
+  if $verify; then
+    local check_status=0
+    # Default summary; run_checks overwrites on success (incl. Rust-skip path).
+    SIGNOFF_CHECK_SUMMARY="lint+test passed"
+    start=$(date +%s)
+    if is_remote_run; then
+      post_commit_status "$repo" "$sha" pending \
+        "Remote sign-off in progress (triggered by ${user})…" \
+        || info "warning: could not post pending sign-off status"
+    fi
+    # Capture status without wrapping in `if`/`||` (those also disable set -e
+    # for the LHS). run_checks uses explicit `|| return` so make failures still
+    # short-circuit under the temporary `set +e` used for status capture.
+    set +e
+    run_checks "$revision"
+    check_status=$?
+    set -e
+    if [[ "$check_status" -ne 0 ]]; then
+      elapsed=$(( $(date +%s) - start ))
+      if is_remote_run; then
+        post_commit_status "$repo" "$sha" failure \
+          "Sign-off checks failed after ${elapsed}s (triggered by ${user})" \
+          || true
+        append_step_summary "### Sign-off"$'\n'"**Failed** after ${elapsed}s."$'\n'
+      fi
+      fail "sign-off checks failed"
+    fi
+    elapsed=$(( $(date +%s) - start ))
+    description="Signed off by ${user}${via} — ${SIGNOFF_CHECK_SUMMARY} in ${elapsed}s"
+  else
+    description="Signed off by ${user}${via} (checks not verified locally)"
+  fi
+
+  post_commit_status "$repo" "$sha" success "$description" \
+    || fail "failed to post the sign-off status (do you have write access to ${repo}?)"
+
+  append_step_summary "### Sign-off"$'\n'"**Success** on \`${sha:0:12}\` — ${description}"$'\n'
+
+  echo "${OK} Signed off on ${sha:0:12} — ${description}"
+  refresh_attestation_check "$sha" "$repo"
+}
+
+cmd_status() {
+  require_tools
+  require_jq
+  local revision sha repo combined state desc
+  revision=$(current_revision)
+  sha=$(revision_sha "$revision")
+  repo=$(repo_slug)
+  # Fetch the combined status once, then pick the first matching entry with jq.
+  # (Piping `gh --jq ... | head -n1` would SIGPIPE the writer under pipefail.)
+  # Fail on a real API error rather than falling back to {} → "not signed off".
+  combined=$(gh api "repos/${repo}/commits/${sha}/status") \
+    || fail "failed to read commit status for ${sha} on ${repo} (auth/rate-limit/network?)"
+  state=$(jq -r "first(.statuses[]? | select(.context==\"${STATUS_CONTEXT}\") | .state) // \"\"" <<<"$combined")
+  if [[ "$state" == "success" ]]; then
+    desc=$(jq -r "first(.statuses[]? | select(.context==\"${STATUS_CONTEXT}\") | .description) // \"\"" <<<"$combined")
+    echo "${OK} ${sha:0:12} is signed off — ${desc}"
+  else
+    echo "${NO} ${sha:0:12} is not signed off — run: make signoff"
+    exit 1
+  fi
+}
+
+# Truncate to at most `n` display columns, adding an ellipsis when cut.
+truncate_str() {
+  local s="$1" n="$2"
+  if (( ${#s} > n )); then
+    printf '%s…' "${s:0:$((n - 1))}"
+  else
+    printf '%s' "$s"
+  fi
+}
+
+# One line per PR: colored icon, PR number, a Remote Sign-off run id when one
+# is relevant (blank-padded when there isn't one, so the title column stays
+# aligned), and the title (truncated to the terminal width). `running`=1
+# means a run is currently queued/in_progress on this branch (necessarily for
+# its current tip, since the workflow checks out the ref live); otherwise
+# `run_id`, if set, is the most recent *failed* run for a `failure`/`error`
+# state, so you can jump straight to its logs instead of re-triggering blind.
+print_pr_row() {
+  local number="$1" title="$2" state="$3" run_id="$4" running="$5" width="$6"
+  local icon room run_col run_color
+
+  if [[ "$running" == "1" ]]; then
+    icon="${C_YELLOW}⟳${C_RESET}"
+    run_color="$C_YELLOW"
+  else
+    case "$state" in
+      success)       icon="${C_GREEN}${OK}${C_RESET}" ;;
+      pending)       icon="${C_YELLOW}…${C_RESET}" ;;
+      failure|error) icon="${C_RED}${NO}${C_RESET}" ;;   # a sign-off attempt ran and failed
+      *)             icon="${C_DIM}○${C_RESET}" ;;       # none: never attempted
+    esac
+    run_color="$C_RED"
+  fi
+
+  if [[ -n "$run_id" ]]; then
+    run_col="${run_color}$(printf '%-12s' "$run_id")${C_RESET}"
+  else
+    run_col="$(printf '%-12s' '')"
+  fi
+
+  room=$(( width - 22 ))  # icon(1) + space + "#NNNNN"(6) + space + run id(12) + 2 spaces
+  (( room < 20 )) && room=20
+  printf '%s %-6s %s %s\n' "$icon" "#${number}" "$run_col" "$(truncate_str "$title" "$room")"
+}
+
+# List the sign-off/attestation status of every open PR authored by the
+# authenticated user, one row per PR, including whether a Remote Sign-off run
+# is currently in flight for that PR's branch.
+cmd_mine() {
+  require_tools
+  require_jq
+
+  local repo prs count
+  repo=$(repo_slug)
+
+  prs=$(gh pr list --repo "$repo" --author @me --state open \
+    --json number,title,headRefName,headRefOid) \
+    || fail "failed to list your open PRs on ${repo} (auth/rate-limit/network?)"
+  count=$(jq 'length' <<<"$prs")
+  if [[ "$count" -eq 0 ]]; then
+    echo "${C_DIM}No open PRs authored by you on ${repo}.${C_RESET}"
+    return 0
+  fi
+
+  # Fetch in-flight Remote Sign-off runs once for all PRs, not once per PR.
+  # Match on displayTitle, not headBranch: a workflow_dispatch run's headBranch
+  # is the ref it was dispatched *against* (always trunk here — cmd_remote
+  # doesn't pass --ref), not the `branch` input. signoff.yml's `run-name:
+  # Remote Sign-off (${{ inputs.branch }})` puts the actual branch in the
+  # title instead, so we match on that exact string.
+  local remote_runs
+  remote_runs=$(gh run list --repo "$repo" --workflow signoff.yml \
+    --json displayTitle,status,conclusion,databaseId --limit 50) || remote_runs="[]"
+
+  local width
+  width=$(tput cols 2>/dev/null) || width=100
+
+  echo "${C_BOLD}${repo}${C_RESET} — ${count} open PR(s)"
+  echo
+
+  local i pr number title branch sha combined state run_id running
+  for ((i = 0; i < count; i++)); do
+    pr=$(jq -c ".[$i]" <<<"$prs")
+    number=$(jq -r '.number' <<<"$pr")
+    title=$(jq -r '.title' <<<"$pr")
+    branch=$(jq -r '.headRefName' <<<"$pr")
+    sha=$(jq -r '.headRefOid' <<<"$pr")
+
+    combined=$(gh api "repos/${repo}/commits/${sha}/status" 2>/dev/null) || combined='{}'
+    state=$(jq -r "first(.statuses[]? | select(.context==\"${STATUS_CONTEXT}\") | .state) // \"none\"" <<<"$combined")
+
+    running=0
+    run_id=$(jq -r --arg title "Remote Sign-off (${branch})" \
+      '[.[] | select(.displayTitle == $title and (.status == "in_progress" or .status == "queued"))][0].databaseId // empty' \
+      <<<"$remote_runs")
+    if [[ -n "$run_id" ]]; then
+      running=1
+    elif [[ "$state" == "failure" || "$state" == "error" ]]; then
+      # Most recent completed+failed run for this branch, so a failed
+      # attestation links straight to its logs instead of a bare icon.
+      run_id=$(jq -r --arg title "Remote Sign-off (${branch})" \
+        '[.[] | select(.displayTitle == $title and .status == "completed" and .conclusion == "failure")][0].databaseId // empty' \
+        <<<"$remote_runs")
+    fi
+
+    print_pr_row "$number" "$title" "$state" "$run_id" "$running" "$width"
+  done
+
+  echo
+  echo "${C_DIM}○ not attested   ${NO} attestation failed   … pending   ⟳ remote sign-off running   ${OK} attested${C_RESET}"
+  echo "${C_DIM}Sign off with: make signoff  (or: scripts/signoff remote)${C_RESET}"
+}
+
+# Resolve the ruleset id for TARGET_BRANCH by name. `first(...)` returns a single
+# id inside jq — avoids `head`, which SIGPIPEs the writer under pipefail.
+ruleset_id() {
+  local repo="$1" rulesets
+  rulesets=$(gh api "repos/${repo}/rulesets") \
+    || fail "failed to list rulesets on ${repo} (auth/rate-limit/network?)"
+  jq -r "first(.[] | select(.name==\"${TARGET_BRANCH}\") | .id) // empty" <<<"$rulesets"
+}
+
+cmd_check() {
+  require_tools
+  require_jq
+  local repo id ruleset checks
+  repo=$(repo_slug)
+  id=$(ruleset_id "$repo")
+  [[ -n "$id" ]] || fail "no ruleset named '${TARGET_BRANCH}' on ${repo}"
+  # Fail loudly on an API error instead of reporting "not required" — a swallowed
+  # auth/rate-limit/network error would otherwise look like a missing sign-off gate.
+  ruleset=$(gh api "repos/${repo}/rulesets/${id}") \
+    || fail "failed to read ruleset ${id} on ${repo} (auth/rate-limit/network?)"
+  checks=$(jq -r '.rules[]? | select(.type=="required_status_checks") | .parameters.required_status_checks[]?.context' <<<"$ruleset")
+  if grep -qx "Attestation" <<<"$checks"; then
+    echo "${OK} '${TARGET_BRANCH}' requires developer sign-off (Attestation). Required checks:"
+  else
+    echo "${NO} '${TARGET_BRANCH}' does not yet require sign-off. Run: scripts/signoff install --yes"
+  fi
+  # `|| true`: bullet returns non-zero on an empty list, which under pipefail
+  # would otherwise make this (last) statement exit the command non-zero.
+  echo "$checks" | bullet "  - " || true
+}
+
+cmd_install() {
+  local apply=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes|-y) apply=true; shift ;;
+      -h|--help) cmd_help; exit 0 ;;
+      *) fail "unknown option: $1" ;;
+    esac
+  done
+
+  require_tools
+  require_jq
+  local repo id ruleset
+  repo=$(repo_slug)
+  id=$(ruleset_id "$repo")
+  [[ -n "$id" ]] || fail "no ruleset named '${TARGET_BRANCH}' on ${repo} (create it in the repo settings first)"
+  # Fetch the ruleset once; both the preview and the PUT body derive from it.
+  ruleset=$(gh api "repos/${repo}/rulesets/${id}") \
+    || fail "failed to read ruleset ${id} on ${repo}"
+
+  info "Ruleset '${TARGET_BRANCH}' (id ${id}) on ${repo}"
+  info ""
+  info "Current required checks:"
+  jq -r '.rules[]? | select(.type=="required_status_checks") | .parameters.required_status_checks[]?.context' <<<"$ruleset" \
+    | bullet "  - " >&2 || info "  (none)"
+  info ""
+  info "New required checks:"
+  printf '%s\n' "${REQUIRED_CHECKS[@]}" | bullet "  + " >&2
+
+  if ! $apply; then
+    info ""
+    info "Dry run. Re-run with --yes to apply:  scripts/signoff install --yes"
+    return 0
+  fi
+
+  # Swap only the required_status_checks array, preserving every other rule
+  # (pull_request approvals, merge_queue, etc.).
+  local desired body
+  desired=$(jq -n --argjson iid "$ACTIONS_INTEGRATION_ID" \
+    '$ARGS.positional | map({context: ., integration_id: $iid})' --args "${REQUIRED_CHECKS[@]}")
+  body=$(jq --argjson checks "$desired" '
+    {
+      name,
+      target,
+      enforcement,
+      conditions,
+      bypass_actors: (.bypass_actors // []),
+      rules: (
+        if any((.rules // [])[]; .type == "required_status_checks")
+        then (.rules | map(
+          if .type == "required_status_checks"
+          then (.parameters.required_status_checks = $checks)
+          else . end
+        ))
+        else ((.rules // []) + [{
+          type: "required_status_checks",
+          parameters: {
+            strict_required_status_checks_policy: false,
+            do_not_enforce_on_create: false,
+            required_status_checks: $checks
+          }
+        }])
+        end
+      )
+    }' <<<"$ruleset")
+
+  echo "$body" | gh api --method PUT "repos/${repo}/rulesets/${id}" --input - >/dev/null \
+    || fail "failed to update ruleset ${id} (need admin on ${repo})"
+  echo "${OK} '${TARGET_BRANCH}' now requires developer sign-off + the full merge-queue suite."
+}
+
+# Validate SIGNOFF_SSH_REPO (optional override). Empty → default $HOME/dev/spice2
+# on the remote. Absolute path only (/…); tight charset so it is safe in ssh argv.
+# ~ and relative paths are rejected — they are not expanded through SSH argv.
+signoff_ssh_repo_or_default() {
+  local remote_repo="${SIGNOFF_SSH_REPO:-}"
+  if [[ -z "$remote_repo" ]]; then
+    echo ""
+    return 0
+  fi
+  [[ "$remote_repo" == /* ]] \
+    || fail "SIGNOFF_SSH_REPO must be an absolute path starting with / (got: '${remote_repo}')"
+  [[ "$remote_repo" =~ ^[A-Za-z0-9._/-]+$ ]] \
+    || fail "SIGNOFF_SSH_REPO contains unsafe characters: '${remote_repo}'"
+  echo "$remote_repo"
+}
+
+# Probe SIGNOFF_SSH_HOSTS (default lab IPs) for BatchMode SSH + a spice2 Git checkout.
+# Only Git is accepted (run_signoff_via_ssh requires git); a bare .jj workspace
+# would pass a looser probe and then fail the sign-off itself.
+# Prints the first usable host to stdout; status messages go to stderr via info.
+# Exit 0 with a host, or 1 if none are usable.
+find_signoff_ssh_host() {
+  local hosts host remote_repo probe_cmd
+  hosts="${SIGNOFF_SSH_HOSTS:-$DEFAULT_SIGNOFF_SSH_HOSTS}"
+  remote_repo=$(signoff_ssh_repo_or_default)
+
+  if [[ -n "$remote_repo" ]]; then
+    # Path already charset-validated; embed as a single-quoted remote literal.
+    # Require .git (file or dir) — matches run_signoff_via_ssh Git-only support.
+    probe_cmd="repo='${remote_repo}'; test -d \"\$repo\" && test -e \"\$repo/.git\""
+  else
+    probe_cmd='repo="$HOME/dev/spice2"; test -d "$repo" && test -e "$repo/.git"'
+  fi
+
+  for host in $hosts; do
+    # Hostnames/IPs only — keep the charset tight so ssh argv stays safe.
+    if [[ ! "$host" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      info "  ${NO} skipping invalid SSH host name: '${host}'"
+      continue
+    fi
+    info "Probing SSH connectivity to ${host}…"
+    # BatchMode: never prompt for a password. Short connect timeout so offline
+    # hosts don't stall the developer. stdin from /dev/null so ssh can't eat
+    # a surrounding heredoc or pipe.
+    if ssh -o BatchMode=yes -o ConnectTimeout=1 -o ConnectionAttempts=1 \
+        -o StrictHostKeyChecking=accept-new \
+        "$host" "$probe_cmd" </dev/null 2>/dev/null; then
+      info "  ${OK} ${host} reachable and spice2 repo present"
+      echo "$host"
+      return 0
+    fi
+    info "  ${NO} ${host} unavailable or missing spice2 repo"
+  done
+  return 1
+}
+
+# SSH into a lab host, check out the pushed branch in its spice2 clone, and run
+# scripts/signoff -f there (same attestation as local; -f because checkout -B
+# leaves no @{push} tracking). Branch must already be on origin.
+run_signoff_via_ssh() {
+  local host="$1" branch="$2"
+  local remote_repo
+  remote_repo=$(signoff_ssh_repo_or_default)
+
+  info "Running sign-off via SSH on ${host}:${remote_repo:-\$HOME/dev/spice2} (branch ${branch})…"
+  # Remote command is `bash -s -- <branch> <repo-or-empty>`; the heredoc is
+  # stdin for bash -s. Branch is charset-validated in cmd_remote; repo is an
+  # absolute path or empty (→ $HOME/dev/spice2 on the remote).
+  # shellcheck disable=SC2029 # intentional: host/branch/repo are validated
+  ssh -o BatchMode=yes -o ConnectTimeout=1 -o ConnectionAttempts=1 \
+    -o StrictHostKeyChecking=accept-new \
+    -o ServerAliveInterval=30 -o ServerAliveCountMax=120 \
+    "$host" bash -s -- "$branch" "$remote_repo" <<'REMOTE'
+set -euo pipefail
+branch="$1"
+# Empty $2 → default lab checkout path on this host.
+if [[ -n "${2:-}" ]]; then
+  repo="$2"
+else
+  repo="${HOME}/dev/spice2"
+fi
+cd "$repo" || { echo "✗ cannot cd to ${repo}" >&2; exit 1; }
+
+if command -v git >/dev/null 2>&1 && git rev-parse --show-toplevel >/dev/null 2>&1; then
+  echo "Fetching origin/${branch} into ${repo}…"
+  git fetch --no-tags origin "+refs/heads/${branch}:refs/remotes/origin/${branch}" \
+    || { echo "✗ fetch failed — is '${branch}' pushed to origin?" >&2; exit 1; }
+  # -f discards any dirty local state on the lab machine; HEAD matches origin.
+  git checkout -f -B "$branch" "origin/${branch}"
+  git reset --hard "origin/${branch}"
+  echo "HEAD is now $(git rev-parse --short HEAD) on ${branch}"
+  # -f: no @{push} after checkout -B; tree matches origin tip we just fetched.
+  exec ./scripts/signoff -f
+fi
+
+echo "✗ ${repo} is not a Git checkout (SSH remote sign-off requires Git)" >&2
+exit 1
+REMOTE
+}
+
+# Dispatch remote sign-off for the current branch (Git or JJ).
+# Prefer a LAN SSH host with ~/dev/spice2 (lab machines); fall back to the
+# GitHub Actions Remote Sign-off workflow when no host is reachable.
+# Branch names are validated to a safe charset so they cannot break shell
+# quoting, the SSH remote script, or the workflow input parser.
+cmd_remote() {
+  require_tools
+
+  local branch
+  if [[ "$VCS" == "jj" ]]; then
+    # Prefer a local bookmark on @, then on the selected remote tip revision.
+    # Take the first line without `head` (SIGPIPE under pipefail).
+    local bookmarks
+    bookmarks=$(jj --color=never --no-pager log -r '@ & bookmarks()' --no-graph \
+      -T 'local_bookmarks.map(|b| b.name()).join("\n")' 2>/dev/null || true)
+    branch="${bookmarks%%$'\n'*}"
+    if [[ -z "$branch" ]]; then
+      local revision
+      revision=$(current_revision false)
+      bookmarks=$(jj --color=never --no-pager log -r "${revision} & bookmarks()" --no-graph \
+        -T 'local_bookmarks.map(|b| b.name()).join("\n")' 2>/dev/null || true)
+      branch="${bookmarks%%$'\n'*}"
+    fi
+    [[ -n "$branch" ]] \
+      || fail "no JJ bookmark on the working-copy tip — bookmark the change, or: gh workflow run signoff.yml -f branch=<name>"
+  else
+    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+    [[ -n "$branch" && "$branch" != "HEAD" ]] \
+      || fail "not on a named Git branch — check out a branch, or: gh workflow run signoff.yml -f branch=<name>"
+  fi
+
+  # Mirror the workflow input validation: allow feature/foo, reject whitespace,
+  # quotes, and path tricks so -f branch=… cannot be broken by the name.
+  if [[ "$branch" =~ [[:space:]] || "$branch" == -* || "$branch" == /* || "$branch" == *..* \
+      || "$branch" == *\"* || "$branch" == *\'* || "$branch" == *\$* || "$branch" == *\`* ]]; then
+    fail "refusing to dispatch Remote Sign-off for unsafe branch name: '${branch}'"
+  fi
+  if [[ ! "$branch" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+    fail "refusing to dispatch Remote Sign-off for invalid branch name: '${branch}'"
+  fi
+
+  local host
+  if host=$(find_signoff_ssh_host); then
+    run_signoff_via_ssh "$host" "$branch"
+    return
+  fi
+
+  local repo
+  repo=$(repo_slug) || fail "could not resolve GitHub repo for workflow dispatch"
+
+  info "No SSH sign-off host available — dispatching GitHub Actions Remote Sign-off for ${branch} on ${repo}…"
+  # --repo so non-colocated JJ workspaces (no .git) still resolve the remote;
+  # --raw-field avoids shell re-quoting pitfalls; the branch was validated above.
+  gh workflow run signoff.yml --repo "$repo" --raw-field "branch=${branch}" \
+    || fail "failed to dispatch signoff.yml"
+  echo "${OK} Dispatched. Watch with: gh run watch --repo ${repo} --workflow signoff.yml"
+}
+
+cmd_help() {
+  cat >&2 <<EOF
+scripts/signoff ${VERSION} — local CI attestation for Spice.ai
+
+Developers:
+  make signoff                 Run lint + unit tests, then sign off on HEAD
+  make signoff-remote          SSH lab host if available, else GHA Remote Sign-off
+  scripts/signoff remote       Same as make signoff-remote (Git + JJ)
+  scripts/signoff -f           Sign off even with a dirty/unpushed tree
+  scripts/signoff --no-verify  Sign off without running checks (honor system)
+  scripts/signoff status       Show the sign-off status of HEAD
+  scripts/signoff mine         Show attestation status for all your open PRs
+
+Maintainers:
+  scripts/signoff check        Show whether '${TARGET_BRANCH}' requires sign-off
+  scripts/signoff install      Preview the required-checks change (dry run)
+  scripts/signoff install --yes  Apply it (needs admin on the repo)
+
+Checks (when verify is on):
+  0. If the branch has no Rust-affecting files vs trunk (.rs, Cargo.toml/lock,
+     rust-toolchain*, .cargo/*) → skip Rust lint/build/tests (still posts status)
+  1. Targeted lint of crates touched by this branch vs trunk
+     (make lint-rust PACKAGES="…") — fail-fast feedback
+  2. Full workspace lint (make lint-rust)
+  3. CLI build + unit tests (make build-cli nextest)
+
+  Set SIGNOFF_SKIP_TARGETED_LINT=1 to skip step 1.
+  Remote runs (.github/workflows/signoff.yml) set SIGNOFF_REMOTE_RUN and use
+  the GitHub compare API when the clone is too shallow for merge-base.
+
+  make signoff-remote probes SIGNOFF_SSH_HOSTS (default: ${DEFAULT_SIGNOFF_SSH_HOSTS})
+  for SSH + a Git checkout at \$HOME/dev/spice2, checks out the pushed branch
+  there, and runs signoff. If no host is usable, it falls back to dispatching
+  signoff.yml on GitHub Actions.
+
+The sign-off is a '${STATUS_CONTEXT}' commit status bound to the exact commit you
+pushed. Sign off again after any code change or manual conflict resolution. The
+Attestation check can carry a sign-off across a first-parent chain of unmodified,
+conflict-free base merges. The full test suite runs in the merge queue.
+EOF
+}
+
+main() {
+  case "${1:-}" in
+    ""|signoff) shift || true; cmd_signoff "$@" ;;
+    -f|--force|--no-verify) cmd_signoff "$@" ;;
+    remote)   shift; cmd_remote "$@" ;;
+    status)   shift; cmd_status "$@" ;;
+    mine)     shift; cmd_mine "$@" ;;
+    check)    shift; cmd_check "$@" ;;
+    install)  shift; cmd_install "$@" ;;
+    version|--version) echo "signoff ${VERSION}" ;;
+    -h|--help) cmd_help ;;
+    *) fail "unknown command: $1 (see: scripts/signoff --help)" ;;
+  esac
+}
+
+main "$@"

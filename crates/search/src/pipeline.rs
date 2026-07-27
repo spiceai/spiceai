@@ -18,7 +18,6 @@ use datafusion::{
     common::Column,
     datasource::DefaultTableSource,
     error::DataFusionError,
-    execution::SendableRecordBatchStream,
     sql::{
         TableReference,
         sqlparser::{
@@ -65,13 +64,7 @@ impl Error {
     }
 }
 
-/// [`QueryEngine`] defines the minimal interface needed to execute [`LogicalPlan`].
-///
-/// This allows extensibility beyond [`SessionContext::execute_logical_plan`] then [`DataFrame::execute_stream`].
-#[async_trait::async_trait]
-pub trait QueryEngine: Send + Sync {
-    async fn run(&self, plan: LogicalPlan) -> Result<SendableRecordBatchStream, DataFusionError>;
-}
+pub use runtime_query_engine::query_engine::QueryEngine;
 
 pub struct SearchPipeline<A>
 where
@@ -105,7 +98,7 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
         opt_filter: Option<Expr>,
         addition_projection: Vec<Expr>,
         primary_keys: Vec<Column>,
-        keywords: Vec<String>,
+        keywords: &[String],
         limit: usize,
     ) -> std::result::Result<Option<AggregationResult>, Error> {
         let columns: Vec<_> = [
@@ -124,7 +117,7 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
 
                 // The column name for each `.generator` will be different, and therefore the
                 // keyword filter [`Expr`] must be made differently.
-                let mut filters = prepare_keywords(&keywords.clone(), &content_col)?;
+                let mut filters = prepare_keywords(keywords, &content_col)?;
                 if let Some(ref f) = opt_filter {
                     filters.push(f.clone());
                 }
@@ -143,13 +136,13 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
                 )
                 .context(SearchRequestConstructionSnafu)?;
 
-                let data =
-                    self.engine
-                        .run(lp)
-                        .await
-                        .map_err(|e| Error::CandidateGenerationError {
-                            source: generation::Error::QueryError { source: e },
-                        })?;
+                let data = self.engine.execute_plan(lp).await.map_err(|e| {
+                    Error::CandidateGenerationError {
+                        source: generation::Error::InternalError {
+                            source: Box::new(e),
+                        },
+                    }
+                })?;
 
                 Ok(VectorSearchGenerationResult {
                     data,
@@ -217,7 +210,9 @@ pub fn valid_keywords(keywords: &[String]) -> Result<Vec<String>, Error> {
 }
 
 pub fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr, Error> {
-    let expression = format!("{target_column} ILIKE '%{}%'", k.to_lowercase());
+    let lower = k.to_lowercase();
+    let pattern = format!("%{lower}%");
+    let expression = format!("{target_column} ILIKE '{pattern}'");
     let parser = Parser::new(&GenericDialect {});
     let mut parser = parser.try_with_sql(&expression).map_err(|err| {
         tracing::trace!("failed to parse 'keywords' for search. {err}");
@@ -234,7 +229,12 @@ pub fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr, E
         }
     })?;
 
-    let SqlExpr::ILike { expr, pattern, .. } = &ilike_expr else {
+    let SqlExpr::ILike {
+        expr,
+        pattern: parsed_pattern,
+        ..
+    } = &ilike_expr
+    else {
         tracing::trace!(
             "failed to parse 'keywords' for search. expected ILIKE, but got {ilike_expr:?}"
         );
@@ -249,7 +249,7 @@ pub fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr, E
             value: Value::SingleQuotedString(v),
             ..
         }),
-    ) = (*expr.clone(), *pattern.clone())
+    ) = (expr.as_ref(), parsed_pattern.as_ref())
     {
         if id.value != target_column {
             tracing::trace!(
@@ -261,11 +261,9 @@ pub fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr, E
             });
         }
 
-        if v != format!("%{}%", k.to_lowercase()) {
+        if v != &pattern {
             tracing::trace!(
-                "failed to parse 'keywords' for search. expected '%{}%', but got {}",
-                k.to_lowercase(),
-                v
+                "failed to parse 'keywords' for search. expected '{pattern}', but got {v}"
             );
             return Err(Error::InvalidKeyword {
                 keyword: k.to_string(),
@@ -273,7 +271,7 @@ pub fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr, E
         }
     } else {
         tracing::trace!(
-            "failed to parse 'keywords' for search. expected identifiers, but got {expr:?} - {pattern:?}"
+            "failed to parse 'keywords' for search. expected identifiers, but got {expr:?} - {parsed_pattern:?}"
         );
         return Err(Error::InvalidKeyword {
             keyword: k.to_string(),
@@ -291,7 +289,7 @@ pub fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr, E
         });
     }
 
-    Ok(ident(target_column).ilike(lit(format!("%{}%", k.to_lowercase()))))
+    Ok(ident(target_column).ilike(lit(pattern)))
 }
 
 #[cfg(test)]

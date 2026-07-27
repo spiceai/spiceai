@@ -263,3 +263,13 @@ impl DataConnector for DuckDB {
             })?)
     }
 }
+
+// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_duckdb as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+runtime::register_data_connector!(
+    register_duckdb_connector,
+    DUCKDB_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    DuckDBFactory
+);

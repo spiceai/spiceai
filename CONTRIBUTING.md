@@ -53,8 +53,9 @@ All contributions come through pull requests. To submit a proposed change, we re
 1. Create your change
    - Code changes require tests
 1. Update relevant documentation for the change
-1. Commit and open a PR
-1. Wait for the CI process to finish and make sure all checks are green
+1. Commit and push your branch
+1. Run `make signoff` to attest your change — it skips Rust lint/build/tests when the branch has no Rust-affecting files (`.rs`, Cargo/toolchain config), otherwise target-lints changed crates then full lint + unit tests, and records a sign-off on the exact commit you pushed (or `make signoff-remote` to run the same checks on a lab SSH host or self-hosted runner; see [CI Sign-off](/docs/dev/ci_signoff.md))
+1. Open a PR. A single **Attestation** check validates your sign-off; that plus a review is what adds the PR to the merge queue, where the full test suite runs as the required gate
 1. A maintainer of the project will be assigned, and you can expect a review within a few days
 
 ### Use work-in-progress PRs for early feedback
@@ -90,7 +91,7 @@ xcode-select --install
 # Install dependencies
 brew install rust
 
-# Cmake/Protobuf are only required for building the databricks connector
+# CMake and Protobuf are required by several components (gRPC/Flight, Databricks, and other connectors)
 brew install cmake
 brew install protobuf
 
@@ -125,6 +126,12 @@ spice run
 sudo apt update
 sudo apt install build-essential curl openssl libssl-dev pkg-config protobuf-compiler cmake
 
+# On arm64 (aarch64) also install clang and lld — the build uses the clang/lld
+# linker for aarch64 targets (see .cargo/config.toml), and omitting them fails
+# with `clang: error: invalid linker name in argument '-fuse-ld=lld'`.
+# See docs/DISTRIBUTIONS.md ("Linux arm64 Notes") for details.
+sudo apt install clang lld
+
 # Install Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y # install unattended
 source $HOME/.cargo/env
@@ -155,17 +162,13 @@ spice run
 
 #### VSCode Configuration
 
-To configure VSCode to automatically apply the rustfmt style on save and to use the same Clippy rules we enforce in our CI as the default, add the following in your User Settings JSON file:
+To configure VSCode to automatically apply the rustfmt style on save and to run the same Clippy rules we enforce in CI, copy the checked-in template to your (gitignored) workspace settings:
 
-```json
-  "[rust]": {
-    "editor.defaultFormatter": "rust-lang.rust-analyzer",
-    "editor.formatOnSave": true,
-  },
-  "rust-analyzer.check.command": "clippy",
-  "rust-analyzer.check.features": "all",
-  "rust-analyzer.check.extraArgs": ["--", "-Dwarnings", "-Dclippy::expect_used", "-Dclippy::pedantic", "-Dclippy::unwrap_used", "-Dclippy::clone_on_ref_ptr", "-Aclippy::module_name_repetitions"]
+```bash
+cp .vscode/settings.json.template .vscode/settings.json
 ```
+
+The template is the canonical editor config — if CI lint rules change in the `Makefile`, update the template alongside them.
 
 By default, `rust-analyzer` will attempt to rebuild all dependencies when a change is made to a `cargo.toml` file. To prevent this and only rebuild what has changed, add the following in your User Settings JSON file, setting the value to your architecture:
 

@@ -55,6 +55,10 @@ pub static CHUNKED_INDEX_FULL_SEARCH_FIELD: &str = "_spice.search_field";
 pub struct ChunkedSearchIndex {
     inner: Arc<dyn SearchIndex>,
     chunker: Arc<dyn Chunker>,
+    /// Cached `{search_column}_embedding` — avoids reallocating the name on every write.
+    embedding_col_name: String,
+    /// Cached `{search_column}_offset` — avoids reallocating the name on every write.
+    offset_col_name: String,
 }
 
 #[async_trait]
@@ -93,6 +97,10 @@ impl Index for ChunkedSearchIndex {
 
     async fn on_write_complete(&self) -> Result<(), DataFusionError> {
         self.inner.on_write_complete().await
+    }
+
+    fn write_complete_failure_is_fatal(&self) -> bool {
+        self.inner.write_complete_failure_is_fatal()
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -191,7 +199,13 @@ impl ChunkedSearchIndex {
     }
 
     pub fn new(inner: Arc<dyn SearchIndex>, chunker: Arc<dyn Chunker>) -> Self {
-        Self { inner, chunker }
+        let search_column = inner.search_column();
+        Self {
+            embedding_col_name: embedding_col(search_column.as_str()),
+            offset_col_name: Self::chunking_offset_col(search_column.as_str()),
+            inner,
+            chunker,
+        }
     }
 
     /// Build the intermediate "chunked" [`RecordBatch`] for a contiguous group of input rows
@@ -230,37 +244,26 @@ impl ChunkedSearchIndex {
         // intermediate chunked batch — they are recomputed by the inner index and re-attached
         // as list columns on the final output. Filtering them out *before* `repeat()` avoids
         // expensive `take()` work on nested list columns that would be discarded immediately.
-        let embedding_col_name = embedding_col(self.search_column().as_str());
-        let offset_col_name = Self::chunking_offset_col(self.search_column().as_str());
-
         let (mut fields, mut arrays): (Vec<Field>, Vec<ArrayRef>) = group_record
             .columns()
             .iter()
             .enumerate()
             .filter_map(|(i, arr)| {
                 let field = schema.field(i).clone();
-                if field.name() == &embedding_col_name || field.name() == &offset_col_name {
+                if field.name() == &self.embedding_col_name || field.name() == &self.offset_col_name
+                {
                     return None;
                 }
                 let result = if i == search_field_idx {
+                    // Build string arrays from `&str` slices rather than an intermediate `Vec<String>`.
                     let chunked_array: ArrayRef = match field.data_type() {
                         DataType::LargeUtf8 => {
-                            let values: Vec<String> = group_flatten_chunks
-                                .iter()
-                                .map(|s| (*s).to_string())
-                                .collect();
-                            Arc::new(LargeStringArray::from(values))
+                            Arc::new(LargeStringArray::from(group_flatten_chunks.clone()))
                         }
                         DataType::Utf8View => {
                             Arc::new(StringViewArray::from(group_flatten_chunks.clone()))
                         }
-                        _ => {
-                            let values: Vec<String> = group_flatten_chunks
-                                .iter()
-                                .map(|s| (*s).to_string())
-                                .collect();
-                            Arc::new(StringArray::from(values))
-                        }
+                        _ => Arc::new(StringArray::from(group_flatten_chunks.clone())),
                     };
                     Ok((field, chunked_array))
                 } else if schema
@@ -286,7 +289,7 @@ impl ChunkedSearchIndex {
         arrays.push(Arc::new(UInt64Array::from(group_chunk_index)) as ArrayRef);
 
         fields.push(Field::new(
-            Self::chunking_offset_col(self.search_column().as_str()),
+            self.offset_col_name.clone(),
             DataType::new_fixed_size_list(DataType::Int32, 2, false),
             false,
         ));
@@ -442,8 +445,11 @@ impl SearchIndex for ChunkedSearchIndex {
         let (offsets, chunks): (Vec<Vec<(usize, usize)>>, Vec<Vec<_>>) = arr_str
             .map(|s_opt| {
                 if let Some(s) = s_opt {
+                    // Character offsets, not byte offsets: the read path extracts
+                    // the snippet with DataFusion `substring` (1-based, char-counted).
+                    // See issue #11269.
                     self.chunker
-                        .chunk_with_offsets(s)
+                        .chunk_with_char_offsets(s)
                         .collect::<Vec<_>>()
                         .into_iter()
                         .unzip::<_, _, Vec<(usize, usize)>, Vec<&str>>()
@@ -469,9 +475,6 @@ impl SearchIndex for ChunkedSearchIndex {
         // recover the same flat value buffer the single-call path would have produced, and wrap
         // it with an OffsetBuffer over the full `repeats` vector to produce the per-document
         // list columns.
-        let offsets_col_name = Self::chunking_offset_col(self.search_column().as_str());
-        let embeddings_col_name = embedding_col(self.search_column().as_str());
-
         let mut group_offset_arrays: Vec<ArrayRef> = Vec::with_capacity(row_groups.len());
         let mut group_embedding_arrays: Vec<ArrayRef> = Vec::with_capacity(row_groups.len());
 
@@ -494,10 +497,10 @@ impl SearchIndex for ChunkedSearchIndex {
                 .context(InnerIndexWriteSnafu)
                 .boxed()?;
 
-            if let Some(arr) = inner_rb.column_by_name(&offsets_col_name) {
+            if let Some(arr) = inner_rb.column_by_name(&self.offset_col_name) {
                 group_offset_arrays.push(Arc::clone(arr));
             }
-            if let Some(arr) = inner_rb.column_by_name(&embeddings_col_name) {
+            if let Some(arr) = inner_rb.column_by_name(&self.embedding_col_name) {
                 group_embedding_arrays.push(Arc::clone(arr));
             }
         }
@@ -511,7 +514,7 @@ impl SearchIndex for ChunkedSearchIndex {
 
         attach_list_column(
             &group_offset_arrays,
-            &offsets_col_name,
+            &self.offset_col_name,
             &repeats,
             &schema,
             &mut arrs,
@@ -519,7 +522,7 @@ impl SearchIndex for ChunkedSearchIndex {
         )?;
         attach_list_column(
             &group_embedding_arrays,
-            &embeddings_col_name,
+            &self.embedding_col_name,
             &repeats,
             &schema,
             &mut arrs,
@@ -733,10 +736,10 @@ impl Index for ChunkedVectorIndex {
 
     /// Columns that are required for the index to be computed.
     fn required_columns(&self) -> Vec<String> {
-        ChunkedSearchIndex {
-            inner: Arc::clone(&self.inner) as Arc<dyn SearchIndex>,
-            chunker: Arc::clone(&self.chunker),
-        }
+        ChunkedSearchIndex::new(
+            Arc::clone(&self.inner) as Arc<dyn SearchIndex>,
+            Arc::clone(&self.chunker),
+        )
         .required_columns()
     }
 
@@ -746,10 +749,10 @@ impl Index for ChunkedVectorIndex {
         &self,
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
-        ChunkedSearchIndex {
-            inner: Arc::clone(&self.inner) as Arc<dyn SearchIndex>,
-            chunker: Arc::clone(&self.chunker),
-        }
+        ChunkedSearchIndex::new(
+            Arc::clone(&self.inner) as Arc<dyn SearchIndex>,
+            Arc::clone(&self.chunker),
+        )
         .compute_index(batches)
         .await
     }
@@ -766,6 +769,10 @@ impl Index for ChunkedVectorIndex {
         self.inner.on_write_complete().await
     }
 
+    fn write_complete_failure_is_fatal(&self) -> bool {
+        self.inner.write_complete_failure_is_fatal()
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -779,10 +786,10 @@ impl SearchIndex for ChunkedVectorIndex {
 
     /// All [`Field`]s that define a primary key between the underlying table and the [`SearchIndex`].
     fn primary_fields(&self) -> Vec<Field> {
-        ChunkedSearchIndex {
-            inner: Arc::clone(&self.inner) as Arc<dyn SearchIndex>,
-            chunker: Arc::clone(&self.chunker),
-        }
+        ChunkedSearchIndex::new(
+            Arc::clone(&self.inner) as Arc<dyn SearchIndex>,
+            Arc::clone(&self.chunker),
+        )
         .primary_fields()
     }
 
@@ -791,10 +798,10 @@ impl SearchIndex for ChunkedVectorIndex {
         &self,
         record: RecordBatch,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
-        ChunkedSearchIndex {
-            inner: Arc::clone(&self.inner) as Arc<dyn SearchIndex>,
-            chunker: Arc::clone(&self.chunker),
-        }
+        ChunkedSearchIndex::new(
+            Arc::clone(&self.inner) as Arc<dyn SearchIndex>,
+            Arc::clone(&self.chunker),
+        )
         .write(record)
         .await
     }
@@ -803,10 +810,10 @@ impl SearchIndex for ChunkedVectorIndex {
     /// columns, the associated vectors/indexed content of the [`SearchIndex::search_column`] and the
     ///  search score between `query` and the [`SearchIndex::search_column`].
     fn query_table_provider(&self, query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
-        ChunkedSearchIndex {
-            inner: Arc::clone(&self.inner) as Arc<dyn SearchIndex>,
-            chunker: Arc::clone(&self.chunker),
-        }
+        ChunkedSearchIndex::new(
+            Arc::clone(&self.inner) as Arc<dyn SearchIndex>,
+            Arc::clone(&self.chunker),
+        )
         .query_table_provider(query)
     }
 
@@ -856,6 +863,109 @@ mod tests {
         // [2, 1, 3, 4, 1] with budget=5: 2+1=3, +3=6>5 → flush; 3, +4=7>5 → flush; 4, +1=5 → ok.
         let groups = group_rows_by_chunk_budget(&[2, 1, 3, 4, 1], 5);
         assert_eq!(groups, vec![(0, 2), (2, 1), (3, 2)]);
+    }
+
+    /// Regression for issue #11269: the chunk offsets persisted by the write
+    /// path (`to_offset_array` of `chunk_with_char_offsets`) must round-trip
+    /// through the read path's `substring` extraction and recover each chunk
+    /// exactly — including for non-ASCII text, where byte offsets (the old
+    /// behavior) produced shifted/garbled snippets.
+    #[tokio::test]
+    async fn substring_read_path_recovers_chunks_including_unicode() {
+        use arrow::array::ArrayRef;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use chunking::{ChunkingConfig, RecursiveSplittingChunker};
+        use datafusion::datasource::MemTable;
+        use datafusion::logical_expr::Operator;
+        use datafusion::prelude::{
+            SessionContext, array_element, binary_expr, cast, col, lit, substring,
+        };
+        use std::sync::Arc;
+
+        let cfg = ChunkingConfig {
+            target_chunk_size: 4,
+            overlap_size: 0,
+            trim_whitespace: false,
+            file_format: None,
+        };
+        let text_chunker =
+            RecursiveSplittingChunker::with_character_sizer(&cfg).expect("create chunker");
+
+        // Multi-byte characters so byte and character offsets diverge — the heart
+        // of the bug. The first chunk also exercises the 0-based→1-based fix.
+        let text = "café über señor data points";
+        let chunked: Vec<((usize, usize), String)> = text_chunker
+            .chunk_with_char_offsets(text)
+            .map(|(off, c)| (off, c.to_string()))
+            .collect();
+        assert!(
+            chunked.len() >= 2,
+            "need multiple chunks to exercise offsets, got {}",
+            chunked.len()
+        );
+
+        let offsets: Vec<Vec<(usize, usize)>> = vec![chunked.iter().map(|(off, _)| *off).collect()];
+        let offset_arr = to_offset_array(&offsets, false);
+        let n = chunked.len();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("q", DataType::Utf8, false),
+            Field::new("q_offset", offset_arr.data_type().clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![text; n])) as ArrayRef,
+                Arc::new(offset_arr) as ArrayRef,
+            ],
+        )
+        .expect("build record batch");
+
+        let ctx = SessionContext::new();
+        let table = MemTable::try_new(schema, vec![vec![batch]]).expect("create memtable");
+        let df = ctx.read_table(Arc::new(table)).expect("read table");
+
+        // Mirrors the extraction in `SearchTableProvider::add_match_column`
+        // (crates/search/src/provider.rs) and the candidate vector read path
+        // (crates/runtime-search/src/candidate/vector.rs): 0-based character
+        // offsets, 1-based char-counted `substring`, so start = offset[1] + 1
+        // and length = offset[2] - offset[1].
+        let start = array_element(col("q_offset"), lit(1));
+        let extracted = df
+            .select(vec![
+                cast(
+                    substring(
+                        col("q"),
+                        binary_expr(start.clone(), Operator::Plus, lit(1)),
+                        binary_expr(
+                            array_element(col("q_offset"), lit(2)),
+                            Operator::Minus,
+                            start,
+                        ),
+                    ),
+                    DataType::Utf8,
+                )
+                .alias("match"),
+            ])
+            .expect("select substring");
+
+        let results = extracted.collect().await.expect("collect results");
+        let total: usize = results.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total, n, "one extracted snippet per chunk");
+
+        let col0 = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("utf8 match column");
+        for (i, (_, chunk)) in chunked.iter().enumerate() {
+            assert_eq!(
+                col0.value(i),
+                chunk.as_str(),
+                "extracted snippet must equal the original chunk (row {i})"
+            );
+        }
     }
 
     #[test]
@@ -917,6 +1027,8 @@ mod tests {
         search_column: String,
         calls: AtomicUsize,
         row_counts: std::sync::Mutex<Vec<usize>>,
+        /// What this mock reports from [`Index::write_complete_failure_is_fatal`].
+        write_complete_fatal: bool,
     }
 
     impl RecordingInner {
@@ -925,6 +1037,14 @@ mod tests {
                 search_column: search_column.to_string(),
                 calls: AtomicUsize::new(0),
                 row_counts: std::sync::Mutex::new(Vec::new()),
+                write_complete_fatal: false,
+            }
+        }
+
+        fn with_fatal_write_complete(search_column: &str) -> Self {
+            Self {
+                write_complete_fatal: true,
+                ..Self::new(search_column)
             }
         }
     }
@@ -937,8 +1057,24 @@ mod tests {
         fn required_columns(&self) -> Vec<String> {
             vec![self.search_column.clone()]
         }
+        fn write_complete_failure_is_fatal(&self) -> bool {
+            self.write_complete_fatal
+        }
         fn as_any(&self) -> &dyn Any {
             self
+        }
+    }
+
+    #[async_trait]
+    impl VectorIndex for RecordingInner {
+        fn list_table_provider(&self) -> Result<LogicalPlan, DataFusionError> {
+            Err(DataFusionError::NotImplemented(
+                "RecordingInner stores embeddings in the underlying table".to_string(),
+            ))
+        }
+
+        fn dimension(&self) -> i32 {
+            4
         }
     }
 
@@ -1032,6 +1168,43 @@ mod tests {
             ],
         )
         .expect("valid batch")
+    }
+
+    /// The chunking layer must not downgrade a fatal inner index to best-effort — a
+    /// wrapper inheriting the trait default is exactly the silent no-op #12038 fixes.
+    #[test]
+    fn chunked_search_index_forwards_write_complete_fatality() {
+        let chunker = || Arc::new(DelimChunker { delim: ' ' }) as Arc<dyn Chunker>;
+
+        let best_effort = ChunkedSearchIndex::new(
+            Arc::new(RecordingInner::new("content")) as Arc<dyn SearchIndex>,
+            chunker(),
+        );
+        assert!(!best_effort.write_complete_failure_is_fatal());
+
+        let fatal = ChunkedSearchIndex::new(
+            Arc::new(RecordingInner::with_fatal_write_complete("content")) as Arc<dyn SearchIndex>,
+            chunker(),
+        );
+        assert!(fatal.write_complete_failure_is_fatal());
+    }
+
+    #[test]
+    fn chunked_vector_index_forwards_write_complete_fatality() {
+        let chunker = || Arc::new(DelimChunker { delim: ' ' }) as Arc<dyn Chunker>;
+
+        let best_effort = ChunkedVectorIndex {
+            inner: Arc::new(RecordingInner::new("content")) as Arc<dyn VectorIndex>,
+            chunker: chunker(),
+        };
+        assert!(!best_effort.write_complete_failure_is_fatal());
+
+        let fatal = ChunkedVectorIndex {
+            inner: Arc::new(RecordingInner::with_fatal_write_complete("content"))
+                as Arc<dyn VectorIndex>,
+            chunker: chunker(),
+        };
+        assert!(fatal.write_complete_failure_is_fatal());
     }
 
     /// Smoke test: a tiny input that fits comfortably under the budget should result in exactly

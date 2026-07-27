@@ -24,11 +24,11 @@ use anyhow::{Result, anyhow};
 
 use arrow::{
     array::{
-        Array, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float32Array, Float64Array,
-        Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
-        StringViewArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-        TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
-        UInt64Array,
+        Array, BooleanArray, Date32Array, Date64Array, Decimal128Array, Decimal256Array,
+        Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+        LargeStringArray, RecordBatch, StringArray, StringViewArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+        UInt16Array, UInt32Array, UInt64Array,
     },
     csv::reader::Format,
     datatypes::TimeUnit,
@@ -339,6 +339,40 @@ pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<S
                 (a.to_string(), b.to_string())
             } else {
                 ("0".to_string(), format!("{str_val:0>scale$}"))
+            };
+
+            if frac_part.is_empty() {
+                Ok(Some(format!("{sign}{int_part}")))
+            } else {
+                Ok(Some(format!("{sign}{int_part}.{frac_part}")))
+            }
+        }
+
+        DataType::Decimal256(_, scale) => {
+            let val = array
+                .as_any()
+                .downcast_ref::<Decimal256Array>()
+                .ok_or_else(|| anyhow!("Failed to downcast Decimal256 array"))?
+                .value(index);
+
+            // `i256::to_string()` renders the full signed integer; split it into
+            // integer/fractional parts by the declared scale, mirroring the
+            // Decimal128 arm. Working from the string sidesteps i256 abs/compare
+            // APIs and preserves the exact digits. A `MySQL` `SUM(..)` widens to
+            // DECIMAL(65, s) -> Arrow Decimal256(76, s); this renders the same
+            // string the Int64/Decimal128 side produces, so the values compare
+            // equal (scale 0 -> integer string; scale s -> s fractional digits).
+            let str_signed = val.to_string();
+            let sign = if str_signed.starts_with('-') { "-" } else { "" };
+            let abs_str = str_signed.strip_prefix('-').unwrap_or(&str_signed);
+            let scale = usize::try_from(*scale)?;
+
+            let len = abs_str.len();
+            let (int_part, frac_part) = if len > scale {
+                let (a, b) = abs_str.split_at(len - scale);
+                (a.to_string(), b.to_string())
+            } else {
+                ("0".to_string(), format!("{abs_str:0>scale$}"))
             };
 
             if frac_part.is_empty() {
@@ -676,10 +710,10 @@ mod test {
     use super::*;
     use arrow::{
         array::{
-            Decimal128Builder, Float32Array, Int8Array, Int16Array, UInt8Array, UInt16Array,
-            UInt32Array, UInt64Array,
+            Decimal128Builder, Decimal256Builder, Float32Array, Int8Array, Int16Array, UInt8Array,
+            UInt16Array, UInt32Array, UInt64Array,
         },
-        datatypes::{Field, Schema, SchemaRef},
+        datatypes::{Field, Schema, SchemaRef, i256},
     };
     use rstest::rstest;
     use std::sync::Arc;
@@ -985,6 +1019,28 @@ mod test {
             .with_precision_and_scale(38, scale)
             .expect("Should create builder");
         builder.append_value(value);
+        let array = builder.finish();
+
+        let result = array_value_to_string(&array, 0).expect("Should convert value to string");
+        assert_eq!(result, Some(expected.to_string()));
+    }
+
+    // A `MySQL` `SUM(DECIMAL)` widens to Decimal256(76, scale); ensure the i256
+    // arm renders identically to the Decimal128 arm across sign, scale 0/>0, and
+    // the scale-exceeds-digits case (fractional zero-padding).
+    #[rstest]
+    #[case(0, 12_345_i128, "12345")]
+    #[case(2, 12_345_i128, "123.45")]
+    #[case(3, 12_345_i128, "12.345")]
+    #[case(0, -12_345_i128, "-12345")]
+    #[case(2, -12_345_i128, "-123.45")]
+    #[case(6, 1_i128, "0.000001")]
+    #[case(4, -7_i128, "-0.0007")]
+    fn test_decimal256_values(#[case] scale: i8, #[case] value: i128, #[case] expected: &str) {
+        let mut builder = Decimal256Builder::new()
+            .with_precision_and_scale(76, scale)
+            .expect("Should create Decimal256 builder");
+        builder.append_value(i256::from_i128(value));
         let array = builder.finish();
 
         let result = array_value_to_string(&array, 0).expect("Should convert value to string");

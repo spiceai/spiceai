@@ -1,0 +1,32 @@
+[package]
+name = "connector-git"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+description = "Git data connector for Spice.ai runtime"
+
+[dependencies]
+arrow.workspace = true
+async-trait.workspace = true
+dashmap = "6.1"
+data_components = { path = "../../data_components" }
+datafusion.workspace = true
+git2.workspace = true
+globset.workspace = true
+linkme.workspace = true
+opentelemetry.workspace = true
+regex.workspace = true
+tempfile.workspace = true
+url.workspace = true
+reqwest.workspace = true
+runtime = { path = "../../runtime" }
+runtime-api-types = { path = "../../runtime-api-types" }
+runtime-metrics = { path = "../../runtime-metrics" }
+secrecy.workspace = true
+snafu.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

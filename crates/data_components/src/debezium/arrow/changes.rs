@@ -21,6 +21,7 @@ use crate::{
         arrow::downcast_builder,
         change_event::{ChangeEvent, Op},
     },
+    schema_projection::SchemaProjection,
 };
 use arrow::{
     array::{ArrayBuilder, ListBuilder, RecordBatch, StringBuilder},
@@ -33,12 +34,19 @@ pub fn to_change_batch(
     table_schema: &SchemaRef,
     primary_key: &[String],
     change: &ChangeEvent,
+    projection: Option<&SchemaProjection>,
 ) -> super::Result<ChangeBatch> {
     let schema = changes_schema(table_schema);
 
     let mut struct_builder = StructBuilder::from_fields(schema.fields().clone(), 1);
 
-    append_change_event(&mut struct_builder, &schema, primary_key, change)?;
+    append_change_event(
+        &mut struct_builder,
+        &schema,
+        primary_key,
+        change,
+        projection,
+    )?;
 
     let struct_array = struct_builder.finish();
     let record_batch: RecordBatch = struct_array.into();
@@ -56,13 +64,20 @@ pub fn vector_to_change_batch(
     table_schema: &SchemaRef,
     primary_key: &[String],
     changes: &[&ChangeEvent],
+    projection: Option<&SchemaProjection>,
 ) -> super::Result<ChangeBatch> {
     let schema = changes_schema(table_schema);
 
     let mut struct_builder = StructBuilder::from_fields(schema.fields().clone(), changes.len());
 
     for change in changes {
-        append_change_event(&mut struct_builder, &schema, primary_key, change)?;
+        append_change_event(
+            &mut struct_builder,
+            &schema,
+            primary_key,
+            change,
+            projection,
+        )?;
     }
 
     let struct_array = struct_builder.finish();
@@ -82,6 +97,7 @@ fn append_change_event(
     schema: &Schema,
     primary_key: &[String],
     change: &ChangeEvent,
+    projection: Option<&SchemaProjection>,
 ) -> super::Result<()> {
     if primary_key.is_empty() && matches!(change.payload.op, Op::Update) {
         let before = change
@@ -89,18 +105,19 @@ fn append_change_event(
             .before
             .clone()
             .context(super::UpdateOpWithoutBeforeFieldSnafu)?;
-        append_change_row(struct_builder, schema, primary_key, "d", before)?;
+        append_change_row(struct_builder, schema, primary_key, "d", before, projection)?;
         append_change_row(
             struct_builder,
             schema,
             primary_key,
             "c",
             change.payload.after.clone(),
+            projection,
         )?;
         return Ok(());
     }
 
-    let op = change.payload.op.to_string();
+    let op = change.payload.op.as_str();
     let change_data = match change.payload.op {
         Op::Delete => change
             .payload
@@ -110,7 +127,14 @@ fn append_change_event(
         _ => change.payload.after.clone(),
     };
 
-    append_change_row(struct_builder, schema, primary_key, &op, change_data)
+    append_change_row(
+        struct_builder,
+        schema,
+        primary_key,
+        op,
+        change_data,
+        projection,
+    )
 }
 
 fn append_change_row(
@@ -119,8 +143,16 @@ fn append_change_row(
     primary_key: &[String],
     op: &str,
     change_data: serde_json::Value,
+    projection: Option<&SchemaProjection>,
 ) -> super::Result<()> {
     struct_builder.append(true);
+    // Apply JSON nesting: fold non-declared fields of the `before`/`after`
+    // row into the catch-all column before Arrow conversion. Type-only
+    // projections (no catch-all) leave the row unchanged.
+    let change_data = match projection.filter(|p| p.has_catch_all()) {
+        Some(projection) => projection.project_row(change_data),
+        None => change_data,
+    };
     let mut change_data = Some(change_data);
 
     for (idx, field) in schema.fields().iter().enumerate() {
@@ -165,4 +197,91 @@ fn append_change_row(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema_projection::{ColumnSource, ProjectedColumn, SchemaProjection};
+    use arrow::array::StringArray;
+    use arrow::datatypes::{DataType, Field as ArrowField};
+    use std::sync::Arc;
+
+    fn change_event(after: &serde_json::Value) -> ChangeEvent {
+        // Minimal Debezium create event; only `payload.after`/`op` matter here.
+        let value = serde_json::json!({
+            "schema": {"type": "struct", "fields": [], "optional": false, "name": "s"},
+            "payload": {
+                "before": null,
+                "after": after.clone(),
+                "source": {
+                    "version": "x", "connector": "x", "name": "x", "ts_ms": 0,
+                    "snapshot": "false", "db": "x", "table": "x"
+                },
+                "op": "c",
+                "ts_ms": 0,
+                "transaction": null
+            }
+        });
+        serde_json::from_value(value).expect("valid change event")
+    }
+
+    /// A `json_object` catch-all column folds every non-declared `after` field
+    /// into one sorted-JSON string column on the Debezium change path.
+    #[test]
+    fn json_nesting_folds_into_catch_all() {
+        // Projected (exposed) data schema: declared `id` + catch-all `data`.
+        let table_schema: SchemaRef = Arc::new(Schema::new(vec![
+            ArrowField::new("id", DataType::Utf8, true),
+            ArrowField::new("data", DataType::Utf8, true),
+        ]));
+        let projection = SchemaProjection::new(
+            vec![
+                ProjectedColumn {
+                    output_name: "id".to_string(),
+                    source: ColumnSource::Field,
+                    declared_type: Some(DataType::Utf8),
+                    nullable: true,
+                },
+                ProjectedColumn {
+                    output_name: "data".to_string(),
+                    source: ColumnSource::JsonObject,
+                    declared_type: None,
+                    nullable: true,
+                },
+            ],
+            &["id".to_string()],
+        )
+        .expect("projection");
+
+        let change = change_event(&serde_json::json!({
+            "id": "row1",
+            "zeta": 2,
+            "alpha": 1
+        }));
+
+        let batch = to_change_batch(
+            &table_schema,
+            &["id".to_string()],
+            &change,
+            Some(&projection),
+        )
+        .expect("change batch");
+        let data = batch.data(0);
+
+        let id = data
+            .column(data.schema().index_of("id").expect("id col"))
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("id utf8");
+        assert_eq!(id.value(0), "row1");
+
+        let catch_all = data
+            .column(data.schema().index_of("data").expect("data col"))
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("data utf8");
+        // non-declared fields, alphabetically sorted
+        assert_eq!(catch_all.value(0), r#"{"alpha":1,"zeta":2}"#);
+    }
 }

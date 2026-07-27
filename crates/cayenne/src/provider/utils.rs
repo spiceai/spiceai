@@ -21,6 +21,18 @@ limitations under the License.
 
 use std::convert::TryInto;
 
+/// Encode an `i64` primary key as big-endian bytes without an intermediate `Vec`.
+#[inline]
+pub(crate) fn i64_key(pk: i64) -> Box<[u8]> {
+    Box::from(pk.to_be_bytes())
+}
+
+/// Copy key bytes into a `Box<[u8]>` without an intermediate `Vec`.
+#[inline]
+pub(crate) fn bytes_key(s: &[u8]) -> Box<[u8]> {
+    Box::from(s)
+}
+
 /// Generic conversion function that handles type conversion with proper error handling.
 ///
 /// This is the core conversion utility that all type conversion functions delegate to.

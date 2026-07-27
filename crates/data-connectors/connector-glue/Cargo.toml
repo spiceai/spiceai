@@ -1,0 +1,14 @@
+[package]
+name = "connector-glue"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+description = "AWS Glue data connector for Spice.ai runtime"
+
+[dependencies]
+linkme.workspace = true
+runtime = { path = "../../runtime" }
+
+[lints]
+workspace = true

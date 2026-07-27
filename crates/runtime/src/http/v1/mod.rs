@@ -15,12 +15,12 @@ limitations under the License.
 */
 
 pub mod catalogs;
+pub mod cdc;
 pub mod chat;
 pub mod datasets;
 pub mod embeddings;
 pub mod functions;
 pub mod iceberg;
-pub mod inference;
 pub mod responses;
 pub mod snapshots;
 
@@ -43,21 +43,27 @@ use crate::{
     datafusion::{
         DataFusion,
         query::{
-            Error as QueryError, QueryBuilder, is_cancellation_error, write_to_json_string,
-            write_to_json_value,
+            Error as QueryError, QueryBuilder, TransactionError, is_cancellation_error,
+            is_timeout_error, json_array_writer, run_transaction, schema_has_union_columns,
+            transaction_statements, write_to_json_string, write_to_json_value,
         },
     },
+    egress::EgressAccount,
     status::ComponentStatus,
 };
 use arrow::{array::RecordBatch, util::pretty::pretty_format_batches};
+use async_stream::try_stream;
 use axum::{
+    body::Body,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use axum_extra::TypedHeader;
+use bytes::Bytes;
 use cache::result::CacheStatus;
 use csv::Writer;
 use datafusion::common::ParamValues;
+use datafusion::execution::{SendableRecordBatchStream, memory_pool::MemoryPool};
 use headers_accept::Accept;
 use http::{
     HeaderValue,
@@ -67,7 +73,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::ResultExt;
 
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 
 use runtime_auth::AuthPrincipalRef;
 use runtime_request_context::{AsyncMarker, CacheNamespace, RequestContext};
@@ -176,9 +182,9 @@ impl ResponseMetadata {
     }
 }
 
-/// Gets all possible media types from a `Accept` header.
-pub(crate) fn accept_header_types(accept: &TypedHeader<Accept>) -> Vec<String> {
-    accept.0.media_types().map(ToString::to_string).collect()
+/// Gets all possible media types from a `Accept` header without allocating.
+pub(crate) fn accept_header_types(accept: &TypedHeader<Accept>) -> impl Iterator<Item = &str> + '_ {
+    accept.0.media_types().map(AsRef::<str>::as_ref)
 }
 
 impl ResponseMimeType {
@@ -198,8 +204,7 @@ impl ResponseMimeType {
     pub fn from_accept_header(accept: Option<&TypedHeader<Accept>>) -> ResponseMimeType {
         accept.map_or(ResponseMimeType::default(), |header| {
             accept_header_types(header)
-                .iter()
-                .find_map(|h| match h.as_str() {
+                .find_map(|h| match h {
                     "application/json" => Some(ResponseMimeType::Json),
                     "application/vnd.spiceai.nsql.v1+json" => Some(ResponseMimeType::VndNsqlJsonV1),
                     "application/vnd.spiceai.sql.v1+json" => Some(ResponseMimeType::VndSqlJsonV1),
@@ -237,44 +242,237 @@ fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
     }
 }
 
-// Runs query and converts query results to HTTP response (as JSON).
+// Runs a query and converts the results to an HTTP response.
+//
+// The default JSON format is streamed batch-by-batch via a chunked body, so the
+// full result set is never materialized in memory (previously it was buffered
+// twice — once as `Vec<RecordBatch>`, then again as the rendered `String`). The
+// other formats — csv, plain, the vnd.* envelopes, and JSON containing union
+// columns — still buffer via `to_http_response`.
 pub async fn sql_to_http_response(
     df: Arc<DataFusion>,
-    sql: &str,
+    sql: Arc<str>,
     parameters: Option<ParamValues>,
     format: ResponseMimeType,
     read_only: bool,
 ) -> Response {
-    let (data, results_cache_status) =
-        match run_sql_with_read_only(df, sql, parameters, read_only).await {
-            Ok((data, results_cache_status)) => (data, results_cache_status),
-            Err(e) => {
-                let message = e.to_string();
-                tracing::debug!("Error executing query: {message}");
-                let status = if e
-                    .downcast_ref::<datafusion::error::DataFusionError>()
-                    .is_some_and(is_cancellation_error)
-                    || e.downcast_ref::<QueryError>()
-                        .is_some_and(|err| matches!(err, QueryError::QueryCancelled { .. }))
-                {
-                    // 499 Client Closed Request: used for cancelled queries so
-                    // clients can distinguish cancellation from a bad request.
-                    StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST)
-                } else {
-                    status_for_sql_error(&message)
-                };
-                return (status, message).into_response();
-            }
-        };
+    // A `BEGIN … COMMIT` body is run by the shared transaction orchestrator
+    // rather than the ordinary single-statement path.
+    if let Some(statements) = transaction_statements(&sql) {
+        return transaction_to_http_response(df, statements, parameters, read_only, format).await;
+    }
 
-    to_http_response(
-        data,
-        results_cache_status,
-        format,
-        ResponseMetadata::empty(),
-    )
-    .await
-    .into_response()
+    // Capture the query memory pool before `df` is moved into the builder, so a
+    // streamed body can charge its egress buffers against the pool the query ran
+    // under (see `EgressAccount`).
+    let memory_pool = Arc::clone(&df.ctx.runtime_env().memory_pool);
+
+    let query_res = match QueryBuilder::new_arc(sql, df)
+        .parameters(parameters)
+        .read_only(read_only)
+        .build()
+        .run()
+        .await
+    {
+        Ok(res) => res,
+        Err(e) => {
+            let kind = SqlErrorKind::of_query_error(&e);
+            return sql_error_response(e.to_string(), kind);
+        }
+    };
+
+    query_stream_to_http_response(query_res.data, query_res.cache_status, format, memory_pool).await
+}
+
+/// Converts a query stream to the requested HTTP response format.
+///
+/// Default JSON responses stream batch-by-batch. Formats that require complete
+/// result metadata, and JSON schemas containing union columns, use the buffered
+/// response path.
+async fn query_stream_to_http_response(
+    mut data_stream: SendableRecordBatchStream,
+    cache_status: CacheStatus,
+    format: ResponseMimeType,
+    memory_pool: Arc<dyn MemoryPool>,
+) -> Response {
+    // Stream only the default JSON format with non-union columns; csv/plain/vnd
+    // buffer via `to_http_response`, and union columns (which the arrow-json array
+    // writer can't render) fall back to the buffered JSON path. Streamability is a
+    // schema property, so decide it before pulling any batch.
+    if !matches!(format, ResponseMimeType::Json) || schema_has_union_columns(&data_stream.schema())
+    {
+        return buffered_sql_response(data_stream, cache_status, format).await;
+    }
+
+    // Pull the first batch eagerly so the common immediate-execution error still
+    // yields a clean status code instead of a truncated 200 response.
+    let first = match data_stream.next().await {
+        Some(Ok(batch)) => Some(batch),
+        Some(Err(e)) => {
+            return sql_error_response(e.to_string(), SqlErrorKind::of_datafusion_error(&e));
+        }
+        None => None,
+    };
+
+    let headers = response_headers(format, cache_status).await;
+    let account = EgressAccount::register(&memory_pool, "http_egress");
+    let body = Body::from_stream(json_array_body_stream(first, data_stream, account));
+    (StatusCode::OK, headers, body).into_response()
+}
+
+/// Run a `BEGIN … COMMIT` body through the shared transaction orchestrator
+/// and shape the outcome (or error) into an HTTP response.
+async fn transaction_to_http_response(
+    df: Arc<DataFusion>,
+    statements: Vec<String>,
+    parameters: Option<ParamValues>,
+    read_only: bool,
+    format: ResponseMimeType,
+) -> Response {
+    match run_transaction(&df, &statements, parameters, read_only).await {
+        Ok(outcome) => match outcome.result {
+            // Return the final statement's result (for the canonical gate+write
+            // shape, the write's row-count summary).
+            Some((batches, cache_status)) => {
+                to_http_response(batches, cache_status, format, ResponseMetadata::empty())
+                    .await
+                    .into_response()
+            }
+            None => (StatusCode::OK, "COMMIT").into_response(),
+        },
+        Err(error) => transaction_error_to_response(error),
+    }
+}
+
+/// Map a [`TransactionError`] to the HTTP response the `/v1/sql` path returns.
+fn transaction_error_to_response(error: TransactionError) -> Response {
+    match error {
+        TransactionError::Rejected(message) => sql_error_response(message, SqlErrorKind::General),
+        TransactionError::Plan(e) | TransactionError::Stream(e) => {
+            sql_error_response(e.to_string(), SqlErrorKind::of_datafusion_error(&e))
+        }
+        TransactionError::Query(e) => {
+            sql_error_response(e.to_string(), SqlErrorKind::of_query_error(&e))
+        }
+        TransactionError::Conflict { table } => {
+            // Optimistic-concurrency conflict: a participant was committed to
+            // between this transaction's start and commit. Retryable — map to
+            // 409 so the client can re-run at the newest committed state.
+            (
+                StatusCode::CONFLICT,
+                format!(
+                    "transaction write conflict on '{table}': a participant table changed since the transaction started; retry"
+                ),
+            )
+                .into_response()
+        }
+        TransactionError::Publish(message) => sql_error_response(
+            format!("transaction publish failed: {message}"),
+            SqlErrorKind::General,
+        ),
+    }
+}
+
+/// Classifies a query error for HTTP status mapping: client-initiated
+/// cancellation maps to 499 Client Closed Request, a `runtime.query.timeout`
+/// expiry maps to 504 Gateway Timeout, everything else falls through to
+/// [`status_for_sql_error`].
+#[derive(Clone, Copy)]
+enum SqlErrorKind {
+    General,
+    Cancellation,
+    Timeout,
+}
+
+impl SqlErrorKind {
+    fn of_query_error(e: &QueryError) -> Self {
+        match e {
+            QueryError::QueryCancelled { .. } => Self::Cancellation,
+            QueryError::QueryTimedOut { .. } => Self::Timeout,
+            _ => Self::General,
+        }
+    }
+
+    fn of_datafusion_error(e: &datafusion::error::DataFusionError) -> Self {
+        if is_cancellation_error(e) {
+            Self::Cancellation
+        } else if is_timeout_error(e) {
+            Self::Timeout
+        } else {
+            Self::General
+        }
+    }
+}
+
+/// Maps a query error message to an HTTP response, distinguishing cancellation
+/// (499 Client Closed Request) and query timeout (504 Gateway Timeout) from
+/// other errors.
+fn sql_error_response(message: String, kind: SqlErrorKind) -> Response {
+    tracing::debug!("Error executing query: {message}");
+    let status = match kind {
+        SqlErrorKind::Cancellation => StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
+        SqlErrorKind::Timeout => StatusCode::GATEWAY_TIMEOUT,
+        SqlErrorKind::General => status_for_sql_error(&message),
+    };
+    (status, message).into_response()
+}
+
+/// Buffered (non-streaming) response path for formats that cannot stream.
+async fn buffered_sql_response(
+    data_stream: SendableRecordBatchStream,
+    cache_status: CacheStatus,
+    format: ResponseMimeType,
+) -> Response {
+    let data = match data_stream.try_collect::<Vec<RecordBatch>>().await {
+        Ok(data) => data,
+        Err(e) => return sql_error_response(e.to_string(), SqlErrorKind::of_datafusion_error(&e)),
+    };
+    to_http_response(data, cache_status, format, ResponseMetadata::empty())
+        .await
+        .into_response()
+}
+
+/// Streams the query result as a single JSON array, one input batch at a time,
+/// charging each serialized chunk against the query memory pool via `account`.
+/// The bytes emitted are identical to the non-streamed `arrow_to_json` output.
+fn json_array_body_stream(
+    first: Option<RecordBatch>,
+    rest: SendableRecordBatchStream,
+    account: Arc<EgressAccount>,
+) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    let mut batches =
+        futures::stream::iter(first.map(Ok::<_, datafusion::error::DataFusionError>)).chain(rest);
+    try_stream! {
+        // One JSON-array writer drives the whole response: it emits the opening
+        // `[`, the inter-row/inter-batch commas, and the closing `]`, so the
+        // streamed bytes match `arrow_to_json` exactly. Drain its buffer after
+        // each write to yield a chunk (zero-copy — `mem::take` moves the `Vec`).
+        let mut writer = json_array_writer();
+        while let Some(item) = batches.next().await {
+            let batch = item.map_err(|e| std::io::Error::other(e.to_string()))?;
+            writer
+                .write(&batch)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            let chunk = std::mem::take(writer.get_mut());
+            if !chunk.is_empty() {
+                let size = chunk.len();
+                account.reserve(size).await;
+                yield Bytes::from(chunk);
+                account.release(size);
+            }
+        }
+        // Closes the array (`]`), or emits `[]` for an empty result.
+        writer
+            .finish()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let tail = std::mem::take(writer.get_mut());
+        if !tail.is_empty() {
+            let size = tail.len();
+            account.reserve(size).await;
+            yield Bytes::from(tail);
+            account.release(size);
+        }
+    }
 }
 
 // Runs query and returns the results as a vector of `RecordBatch`.
@@ -306,15 +504,13 @@ pub async fn run_sql_with_read_only(
     ))
 }
 
-// Converts query result to HTTP response (as JSON).
+// Converts a buffered query result to an HTTP response.
 pub async fn to_http_response(
     data: Vec<RecordBatch>,
     cache_status: CacheStatus,
     format: ResponseMimeType,
     meta: ResponseMetadata,
 ) -> (StatusCode, HeaderMap, String) {
-    let mut headers = HeaderMap::new();
-
     let res = match format {
         ResponseMimeType::Json => arrow_to_json(&data),
         ResponseMimeType::Csv => arrow_to_csv(&data),
@@ -327,10 +523,26 @@ pub async fn to_http_response(
     let body = match res {
         Ok(body) => body,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                HeaderMap::new(),
+                e.to_string(),
+            );
         }
     };
 
+    (
+        StatusCode::OK,
+        response_headers(format, cache_status).await,
+        body,
+    )
+}
+
+/// Builds the content-type + cache-metadata headers for a query response. These
+/// are computable before the body since `cache_status` is known once the query
+/// starts producing rows, so they can precede a streamed body.
+async fn response_headers(format: ResponseMimeType, cache_status: CacheStatus) -> HeaderMap {
+    let mut headers = HeaderMap::new();
     let request_context = RequestContext::current(AsyncMarker::new().await);
 
     if let Some(header_value) = format.to_accept_header() {
@@ -344,7 +556,7 @@ pub async fn to_http_response(
         &request_context,
     );
 
-    (StatusCode::OK, headers, body)
+    headers
 }
 
 fn attach_cache_headers(
@@ -357,11 +569,8 @@ fn attach_cache_headers(
         headers.insert("X-Cache", val);
     }
 
-    if let Some(val) = results_cache_status
-        .to_header_string()
-        .and_then(|v| v.parse().ok())
-    {
-        headers.insert("Results-Cache-Status", val);
+    if let Some(val) = results_cache_status.to_header_string() {
+        headers.insert("Results-Cache-Status", HeaderValue::from_static(val));
     }
 
     // Surface the cache scope so callers can tell whether a MISS came
@@ -512,7 +721,103 @@ mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::scalar::ScalarValue;
     use std::sync::Arc;
+
+    use crate::{
+        dataaccelerator::AcceleratorEngineRegistry, datafusion::builder::DataFusionBuilder,
+        status::RuntimeStatus,
+    };
+
+    /// `/v1/sql` must let clients distinguish outcomes by status code: a
+    /// `runtime.query.timeout` expiry maps to 504 Gateway Timeout, a
+    /// client-initiated cancel to 499, and both classifications must hold for
+    /// the pre-stream (`QueryError`) and mid-stream (`DataFusionError`) paths.
+    #[test]
+    fn sql_error_response_status_for_timeout_and_cancellation() {
+        let timeout_err = QueryError::QueryTimedOut {
+            query_id: "q1".to_string(),
+            timeout: "30s".to_string(),
+        };
+        let response = sql_error_response(
+            timeout_err.to_string(),
+            SqlErrorKind::of_query_error(&timeout_err),
+        );
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+
+        let cancel_err = QueryError::QueryCancelled {
+            query_id: "q1".to_string(),
+        };
+        let response = sql_error_response(
+            cancel_err.to_string(),
+            SqlErrorKind::of_query_error(&cancel_err),
+        );
+        assert_eq!(response.status().as_u16(), 499);
+
+        // Mid-stream errors arrive as DataFusionError::External wrapping the
+        // query error (produced by `attach_cancellation_to_stream`).
+        let stream_timeout =
+            datafusion::error::DataFusionError::External(Box::new(QueryError::QueryTimedOut {
+                query_id: "q1".to_string(),
+                timeout: "30s".to_string(),
+            }));
+        let response = sql_error_response(
+            stream_timeout.to_string(),
+            SqlErrorKind::of_datafusion_error(&stream_timeout),
+        );
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+
+        let stream_cancel =
+            datafusion::error::DataFusionError::External(Box::new(QueryError::QueryCancelled {
+                query_id: "q1".to_string(),
+            }));
+        let response = sql_error_response(
+            stream_cancel.to_string(),
+            SqlErrorKind::of_datafusion_error(&stream_cancel),
+        );
+        assert_eq!(response.status().as_u16(), 499);
+    }
+
+    #[test]
+    fn transaction_statements_requires_begin_and_commit() {
+        assert_eq!(
+            transaction_statements("BEGIN; SELECT 1; COMMIT"),
+            Some(vec!["SELECT 1".to_string()])
+        );
+        assert!(transaction_statements("SELECT 1; SELECT 2").is_none());
+        assert!(transaction_statements("BEGIN; COMMIT").is_none());
+    }
+
+    #[tokio::test]
+    async fn transaction_executes_bound_parameters_and_returns_final_result() {
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                tokio::runtime::Handle::current(),
+            )
+            .build(),
+        );
+        let parameters = ParamValues::from(vec![
+            ScalarValue::Int64(Some(41)),
+            ScalarValue::Int64(Some(42)),
+        ]);
+
+        let response = sql_to_http_response(
+            df,
+            Arc::from("BEGIN; SELECT $1 AS ignored; SELECT $2 AS value; COMMIT"),
+            Some(parameters),
+            ResponseMimeType::Json,
+            false,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("transaction response body should be readable");
+        assert_eq!(body.as_ref(), br#"[{"value":42}]"#);
+    }
 
     #[test]
     fn test_arrow_to_vnd_json_v1() {
@@ -545,5 +850,69 @@ mod tests {
             "vnd_json_v1_with_sql",
             serde_json::from_str::<serde_json::Value>(&result_with_sql).expect("to parse")
         );
+    }
+
+    /// The chunked `/v1/sql` JSON body must be byte-identical to the buffered
+    /// `arrow_to_json` output across multi-batch, empty, and NULL cases.
+    #[tokio::test]
+    async fn json_array_body_stream_matches_buffered_output() {
+        use arrow::array::ArrayRef;
+        use datafusion::error::DataFusionError;
+        use datafusion::execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let make = |ids: Vec<Option<i64>>, names: Vec<Option<&str>>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)) as ArrayRef,
+                    Arc::new(StringArray::from(names)) as ArrayRef,
+                ],
+            )
+            .expect("record batch")
+        };
+
+        let cases: Vec<Vec<RecordBatch>> = vec![
+            // Multiple batches, an empty batch mid-stream, and NULL values.
+            vec![
+                make(vec![Some(1), None], vec![Some("a"), Some("b")]),
+                make(vec![], vec![]),
+                make(vec![Some(3)], vec![None]),
+            ],
+            // Empty result.
+            vec![],
+            // Single empty batch.
+            vec![make(vec![], vec![])],
+        ];
+
+        for batches in cases {
+            let expected = write_to_json_string(&batches).expect("buffered json");
+
+            let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+            let account = EgressAccount::register(&pool, "test_egress");
+
+            let mut batches = batches.into_iter();
+            let first = batches.next();
+            let rest: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                futures::stream::iter(batches.map(Ok::<_, DataFusionError>)),
+            ));
+
+            let mut body = std::pin::pin!(json_array_body_stream(first, rest, account));
+            let mut streamed = Vec::new();
+            while let Some(chunk) = body.next().await {
+                streamed.extend_from_slice(&chunk.expect("chunk"));
+            }
+
+            assert_eq!(
+                String::from_utf8(streamed).expect("utf8"),
+                expected,
+                "streamed JSON must match buffered arrow_to_json output"
+            );
+        }
     }
 }

@@ -40,7 +40,6 @@ use datafusion::{
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
-use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
 use runtime_datafusion_index::IndexedTableProvider;
 #[cfg(test)]
 use runtime_datafusion_udfs::{
@@ -52,6 +51,7 @@ use runtime_datafusion_udfs::{
     l2_norm::L2_NORM_UDF_NAME,
     truncate::TRUNCATE_SCALAR_UDF_NAME,
 };
+use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
 use runtime_request_context::RequestContext;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -71,23 +71,22 @@ use crate::{
         request_context_extension::get_current_datafusion,
         udf::{UserFunctionInfo, effective_user_function_volatility, user_function_infos},
     },
-    embeddings::table::{EmbeddingInputMode, EmbeddingTable},
-    embeddings::udtf::VECTOR_SEARCH_UDTF_NAME,
-    search::{
-        full_text::udtf::TEXT_SEARCH_UDTF_NAME, rerank::RERANK_UDTF_NAME, rrf::RRF_UDF_NAME,
-        util::find_concrete_table_provider,
+    search::util::find_concrete_table_provider,
+    tools::{SpiceModelTool, utils::tool_call_error_response},
+};
+use runtime_query_engine::query_engine::QueryEngine;
+use runtime_search::{
+    embeddings::table::EmbeddingTable,
+    rerank::RERANK_UDTF_NAME,
+    rrf::RRF_UDF_NAME,
+    udtf::{EmbeddingInputMode, TEXT_SEARCH_UDTF_NAME, VECTOR_SEARCH_UDTF_NAME},
+};
+use runtime_tools::builtin::{
+    sample::{
+        SampleTableMethod, SampleTableParams, distinct::DistinctColumnsParams,
+        random::RandomSampleParams, tool::SampleDataTool,
     },
-    tools::{
-        SpiceModelTool,
-        builtin::{
-            sample::{
-                SampleTableMethod, SampleTableParams, distinct::DistinctColumnsParams,
-                random::RandomSampleParams, tool::SampleDataTool,
-            },
-            table_schema::{TableSchemaTool, TableSchemaToolParams},
-        },
-        utils::tool_call_error_response,
-    },
+    table_schema::{TableSchemaTool, TableSchemaToolParams},
 };
 
 #[cfg(test)]
@@ -437,8 +436,13 @@ async fn table_schema_context(
     rt: Arc<Runtime>,
     table_allowlist: Option<ResolvedTableAwareAllowlist>,
 ) -> Result<String, Box<dyn StdError + Send + Sync>> {
-    let table_schema_tool =
-        TableSchemaTool::new(rt, None, None).with_table_allowlist(table_allowlist);
+    let table_schema_tool = TableSchemaTool::new(
+        rt.datafusion() as Arc<dyn QueryEngine>,
+        Arc::clone(&rt.app),
+        None,
+        None,
+    )
+    .with_table_allowlist(table_allowlist);
     let params = TableSchemaToolParams::new(tables.iter().map(ToString::to_string).collect());
     tool_context_text(&table_schema_tool, &params).await
 }
@@ -660,10 +664,12 @@ fn runtime_indexes_from_provider(
                 .map(|index| {
                     let mut columns = index.required_columns();
                     columns.sort();
+                    let kind =
+                        compound_index_kind(&index).unwrap_or_else(|| index.name().to_string());
                     NsqlIndexContext {
                         name: Some(index.name().to_string()),
                         columns,
-                        kind: index.name().to_string(),
+                        kind,
                         source: "runtime_index".to_string(),
                     }
                 })
@@ -696,19 +702,46 @@ fn dataset_search_function_availability(
 }
 
 fn is_vector_search_index(kind: &str) -> bool {
+    // `"CompoundVectorIndex"` is how `compound_index_kind` reports a vector-composing
+    // `CompoundSearchIndex`; without it here, such a compound would never match a column.
     matches!(
         kind,
         "NativeVectorIndex"
             | "duckdb_vector_index"
             | "elasticsearch_index"
             | "s3_vector_index"
+            | "memory_vector_index"
+            | "CompoundVectorIndex"
             | "ChunkedSearchIndex"
             | "ChunkedVectorIndex"
     )
 }
 
 fn is_full_text_search_index(kind: &str) -> bool {
-    matches!(kind, "full_text" | "elasticsearch_text_index")
+    // A `"CompoundSearchIndex"` kind is only ever a full-text compound here: a vector-composing
+    // `CompoundSearchIndex` is reclassified as `"CompoundVectorIndex"` by `compound_index_kind`
+    // before it reaches this matcher.
+    matches!(
+        kind,
+        "full_text" | "elasticsearch_text_index" | "CompoundSearchIndex"
+    )
+}
+
+/// Resolves the classification `kind` for a `CompoundSearchIndex`, whose [`Index::name`] is the
+/// same (`"CompoundSearchIndex"`) whether it composes vector or full-text tiers. Reports a
+/// vector-composing compound as `"CompoundVectorIndex"` (via [`SearchIndex::as_vector_index`]) so
+/// it is never misclassified as full-text; returns `None` for any other index, leaving the
+/// caller to use [`Index::name`].
+fn compound_index_kind(
+    index: &Arc<dyn runtime_datafusion_index::Index + Send + Sync>,
+) -> Option<String> {
+    use search::index::SearchIndex;
+    use search::index::compound::CompoundSearchIndex;
+
+    let compound = index.as_any().downcast_ref::<CompoundSearchIndex>()?;
+    Arc::new(compound.clone())
+        .as_vector_index()
+        .map(|_| "CompoundVectorIndex".to_string())
 }
 
 fn search_index_for_column(
@@ -1210,7 +1243,7 @@ async fn sample_context_blocks(
                     sample_context_method_order(&method),
                 );
                 let content = tool_context_text(
-                    &SampleDataTool::new(rt.datafusion(), method.clone())
+                    &SampleDataTool::new(rt.datafusion() as Arc<dyn QueryEngine>, method.clone())
                         .with_table_allowlist(allowlist),
                     &params,
                 )

@@ -19,7 +19,7 @@ All criteria must be met for the Catalog to be considered [RC](../definitions.md
 | Oracle        | ➖         |              |
 | PostgreSQL    | ➖         |              |
 | Snowflake     | ➖         |              |
-| Spice.ai      | ➖         |              |
+| Spice.ai      | ✅         | @peasee      |
 | Unity Catalog | ✅         | @Sevenannn   |
 
 ## RC Criteria

@@ -17,7 +17,6 @@ limitations under the License.
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Instant};
 
 use crate::cluster::partition::get_partition_filter_exprs;
-use crate::component::dataset::acceleration::Mode;
 use crate::dataaccelerator::BootstrapStatus;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::caching_engine::CachingEngineSys;
@@ -47,7 +46,6 @@ use crate::{
     embeddings::connector::EmbeddingConnector,
     error_spaced,
     federated_table::FederatedTable,
-    metrics::{self, components::register_component_metric},
     search::full_text::connector::FullTextConnector,
     status,
     tracing_util::dataset_registered_trace,
@@ -55,10 +53,10 @@ use crate::{
 };
 use app::App;
 use datafusion::sql::TableReference;
-#[cfg(any(feature = "duckdb", feature = "sqlite"))]
 use futures::StreamExt;
 use futures::future::join_all;
 use opentelemetry::KeyValue;
+use runtime_metrics::{self as metrics, components::register_component_metric};
 use snafu::prelude::*;
 use tokio::sync::Semaphore;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
@@ -101,7 +99,9 @@ impl Runtime {
             .filter(|ds| init_results.get(&ds.name).is_some_and(Result::is_ok))
             .map(|ds| ds.clone_arc())
             .collect();
-        if let Err(err) = validate_snapshot_paths(initialized_sources).await {
+        if let Err(err) =
+            validate_snapshot_paths(initialized_sources, &self.accelerator_engine_registry).await
+        {
             tracing::error!("{err}");
             return;
         }
@@ -289,6 +289,39 @@ impl Runtime {
                 }
             })
             .collect()
+    }
+
+    /// Resolve the accelerated dataset named `table_ref` and, if a write carrying new
+    /// columns (`target_schema`) arrives, evolve its accelerator schema in place per the
+    /// dataset's `on_schema_change` policy. This is the entrypoint the OpenTelemetry
+    /// metrics ingest path uses to admit new metric dimensions.
+    ///
+    /// Returns `Ok(Some(schema))` when the caller must rebuild its batch against `schema`
+    /// before writing — either because an evolution was just applied, or because the
+    /// accelerator schema is already a superset (e.g. a concurrent writer evolved it, or
+    /// the change was a no-op) and the batch must still match its canonical field order.
+    /// Returns `Ok(None)` when nothing was evolved — unknown dataset, no acceleration, a
+    /// `block`/`fail` policy, or an unsupported/incompatible change. In every `Ok(None)`
+    /// case the caller's write proceeds unchanged.
+    pub async fn evolve_accelerated_schema_for_write(
+        self: &Arc<Self>,
+        table_ref: &TableReference,
+        target_schema: &arrow_schema::SchemaRef,
+    ) -> std::result::Result<Option<arrow_schema::SchemaRef>, crate::datafusion::Error> {
+        let Some(app) = self.read_app().await else {
+            return Ok(None);
+        };
+        let Some(dataset) = Arc::clone(self)
+            .get_valid_datasets(&app, LogErrors(false))
+            .into_iter()
+            .find(|ds| &ds.name == table_ref)
+        else {
+            return Ok(None);
+        };
+
+        self.df
+            .evolve_and_rebind_accelerated_schema(&dataset, self.secrets(), target_schema)
+            .await
     }
 
     #[expect(clippy::result_large_err)]
@@ -571,29 +604,83 @@ impl Runtime {
         }
     }
 
-    /// Apply extended schema inference to a freshly-resolved dataset.
+    /// Bootstraps the accelerator (if any) for a single dataset and loads it
+    /// through the normal dataset lifecycle (connector creation,
+    /// `AcceleratedTable` construction, `DataFusion` registration, retry with
+    /// backoff on transient failure) — identical to how every spicepod-declared
+    /// dataset is loaded via [`Runtime::load_dataset`].
     ///
-    /// When the dataset opts into `schema_inference: extended` and the source
-    /// connector emitted inferred-schema metadata, this fills any acceleration
-    /// settings the user left unset (primary key, indexes, sort columns) and
-    /// returns a rebuilt `Dataset`. Applying it here — before the `FederatedTable`
-    /// and registration are created — ensures every refresh mode, including CDC
-    /// (`refresh_mode: changes`), observes the inferred values. Returns `ds`
-    /// unchanged when inference is disabled, the dataset is not accelerated, or no
-    /// usable metadata was emitted.
+    /// Used for datasets synthesized at runtime (e.g. by catalog-level
+    /// acceleration) rather than declared in the Spicepod `datasets:` list.
+    // Only the PostgreSQL catalog connector synthesizes datasets today.
+    #[cfg(feature = "postgres")]
+    pub(crate) async fn load_synthesized_dataset(self: Arc<Self>, ds: Arc<Dataset>) {
+        // Throttle accelerator init to the same `dataset_load_parallelism` budget
+        // `load_dataset` enforces. Catalog-level acceleration spawns one
+        // `load_synthesized_dataset` task per table (potentially hundreds), and
+        // `initialize_datasets_accelerators` does real init work/IO; without a
+        // permit here every table would initialize its accelerator at once, ahead
+        // of any throttling. The permit is held ONLY around init and dropped before
+        // `load_dataset` (which acquires its own permit) -- holding both at once
+        // would deadlock once `dataset_load_parallelism` tasks each await a second.
+        let bootstrap_status = {
+            let Ok(_init_permit) = self.dataset_load_semaphore.acquire().await else {
+                unreachable!("Semaphore is never closed.");
+            };
+            match self
+                .initialize_datasets_accelerators(std::slice::from_ref(&ds))
+                .await
+                .remove(&ds.name)
+            {
+                Some(Ok(status)) => status,
+                Some(Err(_)) => return, // error already logged in initialize_datasets_accelerators
+                None => {
+                    let message = format!(
+                        "Dataset {} missing from accelerator initialization results",
+                        ds.name
+                    );
+                    tracing::error!("{message}");
+                    self.status.update_dataset(
+                        &ds.name,
+                        status::ComponentStatus::error_with_message(message),
+                    );
+                    return;
+                }
+            }
+        };
+
+        self.status
+            .update_dataset(&ds.name, status::ComponentStatus::Initializing);
+
+        let semaphore = Arc::clone(&self.dataset_load_semaphore);
+        self.load_dataset(ds, bootstrap_status, semaphore).await;
+    }
+
+    /// Apply schema inference to a freshly-resolved dataset.
+    ///
+    /// When the source connector emitted inferred-schema metadata, this fills any
+    /// acceleration settings the user left unset (primary key, indexes, sort
+    /// columns) and returns a rebuilt `Dataset`. Applying it here — before the
+    /// `FederatedTable` and registration are created — ensures every refresh mode,
+    /// including CDC (`refresh_mode: changes`), observes the inferred values.
+    /// `resolved_refresh_mode` (the connector-resolved mode, not the raw Spicepod
+    /// value) gates which inferred settings are safe to apply — see
+    /// `apply_inferred_schema`. Schema inference is always attempted; this returns
+    /// `ds` unchanged when the dataset is not accelerated or the source emitted no
+    /// usable metadata.
     fn apply_inferred_acceleration(
         ds: Arc<Dataset>,
         provider: &Arc<dyn datafusion::datasource::TableProvider>,
+        resolved_refresh_mode: RefreshMode,
     ) -> Arc<Dataset> {
         use crate::component::dataset::schema_inference::apply_inferred_schema;
         use data_components::inferred_schema::InferredSchema;
 
-        // Skip when extended inference is off, or the dataset is not accelerated —
-        // including an `acceleration` block that is present but `enabled: false`,
-        // which the rest of the runtime treats as non-accelerated.
-        if !ds.schema_inference.is_extended()
-            || !ds.acceleration.as_ref().is_some_and(|a| a.enabled)
-        {
+        // Skip when the dataset is not accelerated — including an `acceleration`
+        // block that is present but `enabled: false`, which the rest of the runtime
+        // treats as non-accelerated. Schema inference is always attempted, so a
+        // source that exposed no inferred metadata simply yields an empty set below.
+        if !ds.acceleration.as_ref().is_some_and(|a| a.enabled) {
             return ds;
         }
 
@@ -639,7 +726,7 @@ impl Runtime {
                     tracing::debug!(
                         dataset = %ds.name,
                         %error,
-                        "Skipping extended schema inference; could not parse refresh_sql to validate inferred columns"
+                        "Skipping schema inference; could not parse refresh_sql to validate inferred columns"
                     );
                     return ds;
                 }
@@ -649,7 +736,13 @@ impl Runtime {
 
         let mut new_ds = (*ds).clone();
         if let Some(acceleration) = new_ds.acceleration.as_mut() {
-            apply_inferred_schema(acceleration, &inferred, &effective_schema, ds.name.table());
+            apply_inferred_schema(
+                acceleration,
+                &inferred,
+                &effective_schema,
+                ds.name.table(),
+                resolved_refresh_mode,
+            );
         }
         Arc::new(new_ds)
     }
@@ -663,7 +756,7 @@ impl Runtime {
         load_semaphore: Option<Arc<Semaphore>>,
     ) -> Result<()> {
         // Owned (not borrowed from `ds`) so the dataset can be rebuilt below by
-        // extended schema inference without holding a borrow across the reassignment.
+        // schema inference without holding a borrow across the reassignment.
         let source = ds.source().to_string();
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
         if let Some(acceleration) = &ds.acceleration
@@ -679,12 +772,19 @@ impl Runtime {
             return Err(err);
         }
 
-        // In file_update mode, schema mismatches are handled by create_accelerated_table
-        // which detects changes and recreates the acceleration with the new schema.
-        let allow_schema_mismatch = ds
-            .acceleration
-            .as_ref()
-            .is_some_and(|a| a.mode == Mode::FileUpdate);
+        // Bypass the deferred-mismatch gate when the dataset recreates on a schema change, so
+        // create_accelerated_table drops + recreates the table with the new schema instead of
+        // deferring. `recreates_on_schema_mismatch` is the single source of truth for the exact
+        // conditions (`file_update` with refreshes enabled, or `on_schema_change:
+        // drop_and_recreate` + `refresh_mode: full` on a recreate-capable engine); sharing it
+        // keeps this gate and the recreate decision in create_accelerated_table aligned.
+        let allow_schema_mismatch = ds.acceleration.as_ref().is_some_and(|a| {
+            crate::schema_evolution::recreates_on_schema_mismatch(
+                a,
+                ds.on_schema_change,
+                data_connector.resolve_refresh_mode(a.refresh_mode),
+            )
+        });
 
         // Test dataset connectivity by attempting to get a read provider.
         // Acquire the load semaphore (if provided) to limit concurrent source queries.
@@ -699,10 +799,12 @@ impl Runtime {
         let schema_start = Instant::now();
         let federated_table = match data_connector.read_provider(&ds).await {
             Ok(provider) => {
-                // Gap-fill acceleration settings from extended schema inference (no-op
-                // unless `schema_inference: extended` and the connector emitted metadata)
-                // before the dataset flows into registration and any changes stream.
-                ds = Self::apply_inferred_acceleration(ds, &provider);
+                // Gap-fill acceleration settings from schema inference (a no-op when
+                // the connector emitted no inferred metadata) before the dataset
+                // flows into registration and any changes stream.
+                let resolved_refresh_mode = data_connector
+                    .resolve_refresh_mode(ds.acceleration.as_ref().and_then(|a| a.refresh_mode));
+                ds = Self::apply_inferred_acceleration(ds, &provider, resolved_refresh_mode);
                 FederatedTable::new(
                     Arc::clone(&ds),
                     provider,
@@ -991,6 +1093,51 @@ impl Runtime {
         true
     }
 
+    /// Resolve executor partition scoping for `ds` before creating its accelerated table.
+    ///
+    /// On an executor node (partition assignments present) with a `partition_by`
+    /// configured dataset, returns the dataset with `partition_by` cleared and its
+    /// engine converted to unpartitioned, plus `Some` partition filters for the
+    /// partitions assigned to this executor. `Some(empty)` — no partition assigned —
+    /// resolves downstream to a `false` predicate (load no rows) rather than an
+    /// unfiltered full-table load. Otherwise returns `ds` unchanged with `None`
+    /// (not partition-scoped; retrieve everything).
+    async fn resolve_executor_partition_scoping(
+        &self,
+        ds: Arc<Dataset>,
+    ) -> (Arc<Dataset>, Option<Vec<datafusion_expr::Expr>>) {
+        if ds
+            .acceleration
+            .as_ref()
+            .is_none_or(|acc| acc.partition_by.is_empty())
+        {
+            return (ds, None);
+        }
+        let Some(assignments) = self.partition_assignments() else {
+            return (ds, None);
+        };
+
+        let assignments = assignments.read().await;
+        let resolved = ds.name.clone().resolve(
+            crate::datafusion::SPICE_DEFAULT_CATALOG,
+            crate::datafusion::SPICE_DEFAULT_SCHEMA,
+        );
+        let partition_filters = get_partition_filter_exprs(&resolved, &assignments);
+        tracing::debug!(
+            "For table={}, extracted {} partition filter(s) for assigned partitions.",
+            ds.name,
+            partition_filters.len(),
+        );
+
+        // Clear partition_by and convert engine to unpartitioned.
+        let mut ds_mod = (*ds).clone();
+        if let Some(acc) = ds_mod.acceleration.as_mut() {
+            acc.partition_by = vec![];
+            acc.engine = acc.engine.to_unpartitioned();
+        }
+        (Arc::new(ds_mod), Some(partition_filters))
+    }
+
     async fn reload_accelerated_dataset(
         self: Arc<Self>,
         ds: Arc<Dataset>,
@@ -1002,10 +1149,16 @@ impl Runtime {
             }
             .build()
         })?;
-        let allow_schema_mismatch = ds
-            .acceleration
-            .as_ref()
-            .is_some_and(|a| a.mode == Mode::FileUpdate);
+        // Same recreate-bypass as the initial-load gate. Previously this honored only
+        // `file_update`, so a reloaded `on_schema_change: drop_and_recreate` dataset would not
+        // recreate on an incompatible source change; the shared helper fixes that.
+        let allow_schema_mismatch = ds.acceleration.as_ref().is_some_and(|a| {
+            crate::schema_evolution::recreates_on_schema_mismatch(
+                a,
+                ds.on_schema_change,
+                connector.resolve_refresh_mode(a.refresh_mode),
+            )
+        });
         let federated_table = FederatedTable::new(
             Arc::clone(&ds),
             read_table,
@@ -1020,6 +1173,11 @@ impl Runtime {
             .remove_dataset_or_view_schedule(&ds.name)
             .await?;
 
+        // Mirror the initial-load path: on an executor, scope the recreated table
+        // to this node's assigned partitions so a hot reload doesn't load the full
+        // source table (or duplicate it across executors).
+        let (ds, initial_partition_filters) = self.resolve_executor_partition_scoping(ds).await;
+
         // create new accelerated table for updated data connector
         let accelerated_table = Arc::new(
             self.df
@@ -1029,7 +1187,7 @@ impl Runtime {
                     federated_table,
                     self.secrets(),
                     BootstrapStatus::None,
-                    vec![],
+                    initial_partition_filters,
                 )
                 .await
                 .context(UnableToCreateAcceleratedTableSnafu {
@@ -1225,39 +1383,12 @@ impl Runtime {
             return Ok(());
         }
 
-        // Apply partition filters if assigned (Executor mode)
-        let mut ds = ds;
-        let mut initial_partition_filters = vec![];
-        // Only apply partition logic if the dataset is configured for partitioning
-        if ds
-            .acceleration
-            .as_ref()
-            .is_some_and(|acc| !acc.partition_by.is_empty())
-            && let Some(assignments) = self.partition_assignments()
-        {
-            let assignments = assignments.read().await;
-            let resolved = ds.name.clone().resolve(
-                crate::datafusion::SPICE_DEFAULT_CATALOG,
-                crate::datafusion::SPICE_DEFAULT_SCHEMA,
-            );
-            let partition_filters = get_partition_filter_exprs(&resolved, &assignments);
-            if !partition_filters.is_empty() {
-                tracing::debug!(
-                    "For table={}, extracted {} partition filter(s) for assigned partitions.",
-                    ds.name,
-                    partition_filters.len(),
-                );
-                initial_partition_filters = partition_filters;
-            }
-
-            // Clear partition_by and convert engine to unpartitioned
-            let mut ds_mod = (*ds).clone();
-            if let Some(acc) = ds_mod.acceleration.as_mut() {
-                acc.partition_by = vec![];
-                acc.engine = acc.engine.to_unpartitioned();
-            }
-            ds = Arc::new(ds_mod);
-        }
+        // Apply partition filters if assigned (Executor mode). `None` means the
+        // dataset is not partition-scoped (retrieve everything); in executor
+        // partitioned mode this is `Some`, so an executor with no assigned
+        // partition gets `Some(empty)` — a `false` predicate that loads no rows —
+        // rather than an unfiltered full load.
+        let (ds, initial_partition_filters) = self.resolve_executor_partition_scoping(ds).await;
 
         // ACCELERATED TABLE
         let acceleration_settings =
@@ -1545,11 +1676,12 @@ impl Runtime {
                     }
                 };
 
-                match accelerator.init(ds.as_ref()).await.context(
-                    AcceleratorInitializationFailedSnafu {
+                match accelerator
+                    .init(ds.as_ref(), Arc::clone(&accelerator_engine_registry))
+                    .await
+                    .context(AcceleratorInitializationFailedSnafu {
                         name: acceleration_settings.engine.to_string(),
-                    },
-                ) {
+                    }) {
                     Ok(bootstrap_status) => {
                         if bootstrap_status.is_bootstrapped() {
                             update_cached_dataset_timestamps(ds.as_ref()).await;
@@ -1577,8 +1709,6 @@ impl Runtime {
         init_results
     }
 
-    /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
-    #[cfg(any(feature = "duckdb", feature = "sqlite"))]
     pub(crate) async fn get_initialized_datasets(
         self: Arc<Self>,
         app: &Arc<App>,

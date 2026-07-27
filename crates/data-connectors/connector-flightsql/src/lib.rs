@@ -263,9 +263,17 @@ impl DataConnectorFactory for FlightSQLFactory {
                     .await
                     .context(UnableToPerformHandshakeSnafu)?;
             }
+            // Extract bearer token for per-endpoint client auth propagation.
+            let token = client.token().cloned();
             let flightsql_factory =
-                DataComponentFlightSQLFactory::new(client, endpoint, cookie_store)
-                    .with_function_support(deny_spice_specific_functions().as_ref().clone());
+                DataComponentFlightSQLFactory::new(client, endpoint, cookie_store);
+            let flightsql_factory = if let Some(t) = token {
+                flightsql_factory.with_token(t)
+            } else {
+                flightsql_factory
+            };
+            let flightsql_factory = flightsql_factory
+                .with_function_support(deny_spice_specific_functions().as_ref().clone());
             Ok(Arc::new(FlightSQL { flightsql_factory }) as Arc<dyn DataConnector>)
         })
     }
@@ -308,3 +316,13 @@ pub const CONNECTOR_NAME: &str = "flightsql";
 pub fn factory() -> Arc<dyn DataConnectorFactory> {
     FlightSQLFactory::new_arc()
 }
+
+// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_flightsql as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+runtime::register_data_connector!(
+    register_flightsql_connector,
+    FLIGHTSQL_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    FlightSQLFactory
+);

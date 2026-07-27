@@ -43,7 +43,7 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use http::Uri;
 use reqwest::{
     Client,
-    header::{AUTHORIZATION, CACHE_CONTROL, HeaderMap, HeaderName, HeaderValue},
+    header::{CACHE_CONTROL, HeaderMap, HeaderName, HeaderValue},
 };
 use runtime_rate_control::{Permit, RateController};
 use snafu::prelude::*;
@@ -618,9 +618,15 @@ impl HttpTableProvider {
                 message: format!("Invalid request_header_allowlist entry '{raw}': {e}"),
             })?;
             ensure!(
-                !(self.auth.is_some() && parsed == AUTHORIZATION),
+                !self
+                    .auth
+                    .as_ref()
+                    .is_some_and(|auth| auth.header_name() == parsed),
                 ConfigurationSnafu {
-                    message: "request_header_allowlist cannot include 'authorization' when HTTP authentication is configured. Remove 'authorization' from request_header_allowlist or disable HTTP authentication.".to_string()
+                    message: format!(
+                        "request_header_allowlist cannot include '{name}' when HTTP authentication is configured; that header carries the auth token. Remove '{name}' from request_header_allowlist or disable HTTP authentication.",
+                        name = parsed.as_str(),
+                    )
                 }
             );
             allowed_headers.insert(parsed);
@@ -714,8 +720,8 @@ impl HttpTableProvider {
     }
 
     /// Attach an [`HttpAuthenticator`](super::auth::HttpAuthenticator) that decorates
-    /// every outgoing data request (e.g. to apply a bearer token refreshed in the
-    /// background by [`RefreshTokenAuth`](super::auth::RefreshTokenAuth)).
+    /// every outgoing data request (e.g. to apply an access token refreshed in the
+    /// background by [`OAuth2Auth`](super::auth::OAuth2Auth)).
     #[must_use]
     pub fn with_auth(mut self, auth: Arc<dyn super::auth::HttpAuthenticator>) -> Self {
         self.auth = Some(auth);
@@ -1275,10 +1281,19 @@ impl HttpTableProvider {
             .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
 
+        // Reading the response body can fail after a successful status line — connection
+        // reset, read timeout, truncated body, or a decompression error on a partially
+        // received gzip/brotli/zstd stream. These are all transient network conditions an
+        // overloaded or rate-limited upstream produces routinely, so retry them like a failed
+        // send rather than dropping the row on the first hiccup (previously every body-read
+        // failure was classified permanent). Note `reqwest::Error::is_decode()` also fires on a
+        // truncated compressed body, so it is NOT a reliable "permanent" signal; this mirrors
+        // the retriable-error classification in `graphql/mod.rs`, which groups
+        // is_timeout/is_connect/is_body/is_decode together as transient.
         let content = response
             .text()
             .await
-            .map_err(|e| RetryError::permanent(Error::HttpRequest { source: e }))?;
+            .map_err(|e| RetryError::transient(Error::HttpRequest { source: e }))?;
 
         let detected_format = if detected_format.is_empty() {
             let inferred = Self::infer_format_from_content(&content);
@@ -1890,7 +1905,7 @@ impl HttpExec {
             .filter(|f| !nesting.metadata_fields.contains(f.name()))
             .map(|f| f.name().as_str())
             .collect();
-        let catchall_projected = body_field_names.contains(&nesting.json_field_name.as_str());
+        let catchall_projected = body_field_names.contains(&nesting.json_field_name());
 
         // Build body-derived columns via string builders, in projected
         // (not full-schema) order, restricted to non-metadata fields.
@@ -3298,9 +3313,16 @@ impl HttpTableProvider {
                 });
             }
 
-            if self.auth.is_some() && header_name == AUTHORIZATION {
+            if self
+                .auth
+                .as_ref()
+                .is_some_and(|auth| auth.header_name() == header_name)
+            {
                 return Err(Error::FilterRejected {
-                    message: "The 'request_headers' object cannot set 'authorization' when HTTP authentication is configured. Remove 'authorization' from request_headers or disable HTTP authentication.".to_string(),
+                    message: format!(
+                        "The 'request_headers' object cannot set '{name}' when HTTP authentication is configured; that header carries the auth token. Remove '{name}' from request_headers or disable HTTP authentication.",
+                        name = header_name.as_str(),
+                    ),
                 });
             }
 
@@ -3363,6 +3385,7 @@ mod tests {
     use datafusion::common::Column;
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator, expr::InList};
     use datafusion::scalar::ScalarValue;
+    use reqwest::header::AUTHORIZATION;
     use std::sync::{Arc, atomic::AtomicUsize};
     use std::time::Duration;
     use url::Url;
@@ -3373,6 +3396,25 @@ mod tests {
     impl super::super::auth::HttpAuthenticator for TestAuthenticator {
         fn apply(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
             builder.header(AUTHORIZATION, "Bearer token")
+        }
+
+        fn header_name(&self) -> &reqwest::header::HeaderName {
+            &AUTHORIZATION
+        }
+    }
+
+    /// Authenticator that writes a non-standard header, to exercise the
+    /// configured-header-name conflict guards.
+    #[derive(Debug)]
+    struct CustomHeaderAuthenticator(reqwest::header::HeaderName);
+
+    impl super::super::auth::HttpAuthenticator for CustomHeaderAuthenticator {
+        fn apply(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+            builder.header(&self.0, "secret-token")
+        }
+
+        fn header_name(&self) -> &reqwest::header::HeaderName {
+            &self.0
         }
     }
 
@@ -4003,6 +4045,82 @@ mod tests {
     }
 
     #[test]
+    fn enable_header_filters_guards_configured_auth_header_name() {
+        let auth = Arc::new(CustomHeaderAuthenticator(HeaderName::from_static(
+            "x-shopify-access-token",
+        )));
+
+        // Allowlisting the exact header the auth token occupies is rejected.
+        let err = base_provider()
+            .with_auth(Arc::clone(&auth) as Arc<dyn super::super::auth::HttpAuthenticator>)
+            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["x-shopify-access-token"])
+            .expect_err("allowlisting the configured auth header must be rejected");
+        match err {
+            Error::Configuration { message } => {
+                assert!(
+                    message.contains("x-shopify-access-token"),
+                    "message: {message}"
+                );
+                assert!(
+                    message.contains("HTTP authentication"),
+                    "message: {message}"
+                );
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+
+        // A different header name is unaffected — the guard is keyed on the
+        // configured name, not hard-coded to `authorization`.
+        base_provider()
+            .with_auth(auth as Arc<dyn super::super::auth::HttpAuthenticator>)
+            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["x-region"])
+            .expect("a non-auth header name should be allowlisted fine");
+    }
+
+    #[test]
+    fn request_headers_filter_rejects_configured_auth_header_name() {
+        // Allowlist the custom header before auth is configured, then attach an
+        // authenticator that uses it — a query-time filter must not be able to
+        // overwrite the auth token's header.
+        let provider = base_provider()
+            .enable_header_filters(DEFAULT_MAX_HEADERS_LENGTH, vec!["x-shopify-access-token"])
+            .expect("allowlisted before auth configured")
+            .with_auth(Arc::new(CustomHeaderAuthenticator(HeaderName::from_static(
+                "x-shopify-access-token",
+            )))
+                as Arc<dyn super::super::auth::HttpAuthenticator>);
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_headers"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some(r#"{"x-shopify-access-token":"secret"}"#.to_string())),
+                None,
+            )),
+        })];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("expected rejection of the configured auth header");
+        match err {
+            DataFusionError::Plan(message) => {
+                assert!(
+                    message.contains("x-shopify-access-token"),
+                    "message: {message}"
+                );
+                assert!(
+                    message.contains("HTTP authentication"),
+                    "message: {message}"
+                );
+                assert!(
+                    !message.contains("secret"),
+                    "must not leak the value: {message}"
+                );
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_request_headers_filter_rejects_invalid_json() {
         let provider = header_provider();
         let filters = vec![Expr::BinaryExpr(BinaryExpr {
@@ -4443,6 +4561,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "hits a live external API (api.tvmaze.com); not deterministic in CI — run with --ignored"]
     async fn test_query_params_any_order_works() {
         use datafusion::prelude::SessionContext;
 
@@ -4489,8 +4608,36 @@ mod tests {
         );
     }
 
-    // Integration tests that make real HTTP requests
-    // These are marked with #[ignore] by default to avoid network dependencies in CI
+    #[test]
+    fn is_retryable_status_covers_5xx_and_429_only() {
+        // 5xx server errors are transient and must be retried.
+        for status in [500_u16, 502, 503, 504, 599] {
+            assert!(
+                HttpTableProvider::is_retryable_status(status),
+                "{status} (5xx) should be retryable"
+            );
+        }
+        // 429 Too Many Requests is retryable (rate limiting).
+        assert!(
+            HttpTableProvider::is_retryable_status(429),
+            "429 should be retryable"
+        );
+        // 2xx/3xx success-ish and 4xx client errors (other than 429) are NOT retried —
+        // they are deterministic responses the caller should see, not transient faults.
+        for status in [200_u16, 204, 301, 400, 401, 403, 404, 410, 422, 600] {
+            assert!(
+                !HttpTableProvider::is_retryable_status(status),
+                "{status} should not be retryable"
+            );
+        }
+    }
+
+    // Integration tests that make real HTTP requests.
+    // These are marked with #[ignore] because they depend on live external services and are
+    // therefore not deterministic in CI; run them explicitly with `cargo test -- --ignored`.
+    // The runtime's resilience against transient upstream failures (timeouts, connection
+    // resets mid-body, 5xx, 429) is exercised in production via the configured retry/backoff
+    // and timeouts; the retry *policy* is unit-tested above without depending on the network.
 
     // Tests for globset pattern matching
     #[test]
@@ -4789,6 +4936,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "hits a live external API (jsonplaceholder.typicode.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_jsonplaceholder_single_post() {
         use datafusion::prelude::SessionContext;
 
@@ -4854,6 +5002,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "hits a live external API (jsonplaceholder.typicode.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_jsonplaceholder_multiple_posts() {
         use datafusion::prelude::SessionContext;
 
@@ -4926,6 +5075,7 @@ mod tests {
         assert!(found_posts[2], "Should have found post 3");
     }
     #[tokio::test]
+    #[ignore = "hits a live external API (jsonplaceholder.typicode.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_jsonplaceholder_all_posts() {
         use datafusion::prelude::SessionContext;
 
@@ -4998,6 +5148,7 @@ mod tests {
         assert!(found_last_post, "Should have found post with id 100");
     }
     #[tokio::test]
+    #[ignore = "hits a live external API (api.tvmaze.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_tvmaze_single_show() {
         use datafusion::prelude::SessionContext;
 
@@ -5057,6 +5208,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "hits a live external API (api.tvmaze.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_tvmaze_404_not_found() {
         use datafusion::prelude::SessionContext;
 
@@ -5110,6 +5262,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "hits a live external API (httpbin.org); not deterministic in CI — run with --ignored"]
     async fn test_integration_httpbin_500_server_error() {
         use datafusion::prelude::SessionContext;
 
@@ -5161,6 +5314,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "hits a live external API (api.tvmaze.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_tvmaze_multiple_shows() {
         use datafusion::prelude::SessionContext;
 
@@ -5238,6 +5392,7 @@ mod tests {
         assert!(found_game_thrones, "Should have found Game of Thrones");
     }
     #[tokio::test]
+    #[ignore = "hits a live external API (api.tvmaze.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_tvmaze_projection() {
         use datafusion::prelude::SessionContext;
 
@@ -5286,6 +5441,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "hits a live external API (api.tvmaze.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_tvmaze_aggregation() {
         use datafusion::prelude::SessionContext;
 
@@ -5364,6 +5520,7 @@ mod tests {
     /// paginate through search results, and `pagination_data_pointer` to extract
     /// the `docs` array from each page.
     #[tokio::test]
+    #[ignore = "hits a live external API (openlibrary.org); not deterministic in CI — run with --ignored"]
     async fn test_integration_openlibrary_query_param_pagination() {
         use datafusion::prelude::SessionContext;
 

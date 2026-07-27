@@ -9,18 +9,12 @@ on:
       - release/*
     paths:
       - 'crates/llms/**'
-  pull_request:
-    branches:
-      - trunk
-      - release-*
-      - release/*
-    paths:
-      - 'crates/llms/**'
   merge_group:
     branches:
       - trunk
       - release-*
       - release/*
+      - feature-*
   workflow_dispatch:
     inputs:
       run:
@@ -98,7 +92,7 @@ jobs:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
       TEST_BINARY_OBJECT_KEY: test_binaries/${{ github.run_id }}/llms_integration_test
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
           fetch-depth: 1 # Shallow clone for faster checkout
@@ -161,7 +155,7 @@ jobs:
     permissions: read-all
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 

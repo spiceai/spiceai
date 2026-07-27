@@ -538,11 +538,49 @@ pub static DATA_FRESHNESS_P99: LazyLock<Gauge<f64>> = LazyLock::new(|| {
         .build()
 });
 
+pub static DATA_FRESHNESS_MAX: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    meter()
+        .f64_gauge("data_freshness_max_ms")
+        .with_description("Max data freshness gap between source and accelerator per dataset.")
+        .with_unit("ms")
+        .build()
+});
+
 pub static REPLICATION_LAG_MS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
     meter()
         .f64_gauge("replication_lag_ms")
-        .with_description("Replication lag from source to accelerator per dataset.")
+        .with_description("Replication lag from source to accelerator per dataset (last observed).")
         .with_unit("ms")
+        .build()
+});
+
+pub static REPLICATION_LAG_P99_MS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    meter()
+        .f64_gauge("replication_lag_p99_ms")
+        .with_description(
+            "P99 replication lag from source to accelerator per dataset over the under-load window.",
+        )
+        .with_unit("ms")
+        .build()
+});
+
+pub static REPLICATION_LAG_MAX_MS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    meter()
+        .f64_gauge("replication_lag_max_ms")
+        .with_description(
+            "Max replication lag from source to accelerator per dataset over the under-load window.",
+        )
+        .with_unit("ms")
+        .build()
+});
+
+pub static REPLICATION_LAG_BYTES: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    meter()
+        .f64_gauge("replication_lag_bytes")
+        .with_description(
+            "Replication WAL backlog in bytes (server WAL end − confirmed flush LSN) per dataset — the direct source-side CDC backpressure signal.",
+        )
+        .with_unit("By")
         .build()
 });
 

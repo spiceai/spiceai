@@ -79,9 +79,15 @@ pub struct RefreshSQL {
     user_filters: Vec<sqlparser::ast::Expr>,
     /// LIMIT clause from user SQL, if any.
     limit: Option<usize>,
-    /// Cluster partition filter expressions (`DataFusion` Exprs).
-    /// Applied as `DataFrame` `.filter()` calls at query time.
-    partition_filters: Vec<datafusion_expr::Expr>,
+    /// Cluster partition filter expressions (`DataFusion` Exprs), applied as
+    /// `DataFrame` `.filter()` calls at refresh time. Three-state:
+    /// - `None` — the table is not partition-scoped (non-clustered, or this
+    ///   node is not an executor); apply no partition predicate and retrieve
+    ///   everything.
+    /// - `Some(filters)` (non-empty) — apply the assigned partitions' predicate.
+    /// - `Some(empty)` — this executor owns no partition of the table; apply a
+    ///   `false` predicate so no rows are loaded, rather than the whole table.
+    partition_filters: Option<Vec<datafusion_expr::Expr>>,
 }
 
 impl RefreshSQL {
@@ -98,7 +104,7 @@ impl RefreshSQL {
             columns,
             user_filters,
             limit,
-            partition_filters: vec![],
+            partition_filters: None,
         }
     }
 
@@ -134,28 +140,50 @@ impl RefreshSQL {
         sql
     }
 
-    /// Get the partition filter expressions for `DataFrame` filtering.
+    /// The partition filters as stored: `None` when the table is not
+    /// partition-scoped, `Some` (possibly empty) when it is. Callers applying
+    /// the predicate to a refresh should use
+    /// [`Self::extend_effective_partition_filters`], which resolves the
+    /// empty-`Some` case to a `false` predicate.
     #[must_use]
-    pub fn partition_filters(&self) -> &[datafusion_expr::Expr] {
-        &self.partition_filters
+    pub fn partition_filters(&self) -> Option<&[datafusion_expr::Expr]> {
+        self.partition_filters.as_deref()
     }
 
-    /// Set the partition filter expressions.
-    pub fn set_partition_filters(&mut self, filters: Vec<datafusion_expr::Expr>) {
+    /// Set the partition filters. Pass `None` for a non-partition-scoped table,
+    /// or `Some(filters)` for the assigned partitions — where an empty `Vec`
+    /// means this executor owns no partition of the table and should load no
+    /// rows (see [`Self::extend_effective_partition_filters`]).
+    pub fn set_partition_filters(&mut self, filters: Option<Vec<datafusion_expr::Expr>>) {
         self.partition_filters = filters;
     }
 
-    /// For logging/status display. Shows the user SQL and annotates if partition filters are active.
+    /// Append the partition predicate(s) to AND into the refresh query onto
+    /// `out`, resolving the three stored states without allocating a temporary
+    /// `Vec`:
+    /// - `None` → nothing appended (retrieve everything).
+    /// - `Some(filters)` (non-empty) → the assigned partitions' predicate.
+    /// - `Some(empty)` → a single `false` predicate, so an executor with no
+    ///   assigned partition loads no rows instead of the whole table.
+    pub fn extend_effective_partition_filters(&self, out: &mut Vec<datafusion_expr::Expr>) {
+        match &self.partition_filters {
+            None => {}
+            Some(filters) if filters.is_empty() => out.push(datafusion_expr::lit(false)),
+            Some(filters) => out.extend(filters.iter().cloned()),
+        }
+    }
+
+    /// For logging/status display. Shows the user SQL and annotates the
+    /// partition-filter state.
     #[must_use]
     pub fn display_sql(&self) -> String {
         let base = self.to_sql();
-        if self.partition_filters.is_empty() {
-            base
-        } else {
-            format!(
-                "{base} [+{} partition filter(s)]",
-                self.partition_filters.len()
-            )
+        match &self.partition_filters {
+            None => base,
+            Some(filters) if filters.is_empty() => {
+                format!("{base} [partition filter: no partitions assigned — no rows]")
+            }
+            Some(filters) => format!("{base} [+{} partition filter(s)]", filters.len()),
         }
     }
 
@@ -543,7 +571,10 @@ fn validate_time_partition_format(
         | arrow::datatypes::DataType::Float16
         | arrow::datatypes::DataType::Float32
         | arrow::datatypes::DataType::Float64 => {
-            if time_format != TimeFormat::UnixSeconds && time_format != TimeFormat::UnixMillis {
+            if time_format != TimeFormat::UnixSeconds
+                && time_format != TimeFormat::UnixMillis
+                && time_format != TimeFormat::UnixNanos
+            {
                 invalid = true;
             }
         }
@@ -1360,6 +1391,63 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
+
+    fn test_refresh_sql() -> RefreshSQL {
+        RefreshSQL::new(
+            TableReference::bare("t"),
+            RefreshSQLColumns::All,
+            vec![],
+            None,
+        )
+    }
+
+    fn effective(sql: &RefreshSQL) -> Vec<datafusion_expr::Expr> {
+        let mut out = vec![];
+        sql.extend_effective_partition_filters(&mut out);
+        out
+    }
+
+    #[test]
+    fn partition_filters_none_applies_no_predicate() {
+        let sql = test_refresh_sql();
+        assert!(sql.partition_filters().is_none());
+        assert!(
+            effective(&sql).is_empty(),
+            "None must retrieve everything (no predicate)"
+        );
+        assert_eq!(sql.display_sql(), "SELECT * FROM t");
+    }
+
+    #[test]
+    fn partition_filters_empty_some_applies_false_predicate() {
+        let mut sql = test_refresh_sql();
+        sql.set_partition_filters(Some(vec![]));
+        assert_eq!(
+            effective(&sql),
+            vec![datafusion_expr::lit(false)],
+            "an executor with no assigned partition must load no rows"
+        );
+        assert!(sql.display_sql().contains("no partitions assigned"));
+    }
+
+    #[test]
+    fn partition_filters_non_empty_some_applies_assigned_predicate() {
+        let mut sql = test_refresh_sql();
+        let predicate = datafusion_expr::col("bucket").eq(datafusion_expr::lit(0_i64));
+        sql.set_partition_filters(Some(vec![predicate.clone()]));
+        assert_eq!(effective(&sql), vec![predicate]);
+        assert!(sql.display_sql().contains("+1 partition filter(s)"));
+    }
+
+    #[test]
+    fn extend_effective_partition_filters_appends_without_clearing() {
+        let mut sql = test_refresh_sql();
+        sql.set_partition_filters(Some(vec![]));
+        let existing = datafusion_expr::col("a").eq(datafusion_expr::lit(1_i64));
+        let mut out = vec![existing.clone()];
+        sql.extend_effective_partition_filters(&mut out);
+        assert_eq!(out, vec![existing, datafusion_expr::lit(false)]);
+    }
 
     // Mock implementation of DatasetCheckpointer trait
     struct MockCheckpointer {
@@ -2241,6 +2329,7 @@ mod tests {
         for format in [
             TimeFormat::UnixSeconds,
             TimeFormat::UnixMillis,
+            TimeFormat::UnixNanos,
             TimeFormat::Timestamp,
             TimeFormat::Timestamptz,
             TimeFormat::Date,
@@ -2285,6 +2374,7 @@ mod tests {
         for format in [
             TimeFormat::UnixMillis,
             TimeFormat::UnixSeconds,
+            TimeFormat::UnixNanos,
             TimeFormat::Timestamptz,
             TimeFormat::ISO8601,
             TimeFormat::Date,
@@ -2310,6 +2400,7 @@ mod tests {
         for format in [
             TimeFormat::UnixMillis,
             TimeFormat::UnixSeconds,
+            TimeFormat::UnixNanos,
             TimeFormat::Timestamp,
             TimeFormat::ISO8601,
             TimeFormat::Date,
@@ -2344,7 +2435,11 @@ mod tests {
 
     #[test]
     fn test_validate_time_column_when_unix_timestamp_match() {
-        for format in [TimeFormat::UnixMillis, TimeFormat::UnixSeconds] {
+        for format in [
+            TimeFormat::UnixMillis,
+            TimeFormat::UnixSeconds,
+            TimeFormat::UnixNanos,
+        ] {
             let refresh = Refresh::new(RefreshMode::Full)
                 .time_column("time".to_string())
                 .time_format(format);
@@ -2413,6 +2508,7 @@ mod tests {
         for format in [
             TimeFormat::UnixMillis,
             TimeFormat::UnixSeconds,
+            TimeFormat::UnixNanos,
             TimeFormat::Timestamp,
             TimeFormat::Timestamptz,
             TimeFormat::ISO8601,

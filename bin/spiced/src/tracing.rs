@@ -14,6 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// OpenTelemetry 0.32 deprecated the Zipkin exporter in favor of OTLP. Spice still
+// supports Zipkin task-history export; migrating to OTLP is tracked separately.
+#![expect(
+    deprecated,
+    reason = "Zipkin exporter deprecated in opentelemetry 0.32; Spice still supports Zipkin export"
+)]
+
 use std::sync::Arc;
 
 use app::spicepod::component::runtime::OutputLevel;
@@ -30,7 +37,7 @@ use opentelemetry_sdk::{
 use opentelemetry_zipkin::ZipkinExporter;
 use reqwest::Client;
 use runtime::{datafusion::DataFusion, task_history};
-use runtime_datafusion::query_engine::QueryEngine;
+use runtime_query_engine::query_engine::QueryEngine;
 use std::time::Duration;
 use tracing::Subscriber;
 use tracing_log::LogTracer;
@@ -78,6 +85,7 @@ const INTERNAL_COMPONENTS: &[&str] = &[
     "runtime",
     "secrets",
     "data_components",
+    "cayenne",
     "cache",
     "extensions",
     "spice_cloud",
@@ -149,6 +157,33 @@ fn should_include_otel_location(is_release_build: bool, verbosity: &LogVerbosity
     }
 }
 
+/// Build the Cloud Connect log-capture layer, or `None` when Cloud Connect
+/// is not configured for this instance.
+///
+/// When present, the layer mirrors console output into a bounded in-memory
+/// ring buffer (ANSI stripped) that the `GetPodLogs` control message reads.
+/// It is added *alongside* the terminal `fmt` layer, so normal logging is
+/// unchanged. The same `task_history` exclusion as the console layer is
+/// applied so span-only records don't pollute the log tail.
+fn cloud_connect_log_capture_layer<S>() -> Option<Box<dyn Layer<S> + Send + Sync>>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    if !crate::cloud_connect::is_configured() {
+        return None;
+    }
+    let ring = crate::log_capture::install(crate::log_capture::DEFAULT_CAPACITY);
+    Some(
+        fmt::layer()
+            .with_ansi(false)
+            .with_writer(ring)
+            .with_filter(filter::filter_fn(|metadata| {
+                metadata.target() != "task_history"
+            }))
+            .boxed(),
+    )
+}
+
 pub(crate) async fn init_tracing(
     app: Option<&Arc<App>>,
     config: Option<&TracingConfig>,
@@ -161,13 +196,16 @@ pub(crate) async fn init_tracing(
     if let Some(app) = app.as_ref()
         && !app.runtime.task_history.enabled
     {
-        let subscriber = tracing_subscriber::registry().with(filter).with(
-            fmt::layer()
-                .with_ansi(true)
-                .with_filter(filter::filter_fn(|metadata| {
-                    metadata.target() != "task_history"
-                })),
-        );
+        let subscriber = tracing_subscriber::registry()
+            .with(filter)
+            .with(
+                fmt::layer()
+                    .with_ansi(true)
+                    .with_filter(filter::filter_fn(|metadata| {
+                        metadata.target() != "task_history"
+                    })),
+            )
+            .with(cloud_connect_log_capture_layer());
 
         tracing::subscriber::set_global_default(subscriber)?;
 
@@ -188,7 +226,8 @@ pub(crate) async fn init_tracing(
                 .with_filter(filter::filter_fn(|metadata| {
                     metadata.target() != "task_history"
                 })),
-        );
+        )
+        .with(cloud_connect_log_capture_layer());
 
     tracing::subscriber::set_global_default(subscriber)?;
     LogTracer::init()?;
@@ -236,6 +275,14 @@ where
         .map(|app| app.runtime.task_history.min_plan_duration_as_millis())
         .transpose()?
         .flatten();
+
+    df.set_plan_capture_config(
+        runtime::datafusion::query::plan_capture::PlanCaptureConfig {
+            captured_plan: captured_plan.clone(),
+            min_plan_duration_ms,
+            min_sql_duration_ms,
+        },
+    );
 
     // Compute node_id for cluster mode: "host:port"
     let node_id: Option<Arc<str>> = df.cluster_config.effective_role().and_then(|_| {
@@ -380,8 +427,8 @@ impl SpanExporter for OtelExportMultiplexer {
         }
     }
 
-    fn shutdown(&mut self) -> OTelSdkResult {
-        if let Some(exporter) = &mut self.zipkin {
+    fn shutdown(&self) -> OTelSdkResult {
+        if let Some(exporter) = self.zipkin.as_ref() {
             let _ = exporter.shutdown();
         }
 
@@ -390,8 +437,8 @@ impl SpanExporter for OtelExportMultiplexer {
         Ok(())
     }
 
-    fn force_flush(&mut self) -> OTelSdkResult {
-        if let Some(exporter) = &mut self.zipkin {
+    fn force_flush(&self) -> OTelSdkResult {
+        if let Some(exporter) = self.zipkin.as_ref() {
             let _ = exporter.force_flush();
         }
 

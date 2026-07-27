@@ -1154,6 +1154,33 @@ impl DeletionIndex {
         }
     }
 
+    /// Fold BOTH pure deletes and upsert conflicts into the index in a SINGLE
+    /// pass — one `core.extend` (hence one bloom rebuild) instead of one
+    /// `extend_max_*` call per `(sequence, keys)` group. `pure` entries are
+    /// `(pk, delete_seq)`; `conflicts` are `(pk, delete_seq, insert_seq)`.
+    ///
+    /// Because the merge is per-key max, combining all groups into one
+    /// order-independent fold is exactly what makes replaying a multi-group
+    /// deletion delta under `rcu` against the live index cheap. Prefer this over
+    /// chaining `extend_max_deletes`/`extend_max_conflicts` in a loop, which
+    /// rebuilds the bloom once per group — the compounding cost called out on
+    /// [`Self::extend_max_deletes`].
+    #[must_use]
+    pub fn extend_max(
+        &self,
+        pure: impl IntoIterator<Item = (i64, i64)>,
+        conflicts: impl IntoIterator<Item = (i64, i64, i64)>,
+    ) -> Self {
+        Self {
+            core: self.core.extend(
+                pure.into_iter()
+                    .map(|(pk, delete_seq)| (pk, delete_seq, SEQUENCE_ABSENT))
+                    .chain(conflicts),
+                |pk| hash_key_i64(*pk),
+            ),
+        }
+    }
+
     /// Build a new index with every **deletion** at or below `cutoff` removed,
     /// retaining deletions with `delete_seq > cutoff` and all insert records.
     ///
@@ -1187,7 +1214,7 @@ fn bloom_half(hash: u128) -> u64 {
 }
 
 /// Frozen deletion index for tables with a composite or non-integer primary key.
-/// Probe keys are the byte-encoded form produced by `arrow_row::RowConverter`.
+/// Probe keys are the byte-encoded form produced by `crate::row_converter::RowConverter`.
 ///
 /// Entries are keyed by the **seeded XXH3-128 hash of the key bytes**
 /// ([`hash_key_128`]) rather than the bytes themselves: the hash is the key's
@@ -1387,16 +1414,41 @@ impl KeyDeletionIndex {
     pub fn get_batch<K: AsRef<[u8]>>(
         &self,
         keys: impl IntoIterator<Item = K>,
-        mut on_hit: impl FnMut(usize, Tombstone),
+        on_hit: impl FnMut(usize, Tombstone),
     ) {
         // Deletion-keyed bloom: with no recorded deletions every probe would
-        // miss (insert-only entries probe as absent), so skip the sweep.
+        // miss (insert-only entries probe as absent), so skip the sweep
+        // before paying for the chunk buffers below.
+        if self.core.delete_count == 0 {
+            return;
+        }
+        let mut hashes: Vec<u128> = Vec::with_capacity(BATCH_SWEEP_CHUNK);
+        let mut candidates: Vec<u32> = Vec::with_capacity(BATCH_SWEEP_CHUNK);
+        self.get_batch_with_scratch(keys, &mut hashes, &mut candidates, on_hit);
+    }
+
+    /// Like [`get_batch`](Self::get_batch), but the chunk-sweep buffers are
+    /// owned by the caller instead of allocated fresh (~40 KB across the two
+    /// `BATCH_SWEEP_CHUNK`-sized `Vec`s) on every call. Intended for a caller
+    /// that probes many batches in a loop (e.g. a per-`RecordBatch` deletion
+    /// filter stream) and keeps `hashes`/`candidates` as `&mut self` fields
+    /// across calls.
+    ///
+    /// `hashes` and `candidates` are cleared before each chunk's sweep, so
+    /// stale contents from a prior call (or a prior chunk) never leak into
+    /// the result — passing non-empty buffers is safe and has no effect on
+    /// the reported hits, only on avoided reallocations.
+    pub fn get_batch_with_scratch<K: AsRef<[u8]>>(
+        &self,
+        keys: impl IntoIterator<Item = K>,
+        hashes: &mut Vec<u128>,
+        candidates: &mut Vec<u32>,
+        mut on_hit: impl FnMut(usize, Tombstone),
+    ) {
         if self.core.delete_count == 0 {
             return;
         }
         let mut keys = keys.into_iter();
-        let mut hashes: Vec<u128> = Vec::with_capacity(BATCH_SWEEP_CHUNK);
-        let mut candidates: Vec<u32> = Vec::with_capacity(BATCH_SWEEP_CHUNK);
         let mut chunk_base = 0_usize;
         loop {
             hashes.clear();
@@ -1418,7 +1470,7 @@ impl KeyDeletionIndex {
             }
             // Pass 2: tier walk for the bloom survivors only (probed by the
             // retained hash identity; false positives resolve to "absent").
-            for &i in &candidates {
+            for &i in candidates.iter() {
                 if let Some(tombstone) = self.core.tombstone_of(
                     &hashes[i as usize],
                     bloom_half(hashes[i as usize]),
@@ -1471,6 +1523,29 @@ impl KeyDeletionIndex {
             core: self.core.extend(
                 keys.into_iter()
                     .map(|key| (hash_key_128(key.as_ref()), delete_sequence, insert_sequence)),
+                |key_hash| bloom_half(*key_hash),
+            ),
+        }
+    }
+
+    /// Key-based counterpart to [`DeletionIndex::extend_max`]: folds pure
+    /// deletes (`(key, delete_seq)`) and upsert conflicts
+    /// (`(key, delete_seq, insert_seq)`) in a SINGLE pass / one bloom rebuild.
+    #[must_use]
+    pub fn extend_max<K: AsRef<[u8]>>(
+        &self,
+        pure: impl IntoIterator<Item = (K, i64)>,
+        conflicts: impl IntoIterator<Item = (K, i64, i64)>,
+    ) -> Self {
+        Self {
+            core: self.core.extend(
+                pure.into_iter()
+                    .map(|(key, delete_seq)| {
+                        (hash_key_128(key.as_ref()), delete_seq, SEQUENCE_ABSENT)
+                    })
+                    .chain(conflicts.into_iter().map(|(key, delete_seq, insert_seq)| {
+                        (hash_key_128(key.as_ref()), delete_seq, insert_seq)
+                    })),
                 |key_hash| bloom_half(*key_hash),
             ),
         }
@@ -2307,6 +2382,75 @@ mod tests {
         let many: Vec<Box<[u8]>> = (0..5000_u64).map(byte_key).collect();
         assert!(many.len() > 2 * BATCH_SWEEP_CHUNK);
         assert_eq!(batch_gets_key(&idx, &many), per_row_gets_key(&idx, &many));
+    }
+
+    /// `get_batch_with_scratch` must agree with the allocating `get_batch`
+    /// wrapper even when its scratch buffers arrive pre-populated with
+    /// unrelated contents from a prior call — the reused-buffer contract is
+    /// that `hashes`/`candidates` are cleared per chunk, so stale entries
+    /// (here, from probing a disjoint key set first) never leak into a
+    /// later probe's hits.
+    #[test]
+    fn get_batch_with_scratch_reuse_does_not_leak_across_calls() {
+        let deleted: HashMap<Box<[u8]>, i64> = (0..100_u64).map(|i| (byte_key(i * 2), 1)).collect();
+        let idx = KeyDeletionIndex::from_map(deleted);
+
+        let mut hashes: Vec<u128> = Vec::new();
+        let mut candidates: Vec<u32> = Vec::new();
+
+        // First probe: a large, all-hit batch, to populate the scratch
+        // buffers with unrelated hashes/candidates at high capacity.
+        let warm_up: Vec<Box<[u8]>> = (0..10_u64).map(|i| byte_key(i * 2)).collect();
+        let mut warm_up_out: Vec<Option<Tombstone>> = vec![None; warm_up.len()];
+        idx.get_batch_with_scratch(
+            warm_up.iter().map(AsRef::as_ref),
+            &mut hashes,
+            &mut candidates,
+            |i, t| {
+                warm_up_out[i] = Some(t);
+            },
+        );
+        assert_eq!(warm_up_out, per_row_gets_key(&idx, &warm_up));
+        // `hashes` ends each call empty (the loop's terminating iteration clears it
+        // before finding no more keys). `candidates` may retain a non-empty len,
+        // so the reuse invariant under test is retained *capacity*, not len.
+        assert!(
+            hashes.capacity() > 0,
+            "scratch buffers should retain capacity after use"
+        );
+
+        // Second probe reuses the same scratch buffers (retaining capacity) with a
+        // disjoint shape (chunk-spanning, mixed hit/miss); results must match a
+        // fresh per-row probe, not a mix of stale and fresh hits.
+        let shapes: Vec<Vec<Box<[u8]>>> = vec![
+            vec![],
+            vec![byte_key(2)],
+            vec![byte_key(3)],
+            (0..5000_u64).map(byte_key).collect(),
+        ];
+        for keys in &shapes {
+            let mut out: Vec<Option<Tombstone>> = vec![None; keys.len()];
+            let mut last: Option<usize> = None;
+            idx.get_batch_with_scratch(
+                keys.iter().map(AsRef::as_ref),
+                &mut hashes,
+                &mut candidates,
+                |i, tombstone| {
+                    assert!(i < keys.len(), "callback index out of bounds: {i}");
+                    assert!(
+                        last.is_none_or(|prev| prev < i),
+                        "callback indices must be strictly ascending: {last:?} then {i}"
+                    );
+                    last = Some(i);
+                    out[i] = Some(tombstone);
+                },
+            );
+            assert_eq!(
+                out,
+                per_row_gets_key(&idx, keys),
+                "reused scratch buffers must not leak stale hits across calls"
+            );
+        }
     }
 
     #[test]

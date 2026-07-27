@@ -26,11 +26,14 @@ on:
       - trunk
       - release-*
       - release/*
-    paths-ignore:
-      - 'docs/**'
-      - 'README.md'
-      - 'version.txt'
-      - 'acknowledgements.md'
+      - feature-*
+  merge_group:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+  workflow_dispatch:
 
 env:
   FORBIDDEN_LICENSE_CHECK: |
@@ -40,11 +43,17 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
+  # Required check, so it runs on every merge-queue entry (merge_group can't
+  # path-filter). Dependency licenses are the gate here; running
+  # unconditionally is intentional.
   license-check-rust:
     name: Check Rust Licenses
+    # Emit the required context on pull requests without running cargo-deny;
+    # the real check runs on the merge-group commit.
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
@@ -56,6 +65,3 @@ jobs:
 
       - name: Check Rust Licenses
         run: cargo deny check licenses
-
-      - name: Check Rust Advisories
-        run: cargo deny check advisories

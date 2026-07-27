@@ -71,48 +71,82 @@ limitations under the License.
 //! - [`constants`]: Staging-dir name, WAL filename, and other shared constants.
 //! - [`partitioned_wal`]: Cross-partition WAL for the partitioned-table
 //!   coordinator (feature-gated).
+pub(crate) mod cold_partition;
+pub(crate) mod column_stats;
 pub(crate) mod compaction;
+pub(crate) mod compaction_writer;
 pub(crate) mod constants;
 pub(crate) mod context;
 pub(crate) mod delete;
 pub mod deletion_index;
 pub(crate) mod deletion_strategy;
 pub(crate) mod delta_encoding;
+pub(crate) mod fadvise_tier;
+pub(crate) mod file_digest;
 pub(crate) mod file_pruning;
 pub(crate) mod fsync_tier;
+pub(crate) mod inlined_cache;
+pub(crate) mod maintenance;
+pub(crate) mod manifest;
 pub(crate) mod mem_tier;
 pub(crate) mod mem_tier_budget;
 pub(crate) mod memory_account;
 pub(crate) mod mutation_writer;
+pub(crate) mod on_conflict;
 pub(crate) mod overwrite;
 pub mod partitioned_wal;
+pub(crate) mod pk_index;
+pub(crate) mod predicate_stats;
+pub(crate) mod query_admission;
 pub(crate) mod retention;
 pub(crate) mod scan;
 pub(crate) mod sink;
+pub(crate) mod staged_upsert;
 pub(crate) mod staging_wal;
 pub(crate) mod streaming;
 pub(crate) mod table;
+pub(crate) mod transaction;
 pub(crate) mod tuning;
 pub(crate) mod utils;
 pub(crate) mod vortex_format;
+pub(crate) mod wal_checksum;
 pub(crate) mod write_budget;
+pub(crate) mod zorder;
 
 // Re-export the main type at the module level for convenience
-pub use compaction::{set_compaction_runtime_env, set_compaction_runtime_handle};
+pub use compaction::{
+    begin_compaction_shutdown, drain_compaction_tasks, in_flight_compaction_tasks,
+    reset_compaction_shutdown, set_compaction_runtime_env, set_compaction_runtime_handle,
+};
 pub use context::CayenneContext;
 pub use mem_tier::SlotAdvancer;
-pub use mem_tier_budget::set_global_mem_tier_bytes;
+pub use mem_tier_budget::{
+    clear_global_mem_tier_pool_account, global_mem_tier_pool_account_bytes, global_mem_tier_total,
+    global_mem_tier_used, release_bytes as release_global_mem_tier_bytes,
+    set_global_mem_tier_bytes, set_global_mem_tier_pool_account,
+    try_reserve_bytes as try_reserve_global_mem_tier_bytes, update_global_mem_tier_total,
+};
+pub use on_conflict::PreparedOnConflictDeletionPublish;
 pub use overwrite::PreparedOverwrite;
 pub use partitioned_wal::{PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry};
+pub use query_admission::set_query_admission_governor;
 pub use retention::TimeRetentionFilterBuilder;
 pub use scan::CayenneAccelerationExec;
-pub use staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
-pub use table::{CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder};
-pub use tuning::{
-    QueryObservations, deregister_query_observations, record_query_latency,
-    register_query_observations, set_global_memory_budget,
+pub use staged_upsert::{CayenneStagedUpsert, PreparedTxnCommit, TransactionWriteToken};
+pub use staging_wal::{CayenneStagedAppend, PartitionedWalObjectStore, PreparedStagedAppend};
+pub use table::{
+    CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder, LastSmallFileCompactPath,
+    PreparedAppendSnapshotPublish,
 };
-pub use write_budget::set_global_encode_concurrency;
+pub use transaction::{CayenneTransaction, TransactionCommit, TxnTable};
+pub use tuning::{
+    QueryObservations, deregister_query_observations, global_qph, record_global_query,
+    record_query_latency, register_query_observations, set_cpu_burstable, set_global_memory_budget,
+};
+pub use write_budget::{
+    EncodeBudgetSnapshot, cap_global_encode_concurrency, encode_budget_snapshot,
+    set_global_encode_concurrency,
+};
 
 // Re-export deletion utilities for advanced use cases
 pub use delete::CayenneDeletionSink;
@@ -163,6 +197,23 @@ pub enum Error {
     #[snafu(display("Data validation failed for table '{table}': {message}"))]
     DataValidation { table: String, message: String },
 
+    /// A `mode: memory` (in-RAM) table reached its configured memory limit. Memory
+    /// mode never spills to disk, so the write is rejected rather than silently
+    /// dropped or grown unbounded.
+    #[snafu(display(
+        "Failed to write to dataset {table} (cayenne): the in-memory accelerator reached its \
+         memory limit ({limit_bytes} bytes; resident {resident_bytes} + incoming {incoming_bytes}). \
+         Use 'mode: file' for durable on-disk acceleration, or raise the limit with the \
+         'cayenne_cdc_mem_tier_max_bytes' parameter. \
+         See: https://spiceai.org/docs/components/data-accelerators"
+    ))]
+    MemTierLimitExceeded {
+        table: String,
+        limit_bytes: u64,
+        resident_bytes: u64,
+        incoming_bytes: u64,
+    },
+
     /// Failed to parse a snapshot or table URL.
     #[snafu(display("Failed to parse URL '{url}': {source}"))]
     UrlParse {
@@ -203,6 +254,14 @@ pub enum Error {
     /// Operation is not yet implemented.
     #[snafu(display("Unsupported operation: {operation}"))]
     Unsupported { operation: &'static str },
+
+    /// A transaction lost an optimistic-concurrency race: the
+    /// target table was committed to between this transaction's start and its
+    /// commit. Retryable at the newest committed state.
+    #[snafu(display(
+        "Transaction write conflict on table '{table}': the table changed since the transaction started; retry"
+    ))]
+    WriteConflict { table: String },
 
     /// Invalid number of children provided to an execution plan.
     #[snafu(display(

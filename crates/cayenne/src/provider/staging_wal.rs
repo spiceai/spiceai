@@ -58,13 +58,17 @@ limitations under the License.
 use super::PartitionedWal;
 use super::Result;
 use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
-use super::table::CayenneTableProvider;
+use super::on_conflict::{PostValidationState, PreparedOnConflictDeletionPublish};
+use super::table::{CayenneTableProvider, PreparedAppendSnapshotPublish};
+use crate::metadata::SnapshotFile;
 use crate::metastore::MetastoreTransaction;
 use crate::provider::Error;
+use arrow::record_batch::RecordBatch;
 use datafusion::execution::SendableRecordBatchStream;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectStorePath;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
@@ -87,6 +91,7 @@ pub struct CayenneStagedAppend {
     table: CayenneTableProvider,
     write_guard: Option<OwnedMutexGuard<()>>,
     staging_snapshot_id: String,
+    source_snapshot_id: Option<String>,
     target_snapshot_id: String,
     target_kind: StagingWalTargetKind,
     row_count: u64,
@@ -98,6 +103,7 @@ impl std::fmt::Debug for CayenneStagedAppend {
             .field("table", &self.table.table_name())
             .field("has_write_guard", &self.write_guard.is_some())
             .field("staging_snapshot_id", &self.staging_snapshot_id)
+            .field("source_snapshot_id", &self.source_snapshot_id)
             .field("target_snapshot_id", &self.target_snapshot_id)
             .field("target_kind", &self.target_kind)
             .field("row_count", &self.row_count)
@@ -158,20 +164,22 @@ impl CayenneStagedAppend {
         row_count: u64,
     ) -> Self {
         let target_snapshot_id = table.get_current_snapshot_id();
-        Self::from_staged_append_to_snapshot(
+        Self {
             table,
             write_guard,
             staging_snapshot_id,
+            source_snapshot_id: None,
             target_snapshot_id,
-            StagingWalTargetKind::CurrentSnapshot,
+            target_kind: StagingWalTargetKind::CurrentSnapshot,
             row_count,
-        )
+        }
     }
 
     pub(crate) fn from_staged_append_to_snapshot(
         table: CayenneTableProvider,
         write_guard: Option<OwnedMutexGuard<()>>,
         staging_snapshot_id: String,
+        source_snapshot_id: String,
         target_snapshot_id: String,
         target_kind: StagingWalTargetKind,
         row_count: u64,
@@ -180,6 +188,7 @@ impl CayenneStagedAppend {
             table,
             write_guard,
             staging_snapshot_id,
+            source_snapshot_id: Some(source_snapshot_id),
             target_snapshot_id,
             target_kind,
             row_count,
@@ -358,10 +367,34 @@ impl CayenneStagedAppend {
         inflight_guard.disarm();
         Ok(PreparedStagedAppend {
             table: self.table,
+            // Retain the per-table write guard through finalize ONLY for the
+            // deferred / protected-snapshot path (the cross-partition coordinator
+            // in `begin_deferred_snapshot_append` and the on-conflict deferred
+            // publish), which finalizes via `apply_under_held_barrier` and holds
+            // the lock across the coordinated commit. A single-table
+            // current-snapshot append finalizes via `finish` → `apply_under_barrier`,
+            // which RE-ACQUIRES `write_lock` in `lock_current_snapshot_for_apply`:
+            // keeping the guard here would self-deadlock that re-acquire and block
+            // any concurrent staged append. Dropping it (it stays held through this
+            // method's WAL write, then releases when `self` is consumed) mirrors the
+            // pre-refactor behavior and the `write_cdc_pipelined` guard handling.
+            write_guard: if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
+                None
+            } else {
+                self.write_guard
+            },
             staging_snapshot_id: self.staging_snapshot_id,
+            source_snapshot_id: self.source_snapshot_id,
             target_snapshot_id: self.target_snapshot_id,
             target_kind: self.target_kind,
             row_count: self.row_count,
+            // Default: no incremental IVM feed. The write path attaches captured
+            // batches via `set_ivm_feed_batches` only for IVM tables.
+            ivm_feed_batches: None,
+            prepared_on_conflict: None,
+            deferred_manifest: None,
+            validated_file_keys: None,
+            append_sequence: None,
         })
     }
 
@@ -397,20 +430,47 @@ impl CayenneStagedAppend {
 /// [`CayenneTableProvider::ensure_no_incomplete_write`].
 pub struct PreparedStagedAppend {
     table: CayenneTableProvider,
+    write_guard: Option<OwnedMutexGuard<()>>,
     staging_snapshot_id: String,
+    source_snapshot_id: Option<String>,
     target_snapshot_id: String,
     target_kind: StagingWalTargetKind,
     row_count: u64,
+    /// IVM feed: the insert `RecordBatches` captured at Stage A, present ONLY when
+    /// this table has a registered maintained aggregate AND the write is
+    /// incrementally feedable (set by the write path; `None` for non-IVM tables —
+    /// the common case, zero cost — or when the write must fall back to a full
+    /// rebuild). Consumed under the publish fence by
+    /// [`CayenneTableProvider::feed_staged_ivm_under_fence`]: `Some` feeds the
+    /// registry incrementally, `None` marks it stale (if IVM is registered).
+    ivm_feed_batches: Option<Arc<Vec<RecordBatch>>>,
+    prepared_on_conflict: Option<PreparedOnConflictDeletionPublish>,
+    deferred_manifest: Option<Vec<SnapshotFile>>,
+    validated_file_keys: Option<super::pk_index::PkDigestSet>,
+    append_sequence: Option<i64>,
 }
+
+/// Object-store handle, table-level WAL prefix, and canonical backend identity.
+pub type PartitionedWalObjectStore = (Arc<dyn object_store::ObjectStore>, ObjectStorePath, String);
 
 impl std::fmt::Debug for PreparedStagedAppend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreparedStagedAppend")
             .field("table", &self.table.table_name())
             .field("staging_snapshot_id", &self.staging_snapshot_id)
+            .field("source_snapshot_id", &self.source_snapshot_id)
             .field("target_snapshot_id", &self.target_snapshot_id)
             .field("target_kind", &self.target_kind)
             .field("row_count", &self.row_count)
+            .field("has_write_guard", &self.write_guard.is_some())
+            .field("has_ivm_feed", &self.ivm_feed_batches.is_some())
+            .field("has_on_conflict", &self.prepared_on_conflict.is_some())
+            .field("has_deferred_manifest", &self.deferred_manifest.is_some())
+            .field(
+                "has_validated_file_keys",
+                &self.validated_file_keys.is_some(),
+            )
+            .field("append_sequence", &self.append_sequence)
             .finish()
     }
 }
@@ -429,6 +489,247 @@ impl PreparedStagedAppend {
         self.row_count
     }
 
+    /// Attach the IVM insert batches captured at Stage A (write path → receipt),
+    /// to be fed to the maintained-aggregate registry under the publish fence in
+    /// `apply_under_barrier` / `apply_under_held_barrier`. `None` (the default)
+    /// means no incremental feed — the registry is marked stale if IVM is
+    /// registered, falling queries back to a base scan.
+    pub(crate) fn set_ivm_feed_batches(&mut self, batches: Option<Arc<Vec<RecordBatch>>>) {
+        self.ivm_feed_batches = batches;
+    }
+
+    pub(crate) fn set_prepared_on_conflict(&mut self, prepared: PreparedOnConflictDeletionPublish) {
+        self.prepared_on_conflict = Some(prepared);
+    }
+
+    pub(crate) fn set_validated_file_keys(&mut self, keys: super::pk_index::PkDigestSet) {
+        self.validated_file_keys = Some(keys);
+    }
+
+    /// Publish primary-key digests validated while the staged snapshot was private.
+    ///
+    /// `on_conflict_sequence` is the publish sequence when this append carries a
+    /// prepared on-conflict deletion (whose `prepared_on_conflict` was moved out
+    /// before publication). It takes precedence because an on-conflict append has
+    /// no `append_sequence` — stamping the fallback `0` would let a later
+    /// transaction that read these keys miss the conflict (silent lost update).
+    pub fn publish_validated_file_keys(&self, on_conflict_sequence: Option<i64>) {
+        if let Some(keys) = &self.validated_file_keys {
+            // Stamp the appended keys with this append's commit sequence for the
+            // per-key optimistic-concurrency check (a transaction that read these
+            // keys before the append sees them advance and conflicts).
+            if let Some(sequence) = on_conflict_sequence.or(self.append_sequence) {
+                self.table.record_file_pk_keys(keys, sequence);
+            } else {
+                // Neither sequence is available. Stamping the fallback `0` would
+                // fail OPEN for per-key OCC — a transaction that read these keys
+                // would see stamp 0 <= its begin token and MISS the conflict
+                // (silent lost update). Degrade per-key OCC to the per-table
+                // fallback, and do it BEFORE publishing the stamp-0 keys: a reader
+                // observes the keys only after acquiring the pk_keyset_cache lock
+                // that `record_file_pk_keys` releases, and that lock's
+                // release/acquire chains after this `Release` store, so any reader
+                // that sees a stamp-0 entry is guaranteed to also see degraded and
+                // take the per-table fallback (setting the flag after the publish
+                // would leave a window where the untrustworthy stamp is trusted).
+                self.table.mark_pk_keyset_occ_degraded();
+                self.table.record_file_pk_keys(keys, 0);
+            }
+        }
+    }
+
+    /// Remove and return deferred on-conflict publication state from this receipt.
+    pub fn take_prepared_on_conflict(&mut self) -> Option<PreparedOnConflictDeletionPublish> {
+        self.prepared_on_conflict.take()
+    }
+
+    /// Restore deferred on-conflict state after durable-outcome reconciliation.
+    pub fn restore_prepared_on_conflict(
+        &mut self,
+        prepared: Option<PreparedOnConflictDeletionPublish>,
+    ) {
+        self.prepared_on_conflict = prepared;
+    }
+
+    /// Preserve physical deletion files for top-level WAL recovery while
+    /// relinquishing process-local cleanup bookkeeping.
+    pub fn retain_files_for_wal_recovery(&mut self) {
+        if let Some(prepared) = self.prepared_on_conflict.as_mut() {
+            prepared.retain_files_for_wal_recovery();
+        }
+    }
+
+    /// Resolve abort-cleanup ownership after a cancelled shared commit.
+    /// Recovery calls this only after the durable snapshot pointer proves the
+    /// transaction committed, then verifies every generated delete-file path is
+    /// present in the committed catalog payload before disarming cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if committed deletion metadata cannot be loaded or does
+    /// not exactly contain every prepared deletion-vector path.
+    pub async fn reconcile_committed_on_conflict_cleanup(&mut self) -> Result<()> {
+        let Some(prepared) = self.prepared_on_conflict.as_mut() else {
+            return Ok(());
+        };
+        let committed_paths = self
+            .table
+            .metadata_catalog()
+            .get_table_delete_files(self.table.table_id())
+            .await?
+            .into_iter()
+            .map(|file| file.path)
+            .collect::<std::collections::HashSet<_>>();
+        if !prepared.mark_catalog_committed_if_paths_match(&committed_paths) {
+            return Err(Error::IncompleteWrite {
+                table: self.table.table_name().to_string(),
+                message: format!(
+                    "Catalog committed deferred snapshot '{}', but its prepared deletion-vector files do not exactly match the committed metadata; retaining cleanup ownership and requiring manual recovery",
+                    self.target_snapshot_id
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Reconcile this receipt's table from its durable staging WAL and catalog
+    /// pointer while the receipt still owns its write guard.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if staged-write recovery cannot converge safely.
+    pub async fn recover_committed_snapshot(&self) -> Result<()> {
+        self.table.ensure_no_incomplete_write().await
+    }
+
+    /// Return the exact manifest prepared for this deferred snapshot.
+    #[must_use]
+    pub fn deferred_manifest(&self) -> Option<&[SnapshotFile]> {
+        self.deferred_manifest.as_deref()
+    }
+
+    /// Build and validate the target snapshot's exact durable manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if source or target files cannot be listed, metadata
+    /// cannot be loaded, or the target manifest is inconsistent.
+    pub async fn prepare_deferred_manifest(&mut self) -> Result<()> {
+        let source_snapshot_id =
+            self.source_snapshot_id
+                .as_ref()
+                .ok_or_else(|| Error::Internal {
+                    table: self.table.table_name().to_string(),
+                    message: "Deferred manifest preparation requires a source snapshot".to_string(),
+                })?;
+        let source_manifest = self
+            .table
+            .metadata_catalog()
+            .get_snapshot_files(self.table.table_id(), source_snapshot_id)
+            .await?;
+        let source_names = self
+            .table
+            .list_snapshot_files_with_sizes(source_snapshot_id)
+            .await?
+            .into_iter()
+            .map(|(file, _)| file)
+            .collect::<std::collections::HashSet<_>>();
+        let new_sequence = if let Some(prepared) = &self.prepared_on_conflict {
+            prepared.snapshot_sequence
+        } else if let Some(sequence) = self.append_sequence {
+            sequence
+        } else {
+            return Err(Error::Internal {
+                table: self.table.table_name().to_string(),
+                message: "Deferred append manifest has no reserved append sequence".to_string(),
+            });
+        };
+        let listed_files = self
+            .table
+            .list_snapshot_files_with_sizes(&self.target_snapshot_id)
+            .await?;
+        let target_names = listed_files
+            .iter()
+            .map(|(file, _)| file.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let listed_file_count = listed_files.len();
+        if target_names.len() != listed_files.len() {
+            return Err(Error::Internal {
+                table: self.table.table_name().to_string(),
+                message: format!(
+                    "Deferred snapshot '{}' contains duplicate data-file names",
+                    self.target_snapshot_id
+                ),
+            });
+        }
+        let mut manifest = source_manifest
+            .into_iter()
+            .filter(|file| {
+                source_names.contains(&file.file_path) && target_names.contains(&file.file_path)
+            })
+            .map(|mut file| {
+                file.snapshot_id.clone_from(&self.target_snapshot_id);
+                file
+            })
+            .collect::<Vec<_>>();
+        let manifest_names = manifest
+            .iter()
+            .map(|file| file.file_path.clone())
+            .collect::<std::collections::HashSet<_>>();
+        manifest.extend(
+            listed_files
+                .iter()
+                .filter(|(name, _)| source_names.contains(name) && !manifest_names.contains(name))
+                .map(|(file_path, file_size_bytes)| SnapshotFile {
+                    table_id: self.table.table_id().to_string(),
+                    snapshot_id: self.target_snapshot_id.clone(),
+                    file_path: file_path.clone(),
+                    row_count: 0,
+                    file_size_bytes: i64::try_from(*file_size_bytes).unwrap_or(i64::MAX),
+                    min_sequence: 0,
+                    max_sequence: new_sequence,
+                    digest: None,
+                }),
+        );
+        manifest.extend(
+            listed_files
+                .into_iter()
+                .filter(|(name, _)| !source_names.contains(name))
+                .map(|(file_path, file_size_bytes)| SnapshotFile {
+                    table_id: self.table.table_id().to_string(),
+                    snapshot_id: self.target_snapshot_id.clone(),
+                    file_path,
+                    row_count: 0,
+                    file_size_bytes: i64::try_from(file_size_bytes).unwrap_or(i64::MAX),
+                    min_sequence: new_sequence,
+                    max_sequence: new_sequence,
+                    digest: None,
+                }),
+        );
+        manifest.sort_unstable_by(|left, right| left.file_path.cmp(&right.file_path));
+        if manifest.len() != listed_file_count {
+            return Err(Error::Internal {
+                table: self.table.table_name().to_string(),
+                message: format!(
+                    "Deferred manifest for snapshot '{}' has {} rows for {} physical files",
+                    self.target_snapshot_id,
+                    manifest.len(),
+                    listed_file_count
+                ),
+            });
+        }
+        self.deferred_manifest = Some(manifest);
+        Ok(())
+    }
+
+    /// Publish prepared on-conflict state while the caller holds the listing fence.
+    pub fn publish_on_conflict_under_held_fence(
+        &self,
+        prepared: PreparedOnConflictDeletionPublish,
+    ) {
+        self.table.publish_prepared_on_conflict_deletions(prepared);
+    }
+
     async fn lock_current_snapshot_for_apply(&self) -> Option<OwnedMutexGuard<()>> {
         if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
             Some(self.table.write_lock_arc().lock_owned().await)
@@ -438,7 +739,7 @@ impl PreparedStagedAppend {
     }
 
     fn try_lock_current_snapshot_for_held_barrier(&self) -> Result<Option<OwnedMutexGuard<()>>> {
-        if self.target_kind != StagingWalTargetKind::CurrentSnapshot {
+        if self.target_kind != StagingWalTargetKind::CurrentSnapshot || self.write_guard.is_some() {
             return Ok(None);
         }
 
@@ -515,14 +816,19 @@ impl PreparedStagedAppend {
         self.table
             .move_staged_files_to_snapshot(&self.staging_snapshot_id, &self.target_snapshot_id)
             .await?;
-        self.table
-            .remove_staging_wal_for(&self.staging_snapshot_id)
-            .await?;
         if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
+            self.table
+                .remove_staging_wal_for(&self.staging_snapshot_id)
+                .await?;
             self.table
                 .publish_current_snapshot_files_changed_under_held_fence();
         }
-        self.table.mark_maintained_aggregates_stale();
+        // IVM: feed the maintained-aggregate registry from this staged publish,
+        // atomically with the held listing fence (the serializer for concurrent
+        // finish() tasks) so applier-enqueue order == epoch order. `None` feed
+        // (non-IVM table, or a non-incremental write) marks stale instead.
+        self.table
+            .feed_staged_ivm_under_fence(self.ivm_feed_batches.as_ref());
         Ok(())
     }
 
@@ -550,14 +856,19 @@ impl PreparedStagedAppend {
         self.table
             .move_staged_files_to_snapshot(&self.staging_snapshot_id, &self.target_snapshot_id)
             .await?;
-        self.table
-            .remove_staging_wal_for(&self.staging_snapshot_id)
-            .await?;
         if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
+            self.table
+                .remove_staging_wal_for(&self.staging_snapshot_id)
+                .await?;
             self.table
                 .publish_current_snapshot_files_changed_under_held_fence();
         }
-        self.table.mark_maintained_aggregates_stale();
+        // IVM: feed the maintained-aggregate registry from this staged publish,
+        // atomically with the held listing fence (the serializer for concurrent
+        // finish() tasks) so applier-enqueue order == epoch order. `None` feed
+        // (non-IVM table, or a non-incremental write) marks stale instead.
+        self.table
+            .feed_staged_ivm_under_fence(self.ivm_feed_batches.as_ref());
         Ok(())
     }
 
@@ -568,6 +879,76 @@ impl PreparedStagedAppend {
         self.table.table_id()
     }
 
+    /// The snapshot containing this prepared append's complete post-commit
+    /// contents.
+    #[must_use]
+    pub fn target_snapshot_id(&self) -> &str {
+        &self.target_snapshot_id
+    }
+
+    /// Build the fallible listing-table state needed to publish this deferred
+    /// append. Call before the cross-partition catalog transaction commits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the receipt is not a protected-snapshot append or
+    /// listing-table publication state cannot be prepared.
+    pub fn prepare_deferred_snapshot_publish(&self) -> Result<PreparedAppendSnapshotPublish> {
+        if self.target_kind != StagingWalTargetKind::ProtectedSnapshot {
+            return Err(Error::Internal {
+                table: self.table.table_name().to_string(),
+                message: "Deferred snapshot preparation requires a protected-snapshot target"
+                    .to_string(),
+            });
+        }
+        self.table
+            .prepare_append_snapshot_publish(&self.target_snapshot_id)
+    }
+
+    /// Publish a prebuilt deferred-snapshot append after the cross-partition
+    /// catalog transaction has atomically advanced every partition pointer.
+    /// This is deliberately synchronous: once the durable commit decision has
+    /// been recorded, cancellation must not interrupt publication midway.
+    pub fn publish_deferred_snapshot_under_held_fence(
+        &self,
+        prepared: PreparedAppendSnapshotPublish,
+    ) {
+        self.table
+            .publish_append_snapshot_under_held_fence(prepared);
+    }
+
+    /// Remove this append's staging WAL after its committed protected-snapshot
+    /// has been finalized (replacement files durably in the target snapshot).
+    /// Called by the cross-partition coordinator after its multi-partition
+    /// commit and by the single-table CDC upsert finalize (`CayenneCdcWrite::finish`),
+    /// since `apply_under_held_barrier` removes the WAL only for `CurrentSnapshot`
+    /// targets.
+    ///
+    /// Callers treat failure as best-effort recoverable maintenance: the append
+    /// is already durably committed, so a failed WAL removal must NOT turn it
+    /// into a client-visible failure — the leftover WAL is rolled forward
+    /// idempotently by the next write's `ensure_no_incomplete_write`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the local or object-store WAL cannot be removed.
+    pub async fn remove_committed_staging_wal(&self) -> Result<()> {
+        self.table
+            .remove_staging_wal_for(&self.staging_snapshot_id)
+            .await
+    }
+
+    /// Run best-effort maintenance after the deferred snapshot is visible.
+    pub async fn finish_deferred_snapshot_maintenance(&self) {
+        self.table
+            .finish_deferred_append_snapshot(&self.target_snapshot_id)
+            .await;
+        if let Some(source_snapshot_id) = &self.source_snapshot_id {
+            self.table
+                .retire_snapshot_dirs(std::iter::once(source_snapshot_id.as_str()));
+        }
+    }
+
     /// Returns this partition's absolute staging-WAL path, used by the
     /// cross-partition coordinator to record what the top-level WAL refers
     /// to.
@@ -575,6 +956,17 @@ impl PreparedStagedAppend {
     pub fn staging_wal_path(&self) -> std::path::PathBuf {
         self.table
             .staging_wal_path_for_recovery_for(&self.staging_snapshot_id)
+    }
+
+    /// Return the object store and table-level prefix used for a top-level
+    /// cross-partition WAL. Local tables return `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if object-store configuration or the canonical table
+    /// prefix cannot be resolved.
+    pub fn partitioned_wal_object_store(&self) -> Result<Option<PartitionedWalObjectStore>> {
+        self.table.partitioned_wal_object_store()
     }
 
     /// Acquire this partition's listing fence for write, returning an owned
@@ -645,6 +1037,11 @@ impl PreparedStagedAppend {
         self.table
             .clear_staging_snapshot_dir(&self.staging_snapshot_id)
             .await?;
+        if self.target_kind == StagingWalTargetKind::ProtectedSnapshot {
+            self.table
+                .clear_snapshot_dir(&self.target_snapshot_id)
+                .await?;
+        }
         self.mark_inflight_complete();
         Ok(())
     }
@@ -682,11 +1079,62 @@ pub(crate) enum StagingWalTargetKind {
 #[derive(Debug)]
 struct LocatedStagingWal {
     staging_snapshot_id: String,
-    wal: StagingWal,
+    outcome: StagingWalOutcome,
     location: String,
 }
 
+/// The result of reading one staging-WAL record on recovery.
+#[derive(Debug)]
+enum StagingWalOutcome {
+    /// A record that read back and (when framed) passed its checksum.
+    Parsed(StagingWal),
+    /// A checksum-framed record that failed its integrity check (bit-rot or a
+    /// torn write). Carries a human-readable reason for logs. Recovery discards
+    /// it — its staged files were never durably committed into a snapshot (the
+    /// metastore visibility commit, not this marker, is the durable commit
+    /// point; see `write_staging_wal_local`), so dropping them converges to the
+    /// last committed snapshot rather than replaying corrupted move
+    /// instructions.
+    Corrupt(String),
+}
+
 impl CayenneTableProvider {
+    /// Return the object store and table-level prefix used for top-level
+    /// cross-partition WALs. Local tables return `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if object-store configuration or the canonical table
+    /// prefix cannot be resolved.
+    pub fn partitioned_wal_object_store(&self) -> Result<Option<PartitionedWalObjectStore>> {
+        if !self.table_path().starts_with("s3://") {
+            return Ok(None);
+        }
+        let config = self.require_object_store()?;
+        let snapshot_id = self.get_current_snapshot_id();
+        let partition_prefix = self
+            .snapshot_object_store_prefix(&snapshot_id)?
+            .ok_or_else(|| Error::Internal {
+                table: self.table_name().to_string(),
+                message: "Missing object-store snapshot prefix".to_string(),
+            })?;
+        let suffix = format!("{}/{snapshot_id}", self.table_id());
+        let prefix = partition_prefix
+            .as_ref()
+            .strip_suffix(&suffix)
+            .ok_or_else(|| Error::Internal {
+                table: self.table_name().to_string(),
+                message: format!(
+                    "Snapshot prefix '{partition_prefix}' does not end with expected suffix '{suffix}'"
+                ),
+            })?;
+        Ok(Some((
+            Arc::clone(&config.store),
+            ObjectStorePath::from(prefix),
+            config.url.to_string(),
+        )))
+    }
+
     /// Stage an append into Cayenne without making the new rows visible.
     ///
     /// This path supports append-only semantics and returns a handle that allows
@@ -776,6 +1224,159 @@ impl CayenneTableProvider {
         ))
     }
 
+    /// Begin a staged append into a fresh snapshot cloned from the current
+    /// snapshot. The new snapshot remains invisible until its catalog pointer is
+    /// committed and [`PreparedStagedAppend::publish_deferred_snapshot`] runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source snapshot cannot be cloned, the append
+    /// cannot be staged, or its exact target manifest cannot be prepared.
+    pub async fn begin_deferred_snapshot_append(
+        &self,
+        data: SendableRecordBatchStream,
+        target_partitions: usize,
+    ) -> Result<PreparedStagedAppend> {
+        struct DeferredSetupCleanup {
+            table: CayenneTableProvider,
+            snapshots: Vec<String>,
+            armed: bool,
+        }
+        impl Drop for DeferredSetupCleanup {
+            fn drop(&mut self) {
+                if !self.armed {
+                    return;
+                }
+                let table = self.table.clone_for_write_operations();
+                let snapshots = std::mem::take(&mut self.snapshots);
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn(async move {
+                        for snapshot in snapshots {
+                            let _ = table.clear_snapshot_dir(&snapshot).await;
+                            let _ = table.clear_staging_snapshot_dir(&snapshot).await;
+                        }
+                    });
+                } else {
+                    std::thread::spawn(move || {
+                        let runtime = match tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                        {
+                            Ok(runtime) => runtime,
+                            Err(error) => {
+                                tracing::warn!(
+                                    table = table.table_name(),
+                                    %error,
+                                    "Failed to start cleanup runtime for deferred snapshot setup"
+                                );
+                                return;
+                            }
+                        };
+                        runtime.block_on(async move {
+                            for snapshot in snapshots {
+                                let _ = table.clear_snapshot_dir(&snapshot).await;
+                                let _ = table.clear_staging_snapshot_dir(&snapshot).await;
+                            }
+                        });
+                    });
+                }
+            }
+        }
+        let write_guard = self.write_lock_arc().lock_owned().await;
+        self.ensure_no_incomplete_write().await?;
+
+        // The private target currently clones only immutable snapshot data.
+        // Pending deletion vectors, inline rows/deletes, and protected snapshot
+        // state are separate visibility inputs and cannot be dropped from a
+        // cross-partition append. Refuse before cloning or consuming input until
+        // those states are included in the coordinated transaction.
+        let current_snapshot_id = self.get_current_snapshot_id();
+        let target_snapshot_id = Self::new_staging_snapshot_id();
+        let mut setup_cleanup = DeferredSetupCleanup {
+            table: self.clone_for_write_operations(),
+            snapshots: vec![target_snapshot_id.clone()],
+            armed: true,
+        };
+        self.clone_snapshot_files(&current_snapshot_id, &target_snapshot_id)
+            .await?;
+
+        let staging_snapshot_id = Self::new_staging_snapshot_id();
+        setup_cleanup.snapshots.push(staging_snapshot_id.clone());
+        self.clear_staging_snapshot_dir(&staging_snapshot_id)
+            .await?;
+        let prepared_insert = match self.prepare_stream_for_insert(data).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.clear_snapshot_dir(&target_snapshot_id).await?;
+                return Err(error);
+            }
+        };
+        let may_have_on_conflict_deletions = prepared_insert.may_have_on_conflict_deletions();
+        let post_validation = prepared_insert.post_validation();
+        let row_count = match self
+            .write_stream_to_staging_snapshot(
+                prepared_insert.stream,
+                &staging_snapshot_id,
+                target_partitions,
+            )
+            .await
+        {
+            Ok(row_count) => row_count,
+            Err(error) => {
+                self.clear_staging_snapshot_dir(&staging_snapshot_id)
+                    .await?;
+                self.clear_snapshot_dir(&target_snapshot_id).await?;
+                return Err(error);
+            }
+        };
+        let PostValidationState {
+            on_conflict_deletions,
+            validated_keys,
+        } = post_validation.lock().take().unwrap_or_default();
+        let prepared_on_conflict = if may_have_on_conflict_deletions || self.has_pending_deletions()
+        {
+            match self
+                .prepare_on_conflict_deletions_for_staged_snapshot(
+                    on_conflict_deletions,
+                    target_snapshot_id.clone(),
+                    true,
+                )
+                .await
+            {
+                Ok(prepared) => Some(prepared),
+                Err(error) => {
+                    let _ = self.clear_staging_snapshot_dir(&staging_snapshot_id).await;
+                    let _ = self.clear_snapshot_dir(&target_snapshot_id).await;
+                    return Err(error.into());
+                }
+            }
+        } else {
+            None
+        };
+        let append_sequence = if prepared_on_conflict.is_none() {
+            Some(self.reserve_sequences_local(1).await?)
+        } else {
+            None
+        };
+        let staged = CayenneStagedAppend::from_staged_append_to_snapshot(
+            self.clone_for_write_operations(),
+            Some(write_guard),
+            staging_snapshot_id,
+            current_snapshot_id,
+            target_snapshot_id,
+            StagingWalTargetKind::ProtectedSnapshot,
+            row_count,
+        );
+        let mut prepared = staged.prepare().await?;
+        if let Some(on_conflict) = prepared_on_conflict {
+            prepared.set_prepared_on_conflict(on_conflict);
+        }
+        prepared.set_validated_file_keys(validated_keys);
+        prepared.append_sequence = append_sequence;
+        setup_cleanup.armed = false;
+        Ok(prepared)
+    }
+
     /// Write the staging WAL file that records the pending move operation.
     ///
     /// The WAL is written after all data files have been staged but before any
@@ -857,6 +1458,14 @@ impl CayenneTableProvider {
             table: self.table_name().to_string(),
             message: format!("Failed to serialize staging WAL: {e}"),
         })?;
+        // With integrity checksums enabled, wrap the JSON payload in a checksum
+        // envelope so a corrupt/torn record is detected on recovery instead of
+        // parsed as garbage. Off → byte-identical legacy pure-JSON.
+        let record_bytes: Vec<u8> = if self.integrity_checksums() {
+            super::wal_checksum::frame(content.as_bytes())
+        } else {
+            content.into_bytes()
+        };
 
         // Single open + write + fsync, keeping the fd through to the sync.
         // The previous revision called `tokio::fs::write` (which opens,
@@ -884,7 +1493,7 @@ impl CayenneTableProvider {
             .truncate(true)
             .open(&tmp_path)
             .await?;
-        file.write_all(content.as_bytes()).await?;
+        file.write_all(&record_bytes).await?;
         super::fsync_tier::ordering_sync_tokio_file(&file).await?;
         drop(file);
 
@@ -967,12 +1576,19 @@ impl CayenneTableProvider {
             table: self.table_name().to_string(),
             message: format!("Failed to serialize staging WAL: {e}"),
         })?;
+        // See `write_staging_wal_local`: frame with a checksum envelope when
+        // integrity checksums are enabled, else write byte-identical legacy JSON.
+        let record_bytes: Vec<u8> = if self.integrity_checksums() {
+            super::wal_checksum::frame(content.as_bytes())
+        } else {
+            content.into_bytes()
+        };
 
         let wal_key =
             ObjectStorePath::from(format!("{}{STAGING_WAL_FILENAME}", staging_prefix.as_ref()));
         config
             .store
-            .put(&wal_key, content.into())
+            .put(&wal_key, record_bytes.into())
             .await
             .map_err(|e| Error::ObjectStore {
                 operation: "write staging WAL",
@@ -992,8 +1608,8 @@ impl CayenneTableProvider {
     /// Remove the staging WAL file after a successful move.
     ///
     /// This signals that all staged files have been moved successfully. If this
-    /// removal fails, the WAL is stale (files already moved) and will be detected
-    /// as a false positive on next open — harmless but logged.
+    /// removal fails, the commit is not reported as complete: callers must retain
+    /// the recovery intent and surface the failure.
     pub(crate) async fn remove_staging_wal_for(&self, staging_snapshot_id: &str) -> Result<()> {
         if self.table_path().starts_with("s3://") {
             let config = self.require_object_store()?;
@@ -1002,7 +1618,6 @@ impl CayenneTableProvider {
                     "{}{STAGING_WAL_FILENAME}",
                     staging_prefix.as_ref()
                 ));
-                // Best-effort delete — if the key doesn't exist, that's fine.
                 match config.store.delete(&wal_key).await {
                     Ok(()) | Err(object_store::Error::NotFound { .. }) => {
                         if !self.has_inflight_staging_appends() {
@@ -1012,11 +1627,11 @@ impl CayenneTableProvider {
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "Failed to remove staging WAL (S3) for table {}: {e}",
-                            self.table_name(),
-                        );
-                        // leave flag true so next ensure will retry the check
+                        return Err(Error::ObjectStore {
+                            operation: "remove staging WAL after commit",
+                            table: self.table_name().to_string(),
+                            source: e,
+                        });
                     }
                 }
             }
@@ -1026,14 +1641,8 @@ impl CayenneTableProvider {
             let wal_path = staging_dir.join(STAGING_WAL_FILENAME);
             let removed = match tokio::fs::remove_file(&wal_path).await {
                 Ok(()) => true,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true, // already gone = success state
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to remove staging WAL for table {}: {e}",
-                        self.table_name(),
-                    );
-                    false
-                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                Err(source) => return Err(Error::IoError { source }),
             };
 
             if removed {
@@ -1042,20 +1651,22 @@ impl CayenneTableProvider {
                     self.staging_may_have_files()
                         .store(false, Ordering::Release);
                 }
-                // Durability: after removing the WAL marker (the "commit success" signal),
-                // fsync the staging directory so the unlink is persisted. A crash without
-                // this sync could make the removal non-durable, causing a false-positive
-                // "incomplete write" detection on the next open even though the data move
-                // succeeded and was synced. This completes the "WAL absent = durably
-                // committed" contract for local FS staged appends (symmetric to the
-                // sync after data file moves).
-                if let Err(e) = Self::sync_snapshot_dir(&staging_dir).await {
-                    tracing::warn!(
-                        "Failed to sync staging dir after WAL removal for table {}: {e} (data is safe; may see stale WAL on restart)",
-                        self.table_name(),
-                    );
-                    // Non-fatal: data files are already durable. A lingering WAL is conservative.
-                }
+                // No staging-dir fsync after the WAL unlink. The data move's
+                // target-snapshot dir fsync (`move_staging_files_local`) already
+                // made this commit durable BEFORE this point, so persisting the
+                // WAL *unlink* is a recovery-hygiene ordering hint, not a
+                // durability barrier — and it bought nothing end-to-end (the
+                // next line `remove_dir`s this same directory without a sync
+                // anyway). A crash in this window self-heals: recovery's
+                // `ensure_no_incomplete_write` audit finds every WAL-listed file
+                // already in the target snapshot and re-drives the idempotent
+                // (now no-op) move, then removes the stale WAL. Dropping this
+                // barrier cuts one ordering-tier `fsync(2)` from EVERY staged
+                // commit — a real saving on EBS / provisioned-IOPS, where each
+                // barrier is a billed, capped operation. The durable commit
+                // boundary (the target-dir fsync) and the recovery substrate
+                // (the WAL-content fsync + the post-rename staging-dir fsync)
+                // are untouched.
                 match tokio::fs::remove_dir(&staging_dir).await {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1069,15 +1680,56 @@ impl CayenneTableProvider {
         Ok(())
     }
 
-    /// Ensure no incomplete write is pending before starting a new write.
+    /// Ensure no incomplete write is pending before starting a new write, and
+    /// roll any recoverable one forward (or back) so the table is writable.
     ///
-    /// Checks for a leftover staging WAL, which indicates a previous staged
-    /// append was interrupted during the file-move phase. Returns an error to
-    /// block further writes until the inconsistency is resolved.
+    /// Runs on the pre-write gate (under `write_lock`) and at provider open. For
+    /// each leftover staging WAL it either self-heals — idempotently completing
+    /// the staged file move (roll FORWARD) or discarding an uncommitted staged
+    /// append (roll BACK) — or, for a genuinely ambiguous / torn write, refuses
+    /// and returns [`Error::IncompleteWrite`] so an operator can intervene.
+    ///
+    /// ## Why this can never double-publish or roll back a *committed* append
+    ///
+    /// Finalize normally clears a committed append's WAL itself, so recovery
+    /// fires only for interrupted writes (a crash between the durable move and
+    /// the WAL removal), the cross-partition coordinator's brief post-commit
+    /// window, or a failed best-effort WAL removal. Even when it rolls a
+    /// *committed* `ProtectedSnapshot` append forward, a layered invariant keeps
+    /// that safe:
+    ///
+    /// 1. **In-flight registration covers the entire live-finalize window.**
+    ///    `CayenneStagedAppend::prepare` registers the append in-flight *before*
+    ///    its WAL becomes discoverable, and only `finish()` (which runs *after*
+    ///    `apply_*` has completed the move), `rollback()`, or `Drop`
+    ///    (cancellation) clears it. The `staging_append_is_inflight` skip below
+    ///    therefore excludes any append whose finalize is still live — recovery
+    ///    only ever acts on an append whose finalize has already completed, been
+    ///    rolled back, or been abandoned.
+    /// 2. **`visibility_lock` serializes recovery's move against a concurrent
+    ///    finalize's move**, so even at the instant of hand-off there is no torn
+    ///    concurrent directory mutation (see the lock note below).
+    /// 3. **Roll-forward vs roll-back is decided by the DURABLE snapshot sequence,
+    ///    not the provider pointer.** A single-table CDC upsert commits its
+    ///    `snapshot_sequence` synchronously in Stage A
+    ///    (`commit_on_conflict_deletions_with_tombstone`), which runs *before*
+    ///    `finish()`. Since `not-in-flight ⟹ finish() ran (or the receipt was
+    ///    dropped)`, a *committed* upsert always has a durable sequence when
+    ///    recovery sees its WAL ⟹ it is always rolled FORWARD, never back. An
+    ///    append abandoned *before* its sequence commit has no durable sequence
+    ///    and is correctly rolled back (it published no rows).
+    /// 4. **The roll-forward move is idempotent.**
+    ///    `move_staged_files_to_snapshot` renames whatever is in the (uuid-named)
+    ///    `_staging/<id>/` dir into the target; once finalize has moved the files
+    ///    the staging dir is empty and recovery's move is a no-op — so re-running
+    ///    recovery any number of times neither duplicates rows nor loses them.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::IncompleteWrite`] if a staging WAL file is found.
+    /// Returns [`Error::IncompleteWrite`] when a leftover WAL cannot be safely
+    /// self-healed: its target current-snapshot has moved, WAL-listed files are
+    /// missing from both staging and the target snapshot, or the WAL removal
+    /// after a successful move fails.
     pub(crate) async fn ensure_no_incomplete_write(&self) -> Result<()> {
         if !self.staging_wal_present().load(Ordering::Acquire)
             && !self.staging_may_have_files().load(Ordering::Acquire)
@@ -1127,23 +1779,56 @@ impl CayenneTableProvider {
         located_wals
             .sort_by(|left, right| left.staging_snapshot_id.cmp(&right.staging_snapshot_id));
 
-        let mut recovered_current_any = false;
+        let mut recovered_current_snapshot_any = false;
+        let mut recovered_protected_snapshots = Vec::new();
         for located_wal in located_wals {
             if self.staging_append_is_inflight(&located_wal.staging_snapshot_id) {
                 continue;
             }
 
-            let wal = located_wal.wal;
-            let wal_location = located_wal.location;
             let staging_snapshot_id = located_wal.staging_snapshot_id;
+            let wal_location = located_wal.location;
             let table_name = self.table_name().to_string();
+
+            // A checksum-framed record that failed its integrity check is
+            // *discarded* rather than parsed as garbage. It cannot be an
+            // in-flight append this process staged (that WAL was just written
+            // with a valid checksum and is excluded above), so a mismatch means
+            // a prior process's torn write or on-disk bit-rot. The staged files
+            // were never moved into a snapshot, so removing the staging dir
+            // converges to the last committed snapshot. This keeps the table
+            // usable (unlike the conservative "refuse all writes" path for
+            // genuinely ambiguous cases below), which is only safe *because* the
+            // checksum proves the record is untrustworthy.
+            let wal = match located_wal.outcome {
+                StagingWalOutcome::Parsed(wal) => wal,
+                StagingWalOutcome::Corrupt(reason) => {
+                    tracing::error!(
+                        table = %table_name,
+                        location = %wal_location,
+                        staging_snapshot_id = %staging_snapshot_id,
+                        "Discarding corrupt staging WAL detected by integrity checksum ({reason}); \
+                         its staged files were never committed, converging to the last snapshot",
+                    );
+                    self.clear_staging_snapshot_dir(&staging_snapshot_id)
+                        .await?;
+                    continue;
+                }
+            };
 
             // If this per-partition incomplete write belongs to a cross-partition
             // commit, carry the commit id through every operator-facing recovery
             // error so related partition failures can be correlated.
             let mut extra = String::new();
-            if let Ok(all_wals) =
-                PartitionedWal::read_all_in(std::path::Path::new(self.table_path())).await
+            let partitioned_table_root =
+                std::path::Path::new(self.table_path())
+                    .ancestors()
+                    .find(|path| {
+                        path.join(super::partitioned_wal::PARTITIONED_WAL_DIR)
+                            .exists()
+                    });
+            if let Some(partitioned_table_root) = partitioned_table_root
+                && let Ok(all_wals) = PartitionedWal::read_all_in(partitioned_table_root).await
             {
                 for (partitioned_wal, _) in all_wals {
                     if partitioned_wal
@@ -1160,9 +1845,23 @@ impl CayenneTableProvider {
                 }
             }
 
-            let current_snapshot = self.get_current_snapshot_id();
+            // The provider-local pointer can be stale if cancellation happens
+            // while the metastore COMMIT is in flight: both SQLite and Turso
+            // may complete that COMMIT after the coordinator future is dropped,
+            // before its synchronous publication block runs. Classify protected
+            // targets from the durable catalog pointer so recovery never deletes
+            // a snapshot that the catalog has committed.
+            let provider_snapshot = self.get_current_snapshot_id();
+            let durable_snapshot = if wal.target_kind == StagingWalTargetKind::ProtectedSnapshot {
+                self.metadata_catalog()
+                    .get_table(self.table_name())
+                    .await?
+                    .current_snapshot_id
+            } else {
+                provider_snapshot.clone()
+            };
             if wal.target_kind == StagingWalTargetKind::CurrentSnapshot
-                && current_snapshot != wal.target_snapshot
+                && provider_snapshot != wal.target_snapshot
             {
                 return Err(Error::IncompleteWrite {
                     table: table_name,
@@ -1171,9 +1870,69 @@ impl CayenneTableProvider {
                         wal.staged_files.len(),
                         wal.target_snapshot,
                         wal.created_at,
-                        current_snapshot,
+                        provider_snapshot,
                     ),
                 });
+            }
+            if wal.target_kind == StagingWalTargetKind::ProtectedSnapshot
+                && durable_snapshot != wal.target_snapshot
+            {
+                // The target is NOT the durable current-snapshot pointer. Whether
+                // it is committed is decided by its durable snapshot sequence
+                // (`cayenne_snapshot_sequence`), NOT the pointer, because the two
+                // protected-snapshot producers commit differently:
+                //
+                //   * A single-table CDC upsert writes its protected target's
+                //     sequence SYNCHRONOUSLY in Stage A — before `write_cdc_append_stream`
+                //     returns and the CDC source offset advances — and its
+                //     writer-free Stage-B publish (`CayenneCdcWrite::finish`) never
+                //     moves the current pointer: the target is a merge-on-read
+                //     OVERLAY layered on the unchanged current snapshot. Such an
+                //     append is COMMITTED. It must be rolled FORWARD, both when a
+                //     crash lands between Stage A and Stage B (recovered at reopen)
+                //     and when the NEXT write's recovery pass finds a finalized
+                //     batch's still-present WAL (Stage B does not remove a
+                //     protected-snapshot WAL). Rolling it back deletes durably
+                //     committed rows — including rows the upsert did NOT supersede.
+                //   * A cross-partition deferred append DEFERS its sequence write
+                //     into the coordinator transaction that also flips every
+                //     partition's pointer, so a crash before that COMMIT leaves no
+                //     durable sequence and the pointer unmoved — genuinely
+                //     uncommitted, and correctly rolled back.
+                //
+                // Durable sequence present => roll FORWARD by falling through to the
+                // move + WAL-removal below. The pointer is deliberately NOT advanced:
+                // `recovered_protected_snapshots` (which drives
+                // `publish_recovered_deferred_snapshot`, and with it `current = target`)
+                // stays gated on `durable_snapshot == target`, reserved for the
+                // pointer-committed cross-partition case. A CDC-upsert overlay's
+                // in-memory visibility is (re)established by the owning `finish()` or,
+                // after a crash, by table-open reloading `protected_snapshots` and
+                // activating orphan inline tombstones — recovery here only makes the
+                // staged files durable in the target dir and clears the WAL.
+                let durably_committed = self
+                    .metadata_catalog()
+                    .get_snapshot_sequence(self.table_id(), &wal.target_snapshot)
+                    .await?
+                    .is_some();
+                if !durably_committed {
+                    tracing::warn!(
+                        table = table_name.as_str(),
+                        target_snapshot = wal.target_snapshot.as_str(),
+                        current_snapshot = durable_snapshot.as_str(),
+                        "Rolling back an uncommitted deferred snapshot append"
+                    );
+                    self.clear_staging_snapshot_dir(&staging_snapshot_id)
+                        .await?;
+                    self.clear_snapshot_dir(&wal.target_snapshot).await?;
+                    continue;
+                }
+                tracing::debug!(
+                    table = table_name.as_str(),
+                    target_snapshot = wal.target_snapshot.as_str(),
+                    current_snapshot = durable_snapshot.as_str(),
+                    "Recovering a durably-committed protected-snapshot append forward (merge-on-read overlay; current pointer unchanged)"
+                );
             }
 
             // Audit: every file the WAL claims must be reachable — either
@@ -1259,43 +2018,74 @@ impl CayenneTableProvider {
                     });
                 };
 
-                let target_prefix = self
+                let Some(target_prefix) = self
                     .snapshot_object_store_prefix(&wal.target_snapshot)
-                    .ok()
-                    .flatten();
+                    .map_err(|error| Error::IncompleteWrite {
+                        table: table_name.clone(),
+                        message: format!(
+                            "A previous write was interrupted while moving {} file(s) to '{}'. Failed to determine the target S3 prefix for the pre-recovery audit ({error}); refusing automated recovery because file reachability is unknown. Manual resolution is required. The WAL file is located at '{wal_location}'.{extra}",
+                            wal.staged_files.len(),
+                            wal.target_snapshot
+                        ),
+                    })?
+                else {
+                    return Err(Error::IncompleteWrite {
+                        table: table_name.clone(),
+                        message: format!(
+                            "A previous write was interrupted while moving {} file(s) to '{}'. Could not determine the target S3 prefix for the pre-recovery audit; refusing automated recovery because file reachability is unknown. Manual resolution is required. The WAL file is located at '{wal_location}'.{extra}",
+                            wal.staged_files.len(),
+                            wal.target_snapshot
+                        ),
+                    });
+                };
 
                 let mut reachable: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
+                let expected = wal
+                    .staged_files
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<std::collections::HashSet<_>>();
 
-                if let Ok(objects) = config
-                    .store
-                    .list(Some(&staging_prefix))
-                    .try_collect::<Vec<_>>()
-                    .await
-                {
-                    for meta in objects {
-                        if let Some(rel) =
-                            meta.location.as_ref().strip_prefix(staging_prefix.as_ref())
-                            && rel != STAGING_WAL_FILENAME
-                            && rel != STAGING_WAL_TMP_FILENAME
-                        {
-                            reachable.insert(rel.to_string());
+                let mut staging_objects = config.store.list(Some(&staging_prefix));
+                while let Some(meta) = staging_objects.next().await {
+                    let meta = meta.map_err(|error| Error::IncompleteWrite {
+                        table: table_name.clone(),
+                        message: format!(
+                            "A previous write was interrupted while moving {} file(s) to '{}'. Failed to list the S3 staging prefix during the pre-recovery audit ({error}); refusing automated recovery because file reachability is unknown. Manual resolution is required. The WAL file is located at '{wal_location}'.{extra}",
+                            wal.staged_files.len(),
+                            wal.target_snapshot
+                        ),
+                    })?;
+                    if let Some(rel) = meta.location.as_ref().strip_prefix(staging_prefix.as_ref())
+                        && expected.contains(rel)
+                    {
+                        reachable.insert(rel.to_string());
+                        if reachable.len() == expected.len() {
+                            break;
                         }
                     }
                 }
 
-                if let Some(target_prefix) = &target_prefix
-                    && let Ok(objects) = config
-                        .store
-                        .list(Some(target_prefix))
-                        .try_collect::<Vec<_>>()
-                        .await
-                {
-                    for meta in objects {
+                if reachable.len() != expected.len() {
+                    let mut target_objects = config.store.list(Some(&target_prefix));
+                    while let Some(meta) = target_objects.next().await {
+                        let meta = meta.map_err(|error| Error::IncompleteWrite {
+                            table: table_name.clone(),
+                            message: format!(
+                                "A previous write was interrupted while moving {} file(s) to '{}'. Failed to list the target S3 prefix during the pre-recovery audit ({error}); refusing automated recovery because file reachability is unknown. Manual resolution is required. The WAL file is located at '{wal_location}'.{extra}",
+                                wal.staged_files.len(),
+                                wal.target_snapshot
+                            ),
+                        })?;
                         if let Some(rel) =
                             meta.location.as_ref().strip_prefix(target_prefix.as_ref())
+                            && expected.contains(rel)
                         {
                             reachable.insert(rel.to_string());
+                            if reachable.len() == expected.len() {
+                                break;
+                            }
                         }
                     }
                 }
@@ -1364,8 +2154,21 @@ impl CayenneTableProvider {
                         table = table_name.as_str(),
                         "Automated recovery from incomplete write succeeded; table is now writable"
                     );
-                    if wal.target_kind == StagingWalTargetKind::CurrentSnapshot {
-                        recovered_current_any = true;
+                    // A protected-snapshot target is visible when the durable
+                    // catalog pointer already equals it (the committed
+                    // cross-partition append case). Refresh the provider's
+                    // in-memory pointer/listing just as for a current-snapshot
+                    // append; otherwise a long-lived provider would keep serving
+                    // its pre-crash snapshot until reopened.
+                    if durable_snapshot == wal.target_snapshot {
+                        match wal.target_kind {
+                            StagingWalTargetKind::CurrentSnapshot => {
+                                recovered_current_snapshot_any = true;
+                            }
+                            StagingWalTargetKind::ProtectedSnapshot => {
+                                recovered_protected_snapshots.push(wal.target_snapshot.clone());
+                            }
+                        }
                     }
                 }
                 Err(e) => {
@@ -1388,7 +2191,16 @@ impl CayenneTableProvider {
             }
         }
 
-        if recovered_current_any {
+        // A protected target became the durable current snapshot in the shared
+        // cross-partition transaction. Rehydrate every catalog-backed
+        // visibility input before publishing the pointer/listing under its
+        // listing fence; a pointer-only refresh would leave stale deletions and
+        // protected-snapshot thresholds after cancellation at COMMIT.
+        for snapshot_id in recovered_protected_snapshots {
+            self.publish_recovered_deferred_snapshot(&snapshot_id)
+                .await?;
+        }
+        if recovered_current_snapshot_any {
             self.publish_current_snapshot_files_changed().await;
         }
 
@@ -1407,6 +2219,19 @@ impl CayenneTableProvider {
             self.staging_wal_present().store(false, Ordering::Release);
         }
         Ok(())
+    }
+
+    /// Reconcile leftover staged appends after a cross-partition coordinator
+    /// crash. The catalog pointer is the durable commit decision: protected
+    /// targets equal to the pointer are completed; all others are rolled back.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a WAL cannot be read, its durable outcome cannot be
+    /// classified safely, or committed publication/rollback cannot complete.
+    pub async fn recover_incomplete_writes(&self) -> Result<()> {
+        let _write_guard = self.write_lock_arc().lock_owned().await;
+        self.ensure_no_incomplete_write().await
     }
 
     async fn read_staging_wals(&self) -> Result<Vec<LocatedStagingWal>> {
@@ -1464,19 +2289,36 @@ impl CayenneTableProvider {
             Self::snapshot_dir_path(self.table_path(), self.table_id(), staging_snapshot_id);
         let wal_path = staging_dir.join(STAGING_WAL_FILENAME);
         let location = wal_path.to_string_lossy().to_string();
-        match tokio::fs::read_to_string(&wal_path).await {
-            Ok(content) => match serde_json::from_str::<StagingWal>(&content) {
-                Ok(wal) => Ok(Some(LocatedStagingWal {
+        // Read raw bytes (not a String): a checksum-framed record is binary. The
+        // envelope is auto-detected, so both framed and legacy pure-JSON records
+        // are handled regardless of the current `integrity_checksums` setting.
+        match tokio::fs::read(&wal_path).await {
+            Ok(bytes) => match super::wal_checksum::verify(&bytes) {
+                Ok(payload) => match serde_json::from_slice::<StagingWal>(payload.bytes()) {
+                    Ok(wal) => Ok(Some(LocatedStagingWal {
+                        staging_snapshot_id: staging_snapshot_id.to_string(),
+                        outcome: StagingWalOutcome::Parsed(wal),
+                        location,
+                    })),
+                    // The bytes are intact (checksum passed, or legacy
+                    // unchecksummed) but do not parse as a `StagingWal`. Keep the
+                    // conservative refuse-and-flag behavior: the record is not
+                    // corrupt, so we must not silently drop a possibly committed
+                    // append.
+                    Err(e) => Err(Error::IncompleteWrite {
+                        table: self.table_name().to_string(),
+                        message: format!(
+                            "Found unreadable staging WAL at '{location}': {e}. Refusing writes to avoid ignoring a possibly committed staged append. Manual resolution is required."
+                        ),
+                    }),
+                },
+                // The checksum envelope failed to verify → corrupt/torn record.
+                // Signal it up so recovery discards the staging dir.
+                Err(checksum_err) => Ok(Some(LocatedStagingWal {
                     staging_snapshot_id: staging_snapshot_id.to_string(),
-                    wal,
+                    outcome: StagingWalOutcome::Corrupt(checksum_err.to_string()),
                     location,
                 })),
-                Err(e) => Err(Error::IncompleteWrite {
-                    table: self.table_name().to_string(),
-                    message: format!(
-                        "Found unreadable staging WAL at '{location}': {e}. Refusing writes to avoid ignoring a possibly committed staged append. Manual resolution is required."
-                    ),
-                }),
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(Error::IoError { source: e }),
@@ -1535,17 +2377,27 @@ impl CayenneTableProvider {
                 table: self.table_name().to_string(),
                 source: e,
             })?;
-            let wal = serde_json::from_slice::<StagingWal>(&bytes).map_err(|e| {
-                Error::IncompleteWrite {
-                    table: self.table_name().to_string(),
-                    message: format!(
-                        "Found unreadable staging WAL at '{location}': {e}. Refusing writes to avoid ignoring a possibly committed staged append. Manual resolution is required."
-                    ),
-                }
-            })?;
+            // Auto-detect the checksum envelope (both framed and legacy
+            // pure-JSON records are handled regardless of `integrity_checksums`).
+            let outcome = match super::wal_checksum::verify(&bytes) {
+                Ok(payload) => match serde_json::from_slice::<StagingWal>(payload.bytes()) {
+                    Ok(wal) => StagingWalOutcome::Parsed(wal),
+                    Err(e) => {
+                        // Intact bytes that do not parse as a `StagingWal`:
+                        // conservatively refuse (not corruption).
+                        return Err(Error::IncompleteWrite {
+                            table: self.table_name().to_string(),
+                            message: format!(
+                                "Found unreadable staging WAL at '{location}': {e}. Refusing writes to avoid ignoring a possibly committed staged append. Manual resolution is required."
+                            ),
+                        });
+                    }
+                },
+                Err(checksum_err) => StagingWalOutcome::Corrupt(checksum_err.to_string()),
+            };
             wals.push(LocatedStagingWal {
                 staging_snapshot_id,
-                wal,
+                outcome,
                 location,
             });
         }

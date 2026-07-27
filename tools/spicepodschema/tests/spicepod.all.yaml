@@ -436,17 +436,12 @@ datasets:
         username: unique
       on_conflict:
         id: upsert # drop, upsert, upsert_dedup, upsert_dedup_by_row_id
-      partition_by:
-        - name: created_date
-          expression: DATE(created_at)
       snapshots: enabled # disabled, enabled, bootstrap_only, create_only
       params:
         duckdb_file: ./data/postgres.duckdb
         file_watcher: 'true'
-        partition_mode: auto
         connection_pool_size: '5'
         on_refresh_recompute_statistics: 'true'
-        partitioned_write_buffer: '1000'
         optimizer_duckdb_aggregate_pushdown: 'true'
       metrics:
         metrics:
@@ -806,7 +801,7 @@ datasets:
       mongodb_direct_connection: 'false'
       mongodb_time_zone: UTC
       mongodb_unnest_depth: '3'
-      mongodb_num_docs_to_infer_schema: '100'
+      mongodb_schema_infer_max_records: '100'
       mongodb_pool_min: '1'
       mongodb_pool_max: '10'
 

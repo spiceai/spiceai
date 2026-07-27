@@ -1336,7 +1336,7 @@ impl SnapshotManager {
         destination_location: &ObjectPath,
         lock_guard: OwnedMutexGuard<()>,
     ) -> Result<(u64, String), SnapshotUploadError> {
-        use crate::snapshot::directory_archive::archive_directories_with_plan;
+        use crate::snapshot::directory_archive::archive_directories_to_file_with_plan;
 
         // Step 0: Ask the engine for any per-directory skip list / extras.
         let plan = self
@@ -1359,15 +1359,8 @@ impl SnapshotManager {
             uuid::Uuid::now_v7()
         ));
 
-        let archive_file = fs::File::create(&temp_archive_path)
-            .await
-            .map_err(|source| SnapshotUploadError::ArchiveCreate {
-                path: temp_archive_path.clone(),
-                source,
-            })?;
-
         let total_archived =
-            archive_directories_with_plan(dirs, archive_file, &skip_paths, &extras)
+            archive_directories_to_file_with_plan(dirs, &temp_archive_path, &skip_paths, &extras)
                 .await
                 .map_err(|source| SnapshotUploadError::ArchiveCreate {
                     path: temp_archive_path.clone(),
@@ -1536,6 +1529,17 @@ impl SnapshotManager {
     }
 
     /// Attempts to download the latest snapshot, returning details if successful.
+    ///
+    /// INVARIANT (Cayenne orphaned-DV cleanup): restore is wholesale and
+    /// self-contained — the downloaded archive carries its OWN data and
+    /// deletion-vector (`.arrow`) files plus metastore slice, and extraction
+    /// replaces the local table directory before the provider is (re)opened. It
+    /// never reuses the live table's files. Cayenne's orphaned-DV sweep
+    /// (`CayenneTableProvider::sweep_orphaned_deletion_vectors`) deletes DV files
+    /// once they fall below the surviving-sequence floor and depends on this: if
+    /// restore is ever changed to reuse the live table's files (e.g. an in-place
+    /// pointer flip without re-extraction), it must account for DV deletion —
+    /// keep orphaned DVs alive longer or restrict which snapshots can be restored.
     ///
     /// # Errors
     ///
@@ -2169,7 +2173,9 @@ impl SnapshotManager {
         entry: &SnapshotEntry,
         path_display: &str,
     ) -> Result<(u64, String), SnapshotDownloadError> {
-        use crate::snapshot::directory_archive::{ExtractOptions, extract_archive_with_options};
+        use crate::snapshot::directory_archive::{
+            ExtractOptions, extract_archive_file_with_options,
+        };
 
         // Download to a temporary file first
         let temp_archive_path = std::env::temp_dir().join(format!(
@@ -2258,13 +2264,6 @@ impl SnapshotManager {
         // Use skip_if_exists to handle shared metadata directories across multiple
         // Cayenne datasets. The first dataset's snapshot extracts the metadata,
         // and subsequent datasets skip those files since they already exist.
-        let archive_file = fs::File::open(&temp_archive_path).await.map_err(|source| {
-            SnapshotDownloadError::WriteLocal {
-                path: temp_archive_path.clone(),
-                source,
-            }
-        })?;
-
         // Build prefix mappings from dirs: map archive prefixes to target directories.
         // This ensures files archived with prefix "data/" are extracted to the actual
         // data directory (e.g., /spice/data/my_table/) rather than a literal "data/" subdirectory.
@@ -2276,7 +2275,7 @@ impl SnapshotManager {
         let mut extract_options = ExtractOptions::skip_existing();
         extract_options.prefix_mappings = Some(prefix_mappings);
 
-        extract_archive_with_options(archive_file, extract_target, extract_options)
+        extract_archive_file_with_options(&temp_archive_path, extract_target, extract_options)
             .await
             .map_err(|source| SnapshotDownloadError::ArchiveExtract {
                 path: temp_archive_path.clone(),

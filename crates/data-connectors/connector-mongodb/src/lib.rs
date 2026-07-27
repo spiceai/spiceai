@@ -24,6 +24,7 @@ limitations under the License.
 //! this crate, not the entire runtime.
 
 mod changes;
+pub mod stream;
 
 use async_trait::async_trait;
 use data_components::inferred_schema::{InferredIndex, InferredSchema, InferredSortColumn};
@@ -34,6 +35,7 @@ use datafusion_table_providers::mongodb::{
 use mongodb::bson::{Bson, Document, doc};
 use runtime::component::dataset::Dataset;
 use runtime::component::dataset::acceleration::RefreshMode;
+use runtime::dataconnector::schema_projection::{ProjectionPolicy, parse_schema_projection};
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult,
@@ -121,8 +123,11 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("Time zone to use for interpreting and returning timestamp values (e.g., 'UTC', 'America/Los_Angeles')."),
     ParameterSpec::component("unnest_depth")
         .description("Maximum nesting depth for unnesting embedded documents into a flattened structure. Higher values expand deeper nested fields."),
-    ParameterSpec::component("num_docs_to_infer_schema")
+    ParameterSpec::component("schema_infer_max_records")
         .description("Number of documents to use to infer the schema. Defaults to 400."),
+    ParameterSpec::component("num_docs_to_infer_schema")
+        .description("Number of documents to use to infer the schema. Defaults to 400.")
+        .deprecated("Use 'schema_infer_max_records' instead."),
     ParameterSpec::component("pool_min")
         .description("The minimum number of connections to keep open in the pool, lazily created when requested.")
         .default(DEFAULT_CONNECTION_POOL_MIN_STR),
@@ -261,6 +266,26 @@ impl DataConnectorFactory for MongoDBFactory {
                 params
                     .parameters
                     .insert("pool_max".to_string(), pool_max.to_string().into());
+            }
+
+            // `schema_infer_max_records` is the preferred, cross-connector name and is
+            // the key the connection pool reads. `num_docs_to_infer_schema` is deprecated:
+            // when it's set (and the new name isn't), map it onto the new key so existing
+            // configs keep working. `schema_infer_max_records` always takes precedence.
+            let has_schema_infer_max_records = params
+                .parameters
+                .get("schema_infer_max_records")
+                .ok()
+                .is_some();
+            let legacy_num_docs = params
+                .parameters
+                .get("num_docs_to_infer_schema")
+                .ok()
+                .map(|s| s.expose_secret().to_string());
+            if !has_schema_infer_max_records && let Some(value) = legacy_num_docs {
+                params
+                    .parameters
+                    .insert("schema_infer_max_records".to_string(), value.into());
             }
 
             let pool = match MongoDBConnectionPool::new(params.parameters.to_secret_map()).await {
@@ -672,18 +697,22 @@ async fn mongodb_inferred_schema_metadata(
     {
         Ok(Ok(details)) => details,
         Ok(Err(error)) => {
-            tracing::debug!(
+            // Graceful degradation: catalog enrichment failed (commonly the user
+            // lacks listIndexes/listCollections/collStats access). Fall back to the
+            // structural `_id` primary key only; secondary indexes, sort, and sizing
+            // are not inferred.
+            tracing::info!(
                 collection = collection_name,
                 %error,
-                "MongoDB catalog enrichment failed; inferring the `_id` primary key only"
+                "MongoDB schema inference degraded to the `_id` primary key only: catalog enrichment failed, usually because the connection user lacks catalog access. Secondary indexes, sort order, and sizing were not inferred."
             );
             MongoCatalogDetails::primary_key_only(&primary_key)
         }
         Err(_elapsed) => {
-            tracing::debug!(
+            tracing::info!(
                 collection = collection_name,
                 timeout_secs = MONGODB_CATALOG_TIMEOUT.as_secs(),
-                "MongoDB catalog enrichment timed out; inferring the `_id` primary key only"
+                "MongoDB schema inference degraded to the `_id` primary key only: catalog enrichment timed out. Secondary indexes, sort order, and sizing were not inferred."
             );
             MongoCatalogDetails::primary_key_only(&primary_key)
         }
@@ -701,21 +730,19 @@ async fn mongodb_inferred_schema_metadata(
     }
 }
 
-/// Enrich the provider's schema with inferred primary key / indexes / sort columns
-/// when the dataset opts into `schema_inference: extended`.
+/// Enrich the provider's schema with the inferred primary key / indexes / sort
+/// columns. Inference is always attempted; the `_id` primary key is structural
+/// (always available) and catalog enrichment (indexes, sort, sizing) is
+/// best-effort, degrading gracefully when the source restricts catalog access.
 async fn enrich_with_mongodb_metadata(
     pool: &Arc<MongoDBConnectionPool>,
     dataset: &Dataset,
     provider: Arc<dyn TableProvider>,
 ) -> Arc<dyn TableProvider> {
-    if !dataset.schema_inference.is_extended() {
-        return provider;
-    }
-
     tracing::debug!(
         dataset = %dataset.name,
         collection = %dataset.path(),
-        "Applying MongoDB extended schema inference (inferring `_id` primary key; catalog enrichment is best-effort)"
+        "Applying MongoDB schema inference (inferring `_id` primary key; catalog enrichment is best-effort)"
     );
     let inferred = mongodb_inferred_schema_metadata(pool, dataset.path()).await;
     if inferred.is_empty() {
@@ -729,7 +756,7 @@ async fn enrich_with_mongodb_metadata(
         sort_columns = inferred.sort_columns.len(),
         row_count = ?inferred.row_count,
         table_bytes = ?inferred.table_bytes,
-        "Inferred extended schema metadata from MongoDB catalog"
+        "Inferred schema metadata from MongoDB catalog"
     );
     data_components::metadata_enriched_table_provider(
         provider,
@@ -748,9 +775,15 @@ impl DataConnector for MongoDB {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+        // JSON-nesting / declared-schema projection. `_id` is MongoDB's only
+        // primary key and must stay a declared column when a catch-all is used.
+        let projection = parse_schema_projection(
+            dataset,
+            &ProjectionPolicy::new("mongodb").with_required_columns(vec!["_id".to_string()]),
+        )?;
         let provider = self
             .mongodb_factory
-            .table_provider(dataset.path().into(), dataset.schema.clone())
+            .table_provider(dataset.path().into(), dataset.schema.clone(), projection)
             .await
             .context(UnableToGetReadProviderSnafu {
                 dataconnector: "mongodb",
@@ -767,9 +800,6 @@ impl DataConnector for MongoDB {
         &self,
         federated_table: Arc<FederatedTable>,
         dataset: &Dataset,
-        _accelerated_table_provider: Arc<dyn TableProvider>,
-        _accelerator_write_mutex: Arc<tokio::sync::Mutex<()>>,
-        _cpu_runtime: Option<tokio::runtime::Handle>,
     ) -> Option<data_components::cdc::ChangesStream> {
         Some(changes::build_changes_stream(
             Arc::clone(&self.pool),
@@ -1107,3 +1137,13 @@ mod inferred_schema_tests {
         assert_eq!(details.table_bytes, None);
     }
 }
+
+// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_mongodb as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+runtime::register_data_connector!(
+    register_mongodb_connector,
+    MONGODB_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    MongoDBFactory
+);

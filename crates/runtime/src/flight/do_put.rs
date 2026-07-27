@@ -30,7 +30,7 @@ use datafusion::{
     error::DataFusionError, execution::SendableRecordBatchStream,
     physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
 };
-use opentelemetry::KeyValue;
+use opentelemetry::{KeyValue, Value};
 use prost::Message as _;
 use runtime_auth::AuthRequestContext;
 use tokio::sync::mpsc::{self, Sender};
@@ -192,8 +192,11 @@ pub(crate) async fn handle(
     };
     let path = datafusion.normalize_table_reference(path);
 
-    // Initializing tracking here so that both counter and duration have consistent path dimensions
-    let start = metrics::track_flight_request("do_put", Some(&path.to_string())).await;
+    // Allocate path label once for request + per-batch metrics (avoids re-stringifying per batch).
+    let path_label: Arc<str> = Arc::from(path.to_string());
+    let start =
+        metrics::track_flight_request_value("do_put", Some(Value::from(Arc::clone(&path_label))))
+            .await;
 
     if !datafusion.is_writable(&path) && !datafusion.is_path_catalog_writable(&path) {
         return Err(Status::invalid_argument(format!(
@@ -269,6 +272,7 @@ pub(crate) async fn handle(
     let first_message = first_message.clone();
     let response_stream = create_response_stream(
         path,
+        path_label,
         schema,
         Arc::clone(&datafusion),
         streaming_flight,
@@ -286,8 +290,42 @@ fn allow_scheduler_trusted_executor_write(datafusion: &DataFusion) -> bool {
         && datafusion.cluster_config.tls_config().is_some()
 }
 
+/// Drains the messages remaining on the inbound flight stream after the write
+/// sink has already completed, returning the number of discarded messages that
+/// carried record-batch data — i.e. client rows that were streamed but never
+/// written. Keepalive heartbeats and empty trailer messages do not carry data
+/// and are not counted, so a sink that completes exactly as the stream ends
+/// reports zero discarded batches and the write is still acked as a success.
+async fn drain_discarded_data_batches<S>(stream: &mut S) -> usize
+where
+    S: futures::Stream<Item = Result<FlightData, Status>> + Unpin,
+{
+    let mut discarded = 0usize;
+    while let Some(msg) = stream.next().await {
+        match msg {
+            Ok(data) => {
+                // A message carries record-batch (or dictionary) data when its
+                // body is non-empty; keepalive heartbeats are tagged and never
+                // count as lost client data.
+                if data.app_metadata.as_ref() != crate::flight::KEEPALIVE_APP_METADATA
+                    && !data.data_body.is_empty()
+                {
+                    discarded += 1;
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Error reading remaining message after early write completion: {e}"
+                );
+            }
+        }
+    }
+    discarded
+}
+
 fn create_response_stream(
     path: TableReference,
+    path_label: Arc<str>,
     schema: SchemaRef,
     df: Arc<DataFusion>,
     mut streaming_flight: Peekable<Streaming<FlightData>>,
@@ -314,7 +352,7 @@ fn create_response_stream(
         let mut write_future = Box::pin(df.write_streaming_data(&path, streaming_update));
 
         if let Some(first_batch) = first_batch {
-            yield handle_record_batch(first_batch, &batch_tx, &path.to_string()).await;
+            yield handle_record_batch(first_batch, &batch_tx, &path_label).await;
         }
 
         // Use a single pinned Sleep future that is reset on each received message,
@@ -344,13 +382,23 @@ fn create_response_stream(
                             // The write operation completed before the flight stream
                             // ended. This can happen when the data sink does not
                             // consume the input stream or finishes early. Drain
-                            // remaining messages and report success.
-                            tracing::warn!("Write operation completed before stream ended for dataset: {path}");
-                            while let Some(msg) = streaming_flight.next().await {
-                                if let Err(e) = msg {
-                                    tracing::error!("Error reading remaining message after early write completion: {e}");
-                                }
+                            // the remaining messages, but if any of them carried
+                            // record-batch data those client rows were never
+                            // written — fail loudly instead of acking a silent
+                            // partial ingest.
+                            let discarded = drain_discarded_data_batches(&mut streaming_flight).await;
+                            if discarded > 0 {
+                                tracing::error!(
+                                    dataset = %path,
+                                    discarded_batches = discarded,
+                                    "Write sink completed before the client finished streaming; {discarded} data batch(es) were not written",
+                                );
+                                yield Err(Status::data_loss(format!(
+                                    "Write sink for dataset `{path}` finished before the client stream ended; {discarded} data batch(es) streamed by the client were not written",
+                                )));
+                                break;
                             }
+                            tracing::warn!("Write operation completed before stream ended for dataset: {path}");
                             yield Ok(PutResult::default());
                             break;
                         }
@@ -401,8 +449,7 @@ fn create_response_stream(
                             // sink and the idle deadline polled while the send is
                             // pending so backpressure propagates instead of
                             // deadlocking.
-                            let path_str = path.to_string();
-                            let batch_send = handle_record_batch(new_batch, &batch_tx, &path_str);
+                            let batch_send = handle_record_batch(new_batch, &batch_tx, &path_label);
                             let mut batch_send = std::pin::pin!(batch_send);
                             tokio::select! {
                                 biased;
@@ -421,15 +468,19 @@ fn create_response_stream(
                                 write_result = &mut write_future => {
                                     match write_result {
                                         Ok(()) => {
-                                            // Sink finished while a batch was still pending —
-                                            // mirror the early-completion arm: drain and succeed.
-                                            tracing::warn!("Write operation completed before stream ended for dataset: {path}");
-                                            while let Some(msg) = streaming_flight.next().await {
-                                                if let Err(e) = msg {
-                                                    tracing::error!("Error reading remaining message after early write completion: {e}");
-                                                }
-                                            }
-                                            yield Ok(PutResult::default());
+                                            // Sink finished while a batch was still pending. That
+                                            // pending batch was not accepted by the sink, so it
+                                            // counts as discarded along with anything left on the
+                                            // wire; fail loudly rather than ack a partial ingest.
+                                            let discarded = 1 + drain_discarded_data_batches(&mut streaming_flight).await;
+                                            tracing::error!(
+                                                dataset = %path,
+                                                discarded_batches = discarded,
+                                                "Write sink completed while a client batch was still pending; {discarded} data batch(es) were not written",
+                                            );
+                                            yield Err(Status::data_loss(format!(
+                                                "Write sink for dataset `{path}` finished before the client stream ended; {discarded} data batch(es) streamed by the client were not written",
+                                            )));
                                             break;
                                         }
                                         Err(e) => {
@@ -471,9 +522,10 @@ fn create_response_stream(
                             if let Err(e) = write_result {
                                 tracing::error!("Write operation failed. Details included in the response.");
                                 yield Err(Status::internal(format!("Write operation failed: {e}")));
+                                break;
                             }
                             tracing::debug!("Write operation completed successfully for dataset: {path}");
-                            yield Ok(PutResult::default())
+                            yield Ok(PutResult::default());
                             break;
                         }
                         Some(Err(e)) => {
@@ -493,11 +545,11 @@ fn create_response_stream(
 async fn handle_record_batch(
     batch: RecordBatch,
     batch_tx: &Sender<Result<RecordBatch, DataFusionError>>,
-    path: &str,
+    path: &Arc<str>,
 ) -> Result<PutResult, Status> {
     tracing::trace!("Received batch with {} rows", batch.num_rows());
 
-    let labels = [KeyValue::new("dataset", path.to_string())];
+    let labels = [KeyValue::new("dataset", Arc::clone(path))];
     metrics::DO_PUT_ROWS_WRITTEN.add(batch.num_rows() as u64, &labels);
     metrics::DO_PUT_BYTES_WRITTEN.add(batch.get_array_memory_size() as u64, &labels);
 
@@ -508,4 +560,61 @@ async fn handle_record_batch(
         )));
     }
     Ok(PutResult::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn data_message(body: &'static [u8]) -> FlightData {
+        FlightData {
+            data_body: body.into(),
+            ..Default::default()
+        }
+    }
+
+    fn keepalive_message() -> FlightData {
+        FlightData {
+            app_metadata: crate::flight::KEEPALIVE_APP_METADATA.into(),
+            // Even if a keepalive carried a body, it must never be counted as
+            // discarded client data.
+            data_body: (&b"heartbeat"[..]).into(),
+            ..Default::default()
+        }
+    }
+
+    /// Only data-bearing messages count as discarded; keepalives, empty
+    /// trailers, and transient read errors are ignored.
+    #[tokio::test]
+    async fn drain_counts_only_data_bearing_messages() {
+        let messages = vec![
+            Ok(data_message(b"batch-1")),
+            Ok(keepalive_message()),
+            Ok(data_message(b"batch-2")),
+            Ok(FlightData::default()), // empty trailer message
+            Err(Status::internal("transient read error")),
+            Ok(data_message(b"batch-3")),
+        ];
+        let mut stream = futures::stream::iter(messages);
+        assert_eq!(drain_discarded_data_batches(&mut stream).await, 3);
+    }
+
+    /// A sink that completes exactly as the stream ends discards nothing, so
+    /// the write is still acked as a success.
+    #[tokio::test]
+    async fn drain_empty_stream_reports_zero() {
+        let mut stream = futures::stream::iter(Vec::<Result<FlightData, Status>>::new());
+        assert_eq!(drain_discarded_data_batches(&mut stream).await, 0);
+    }
+
+    #[tokio::test]
+    async fn drain_keepalive_and_trailers_only_reports_zero() {
+        let messages = vec![
+            Ok(keepalive_message()),
+            Ok(FlightData::default()),
+            Ok(keepalive_message()),
+        ];
+        let mut stream = futures::stream::iter(messages);
+        assert_eq!(drain_discarded_data_batches(&mut stream).await, 0);
+    }
 }

@@ -25,7 +25,7 @@ pub mod snapshot_engine;
 use std::any::Any;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, RwLock, Weak};
 use std::time::Duration;
 
 use regex::Regex;
@@ -44,7 +44,7 @@ use datafusion::scalar::ScalarValue;
 use datafusion_table_providers::UnsupportedTypeAction;
 use runtime_table_partition::Partition;
 use runtime_table_partition::creator::filename::{
-    encode_key, parse_partition_value, to_hive_partition_dir,
+    encode_composite_key, encode_key, parse_partition_value, to_hive_partition_dir,
 };
 use runtime_table_partition::creator::{self, PartitionCreator};
 use runtime_table_partition::expression::PartitionedBy;
@@ -54,8 +54,8 @@ use tokio::sync::OnceCell;
 use util::concat_arrays;
 
 use super::{
-    AccelerationSource, BootstrapStatus, DataAccelerator, get_primary_keys_from_constraints,
-    upsert_dedup,
+    AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator,
+    get_primary_keys_from_constraints, upsert_dedup,
 };
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
 use crate::dataaccelerator::cayenne::s3::{S3_PARAMETERS, S3_PARAMS_LEN};
@@ -67,6 +67,7 @@ use runtime_acceleration::snapshot::{AccelerationEngine, AccelerationLayout};
 use runtime_datafusion_index::{Index, IndexedTableProvider};
 use search::index::native_vector::NativeVectorIndex;
 use spicepod::acceleration as spicepod_acceleration;
+use spicepod::acceleration::WriteMode;
 
 /// Metadata key to identify the accelerator type in the schema metadata.
 const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
@@ -124,6 +125,8 @@ static UNSUPPORTED_LOCAL_PARTITION_PATTERN: LazyLock<Regex> =
 
 fn maintained_aggregate_specs_for_cayenne(
     acceleration: Option<&Acceleration>,
+    schema: &Schema,
+    primary_keys: &[String],
 ) -> Result<Vec<cayenne::maintained_aggregate::MaintainedAggregateSpec>> {
     let Some(acceleration) = acceleration else {
         return Ok(Vec::new());
@@ -142,36 +145,134 @@ fn maintained_aggregate_specs_for_cayenne(
         });
     }
 
-    Ok(maintained_aggregates
-        .iter()
-        .map(
-            |aggregate| cayenne::maintained_aggregate::MaintainedAggregateSpec {
-                group_by: aggregate.group_by.clone(),
-                aggregates: aggregate
-                    .aggregates
-                    .iter()
-                    .map(|expr| {
-                        let function = match expr.function {
-                            spicepod_acceleration::MaintainedAggregateFunction::Count => {
-                                cayenne::maintained_aggregate::MaintainedAggregateFunction::Count
-                            }
-                            spicepod_acceleration::MaintainedAggregateFunction::Sum => {
-                                cayenne::maintained_aggregate::MaintainedAggregateFunction::Sum
-                            }
-                            spicepod_acceleration::MaintainedAggregateFunction::Avg => {
-                                cayenne::maintained_aggregate::MaintainedAggregateFunction::Avg
-                            }
-                        };
+    let has_min_or_max = maintained_aggregates.iter().any(|aggregate| {
+        aggregate.aggregates.iter().any(|expr| {
+            matches!(
+                expr.function,
+                spicepod_acceleration::MaintainedAggregateFunction::Min
+                    | spicepod_acceleration::MaintainedAggregateFunction::Max
+            )
+        })
+    });
+    if has_min_or_max && primary_keys.is_empty() {
+        return Err(Error::InvalidConfiguration {
+            detail: Arc::from(
+                "Cayenne maintained_aggregates MIN/MAX require a primary key so UPDATE and DELETE changes can retract prior extrema within the retained-index cap. Set acceleration.primary_key, ensure the source table has a primary key that schema inference can read (the connection role needs catalog read access), or remove MIN/MAX from maintained_aggregates.",
+            ),
+        });
+    }
 
-                        cayenne::maintained_aggregate::MaintainedAggregateExpr {
-                            function,
-                            column: expr.column.clone(),
+    maintained_aggregates
+        .iter()
+        .map(|aggregate| {
+            // An optional `filter` is the maintained equivalent of a query
+            // `WHERE`: it is parsed against the table schema into a physical
+            // predicate so the view maintains only the matching rows and the
+            // optimizer can serve a query carrying the identical predicate.
+            let filter = aggregate
+                .filter_sql
+                .as_deref()
+                .map(|sql| parse_maintained_aggregate_filter(sql, schema))
+                .transpose()?;
+
+            let aggregates = aggregate
+                .aggregates
+                .iter()
+                .map(|expr| {
+                    let function = match expr.function {
+                        spicepod_acceleration::MaintainedAggregateFunction::Count => {
+                            cayenne::maintained_aggregate::MaintainedAggregateFunction::Count
                         }
-                    })
-                    .collect(),
-            },
-        )
-        .collect())
+                        spicepod_acceleration::MaintainedAggregateFunction::Sum => {
+                            cayenne::maintained_aggregate::MaintainedAggregateFunction::Sum
+                        }
+                        spicepod_acceleration::MaintainedAggregateFunction::Avg => {
+                            cayenne::maintained_aggregate::MaintainedAggregateFunction::Avg
+                        }
+                        spicepod_acceleration::MaintainedAggregateFunction::Min => {
+                            cayenne::maintained_aggregate::MaintainedAggregateFunction::Min
+                        }
+                        spicepod_acceleration::MaintainedAggregateFunction::Max => {
+                            cayenne::maintained_aggregate::MaintainedAggregateFunction::Max
+                        }
+                    };
+
+                    cayenne::maintained_aggregate::MaintainedAggregateExpr {
+                        function,
+                        column: expr.column.clone(),
+                    }
+                })
+                .collect();
+
+            Ok(cayenne::maintained_aggregate::MaintainedAggregateSpec {
+                filter,
+                group_by: aggregate.group_by.clone(),
+                aggregates,
+            })
+        })
+        .collect()
+}
+
+/// Parse a maintained-aggregate `filter` SQL predicate into a physical
+/// expression over the table `schema`. The resulting expression references the
+/// table columns by their schema position, so it lines up with the CDC batches
+/// the view is maintained from. For serving, the view answers a query only when
+/// this predicate is structurally equal to the query's `FilterExec` predicate
+/// (see `MaintainedAggregateView::matches_query`): that holds when the query
+/// filters the scan output directly, but a projection or type-coercion between
+/// the scan and the filter changes the predicate's column indices/literal types
+/// and the view silently falls back to a re-scan. Declare the filter to match
+/// the predicate the query carries over the scan output.
+fn parse_maintained_aggregate_filter(
+    sql: &str,
+    schema: &Schema,
+) -> Result<Arc<dyn datafusion::physical_expr::PhysicalExpr>> {
+    use datafusion::common::ToDFSchema;
+
+    let df_schema = schema
+        .clone()
+        .to_dfschema()
+        .map_err(|source| Error::InvalidConfiguration {
+            detail: Arc::from(format!(
+                "Cayenne maintained_aggregates filter '{sql}' could not bind to the table schema: {source}"
+            )),
+        })?;
+    let context = datafusion::prelude::SessionContext::new();
+    let logical = context
+        .parse_sql_expr(sql, &df_schema)
+        .map_err(|source| Error::InvalidConfiguration {
+            detail: Arc::from(format!(
+                "Cayenne maintained_aggregates filter '{sql}' is not a valid SQL predicate over the table columns: {source}"
+            )),
+        })?;
+    let physical = datafusion::physical_expr::create_physical_expr(
+        &logical,
+        &df_schema,
+        &datafusion_expr::execution_props::ExecutionProps::new(),
+    )
+    .map_err(|source| Error::InvalidConfiguration {
+        detail: Arc::from(format!(
+            "Cayenne maintained_aggregates filter '{sql}' could not be planned: {source}"
+        )),
+    })?;
+    // A filter is a `WHERE` condition, so it must evaluate to Boolean. Reject a
+    // non-Boolean predicate (e.g. `filter: 1`) at config time with a clear error,
+    // rather than letting it fail later during maintenance.
+    let data_type = physical
+        .data_type(schema)
+        .map_err(|source| Error::InvalidConfiguration {
+            detail: Arc::from(format!(
+                "Cayenne maintained_aggregates filter '{sql}' could not be type-checked: {source}"
+            )),
+        })?;
+    if data_type != DataType::Boolean {
+        return Err(Error::InvalidConfiguration {
+            detail: Arc::from(format!(
+                "Cayenne maintained_aggregates filter '{sql}' must be a Boolean predicate (a WHERE condition), but it evaluates to {data_type}"
+            )),
+        });
+    }
+    Ok(physical)
 }
 
 /// Transform schema according to `unsupported_type_action` policy.
@@ -199,12 +300,161 @@ pub(crate) fn transform_schema_for_vortex(
 
 pub struct CayenneAccelerator {
     catalog: Arc<OnceCell<Arc<dyn cayenne::MetadataCatalog>>>,
+    /// Separate catalog for `mode: memory` (in-RAM) tables, backed by an in-memory
+    /// `SQLite` `memdb` metastore. File-mode and memory-mode tables cannot share one
+    /// metastore (memory-mode data must never touch disk), so memory tables use this.
+    memory_catalog: Arc<OnceCell<Arc<dyn cayenne::MetadataCatalog>>>,
+    /// Process-unique id for this accelerator instance, used to name the in-memory
+    /// `memdb` metastore so separate instances (e.g. per-test runtimes) never share
+    /// one in-memory database.
+    instance_id: u64,
     footer_cache_mb: Option<usize>,
     /// Shared semaphore that bounds the number of concurrent per-table
     /// background compactions across all Cayenne tables registered with this
     /// accelerator. Sized at `available_parallelism()` so a fleet of tables
     /// can't oversubscribe the writer pool.
     compaction_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Initial permit count of `compaction_semaphore` (the semaphore itself only
+    /// exposes *available* permits), published for the occupancy gauge's total.
+    compaction_permits_total: usize,
+}
+
+/// A `(weak handle, total permits)` view of the fleet-wide compaction semaphore,
+/// published when a real table's background compaction is spawned (see
+/// [`Self::create_cayenne_table_provider`]) so the metrics registration
+/// ([`register_cayenne_telemetry`]) can read live occupancy at scrape
+/// time without holding the accelerator alive. Published from the spawn path
+/// rather than the constructor because `CayenneAccelerator::new()` is also called
+/// for throwaway helpers (e.g. `cayenne_data_dir`), whose semaphore is dropped
+/// immediately — capturing that one would leave a dead `Weak`. A `RwLock` (not
+/// `OnceLock`) so the live accelerator's semaphore always wins; a `Weak` never
+/// resurrects a dropped semaphore.
+static COMPACTION_SEMAPHORE_FOR_METRICS: RwLock<Option<(Weak<tokio::sync::Semaphore>, usize)>> =
+    RwLock::new(None);
+
+/// Publish the fleet-wide compaction semaphore for the occupancy gauges. Called
+/// from the real table-registration path; idempotent across a fleet of tables
+/// (they share one semaphore).
+fn publish_compaction_semaphore_for_metrics(sem: &Arc<tokio::sync::Semaphore>, total: usize) {
+    // Recover through poisoning: an unrelated panic must not permanently disable the
+    // compaction-permit gauges (the guarded Weak<Semaphore> isn't corrupted by another
+    // thread's panic).
+    let mut guard = COMPACTION_SEMAPHORE_FOR_METRICS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some((Arc::downgrade(sem), total));
+}
+
+/// `(available, total)` permits of the fleet-wide compaction semaphore, or `None`
+/// before a real table has registered (or after teardown).
+fn compaction_semaphore_snapshot() -> Option<(u64, u64)> {
+    let guard = COMPACTION_SEMAPHORE_FOR_METRICS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (weak, total) = guard.as_ref()?;
+    let sem = weak.upgrade()?;
+    Some((sem.available_permits() as u64, *total as u64))
+}
+
+/// Register the Cayenne write-path backpressure gauges (pull-based observable
+/// gauges on the global `cayenne` meter) so `/metrics` localizes *where* the CDC
+/// apply path is stalling: the process-global encode budget, the in-memory CDC
+/// tier byte budget, and the fleet-wide compaction semaphore. Each callback reads
+/// a cheap live snapshot at Prometheus scrape time — no sampler task, near-zero
+/// cost between scrapes.
+///
+/// Like [`telemetry::cayenne::register_compaction_metrics`], the binary MUST call
+/// this once AFTER `init_metrics` has installed the Prometheus meter provider;
+/// otherwise the instruments bind to the early noop meter and never export.
+pub fn register_cayenne_telemetry() {
+    use opentelemetry::global;
+    let meter = global::meter("cayenne");
+
+    // --- Process-global encode-concurrency budget ---
+    let _ = meter
+        .u64_observable_gauge("cayenne_encode_permits_available")
+        .with_description(
+            "Available permits in the process-global Cayenne encode-concurrency budget; 0 under a growing backlog is the encode-semaphore stall signature.",
+        )
+        .with_unit("{permit}")
+        .with_callback(|obs| {
+            if let Some(s) = cayenne::encode_budget_snapshot() {
+                obs.observe(s.available, &[]);
+            }
+        })
+        .build();
+    let _ = meter
+        .u64_observable_gauge("cayenne_encode_permits_total")
+        .with_description(
+            "Total permits (ceiling) of the process-global Cayenne encode-concurrency budget.",
+        )
+        .with_unit("{permit}")
+        .with_callback(|obs| {
+            if let Some(s) = cayenne::encode_budget_snapshot() {
+                obs.observe(s.total, &[]);
+            }
+        })
+        .build();
+    let _ = meter
+        .u64_observable_gauge("cayenne_encode_maintenance_gate_available")
+        .with_description(
+            "Available permits in the reserved maintenance slice of the Cayenne encode budget (compaction/rewrite outputs).",
+        )
+        .with_unit("{permit}")
+        .with_callback(|obs| {
+            if let Some(s) = cayenne::encode_budget_snapshot() {
+                obs.observe(s.maintenance_gate_available, &[]);
+            }
+        })
+        .build();
+
+    // --- Process-global in-memory CDC tier byte budget (cdc_durability: memory) ---
+    let _ = meter
+        .u64_observable_gauge("cayenne_mem_tier_budget_used_bytes")
+        .with_description(
+            "Currently-reserved bytes across all in-memory CDC tiers; approaching the total forces writes to spill/fall back to the durable path.",
+        )
+        .with_unit("By")
+        .with_callback(|obs| {
+            if let Some(used) = cayenne::global_mem_tier_used() {
+                obs.observe(used, &[]);
+            }
+        })
+        .build();
+    let _ = meter
+        .u64_observable_gauge("cayenne_mem_tier_budget_total_bytes")
+        .with_description("Total byte ceiling of the process-global in-memory CDC tier budget.")
+        .with_unit("By")
+        .with_callback(|obs| {
+            if let Some(total) = cayenne::global_mem_tier_total() {
+                obs.observe(total, &[]);
+            }
+        })
+        .build();
+
+    // --- Fleet-wide compaction semaphore ---
+    let _ = meter
+        .u64_observable_gauge("cayenne_compaction_permits_available")
+        .with_description(
+            "Available permits in the fleet-wide Cayenne compaction semaphore; 0 means every compaction slot is in use and peers queue.",
+        )
+        .with_unit("{permit}")
+        .with_callback(|obs| {
+            if let Some((available, _total)) = compaction_semaphore_snapshot() {
+                obs.observe(available, &[]);
+            }
+        })
+        .build();
+    let _ = meter
+        .u64_observable_gauge("cayenne_compaction_permits_total")
+        .with_description("Total permits of the fleet-wide Cayenne compaction semaphore.")
+        .with_unit("{permit}")
+        .with_callback(|obs| {
+            if let Some((_available, total)) = compaction_semaphore_snapshot() {
+                obs.observe(total, &[]);
+            }
+        })
+        .build();
 }
 
 impl Default for CayenneAccelerator {
@@ -240,36 +490,50 @@ fn parse_u64_aliases_with_hint(
 /// `fundu` for consistency with the other Spice duration knobs (e.g.
 /// `retention_period`). `None` when unset; a warning + `None` when present but
 /// unparseable.
-fn parse_goal_duration_secs(
-    acceleration: &Acceleration,
+/// Resolve a `cayenne_goal_*` setpoint's raw string with global+override
+/// semantics: a per-dataset (`acceleration.params`) value OVERRIDES the
+/// runtime-level (`runtime.params`) global default. `None` when neither sets it —
+/// the legacy "no goal" case, where the controller stays on its signal-driven path.
+fn resolve_goal_raw<'a>(
+    acceleration: &'a Acceleration,
+    runtime_params: &'a std::collections::HashMap<String, String>,
     key: &str,
-    table_name: &str,
-) -> Option<f64> {
-    let raw = acceleration.params.get(key)?;
+) -> Option<&'a str> {
+    acceleration
+        .params
+        .get(key)
+        .or_else(|| runtime_params.get(key))
+        .map(String::as_str)
+}
+
+/// Parse a goal duration setpoint (`5s`/`1m`/`250ms`) from its already-resolved
+/// raw value. `None` when unset; a warning + `None` when present but unparseable.
+/// `source_desc` names where the value applies, for the diagnostic.
+fn parse_goal_duration_secs(raw: Option<&str>, key: &str, source_desc: &str) -> Option<f64> {
+    let raw = raw?;
     match fundu::parse_duration(raw) {
         Ok(d) => Some(d.as_secs_f64()),
         Err(e) => {
             tracing::warn!(
                 target: "spiced::acceleration::cayenne",
-                table = %table_name,
-                "Invalid '{key}' duration '{raw}': {e}; ignoring. Expected a duration like '5s' or '1m'."
+                "Invalid '{key}' duration '{raw}' ({source_desc}): {e}; ignoring. Expected a duration like '5s' or '1m'."
             );
             None
         }
     }
 }
 
-/// Parse a positive goal float param (e.g. queries-per-hour). `None` when unset; a
-/// warning + `None` when present but unparseable or non-positive.
-fn parse_goal_f64(acceleration: &Acceleration, key: &str, table_name: &str) -> Option<f64> {
-    let raw = acceleration.params.get(key)?;
+/// Parse a positive goal float param (e.g. queries-per-hour) from its resolved raw
+/// value. `None` when unset; a warning + `None` when present but unparseable or
+/// non-positive. `source_desc` names where the value applies, for the diagnostic.
+fn parse_goal_f64(raw: Option<&str>, key: &str, source_desc: &str) -> Option<f64> {
+    let raw = raw?;
     match raw.parse::<f64>() {
         Ok(v) if v.is_finite() && v > 0.0 => Some(v),
         _ => {
             tracing::warn!(
                 target: "spiced::acceleration::cayenne",
-                table = %table_name,
-                "Invalid '{key}' value '{raw}'; expected a positive number, ignoring."
+                "Invalid '{key}' value '{raw}' ({source_desc}); expected a positive number, ignoring."
             );
             None
         }
@@ -311,6 +575,78 @@ const SMALL_WRITE_INLINE_MAX_BYTES: usize = cayenne::metadata::DEFAULT_INLINE_MA
 const SMALL_WRITE_INLINE_MAX_BUFFER_BYTES: usize =
     cayenne::metadata::DEFAULT_INLINE_MAX_BUFFER_BYTES;
 const APPEND_SMALL_WRITE_REFRESH_INTERVAL_THRESHOLD: Duration = Duration::from_mins(5);
+
+/// Map the runtime's detected acceleration storage class onto the Cayenne-local
+/// [`cayenne::metadata::StorageClass`] (the crates can't share the enum — `runtime`
+/// depends on `cayenne`). The continuous slow-tier bias is refined further by the
+/// measured throughput threaded alongside it.
+fn to_cayenne_storage_class(
+    storage: crate::dataaccelerator::storage::ResolvedAccelerationStorage,
+) -> cayenne::metadata::StorageClass {
+    use crate::dataaccelerator::storage::ResolvedAccelerationStorage as Resolved;
+    use cayenne::metadata::StorageClass as Class;
+    match storage {
+        Resolved::LocalSsd => Class::LocalSsd,
+        Resolved::Ebs => Class::Ebs,
+        Resolved::Tmpfs => Class::Tmpfs,
+        Resolved::Unknown => Class::Unknown,
+    }
+}
+
+/// Warn (once per canonicalized path) when the filesystem backing `path` is low on
+/// free space.
+/// Under memory pressure the in-memory CDC tier spills to this volume; if it fills,
+/// ingestion fails — so surface it at startup rather than discovering it on a crash.
+async fn warn_if_low_disk(label: &str, path: &str) {
+    // `disk_space_bytes` canonicalizes + enumerates every mount (blocking OS I/O);
+    // run it off the Tokio runtime so it can't stall a worker during concurrent
+    // table registration.
+    let label = label.to_string();
+    let path = path.to_string();
+    let _ = tokio::task::spawn_blocking(move || warn_if_low_disk_blocking(&label, &path)).await;
+}
+
+fn warn_if_low_disk_blocking(label: &str, path: &str) {
+    use std::sync::{LazyLock, Mutex};
+    /// Below this fraction free OR this many absolute bytes free ⇒ warn.
+    const LOW_DISK_FRACTION_DENOM: u64 = 10; // < 10% free
+    const LOW_DISK_FLOOR_BYTES: u64 = 2 * 1024 * 1024 * 1024; // < 2 GiB free
+    static CHECKED: LazyLock<Mutex<std::collections::HashSet<std::path::PathBuf>>> =
+        LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+    // Check each distinct canonicalized path once per process, BEFORE probing free
+    // space (`disk_space_bytes` re-enumerates every mount). Canonicalizing collapses
+    // equivalent paths (trailing slash, symlinks); distinct dirs on the same mount
+    // each warn once — keyed by path, not mount point.
+    let key = std::path::Path::new(path)
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(path));
+    if !CHECKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key)
+    {
+        return;
+    }
+    let Some((available, total)) = crate::dataaccelerator::storage::disk_space_bytes(path) else {
+        return;
+    };
+    if total == 0
+        || (available >= total / LOW_DISK_FRACTION_DENOM && available >= LOW_DISK_FLOOR_BYTES)
+    {
+        return;
+    }
+    tracing::warn!(
+        label,
+        path,
+        available_mib = available / (1024 * 1024),
+        total_mib = total / (1024 * 1024),
+        // saturating_mul so `available * 100` can't overflow u64 on a very large
+        // volume; a purely-informational percentage in a low-disk warning.
+        percent_free = available.saturating_mul(100) / total,
+        "Cayenne {label} volume is low on free space. Under memory pressure the in-memory CDC tier spills here; if it fills, ingestion fails. Free space or point the acceleration at a larger volume."
+    );
+}
 
 fn apply_refresh_mode_defaults(
     config: &mut cayenne::metadata::VortexConfig,
@@ -368,8 +704,8 @@ fn is_upsert_on_conflict(
 }
 
 /// Build the auto-tune [`autotune::WorkloadProfile`] from the dataset's refresh
-/// mode, its resolved primary keys / `on_conflict`, and any extended-schema-
-/// inference metadata carried on the Arrow schema (`spice.inferred_row_count` /
+/// mode, its resolved primary keys / `on_conflict`, and any schema-inference
+/// metadata carried on the Arrow schema (`spice.inferred_row_count` /
 /// `spice.inferred_table_bytes`, see `data_components::inferred_schema`). Every
 /// signal degrades gracefully: an unknown one falls back to the hardware-only
 /// derivation.
@@ -422,6 +758,12 @@ fn fs_probe_path(path: &str) -> &str {
     }
 }
 
+/// Process-wide counter giving each [`CayenneAccelerator`] instance a unique id,
+/// used to name its in-memory (`memdb`) metastore so distinct instances never
+/// share one in-memory database.
+static CAYENNE_ACCELERATOR_INSTANCE_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 impl CayenneAccelerator {
     #[must_use]
     pub fn new() -> Self {
@@ -433,10 +775,15 @@ impl CayenneAccelerator {
         let permits = std::thread::available_parallelism()
             .map_or(1, std::num::NonZeroUsize::get)
             .max(1);
+        let compaction_semaphore = Arc::new(tokio::sync::Semaphore::new(permits));
         Self {
             catalog: Arc::new(OnceCell::new()),
+            memory_catalog: Arc::new(OnceCell::new()),
+            instance_id: CAYENNE_ACCELERATOR_INSTANCE_COUNTER
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             footer_cache_mb,
-            compaction_semaphore: Arc::new(tokio::sync::Semaphore::new(permits)),
+            compaction_semaphore,
+            compaction_permits_total: permits,
         }
     }
 
@@ -644,18 +991,22 @@ impl CayenneAccelerator {
     ) -> cayenne::metadata::VortexConfig {
         let mut config = cayenne::metadata::VortexConfig {
             footer_cache_mb,
-            // Default the query/scan path to Arrow view types (Utf8View/BinaryView)
-            // so DataFusion plans joins/aggregates on view arrays and the
-            // hash-join build-side `concat_batches` cannot hit the i32 2 GiB offset
-            // overflow (CH-benCH q21 @SF1000). The stored schema stays Utf8/Binary.
-            // Operators can opt out with `cayenne_force_view_types: false`.
-            force_view_read_schema: true,
+            // Default the query/scan path to native Arrow types (Utf8/Binary).
+            force_view_read_schema: false,
             ..Default::default()
         };
         if let Some(acceleration) = source.acceleration()
             && let Some(v) = acceleration.params.get("cayenne_force_view_types")
         {
+            // Any value other than `false` enables view types
             config.force_view_read_schema = !v.trim().eq_ignore_ascii_case("false");
+        }
+        if let Some(acceleration) = source.acceleration()
+            && let Some(v) = acceleration.params.get("cayenne_integrity_checksums")
+        {
+            // Opt in to end-to-end WAL/data-file integrity checksums. Any value
+            // other than `false` enables the feature; unset keeps it off.
+            config.integrity_checksums = !v.trim().eq_ignore_ascii_case("false");
         }
 
         // Auto-tune the memory-/cpu-/storage-sensitive Vortex knobs from a
@@ -689,6 +1040,38 @@ impl CayenneAccelerator {
                 fs_probe_path(&metadata_dir),
             )
             .await;
+
+            // Thread the detected storage medium + measured throughput onto the
+            // Cayenne config so the closed-loop tuner reasons over them. Previously
+            // these were left at the `StorageClass::Unknown` default (never wired
+            // from `hw`), so the loop applied the EBS slow-tier bias even on local
+            // NVMe; mapping the real class fixes that, and the measured throughput
+            // refines the class into a *continuous* bias (see `tuning::tier_scale`).
+            config.data_storage_class = to_cayenne_storage_class(hw.data_storage);
+            config.metastore_storage_class = to_cayenne_storage_class(hw.metastore_storage);
+            config.data_storage_write_mbps = hw.data_perf.write_mbps;
+            config.metastore_storage_write_mbps = hw.metastore_perf.write_mbps;
+
+            // Bound the process-global encode budget by the instance EBS write
+            // bandwidth: a single EBS volume is a shared, bandwidth-bounded pipe, so
+            // many parallel uploads to it just fan out small files without adding
+            // throughput (the regression that made a lag-violated EBS table keep
+            // ADDING write shards). Only ever lowers the budget; local NVMe /
+            // instance store propose no cap.
+            if let Some(cap) = hw.ebs_upload_concurrency_cap() {
+                cayenne::cap_global_encode_concurrency(cap);
+            }
+            // T-family burstable CPU (IMDS): the tuner withholds CPU-stealing moves
+            // at a lower busy-fraction, since CPU credits deplete under sustained
+            // load and throttle the vCPUs to a low baseline.
+            cayenne::set_cpu_burstable(hw.burstable);
+
+            // Low-disk startup warning: a full data/spill volume turns a
+            // memory-pressure spill into a crash. Best-effort, once per path.
+            if let Some(dir) = data_dir.as_deref() {
+                warn_if_low_disk("data", fs_probe_path(dir)).await;
+            }
+            warn_if_low_disk("metastore", fs_probe_path(&metadata_dir)).await;
 
             // Storage-aware target Vortex file size on local disk (the `auto`
             // baseline): smaller files reduce write amplification on EBS-class
@@ -916,6 +1299,15 @@ impl CayenneAccelerator {
                 config.cdc_mem_tier_checkpoint_interval_ms,
                 " (milliseconds)",
             );
+            config.cdc_mem_tier_seal_age_ms = parse_u64_aliases_with_hint(
+                acceleration,
+                &[
+                    "cayenne_cdc_mem_tier_seal_age_ms",
+                    "cdc_mem_tier_seal_age_ms",
+                ],
+                config.cdc_mem_tier_seal_age_ms,
+                " (milliseconds)",
+            );
 
             // Widening schema evolution at table open is gated on the dataset's
             // `on_schema_change` policy. The policy lives on the Dataset
@@ -937,7 +1329,8 @@ impl CayenneAccelerator {
                         crate::component::dataset::OnSchemaChange::AppendNewColumns => {
                             cayenne::metadata::SchemaEvolutionMode::AddColumnsOnly
                         }
-                        crate::component::dataset::OnSchemaChange::SyncAllColumns => {
+                        crate::component::dataset::OnSchemaChange::SyncAllColumns
+                        | crate::component::dataset::OnSchemaChange::DropAndRecreate => {
                             cayenne::metadata::SchemaEvolutionMode::Widen
                         }
                         crate::component::dataset::OnSchemaChange::Block
@@ -960,6 +1353,22 @@ impl CayenneAccelerator {
                     .collect();
             }
 
+            // Provenance of the sort order. Schema inference sets this to
+            // `inferred` when it fills `cayenne_sort_columns` itself; an operator
+            // who configured the sort order explicitly leaves it absent, which
+            // defaults to `user` (authoritative). Only an authoritative order may
+            // shadow the hot filter columns observed on scans — see
+            // `SortColumnsOrigin`. Unrecognized values fall back to the
+            // conservative `user`, which preserves pre-existing behavior.
+            if let Some(origin) = acceleration
+                .params
+                .get("cayenne_sort_columns_origin")
+                .or_else(|| acceleration.params.get("sort_columns_origin"))
+                && origin.trim().eq_ignore_ascii_case("inferred")
+            {
+                config.sort_columns_origin = cayenne::metadata::SortColumnsOrigin::Inferred;
+            }
+
             // Parse shard key columns (the hash-clustering key for intra-write
             // sharding; the engine derives it from the primary key when unset)
             if let Some(shard_cols_str) = acceleration
@@ -972,6 +1381,94 @@ impl CayenneAccelerator {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect();
+            }
+
+            // Datalake / cold object-store tier (storage-cascade bottom tier).
+            // Presence of a non-empty `cayenne_datalake_location` enables it; the
+            // rest tune the clustering key, cold file size, and the warm→cold
+            // promotion trigger.
+            if let Some(loc) = acceleration.params.get("cayenne_datalake_location") {
+                let loc = loc.trim();
+                if !loc.is_empty() {
+                    config.cold_tier_location = Some(loc.to_string());
+                }
+            }
+            if let Some(cols) = acceleration
+                .params
+                .get("cayenne_datalake_clustering_columns")
+            {
+                config.cold_clustering_columns = cols
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+            // Numeric cold knobs go through the same `auto_or_*` helpers as the
+            // warm tuning params, so they honor `auto`, warn on invalid input,
+            // and clamp consistently with the rest of the config surface.
+            config.cold_target_file_size_mb = autotune::auto_or_usize(
+                acceleration,
+                &["cayenne_datalake_target_file_size_mb"],
+                config.cold_target_file_size_mb,
+            )
+            .max(1);
+            config.cold_tier_warm_max_bytes = autotune::auto_or_i64(
+                acceleration,
+                &["cayenne_datalake_warm_max_bytes"],
+                config.cold_tier_warm_max_bytes,
+            );
+            config.cold_tier_warm_max_files = autotune::auto_or_usize(
+                acceleration,
+                &["cayenne_datalake_warm_max_files"],
+                config.cold_tier_warm_max_files,
+            );
+            config.cold_tier_background_interval_ms = autotune::auto_or_u64(
+                acceleration,
+                &["cayenne_datalake_tiering_check_interval_ms"],
+                config.cold_tier_background_interval_ms,
+            );
+            config.cold_tier_gc_interval_ms = autotune::auto_or_u64(
+                acceleration,
+                &["cayenne_datalake_gc_interval_ms"],
+                config.cold_tier_gc_interval_ms,
+            );
+            // Default promotion trigger when the tier is enabled but neither
+            // expert trigger is set (both `VortexConfig` defaults are 0 = never
+            // promote, which would leave a location-only config silently
+            // inert): promote once warm accumulates 16 target cold files'
+            // worth of data. Data is sorted per clustering run, so a larger
+            // accumulation yields better zone-map pruning in the written files.
+            if config.cold_tier_enabled()
+                && config.cold_tier_warm_max_bytes == 0
+                && config.cold_tier_warm_max_files == 0
+            {
+                config.cold_tier_warm_max_bytes = i64::try_from(
+                    config
+                        .cold_target_file_size_mb
+                        .saturating_mul(16 * 1024 * 1024),
+                )
+                .unwrap_or(i64::MAX);
+                tracing::info!(
+                    "Dataset '{table_name}': warm-tier data will move to the datalake once it reaches {} bytes (default). Set 'cayenne_datalake_warm_max_bytes' to override.",
+                    config.cold_tier_warm_max_bytes
+                );
+            }
+            // The datalake (cold) tier requires key-based deletes: position
+            // deletes are file-path scoped and cannot survive the warm→cold
+            // rewrite. An unresolved `auto` resolves to `key` here (otherwise
+            // it resolves to `position` for non-CDC tables and the tier is
+            // silently inert); an EXPLICIT `position` is left as-is and
+            // rejected with a structured error at registration
+            // (`validate_datalake_table_options`) — never silently overridden.
+            // Must run AFTER cayenne_datalake_location is parsed above.
+            if config.cold_tier_enabled()
+                && workload.has_primary_key
+                && config.deletion_mode == cayenne::metadata::DeletionMode::Auto
+            {
+                config.deletion_mode = cayenne::metadata::DeletionMode::Key;
+                tracing::warn!(
+                    "Dataset '{table_name}': auto-resolved cayenne_deletion_mode to 'key' (the datalake tier requires key-based deletes)."
+                );
             }
 
             // Upload concurrency: `auto`/unset keeps the available-parallelism
@@ -1098,56 +1595,43 @@ impl CayenneAccelerator {
             // Independently, an explicit per-knob value always overrides the
             // derived value — and under `adaptive` it *pins* that knob, so the
             // loop leaves it alone (its bounds collapse to a point downstream).
-            let tuning_mode = acceleration
+            // Normalize `cayenne_tuning` up front (see `normalize_cayenne_tuning`): an
+            // invalid value folds to `auto` so it behaves as the documented default
+            // everywhere downstream — including the goal-gate below (which tests
+            // `== "auto"`) — instead of slipping through as "not auto" and enabling
+            // adaptive.
+            let raw_tuning = acceleration
                 .params
                 .get("cayenne_tuning")
-                .map(|v| v.trim().to_ascii_lowercase());
-            if let Some(mode) = &tuning_mode
-                && mode != "auto"
-                && mode != "adaptive"
-            {
+                .map(String::as_str);
+            let (tuning_mode, tuning_was_invalid) = normalize_cayenne_tuning(raw_tuning);
+            if tuning_was_invalid {
                 tracing::warn!(
-                    "Dataset '{table_name}' has an invalid `cayenne_tuning` value: '{mode}'. Expected 'auto' or 'adaptive'. Defaulting to 'auto'."
+                    "Dataset '{table_name}' has an invalid `cayenne_tuning` value: '{}'. Expected 'auto' or 'adaptive'. Defaulting to 'auto'.",
+                    raw_tuning.unwrap_or_default().trim()
                 );
             }
             // Resolve the tuning mode. An explicit `cayenne_tuning` value always
-            // wins. When it is UNSET, default to `adaptive` IF extended schema
-            // inference produced metadata (`schema_inference: extended` emitted
-            // the inferred PK / cardinality / sort onto the Arrow schema):
-            // opting into extended schema is the signal the operator wants the
-            // engine to self-tune, and that same metadata is the adaptive
-            // controller's warm start. Without extended-schema metadata (or with
-            // an explicit `auto`/invalid value) the static `auto` derivation is
-            // used. Set `cayenne_tuning: auto` to opt out of the closed loop even
-            // with extended schema enabled.
-            config.dynamic_tuning = match tuning_mode.as_deref() {
-                Some("adaptive") => true,
-                // Explicit `auto` (or an invalid value, already warned above):
-                // static derivation, no closed loop.
-                Some(_) => false,
-                // Unset: enable adaptive iff extended schema inference produced
-                // metadata (see the comment above).
-                None => workload.inferred_metadata.is_present(),
-            };
-            if config.dynamic_tuning && tuning_mode.is_none() {
-                tracing::info!(
-                    target: "spiced::acceleration::cayenne",
-                    table = %table_name,
-                    "`schema_inference: extended` detected and `cayenne_tuning` unset: defaulting to adaptive tuning (closed-feedback loop). Set `cayenne_tuning: auto` to opt out.",
-                );
-            }
-            // Extended schema inference SHARPENS the warm start (row_count/
+            // wins; when it is UNSET the default is `auto` (static derivation from
+            // the detected environment and inferred schema, no closed loop). Schema
+            // inference is always attempted now, so its presence is no longer a
+            // signal to auto-enable the closed loop — opt in explicitly with
+            // `cayenne_tuning: adaptive`. Inferred metadata still sharpens the
+            // adaptive warm start when the loop is enabled.
+            config.dynamic_tuning = matches!(tuning_mode.as_deref(), Some("adaptive"));
+            // Inferred schema metadata SHARPENS the adaptive warm start (row_count/
             // table_bytes refine the memory sizing; inferred PK/index/sort metadata
-            // feeds the query-health surface), but it is no longer REQUIRED for
+            // feeds the query-health surface), but it is not REQUIRED for
             // `adaptive`: the controller relearns the observed mean row width from
             // live ingest and converges its actuators from the hardware-derived
-            // warm start regardless. When the metadata is absent, note that the
-            // warm start is coarser but still let the closed loop run.
+            // warm start regardless. When the metadata is absent (the source may not
+            // expose catalog metadata, or the connection role lacks read access),
+            // note that the warm start is coarser but still let the closed loop run.
             if config.dynamic_tuning && !workload.inferred_metadata.is_present() {
                 tracing::info!(
                     target: "spiced::acceleration::cayenne",
                     table = %table_name,
-                    "`cayenne_tuning: adaptive`: no inferred schema metadata found (set `schema_inference: extended` for a sharper warm-start); starting from the hardware-derived config and adapting from observed ingest."
+                    "`cayenne_tuning: adaptive`: no inferred schema metadata available for this table (the source may not expose catalog metadata or the connection role lacks read access); starting from the hardware-derived config and adapting from observed ingest."
                 );
             }
             // The closed-loop controller rides the per-table background compaction
@@ -1165,19 +1649,47 @@ impl CayenneAccelerator {
             // unless the operator explicitly opted out with `cayenne_tuning: auto`,
             // and provided the background compaction tick the controller rides is
             // enabled. Query latency is stored in ms.
-            config.goal_replication_lag_secs =
-                parse_goal_duration_secs(acceleration, "cayenne_goal_replication_lag", table_name);
-            config.goal_freshness_secs =
-                parse_goal_duration_secs(acceleration, "cayenne_goal_freshness", table_name);
-            config.goal_query_latency_ms =
-                parse_goal_duration_secs(acceleration, "cayenne_goal_query_latency", table_name)
-                    .map(|secs| secs * 1000.0);
+            // SLO setpoints resolve a GLOBAL default (`runtime.params`) with a
+            // per-dataset (`acceleration.params`) override: set an SLO once for the
+            // whole runtime and sharpen it per table where needed.
+            let app = source.app();
+            let runtime_params = &app.runtime.params;
+            config.goal_replication_lag_secs = parse_goal_duration_secs(
+                resolve_goal_raw(acceleration, runtime_params, "cayenne_goal_replication_lag"),
+                "cayenne_goal_replication_lag",
+                table_name,
+            );
+            config.goal_freshness_secs = parse_goal_duration_secs(
+                resolve_goal_raw(acceleration, runtime_params, "cayenne_goal_freshness"),
+                "cayenne_goal_freshness",
+                table_name,
+            );
+            config.goal_query_latency_ms = parse_goal_duration_secs(
+                resolve_goal_raw(acceleration, runtime_params, "cayenne_goal_query_latency"),
+                "cayenne_goal_query_latency",
+                table_name,
+            )
+            .map(|secs| secs * 1000.0);
+            // The convergence window paces HOW the loop chases the SLOs (step
+            // cadence = window / N), not a target outcome — a control/benchmarking
+            // knob with a sensible default. It stays a PER-DATASET advanced override
+            // and is intentionally NOT part of the global SLO surface.
             config.goal_convergence_window_secs = parse_goal_duration_secs(
-                acceleration,
+                acceleration
+                    .params
+                    .get("cayenne_goal_convergence_window")
+                    .map(String::as_str),
                 "cayenne_goal_convergence_window",
                 table_name,
             );
-            config.goal_qph = parse_goal_f64(acceleration, "cayenne_goal_qph", table_name);
+            // QPH is a SYSTEM-WIDE metric — a query (e.g. a join) spans datasets and
+            // is counted once globally — so its goal is configured GLOBALLY only,
+            // under `runtime.params`. There is no per-dataset QPH goal.
+            config.goal_qph = parse_goal_f64(
+                runtime_params.get("cayenne_goal_qph").map(String::as_str),
+                "cayenne_goal_qph",
+                "runtime.params",
+            );
             let any_goal = config.goal_replication_lag_secs.is_some()
                 || config.goal_freshness_secs.is_some()
                 || config.goal_query_latency_ms.is_some()
@@ -1269,13 +1781,13 @@ impl CayenneAccelerator {
                 metastore_storage = %hw.metastore_storage,
                 runtime_footer_cache_mb = ?config.footer_cache_mb,
                 tuning = if config.dynamic_tuning { "adaptive" } else { "auto" },
-                // Inferred workload signals (from extended schema inference). When
-                // these are `None`/false the schema wasn't inferred for this table,
-                // so the data-aware sizing fell back to hardware-only and adaptive
-                // (if requested) was gated off — makes that immediately visible.
+                // Inferred workload signals (from schema inference). When these are
+                // `None`/false the source exposed no inferred metadata for this
+                // table (no catalog access, or nothing to infer), so the data-aware
+                // sizing fell back to hardware-only — makes that immediately visible.
                 inferred_row_count = ?workload.row_count,
                 inferred_table_bytes = ?workload.table_bytes,
-                inferred_extended_schema = workload.inferred_metadata.is_present(),
+                inferred_schema_present = workload.inferred_metadata.is_present(),
                 has_primary_key = workload.has_primary_key,
                 is_upsert = workload.is_upsert,
                 "Cayenne auto-tuned config: segment_cache={}MB, pk_keyset_cache={:?}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, delta_encoding={}, pk_conflict_detection={}, deletion_mode={:?}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}, cdc_durability={}, cdc_mem_tier_max_bytes={}, cdc_mem_tier_min_flush_bytes={}",
@@ -1337,6 +1849,35 @@ impl CayenneAccelerator {
         Ok(path_buf)
     }
 
+    /// Lazily initialize a Cayenne catalog into `cell` from `connection_string`,
+    /// sharing the init/`OnceCell` machinery between the file-mode and memory-mode
+    /// catalog getters.
+    async fn init_cayenne_catalog(
+        cell: &OnceCell<Arc<dyn cayenne::MetadataCatalog>>,
+        connection_string: String,
+    ) -> Result<Arc<dyn cayenne::MetadataCatalog>> {
+        cell.get_or_try_init(move || {
+            let connection_string = connection_string;
+            async move {
+                let catalog = Arc::new(
+                    cayenne::CayenneCatalog::new(connection_string)
+                        .boxed()
+                        .context(AccelerationInitializationFailedSnafu)?,
+                ) as Arc<dyn cayenne::MetadataCatalog>;
+
+                catalog
+                    .init()
+                    .await
+                    .boxed()
+                    .context(AccelerationInitializationFailedSnafu)?;
+
+                Ok::<Arc<dyn cayenne::MetadataCatalog>, Error>(catalog)
+            }
+        })
+        .await
+        .map(Arc::clone)
+    }
+
     async fn get_or_create_catalog(
         &self,
         metadata_dir: &str,
@@ -1346,28 +1887,52 @@ impl CayenneAccelerator {
             "turso" => format!("libsql://{metadata_dir}/cayenne.db"),
             _ => format!("sqlite://{metadata_dir}/cayenne.db"), // Default to SQLite
         };
+        Self::init_cayenne_catalog(&self.catalog, connection_string).await
+    }
 
-        self.catalog
-            .get_or_try_init(move || {
-                let connection_string = connection_string;
-                async move {
-                    let catalog = Arc::new(
-                        cayenne::CayenneCatalog::new(connection_string)
-                            .boxed()
-                            .context(AccelerationInitializationFailedSnafu)?,
-                    ) as Arc<dyn cayenne::MetadataCatalog>;
+    /// Get or create the shared in-memory (`memdb`) catalog for `mode: memory`
+    /// tables. The DSN uses `SQLite`'s `memdb` VFS keyed by this accelerator's
+    /// instance id, so the metastore lives entirely in RAM (nothing on disk) and
+    /// distinct accelerator instances stay isolated.
+    async fn get_or_create_memory_catalog(&self) -> Result<Arc<dyn cayenne::MetadataCatalog>> {
+        let connection_string =
+            format!("sqlite://file:/cayenne-mem-{}?vfs=memdb", self.instance_id);
+        Self::init_cayenne_catalog(&self.memory_catalog, connection_string).await
+    }
 
-                    catalog
-                        .init()
-                        .await
-                        .boxed()
-                        .context(AccelerationInitializationFailedSnafu)?;
-
-                    Ok::<Arc<dyn cayenne::MetadataCatalog>, Error>(catalog)
-                }
-            })
-            .await
-            .map(Arc::clone)
+    /// Apply the `mode: memory` overrides to a table's [`cayenne::metadata::VortexConfig`]:
+    /// make the mem-tier the permanent in-RAM store — never checkpoint/seal to
+    /// Vortex, no compaction/cold tier, single shard (so a full-refresh overwrite is
+    /// one atomic swap), and no inline-corpus publishing. The per-table byte cap
+    /// becomes the hard RAM bound (breach => error, never spill); default `0` =
+    /// unbounded (Arrow parity) unless the operator sets an explicit
+    /// `cayenne_cdc_mem_tier_max_bytes`.
+    ///
+    /// Note: with the drain disabled, an `append`/`changes` memory table accumulates
+    /// mem-tier segments with no in-RAM coalesce valve, so append cost grows with the
+    /// segment count. `full` refresh is unaffected (each overwrite resets the tier to
+    /// a single segment). A periodic in-RAM segment coalesce is a future follow-up.
+    fn apply_memory_mode_overrides(
+        config: &mut cayenne::metadata::VortexConfig,
+        acceleration: Option<&Acceleration>,
+    ) {
+        config.memory_mode = true;
+        config.cdc_mem_tier_shards = 1;
+        config.cdc_mem_tier_max_age_ms = 0;
+        config.cdc_mem_tier_checkpoint_interval_ms = 0;
+        config.cdc_mem_tier_seal_age_ms = 0;
+        config.compaction_background_interval_ms = 0;
+        config.cold_tier_location = None;
+        config.inline_max_rows = 0;
+        config.inline_max_bytes = 0;
+        config.inline_max_buffer_bytes = 0;
+        let explicit_limit = acceleration.is_some_and(|a| {
+            a.params.contains_key("cayenne_cdc_mem_tier_max_bytes")
+                || a.params.contains_key("cdc_mem_tier_max_bytes")
+        });
+        if !explicit_limit {
+            config.cdc_mem_tier_max_bytes = 0;
+        }
     }
 
     /// Builds a [`cayenne::TimeRetentionFilterBuilder`] from the acceleration
@@ -1433,31 +1998,40 @@ impl CayenneAccelerator {
         // Get metastore type and metadata directory
         let acceleration = source.acceleration();
         let metadata_dir = Self::resolve_metadata_dir(acceleration);
-        let maintained_aggregate_specs = maintained_aggregate_specs_for_cayenne(acceleration)?;
+        let maintained_aggregate_specs =
+            maintained_aggregate_specs_for_cayenne(acceleration, &schema, &primary_keys)?;
         let metastore_type = acceleration
             .and_then(|a| a.params.get("cayenne_metastore"))
             .map_or("sqlite", String::as_str)
             .to_string();
 
-        // Ensure metadata directory exists
-        std::fs::create_dir_all(&metadata_dir)
-            .boxed()
-            .context(AccelerationCreationFailedSnafu)?;
+        // Memory mode (`mode: memory`): fully in-RAM — an in-memory `memdb`
+        // metastore (nothing on disk) and no metadata directory. File mode creates
+        // the metadata dir and uses the shared on-disk catalog as before.
+        let memory_mode = !source.is_file_accelerated();
+        let catalog = if memory_mode {
+            self.get_or_create_memory_catalog().await?
+        } else {
+            // Ensure metadata directory exists
+            std::fs::create_dir_all(&metadata_dir)
+                .boxed()
+                .context(AccelerationCreationFailedSnafu)?;
+            // Get or create the shared catalog (lazy initialization)
+            self.get_or_create_catalog(&metadata_dir, &metastore_type)
+                .await?
+        };
 
-        // Get or create the shared catalog (lazy initialization)
-        let catalog = self
-            .get_or_create_catalog(&metadata_dir, &metastore_type)
-            .await?;
-
-        // Check if using S3 Express One Zone storage
-        let is_s3_express = s3::is_s3_express_data_path(source);
+        // S3 Express One Zone is file-mode only. Memory mode never builds an
+        // object store; if S3 Express params linger while mode is memory, treat
+        // them as inactive so we don't fail with a missing object-store error.
+        let is_s3_express = !memory_mode && s3::is_s3_express_data_path(source);
         let workload = build_workload_profile(
             acceleration,
             schema.as_ref(),
             &primary_keys,
             on_conflict.as_ref(),
         );
-        let vortex_config = Self::get_vortex_config_with_footer_cache(
+        let mut vortex_config = Self::get_vortex_config_with_footer_cache(
             table_name,
             source,
             self.footer_cache_mb,
@@ -1465,11 +2039,23 @@ impl CayenneAccelerator {
         )
         .await;
 
-        // Build S3 object store if using S3 Express One Zone storage
-        let object_store =
-            s3::build_s3_object_store(source, CayenneAccelerator::new().cayenne_data_dir(source)?)
+        // Memory mode: make the mem-tier the permanent in-RAM store — never
+        // checkpoint/seal to Vortex, no compaction/cold tier, single shard (so a
+        // full-refresh overwrite is one atomic swap), no inline-corpus publishing.
+        if memory_mode {
+            Self::apply_memory_mode_overrides(&mut vortex_config, acceleration);
+        }
+
+        // Build S3 object store if using S3 Express One Zone storage. Memory mode
+        // has no data directory or object store (and `cayenne_data_dir` errors for
+        // it), so skip this entirely — memory-mode data lives only in RAM.
+        let object_store = if memory_mode {
+            None
+        } else {
+            s3::build_s3_object_store(source, self.cayenne_data_dir(source)?)
                 .await
-                .context(S3Snafu)?;
+                .context(S3Snafu)?
+        };
 
         // Log S3 Express configuration
         if is_s3_express {
@@ -1497,13 +2083,99 @@ impl CayenneAccelerator {
             table_name,
         );
 
+        // Durable federated write-back (#11838): a write_back + on_conflict +
+        // refresh_mode:changes Cayenne dataset resolves to WriteMode::WriteBack
+        // (on_conflict with a non-`changes` refresh forces AcceleratorOnly). When
+        // so configured, every committed write durably marks its PKs so the
+        // delivery worker reconciles them to the federated source.
+        let durable_write_back = source.acceleration().is_some_and(|acceleration| {
+            acceleration.write_mode == WriteMode::WriteBack
+                && !acceleration.on_conflict.is_empty()
+                && acceleration.refresh_mode == Some(RefreshMode::Changes)
+        });
+
         // Create CayenneTableProvider with object store for S3 Express One Zone
         let mut builder = CayenneTableProviderBuilder::new(catalog, runtime_env)
             .with_context(context)
             .with_retention_filters(retention_filters)
-            .with_maintained_aggregates(maintained_aggregate_specs);
+            .with_maintained_aggregates(maintained_aggregate_specs)
+            .with_durable_write_back(durable_write_back);
         if let Some(retention_builder) = time_retention_filter_builder {
             builder = builder.with_time_retention_filter_builder(retention_builder);
+        }
+        // The datalake tier supports `s3://` locations only. Anything else
+        // would be silently treated as a local directory by the engine's write
+        // path — reject it at registration instead.
+        if let Some(location) = table_options.vortex_config.cold_tier_location.as_deref()
+            && !location.starts_with("s3://")
+        {
+            return Err(Error::AccelerationCreationFailed {
+                source: Box::new(std::io::Error::other(format!(
+                    "Failed to register dataset {table_name} (cayenne): unsupported datalake location '{location}'. Expected 's3://bucket/prefix'. Update 'cayenne_datalake_location'."
+                ))),
+            });
+        }
+        // The datalake tier supports only continuously-ingesting refresh modes:
+        // 'changes' (CDC) and 'append'. A 'full' refresh re-materializes the
+        // whole table on every refresh — an overwrite that discards the
+        // promoted datalake generation each time, defeating the tier.
+        if table_options.vortex_config.cold_tier_enabled() {
+            let refresh_mode = source
+                .acceleration()
+                .and_then(|a| a.refresh_mode)
+                .unwrap_or(RefreshMode::Full);
+            if !matches!(refresh_mode, RefreshMode::Changes | RefreshMode::Append) {
+                return Err(Error::AccelerationCreationFailed {
+                    source: Box::new(std::io::Error::other(format!(
+                        "Failed to register dataset {table_name} (cayenne): the datalake tier supports refresh_mode 'changes' or 'append'; found '{refresh_mode:?}'. \
+                        Set 'refresh_mode: changes' or 'refresh_mode: append', or remove 'cayenne_datalake_location'."
+                    ))),
+                });
+            }
+        }
+        // Reject configurations that would leave the datalake tier silently
+        // inert or unsafe (explicit position deletes, disabled promotion/GC
+        // loops) and WARN on degraded ones (PK-less table → tier inactive,
+        // unknown clustering columns) — a diagnostic at registration beats a
+        // tier that never promotes with no explanation.
+        match validate_datalake_table_options(table_name, &table_options) {
+            Ok(warnings) => {
+                for warning in warnings {
+                    tracing::warn!("{warning}");
+                }
+            }
+            Err(message) => {
+                return Err(Error::InvalidConfiguration {
+                    detail: message.into(),
+                });
+            }
+        }
+        // Datalake (cold) tier object store: built from the dedicated
+        // `cayenne_datalake_s3_*` params (default `iam_role` auth falls back to environment/SDK credentials).
+        let cold_object_store = if table_options.vortex_config.cold_tier_enabled()
+            && table_options
+                .vortex_config
+                .cold_tier_location
+                .as_deref()
+                .is_some_and(|l| l.starts_with("s3://"))
+        {
+            let location = table_options
+                .vortex_config
+                .cold_tier_location
+                .clone()
+                .unwrap_or_default();
+            s3::build_datalake_object_store(source, &location)
+                .await
+                .context(S3Snafu)?
+        } else {
+            None
+        };
+        // Fail fast at registration on datalake-store misconfiguration: verify
+        // write access to the location prefix before the table is created.
+        if let Some(ref cold) = cold_object_store {
+            s3::validate_datalake_store_access(cold, table_name)
+                .await
+                .context(S3Snafu)?;
         }
         if let Some(object_store) = object_store {
             tracing::info!(
@@ -1519,6 +2191,9 @@ impl CayenneAccelerator {
                 )),
             });
         }
+        if let Some(cold) = cold_object_store {
+            builder = builder.with_cold_object_store(cold);
+        }
         tracing::debug!("create_cayenne_table_provider: calling builder.create for {table_name}");
         let cayenne_table = builder
             .create(table_options)
@@ -1528,20 +2203,116 @@ impl CayenneAccelerator {
 
         tracing::debug!("create_cayenne_table_provider: table {table_name} created successfully");
         let provider = Arc::new(cayenne_table);
-        let spawned = provider.spawn_background_compaction(Arc::clone(&self.compaction_semaphore));
-        if spawned {
-            tracing::debug!("Background compaction task spawned for Cayenne table {table_name}",);
-        }
-        // Periodic mem-tier checkpoint (cdc_durability: memory only); a no-op for
-        // file-mode tables. This is what advances the deferred source slot ack on
-        // an idle/pure-upsert stream so replication lag stays bounded.
-        if provider.spawn_background_mem_tier_checkpoint() {
-            tracing::debug!(
-                "Background mem-tier checkpoint task spawned for Cayenne table {table_name}",
-            );
+        // Publish the real, in-use compaction semaphore for the occupancy gauges
+        // (idempotent across the fleet — every table shares this one semaphore).
+        publish_compaction_semaphore_for_metrics(
+            &self.compaction_semaphore,
+            self.compaction_permits_total,
+        );
+        // Memory mode never drains to Vortex (no compaction, no mem-tier
+        // checkpoint/seal, no cold tier), so skip the background drain tasks
+        // entirely; the provider's own guards also no-op them defensively.
+        if !memory_mode {
+            let spawned =
+                provider.spawn_background_compaction(Arc::clone(&self.compaction_semaphore));
+            if spawned {
+                tracing::debug!(
+                    "Background compaction task spawned for Cayenne table {table_name}",
+                );
+            }
+            // Periodic mem-tier checkpoint (cdc_durability: memory only); a no-op for
+            // file-mode tables. This is what advances the deferred source slot ack on
+            // an idle/pure-upsert stream so replication lag stays bounded.
+            if provider.spawn_background_mem_tier_checkpoint() {
+                tracing::debug!(
+                    "Background mem-tier checkpoint task spawned for Cayenne table {table_name}",
+                );
+            }
+            // Cold-tier promotion (storage-cascade bottom tier); a no-op unless
+            // cayenne_datalake_location is set. Runs on the same internal
+            // background-worker infra as the mem-tier checkpointer, on its own
+            // cadence — no spicepod `workers:` section, nothing user-facing.
+            if provider.spawn_background_cold_tier_promotion() {
+                tracing::debug!(
+                    "Background datalake tiering task spawned for Cayenne table {table_name}",
+                );
+            }
         }
         Ok(provider)
     }
+}
+
+/// Registration-time validation for datalake (cold) tier table options: the
+/// misconfigurations rejected here would otherwise leave the tier silently
+/// inert (a promoter that early-returns forever) or unsafe (a GC grace of
+/// zero). A no-op when the tier is disabled.
+///
+/// Returns `Err(message)` for configurations that must fail registration and
+/// `Ok(warnings)` for configurations that register but degrade — including a
+/// PK-less table, where the tier stays INACTIVE rather than failing (the
+/// dataset is fully serviceable from the warm tier, so a fleet-wide datalake
+/// location must not block PK-less datasets).
+/// Pure (no I/O, no logging) so each rule stays unit-testable.
+fn validate_datalake_table_options(
+    table_name: &str,
+    options: &cayenne::metadata::CreateTableOptions,
+) -> Result<Vec<String>, String> {
+    let vc = &options.vortex_config;
+    if !vc.cold_tier_enabled() {
+        return Ok(Vec::new());
+    }
+    let mut warnings = Vec::new();
+    if options.primary_key.is_empty() {
+        // Promotion classifies and rewrites cold files by primary key, and
+        // deletes against cold-resident rows are key-based, so the promoter
+        // early-returns for PK-less tables — the tier is configured but
+        // inactive. Warn loudly instead of failing registration.
+        warnings.push(format!(
+            "Dataset '{table_name}': 'cayenne_datalake_location' is set but the dataset has no primary key, so the datalake tier stays INACTIVE (data never moves to the datalake and stays in the warm tier). Add 'primary_key' to the acceleration to activate it, or remove 'cayenne_datalake_location'."
+        ));
+    }
+    // Position deletes are file-path scoped and cannot survive the warm→cold
+    // rewrite; the engine skips promotion for position-mode tables. An
+    // explicit conflict is an error, not a silent override.
+    if vc.deletion_mode == cayenne::metadata::DeletionMode::Position {
+        return Err(format!(
+            "Failed to register dataset {table_name} (cayenne): the datalake tier requires key-based deletes, but 'cayenne_deletion_mode: position' is set. \
+            Set 'cayenne_deletion_mode: key' (or remove it), or remove 'cayenne_datalake_location'."
+        ));
+    }
+    // Default values quoted in the error hints, derived so they can never
+    // drift from the actual `VortexConfig` defaults.
+    let defaults = cayenne::metadata::VortexConfig::default();
+    // The tiering-check interval drives BOTH the data-move evaluation and the
+    // physical GC loop; 0 means the background task is never spawned, so warm
+    // data never moves to the datalake and superseded objects are never reclaimed.
+    if vc.cold_tier_background_interval_ms == 0 {
+        return Err(format!(
+            "Failed to register dataset {table_name} (cayenne): 'cayenne_datalake_tiering_check_interval_ms' is 0, which disables the datalake tiering loop — warm-tier data would never move to the datalake and superseded objects would never be reclaimed. \
+            Set a positive interval (default {}), or remove 'cayenne_datalake_location'.",
+            defaults.cold_tier_background_interval_ms
+        ));
+    }
+    // The GC interval doubles as the orphan grace: 0 would let a superseded
+    // object be deleted while a running scan still reads it.
+    if vc.cold_tier_gc_interval_ms == 0 {
+        return Err(format!(
+            "Failed to register dataset {table_name} (cayenne): 'cayenne_datalake_gc_interval_ms' is 0, which collapses the garbage-collection grace period to zero — a superseded datalake object could be deleted while a running query still reads it. \
+            Set a positive interval (default {}), or remove 'cayenne_datalake_location'.",
+            defaults.cold_tier_gc_interval_ms
+        ));
+    }
+    // Unknown clustering columns are dropped by the engine at promotion time
+    // (falling back to sort columns, then the primary key) — surface the
+    // misconfiguration instead of silently clustering by something else.
+    for column in &vc.cold_clustering_columns {
+        if options.schema.column_with_name(column).is_none() {
+            warnings.push(format!(
+                "Dataset '{table_name}': 'cayenne_datalake_clustering_columns' entry '{column}' does not exist in the schema and is ignored; datalake clustering falls back to cayenne_sort_columns, then the primary key."
+            ));
+        }
+    }
+    Ok(warnings)
 }
 
 /// Build a [`NativeVectorIndex`] for each `FixedSizeList<Float32, N>` column in
@@ -1619,8 +2390,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    47,
-    { S3_PARAMS_LEN + 47 },
+    63,
+    { S3_PARAMS_LEN + 63 },
 >(
     S3_PARAMETERS,
     [
@@ -1649,10 +2420,54 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("When 'true' (default), Cayenne advertises and decodes string and binary columns as Arrow view types (Utf8View/BinaryView) on the query/scan path so DataFusion plans joins and aggregates on view arrays, avoiding the i32 2 GiB offset overflow in hash-join build-side batch concatenation at scale. The stored schema keeps Utf8/Binary for writes, CDC, and stats. Set 'false' to opt out.")
             .one_of(&["true", "false"])
             .default("true"),
+        ParameterSpec::component("datalake_location")
+            .description("Object-store URL prefix for the datalake tier, e.g. 's3://bucket/prefix' — the storage-cascade bottom tier. When set, a background tiering loop moves warm local-disk data to read-optimized, Z-order-clustered Vortex files on this store, and queries span warm + datalake with per-tier pushdown. Unset (default) disables the tier. Requires key-based deletes and a primary key (auto-resolved). Partitioned and position-delete tables are not supported."),
+        ParameterSpec::component("datalake_clustering_columns")
+            .description("Comma-separated liquid-clustering key columns for datalake files (multi-column Z-order), e.g. 'tenant_id,ts'. When unset, falls back to cayenne_sort_columns, then the primary key. Clustering tightens each cold file's per-column zone maps so selective queries on any clustering dimension prune at the storage layer."),
+        ParameterSpec::component("datalake_s3_auth")
+            .description("Authentication method for the datalake S3 store. 'iam_role' (default) uses environment/SDK credentials; 'key' uses cayenne_datalake_s3_key/_secret.")
+            .one_of(&["iam_role", "key"])
+            .default("iam_role"),
+        ParameterSpec::component("datalake_s3_key")
+            .description("Access key ID for the datalake S3 store (with cayenne_datalake_s3_auth: key).")
+            .secret(),
+        ParameterSpec::component("datalake_s3_secret")
+            .description("Secret access key for the datalake S3 store (with cayenne_datalake_s3_auth: key).")
+            .secret(),
+        ParameterSpec::component("datalake_s3_session_token")
+            .description("Optional session token for the datalake S3 store (with cayenne_datalake_s3_auth: key).")
+            .secret(),
+        ParameterSpec::component("datalake_s3_region")
+            .description("AWS region of the datalake S3 bucket. Defaults to the environment region (AWS_REGION/AWS_DEFAULT_REGION), then us-east-1; inert for S3-compatible endpoints."),
+        ParameterSpec::component("datalake_s3_endpoint")
+            .description("Custom S3 endpoint URL for the datalake store (e.g. an S3-compatible store such as MinIO). http:// endpoints implicitly allow HTTP."),
+        ParameterSpec::component("datalake_s3_allow_http")
+            .description("Allow plain-HTTP connections to the datalake S3 endpoint. Default: false.")
+            .one_of(&["true", "false"])
+            .default("false"),
+        ParameterSpec::component("datalake_s3_client_timeout")
+            .description("HTTP client timeout for datalake store requests, as a duration (e.g. '2m'). Default: 2m."),
+        ParameterSpec::component("datalake_s3_unsigned_payload")
+            .description("Use unsigned payloads for datalake S3 uploads. Default: true.")
+            .one_of(&["true", "false"])
+            .default("true"),
+        ParameterSpec::component("datalake_target_file_size_mb")
+            .description("Target size for datalake (cold) tier Vortex files in MB. Larger than the warm cayenne_target_file_size_mb because object stores favor fewer, larger objects and cold scans are range reads. Default: 512."),
+        ParameterSpec::component("datalake_warm_max_bytes")
+            .description("Warm-tier data moves to the datalake once the warm tier's total Vortex bytes reach this threshold. Pairs with cayenne_datalake_warm_max_files; 0 disables the byte trigger, but when BOTH triggers are 0/unset this one defaults to 16 x cayenne_datalake_target_file_size_mb."),
+        ParameterSpec::component("datalake_warm_max_files")
+            .description("Warm-tier data moves to the datalake once the warm tier's Vortex file count reaches this threshold. 0 (default) disables the file-count trigger; when cayenne_datalake_warm_max_bytes is also 0/unset, the byte trigger defaults to 16 x cayenne_datalake_target_file_size_mb."),
+        ParameterSpec::component("datalake_tiering_check_interval_ms")
+            .description("How often the background loop checks whether warm-tier data should move to the datalake (a check does not guarantee a move). Normally auto-tuned; override for testing. Default: 60000 (60s)."),
+        ParameterSpec::component("datalake_gc_interval_ms")
+            .description("Physical-GC cadence and orphan grace for superseded datalake objects: the background sweep runs about this often and deletes an object no longer referenced by the manifest only once it has been observed orphaned for at least this long (so an in-flight scan has a full interval to finish). Default: 300000 (5min)."),
         ParameterSpec::component("sort_columns")
             .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
+        ParameterSpec::component("sort_columns_origin")
+            .description("Provenance of 'sort_columns'. Normally set by schema inference rather than by hand: 'user' (the default when absent) means the sort order was configured explicitly and is authoritative, while 'inferred' means schema inference filled it from the source's declared order (the primary key, for most CDC tables), which is a guess and is outranked by the filter columns actually observed on scans, so the adaptive layout can cluster for the real workload. Setting it explicitly is supported and is useful for reproducing the inferred configuration in a benchmark or test.")
+            .one_of(&["user", "inferred"]),
         ParameterSpec::component("shard_key_columns")
-            .description("Comma-separated list of columns to hash-cluster rows by during intra-write sharding (the parallel encode fan-out), e.g. 'tenant_id'. When unset, the shard key derives from the primary key (PK-hash clustering); tables without a primary key shard round-robin. Extended schema inference (schema_inference: extended) fills this from the source's declared partition/shard key when the user leaves it unset. Ignored for sorted tables: sort_columns forces a single serial writer."),
+            .description("Comma-separated list of columns to hash-cluster rows by during intra-write sharding (the parallel encode fan-out), e.g. 'tenant_id'. When unset, the shard key derives from the primary key (PK-hash clustering); tables without a primary key shard round-robin. Schema inference fills this from the source's declared partition/shard key when the user leaves it unset. Ignored for sorted tables: sort_columns forces a single serial writer."),
         ParameterSpec::component("compression_strategy")
             .description("Compression strategy to use for Vortex files. Options: 'btrblocks' (default), 'zstd'")
             .one_of(&["btrblocks", "zstd"])
@@ -1681,7 +2496,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("compaction_trigger_snapshot_age_ms")
             .description("Maximum age in milliseconds of the oldest protected snapshot before snapshot-maintenance compaction runs. Set to 0 to disable the age trigger. Default: 60000 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 300000 otherwise."),
         ParameterSpec::component("compaction_max_levels")
-            .description("Maximum number of consecutive compaction passes per trigger. Bounds write amplification when promotion keeps producing new candidates. Default: 3.")
+            .description("Maximum number of consecutive compaction passes per trigger. Bounds write amplification when tiered compaction keeps producing new candidates. Default: 3.")
             .default("3"),
         ParameterSpec::component("compaction_max_files_per_pick")
             .description("Maximum number of eligible file paths retained in one compaction candidate for trigger selection and observability. The current compactor rewrites the whole current snapshot once triggered, so this does not bound rewrite IO or memory. Default: 32.")
@@ -1715,18 +2530,19 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("cdc_mem_tier_shards")
             .description("Number of PK-hash shards the in-RAM CDC tier is partitioned into, in cdc_durability: memory mode only (non-partitioned, key-based merge-on-read tables). Each shard is an independent serial validate->append domain keyed by the RowConverter OwnedRow bytes, so disjoint keys validate and append in parallel within one apply (intra-apply fan-out) while a key's whole version history — upserts AND delete tombstones — stays confined to its one owning shard (last-writer-wins preserved). Checkpoints are always all-shards-atomic on a single source-position axis. Default 1 (the byte-identical serial path). Raise (e.g. 4) on update/insert-heavy CDC tables to lift the per-apply serialization ceiling."),
         ParameterSpec::component("tuning")
-            .description("Auto-tuning mode. 'auto': derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate, delete fraction, and arrival burstiness AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adapts the inline-memtable flush caps, the in-memory CDC tier byte cap, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. DEFAULT: when this is unset, the mode is 'adaptive' if extended schema inference produced metadata (the dataset set 'schema_inference: extended' and the source emitted it) — opting into extended schema enables self-tuning, and that metadata is the adaptive warm-start — otherwise 'auto'. Set 'cayenne_tuning: auto' explicitly to opt out of the closed loop even with extended schema. 'schema_inference: extended' also sharpens the 'adaptive' warm-start (inferred cardinality/size) but is not required for an explicit 'adaptive' — without it the controller relearns the row width from observed ingest and converges from the hardware-derived warm-start. In BOTH modes an explicit per-parameter value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set actuator is pinned (the loop will not move it).")
+            .description("Auto-tuning mode. 'auto': derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate, delete fraction, and arrival burstiness AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adapts the inline-memtable flush caps, the in-memory CDC tier byte cap, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. DEFAULT: when this is unset, the mode is 'auto' — except that a configured cayenne_goal_* SLO implies 'adaptive' unless you set 'auto' explicitly. Set 'cayenne_tuning: adaptive' explicitly to enable the closed loop without a goal. Schema inference is always attempted and sharpens the 'adaptive' warm-start (inferred cardinality/size) but is not required for it — without inferred metadata the controller relearns the row width from observed ingest and converges from the hardware-derived warm-start. In BOTH modes an explicit per-parameter value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set actuator is pinned (the loop will not move it).")
             .one_of(&["auto", "adaptive"]),
         ParameterSpec::component("goal_replication_lag")
-            .description("Goal-driven adaptive tuning: target end-to-end CDC replication lag as a duration (e.g. '5s'). When set (and cayenne_tuning is not 'auto'), the closed-loop controller converges toward this SLO in small, bounded steps within cayenne_goal_convergence_window."),
+            .description("Goal-driven adaptive tuning: target end-to-end CDC replication lag as a duration (e.g. '5s'). Best set GLOBALLY at runtime.params (cayenne_goal_replication_lag) and overridden here per-dataset. When set (and cayenne_tuning is not 'auto'), the closed-loop controller converges toward this SLO in small, bounded steps."),
         ParameterSpec::component("goal_freshness")
-            .description("Goal-driven adaptive tuning: target data freshness — age of the newest queryable data — as a duration (e.g. '30s')."),
+            .description("Goal-driven adaptive tuning: target data freshness — age of the newest queryable data — as a duration (e.g. '30s'). Settable globally at runtime.params and overridden here per-dataset."),
         ParameterSpec::component("goal_query_latency")
-            .description("Goal-driven adaptive tuning: target p99 query latency on this table as a duration (e.g. '10s' or '250ms')."),
-        ParameterSpec::component("goal_qph")
-            .description("Goal-driven adaptive tuning: target query throughput in queries per hour (higher is better), e.g. '5000'."),
+            .description("Goal-driven adaptive tuning: target p99 query latency on this table as a duration (e.g. '10s' or '250ms'). Settable globally at runtime.params and overridden here per-dataset."),
+        // NOTE: there is no per-dataset `goal_qph` ParameterSpec — QPH is a
+        // system-wide metric (a query/join spans datasets), so its goal is
+        // configured globally only, under `runtime.params`.
         ParameterSpec::component("goal_convergence_window")
-            .description("Goal-driven adaptive tuning: the time budget to converge toward the configured cayenne_goal_* SLOs, as a duration (e.g. '1m'). Default 60s."),
+            .description("Advanced: the control-loop pacing window — the time budget over which the loop steps toward the configured cayenne_goal_* SLOs, as a duration (e.g. '1m'). Default 60s. This paces HOW fast the loop chases the goals, not a target outcome; it is a per-dataset knob, not part of the global SLO surface."),
         ParameterSpec::runtime("cdc_prefetch_buffer")
             .description("Per-dataset override for the CDC source-reader prefetch channel depth (envelopes)."),
         ParameterSpec::runtime("cdc_max_coalesced_envelopes")
@@ -1808,13 +2624,13 @@ impl DataAccelerator for CayenneAccelerator {
     async fn init(
         &self,
         source: &dyn AccelerationSource,
+        registry: Arc<AcceleratorEngineRegistry>,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         if !source.is_file_accelerated() {
-            return Err(Box::new(Error::InvalidConfiguration {
-                detail: Arc::from(
-                    "Cayenne data accelerator only supports file mode. Please configure the accelerator with mode: file",
-                ),
-            }));
+            // Memory mode (`mode: memory`) is fully in-RAM and ephemeral — there is
+            // nothing to bootstrap on disk; the dataset reloads from its federated
+            // source on startup, like the in-memory Arrow accelerator.
+            return Ok(BootstrapStatus::none());
         }
 
         if let Some(acceleration) = source.acceleration() {
@@ -2071,6 +2887,7 @@ impl DataAccelerator for CayenneAccelerator {
             Ok(download_snapshot_if_needed(
                 acceleration,
                 source,
+                registry,
                 snapshot_adapter,
                 AccelerationEngine::Cayenne,
                 snapshot_engine,
@@ -2101,9 +2918,30 @@ impl DataAccelerator for CayenneAccelerator {
             }) as Box<dyn std::error::Error + Send + Sync>
         })?;
 
-        let dir_path = self.resolve_storage_config(source).boxed()?;
+        // Memory mode (`mode: memory`) writes no data files, so it needs no storage
+        // directory: derive a (never-written) base path and skip directory creation.
+        // File mode resolves and creates the data dir as before.
+        let memory_mode = !source.is_file_accelerated();
+        // Memory mode is non-partitioned only: `is_memory_resident_mode()` (the
+        // predicate the write/scan paths consult) requires no partition column, so a
+        // partitioned memory table would fall through to the durable Vortex path and
+        // silently write to disk. Reject it up front rather than half-configuring an
+        // on-disk partitioned table.
+        if memory_mode && !partition_by.is_empty() {
+            return Err(Box::new(Error::InvalidConfiguration {
+                detail: Arc::from(
+                    "Cayenne mode: memory is not supported with partitioning. Remove partition_by, or use mode: file for a partitioned accelerator.",
+                ),
+            }));
+        }
+        let dir_path = if memory_mode {
+            Self::resolve_default_data_path(&source.name().to_string().replace(['.', '/'], "_"))
+        } else {
+            let dir_path = self.resolve_storage_config(source).boxed()?;
+            let _ = Self::ensure_directory(&dir_path).boxed()?;
+            dir_path
+        };
         let arrow_schema = Self::transformed_arrow_schema(&cmd, source).boxed()?;
-        let _ = Self::ensure_directory(&dir_path).boxed()?;
 
         // Get the table name from the source
         let table_name = source.name().to_string();
@@ -2297,6 +3135,8 @@ impl DataAccelerator for CayenneAccelerator {
                 vortex_config.schema_evolution = cayenne::metadata::SchemaEvolutionMode::Disabled;
             }
 
+            serialize_partition_child_writes(&mut vortex_config, &table_name);
+
             // Log S3 Express configuration for partitioned tables
             if is_s3_express {
                 tracing::info!(
@@ -2334,13 +3174,19 @@ impl DataAccelerator for CayenneAccelerator {
                     PathBuf::from(&dir_path),
                 ),
             );
-            let partition_provider = Arc::new(
+            let partition_provider =
                 PartitionTableProvider::new(creator, partition_by, Arc::clone(&arrow_schema))
                     .await
                     .boxed()
-                    .context(AccelerationCreationFailedSnafu)?
-                    .with_insert_strategy(insert_strategy),
-            );
+                    .context(AccelerationCreationFailedSnafu)?;
+            let partition_table_providers = partition_provider.partition_table_providers().await;
+            insert_strategy
+                .recover_partitioned_wals(&partition_table_providers)
+                .await
+                .boxed()
+                .context(AccelerationCreationFailedSnafu)?;
+            let partition_provider =
+                Arc::new(partition_provider.with_insert_strategy(insert_strategy));
 
             // Wrap with upsert deduplication if needed based on on_conflict settings
             let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
@@ -2578,6 +3424,45 @@ impl DataAccelerator for CayenneAccelerator {
     }
 }
 
+/// Force partition child tables to encode serially (one write shard).
+///
+/// Two reasons, both specific to partitioned datasets:
+///
+/// 1. **Parallelism already comes from the partition fan-out.** The insert
+///    path runs one concurrent insert task per partition
+///    (`runtime_table_partition::insert`), so intra-write encode sharding
+///    would multiply the aggregate encode-shard count by the partition count.
+/// 2. **Child writes bypass the global encode budget, so they must stay
+///    serial.** The per-partition insert tasks are coupled through one
+///    routing demux over bounded channels; a child write parked on the encode
+///    budget stalls the demux, starving the permit-holding sibling writes of
+///    input — a hold-and-wait cycle that left partitioned tables permanently
+///    unready (spiceai/spiceai#11818). Child tables are therefore created as
+///    coupled writers (`CayenneContext::new_for_partition_child`), exempt
+///    from the budget (see `cayenne::provider::write_budget`) — and an
+///    unmetered writer must contribute the minimum encode footprint, one
+///    shard, which this clamp guarantees.
+///
+/// An operator-pinned `cayenne_write_concurrency > 1` is IGNORED (clamped to
+/// 1, with a warning), like schema evolution above: there is no safe way to
+/// honor it — child writes are budget-exempt, so a multi-shard child would
+/// fan out unmetered, multiplied by a partition count that isn't statically
+/// bounded (time-based partitions grow indefinitely).
+fn serialize_partition_child_writes(
+    config: &mut cayenne::metadata::VortexConfig,
+    table_name: &str,
+) {
+    if config.pinned_tuning_actuators.write_concurrency && config.write_concurrency.unwrap_or(1) > 1
+    {
+        tracing::warn!(
+            dataset = table_name,
+            write_concurrency = ?config.write_concurrency,
+            "cayenne_write_concurrency is not supported for partitioned Cayenne tables (partition writes bypass the global encode budget, so intra-partition sharding would fan out unmetered); writing each partition serially instead"
+        );
+    }
+    config.write_concurrency = Some(1);
+}
+
 /// Partition creator for Cayenne accelerator.
 ///
 /// Supports single and composite partition keys (e.g., `partition_by: [year, month, day]`).
@@ -2653,7 +3538,11 @@ impl CayennePartitionCreator {
         // Create shared Cayenne context with cache once, to be shared across all partitions.
         // This ensures all partitions share the same footer/segment caches instead of
         // each partition creating its own cache.
-        let context = cayenne::CayenneContext::new(&vortex_config, runtime_env, &table_name);
+        let context = cayenne::CayenneContext::new_for_partition_child(
+            &vortex_config,
+            runtime_env,
+            &table_name,
+        );
 
         Self {
             table_name,
@@ -2687,9 +3576,15 @@ impl CayennePartitionCreator {
 
     /// Generate a unique table name for this partition based on composite key.
     fn partition_table_name(&self, partition_key: &str) -> String {
-        // Replace "/" with "_" to create a valid table name
-        let safe_key = partition_key.replace('/', "_");
-        format!("{}_{}", self.table_name, safe_key)
+        format!(
+            "{}_p{}",
+            self.table_name,
+            encode_identifier_hex(partition_key)
+        )
+    }
+
+    fn legacy_partition_table_name(&self, partition_values: &[String]) -> String {
+        format!("{}_{}", self.table_name, partition_values.join("_"))
     }
 
     /// Generate partition directory path from multiple partition values.
@@ -2764,14 +3659,17 @@ impl PartitionCreator for CayennePartitionCreator {
 
         tracing::debug!("creating Cayenne partition at {partition_path}");
 
-        // Create the partition directory (including nested directories for composite partitions)
-        std::fs::create_dir_all(&partition_dir)
+        // Create the partition directory (including nested directories for composite partitions).
+        // Use tokio's async variant so partition creation does not block the runtime thread.
+        tokio::fs::create_dir_all(&partition_dir)
+            .await
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
         let partition_column_names = self.partition_column_labels();
 
-        // Create composite key for table naming (slash-separated values)
-        let partition_key = partition_value_strings.join("/");
+        let partition_key = encode_composite_key(&partition_values)
+            .boxed()
+            .context(creator::CreatePartitionSnafu)?;
 
         // Create partition metadata with composite key support
         let partition_metadata = cayenne::PartitionMetadata::new_composite(
@@ -2866,8 +3764,7 @@ impl PartitionCreator for CayennePartitionCreator {
                 partition_values.push(partition_value);
             }
 
-            // Create composite key for table lookup
-            let partition_key = partition_meta.partition_values.join("/");
+            let partition_key = partition_meta.composite_key();
             let partition_table_name = self.partition_table_name(&partition_key);
 
             // Use builder pattern to pass object store config for S3 support.
@@ -2884,11 +3781,38 @@ impl PartitionCreator for CayennePartitionCreator {
             if let Some(ref object_store) = self.object_store_config {
                 builder = builder.with_object_store(object_store.clone());
             }
-            let cayenne_table = builder
-                .open(&partition_table_name)
-                .await
-                .boxed()
-                .context(creator::InferringPartitionsSnafu)?;
+            let cayenne_table = match builder.open(&partition_table_name).await {
+                Ok(table) => table,
+                Err(cayenne::provider::Error::Catalog {
+                    source: cayenne::CatalogError::TableNotFound { .. },
+                }) => {
+                    let legacy_name =
+                        self.legacy_partition_table_name(&partition_meta.partition_values);
+                    let mut legacy_builder = cayenne::CayenneTableProviderBuilder::new(
+                        Arc::clone(&self.catalog),
+                        Arc::clone(self.context.runtime_env()),
+                    )
+                    .with_context(Arc::clone(&self.context))
+                    .with_retention_filters(self.retention_filters.clone());
+                    if let Some(ref retention_builder) = self.time_retention_filter_builder {
+                        legacy_builder = legacy_builder
+                            .with_time_retention_filter_builder(retention_builder.clone());
+                    }
+                    if let Some(ref object_store) = self.object_store_config {
+                        legacy_builder = legacy_builder.with_object_store(object_store.clone());
+                    }
+                    legacy_builder
+                        .open(&legacy_name)
+                        .await
+                        .boxed()
+                        .context(creator::InferringPartitionsSnafu)?
+                }
+                Err(error) => {
+                    return Err(creator::Error::InferringPartitions {
+                        source: Box::new(error),
+                    });
+                }
+            };
 
             let partition_provider = Arc::new(cayenne_table);
             partition_provider.spawn_background_compaction(Arc::clone(&self.compaction_semaphore));
@@ -2942,11 +3866,58 @@ impl PartitionCreator for CayennePartitionCreator {
     }
 }
 
+fn encode_identifier_hex(value: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value.as_bytes() {
+        let _ = write!(encoded, "{byte:02X}");
+    }
+    encoded
+}
+
 register_data_accelerator!(Engine::Cayenne, CayenneAccelerator);
+
+/// Normalize a raw `cayenne_tuning` value: trim + lowercase, mapping `auto`/`adaptive`
+/// through unchanged and any *other* value to `Some("auto")` (the documented default).
+/// Returns `(normalized_mode, was_invalid)`. Folding an invalid value to `auto` keeps
+/// it behaving as the default everywhere downstream — including the `cayenne_goal_*`
+/// gate that tests `== "auto"` — instead of slipping through as "not auto" and
+/// enabling adaptive.
+fn normalize_cayenne_tuning(raw: Option<&str>) -> (Option<String>, bool) {
+    match raw.map(|v| v.trim().to_ascii_lowercase()) {
+        Some(mode) if mode != "auto" && mode != "adaptive" => (Some("auto".to_string()), true),
+        other => (other, false),
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_cayenne_tuning_folds_invalid_to_auto() {
+        // Unset stays unset; `auto`/`adaptive` pass through (trim + lowercase).
+        assert_eq!(normalize_cayenne_tuning(None), (None, false));
+        assert_eq!(
+            normalize_cayenne_tuning(Some("auto")),
+            (Some("auto".to_string()), false)
+        );
+        assert_eq!(
+            normalize_cayenne_tuning(Some("  Adaptive ")),
+            (Some("adaptive".to_string()), false)
+        );
+        // An invalid value folds to `auto` (flagged invalid), so it can NEVER enable
+        // adaptive, and the `cayenne_goal_*` gate (which tests `== "auto"`) treats it
+        // as auto rather than "not auto".
+        let (mode, invalid) = normalize_cayenne_tuning(Some("nonsense"));
+        assert!(invalid, "an unrecognized value is flagged invalid");
+        assert_eq!(mode.as_deref(), Some("auto"), "invalid folds to auto");
+        assert!(
+            !matches!(mode.as_deref(), Some("adaptive")),
+            "invalid must not enable adaptive tuning"
+        );
+    }
     use crate::component::dataset::acceleration::{Acceleration, Mode, RefreshMode};
     use crate::component::dataset::builder::DatasetBuilder;
     use app::AppBuilder;
@@ -2954,6 +3925,90 @@ mod tests {
     use datafusion_table_providers::UnsupportedTypeAction;
     use search::index::{SearchIndex, VectorIndex};
     use std::sync::Arc;
+
+    /// Partition child tables default to serial writes (`write_concurrency: 1`):
+    /// multi-shard child writes can deadlock the partition insert demux against
+    /// the global encode budget (spiceai/spiceai#11818).
+    #[test]
+    fn partition_child_writes_default_to_serial() {
+        let mut config = cayenne::metadata::VortexConfig {
+            write_concurrency: None,
+            ..Default::default()
+        };
+        serialize_partition_child_writes(&mut config, "t");
+        assert_eq!(config.write_concurrency, Some(1));
+
+        // Auto-tuned (unpinned) values are overridden too.
+        let mut config = cayenne::metadata::VortexConfig {
+            write_concurrency: Some(8),
+            ..Default::default()
+        };
+        serialize_partition_child_writes(&mut config, "t");
+        assert_eq!(config.write_concurrency, Some(1));
+    }
+
+    /// An operator-pinned `cayenne_write_concurrency > 1` is clamped to serial
+    /// for partition children — safety depends on the host-sized encode budget
+    /// and the (unbounded) partition count, so it cannot be honored safely.
+    #[test]
+    fn partition_child_writes_clamp_pinned_write_concurrency() {
+        let mut config = cayenne::metadata::VortexConfig {
+            write_concurrency: Some(4),
+            ..Default::default()
+        };
+        config.pinned_tuning_actuators.write_concurrency = true;
+        serialize_partition_child_writes(&mut config, "t");
+        assert_eq!(config.write_concurrency, Some(1));
+    }
+
+    #[test]
+    fn resolve_goal_raw_global_default_then_per_dataset_override() {
+        use std::collections::HashMap;
+
+        // Global SLOs set once at runtime.params.
+        let global: HashMap<String, String> = [
+            ("cayenne_goal_freshness".to_string(), "10s".to_string()),
+            (
+                "cayenne_goal_replication_lag".to_string(),
+                "30s".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        // Dataset overrides freshness, inherits the global replication_lag, and
+        // sets a latency goal that the global doesn't have.
+        let accel = Acceleration {
+            params: [
+                ("cayenne_goal_freshness".to_string(), "2s".to_string()),
+                (
+                    "cayenne_goal_query_latency".to_string(),
+                    "250ms".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+
+        // Per-dataset value wins over the global default.
+        assert_eq!(
+            resolve_goal_raw(&accel, &global, "cayenne_goal_freshness"),
+            Some("2s")
+        );
+        // Unset on the dataset → inherits the global default.
+        assert_eq!(
+            resolve_goal_raw(&accel, &global, "cayenne_goal_replication_lag"),
+            Some("30s")
+        );
+        // Set only on the dataset (no global) → the dataset value.
+        assert_eq!(
+            resolve_goal_raw(&accel, &global, "cayenne_goal_query_latency"),
+            Some("250ms")
+        );
+        // Set nowhere → None (legacy "no goal"; controller stays signal-driven).
+        assert_eq!(resolve_goal_raw(&accel, &global, "cayenne_goal_qph"), None);
+    }
 
     fn http_response_headers_field() -> Field {
         Field::new(
@@ -2981,18 +4036,30 @@ mod tests {
                     function: spicepod_acceleration::MaintainedAggregateFunction::Count,
                     column: None,
                 }],
+                filter_sql: None,
             }]
             .into(),
             ..Default::default()
         }
     }
 
+    fn maintained_aggregate_test_schema() -> Schema {
+        Schema::new(vec![
+            arrow_schema::Field::new("customer_id", DataType::Int64, false),
+            arrow_schema::Field::new("amount", DataType::Int64, true),
+        ])
+    }
+
     #[test]
     fn maintained_aggregate_specs_convert_for_unpartitioned_cayenne() {
         let acceleration = maintained_aggregate_acceleration();
 
-        let specs = maintained_aggregate_specs_for_cayenne(Some(&acceleration))
-            .expect("unpartitioned maintained aggregate config should convert");
+        let specs = maintained_aggregate_specs_for_cayenne(
+            Some(&acceleration),
+            &maintained_aggregate_test_schema(),
+            &[],
+        )
+        .expect("unpartitioned maintained aggregate config should convert");
 
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].group_by, vec!["customer_id".to_string()]);
@@ -3005,6 +4072,76 @@ mod tests {
     }
 
     #[test]
+    fn maintained_aggregate_specs_convert_min_max() {
+        let acceleration = Acceleration {
+            maintained_aggregates: vec![spicepod_acceleration::MaintainedAggregate {
+                group_by: vec!["customer_id".to_string()],
+                aggregates: vec![
+                    spicepod_acceleration::MaintainedAggregateExpr {
+                        function: spicepod_acceleration::MaintainedAggregateFunction::Min,
+                        column: Some("amount".to_string()),
+                    },
+                    spicepod_acceleration::MaintainedAggregateExpr {
+                        function: spicepod_acceleration::MaintainedAggregateFunction::Max,
+                        column: Some("amount".to_string()),
+                    },
+                ],
+                filter_sql: None,
+            }]
+            .into(),
+            ..Default::default()
+        };
+
+        let specs = maintained_aggregate_specs_for_cayenne(
+            Some(&acceleration),
+            &maintained_aggregate_test_schema(),
+            &["customer_id".to_string()],
+        )
+        .expect("min/max maintained aggregate config should convert");
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].aggregates.len(), 2);
+        assert_eq!(
+            specs[0].aggregates[0].function,
+            cayenne::maintained_aggregate::MaintainedAggregateFunction::Min
+        );
+        assert_eq!(
+            specs[0].aggregates[1].function,
+            cayenne::maintained_aggregate::MaintainedAggregateFunction::Max
+        );
+        assert_eq!(specs[0].aggregates[0].column.as_deref(), Some("amount"));
+    }
+
+    #[test]
+    fn maintained_aggregate_specs_reject_min_max_without_primary_key() {
+        let acceleration = Acceleration {
+            maintained_aggregates: vec![spicepod_acceleration::MaintainedAggregate {
+                group_by: Vec::new(),
+                aggregates: vec![spicepod_acceleration::MaintainedAggregateExpr {
+                    function: spicepod_acceleration::MaintainedAggregateFunction::Min,
+                    column: Some("amount".to_string()),
+                }],
+                filter_sql: None,
+            }]
+            .into(),
+            ..Default::default()
+        };
+
+        let error = maintained_aggregate_specs_for_cayenne(
+            Some(&acceleration),
+            &maintained_aggregate_test_schema(),
+            &[],
+        )
+        .expect_err("min/max without a primary key must be rejected");
+
+        let Error::InvalidConfiguration { detail } = error else {
+            panic!("expected InvalidConfiguration, got {error:?}");
+        };
+        assert!(detail.contains("MIN/MAX"));
+        assert!(detail.contains("primary key"));
+    }
+
+    #[test]
     fn maintained_aggregate_specs_empty_when_maintenance_disabled() {
         let mut acceleration = maintained_aggregate_acceleration();
         acceleration.maintained_aggregates = spicepod_acceleration::MaintainedAggregates::new(
@@ -3012,8 +4149,12 @@ mod tests {
             acceleration.maintained_aggregates.as_slice().to_vec(),
         );
 
-        let specs = maintained_aggregate_specs_for_cayenne(Some(&acceleration))
-            .expect("disabled maintained aggregate config should parse");
+        let specs = maintained_aggregate_specs_for_cayenne(
+            Some(&acceleration),
+            &maintained_aggregate_test_schema(),
+            &[],
+        )
+        .expect("disabled maintained aggregate config should parse");
 
         assert!(specs.is_empty());
     }
@@ -3026,14 +4167,89 @@ mod tests {
             expression: "region".to_string(),
         }];
 
-        let error = maintained_aggregate_specs_for_cayenne(Some(&acceleration))
-            .expect_err("partitioned maintained aggregate config should be rejected");
+        let error = maintained_aggregate_specs_for_cayenne(
+            Some(&acceleration),
+            &maintained_aggregate_test_schema(),
+            &[],
+        )
+        .expect_err("partitioned maintained aggregate config should be rejected");
 
         let Error::InvalidConfiguration { detail } = error else {
             panic!("expected InvalidConfiguration, got {error:?}");
         };
         assert!(detail.contains("maintained_aggregates"));
         assert!(detail.contains("partitioned"));
+    }
+
+    fn maintained_aggregate_acceleration_with_filter(filter: &str) -> Acceleration {
+        let mut views = maintained_aggregate_acceleration()
+            .maintained_aggregates
+            .as_slice()
+            .to_vec();
+        views[0].filter_sql = Some(filter.to_string());
+        Acceleration {
+            maintained_aggregates: views.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn maintained_aggregate_specs_parse_config_filter() {
+        let acceleration = maintained_aggregate_acceleration_with_filter("amount > 100");
+
+        let specs = maintained_aggregate_specs_for_cayenne(
+            Some(&acceleration),
+            &maintained_aggregate_test_schema(),
+            &[],
+        )
+        .expect("a valid maintained aggregate filter should convert");
+
+        assert_eq!(specs.len(), 1);
+        assert!(
+            specs[0].filter.is_some(),
+            "the config filter must be parsed onto the maintained aggregate spec"
+        );
+    }
+
+    #[test]
+    fn maintained_aggregate_specs_reject_unknown_filter_column() {
+        let acceleration = maintained_aggregate_acceleration_with_filter("nonexistent_column > 1");
+
+        let error = maintained_aggregate_specs_for_cayenne(
+            Some(&acceleration),
+            &maintained_aggregate_test_schema(),
+            &[],
+        )
+        .expect_err("a filter referencing an unknown column must be rejected");
+
+        let Error::InvalidConfiguration { detail } = error else {
+            panic!("expected InvalidConfiguration, got {error:?}");
+        };
+        assert!(
+            detail.contains("filter"),
+            "the error must identify the maintained-aggregate filter: {detail}"
+        );
+    }
+
+    #[test]
+    fn maintained_aggregate_specs_reject_non_boolean_filter() {
+        // `amount` alone is an Int64 column, not a `WHERE` predicate.
+        let acceleration = maintained_aggregate_acceleration_with_filter("amount");
+
+        let error = maintained_aggregate_specs_for_cayenne(
+            Some(&acceleration),
+            &maintained_aggregate_test_schema(),
+            &[],
+        )
+        .expect_err("a non-Boolean filter must be rejected at config time");
+
+        let Error::InvalidConfiguration { detail } = error else {
+            panic!("expected InvalidConfiguration, got {error:?}");
+        };
+        assert!(
+            detail.contains("Boolean"),
+            "the error must say the filter must be a Boolean predicate: {detail}"
+        );
     }
 
     #[test]
@@ -3837,6 +5053,122 @@ mod tests {
         )
         .await;
         assert_eq!(config.deletion_mode, cayenne::metadata::DeletionMode::Auto);
+    }
+
+    fn datalake_test_options(
+        primary_key: Vec<String>,
+        vortex_config: cayenne::metadata::VortexConfig,
+    ) -> cayenne::metadata::CreateTableOptions {
+        cayenne::metadata::CreateTableOptions {
+            table_name: "dl_t".to_string(),
+            schema: Arc::new(arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+                arrow_schema::Field::new("value", arrow_schema::DataType::Int64, false),
+            ])),
+            primary_key,
+            on_conflict: None,
+            base_path: "/tmp/dl_t".to_string(),
+            partition_column: None,
+            vortex_config,
+        }
+    }
+
+    fn datalake_enabled_config() -> cayenne::metadata::VortexConfig {
+        cayenne::metadata::VortexConfig {
+            cold_tier_location: Some("s3://bucket/prefix".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_validate_datalake_disabled_tier_is_silent() {
+        let options = datalake_test_options(vec![], cayenne::metadata::VortexConfig::default());
+        let warnings = validate_datalake_table_options("dl_t", &options)
+            .expect("disabled tier validates cleanly");
+        assert!(warnings.is_empty(), "disabled tier emits no warnings");
+    }
+
+    #[test]
+    fn test_validate_datalake_valid_config_is_silent() {
+        let options = datalake_test_options(vec!["id".to_string()], datalake_enabled_config());
+        let warnings = validate_datalake_table_options("dl_t", &options)
+            .expect("well-formed datalake config validates cleanly");
+        assert!(warnings.is_empty(), "well-formed config emits no warnings");
+    }
+
+    #[test]
+    fn test_validate_datalake_warns_pk_less_table_tier_inactive() {
+        let options = datalake_test_options(vec![], datalake_enabled_config());
+        let warnings = validate_datalake_table_options("dl_t", &options)
+            .expect("a PK-less datalake table registers (tier inactive), it must not fail");
+        assert_eq!(warnings.len(), 1, "exactly the inactive-tier warning");
+        assert!(
+            warnings[0].contains("INACTIVE"),
+            "unexpected warning: {}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn test_validate_datalake_rejects_explicit_position_deletes() {
+        let config = cayenne::metadata::VortexConfig {
+            deletion_mode: cayenne::metadata::DeletionMode::Position,
+            ..datalake_enabled_config()
+        };
+        let options = datalake_test_options(vec!["id".to_string()], config);
+        let error = validate_datalake_table_options("dl_t", &options)
+            .expect_err("explicit position deletes must fail registration");
+        assert!(
+            error.contains("cayenne_deletion_mode: position"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_validate_datalake_rejects_zero_tiering_check_interval() {
+        let config = cayenne::metadata::VortexConfig {
+            cold_tier_background_interval_ms: 0,
+            ..datalake_enabled_config()
+        };
+        let options = datalake_test_options(vec!["id".to_string()], config);
+        let error = validate_datalake_table_options("dl_t", &options)
+            .expect_err("tiering-check interval 0 must fail registration");
+        assert!(
+            error.contains("cayenne_datalake_tiering_check_interval_ms"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_validate_datalake_rejects_zero_gc_interval() {
+        let config = cayenne::metadata::VortexConfig {
+            cold_tier_gc_interval_ms: 0,
+            ..datalake_enabled_config()
+        };
+        let options = datalake_test_options(vec!["id".to_string()], config);
+        let error = validate_datalake_table_options("dl_t", &options)
+            .expect_err("GC interval 0 must fail registration");
+        assert!(
+            error.contains("cayenne_datalake_gc_interval_ms"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_validate_datalake_warns_on_unknown_clustering_column() {
+        let config = cayenne::metadata::VortexConfig {
+            cold_clustering_columns: vec!["id".to_string(), "no_such_column".to_string()],
+            ..datalake_enabled_config()
+        };
+        let options = datalake_test_options(vec!["id".to_string()], config);
+        let warnings = validate_datalake_table_options("dl_t", &options)
+            .expect("unknown clustering column is a warning, not an error");
+        assert_eq!(warnings.len(), 1, "exactly the unknown column is flagged");
+        assert!(
+            warnings[0].contains("no_such_column"),
+            "unexpected warning: {}",
+            warnings[0]
+        );
     }
 
     #[tokio::test]

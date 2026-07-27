@@ -34,9 +34,21 @@ use crate::vector_simd::{
 
 pub static INNER_PRODUCT_UDF_NAME: &str = "inner_product";
 
+/// Alias so `dot_product(a, b)` resolves to this UDF.
+///
+/// `DataFusion` 54's built-in `inner_product` declares the same `dot_product`
+/// alias. Spice registers this UDF *after* `DataFusion`'s defaults
+/// (`register_core_scalar_udfs` runs after `with_default_features`), and
+/// `SessionState::register_udf` stores each alias under its own key — so
+/// declaring the alias here makes both `inner_product` and `dot_product`
+/// resolve to this SIMD (`simsimd`) impl rather than `DataFusion`'s scalar
+/// `Float64` fallback.
+pub static DOT_PRODUCT_UDF_ALIAS: &str = "dot_product";
+
 #[derive(Debug, Hash, PartialEq, Eq)]
 pub struct InnerProduct {
     signature: Signature,
+    aliases: Vec<String>,
 }
 
 impl Default for InnerProduct {
@@ -50,6 +62,7 @@ impl InnerProduct {
     pub fn new() -> Self {
         Self {
             signature: Signature::user_defined(Volatility::Immutable),
+            aliases: vec![DOT_PRODUCT_UDF_ALIAS.to_string()],
         }
     }
 }
@@ -61,6 +74,10 @@ impl ScalarUDFImpl for InnerProduct {
 
     fn signature(&self) -> &Signature {
         &self.signature
+    }
+
+    fn aliases(&self) -> &[String] {
+        &self.aliases
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> DataFusionResult<DataType> {
@@ -86,6 +103,16 @@ mod tests {
     use crate::vector_simd::testing::fsl_f32;
     use arrow::array::AsArray;
     use arrow::datatypes::Float64Type;
+
+    #[test]
+    fn declares_dot_product_alias() {
+        // `dot_product` must resolve to this UDF. DataFusion 54's built-in
+        // `inner_product` also claims this alias, so Spice must declare it to
+        // win the `dot_product` registry key when it overrides the built-in.
+        let udf = InnerProduct::new();
+        assert_eq!(udf.aliases().len(), 1);
+        assert_eq!(udf.aliases()[0], DOT_PRODUCT_UDF_ALIAS);
+    }
 
     #[test]
     fn basic_dot() {

@@ -20,7 +20,7 @@ use crate::datafusion::DataFusion;
 use crate::datafusion::request_context_extension::DataFusionContextExtension;
 use crate::model::ModelContextLayer;
 use crate::request::DatabricksAuthExtension;
-use crate::{search::search_engine, status::RuntimeStatus};
+use crate::status::RuntimeStatus;
 
 use crate::Runtime;
 use crate::cluster::ExecutorRegistry;
@@ -32,8 +32,6 @@ use crate::http::v1::{
 };
 use runtime_request_context::{Protocol, RequestContext};
 
-#[cfg(feature = "mcp")]
-use crate::tools::mcp::server::RuntimeServer;
 use app::App;
 use axum::{extract::State, routing::patch};
 use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
@@ -42,9 +40,12 @@ use opentelemetry::KeyValue;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpService, session::local::LocalSessionManager, tower::StreamableHttpServerConfig,
 };
+#[cfg(feature = "mcp")]
+use runtime_tools::mcp::server::RuntimeServer;
 use spicepod::component::runtime::CorsConfig;
 #[cfg(feature = "mcp")]
 use spicepod::component::runtime::McpConfig;
+use std::borrow::Cow;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -57,7 +58,8 @@ use utoipa::{
 #[cfg(feature = "dev")]
 use utoipa_swagger_ui::SwaggerUi;
 
-use super::{metrics, v1};
+use super::v1;
+use runtime_metrics::http as metrics;
 
 use axum::{
     Extension,
@@ -88,6 +90,7 @@ use tower_http::limit::RequestBodyLimitLayer;
         v1::datasets::get,
         v1::datasets::acceleration,
         v1::datasets::refresh,
+        v1::cdc::post,
         v1::catalogs::get,
         v1::ready::get,
         v1::status::get,
@@ -100,8 +103,6 @@ use tower_http::limit::RequestBodyLimitLayer;
         v1::workers::get,
         v1::nsql::get_context,
         v1::nsql::post,
-        v1::inference::get,
-        v1::inference::post,
         v1::tools::list,
         v1::tools::search,
         v1::tools::post,
@@ -315,7 +316,11 @@ const HEALTH_REQUEST_BODY_LIMIT: usize = 128 * 1024; // 128 KiB
 pub(crate) fn routes(
     rt: &Arc<Runtime>,
     config: Arc<config::Config>,
-    search: Arc<search_engine::SearchEngine>,
+    search: Arc<
+        runtime_search::search_engine::SearchEngine<
+            crate::search::util::RuntimeTableProviderExplorer,
+        >,
+    >,
     auth_layer: Option<AuthLayer>,
     cors_config: &CorsConfig,
     metrics_tls: bool,
@@ -332,6 +337,7 @@ pub(crate) fn routes(
         .route("/v1/catalogs", get(v1::catalogs::get))
         .route("/v1/functions", get(v1::functions::list))
         .route("/v1/datasets", get(v1::datasets::get))
+        .route("/v1/datasets/{name}/cdc", post(v1::cdc::post))
         .route(
             "/v1/datasets/{name}/acceleration/refresh",
             post(v1::datasets::refresh),
@@ -402,8 +408,6 @@ pub(crate) fn routes(
 
         authenticated_router = authenticated_router
             .route("/v1/models", get(v1::models::get))
-            .route("/v1/models/{name}/predict", get(v1::inference::get))
-            .route("/v1/predict", post(v1::inference::post))
             .route("/v1/nsql/context", get(v1::nsql::get_context))
             .route("/v1/nsql", post(v1::nsql::post).layer(ModelContextLayer))
             .route(
@@ -419,7 +423,6 @@ pub(crate) fn routes(
             .merge(tools_router)
             .route("/v1/workers", get(v1::workers::get))
             .layer(Extension(rt.completion_llms()))
-            .layer(Extension(Arc::clone(&rt.models)))
             .layer(Extension(search))
             .layer(Extension(Arc::clone(&rt.embeds)))
             .layer(Extension(Arc::clone(&rt.workers)))
@@ -459,7 +462,7 @@ pub(crate) fn routes(
         let runtime_arc = Arc::clone(rt);
         let mcp_config = mcp_server_config(mcp_config);
         let mcp_service = StreamableHttpService::new(
-            move || Ok(RuntimeServer::from(&runtime_arc)),
+            move || Ok(RuntimeServer::new(Arc::clone(&runtime_arc.tools))),
             Arc::new(LocalSessionManager::default()),
             mcp_config,
         );
@@ -557,12 +560,12 @@ async fn track_metrics(
     let request_dimensions = request_context.to_dimensions();
 
     let start = Instant::now();
-    let path = if let Some(matched_path) = req.extensions().get::<MatchedPath>() {
-        matched_path.as_str().to_owned()
+    let path: Arc<str> = if let Some(matched_path) = req.extensions().get::<MatchedPath>() {
+        Arc::from(matched_path.as_str())
     } else {
-        req.uri().path().to_owned()
+        Arc::from(req.uri().path())
     };
-    let method = req.method().clone();
+    let method = http_method_label(req.method());
 
     let response = Arc::clone(&request_context)
         .scope(async move {
@@ -589,10 +592,10 @@ async fn track_metrics(
         .await;
 
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let status = response.status().as_u16().to_string();
+    let status = http_status_label(response.status().as_u16());
 
     let mut labels = vec![
-        KeyValue::new("method", method.to_string()),
+        KeyValue::new("method", method),
         KeyValue::new("path", path),
         KeyValue::new("status", status),
     ];
@@ -631,7 +634,7 @@ fn cors_layer(cors_config: &CorsConfig) -> CorsLayer {
         return cors;
     }
 
-    let allowed_origins: AllowOrigin = if cors_config.allowed_origins.contains(&"*".to_string()) {
+    let allowed_origins: AllowOrigin = if cors_config.allowed_origins.iter().any(|o| o == "*") {
         Any.into()
     } else {
         cors_config
@@ -651,6 +654,40 @@ fn cors_layer(cors_config: &CorsConfig) -> CorsLayer {
     cors.allow_methods([Method::GET, Method::POST, Method::PATCH, Method::OPTIONS])
         .allow_headers([ACCEPT, CONTENT_TYPE, AUTHORIZATION])
         .allow_origin(allowed_origins)
+}
+
+/// Map common HTTP methods to static metric labels (avoids per-request allocation).
+fn http_method_label(method: &Method) -> &'static str {
+    match method.as_str() {
+        "GET" => "GET",
+        "POST" => "POST",
+        "PUT" => "PUT",
+        "PATCH" => "PATCH",
+        "DELETE" => "DELETE",
+        "HEAD" => "HEAD",
+        "OPTIONS" => "OPTIONS",
+        "CONNECT" => "CONNECT",
+        "TRACE" => "TRACE",
+        _ => "OTHER",
+    }
+}
+
+/// Map common HTTP status codes to static metric labels; rare codes allocate.
+fn http_status_label(code: u16) -> Cow<'static, str> {
+    match code {
+        200 => Cow::Borrowed("200"),
+        201 => Cow::Borrowed("201"),
+        204 => Cow::Borrowed("204"),
+        400 => Cow::Borrowed("400"),
+        401 => Cow::Borrowed("401"),
+        403 => Cow::Borrowed("403"),
+        404 => Cow::Borrowed("404"),
+        429 => Cow::Borrowed("429"),
+        500 => Cow::Borrowed("500"),
+        502 => Cow::Borrowed("502"),
+        503 => Cow::Borrowed("503"),
+        other => Cow::Owned(other.to_string()),
+    }
 }
 
 async fn check_shutdown(

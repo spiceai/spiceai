@@ -45,7 +45,6 @@ on:
           - 'oracle'
           - 'duckdb'
           - 'duckdb-zero-results'
-          - 'duckdb-partitioned'
           - 'snowflake'
           - 'snowflake-catalog'
           - 'spark'
@@ -113,8 +112,34 @@ jobs:
         env:
           MSSQL_SA_PASSWORD: S3cretP@ssw0rd
           DB_NAME: tpch_sf1
+      # Local, ephemeral PostgreSQL for TPC-H/TPC-DS SF1/SF10 (used by both the
+      # postgres data connector and postgres catalog connector benches); avoids
+      # depending on an externally-provisioned benchmarking-postgres host for
+      # these cheap-to-generate scale factors (see #11730). Larger scale
+      # factors (SF100+) target benchmarking-postgres directly instead. Either
+      # way the target starts empty and is seeded by the "Seed postgres..."
+      # step below (a plain postgres image with no pre-baked data, unlike the
+      # earlier iteration of this fix). Excludes ducklake[postgres+s3], which
+      # provisions its own local postgres catalog DB on the same port, and
+      # clickbench, whose postgres source uses a different (unseeded) database.
+      postgres_tpch:
+        image: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')) && 'postgres:16' || '' }}
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
+        # --shm-size: postgres's default 64MB /dev/shm (Docker's own default)
+        # is too small for parallel-worker queries against TPC-H/TPC-DS data;
+        # several queries fail with "could not resize shared memory segment"
+        # otherwise.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+          --shm-size=1g
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Rust toolchain
         uses: ./.github/actions/setup-rust
@@ -206,6 +231,103 @@ jobs:
             echo "MYSQL_DB_SF100=tpch_sf100" >> $GITHUB_ENV
           fi
 
+      # One seeding path for every scale factor, just pointed at a different
+      # (always-empty-until-seeded) target: the local postgres_tpch container
+      # for SF1/SF10, or benchmarking-postgres directly for SF100+ — avoiding
+      # the separate, ts-dev-runner-backed `Load - Benchmark Data` workflow in
+      # spicehq/ai-platform. Checks for existing data first, so the local
+      # container (always empty on a fresh run) always seeds, while a
+      # benchmarking-postgres scale factor that's already loaded skips
+      # straight through.
+      - name: Seed postgres TPC-H/TPC-DS data if missing
+        if: ${{ contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') }}
+        timeout-minutes: 120
+        env:
+          PGHOST: ${{ (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10') && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
+          PGPASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
+        run: |
+          set -e
+          QUERY_SET="${{ github.event.inputs.query_set }}"
+          QUERY_SET="${QUERY_SET%%\[*\]*}"
+          SCALE_FACTOR="${{ github.event.inputs.scale_factor }}"
+          DB_NAME="${QUERY_SET}_sf${SCALE_FACTOR}"
+
+          sudo apt-get update -y
+          sudo apt-get install -y postgresql-client
+
+          echo "Checking whether $DB_NAME already has data on $PGHOST..."
+          set +e
+          PSQL_OUTPUT="$(PGCONNECT_TIMEOUT=10 psql -U postgres -d "$DB_NAME" -tAc 'SELECT count(*) FROM customer;' 2>&1)"
+          PSQL_EXIT=$?
+          set -e
+
+          if [ "$PSQL_EXIT" -eq 0 ]; then
+            EXISTING_ROWS="$PSQL_OUTPUT"
+          elif echo "$PSQL_OUTPUT" | grep -qi "does not exist"; then
+            # Database or the customer table doesn't exist yet - genuinely unseeded.
+            echo "$DB_NAME (or its customer table) doesn't exist yet on $PGHOST."
+            EXISTING_ROWS=0
+          else
+            # Any other failure (auth, network, host unreachable, timeout) is a
+            # real problem, not "unseeded" - don't silently treat it as empty.
+            echo "::error::Could not check $DB_NAME on $PGHOST - this looks like a connectivity or authentication problem, not a missing database:"
+            echo "$PSQL_OUTPUT"
+            exit 1
+          fi
+
+          cd test/tpc-bench
+
+          if [ "${EXISTING_ROWS:-0}" -gt 0 ] 2>/dev/null; then
+            echo "$DB_NAME already has $EXISTING_ROWS rows in 'customer' - skipping data load, but ensuring indexes are up to date (idempotent, no rebuild if already present)."
+            if [ "$QUERY_SET" = "tpcds" ]; then
+              DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-tpcds-create-index
+            else
+              DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-create-index
+            fi
+            exit 0
+          fi
+
+          # SF1/SF10 always run against the self-contained postgres:16 service
+          # container (PGHOST=127.0.0.1), so generating fresh data inline is
+          # cheap and expected. Anything larger targets the shared hosted
+          # cluster - generating+loading that inline risks a multi-hour job
+          # that can time out or exhaust the runner's disk, and a failure
+          # partway through would leave the shared database partially seeded.
+          # Require those scale factors to be pre-provisioned instead.
+          if [ "$PGHOST" != "127.0.0.1" ]; then
+            echo "::error::$DB_NAME is missing or empty on the hosted $PGHOST cluster. Scale factor $SCALE_FACTOR is too large to safely generate and load inline from a CI runner. Pre-provision it first, e.g.:"
+            echo "  cd test/tpc-bench && DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME DBGEN_SCALE=$SCALE_FACTOR make tpch-init tpch-gen pg-init pg-load pg-create-index"
+            echo "(substitute the tpcds-* targets for a tpcds run)"
+            exit 1
+          fi
+
+          echo "$DB_NAME is missing or empty on $PGHOST - seeding it now."
+          sudo apt-get install -y git make flex bison byacc
+          if [ "$QUERY_SET" = "tpcds" ]; then
+            # tpcds-kit's tools/Makefile hardcodes CC=gcc-9 on Linux; ubuntu-24.04's
+            # default gcc isn't named gcc-9, so install it explicitly via the PPA.
+            sudo add-apt-repository ppa:ubuntu-toolchain-r/ppa -y
+            sudo apt-get update -y
+            sudo apt-get install -y gcc-9 g++-9
+          else
+            sudo apt-get install -y gcc g++
+          fi
+
+          if [ "$QUERY_SET" = "tpcds" ]; then
+            make tpcds-init
+            DBGEN_SCALE=$SCALE_FACTOR make tpcds-gen
+            DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-tpcds-init
+            DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-tpcds-load
+            DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-tpcds-create-index
+          else
+            make tpch-init
+            DBGEN_SCALE=$SCALE_FACTOR make tpch-gen
+            DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-init
+            DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-load
+            DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-create-index
+          fi
+          echo "Seed complete: $DB_NAME on $PGHOST."
+
       - name: Setup ODBC
         if: ${{ contains(github.event.inputs.spicepod_path, 'odbc') }}
         uses: ./.github/actions/setup-odbc
@@ -220,7 +342,7 @@ jobs:
 
       - name: Set up Python
         if: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') || contains(github.event.inputs.spicepod_path, 'ducklake') }}
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
 
@@ -332,7 +454,6 @@ jobs:
           PY
 
       - name: Run the benchmark test - ${{ github.event.inputs.spicepod_path }}
-        if: ${{ github.event.inputs.query_overrides == '' }}
         run: |
           [ -z "$AWS_ENDPOINT_URL" ] && unset AWS_ENDPOINT_URL
 
@@ -343,6 +464,7 @@ jobs:
             -d /opt/spiced/data \
             --query-set ${{ github.event.inputs.query_set }} \
             ${{ github.event.inputs.scenario_query_file != '' && format('--scenario-query-file ./test/scenario/{0}', github.event.inputs.scenario_query_file) || '' }} \
+            ${{ github.event.inputs.query_overrides != '' && format('--query-overrides {0}', github.event.inputs.query_overrides) || '' }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --disable-progress-bars \
             --validate=${{ github.event.inputs.validate_results }} \
@@ -379,8 +501,8 @@ jobs:
           MYSQL_PASSWORD: ${{ secrets.TEST_MYSQL_PASSWORD }}
           MONGODB_HOST: ${{ vars.TEST_MONGODB_HOST }}
           MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
-          POSTGRES_HOST: ${{ vars.TEST_POSTGRES_HOST }}
-          POSTGRES_RW_HOST: ${{ vars.TEST_POSTGRES_HOST }}
+          POSTGRES_HOST: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')) && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
+          POSTGRES_RW_HOST: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')) && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
           POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
           SPICEAI_TEST_ENDPOINT: ${{ vars.SPICE_SECRET_SPICEAI_TEST_ENDPOINT }}
           SPICEAI_TEST_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY }}
@@ -407,84 +529,7 @@ jobs:
           SCYLLADB_HOST: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '127.0.0.1' || '' }}
           SCYLLADB_PORT: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '9042' || '' }}
           SCYLLADB_KEYSPACE: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && 'tpch_sf1' || '' }}
-
-      - name: Run the benchmark test (with overrides) - ${{ github.event.inputs.spicepod_path }}
-        if: ${{ github.event.inputs.query_overrides != '' }}
-        run: |
-          [ -z "$AWS_ENDPOINT_URL" ] && unset AWS_ENDPOINT_URL
-
-          rm -rf .spice/data
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" testoperator run bench \
-            -s /usr/local/bin/spiced \
-            -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
-            -d /opt/spiced/data \
-            --query-set ${{ github.event.inputs.query_set }} \
-            ${{ github.event.inputs.scenario_query_file != '' && format('--scenario-query-file ./test/scenario/{0}', github.event.inputs.scenario_query_file) || '' }} \
-            --query-overrides ${{ github.event.inputs.query_overrides }} \
-            --ready-wait ${{ github.event.inputs.ready_wait }} \
-            --disable-progress-bars \
-            --validate=${{ github.event.inputs.validate_results }} \
-            --metrics \
-            --scale-factor ${{ github.event.inputs.scale_factor }}
-        env:
-          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
-          DATABRICKS_ODBC_PATH: ${{ vars.DATABRICKS_ODBC_PATH }}
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          DATABRICKS_ENDPOINT: ${{ vars.DATABRICKS_ENDPOINT }}
-          DATABRICKS_CLUSTER_ID: ${{ vars.DATABRICKS_CLUSTER_ID }}
-          DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.DATABRICKS_SQL_WAREHOUSE_ID }}
-          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
-          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
-          AWS_ACCESS_KEY_ID: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'minioadmin' || secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'minioadmin' || secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
-          AWS_DYNAMODB_ACCESS_KEY_ID: ${{ secrets.AWS_DYNAMODB_ACCESS_KEY_ID }}
-          AWS_DYNAMODB_SECRET_ACCESS_KEY: ${{ secrets.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
-          AWS_ENDPOINT_URL: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'http://127.0.0.1:9000' || '' }}
-          AWS_ALLOW_HTTP: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'true' || '' }}
-          BIGQUERY_SERVICE_ACCOUNT_JSON: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_JSON }}
-          DUCKLAKE_CONNECTION_STRING: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'postgres:dbname=ducklake_catalog host=localhost user=postgres password=postgres' || '' }}
-          GLUE_AWS_KEY: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
-          GLUE_AWS_SECRET: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
-          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
-          MYSQL_HOST: ${{ vars.TEST_MYSQL_HOST }}
-          MYSQL_TCP_PORT: 3306
-          MYSQL_USER: ${{ secrets.TEST_MYSQL_USERNAME }}
-          MYSQL_PASSWORD: ${{ secrets.TEST_MYSQL_PASSWORD }}
-          MONGODB_HOST: ${{ vars.TEST_MONGODB_HOST }}
-          MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
-          POSTGRES_HOST: ${{ vars.TEST_POSTGRES_HOST }}
-          POSTGRES_RW_HOST: ${{ vars.TEST_POSTGRES_HOST }}
-          POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
-          SPICEAI_TEST_ENDPOINT: ${{ vars.SPICE_SECRET_SPICEAI_TEST_ENDPOINT }}
-          SPICEAI_TEST_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY }}
-          SPICEAI_TEST_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCDS_BENCHMARK_KEY }}
-          SPICEAI_CLICKBENCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_CLICKBENCH_BENCHMARK_KEY }}
-          SPICEAI_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
-          SQL_WAREHOUSE_DATABRICKS_TOKEN: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_TOKEN }}
-          SQL_WAREHOUSE_DATABRICKS_HOST: ${{ vars.SQL_WAREHOUSE_DATABRICKS_HOST }}
-          SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}
-          DREMIO_ENDPOINT: ${{ vars.TEST_DREMIO_ENDPOINT}}
-          DREMIO_USERNAME: ${{ secrets.TEST_DREMIO_USERNAME}}
-          DREMIO_PASSWORD: ${{ secrets.TEST_DREMIO_PASSWORD}}
-          INSTA_UPDATE: ${{ steps.determine_update_snapshots.outputs.update_snapshots}}
-          MSSQL_HOST: localhost
-          MSSQL_USER: sa
-          MSSQL_PASSWORD: S3cretP@ssw0rd
-          MSSQL_TPCH_DB: tpch_sf1
-          ORACLE_CLOUD_CONNECTION_STRING: ${{ secrets.ORACLE_CLOUD_CONNECTION_STRING }}
-          ORACLE_CLOUD_USERNAME: ${{ secrets.ORACLE_CLOUD_USERNAME }}
-          ORACLE_CLOUD_PASSWORD: ${{ secrets.ORACLE_CLOUD_PASSWORD }}
-          ORACLE_CLOUD_WALLET_SSO_CERT: ${{ secrets.ORACLE_CLOUD_WALLET_SSO_CERT }}
-          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
-          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          SCYLLADB_HOST: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '127.0.0.1' || '' }}
-          SCYLLADB_PORT: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '9042' || '' }}
-          SCYLLADB_KEYSPACE: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && 'tpch_sf1' || '' }}
+          CHBENCH_PG_HOST: 127.0.0.1
 
       - name: Install GH CLI
         if: steps.determine_update_snapshots.outputs.update_snapshots == 'always'

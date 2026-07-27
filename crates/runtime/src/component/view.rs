@@ -18,7 +18,8 @@ use app::App;
 use datafusion::sql::TableReference;
 use snafu::prelude::*;
 use spicepod::{component::view as spicepod_view, vector::VectorStore};
-use std::{collections::HashMap, fs, sync::Arc, time::Duration};
+use std::ops::{Deref, DerefMut};
+use std::{collections::HashMap, fs, sync::Arc};
 
 use crate::{Runtime, dataaccelerator::AccelerationSource};
 
@@ -31,29 +32,37 @@ use super::{
 };
 use spicepod::semantic::Column;
 
-/// [`View`] is the internal representation of the [`spicepod_view::View`] spicepod component.
+// Config-only spec lives in `runtime-component`; re-export for path
+// compatibility (`crate::component::view::ViewSpec`).
+pub use runtime_component::view::ViewSpec;
+
+/// `Arc<Runtime>`-bound wrapper over a [`ViewSpec`]. Derefs to the spec so
+/// `view.acceleration`, `view.columns`, `view.is_accelerated()`, etc. keep
+/// working unchanged.
 #[derive(Clone)]
 pub struct View {
-    pub name: TableReference,
-    pub sql: Arc<str>,
-    pub metadata: HashMap<String, String>,
-    pub columns: Vec<Column>,
-    pub acceleration: Option<acceleration::Acceleration>,
-    pub ready_state: ReadyState,
+    pub spec: ViewSpec,
     pub runtime: Arc<Runtime>,
-    pub vectors: Option<VectorStore>,
     pub app: Arc<App>,
+}
+
+impl Deref for View {
+    type Target = ViewSpec;
+
+    fn deref(&self) -> &Self::Target {
+        &self.spec
+    }
+}
+
+impl DerefMut for View {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.spec
+    }
 }
 
 impl PartialEq for View {
     fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-            && self.sql == other.sql
-            && self.metadata == other.metadata
-            && self.columns == other.columns
-            && self.acceleration == other.acceleration
-            && self.vectors == other.vectors
-            && self.ready_state == other.ready_state
+        self.spec == other.spec
     }
 }
 
@@ -67,6 +76,7 @@ impl std::fmt::Debug for View {
             .field("acceleration", &self.acceleration)
             .field("ready_state", &self.ready_state)
             .field("vectors", &self.vectors)
+            .field("params", &self.params)
             .finish_non_exhaustive()
     }
 }
@@ -80,57 +90,10 @@ impl View {
     }
 
     #[must_use]
-    pub fn is_accelerated(&self) -> bool {
-        if let Some(acceleration) = &self.acceleration {
-            return acceleration.enabled;
-        }
-
-        false
-    }
-
-    #[must_use]
-    pub fn refresh_check_interval(&self) -> Option<Duration> {
-        if let Some(acceleration) = &self.acceleration {
-            return acceleration.refresh_check_interval;
-        }
-        None
-    }
-
-    #[must_use]
-    pub fn refresh_max_jitter(&self) -> Option<Duration> {
-        if let Some(acceleration) = &self.acceleration
-            && acceleration.refresh_jitter_enabled
-        {
-            // If `refresh_jitter_max` is not set, use 10% of `refresh_check_interval`.
-            return match acceleration.refresh_jitter_max {
-                Some(jitter) => Some(jitter),
-                None => self.refresh_check_interval().map(|i| i.mul_f64(0.1)),
-            };
-        }
-        None
-    }
-
-    #[must_use]
-    pub fn refresh_retry_enabled(&self) -> bool {
-        if let Some(acceleration) = &self.acceleration {
-            return acceleration.refresh_retry_enabled;
-        }
-        false
-    }
-
-    #[must_use]
-    pub fn refresh_retry_max_attempts(&self) -> Option<usize> {
-        if let Some(acceleration) = &self.acceleration {
-            return acceleration.refresh_retry_max_attempts;
-        }
-        None
-    }
-
-    #[must_use]
     pub async fn is_accelerator_initialized(&self) -> bool {
         if let Some(acceleration_settings) = &self.acceleration {
             let Some(accelerator) = self
-                .runtime()
+                .runtime
                 .accelerator_engine_registry()
                 .get_accelerator_engine(acceleration_settings.engine)
                 .await
@@ -143,18 +106,6 @@ impl View {
 
         false
     }
-
-    #[must_use]
-    pub fn has_embeddings(&self) -> bool {
-        self.columns.iter().any(|c| !c.embeddings.is_empty())
-    }
-
-    #[must_use]
-    pub fn has_full_text_column(&self) -> bool {
-        self.columns
-            .iter()
-            .any(|c| c.full_text_search.as_ref().is_some_and(|cfg| cfg.enabled))
-    }
 }
 
 pub struct ViewBuilder {
@@ -165,6 +116,7 @@ pub struct ViewBuilder {
     pub acceleration: Option<acceleration::Acceleration>,
     pub ready_state: ReadyState,
     pub vectors: Option<VectorStore>,
+    pub params: HashMap<String, String>,
 }
 
 impl TryFrom<spicepod_view::View> for ViewBuilder {
@@ -219,6 +171,11 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
             acceleration,
             ready_state: ReadyState::from(view.ready_state),
             vectors: view.vectors,
+            params: view
+                .params
+                .as_ref()
+                .map(spicepod::param::Params::as_string_map)
+                .unwrap_or_default(),
         })
     }
 }
@@ -246,8 +203,8 @@ impl AccelerationSource for View {
         Arc::clone(&self.app)
     }
 
-    fn runtime(&self) -> Arc<Runtime> {
-        Arc::clone(&self.runtime)
+    fn secrets(&self) -> Arc<tokio::sync::RwLock<crate::secrets::Secrets>> {
+        self.runtime.secrets()
     }
 
     fn acceleration(&self) -> Option<&Acceleration> {
@@ -265,6 +222,41 @@ impl AccelerationSource for View {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
+    fn initialized_sources<'a>(
+        &'a self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Vec<Arc<dyn runtime_acceleration::AccelerationSource>>>
+                + Send
+                + 'a,
+        >,
+    > {
+        let app = self.app();
+        let runtime = Arc::clone(&self.runtime);
+        Box::pin(async move {
+            let datasets: Vec<Arc<dyn runtime_acceleration::AccelerationSource>> =
+                Arc::clone(&runtime)
+                    .get_initialized_datasets(&app, crate::LogErrors(false))
+                    .await
+                    .into_iter()
+                    .map(|ds| ds as Arc<dyn runtime_acceleration::AccelerationSource>)
+                    .collect();
+            #[cfg(feature = "duckdb")]
+            {
+                let views: Vec<Arc<dyn runtime_acceleration::AccelerationSource>> =
+                    Arc::clone(&runtime)
+                        .get_initialized_views(&app, crate::LogErrors(false))
+                        .await
+                        .into_iter()
+                        .map(|v| v as Arc<dyn runtime_acceleration::AccelerationSource>)
+                        .collect();
+                datasets.into_iter().chain(views).collect()
+            }
+            #[cfg(not(feature = "duckdb"))]
+            datasets
+        })
+    }
 }
 
 impl ViewBuilder {
@@ -278,19 +270,23 @@ impl ViewBuilder {
             acceleration: None,
             ready_state: ReadyState::default(),
             vectors: None,
+            params: HashMap::default(),
         }
     }
 
     #[must_use]
     pub fn build_with(self, runtime: Arc<Runtime>, app: Arc<App>) -> View {
         View {
-            name: self.name,
-            sql: Arc::from(self.sql),
-            metadata: self.metadata,
-            columns: self.columns,
-            acceleration: self.acceleration,
-            ready_state: self.ready_state,
-            vectors: self.vectors,
+            spec: ViewSpec {
+                name: self.name,
+                sql: Arc::from(self.sql),
+                metadata: self.metadata,
+                columns: self.columns,
+                acceleration: self.acceleration,
+                ready_state: self.ready_state,
+                vectors: self.vectors,
+                params: self.params,
+            },
             runtime,
             app,
         }

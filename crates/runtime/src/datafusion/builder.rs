@@ -30,13 +30,13 @@ use crate::cluster::ExecutorRegistry;
 use crate::cluster::ResolvedClusterConfig;
 #[cfg(not(windows))]
 use crate::dataaccelerator::upsert_dedup::UpsertDedupTableProvider;
-use crate::{config::ClusterRole, metrics::telemetry::track_bytes_processed, status};
+use crate::{config::ClusterRole, status};
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use cache::Caching;
 #[cfg(not(windows))]
 use cayenne::optimizer_rules::{
     CayenneAntiJoinSortMergeRewriter, CayenneDynamicFilterSharing, CayenneJoinRewriter,
-    CayenneMaintainedAggregateRewriter, CayenneOptimizerConfig,
+    CayenneMaintainedAggregateRewriter, CayenneOptimizerConfig, CayenneStatsAggregateRewriter,
 };
 #[cfg(not(windows))]
 use cayenne::{
@@ -55,7 +55,7 @@ use datafusion::optimizer::{Optimizer, OptimizerRule};
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
     execution::{
-        DiskManager, SessionStateBuilder,
+        DiskManager, FunctionRegistry, SessionStateBuilder,
         disk_manager::DiskManagerMode,
         memory_pool::{GreedyMemoryPool, TrackConsumersPool},
         object_store::ObjectStoreRegistry,
@@ -106,6 +106,7 @@ use runtime_datafusion::{
     url_table::{DynamicUrlCatalogList, SpiceUrlTableFactory},
 };
 use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
+use runtime_metrics::telemetry::track_bytes_processed;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use spicepod::component::runtime::SpillCompression as SpiceSpillCompression;
 use spicepod::metric::Metrics;
@@ -175,12 +176,14 @@ impl CayennePhysicalOptimizerRules {
     const MAINTAINED_AGGREGATE: u8 = 1 << 1;
     const ANTI_JOIN_SORT_MERGE: u8 = 1 << 2;
     const EXACT_JOIN_FILTER: u8 = 1 << 3;
+    const STATS_AGGREGATE: u8 = 1 << 4;
 
     const fn auto_enabled() -> Self {
         Self {
             enabled_rules: Self::DYNAMIC_FILTER_SHARING
                 | Self::MAINTAINED_AGGREGATE
-                | Self::ANTI_JOIN_SORT_MERGE,
+                | Self::ANTI_JOIN_SORT_MERGE
+                | Self::STATS_AGGREGATE,
         }
     }
 
@@ -189,7 +192,8 @@ impl CayennePhysicalOptimizerRules {
             enabled_rules: Self::DYNAMIC_FILTER_SHARING
                 | Self::MAINTAINED_AGGREGATE
                 | Self::ANTI_JOIN_SORT_MERGE
-                | Self::EXACT_JOIN_FILTER,
+                | Self::EXACT_JOIN_FILTER
+                | Self::STATS_AGGREGATE,
         }
     }
 
@@ -323,6 +327,17 @@ impl CayenneOptimizerRules {
     }
 
     #[must_use]
+    pub const fn stats_aggregate(self) -> bool {
+        self.physical
+            .is_enabled(CayennePhysicalOptimizerRules::STATS_AGGREGATE)
+    }
+
+    pub fn set_stats_aggregate(&mut self, enabled: bool) {
+        self.physical
+            .set(CayennePhysicalOptimizerRules::STATS_AGGREGATE, enabled);
+    }
+
+    #[must_use]
     pub const fn anti_join_sort_merge(self) -> bool {
         self.physical
             .is_enabled(CayennePhysicalOptimizerRules::ANTI_JOIN_SORT_MERGE)
@@ -358,6 +373,9 @@ pub struct DataFusionBuilder {
     memory_limit: Option<u64>,
     target_partitions: Option<usize>,
     prefer_hash_join: Option<bool>,
+    eager_aggregation: Option<bool>,
+    eager_aggregation_min_reduction_factor: Option<usize>,
+    eager_aggregation_max_pushed_groups: Option<usize>,
     temp_directory: Option<String>,
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
     query_admission_semaphore: Option<Arc<Semaphore>>,
@@ -377,6 +395,18 @@ pub struct DataFusionBuilder {
     /// dedicated thread pools are enabled (set by the Runtime builder); `None`
     /// leaves the full budget to queries and gives compaction no separate pool.
     compaction_memory_fraction: Option<f64>,
+    /// Estimated aggregate bytes the enabled changes-mode Cayenne tables reserve
+    /// OUTSIDE the query pool (per-table keyset/segment/coalesce/inline caches),
+    /// set by the Runtime builder. When it exceeds the base host/10 headroom, the
+    /// query-memory default is reduced by the excess. 0 = none / not Cayenne CDC.
+    cayenne_cdc_reservation_bytes: u64,
+    /// Coordinated query-pool ceiling (bytes) when `DuckDB` file accelerators are
+    /// present, computed by the Runtime builder's cgroup-aware budget so the query
+    /// pool + each `DuckDB` instance's own `memory_limit` can't over-commit the
+    /// memory available to this process (the cgroup limit in a container).
+    /// Applied as a `min`-cap on the DEFAULT query pool only (an explicit
+    /// `runtime.query.memory_limit` still wins). `None` = no `DuckDB` coordination.
+    duckdb_query_pool_cap: Option<u64>,
     cayenne_optimizer_rules: CayenneOptimizerRules,
     /// Arbitrary additional analyzer rules.
     additional_analyzer_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
@@ -418,6 +448,9 @@ impl DataFusionBuilder {
             memory_limit: None,
             target_partitions: None,
             prefer_hash_join: None,
+            eager_aggregation: None,
+            eager_aggregation_min_reduction_factor: None,
+            eager_aggregation_max_pushed_groups: None,
             temp_directory: None,
             accelerated_refresh_semaphore: None,
             query_admission_semaphore: None,
@@ -433,6 +466,8 @@ impl DataFusionBuilder {
             cayenne_sort_merge_memory_pool_fraction: None,
             cayenne_footer_cache_mb: None,
             compaction_memory_fraction: None,
+            cayenne_cdc_reservation_bytes: 0,
+            duckdb_query_pool_cap: None,
             cayenne_optimizer_rules: CayenneOptimizerRules::default(),
             additional_analyzer_rules: vec![],
             executor_registry: None,
@@ -474,6 +509,24 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn prefer_hash_join(mut self, prefer_hash_join: Option<bool>) -> Self {
         self.prefer_hash_join = prefer_hash_join;
+        self
+    }
+
+    #[must_use]
+    pub fn eager_aggregation(mut self, eager_aggregation: Option<bool>) -> Self {
+        self.eager_aggregation = eager_aggregation;
+        self
+    }
+
+    #[must_use]
+    pub fn eager_aggregation_min_reduction_factor(mut self, factor: Option<usize>) -> Self {
+        self.eager_aggregation_min_reduction_factor = factor;
+        self
+    }
+
+    #[must_use]
+    pub fn eager_aggregation_max_pushed_groups(mut self, cap: Option<usize>) -> Self {
+        self.eager_aggregation_max_pushed_groups = cap;
         self
     }
 
@@ -566,6 +619,29 @@ impl DataFusionBuilder {
         self
     }
 
+    /// Estimated off-pool per-table Cayenne CDC cache reservation (bytes), summed
+    /// over enabled changes-mode Cayenne tables (keyset/segment/coalesce/inline).
+    /// Used to reduce the query-memory default when it exceeds the base host/10
+    /// headroom. Set by the Runtime builder; `0` disables the reduction.
+    #[must_use]
+    pub fn cayenne_cdc_reservation_bytes(mut self, bytes: u64) -> Self {
+        self.cayenne_cdc_reservation_bytes = bytes;
+        self
+    }
+
+    /// Coordinated query-pool ceiling (bytes) when `DuckDB` file accelerators are
+    /// present. Reduces ONLY the default query pool (via a `min`-cap in
+    /// [`effective_query_memory_limit`]) so the query pool + each `DuckDB` instance's
+    /// own `memory_limit` can't over-commit the memory available to this process
+    /// (the cgroup limit in a container). Set by the Runtime builder;
+    /// `None` disables the reduction and an explicit `runtime.query.memory_limit`
+    /// always wins.
+    #[must_use]
+    pub fn duckdb_query_pool_cap(mut self, cap: Option<u64>) -> Self {
+        self.duckdb_query_pool_cap = cap;
+        self
+    }
+
     /// Carve a dedicated compaction memory pool of `fraction` of the query
     /// memory limit. Set by the Runtime builder only when Cayenne acceleration
     /// is configured and dedicated thread pools are enabled.
@@ -635,14 +711,24 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn build(self) -> DataFusion {
         let mut config = self.config;
-        let effective_memory_limit = effective_query_memory_limit(self.memory_limit);
         // Request a dedicated compaction memory budget when a fraction is
-        // configured (Cayenne acceleration + dedicated thread pools). The query
-        // pool is only shrunk after the dedicated compaction RuntimeEnv builds
-        // successfully; otherwise queries keep the full configured budget.
+        // configured (Cayenne acceleration + dedicated thread pools). Its presence
+        // is also the "Cayenne in-memory acceleration active" signal that gates the
+        // coordinated host-memory partition below: a reduced query-pool default
+        // that leaves room for the off-pool Cayenne in-memory CDC tier so
+        // query_pool + compaction + tier + headroom ≤ host. The query pool is only
+        // shrunk by the compaction carve after the dedicated compaction RuntimeEnv
+        // builds successfully; otherwise queries keep the full configured budget.
         let compaction_memory_fraction = self
             .compaction_memory_fraction
             .and_then(validate_compaction_memory_fraction);
+        let cayenne_active = compaction_memory_fraction.is_some();
+        let effective_memory_limit = effective_query_memory_limit(
+            self.memory_limit,
+            cayenne_active,
+            self.cayenne_cdc_reservation_bytes,
+            self.duckdb_query_pool_cap,
+        );
         let compaction_memory_bytes = compaction_memory_fraction.map(|fraction| {
             #[expect(
                 clippy::cast_precision_loss,
@@ -676,6 +762,60 @@ impl DataFusionBuilder {
                 None => (effective_memory_limit, None, None),
             };
 
+        // After the compaction carve, `effective_memory_limit` is the query memory
+        // pool size. Coordinate the off-pool Cayenne in-memory CDC tier budget
+        // against it, the carved compaction pool, AND any external accelerator
+        // reservation (e.g. co-resident DuckDB instance ceilings) so they never sum
+        // past the memory available to this process — get_total_memory() is
+        // cgroup-aware, so in a container that is the cgroup limit, not host RAM.
+        // `set_compaction_runtime` installs `mem_tier_budget_bytes` instead of the
+        // old, isolation-sized `get_total_memory() / 4`.
+        let query_memory_pool_bytes = effective_memory_limit;
+        let mem_tier_budget_bytes = cayenne_active.then(|| {
+            let total_memory = crate::resource_monitor::get_total_memory();
+            let external_reservation_bytes =
+                crate::accelerator_memory_budget::duckdb_total_reservation_bytes();
+            let budget = coordinated_mem_tier_budget(
+                total_memory,
+                query_memory_pool_bytes,
+                compaction_memory_bytes.unwrap_or(0),
+                external_reservation_bytes,
+            );
+            // The tier floor (available/32) can exceed the coordinated remainder when the
+            // query pool + compaction + external (DuckDB) reservations leave too
+            // little room; the clamp then installs `floor > remainder`, a deliberate
+            // small over-commit so a nonzero global cap always exists (memory mode
+            // then leans on per-table caps + spill). Warn whenever that binds —
+            // whether from an explicit runtime.query.memory_limit OR from a large
+            // co-resident DuckDB accelerator reservation (which can now trigger it
+            // even when runtime.query.memory_limit is unset).
+            if budget <= total_memory / MEM_TIER_FLOOR_FRACTION
+                && (self.memory_limit.is_some() || external_reservation_bytes > 0)
+            {
+                tracing::warn!(
+                    query_memory_pool_bytes,
+                    total_memory,
+                    external_reservation_bytes,
+                    mem_tier_budget_bytes = budget,
+                    "Cayenne in-memory CDC ingestion has limited memory available: the query pool, compaction pool, and co-resident DuckDB accelerator reservations leave little room for in-memory CDC, so ingestion spills to disk more often and combined memory ceilings may slightly exceed the memory available to this process (the cgroup limit when running in a container). Consider lowering runtime.query.memory_limit or per-dataset duckdb_memory_limit to give in-memory CDC more room."
+                );
+            }
+            budget
+        });
+
+        // Cayenne HTAP runs large analytical queries (sorts, hash aggregations,
+        // sort-merge joins) that spill to disk via the DiskManager. Its default is
+        // the OS temp directory; on hosts that mount the data on a separate volume
+        // (e.g. EBS at /media/ebs) the root volume backing OS-tmp is often too
+        // small, so a spill fails and the query exhausts the memory pool
+        // (ResourceExhausted) instead of spilling — the SF1000 Q10/Q18 symptom.
+        // Guide operators to point spill at a roomy volume.
+        if cayenne_active && self.temp_directory.is_none() {
+            tracing::info!(
+                "Cayenne acceleration is active but runtime.query.temp_directory is unset: large analytical queries spill to the OS temp directory. If your data is on a separate volume (e.g. EBS) and the root volume is small, set runtime.query.temp_directory to a path with ample free space so large queries can spill instead of failing."
+            );
+        }
+
         if let Some(spill_compression) = self.spill_compression {
             config = config.with_spill_compression(spill_compression);
         }
@@ -705,6 +845,44 @@ impl DataFusionBuilder {
         if let Some(prefer_hash_join) = self.prefer_hash_join {
             config.options_mut().optimizer.prefer_hash_join = prefer_hash_join;
             tracing::info!(prefer_hash_join, "Applied runtime.query.prefer_hash_join");
+        }
+
+        // Cost-based eager-aggregation physical optimizer
+        // (`datafusion.optimizer.enable_eager_aggregation`): pushes a partial
+        // aggregation below a join when a statistics-based cost model predicts a
+        // large row reduction, then re-aggregates above the join. Enabled by
+        // default in spiced (DataFusion's own default is off); disable via
+        // `runtime.query.eager_aggregation: false`. The cost gate can be tuned
+        // with `runtime.query.eager_aggregation_min_reduction_factor`
+        // (DataFusion default 4) and `..._max_pushed_groups` (default 0 =
+        // uncapped); unset leaves the DataFusion default in place.
+        let eager_aggregation = self.eager_aggregation.unwrap_or(true);
+        config.options_mut().optimizer.enable_eager_aggregation = eager_aggregation;
+        if let Some(factor) = self.eager_aggregation_min_reduction_factor {
+            if factor > 0 {
+                config
+                    .options_mut()
+                    .optimizer
+                    .eager_aggregation_min_reduction_factor = factor;
+            } else {
+                tracing::warn!(
+                    "Ignoring runtime.query.eager_aggregation_min_reduction_factor=0; value must be greater than 0"
+                );
+            }
+        }
+        if let Some(cap) = self.eager_aggregation_max_pushed_groups {
+            config
+                .options_mut()
+                .optimizer
+                .eager_aggregation_max_pushed_groups = cap;
+        }
+        if self.eager_aggregation.is_some() {
+            tracing::info!(eager_aggregation, "Applied runtime.query.eager_aggregation");
+        } else {
+            tracing::info!(
+                eager_aggregation,
+                "runtime.query.eager_aggregation not set; defaulting to spiced default"
+            );
         }
 
         // Sizes DataFusion's *native* hash-join InList dynamic-filter budget
@@ -799,6 +977,10 @@ impl DataFusionBuilder {
                     CayenneMaintainedAggregateRewriter::new(),
                 ));
             }
+            if self.cayenne_optimizer_rules.stats_aggregate() {
+                state = state
+                    .with_physical_optimizer_rule(Arc::new(CayenneStatsAggregateRewriter::new()));
+            }
             if self.cayenne_optimizer_rules.anti_join_sort_merge() {
                 state = state.with_physical_optimizer_rule(Arc::new(
                     CayenneAntiJoinSortMergeRewriter::new(),
@@ -856,8 +1038,40 @@ impl DataFusionBuilder {
             panic!("Unable to register JSON functions: {e}");
         }
 
-        if let Err(e) = datafusion_spark::register_all(&mut state) {
-            panic!("Unable to register Spark functions: {e}");
+        // Register Spark-compatible functions, but skip Spark's `trunc` (scalar) and
+        // `avg` (aggregate): `register_all` would register them *over* the built-ins
+        // of the same name. Spark `trunc` is date-truncation and shadows numeric
+        // `trunc(<float>, <int>)` (see spiceai/spiceai#11415). Spark `avg` uses a different
+        // partial-aggregate state layout (`[sum, count:Int64]`) than the built-in
+        // (`[count:UInt64, sum]`); harmless single-node, but it corrupts DISTRIBUTED
+        // plans — the scheduler bakes the shuffle/stage schema from Spark `avg`'s
+        // `state_fields` while executors run the built-in `avg`, so the coalescing
+        // shuffle reader downcasts the wrong primitive type and panics ("primitive
+        // array"). Keep the built-ins; register every other Spark function (mirrors
+        // `datafusion_spark::register_all`).
+        for udf in datafusion_spark::all_default_scalar_functions() {
+            if udf.name() == "trunc" {
+                continue;
+            }
+            let name = udf.name().to_string();
+            if let Err(e) = state.register_udf(udf) {
+                panic!("Unable to register Spark scalar function `{name}`: {e}");
+            }
+        }
+        for udaf in datafusion_spark::all_default_aggregate_functions() {
+            if udaf.name() == "avg" {
+                continue;
+            }
+            let name = udaf.name().to_string();
+            if let Err(e) = state.register_udaf(udaf) {
+                panic!("Unable to register Spark aggregate function `{name}`: {e}");
+            }
+        }
+        for udwf in datafusion_spark::all_default_window_functions() {
+            let name = udwf.name().to_string();
+            if let Err(e) = state.register_udwf(udwf) {
+                panic!("Unable to register Spark window function `{name}`: {e}");
+            }
         }
 
         let catalog = MemoryCatalogProvider::new();
@@ -1009,12 +1223,15 @@ impl DataFusionBuilder {
             ddl_extension_store,
             datafusion_ref,
             caching,
+            schema_evolve_locks: TokioRwLock::new(HashMap::new()),
             pending_sink_tables: TokioRwLock::new(Vec::new()),
             deferred_tables: TokioRwLock::new(HashMap::new()),
             deferred_catalogs: TokioRwLock::new(HashMap::new()),
             pending_initializations: TokioRwLock::new(HashMap::new()),
             pending_initializations_count: std::sync::atomic::AtomicUsize::new(0),
             query_cancel_registry: Arc::new(super::query::registry::QueryCancelRegistry::new()),
+            plan_capture: OnceLock::new(),
+            write_stats_notify: tokio::sync::Notify::new(),
             accelerated_tables: TokioRwLock::new(HashSet::new()),
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
@@ -1027,6 +1244,8 @@ impl DataFusionBuilder {
             compaction_runtime: OnceLock::new(),
             compaction_runtime_env,
             compaction_memory_bytes,
+            query_memory_pool_bytes,
+            mem_tier_budget_bytes,
             io_runtime: self.io_runtime,
             metrics: self.metrics,
             resource_monitor: self.resource_monitor,
@@ -1222,9 +1441,7 @@ fn is_cayenne_accelerated_table_provider(provider: &dyn TableProvider) -> bool {
 
 #[cfg(not(windows))]
 fn is_cayenne_table_provider(provider: &dyn TableProvider) -> bool {
-    if provider.downcast_ref::<CayenneTableProvider>().is_some()
-        || has_cayenne_accelerator_metadata(provider)
-    {
+    if provider.is::<CayenneTableProvider>() || has_cayenne_accelerator_metadata(provider) {
         return true;
     }
 
@@ -1303,18 +1520,200 @@ impl Default for AnalyzerRulesBuilder {
     }
 }
 
-fn effective_query_memory_limit(memory_limit: Option<u64>) -> u64 {
+/// Default fraction of host/container RAM for the query memory pool (before the
+/// compaction carve) when the operator sets no explicit `runtime.query.memory_limit`.
+const DEFAULT_QUERY_MEMORY_PERCENT: u64 = 90;
+
+/// Reduced BASE default used when Cayenne in-memory acceleration is active. The
+/// query pool, the carved compaction pool, AND the off-pool Cayenne in-memory CDC
+/// tier (`cdc_durability: memory`) are each derived from total RAM; sized in
+/// isolation they sum to >100% of host — the SF1000 process-OOM (RSS 242 GiB on a
+/// 256 GiB box, the query pool never reporting exhaustion because the tier is
+/// off-pool). Capping the query+compaction block at 70% reserves the remaining 30%
+/// for the in-memory tier (up to 20%, host/5, [`coordinated_mem_tier_budget`]) plus
+/// a 10% (host/10) headroom covering the off-pool per-table CDC caches / inline
+/// memtables / encode buffers / OS overhead — a 70% / 20% / 10% = 100% partition.
+/// This is only the BASE: when the estimated per-table CDC cache reservation
+/// (keyset/segment/coalesce/inline, summed over changes-mode tables) EXCEEDS the
+/// host/10 headroom, the query default is reduced further by the excess in
+/// [`effective_query_memory_limit`], down to [`CAYENNE_QUERY_MEMORY_FLOOR_PERCENT`].
+const CAYENNE_QUERY_MEMORY_PERCENT: u64 = 70;
+
+/// Floor (% of host) the reservation-aware reduction never pushes the query pool
+/// below, so a cache-heavy CDC config (many tables and/or large per-table caches)
+/// cannot starve queries. Beyond it, the mem-tier install-time check warns and
+/// memory mode leans on the per-table caps + spill/durable backstops.
+const CAYENNE_QUERY_MEMORY_FLOOR_PERCENT: u64 = 50;
+
+pub(crate) fn effective_query_memory_limit(
+    memory_limit: Option<u64>,
+    cayenne_active: bool,
+    cdc_reservation_bytes: u64,
+    duckdb_query_pool_cap: Option<u64>,
+) -> u64 {
     memory_limit.unwrap_or_else(|| {
         let total_memory = crate::resource_monitor::get_total_memory();
-        let default_limit = total_memory.saturating_mul(90) / 100;
+        let default_limit = if cayenne_active {
+            // Cayenne CDC active. Base is CAYENNE_QUERY_MEMORY_PERCENT of host, leaving
+            // room for the off-pool in-memory tier (clamped to <= host/5 by
+            // `coordinated_mem_tier_budget`) plus a host/10 headroom for the off-pool
+            // per-table CDC caches + OS overhead — a 70 / 20 / 10 = 100% partition. The
+            // per-table caches (keyset/segment/coalesce/inline) live OUTSIDE the query
+            // pool and scale with table count; they are assumed to fit the host/10
+            // headroom. When the estimated reservation EXCEEDS that headroom, carve the
+            // excess out of the query pool so the freed query bytes cover the excess
+            // caches and `query_pool + compaction + tier + caches + headroom` stays
+            // within host. Floored at CAYENNE_QUERY_MEMORY_FLOOR_PERCENT so a very
+            // cache-heavy config never starves queries (past the floor the tier
+            // install-time check warns).
+            let base = total_memory.saturating_mul(CAYENNE_QUERY_MEMORY_PERCENT) / 100;
+            let base_headroom = total_memory / MEM_TIER_HEADROOM_FRACTION;
+            let reservation_excess = cdc_reservation_bytes.saturating_sub(base_headroom);
+            let floor = total_memory.saturating_mul(CAYENNE_QUERY_MEMORY_FLOOR_PERCENT) / 100;
+            let default_limit = base.saturating_sub(reservation_excess).max(floor);
 
-        tracing::debug!(
-            "No memory limit specified, defaulting to 90% of total memory: {}",
-            util::human_readable_bytes(default_limit as usize)
-        );
+            tracing::debug!(
+                cayenne_active,
+                cdc_reservation_bytes,
+                reservation_excess,
+                "No query memory limit specified; Cayenne CDC base {CAYENNE_QUERY_MEMORY_PERCENT}% of total, reduced by the per-table CDC reservation above the host/10 headroom to: {}",
+                util::human_readable_bytes(default_limit as usize)
+            );
 
-        default_limit
+            default_limit
+        } else {
+            let default_limit = total_memory.saturating_mul(DEFAULT_QUERY_MEMORY_PERCENT) / 100;
+            tracing::debug!(
+                cayenne_active,
+                "No query memory limit specified, defaulting to {DEFAULT_QUERY_MEMORY_PERCENT}% of total memory: {}",
+                util::human_readable_bytes(default_limit as usize)
+            );
+            default_limit
+        };
+
+        // Coordinated DuckDB cap: when DuckDB file accelerators are present the
+        // Runtime builder computes a reduced query-pool ceiling (see
+        // `accelerator_memory_budget`) that leaves room for each DuckDB instance's
+        // own `memory_limit`, so the query pool + DuckDB ceilings can't over-commit
+        // host RAM. It only ever LOWERS the default (an explicit
+        // `runtime.query.memory_limit` short-circuits above and is never reduced).
+        match duckdb_query_pool_cap {
+            Some(cap) => {
+                let capped = default_limit.min(cap);
+                if capped < default_limit {
+                    tracing::debug!(
+                        default_query_memory_bytes = default_limit,
+                        coordinated_query_memory_bytes = capped,
+                        "Query memory pool reduced below its default by the coordinated DuckDB accelerator budget, leaving room for each DuckDB instance's own memory_limit."
+                    );
+                }
+                capped
+            }
+            None => default_limit,
+        }
     })
+}
+
+/// 1/N of host RAM bounding the aggregate off-pool Cayenne in-memory CDC tier (the
+/// ceiling, 1/5 = 20%), and the headroom reserve held beyond the pools+tier for the
+/// off-pool per-table CDC caches, inline memtables, encode buffers, and OS/allocator
+/// overhead (1/10 = 10%). With the 70% query+compaction block the host partitions as
+/// 70% / 20% / 10% = 100%.
+const MEM_TIER_CEILING_FRACTION: u64 = 5;
+const MEM_TIER_HEADROOM_FRACTION: u64 = 10;
+/// Raised tier ceiling (1/N of host, > the base `MEM_TIER_CEILING_FRACTION`) the
+/// tier may FLOAT up to on a query-light deployment — one where the operator set a
+/// low `runtime.query.memory_limit`, leaving RAM the default partition would not
+/// otherwise use. The float only consumes room left beyond a DOUBLED headroom
+/// reserve and never exceeds the coordinated remainder, so `query_pool +
+/// compaction + tier + headroom <= host` (the #11449 invariant) is preserved
+/// exactly. 1/4 = 25%, a modest bump above the 20% base ceiling — the fraction must
+/// stay SMALLER than `MEM_TIER_CEILING_FRACTION` so the float sits ABOVE the base.
+const MEM_TIER_FLOAT_CEILING_FRACTION: u64 = 4;
+/// Lower clamp (1/N of host) that keeps a healthy deployment's tier off the ground,
+/// and the threshold below which [`coordinated_mem_tier_budget`] stops clamping up
+/// and yields to the coordinated remainder instead. When an operator pins an
+/// explicit, greedy `runtime.query.memory_limit` that leaves less than this floor,
+/// the budget follows the remainder down — but never to 0, because a 0 budget
+/// disables the global aggregate cap entirely (per-table caps then sum unbounded
+/// across a fleet: the original no-global-cap OOM). Memory mode then leans on the
+/// per-table caps + spill/durable backstops, and the caller warns.
+pub(crate) const MEM_TIER_FLOOR_FRACTION: u64 = 32;
+
+/// Coordinated aggregate byte budget for the off-pool Cayenne in-memory CDC tier.
+///
+/// The query pool, carved compaction pool, and this tier are otherwise each
+/// derived from total RAM IN ISOLATION (`builder.rs` query pool, compaction carve,
+/// and `mod.rs` `get_total_memory()/4`) and sum to >100% of host. Sizing the tier
+/// as the host RAM left AFTER the query pool, the compaction pool, any memory
+/// reserved outside both by another subsystem (`external_reservation_bytes` — today
+/// a co-resident `DuckDB` accelerator's ceiling), and a headroom reserve is the missing
+/// cross-subsystem coordination. For the coordinated default inputs — a query pool
+/// sized to leave room (see [`effective_query_memory_limit`]) — it yields
+/// `query_pool + compaction + external + tier + headroom ≤ host`. While that
+/// remainder reaches the `host/32` floor the result is clamped to `[host/32, host/5]`:
+/// the `host/5` ceiling keeps the tier ≤ 1/5 of host when the pools are small.
+///
+/// A greedy explicit `runtime.query.memory_limit`, or a large external reservation,
+/// can leave a remainder BELOW the floor. The tier then yields to the remainder rather
+/// than clamping up to a floor that would overcommit the host — down to a 1-byte
+/// refuse-all gate, since a 0 budget would uninstall the global aggregate cap entirely
+/// (see [`MEM_TIER_FLOOR_FRACTION`]). So the inequality above holds exactly, except for
+/// that one reserved byte when the remainder is 0; every real append then refuses and
+/// CDC spills to the durable backstops. The caller ([`DataFusionBuilder::build`])
+/// detects the squeezed budget and warns.
+pub(crate) fn coordinated_mem_tier_budget(
+    total_memory: u64,
+    query_pool_bytes: u64,
+    compaction_pool_bytes: u64,
+    external_reservation_bytes: u64,
+) -> u64 {
+    let headroom = total_memory / MEM_TIER_HEADROOM_FRACTION;
+    let base_ceiling = total_memory / MEM_TIER_CEILING_FRACTION;
+    let floor = (total_memory / MEM_TIER_FLOOR_FRACTION).min(base_ceiling);
+    // Memory reserved OUTSIDE the query and compaction pools by other subsystems —
+    // today a co-resident DuckDB accelerator's aggregate ceiling (see
+    // `accelerator_memory_budget`), and any future external consumer — carved from
+    // the same host RAM by the coordinated budget. Subtract it here so the tier,
+    // and especially its query-light float below, can't reclaim room already
+    // reserved elsewhere. `0` when nothing external is reserved.
+    let remainder = total_memory
+        .saturating_sub(query_pool_bytes)
+        .saturating_sub(compaction_pool_bytes)
+        .saturating_sub(external_reservation_bytes)
+        .saturating_sub(headroom);
+    // Floating ceiling for query-light deployments: when the query + compaction
+    // pools are sized well below the default partition (an operator who set a low
+    // `runtime.query.memory_limit`), let the tier reclaim part of the freed RAM
+    // above the base host/5 cap — up to `host / MEM_TIER_FLOAT_CEILING_FRACTION` —
+    // but only the room left beyond a DOUBLED headroom reserve, so the off-pool
+    // caches/memtables the single headroom covers keep their slack. `float_room`
+    // subtracts the external reservation just like `remainder`, so the float can
+    // never reclaim externally-reserved RAM. Raising only the ceiling never lifts
+    // the result above `remainder` (the ceiling caps from above, and `remainder` is
+    // computed with the single headroom), so the floating ceiling preserves the
+    // #11449 no-overcommit invariant `query_pool + compaction + external + tier +
+    // headroom <= host` for ANY ceiling.
+    //
+    // Honesty under a tight explicit `runtime.query.memory_limit`: when the remainder
+    // is below the floor, yield to the remainder instead of clamping up to a floor
+    // that would make `query + compaction + tier + headroom > host`. A refuse-all
+    // budget is the honest envelope there — mem-tier leans on the per-table caps +
+    // spill/durable backstops — and it must stay nonzero to keep the global cap
+    // installed, so the single reserved byte below is the one deliberate exception
+    // to the `<= host` invariant above.
+    if remainder < floor {
+        // Nonzero refuse-all gate: 1 byte means every real append refuses and
+        // CDC spills/falls back, without uninstalling the budget.
+        return remainder.max(1);
+    }
+    let float_room = total_memory
+        .saturating_sub(query_pool_bytes)
+        .saturating_sub(compaction_pool_bytes)
+        .saturating_sub(external_reservation_bytes)
+        .saturating_sub(2 * headroom);
+    let ceiling = base_ceiling.max(float_room.min(total_memory / MEM_TIER_FLOAT_CEILING_FRACTION));
+    remainder.clamp(floor, ceiling)
 }
 
 #[cfg(not(windows))]
@@ -1538,8 +1937,11 @@ mod tests {
     use datafusion_expr::{Expr, LogicalPlan};
 
     use super::{
-        CayenneOptimizerRules, DataFusionBuilder, build_compaction_runtime_env,
-        configure_hash_join_memory_limits,
+        CAYENNE_QUERY_MEMORY_FLOOR_PERCENT, CAYENNE_QUERY_MEMORY_PERCENT, CayenneOptimizerRules,
+        DEFAULT_QUERY_MEMORY_PERCENT, DataFusionBuilder, MEM_TIER_CEILING_FRACTION,
+        MEM_TIER_FLOAT_CEILING_FRACTION, MEM_TIER_FLOOR_FRACTION, MEM_TIER_HEADROOM_FRACTION,
+        build_compaction_runtime_env, configure_hash_join_memory_limits,
+        coordinated_mem_tier_budget, effective_query_memory_limit,
         runtime_env_with_effective_memory_limit_and_object_store_registry,
         validate_compaction_memory_fraction,
     };
@@ -1551,6 +1953,222 @@ mod tests {
     #[cfg(not(windows))]
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    /// An explicit `runtime.query.memory_limit` is honored verbatim regardless of
+    /// whether Cayenne is active — the coordinated default only applies when unset.
+    #[test]
+    fn effective_query_memory_limit_honors_explicit_value() {
+        assert_eq!(
+            effective_query_memory_limit(Some(123 << 30), true, 0, None),
+            123 << 30
+        );
+        assert_eq!(
+            effective_query_memory_limit(Some(123 << 30), false, 0, None),
+            123 << 30
+        );
+        // A nonzero CDC reservation never overrides an explicit limit.
+        assert_eq!(
+            effective_query_memory_limit(Some(7), true, 1 << 30, None),
+            7
+        );
+        // Nor does a DuckDB query-pool cap override an explicit limit.
+        assert_eq!(
+            effective_query_memory_limit(Some(123 << 30), false, 0, Some(1 << 30)),
+            123 << 30
+        );
+    }
+
+    /// Cayenne active, no explicit limit: a per-table CDC reservation at/under the
+    /// base host/10 headroom leaves the default at the base 70%; a reservation ABOVE
+    /// the headroom reduces the default by exactly the excess; and a very large
+    /// reservation floors at `CAYENNE_QUERY_MEMORY_FLOOR_PERCENT` (never 0). Reads
+    /// live host RAM, so it asserts the RELATIONSHIPS rather than absolute bytes.
+    #[test]
+    fn effective_query_memory_limit_reduces_by_cdc_reservation() {
+        let total = crate::resource_monitor::get_total_memory();
+        let base = total.saturating_mul(CAYENNE_QUERY_MEMORY_PERCENT) / 100;
+        let headroom = total / MEM_TIER_HEADROOM_FRACTION;
+        let floor = total.saturating_mul(CAYENNE_QUERY_MEMORY_FLOOR_PERCENT) / 100;
+
+        // Reservation within the base headroom -> no reduction, stays at base 70%.
+        assert_eq!(effective_query_memory_limit(None, true, 0, None), base);
+        assert_eq!(
+            effective_query_memory_limit(None, true, headroom, None),
+            base
+        );
+
+        // Reservation above the headroom -> reduced by exactly the excess.
+        let excess = headroom / 2;
+        assert_eq!(
+            effective_query_memory_limit(None, true, headroom + excess, None),
+            base - excess
+        );
+
+        // A reservation larger than the whole host floors the pool, never 0.
+        let floored = effective_query_memory_limit(None, true, total.saturating_mul(2), None);
+        assert_eq!(floored, floor);
+        assert!(floored > 0);
+
+        // The reservation never affects the non-Cayenne default.
+        assert_eq!(
+            effective_query_memory_limit(None, false, total, None),
+            total.saturating_mul(DEFAULT_QUERY_MEMORY_PERCENT) / 100
+        );
+
+        // A DuckDB query-pool cap lowers (never raises) the default query pool.
+        let non_cayenne_default = total.saturating_mul(DEFAULT_QUERY_MEMORY_PERCENT) / 100;
+        let half = non_cayenne_default / 2;
+        assert_eq!(
+            effective_query_memory_limit(None, false, 0, Some(half)),
+            half,
+            "a smaller cap reduces the default"
+        );
+        assert_eq!(
+            effective_query_memory_limit(None, false, 0, Some(non_cayenne_default * 2)),
+            non_cayenne_default,
+            "a larger cap never raises the default"
+        );
+    }
+
+    // Compile-time invariants on the host-partition constants: the Cayenne
+    // query-pool default must be below the non-Cayenne default, and the default
+    // partition (70% query+compaction, one-fifth tier ceiling, one-tenth headroom)
+    // sums to exactly 100% of host — a 90% allocated block plus a 10% headroom
+    // reserve for the off-pool per-table CDC caches and OS overhead. `const`
+    // assertions (compile-time) rather than a runtime test asserting constant values
+    // (which clippy flags as assertions_on_constants).
+    const _: () = assert!(CAYENNE_QUERY_MEMORY_PERCENT < DEFAULT_QUERY_MEMORY_PERCENT);
+    const _: () = assert!(CAYENNE_QUERY_MEMORY_PERCENT == 70);
+    const _: () = assert!(MEM_TIER_CEILING_FRACTION == 5); // one-fifth = 20%
+    const _: () = assert!(MEM_TIER_HEADROOM_FRACTION == 10); // one-tenth = 10%
+    // The default partition must not overcommit host RAM: query+compaction (%) +
+    // tier ceiling (100/CEIL %) + headroom (100/HEAD %) <= 100. Cross-multiplied to
+    // exact integer form (no truncation of fractional percentages). 70/20/10 = 100.
+    const _: () = assert!(
+        CAYENNE_QUERY_MEMORY_PERCENT * MEM_TIER_CEILING_FRACTION * MEM_TIER_HEADROOM_FRACTION
+            + 100 * MEM_TIER_HEADROOM_FRACTION
+            + 100 * MEM_TIER_CEILING_FRACTION
+            <= 100 * MEM_TIER_CEILING_FRACTION * MEM_TIER_HEADROOM_FRACTION
+    );
+    // The float ceiling must sit ABOVE the base ceiling (smaller fraction = larger
+    // share of host) or the query-light float is inert.
+    const _: () = assert!(MEM_TIER_FLOAT_CEILING_FRACTION < MEM_TIER_CEILING_FRACTION);
+
+    /// THE invariant: for the coordinated default partition (Cayenne active, no
+    /// explicit limit), `query_pool + compaction + mem_tier + headroom` never
+    /// exceeds host RAM — across a wide range of host sizes and compaction
+    /// fractions. This is the cross-subsystem coordination that prevents the
+    /// SF1000 process OOM (the three budgets summed to 115% of host before).
+    #[test]
+    fn coordinated_partition_never_overcommits_host() {
+        // Mirrors the memory math in `DataFusionBuilder::build` for the default
+        // (unset `memory_limit`) path so the asserted invariant tracks the build.
+        let totals_gib: [u64; 7] = [8, 16, 32, 64, 128, 256, 1024];
+        let compaction_percents: [u64; 5] = [5, 10, 20, 30, 50];
+        for gib in totals_gib {
+            let total = gib << 30;
+            for compaction_pct in compaction_percents {
+                let pre_carve = total.saturating_mul(CAYENNE_QUERY_MEMORY_PERCENT) / 100;
+                let compaction = pre_carve.saturating_mul(compaction_pct) / 100;
+                let query_pool = pre_carve.saturating_sub(compaction);
+                let tier = coordinated_mem_tier_budget(total, query_pool, compaction, 0);
+                let headroom = total / MEM_TIER_HEADROOM_FRACTION;
+                let sum = query_pool + compaction + tier + headroom;
+                assert!(
+                    sum <= total,
+                    "overcommit at {gib} GiB host, compaction {compaction_pct}%: query={query_pool} compaction={compaction} tier={tier} headroom={headroom} sum={sum} > total={total}"
+                );
+            }
+        }
+    }
+
+    /// While the coordinated remainder reaches the floor, the tier budget stays inside
+    /// `[host/32, host/MEM_TIER_FLOAT_CEILING]` — never above the float ceiling even
+    /// when the pools are tiny, and the float (host/4) only engages on a query-light
+    /// deployment without breaking the no-overcommit invariant. A greedy pool drives
+    /// the remainder under the floor and the budget follows it down, but never to 0 (a
+    /// 0 budget disables the global aggregate cap, the original no-global-cap OOM).
+    #[test]
+    fn coordinated_tier_budget_stays_within_clamp() {
+        for gib in [16_u64, 64, 256, 1024] {
+            let total = gib << 30;
+            let base_ceiling = total / MEM_TIER_CEILING_FRACTION;
+            let float_ceiling = total / MEM_TIER_FLOAT_CEILING_FRACTION;
+            let floor = (total / MEM_TIER_FLOOR_FRACTION).min(base_ceiling);
+
+            // A tiny query pool (query-light) → the tier floats up to the raised
+            // ceiling to use the spare RAM, never above it.
+            let big = coordinated_mem_tier_budget(total, total / 100, 0, 0);
+            assert_eq!(
+                big, float_ceiling,
+                "a query-light deployment floats the tier to the raised ceiling"
+            );
+            // ...and even at the raised ceiling the no-overcommit invariant holds.
+            let headroom = total / MEM_TIER_HEADROOM_FRACTION;
+            assert!(
+                (total / 100) + big + headroom <= total,
+                "the float must not overcommit host RAM"
+            );
+
+            // A moderate query pool at the default 70% partition stays at/under the
+            // BASE ceiling (the float only helps when the pool is sized down) and
+            // at/above the floor (remainder still allows the lower clamp).
+            let pre_carve = total.saturating_mul(CAYENNE_QUERY_MEMORY_PERCENT) / 100;
+            let moderate = coordinated_mem_tier_budget(total, pre_carve, 0, 0);
+            assert!(
+                moderate <= base_ceiling,
+                "the default partition does not float above the base ceiling"
+            );
+            assert!(
+                moderate >= floor,
+                "when remainder allows, the tier budget stays at/above the floor"
+            );
+
+            // A greedy pool that consumes all of host → tier yields to the
+            // remainder (honest, no forced overcommit). Remainder is 0 after
+            // headroom, but we still install a 1-byte always-refuse gate so the
+            // global cap is never disabled (try_reserve fails → spill). The
+            // meaningful claim here is the refuse-all gate, not "no host
+            // overcommit" via the floor — the pool already consumes `total`.
+            let small = coordinated_mem_tier_budget(total, total, 0, 0);
+            assert_eq!(
+                small, 1,
+                "a greedy pool installs a 1-byte refuse-all gate rather than the host/32 floor"
+            );
+            assert!(small > 0, "the global aggregate cap must never be disabled");
+            assert!(
+                small < floor,
+                "a greedy pool yields BELOW the floor rather than clamping up to it (floor={floor}, small={small})"
+            );
+        }
+    }
+
+    /// A non-zero external (`DuckDB`) reservation is subtracted from BOTH the tier
+    /// remainder and its query-light float, so the tier can only shrink — it can't
+    /// reclaim externally-reserved memory — and `query + external + tier + headroom`
+    /// never exceeds host RAM.
+    #[test]
+    fn coordinated_tier_budget_reserves_external_bytes() {
+        for gib in [16_u64, 64, 256, 1024] {
+            let total = gib << 30;
+            let headroom = total / MEM_TIER_HEADROOM_FRACTION;
+            let query_pool = total / 10; // query-light: the tier would otherwise float up
+            let external = total / 2; // a sizeable co-resident DuckDB reservation
+
+            let with_ext = coordinated_mem_tier_budget(total, query_pool, 0, external);
+            let no_ext = coordinated_mem_tier_budget(total, query_pool, 0, 0);
+
+            assert!(
+                with_ext <= no_ext,
+                "gib={gib}: an external reservation must never grow the tier"
+            );
+            let sum = query_pool + external + with_ext + headroom;
+            assert!(
+                sum <= total,
+                "gib={gib}: overcommit — query={query_pool} external={external} tier={with_ext} headroom={headroom} sum={sum} > total={total}"
+            );
+        }
+    }
 
     /// Verifies that the default analyzer rules are in the expected order.
     ///
@@ -1754,6 +2372,84 @@ mod tests {
     }
 
     #[test]
+    fn test_eager_aggregation_wires_through_to_session_config() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        // Default: spiced enables eager aggregation even though DataFusion's own
+        // default is off.
+        let df_default = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle.clone(),
+        )
+        .build();
+        assert!(
+            df_default
+                .ctx
+                .state()
+                .config()
+                .options()
+                .optimizer
+                .enable_eager_aggregation,
+            "eager aggregation should default to enabled in spiced"
+        );
+
+        // An explicit `false` disables the rule.
+        let df_off = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle.clone(),
+        )
+        .eager_aggregation(Some(false))
+        .build();
+        assert!(
+            !df_off
+                .ctx
+                .state()
+                .config()
+                .options()
+                .optimizer
+                .enable_eager_aggregation,
+            "eager_aggregation: false should disable the rule"
+        );
+
+        // The two tuning knobs wire through to the optimizer options.
+        let df_tuned = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .eager_aggregation(Some(true))
+        .eager_aggregation_min_reduction_factor(Some(8))
+        .eager_aggregation_max_pushed_groups(Some(1024))
+        .build();
+        assert_eq!(
+            df_tuned
+                .ctx
+                .state()
+                .config()
+                .options()
+                .optimizer
+                .eager_aggregation_min_reduction_factor,
+            8
+        );
+        assert_eq!(
+            df_tuned
+                .ctx
+                .state()
+                .config()
+                .options()
+                .optimizer
+                .eager_aggregation_max_pushed_groups,
+            1024
+        );
+    }
+
+    #[test]
     #[cfg(not(windows))]
     fn test_cayenne_provider_predicate_detects_poly_accelerator_metadata() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -1848,9 +2544,10 @@ mod tests {
             vec![
                 "CayenneDynamicFilterSharing",
                 "CayenneMaintainedAggregateRewriter",
+                "CayenneStatsAggregateRewriter",
                 "CayenneAntiJoinSortMergeRewriter",
             ],
-            "Default Cayenne physical optimizer selection should preserve prior safe defaults without re-enabling the exact join filter"
+            "Default Cayenne physical optimizer selection should preserve prior safe defaults (now including the metadata-only stats aggregate fold) without re-enabling the exact join filter"
         );
     }
 
@@ -1951,6 +2648,8 @@ mod tests {
         dynamic_filter_sharing.set_dynamic_filter_sharing(true);
         let mut maintained_aggregate = CayenneOptimizerRules::none();
         maintained_aggregate.set_maintained_aggregate(true);
+        let mut stats_aggregate = CayenneOptimizerRules::none();
+        stats_aggregate.set_stats_aggregate(true);
         let mut anti_join_sort_merge = CayenneOptimizerRules::none();
         anti_join_sort_merge.set_anti_join_sort_merge(true);
         let mut exact_join_filter = CayenneOptimizerRules::none();
@@ -1987,6 +2686,11 @@ mod tests {
                 maintained_aggregate,
                 vec![],
                 vec!["CayenneMaintainedAggregateRewriter"],
+            ),
+            (
+                stats_aggregate,
+                vec![],
+                vec!["CayenneStatsAggregateRewriter"],
             ),
             (
                 anti_join_sort_merge,

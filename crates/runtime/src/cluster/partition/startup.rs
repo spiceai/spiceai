@@ -25,9 +25,11 @@ use datafusion::{
 };
 use datafusion_proto::bytes::Serializeable;
 use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+
 use runtime_proto::{
     AllocateInitialPartitionsRequest, cluster_service_client::ClusterServiceClient,
 };
+use runtime_query_engine::query_engine::QueryEngine;
 use snafu::prelude::*;
 use spicepod::partitioning::PartitionedBy;
 use tonic::transport::Channel;
@@ -125,7 +127,7 @@ pub fn validate_partition_keys(app: &App) -> Result<()> {
 /// startup window the answer is `Some(table)`; the caller should defer.
 pub async fn first_unready_accelerated_table(
     app: &Arc<App>,
-    df: &crate::datafusion::DataFusion,
+    df: &dyn QueryEngine,
 ) -> Option<TableReference> {
     // Collect without holding any external lock — the caller is expected to
     // pass an already-snapshotted `Arc<App>` so we don't hold an async

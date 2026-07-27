@@ -22,3 +22,6 @@ humantime.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+
+[lints]
+workspace = true

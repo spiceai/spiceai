@@ -222,6 +222,47 @@ impl Query {
         ))
     }
 
+    /// Plans a query without consulting or populating the SQL results cache.
+    pub(super) async fn get_plan_without_results_cache(
+        df: &Arc<DataFusion>,
+        session: &SessionState,
+        request_context: &RequestContext,
+        sql: &str,
+        parameters: Option<ParamValues>,
+        tracker: Option<QueryTracker>,
+        pre_parsed_plan: Option<Box<LogicalPlan>>,
+    ) -> super::Result<PlanOrCached> {
+        let cache_namespace = request_context.cache_namespace();
+        let (ns_tag, ns_id) = cache_namespace.hash_inputs();
+        let raw_cache_key = CacheKey::Query(sql, parameters.as_ref()).as_raw_key_in_namespace(
+            Self::plan_hasher(df),
+            ns_tag,
+            ns_id,
+        );
+        let plan = if let Some(plan) = pre_parsed_plan {
+            plan
+        } else {
+            match Self::get_plan(df, session, sql, &raw_cache_key, parameters).await {
+                Ok(plan) => Box::new(plan),
+                Err(super::Error::UnableToExecuteQuery { source }) => {
+                    let code = ErrorCode::from(&source);
+                    let error = super::Error::UnableToExecuteQuery { source };
+                    if let Some(tracker) = tracker {
+                        tracker.finish_with_error(request_context, error.to_string(), code);
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        };
+
+        Ok(PlanOrCached::Plan(
+            plan,
+            tracker,
+            RequestCacheManager::new(CacheStatus::CacheDisabled, raw_cache_key),
+        ))
+    }
+
     /// Get the logical plan for the given SQL query, applying parameter values if provided.
     pub(super) async fn get_plan(
         df: &Arc<DataFusion>,
@@ -392,7 +433,7 @@ impl Query {
         });
 
         let records = match cached_result.records().await {
-            Ok(records) => Arc::new(records),
+            Ok(records) => records,
             Err(e) => {
                 tracing::error!("Failed to decode cached query result: {e}");
                 return Ok(CacheResponse::from(
@@ -478,7 +519,7 @@ impl Query {
             tracing::debug!("Background revalidation: re-executing query with existing plan");
             let input_tables = cache::get_logical_plan_input_tables(&logical_plan);
             (
-                super::Query::from_logical_plan(df, &logical_plan),
+                super::Query::from_logical_plan(df, logical_plan),
                 input_tables,
             )
         } else {
@@ -507,23 +548,23 @@ impl Query {
             // Skip cache writes if the revalidation result contains transient HTTP
             // error responses. Preserve the existing stale cache entry instead of
             // storing a partial result set.
-            let Some(batches_to_cache) = cache::batches_to_cache(&batches) else {
+            if !cache::batches_cacheable(&batches) {
                 tracing::debug!(
                     cache_key = cache_key_u64,
                     "Background revalidation returned transient HTTP error responses, preserving stale cache"
                 );
                 return;
-            };
-
-            if batches_to_cache.is_empty() {
-                return;
             }
 
+            // Empty (0-row) revalidation results are cached too. The schema is
+            // preserved separately in `CachedQueryResult`, so an empty result
+            // refreshes the entry correctly rather than leaving the previous
+            // (now stale) value in place.
             let cached_at = std::time::Instant::now();
             let encoder = cache_provider.encoder();
 
             match cache::result::query::CachedQueryResult::from_batches(
-                &batches_to_cache,
+                batches,
                 schema,
                 input_tables,
                 cached_at,
@@ -720,7 +761,10 @@ mod tests {
 
     use crate::{
         builder::RuntimeBuilder,
-        datafusion::{DataFusion, query::QueryBuilder},
+        datafusion::{
+            DataFusion,
+            query::{QueryBuilder, ResultsCacheMode},
+        },
         status,
     };
     use runtime_request_context::{
@@ -798,6 +842,69 @@ mod tests {
 
         let manager = RequestCacheManager::new(cache_status, raw_cache_key);
         assert!(manager.should_cache_results());
+    }
+
+    async fn run_i64_query(
+        df: &Arc<DataFusion>,
+        sql: &str,
+        results_cache_mode: ResultsCacheMode,
+    ) -> (CacheStatus, i64) {
+        let result = QueryBuilder::new(sql, Arc::clone(df))
+            .results_cache_mode(results_cache_mode)
+            .build()
+            .run()
+            .await
+            .expect("query should succeed");
+        let cache_status = result.cache_status;
+        let records = result
+            .data
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("query should return records");
+        let value = records
+            .first()
+            .expect("query should return one batch")
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("query should return an Int64 column")
+            .value(0);
+        (cache_status, value)
+    }
+
+    #[tokio::test]
+    async fn test_results_cache_bypass_skips_lookup_and_storage() {
+        let df = prepare_runtime(Some(SQLResultsCacheConfig {
+            item_ttl: Some("10m".to_string()),
+            cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+            ..Default::default()
+        }))
+        .await;
+        let request_context = create_test_request_context(
+            CacheControl::Cache(CacheKeyType::ClientSupplied),
+            Some("bypass-regression".to_string()),
+        );
+
+        let (status, value) = Arc::clone(&request_context)
+            .scope(run_i64_query(&df, "SELECT 1", ResultsCacheMode::Default))
+            .await;
+        assert_eq!(status, CacheStatus::CacheMiss);
+        assert_eq!(value, 1);
+
+        // The same client cache key is warm, but bypass must execute SELECT 2.
+        let (status, value) = Arc::clone(&request_context)
+            .scope(run_i64_query(&df, "SELECT 2", ResultsCacheMode::Bypass))
+            .await;
+        assert_eq!(status, CacheStatus::CacheDisabled);
+        assert_eq!(value, 2);
+
+        // Bypass must not replace the warm entry. A normal request with the same
+        // client key still returns the original SELECT 1 result, not SELECT 2.
+        let (status, value) = request_context
+            .scope(run_i64_query(&df, "SELECT 3", ResultsCacheMode::Default))
+            .await;
+        assert_eq!(status, CacheStatus::CacheHit);
+        assert_eq!(value, 1);
     }
 
     /// SWR background revalidation must run under the originating user's
@@ -1170,6 +1277,67 @@ mod tests {
                 // Since cache-control is set, an invalid key with repeated query will fall back
                 // to the default plan-key behavior and result in a cache hit
                 assert_eq!(result.cache_status, CacheStatus::CacheHit);
+            })
+            .await;
+    }
+
+    /// Regression test for empty (0-row) result sets not being cached.
+    ///
+    /// `SELECT 1 WHERE 1=0` is optimized to an `EmptyRelation`/`EmptyExec`,
+    /// which yields **zero** record batches. Such a result must still be cached
+    /// so the second identical request is served from cache instead of being
+    /// re-executed against the source.
+    #[tokio::test]
+    async fn test_empty_result_set_is_cached() {
+        let df = prepare_runtime(Some(SQLResultsCacheConfig {
+            item_ttl: Some("10m".to_string()),
+            cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+            ..Default::default()
+        }))
+        .await;
+
+        let request_context =
+            create_test_request_context(CacheControl::Cache(CacheKeyType::Raw), None);
+
+        // First request: cache miss, populates the cache when drained.
+        let query = QueryBuilder::new("SELECT 1 WHERE 1=0", Arc::clone(&df)).build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                assert_eq!(result.cache_status, CacheStatus::CacheMiss);
+                let records = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should collect");
+                let total_rows: usize = records
+                    .iter()
+                    .map(arrow::array::RecordBatch::num_rows)
+                    .sum();
+                assert_eq!(total_rows, 0, "result set should be empty");
+            })
+            .await;
+
+        // Second request: must be a cache hit for the empty result set.
+        let query = QueryBuilder::new("SELECT 1 WHERE 1=0", Arc::clone(&df)).build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                assert_eq!(
+                    result.cache_status,
+                    CacheStatus::CacheHit,
+                    "empty result sets should be served from cache on repeat requests"
+                );
+                let records = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should collect");
+                let total_rows: usize = records
+                    .iter()
+                    .map(arrow::array::RecordBatch::num_rows)
+                    .sum();
+                assert_eq!(total_rows, 0, "cached empty result should still be empty");
             })
             .await;
     }

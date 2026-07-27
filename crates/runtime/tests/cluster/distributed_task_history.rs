@@ -132,7 +132,7 @@ impl opentelemetry_sdk::trace::SpanExporter for SwappableExporter {
             // `node_id` — synthesize one for the test.
             let (ballista_transform, ballista_retention) =
                 runtime::datafusion::query::stage_history::BallistaStageMiddleware::pair();
-            let query_engine: std::sync::Arc<dyn runtime_datafusion::query_engine::QueryEngine> =
+            let query_engine: std::sync::Arc<dyn runtime_query_engine::query_engine::QueryEngine> =
                 df;
             let exporter = TaskHistoryExporter::new(
                 query_engine,
@@ -514,6 +514,130 @@ async fn test_distributed_query_records_error_on_failure() -> Result<(), anyhow:
                 Duration::from_secs(10),
             )
             .await?;
+
+            if let Some(slot) = DF_SLOT.get() {
+                *slot.lock().expect("slot poisoned") = None;
+            }
+            harness.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(target_os = "windows"))]
+async fn test_distributed_query_captures_plan_from_executed_graph() -> Result<(), anyhow::Error> {
+    let _serial = test_lock().lock().await;
+    test_request_context()
+        .scope(async {
+            let tempdir = tempfile::tempdir().expect("csv tempdir");
+            let csv_path = tempdir.path().join("names.csv");
+            tokio::fs::write(&csv_path, NAMES_CSV)
+                .await
+                .expect("write csv");
+
+            configure_test_datafusion();
+
+            let app = AppBuilder::new("test_distributed_plan_capture")
+                .with_dataset(Dataset::new(
+                    format!("file:{}", csv_path.display()).as_str(),
+                    "names",
+                ))
+                .build();
+
+            let harness = ClusterHarness::builder()
+                .scheduler(app)
+                .executors(1)
+                .start()
+                .await?;
+            harness.wait_for_executors(Duration::from_secs(15)).await?;
+
+            // Enable execution-time ExplainAnalyze capture on the scheduler DF.
+            harness.scheduler.datafusion().set_plan_capture_config(
+                runtime::datafusion::query::plan_capture::PlanCaptureConfig {
+                    captured_plan: TaskHistoryCapturedPlan::ExplainAnalyze,
+                    min_plan_duration_ms: None,
+                    min_sql_duration_ms: None,
+                },
+            );
+
+            let provider = init_global_task_history(&harness.scheduler);
+
+            let query_sql = "SELECT id, name FROM names ORDER BY id LIMIT 5";
+            let plan_input = format!("EXPLAIN ANALYZE {query_sql}");
+
+            run_distributed(&harness, query_sql, "th_test_plan_capture").await?;
+
+            let _ = provider.force_flush();
+
+            wait_for_row_count(
+                &harness,
+                "SELECT count(*)::bigint \
+                 FROM runtime.task_history \
+                 WHERE task = 'sql_query' \
+                 AND labels['distributed'] = 'true' \
+                 AND labels['job_id'] = 'th_test_plan_capture'",
+                1,
+                Duration::from_secs(10),
+            )
+            .await?;
+            wait_for_row_count(
+                &harness,
+                &format!(
+                    "SELECT count(*)::bigint \
+                     FROM runtime.task_history \
+                     WHERE task = 'plan' \
+                     AND labels['plan_capture'] = 'true' \
+                     AND parent_span_id IS NOT NULL \
+                     AND input = '{plan_input}'"
+                ),
+                1,
+                Duration::from_secs(10),
+            )
+            .await?;
+
+            // No EXPLAIN ANALYZE re-run sql_query row.
+            let rerun = single_i64(
+                &harness
+                    .query(
+                        "SELECT count(*)::bigint \
+                         FROM runtime.task_history \
+                         WHERE task = 'sql_query' \
+                         AND input LIKE 'EXPLAIN ANALYZE%'",
+                    )
+                    .await?,
+            );
+            assert_eq!(rerun, 0, "must not re-run EXPLAIN ANALYZE in-process");
+
+            let plan_rows = harness
+                .query(&format!(
+                    "SELECT captured_output \
+                     FROM runtime.task_history \
+                     WHERE task = 'plan' \
+                     AND labels['plan_capture'] = 'true' \
+                     AND input = '{plan_input}'"
+                ))
+                .await?;
+            assert!(!plan_rows.is_empty());
+            assert_eq!(
+                plan_rows[0].num_rows(),
+                1,
+                "exactly one plan row for the distributed query"
+            );
+            let output = plan_rows[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("string")
+                .value(0);
+            assert!(
+                output.contains("Plan with Metrics"),
+                "missing Plan with Metrics: {output}"
+            );
+            assert!(
+                output.contains("Stage "),
+                "distributed plan should include Stage sections: {output}"
+            );
 
             if let Some(slot) = DF_SLOT.get() {
                 *slot.lock().expect("slot poisoned") = None;

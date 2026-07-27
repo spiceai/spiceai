@@ -20,7 +20,6 @@ use crate::component::ComponentInitialization;
 use crate::component::dataset::Dataset;
 #[cfg(feature = "duckdb")]
 use crate::component::dataset::acceleration::Engine;
-use crate::component::metrics::MetricsProvider;
 #[cfg(feature = "duckdb")]
 use crate::component::view::View;
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
@@ -38,6 +37,7 @@ use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use itertools::Itertools;
 use runtime_datafusion_index::IndexedTableProvider;
+use runtime_metrics::component::MetricsProvider;
 use search::generation::text_search::index::FullTextDatabaseIndex;
 use search::index::VectorScanTableProvider;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
@@ -47,9 +47,9 @@ use spicepod::semantic::ColumnLevelEmbeddingConfig;
 use spicepod::vector::VectorStore;
 use std::any::Any;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
-use super::table::EmbeddingTable;
+use runtime_search::embeddings::table::EmbeddingTable;
 
 pub struct EmbeddingConnector {
     inner_connector: Arc<dyn DataConnector>,
@@ -116,6 +116,12 @@ impl EmbeddingConnector {
                 });
             }
 
+            let on_zero_results = dataset
+                .acceleration
+                .as_ref()
+                .map(|acceleration| acceleration.on_zero_results.clone())
+                .unwrap_or_default();
+
             let mut provider = Arc::clone(&inner_table_provider);
             for (effective_vector_store, columns) in vector_index_groups(vector_engine, dataset) {
                 provider = wrap_table_as_index(
@@ -127,6 +133,7 @@ impl EmbeddingConnector {
                     dataset.params.get("file_format").map(String::as_str),
                     provider,
                     &effective_vector_store,
+                    &on_zero_results,
                 )
                 .await
                 .map_err(|e| {
@@ -185,7 +192,11 @@ impl EmbeddingConnector {
             e
         })?;
 
-        let (change_committer, batch, is_dataset_ready) = envelope.into_parts();
+        // Materializes a deferred batch here, on the embedding wrapper's task —
+        // this wrapper sits between a (possibly multiplexed) source and the
+        // accelerator, so it must build the deferred rows before augmenting them.
+        // Offload the synchronous build so a large burst can't stall this worker.
+        let (change_committer, batch, is_dataset_ready) = envelope.into_parts_offloaded().await?;
         let data_batch = batch.data_batch();
 
         let embeddings = compute_additional_embedding_columns(
@@ -330,9 +341,6 @@ impl DataConnector for EmbeddingConnector {
         &self,
         federated_table: Arc<FederatedTable>,
         dataset: &Dataset,
-        accelerated_table_provider: Arc<dyn TableProvider>,
-        accelerator_write_mutex: Arc<Mutex<()>>,
-        cpu_runtime: Option<tokio::runtime::Handle>,
     ) -> Option<ChangesStream> {
         let table_provider = federated_table.try_table_provider_sync()?;
         if let Some(indexed_table) = table_provider
@@ -342,13 +350,9 @@ impl DataConnector for EmbeddingConnector {
             let Some(underlying_federated_table) =
                 underlying_federated_table_for_indexed_table(&table_provider)
             else {
-                return self.inner_connector.changes_stream(
-                    federated_table,
-                    dataset,
-                    accelerated_table_provider,
-                    accelerator_write_mutex,
-                    cpu_runtime,
-                );
+                return self
+                    .inner_connector
+                    .changes_stream(federated_table, dataset);
             };
 
             // Avoid reindexing full-text indexes.
@@ -366,13 +370,7 @@ impl DataConnector for EmbeddingConnector {
 
             let stream = self
                 .inner_connector
-                .changes_stream(
-                    underlying_federated_table,
-                    dataset,
-                    accelerated_table_provider,
-                    accelerator_write_mutex,
-                    cpu_runtime,
-                )?
+                .changes_stream(underlying_federated_table, dataset)?
                 .then(move |item| index_change_envelope(item, Arc::clone(&indexes)))
                 .boxed();
 
@@ -385,9 +383,6 @@ impl DataConnector for EmbeddingConnector {
                     &vector_scan.table_provider,
                 ))),
                 dataset,
-                accelerated_table_provider,
-                accelerator_write_mutex,
-                cpu_runtime,
             )
         } else if let Some(embedding_table) = table_provider.downcast_ref::<EmbeddingTable>() {
             let embedding_table = Arc::new(embedding_table.clone());
@@ -396,13 +391,7 @@ impl DataConnector for EmbeddingConnector {
 
             Some(
                 self.inner_connector
-                    .changes_stream(
-                        underlying_federated_table,
-                        dataset,
-                        accelerated_table_provider,
-                        accelerator_write_mutex,
-                        cpu_runtime,
-                    )?
+                    .changes_stream(underlying_federated_table, dataset)?
                     .then(move |item| {
                         Self::embed_change_envelope(item, Arc::clone(&embedding_table))
                     })

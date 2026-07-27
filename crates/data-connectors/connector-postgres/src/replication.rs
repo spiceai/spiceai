@@ -26,24 +26,33 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_stream::try_stream;
-use data_components::cdc::{ChangesStream, StreamError};
+use data_components::cdc::{ChangesStream, InitialSnapshotMode, StreamError};
 use data_components::postgres_replication::{
-    ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
-    SchemaEvolutionPolicy, config, start_replication_stream_with_policy,
+    PgOutputFormat, ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams,
+    ReplicationStreamInput, SchemaEvolutionPolicy, config, start_replication_stream,
 };
 use datafusion::sql::TableReference;
 use futures::StreamExt;
 use opentelemetry::KeyValue;
-use runtime::component::ComponentType;
 use runtime::component::dataset::Dataset;
-use runtime::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime::federated_table::FederatedTable;
 use runtime::parameters::{ExposedParamLookup, Parameters};
+use runtime_api_types::v1::ComponentType;
+use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use secrecy::SecretString;
 
-const DEFAULT_STATUS_INTERVAL: Duration = Duration::from_secs(10);
+// Standby status feedback cadence. Kept well below Postgres's default
+// `wal_sender_timeout` (60s) so that — combined with the worker's
+// feedback-while-backpressured behavior — a slow apply loop never lets the
+// server's liveness window lapse and reset the walsender. ~1/6 of the default
+// timeout leaves margin under CPU pressure.
+const DEFAULT_STATUS_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_BOOTSTRAP_BATCH_SIZE: usize = 8192;
 const MAX_BOOTSTRAP_BATCH_SIZE: usize = 1_048_576;
+// Upper bound on the configurable shared-slot member channel capacity. Matches
+// the bootstrap-batch ceiling — a bounded, backpressure-preserving queue in
+// front of the accelerator prefetch, not an unbounded buffer.
+const MAX_MEMBER_CHANNEL_CAPACITY: usize = 1_048_576;
 
 pub fn build_changes_stream(
     params: &Parameters,
@@ -68,11 +77,13 @@ pub fn build_changes_stream(
     // A non-persistent accelerator starts empty on every boot, so resuming
     // from an existing slot without a snapshot would silently serve only the
     // rows touched after startup. Force the snapshot on every start for such
-    // accelerators (snapshot + WAL resume converges via the PK upsert).
-    if dataset
-        .acceleration
-        .as_ref()
-        .is_some_and(accelerator_is_ephemeral)
+    // accelerators (snapshot + WAL resume converges via the PK upsert). Only
+    // applies when snapshots are enabled at all — `disabled` opts out entirely.
+    if params_for_stream.initial_snapshot
+        && dataset
+            .acceleration
+            .as_ref()
+            .is_some_and(accelerator_is_ephemeral)
     {
         params_for_stream.snapshot_on_resume = true;
         tracing::info!(
@@ -135,7 +146,12 @@ pub fn build_changes_stream(
         runtime::component::dataset::OnSchemaChange::AppendNewColumns => {
             SchemaEvolutionPolicy::AppendNewColumns
         }
-        runtime::component::dataset::OnSchemaChange::SyncAllColumns => {
+        // A CDC stream cannot drop-and-recreate without losing un-replayable history, so
+        // `drop_and_recreate` adopts widening changes like `sync_all_columns` and rejects
+        // incompatible changes mid-stream. The accelerated table is recreated only on a
+        // `refresh_mode: full` registration, not from the replication stream.
+        runtime::component::dataset::OnSchemaChange::SyncAllColumns
+        | runtime::component::dataset::OnSchemaChange::DropAndRecreate => {
             SchemaEvolutionPolicy::SyncAllColumns
         }
     };
@@ -214,9 +230,10 @@ pub fn build_changes_stream(
             schema_name,
             table_name,
             metrics,
+            policy: schema_evolution_policy,
         };
 
-        let mut inner = start_replication_stream_with_policy(input, schema_evolution_policy);
+        let mut inner = start_replication_stream(input);
         while let Some(item) = inner.next().await {
             yield item?;
         }
@@ -250,15 +267,41 @@ const METRICS: &[MetricSpec] = &[
     )
     .description(
         "Most recent LSN Spice has acknowledged to Postgres. Matches \
-             `pg_replication_slots.confirmed_flush_lsn`.",
-    ),
+             `pg_replication_slots.confirmed_flush_lsn`. Compare its advance rate \
+             against the applied watermark to spot slot-ack racing ahead of apply.",
+    )
+    .auto_register(),
     MetricSpec::new(
         "replication_server_wal_end_lsn",
         MetricType::ObservableGaugeU64,
     )
     .description(
         "Most recent WAL end LSN reported by the Postgres server (via keepalive or WAL data).",
-    ),
+    )
+    .auto_register(),
+    MetricSpec::new(
+        "replication_reader_input_wait_micros_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Cumulative microseconds the replication reader spent BLOCKED awaiting the \
+         next event from the source socket. High relative to \
+         `reader_processing_micros_total` ⇒ source/network can't deliver fast \
+         enough (source-bound); low ⇒ our decode/build is the limiter.",
+    )
+    .unit("us")
+    .auto_register(),
+    MetricSpec::new(
+        "replication_reader_processing_micros_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Cumulative microseconds the replication reader spent decoding + building \
+         change batches (and yielding downstream) after a socket event. The \
+         source-vs-our-decode discriminator, paired with reader_input_wait_micros_total.",
+    )
+    .unit("us")
+    .auto_register(),
     MetricSpec::new(
         "replication_transactions_total",
         MetricType::ObservableCounterU64,
@@ -346,6 +389,59 @@ const METRICS: &[MetricSpec] = &[
          error just means the connection wobbled and we recovered.",
     )
     .auto_register(),
+    MetricSpec::new(
+        "replication_disconnected_ms_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Cumulative milliseconds the replication stream was disconnected across all \
+         reconnects (drop → successful resume, including backoff). Paired with \
+         replication_reconnects_total it quantifies the DURATION cost of a reconnect \
+         storm — no changes are delivered and lag grows while disconnected.",
+    )
+    .unit("ms")
+    .auto_register(),
+    MetricSpec::new(
+        "replication_member_send_stalled_seconds_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Cumulative seconds the shared-slot pump spent blocked delivering committed \
+         changes into this dataset's channel because its sink was not draining \
+         (downstream backpressure). The server replication connection stays alive \
+         throughout; a rising value indicates a slow apply loop stalling the shared \
+         pump. Only reported for datasets on a shared (explicitly-named) slot.",
+    )
+    .auto_register(),
+    MetricSpec::new(
+        "replication_member_attached",
+        MetricType::ObservableGaugeU64,
+    )
+    .description(
+        "1 while this dataset is an attached member of its shared replication slot, \
+         0 once it has detached. A detached member freezes its ack floor and pins WAL \
+         retention for the WHOLE shared slot until it rejoins or spiced restarts, so a \
+         value of 0 is the unambiguous signal for which dataset stalled the slot (the \
+         lag metric grows on the surviving slot-mates instead). Only reported for \
+         datasets on a shared (explicitly-named) slot; a dedicated slot reports no series. \
+         Carries a `slot` label for shared-slot grouping.",
+    )
+    .auto_register(),
+    MetricSpec::new(
+        "replication_member_send_wait_micros_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Cumulative microseconds the shared-slot pump spent awaiting this dataset's \
+         delivery channel while applying committed changes. Unlike \
+         member_send_stalled_seconds_total, this accrues the full per-commit wait \
+         (including sub-second waits). The pump subtracts this wait from \
+         reader_processing_micros_total at the source, so that counter stays \
+         decode-only; this metric exports the subtracted amount for attribution. \
+         Only meaningful for datasets on a shared slot; dedicated-slot datasets will export 0.",
+    )
+    .unit("us")
+    .auto_register(),
 ];
 
 #[derive(Debug, Clone)]
@@ -398,6 +494,16 @@ impl MetricsProvider for PostgresMetricsProvider {
             "replication_server_wal_end_lsn" => {
                 Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
                     instrument.observe(m.server_wal_end_lsn(), &attributes);
+                })))
+            }
+            "replication_reader_input_wait_micros_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.reader_input_wait_micros_total(), &attributes);
+                })))
+            }
+            "replication_reader_processing_micros_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.reader_processing_micros_total(), &attributes);
                 })))
             }
             "replication_transactions_total" => {
@@ -464,6 +570,36 @@ impl MetricsProvider for PostgresMetricsProvider {
                     instrument.observe(m.replication_reconnects_total(), &attributes);
                 })))
             }
+            "replication_disconnected_ms_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.replication_disconnected_ms_total(), &attributes);
+                })))
+            }
+            "replication_member_attached" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    // Observe only for shared-slot members (`Some`); a dedicated slot has
+                    // no member-detach concept, so its series stays absent rather than a
+                    // misleading constant `0`. Append the shared-slot label so the
+                    // analysis can group datasets by slot + join authoritative backlog.
+                    if let Some(v) = m.member_attached() {
+                        let mut attrs = attributes.clone();
+                        if let Some(slot) = m.slot_name() {
+                            attrs.push(KeyValue::new("slot", slot));
+                        }
+                        instrument.observe(v, &attrs);
+                    }
+                })))
+            }
+            "replication_member_send_stalled_seconds_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.member_send_stalled_seconds_total(), &attributes);
+                })))
+            }
+            "replication_member_send_wait_micros_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.member_send_wait_micros_total(), &attributes);
+                })))
+            }
             _ => None,
         }
     }
@@ -495,15 +631,14 @@ fn replication_params_from_connector_params(
     params: &Parameters,
     dataset_name: &str,
 ) -> std::result::Result<ReplicationParams, String> {
-    let host = required_string(params, "host")?;
-    let port = optional_parse::<u16>(params, "port", 5432, "a port number (0-65535)")?;
-    let user = required_string(params, "user")?;
-    let password_str = required_secret(params, "pass")?;
-    let database = required_string(params, "db")?;
-    let sslmode =
-        config::SslMode::from_str_strict(optional_string(params, "sslmode").as_deref())
-            .map_err(|reason| format!("parameter `{}` {reason}", params.user_param("sslmode")))?;
-    let sslrootcert = optional_string(params, "sslrootcert").map(std::path::PathBuf::from);
+    // Same override rule / parser as `PostgresConnectionPool` (see
+    // `crate::connection`): `pg_connection_string` wins over discrete
+    // `pg_host`/`pg_user`/`pg_db`/…; discrete `pg_sslmode` / `pg_sslrootcert`
+    // still override values embedded in the connection string.
+    let identity = crate::connection::connection_identity_from_params(params)?;
+    let sslmode = config::SslMode::from_str_strict(identity.sslmode.as_deref())
+        .map_err(|reason| format!("parameter `{}` {reason}", params.user_param("sslmode")))?;
+    let sslrootcert = identity.sslrootcert.map(std::path::PathBuf::from);
 
     // An explicitly-named slot is shareable: every dataset on the same
     // connection naming the same slot is multiplexed onto one replication
@@ -514,6 +649,12 @@ fn replication_params_from_connector_params(
     let shared = explicit_slot.is_some();
     let (slot_name, publication_name) = match explicit_slot {
         Some(slot) => {
+            config::validate_replication_slot_name(&slot).map_err(|reason| {
+                format!(
+                    "parameter `{}` {reason}",
+                    params.user_param("replication_slot")
+                )
+            })?;
             let publication = optional_string(params, "publication")
                 .unwrap_or_else(|| config::publication_name_for_slot(&slot));
             (slot, publication)
@@ -524,7 +665,7 @@ fn replication_params_from_connector_params(
                 .unwrap_or_else(|| config::default_publication_name(dataset_name)),
         ),
     };
-    let initial_snapshot = optional_bool(params, "replication_initial_snapshot", true)?;
+    let (initial_snapshot, snapshot_on_resume) = parse_initial_snapshot(params)?;
     let temporary_slot = optional_bool(params, "replication_temporary_slot", false)?;
     let status_interval = optional_duration(
         params,
@@ -537,39 +678,43 @@ fn replication_params_from_connector_params(
         DEFAULT_BOOTSTRAP_BATCH_SIZE,
         MAX_BOOTSTRAP_BATCH_SIZE,
     )?;
+    let ready_lag = optional_duration(
+        params,
+        "replication_ready_lag",
+        data_components::cdc::DEFAULT_READY_LAG,
+    )?;
+    // Only meaningful on the shared path, but parsed unconditionally so a
+    // misconfigured value is rejected up front regardless of slot mode.
+    let member_channel_capacity = optional_usize_in_range(
+        params,
+        "replication_member_channel_capacity",
+        data_components::postgres_replication::shared::DEFAULT_MEMBER_CHANNEL_CAPACITY,
+        MAX_MEMBER_CHANNEL_CAPACITY,
+    )?;
 
     Ok(ReplicationParams {
-        host,
-        port,
-        user,
-        password: SecretString::from(password_str),
-        database,
+        host: identity.host,
+        port: identity.port,
+        user: identity.user,
+        password: SecretString::from(identity.password),
+        database: identity.database,
         sslmode,
         sslrootcert,
         slot_name,
         publication_name,
         initial_snapshot,
-        // Set by the caller from the dataset's acceleration config.
-        snapshot_on_resume: false,
+        snapshot_on_resume,
         temporary_slot,
         status_interval,
+        ready_lag,
         bootstrap_batch_size,
         shared,
+        member_channel_capacity,
+        // Binary pgoutput on every stream — faster decode, no source-side text
+        // formatting. Not a user-facing parameter; the per-column text fallback
+        // still handles types Postgres emits as text.
+        pg_output_format: PgOutputFormat::Binary,
     })
-}
-
-fn required_string(params: &Parameters, key: &str) -> std::result::Result<String, String> {
-    match params.get(key).expose() {
-        ExposedParamLookup::Present(v) => Ok(v.to_string()),
-        ExposedParamLookup::Absent(name) => Err(format!("missing required parameter `{name}`")),
-    }
-}
-
-fn required_secret(params: &Parameters, key: &str) -> std::result::Result<String, String> {
-    match params.get(key).expose() {
-        ExposedParamLookup::Present(v) => Ok(v.to_string()),
-        ExposedParamLookup::Absent(name) => Err(format!("missing required secret `{name}`")),
-    }
 }
 
 fn optional_string(params: &Parameters, key: &str) -> Option<String> {
@@ -639,9 +784,68 @@ fn optional_bool(
     }
 }
 
+/// Map the shared [`InitialSnapshotMode`] onto Postgres's two internal flags
+/// `(initial_snapshot, snapshot_on_resume)`:
+///
+/// - `Auto` -> `(true, false)`: snapshot a freshly-created slot; the caller still
+///   forces a resume snapshot for a non-persistent accelerator.
+/// - `Always` -> `(true, true)`: snapshot on every start, including slot resume.
+/// - `Disabled` -> `(false, false)`: never snapshot.
+fn snapshot_flags(mode: InitialSnapshotMode) -> (bool, bool) {
+    match mode {
+        InitialSnapshotMode::Auto => (true, false),
+        InitialSnapshotMode::Always => (true, true),
+        InitialSnapshotMode::Disabled => (false, false),
+    }
+}
+
+/// Resolve `pg_replication_initial_snapshot` into the two internal snapshot
+/// flags. Accepts the shared canonical vocabulary (`auto|always|disabled`, via
+/// [`InitialSnapshotMode::from_canonical`]) and, for backward compatibility, the
+/// legacy booleans `true|false` (mapped to `auto|disabled`).
+///
+/// A typo is rejected rather than silently skipping the bootstrap snapshot (the
+/// same correctness concern that motivates the strict [`optional_bool`]).
+fn parse_initial_snapshot(params: &Parameters) -> std::result::Result<(bool, bool), String> {
+    let Some(raw) = optional_string(params, "replication_initial_snapshot") else {
+        return Ok(snapshot_flags(InitialSnapshotMode::Auto));
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(snapshot_flags(InitialSnapshotMode::Auto));
+    }
+    if let Some(mode) = InitialSnapshotMode::from_canonical(trimmed) {
+        return Ok(snapshot_flags(mode));
+    }
+    // Deprecated boolean spellings map to auto / disabled.
+    match trimmed.to_ascii_lowercase().as_str() {
+        legacy @ ("true" | "1" | "yes" | "y") => {
+            tracing::warn!(
+                "parameter `{}` uses the deprecated boolean value {legacy:?}; use 'auto' instead (or 'always'/'disabled')",
+                params.user_param("replication_initial_snapshot")
+            );
+            Ok(snapshot_flags(InitialSnapshotMode::Auto))
+        }
+        legacy @ ("false" | "0" | "no" | "n") => {
+            tracing::warn!(
+                "parameter `{}` uses the deprecated boolean value {legacy:?}; use 'disabled' instead",
+                params.user_param("replication_initial_snapshot")
+            );
+            Ok(snapshot_flags(InitialSnapshotMode::Disabled))
+        }
+        other => {
+            let user_param = params.user_param("replication_initial_snapshot");
+            Err(format!(
+                "parameter `{user_param}` must be 'auto', 'always', or 'disabled', got {other:?}"
+            ))
+        }
+    }
+}
+
 /// Parses an optional value via `FromStr`. An absent or empty value uses
 /// `default`; a parse failure is reported with the user-facing parameter name
 /// and `expected` description rather than silently substituting the default.
+#[cfg(test)]
 fn optional_parse<T>(
     params: &Parameters,
     key: &str,
@@ -741,13 +945,69 @@ mod tests {
         Parameters::new(vec![], "pg", crate::PARAMETERS)
     }
 
+    // Regression for #11994: CDC must honor `pg_connection_string` the same way
+    // as the federated read pool (libpq key=value; default sslmode verify-full).
+    #[test]
+    fn connection_string_flows_into_replication_params() {
+        let params = Parameters::new(
+            vec![
+                (
+                    "connection_string".to_string(),
+                    SecretString::from(
+                        "host=db.internal port=5433 dbname=csdb user=csuser password=secret",
+                    ),
+                ),
+                ("host".to_string(), SecretString::from("ignored")),
+            ],
+            "pg",
+            crate::PARAMETERS,
+        );
+        let repl = replication_params_from_connector_params(&params, "hits")
+            .expect("valid connection_string should parse");
+        assert_eq!(repl.host, "db.internal");
+        assert_eq!(repl.port, 5433);
+        assert_eq!(repl.user, "csuser");
+        assert_eq!(repl.database, "csdb");
+        assert_eq!(repl.sslmode, config::SslMode::VerifyFull);
+        assert_eq!(
+            secrecy::ExposeSecret::expose_secret(&repl.password),
+            "secret"
+        );
+    }
+
+    #[test]
+    fn uri_connection_string_flows_into_replication_params() {
+        let params = Parameters::new(
+            vec![
+                (
+                    "connection_string".to_string(),
+                    SecretString::from("postgresql://csuser:secret@db.internal:5433/csdb"),
+                ),
+                ("host".to_string(), SecretString::from("ignored")),
+            ],
+            "pg",
+            crate::PARAMETERS,
+        );
+        let repl = replication_params_from_connector_params(&params, "hits")
+            .expect("URI connection_string should parse for CDC");
+        assert_eq!(repl.host, "db.internal");
+        assert_eq!(repl.port, 5433);
+        assert_eq!(repl.user, "csuser");
+        assert_eq!(repl.database, "csdb");
+        assert_eq!(repl.sslmode, config::SslMode::VerifyFull);
+        assert_eq!(
+            secrecy::ExposeSecret::expose_secret(&repl.password),
+            "secret"
+        );
+    }
+
     #[test]
     fn optional_bool_recognizes_true_and_false_tokens() {
         for v in ["true", "TRUE", "1", "yes", "Y", " true "] {
             assert_eq!(
                 optional_bool(
-                    &params_with("replication_initial_snapshot", v),
-                    "replication_initial_snapshot",
+                    &params_with("replication_temporary_slot", v),
+                    "replication_temporary_slot",
                     false
                 ),
                 Ok(true),
@@ -757,8 +1017,8 @@ mod tests {
         for v in ["false", "FALSE", "0", "no", "N", " false "] {
             assert_eq!(
                 optional_bool(
-                    &params_with("replication_initial_snapshot", v),
-                    "replication_initial_snapshot",
+                    &params_with("replication_temporary_slot", v),
+                    "replication_temporary_slot",
                     true
                 ),
                 Ok(false),
@@ -770,7 +1030,7 @@ mod tests {
     #[test]
     fn optional_bool_uses_default_when_absent_or_empty() {
         assert_eq!(
-            optional_bool(&empty_params(), "replication_initial_snapshot", true),
+            optional_bool(&empty_params(), "replication_temporary_slot", true),
             Ok(true)
         );
         assert_eq!(
@@ -779,27 +1039,60 @@ mod tests {
         );
         assert_eq!(
             optional_bool(
-                &params_with("replication_initial_snapshot", "   "),
-                "replication_initial_snapshot",
+                &params_with("replication_temporary_slot", "   "),
+                "replication_temporary_slot",
                 true
             ),
             Ok(true)
         );
     }
 
-    // Regression for #11274: a typo'd `replication_initial_snapshot` previously
-    // collapsed to `false`, silently skipping the bootstrap snapshot and
-    // dropping every pre-existing row. It must now error loudly instead.
+    // Regression for #11274: a typo'd boolean previously collapsed to `false`,
+    // silently changing behavior. It must now error loudly instead.
     #[test]
     fn optional_bool_rejects_unrecognized_value() {
         let result = optional_bool(
-            &params_with("replication_initial_snapshot", "ture"),
-            "replication_initial_snapshot",
+            &params_with("replication_temporary_slot", "ture"),
+            "replication_temporary_slot",
             true,
         );
         assert_eq!(
             result,
-            Err("parameter `pg_replication_initial_snapshot` must be a boolean (true/false), got \"ture\"".to_string())
+            Err("parameter `pg_replication_temporary_slot` must be a boolean (true/false), got \"ture\"".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_initial_snapshot_maps_enum_and_legacy_booleans() {
+        // Canonical enum values -> (initial_snapshot, snapshot_on_resume).
+        for (raw, expected) in [
+            ("auto", (true, false)),
+            ("AUTO", (true, false)),
+            ("always", (true, true)),
+            ("disabled", (false, false)),
+            // Deprecated boolean spellings map to auto / disabled.
+            ("true", (true, false)),
+            ("1", (true, false)),
+            ("false", (false, false)),
+            ("no", (false, false)),
+        ] {
+            assert_eq!(
+                parse_initial_snapshot(&params_with("replication_initial_snapshot", raw)),
+                Ok(expected),
+                "raw: {raw}"
+            );
+        }
+        // Absent -> auto default.
+        assert_eq!(parse_initial_snapshot(&empty_params()), Ok((true, false)));
+    }
+
+    #[test]
+    fn parse_initial_snapshot_rejects_unrecognized_value() {
+        let err = parse_initial_snapshot(&params_with("replication_initial_snapshot", "sometimes"))
+            .expect_err("typo must error");
+        assert_eq!(
+            err,
+            "parameter `pg_replication_initial_snapshot` must be 'auto', 'always', or 'disabled', got \"sometimes\"".to_string()
         );
     }
 
@@ -905,5 +1198,42 @@ mod tests {
                     "parameter `pg_replication_bootstrap_batch_size` must be a positive integer, got \"many\""
                 )
         );
+    }
+
+    fn replication_connection_params(slot: Option<&str>) -> Parameters {
+        let mut entries = vec![
+            ("host".to_string(), SecretString::from("localhost")),
+            ("user".to_string(), SecretString::from("spice")),
+            ("db".to_string(), SecretString::from("spice")),
+        ];
+        if let Some(slot) = slot {
+            entries.push(("replication_slot".to_string(), SecretString::from(slot)));
+        }
+        Parameters::new(entries, "pg", crate::PARAMETERS)
+    }
+
+    #[test]
+    fn replication_params_rejects_invalid_slot_name() {
+        let params =
+            replication_connection_params(Some("scp-onboarding-realtime-analytics-prod-us-east-1"));
+        let err = replication_params_from_connector_params(&params, "hits")
+            .expect_err("hyphenated slot must be rejected");
+        assert!(
+            err.starts_with("parameter `pg_replication_slot` must contain only lowercase"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains("invalid character '-'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn replication_params_accepts_valid_explicit_slot_name() {
+        let params = replication_connection_params(Some("spice_hits_cdc"));
+        let parsed = replication_params_from_connector_params(&params, "hits")
+            .expect("valid slot must parse");
+        assert_eq!(parsed.slot_name, "spice_hits_cdc");
+        assert!(parsed.shared);
     }
 }

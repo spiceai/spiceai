@@ -482,3 +482,13 @@ mod tests {
         );
     }
 }
+
+// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_snowflake as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+runtime::register_data_connector!(
+    register_snowflake_connector,
+    SNOWFLAKE_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    SnowflakeFactory
+);

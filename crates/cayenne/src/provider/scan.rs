@@ -274,6 +274,30 @@ impl CayenneAccelerationExec {
         filters
     }
 
+    /// Returns `true` if any underlying file source carries a pushed-down
+    /// filter — a static predicate or a dynamic join filter.
+    ///
+    /// Whole-table statistics (`num_rows`, per-column `sum`/`min`/`max`) describe
+    /// the *unfiltered* file, so a stats-based aggregate fold
+    /// ([`crate::stats_aggregate`]) must decline whenever a filter is present:
+    /// the metadata cannot answer an aggregate restricted to a row subset.
+    #[must_use]
+    pub(crate) fn has_pushed_filter(&self) -> bool {
+        plan_has_pushed_filter(&self.inner)
+    }
+
+    /// Like [`Self::has_pushed_filter`] but detects a predicate pushed onto a file
+    /// source ANYWHERE in the wrapped plan — including below a deletion-filter exec
+    /// on a merge-on-read table (which [`Self::has_pushed_filter`]'s shallow walk
+    /// stops above). The maintained-aggregate rewrite's soundness guard uses this:
+    /// a maintained view answers the unfiltered relation, so it must decline when a
+    /// query predicate has narrowed the scan — even when a pending-tombstone
+    /// deletion-filter exec sits between the scan wrapper and the source.
+    #[must_use]
+    pub(crate) fn has_pushed_filter_deep(&self) -> bool {
+        plan_has_pushed_filter_deep(&self.inner)
+    }
+
     /// Push additional dynamic filters into the underlying file source.
     ///
     /// Returns `Ok(None)` when the scan source declined all filters or the inner
@@ -298,12 +322,12 @@ impl CayenneAccelerationExec {
     }
 }
 
-/// Refills only the `Precision::Absent` `distinct_count` (NDV) in `child` from
-/// `overlay`, restoring the join-key NDV that the Cayenne base+delta `UnionExec`
-/// drops (a stat-less/empty delta branch makes `col_stats_union` return `Absent`,
-/// collapsing `estimate_inner_join_cardinality` to `min(L, R)`). Present child
-/// stats — filter-aware `num_rows`/`null_count` and any surviving column stat —
-/// are preserved; a column-count mismatch is a defensive no-op.
+/// Refills the `Precision::Absent` `num_rows` and per-column `distinct_count`
+/// (NDV) in `child` from `overlay`, restoring the table size and join-key NDV
+/// that the Cayenne base+delta `UnionExec` drops. A stat-less branch (e.g. a
+/// `collect_stats=false` scan during pending deletions) makes the union return
+/// `num_rows = Absent` — the `(Absent, _) => Absent` rule discards the known
+/// per-branch counts — and makes `col_stats_union` drop NDV.
 ///
 /// `UnionExec` can't fix this itself: an `Absent` branch means *unknown*, not
 /// *empty*, so it must drop the NDV, which isn't additive across branches of
@@ -319,20 +343,49 @@ impl CayenneAccelerationExec {
 /// reads only `total_byte_size`/`num_rows`, and join-cardinality estimation
 /// prefers NDV when present, so the restored NDV is what carries the estimate —
 /// min/max are not needed here and only re-introduce the assertion hazard.
+///
+/// The refilled NDV is capped at the child's `num_rows`: a column cannot have
+/// more distinct values than it has rows. The overlay NDV is the whole-table HLL
+/// aggregate, which only ever GROWS — it is never shrunk on a delete, an
+/// upsert-supersede, or a retention drop, and is not filter-aware — so on a
+/// churned or selectively-filtered scan it can exceed the child's live row count.
+/// Without the cap that never-shrink over-count would inflate the per-key NDV and
+/// mis-drive `estimate_inner_join_cardinality`.
 fn restore_absent_column_statistics(mut child: Statistics, overlay: &Statistics) -> Statistics {
     if child.column_statistics.len() != overlay.column_statistics.len() {
         return child;
     }
+    // Backfill an Absent num_rows from the overlay's maintained whole-table count
+    if matches!(child.num_rows, Precision::Absent)
+        && matches!(overlay.num_rows, Precision::Exact(n) | Precision::Inexact(n) if n > 0)
+    {
+        child.num_rows = overlay.num_rows;
+    }
+    let child_num_rows = child.num_rows;
     for (col, src) in child
         .column_statistics
         .iter_mut()
         .zip(overlay.column_statistics.iter())
     {
         if matches!(col.distinct_count, Precision::Absent) {
-            col.distinct_count = src.distinct_count;
+            col.distinct_count = cap_distinct_count_at_rows(src.distinct_count, child_num_rows);
         }
     }
     child
+}
+
+/// Clamp an NDV (`distinct_count`) to a row count — a column cannot have more
+/// distinct values than it has rows. Returns the NDV unchanged when either side
+/// is unknown or it is already within bounds; a clamped value is `Inexact`
+/// (it is a derived bound, not a measured count).
+fn cap_distinct_count_at_rows(
+    distinct_count: Precision<usize>,
+    num_rows: Precision<usize>,
+) -> Precision<usize> {
+    match (distinct_count.get_value(), num_rows.get_value()) {
+        (Some(&ndv), Some(&rows)) if ndv > rows => Precision::Inexact(rows),
+        _ => distinct_count,
+    }
 }
 
 fn compute_scan_identity(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<ScanIdentity>> {
@@ -410,6 +463,52 @@ fn file_scan_configs(plan: &Arc<dyn ExecutionPlan>) -> Vec<&FileScanConfig> {
     configs
 }
 
+/// Whether any file source reachable from `plan` carries a pushed-down filter (a
+/// static predicate or a dynamic join filter). Reachability is exactly what
+/// [`file_scan_configs`] walks — it descends only identity-preserving wrappers
+/// and `UnionExec` (the Cayenne base+delta shape), not arbitrary intermediate
+/// operators — so a filter buried under a non-passthrough node is not detected.
+/// That matches the intended callers, whose `FileScanConfig`s sit directly under
+/// such wrappers: the file-metadata `num_rows` describes the *unfiltered* file,
+/// so a consumer reasoning about a scan's live row count — e.g. the deletion
+/// filter's delete-aware `num_rows`, which subtracts a whole-table deletion count
+/// — must not treat a filtered scan's (subset) count as the whole-table count.
+/// Reused by [`CayenneAccelerationExec::has_pushed_filter`] and the
+/// deletion-filter execs.
+pub(crate) fn plan_has_pushed_filter(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    file_scan_configs(plan)
+        .iter()
+        .any(|config| config.file_source().filter().is_some())
+}
+
+/// Like [`plan_has_pushed_filter`] but walks the ENTIRE subtree (every descendant,
+/// not just the identity-preserving whitelist), so a query predicate pushed onto a
+/// file source BELOW a non-passthrough operator is still detected. The critical
+/// case is a merge-on-read table with pending tombstones: `scan()` wraps the Vortex
+/// `DataSourceExec` in a deletion-filter exec (which is NOT identity-preserving, so
+/// [`plan_has_pushed_filter`] stops above it), and a Vortex-convertible `WHERE` is
+/// pushed THROUGH that exec onto the source. The aggregate-rewrite soundness guard
+/// must see that predicate — otherwise a maintained / whole-file aggregate silently
+/// serves the unfiltered relation for a filtered query. Over-detection is sound for
+/// that guard: it only ever causes a decline (the real scan+aggregate runs).
+/// Distinct from [`plan_has_pushed_filter`], which is intentionally shallow because
+/// the deletion-filter exec's delete-aware `num_rows` math must NOT see a filtered
+/// (subset) count as a whole-table count.
+pub(crate) fn plan_has_pushed_filter_deep(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    if let Some(data_source_exec) = plan.downcast_ref::<DataSourceExec>() {
+        return data_source_exec
+            .data_source()
+            .downcast_ref::<FileScanConfig>()
+            .is_some_and(|config| config.file_source().filter().is_some());
+    }
+    for child in plan.children() {
+        if plan_has_pushed_filter_deep(child) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Counts file-backed scan sources (snapshot generations) and the total files
 /// across them in `plan`, returning `(snapshots_scanned, files_scanned)`.
 ///
@@ -484,7 +583,7 @@ fn collect_file_scan_configs<'a>(
         return;
     }
 
-    if plan.downcast_ref::<UnionExec>().is_some() {
+    if plan.is::<UnionExec>() {
         for child in plan.children() {
             collect_file_scan_configs(child, configs);
         }
@@ -513,15 +612,11 @@ fn collect_file_scan_configs<'a>(
 /// it stops a future operator from silently being treated as transparent.
 #[expect(deprecated)]
 fn is_identity_preserving_wrapper(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    if plan.downcast_ref::<ProjectionExec>().is_some()
-        || plan.downcast_ref::<RepartitionExec>().is_some()
-        || plan
-            .downcast_ref::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
-            .is_some()
-        || plan
-            .downcast_ref::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
-            .is_some()
-        || plan.downcast_ref::<CayenneAccelerationExec>().is_some()
+    if plan.is::<ProjectionExec>()
+        || plan.is::<RepartitionExec>()
+        || plan.is::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
+        || plan.is::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
+        || plan.is::<CayenneAccelerationExec>()
     {
         return true;
     }
@@ -606,7 +701,7 @@ fn push_dynamic_filters_to_data_source(
         return Ok(None);
     }
 
-    let is_union = plan.downcast_ref::<UnionExec>().is_some();
+    let is_union = plan.is::<UnionExec>();
     if !is_union && !is_identity_preserving_wrapper(&plan) {
         return Ok(None);
     }
@@ -918,11 +1013,7 @@ mod tests {
                 .partition_count(),
             4
         );
-        assert!(
-            repartitioned_plan
-                .downcast_ref::<RepartitionExec>()
-                .is_some()
-        );
+        assert!(repartitioned_plan.is::<RepartitionExec>());
     }
 
     #[test]
@@ -952,7 +1043,7 @@ mod tests {
             .expect("inner plan should support projection swapping");
 
         assert!(
-            swapped.downcast_ref::<CayenneAccelerationExec>().is_some(),
+            swapped.is::<CayenneAccelerationExec>(),
             "projection-swapped Cayenne plan should stay wrapped for optimizer identification"
         );
     }
@@ -1103,7 +1194,9 @@ mod tests {
                 max_value: Precision::Inexact(ScalarValue::Int64(Some(9999))),
                 min_value: Precision::Inexact(ScalarValue::Int64(Some(1))),
                 sum_value: Precision::Absent,
-                distinct_count: Precision::Inexact(42),
+                // <= the 3-row union count, so the row-count cap is a no-op here;
+                // the cap has its own tests (`overlay_refilled_ndv_*`).
+                distinct_count: Precision::Inexact(2),
                 byte_size: Precision::Absent,
             }],
         });
@@ -1133,7 +1226,7 @@ mod tests {
         let col = &restored.column_statistics[0];
         assert!(matches!(col.min_value, Precision::Absent));
         assert!(matches!(col.max_value, Precision::Absent));
-        assert_eq!(col.distinct_count, Precision::Inexact(42));
+        assert_eq!(col.distinct_count, Precision::Inexact(2));
         assert_eq!(
             restored.num_rows, poisoned.num_rows,
             "overlay must not override the child's filter-aware num_rows"
@@ -1205,5 +1298,166 @@ mod tests {
         // Absent distinct_count is filled from the overlay.
         assert_eq!(col.distinct_count, Precision::Inexact(50));
         assert_eq!(restored.num_rows, Precision::Exact(100));
+    }
+
+    /// The base+delta `UnionExec` collapses `num_rows` to `Absent` when a branch
+    /// is stat-less (e.g. `collect_stats=false` during pending deletions). The
+    /// overlay's maintained whole-table count backfills it.
+    #[test]
+    fn restore_backfills_absent_num_rows_from_overlay() {
+        use datafusion_common::ColumnStatistics;
+
+        let child = Statistics {
+            num_rows: Precision::Absent, // union collapsed the per-branch counts
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics::new_unknown()],
+        };
+        let overlay = Statistics {
+            num_rows: Precision::Inexact(21_420_000), // maintained table count
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics::new_unknown()],
+        };
+
+        let restored = restore_absent_column_statistics(child, &overlay);
+        assert_eq!(restored.num_rows, Precision::Inexact(21_420_000));
+    }
+
+    /// A non-positive overlay count (cold/un-seeded aggregate, or the window
+    /// before the first checkpoint seeds a `cdc_durability: memory` table) carries
+    /// no information and must NOT be restored: doing so mis-sizes the join and,
+    /// via the NDV cap, would zero every refilled `distinct_count`. The child stays
+    /// Absent — better than reporting an invalid 0.
+    #[test]
+    fn restore_does_not_backfill_num_rows_from_zero_overlay() {
+        use datafusion_common::ColumnStatistics;
+
+        let child = Statistics {
+            num_rows: Precision::Absent,
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Absent,
+                max_value: Precision::Absent,
+                min_value: Precision::Absent,
+                sum_value: Precision::Absent,
+                distinct_count: Precision::Absent,
+                byte_size: Precision::Absent,
+            }],
+        };
+        let overlay = Statistics {
+            num_rows: Precision::Inexact(0), // un-seeded maintained count
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Absent,
+                max_value: Precision::Absent,
+                min_value: Precision::Absent,
+                sum_value: Precision::Absent,
+                distinct_count: Precision::Inexact(98_421), // good HLL NDV
+                byte_size: Precision::Absent,
+            }],
+        };
+
+        let restored = restore_absent_column_statistics(child, &overlay);
+        // num_rows left Absent (not restored to 0)...
+        assert_eq!(restored.num_rows, Precision::Absent);
+        // ...so the NDV cap does not collapse the refilled distinct_count to 0:
+        // with an Absent row count the cap is a no-op and the good NDV survives.
+        assert_eq!(
+            restored.column_statistics[0].distinct_count,
+            Precision::Inexact(98_421),
+        );
+    }
+
+    /// A present (filter-aware) child `num_rows` must win over the whole-table
+    /// overlay count — the overlay is only a fallback for an `Absent` count.
+    #[test]
+    fn restore_preserves_present_num_rows_over_overlay() {
+        use datafusion_common::ColumnStatistics;
+
+        let child = Statistics {
+            num_rows: Precision::Inexact(500),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics::new_unknown()],
+        };
+        let overlay = Statistics {
+            num_rows: Precision::Inexact(21_420_000),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics::new_unknown()],
+        };
+
+        let restored = restore_absent_column_statistics(child, &overlay);
+        assert_eq!(restored.num_rows, Precision::Inexact(500));
+    }
+
+    /// The refilled NDV is capped at the child's `num_rows`: a column cannot have
+    /// more distinct values than it has rows. The whole-table overlay NDV is an
+    /// HLL union that only grows (never shrinks on delete/upsert-supersede), so it
+    /// can exceed the live row count; the cap keeps it from inflating the join
+    /// cardinality estimate.
+    #[test]
+    fn overlay_refilled_ndv_is_capped_at_num_rows() {
+        use datafusion_common::ColumnStatistics;
+
+        let child = Statistics {
+            num_rows: Precision::Exact(3),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Absent,
+                max_value: Precision::Absent,
+                min_value: Precision::Absent,
+                sum_value: Precision::Absent,
+                distinct_count: Precision::Absent,
+                byte_size: Precision::Absent,
+            }],
+        };
+        let overlay = Statistics {
+            num_rows: Precision::Absent,
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Absent,
+                max_value: Precision::Absent,
+                min_value: Precision::Absent,
+                sum_value: Precision::Absent,
+                // Over-counts the live 3 rows (HLL never-shrink drift).
+                distinct_count: Precision::Inexact(42),
+                byte_size: Precision::Absent,
+            }],
+        };
+
+        let restored = restore_absent_column_statistics(child, &overlay);
+        // Capped at num_rows (3), not the inflated overlay NDV (42).
+        assert_eq!(
+            restored.column_statistics[0].distinct_count,
+            Precision::Inexact(3)
+        );
+    }
+
+    /// The NDV cap clamps only when the NDV strictly exceeds the row count, and is
+    /// a no-op when either side is unknown.
+    #[test]
+    fn cap_distinct_count_at_rows_clamps_only_when_exceeding() {
+        // Exceeds rows -> clamped to rows (Inexact).
+        assert_eq!(
+            cap_distinct_count_at_rows(Precision::Inexact(42), Precision::Exact(3)),
+            Precision::Inexact(3)
+        );
+        // Within bounds -> unchanged.
+        assert_eq!(
+            cap_distinct_count_at_rows(Precision::Inexact(2), Precision::Exact(3)),
+            Precision::Inexact(2)
+        );
+        // Equal -> unchanged.
+        assert_eq!(
+            cap_distinct_count_at_rows(Precision::Exact(3), Precision::Exact(3)),
+            Precision::Exact(3)
+        );
+        // Unknown NDV or unknown rows -> unchanged.
+        assert_eq!(
+            cap_distinct_count_at_rows(Precision::Absent, Precision::Exact(3)),
+            Precision::Absent
+        );
+        assert_eq!(
+            cap_distinct_count_at_rows(Precision::Inexact(5), Precision::Absent),
+            Precision::Inexact(5)
+        );
     }
 }

@@ -24,6 +24,7 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
+use datafusion::common::utils::quote_identifier;
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
 use datafusion::sql::TableReference;
@@ -49,12 +50,23 @@ pub enum Error {
         "PostgreSQL query failed: {source}. Check SQL syntax and that referenced tables exist. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
     ))]
     QueryFailed { source: tokio_postgres::Error },
+
+    /// Wraps errors from the shared `connector-postgres-common` queries
+    /// (`list_schemas`/`list_tables`, re-exported below) so this crate's own
+    /// callers can still propagate them with `?`.
+    #[snafu(display("{source}"), context(false))]
+    Common {
+        source: connector_postgres_common::Error,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// System schemas to exclude from discovery.
-const SYSTEM_SCHEMAS: &[&str] = &["information_schema", "pg_catalog", "pg_toast"];
+pub use connector_postgres_common::{
+    ReplicaIdentityOutcome, ReplicationSlotStatus, SkipReason, check_cdc_prerequisites,
+    classify_replica_identity, list_schemas, list_tables, primary_key_columns, replica_identity,
+    replication_slot_status, wal_sender_timeout_ms,
+};
 
 /// A single foreign key constraint discovered from `information_schema`.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -87,6 +99,7 @@ pub struct PostgresCatalogProvider {
     table_creator: Arc<dyn Read>,
     schemas: RwLock<HashMap<String, Arc<PostgresSchemaProvider>>>,
     include: Option<Arc<GlobSet>>,
+    exclude: Option<Arc<GlobSet>>,
 }
 
 impl std::fmt::Debug for PostgresCatalogProvider {
@@ -103,6 +116,7 @@ impl PostgresCatalogProvider {
         pool: Arc<PostgresConnectionPool>,
         table_creator: Arc<dyn Read>,
         include: Option<GlobSet>,
+        exclude: Option<GlobSet>,
     ) -> Self {
         Self {
             catalog_name,
@@ -110,6 +124,7 @@ impl PostgresCatalogProvider {
             table_creator,
             schemas: RwLock::new(HashMap::new()),
             include: include.map(Arc::new),
+            exclude: exclude.map(Arc::new),
         }
     }
 
@@ -146,11 +161,56 @@ impl PostgresCatalogProvider {
                 schema_name.clone(),
                 Arc::clone(&self.table_creator),
                 self.include.clone(),
+                self.exclude.clone(),
             );
-            schema_provider
+            // A single schema's table discovery failing (e.g. a transient
+            // connection reset or lock timeout) must not abort the whole catalog
+            // load; skip just this schema and keep the others (#11724).
+            //
+            // This provider is polled repeatedly by `RefreshingCatalogProvider`,
+            // not just at initial load, so a transient failure on a schema that
+            // previously refreshed fine must not remove it from the catalog
+            // either. Look up (not clone) the last-known-good entry for just this
+            // one schema — only reading `self.schemas` on the failure path avoids
+            // cloning the whole map on every refresh cycle when nothing fails.
+            let refresh_result = schema_provider
                 .refresh_tables(&foreign_keys, &comments)
-                .await?;
-            schemas.insert(schema_name.clone(), Arc::new(schema_provider));
+                .await;
+            let previous = if refresh_result.is_ok() {
+                None
+            } else {
+                let guard = match self.schemas.read() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.get(schema_name).cloned()
+            };
+
+            match schema_refresh_outcome(refresh_result.is_ok(), previous.is_some()) {
+                SchemaRefreshOutcome::InsertNew => {
+                    schemas.insert(schema_name.clone(), Arc::new(schema_provider));
+                }
+                SchemaRefreshOutcome::KeepPrevious => {
+                    // Only the (Err, Some) branch reaches here, so both are present.
+                    if let (Err(e), Some(previous)) = (&refresh_result, previous) {
+                        tracing::warn!(
+                            schema = %schema_name,
+                            error = %e,
+                            "Failed to discover tables for schema, keeping last-known-good state"
+                        );
+                        schemas.insert(schema_name.clone(), previous);
+                    }
+                }
+                SchemaRefreshOutcome::Skip => {
+                    if let Err(e) = &refresh_result {
+                        tracing::warn!(
+                            schema = %schema_name,
+                            error = %e,
+                            "Failed to discover tables for schema, skipping schema"
+                        );
+                    }
+                }
+            }
         }
 
         {
@@ -217,10 +277,8 @@ impl PostgresCatalogProvider {
 
             let table_constraints = constraints_by_table.entry(table_name).or_default();
 
-            let foreign_table = format!(
-                "{}.{}.{}",
-                self.catalog_name, referenced_schema, referenced_table
-            );
+            let foreign_table =
+                foreign_key_target(&self.catalog_name, &referenced_schema, &referenced_table);
             let fk =
                 table_constraints
                     .entry(constraint_name)
@@ -308,34 +366,7 @@ impl PostgresCatalogProvider {
     }
 
     async fn list_schemas(&self) -> Result<Vec<String>> {
-        let conn = self
-            .pool
-            .connect_direct()
-            .await
-            .context(ConnectionFailedSnafu)?;
-
-        let rows = conn
-            .conn
-            .query(
-                "SELECT schema_name FROM information_schema.schemata ORDER BY schema_name",
-                &[],
-            )
-            .await
-            .context(QueryFailedSnafu)?;
-
-        let names: Vec<String> = rows
-            .iter()
-            .filter_map(|row| {
-                let name: String = row.get(0);
-                if SYSTEM_SCHEMAS.contains(&name.as_str()) || name.starts_with("pg_temp") {
-                    None
-                } else {
-                    Some(name)
-                }
-            })
-            .collect();
-
-        Ok(names)
+        Ok(list_schemas(&self.pool).await?)
     }
 }
 
@@ -374,6 +405,7 @@ pub struct PostgresSchemaProvider {
     table_creator: Arc<dyn Read>,
     tables: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
     include: Option<Arc<GlobSet>>,
+    exclude: Option<Arc<GlobSet>>,
 }
 
 impl std::fmt::Debug for PostgresSchemaProvider {
@@ -391,6 +423,7 @@ impl PostgresSchemaProvider {
         schema_name: String,
         table_creator: Arc<dyn Read>,
         include: Option<Arc<GlobSet>>,
+        exclude: Option<Arc<GlobSet>>,
     ) -> Self {
         Self {
             pool,
@@ -398,6 +431,7 @@ impl PostgresSchemaProvider {
             table_creator,
             tables: RwLock::new(HashMap::new()),
             include,
+            exclude,
         }
     }
 
@@ -413,6 +447,7 @@ impl PostgresSchemaProvider {
             table_names,
             &self.table_creator,
             self.include.as_deref(),
+            self.exclude.as_deref(),
             foreign_keys,
             comments,
         )
@@ -430,32 +465,71 @@ impl PostgresSchemaProvider {
     }
 
     async fn list_tables(&self) -> Result<Vec<String>> {
-        let conn = self
-            .pool
-            .connect_direct()
-            .await
-            .context(ConnectionFailedSnafu)?;
-
-        let rows = conn
-            .conn
-            .query(
-                "SELECT table_name FROM information_schema.tables \
-                 WHERE table_schema = $1 \
-                 AND table_type IN ('BASE TABLE', 'VIEW') \
-                 ORDER BY table_name",
-                &[&self.schema_name],
-            )
-            .await
-            .context(QueryFailedSnafu)?;
-
-        let names: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
-        Ok(names)
+        // Include view-like relations (views, materialized views, foreign
+        // tables) here -- the non-accelerated schema provider serves them as
+        // ordinary read-only federated tables. The accelerated catalog path
+        // passes `include_views: false` so only CDC-able base tables are
+        // discovered. See `connector_postgres_common::list_tables`.
+        Ok(list_tables(&self.pool, &self.schema_name, true).await?)
     }
 }
 
-fn is_table_included(schema_name: &str, table_name: &str, include: Option<&GlobSet>) -> bool {
+/// Build the fully-qualified name of a foreign-key target table
+/// (`catalog.schema.table`) for the `foreign_keys` schema metadata.
+///
+/// Each component is quoted following `PostgreSQL` `quote_ident` semantics
+/// (quoted only when required, doubling any embedded `"`) so the joined name
+/// round-trips back to the exact `(catalog, schema, table)` triple via
+/// `TableReference::parse_str`, even when a component legally contains a `.`
+/// (a quoted identifier such as `"my.schema"`). See #11727.
+fn foreign_key_target(catalog: &str, schema: &str, table: &str) -> String {
+    format!(
+        "{}.{}.{}",
+        quote_identifier(catalog),
+        quote_identifier(schema),
+        quote_identifier(table),
+    )
+}
+
+fn is_table_selected(
+    schema_name: &str,
+    table_name: &str,
+    include: Option<&GlobSet>,
+    exclude: Option<&GlobSet>,
+) -> bool {
     let schema_with_table = format!("{schema_name}.{table_name}");
-    include.is_none_or(|globset| globset.is_match(&schema_with_table))
+    let included = include.is_none_or(|globset| globset.is_match(&schema_with_table));
+    let excluded = exclude.is_some_and(|globset| globset.is_match(&schema_with_table));
+    included && !excluded
+}
+
+/// What `refresh_schemas` does with a single schema after attempting to refresh
+/// its tables (#11724). Factored out as a pure decision so the
+/// (refresh succeeded / failed) × (previous entry present / absent) matrix can be
+/// unit-tested without live `PostgreSQL` I/O, guarding against a refactor
+/// reintroducing the all-or-nothing failure mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchemaRefreshOutcome {
+    /// Refresh succeeded — install the freshly discovered schema.
+    InsertNew,
+    /// Refresh failed but a last-known-good entry exists — keep it so a
+    /// transient error doesn't flap a previously healthy schema out of the catalog.
+    KeepPrevious,
+    /// Refresh failed and the schema has never refreshed successfully — drop it
+    /// for this cycle.
+    Skip,
+}
+
+/// Decide the outcome for a schema from whether its table refresh succeeded and
+/// whether a previously discovered entry exists. A successful refresh always
+/// installs the new schema; a failure keeps the last-known-good entry when one
+/// exists and otherwise skips the schema.
+fn schema_refresh_outcome(refresh_succeeded: bool, has_previous: bool) -> SchemaRefreshOutcome {
+    match (refresh_succeeded, has_previous) {
+        (true, _) => SchemaRefreshOutcome::InsertNew,
+        (false, true) => SchemaRefreshOutcome::KeepPrevious,
+        (false, false) => SchemaRefreshOutcome::Skip,
+    }
 }
 
 async fn build_table_providers_for_schema(
@@ -463,6 +537,7 @@ async fn build_table_providers_for_schema(
     table_names: Vec<String>,
     table_creator: &Arc<dyn Read>,
     include: Option<&GlobSet>,
+    exclude: Option<&GlobSet>,
     foreign_keys: &ForeignKeyMap,
     comments: &CommentMap,
 ) -> HashMap<String, Arc<dyn TableProvider>> {
@@ -470,8 +545,13 @@ async fn build_table_providers_for_schema(
 
     for table_name in table_names {
         let schema_with_table = format!("{schema_name}.{table_name}");
-        if !is_table_included(schema_name, &table_name, include) {
-            tracing::debug!("Table {schema_with_table} is not included, skipping");
+        if !is_table_selected(schema_name, &table_name, include, exclude) {
+            let reason = if include.is_some_and(|globset| !globset.is_match(&schema_with_table)) {
+                "does not match include patterns"
+            } else {
+                "matches exclude patterns"
+            };
+            tracing::debug!("Table {schema_with_table} is not selected ({reason}), skipping");
             continue;
         }
 
@@ -606,8 +686,9 @@ impl SchemaProvider for PostgresSchemaProvider {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommentMap, ForeignKeyConstraint, ForeignKeyMap, TableComments,
-        build_table_providers_for_schema, is_table_included,
+        CommentMap, ForeignKeyConstraint, ForeignKeyMap, SchemaRefreshOutcome, TableComments,
+        build_table_providers_for_schema, foreign_key_target, is_table_selected,
+        schema_refresh_outcome,
     };
     use crate::{
         DESCRIPTION_METADATA_KEY, FOREIGN_KEYS_METADATA_KEY, Read, SOURCE_TYPE_METADATA_KEY,
@@ -703,7 +784,7 @@ mod tests {
         }
     }
 
-    fn make_include(patterns: &[&str]) -> Arc<globset::GlobSet> {
+    fn make_globset(patterns: &[&str]) -> Arc<globset::GlobSet> {
         let mut builder = GlobSetBuilder::new();
         for pattern in patterns {
             builder.add(Glob::new(pattern).expect("glob pattern should parse"));
@@ -711,17 +792,102 @@ mod tests {
         Arc::new(builder.build().expect("glob set should build"))
     }
 
+    /// Regression test for #11727: a foreign-key target whose schema or table
+    /// name legally contains a `.` (e.g. a schema created as `"my.schema"`)
+    /// must round-trip back to the exact `(catalog, schema, table)` triple.
+    ///
+    /// The pre-fix code joined the parts with a bare `format!("{}.{}.{}")`,
+    /// producing the ambiguous `spice.my.schema.customers`. That string has four
+    /// identifier parts, which `TableReference::parse_str` cannot resolve to a
+    /// 3-part reference — it silently degrades to a bare table name, so a
+    /// downstream NL-to-SQL consumer loses (or misresolves) the FK target.
     #[test]
-    fn test_is_table_included_with_glob_filter() {
-        let include = make_include(&["public.orders"]);
-        assert!(is_table_included("public", "orders", Some(&include)));
-        assert!(!is_table_included("public", "lineitem", Some(&include)));
+    fn foreign_key_target_with_dotted_identifier_round_trips() {
+        let cases = [
+            ("spice", "my.schema", "customers"),
+            ("spice", "sales", "order.lines"),
+            ("odd.catalog", "sales", "customers"),
+            // A component containing a literal double-quote must also survive.
+            ("spice", "we\"ird", "customers"),
+        ];
+
+        for (catalog, schema, table) in cases {
+            let target = foreign_key_target(catalog, schema, table);
+            let parsed = TableReference::parse_str(&target);
+
+            assert_eq!(
+                parsed.catalog(),
+                Some(catalog),
+                "catalog must round-trip (target = `{target}`)"
+            );
+            assert_eq!(
+                parsed.schema(),
+                Some(schema),
+                "schema must round-trip (target = `{target}`)"
+            );
+            assert_eq!(
+                parsed.table(),
+                table,
+                "table must round-trip (target = `{target}`)"
+            );
+        }
+    }
+
+    /// Regression coverage for #11724: the per-schema failure decision must keep
+    /// a previously healthy schema on a transient error and only drop a schema
+    /// that has never refreshed successfully — never abort the whole catalog.
+    #[test]
+    fn schema_refresh_outcome_covers_full_matrix() {
+        // A successful refresh always installs the freshly discovered schema,
+        // regardless of whether a previous entry existed.
+        assert_eq!(
+            schema_refresh_outcome(true, true),
+            SchemaRefreshOutcome::InsertNew
+        );
+        assert_eq!(
+            schema_refresh_outcome(true, false),
+            SchemaRefreshOutcome::InsertNew
+        );
+        // A failed refresh keeps the last-known-good entry when one exists...
+        assert_eq!(
+            schema_refresh_outcome(false, true),
+            SchemaRefreshOutcome::KeepPrevious
+        );
+        // ...and only drops the schema when it has never refreshed successfully.
+        assert_eq!(
+            schema_refresh_outcome(false, false),
+            SchemaRefreshOutcome::Skip
+        );
+    }
+
+    #[test]
+    fn test_is_table_selected_with_glob_filter() {
+        let include = make_globset(&["public.orders"]);
+        assert!(is_table_selected("public", "orders", Some(&include), None));
+        assert!(!is_table_selected(
+            "public",
+            "lineitem",
+            Some(&include),
+            None
+        ));
+    }
+
+    #[test]
+    fn test_is_table_selected_with_exclude_filter() {
+        let exclude = make_globset(&["public.secrets"]);
+        assert!(is_table_selected("public", "orders", None, Some(&exclude)));
+        assert!(!is_table_selected(
+            "public",
+            "secrets",
+            None,
+            Some(&exclude)
+        ));
     }
 
     #[tokio::test]
     async fn test_build_table_providers_applies_include_filter_before_factory() {
         let read = Arc::new(MockRead::new(HashSet::new()));
-        let include = make_include(&["public.orders"]);
+        let include = make_globset(&["public.orders"]);
         let table_creator: Arc<dyn Read> = Arc::<MockRead>::clone(&read);
         let no_fks: ForeignKeyMap = HashMap::new();
         let no_comments: CommentMap = HashMap::new();
@@ -731,6 +897,31 @@ mod tests {
             vec!["orders".to_string(), "lineitem".to_string()],
             &table_creator,
             Some(&include),
+            None,
+            &no_fks,
+            &no_comments,
+        )
+        .await;
+
+        assert_eq!(tables.len(), 1);
+        assert!(tables.contains_key("orders"));
+        assert_eq!(read.seen_tables(), vec!["public.orders".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_build_table_providers_applies_exclude_filter_before_factory() {
+        let read = Arc::new(MockRead::new(HashSet::new()));
+        let exclude = make_globset(&["public.lineitem"]);
+        let table_creator: Arc<dyn Read> = Arc::<MockRead>::clone(&read);
+        let no_fks: ForeignKeyMap = HashMap::new();
+        let no_comments: CommentMap = HashMap::new();
+
+        let tables = build_table_providers_for_schema(
+            "public",
+            vec!["orders".to_string(), "lineitem".to_string()],
+            &table_creator,
+            None,
+            Some(&exclude),
             &no_fks,
             &no_comments,
         )
@@ -754,6 +945,7 @@ mod tests {
             "public",
             vec!["orders".to_string(), "lineitem".to_string()],
             &table_creator,
+            None,
             None,
             &no_fks,
             &no_comments,
@@ -784,6 +976,7 @@ mod tests {
             vec!["orders".to_string(), "lineitem".to_string()],
             &table_creator,
             None,
+            None,
             &no_fks,
             &no_comments,
         )
@@ -812,6 +1005,7 @@ mod tests {
             "public",
             vec!["orders".to_string(), "lineitem".to_string()],
             &table_creator,
+            None,
             None,
             &fk_map,
             &no_comments,
@@ -863,6 +1057,7 @@ mod tests {
             "public",
             vec!["order_lines".to_string()],
             &table_creator,
+            None,
             None,
             &fk_map,
             &no_comments,
@@ -917,6 +1112,7 @@ mod tests {
             "public",
             vec!["orders".to_string()],
             &table_creator,
+            None,
             None,
             &no_fks,
             &comments,

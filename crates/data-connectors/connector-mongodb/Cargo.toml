@@ -23,9 +23,11 @@ license-file.workspace = true
 description = "MongoDB data connector for Spice.ai runtime"
 
 [dependencies]
+arrow.workspace = true
+arrow-buffer.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
-data_components = { path = "../../data_components", features = ["mongodb"] }
+data_components = { path = "../../data_components" }
 datafusion.workspace = true
 datafusion-table-providers = { workspace = true, features = ["mongodb"] }
 fundu.workspace = true
@@ -43,3 +45,13 @@ tracing.workspace = true
 
 [features]
 default = []
+
+[dev-dependencies]
+criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
+
+[[bench]]
+name = "mongodb_change_stream"
+harness = false
+
+[lints]
+workspace = true

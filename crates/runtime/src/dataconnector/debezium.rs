@@ -22,8 +22,8 @@ use crate::accelerated_table::refresh_task::changes::{
 };
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::dataset::{Dataset, OnSchemaChange};
-use crate::component::metrics::MetricsProvider;
 use crate::dataaccelerator::spice_sys::{self, OpenOption, debezium_kafka::DebeziumKafkaSys};
+use crate::dataconnector::schema_projection::{ProjectionPolicy, parse_schema_projection};
 use crate::dataconnector::{
     ConnectorComponent,
     kafka::{SidecarOffsetCommitHook, SidecarOffsetStore},
@@ -43,6 +43,7 @@ use data_components::kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics, KafkaOffs
 use data_components::schema_discovery::merge_inferred_and_declared_schemas;
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
+use runtime_metrics::component::MetricsProvider;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::any::Any;
@@ -50,7 +51,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 
 const SCHEMA_INFERENCE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -135,6 +135,21 @@ impl Debezium {
                 .map(ToString::to_string),
             ssl_ca_location: params
                 .get("kafka_ssl_ca_location")
+                .expose()
+                .ok()
+                .map(ToString::to_string),
+            ssl_certificate_location: params
+                .get("kafka_ssl_certificate_location")
+                .expose()
+                .ok()
+                .map(ToString::to_string),
+            ssl_key_location: params
+                .get("kafka_ssl_key_location")
+                .expose()
+                .ok()
+                .map(ToString::to_string),
+            ssl_key_password: params
+                .get("kafka_ssl_key_password")
                 .expose()
                 .ok()
                 .map(ToString::to_string),
@@ -240,6 +255,15 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("kafka_ssl_ca_location")
         .secret()
         .description("Path to the SSL/TLS CA certificate file for server verification."),
+    ParameterSpec::runtime("kafka_ssl_certificate_location")
+        .secret()
+        .description("Path to the client SSL/TLS certificate file for mTLS authentication."),
+    ParameterSpec::runtime("kafka_ssl_key_location")
+        .secret()
+        .description("Path to the client SSL/TLS private key file for mTLS authentication."),
+    ParameterSpec::runtime("kafka_ssl_key_password")
+        .secret()
+        .description("Password for the client SSL/TLS private key, if encrypted."),
     ParameterSpec::runtime("kafka_enable_ssl_certificate_verification")
         .default("true")
         .description("Enable SSL/TLS certificate verification. Default: 'true'."),
@@ -463,6 +487,18 @@ impl DataConnector for Debezium {
             }
         };
 
+        // JSON-nesting / declared-schema projection. Primary-key (Kafka key)
+        // columns must be declared explicitly — never folded into the catch-all
+        // — so CDC UPDATE/DELETE apply keeps working.
+        let projection = parse_schema_projection(
+            dataset,
+            &ProjectionPolicy::new("debezium").with_required_columns(metadata.primary_keys.clone()),
+        )?;
+        let schema = match &projection {
+            Some(p) => p.project_schema(schema),
+            None => schema,
+        };
+
         ensure!(
             !metadata.primary_keys.is_empty()
                 || matches!(acceleration.engine.to_unpartitioned(), Engine::Arrow),
@@ -511,6 +547,7 @@ impl DataConnector for Debezium {
             metadata.primary_keys,
             kafka_consumer,
             self.batching,
+            projection,
         );
 
         if let Some(debezium_kafka_sys) = debezium_kafka_sys {
@@ -530,9 +567,6 @@ impl DataConnector for Debezium {
         &self,
         federated_table: Arc<FederatedTable>,
         _dataset: &Dataset,
-        _accelerated_table_provider: Arc<dyn TableProvider>,
-        _accelerator_write_mutex: Arc<Mutex<()>>,
-        _cpu_runtime: Option<tokio::runtime::Handle>,
     ) -> Option<ChangesStream> {
         Some(Box::pin(stream! {
             let table_provider = federated_table.table_provider().await;

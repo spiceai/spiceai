@@ -14,17 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::stream::{
+    change_events_to_change_batch, default_unnest_parameters, nullable_clone, truncate_change_batch,
+};
 use async_stream::try_stream;
 use async_trait::async_trait;
-use data_components::{
-    cdc::{
-        ChangeEnvelope, ChangesStream, CommitChange, CommitError, NoOpCommitter, StreamError,
-        build_ready_signal_envelope, wrap_data_as_change_batch,
-    },
-    mongodb::stream::{
-        change_events_to_change_batch, default_unnest_parameters, nullable_clone,
-        truncate_change_batch,
-    },
+use data_components::cdc::{
+    ChangeEnvelope, ChangesStream, CommitChange, CommitError, NoOpCommitter, StreamError,
+    build_ready_signal_envelope, wrap_data_as_change_batch,
 };
 use datafusion::{
     arrow::datatypes::SchemaRef, datasource::TableProvider,
@@ -47,6 +44,7 @@ use runtime::{
         OpenOption,
         mongodb::{MongoCheckpointMetadata, MongoSys},
     },
+    dataconnector::schema_projection::{ProjectionPolicy, parse_schema_projection},
     federated_table::FederatedTable,
     parameters::{ExposedParamLookup, Parameters},
 };
@@ -71,6 +69,14 @@ pub fn build_changes_stream(
         let table_provider = federated_table.table_provider().await;
         let schema = table_provider.schema();
         let primary_keys = resolve_primary_keys(&dataset.name, dataset.acceleration.as_ref(), &schema)?;
+        // JSON-nesting projection, matching the scan path. `_id` is MongoDB's
+        // only primary key and must stay a declared column (never folded into
+        // the catch-all). `schema` is already the projected (exposed) schema.
+        let projection = parse_schema_projection(
+            &dataset,
+            &ProjectionPolicy::new("mongodb").with_required_columns(vec!["_id".to_string()]),
+        )
+        .map_err(|e| StreamError::External(e.to_string()))?;
         let config = ChangeStreamConfig::from_params(&params)?;
         let invalid_token_behavior = ResumeTokenInvalidBehavior::from_params(&params)?;
         let collection_name = dataset.path().to_string();
@@ -175,7 +181,7 @@ pub fn build_changes_stream(
             );
 
             let truncate = truncate_change_batch(&schema)
-                .map_err(StreamError::MongoDB)?;
+                .map_err(StreamError::from)?;
             yield ChangeEnvelope::new(Box::new(NoOpCommitter), truncate, false);
 
             // Use the same nullable schema that CDC event batches use (via nullable_clone
@@ -209,7 +215,8 @@ pub fn build_changes_stream(
                 )))?;
             let ready = build_ready_signal_envelope(&schema)
                 .map_err(|error| StreamError::Arrow(error.to_string()))?;
-            let (_, batch, is_ready) = ready.into_parts();
+            let (_, batch, is_ready) = ready.into_parts()
+                .map_err(|error| StreamError::Arrow(error.to_string()))?;
             let committer: Box<dyn CommitChange + Send + Sync> = match mongo_sys.as_ref() {
                 Some(sys) => Box::new(MongoResumeTokenCommitter::new(
                     Arc::clone(sys),
@@ -262,8 +269,9 @@ pub fn build_changes_stream(
                 &schema,
                 &primary_keys,
                 &unnest_parameters,
+                projection.as_ref(),
             )
-            .map_err(StreamError::MongoDB)? {
+            .map_err(StreamError::from)? {
                 // MongoDB change-stream cluster time is whole seconds (BSON
                 // Timestamp), so the replication-lag signal here has ~1s
                 // granularity — fine for a multi-second tuner.

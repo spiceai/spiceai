@@ -38,11 +38,12 @@ use crate::{
     datasets_health_monitor::DatasetsHealthMonitor,
     extension::{Extension, ExtensionFactory},
     flight::RateLimits,
-    metrics, podswatcher,
+    podswatcher,
     secrets::{self, Secrets},
     status, tracers,
 };
 use app::App;
+use runtime_metrics as metrics;
 use spicepod::component::runtime::Runtime as SpicepodRuntime;
 use spicepod::component::runtime::RuntimeReadyState as SpicepodRuntimeReadyState;
 use spicepod::component::runtime::SourceRateControl as SpicepodSourceRateControl;
@@ -62,6 +63,21 @@ const CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM: &str =
     "cayenne_sort_merge_memory_pool_fraction";
 const CAYENNE_FILTER_PROPAGATION_PARAM: &str = "cayenne_filter_propagation";
 const CAYENNE_OPTIMIZER_RULES_PARAM: &str = "cayenne_optimizer_rules";
+
+/// Goal-driven adaptive-tuning SLO setpoints, settable GLOBALLY here at
+/// `runtime.params` and overridden per-dataset via the matching
+/// `acceleration.params` key (see `dataaccelerator::cayenne`). `cayenne_goal_qph`
+/// is the exception: QPH is a system-wide metric (a join spans datasets), so it
+/// is global-only and a per-dataset value is ignored. Declared here so the keys
+/// are part of the recognized `runtime.params` vocabulary and don't false-warn as
+/// unknown; the values are resolved (and validated) where the per-dataset Cayenne
+/// config is built. NOTE: `cayenne_goal_convergence_window` is deliberately NOT
+/// here — it paces HOW the loop chases these SLOs (a control-cadence/benchmarking
+/// knob), not a target outcome, so it stays a per-dataset advanced override.
+const CAYENNE_GOAL_REPLICATION_LAG_PARAM: &str = "cayenne_goal_replication_lag";
+const CAYENNE_GOAL_FRESHNESS_PARAM: &str = "cayenne_goal_freshness";
+const CAYENNE_GOAL_QUERY_LATENCY_PARAM: &str = "cayenne_goal_query_latency";
+const CAYENNE_GOAL_QPH_PARAM: &str = "cayenne_goal_qph";
 
 /// Process-global `SQLite` metastore pragma tuning keys (cache, mmap, busy
 /// timeout, WAL autocheckpoint, `auto_vacuum`). Consumed once at startup in
@@ -100,12 +116,17 @@ const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
     CAYENNE_METASTORE_WAL_AUTOCHECKPOINT_PAGES_PARAM,
     CAYENNE_METASTORE_WAL_TRUNCATE_THRESHOLD_MB_PARAM,
     CAYENNE_METASTORE_AUTO_VACUUM_PARAM,
+    CAYENNE_GOAL_REPLICATION_LAG_PARAM,
+    CAYENNE_GOAL_FRESHNESS_PARAM,
+    CAYENNE_GOAL_QUERY_LATENCY_PARAM,
+    CAYENNE_GOAL_QPH_PARAM,
 ];
 
 /// Recognized `runtime.params` keys that don't belong to a larger prefix
 /// family (the family lists live next to the code that consumes them:
 /// `KNOWN_CAYENNE_RUNTIME_PARAMS`, `changes::CDC_RUNTIME_PARAMS`,
-/// `http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS`).
+/// `http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS`,
+/// `cluster::CLUSTER_GRPC_RUNTIME_PARAMS`).
 const MISC_RUNTIME_PARAMS: &[&str] = &[
     "url_tables",
     "geo",
@@ -129,11 +150,13 @@ fn known_runtime_params() -> Vec<&'static str> {
         KNOWN_CAYENNE_RUNTIME_PARAMS.len()
             + crate::accelerated_table::refresh_task::changes::CDC_RUNTIME_PARAMS.len()
             + dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS.len()
+            + crate::cluster::CLUSTER_GRPC_RUNTIME_PARAMS.len()
             + MISC_RUNTIME_PARAMS.len(),
     );
     known.extend_from_slice(KNOWN_CAYENNE_RUNTIME_PARAMS);
     known.extend_from_slice(crate::accelerated_table::refresh_task::changes::CDC_RUNTIME_PARAMS);
     known.extend_from_slice(dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS);
+    known.extend_from_slice(crate::cluster::CLUSTER_GRPC_RUNTIME_PARAMS);
     known.extend_from_slice(MISC_RUNTIME_PARAMS);
     known
 }
@@ -159,6 +182,7 @@ pub struct RuntimeBuilder {
 }
 
 impl RuntimeBuilder {
+    #[must_use]
     pub fn new() -> Self {
         RuntimeBuilder {
             app: None,
@@ -181,27 +205,32 @@ impl RuntimeBuilder {
         }
     }
 
+    #[must_use]
     pub fn with_app(mut self, app: app::App) -> Self {
         self.app = Some(Arc::new(app));
         self
     }
 
+    #[must_use]
     pub fn with_app_opt(mut self, app: Option<Arc<app::App>>) -> Self {
         self.app = app;
         self
     }
 
+    #[must_use]
     pub fn with_runtime_config(mut self, config: Config) -> Self {
         self.runtime_config = Arc::new(config);
         self
     }
 
+    #[must_use]
     pub fn with_extensions(mut self, extensions: Vec<Box<dyn ExtensionFactory>>) -> Self {
         self.extensions = extensions;
         self
     }
 
     /// Extensions that will be automatically loaded if a component requests them and the user hasn't explicitly loaded it.
+    #[must_use]
     pub fn with_autoload_extensions(
         mut self,
         extensions: HashMap<String, Box<dyn ExtensionFactory>>,
@@ -210,16 +239,19 @@ impl RuntimeBuilder {
         self
     }
 
+    #[must_use]
     pub fn with_pods_watcher(mut self, pods_watcher: podswatcher::PodsWatcher) -> Self {
         self.pods_watcher = Some(pods_watcher);
         self
     }
 
+    #[must_use]
     pub fn with_datasets_health_monitor(mut self) -> Self {
         self.datasets_health_monitor_enabled = true;
         self
     }
 
+    #[must_use]
     pub fn with_metrics_server(
         mut self,
         metrics_endpoint: SocketAddr,
@@ -230,6 +262,7 @@ impl RuntimeBuilder {
         self
     }
 
+    #[must_use]
     pub fn with_metrics_server_opt(
         mut self,
         metrics_endpoint: Option<SocketAddr>,
@@ -240,16 +273,19 @@ impl RuntimeBuilder {
         self
     }
 
+    #[must_use]
     pub fn with_rate_limits(mut self, rate_limits: RateLimits) -> Self {
         self.rate_limits = Some(Arc::new(rate_limits));
         self
     }
 
+    #[must_use]
     pub fn with_io_runtime(mut self, io_runtime: Handle) -> Self {
         self.io_runtime = Some(io_runtime);
         self
     }
 
+    #[must_use]
     pub fn with_resolved_cluster_config(
         mut self,
         resolved_cluster_config: ResolvedClusterConfig,
@@ -261,6 +297,7 @@ impl RuntimeBuilder {
     /// Sets a `SetOnce` handle that will be resolved with the spicepod
     /// `TelemetryConfig` once it is available.  For executors, this is set
     /// after the app definition is fetched from the scheduler.
+    #[must_use]
     pub fn with_telemetry_config(
         mut self,
         telemetry_config: Arc<tokio::sync::SetOnce<TelemetryConfig>>,
@@ -274,6 +311,7 @@ impl RuntimeBuilder {
     /// This reader is used by:
     /// - `GetMetrics` RPC to return local metrics to peer schedulers
     /// - Executors responding to metrics requests from schedulers via control stream
+    #[must_use]
     pub fn with_metrics_reader(mut self, metrics_reader: MetricsReader) -> Self {
         self.metrics_reader = Some(metrics_reader);
         self
@@ -286,6 +324,12 @@ impl RuntimeBuilder {
                 "Failed to initialize DataFusion tracer: {e}. Span context may not propagate correctly across async boundaries."
             );
         }
+
+        // Cayenne compaction shutdown state is process-global. Reset it when a
+        // fresh Runtime is built so embedded/test runtimes created after a prior
+        // shutdown can start maintenance passes again, including when dedicated
+        // thread pools are disabled and no compaction runtime handle is injected.
+        cayenne::reset_compaction_shutdown();
 
         self.accelerator_engine_registry.register_all().await;
         dataconnector::register_all().await;
@@ -304,6 +348,13 @@ impl RuntimeBuilder {
         let memory_limit = parse_memory_limit(query.memory_limit.clone());
         let target_partitions = query.target_partitions;
         let max_concurrent_queries = query.max_concurrent_queries;
+
+        // The effective timeout is resolved per request by
+        // `RequestContextBuilder::build` from the app's `runtime.query.timeout`;
+        // validate here so a misconfigured value is warned about once at startup
+        if let Err(e) = query.timeout() {
+            tracing::warn!("{e} No query timeout will be applied.");
+        }
 
         let metrics = spicepod_rt.metrics.clone();
 
@@ -450,6 +501,70 @@ impl RuntimeBuilder {
                 clamp_cayenne_compaction_memory_fraction(requested)
             });
 
+        // Estimate the off-pool per-table Cayenne CDC cache reservation (keyset /
+        // segment / coalesce / inline, summed over enabled changes-mode Cayenne
+        // tables). The DataFusion builder reduces the query-memory default by the
+        // amount this exceeds the base host/8 headroom, so the query pool + the
+        // in-memory tier + the per-table caches stay within host RAM as the table
+        // count grows.
+        let cayenne_cdc_reservation_bytes =
+            estimate_cayenne_cdc_reservation_bytes(self.app.as_ref(), &spicepod_rt.params);
+
+        // ---- Coordinated cgroup-aware memory budget for DuckDB accelerators ----
+        // The DataFusion query pool defaults to 90% of RAM and EACH distinct DuckDB
+        // instance defaults to DuckDB's own ~80%-of-RAM `memory_limit`; stacked they
+        // over-commit host memory (N datasets on N separate DuckDB files ⇒ N×80%).
+        // Compute a cgroup-aware split that fits, publish the per-instance cap for
+        // the DuckDB accelerator to apply, and warn with what was applied /
+        // recommended. An explicit `runtime.query.memory_limit` / per-dataset
+        // `duckdb_memory_limit` always overrides. See `accelerator_memory_budget`.
+        let duckdb_budget_inputs = duckdb_budget_inputs(self.app.as_ref());
+        let has_duckdb_instances = duckdb_budget_inputs.num_unset_instances > 0
+            || duckdb_budget_inputs.num_explicit_instances > 0;
+        let duckdb_query_pool_cap = if has_duckdb_instances {
+            let cayenne_active = compaction_memory_fraction.is_some();
+            let total_memory = crate::resource_monitor::get_total_memory();
+            // DuckDB's own default memory_limit is ~80% of HOST RAM (not the cgroup
+            // limit), so project the un-coordinated ceiling from host memory —
+            // otherwise a container (host RAM > cgroup) would under-estimate it and
+            // skip coordination exactly where the OOM risk is highest.
+            let duckdb_default_per_instance =
+                crate::accelerator_memory_budget::duckdb_default_per_instance_bytes(
+                    crate::resource_monitor::get_host_memory(),
+                );
+            let base_query_budget = crate::datafusion::builder::effective_query_memory_limit(
+                None,
+                cayenne_active,
+                cayenne_cdc_reservation_bytes,
+                None,
+            );
+            let plan = crate::accelerator_memory_budget::plan(
+                total_memory,
+                duckdb_default_per_instance,
+                base_query_budget,
+                memory_limit,
+                &duckdb_budget_inputs,
+            );
+            crate::accelerator_memory_budget::publish_duckdb_budget(
+                plan.per_instance_cap_bytes,
+                plan.duckdb_reservation_bytes,
+            );
+            emit_duckdb_memory_budget_warning(
+                &plan,
+                total_memory,
+                duckdb_default_per_instance,
+                &duckdb_budget_inputs,
+            );
+            plan.query_pool_cap_bytes
+        } else {
+            // No DuckDB accelerators (or the duckdb feature isn't compiled in): skip
+            // the cgroup/host memory probes and the planner entirely — the plan would
+            // NoOp anyway. Clear any previously-published budget so a hot-reload that
+            // removed all DuckDB accelerators doesn't leave a stale reservation.
+            crate::accelerator_memory_budget::publish_duckdb_budget(0, 0);
+            None
+        };
+
         #[cfg(not(windows))]
         if cayenne_footer_cache_mb.is_some() {
             self.accelerator_engine_registry
@@ -478,7 +593,32 @@ impl RuntimeBuilder {
 
         // Create resource monitor early so it can be passed to DataFusion
         let resource_monitor = crate::resource_monitor::ResourceMonitor::new();
-        let secrets = Arc::new(RwLock::new(Self::load_secrets(self.app.as_ref()).await));
+        let loaded_secrets = Self::load_secrets(self.app.as_ref()).await;
+
+        // Diagnostics-only: resolve every `${ store:key }` reference in the
+        // app up front so secret problems surface as one consolidated report
+        // instead of scattered per-component errors. Skipped on cluster
+        // executors, where secrets resolve via scheduler RPC and the
+        // scheduler has already validated them. Never changes component
+        // loading; never logs secret values.
+        //
+        // Runs on the owned `Secrets` before it is wrapped in the shared
+        // `RwLock` below, so no lock guard is held across the lookups' awaits.
+        // Wrapped in `in_tracing_context_async` for the same reason as
+        // `load_secrets`: this runs before `spiced::init_tracing` installs the
+        // global subscriber, so without a temporary subscriber the summary
+        // would be dropped on the floor.
+        let is_cluster_executor = matches!(
+            self.resolved_cluster_config
+                .as_ref()
+                .and_then(ResolvedClusterConfig::effective_role),
+            Some(ClusterRole::Executor)
+        );
+        if !is_cluster_executor && let Some(app) = self.app.as_ref() {
+            in_tracing_context_async(crate::secrets_preflight::run(app, &loaded_secrets)).await;
+        }
+
+        let secrets = Arc::new(RwLock::new(loaded_secrets));
 
         // Create the shared app reference early so DataFusion, Runtime, and PartitionService share it.
         let shared_app: Arc<RwLock<Option<Arc<App>>>> = Arc::new(RwLock::new(self.app));
@@ -616,6 +756,9 @@ impl RuntimeBuilder {
         .target_partitions(target_partitions)
         .max_concurrent_queries(max_concurrent_queries)
         .prefer_hash_join(query.prefer_hash_join)
+        .eager_aggregation(query.eager_aggregation)
+        .eager_aggregation_min_reduction_factor(query.eager_aggregation_min_reduction_factor)
+        .eager_aggregation_max_pushed_groups(query.eager_aggregation_max_pushed_groups)
         .temp_directory(query.temp_directory)
         .spill_compression(query.spill_compression)
         .with_task_history(task_history)
@@ -627,6 +770,8 @@ impl RuntimeBuilder {
         .cayenne_sort_merge_memory_pool_fraction(cayenne_sort_merge_memory_pool_fraction)
         .cayenne_footer_cache_mb(cayenne_footer_cache_mb)
         .compaction_memory_fraction(compaction_memory_fraction)
+        .cayenne_cdc_reservation_bytes(cayenne_cdc_reservation_bytes)
+        .duckdb_query_pool_cap(duckdb_query_pool_cap)
         .cayenne_optimizer_rules(cayenne_optimizer_rules);
 
         if let Some(DistributedNode::Scheduler {
@@ -671,8 +816,8 @@ impl RuntimeBuilder {
 
         let mut rt = Runtime {
             app: shared_app,
+            apply_app_lock: Arc::new(tokio::sync::Mutex::new(())),
             df,
-            models: Arc::new(RwLock::new(HashMap::new())),
             llm_runtime_stores: Arc::new(crate::model::LlmRuntimeStores::default()),
             http_rate_control_registry,
             workers: Arc::new(RwLock::new(HashMap::new())),
@@ -704,6 +849,14 @@ impl RuntimeBuilder {
             )),
             telemetry_config: self.telemetry_config,
         };
+
+        // Executors: register cluster status before any concurrent
+        // `load_components` / `start_servers` race so readiness cannot pass on
+        // dataset-only status while task slots are still closed (#11758 Fix B).
+        if is_cluster_executor {
+            rt.status
+                .update_cluster("executor", status::ComponentStatus::Initializing);
+        }
 
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();
         for factory in self.extensions {
@@ -750,76 +903,87 @@ impl Default for RuntimeBuilder {
     }
 }
 
+#[cfg(not(feature = "rate-control"))]
+// This build has no persisted rate-control backend, so this stub never awaits.
+// It must stay `async` to match the `rate-control` variant's signature: the sole
+// caller awaits the result unconditionally. The suppression is inherently
+// feature-conditional — it exists only in this `cfg(not(rate-control))` variant,
+// exactly the build where the lint fires; under `rate-control` this whole fn is
+// compiled out and the real variant awaits.
+#[expect(
+    clippy::unused_async,
+    reason = "signature parity with the rate-control variant; caller awaits unconditionally"
+)]
 async fn build_http_rate_control_registry(
     source_rate_control: Option<&SpicepodSourceRateControl>,
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
 ) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
-    #[cfg(not(feature = "rate-control"))]
+    let _ = (&secrets, &io_runtime);
+    if source_rate_control
+        .and_then(|config| config.state_location.as_ref())
+        .is_some()
     {
-        let _ = (&secrets, &io_runtime);
-        if source_rate_control
-            .and_then(|config| config.state_location.as_ref())
-            .is_some()
-        {
-            tracing::warn!(
-                "Persisted HTTP governor rate-control state requires a Spice.ai Enterprise build. Falling back to in-memory HTTP rate-control state."
-            );
-        }
-        return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
+        tracing::warn!(
+            "Persisted HTTP governor rate-control state requires a Spice.ai Enterprise build. Falling back to in-memory HTTP rate-control state."
+        );
     }
+    Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default())
+}
 
-    #[cfg(feature = "rate-control")]
-    {
-        let Some((state_location, params, refresh_interval, config_path)) = source_rate_control
-            .and_then(|config| {
-                config.state_location.as_deref().map(|state_location| {
-                    (
-                        state_location,
-                        config.params.as_ref(),
-                        config.refresh_interval.as_str(),
-                        "runtime.source_rate_control",
-                    )
-                })
+#[cfg(feature = "rate-control")]
+async fn build_http_rate_control_registry(
+    source_rate_control: Option<&SpicepodSourceRateControl>,
+    secrets: Arc<RwLock<Secrets>>,
+    io_runtime: Handle,
+) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
+    let Some((state_location, params, refresh_interval, config_path)) = source_rate_control
+        .and_then(|config| {
+            config.state_location.as_deref().map(|state_location| {
+                (
+                    state_location,
+                    config.params.as_ref(),
+                    config.refresh_interval.as_str(),
+                    "runtime.source_rate_control",
+                )
             })
-        else {
-            return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
-        };
+        })
+    else {
+        return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
+    };
 
-        let Some(refresh_interval) =
-            parse_rate_control_refresh_interval(refresh_interval, config_path)
-        else {
-            return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
-        };
+    let Some(refresh_interval) = parse_rate_control_refresh_interval(refresh_interval, config_path)
+    else {
+        return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
+    };
 
-        match crate::object_store_state::build_object_store(
-            secrets,
-            io_runtime,
-            state_location,
-            params,
-            "rate-control state",
-        )
-        .await
-        {
-            Ok((store, base_prefix)) => {
-                tracing::info!(
-                    "Initialized persisted HTTP governor rate-control state with location: {}",
-                    state_location
-                );
-                let registry = Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::with_persisted_governor_state(
-                    store,
-                    base_prefix,
-                    refresh_interval,
-                ));
-                registry.start_persistence_task();
-                registry
-            }
-            Err(error) => {
-                tracing::error!(
-                    "Failed to initialize persisted HTTP governor rate-control state: {error}"
-                );
-                Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default())
-            }
+    match crate::object_store_state::build_object_store(
+        secrets,
+        io_runtime,
+        state_location,
+        params,
+        "rate-control state",
+    )
+    .await
+    {
+        Ok((store, base_prefix)) => {
+            tracing::info!(
+                "Initialized persisted HTTP governor rate-control state with location: {}",
+                state_location
+            );
+            let registry = Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::with_persisted_governor_state(
+                store,
+                base_prefix,
+                refresh_interval,
+            ));
+            registry.start_persistence_task();
+            registry
+        }
+        Err(error) => {
+            tracing::error!(
+                "Failed to initialize persisted HTTP governor rate-control state: {error}"
+            );
+            Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default())
         }
     }
 }
@@ -921,6 +1085,287 @@ fn parse_usize_runtime_param(params: &HashMap<String, String>, key: &str) -> Opt
             );
             None
         }
+    }
+}
+
+/// Estimate the aggregate bytes that enabled `refresh_mode: changes` Cayenne tables
+/// reserve OUTSIDE the `DataFusion` query pool: per table, the PK keyset cache +
+/// segment cache + CDC coalesce buffer + inline memtable. Each uses the explicit
+/// per-table param (matching the accelerator's key lists, incl. `cayenne_`-prefixed
+/// aliases) when set, else the accelerator's auto-derived cap (mirroring
+/// `dataaccelerator::cayenne::autotune::HardwareProfile` — keep the fractions in
+/// sync). The globally coordinated in-memory tier and the virtual (non-resident)
+/// metastore mmap are intentionally excluded: the tier is already capped at host/5
+/// and the mmap is page-cache-backed. Returns 0 when no changes-mode Cayenne table
+/// is configured, which disables the query-pool reduction.
+fn estimate_cayenne_cdc_reservation_bytes(
+    app: Option<&Arc<app::App>>,
+    runtime_params: &HashMap<String, String>,
+) -> u64 {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    // Auto-derived per-table cap fractions (mirror of the accelerator's autotune).
+    const KEYSET_CACHE_HOST_FRACTION: u64 = 32; // ~1/32 host, clamped [256 MiB, 8 GiB]
+    const SEGMENT_CACHE_HOST_FRACTION: u64 = 128; // ~1/128 host, clamped [256 MiB, 1 GiB]
+    const DEFAULT_COALESCE_BYTES: u64 = 128 * MIB;
+    const DEFAULT_INLINE_BYTES: u64 = 8 * MIB;
+
+    // Parse the first matching key as a trimmed u64 (params may carry whitespace,
+    // matching the rest of the runtime/dataset param parsing).
+    fn parse_u64(map: &HashMap<String, String>, keys: &[&str]) -> Option<u64> {
+        keys.iter()
+            .find_map(|k| map.get(*k))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    }
+
+    let Some(app) = app else {
+        return 0;
+    };
+    let total_memory = crate::resource_monitor::get_total_memory();
+    // Global CDC coalesce-buffer size (default 128 MiB); a per-dataset
+    // `cdc_max_coalesced_bytes` overlays it per table (see `cdc_config_overlay`).
+    let global_coalesce_bytes =
+        parse_u64(runtime_params, &["cdc_max_coalesced_bytes"]).unwrap_or(DEFAULT_COALESCE_BYTES);
+
+    let mut total: u64 = 0;
+    for dataset in &app.datasets {
+        let Some(accel) = dataset.acceleration.as_ref() else {
+            continue;
+        };
+        if !accel.enabled
+            || !accel
+                .engine
+                .as_deref()
+                .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
+            || accel.refresh_mode != Some(spicepod::acceleration::RefreshMode::Changes)
+        {
+            continue;
+        }
+        let params = accel
+            .params
+            .as_ref()
+            .map(spicepod::param::Params::as_string_map)
+            .unwrap_or_default();
+        // MB-valued cache params -> bytes; else the accelerator's auto host-fraction cap.
+        let keyset = parse_u64(
+            &params,
+            &["cayenne_pk_keyset_cache_mb", "pk_keyset_cache_mb"],
+        )
+        .map_or_else(
+            || (total_memory / KEYSET_CACHE_HOST_FRACTION).clamp(256 * MIB, 8 * GIB),
+            |mb| mb.saturating_mul(MIB),
+        );
+        let segment = parse_u64(&params, &["cayenne_segment_cache_mb", "segment_cache_mb"])
+            .map_or_else(
+                || (total_memory / SEGMENT_CACHE_HOST_FRACTION).clamp(256 * MIB, GIB),
+                |mb| mb.saturating_mul(MIB),
+            );
+        // Inline memtable is byte-valued; match the accelerator's key list including
+        // the `cayenne_`-prefixed aliases (see dataaccelerator::cayenne mod.rs).
+        let inline = parse_u64(
+            &params,
+            &[
+                "cayenne_inline_flush_max_bytes",
+                "inline_flush_max_bytes",
+                "cayenne_inline_memtable_max_bytes",
+                "inline_memtable_max_bytes",
+            ],
+        )
+        .unwrap_or(DEFAULT_INLINE_BYTES);
+        // Per-dataset coalesce override wins over the global (mirrors cdc_config_overlay).
+        let coalesce =
+            parse_u64(&params, &["cdc_max_coalesced_bytes"]).unwrap_or(global_coalesce_bytes);
+        total = total
+            .saturating_add(keyset)
+            .saturating_add(segment)
+            .saturating_add(coalesce)
+            .saturating_add(inline);
+    }
+    total
+}
+
+/// Deduped-by-instance summary of the `DuckDB` accelerators in `app`, for the
+/// coordinated memory budget ([`crate::accelerator_memory_budget::plan`]).
+///
+/// Groups datasets by `DuckDB` instance identity — one per distinct resolved file
+/// path, plus a single shared key for all memory-mode datasets (mirroring the
+/// fork's `DbInstanceKey`) — and classifies each instance as explicit (some
+/// dataset sets `duckdb_memory_limit`, taking the max) or un-limited. Imperfect
+/// path canonicalization only ever OVER-counts instances, yielding smaller, safer
+/// caps.
+#[cfg(feature = "duckdb")]
+fn duckdb_budget_inputs(
+    app: Option<&Arc<app::App>>,
+) -> crate::accelerator_memory_budget::DuckDbBudgetInputs {
+    use crate::accelerator_memory_budget::DuckDbBudgetInputs;
+
+    /// Per-instance aggregation while grouping datasets by `DbInstanceKey`.
+    #[derive(Default)]
+    struct InstanceAgg {
+        explicit_max: Option<u64>,
+        has_unset: bool,
+        /// Datasets sharing this instance set DIFFERENT explicit `duckdb_memory_limit`
+        /// values. Since the setting is per-instance (last dataset created wins), the
+        /// effective limit is ambiguous — surfaced in the warning.
+        conflicting_explicit: bool,
+    }
+
+    let mut inputs = DuckDbBudgetInputs::default();
+    let Some(app) = app else {
+        return inputs;
+    };
+    let accelerator = crate::dataaccelerator::duckdb::DuckDBAccelerator::default();
+    let mut instances: HashMap<String, InstanceAgg> = HashMap::new();
+
+    for dataset in &app.datasets {
+        let Some(accel) = dataset.acceleration.as_ref() else {
+            continue;
+        };
+        if !accel.enabled
+            || !accel
+                .engine
+                .as_deref()
+                .is_some_and(|engine| engine.eq_ignore_ascii_case("duckdb"))
+        {
+            continue;
+        }
+        // Instance identity: memory-mode datasets share ONE in-memory instance;
+        // file-mode datasets group by their resolved DuckDB file path.
+        let key = if accel.mode == spicepod::acceleration::Mode::Memory {
+            "<in-memory>".to_string()
+        } else {
+            accelerator
+                .spicepod_dataset_duckdb_file_path(dataset)
+                .unwrap_or_else(|| format!("<file:{}>", dataset.name))
+        };
+        let params = accel
+            .params
+            .as_ref()
+            .map(spicepod::param::Params::as_string_map)
+            .unwrap_or_default();
+        // Parse with binary units (`true`) to match the DuckDB fork's own
+        // `MemoryLimitSetting` validation; an unparseable explicit value is treated
+        // as unset so the instance still gets a safe auto-cap (the fork would reject
+        // the bad value at creation anyway).
+        let explicit = params
+            .get("duckdb_memory_limit")
+            .and_then(|v| byte_unit::Byte::parse_str(v.trim(), true).ok())
+            .map(byte_unit::Byte::as_u64);
+
+        let agg = instances.entry(key).or_default();
+        match explicit {
+            Some(bytes) => {
+                // A different explicit value than one already seen on this instance
+                // means the datasets disagree on the per-instance limit.
+                if let Some(prev) = agg.explicit_max
+                    && prev != bytes
+                {
+                    agg.conflicting_explicit = true;
+                }
+                agg.explicit_max = Some(agg.explicit_max.map_or(bytes, |m| m.max(bytes)));
+            }
+            None => agg.has_unset = true,
+        }
+    }
+
+    for (key, agg) in instances {
+        if let Some(bytes) = agg.explicit_max {
+            inputs.num_explicit_instances += 1;
+            inputs.sum_explicit_bytes = inputs.sum_explicit_bytes.saturating_add(bytes);
+            // Inconsistent per-instance limit: some datasets set it and some didn't,
+            // or datasets set different explicit values. Either way it's ambiguous.
+            if agg.has_unset || agg.conflicting_explicit {
+                inputs.has_mixed_instance = true;
+            }
+        } else {
+            inputs.num_unset_instances += 1;
+            inputs.unset_instance_labels.push(key);
+        }
+    }
+    // Deterministic warning output: `instances` is a `HashMap`, so its iteration
+    // order (and thus the pushed label order) varies run-to-run. Sort so identical
+    // Spicepods always log the same `duckdb_unset_instance_paths` list, keeping log
+    // analysis and alert dedup stable.
+    inputs.unset_instance_labels.sort();
+    inputs
+}
+
+/// Without the `duckdb` feature no `DuckDB` accelerators can be configured, so the
+/// coordinated budget has nothing to do.
+#[cfg(not(feature = "duckdb"))]
+fn duckdb_budget_inputs(
+    _app: Option<&Arc<app::App>>,
+) -> crate::accelerator_memory_budget::DuckDbBudgetInputs {
+    crate::accelerator_memory_budget::DuckDbBudgetInputs::default()
+}
+
+/// Emits the "auto-limit with warning" guidance when the coordinated `DuckDB`
+/// budget engaged. `NoOp` (no `DuckDB` accelerators, or the naive ceilings already
+/// fit) stays silent.
+fn emit_duckdb_memory_budget_warning(
+    plan: &crate::accelerator_memory_budget::AcceleratorMemoryPlan,
+    total_memory: u64,
+    duckdb_default_per_instance: u64,
+    inputs: &crate::accelerator_memory_budget::DuckDbBudgetInputs,
+) {
+    use crate::accelerator_memory_budget::PlanOutcome;
+
+    if plan.outcome != PlanOutcome::Applied {
+        return;
+    }
+
+    let hb = |bytes: u64| util::human_readable_bytes(usize::try_from(bytes).unwrap_or(usize::MAX));
+    let n = inputs.num_unset_instances;
+    let total_h = hb(total_memory);
+    let query_h = hb(plan.effective_query_pool_bytes);
+    let per_instance_h = hb(plan.per_instance_cap_bytes);
+    // DuckDB's own default is ~80% of HOST RAM (not the cgroup total) — the value the
+    // projection/decision used.
+    let duckdb_default_h = hb(duckdb_default_per_instance);
+    let mixed = if inputs.has_mixed_instance {
+        " One or more DuckDB instances have inconsistent duckdb_memory_limit across the datasets that share them (mixed set/unset, or different explicit values); because DuckDB's memory_limit is per-instance the last dataset created wins, so set it consistently on all datasets sharing an instance."
+    } else {
+        ""
+    };
+
+    if n == 0 {
+        // Every DuckDB instance set an explicit duckdb_memory_limit — there are no
+        // un-limited instances to auto-cap, only the query pool was reduced to fit
+        // those explicit ceilings. (Describe just that, not a "0 instances capped".)
+        if plan.residual_overcommit {
+            tracing::warn!(
+                total_memory_bytes = total_memory,
+                query_pool_bytes = plan.effective_query_pool_bytes,
+                duckdb_explicit_bytes = inputs.sum_explicit_bytes,
+                "The explicit DuckDB accelerator memory limits plus the query memory limit exceed the coordinated memory budget and cut into the safety headroom below the {total_h} available to this process; combined ceilings may approach or exceed it and risk an OOM kill under load. Lower the per-dataset duckdb_memory_limit values and/or runtime.query.memory_limit so combined ceilings fit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
+            );
+        } else {
+            tracing::warn!(
+                total_memory_bytes = total_memory,
+                query_pool_bytes = plan.effective_query_pool_bytes,
+                duckdb_explicit_bytes = inputs.sum_explicit_bytes,
+                "Reduced the DataFusion query memory limit to {query_h} so it plus the explicit DuckDB accelerator memory limits fit the {total_h} available to this process. To customize, set runtime.query.memory_limit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
+            );
+        }
+    } else if plan.residual_overcommit {
+        tracing::warn!(
+            total_memory_bytes = total_memory,
+            projected_ceiling_bytes = plan.projected_ceiling_bytes,
+            query_pool_bytes = plan.effective_query_pool_bytes,
+            duckdb_unset_instances = n,
+            recommended_duckdb_memory_limit_bytes = plan.per_instance_cap_bytes,
+            recommended_query_memory_limit_bytes = plan.effective_query_pool_bytes,
+            "Even after auto-capping, the {n} DuckDB instance(s) without an explicit duckdb_memory_limit plus the query memory limit exceed the coordinated memory budget and cut into the safety headroom below the {total_h} available to this process; combined ceilings may approach or exceed it and risk an OOM kill under load. Reduce the number of distinct DuckDB files, or set runtime.query.memory_limit: \"{query_h}\" and duckdb_memory_limit: \"{per_instance_h}\" on each DuckDB-accelerated dataset so combined ceilings fit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
+        );
+    } else {
+        tracing::warn!(
+            total_memory_bytes = total_memory,
+            query_pool_bytes = plan.effective_query_pool_bytes,
+            duckdb_unset_instances = n,
+            duckdb_per_instance_bytes = plan.per_instance_cap_bytes,
+            duckdb_unset_instance_paths = ?inputs.unset_instance_labels,
+            "Detected potential memory over-commit from DuckDB accelerators and automatically capped memory to fit the {total_h} available to this process: {n} DuckDB instance(s) without an explicit duckdb_memory_limit — each would otherwise default to ~80% of host RAM (about {duckdb_default_h} here, or more in a container where DuckDB sees the host's RAM rather than this process's cgroup limit) — are capped at {per_instance_h} each, and the query memory limit at {query_h}. To customize, set runtime.query.memory_limit and/or per-dataset duckdb_memory_limit.{mixed} For details, visit: https://spiceai.org/docs/reference/memory"
+        );
     }
 }
 
@@ -1058,6 +1503,9 @@ fn parse_cayenne_optimizer_rules(
             "exact_join_filter" | "join_rewriter" | "exact_accumulator" => {
                 rules.set_exact_join_filter(true);
             }
+            "stats_aggregate" | "metadata_aggregate" | "aggregate_pushdown" => {
+                rules.set_stats_aggregate(true);
+            }
             _ => {
                 // Don't discard the rest of an explicit list because of one bad
                 // token; collect the unknown ones, keep the recognized rules,
@@ -1126,6 +1574,129 @@ mod test {
             let result = parse_memory_limit(input.map(ToString::to_string));
             assert_eq!(result, expected, "Input: {input:?}");
         }
+    }
+
+    /// The `DuckDB` budget adapter groups datasets by instance identity (distinct
+    /// file paths → distinct instances; a shared file or all memory-mode datasets →
+    /// one), classifies explicit vs un-limited, and ignores non-DuckDB engines.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn test_duckdb_budget_inputs_groups_by_instance() {
+        use spicepod::acceleration::{Acceleration, Mode};
+        use spicepod::component::dataset::Dataset;
+        use spicepod::param::Params;
+        use std::sync::Arc;
+
+        fn duckdb_ds(name: &str, mode: Mode, params: &[(&str, &str)]) -> Dataset {
+            let mut ds = Dataset::new("dummy:source", name);
+            ds.acceleration = Some(Acceleration {
+                enabled: true,
+                engine: Some("duckdb".to_string()),
+                mode,
+                params: Some(Params::from_string_map(
+                    params
+                        .iter()
+                        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                        .collect::<HashMap<String, String>>(),
+                )),
+                ..Acceleration::default()
+            });
+            ds
+        }
+
+        let inputs_for = |datasets: Vec<Dataset>| {
+            let app = datasets
+                .into_iter()
+                .fold(app::AppBuilder::new("mem-budget-test"), |b, ds| {
+                    b.with_dataset(ds)
+                })
+                .build();
+            duckdb_budget_inputs(Some(&Arc::new(app)))
+        };
+
+        // Two file-mode datasets on DISTINCT files → two un-limited instances.
+        let inputs = inputs_for(vec![
+            duckdb_ds("a", Mode::File, &[("duckdb_file", "/tmp/spice-mbt-a.db")]),
+            duckdb_ds("b", Mode::File, &[("duckdb_file", "/tmp/spice-mbt-b.db")]),
+        ]);
+        assert_eq!(inputs.num_unset_instances, 2);
+        assert_eq!(inputs.num_explicit_instances, 0);
+
+        // Two file-mode datasets on the SAME file share ONE instance.
+        let inputs = inputs_for(vec![
+            duckdb_ds(
+                "a",
+                Mode::File,
+                &[("duckdb_file", "/tmp/spice-mbt-shared.db")],
+            ),
+            duckdb_ds(
+                "b",
+                Mode::File,
+                &[("duckdb_file", "/tmp/spice-mbt-shared.db")],
+            ),
+        ]);
+        assert_eq!(inputs.num_unset_instances, 1);
+
+        // One explicit + one un-limited instance.
+        let inputs = inputs_for(vec![
+            duckdb_ds(
+                "a",
+                Mode::File,
+                &[
+                    ("duckdb_file", "/tmp/spice-mbt-x.db"),
+                    ("duckdb_memory_limit", "2GiB"),
+                ],
+            ),
+            duckdb_ds("b", Mode::File, &[("duckdb_file", "/tmp/spice-mbt-y.db")]),
+        ]);
+        assert_eq!(inputs.num_unset_instances, 1);
+        assert_eq!(inputs.num_explicit_instances, 1);
+        assert_eq!(inputs.sum_explicit_bytes, 2 * 1024 * 1024 * 1024);
+
+        // All memory-mode datasets collapse to ONE in-memory instance.
+        let inputs = inputs_for(vec![
+            duckdb_ds("a", Mode::Memory, &[]),
+            duckdb_ds("b", Mode::Memory, &[]),
+        ]);
+        assert_eq!(inputs.num_unset_instances, 1);
+
+        // A non-DuckDB (Arrow) accelerated dataset is ignored.
+        let mut arrow_ds = Dataset::new("dummy:source", "arrow");
+        arrow_ds.acceleration = Some(Acceleration {
+            enabled: true,
+            engine: None,
+            mode: Mode::Memory,
+            ..Acceleration::default()
+        });
+        let inputs = inputs_for(vec![arrow_ds]);
+        assert_eq!(inputs.num_unset_instances, 0);
+        assert_eq!(inputs.num_explicit_instances, 0);
+
+        // Two datasets on the SAME file with DIFFERENT explicit limits → one
+        // explicit instance flagged as inconsistent (per-instance limit is ambiguous).
+        let inputs = inputs_for(vec![
+            duckdb_ds(
+                "a",
+                Mode::File,
+                &[
+                    ("duckdb_file", "/tmp/spice-mbt-conflict.db"),
+                    ("duckdb_memory_limit", "2GiB"),
+                ],
+            ),
+            duckdb_ds(
+                "b",
+                Mode::File,
+                &[
+                    ("duckdb_file", "/tmp/spice-mbt-conflict.db"),
+                    ("duckdb_memory_limit", "4GiB"),
+                ],
+            ),
+        ]);
+        assert_eq!(inputs.num_explicit_instances, 1);
+        assert_eq!(inputs.num_unset_instances, 0);
+        assert!(inputs.has_mixed_instance, "conflicting per-instance limits");
+        // The instance's ceiling uses the max of the conflicting values.
+        assert_eq!(inputs.sum_explicit_bytes, 4 * 1024 * 1024 * 1024);
     }
 
     #[test]
@@ -1333,6 +1904,23 @@ mod test {
                 false,
             ),
             semi_join_only
+        );
+
+        // `stats_aggregate` is on under both `auto` and `all`, and is also
+        // selectable by token (including its aliases) without enabling anything else.
+        assert!(CayenneOptimizerRules::auto_enabled().stats_aggregate());
+        assert!(CayenneOptimizerRules::all_enabled().stats_aggregate());
+        let mut stats_aggregate_only = CayenneOptimizerRules::none();
+        stats_aggregate_only.set_stats_aggregate(true);
+        assert_eq!(
+            parse_cayenne_optimizer_rules(
+                &HashMap::from([(
+                    CAYENNE_OPTIMIZER_RULES_PARAM.to_string(),
+                    "metadata_aggregate".to_string(),
+                )]),
+                false,
+            ),
+            stats_aggregate_only
         );
 
         assert_eq!(

@@ -26,7 +26,6 @@ async-trait.workspace = true
 aws-config.workspace = true
 aws-credential-types.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
-aws-sdk-dynamodb = { workspace = true, optional = true }
 aws-sdk-glue.workspace = true
 aws-sdk-s3.workspace = true
 aws-sdk-sts = { workspace = true, optional = true }
@@ -66,7 +65,6 @@ duckdb = { workspace = true, features = [
     "r2d2",
     "extensions-full",
 ], optional = true }
-dynamodb-streams = { path = "../dynamodb-streams", optional = true }
 event_stream = { path = "../event_stream" }
 flight_client = { path = "../flight_client" }
 fundu = { workspace = true }
@@ -78,7 +76,6 @@ headers-accept = "0.3.0"
 http.workspace = true
 http-body = "1.0.1"
 http-body-util = "0.1.3"
-humantime = { workspace = true, optional = true }
 hyper = "1.7.0"
 hyper-util = { version = "0.1.20", features = ["service"] }
 iceberg.workspace = true
@@ -94,7 +91,6 @@ jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 linkme.workspace = true
 llms = { path = "../llms", default-features = false }
 mediatype = "0.21.0"
-model_components = { path = "../model_components" }
 moka.workspace = true
 mysql_async = { workspace = true, optional = true }
 notify = "8.2.0"
@@ -106,7 +102,7 @@ object_store_occ = { path = "../object_store_occ" }
 opentelemetry.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry-prometheus.workspace = true
-opentelemetry-proto = { version = "0.31", default-features = false, features = [
+opentelemetry-proto = { version = "0.32", default-features = false, features = [
     "gen-tonic-messages",
     "gen-tonic",
     "metrics",
@@ -122,7 +118,7 @@ postcard.workspace = true
 prometheus.workspace = true
 prost.workspace = true
 rand.workspace = true
-rayon = "1.11.0"
+rayon = { workspace = true }
 regex.workspace = true
 reqwest.workspace = true
 rmcp = { workspace = true, optional = true, features = [
@@ -136,9 +132,19 @@ rmcp = { workspace = true, optional = true, features = [
 runtime-acceleration = { path = "../runtime-acceleration" }
 runtime-api-types = { path = "../runtime-api-types" }
 runtime-async = { path = "../runtime-async" }
+runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
+runtime-checkpoint-duckdb = { path = "../runtime-checkpoint-duckdb", optional = true }
+runtime-checkpoint-sqlite = { path = "../runtime-checkpoint-sqlite", optional = true }
+runtime-checkpoint-postgres = { path = "../runtime-checkpoint-postgres", optional = true }
+runtime-checkpoint-turso = { path = "../runtime-checkpoint-turso", optional = true }
+runtime-component = { path = "../runtime-component" }
+runtime-metrics = { path = "../runtime-metrics" }
 runtime-auth = { path = "../runtime-auth" }
 runtime-cluster = { path = "../runtime-cluster" }
 runtime-datafusion = { path = "../runtime-datafusion" }
+runtime-query-engine = { path = "../runtime-query-engine" }
+runtime-search = { path = "../runtime-search" }
+runtime-tools = { path = "../runtime-tools" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
 runtime-object-store = { path = "../runtime-object-store" }
@@ -150,14 +156,12 @@ runtime-secrets = { path = "../runtime-secrets", default-features = false }
 runtime-table-partition = { path = "../runtime-table-partition" }
 rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
-rustls-pemfile.workspace = true
 elasticsearch = { path = "../elasticsearch", optional = true }
 duration-parse = { workspace = true, optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
 scheduler = { path = "../scheduler" }
 schemars.workspace = true
 scopeguard = "1.2.0"
-scylla = { workspace = true, optional = true }
 search = { path = "../search", default-features = false, features = [
     "text_search",
 ], optional = false }
@@ -192,14 +196,14 @@ turso-shared = { workspace = true }
 twox-hash.workspace = true
 url.workspace = true
 util = { path = "../util", features = ["datafusion", "http"] }
-utoipa = { version = "5", features = ["axum_extras"], optional = true }
+utoipa = { workspace = true, features = ["axum_extras"], optional = true }
 utoipa-swagger-ui = { version = "9", features = [
     "axum",
     "vendored",
 ], optional = true }
 
 gethostname.workspace = true
-uuid = { workspace = true, features = ["v4", "v7"] }
+uuid = { workspace = true, features = ["v4", "v7", "serde"] }
 workers = { path = "../workers" }
 x509-certificate.workspace = true
 
@@ -214,6 +218,10 @@ rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc
 aws-credential-types = { workspace = true, features = [
     "hardcoded-credentials",
 ] }
+# Used directly by the `tests/dynamodb` integration suite (table setup via the AWS
+# SDK). A dev-dependency, so it stays out of the shipped runtime and is exempt from
+# the `restricted_deps` driver-confinement guard.
+aws-sdk-dynamodb.workspace = true
 azure_core = "0.31.0"
 azure_storage = "0.21.0"
 azure_storage_blobs = "0.21.0"
@@ -223,15 +231,25 @@ bollard = "0.18.1"
 bytes.workspace = true
 chrono.workspace = true
 # Connector crates for integration tests
+connector-abfs = { path = "../data-connectors/connector-abfs" }
+connector-adbc = { path = "../data-connectors/connector-adbc" }
 connector-clickhouse = { path = "../data-connectors/connector-clickhouse" }
+connector-cosmosdb = { path = "../data-connectors/connector-cosmosdb" }
+connector-dynamodb = { path = "../data-connectors/connector-dynamodb" }
 connector-databricks = { path = "../data-connectors/connector-databricks" }
 connector-delta-lake = { path = "../data-connectors/connector-delta-lake" }
 connector-dremio = { path = "../data-connectors/connector-dremio" }
 connector-duckdb = { path = "../data-connectors/connector-duckdb" }
+connector-ducklake = { path = "../data-connectors/connector-ducklake" }
 connector-flightsql = { path = "../data-connectors/connector-flightsql" }
 connector-ftp = { path = "../data-connectors/connector-ftp" }
+connector-gcs = { path = "../data-connectors/connector-gcs" }
+connector-git = { path = "../data-connectors/connector-git" }
+connector-github = { path = "../data-connectors/connector-github" }
+connector-glue = { path = "../data-connectors/connector-glue" }
 connector-graphql = { path = "../data-connectors/connector-graphql" }
 connector-imap = { path = "../data-connectors/connector-imap" }
+connector-kafka = { path = "../data-connectors/connector-kafka" }
 connector-mongodb = { path = "../data-connectors/connector-mongodb" }
 connector-mssql = { path = "../data-connectors/connector-mssql" }
 connector-mysql = { path = "../data-connectors/connector-mysql" }
@@ -244,6 +262,7 @@ connector-sharepoint = { path = "../data-connectors/connector-sharepoint" }
 connector-smb = { path = "../data-connectors/connector-smb" }
 connector-snowflake = { path = "../data-connectors/connector-snowflake" }
 connector-spark = { path = "../data-connectors/connector-spark" }
+connector-spiceai = { path = "../data-connectors/connector-spiceai" }
 criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
 hf-hub = { workspace = true }
 insta = { workspace = true, features = ["json", "redactions"] }
@@ -276,8 +295,7 @@ aws-secrets-manager = ["dep:aws-sdk-sts", "runtime-secrets/aws-secrets-manager"]
 azure-keyvault = ["runtime-secrets/azure-keyvault"]
 hashicorp_vault = ["runtime-secrets/hashicorp_vault"]
 bedrock = []
-clickhouse = ["db_connection_pool/clickhouse", "data_components/clickhouse"]
-cosmosdb = ["data_components/cosmosdb"]
+cosmosdb = []
 cuda = ["llms/cuda"]
 databricks = ["data_components/databricks", "dep:duration-parse"]
 debezium = ["kafka", "data_components/debezium"]
@@ -289,21 +307,24 @@ elasticsearch = [
     "dep:elasticsearch",
     "dep:duration-parse",
     "search/elasticsearch",
+    "runtime-search/elasticsearch",
 ]
 duckdb = [
     "dep:duckdb",
+    "dep:runtime-checkpoint-duckdb",
     "db_connection_pool/duckdb",
     "data_components/duckdb",
     "datafusion-optimizer-rules/duckdb",
     "runtime-acceleration/duckdb",
     "search/duckdb",
+    "runtime-search/duckdb",
 ]
-dynamodb = [
-    "dep:aws-sdk-dynamodb",
-    "data_components/dynamodb",
-    "dep:dynamodb-streams",
-    "dep:humantime",
-]
+# Test-only marker: the DynamoDB connector now lives in `connector-dynamodb` (a
+# dev-dependency, registered unconditionally by `do_register_test_connectors`).
+# This gates the `tests/dynamodb` integration suite; the AWS SDK it uses directly is
+# a dev-dependency, so the shipped runtime lib carries no DynamoDB code or driver
+# (the driver-free `spice_sys/dynamodb` checkpoint sidecar is always compiled).
+dynamodb = []
 extended_tests = []
 flightsql = ["data_components/flightsql"]
 ftp = ["runtime-object-store/ftp"]
@@ -312,23 +333,23 @@ rate-control = []
 wasm-functions = ["runtime-datafusion-udfs/wasm-functions"]
 wasm-functions-compile = ["runtime-datafusion-udfs/wasm-functions-compile"]
 iceberg-write = []
-imap = ["data_components/imap"]
+imap = []
 kafka = ["data_components/kafka"]
 keyring-secret-store = ["runtime-secrets/keyring-secret-store"]
-mcp = ["dep:rmcp", "tools/mcp"]
+mcp = ["dep:rmcp", "runtime-tools/mcp", "tools/mcp"]
 metal = ["llms/metal"]
 distributed = ["llms/distributed", "models"]
 models = [
     "bedrock",
-    "model_components/full",
     "mcp",
     "runtime-datafusion-udfs/models",
     "search/llms",
     "llms/local_llm",
     "llms/local_embed",
 ]
-mongodb = ["data_components/mongodb"]
+mongodb = [] # marker: gates the driver-free spice_sys/mongodb resume-token checkpoint; connector lives in connector-mongodb
 mssql = ["dep:tiberius", "data_components/mssql"]
+mssql-kerberos-unix = ["data_components/mssql-kerberos-unix"]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "data_components/mysql"]
 nfs = ["runtime-object-store/nfs"]
 odbc = []
@@ -336,7 +357,10 @@ openapi = [
     "dep:utoipa-swagger-ui",
     "dep:utoipa",
     "mcp",
+    "runtime-acceleration/openapi",
     "runtime-api-types/openapi",
+    "runtime-search/openapi",
+    "runtime-tools/openapi",
 ]
 oracle = ["data_components/oracle"]
 pingora = ["cache/pingora"]
@@ -345,16 +369,17 @@ postgres = [
     "data_components/postgres",
     "datafusion-table-providers/postgres",
 ]
-postgres-accel = ["postgres", "dep:tokio-postgres"]
+postgres-accel = ["postgres", "dep:tokio-postgres", "dep:runtime-checkpoint-postgres"]
 
 s3_vectors = [
     "data_components/s3_vectors",
     "dep:s3_vectors",
     "search/s3_vectors",
+    "runtime-search/s3_vectors",
 ]
-scylladb = ["db_connection_pool/scylladb", "data_components/scylladb"]
+scylladb = []
 sftp = ["runtime-object-store/sftp"]
-sharepoint = ["data_components/sharepoint"]
+sharepoint = []
 smb = ["runtime-object-store/smb"]
 client_tls = []
 snapshots = ["runtime-acceleration/snapshots"]
@@ -369,6 +394,7 @@ spark = ["data_components/spark_connect"]
 spicebench = []
 sqlite = [
     "dep:tokio-rusqlite",
+    "dep:runtime-checkpoint-sqlite",
     "db_connection_pool/sqlite",
     "data_components/sqlite",
     "dep:rusqlite",
@@ -377,6 +403,7 @@ sqlite = [
 turso = [
     "dep:turso",
     "dep:tokio-rusqlite",
+    "dep:runtime-checkpoint-turso",
     "db_connection_pool/sqlite",
     "data_components/sqlite",
     "data_components/turso",
@@ -400,3 +427,10 @@ name = "flatten_json_properties"
 [[bench]]
 harness = false
 name = "cdc_cayenne_inline"
+
+[[bench]]
+harness = false
+name = "cdc_delete_burst"
+
+[lints]
+workspace = true

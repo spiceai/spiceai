@@ -9,6 +9,10 @@ The project docs for contributors and community. For user documentation of the S
 - [Distributions](DISTRIBUTIONS.md)
 - [Extensibility](EXTENSIBILITY.md)
 
+## Architecture References
+
+- [Cayenne](cayenne/README.md) — technical reference for the `cayenne` CDC acceleration engine (built to a PDF in CI)
+
 ## Contributing
 
 - [CONTRIBUTING.md](../CONTRIBUTING.md)
@@ -17,6 +21,7 @@ The project docs for contributors and community. For user documentation of the S
 ## Developer Notes
 
 - [Cosmos DB](dev/cosmosdb.md)
+- [Crate Layering](dev/crate_layering.md)
 - [Error Handling](dev/error_handling.md)
 - [LLM Prompt Caching](dev/llm-prompt-caching.md)
 - [Metrics](dev/metrics.md)

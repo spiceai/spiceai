@@ -35,10 +35,28 @@ limitations under the License.
 //! cap deadlock-free: a write can never hold some permits while waiting for the
 //! rest, so independent writes can't form a hold-and-wait cycle.
 //!
+//! That argument only holds for writes that are **independent**. Writes into a
+//! partitioned table are not: the partition insert path demuxes one input
+//! stream into per-partition writes over bounded channels
+//! (`runtime_table_partition::insert`), so a child write parked on this budget
+//! stalls the demux, which starves the permit-holding sibling writes of input —
+//! a hold-and-wait cycle *through the channels* that left partitioned tables
+//! permanently unready (spiceai/spiceai#11818). Such COUPLED writers — tables
+//! whose writes someone else stands behind, marked at construction via
+//! `CayenneContext::new_for_partition_child` — are therefore **exempt from the
+//! budget** ([`acquire_for_write`]): an exempt write can always drain its
+//! input, so the demux always makes progress, for any partition count. The
+//! exemption is safe because coupled tables are also forced to serial writes
+//! (one encode shard — the pre-budget baseline; the budget exists to cap
+//! encode *fan-out*), so an exempt child contributes the minimum possible
+//! encode footprint. Every uncoupled write, serial included, still queues.
+//!
 //! When unset (unit tests, embedders that don't wire it up) acquisition is a
 //! no-op and writes proceed ungated, preserving the prior per-table behavior.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
 use parking_lot::RwLock;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -109,7 +127,26 @@ struct EncodeBudget {
     /// then main) and `Delta` never touches the gate, so no hold-and-wait
     /// cycle exists across classes.
     maintenance_gate: Arc<Semaphore>,
-    total: usize,
+    /// The current budget ceiling, shared (an `Arc<AtomicUsize>` rather than a
+    /// plain `usize`) so [`cap_global_encode_concurrency`] can lower it IN
+    /// PLACE on the live `semaphore`/`maintenance_gate` — every clone an
+    /// in-flight acquirer holds observes the new ceiling. Per-acquire clamps
+    /// (`acquire_from`) read this, not a stale snapshot, so a request can never
+    /// ask for more permits than the (possibly just-shrunk) budget can ever
+    /// hold — closing the "pending `acquire_many` clamped to the old cap stalls
+    /// forever" hazard.
+    total: Arc<AtomicUsize>,
+    /// Permits a cap-shrink still owes on `semaphore`: tokio's `forget_permits`
+    /// can only remove *available* permits, so when held permits exceed the new
+    /// cap the residual is recorded here and forgotten as those permits return
+    /// (drained best-effort in `acquire_from`). This converges the live budget
+    /// down to the cap WITHOUT ever re-adding capacity — the prior swap-in of a
+    /// fresh full-size semaphore left old held permits running alongside a new
+    /// full budget, transiently over-subscribing the shared EBS pipe by
+    /// `old_held + new_cap`.
+    pending_forget: Arc<AtomicUsize>,
+    /// As [`Self::pending_forget`], for the `maintenance_gate` semaphore.
+    pending_gate_forget: Arc<AtomicUsize>,
 }
 
 /// Permits held for one write's encode, released together on drop.
@@ -132,7 +169,9 @@ pub fn set_global_encode_concurrency(permits: usize) {
     let budget = EncodeBudget {
         semaphore: Arc::new(Semaphore::new(permits)),
         maintenance_gate: Arc::new(Semaphore::new(maintenance_gate_cap(permits))),
-        total: permits,
+        total: Arc::new(AtomicUsize::new(permits)),
+        pending_forget: Arc::new(AtomicUsize::new(0)),
+        pending_gate_forget: Arc::new(AtomicUsize::new(0)),
     };
     let mut guard = GLOBAL_ENCODE_BUDGET.write();
     if guard.is_some() {
@@ -145,20 +184,184 @@ pub fn set_global_encode_concurrency(permits: usize) {
     *guard = Some(budget);
 }
 
+/// Forget up to `delta` permits on `sem` now, recording any that could not be
+/// forgotten (because they are currently held) as owed in `owed` — to be
+/// forgotten as those permits return (see [`drain_owed`]). Never adds capacity.
+fn forget_or_owe(sem: &Semaphore, owed: &AtomicUsize, delta: usize) {
+    if delta == 0 {
+        return;
+    }
+    let forgot = sem.forget_permits(delta);
+    if forgot < delta {
+        owed.fetch_add(delta - forgot, Ordering::AcqRel);
+    }
+}
+
+/// Forget any still-owed permits that have become available since the last
+/// cap-shrink (a held permit released back to `sem`). Best-effort and cheap: a
+/// single `forget_permits` of whatever is owed, capped by what is available
+/// now; the remainder drains on a later call. Called on the acquire path so the
+/// live budget converges to its cap as in-flight encodes finish, without ever
+/// having re-added capacity.
+fn drain_owed(sem: &Semaphore, owed: &AtomicUsize) {
+    let pending = owed.load(Ordering::Acquire);
+    if pending == 0 {
+        return;
+    }
+    let forgot = sem.forget_permits(pending);
+    if forgot > 0 {
+        owed.fetch_sub(forgot, Ordering::AcqRel);
+    }
+}
+
+impl EncodeBudget {
+    /// Lower this budget's ceiling to `max_permits` IN PLACE (never raises).
+    /// Returns the previous total when the cap bound (shrank), or `None` when it
+    /// was already at or below `max_permits`. The caller serializes (the global
+    /// write lock); `max_permits` is clamped to ≥ 1.
+    ///
+    /// This is the SINGLE source of the cap-shrink arithmetic —
+    /// [`cap_global_encode_concurrency`] and the unit test both drive it, so the
+    /// test can never validate a drifted copy of the shrink logic.
+    ///
+    /// Shrinks via `forget_permits` on the live semaphores rather than swapping
+    /// in fresh ones. A swap left every permit already held against the old
+    /// semaphore running ALONGSIDE a brand-new full-size budget, so aggregate
+    /// concurrency could transiently reach `old_held + max_permits` —
+    /// over-subscribing the very EBS pipe the cap protects. Forgetting in place
+    /// never adds capacity: it removes available permits immediately and records
+    /// the residual still held as owed (`pending_forget`/`pending_gate_forget`),
+    /// forgotten as those permits return ([`drain_owed`] on the acquire path), so
+    /// the budget converges DOWN to the cap and never temporarily up.
+    fn shrink_to(&self, max_permits: usize) -> Option<usize> {
+        let max_permits = max_permits.max(1);
+        let current = self.total.load(Ordering::Acquire);
+        if current <= max_permits {
+            return None; // Already at or below the cap — never raises.
+        }
+        forget_or_owe(&self.semaphore, &self.pending_forget, current - max_permits);
+        let gate_delta =
+            maintenance_gate_cap(current).saturating_sub(maintenance_gate_cap(max_permits));
+        forget_or_owe(
+            &self.maintenance_gate,
+            &self.pending_gate_forget,
+            gate_delta,
+        );
+        self.total.store(max_permits, Ordering::Release);
+        Some(current)
+    }
+}
+
+/// Lower the process-global encode budget to at most `max_permits`, never raising
+/// it. The integration point for the instance EBS-bandwidth cap: a single EBS
+/// volume is a shared, bandwidth-bounded pipe, so the aggregate parallel
+/// encode/upload streams must be bounded below the core-derived budget or they
+/// just fan out small files without adding throughput. Idempotent and safe across
+/// multiple table registrations — each EBS-class table proposes its
+/// bandwidth-derived cap and the tightest wins; a local-SSD table proposes
+/// nothing. A no-op when no budget is installed yet or the cap does not bind.
+pub fn cap_global_encode_concurrency(max_permits: usize) {
+    // The write lock serializes concurrent registrations proposing different
+    // caps: `shrink_to` re-reads the current total and shrinks only while it still
+    // exceeds `max_permits`, so a looser cap landing last cannot raise the budget
+    // back up ("tightest wins, never raises"). The semaphores are mutated in place
+    // (the shared `Arc`s every in-flight acquirer holds), so the lock guards the
+    // total/forget bookkeeping, not an `Option` swap.
+    let guard = GLOBAL_ENCODE_BUDGET.write();
+    let Some(budget) = guard.as_ref() else {
+        return; // No budget installed yet.
+    };
+    if let Some(previous) = budget.shrink_to(max_permits) {
+        tracing::info!(
+            target: "cayenne::write_budget",
+            max_permits,
+            previous,
+            "Capping global encode-concurrency budget to the instance EBS write-bandwidth ceiling"
+        );
+    }
+}
+
+/// Point-in-time occupancy of the process-global encode budget, for operator
+/// metrics. `available`/`total` are the main-semaphore permits (aggregate encode
+/// concurrency headroom / ceiling); `maintenance_gate_available` is the headroom
+/// left in the reserved maintenance slice. `available == 0` under a growing WAL
+/// backlog is the direct signature of the encode-semaphore stall that this
+/// budget exists to bound.
+#[derive(Debug, Clone, Copy)]
+pub struct EncodeBudgetSnapshot {
+    /// Available (unheld) main-semaphore permits — aggregate encode-concurrency
+    /// headroom right now. `0` means every permit is held (writes queue).
+    pub available: u64,
+    /// The current budget ceiling (total main permits).
+    pub total: u64,
+    /// Available permits in the reserved maintenance slice (compaction/rewrite
+    /// outputs); `Delta` writes never consume these.
+    pub maintenance_gate_available: u64,
+}
+
+/// Snapshot the process-global encode budget's occupancy, or `None` when no
+/// budget is installed (unit tests / embedders that don't wire it up). Cheap and
+/// lock-light: a read-guard plus three atomic loads — safe to call from a metrics
+/// scrape callback.
+#[must_use]
+pub fn encode_budget_snapshot() -> Option<EncodeBudgetSnapshot> {
+    let guard = GLOBAL_ENCODE_BUDGET.read();
+    let budget = guard.as_ref()?;
+    Some(EncodeBudgetSnapshot {
+        available: budget.semaphore.available_permits() as u64,
+        total: budget.total.load(Ordering::Acquire) as u64,
+        maintenance_gate_available: budget.maintenance_gate.available_permits() as u64,
+    })
+}
+
 /// Acquire up to `shards` encode permits from the global budget, atomically.
 ///
 /// Returns the held permits (which release on drop, so callers scope them to
-/// the write) or `None` when no budget is installed (proceed ungated). `shards`
+/// the write) or `None` when the write proceeds ungated: no budget installed,
+/// or a coupled writer (see [`acquire_for_write`]). For gated writes, `shards`
 /// is clamped to `[1, class cap]` so the request is always satisfiable and can
 /// never block forever waiting for more permits than the budget can ever hold.
 /// `Delta` writes may use the whole budget; `Maintenance` writes are capped to
 /// [`maintenance_gate_cap`] in aggregate (see `maintenance_gate`).
+///
+/// `coupled_writer` is `CayenneContext::is_coupled_writer()` — whether this
+/// table's writes are fed by a shared demux alongside sibling writers
+/// (partition child tables).
 pub(crate) async fn acquire_encode_permits(
     shards: usize,
     class: WriteClass,
+    coupled_writer: bool,
 ) -> Option<EncodePermits> {
     let budget = GLOBAL_ENCODE_BUDGET.read().clone()?;
-    acquire_from(&budget, shards, class).await
+    acquire_for_write(&budget, shards, class, coupled_writer).await
+}
+
+/// Budget policy for a write: independent writes acquire permits
+/// ([`acquire_from`]); **coupled writers are exempt** and proceed ungated
+/// (`None`).
+///
+/// The exemption is load-bearing, not an optimization. Coupled writers — the
+/// partition child tables of a partitioned dataset — are all fed by one
+/// routing demux over bounded channels, and deadlock if any of them can park
+/// on this budget: the parked write stalls the demux, starving the
+/// permit-holding siblings of input, and no permit is ever released
+/// (spiceai/spiceai#11818). An exempt write never parks, so the demux always
+/// drains, for any partition count. The budget's purpose — capping aggregate
+/// encode *fan-out* — is preserved: coupled tables are also forced to serial
+/// (single-shard) writes at creation, the pre-budget baseline of one encode
+/// stream per writer, and compaction's aggregate concurrency stays bounded by
+/// the `BackgroundCompactor` semaphore independently of this gate. Uncoupled
+/// writes — including serial ones — queue exactly as before.
+async fn acquire_for_write(
+    budget: &EncodeBudget,
+    shards: usize,
+    class: WriteClass,
+    coupled_writer: bool,
+) -> Option<EncodePermits> {
+    if coupled_writer {
+        return None;
+    }
+    acquire_from(budget, shards, class).await
 }
 
 /// Acquire `min(shards, class cap)` permits from a specific budget. Extracted
@@ -175,13 +378,27 @@ async fn acquire_from(
     shards: usize,
     class: WriteClass,
 ) -> Option<EncodePermits> {
+    // Forget any permits a prior cap-shrink still owes that have since returned,
+    // converging the live budget down to its cap before we read it. Cheap no-op
+    // in the common case (nothing owed).
+    drain_owed(&budget.semaphore, &budget.pending_forget);
+    drain_owed(&budget.maintenance_gate, &budget.pending_gate_forget);
+    // Read the LIVE ceiling (not a stale snapshot) so a request is always
+    // satisfiable under the current — possibly just-shrunk — budget and can
+    // never block forever waiting for more permits than it can ever hold.
+    let total = budget.total.load(Ordering::Acquire);
+    // Time the blocking acquire so the wait attributable to encode-budget
+    // contention is observable (`cayenne_encode_acquire_wait_ms{class}`). This is
+    // the CDC apply-path backpressure signal: near-zero under headroom, seconds
+    // when a fleet of tables saturates the shared budget.
+    let wait_start = Instant::now();
     let gate = match class {
         WriteClass::Delta => None,
         WriteClass::Maintenance => {
             // Gate first (uniform order; see `maintenance_gate` docs). The gate
             // is sized below `total`, so the subsequent main acquisition of the
             // same count can always be satisfied once delta holders release.
-            let gate_cap = maintenance_gate_cap(budget.total);
+            let gate_cap = maintenance_gate_cap(total);
             let permits = u32::try_from(shards.clamp(1, gate_cap)).unwrap_or(u32::MAX);
             Some(
                 Arc::clone(&budget.maintenance_gate)
@@ -193,12 +410,20 @@ async fn acquire_from(
     };
     let main_count = gate
         .as_ref()
-        .map_or_else(|| shards.clamp(1, budget.total), |g| g.num_permits().max(1));
+        .map_or_else(|| shards.clamp(1, total), |g| g.num_permits().max(1));
     let main_count = u32::try_from(main_count).unwrap_or(u32::MAX);
     let main = Arc::clone(&budget.semaphore)
         .acquire_many_owned(main_count)
         .await
         .ok()?;
+    let class_label = match class {
+        WriteClass::Delta => "delta",
+        WriteClass::Maintenance => "maintenance",
+    };
+    telemetry::cayenne::track_encode_acquire_wait(
+        wait_start.elapsed(),
+        &[telemetry::KeyValue::new("class", class_label)],
+    );
     Some(EncodePermits {
         _main: main,
         _gate: gate,
@@ -215,8 +440,77 @@ mod tests {
         EncodeBudget {
             semaphore: Arc::new(Semaphore::new(total)),
             maintenance_gate: Arc::new(Semaphore::new(maintenance_gate_cap(total))),
-            total,
+            total: Arc::new(AtomicUsize::new(total)),
+            pending_forget: Arc::new(AtomicUsize::new(0)),
+            pending_gate_forget: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// REGRESSION (the resize-without-coordination bug): capping the budget while
+    /// permits are held must NOT add capacity. The prior implementation swapped in
+    /// a fresh `Semaphore::new(max_permits)`, so the already-held permits kept
+    /// running alongside a brand-new full budget — a further acquire succeeded
+    /// immediately, pushing aggregate concurrency to `old_held + new_cap` and
+    /// over-subscribing the shared EBS pipe the cap exists to protect.
+    ///
+    /// With the in-place forget, capping below the held count leaves zero
+    /// available, so a further acquire BLOCKS (no new capacity) — and once the
+    /// over-cap held permits drain, the budget converges to the new cap rather
+    /// than reverting to the old total.
+    #[tokio::test]
+    async fn cap_under_held_permits_never_oversubscribes() {
+        let b = budget(4);
+        // Hold the entire budget (4 permits), modelling 4 in-flight encodes.
+        let held = acquire_from(&b, 4, WriteClass::Delta)
+            .await
+            .expect("initial acquire of the full budget succeeds");
+        assert_eq!(b.semaphore.available_permits(), 0, "all 4 permits held");
+
+        // A registration tightens the EBS cap to 2 while those 4 are in flight.
+        b.shrink_to(2);
+
+        // BUG would allow this: a fresh 2-permit semaphore grants immediately,
+        // so 4 (old) + up-to-2 (new) = up to 6 concurrent encodes. FIX: the live
+        // semaphore has 0 available, so the new acquire must block.
+        let pending = acquire_from(&b, 1, WriteClass::Delta);
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut pending)
+                .await
+                .is_err(),
+            "capping below the held count must NOT grant new permits \
+             (the swap re-added capacity, over-subscribing to old_held + new_cap)"
+        );
+
+        // Release the 4 over-cap in-flight permits; the budget must converge DOWN
+        // to the new cap of 2, not revert to the old total of 4.
+        drop(held);
+        // The blocked acquire now proceeds (a returned permit satisfies it).
+        let resumed = tokio::time::timeout(Duration::from_millis(500), &mut pending)
+            .await
+            .expect("the waiter proceeds once an in-flight encode releases")
+            .expect("acquire yields permits after release");
+        // One more acquire drives the owed-forget drain to completion, then with
+        // 1 of the 2 capped permits held by `resumed`, exactly 1 remains.
+        let _second = acquire_from(&b, 1, WriteClass::Delta)
+            .await
+            .expect("a second acquire fits within the capped budget of 2");
+        assert_eq!(
+            b.semaphore.available_permits(),
+            0,
+            "budget converged to the cap of 2 (both held), not the old total of 4"
+        );
+        // And a THIRD acquire must block: the cap of 2 is now fully held, proving
+        // the old total of 4 was not silently restored when the held permits returned.
+        let third = acquire_from(&b, 1, WriteClass::Delta);
+        tokio::pin!(third);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut third)
+                .await
+                .is_err(),
+            "the capped budget of 2 must stay enforced after the held permits drained"
+        );
+        drop(resumed);
     }
 
     /// The reserve scales with the total (~25%) within `[2, 6]`, and the gate
@@ -365,6 +659,81 @@ mod tests {
     /// here — keeping this free of cross-test interference.
     #[tokio::test]
     async fn acquire_encode_permits_is_noop_when_unset() {
-        assert!(acquire_encode_permits(8, WriteClass::Delta).await.is_none());
+        assert!(
+            acquire_encode_permits(8, WriteClass::Delta, false)
+                .await
+                .is_none()
+        );
+    }
+
+    /// REGRESSION (spiceai/spiceai#11818): a coupled write must proceed
+    /// ungated even when the budget is fully held. Partitioned-table inserts
+    /// feed their per-partition writes through one bounded-channel demux, so a
+    /// child write that parks on the budget stalls the demux, starves the
+    /// permit-holding siblings of input, and deadlocks the whole insert —
+    /// datasets loaded but the table never ready.
+    #[tokio::test]
+    async fn coupled_write_is_exempt_even_at_zero_headroom() {
+        let b = budget(2);
+        let held = acquire_from(&b, 2, WriteClass::Delta).await;
+        assert!(held.is_some());
+        assert_eq!(b.semaphore.available_permits(), 0, "budget fully held");
+
+        let exempt = tokio::time::timeout(
+            Duration::from_millis(500),
+            acquire_for_write(&b, 1, WriteClass::Delta, true),
+        )
+        .await
+        .expect("a coupled write must never block on the budget");
+        assert!(exempt.is_none(), "exempt writes hold no permits");
+        assert_eq!(
+            b.semaphore.available_permits(),
+            0,
+            "the exemption consumes no budget"
+        );
+    }
+
+    /// The exemption applies to `Maintenance` too: a coupled table's
+    /// compaction output must not park on the gate — its aggregate concurrency
+    /// is bounded by the compactor's own semaphore, not this budget.
+    #[tokio::test]
+    async fn coupled_maintenance_is_exempt() {
+        let total = 16;
+        let b = budget(total);
+        let gate = maintenance_gate_cap(total);
+        let _held = acquire_from(&b, gate, WriteClass::Maintenance).await;
+        assert_eq!(b.maintenance_gate.available_permits(), 0, "gate exhausted");
+
+        let exempt = tokio::time::timeout(
+            Duration::from_millis(500),
+            acquire_for_write(&b, 1, WriteClass::Maintenance, true),
+        )
+        .await
+        .expect("a coupled maintenance write must never block on the gate");
+        assert!(exempt.is_none());
+    }
+
+    /// Uncoupled writes stay gated — the exemption is strictly for coupled
+    /// writers. A serial (1-shard) independent write still claims its permit
+    /// and queues at zero headroom, preserving the budget's aggregate
+    /// accounting for everything outside partitioned inserts.
+    #[tokio::test]
+    async fn uncoupled_writes_stay_gated() {
+        let b = budget(2);
+        let held = acquire_for_write(&b, 2, WriteClass::Delta, false).await;
+        assert!(held.is_some(), "a gated acquire succeeds under headroom");
+        assert_eq!(b.semaphore.available_permits(), 0);
+
+        let mut pending = std::pin::pin!(acquire_for_write(&b, 1, WriteClass::Delta, false));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut pending)
+                .await
+                .is_err(),
+            "an uncoupled serial write queues while the budget is held"
+        );
+        drop(held);
+        tokio::time::timeout(Duration::from_millis(500), &mut pending)
+            .await
+            .expect("the queued write proceeds once permits release");
     }
 }

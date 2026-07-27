@@ -36,10 +36,14 @@ use tokio::task::JoinSet;
 use tokio_stream::wrappers::BroadcastStream;
 use util::RetryError;
 
+use data_components::index_maintenance::perform_index_maintenance;
 use runtime_datafusion_index::Index;
 
 use crate::{
-    accelerated_table::{refresh_task::retry_from_df_error, synchronized_table::SynchronizedTable},
+    accelerated_table::{
+        refresh_task::retry_from_df_error, sink::finalize_indexes,
+        synchronized_table::SynchronizedTable,
+    },
     datafusion::error::find_datafusion_root,
     dataupdate::StreamingDataUpdateExecutionPlan,
 };
@@ -227,19 +231,33 @@ impl MultiSink {
             return Err(first_error);
         }
 
-        // Run on_write_complete for all sink_indexes.
-        for index in &self.sink_indexes {
-            tracing::debug!(
-                "MultiSink: running on_write_complete for index '{}'",
-                index.name()
-            );
-            if let Err(e) = index.on_write_complete().await {
+        // Rebuild hash indexes (if any) on the parent and every synchronized child
+        // accelerator after a successful write, mirroring TableSink. Without this an
+        // IndexedMemTable behind a synchronized table would be left permanently
+        // dirty after add_synchronized_table converts the sink, serving every PK
+        // lookup via a full scan (correct but slow) forever (#11262).
+        // perform_index_maintenance is a no-op for providers that don't maintain an
+        // index, and a failed rebuild is best-effort: the table stays dirty and
+        // reads fall back to a full scan rather than serving stale results.
+        let mut maintenance_targets: Vec<Arc<dyn TableProvider>> =
+            vec![Arc::clone(&self.original_table_provider)];
+        maintenance_targets.extend(
+            self.synchronized_tables
+                .iter()
+                .map(SynchronizedTable::child_accelerator),
+        );
+        for provider in &maintenance_targets {
+            if let Err(e) = perform_index_maintenance(provider.as_ref()).await {
                 tracing::warn!(
-                    "MultiSink: on_write_complete failed for index '{}': {e}. Index may be stale until next refresh.",
-                    index.name()
+                    "MultiSink: index maintenance failed after write: {e}. Index may be stale until next refresh."
                 );
             }
         }
+
+        // Run on_write_complete for all sink_indexes.
+        finalize_indexes("MultiSink", self.sink_indexes.iter())
+            .await
+            .map_err(retry_from_df_error)?;
 
         Ok(())
     }

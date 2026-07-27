@@ -40,10 +40,11 @@ use crate::cluster::cluster_state::{
 };
 use crate::cluster::heartbeat::{self, CLOCK_SKEW_TOLERANCE_MS, SchedulerHeartbeatStore};
 use crate::cluster::reaper::Reaper;
-use crate::metrics::cluster as cluster_metrics;
+use runtime_metrics::cluster as cluster_metrics;
 
 const DEFAULT_TTL_MS: u64 = 30_000;
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
+const JOB_RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
 const HEARTBEAT_DIVISOR: u64 = 3;
 
 #[derive(Debug, Snafu)]
@@ -80,6 +81,7 @@ struct SchedulerRegistryRunner {
     instance_id: Uuid,
     entry: SchedulerEntry,
     peers: Arc<RwLock<SchedulerPeers>>,
+    job_executor: Arc<crate::jobs::JobExecutor>,
 }
 
 pub async fn start_scheduler_registry(
@@ -126,10 +128,13 @@ pub async fn start_scheduler_registry(
     let job_store = crate::jobs::JobStore::new(
         Arc::clone(&store),
         base_prefix.clone(),
-        scheduler_id.clone(),
+        instance_id.to_string(),
     );
-    let job_executor = crate::jobs::JobExecutor::new(Arc::new(job_store), rt.datafusion());
-    rt.set_job_executor(Arc::new(job_executor)).await;
+    let job_executor = Arc::new(crate::jobs::JobExecutor::new(
+        Arc::new(job_store),
+        rt.datafusion(),
+    ));
+    rt.set_job_executor(Arc::clone(&job_executor)).await;
     tracing::info!(
         "Initialized async SQL jobs API with state location: {}",
         config.state_location
@@ -137,6 +142,9 @@ pub async fn start_scheduler_registry(
 
     let reaper = Reaper::new(Arc::clone(&cluster), Arc::clone(&heartbeats));
 
+    // The job-recovery sweep runs as another arm of the runner's select loop (see
+    // `run`), so it shares this already-tracked registry task's lifecycle and
+    // graceful shutdown rather than a separate untracked tokio::spawn.
     let runner = SchedulerRegistryRunner {
         cluster,
         heartbeats,
@@ -145,9 +153,53 @@ pub async fn start_scheduler_registry(
         instance_id,
         entry,
         peers,
+        job_executor,
     };
 
     runner.run(cancel).await
+}
+
+/// Resumes any running job whose recorded scheduler instance is not currently
+/// live. Each driving scheduler records its own `instance_id` on the job, and
+/// this scheduler's id is always treated as live so it never reclaims its own
+/// in-flight jobs.
+async fn recover_orphaned_jobs(
+    job_executor: &crate::jobs::JobExecutor,
+    peers: &RwLock<SchedulerPeers>,
+    instance_id: Uuid,
+) {
+    let live: HashSet<String> = {
+        let guard = peers.read().await;
+        let mut live: HashSet<String> = guard.values().map(|e| e.instance_id.to_string()).collect();
+        live.insert(instance_id.to_string());
+        live
+    };
+
+    let jobs = match job_executor
+        .list_jobs(Some(crate::jobs::JobStatus::Running))
+        .await
+    {
+        Ok(jobs) => jobs,
+        Err(err) => {
+            tracing::warn!("Failed to list jobs during recovery sweep: {err}");
+            return;
+        }
+    };
+
+    for job in jobs {
+        let driven = job
+            .scheduler_node
+            .as_ref()
+            .is_some_and(|node| live.contains(node));
+        if !driven {
+            tracing::info!(
+                job_id = %job.job_id,
+                scheduler_node = ?job.scheduler_node,
+                "Recovering job orphaned by a lost scheduler"
+            );
+            job_executor.resume(&job.job_id).await;
+        }
+    }
 }
 
 impl SchedulerRegistryRunner {
@@ -162,6 +214,13 @@ impl SchedulerRegistryRunner {
         let mut heartbeat_tick = tokio::time::interval(heartbeat_interval);
         let mut discovery_tick = tokio::time::interval(DISCOVERY_INTERVAL);
         let mut reaper_tick = tokio::time::interval(reaper_jittered);
+        // `interval_at` starts the first recovery sweep one interval out, so the
+        // initial discovery below has populated `peers` before we judge any job
+        // orphaned — otherwise live schedulers look lost at startup.
+        let mut recovery_tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + JOB_RECOVERY_INTERVAL,
+            JOB_RECOVERY_INTERVAL,
+        );
 
         // Run an initial discovery so peers are populated promptly.
         if let Err(err) = self.refresh_peers().await {
@@ -201,6 +260,9 @@ impl SchedulerRegistryRunner {
                             "Skipping reaper tick because current time is unavailable: {err}"
                         ),
                     }
+                }
+                _ = recovery_tick.tick() => {
+                    recover_orphaned_jobs(&self.job_executor, &self.peers, self.instance_id).await;
                 }
             }
         }
@@ -380,6 +442,9 @@ fn now_ms() -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataaccelerator::AcceleratorEngineRegistry;
+    use crate::datafusion::builder::DataFusionBuilder;
+    use crate::status;
     use object_store::memory::InMemory;
 
     #[tokio::test]
@@ -401,6 +466,17 @@ mod tests {
             build_version: "test".to_string(),
             labels: HashMap::new(),
         };
+        let job_store = crate::jobs::JobStore::new(Arc::clone(&store), "", instance_id.to_string());
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            Handle::current(),
+        )
+        .build();
+        let job_executor = Arc::new(crate::jobs::JobExecutor::new(
+            Arc::new(job_store),
+            Arc::new(df),
+        ));
         let runner = SchedulerRegistryRunner {
             cluster: Arc::clone(&cluster),
             heartbeats: Arc::clone(&heartbeats),
@@ -409,6 +485,7 @@ mod tests {
             instance_id,
             entry,
             peers: Arc::new(RwLock::new(HashMap::new())),
+            job_executor,
         };
         runner.register_self().await.expect("register");
 

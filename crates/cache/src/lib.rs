@@ -54,7 +54,7 @@ pub use metrics::CacheMetrics;
 pub use simple_cache::SimpleCache;
 use spicepod::component::caching::SQLResultsCacheConfig;
 pub use utils::RESPONSE_STATUS_COLUMN;
-pub use utils::batches_to_cache;
+pub use utils::batches_cacheable;
 pub use utils::filter_transient_error_responses;
 pub use utils::get_logical_plan_input_tables;
 pub use utils::to_cached_record_batch_stream;
@@ -122,6 +122,46 @@ impl AsTableRefs for LogicalPlan {
     fn as_table_refs(&self) -> Arc<HashSet<TableReference>> {
         Arc::new(get_logical_plan_input_tables(self))
     }
+}
+
+/// Default catalog and schema used to resolve table references before comparing
+/// them during cache invalidation.
+///
+/// These mirror `runtime_datafusion::SPICE_DEFAULT_CATALOG` /
+/// `SPICE_DEFAULT_SCHEMA`. They are duplicated here because the `cache` crate
+/// cannot depend on `runtime-datafusion` without forming a dependency cycle
+/// (`runtime-datafusion -> search -> datafusion-optimizer-rules -> cache`).
+pub const SPICE_DEFAULT_CATALOG: &str = "spice";
+pub const SPICE_DEFAULT_SCHEMA: &str = "public";
+
+/// Returns `true` if `target` refers to the same physical table as any reference
+/// in `stored`, after resolving both sides to fully-qualified
+/// (`catalog.schema.table`) form.
+///
+/// Cache entries record table references exactly as written in the originating
+/// SQL (e.g. bare `customer` or fully-qualified `spice.public.customer`), while
+/// invalidators — accelerated-refresh completion, `INSERT INTO`, and other DML —
+/// may pass a differently-qualified reference for the same table. Plain
+/// `TableReference` equality therefore misses entries that name the same table
+/// with a different qualification, leaving stale rows served as fresh cache hits
+/// until TTL expiry. Resolving both sides first makes the comparison robust to
+/// qualification differences.
+#[must_use]
+pub fn resolved_table_match<S: std::hash::BuildHasher>(
+    stored: &HashSet<TableReference, S>,
+    target: &TableReference,
+) -> bool {
+    // Resolve the target once into a local (&str, &str, &str) triple so the
+    // O(cache_size) scan never clones TableReference or allocates via resolve().
+    let target_catalog = target.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
+    let target_schema = target.schema().unwrap_or(SPICE_DEFAULT_SCHEMA);
+    let target_table = target.table();
+
+    stored.iter().any(|stored_ref| {
+        stored_ref.catalog().unwrap_or(SPICE_DEFAULT_CATALOG) == target_catalog
+            && stored_ref.schema().unwrap_or(SPICE_DEFAULT_SCHEMA) == target_schema
+            && stored_ref.table() == target_table
+    })
 }
 
 #[async_trait]
@@ -613,6 +653,59 @@ mod tests {
     use utils::tests::parse_sql_to_logical_plan;
 
     use super::*;
+
+    #[test]
+    fn resolved_table_match_bare_vs_fully_qualified() {
+        let stored: HashSet<TableReference> = HashSet::from([TableReference::bare("customer")]);
+        let target = TableReference::full(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, "customer");
+        assert!(resolved_table_match(&stored, &target));
+
+        // Reverse direction: stored fully-qualified, target bare.
+        let stored: HashSet<TableReference> = HashSet::from([TableReference::full(
+            SPICE_DEFAULT_CATALOG,
+            SPICE_DEFAULT_SCHEMA,
+            "customer",
+        )]);
+        let target = TableReference::bare("customer");
+        assert!(resolved_table_match(&stored, &target));
+    }
+
+    #[test]
+    fn resolved_table_match_bare_vs_partially_qualified() {
+        let stored: HashSet<TableReference> = HashSet::from([TableReference::bare("customer")]);
+        let target = TableReference::partial(SPICE_DEFAULT_SCHEMA, "customer");
+        assert!(resolved_table_match(&stored, &target));
+
+        // Different schema must not match a bare name (defaults to public).
+        let target = TableReference::partial("other_schema", "customer");
+        assert!(!resolved_table_match(&stored, &target));
+    }
+
+    #[test]
+    fn resolved_table_match_partial_vs_fully_qualified() {
+        let stored: HashSet<TableReference> =
+            HashSet::from([TableReference::partial(SPICE_DEFAULT_SCHEMA, "customer")]);
+        let target = TableReference::full(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, "customer");
+        assert!(resolved_table_match(&stored, &target));
+
+        // Different catalog must not match.
+        let target = TableReference::full("other_catalog", SPICE_DEFAULT_SCHEMA, "customer");
+        assert!(!resolved_table_match(&stored, &target));
+    }
+
+    #[test]
+    fn resolved_table_match_different_table_names() {
+        let stored: HashSet<TableReference> = HashSet::from([TableReference::bare("customer")]);
+        let target = TableReference::bare("orders");
+        assert!(!resolved_table_match(&stored, &target));
+    }
+
+    #[test]
+    fn resolved_table_match_empty_set() {
+        let stored: HashSet<TableReference> = HashSet::new();
+        let target = TableReference::bare("customer");
+        assert!(!resolved_table_match(&stored, &target));
+    }
 
     #[tokio::test]
     async fn test_cache_is_enabled_for_system_query_describe() {

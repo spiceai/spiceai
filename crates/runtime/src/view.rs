@@ -14,8 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::{
-    component::view::View,
-    embeddings::{index::table::wrap_table_as_index, table::EmbeddingTable},
+    component::view::View, embeddings::index::table::wrap_table_as_index,
     search::full_text::table::add_full_text_search_to_table,
 };
 use ::datafusion::sql::{TableReference, parser, sqlparser::ast};
@@ -25,6 +24,7 @@ use datafusion::{
     error::{DataFusionError, Result},
     prelude::SessionContext,
 };
+use runtime_search::embeddings::table::EmbeddingTable;
 use snafu::ResultExt;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 use std::{collections::HashSet, sync::Arc};
@@ -112,18 +112,26 @@ pub(crate) async fn prepare_view(
 
     // Add any embedding columns (and vector engine, if applicable)
     if view.has_embeddings() {
+        let file_format = view.params.get("file_format").map(String::as_str);
         if let Some(ref vectors) = view.vectors
             && vectors.enabled
         {
+            let on_zero_results = view
+                .acceleration
+                .as_ref()
+                .map(|acceleration| acceleration.on_zero_results.clone())
+                .unwrap_or_default();
+
             tbl_provider = wrap_table_as_index(
                 &Arc::new(ctx.clone()),
                 &view.runtime.embeds(),
                 &view.runtime.secrets(),
                 &view.name,
                 &view.columns,
-                None,
+                file_format,
                 tbl_provider,
                 vectors,
+                &on_zero_results,
             )
             .await?;
         } else {
@@ -144,7 +152,7 @@ pub(crate) async fn prepare_view(
                     })
                     .collect(),
                 &view.runtime.embeds(),
-                None, // TODO handle file formats: `view.params.get("file_format").map(String::as_str)`.
+                file_format,
             )
             .await
             .boxed()
@@ -155,7 +163,7 @@ pub(crate) async fn prepare_view(
     // Configure full-text search
     if view.has_full_text_column() {
         tbl_provider = Arc::new(add_full_text_search_to_table(
-            tbl_provider,
+            &tbl_provider,
             &view.columns,
             &view.name,
         )?) as Arc<dyn TableProvider>;

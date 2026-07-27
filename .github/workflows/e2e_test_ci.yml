@@ -28,24 +28,16 @@ on:
   pull_request:
     branches:
       - trunk
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'README.md'
-      - 'Makefile'
-      - 'CONTRIBUTING.md'
-      - 'SECURITY.md'
-      - 'LICENSE'
-      - '.github/**'
-      - 'version.txt'
-      - '.schema/**'
-      - '.vscode/**'
-      - 'deploy/**'
-      - 'install/**'
-      - 'media/**'
-      - 'monitoring/**'
-      - 'acknowledgements.md'
-      - 'Dockerfile*'
+      - release-*
+      - release/*
+      - feature-*
+
+  merge_group:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
 
   workflow_dispatch:
 
@@ -63,8 +55,26 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
+  # Skip the expensive E2E matrix on merge groups that don't touch code (docs,
+  # etc.). `build` — which every test job depends on — is gated on this, so the
+  # whole matrix cascades to "skipped" while the E2E Test CI gate still reports.
+  check_changes:
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: spiceai-dev-runners
+    outputs:
+      relevant_changes: ${{ steps.check.outputs.relevant_changes == 'true' || github.event_name == 'workflow_dispatch' }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Check for code changes
+        id: check
+        uses: ./.github/actions/check-code-changes
+
   setup-matrix:
     name: Setup strategy matrix
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-dev-runners
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
@@ -97,14 +107,15 @@ jobs:
   build:
     name: Build ${{ matrix.target.name }} binaries
     runs-on: ${{ matrix.target.builder }}
-    needs: setup-matrix
+    needs: [setup-matrix, check_changes]
+    if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
 
     strategy:
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1 # Shallow clone for faster checkout
@@ -158,6 +169,7 @@ jobs:
 
   setup-model-matrix:
     name: Setup model strategy matrix
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
@@ -198,7 +210,7 @@ jobs:
       matrix:
         target: ${{ fromJson(needs.setup-model-matrix.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1
@@ -246,6 +258,10 @@ jobs:
             HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install expect
           fi
 
+      - name: Test the expect scripts driving the REPLs
+        run: |
+          ./test/models/expect_test.sh
+
       - name: Test vector search
         run: |
           ./test/models/search_01.exp
@@ -284,7 +300,7 @@ jobs:
             target_os: 'darwin'
             target_arch: 'aarch64'
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1
@@ -332,6 +348,10 @@ jobs:
             HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install expect
           fi
 
+      - name: Test the expect scripts driving the REPLs
+        run: |
+          ./test/models/expect_test.sh
+
       - name: Test vector search
         run: |
           ./test/models/search_01.exp
@@ -368,7 +388,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -444,7 +464,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -512,7 +532,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -624,7 +644,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install PostgreSQL
         uses: ./.github/actions/install-postgres
@@ -809,7 +829,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install PostgreSQL
         if: matrix.acceleration.engine == 'postgres'
@@ -1002,7 +1022,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install Clickhouse
         if: matrix.target.target_os == 'linux'
@@ -1111,7 +1131,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install DuckDB
         if: matrix.target.target_os == 'linux'
@@ -1207,7 +1227,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install PostgreSQL
         uses: ./.github/actions/install-postgres
@@ -1343,7 +1363,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -1498,7 +1518,7 @@ jobs:
               target_os: 'darwin'
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -1651,7 +1671,7 @@ jobs:
           SA_PASSWORD: 1StrongPwd!!
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install mssql-tools
         run: |
@@ -1754,7 +1774,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -1856,7 +1876,7 @@ jobs:
               target_os: 'darwin'
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -2008,10 +2028,20 @@ jobs:
           # `simulate_append_data.sh` rewrites `.spice/service_data.parquet`
           # every 3s; a refresh tick that races the rename observes a
           # half-published file and the runtime logs a WARN before
-          # retrying on the next tick. Tolerate that specific transient.
-          if grep -iE "(failed|error)" spice.log \
+          # retrying on the next tick. DuckDB surfaces the truncated read as
+          # one of two errors depending on which part of the file it reaches
+          # first: "TProtocolException: Invalid data" (corrupt Thrift footer)
+          # or "don't know what type:" with an empty type (schema element not
+          # yet written). Tolerate both variants of that specific transient.
+          #
+          # Strip ANSI first: spiced logs with_ansi(true), so whitelist
+          # patterns like `WARN +runtime::...` miss `WARN\e[0m \e[2mruntime::...`
+          # and the same transient fails the job (see run 29659183104).
+          if sed $'s/\x1b\\[[0-9;]*m//g' spice.log \
+             | grep -iE "(failed|error)" \
              | grep -vE "WARN +runtime::accelerated_table::refresh_task: Failed to load data for dataset" \
-             | grep -vE "^Invalid Error: TProtocolException: Invalid data$"; then
+             | grep -vE "^Invalid Error: TProtocolException: Invalid data$" \
+             | grep -vE "^Invalid Error: don't know what type: *$"; then
             echo "Failures detected in spice.log"
             exit 1
           fi
@@ -2045,11 +2075,15 @@ jobs:
         run: |
           killall spice || true
           cat spice.log
-          # See note above: tolerate transient parquet-rename races emitted
-          # at WARN level by the refresh task.
-          if grep -iE "(failed|error)" spice.log \
+          # See note above: strip ANSI, then tolerate transient parquet-rename
+          # races emitted at WARN level by the refresh task (both the
+          # "TProtocolException: Invalid data" and empty-type "don't know what
+          # type:" variants).
+          if sed $'s/\x1b\\[[0-9;]*m//g' spice.log \
+             | grep -iE "(failed|error)" \
              | grep -vE "WARN +runtime::accelerated_table::refresh_task: Failed to load data for dataset" \
-             | grep -vE "^Invalid Error: TProtocolException: Invalid data$"; then
+             | grep -vE "^Invalid Error: TProtocolException: Invalid data$" \
+             | grep -vE "^Invalid Error: don't know what type: *$"; then
             echo "Failures detected in spice.log"
             exit 1
           fi
@@ -2078,7 +2112,7 @@ jobs:
               target_os: 'darwin'
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -2202,3 +2236,44 @@ jobs:
             echo "Failures detected in spice.log"
             exit 1
           fi
+
+  # Stable, matrix-proof summary check. On pull requests, the upstream jobs are
+  # skipped and this lightweight gate reports the required context. In the merge
+  # queue it succeeds only if every E2E job above succeeded (or was skipped), so
+  # the whole matrix is gated by one ruleset entry rather than dozens of shifting
+  # matrix names.
+  e2e-gate:
+    name: E2E Test CI
+    runs-on: ubuntu-latest
+    if: ${{ !cancelled() }}
+    needs:
+      - check_changes
+      - setup-matrix
+      - build
+      - setup-model-matrix
+      - test_openai_model
+      - test_hf_model
+      - test_quickstart_dremio
+      - test_quickstart_spiceai
+      - test_quickstart_s3
+      - test_quickstart_data_postgres
+      - test_quickstart_data_mysql
+      - test_quickstart_clickhouse
+      - test_quickstart_duckdb
+      - test_local_acceleration
+      - test_results_caching
+      - gh_connector_quickstart
+      - mssql_connector_quickstart
+      - databricks_delta_catalog_connector_quickstart
+      - graceful_shutdown_test_append
+      - graceful_shutdown_test_full
+    steps:
+      - name: Verify all E2E jobs succeeded
+        run: |
+          failure="${{ contains(needs.*.result, 'failure') }}"
+          cancelled="${{ contains(needs.*.result, 'cancelled') }}"
+          if [ "$failure" = "true" ] || [ "$cancelled" = "true" ]; then
+            echo "::error::One or more E2E Test CI jobs did not succeed"
+            exit 1
+          fi
+          echo "All E2E Test CI jobs succeeded"

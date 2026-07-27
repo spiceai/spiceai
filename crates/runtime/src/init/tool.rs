@@ -17,12 +17,14 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use crate::{
-    Runtime, SpiceToolCatalog, UnableToInitializeLlmToolSnafu, metrics, status,
+    Runtime, UnableToInitializeLlmToolSnafu, status,
     tools::{self, Tooling, factory::default_available_catalogs},
 };
 use futures::future::join_all;
 use opentelemetry::KeyValue;
+use runtime_metrics as metrics;
 use runtime_secrets::get_params_with_secrets;
+use runtime_tools::catalog::SpiceToolCatalog;
 use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::component::tool::Tool;
@@ -44,7 +46,7 @@ impl Runtime {
         // This will enable loading each tool in the catalog, and the catalog as a whole. E.g:
         //   `tools: models, builtin`
         //   `tools: sql, load_memory`
-        for ctlg in default_available_catalogs(Arc::clone(&self)) {
+        for ctlg in default_available_catalogs(&self) {
             self.insert_tool_catalog(&ctlg).await;
             for tool in ctlg.all().await {
                 let cloned_self = Arc::clone(&cloned_self);
@@ -62,7 +64,16 @@ impl Runtime {
         let name = t.name().to_string();
         let mut tools_map = self.tools.write().await;
 
-        tools_map.insert(name.clone(), Arc::clone(t).into());
+        tools_map.insert(
+            name.clone(),
+            Tooling::Catalog {
+                tools: Arc::clone(t),
+                default_catalog_names: crate::tools::factory::default_catalog_names()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            },
+        );
         tracing::trace!("Tool catalog {} ready to use", name.clone());
         metrics::tools::COUNT.add(1, &[KeyValue::new("tool_catalog", name.clone())]);
         self.status
@@ -108,7 +119,7 @@ impl Runtime {
         };
         let inner: Arc<dyn crate::tools::SpiceModelTool> = match tooling {
             Tooling::Tool(t) | Tooling::FunctionTool(t) => Arc::clone(t),
-            Tooling::Catalog(_) => {
+            Tooling::Catalog { .. } => {
                 tracing::warn!(
                     tool = %decl.name,
                     "Tool catalogs cannot currently be exposed as SQL UDFs — skipping"

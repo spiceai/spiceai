@@ -1,0 +1,221 @@
+// Copyright 2024-2026 The Spice.ai OSS Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Spice Cloud Connect — bidirectional control plane between a spiced
+// runtime (standalone or cluster-managed) and the Spice Cloud control
+// plane. One service, two instance kinds disambiguated by
+// `Hello.kind`.
+syntax = "proto3";
+package spice.cloud.v1;
+
+service CloudConnect {
+  // Bidirectional control stream between a Spice runtime and the Spice
+  // Cloud control plane. The method is named `Stream` rather than
+  // `Connect` to avoid colliding with the tonic-generated client
+  // constructor of the same name.
+  rpc Stream(stream ClientMessage) returns (stream ControlMessage);
+}
+
+enum InstanceKind {
+  INSTANCE_KIND_UNSPECIFIED = 0;
+  INSTANCE_KIND_CLUSTER = 1;     // K8s operator (BYOC); reserved.
+  INSTANCE_KIND_STANDALONE = 2;  // Standalone spiced runtime.
+}
+
+message ClientMessage {
+  oneof body {
+    Hello hello = 1;
+    Heartbeat heartbeat = 2;
+    CommandResult result = 3;
+    Telemetry telemetry = 4;
+    EventLog event = 5;
+    AdoptAck adopt_ack = 6;
+  }
+}
+
+message ControlMessage {
+  oneof body {
+    Ack ack = 1;
+    GetRuntimeInfo get_runtime_info = 2;
+    RunQuery run_query = 3;
+    Restart restart = 4;
+    ApplySpicepod apply_spicepod = 10;
+    UpgradeRuntime upgrade_runtime = 11;
+    Adopt adopt = 12;
+    Forget forget = 13;
+    ApplyManifest apply_manifest = 20;
+    DeleteManifest delete_manifest = 21;
+    GetStatus get_status = 22;
+    Drain drain = 23;
+    Pause pause = 24;
+    GetPodLogs get_pod_logs = 28;
+  }
+}
+
+message Hello {
+  InstanceKind kind = 1;
+  string identifier = 2;
+  string credential = 3;
+  string runtime_version = 4;
+  map<string, string> extra_versions = 5;
+  string hostname = 6;
+  string os = 7;
+  string arch = 8;
+  string fingerprint = 9;
+  string public_ip_hint = 10;
+  string operator_version = 30;
+  map<string, string> runtime_versions = 31;
+  string agent_pubkey_pem = 32;     // client identity public key (PEM); set during enrollment
+  // PKCS#10 CSR (PEM) for the client-generated keypair. Present on the
+  // enrollment Hello; dp validates `credential`, signs this CSR with its
+  // issuing CA, and returns the leaf in Adopt.identity_cert_pem. Binding the
+  // issued cert to a client-proven key is what makes the subsequent mTLS real.
+  string csr_pem = 33;
+}
+
+message Heartbeat {
+  string identifier = 1;
+  uint64 sequence = 2;
+  string status = 3;
+  repeated string warnings = 4;
+  uint32 active_datasets = 10;
+  uint32 active_models = 11;
+  uint32 active_spicepods = 30;
+  map<string, string> runtime_versions = 31;
+}
+
+message CommandResult {
+  string command_id = 1;
+  bool success = 2;
+  string error = 3;
+  // Small structured payloads (e.g. GetRuntimeInfo) and RunQuery metadata
+  // ({"row_count":N,"truncated":bool}). Tabular RunQuery data rides in
+  // result_arrow_ipc instead.
+  string payload_json = 4;
+  // Arrow IPC stream bytes for tabular results (RunQuery). Empty for
+  // non-tabular commands. The cloud control plane decodes these natively;
+  // results are never JSON-encoded on the wire.
+  bytes result_arrow_ipc = 5;
+}
+
+message Telemetry {
+  string identifier = 1;
+  uint64 window_start_unix = 2;
+  uint64 window_end_unix = 3;
+  map<string, double> metrics = 4;
+}
+
+message EventLog {
+  string identifier = 1;
+  string kind = 2;
+  string event_json = 3;
+  uint64 timestamp_unix = 4;
+}
+
+message Ack {
+  string for_command_id = 1;
+}
+
+message AdoptAck {
+  string identifier = 1;
+  string identity_pubkey_pem = 2;
+}
+
+message GetRuntimeInfo {
+  string command_id = 1;
+}
+
+message RunQuery {
+  string command_id = 1;
+  string sql = 2;
+  uint32 max_rows = 3;
+}
+
+message Restart {
+  string command_id = 1;
+  bool graceful = 2;
+}
+
+message ApplySpicepod {
+  string command_id = 1;
+  string spicepod_yaml = 2;
+}
+
+message UpgradeRuntime {
+  string command_id = 1;
+  string target_version = 2;
+}
+
+message Adopt {
+  string command_id = 1;
+  string assigned_identifier = 2;
+  string identity_cert_pem = 3;     // leaf cert dp signed from Hello.csr_pem
+  uint64 not_after_unix = 4;
+  string ca_bundle_pem = 5;         // dp issuing-CA chain the client pins for mTLS
+}
+
+message Forget {
+  string command_id = 1;
+}
+
+// Operator-only (reserved).
+message ApplyManifest {
+  string command_id = 1;
+  string namespace = 2;
+  string kind = 3;
+  string yaml = 4;
+}
+
+message DeleteManifest {
+  string command_id = 1;
+  string namespace = 2;
+  string kind = 3;
+  string name = 4;
+}
+
+message GetStatus {
+  string command_id = 1;
+  string namespace = 2;
+  string kind = 3;
+  string name = 4;
+}
+
+message Drain {
+  string command_id = 1;
+  string namespace = 2;
+  string name = 3;
+}
+
+message Pause {
+  string command_id = 1;
+  bool paused = 2;
+}
+
+// GetPodLogs returns recent stdout/stderr of a spiced runtime. For
+// cluster (BYOC) instances the operator reads the logs from the customer
+// cluster's kube API. For a standalone spiced there is no pod: the runtime
+// returns its own recently-captured log lines. Either way the log text is
+// returned verbatim in CommandResult.payload_json (a raw string, not JSON).
+// Only `tail_lines` is meaningful for standalone; the namespace/kind/name/
+// pod_name fields address a workload in a cluster and are ignored otherwise.
+// Field numbers must stay identical to the ai-platform / operator copies of
+// this proto.
+message GetPodLogs {
+  string command_id = 1;
+  string namespace = 2;
+  string name = 3;
+  string kind = 4;
+  string pod_name = 5;
+  int64 tail_lines = 6;
+}

@@ -23,7 +23,7 @@ use common::{get_mongodb_client, make_mongodb_dataset, start_mongodb_docker_cont
 #[cfg(feature = "duckdb")]
 use common::{
     get_mongodb_replica_set_client, make_mongodb_change_stream_dataset,
-    make_mongodb_change_stream_dataset_inferred, make_mongodb_extended_inference_dataset,
+    make_mongodb_change_stream_dataset_inferred, make_mongodb_inference_dataset,
     make_mongodb_widen_dataset, start_mongodb_replica_set_docker_container,
 };
 #[cfg(feature = "duckdb")]
@@ -47,6 +47,7 @@ use runtime::Runtime;
 use tracing::instrument;
 
 const MONGODB_PORT1: u16 = 27019;
+const MONGODB_JSON_NESTING_PORT: u16 = 27038;
 #[cfg(feature = "duckdb")]
 const MONGODB_CHANGE_STREAM_PORT: u16 = 27020;
 #[cfg(feature = "duckdb")]
@@ -230,7 +231,7 @@ async fn mongodb_integration_test() -> Result<(), String> {
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
             retry(retry_strategy, || async {
                 init_mongodb_db(MONGODB_PORT1).await.map_err(|e| {
-                    tracing::error!("Failed transiently  to initialize MongoDB database: {e}");
+                    tracing::error!("Failed transiently to initialize MongoDB database: {e}");
                     RetryError::transient(e)
                 })
             })
@@ -299,15 +300,166 @@ async fn mongodb_integration_test() -> Result<(), String> {
         .await
 }
 
+/// Seed a `nested` collection whose documents carry, beyond `_id`/`name`, extra
+/// scalar (`email`, `age`), nested-document (`address`), and array (`tags`)
+/// fields — everything a `json_object` catch-all must fold in.
+#[instrument]
+async fn init_mongodb_json_nesting_db(port: u16) -> Result<(), anyhow::Error> {
+    let client = get_mongodb_client(port).await?;
+    let database = client.database("testdb");
+    let collection: Collection<mongodb::bson::Document> = database.collection("nested");
+    collection.drop().await.ok();
+    collection
+        .insert_many(vec![
+            doc! {
+                "_id": 1,
+                "name": "Alice",
+                "email": "alice@example.com",
+                "age": 30,
+                "address": { "city": "NYC", "zip": "10001" },
+            },
+            doc! {
+                "_id": 2,
+                "name": "Bob",
+                "email": "bob@example.com",
+                "age": 25,
+                "tags": ["x", "y"],
+            },
+        ])
+        .await?;
+    Ok(())
+}
+
+/// JSON nesting (`json_object: "*"`) on a federated `MongoDB` dataset: the declared
+/// static columns (`_id`, `name`) stay top-level, and every other document field
+/// is folded into one sorted-JSON catch-all `Utf8` column (`data`). Asserts both
+/// that non-declared fields (scalar, nested, array) land in the catch-all and
+/// that static columns do **not** leak into it.
+#[tokio::test]
+async fn mongodb_json_nesting_folds_into_catch_all() -> Result<(), anyhow::Error> {
+    use arrow::array::{Array, StringArray};
+    use serde_json::json;
+    use spicepod::semantic::Column;
+    use std::collections::HashMap;
+
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let running_container =
+                start_mongodb_docker_container(MONGODB_JSON_NESTING_PORT).await?;
+
+            let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
+            retry(retry_strategy, || async {
+                init_mongodb_json_nesting_db(MONGODB_JSON_NESTING_PORT)
+                    .await
+                    .map_err(RetryError::transient)
+            })
+            .await?;
+
+            let mut metadata = HashMap::new();
+            metadata.insert("json_object".to_string(), json!("*"));
+            let mut dataset =
+                make_mongodb_dataset("nested", "nested", MONGODB_JSON_NESTING_PORT, false);
+            dataset.columns = vec![
+                Column::new("_id"),
+                Column::new("name"),
+                Column::new("data").with_metadata(metadata),
+            ];
+
+            let app = AppBuilder::new("mongodb_json_nesting")
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = Arc::clone(&cloned_rt).load_components() => {}
+            }
+
+            let batches =
+                run_query(&cloned_rt, "SELECT name, data FROM nested ORDER BY _id").await?;
+
+            let mut rows: Vec<(String, serde_json::Value)> = Vec::new();
+            for batch in &batches {
+                let names = batch
+                    .column_by_name("name")
+                    .ok_or_else(|| anyhow::anyhow!("missing `name` column"))?
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| anyhow::anyhow!("`name` should be a static Utf8 column"))?;
+                let data = batch
+                    .column_by_name("data")
+                    .ok_or_else(|| anyhow::anyhow!("missing catch-all `data` column"))?
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("catch-all `data` should be a Utf8 JSON string")
+                    })?;
+                for row in 0..batch.num_rows() {
+                    let catch_all: serde_json::Value = serde_json::from_str(data.value(row))
+                        .map_err(|e| anyhow::anyhow!("catch-all must be valid JSON: {e}"))?;
+                    rows.push((names.value(row).to_string(), catch_all));
+                }
+            }
+
+            assert_eq!(rows.len(), 2, "expected two documents, got {}", rows.len());
+
+            // Row 0 (_id=1, Alice): declared statics stay top-level; every other
+            // field (scalar, nested doc, array) is folded into the catch-all, and
+            // no static key leaks into it.
+            let (name0, data0) = &rows[0];
+            assert_eq!(name0, "Alice");
+            assert_eq!(data0["email"], json!("alice@example.com"));
+            assert!(
+                data0.get("age").is_some(),
+                "scalar `age` must be in the catch-all"
+            );
+            assert!(
+                data0["address"].is_object(),
+                "nested `address` must be preserved as JSON in the catch-all"
+            );
+            assert!(
+                data0.get("name").is_none(),
+                "static `name` must not leak into the catch-all"
+            );
+            assert!(
+                data0.get("_id").is_none(),
+                "static `_id` must not leak into the catch-all"
+            );
+
+            // Row 1 (_id=2, Bob): array field also folds in.
+            let (name1, data1) = &rows[1];
+            assert_eq!(name1, "Bob");
+            assert_eq!(data1["email"], json!("bob@example.com"));
+            assert!(
+                data1["tags"].is_array(),
+                "array `tags` must be preserved in the catch-all"
+            );
+            assert!(data1.get("name").is_none());
+
+            running_container.remove().await?;
+            Ok(())
+        })
+        .await
+}
+
 /// Non-CDC counterpart to `mongodb_change_streams_infer_primary_key`: a `DuckDB`
-/// full-refresh dataset with `schema_inference: extended` loads end-to-end against a
-/// real `MongoDB`. The catalog query (`listIndexes`/`collStats`) runs on the server and
-/// the inferred `_id` primary key, secondary indexes, and `_id` sort order are all
+/// full-refresh dataset loads end-to-end against a real `MongoDB` with always-on
+/// schema inference. The catalog query (`listIndexes`/`collStats`) runs on the server
+/// and the inferred settings applied for `DuckDB` + full refresh (the `_id` sort
+/// order; physical constraints are intentionally skipped for this engine/mode) are
 /// accepted by the accelerator — a correct row count proves none of those steps
 /// errored. (Precise value-level mapping is covered by unit tests.)
 #[cfg(feature = "duckdb")]
 #[tokio::test]
-async fn mongodb_extended_schema_inference_loads_and_queries() -> Result<(), anyhow::Error> {
+async fn mongodb_schema_inference_loads_and_queries() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,connector_mongodb=debug,info"));
     register_test_connectors().await;
 
@@ -322,8 +474,8 @@ async fn mongodb_extended_schema_inference_loads_and_queries() -> Result<(), any
             })
             .await?;
 
-            let app = AppBuilder::new("mongodb_extended_schema_inference")
-                .with_dataset(make_mongodb_extended_inference_dataset(
+            let app = AppBuilder::new("mongodb_schema_inference")
+                .with_dataset(make_mongodb_inference_dataset(
                     "inventory",
                     "inventory",
                     MONGODB_INFERENCE_PORT,
@@ -462,7 +614,7 @@ async fn mongodb_change_streams_apply_insert_update_delete() -> Result<(), anyho
         .await
 }
 
-/// `MongoDB` Streams (`refresh_mode: changes`) work with `schema_inference: extended`
+/// `MongoDB` Streams (`refresh_mode: changes`) work with always-on schema inference
 /// and no explicit `primary_key`/`on_conflict`: inference supplies `_id` as the
 /// primary key plus the matching upsert, which the change-stream path requires.
 #[cfg(feature = "duckdb")]

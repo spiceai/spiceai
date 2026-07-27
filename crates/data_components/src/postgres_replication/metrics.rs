@@ -52,6 +52,12 @@ pub struct MetricsCollector {
     confirmed_flush_lsn: AtomicU64, // last LSN we acknowledged to the server
     server_wal_end_lsn: AtomicU64,  // latest WAL end reported by the server (keepalive)
 
+    // Reader-task time accounting (microseconds), to split "blocked waiting on the
+    // source socket" (input wait) from "our decode/build" (processing) — the
+    // source-vs-us discriminator for a reader/delivery-bound pipeline.
+    reader_input_wait_micros_total: AtomicU64,
+    reader_processing_micros_total: AtomicU64,
+
     // Schema evolution (stream-time, from pgoutput Relation messages).
     /// Widening schema changes adopted into the working schema.
     schema_evolutions_total: AtomicU64,
@@ -67,6 +73,43 @@ pub struct MetricsCollector {
     /// A non-zero value with no user-visible error just means the network
     /// wobbled and we recovered.
     replication_reconnects_total: AtomicU64,
+    /// Cumulative milliseconds the stream was disconnected across all reconnects
+    /// (drop → successful resume, including backoff). Paired with
+    /// `replication_reconnects_total`, this quantifies the DURATION cost of a
+    /// reconnect storm — during that time no changes are delivered and lag grows,
+    /// and Postgres replays from the held floor on resume.
+    replication_disconnected_ms_total: AtomicU64,
+    /// The replication slot this dataset is a member of (for shared slots, several
+    /// datasets share one). Lets the analysis join the per-dataset view to the
+    /// authoritative per-slot backlog and show grouping. Set at (shared) attach.
+    slot_name: RwLock<Option<String>>,
+    /// Cumulative seconds the shared-slot pump spent blocked trying to deliver
+    /// committed changes into this member's channel because its sink was not
+    /// draining. Non-zero means downstream backpressure stalled the pump (and
+    /// therefore every other member on the slot); the server connection itself
+    /// stays alive throughout. Only ever set for shared-slot datasets.
+    member_send_stalled_seconds_total: AtomicU64,
+    /// Cumulative microseconds the shared-slot pump spent `await`ing this
+    /// member's bounded channel while delivering committed changes. Unlike
+    /// `member_send_stalled_seconds_total` (which only ticks after a full
+    /// `MEMBER_SEND_STALL_WARN` interval elapses), this accrues the *full*
+    /// per-commit wait, including sub-second waits. The pump already subtracts
+    /// this wait from `reader_processing_micros_total` at the source (so that
+    /// counter stays decode-only, not inflated by downstream back-pressure);
+    /// this counter exports the subtracted amount so the waterfall can attribute
+    /// it to apply back-pressure rather than lose it. Only set for shared slots.
+    member_send_wait_micros_total: AtomicU64,
+
+    // Shared-slot membership liveness. `member_attached` is `1` while this
+    // dataset is an attached member of its shared replication slot and `0` once
+    // it has detached — a detached member freezes its ack floor and pins WAL
+    // retention for the WHOLE shared slot until it rejoins or spiced restarts
+    // (#11644). `member_attached_known` gates observation to shared-slot datasets
+    // only: it stays `false` for a dedicated (non-shared) slot, whose single
+    // consumer has no member-detach concept, so the metric reports no series
+    // there rather than a misleading constant `0`/`1`.
+    member_attached: AtomicU64,
+    member_attached_known: AtomicBool,
 
     // Watermark: commit time of the most-recent transaction we've ingested.
     // Used to compute `replication_lag_ms = now - watermark`.
@@ -76,7 +119,21 @@ pub struct MetricsCollector {
 impl MetricsCollector {
     #[must_use]
     pub fn new() -> Arc<Self> {
+        // `member_attached` stays "unknown" (series absent) until the shared-slot path
+        // calls `mark_member_attached`; a dedicated (non-shared) slot never does, so it
+        // reports no membership series rather than a misleading constant.
         Arc::new(Self::default())
+    }
+
+    /// Record which replication slot this member belongs to (shared-slot grouping).
+    pub fn set_slot_name(&self, slot: String) {
+        // Recover through poisoning so an unrelated panic can't leave the `slot` label
+        // permanently unset (which would break shared-slot grouping in the analysis).
+        let mut guard = self
+            .slot_name
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(slot);
     }
 
     pub fn inc_insert(&self) {
@@ -102,7 +159,7 @@ impl MetricsCollector {
         self.bootstrap_complete.store(1, Ordering::Relaxed);
     }
 
-    /// Set the estimated total rows to bootstrap (from extended schema inference).
+    /// Set the estimated total rows to bootstrap (from schema inference).
     /// Marks the estimate as known, so a count of `0` is a valid value (a known-empty
     /// source table) rather than being conflated with "no estimate available".
     pub fn set_bootstrap_rows_expected(&self, n: u64) {
@@ -114,7 +171,7 @@ impl MetricsCollector {
             .store(true, Ordering::Release);
     }
     /// The estimated bootstrap row total, or `None` when no estimate is available
-    /// (extended schema inference is off or surfaced no row count). `Some(0)` is a
+    /// (schema inference surfaced no row count for the source). `Some(0)` is a
     /// known-empty source table — deliberately distinct from `None`.
     #[must_use]
     pub fn bootstrap_rows_expected(&self) -> Option<u64> {
@@ -170,6 +227,20 @@ impl MetricsCollector {
         }
     }
 
+    /// Add to the reader input-wait accumulator (time blocked awaiting the next
+    /// event from the source socket). High relative to processing ⇒ source/network
+    /// can't deliver fast enough (source-bound).
+    pub fn add_reader_input_wait_micros(&self, us: u64) {
+        self.reader_input_wait_micros_total
+            .fetch_add(us, Ordering::Relaxed);
+    }
+    /// Add to the reader processing accumulator (decode + batch-build after a
+    /// socket event). High relative to input-wait ⇒ our decode/build is the limiter.
+    pub fn add_reader_processing_micros(&self, us: u64) {
+        self.reader_processing_micros_total
+            .fetch_add(us, Ordering::Relaxed);
+    }
+
     pub fn record_commit_watermark(&self, at: SystemTime) {
         if let Ok(mut guard) = self.last_commit_seen_at.write() {
             *guard = Some(at);
@@ -195,9 +266,47 @@ impl MetricsCollector {
         self.replication_recv_errors_total
             .fetch_add(1, Ordering::Relaxed);
     }
+    /// Add to the cumulative member-send-stalled seconds counter (shared slot).
+    pub fn add_send_stalled(&self, secs: u64) {
+        self.member_send_stalled_seconds_total
+            .fetch_add(secs, Ordering::Relaxed);
+    }
+    /// Add microseconds the shared-slot pump spent `await`ing this member's
+    /// channel during commit delivery (shared slot). The pump subtracts the
+    /// same amount from `reader_processing_micros_total` at the source, so that
+    /// counter stays decode-only; this exports the subtracted wait for
+    /// attribution.
+    pub fn add_member_send_wait_micros(&self, us: u64) {
+        self.member_send_wait_micros_total
+            .fetch_add(us, Ordering::Relaxed);
+    }
     pub fn inc_reconnect(&self) {
         self.replication_reconnects_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+    /// Add elapsed disconnected time (ms) for a completed reconnect (drop → resume).
+    pub fn add_disconnected_ms(&self, ms: u64) {
+        self.replication_disconnected_ms_total
+            .fetch_add(ms, Ordering::Relaxed);
+    }
+
+    /// Mark this dataset as an attached member of its shared replication slot
+    /// (fresh join or in-process rejoin). Also flips the "known" flag so the
+    /// metric begins reporting — a dataset on a dedicated (non-shared) slot never
+    /// calls this, so its series stays absent rather than a misleading `0`.
+    pub fn mark_member_attached(&self) {
+        self.member_attached.store(1, Ordering::Relaxed);
+        // Release pairs with the Acquire load in `member_attached()` so a reader
+        // that observes `known == true` also sees the value store above.
+        self.member_attached_known.store(true, Ordering::Release);
+    }
+
+    /// Mark this dataset as DETACHED from its shared replication slot: its ack
+    /// floor is now frozen and pins WAL retention for the whole slot until it
+    /// rejoins or spiced restarts (#11644).
+    pub fn mark_member_detached(&self) {
+        self.member_attached.store(0, Ordering::Relaxed);
+        self.member_attached_known.store(true, Ordering::Release);
     }
 }
 
@@ -265,6 +374,19 @@ impl Metrics {
         self.collector.server_wal_end_lsn.load(Ordering::Relaxed)
     }
 
+    #[must_use]
+    pub fn reader_input_wait_micros_total(&self) -> u64 {
+        self.collector
+            .reader_input_wait_micros_total
+            .load(Ordering::Relaxed)
+    }
+    #[must_use]
+    pub fn reader_processing_micros_total(&self) -> u64 {
+        self.collector
+            .reader_processing_micros_total
+            .load(Ordering::Relaxed)
+    }
+
     /// Bytes between the server's reported WAL end and our last confirmed
     /// flush LSN. Returns 0 if the server hasn't reported yet or if we're
     /// ahead of the last-seen server position (can happen with stale atomic reads).
@@ -329,6 +451,52 @@ impl Metrics {
             .replication_reconnects_total
             .load(Ordering::Relaxed)
     }
+    #[must_use]
+    pub fn replication_disconnected_ms_total(&self) -> u64 {
+        self.collector
+            .replication_disconnected_ms_total
+            .load(Ordering::Relaxed)
+    }
+    #[must_use]
+    pub fn slot_name(&self) -> Option<String> {
+        // Recover through poisoning: an unrelated panic must not permanently drop the
+        // `slot` label (which would break shared-slot grouping in the analysis). The
+        // guarded String is not corrupted by another thread's panic.
+        self.collector
+            .slot_name
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+    #[must_use]
+    pub fn member_send_stalled_seconds_total(&self) -> u64 {
+        self.collector
+            .member_send_stalled_seconds_total
+            .load(Ordering::Relaxed)
+    }
+
+    /// Shared-slot membership liveness: `Some(1)` while attached, `Some(0)` once
+    /// detached (ack floor frozen, WAL pinned for the whole slot — #11644), or
+    /// `None` for a dedicated (non-shared) slot, which has no member-detach
+    /// concept and reports no series. Callers observe only on `Some` so an absent
+    /// series means "not applicable", never a misleading `0`.
+    #[must_use]
+    pub fn member_attached(&self) -> Option<u64> {
+        // Acquire pairs with the Release store in `mark_member_{attached,detached}`
+        // so the value load never observes a stale default once `known` is true.
+        if self.collector.member_attached_known.load(Ordering::Acquire) {
+            Some(self.collector.member_attached.load(Ordering::Relaxed))
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub fn member_send_wait_micros_total(&self) -> u64 {
+        self.collector
+            .member_send_wait_micros_total
+            .load(Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]
@@ -380,6 +548,24 @@ mod tests {
         c.set_bootstrap_rows_expected(0);
         assert_eq!(m.bootstrap_rows_expected(), Some(0));
         assert_eq!(m.bootstrap_progress_percent(), Some(100));
+    }
+
+    #[test]
+    fn member_attached_reports_only_for_shared_slot_members() {
+        let c = MetricsCollector::new();
+        let m = Metrics::new(Arc::clone(&c));
+        // A dedicated (non-shared) slot never marks membership: no series, so an
+        // absent value means "not applicable" — never a misleading `0`.
+        assert_eq!(m.member_attached(), None);
+
+        // A shared-slot member: attached on join, 0 on detach (ack floor frozen /
+        // WAL pinned), back to 1 on rejoin.
+        c.mark_member_attached();
+        assert_eq!(m.member_attached(), Some(1));
+        c.mark_member_detached();
+        assert_eq!(m.member_attached(), Some(0));
+        c.mark_member_attached();
+        assert_eq!(m.member_attached(), Some(1));
     }
 
     #[test]

@@ -70,6 +70,11 @@ pub struct DatasetTestArgs {
     #[arg(long)]
     pub(crate) scale_factor: Option<f64>,
 
+    /// Source database for the CH-benCH workload (only used with `--query-set chbench`).
+    /// Defaults to postgres.
+    #[arg(long, value_enum, default_value = "postgres")]
+    pub(crate) source_type: SourceType,
+
     /// The query set to use for the test
     #[arg(long)]
     pub(crate) query_set: QuerySetArg,
@@ -127,6 +132,15 @@ pub enum QuerySetArg {
     Scenario,
 }
 
+/// Source database backing the CH-benCH workload.
+#[derive(Clone, Copy, ValueEnum, Debug, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceType {
+    #[default]
+    Postgres,
+    Mysql,
+}
+
 #[derive(Clone, ValueEnum, Debug, Deserialize, Serialize)]
 pub enum QueryOverridesArg {
     #[serde(rename = "sqlite")]
@@ -147,8 +161,6 @@ pub enum QueryOverridesArg {
     Duckdb,
     #[serde(rename = "duckdb-zero-results")]
     DuckdbZeroResults,
-    #[serde(rename = "duckdb-partitioned")]
-    DuckdbPartitioned,
     #[serde(rename = "snowflake")]
     Snowflake,
     #[serde(rename = "oracle")]
@@ -195,6 +207,9 @@ pub enum QueryOverridesArg {
     #[serde(rename = "scylladb")]
     #[value(name = "scylladb")]
     ScyllaDB,
+    #[serde(rename = "chbench-skip-slow")]
+    #[value(name = "chbench-skip-slow")]
+    ChbenchSkipSlow,
 }
 
 impl From<QuerySetArg> for QuerySet {
@@ -294,7 +309,6 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::ODBCDatabricks => QueryOverrides::ODBCDatabricks,
             QueryOverridesArg::Duckdb => QueryOverrides::DuckDB,
             QueryOverridesArg::DuckdbZeroResults => QueryOverrides::DuckDBOnZeroResults,
-            QueryOverridesArg::DuckdbPartitioned => QueryOverrides::DuckDBPartitioned,
             QueryOverridesArg::Snowflake => QueryOverrides::Snowflake,
             QueryOverridesArg::Oracle => QueryOverrides::Oracle,
             QueryOverridesArg::IcebergSF1 => QueryOverrides::IcebergSF1,
@@ -316,6 +330,7 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::Turso => QueryOverrides::Turso,
             QueryOverridesArg::BigQuery => QueryOverrides::BigQuery,
             QueryOverridesArg::ScyllaDB => QueryOverrides::ScyllaDB,
+            QueryOverridesArg::ChbenchSkipSlow => QueryOverrides::ChbenchSkipSlow,
         }
     }
 }

@@ -78,27 +78,24 @@ pub struct MongoCheckpointMetadata {
 }
 
 pub struct MongoSys {
-    #[cfg_attr(
-        not(any(
-            feature = "sqlite",
-            feature = "duckdb",
-            feature = "postgres-accel",
-            feature = "turso"
-        )),
-        expect(dead_code)
-    )]
     pub dataset_name: String,
     acceleration_connection: AccelerationConnection,
 }
 
 impl MongoSys {
     pub async fn try_new(dataset: &Dataset, open_option: OpenOption) -> Result<Self> {
+        let registry = dataset.runtime.accelerator_engine_registry();
         Ok(Self {
             dataset_name: dataset.name.to_string(),
-            acceleration_connection: acceleration_connection(dataset, open_option).await?,
+            acceleration_connection: acceleration_connection(dataset, registry, open_option)
+                .await?,
         })
     }
 
+    #[cfg_attr(
+        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        expect(clippy::unused_async)
+    )]
     pub async fn get(&self) -> Option<MongoCheckpointMetadata> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
@@ -117,10 +114,19 @@ impl MongoSys {
                 feature = "postgres-accel",
                 feature = "turso"
             )))]
-            _ => None,
+            _ => {
+                // Referenced so the field is never dead code when no accelerator backend is
+                // compiled in (backends read it to key the sidecar row by dataset).
+                let _ = &self.dataset_name;
+                None
+            }
         }
     }
 
+    #[cfg_attr(
+        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        expect(clippy::unused_async)
+    )]
     pub async fn upsert(
         &self,
         #[cfg_attr(
@@ -155,6 +161,10 @@ impl MongoSys {
         }
     }
 
+    #[cfg_attr(
+        not(any(feature = "sqlite", feature = "postgres-accel", feature = "turso")),
+        expect(clippy::unused_async)
+    )]
     pub async fn delete(&self) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]

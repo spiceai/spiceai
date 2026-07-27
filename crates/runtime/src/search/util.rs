@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,103 +15,89 @@ limitations under the License.
 */
 #![allow(clippy::implicit_hasher)]
 
-use std::collections::HashSet;
-use std::{collections::HashMap, sync::Arc};
-
-use app::App;
-use data_components::MetadataEnrichedTableProvider;
-use data_components::iceberg::delete::IcebergDeletionProvider;
-use datafusion::common::Column;
-use datafusion::error::DataFusionError;
-use datafusion::{datasource::TableProvider, sql::TableReference};
-use datafusion_federation::FederatedTableProviderAdaptor;
-use runtime_datafusion_index::{Index, IndexedTableProvider};
-use search::generation::CandidateGeneration;
-use search::generation::text_search::index::FullTextDatabaseIndex;
-use search::generation::util::get_primary_keys;
-use search::index::SearchIndex;
-use search::index::chunking::ChunkedSearchIndex;
-use snafu::ResultExt;
-use tokio::sync::RwLock;
+use std::sync::Arc;
 
 use crate::accelerated_table::AcceleratedTable;
+use data_components::MetadataEnrichedTableProvider;
+use datafusion::datasource::TableProvider;
+use datafusion::error::DataFusionError;
+use datafusion_federation::FederatedTableProviderAdaptor;
+use runtime_datafusion_index::{
+    INDEXED_INNER, Index, IndexedTableProvider, InnerProviderFn, find_concrete_table_provider_with,
+};
+use runtime_search::embeddings::table::EmbeddingTable;
+use runtime_search::table_provider_explorer::TableProviderExplorer;
+
 use crate::dataconnector::iceberg_cluster::IcebergClusterTableProvider;
-use crate::datafusion::{DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use data_components::iceberg::delete::IcebergDeletionProvider;
 
-use crate::embeddings::table::EmbeddingTable;
-use crate::search::SearchGenerationSnafu;
-use crate::search::full_text::as_candidate_generations;
-#[cfg(feature = "elasticsearch")]
-use crate::search::full_text::as_es_text_candidate_generations;
+/// Inner-provider accessor for [`FederatedTableProviderAdaptor`].
+pub const FEDERATED_ADAPTOR_INNER: InnerProviderFn = |tbl| {
+    tbl.downcast_ref::<FederatedTableProviderAdaptor>()
+        .and_then(|adaptor| adaptor.table_provider.as_ref())
+};
 
-use super::{Error, Result};
+/// Inner-provider accessor for [`MetadataEnrichedTableProvider`].
+pub const METADATA_ENRICHED_INNER: InnerProviderFn = |tbl| {
+    tbl.downcast_ref::<MetadataEnrichedTableProvider>()
+        .map(MetadataEnrichedTableProvider::get_inner_ref)
+};
 
-/// Attempt to return a concrete [`TableProvider`] type from a given [`impl TableProvider`]. This includes if the [`TableProvider`] is a base table for an [`AcceleratedTable`] or [`FederatedTableProviderAdaptor`] or other known [`TableProvider`] that wrap a table.
-pub(crate) fn find_concrete_table_provider<T: TableProvider + 'static>(
+/// Inner-provider accessor for [`IcebergClusterTableProvider`].
+pub const ICEBERG_CLUSTER_INNER: InnerProviderFn = |tbl| {
+    tbl.downcast_ref::<IcebergClusterTableProvider>()
+        .map(IcebergClusterTableProvider::inner)
+};
+
+/// Inner-provider accessor for [`IcebergDeletionProvider`].
+pub const ICEBERG_DELETION_INNER: InnerProviderFn = |tbl| {
+    tbl.downcast_ref::<IcebergDeletionProvider>()
+        .map(IcebergDeletionProvider::inner)
+};
+
+/// Inner-provider accessor for [`EmbeddingTable`].
+pub const EMBEDDING_INNER: InnerProviderFn = |tbl| {
+    tbl.downcast_ref::<EmbeddingTable>()
+        .map(EmbeddingTable::get_underlying_ref)
+};
+
+/// Inner-provider accessor for [`AcceleratedTable`]. Resolves to the federated
+/// provider only if it is available synchronously (a deferred provider that is
+/// not yet ready yields `None`).
+pub const ACCELERATED_INNER: InnerProviderFn = |tbl| {
+    tbl.downcast_ref::<AcceleratedTable>()
+        .and_then(|accelerated| {
+            accelerated
+                .get_federated_table_ref()
+                .try_table_provider_sync_ref()
+        })
+};
+
+/// The full set of runtime wrapper layers understood by
+/// [`find_concrete_table_provider`].
+pub const DEFAULT_INNER_FNS: &[InnerProviderFn] = &[
+    INDEXED_INNER,
+    FEDERATED_ADAPTOR_INNER,
+    METADATA_ENRICHED_INNER,
+    ICEBERG_CLUSTER_INNER,
+    ICEBERG_DELETION_INNER,
+    EMBEDDING_INNER,
+    ACCELERATED_INNER,
+];
+
+/// Attempt to return a concrete [`TableProvider`] type from a given
+/// [`impl TableProvider`], unwrapping all known runtime wrapper layers
+/// (including `AcceleratedTable`). See [`find_concrete_table_provider_with`]
+/// to restrict which layers are peeled.
+pub fn find_concrete_table_provider<T: TableProvider + 'static>(
     tbl: &Arc<dyn TableProvider>,
 ) -> Option<&T> {
-    let mut current_tbl = tbl;
-
-    // For the many possible wrapping [`TableProvider`], attempt to find the concrete `impl TableProvider`.
-    // Also avoids having to [`Box::pin`] for recursive `async fn`.
-    loop {
-        // Attempt to downcast the current table to the desired type.
-        if let Some(found_table) = current_tbl.downcast_ref::<T>() {
-            return Some(found_table);
-        }
-
-        // Handle specific table wrapping logic.
-        if let Some(index_table) = current_tbl.downcast_ref::<IndexedTableProvider>() {
-            current_tbl = index_table.get_underlying_ref();
-            continue;
-        }
-
-        if let Some(adaptor) = current_tbl.downcast_ref::<FederatedTableProviderAdaptor>()
-            && let Some(adapted_tbl) = adaptor.table_provider.as_ref()
-        {
-            current_tbl = adapted_tbl;
-            continue;
-        }
-
-        if let Some(metadata_table) = current_tbl.downcast_ref::<MetadataEnrichedTableProvider>() {
-            current_tbl = metadata_table.get_inner_ref();
-            continue;
-        }
-
-        // The Iceberg data connector wraps its providers so distributed (Ballista)
-        // scans can be serialized; peel both layers so callers (e.g. the health
-        // monitor's Iceberg skip) still see the underlying `IcebergTableProvider`.
-        if let Some(cluster_table) = current_tbl.downcast_ref::<IcebergClusterTableProvider>() {
-            current_tbl = cluster_table.inner();
-            continue;
-        }
-
-        if let Some(deletion_table) = current_tbl.downcast_ref::<IcebergDeletionProvider>() {
-            current_tbl = deletion_table.inner();
-            continue;
-        }
-
-        if let Some(embedding_table) = current_tbl.downcast_ref::<EmbeddingTable>() {
-            current_tbl = embedding_table.get_underlying_ref();
-            continue;
-        }
-
-        if let Some(accelerated_table) = current_tbl.downcast_ref::<AcceleratedTable>() {
-            current_tbl = accelerated_table
-                .get_federated_table_ref()
-                .try_table_provider_sync_ref()?;
-            continue;
-        }
-
-        // Exit if no further wrapping is found.
-        return None;
-    }
+    find_concrete_table_provider_with::<T>(tbl, DEFAULT_INNER_FNS)
 }
 
-pub(crate) fn find_index_in_table_provider<T: Index + 'static>(
+pub fn find_index_in_table_provider<T: Index + 'static>(
     tbl: &Arc<dyn TableProvider>,
 ) -> Option<(Vec<&T>, Arc<dyn TableProvider>)> {
-    // `AcceleratedTable` is a concrete TableProvider underneath `FederatedTableProviderAdaptor`.
     if let Some(accelerated_table) = find_concrete_table_provider::<AcceleratedTable>(tbl)
         && let Some(indexes) =
             find_index_in_table_provider::<T>(accelerated_table.get_accelerator_ref())
@@ -131,264 +117,37 @@ pub(crate) fn find_index_in_table_provider<T: Index + 'static>(
     None
 }
 
-/// Compute the primary keys for each table in the app. Primary Keys can be explicitly defined in the Spicepod.yaml
-pub async fn parse_explicit_primary_keys(
-    app: Arc<RwLock<Option<Arc<App>>>>,
-) -> HashMap<TableReference, Vec<String>> {
-    app.read().await.as_ref().map_or(HashMap::new(), |app| {
-        let mut pks = app
-            .datasets
-            .iter()
-            .filter_map(|d| {
-                d.primary_key_override().map(|pks| {
-                    (
-                        TableReference::parse_str(&d.name)
-                            .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
-                            .into(),
-                        pks,
-                    )
-                })
-            })
-            .collect::<HashMap<TableReference, Vec<_>>>();
+/// Runtime's implementation of [`TableProviderExplorer`] that knows how to
+/// unwrap `AcceleratedTable` and other runtime-specific wrappers.
+#[derive(Debug, Clone)]
+pub struct RuntimeTableProviderExplorer;
 
-        pks.extend(app.views.iter().filter_map(|d| {
-            d.primary_key_override().map(|pks| {
-                (
-                    TableReference::parse_str(&d.name)
-                        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
-                        .into(),
-                    pks,
-                )
-            })
-        }));
-        pks
-    })
-}
-
-pub(crate) async fn get_primary_keys_from_table(
-    df: &Arc<DataFusion>,
-    table: &TableReference,
-) -> Result<Vec<String>> {
-    let tbl_ref = df
-        .get_table(table)
-        .await
-        .ok_or_else(|| Error::DataSourcesNotFound {
-            data_source: vec![table.clone()],
-        })?;
-
-    get_primary_keys(&tbl_ref).map_err(|e| Error::DataFusionError {
-        source: DataFusionError::from(e),
-    })
-}
-
-/// For a set of tables, get their primary keys. Attempt to determine the primary key(s) of the
-/// table from the [`TableProvider`] constraints, and if not provided, use the explicit primary
-/// keys defined in the spicepod configuration.
-pub async fn get_primary_keys_with_overrides(
-    df: &Arc<DataFusion>,
-    tables: &[TableReference],
-    explicit_primary_keys: &HashMap<TableReference, Vec<String>>,
-) -> Result<HashMap<TableReference, Vec<String>>> {
-    let mut tbl_to_pks: HashMap<TableReference, Vec<String>> = HashMap::new();
-
-    for tbl in tables {
-        // `explicit_primary_keys` are [`ResolvedTableReference`], must resolve with spice defaults first.
-        // Equivalent to using [`TableReference::resolve_eq`] on `explicit_primary_keys` keys.
-        let resolved_tbl: TableReference = tbl
-            .clone()
-            .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
-            .into();
-        let pks = get_primary_keys_from_table(df, &resolved_tbl).await?;
-        if !pks.is_empty() {
-            tbl_to_pks.insert(tbl.clone(), pks);
-        } else if let Some(explicit_pks) = explicit_primary_keys.get(&resolved_tbl) {
-            tbl_to_pks.insert(tbl.clone(), explicit_pks.clone());
-        }
-    }
-    Ok(tbl_to_pks)
-}
-
-pub async fn user_tables_that_can_search(df: &Arc<DataFusion>) -> Result<Vec<TableReference>> {
-    let mut searchable_tables = Vec::new();
-
-    for t in df.get_user_table_names() {
-        if embedding_columns_from_table(df, &t)
-            .await
-            .is_some_and(|cols| !cols.is_empty())
-        {
-            searchable_tables.push(t);
-            continue;
-        }
-
-        if full_text_search_candidates(df, &t)
-            .await
-            .is_some_and(|fts_res| fts_res.is_ok_and(|c| !c.is_empty()))
-        {
-            searchable_tables.push(t);
-        }
+impl TableProviderExplorer for RuntimeTableProviderExplorer {
+    fn find_concrete<'a, T: TableProvider + 'static>(
+        &self,
+        tbl: &'a Arc<dyn TableProvider>,
+    ) -> Option<&'a T> {
+        find_concrete_table_provider::<T>(tbl)
     }
 
-    Ok(searchable_tables)
-}
-
-/// Returns the column names of a [`TableReference`] that have associated embedding column(s)
-///
-/// This includes per-row embeddings and chunked embeddings.
-pub async fn embedding_columns_from_table(
-    df: &Arc<DataFusion>,
-    tbl: &TableReference,
-) -> Option<Vec<String>> {
-    let table_provider = df.get_table(tbl).await?;
-
-    let mut embedding_columns: HashSet<String> = HashSet::default();
-
-    // embedding columns from [`EmbeddingTable`].
-    if let Some(embedding_table) = find_concrete_table_provider::<EmbeddingTable>(&table_provider) {
-        for c in embedding_table.get_embedding_columns() {
-            embedding_columns.insert(c);
-        }
+    fn find_index<'a, T: Index + 'static>(
+        &self,
+        tbl: &'a Arc<dyn TableProvider>,
+    ) -> Option<(Vec<&'a T>, Arc<dyn TableProvider>)> {
+        find_index_in_table_provider::<T>(tbl)
     }
 
-    // embedding columns from [`IndexedTableProvider`].
-    #[cfg(feature = "s3_vectors")]
-    {
-        use search::index::s3_vectors::S3Vector;
-        if let Some((indexes, _)) = find_index_in_table_provider::<S3Vector>(&table_provider) {
-            embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
-        }
-    }
-
-    if let Some((indexes, _)) = find_index_in_table_provider::<ChunkedSearchIndex>(&table_provider)
-    {
-        embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
-    }
-
-    #[cfg(feature = "elasticsearch")]
-    {
-        use search::index::elasticsearch::ElasticsearchIndex;
-        if let Some((indexes, _)) =
-            find_index_in_table_provider::<ElasticsearchIndex>(&table_provider)
-        {
-            embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
-        }
-    }
-
-    #[cfg(feature = "duckdb")]
-    {
-        use search::index::duckdb::DuckDBVectorIndex;
-        if let Some((indexes, _)) =
-            find_index_in_table_provider::<DuckDBVectorIndex>(&table_provider)
-        {
-            embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
-        }
-    }
-
-    Some(embedding_columns.into_iter().collect())
-}
-
-/// Returns a full text search [`CandidateGeneration`] if the [`TableReference`] has the appropriate index(es) defined in [`DataFusion`].
-///
-/// Returns:
-///   None:
-///     - `tbl` does not exist
-///     - `tbl` does not have relevant full text search support.
-pub async fn full_text_search_candidates(
-    df: &Arc<DataFusion>,
-    tbl: &TableReference,
-) -> Option<Result<Vec<Arc<dyn CandidateGeneration>>>> {
-    let base_table_provider = df.get_table(tbl).await?;
-
-    // If the table exists, but does not have full text search support, return no candidates.
-    let Some(indexed_table) =
-        find_concrete_table_provider::<IndexedTableProvider>(&base_table_provider)
-    else {
-        return Some(Ok(vec![]));
-    };
-
-    // Tantivy path.
-    if let Some(fts) = indexed_table.get_index::<FullTextDatabaseIndex>() {
-        return Some(
-            as_candidate_generations(
-                &fts.with_new_base(Arc::clone(&base_table_provider)),
-                Arc::clone(df),
-                tbl.clone(),
-            )
-            .await
-            .context(SearchGenerationSnafu),
-        );
-    }
-
-    // Elasticsearch BM25 path.
-    #[cfg(feature = "elasticsearch")]
-    {
-        use search::index::elasticsearch::ElasticsearchTextIndex;
-        let es_indexes = indexed_table.get_indexes::<ElasticsearchTextIndex>();
-        if !es_indexes.is_empty() {
-            return Some(
-                as_es_text_candidate_generations(es_indexes, Arc::clone(df), tbl.clone())
-                    .await
-                    .context(SearchGenerationSnafu),
-            );
-        }
-    }
-
-    Some(Ok(vec![]))
-}
-
-/// There is no [`Expr`] that can parse a fully qualified table name. For UDTFs that require
-/// tables as an input [`Expr`], it will be parsed as a [`Column`]. This function converts a
-///  [`Column`] to the [`TableReference`] intended.
-#[must_use]
-pub fn table_ref_from_column_expr(c: &Column) -> TableReference {
-    let table: Arc<str> = c.name.clone().into();
-    let schema: Option<&str> = c.relation.as_ref().map(TableReference::table);
-    let catalog: Option<&str> = c.relation.as_ref().and_then(TableReference::schema);
-    match (catalog, schema) {
-        // Catalog without schema is impossible.
-        (None | Some(_), None) => TableReference::Bare { table },
-        (None, Some(s)) => TableReference::Partial {
-            schema: s.into(),
-            table,
-        },
-        (Some(c), Some(s)) => TableReference::Full {
-            catalog: c.into(),
-            schema: s.into(),
-            table,
-        },
-    }
-}
-
-// Constructs the associated [`Column`] derived from [`table_ref_from_column_expr`].
-#[must_use]
-pub fn to_column_expr(tbl: &TableReference) -> Column {
-    match tbl {
-        TableReference::Bare { table } => Column::new_unqualified(table.to_string()),
-        TableReference::Partial { schema, table } => Column::new(
-            Some(TableReference::Bare {
-                table: Arc::clone(schema),
-            }),
-            table.to_string(),
-        ),
-        TableReference::Full {
-            catalog,
-            schema,
-            table,
-        } => Column::new(
-            Some(TableReference::Partial {
-                schema: Arc::clone(catalog),
-                table: Arc::clone(schema),
-            }),
-            table.to_string(),
-        ),
+    fn not_ready_error(&self, tbl: &Arc<dyn TableProvider>) -> Option<DataFusionError> {
+        find_concrete_table_provider::<AcceleratedTable>(tbl)?.not_ready_error()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::FullTextDatabaseIndex;
     use super::*;
     use arrow_schema::{DataType, Field, Schema};
     use data_components::arrow::write::MemTable;
+    use search::generation::text_search::index::FullTextDatabaseIndex;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -433,6 +192,31 @@ mod tests {
         assert!(find_concrete_table_provider::<EmbeddingTable>(&wrapped_table).is_none());
     }
 
+    /// A provider with no accelerator behind it has no load to wait on, so it
+    /// must never be reported as not-ready — otherwise search would reject
+    /// federated-only datasets outright (#10956).
+    #[test]
+    fn test_not_ready_error_is_none_without_an_accelerated_table() {
+        let base: Arc<dyn TableProvider> = Arc::new(
+            MemTable::try_new(Arc::new(Schema::empty()), vec![]).expect("failed to make table"),
+        );
+
+        assert!(
+            RuntimeTableProviderExplorer
+                .not_ready_error(&base)
+                .is_none(),
+            "a non-accelerated provider must be scannable"
+        );
+
+        let wrapped: Arc<dyn TableProvider> = Arc::new(IndexedTableProvider::new(base));
+        assert!(
+            RuntimeTableProviderExplorer
+                .not_ready_error(&wrapped)
+                .is_none(),
+            "a wrapped non-accelerated provider must be scannable"
+        );
+    }
+
     #[test]
     fn test_find_concrete_table_provider_peels_iceberg_cluster_wrapper() {
         use datafusion::sql::TableReference;
@@ -446,13 +230,57 @@ mod tests {
             Arc::clone(&base),
         ));
 
-        // The Iceberg cluster wrapper must be peeled so concrete-provider lookups
-        // (e.g. the health monitor's Iceberg skip, #6994) still reach the inner
-        // provider. Using MemTable as the inner exercises the peel arm without a
-        // live Iceberg catalog.
         assert!(
             find_concrete_table_provider::<MemTable>(&wrapped).is_some(),
             "find_concrete_table_provider must peel IcebergClusterTableProvider"
+        );
+    }
+
+    #[test]
+    fn test_find_concrete_table_provider_with_respects_restricted_layer_set() {
+        let base_table: Arc<dyn TableProvider> = Arc::new(
+            MemTable::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "search_field",
+                    DataType::Utf8,
+                    false,
+                )])),
+                vec![],
+            )
+            .expect("failed to make table"),
+        );
+
+        let index = Arc::new(
+            FullTextDatabaseIndex::try_new(
+                Arc::clone(&base_table),
+                vec!["search_field".to_string()],
+                Some(vec!["search_field".to_string()]),
+                None,
+                &[],
+            )
+            .expect("cannot make full text table"),
+        );
+
+        let wrapped = Arc::new(IndexedTableProvider::new(base_table).add_index(index))
+            as Arc<dyn TableProvider>;
+
+        // The default set peels the IndexedTableProvider down to the MemTable.
+        assert!(
+            find_concrete_table_provider::<MemTable>(&wrapped).is_some(),
+            "default unwrappers must peel IndexedTableProvider"
+        );
+
+        // A restricted set that lacks the indexed-table accessor must not peel it.
+        assert!(
+            find_concrete_table_provider_with::<MemTable>(&wrapped, &[ICEBERG_CLUSTER_INNER])
+                .is_none(),
+            "restricted accessors must not peel layers outside the provided set"
+        );
+
+        // The layer itself is still reachable directly under a restricted set.
+        assert!(
+            find_concrete_table_provider_with::<IndexedTableProvider>(&wrapped, &[]).is_some(),
+            "an empty unwrapper set must still match the outermost provider"
         );
     }
 }

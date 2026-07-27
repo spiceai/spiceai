@@ -57,7 +57,7 @@ use tokio::sync::Mutex;
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
     dataaccelerator::{
-        FilePathError,
+        AcceleratorEngineRegistry, FilePathError,
         snapshots::{download_snapshot_if_needed, snapshot_before_recreate},
         storage::{ResolvedAccelerationStorage, resolve_acceleration_storage_async},
     },
@@ -514,6 +514,7 @@ impl DataAccelerator for TursoAccelerator {
     async fn init(
         &self,
         source: &dyn AccelerationSource,
+        registry: Arc<AcceleratorEngineRegistry>,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         // Reject remote database configurations (not supported as accelerators)
         // Note: This is an accelerator-specific limitation. Remote databases will be
@@ -586,6 +587,7 @@ impl DataAccelerator for TursoAccelerator {
             let bootstrap_status = download_snapshot_if_needed(
                 acceleration,
                 source,
+                registry,
                 runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(path)),
                 AccelerationEngine::Turso,
                 None,
@@ -903,18 +905,35 @@ mod tests {
 
     fn cleanup_turso_test_files(path: &str) {
         let db_path = std::path::Path::new(path);
-        let mut candidates = vec![db_path.to_path_buf()];
+        let _ = std::fs::remove_file(db_path);
 
-        if let (Some(parent), Some(file_name)) = (db_path.parent(), db_path.file_name()) {
-            for suffix in ["-wal", "-shm", "-journal"] {
-                let mut sidecar = file_name.to_os_string();
-                sidecar.push(suffix);
-                candidates.push(parent.join(sidecar));
+        // Remove every sidecar turso/libsql may leave next to the database: the
+        // WAL/SHM/journal files (`<name>-wal`, ...) and the MVCC logical log
+        // (`<stem>.db-log`). A stale MVCC log from a previous run makes the next
+        // open fail with `Corrupt("MVCC logical log file exists ... but header
+        // indicates WAL mode")`, so match any sibling whose name is exactly the
+        // stem (`rest.is_empty()`, e.g. a leftover file named like the stem with
+        // no extension) or the stem followed by a `.` or `-` separator — covering
+        // both `<stem>.<ext>[-suffix]` and the extensionless `<stem>-<suffix>`
+        // form. Otherwise these tests only pass on a pristine tree and fail on
+        // re-run.
+        let (Some(parent), Some(stem)) = (
+            db_path.parent(),
+            db_path.file_stem().and_then(std::ffi::OsStr::to_str),
+        ) else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(stem)) else {
+                continue;
+            };
+            if rest.is_empty() || rest.starts_with('.') || rest.starts_with('-') {
+                let _ = std::fs::remove_file(entry.path());
             }
-        }
-
-        for candidate in candidates {
-            std::fs::remove_file(candidate).ok();
         }
     }
 
@@ -948,7 +967,7 @@ mod tests {
         assert!(!accelerator.is_initialized(&dataset));
 
         accelerator
-            .init(&dataset)
+            .init(&dataset, dataset.runtime.accelerator_engine_registry())
             .await
             .expect("initialization should be successful");
 
@@ -988,7 +1007,9 @@ mod tests {
         });
 
         let accelerator = TursoAccelerator::new();
-        let result = accelerator.init(&dataset).await;
+        let result = accelerator
+            .init(&dataset, dataset.runtime.accelerator_engine_registry())
+            .await;
         assert!(result.is_err());
         let error = result.expect_err("Expected error for remote Turso database");
         assert!(
@@ -1018,7 +1039,9 @@ mod tests {
             ..Default::default()
         });
 
-        let result2 = accelerator.init(&dataset2).await;
+        let result2 = accelerator
+            .init(&dataset2, dataset2.runtime.accelerator_engine_registry())
+            .await;
         assert!(result2.is_err());
         let error2 = result2.expect_err("Expected error for remote Turso database with auth token");
         assert!(
@@ -1390,7 +1413,7 @@ mod tests {
 
         // Initialize the accelerator
         accelerator
-            .init(&dataset)
+            .init(&dataset, dataset.runtime.accelerator_engine_registry())
             .await
             .expect("initialization should be successful");
 

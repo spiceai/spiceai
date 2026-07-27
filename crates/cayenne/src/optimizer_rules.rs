@@ -196,6 +196,39 @@ impl std::fmt::Debug for CayenneMaintainedAggregateRewriter {
     }
 }
 
+/// Folds whole-table aggregates over an *unfiltered* Cayenne scan into a literal
+/// one-row result computed from the scan's Vortex file statistics, avoiding the
+/// scan entirely.
+///
+/// This complements `DataFusion`'s built-in `AggregateStatistics` rule, which only
+/// covers `COUNT`/`MIN`/`MAX` (the aggregate UDFs that implement
+/// `value_from_stats`). This rule additionally folds `SUM` and `AVG` — and, so
+/// that mixed queries like `SELECT COUNT(*), SUM(v) FROM t` fold as a whole,
+/// also handles `COUNT`/`MIN`/`MAX` when they appear alongside `SUM`/`AVG`.
+///
+/// Unlike [`CayenneMaintainedAggregateRewriter`], no registry or freshness epoch
+/// is involved: the answer comes from the file footer surfaced through
+/// [`crate::provider::CayenneAccelerationExec`]'s statistics. Soundness rests on
+/// two guards in [`Self::optimize`]: the scan must carry no pushed-down filter,
+/// and every statistic consumed must be `Precision::Exact` (see
+/// [`crate::stats_aggregate`]).
+#[derive(Default)]
+pub struct CayenneStatsAggregateRewriter;
+
+impl CayenneStatsAggregateRewriter {
+    /// Create a new `CayenneStatsAggregateRewriter` optimizer rule.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl std::fmt::Debug for CayenneStatsAggregateRewriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CayenneStatsAggregateRewriter").finish()
+    }
+}
+
 impl std::fmt::Debug for CayenneDynamicFilterSharing {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CayenneDynamicFilterSharing").finish()
@@ -362,13 +395,17 @@ impl PhysicalOptimizerRule for CayenneMaintainedAggregateRewriter {
             let Some(aggregate) = node.downcast_ref::<AggregateExec>() else {
                 return Ok(Transformed::no(node));
             };
-            let Some((source, scan_epoch, query_aggregate)) =
+            let Some((source, scan_epoch, query_aggregate, filter)) =
                 maintained_aggregate_source_for_aggregate(aggregate)
             else {
                 return Ok(Transformed::no(node));
             };
-            let Some(batch) =
-                source.batch_for_aggregate_with_output(query_aggregate, aggregate, scan_epoch)?
+            let Some(batch) = source.batch_for_aggregate_with_output(
+                query_aggregate,
+                aggregate,
+                scan_epoch,
+                filter,
+            )?
             else {
                 return Ok(Transformed::no(node));
             };
@@ -381,13 +418,29 @@ impl PhysicalOptimizerRule for CayenneMaintainedAggregateRewriter {
     }
 }
 
+/// A Cayenne maintained-aggregate scan source reached during plan descent: the
+/// registry, the scan's freshness epoch, and an optional captured `FilterExec`
+/// predicate (the query's `WHERE`).
+type MaintainedAggregateSource<'a> = (
+    &'a Arc<MaintainedAggregateRegistry>,
+    u64,
+    Option<Arc<dyn PhysicalExpr>>,
+);
+
+type MaintainedAggregateMatch<'a> = (
+    &'a Arc<MaintainedAggregateRegistry>,
+    u64,
+    &'a AggregateExec,
+    Option<Arc<dyn PhysicalExpr>>,
+);
+
 fn maintained_aggregate_source_for_aggregate(
     aggregate: &AggregateExec,
-) -> Option<(&Arc<MaintainedAggregateRegistry>, u64, &AggregateExec)> {
+) -> Option<MaintainedAggregateMatch<'_>> {
     match aggregate.mode() {
         AggregateMode::Single | AggregateMode::SinglePartitioned => {
             maintained_aggregate_source(aggregate.input())
-                .map(|(source, scan_epoch)| (source, scan_epoch, aggregate))
+                .map(|(source, scan_epoch, filter)| (source, scan_epoch, aggregate, filter))
         }
         AggregateMode::Final | AggregateMode::FinalPartitioned => {
             let partial = maintained_aggregate_partial_input(aggregate.input())?;
@@ -395,7 +448,7 @@ fn maintained_aggregate_source_for_aggregate(
                 return None;
             }
             maintained_aggregate_source(partial.input())
-                .map(|(source, scan_epoch)| (source, scan_epoch, partial))
+                .map(|(source, scan_epoch, filter)| (source, scan_epoch, partial, filter))
         }
         AggregateMode::Partial | AggregateMode::PartialReduce => None,
     }
@@ -407,13 +460,9 @@ fn maintained_aggregate_partial_input(plan: &Arc<dyn ExecutionPlan>) -> Option<&
         return Some(aggregate);
     }
 
-    if plan.downcast_ref::<RepartitionExec>().is_none()
-        && plan
-            .downcast_ref::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
-            .is_none()
-        && plan
-            .downcast_ref::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
-            .is_none()
+    if !plan.is::<RepartitionExec>()
+        && !plan.is::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
+        && !plan.is::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
     {
         return None;
     }
@@ -432,19 +481,56 @@ fn is_simple_partial_aggregate(aggregate: &AggregateExec) -> bool {
 #[expect(deprecated)]
 fn maintained_aggregate_source(
     plan: &Arc<dyn ExecutionPlan>,
-) -> Option<(&Arc<MaintainedAggregateRegistry>, u64)> {
+) -> Option<MaintainedAggregateSource<'_>> {
     if let Some(cayenne_scan) = plan.downcast_ref::<CayenneAccelerationExec>() {
-        return cayenne_scan.maintained_aggregates();
+        // Soundness guard — mirrors `CayenneStatsAggregateRewriter::optimize`,
+        // which declines when `scan.has_pushed_filter()`. A maintained aggregate
+        // view answers the *unfiltered* relation, but the physical `FilterPushdown`
+        // pass can push a query's `WHERE` ONTO the scan and REMOVE the `FilterExec`
+        // above it (the inner Vortex source accepts the predicate; see
+        // `CayenneAccelerationExec::handle_child_pushdown_result`). Reaching the bare
+        // scan with a pushed filter therefore means the scan returns a row *subset*
+        // the whole-relation view cannot answer — serving it would silently drop the
+        // predicate and return wrong results. Decline so the real scan+aggregate runs.
+        // (A *surviving* `FilterExec` is still captured by the `FilterExec` branch
+        // below and matched against a filtered view, so filtered views are unaffected.)
+        //
+        // DEEP walk: on a merge-on-read table with pending tombstones the scan is
+        // wrapped in a deletion-filter exec and the predicate is pushed onto the file
+        // source BELOW it, which the shallow `has_pushed_filter` (identity-preserving
+        // whitelist) would miss — leaving the bug open on exactly the delete-heavy CDC
+        // tables this view targets.
+        if cayenne_scan.has_pushed_filter_deep() {
+            return None;
+        }
+        return cayenne_scan
+            .maintained_aggregates()
+            .map(|(registry, scan_epoch)| (registry, scan_epoch, None));
     }
 
-    if plan.downcast_ref::<RepartitionExec>().is_none()
-        && plan
-            .downcast_ref::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
-            .is_none()
-        && plan.downcast_ref::<SchemaCastScanExec>().is_none()
-        && plan
-            .downcast_ref::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
-            .is_none()
+    // A single `FilterExec` between the aggregate and the Cayenne scan is the
+    // `WHERE` of a filtered analytical query (e.g. CH-benCH q1/q6). Capture its
+    // predicate so the registry can serve from a maintained view declared with
+    // the identical filter. Two stacked filters can't be matched as one
+    // predicate, so bail (fall back to the base-table scan — correct, just not
+    // accelerated).
+    if let Some(filter_exec) = plan.downcast_ref::<datafusion_physical_plan::filter::FilterExec>() {
+        let (registry, scan_epoch, inner_filter) =
+            maintained_aggregate_source(filter_exec.input())?;
+        if inner_filter.is_some() {
+            return None;
+        }
+        return Some((
+            registry,
+            scan_epoch,
+            Some(Arc::clone(filter_exec.predicate())),
+        ));
+    }
+
+    if !plan.is::<RepartitionExec>()
+        && !plan.is::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
+        && !plan.is::<SchemaCastScanExec>()
+        && !plan.is::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
     {
         return None;
     }
@@ -454,6 +540,106 @@ fn maintained_aggregate_source(
         return None;
     }
     maintained_aggregate_source(children[0])
+}
+
+impl PhysicalOptimizerRule for CayenneStatsAggregateRewriter {
+    fn name(&self) -> &'static str {
+        "CayenneStatsAggregateRewriter"
+    }
+
+    fn schema_check(&self) -> bool {
+        false
+    }
+
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        _config: &ConfigOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        plan.transform_down(|node| {
+            let Some(aggregate) = node.downcast_ref::<AggregateExec>() else {
+                return Ok(Transformed::no(node));
+            };
+            let Some((query_aggregate, scan)) = stats_aggregate_source_for_aggregate(aggregate)
+            else {
+                return Ok(Transformed::no(node));
+            };
+
+            // Soundness guard #1: whole-file statistics describe the unfiltered
+            // file. A scan carrying a pushed-down predicate (or dynamic join
+            // filter) returns a row subset whose aggregate the footer cannot
+            // answer, so decline and leave the real scan+aggregate in place.
+            if scan.has_pushed_filter() {
+                return Ok(Transformed::no(node));
+            }
+
+            // Statistics of the aggregate's input are aligned to the schema the
+            // aggregate's column indices reference. Soundness guard #2 lives in
+            // `stats_aggregate_batch`: every value consumed must be `Exact`.
+            let Ok(input_stats) = query_aggregate.input().partition_statistics(None) else {
+                return Ok(Transformed::no(node));
+            };
+            let Some(batch) = crate::stats_aggregate::stats_aggregate_batch(
+                query_aggregate,
+                aggregate,
+                &input_stats,
+            )?
+            else {
+                return Ok(Transformed::no(node));
+            };
+
+            Ok(Transformed::yes(
+                Arc::new(MaintainedAggregateExec::try_new(batch)?) as Arc<dyn ExecutionPlan>,
+            ))
+        })
+        .data()
+    }
+}
+
+/// Locate the aggregate that defines the stats-foldable shape and the Cayenne
+/// scan beneath it, mirroring the partial/final handling of
+/// [`maintained_aggregate_source_for_aggregate`]. Returns the *query* aggregate
+/// (the `Partial` under a `Final`, or the `Single` node) paired with the scan.
+fn stats_aggregate_source_for_aggregate(
+    aggregate: &AggregateExec,
+) -> Option<(&AggregateExec, &CayenneAccelerationExec)> {
+    match aggregate.mode() {
+        AggregateMode::Single | AggregateMode::SinglePartitioned => {
+            cayenne_scan_input(aggregate.input()).map(|scan| (aggregate, scan))
+        }
+        AggregateMode::Final | AggregateMode::FinalPartitioned => {
+            let partial = maintained_aggregate_partial_input(aggregate.input())?;
+            if !matches!(partial.mode(), AggregateMode::Partial) {
+                return None;
+            }
+            cayenne_scan_input(partial.input()).map(|scan| (partial, scan))
+        }
+        AggregateMode::Partial | AggregateMode::PartialReduce => None,
+    }
+}
+
+/// Descend through statistics-preserving passthrough nodes to the
+/// [`CayenneAccelerationExec`] beneath an aggregate's input, mirroring the
+/// allowlist in [`maintained_aggregate_source`].
+#[expect(deprecated)]
+fn cayenne_scan_input(plan: &Arc<dyn ExecutionPlan>) -> Option<&CayenneAccelerationExec> {
+    if let Some(cayenne_scan) = plan.downcast_ref::<CayenneAccelerationExec>() {
+        return Some(cayenne_scan);
+    }
+
+    if !plan.is::<RepartitionExec>()
+        && !plan.is::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
+        && !plan.is::<SchemaCastScanExec>()
+        && !plan.is::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
+    {
+        return None;
+    }
+
+    let children = plan.children();
+    if children.len() != 1 {
+        return None;
+    }
+    cayenne_scan_input(children[0])
 }
 
 #[derive(Clone)]
@@ -747,7 +933,7 @@ fn count_hash_joins(plan: &Arc<dyn ExecutionPlan>) -> usize {
 }
 
 fn count_hash_joins_inner(plan: &Arc<dyn ExecutionPlan>, count: &mut usize) {
-    if plan.downcast_ref::<HashJoinExec>().is_some() {
+    if plan.is::<HashJoinExec>() {
         *count += 1;
     }
     for child in plan.children() {
@@ -791,6 +977,20 @@ fn fractional_bytes(bytes: usize, fraction: f64) -> usize {
     }
 }
 
+/// Multiplier applied to the raw Arrow payload when estimating a `HashJoinExec`
+/// build-side hash table's resident bytes.
+///
+/// The raw row-width × row-count estimate under-counts badly: `DataFusion`'s hash
+/// table stores keys, values, and open-addressing slots at a load factor well
+/// below 1.0, plus per-entry pointer/tag overhead. Empirically this lands in the
+/// 2–3× range of the Arrow payload for typical fixed-width join keys; we use
+/// **2.5×** (`5/2`) as a conservative middle — under-estimating leaves the
+/// non-spillable hash join in place and can OOM, over-estimating over-fires the
+/// sort-merge rewrite (slower but safe). Integer fraction avoids `f64` on the
+/// planner hot path.
+const HASH_JOIN_BUILD_SIDE_OVERHEAD_NUM: usize = 5;
+const HASH_JOIN_BUILD_SIDE_OVERHEAD_DEN: usize = 2;
+
 fn build_side_memory_estimate(plan: &dyn ExecutionPlan, build_rows: usize) -> Option<usize> {
     let row_width = plan
         .schema()
@@ -800,7 +1000,15 @@ fn build_side_memory_estimate(plan: &dyn ExecutionPlan, build_rows: usize) -> Op
             Some(acc.saturating_add(estimated_arrow_width(field.data_type())?))
         })?;
 
-    Some(row_width.saturating_mul(build_rows))
+    let payload_bytes = row_width.saturating_mul(build_rows);
+    // (payload * 5) / 2 ≈ 2.5× payload, computed in u128 so a saturated payload
+    // stays monotonic: a plain usize `* 5` would saturate to usize::MAX and then
+    // HALVE on `/ 2`, dropping the estimate for extreme/unknown row counts. Clamp
+    // back to usize::MAX. (`usize as u128` is always lossless; std has no
+    // `From<usize>` for the platform-dependent usize.)
+    let estimated = payload_bytes as u128 * HASH_JOIN_BUILD_SIDE_OVERHEAD_NUM as u128
+        / HASH_JOIN_BUILD_SIDE_OVERHEAD_DEN as u128;
+    Some(usize::try_from(estimated).unwrap_or(usize::MAX))
 }
 
 fn estimated_arrow_width(data_type: &DataType) -> Option<usize> {
@@ -1282,10 +1490,7 @@ fn flatten_transparent_nodes(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn Executio
 fn hash_join_build_side_is_cayenne(join: &HashJoinExec) -> bool {
     let build_side = flatten_transparent_nodes(join.left());
 
-    if build_side
-        .downcast_ref::<CayenneAccelerationExec>()
-        .is_some()
-    {
+    if build_side.is::<CayenneAccelerationExec>() {
         true
     } else if let Some(nested_join) = build_side.downcast_ref::<HashJoinExec>() {
         // Recursively check the build side of the nested join
@@ -1311,10 +1516,7 @@ fn is_cayenne_backed_join(hash_join: &HashJoinExec) -> bool {
     // Check the probe side first (right child)
     let probe_side = flatten_transparent_nodes(hash_join.right());
 
-    if probe_side
-        .downcast_ref::<CayenneAccelerationExec>()
-        .is_some()
-    {
+    if probe_side.is::<CayenneAccelerationExec>() {
         return true;
     }
 
@@ -1397,7 +1599,9 @@ mod tests {
     use super::{
         ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS, CayenneAntiJoinSortMergeRewriter,
         CayenneDynamicFilterSharing, CayenneMaintainedAggregateRewriter, CayenneOptimizerConfig,
-        FilterAddition, apply_filter_additions, plan_schema_fields,
+        CayenneStatsAggregateRewriter, FilterAddition, HASH_JOIN_BUILD_SIDE_OVERHEAD_DEN,
+        HASH_JOIN_BUILD_SIDE_OVERHEAD_NUM, apply_filter_additions, build_side_memory_estimate,
+        plan_schema_fields,
     };
     use crate::maintained_aggregate::{
         MaintainedAggregateExec, MaintainedAggregateExpr, MaintainedAggregateFunction,
@@ -1405,7 +1609,7 @@ mod tests {
     };
     use crate::provider::CayenneAccelerationExec;
     use crate::provider::scan::ScanDynamicFilter;
-    use arrow::array::{Int64Array, StringArray};
+    use arrow::array::{Decimal128Array, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion::common::{JoinType, NullEquality};
@@ -1422,6 +1626,7 @@ mod tests {
     use datafusion::physical_plan::union::UnionExec;
     use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, displayable};
     use datafusion_common::stats::Precision;
+    use datafusion_common::{ColumnStatistics, ScalarValue};
     use datafusion_common::{DataFusionError, Result as DFResult, Statistics};
     use datafusion_datasource::file::FileSource;
     use datafusion_datasource::file_groups::FileGroup;
@@ -1429,8 +1634,11 @@ mod tests {
     use datafusion_datasource::file_stream::FileOpener;
     use datafusion_datasource::source::DataSourceExec;
     use datafusion_datasource::{PartitionedFile, TableSchema};
+    use datafusion_functions_aggregate::average::avg_udaf;
     use datafusion_functions_aggregate::count::count_udaf;
-    use datafusion_physical_expr::expressions::{DynamicFilterPhysicalExpr, col, lit};
+    use datafusion_functions_aggregate::min_max::{max_udaf, min_udaf};
+    use datafusion_functions_aggregate::sum::sum_udaf;
+    use datafusion_physical_expr::expressions::{DynamicFilterPhysicalExpr, cast, col, lit};
     use datafusion_physical_expr::projection::ProjectionExprs;
     use datafusion_physical_expr::{PhysicalExpr, conjunction};
     use datafusion_physical_plan::DisplayFormatType;
@@ -1479,12 +1687,88 @@ mod tests {
         )?))
     }
 
+    /// `MIN(value)`, `MAX(value)` GROUP BY `name` over the `[name, value]` scan,
+    /// `Single` mode — the grouped ordered-aggregate shape the maintained
+    /// MIN/MAX view serves.
+    fn maintained_minmax_aggregate(
+        input: Arc<dyn ExecutionPlan>,
+        schema: Arc<Schema>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let group_by =
+            PhysicalGroupBy::new_single(vec![(col("name", schema.as_ref())?, "name".to_string())]);
+        let min_expr = AggregateExprBuilder::new(min_udaf(), vec![col("value", schema.as_ref())?])
+            .schema(Arc::clone(&schema))
+            .alias("min(value)".to_string())
+            .build()?;
+        let max_expr = AggregateExprBuilder::new(max_udaf(), vec![col("value", schema.as_ref())?])
+            .schema(Arc::clone(&schema))
+            .alias("max(value)".to_string())
+            .build()?;
+        Ok(Arc::new(AggregateExec::try_new(
+            AggregateMode::Single,
+            group_by,
+            vec![Arc::new(min_expr), Arc::new(max_expr)],
+            vec![None, None],
+            input,
+            schema,
+        )?))
+    }
+
+    /// The frontier bet's real-path faithfulness precondition: a grouped
+    /// `MIN`/`MAX` query is served from maintained state — the optimizer rewrites
+    /// the `AggregateExec` to a `MaintainedAggregateExec`, so the answer is
+    /// O(groups) maintained state, not an O(rows) re-scan. Pairs with the
+    /// module's value-correctness tests (`maintains_min_max_with_retraction`), so
+    /// together they prove the served path is both selected AND correct. MIN/MAX
+    /// inherits the P0-1 `has_pushed_filter_deep` guard from the shared,
+    /// function-agnostic `maintained_aggregate_source`.
+    #[test]
+    fn maintained_aggregate_rewriter_serves_min_max_group_by() -> DFResult<()> {
+        let schema = maintained_aggregate_test_schema();
+        let batch = maintained_aggregate_test_batch();
+        let registry = Arc::new(MaintainedAggregateRegistry::try_new(
+            &[MaintainedAggregateSpec {
+                filter: None,
+                group_by: vec!["name".to_string()],
+                aggregates: vec![
+                    MaintainedAggregateExpr {
+                        function: MaintainedAggregateFunction::Min,
+                        column: Some("value".to_string()),
+                    },
+                    MaintainedAggregateExpr {
+                        function: MaintainedAggregateFunction::Max,
+                        column: Some("value".to_string()),
+                    },
+                ],
+            }],
+            &schema,
+        )?);
+        registry.apply_insert_batches(1, std::slice::from_ref(&batch))?;
+        let memory = MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)?;
+        let cayenne_scan = Arc::new(CayenneAccelerationExec::new_with_maintained_aggregates(
+            memory, registry, 1,
+        )) as Arc<dyn ExecutionPlan>;
+        let aggregate = maintained_minmax_aggregate(cayenne_scan, schema)?;
+
+        let optimized = CayenneMaintainedAggregateRewriter::new()
+            .optimize(aggregate, &ConfigOptions::default())?;
+
+        assert!(
+            optimized
+                .downcast_ref::<MaintainedAggregateExec>()
+                .is_some(),
+            "a grouped MIN/MAX query must be served from maintained state (precondition: rewrite fired)"
+        );
+        Ok(())
+    }
+
     #[test]
     fn maintained_aggregate_rewriter_replaces_fresh_matching_aggregate() -> DFResult<()> {
         let schema = maintained_aggregate_test_schema();
         let batch = maintained_aggregate_test_batch();
         let registry = Arc::new(MaintainedAggregateRegistry::try_new(
             &[MaintainedAggregateSpec {
+                filter: None,
                 group_by: vec!["name".to_string()],
                 aggregates: vec![MaintainedAggregateExpr {
                     function: MaintainedAggregateFunction::Count,
@@ -1503,10 +1787,156 @@ mod tests {
         let optimized = CayenneMaintainedAggregateRewriter::new()
             .optimize(aggregate, &ConfigOptions::default())?;
 
+        assert!(optimized.is::<MaintainedAggregateExec>());
+        Ok(())
+    }
+
+    /// End-to-end rewrite for `AVG` over a narrow signed-integer column (Postgres
+    /// `INTEGER` → arrow `Int32`, the common CDC case). `DataFusion` plans
+    /// `AVG(Int32)` as `avg(CAST(v AS Float64))`, so this also guards the
+    /// matcher's cast-see-through: the rewriter must resolve the underlying
+    /// `Int32` column against the table schema, match the maintained `AVG` spec,
+    /// and replace the `AggregateExec` with a `MaintainedAggregateExec`.
+    #[test]
+    fn maintained_aggregate_rewriter_replaces_avg_over_int32() -> DFResult<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("v", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![Some("a"), Some("a"), Some("b")])),
+                Arc::new(Int32Array::from(vec![Some(10), Some(20), Some(5)])),
+            ],
+        )
+        .expect("int32 test batch should be valid");
+
+        let registry = Arc::new(MaintainedAggregateRegistry::try_new(
+            &[MaintainedAggregateSpec {
+                filter: None,
+                group_by: vec!["name".to_string()],
+                aggregates: vec![MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Avg,
+                    column: Some("v".to_string()),
+                }],
+            }],
+            &schema,
+        )?);
+        registry.apply_insert_batches(1, std::slice::from_ref(&batch))?;
+        let memory = MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)?;
+        let cayenne_scan = Arc::new(CayenneAccelerationExec::new_with_maintained_aggregates(
+            memory, registry, 1,
+        )) as Arc<dyn ExecutionPlan>;
+
+        // Mirror DataFusion's coercion of `AVG(Int32)` -> `avg(CAST(v AS Float64))`.
+        let avg_arg = cast(
+            col("v", schema.as_ref())?,
+            schema.as_ref(),
+            DataType::Float64,
+        )?;
+        let avg_expr = AggregateExprBuilder::new(avg_udaf(), vec![avg_arg])
+            .schema(Arc::clone(&schema))
+            .alias("avg(v)".to_string())
+            .build()?;
+        let aggregate = Arc::new(AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(vec![(col("name", schema.as_ref())?, "name".to_string())]),
+            vec![Arc::new(avg_expr)],
+            vec![None],
+            cayenne_scan,
+            Arc::clone(&schema),
+        )?) as Arc<dyn ExecutionPlan>;
+
+        let optimized = CayenneMaintainedAggregateRewriter::new()
+            .optimize(aggregate, &ConfigOptions::default())?;
+
         assert!(
             optimized
                 .downcast_ref::<MaintainedAggregateExec>()
-                .is_some()
+                .is_some(),
+            "AVG over an Int32 column must rewrite to the maintained aggregate"
+        );
+        Ok(())
+    }
+
+    /// `SUM`/`AVG` over a `Decimal128` money column (the CH-benCH
+    /// `SUM(ol_amount)` case, Postgres `NUMERIC(6, 2)`) must rewrite to the
+    /// maintained aggregate. Unlike the integer case, `DataFusion`'s decimal
+    /// coercion is exact (no cast over the input column), and the output types
+    /// are the widened decimal `SUM`/`AVG` return types, which the maintained
+    /// view must reproduce for the substitution to match.
+    #[test]
+    fn maintained_aggregate_rewriter_replaces_sum_avg_over_decimal128() -> DFResult<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("amt", DataType::Decimal128(6, 2), true),
+        ]));
+        let amounts = Decimal128Array::from(vec![Some(150_i128), Some(999), Some(-50)])
+            .with_precision_and_scale(6, 2)
+            .expect("valid decimal precision/scale");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![Some("a"), Some("a"), Some("b")])),
+                Arc::new(amounts),
+            ],
+        )
+        .expect("decimal test batch should be valid");
+
+        let registry = Arc::new(MaintainedAggregateRegistry::try_new(
+            &[MaintainedAggregateSpec {
+                filter: None,
+                group_by: vec!["name".to_string()],
+                aggregates: vec![
+                    MaintainedAggregateExpr {
+                        function: MaintainedAggregateFunction::Sum,
+                        column: Some("amt".to_string()),
+                    },
+                    MaintainedAggregateExpr {
+                        function: MaintainedAggregateFunction::Avg,
+                        column: Some("amt".to_string()),
+                    },
+                ],
+            }],
+            &schema,
+        )?);
+        registry.apply_insert_batches(1, std::slice::from_ref(&batch))?;
+        let memory = MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)?;
+        let cayenne_scan = Arc::new(CayenneAccelerationExec::new_with_maintained_aggregates(
+            memory, registry, 1,
+        )) as Arc<dyn ExecutionPlan>;
+
+        // DataFusion's decimal SUM/AVG coercion is exact: the aggregate input
+        // is the bare column, and the builder computes the widened decimal
+        // output types.
+        let aggregate_exprs = [("sum(amt)", sum_udaf()), ("avg(amt)", avg_udaf())]
+            .into_iter()
+            .map(|(alias, udaf)| {
+                AggregateExprBuilder::new(udaf, vec![col("amt", schema.as_ref())?])
+                    .schema(Arc::clone(&schema))
+                    .alias(alias.to_string())
+                    .build()
+                    .map(Arc::new)
+            })
+            .collect::<DFResult<Vec<_>>>()?;
+        let aggregate = Arc::new(AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(vec![(col("name", schema.as_ref())?, "name".to_string())]),
+            aggregate_exprs,
+            vec![None, None],
+            cayenne_scan,
+            Arc::clone(&schema),
+        )?) as Arc<dyn ExecutionPlan>;
+
+        let optimized = CayenneMaintainedAggregateRewriter::new()
+            .optimize(aggregate, &ConfigOptions::default())?;
+
+        assert!(
+            optimized
+                .downcast_ref::<MaintainedAggregateExec>()
+                .is_some(),
+            "SUM/AVG over a Decimal128 column must rewrite to the maintained aggregate"
         );
         Ok(())
     }
@@ -1517,6 +1947,7 @@ mod tests {
         let batch = maintained_aggregate_test_batch();
         let registry = Arc::new(MaintainedAggregateRegistry::try_new(
             &[MaintainedAggregateSpec {
+                filter: None,
                 group_by: vec!["name".to_string()],
                 aggregates: vec![MaintainedAggregateExpr {
                     function: MaintainedAggregateFunction::Count,
@@ -1537,8 +1968,211 @@ mod tests {
             .optimize(Arc::clone(&aggregate), &ConfigOptions::default())?;
 
         assert!(
-            optimized.downcast_ref::<AggregateExec>().is_some(),
+            optimized.is::<AggregateExec>(),
             "stale maintained aggregate state must not rewrite"
+        );
+        Ok(())
+    }
+
+    /// `WHERE value > 1` over the maintained-aggregate test schema.
+    fn value_gt_one(schema: &Arc<Schema>) -> DFResult<Arc<dyn PhysicalExpr>> {
+        datafusion_physical_expr::expressions::binary(
+            col("value", schema.as_ref())?,
+            datafusion::logical_expr::Operator::Gt,
+            lit(1_i64),
+            schema.as_ref(),
+        )
+    }
+
+    /// Whole-table `SUM(value)` over a `[name, value]` scan, `Single` mode.
+    fn sum_value_aggregate(
+        input: Arc<dyn ExecutionPlan>,
+        schema: Arc<Schema>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let expr = AggregateExprBuilder::new(sum_udaf(), vec![col("value", schema.as_ref())?])
+            .schema(Arc::clone(&schema))
+            .alias("sum(value)".to_string())
+            .build()?;
+        Ok(Arc::new(AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(vec![]),
+            vec![Arc::new(expr)],
+            vec![None],
+            input,
+            schema,
+        )?))
+    }
+
+    /// Statistics for the `[name, value]` schema with the given `value`-column sum.
+    fn value_sum_statistics(sum: Precision<ScalarValue>) -> Statistics {
+        Statistics {
+            num_rows: Precision::Exact(3),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![
+                ColumnStatistics::new_unknown(), // name
+                ColumnStatistics {
+                    null_count: Precision::Exact(0),
+                    min_value: Precision::Absent,
+                    max_value: Precision::Absent,
+                    sum_value: sum,
+                    distinct_count: Precision::Absent,
+                    byte_size: Precision::Absent,
+                },
+            ],
+        }
+    }
+
+    // A FILTERED maintained view must serve a query that carries the SAME
+    // predicate as a `FilterExec` between the aggregate and the scan — the q1/q6
+    // shape every CH-benCH query has and the shipped rewrite missed. The rewrite
+    // must descend through the `FilterExec`, match the predicate, and replace the
+    // aggregate with the maintained batch.
+    #[test]
+    fn maintained_aggregate_rewriter_serves_through_matching_filter() -> DFResult<()> {
+        let schema = maintained_aggregate_test_schema();
+        let batch = maintained_aggregate_test_batch();
+        let filter = value_gt_one(&schema)?;
+        let registry = Arc::new(MaintainedAggregateRegistry::try_new(
+            &[MaintainedAggregateSpec {
+                filter: Some(Arc::clone(&filter)),
+                group_by: vec!["name".to_string()],
+                aggregates: vec![MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Count,
+                    column: None,
+                }],
+            }],
+            &schema,
+        )?);
+        registry.apply_insert_batches(1, std::slice::from_ref(&batch))?;
+        let memory = MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)?;
+        let cayenne_scan = Arc::new(CayenneAccelerationExec::new_with_maintained_aggregates(
+            memory, registry, 1,
+        )) as Arc<dyn ExecutionPlan>;
+        // AggregateExec -> FilterExec(value > 1) -> CayenneAccelerationExec.
+        let filter_exec = Arc::new(datafusion_physical_plan::filter::FilterExec::try_new(
+            filter,
+            cayenne_scan,
+        )?) as Arc<dyn ExecutionPlan>;
+        let aggregate = maintained_count_aggregate(filter_exec, schema)?;
+
+        let optimized = CayenneMaintainedAggregateRewriter::new()
+            .optimize(aggregate, &ConfigOptions::default())?;
+
+        assert!(
+            optimized
+                .downcast_ref::<MaintainedAggregateExec>()
+                .is_some(),
+            "a filtered query whose predicate matches the view must serve from maintained state"
+        );
+        Ok(())
+    }
+
+    // The dual guard: a FILTERED view must NOT answer an UNFILTERED query (it
+    // would return only the filtered subset for a query wanting every row). The
+    // rewrite must leave the plain aggregate untouched.
+    #[test]
+    fn maintained_aggregate_rewriter_preserves_unfiltered_query_over_filtered_view() -> DFResult<()>
+    {
+        let schema = maintained_aggregate_test_schema();
+        let batch = maintained_aggregate_test_batch();
+        let registry = Arc::new(MaintainedAggregateRegistry::try_new(
+            &[MaintainedAggregateSpec {
+                filter: Some(value_gt_one(&schema)?),
+                group_by: vec!["name".to_string()],
+                aggregates: vec![MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Count,
+                    column: None,
+                }],
+            }],
+            &schema,
+        )?);
+        registry.apply_insert_batches(1, std::slice::from_ref(&batch))?;
+        let memory = MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)?;
+        let cayenne_scan = Arc::new(CayenneAccelerationExec::new_with_maintained_aggregates(
+            memory, registry, 1,
+        )) as Arc<dyn ExecutionPlan>;
+        // No FilterExec: an unfiltered aggregate directly over the scan.
+        let aggregate = maintained_count_aggregate(cayenne_scan, schema)?;
+
+        let optimized = CayenneMaintainedAggregateRewriter::new()
+            .optimize(aggregate, &ConfigOptions::default())?;
+
+        assert!(
+            optimized.is::<AggregateExec>(),
+            "a filtered view must not answer an unfiltered query"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stats_aggregate_rewriter_folds_sum_over_cayenne_scan() -> DFResult<()> {
+        let schema = maintained_aggregate_test_schema();
+        let stats = value_sum_statistics(Precision::Exact(ScalarValue::Int64(Some(6))));
+        let scan = Arc::new(CayenneAccelerationExec::new(file_exec_with_statistics(
+            &schema, "f.vortex", None, stats,
+        )));
+        let aggregate = sum_value_aggregate(scan, schema)?;
+
+        let optimized =
+            CayenneStatsAggregateRewriter::new().optimize(aggregate, &ConfigOptions::default())?;
+
+        assert!(
+            optimized
+                .downcast_ref::<MaintainedAggregateExec>()
+                .is_some(),
+            "exact whole-file sum over an unfiltered Cayenne scan must fold"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stats_aggregate_rewriter_does_not_fold_with_pushed_filter() -> DFResult<()> {
+        let schema = maintained_aggregate_test_schema();
+        let stats = value_sum_statistics(Precision::Exact(ScalarValue::Int64(Some(6))));
+        // A pushed-down predicate means the scan returns a row subset; the
+        // whole-file sum cannot answer it.
+        let filter = col("value", schema.as_ref())?;
+        let scan = Arc::new(CayenneAccelerationExec::new(file_exec_with_statistics(
+            &schema,
+            "f.vortex",
+            Some(filter),
+            stats,
+        )));
+        let aggregate = sum_value_aggregate(scan, schema)?;
+
+        let optimized = CayenneStatsAggregateRewriter::new()
+            .optimize(Arc::clone(&aggregate), &ConfigOptions::default())?;
+
+        assert!(
+            optimized.is::<AggregateExec>(),
+            "a filtered scan must not fold from whole-file stats"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stats_aggregate_rewriter_does_not_fold_over_base_delta_union() -> DFResult<()> {
+        let schema = maintained_aggregate_test_schema();
+        // Base file has an exact sum, but the inlined (delta) branch has no
+        // stats: the union's combined sum is Absent, so the fold must decline —
+        // the per-table/per-scan soundness invariant for uncompacted deltas.
+        let base = file_exec_with_statistics(
+            &schema,
+            "base.vortex",
+            None,
+            value_sum_statistics(Precision::Exact(ScalarValue::Int64(Some(6)))),
+        );
+        let delta = MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(&schema), None)?;
+        let union = UnionExec::try_new(vec![base, delta])?;
+        let scan = Arc::new(CayenneAccelerationExec::new(union));
+        let aggregate = sum_value_aggregate(scan, schema)?;
+
+        let optimized = CayenneStatsAggregateRewriter::new()
+            .optimize(Arc::clone(&aggregate), &ConfigOptions::default())?;
+
+        assert!(
+            optimized.is::<AggregateExec>(),
+            "a base+delta union with an unknown-stat delta must not fold"
         );
         Ok(())
     }
@@ -2143,7 +2777,7 @@ mod tests {
 
         let optimized = optimize_anti_join_sort_merge(join);
         assert!(
-            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
+            optimized.is::<SortMergeJoinExec>(),
             "same-source Cayenne LeftSemi join should use sort-merge join"
         );
     }
@@ -2169,11 +2803,11 @@ mod tests {
 
         assert_eq!(JoinType::LeftAnti, sort_merge.join_type());
         assert!(
-            sort_merge.left().downcast_ref::<SortExec>().is_some(),
+            sort_merge.left().is::<SortExec>(),
             "left anti-join input should be explicitly sorted"
         );
         assert!(
-            sort_merge.right().downcast_ref::<SortExec>().is_some(),
+            sort_merge.right().is::<SortExec>(),
             "right anti-join input should be explicitly sorted"
         );
     }
@@ -2289,7 +2923,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.downcast_ref::<HashJoinExec>().is_some(),
+            optimized.is::<HashJoinExec>(),
             "inner joins should stay as hash joins unless a more targeted rule proves a win"
         );
     }
@@ -2311,7 +2945,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.downcast_ref::<HashJoinExec>().is_some(),
+            optimized.is::<HashJoinExec>(),
             "outer joins should stay as hash joins unless a more targeted rule proves a win"
         );
     }
@@ -2332,7 +2966,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
+            optimized.is::<SortMergeJoinExec>(),
             "multi-key same-source Cayenne anti join should use sort-merge join"
         );
     }
@@ -2354,7 +2988,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.downcast_ref::<HashJoinExec>().is_some(),
+            optimized.is::<HashJoinExec>(),
             "anti joins over unrelated sources should stay as hash joins"
         );
     }
@@ -2376,7 +3010,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.downcast_ref::<HashJoinExec>().is_some(),
+            optimized.is::<HashJoinExec>(),
             "inner joins over unrelated sources should stay as hash joins"
         );
     }
@@ -2402,7 +3036,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.downcast_ref::<HashJoinExec>().is_some(),
+            optimized.is::<HashJoinExec>(),
             "same-source anti joins at or below the large-input threshold should stay as hash joins"
         );
     }
@@ -2424,7 +3058,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.downcast_ref::<HashJoinExec>().is_some(),
+            optimized.is::<HashJoinExec>(),
             "null-equal anti joins should stay as hash joins"
         );
     }
@@ -2451,7 +3085,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized.downcast_ref::<HashJoinExec>().is_some(),
+            optimized.is::<HashJoinExec>(),
             "configured min-row threshold should keep smaller build sides as hash joins"
         );
     }
@@ -2460,11 +3094,37 @@ mod tests {
     /// build big enough to OOM `HashJoinExec`'s non-spillable hash table. The byte gate
     /// must catch this case even though the row count is below
     /// `sort_merge_min_rows`.
+    /// Direct coverage of the 2.5× HT overhead in [`build_side_memory_estimate`].
+    /// Schema is three Int64 columns (8 B each) so `row_width` is exactly 24.
+    #[test]
+    fn build_side_memory_estimate_applies_two_point_five_ht_overhead() {
+        let schema = order_line_schema();
+        let plan =
+            cayenne_file_exec_with_num_rows(&schema, "order_line.vortex", Precision::Exact(1_000));
+        let estimated = build_side_memory_estimate(plan.as_ref(), 1_000)
+            .expect("known fixed-width schema must estimate");
+        // payload = 1000 × 24 = 24_000; with 5/2 overhead → 60_000.
+        assert_eq!(
+            estimated, 60_000,
+            "HT overhead must be exactly 2.5× the Arrow payload for Int64×3"
+        );
+        // Zero rows → zero estimate (and must not panic on divide path).
+        let zero = build_side_memory_estimate(plan.as_ref(), 0).expect("zero rows");
+        assert_eq!(zero, 0);
+        // Saturating path: huge row count must not overflow to a tiny value.
+        let huge_rows = usize::MAX / 16;
+        let huge = build_side_memory_estimate(plan.as_ref(), huge_rows).expect("huge");
+        assert!(huge > 0, "saturating estimate must stay positive");
+        // Factor itself is the documented 5/2.
+        assert_eq!(HASH_JOIN_BUILD_SIDE_OVERHEAD_NUM, 5);
+        assert_eq!(HASH_JOIN_BUILD_SIDE_OVERHEAD_DEN, 2);
+    }
+
     #[test]
     fn rewrites_low_row_count_wide_build_when_byte_estimate_exceeds_memory_gate() {
         let schema = order_line_schema();
-        // 200K rows × ~24 bytes/row ≈ 4.8 MB, plus inflated overhead from
-        // `build_side_memory_estimate`'s hash-table overhead factor. Well below
+        // 200K rows × ~24 bytes/row ≈ 4.8 MB payload; with the 2.5× hash-table
+        // overhead factor in `build_side_memory_estimate` ≈ 12 MB. Well below
         // the 10M row threshold but well above the 64 KB byte gate below.
         let small_rows = Precision::Exact(200_000);
         let left = cayenne_file_exec_with_num_rows(&schema, "order_line.vortex", small_rows);
@@ -2484,7 +3144,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
+            optimized.is::<SortMergeJoinExec>(),
             "low-row-count + wide-row build exceeding the byte gate should be rewritten to sort-merge"
         );
     }
@@ -2502,12 +3162,16 @@ mod tests {
             JoinType::LeftAnti,
             NullEquality::NullEqualsNothing,
         ));
-        let config = config_with_cayenne_optimizer(None, Some(0.125), Some(4 * 1024 * 1024 * 1024));
+        // 10M rows × ~24 B/row × 2.5 HT overhead ≈ 600 MiB estimated. Gate is
+        // fraction 0.125 of the pool, so 8 GiB × 0.125 = 1 GiB keeps this a hash
+        // join (was 4 GiB / 512 MiB gate before the overhead factor, which now
+        // under-fires and rewrites).
+        let config = config_with_cayenne_optimizer(None, Some(0.125), Some(8 * 1024 * 1024 * 1024));
 
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized.downcast_ref::<HashJoinExec>().is_some(),
+            optimized.is::<HashJoinExec>(),
             "estimated build side within the configured memory fraction should stay a hash join"
         );
     }
@@ -2530,7 +3194,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
+            optimized.is::<SortMergeJoinExec>(),
             "estimated build side above the configured memory fraction should use sort-merge"
         );
     }
@@ -2556,7 +3220,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.downcast_ref::<HashJoinExec>().is_some(),
+            optimized.is::<HashJoinExec>(),
             "same-source anti joins with inexact preserved-side stats should stay as hash joins"
         );
     }
@@ -2578,7 +3242,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.downcast_ref::<HashJoinExec>().is_some(),
+            optimized.is::<HashJoinExec>(),
             "same-source anti joins with unknown preserved-side stats should stay as hash joins"
         );
     }
@@ -2600,7 +3264,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
+            optimized.is::<SortMergeJoinExec>(),
             "RightAnti should gate on the left build side, not the right preserved side"
         );
     }
@@ -2622,7 +3286,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge(join);
 
         assert!(
-            optimized.downcast_ref::<HashJoinExec>().is_some(),
+            optimized.is::<HashJoinExec>(),
             "RightAnti should stay hash join when the left build side has unknown stats"
         );
     }
@@ -2637,7 +3301,7 @@ mod tests {
         }
         for child in plan.children() {
             let filters = cayenne_scan_dynamic_filters(child);
-            if !filters.is_empty() || child.downcast_ref::<CayenneAccelerationExec>().is_some() {
+            if !filters.is_empty() || child.is::<CayenneAccelerationExec>() {
                 return filters;
             }
         }
@@ -2764,7 +3428,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
+            optimized.is::<SortMergeJoinExec>(),
             "a large inner hash join over the memory gate should become a sort-merge join"
         );
     }
@@ -2788,7 +3452,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
+            optimized.is::<SortMergeJoinExec>(),
             "a large full-outer hash join over the memory gate should become a sort-merge join"
         );
     }
@@ -2818,7 +3482,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
+            optimized.is::<SortMergeJoinExec>(),
             "an inexact-but-large inner build side should still be rewritten under the memory gate"
         );
     }
@@ -2843,7 +3507,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized.downcast_ref::<SortMergeJoinExec>().is_some(),
+            optimized.is::<SortMergeJoinExec>(),
             "different-source inner joins are eligible under the memory gate"
         );
     }
@@ -2875,7 +3539,7 @@ mod tests {
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized.downcast_ref::<HashJoinExec>().is_some(),
+            optimized.is::<HashJoinExec>(),
             "non-Cayenne joins are left to the prefer_hash_join knob, not the Cayenne rewriter"
         );
     }
@@ -2893,13 +3557,15 @@ mod tests {
             JoinType::Inner,
             NullEquality::NullEqualsNothing,
         ));
-        // ~240 MB build < 0.9 × 400 MiB ≈ 360 MiB gate, and below the full pool.
-        let config = config_with_cayenne_optimizer(None, Some(0.9), Some(400 * 1024 * 1024));
+        // ~240 MB raw build → ~600 MB with the 2.5× HT overhead, still under the
+        // 0.9 × 1 GiB ≈ 921 MiB absolute gate (and its full-pool fair share for a
+        // lone join), so the join keeps its non-spillable hash join.
+        let config = config_with_cayenne_optimizer(None, Some(0.9), Some(1024 * 1024 * 1024));
 
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
         assert!(
-            optimized.downcast_ref::<HashJoinExec>().is_some(),
+            optimized.is::<HashJoinExec>(),
             "a lone inner join within the pool fraction should stay a hash join"
         );
     }
@@ -2925,9 +3591,10 @@ mod tests {
             make_join("c.vortex", "d.vortex"),
         ])
         .expect("union of two same-schema joins should be valid");
-        // Same 0.9 × 400 MiB config: each ~240 MB build is under the ~360 MiB
-        // absolute gate but over its 200 MiB fair share (pool / 2 joins).
-        let config = config_with_cayenne_optimizer(None, Some(0.9), Some(400 * 1024 * 1024));
+        // Same 0.9 × 1 GiB config: each ~600 MB build (240 MB × 2.5 HT overhead)
+        // is under the ~921 MiB absolute gate but over its 512 MiB fair share
+        // (pool / 2 joins), so only the fair-share term fires.
+        let config = config_with_cayenne_optimizer(None, Some(0.9), Some(1024 * 1024 * 1024));
 
         let optimized = optimize_anti_join_sort_merge_with_config(plan, &config);
 
@@ -2937,7 +3604,7 @@ mod tests {
         assert_eq!(union.children().len(), 2, "union should keep both joins");
         for child in union.children() {
             assert!(
-                child.downcast_ref::<SortMergeJoinExec>().is_some(),
+                child.is::<SortMergeJoinExec>(),
                 "each concurrent inner join should be rewritten to sort-merge under fair-share"
             );
         }

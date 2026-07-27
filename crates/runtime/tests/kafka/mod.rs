@@ -34,7 +34,10 @@ use bootstrap::{
 
 use crate::configure_test_datafusion;
 use crate::utils::runtime_ready_check;
-use crate::{init_tracing, utils::test_request_context};
+use crate::{
+    init_tracing,
+    utils::{register_test_connectors, test_request_context},
+};
 
 const KAFKA_PORT: u16 = 19093;
 const KAFKA_MESSAGE_PROCESSING_TIMEOUT: Duration = Duration::from_secs(30);
@@ -93,6 +96,7 @@ async fn kafka_sasl_connect_test() -> anyhow::Result<()> {
                 .build();
 
             configure_test_datafusion();
+            register_test_connectors().await;
             let rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
@@ -171,6 +175,9 @@ async fn kafka_fetch_latest_message_with_tombstone_test() -> anyhow::Result<()> 
                 sasl_username: Some(bootstrap::KAFKA_SASL_USERNAME.to_string()),
                 sasl_password: Some(bootstrap::KAFKA_SASL_PASSWORD.to_string()),
                 ssl_ca_location: None,
+                ssl_certificate_location: None,
+                ssl_key_location: None,
+                ssl_key_password: None,
                 enable_ssl_certificate_verification: true,
                 ssl_endpoint_identification_algorithm: SslIdentification::None,
                 consumer_group_id: None,
@@ -243,6 +250,9 @@ async fn kafka_fetch_latest_message_many_tombstones_test() -> anyhow::Result<()>
                 sasl_username: Some(bootstrap::KAFKA_SASL_USERNAME.to_string()),
                 sasl_password: Some(bootstrap::KAFKA_SASL_PASSWORD.to_string()),
                 ssl_ca_location: None,
+                ssl_certificate_location: None,
+                ssl_key_location: None,
+                ssl_key_password: None,
                 enable_ssl_certificate_verification: true,
                 ssl_endpoint_identification_algorithm: SslIdentification::None,
                 consumer_group_id: None,
@@ -329,6 +339,9 @@ async fn kafka_fetch_latest_message_multi_partition_test() -> anyhow::Result<()>
                 sasl_username: Some(bootstrap::KAFKA_SASL_USERNAME.to_string()),
                 sasl_password: Some(bootstrap::KAFKA_SASL_PASSWORD.to_string()),
                 ssl_ca_location: None,
+                ssl_certificate_location: None,
+                ssl_key_location: None,
+                ssl_key_password: None,
                 enable_ssl_certificate_verification: true,
                 ssl_endpoint_identification_algorithm: SslIdentification::None,
                 consumer_group_id: None,

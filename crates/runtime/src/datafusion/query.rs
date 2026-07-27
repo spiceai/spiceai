@@ -56,9 +56,13 @@ pub(crate) use tracker::QueryTracker;
 pub mod builder;
 pub use builder::QueryBuilder;
 mod cache;
+pub mod transaction;
+pub use transaction::{
+    TransactionError, TransactionOutcome, run_transaction, schema_statement, transaction_statements,
+};
 pub mod error_code;
 mod handle;
-mod metrics;
+pub mod plan_capture;
 pub mod registry;
 pub mod stage_history;
 mod tracker;
@@ -92,8 +96,8 @@ use crate::datafusion::{
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
 use runtime_auth::AuthRequestContext;
-use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
 use runtime_datafusion::config::request_context_config::SpiceRequestContextConfig;
+use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
 use runtime_request_context::{AsyncMarker, Protocol, RequestContext};
 use tokio::runtime::Handle;
 use util::session_state::builder_from_existing;
@@ -171,6 +175,13 @@ pub enum Error {
 
     #[snafu(display("Query {query_id} was cancelled"))]
     QueryCancelled { query_id: String },
+
+    #[snafu(display(
+        "Query {query_id} exceeded the configured timeout of {timeout} and was cancelled. \
+        Increase 'runtime.query.timeout' or optimize the query. \
+        See: https://spiceai.org/docs/reference/spicepod"
+    ))]
+    QueryTimedOut { query_id: String, timeout: String },
 }
 
 impl Error {
@@ -213,6 +224,16 @@ impl Display for QueryMethod {
     }
 }
 
+/// Controls how a query interacts with the SQL results cache.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ResultsCacheMode {
+    /// Apply the request context's normal results-cache behavior.
+    #[default]
+    Default,
+    /// Skip both results-cache lookup and storage.
+    Bypass,
+}
+
 pub struct Query {
     df: Arc<crate::datafusion::DataFusion>,
     sql: QueryMethod,
@@ -231,6 +252,9 @@ pub struct Query {
     /// regardless of per-catalog writability. Set via [`QueryBuilder::read_only`];
     /// used by `/v1/tools/sql` and `/v1/nsql` to contain LLM-generated SQL.
     read_only: bool,
+    /// Controls results-cache lookup and storage. Set via
+    /// [`QueryBuilder::results_cache_mode`].
+    results_cache_mode: ResultsCacheMode,
 }
 
 macro_rules! handle_error {
@@ -241,15 +265,82 @@ macro_rules! handle_error {
     }};
 }
 
+/// How a distributed query is started: planned and submitted fresh, or recovered
+/// and resumed from an existing job whose owning scheduler was lost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DistributedSubmitMode {
+    New,
+    Resume,
+}
+
+/// Records whether the query's cancellation token was fired by the
+/// `runtime.query.timeout` timer rather than an explicit cancel or client
+/// disconnect, so every site that builds a cancellation error can report
+/// [`Error::QueryTimedOut`] instead of [`Error::QueryCancelled`].
+#[derive(Clone, Default)]
+pub(crate) struct QueryTimeoutState {
+    inner: Option<Arc<QueryTimeoutInner>>,
+}
+
+struct QueryTimeoutInner {
+    fired: std::sync::atomic::AtomicBool,
+    timeout: std::time::Duration,
+}
+
+impl QueryTimeoutState {
+    fn armed(timeout: std::time::Duration) -> Self {
+        Self {
+            inner: Some(Arc::new(QueryTimeoutInner {
+                fired: std::sync::atomic::AtomicBool::new(false),
+                timeout,
+            })),
+        }
+    }
+
+    fn mark_fired(&self) {
+        if let Some(inner) = &self.inner {
+            inner.fired.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// The error to report for a fired cancellation token: `QueryTimedOut`
+    /// when the timeout timer fired it, `QueryCancelled` otherwise.
+    fn cancellation_error(&self, query_id: &str) -> Error {
+        match &self.inner {
+            Some(inner) if inner.fired.load(std::sync::atomic::Ordering::SeqCst) => {
+                Error::QueryTimedOut {
+                    query_id: query_id.to_string(),
+                    timeout: format!("{:?}", inner.timeout),
+                }
+            }
+            _ => Error::QueryCancelled {
+                query_id: query_id.to_string(),
+            },
+        }
+    }
+}
+
+/// Aborts the `runtime.query.timeout` timer task when dropped, so the timer
+/// cannot fire after the query's result stream completes, errors, or is
+/// dropped. Bundled into the guard attached to the result stream.
+struct QueryTimeoutTimerGuard {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for QueryTimeoutTimerGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 impl Query {
     fn ensure_not_cancelled(
         token: &tokio_util::sync::CancellationToken,
         query_id: &str,
+        timeout_state: &QueryTimeoutState,
     ) -> Result<()> {
         if token.is_cancelled() {
-            return Err(Error::QueryCancelled {
-                query_id: query_id.to_string(),
-            });
+            return Err(timeout_state.cancellation_error(query_id));
         }
         Ok(())
     }
@@ -515,7 +606,12 @@ impl Query {
         }
 
         let result = self
-            .submit_distributed_internal(job_id, request_context, span.clone())
+            .submit_distributed_internal(
+                job_id,
+                request_context,
+                span.clone(),
+                DistributedSubmitMode::New,
+            )
             .await;
         if let Err(e) = &result {
             tracing::error!(target: "task_history", parent: &span, "{e}");
@@ -523,16 +619,62 @@ impl Query {
         result
     }
 
-    /// Internal implementation for submitting a distributed query.
+    /// Resumes a distributed query whose owning scheduler was lost, driving the
+    /// recovered execution graph to completion on this scheduler and returning a
+    /// handle to its results. `job_id` must match the original submission.
+    pub async fn resume_distributed(self, job_id: &str) -> Result<QueryHandle> {
+        let request_context = RequestContext::current(AsyncMarker::new().await);
+
+        let span = tracing::span!(
+            target: "task_history",
+            tracing::Level::INFO,
+            "sql_query",
+            input = %self.sql,
+            runtime_query = false,
+            distributed = true,
+            job_id = %job_id,
+            ballista_job_id = tracing::field::Empty,
+            stage_count = tracing::field::Empty,
+            executor_count = tracing::field::Empty,
+            total_tasks = tracing::field::Empty,
+            total_executor_ms = tracing::field::Empty,
+        );
+
+        if let Some(traceparent) = request_context.trace_parent() {
+            crate::http::traceparent::override_task_history_with_trace_parent(&span, traceparent);
+        }
+
+        let result = self
+            .submit_distributed_internal(
+                job_id,
+                request_context,
+                span.clone(),
+                DistributedSubmitMode::Resume,
+            )
+            .await;
+        if let Err(e) = &result {
+            tracing::error!(target: "task_history", parent: &span, "{e}");
+        }
+        result
+    }
+
+    /// Internal implementation for submitting (or resuming) a distributed query.
     async fn submit_distributed_internal(
         self,
         job_id: &str,
         request_context: Arc<RequestContext>,
         span: Span,
+        mode: DistributedSubmitMode,
     ) -> Result<QueryHandle> {
         // Get the scheduler server
         let scheduler = Self::get_scheduler_server(&self.df)?;
         let tracker = self.tracker;
+        let results_cache_mode = self.results_cache_mode;
+        let query_start = std::time::Instant::now();
+        let sql_preview: Arc<str> = match &self.sql {
+            QueryMethod::Text { sql, .. } => Arc::clone(sql),
+            QueryMethod::Plan(_) => Arc::from("<logical plan>"),
+        };
 
         // Create session for this job. The
         // `SpiceRequestContextConfig` extension propagates the originating
@@ -555,51 +697,97 @@ impl Query {
         // Get the session state for planning
         let session = session_ctx.state();
 
-        // Get logical plan and cache key, reusing existing cache infrastructure
-        let (plan, mut tracker, cache_key) = match &self.sql {
+        // Get logical plan and cache key, reusing existing cache infrastructure.
+        // Match by value so a pre-parsed plan / parameters can be moved rather
+        // than deep-cloned on the distributed submit path.
+        let (plan, mut tracker, cache_key) = match self.sql {
             QueryMethod::Text {
                 sql,
                 parameters,
                 pre_parsed_plan,
                 ..
             } => {
-                // Use the existing get_plan_or_cached which handles all cache
-                // control, stale-while-revalidate, and query tracking. The
-                // cache itself is namespaced per principal and refuses to
-                // store write-capable plans, so a read-only caller cannot
-                // observe a cached entry produced by a write-capable plan.
-                match Query::get_plan_or_cached(
-                    &self.df,
-                    &session,
-                    Arc::clone(&request_context),
-                    sql,
-                    parameters.clone(),
-                    tracker,
-                    pre_parsed_plan.clone(),
-                )
-                .await?
-                {
-                    cache::PlanOrCached::Cached(cached_result) => {
-                        tracing::debug!(job_id, "Returning cached result for distributed query");
-                        // Return a QueryHandle with cached results
-                        let schema = cached_result.data.schema();
-                        return Ok(QueryHandle::new_with_cached_result(
-                            job_id.to_string(),
-                            schema,
-                            Arc::clone(&self.df),
-                            None, // Cache key already used for lookup
-                            cached_result.data,
-                            Arc::clone(&request_context),
-                        ));
-                    }
-                    cache::PlanOrCached::Plan(plan, tracker, cache_manager) => {
-                        // Plan needs execution - cache_manager contains the raw cache key for storing results
-                        let cache_key = if cache_manager.should_cache_results() {
-                            Some(cache_manager.raw_cache_key)
-                        } else {
-                            None
-                        };
-                        (*plan, tracker, cache_key)
+                if mode == DistributedSubmitMode::Resume {
+                    // Recovery drives the already-persisted execution graph: it must
+                    // never short-circuit on a cached result (that would skip
+                    // recover_job and leave the running job orphaned) nor write a
+                    // fresh cache entry. Plan without consulting the result cache.
+                    let plan = if let Some(plan) = pre_parsed_plan {
+                        *plan
+                    } else {
+                        let cache_namespace = request_context.cache_namespace();
+                        let (ns_tag, ns_id) = cache_namespace.hash_inputs();
+                        let sql_raw_cache_key = CacheKey::Query(sql.as_ref(), parameters.as_ref())
+                            .as_raw_key_in_namespace(Self::plan_hasher(&self.df), ns_tag, ns_id);
+                        Query::get_plan(
+                            &self.df,
+                            &session,
+                            sql.as_ref(),
+                            &sql_raw_cache_key,
+                            parameters,
+                        )
+                        .await?
+                    };
+                    (plan, tracker, None)
+                } else {
+                    // Use the existing get_plan_or_cached which handles all cache
+                    // control, stale-while-revalidate, and query tracking. The
+                    // cache itself is namespaced per principal and refuses to
+                    // store write-capable plans, so a read-only caller cannot
+                    // observe a cached entry produced by a write-capable plan.
+                    let plan_or_cached = match results_cache_mode {
+                        ResultsCacheMode::Default => {
+                            Query::get_plan_or_cached(
+                                &self.df,
+                                &session,
+                                Arc::clone(&request_context),
+                                sql.as_ref(),
+                                parameters,
+                                tracker,
+                                pre_parsed_plan,
+                            )
+                            .await?
+                        }
+                        ResultsCacheMode::Bypass => {
+                            Query::get_plan_without_results_cache(
+                                &self.df,
+                                &session,
+                                &request_context,
+                                sql.as_ref(),
+                                parameters,
+                                tracker,
+                                pre_parsed_plan,
+                            )
+                            .await?
+                        }
+                    };
+                    match plan_or_cached {
+                        cache::PlanOrCached::Cached(cached_result) => {
+                            tracing::debug!(
+                                job_id,
+                                "Returning cached result for distributed query"
+                            );
+                            // Return a QueryHandle with cached results
+                            let schema = cached_result.data.schema();
+                            return Ok(QueryHandle::new_with_cached_result(
+                                job_id.to_string(),
+                                schema,
+                                Arc::clone(&self.df),
+                                None, // Cache key already used for lookup
+                                cached_result.data,
+                                Arc::clone(&request_context),
+                                Arc::clone(&sql_preview),
+                            ));
+                        }
+                        cache::PlanOrCached::Plan(plan, tracker, cache_manager) => {
+                            // Plan needs execution - cache_manager contains the raw cache key for storing results
+                            let cache_key = if cache_manager.should_cache_results() {
+                                Some(cache_manager.raw_cache_key)
+                            } else {
+                                None
+                            };
+                            (*plan, tracker, cache_key)
+                        }
                     }
                 }
             }
@@ -609,14 +797,18 @@ impl Query {
                 // never served across principals (mirrors the text-query path).
                 let cache_namespace = request_context.cache_namespace();
                 let (ns_tag, ns_id) = cache_namespace.hash_inputs();
-                let plan_cache_key = CacheKey::LogicalPlan(logical_plan).as_raw_key_in_namespace(
+                let plan_cache_key = CacheKey::LogicalPlan(&logical_plan).as_raw_key_in_namespace(
                     Self::plan_hasher(&self.df),
                     ns_tag,
                     ns_id,
                 );
 
-                // Check for cached results using the standard cache lookup
-                if let Some(cache_provider) = self.df.results_cache_provider()
+                // Check for cached results using the standard cache lookup.
+                // Resume drives the persisted graph, so skip the short-circuit
+                // entirely (returning a cached result would orphan the job).
+                if mode != DistributedSubmitMode::Resume
+                    && results_cache_mode == ResultsCacheMode::Default
+                    && let Some(cache_provider) = self.df.results_cache_provider()
                     && let Ok(Some(cached_result)) =
                         cache_provider.get_raw_key(&plan_cache_key).await
                 {
@@ -631,7 +823,7 @@ impl Query {
                             "Returning cached result for distributed query (plan)"
                         );
                         let stream = ::cache::result::query::CachedStream::new(
-                            Arc::new(records),
+                            records,
                             cached_result.schema,
                         );
                         return Ok(QueryHandle::new_with_cached_result(
@@ -641,11 +833,16 @@ impl Query {
                             None,
                             Box::pin(stream),
                             Arc::clone(&request_context),
+                            Arc::clone(&sql_preview),
                         ));
                     }
                 }
 
-                (logical_plan.as_ref().clone(), tracker, Some(plan_cache_key))
+                // Don't cache results for a recovered job or a query that bypasses caching.
+                let cache_key = (mode != DistributedSubmitMode::Resume
+                    && results_cache_mode == ResultsCacheMode::Default)
+                    .then_some(plan_cache_key);
+                (*logical_plan, tracker, cache_key)
             }
         };
 
@@ -662,7 +859,7 @@ impl Query {
         }
 
         // Get the schema from the logical plan
-        let schema = Arc::new(plan.schema().as_arrow().clone());
+        let schema = Arc::clone(plan.schema().inner());
 
         let input_tables = get_logical_plan_input_tables(&plan);
         if input_tables
@@ -702,13 +899,25 @@ impl Query {
             t
         });
 
-        // Submit the job to the Ballista scheduler
-        let ballista_job_id = scheduler
-            .submit_job(job_id, session_ctx, &plan, None)
-            .await
-            .map_err(|e| Error::JobSubmissionFailed {
-                message: e.to_string(),
-            })?;
+        // Submit the job to the Ballista scheduler, or resume driving an
+        // existing one whose owning scheduler was lost. The job id is used as
+        // the Ballista job id so it can be addressed across schedulers.
+        let ballista_job_id = if mode == DistributedSubmitMode::Resume {
+            scheduler
+                .recover_job(&ballista_core::JobId::from(job_id))
+                .await
+                .map_err(|e| Error::JobSubmissionFailed {
+                    message: e.to_string(),
+                })?;
+            job_id.to_string()
+        } else {
+            scheduler
+                .submit_job_with_id(job_id, job_id, session_ctx, &plan, None)
+                .await
+                .map_err(|e| Error::JobSubmissionFailed {
+                    message: e.to_string(),
+                })?
+        };
 
         tracing::debug!(
             job_id,
@@ -726,6 +935,9 @@ impl Query {
             tracker,
             request_context,
             span,
+            sql_preview,
+            query_start,
+            plan_capture::logical_plan_is_explain(&plan),
         ))
     }
 
@@ -776,6 +988,7 @@ impl Query {
     }
 
     async fn run_internal(self, request_context: Arc<RequestContext>) -> Result<QueryResult> {
+        let query_start = std::time::Instant::now();
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
 
         if let Some(traceparent) = request_context.trace_parent() {
@@ -793,13 +1006,51 @@ impl Query {
             None => request_context.child_cancellation_token(),
         };
 
+        // Arm the `runtime.query.timeout` timer: when it elapses it fires the
+        // query's cancellation token and the existing cancellation machinery
+        // tears the query down; the state marker distinguishes the resulting
+        // error as `QueryTimedOut`. The timer covers the query's full
+        // lifetime — planning, admission wait, execution, and result
+        // streaming — and is disarmed (via the guard bundled into the result
+        // stream) when the stream completes, errors, or is dropped. The
+        // timeout is a property of the request context (resolved there from
+        // `runtime.query.timeout` or an explicit per-request override);
+        // internal runtime queries (acceleration refreshes, health checks,
+        // task history) carry no timeout unless explicitly overridden.
+        let (timeout_state, timeout_timer_guard) = match request_context.query_timeout() {
+            Some(timeout) => {
+                let state = QueryTimeoutState::armed(timeout);
+                let timer_state = state.clone();
+                let timer_token = query_cancel_token.clone();
+                let handle = tokio::spawn(async move {
+                    tokio::select! {
+                        // The token fired first (explicit cancel, client
+                        // disconnect): stand down so a cancellation observed
+                        // lazily — after the timeout would have elapsed —
+                        // keeps its `QueryCancelled` classification.
+                        () = timer_token.cancelled() => {}
+                        () = tokio::time::sleep(timeout) => {
+                            // Mark before cancelling so observers of the fired
+                            // token always classify the cancellation as a
+                            // timeout.
+                            timer_state.mark_fired();
+                            timer_token.cancel();
+                        }
+                    }
+                });
+                (state, Some(QueryTimeoutTimerGuard { handle }))
+            }
+            _ => (QueryTimeoutState::default(), None),
+        };
+
         // Register in the DataFusion-owned active-query registry so administrative
         // cancel endpoints can locate this query by id. The guard is captured
         // by the returned stream so the registration is removed on completion,
         // drop, or cancellation.
-        let sql_preview = match &self.sql {
-            QueryMethod::Text { sql, .. } => sql.as_ref(),
-            QueryMethod::Plan(_) => "<logical plan>",
+        // Own the SQL preview before moving `self.sql` into the planning match.
+        let sql_preview: Arc<str> = match &self.sql {
+            QueryMethod::Text { sql, .. } => Arc::clone(sql),
+            QueryMethod::Plan(_) => Arc::from("<logical plan>"),
         };
         let active_query_guard = self.df.query_cancel_registry().register(
             self.query_id,
@@ -807,17 +1058,18 @@ impl Query {
             request_context.protocol(),
             query_cancel_token.clone(),
         );
-        let query_id_str = self.query_id.to_string();
+        let query_id_str: Arc<str> = Arc::from(self.query_id.to_string());
 
         let inner_span = span.clone();
 
         let query_result =
             async {
-                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
 
                 let mut session = self.get_session_state(&request_context);
 
                 let ctx = self;
+                let results_cache_mode = ctx.results_cache_mode;
                 let tracker = ctx.tracker;
 
                 // Sets the request context as an extension on DataFusion, to allow recovering it to track telemetry
@@ -825,26 +1077,31 @@ impl Query {
                     .config_mut()
                     .set_extension(Arc::clone(&request_context));
 
-                // Get the `LogicalPlan` or cached results
-                let (plan, mut tracker, cache_manager) = match &ctx.sql {
+                // Get the `LogicalPlan` or cached results. Match by value so a
+                // pre-parsed plan / parameters can be moved rather than deep-cloned.
+                let (plan, mut tracker, cache_manager) = match ctx.sql {
                     QueryMethod::Text {
                         sql,
                         parameters,
                         table_allowlist: Some(allowlist),
                         pre_parsed_plan,
                     } => {
-                        let raw_cache_key = CacheKey::Query(sql, parameters.as_ref())
+                        let raw_cache_key = CacheKey::Query(sql.as_ref(), parameters.as_ref())
                             .as_raw_key(Query::plan_hasher(&ctx.df));
                         let plan = if let Some(plan) = pre_parsed_plan {
-                            plan.clone()
+                            plan
                         } else {
-                            Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                            Self::ensure_not_cancelled(
+                                &query_cancel_token,
+                                &query_id_str,
+                                &timeout_state,
+                            )?;
                             match Self::get_plan(
                                 &ctx.df,
                                 &session,
-                                sql,
+                                sql.as_ref(),
                                 &raw_cache_key,
-                                parameters.clone(),
+                                parameters,
                             )
                             .await
                             {
@@ -866,7 +1123,11 @@ impl Query {
                                 },
                             }
                         };
-                        Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                        Self::ensure_not_cancelled(
+                            &query_cancel_token,
+                            &query_id_str,
+                            &timeout_state,
+                        )?;
                         let tables_referenced = plan.as_table_refs();
                         if let Some(disallowed_table) = tables_referenced
                             .iter()
@@ -889,28 +1150,53 @@ impl Query {
                         table_allowlist: None,
                         pre_parsed_plan,
                     } => {
-                        match Self::get_plan_or_cached(
-                            &ctx.df,
-                            &session,
-                            Arc::clone(&request_context),
-                            sql,
-                            parameters.clone(),
-                            tracker,
-                            pre_parsed_plan.clone(),
-                        )
-                        .await?
-                        {
+                        let plan_or_cached = match results_cache_mode {
+                            ResultsCacheMode::Default => {
+                                Self::get_plan_or_cached(
+                                    &ctx.df,
+                                    &session,
+                                    Arc::clone(&request_context),
+                                    sql.as_ref(),
+                                    parameters,
+                                    tracker,
+                                    pre_parsed_plan,
+                                )
+                                .await?
+                            }
+                            ResultsCacheMode::Bypass => {
+                                Self::get_plan_without_results_cache(
+                                    &ctx.df,
+                                    &session,
+                                    &request_context,
+                                    sql.as_ref(),
+                                    parameters,
+                                    tracker,
+                                    pre_parsed_plan,
+                                )
+                                .await?
+                            }
+                        };
+                        match plan_or_cached {
                             PlanOrCached::Plan(plan, tracker, cache_manager) => {
-                                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                                Self::ensure_not_cancelled(
+                                    &query_cancel_token,
+                                    &query_id_str,
+                                    &timeout_state,
+                                )?;
                                 (plan, tracker, cache_manager)
                             }
                             PlanOrCached::Cached(query_result) => {
-                                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                                Self::ensure_not_cancelled(
+                                    &query_cancel_token,
+                                    &query_id_str,
+                                    &timeout_state,
+                                )?;
                                 return Ok(attach_cancellation_to_query_result(
                                     query_result,
                                     query_cancel_token.clone(),
-                                    query_id_str.clone(),
-                                    active_query_guard,
+                                    Arc::clone(&query_id_str),
+                                    timeout_state.clone(),
+                                    (active_query_guard, timeout_timer_guard),
                                 ));
                             }
                         }
@@ -920,19 +1206,23 @@ impl Query {
                         // plan-submitted result is never reused across principals.
                         let cache_namespace = request_context.cache_namespace();
                         let (ns_tag, ns_id) = cache_namespace.hash_inputs();
+                        let cache_status = match results_cache_mode {
+                            ResultsCacheMode::Default => CacheStatus::CacheMiss,
+                            ResultsCacheMode::Bypass => CacheStatus::CacheDisabled,
+                        };
                         let cache_manager = RequestCacheManager::new(
-                            CacheStatus::CacheMiss,
-                            CacheKey::LogicalPlan(logical_plan).as_raw_key_in_namespace(
+                            cache_status,
+                            CacheKey::LogicalPlan(&logical_plan).as_raw_key_in_namespace(
                                 Query::plan_hasher(&ctx.df),
                                 ns_tag,
                                 ns_id,
                             ),
                         );
-                        (logical_plan.clone(), None, cache_manager)
+                        (logical_plan, None, cache_manager)
                     }
                 };
 
-                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
 
                 if let Err(e) = validate_sql_query_operations(&plan, &ctx.df) {
                     let e = find_datafusion_root(e);
@@ -1033,7 +1323,11 @@ impl Query {
                 let admission_permit: Option<tokio::sync::OwnedSemaphorePermit> =
                     match ctx.df.query_admission_semaphore() {
                         Some(semaphore) if plan_executes_query => {
-                            Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                            Self::ensure_not_cancelled(
+                                &query_cancel_token,
+                                &query_id_str,
+                                &timeout_state,
+                            )?;
                             // Race permit acquisition against cancellation so a query
                             // cancelled WHILE QUEUED for a permit (client disconnect or
                             // `/cancel` under load) aborts promptly instead of blocking
@@ -1043,9 +1337,7 @@ impl Query {
                             tokio::select! {
                                 biased;
                                 () = query_cancel_token.cancelled() => {
-                                    return Err(Error::QueryCancelled {
-                                        query_id: query_id_str.clone(),
-                                    });
+                                    return Err(timeout_state.cancellation_error(&query_id_str));
                                 }
                                 permit = semaphore.acquire_owned() => permit.ok(),
                             }
@@ -1077,7 +1369,7 @@ impl Query {
                         Arc::new(SessionContext::new_with_state(ctx.df.ctx.state()))
                     };
 
-                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
                     let dataframe = match session_ctx
                         .execute_logical_plan(plan.as_ref().clone())
                         .await
@@ -1096,7 +1388,7 @@ impl Query {
                         }
                     };
 
-                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
                     // Create a physical plan from the dataframe and execute it with our own TaskContext
                     // that includes the request context. This ensures BytesProcessedExec has access to it.
                     let df_plan = match dataframe.create_physical_plan().await {
@@ -1114,7 +1406,7 @@ impl Query {
                         }
                     };
 
-                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
                     let task_ctx = Arc::new(TaskContext::from(&session));
                     let stream = match execute_stream_preserving_output_order(
                         Arc::clone(&df_plan),
@@ -1136,7 +1428,7 @@ impl Query {
                     (stream, df_plan)
                 } else {
                     // For regular plans, use the standard physical plan execution
-                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
                     let mut physical_plan = match session.create_physical_plan(&plan).await {
                         Ok(stream) => stream,
                         Err(e) => {
@@ -1152,11 +1444,17 @@ impl Query {
                         }
                     };
 
-                    let mut execution_session = session.clone();
-                    if let Some(batch_size) =
+                    // Only clone SessionState when adaptive Flight batch sizing
+                    // rebuilds the physical plan; otherwise TaskContext can borrow
+                    // the existing session.
+                    let task_ctx = if let Some(batch_size) =
                         Self::adaptive_flight_batch_size(&session, &request_context, &physical_plan)
                     {
-                        Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                        Self::ensure_not_cancelled(
+                            &query_cancel_token,
+                            &query_id_str,
+                            &timeout_state,
+                        )?;
                         let adaptive_session = Self::session_with_batch_size(&session, batch_size);
                         physical_plan = match adaptive_session.create_physical_plan(&plan).await {
                             Ok(stream) => stream,
@@ -1172,11 +1470,12 @@ impl Query {
                                 )
                             }
                         };
-                        execution_session = adaptive_session;
-                    }
+                        Arc::new(TaskContext::from(&adaptive_session))
+                    } else {
+                        Arc::new(TaskContext::from(&session))
+                    };
 
-                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
-                    let task_ctx = Arc::new(TaskContext::from(&execution_session));
+                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
 
                     let stream = match execute_stream_preserving_output_order(
                         Arc::clone(&physical_plan),
@@ -1195,11 +1494,11 @@ impl Query {
                             )
                         }
                     };
-                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                    Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
                     (stream, physical_plan)
                 };
 
-                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
 
                 // Skip schema verification for Statement plans (PREPARE/EXECUTE/DEALLOCATE),
                 // DDL plans (CREATE TABLE/DROP TABLE), DML Delete/Update plans, and Spice
@@ -1259,6 +1558,12 @@ impl Query {
                     physical_plan,
                     Arc::clone(&request_context),
                     inner_span.clone(),
+                    plan_capture_context(
+                        &ctx.df,
+                        Arc::clone(&sql_preview),
+                        query_start,
+                        plan.as_ref(),
+                    ),
                 );
 
                 let final_stream = attach_query_active_guard_to_stream(
@@ -1275,14 +1580,17 @@ impl Query {
                 let final_stream = attach_cancellation_to_stream(
                     final_stream,
                     query_cancel_token.clone(),
-                    query_id_str.clone(),
-                    // Bundle the admission permit with the active-query guard so
-                    // BOTH release exactly when the result stream is fully drained
-                    // (completion, error, or cancellation) — the permit thus spans
-                    // the query's true lifetime, not merely until `run` returns
-                    // (Flight drains the stream lazily; the managed runtime drives
-                    // it on a separate task).
-                    (active_query_guard, admission_permit),
+                    Arc::clone(&query_id_str),
+                    timeout_state.clone(),
+                    // Bundle the admission permit and the timeout-timer guard
+                    // with the active-query guard so ALL release exactly when
+                    // the result stream is fully drained (completion, error, or
+                    // cancellation) — the permit thus spans the query's true
+                    // lifetime, not merely until `run` returns (Flight drains
+                    // the stream lazily; the managed runtime drives it on a
+                    // separate task), and the timeout timer is disarmed at the
+                    // same moment.
+                    (active_query_guard, admission_permit, timeout_timer_guard),
                 );
 
                 Ok(QueryResult::new(
@@ -1311,14 +1619,15 @@ impl Query {
         }
     }
 
-    pub fn from_logical_plan(df: &Arc<DataFusion>, plan: &LogicalPlan) -> Self {
+    pub fn from_logical_plan(df: &Arc<DataFusion>, plan: LogicalPlan) -> Self {
         Self {
             df: Arc::clone(df),
-            sql: QueryMethod::Plan(Box::new(plan.clone())),
+            sql: QueryMethod::Plan(Box::new(plan)),
             tracker: None,
             query_id: uuid::Uuid::new_v4(),
             cancellation_token: None,
             read_only: false,
+            results_cache_mode: ResultsCacheMode::default(),
         }
     }
 
@@ -1382,8 +1691,27 @@ impl Query {
             self.handle_schema_error(&request_context, &e);
             return Err(e);
         }
-        let dataset_schema = plan.schema().as_arrow().clone();
-        let parameter_schema = parameter_schema_for_plan(&plan)?;
+
+        // Advertise the schema after the analyzer has applied type coercion,
+        // but before logical optimizer rules run. Execution also analyzes the
+        // plan before planning, so using the raw logical schema here can make
+        // FlightSQL GetFlightInfo disagree with DoGet for expressions such as
+        // `CASE WHEN ... THEN decimal_col ELSE 0 END`.
+        let analyzed_plan =
+            match session
+                .analyzer()
+                .execute_and_check(*plan, session.config_options(), |_, _| {})
+            {
+                Ok(plan) => plan,
+                Err(e) => {
+                    let e = find_datafusion_root(e);
+                    self.handle_schema_error(&request_context, &e);
+                    return Err(e);
+                }
+            };
+
+        let dataset_schema = analyzed_plan.schema().as_arrow().clone();
+        let parameter_schema = parameter_schema_for_plan(&analyzed_plan)?;
 
         Ok((dataset_schema, parameter_schema))
     }
@@ -1501,8 +1829,9 @@ fn attach_query_tracker_to_stream(
             }
         }
 
-        crate::metrics::telemetry::track_bytes_returned(num_output_bytes, &request_context.to_dimensions());
-        crate::metrics::telemetry::track_rows_returned(num_records, &request_context.to_dimensions());
+        let dims = request_context.to_dimensions();
+        runtime_metrics::telemetry::track_bytes_returned(num_output_bytes, &dims);
+        runtime_metrics::telemetry::track_rows_returned(num_records, &dims);
 
         tracker
             .schema(schema_copy)
@@ -1532,7 +1861,7 @@ impl QueryActiveGuard {
 
         let active = request_context.entered_top_level_query();
         if active {
-            crate::metrics::telemetry::inc_query_active_count(dimensions);
+            runtime_metrics::telemetry::inc_query_active_count(dimensions);
         }
 
         Self {
@@ -1547,7 +1876,7 @@ impl Drop for QueryActiveGuard {
     fn drop(&mut self) {
         let exited = self.request_context.exited_top_level_query();
         if self.active && exited {
-            crate::metrics::telemetry::dec_query_active_count(self.dimensions);
+            runtime_metrics::telemetry::dec_query_active_count(self.dimensions);
         }
     }
 }
@@ -1578,7 +1907,8 @@ fn attach_query_active_guard_to_stream(
 fn attach_cancellation_to_query_result<G>(
     query_result: QueryResult,
     cancellation_token: tokio_util::sync::CancellationToken,
-    query_id: String,
+    query_id: Arc<str>,
+    timeout_state: QueryTimeoutState,
     guard: G,
 ) -> QueryResult
 where
@@ -1586,19 +1916,21 @@ where
 {
     let QueryResult { data, cache_status } = query_result;
     QueryResult::new(
-        attach_cancellation_to_stream(data, cancellation_token, query_id, guard),
+        attach_cancellation_to_stream(data, cancellation_token, query_id, timeout_state, guard),
         cache_status,
     )
 }
 
 /// Wraps a record batch stream so that cancellation via the supplied
 /// [`CancellationToken`] yields a single [`DataFusionError::External`] wrapping
-/// [`Error::QueryCancelled`] and terminates the stream.
+/// [`Error::QueryCancelled`] — or [`Error::QueryTimedOut`] when the
+/// `runtime.query.timeout` timer fired the token — and terminates the stream.
 ///
-/// Using [`Error::QueryCancelled`] lets downstream callers (HTTP status
-/// mapping, Flight status mapping, metrics) distinguish cancellation from
-/// other query failures via [`is_cancellation_error`] or an
-/// [`std::error::Error::downcast_ref`] on the external error source.
+/// Using these dedicated variants lets downstream callers (HTTP status
+/// mapping, Flight status mapping, metrics) distinguish cancellation and
+/// timeout from other query failures via [`is_cancellation_error`] /
+/// [`is_timeout_error`] or an [`std::error::Error::downcast_ref`] on the
+/// external error source.
 ///
 /// The wrapper also keeps ownership of any `guard` (typically an
 /// [`ActiveQueryGuard`]) so that the query's registry entry is removed when the
@@ -1606,7 +1938,8 @@ where
 fn attach_cancellation_to_stream<G>(
     stream: SendableRecordBatchStream,
     cancellation_token: tokio_util::sync::CancellationToken,
-    query_id: String,
+    query_id: Arc<str>,
+    timeout_state: QueryTimeoutState,
     guard: G,
 ) -> SendableRecordBatchStream
 where
@@ -1615,7 +1948,8 @@ where
     struct State<G> {
         stream: Option<SendableRecordBatchStream>,
         token: tokio_util::sync::CancellationToken,
-        query_id: String,
+        query_id: Arc<str>,
+        timeout: QueryTimeoutState,
         guard: Option<G>,
         emitted_cancel: bool,
     }
@@ -1625,12 +1959,10 @@ where
             self.stream.take();
             self.guard.take();
         }
-    }
 
-    fn cancellation_error(query_id: &str) -> DataFusionError {
-        DataFusionError::External(Box::new(Error::QueryCancelled {
-            query_id: query_id.to_string(),
-        }))
+        fn cancellation_error(&self) -> DataFusionError {
+            DataFusionError::External(Box::new(self.timeout.cancellation_error(&self.query_id)))
+        }
     }
 
     let schema = stream.schema();
@@ -1639,6 +1971,7 @@ where
         stream: Some(stream),
         token: cancellation_token,
         query_id,
+        timeout: timeout_state,
         guard: Some(guard),
         emitted_cancel: false,
     };
@@ -1650,7 +1983,7 @@ where
         if state.token.is_cancelled() {
             state.emitted_cancel = true;
             state.release_query_resources();
-            return Some((Err(cancellation_error(&state.query_id)), state));
+            return Some((Err(state.cancellation_error()), state));
         }
         let token = state.token.clone();
         let mut stream = state.stream.take()?;
@@ -1659,7 +1992,7 @@ where
             () = token.cancelled() => {
                 state.emitted_cancel = true;
                 state.release_query_resources();
-                Some((Err(cancellation_error(&state.query_id)), state))
+                Some((Err(state.cancellation_error()), state))
             }
             next = stream.next() => {
                 state.stream = Some(stream);
@@ -1683,6 +2016,18 @@ pub fn is_cancellation_error(err: &DataFusionError) -> bool {
         .is_some_and(|e| matches!(e, Error::QueryCancelled { .. }))
 }
 
+/// Returns true if `err` represents a query cancelled by the
+/// `runtime.query.timeout` timer, produced by [`attach_cancellation_to_stream`].
+#[must_use]
+pub fn is_timeout_error(err: &DataFusionError) -> bool {
+    let DataFusionError::External(source) = err else {
+        return false;
+    };
+    source
+        .downcast_ref::<Error>()
+        .is_some_and(|e| matches!(e, Error::QueryTimedOut { .. }))
+}
+
 #[must_use]
 /// Attaches logic to a stream which emits metrics from a physical plan.
 fn attach_physical_plan_metrics_to_stream(
@@ -1690,6 +2035,7 @@ fn attach_physical_plan_metrics_to_stream(
     physical_plan: Arc<dyn ExecutionPlan>,
     request_context: Arc<RequestContext>,
     span: Span,
+    plan_capture: Option<PlanCaptureStreamContext>,
 ) -> SendableRecordBatchStream {
     let schema = stream.schema();
 
@@ -1701,15 +2047,49 @@ fn attach_physical_plan_metrics_to_stream(
         let mut totals = PhysicalPlanMetricsTotals::default();
         collect_physical_plan_metrics(physical_plan.as_ref(), &mut totals);
 
-        crate::metrics::telemetry::track_produced_spills(totals.produced_spills, &request_context.to_dimensions());
-        crate::metrics::telemetry::track_spilled_bytes(totals.spilled_bytes, &request_context.to_dimensions());
-        crate::metrics::telemetry::track_spilled_rows(totals.spilled_rows, &request_context.to_dimensions());
+        let dims = request_context.to_dimensions();
+        runtime_metrics::telemetry::track_produced_spills(totals.produced_spills, &dims);
+        runtime_metrics::telemetry::track_spilled_bytes(totals.spilled_bytes, &dims);
+        runtime_metrics::telemetry::track_spilled_rows(totals.spilled_rows, &dims);
+
+        if let Some(ctx) = plan_capture.as_ref() {
+            let elapsed_ms = ctx.query_start.elapsed().as_secs_f64() * 1000.0;
+            if plan_capture::plan_capture_eligible(elapsed_ms, &ctx.config) {
+                let output =
+                    plan_capture::render_local_plan_with_metrics(physical_plan.as_ref());
+                plan_capture::emit_plan_span(ctx.sql.as_ref(), &output);
+            }
+        }
     };
 
     Box::pin(RecordBatchStreamAdapter::new(
         schema,
         Box::pin(updated_stream.instrument(span)),
     ))
+}
+
+/// Context for emitting a `plan` child row at local stream completion.
+struct PlanCaptureStreamContext {
+    sql: Arc<str>,
+    query_start: std::time::Instant,
+    config: plan_capture::PlanCaptureConfig,
+}
+
+fn plan_capture_context(
+    df: &crate::datafusion::DataFusion,
+    sql: Arc<str>,
+    query_start: std::time::Instant,
+    plan: &LogicalPlan,
+) -> Option<PlanCaptureStreamContext> {
+    let config = df.plan_capture_config()?;
+    if !config.analyze_enabled() || plan_capture::logical_plan_is_explain(plan) {
+        return None;
+    }
+    Some(PlanCaptureStreamContext {
+        sql,
+        query_start,
+        config: config.clone(),
+    })
 }
 
 #[derive(Default, Debug)]
@@ -1843,20 +2223,32 @@ fn write_to_json_value_with_arrow(
 fn write_to_json_bytes_with_arrow(
     data: &[RecordBatch],
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let buf = Vec::new();
-    let mut writer = arrow_json::WriterBuilder::new()
-        .with_explicit_nulls(true)
-        .build::<_, JsonArray>(buf);
-
+    let mut writer = json_array_writer();
     writer.write_batches(data.iter().collect::<Vec<&RecordBatch>>().as_slice())?;
     writer.finish()?;
 
     Ok(writer.into_inner())
 }
 
+/// Creates a JSON-array writer over an owned buffer, using the same encoding as
+/// buffered responses. The buffer can be drained incrementally via
+/// `writer.get_mut()` to stream the array batch-by-batch (see the HTTP `/v1/sql`
+/// streaming path).
+pub(crate) fn json_array_writer() -> arrow_json::Writer<Vec<u8>, JsonArray> {
+    arrow_json::WriterBuilder::new()
+        .with_explicit_nulls(true)
+        .build::<Vec<u8>, JsonArray>(Vec::new())
+}
+
 fn record_batch_has_union_columns(batch: &RecordBatch) -> bool {
-    batch
-        .schema()
+    schema_has_union_columns(&batch.schema())
+}
+
+/// Returns `true` when any (possibly nested) field in `schema` is a union type.
+/// Union columns aren't rendered by the arrow-json array writer, so responses
+/// containing them fall back to the buffered JSON path.
+pub(crate) fn schema_has_union_columns(schema: &arrow::datatypes::Schema) -> bool {
+    schema
         .fields()
         .iter()
         .any(|field| data_type_contains_union(field.data_type()))
@@ -2518,6 +2910,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_schema_preserves_parameter_schema_for_unbound_parameters() {
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build(),
+        );
+
+        let (schema, parameter_schema) = QueryBuilder::new("SELECT $1 + 1 AS x", df)
+            .build()
+            .get_schema()
+            .await
+            .expect("schema should be available");
+
+        let output_type = schema.field_with_name("x").expect("x field").data_type();
+        assert!(
+            output_type == &DataType::Int64 || output_type == &DataType::UInt64,
+            "expected Int64 or UInt64 output type, got {output_type:?}"
+        );
+        let parameter_schema = parameter_schema.expect("parameter schema");
+        assert_eq!(parameter_schema.fields().len(), 1);
+        assert_eq!(parameter_schema.field(0).name(), "$1");
+    }
+
+    #[tokio::test]
+    async fn get_schema_uses_analyzed_plan_for_decimal_case_coercion() {
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build(),
+        );
+
+        // Mirrors the CH-benCH Q8 pattern: a decimal branch plus an untyped
+        // integer literal branch. DataFusion's analyzer coerces Int64(0) to
+        // Decimal128(20,0), making the CASE output Decimal128(22,2).
+        let sql = "SELECT CASE WHEN TRUE THEN CAST(1.23 AS DECIMAL(6,2)) ELSE 0 END AS x";
+
+        let (schema, parameter_schema) = QueryBuilder::new(sql, df)
+            .build()
+            .get_schema()
+            .await
+            .expect("schema should be available");
+
+        assert!(parameter_schema.is_none());
+        let field = schema.field_with_name("x").expect("x field");
+        assert_eq!(field.data_type(), &DataType::Decimal128(22, 2));
+    }
+
+    #[tokio::test]
     async fn cached_query_result_keeps_registry_entry_until_stream_drop_and_observes_cancel() {
         let config = SQLResultsCacheConfig::default();
         let cache_provider = Arc::new(
@@ -2702,6 +3148,228 @@ mod tests {
             } => assert_eq!(cancelled, query_id.to_string()),
             other => panic!("expected QueryCancelled, got: {other:?}"),
         }
+    }
+
+    /// [query timeout] A query still QUEUED for an admission permit when the
+    /// `runtime.query.timeout` timer elapses must return `QueryTimedOut` (not
+    /// `QueryCancelled`, and not block until the permit frees). Deterministic:
+    /// A holds the only permit for the whole test, so B can only exit via the
+    /// timeout — the short timeout value is the subject under test, not a
+    /// readiness wait.
+    #[tokio::test]
+    async fn query_timeout_while_queued_returns_timed_out() {
+        use std::time::Duration;
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .max_concurrent_queries(Some(1))
+            .build(),
+        );
+
+        // A holds the only permit for the whole test: its unpolled stream owns
+        // the permit until polled or dropped. A runs under the default
+        // internal request context, which carries no timeout, so A can
+        // neither time out during startup (releasing the permit early) nor
+        // have its unpolled stream affected by a timer.
+        let _query_a = QueryBuilder::new("SELECT 42 AS value", Arc::clone(&df))
+            .build()
+            .run()
+            .await
+            .expect("query A should run");
+
+        let df_b = Arc::clone(&df);
+        let b_err = tokio::time::timeout(
+            Duration::from_secs(10),
+            Arc::new(
+                RequestContext::builder(Protocol::Http)
+                    .with_query_timeout(Some(Duration::from_millis(500)))
+                    .build(),
+            )
+            .scope(async move {
+                QueryBuilder::new("SELECT 43 AS value", df_b)
+                    .build()
+                    .run()
+                    .await
+            }),
+        )
+        .await
+        .expect("timed-out query B should return promptly, not block on the permit")
+        .expect_err("query B should fail with a timeout");
+
+        match b_err {
+            Error::QueryTimedOut { timeout, .. } => assert_eq!(timeout, "500ms"),
+            other => panic!("expected QueryTimedOut, got: {other:?}"),
+        }
+    }
+
+    /// [query timeout] A timeout that elapses while the result stream is still
+    /// being consumed must terminate the stream with a `QueryTimedOut` error
+    /// recognized by `is_timeout_error` (the ADBC TIMEOUT-vs-CANCELLED
+    /// distinction). The sleep is the subject under test (letting the armed
+    /// timer elapse), not a readiness wait.
+    #[tokio::test]
+    async fn query_timeout_terminates_result_stream() {
+        use std::time::Duration;
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build(),
+        );
+
+        // A 1s budget is generous enough that startup (planning/admission)
+        // cannot plausibly consume it on a loaded CI host, so the query
+        // reliably returns a stream before the timer fires.
+        let df_q = Arc::clone(&df);
+        let mut result = Arc::new(
+            RequestContext::builder(Protocol::Http)
+                .with_query_timeout(Some(Duration::from_secs(1)))
+                .build(),
+        )
+        .scope(async move {
+            QueryBuilder::new("SELECT 42 AS value", df_q)
+                .build()
+                .run()
+                .await
+        })
+        .await
+        .expect("query should start successfully");
+
+        // Let the 1s timer fire before the stream is polled (generous margin
+        // for slow CI).
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+
+        let err = result
+            .data
+            .next()
+            .await
+            .expect("stream should yield the timeout error, not end")
+            .expect_err("stream item should be the timeout error");
+        assert!(
+            is_timeout_error(&err),
+            "expected a timeout error, got: {err}"
+        );
+        assert!(
+            !is_cancellation_error(&err),
+            "timeout must not be classified as a plain cancellation"
+        );
+    }
+
+    /// [query timeout] A query cancelled BEFORE the timeout elapses must keep
+    /// its `QueryCancelled` classification even when the cancellation is only
+    /// observed after the timeout would have fired: the timer stands down when
+    /// the token fires first. The sleep lets the (stood-down) timer window
+    /// pass, so it is the subject under test, not a readiness wait.
+    #[tokio::test]
+    async fn query_cancelled_before_timeout_stays_cancelled() {
+        use std::time::Duration;
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build(),
+        );
+
+        // A 1s budget is generous enough that startup (planning/admission)
+        // cannot plausibly consume it on a loaded CI host, so the explicit
+        // cancel below reliably lands before the timer fires.
+        let cancel_token = CancellationToken::new();
+        let df_q = Arc::clone(&df);
+        let token_q = cancel_token.clone();
+        let mut result = Arc::new(
+            RequestContext::builder(Protocol::Http)
+                .with_query_timeout(Some(Duration::from_secs(1)))
+                .build(),
+        )
+        .scope(async move {
+            QueryBuilder::new("SELECT 42 AS value", df_q)
+                .cancellation_token(token_q)
+                .build()
+                .run()
+                .await
+        })
+        .await
+        .expect("query should start successfully");
+
+        // Cancel first, then let the 1s timeout window pass before the
+        // stream observes anything.
+        cancel_token.cancel();
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+
+        let err = result
+            .data
+            .next()
+            .await
+            .expect("stream should yield the cancellation error, not end")
+            .expect_err("stream item should be the cancellation error");
+        assert!(
+            is_cancellation_error(&err),
+            "expected a cancellation error, got: {err}"
+        );
+        assert!(
+            !is_timeout_error(&err),
+            "a pre-timeout cancel must not be reclassified as a timeout"
+        );
+    }
+
+    /// [query timeout] Internal runtime queries (health checks, acceleration
+    /// refreshes — anything under `Protocol::Internal`) are exempt from
+    /// `runtime.query.timeout`: the request context skips the app-derived
+    /// timeout for the internal protocol. With a 50ms timeout configured on
+    /// the app and a 500ms pause before draining, the stream must still
+    /// deliver results. The pause lets a wrongly-armed timer fire, so it is
+    /// the subject under test, not a readiness wait.
+    #[tokio::test]
+    async fn query_timeout_exempts_internal_queries() {
+        use std::time::Duration;
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build(),
+        );
+
+        let mut app = app::AppBuilder::new("test").build();
+        app.runtime.query = Some(spicepod::component::runtime::Query {
+            timeout: Some("50ms".to_string()),
+            ..Default::default()
+        });
+
+        // An internal-protocol context built with the app: the app-derived
+        // timeout must not apply.
+        let df_q = Arc::clone(&df);
+        let mut result = Arc::new(
+            RequestContext::builder(Protocol::Internal)
+                .with_app_opt(Some(Arc::new(app)))
+                .build(),
+        )
+        .scope(async move {
+            QueryBuilder::new("SELECT 42 AS value", df_q)
+                .build()
+                .run()
+                .await
+        })
+        .await
+        .expect("internal query should start successfully");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let batch = result
+            .data
+            .next()
+            .await
+            .expect("internal query should yield data despite the elapsed timeout")
+            .expect("internal query batch should not be an error");
+        assert_eq!(batch.num_rows(), 1);
     }
 
     #[tokio::test]
@@ -3376,11 +4044,12 @@ mod tests {
         .expect("batch");
         let cancel_token = CancellationToken::new();
         let guard_dropped = Arc::new(AtomicBool::new(false));
-        let query_id = uuid::Uuid::new_v4().to_string();
+        let query_id = Arc::<str>::from(uuid::Uuid::new_v4().to_string());
         let mut stream = attach_cancellation_to_stream(
             stream_from_batches(&schema, vec![batch]),
             cancel_token.clone(),
-            query_id.clone(),
+            Arc::clone(&query_id),
+            QueryTimeoutState::default(),
             DropFlag::new(Arc::clone(&guard_dropped)),
         );
 
@@ -3414,11 +4083,12 @@ mod tests {
         )]));
         let cancel_token = CancellationToken::new();
         let guard_dropped = Arc::new(AtomicBool::new(false));
-        let query_id = uuid::Uuid::new_v4().to_string();
+        let query_id = Arc::<str>::from(uuid::Uuid::new_v4().to_string());
         let mut stream = attach_cancellation_to_stream(
             pending_stream(&schema),
             cancel_token.clone(),
-            query_id.clone(),
+            Arc::clone(&query_id),
+            QueryTimeoutState::default(),
             DropFlag::new(Arc::clone(&guard_dropped)),
         );
 

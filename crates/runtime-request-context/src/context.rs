@@ -72,6 +72,12 @@ pub struct RequestContext {
     /// client disconnects) via a drop-guard installed by the transport layer, or
     /// when an administrative cancel is issued against a registered query id.
     cancellation_token: CancellationToken,
+    /// Maximum wall-clock lifetime for queries executed on behalf of this
+    /// request: planning, admission wait, execution, and result streaming all
+    /// count. Resolved at build time from an explicit override or the app's
+    /// `runtime.query.timeout`; `Protocol::Internal` requests are exempt
+    /// unless explicitly overridden. `None` = no timeout.
+    query_timeout: Option<std::time::Duration>,
 }
 
 #[async_trait::async_trait]
@@ -173,6 +179,21 @@ impl RequestContext {
         REQUEST_CONTEXT.scope(self, f).await
     }
 
+    /// Spawns `future` onto the Tokio runtime bound to the current request
+    /// context, so work that outlives the calling task — e.g. a background job
+    /// — still runs as the originating principal. Outside a request this binds
+    /// the internal context.
+    pub fn spawn_current<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let context = REQUEST_CONTEXT
+            .try_with(Arc::clone)
+            .unwrap_or_else(|_| Arc::clone(&INTERNAL_REQUEST_CONTEXT));
+        tokio::spawn(context.scope(future))
+    }
+
     /// Wraps provided stream with the current request context.
     pub fn scope_stream<S>(self: Arc<Self>, stream: S) -> impl Stream<Item = S::Item>
     where
@@ -208,7 +229,8 @@ impl RequestContext {
 
     #[must_use]
     pub fn to_dimensions(&self) -> Vec<KeyValue> {
-        let mut dimensions = vec![KeyValue::new("protocol", self.protocol().as_str())];
+        let mut dimensions = Vec::with_capacity(self.dimensions.len() + 2);
+        dimensions.push(KeyValue::new("protocol", self.protocol().as_str()));
         dimensions.extend(self.dimensions.iter().cloned());
         // Low-cardinality scope dimension: `public` / `principal` / `system`.
         // Never includes the principal id.
@@ -378,6 +400,13 @@ impl RequestContext {
     pub fn cancel(&self) {
         self.cancellation_token.cancel();
     }
+
+    /// Maximum wall-clock lifetime for queries executed on behalf of this
+    /// request (`runtime.query.timeout`); `None` = no timeout.
+    #[must_use]
+    pub fn query_timeout(&self) -> Option<std::time::Duration> {
+        self.query_timeout
+    }
 }
 
 impl AuthRequestContext for RequestContext {
@@ -407,6 +436,7 @@ pub struct RequestContextBuilder {
     trace_parent: Option<TraceParent>,
     authorization_header: Option<String>,
     cancellation_token: Option<CancellationToken>,
+    query_timeout: Option<std::time::Duration>,
 }
 
 impl RequestContextBuilder {
@@ -424,6 +454,7 @@ impl RequestContextBuilder {
             trace_parent: None,
             authorization_header: None,
             cancellation_token: None,
+            query_timeout: None,
         }
     }
 
@@ -529,6 +560,17 @@ impl RequestContextBuilder {
         self
     }
 
+    /// Explicitly sets the query timeout for this request, overriding the
+    /// default derived from the app's `runtime.query.timeout` in `build()`.
+    /// This is the hook for callers that resolve a caller-specific timeout
+    /// (e.g. a future per-user policy); an explicit value applies even to
+    /// `Protocol::Internal` contexts, which are otherwise exempt.
+    #[must_use]
+    pub fn with_query_timeout(mut self, query_timeout: Option<std::time::Duration>) -> Self {
+        self.query_timeout = query_timeout;
+        self
+    }
+
     /// Supplies a pre-existing cancellation token to use as this request's
     /// cancellation token. If unset, a fresh token is created in `build()`.
     ///
@@ -555,13 +597,15 @@ impl RequestContextBuilder {
             dimensions.push(KeyValue::new("runtime_version", super::RUNTIME_VERSION));
             dimensions.push(KeyValue::new(
                 "runtime_system",
-                super::RUNTIME_SYSTEM.to_string(),
+                Arc::clone(&*super::RUNTIME_SYSTEM),
             ));
         };
 
         match self.user_agent {
             UserAgent::Absent => (),
             UserAgent::Raw(raw) => {
+                // Display appends runtime identity; keep that combined value for metric
+                // continuity (runtime is also recorded separately below).
                 dimensions.push(KeyValue::new("user_agent", UserAgent::Raw(raw).to_string()));
                 add_runtime_dimensions(&mut dimensions);
             }
@@ -575,6 +619,8 @@ impl RequestContextBuilder {
                 if let Some(client_system) = &parsed.client_system {
                     dimensions.push(KeyValue::new("client_system", Arc::clone(client_system)));
                 }
+                // Display appends runtime identity; keep that combined value for metric
+                // continuity (runtime is also recorded separately below).
                 dimensions.push(KeyValue::new(
                     "user_agent",
                     UserAgent::Parsed(parsed).to_string(),
@@ -627,6 +673,23 @@ impl RequestContextBuilder {
             cache_control => cache_control,
         };
 
+        // Resolve the effective query timeout: an explicit override wins;
+        // otherwise externally-issued requests inherit the app's
+        // `runtime.query.timeout`. `Protocol::Internal` (acceleration
+        // refreshes, health checks, task history) is exempt. Mirrors how
+        // `CacheKeyType::from_app_runtime` resolves per-request settings.
+        let query_timeout = self.query_timeout.or_else(|| {
+            if matches!(self.protocol, Protocol::Internal) {
+                return None;
+            }
+            self.app
+                .as_ref()
+                .and_then(|app| app.runtime.query.as_ref())
+                // Invalid values are warned about once at runtime startup and
+                // disable the timeout; here they simply resolve to `None`.
+                .and_then(|query| query.timeout().ok().flatten())
+        });
+
         RequestContext {
             protocol: AtomicU8::new(self.protocol as u8),
             cache_control,
@@ -639,6 +702,7 @@ impl RequestContextBuilder {
             nested_query_level: AtomicI16::new(0),
             authorization_header: self.authorization_header,
             cancellation_token: self.cancellation_token.unwrap_or_default(),
+            query_timeout,
         }
     }
 
@@ -675,6 +739,33 @@ mod tests {
     use http::{HeaderMap, HeaderValue};
 
     use crate::{CacheControl, CacheKeyType, Protocol, RequestContextBuilder};
+
+    /// A task spawned via `spawn_current` observes the spawning request's
+    /// context rather than the internal context. Results-cache namespacing and
+    /// principal-scoped authz/masking depend on it.
+    #[tokio::test]
+    async fn spawn_current_carries_request_context() {
+        use crate::{AsyncMarker, CacheNamespace, RequestContext};
+        use std::sync::Arc;
+        use tokio::sync::oneshot;
+
+        let context = Arc::new(RequestContext::builder(Protocol::Http).build());
+        let (tx, rx) = oneshot::channel();
+        context
+            .scope(async move {
+                RequestContext::spawn_current(async move {
+                    let namespace =
+                        RequestContext::current(AsyncMarker::new().await).cache_namespace();
+                    tx.send(namespace).expect("receiver alive");
+                });
+            })
+            .await;
+
+        assert_eq!(
+            rx.await.expect("spawned task reported its context"),
+            CacheNamespace::Public
+        );
+    }
 
     #[test]
     fn test_bind_client_supplied_cache_key() {
@@ -796,6 +887,76 @@ mod tests {
         child.cancel();
         assert!(child.is_cancelled());
         assert!(!ctx.is_cancelled());
+    }
+
+    /// Builds an app whose spicepod sets `runtime.query.timeout` to the given
+    /// human-readable duration string.
+    fn app_with_query_timeout(timeout: &str) -> std::sync::Arc<app::App> {
+        let mut app = app::AppBuilder::new("test").build();
+        app.runtime.query = Some(spicepod::component::runtime::Query {
+            timeout: Some(timeout.to_string()),
+            ..Default::default()
+        });
+        std::sync::Arc::new(app)
+    }
+
+    /// External requests derive their query timeout from the app's
+    /// `runtime.query.timeout`.
+    #[test]
+    fn test_query_timeout_derived_from_app_runtime() {
+        let ctx = RequestContextBuilder::new(Protocol::Http)
+            .with_app_opt(Some(app_with_query_timeout("30s")))
+            .build();
+        assert_eq!(
+            ctx.query_timeout(),
+            Some(std::time::Duration::from_secs(30))
+        );
+    }
+
+    /// Internal requests (acceleration refreshes, health checks) are exempt
+    /// from the app-derived query timeout.
+    #[test]
+    fn test_query_timeout_exempts_internal_protocol() {
+        let ctx = RequestContextBuilder::new(Protocol::Internal)
+            .with_app_opt(Some(app_with_query_timeout("30s")))
+            .build();
+        assert_eq!(ctx.query_timeout(), None);
+    }
+
+    /// Without an app (or with no `runtime.query.timeout` configured) no
+    /// timeout applies; an invalid configured value also resolves to no
+    /// timeout rather than failing the build.
+    #[test]
+    fn test_query_timeout_absent_or_invalid_resolves_to_none() {
+        let no_app = RequestContextBuilder::new(Protocol::Http).build();
+        assert_eq!(no_app.query_timeout(), None);
+
+        let invalid = RequestContextBuilder::new(Protocol::Http)
+            .with_app_opt(Some(app_with_query_timeout("not-a-duration")))
+            .build();
+        assert_eq!(invalid.query_timeout(), None);
+    }
+
+    /// An explicit `with_query_timeout` override wins over the app-derived
+    /// default and applies even to `Protocol::Internal` contexts.
+    #[test]
+    fn test_query_timeout_explicit_override_wins() {
+        let overridden = RequestContextBuilder::new(Protocol::Http)
+            .with_app_opt(Some(app_with_query_timeout("30s")))
+            .with_query_timeout(Some(std::time::Duration::from_secs(5)))
+            .build();
+        assert_eq!(
+            overridden.query_timeout(),
+            Some(std::time::Duration::from_secs(5))
+        );
+
+        let internal = RequestContextBuilder::new(Protocol::Internal)
+            .with_query_timeout(Some(std::time::Duration::from_secs(5)))
+            .build();
+        assert_eq!(
+            internal.query_timeout(),
+            Some(std::time::Duration::from_secs(5))
+        );
     }
 
     #[test]

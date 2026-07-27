@@ -1,0 +1,31 @@
+[package]
+name = "connector-cosmosdb"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+description = "Azure Cosmos DB data connector for Spice.ai runtime"
+
+[dependencies]
+arrow.workspace = true
+linkme.workspace = true
+async-trait.workspace = true
+azure_core = "0.31.0"
+azure_data_cosmos = { version = "0.30.0", default-features = false, features = [
+    "hmac_rust",
+    "key_auth",
+] }
+datafusion.workspace = true
+datafusion-table-providers = { workspace = true }
+futures.workspace = true
+opentelemetry.workspace = true
+runtime = { path = "../../runtime" }
+runtime-api-types = { path = "../../runtime-api-types" }
+runtime-metrics = { path = "../../runtime-metrics" }
+serde_json.workspace = true
+snafu.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

@@ -120,6 +120,12 @@ async fn cayenne_delete_in_list(fixture: &CayenneFixture, ids: &[i64]) -> u64 {
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx())
         .await
         .expect("cayenne delete collect");
+    // NOTE: this `count` column is NOT authoritative for an inline-resident
+    // DELETE — Cayenne's deletion sink documents it as an upper bound that the
+    // inline path leaves at 0 even when rows are removed (see
+    // `provider/delete/sink.rs`). Callers must verify deletion by re-querying the
+    // table, not by this value (see `scan_after_in_list_delete`). Returned only
+    // so the timed lane has something to `black_box`.
     results
         .first()
         .and_then(|b| b.column(0).as_any().downcast_ref::<UInt64Array>())
@@ -214,10 +220,21 @@ fn bench_in_list_delete(c: &mut Criterion) {
         for &lane in CAYENNE_LANES {
             let fixture = Arc::new(rt.block_on(async {
                 let fixture = load_cayenne(lane, rows).await;
-                let deleted = cayenne_delete_in_list(&fixture, &ids).await;
+                let _ = cayenne_delete_in_list(&fixture, &ids).await;
+                // Verify the delete actually removed rows by RE-QUERYING the
+                // table, not via the returned DML count: that count is not
+                // authoritative for the inline path (it stays 0 even though the
+                // rows are removed — see `cayenne_delete_in_list`). The scan this
+                // fixture feeds only needs the deletion to have happened.
+                let remaining: usize = cayenne_query(&fixture.table, "SELECT * FROM t")
+                    .await
+                    .iter()
+                    .map(|b| b.num_rows())
+                    .sum();
                 assert!(
-                    deleted > 0,
-                    "expected the IN-list delete to remove some rows"
+                    remaining < rows,
+                    "expected the IN-list delete to remove some rows \
+                     (loaded {rows}, {remaining} remain)"
                 );
                 fixture
             }));
