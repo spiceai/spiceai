@@ -772,25 +772,26 @@ fn initialize_attribute_schema(
                 continue;
             }
 
-            fields.insert(field.name().clone(), Arc::clone(field));
-            match field.data_type() {
-                DataType::Utf8 => {
-                    columns.insert(field.name().clone(), Box::new(StringBuilder::new()));
-                }
-                DataType::Boolean => {
-                    columns.insert(field.name().clone(), Box::new(BooleanBuilder::new()));
-                }
-                DataType::Int64 => {
-                    columns.insert(field.name().clone(), Box::new(Int64Builder::new()));
-                }
-                DataType::Float64 => {
-                    columns.insert(field.name().clone(), Box::new(Float64Builder::new()));
-                }
-                DataType::Binary => {
-                    columns.insert(field.name().clone(), Box::new(BinaryBuilder::new()));
-                }
-                _ => {}
-            }
+            // Only seed a field when we can also seed a matching column builder for it;
+            // an unsupported type would otherwise insert a field with no column and desync
+            // the `fields`/`columns` maps, failing `RecordBatch::try_new`.
+            let builder: Box<dyn ArrayBuilder> = match field.data_type() {
+                DataType::Utf8 => Box::new(StringBuilder::new()),
+                DataType::Boolean => Box::new(BooleanBuilder::new()),
+                DataType::Int64 => Box::new(Int64Builder::new()),
+                DataType::Float64 => Box::new(Float64Builder::new()),
+                DataType::Binary => Box::new(BinaryBuilder::new()),
+                _ => continue,
+            };
+
+            // Force the seeded dimension column nullable: a data point that omits this
+            // attribute is backfilled with NULL, so a non-nullable field (e.g. a source
+            // column the accelerator stored as `NOT NULL`) would make `RecordBatch::try_new`
+            // reject the whole batch and drop the export.
+            let name = field.name().clone();
+            let nullable_field = Arc::new(field.as_ref().clone().with_nullable(true));
+            fields.insert(name.clone(), nullable_field);
+            columns.insert(name, builder);
         }
     }
 }
@@ -1219,5 +1220,70 @@ mod tests {
             .map(|f| f.name().as_str())
             .collect();
         assert_eq!(widened_names, rebuilt_names);
+    }
+
+    #[test]
+    fn seeded_non_nullable_dimension_is_null_filled_not_dropped() {
+        // Regression: a metric whose stored schema declares a dimension column as
+        // non-nullable (e.g. a source column the accelerator persisted as `NOT NULL`).
+        // A data point that omits that dimension must produce the column present-but-NULL,
+        // not fail the batch build (which would silently drop the whole export).
+        let existing = Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Float64, true),
+            Field::new(TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+            Field::new(START_TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+            Field::new("region", DataType::Utf8, false),
+        ]);
+
+        let data = Data::Gauge(opentelemetry_proto::tonic::metrics::v1::Gauge {
+            data_points: vec![number_data_point(1.0, vec![])],
+        });
+
+        let (result, _) = metric_data_to_record_batch("svc_requests", &data, Some(&existing));
+        let batch = result.expect("batch must build despite the non-nullable stored dimension");
+
+        let region_field = batch
+            .schema()
+            .field_with_name("region")
+            .expect("region column carried over from the existing schema")
+            .clone();
+        assert!(
+            region_field.is_nullable(),
+            "seeded dimension column must be emitted nullable so NULL backfill is valid"
+        );
+
+        let region = column(&batch, "region").as_string::<i32>();
+        assert!(region.is_null(0), "omitted dimension must be NULL, not dropped");
+    }
+
+    #[test]
+    fn seeded_unsupported_type_dimension_is_skipped_without_desync() {
+        // An existing-schema column with a type the attribute builders don't support must be
+        // skipped entirely (field AND column), never inserted as a field with no column —
+        // which would desync `fields`/`columns` and fail `RecordBatch::try_new`.
+        let existing = Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Float64, true),
+            Field::new(TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+            Field::new(START_TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+            Field::new("region", DataType::Utf8, true),
+            // Not one of the supported attribute builder types.
+            Field::new("weird", DataType::Int32, true),
+        ]);
+
+        let data = Data::Gauge(opentelemetry_proto::tonic::metrics::v1::Gauge {
+            data_points: vec![number_data_point(1.0, vec![string_attribute("region", "us")])],
+        });
+
+        let (result, _) = metric_data_to_record_batch("svc_requests", &data, Some(&existing));
+        let batch = result.expect("batch must build even with an unsupported existing column");
+
+        assert!(
+            batch.schema().field_with_name("region").is_ok(),
+            "supported dimension is still carried over"
+        );
+        assert!(
+            batch.schema().field_with_name("weird").is_err(),
+            "unsupported-type column must be skipped, not partially seeded"
+        );
     }
 }
