@@ -19,6 +19,8 @@ limitations under the License.
 pub mod common;
 pub mod execution_plan;
 pub mod table;
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
+pub mod warm_index;
 
 use std::sync::Arc;
 
