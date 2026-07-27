@@ -783,8 +783,7 @@ fn initialize_attribute_schema(
             // Only seed a field when a matching column builder exists; inserting a field
             // without a column would desync the `fields`/`columns` maps and fail
             // `RecordBatch::try_new`.
-            let (builder, builder_type): (Box<dyn ArrayBuilder>, DataType) = match field
-                .data_type()
+            let (builder, builder_type): (Box<dyn ArrayBuilder>, DataType) = match field.data_type()
             {
                 DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
                     (Box::new(StringBuilder::new()), DataType::Utf8)
