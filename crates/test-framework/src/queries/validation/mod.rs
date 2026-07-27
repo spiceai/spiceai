@@ -497,6 +497,13 @@ pub fn validate_batches_as_strings(
                             }
                         }
 
+                        // Timestamp strings may differ only in fractional-second
+                        // padding (ns vs us engines). Treat equal after stripping
+                        // trailing fractional zeros.
+                        if timestamp_strings_equivalent(&expected_val, &actual_val) {
+                            continue;
+                        }
+
                         return Ok(QueryValidationResult::Fail(
                             QueryValidationFailReason::DataMismatch {
                                 column: column_name,
@@ -701,6 +708,46 @@ pub fn validate_row_count(
             },
         ))
     }
+}
+
+/// True when both strings look like timestamps that differ only by fractional
+/// second zero-padding (e.g. `…00.000000000` vs `…00.000000`).
+fn timestamp_strings_equivalent(a: &str, b: &str) -> bool {
+    fn strip_frac_zeros(s: &str) -> &str {
+        if let Some(dot) = s.rfind('.') {
+            let (head, frac) = s.split_at(dot);
+            let frac = frac.trim_start_matches('.').trim_end_matches('0');
+            if frac.is_empty() {
+                head
+            } else {
+                // Keep a stable form: head + '.' + trimmed frac — compare via owned below.
+                s
+            }
+        } else {
+            s
+        }
+    }
+    // Own normalized forms when fractional part needs rebuild.
+    fn normalize(s: &str) -> String {
+        if let Some((date, frac)) = s.rsplit_once('.') {
+            // Require a date-like prefix to avoid collapsing decimals.
+            if !date.contains('-') && !date.contains(':') {
+                return s.to_string();
+            }
+            let frac = frac.trim_end_matches('0');
+            if frac.is_empty() {
+                date.to_string()
+            } else {
+                format!("{date}.{frac}")
+            }
+        } else {
+            s.to_string()
+        }
+    }
+    let _ = strip_frac_zeros; // keep helper available for readability
+    let na = normalize(a);
+    let nb = normalize(b);
+    na == nb && (a.contains(':') || b.contains(':'))
 }
 
 /// How rows should be compared when validating two independent query results.

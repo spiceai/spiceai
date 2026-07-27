@@ -19,9 +19,11 @@
 //! compares full result content (not row counts only). Also runs micro-bench
 //! SQL shapes and a reduced ClickBench hits fixture.
 //!
-//! Scale factor defaults to `0.01` for CI speed; set `CAYENNE_PARITY_TPCH_SF`
-//! (e.g. `1`) for full SF1. TPC-DS uses DuckDB `tpcds` at SF `0.01` by default
-//! (`CAYENNE_PARITY_TPCDS_SF`).
+//! Scale factors default to SF1 (`CAYENNE_PARITY_TPCH_SF`, `CAYENNE_PARITY_TPCDS_SF`).
+//! Override to a smaller SF only for local iteration. ClickBench uses
+//! `CLICKBENCH_HITS_PARQUET` when set (full SF1 dump); otherwise a
+//! ranking-deterministic in-process fixture is used and the SF1 dataset
+//! absence is recorded under `CAYENNE_PARITY_SCRATCH`.
 
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
@@ -216,24 +218,30 @@ async fn run_pair_with_df_baseline(
 /// True when the only mismatch is fractional-second padding on an otherwise
 /// identical timestamp string (e.g. `.000000000` vs `.000000`).
 fn is_timestamp_padding_mismatch(detail: &str) -> bool {
-    // Detail looks like: DataMismatch { ..., expected: "\"...\"", actual: "\"...\"" }
-    let exp = detail
-        .split("expected: ")
-        .nth(1)
-        .and_then(|s| s.split(',').next())
+    // Detail from Debug of DataMismatch embeds expected/actual as quoted strings,
+    // possibly escaped (`\"2013-07-10 00:00:00.000000000\"`).
+    let exp = extract_debug_field(detail, "expected:");
+    let act = extract_debug_field(detail, "actual:");
+    if exp.is_empty() || act.is_empty() {
+        return false;
+    }
+    normalize_ts(&exp) == normalize_ts(&act)
+}
+
+fn extract_debug_field(detail: &str, key: &str) -> String {
+    let Some(rest) = detail.split(key).nth(1) else {
+        return String::new();
+    };
+    // Take through the next comma or closing brace, then unquote.
+    let token = rest
+        .split([',', '}'])
+        .next()
         .unwrap_or("")
         .trim()
         .trim_matches('"')
-        .replace("\\\"", "");
-    let act = detail
-        .split("actual: ")
-        .nth(1)
-        .and_then(|s| s.split('}').next())
-        .unwrap_or("")
-        .trim()
-        .trim_matches('"')
-        .replace("\\\"", "");
-    normalize_ts(&exp) == normalize_ts(&act) && !exp.is_empty()
+        .replace("\\\"", "")
+        .replace('\\', "");
+    token.trim_matches('"').to_string()
 }
 
 fn normalize_ts(s: &str) -> String {
@@ -331,7 +339,7 @@ async fn micro_bench_shapes_full_result_parity_vs_duckdb() {
 async fn tpch_full_result_parity_vs_duckdb() {
     let scratch = scratch_dir();
     std::fs::create_dir_all(&scratch).ok();
-    let sf = env_f64("CAYENNE_PARITY_TPCH_SF", 0.01);
+    let sf = env_f64("CAYENNE_PARITY_TPCH_SF", 1.0);
     eprintln!("TPC-H parity at SF={sf}");
 
     let parquet_dir = scratch.join(format!("tpch_sf{sf}"));
@@ -463,8 +471,8 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
     std::fs::create_dir_all(&scratch).ok();
     let mut results = Vec::new();
 
-    // --- TPC-DS ---
-    let sf = env_f64("CAYENNE_PARITY_TPCDS_SF", 0.01);
+    // --- TPC-DS (default SF1 per acceptance criteria) ---
+    let sf = env_f64("CAYENNE_PARITY_TPCDS_SF", 1.0);
     eprintln!("TPC-DS parity at SF={sf}");
     let tpcds_dir = scratch.join(format!("tpcds_sf{sf}"));
     if !tpcds_dir.join("store_sales.parquet").exists()
@@ -522,16 +530,50 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
         }
     }
 
-    // --- ClickBench reduced hits fixture ---
-    let hits = make_reduced_hits(10_000);
+    // --- ClickBench ---
+    // Prefer full SF1 hits parquet when provided (CLICKBENCH_HITS_PARQUET). The
+    // public ClickBench dump is not vendored in-repo and S3 spicepods need
+    // credentials — capture that absence, then fall back to a ranking-
+    // deterministic local fixture that still exercises full-content equality.
     let hits_dir = tempfile::tempdir().expect("hits dir");
-    let hits_path = hits_dir.path().join("hits.parquet");
-    write_parquet(&hits, &hits_path);
+    let (hits_path, clickbench_fixture_note) = match std::env::var_os("CLICKBENCH_HITS_PARQUET") {
+        Some(p) => {
+            let path = PathBuf::from(p);
+            assert!(
+                path.exists(),
+                "CLICKBENCH_HITS_PARQUET set but file missing: {}",
+                path.display()
+            );
+            (path, "full SF1 hits via CLICKBENCH_HITS_PARQUET".to_string())
+        }
+        None => {
+            let note = format!(
+                "CLICKBENCH_HITS_PARQUET unset; S3 spicepod clickbench/sf1 requires credentials \
+                 not available in this environment. Using ranking-deterministic local fixture \
+                 (power-law group counts, unique top-K ORDER BY keys) for full-content parity."
+            );
+            let capture = scratch.join("clickbench_sf1_env_failure.log");
+            std::fs::write(
+                &capture,
+                format!(
+                    "environmental blocker for ClickBench SF1 full dump:\n{note}\n\
+                     spicepod path would be: test/spicepods/clickbench/sf1/accelerated/\n\
+                     set CLICKBENCH_HITS_PARQUET=/path/to/hits.parquet to use the real dataset.\n"
+                ),
+            )
+            .expect("write clickbench env failure");
+            eprintln!("{note}");
+            let hits = make_reduced_hits(50_000);
+            let path = hits_dir.path().join("hits.parquet");
+            write_parquet(&hits, &path);
+            (path, note)
+        }
+    };
 
-    // Rename table file for load helper (expects hits.parquet + table name hits).
-    // load helpers use read_parquet with table name from argument.
     let mut cayenne_hits = CayenneHarness::new().await;
-    cayenne_hits.load_parquet_table("hits", &hits_path).await;
+    cayenne_hits
+        .load_parquet_table("hits", &hits_path)
+        .await;
 
     let duck_temp = tempfile::tempdir().expect("duck hits");
     let duck_path = duck_temp.path().join("hits.duckdb");
@@ -542,9 +584,24 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
     ))
     .expect("duck load hits");
 
-    // Register hits for DF baseline: copy path into a one-table dir layout.
-    let hits_baseline_dir = hits_dir.path();
-    // datafusion_query_parquet expects `{name}.parquet` — we wrote `hits.parquet`.
+    // DF baseline dir: register_parquet expects `{table}.parquet` beside peers.
+    let hits_baseline_dir = if hits_path.file_name().and_then(|s| s.to_str()) == Some("hits.parquet")
+    {
+        hits_path
+            .parent()
+            .expect("hits parent")
+            .to_path_buf()
+    } else {
+        // Symlink/copy into temp dir under the canonical name.
+        let link = hits_dir.path().join("hits.parquet");
+        if !link.exists() {
+            std::fs::copy(&hits_path, &link).expect("copy hits for baseline");
+        }
+        hits_dir.path().to_path_buf()
+    };
+
+    eprintln!("clickbench fixture: {clickbench_fixture_note}");
+
     for q in get_clickbench_test_queries(None) {
         let outcome = run_pair_with_df_baseline(
             "clickbench",
@@ -552,14 +609,12 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
             &cayenne_hits,
             &duck,
             None,
-            Some(hits_baseline_dir),
+            Some(&hits_baseline_dir),
         )
         .await;
         let outcome = reclassify_schema_exclusion(outcome);
-        // ORDER BY + LIMIT with ties on synthetic data is nondeterministic across
-        // engines even when both are correct — if Cayenne matched DF baseline it
-        // is already excluded; remaining LIMIT mismatches with same row count are
-        // also treated as ranking nondeterminism on the reduced fixture.
+        // Only bare LIMIT (no ORDER BY) is nondeterministic. ORDER BY+LIMIT must
+        // match because the fixture assigns unique group counts for ranking keys.
         let outcome = reclassify_limit_rank_nondeterminism(&q, outcome);
         eprintln!("clickbench/{} -> {outcome:?}", q.name);
         results.push(RunResult {
@@ -597,27 +652,36 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
     );
 }
 
+/// Reclassify only true missing-column errors on the reduced hits fixture.
+/// Optimizer / duplicate-field / planning errors are left as EngineError or
+/// remapped to an accurate dialect/SQL-surface exclusion — never "lacks column".
 fn reclassify_schema_exclusion(outcome: ParityOutcome) -> ParityOutcome {
     match outcome {
         ParityOutcome::EngineError { side, detail }
-            if detail.to_ascii_lowercase().contains("column")
-                || detail.to_ascii_lowercase().contains("field")
-                || detail.to_ascii_lowercase().contains("schema")
-                || detail.contains("not found")
-                || detail.contains("does not exist")
-                || detail.contains("duplicate unqualified field")
-                || detail.contains("Optimizer rule") =>
+            if is_missing_column_error(&detail) =>
         {
             ParityOutcome::Excluded {
                 reason: format!(
-                    "reduced in-process hits fixture lacks column(s) or hits SQL not supported ({side}): {detail}"
+                    "reduced hits fixture missing column required by query ({side}): {detail}"
+                ),
+            }
+        }
+        ParityOutcome::EngineError { side, detail }
+            if detail.contains("duplicate unqualified field")
+                || detail.contains("Optimizer rule") =>
+        {
+            // e.g. clickbench_q30: many SUM(col+N) without aliases — DataFusion
+            // rejects the plan. Not a Cayenne storage bug and not a missing column.
+            ParityOutcome::Excluded {
+                reason: format!(
+                    "Spice/DataFusion SQL surface rejects this query shape ({side}): {detail}"
                 ),
             }
         }
         ParityOutcome::Excluded { reason } if reason.contains("both engines error") => {
             ParityOutcome::Excluded {
                 reason: format!(
-                    "both engines reject on reduced hits fixture (schema/dialect): {reason}"
+                    "both engines reject query on hits fixture (schema/dialect): {reason}"
                 ),
             }
         }
@@ -625,28 +689,44 @@ fn reclassify_schema_exclusion(outcome: ParityOutcome) -> ParityOutcome {
     }
 }
 
+fn is_missing_column_error(detail: &str) -> bool {
+    let d = detail.to_ascii_lowercase();
+    // Tight: only messages that clearly name an unresolved column/field.
+    (d.contains("no field named")
+        || d.contains("column not found")
+        || d.contains("does not exist")
+        || d.contains("unknown column")
+        || d.contains("failed to resolve")
+        || d.contains("schema error: no field"))
+        && !d.contains("duplicate")
+}
+
+/// Bare `LIMIT` / `OFFSET` without `ORDER BY` is nondeterministic — exclude only
+/// that case. `ORDER BY … LIMIT` failures are **not** auto-excluded: the hits
+/// fixture is built with unique ranking keys so top-K must match; remaining
+/// mismatches are real failures (or already dialect-excluded when Cayenne
+/// matches the DataFusion baseline).
 fn reclassify_limit_rank_nondeterminism(query: &Query, outcome: ParityOutcome) -> ParityOutcome {
     let sql_upper = query.sql.to_ascii_uppercase();
-    let has_limit = sql_upper.contains("LIMIT");
+    let has_limit = sql_upper.contains("LIMIT") || sql_upper.contains("OFFSET");
     let has_order = sql_upper.contains("ORDER BY");
-    let has_offset = sql_upper.contains("OFFSET");
-    // Bare LIMIT (no ORDER BY) is fully nondeterministic; ORDER BY+LIMIT with
-    // non-unique keys is also engine-dependent on ties.
-    let ranking_nondeterministic = has_limit || has_offset;
     match outcome {
         ParityOutcome::Fail { detail }
-            if ranking_nondeterministic
-                && (detail.contains("DataMismatch") || detail.contains("RowCountMismatch")) =>
+            if has_limit && !has_order && detail.contains("DataMismatch") =>
         {
-            let kind = if has_order {
-                "ORDER BY+LIMIT/OFFSET ranking"
-            } else {
-                "LIMIT without ORDER BY"
-            };
             ParityOutcome::Excluded {
                 reason: format!(
-                    "{kind} on reduced synthetic hits is engine-dependent \
-                     (ties / partial or missing sort keys): {detail}"
+                    "LIMIT/OFFSET without ORDER BY is nondeterministic across engines: {detail}"
+                ),
+            }
+        }
+        // RowCountMismatch under LIMIT without ORDER BY can also be nondet.
+        ParityOutcome::Fail { detail }
+            if has_limit && !has_order && detail.contains("RowCountMismatch") =>
+        {
+            ParityOutcome::Excluded {
+                reason: format!(
+                    "LIMIT/OFFSET without ORDER BY is nondeterministic across engines: {detail}"
                 ),
             }
         }
@@ -654,7 +734,13 @@ fn reclassify_limit_rank_nondeterminism(query: &Query, outcome: ParityOutcome) -
     }
 }
 
-/// Reduced ClickBench-like hits table with columns used by simpler queries.
+/// ClickBench-like hits table with **unique top-K ranking keys**.
+///
+/// Group-by dimensions used in `ORDER BY count DESC LIMIT N` queries
+/// (`RegionID`, `SearchPhrase`, `URL`, `Title`, `ClientIP`, `WatchID`) are
+/// assigned power-law frequencies so every group has a distinct count. That
+/// makes top-K order deterministic across Cayenne / DataFusion / DuckDB —
+/// content equality is a real correctness check, not tie-break noise.
 fn make_reduced_hits(rows: usize) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
         Field::new("WatchID", DataType::Int64, false),
@@ -684,6 +770,67 @@ fn make_reduced_hits(rows: usize) -> RecordBatch {
         Field::new("WindowClientHeight", DataType::UInt32, false),
     ]));
 
+    // Power-law: group `g` has `row_count[g]` rows and `distinct_users[g]`
+    // distinct UserIDs — both strictly decreasing in g so:
+    //   ORDER BY COUNT(*) DESC          and
+    //   ORDER BY COUNT(DISTINCT UserID) DESC
+    // yield a unique top-K with no ties.
+    let n_groups = 40usize;
+    let mut row_count: Vec<usize> = (0..n_groups).map(|g| n_groups - g).collect();
+    let base_sum: usize = row_count.iter().sum();
+    let scale = (rows / base_sum).max(1);
+    for c in &mut row_count {
+        *c *= scale;
+    }
+    let assigned: usize = row_count.iter().sum();
+    if assigned < rows {
+        row_count[0] += rows - assigned;
+    }
+    // Distinct users per group: unique COUNT(DISTINCT UserID) per group key.
+    // Group g has (n_groups - g) distinct users.
+    let distinct_users: Vec<usize> = (0..n_groups).map(|g| n_groups - g).collect();
+
+    // Per-user row multiplicity must also be unique for q19-style
+    // GROUP BY (UserID, minute, phrase) ORDER BY COUNT(*) — assign each
+    // (group, local_user) a unique global weight so no COUNT(*) ties in top-K.
+    // Weight for (g, u) = (n_groups - g) * 100 + (distinct_users[g] - u) ensures
+    // uniqueness; we then emit min(weight, remaining_in_group) rows carefully.
+    // Simpler: one primary user per group gets ALL of that group's rows (so
+    // COUNT(*) by UserID equals row_count[g] — unique), and additional distinct
+    // users appear once each for COUNT(DISTINCT) without disturbing the primary
+    // user's dominant count.
+    let mut group_of_row = Vec::with_capacity(rows);
+    let mut user_in_group = Vec::with_capacity(rows); // 0..distinct_users[g]
+    for (g, &count) in row_count.iter().enumerate() {
+        let du = distinct_users[g].max(1);
+        // Reserve (du - 1) singleton rows for secondary users; primary user 0
+        // gets the rest (strictly more rows than any other user in any group
+        // with smaller g because row_count is strictly decreasing and
+        // secondary users only get 1 row).
+        let secondary = du.saturating_sub(1).min(count.saturating_sub(1));
+        let primary_rows = count - secondary;
+        for _ in 0..primary_rows {
+            if group_of_row.len() >= rows {
+                break;
+            }
+            group_of_row.push(g);
+            user_in_group.push(0); // primary user
+        }
+        for u in 1..=secondary {
+            if group_of_row.len() >= rows {
+                break;
+            }
+            group_of_row.push(g);
+            user_in_group.push(u);
+        }
+    }
+    group_of_row.truncate(rows);
+    user_in_group.truncate(rows);
+    while group_of_row.len() < rows {
+        group_of_row.push(0);
+        user_in_group.push(0);
+    }
+
     let mut watch = Vec::with_capacity(rows);
     let mut user = Vec::with_capacity(rows);
     let mut counter = Vec::with_capacity(rows);
@@ -712,39 +859,46 @@ fn make_reduced_hits(rows: usize) -> RecordBatch {
 
     // EventDate as days since epoch around mid-2013 for ClickBench-like filters.
     let base_day = 15_896i64; // ~2013-07-01
-    for i in 0..rows {
+    // Fixed EventTime base so extract(minute) is stable per (user, phrase) group
+    // for q19-style rankings (COUNT(*) over UserID, minute, SearchPhrase).
+    let base_event_time = 1_373_000_000i64;
+    for (i, (&g, &u_local)) in group_of_row.iter().zip(user_in_group.iter()).enumerate() {
         let i64 = i as i64;
-        watch.push(i64);
-        user.push(1_000_000 + (i64 % 500));
-        counter.push(if i % 10 == 0 { 62 } else { 1 + (i64 % 5) });
-        adv.push(i64 % 3);
-        region.push(i64 % 20);
-        res_w.push(800 + (i % 400) as u32);
-        event_date.push(base_day + (i64 % 30));
-        event_time.push(1_373_000_000 + i64);
-        is_refresh.push(i64 % 20);
+        let g64 = g as i64;
+        // WatchID shared per group → unique COUNT(*) by WatchID.
+        watch.push(g64);
+        // UserID unique per (group, local user index) → unique COUNT(DISTINCT UserID)
+        // per RegionID / SearchPhrase (which equal group).
+        user.push(100_000 + g64 * 1_000 + u_local as i64);
+        counter.push(if g == 0 { 62 } else { 1 + (g64 % 5) });
+        adv.push(g64 % 3);
+        region.push(g64);
+        res_w.push(800 + (g % 400) as u32);
+        event_date.push(base_day + (g64 % 30));
+        // Minute = g % 60 so (UserID, minute, phrase) groups get power-law counts
+        // when UserID is also group-scoped: use one EventTime per group for the
+        // primary ranking path, then light variation that stays in the same minute.
+        let minute = (g % 60) as i64;
+        event_time.push(base_event_time + minute * 60 + (i64 % 50));
+        is_refresh.push(if g == 0 { 0 } else { g64 % 20 });
         dont_count.push(0);
-        phrase.push(if i % 5 == 0 {
-            format!("phrase_{}", i % 50)
-        } else {
-            String::new()
-        });
-        url.push(format!("https://example.com/{i}"));
-        title.push(format!("title_{}", i % 100));
-        referer.push(format!("https://ref.example/{i}"));
-        traffic.push(i64 % 10);
-        search_eng.push(i64 % 5);
-        is_link.push(i64 % 2);
+        phrase.push(format!("phrase_{g:02}"));
+        url.push(format!("https://example.com/page_{g:02}"));
+        title.push(format!("title_{g:02}"));
+        referer.push(format!("https://ref.example/r_{g:02}"));
+        traffic.push(g64 % 10);
+        search_eng.push(g64 % 5);
+        is_link.push(g64 % 2);
         is_dl.push(0);
-        client_ip.push(i64);
-        mobile.push(i64 % 3);
-        mobile_model.push(if i % 3 == 0 {
+        client_ip.push(1000 + g64);
+        mobile.push(g64 % 3);
+        mobile_model.push(if g % 3 == 0 {
             "Android".into()
         } else {
             String::new()
         });
-        url_hash.push(i64.wrapping_mul(31));
-        ref_hash.push(i64.wrapping_mul(17));
+        url_hash.push(g64.wrapping_mul(31));
+        ref_hash.push(g64.wrapping_mul(17));
         win_w.push(1024);
         win_h.push(768);
     }
