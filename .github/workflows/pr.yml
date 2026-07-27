@@ -128,9 +128,7 @@ jobs:
 
             // Dependabot opened the PR, but its branch lives in this repository,
             // so anyone with write access can replace that commit. Require the
-            // commit itself to be Dependabot's: attributed to the bot account and
-            // carrying GitHub's valid signature, which a forged author line on a
-            // hand-pushed commit can't reproduce.
+            // commit itself to be Dependabot's, on all three counts below.
             const [commit] = commits;
             if (commit.author?.login !== 'dependabot[bot]') {
               core.info(
@@ -140,6 +138,28 @@ jobs:
               );
               return;
             }
+
+            // The author line alone proves nothing: it is plain commit metadata,
+            // and GitHub's signature verification attests the *committer*, not
+            // the author. Someone with write access and a registered signing key
+            // could push a commit they authored as themselves while naming
+            // dependabot[bot] as author, and it would still verify. Dependabot
+            // creates its commits through GitHub's API, so GitHub signs them and
+            // the committer is its own web-flow identity (noreply@github.com) --
+            // which a locally-committed commit cannot claim. Verified against
+            // every Dependabot bump in this repository. If GitHub ever changes
+            // that identity this check fails closed: bumps stop being
+            // fast-tracked and fall back to a normal sign-off.
+            if (commit.committer?.login !== 'web-flow') {
+              core.info(
+                `The PR's single commit ${commit.sha} was committed by ` +
+                `${commit.committer?.login ?? 'an unknown account'} rather than GitHub ` +
+                `itself, so its signature does not attest Dependabot authorship; ` +
+                `Dependabot fast-track does not apply.`
+              );
+              return;
+            }
+
             const verification = commit.commit?.verification;
             if (!verification?.verified) {
               core.info(

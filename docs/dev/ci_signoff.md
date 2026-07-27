@@ -161,10 +161,15 @@ The **Attestation** workflow fast-tracks a PR when **all** of the following hold
 
 - Dependabot opened the pull request (`dependabot[bot]`).
 - The PR introduces exactly one commit.
-- That commit is attributed to the `dependabot[bot]` account and carries a
-  verified signature. Dependabot's branches live in this repository, so anyone
-  with write access can push over them; the signature is what distinguishes
-  Dependabot's own commit from a hand-pushed one wearing its name.
+- That commit is attributed to the `dependabot[bot]` account, was committed by
+  GitHub itself (its `web-flow` identity, `noreply@github.com`), and carries a
+  verified signature. All three matter: Dependabot's branches live in this
+  repository, so anyone with write access can push over them, and an author line
+  is plain commit metadata that anyone can write. Signature verification attests
+  the *committer*, not the author — so a person with a registered signing key
+  could sign a commit they authored under Dependabot's name and have it verify.
+  What they cannot do is claim GitHub's own committer identity, which Dependabot
+  gets because its commits are created through GitHub's API.
 - The PR is from the same repository, not a fork (Dependabot's branches always
   are — this keeps the trusted-committer boundary the same as for reverts).
 
