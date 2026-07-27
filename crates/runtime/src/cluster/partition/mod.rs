@@ -155,7 +155,7 @@ pub fn get_partition_filter_exprs(
 ///
 /// Returns `None` only when the table has no local provider; when the provider
 /// exists but no aggregate/footer statistics are available yet, returns
-/// *unknown* statistics (num_rows `Absent`) so the executor still emits a
+/// *unknown* statistics (`num_rows` `Absent`) so the executor still emits a
 /// per-table report to the coordinator.
 ///
 /// [`Statistics`]: datafusion::common::Statistics

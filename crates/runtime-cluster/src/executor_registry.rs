@@ -334,14 +334,14 @@ impl ExecutorRegistry {
     /// onto a (possibly projected) leaf scan by name.
     pub fn record_executor_statistics(
         &self,
-        table: TableReference,
+        table: &TableReference,
         executor_id: String,
         statistics: Statistics,
         column_names: Vec<String>,
     ) {
         self.executor_statistics
             .write()
-            .entry(normalized_table_name(&table))
+            .entry(normalized_table_name(table))
             .or_default()
             .insert(
                 executor_id,
@@ -778,7 +778,7 @@ pub(crate) fn flight_sql_table_provider(
 /// executor set, and returns `(FlightSQL provider, partition values)` pairs.
 /// Projects the `executor_id`'s reported statistics for `table` onto `schema`,
 /// warning when no usable plan statistics (a known `num_rows`) are available for
-/// this leaf. Absent row counts prevent DataFusion's cost-based join-side swap
+/// this leaf. Absent row counts prevent `DataFusion`'s cost-based join-side swap
 /// (`should_swap_join_order`), so a distributed plan can end up buffering the
 /// large side of a hash join — worth surfacing rather than silently degrading.
 fn stamp_executor_statistics(
@@ -1090,6 +1090,46 @@ mod tests {
 
         assert_eq!(executors.len(), 2);
         assert_eq!(executors, vec!["executor-1", "executor-3"]);
+    }
+
+    #[tokio::test]
+    async fn unknown_statistics_report_still_marks_table_as_having_statistics() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        // Mirrors the decode-failure fallback in `handle_executor_statistics`: a
+        // malformed/forward-incompatible report is recorded as unknown statistics
+        // rather than dropped, so `has_statistics_for` flips `true` and the
+        // readiness gate can open. Dropping it would leave the table stuck out of
+        // `Ready` forever (and could hang /v1/ready).
+        let registry = make_registry().await;
+        let table = TableReference::bare("orders");
+
+        assert!(
+            !registry.has_statistics_for(&table),
+            "no report recorded yet"
+        );
+
+        registry.record_executor_statistics(
+            &table,
+            "executor-1".to_string(),
+            Statistics::new_unknown(&Schema::empty()),
+            Vec::new(),
+        );
+
+        assert!(
+            registry.has_statistics_for(&table),
+            "an unknown-statistics report must still count so table readiness can proceed"
+        );
+
+        // It also reads back safely: projecting onto a real leaf schema yields
+        // absent row count and unknown per-column stats — no panic, no bogus
+        // cardinalities fed to the planner.
+        let snapshot = registry.executor_statistics_snapshot(&table);
+        let entry = snapshot.get("executor-1").expect("recorded entry present");
+        let leaf: SchemaRef = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let projected = entry.projected_onto(&leaf);
+        assert_eq!(projected.num_rows, Precision::Absent);
+        assert_eq!(projected.column_statistics.len(), 1);
     }
 
     fn dummy_flight_sql_client() -> FlightSqlClient {

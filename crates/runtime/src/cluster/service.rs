@@ -958,16 +958,37 @@ async fn handle_executor_statistics(
         Arc::<str>::clone(&resolved.schema),
         Arc::<str>::clone(&resolved.table),
     );
-    let stats = runtime_cluster::decode_statistics(&msg.statistics);
-    if let (Some(stats), Some(registry)) = (stats, datafusion.executor_registry()) {
-        registry.record_executor_statistics(
-            table.clone(),
-            executor_id.to_string(),
-            stats,
-            msg.column_names.clone(),
+    let Some(registry) = datafusion.executor_registry() else {
+        return;
+    };
+
+    // A malformed or forward-incompatible payload decodes to `None`. Record an
+    // explicit unknown-statistics entry rather than dropping the report: since
+    // `evaluate_table_readiness` gates `Ready` on `has_statistics_for`,
+    // silently dropping it would leave the table stuck out of `Ready` forever
+    // (and could hang /v1/ready) with no signal. Recording unknown stats still
+    // lets the coordinator observe that this executor reported for the table;
+    // the planner then treats its slice as unknown-cardinality — the same as a
+    // deliberate unknown report from the executor.
+    let (statistics, column_names) = if let Some(statistics) =
+        runtime_cluster::decode_statistics(&msg.statistics)
+    {
+        (statistics, msg.column_names.clone())
+    } else {
+        tracing::warn!(
+            table = %table,
+            executor = %executor_id,
+            "Failed to decode executor statistics report ({} bytes); recording unknown statistics so the table can still become Ready",
+            msg.statistics.len()
         );
-        evaluate_table_readiness(datafusion, &table).await;
-    }
+        (
+            datafusion::common::Statistics::new_unknown(&arrow::datatypes::Schema::empty()),
+            Vec::new(),
+        )
+    };
+
+    registry.record_executor_statistics(&table, executor_id.to_string(), statistics, column_names);
+    evaluate_table_readiness(datafusion, &table).await;
 }
 
 /// Records a `PartitionsLoaded` ack from an executor and, if all assigned
