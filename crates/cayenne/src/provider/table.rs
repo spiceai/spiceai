@@ -6782,7 +6782,7 @@ impl CayenneTableProvider {
         *self.pk_keyset_cache.lock() = None;
         // The keyset is gone: while it is `None`, `transaction_has_conflict`
         // already takes the per-table fallback, and the next rebuild floor-stamps
-        // every key to the current high-water (`load_existing_keyset`) or returns
+        // every key to the current high-water (`load_existing_pk_index`) or returns
         // a Bloom (also per-table fallback). Either way the stale stamps that set
         // the degraded flag cannot survive, so clear it here. `Release` pairs with
         // the `Acquire` load in `transaction_has_conflict` (see the setter above).
@@ -7303,7 +7303,7 @@ impl CayenneTableProvider {
     /// `cayenne_cold_tier_file` manifest and store it in `cold_pk_existence`,
     /// returning how the keyset rebuild should treat the cold tier.
     ///
-    /// Called on every keyset cache MISS (the same point `load_existing_keyset`
+    /// Called on every keyset cache MISS (the same point `load_existing_pk_index`
     /// would run its cold scan), so the two stay coupled: NO object-store I/O —
     /// the per-file blooms come straight from the manifest rows.
     ///
@@ -7597,7 +7597,7 @@ impl CayenneTableProvider {
     /// Re-add the CURRENT un-checkpointed mem-tier keys to a freshly rebuilt keyset,
     /// so a cold rebuild does not drop keys that live ONLY in the RAM tier (a
     /// brand-new insert not yet checkpointed, or an updated key whose superseding
-    /// copy is still in RAM). The durable scan in [`Self::load_existing_keyset`] sees
+    /// copy is still in RAM). The durable scan in [`Self::load_existing_pk_index`] sees
     /// only checkpointed files; a rebuild forced by [`Self::clear_cached_pk_keyset`]
     /// (compaction / deletion-vector refresh) does NOT flush the mem-tier first, so
     /// without this fold the next UPDATE of a RAM-only key would false-negative in
@@ -7850,7 +7850,7 @@ impl CayenneTableProvider {
 
     /// Try to reconstruct the PK existence index from the persisted sidecar,
     /// skipping the full-table keyset scan. Returns `None` (→ caller falls back to
-    /// the full `load_existing_keyset`) unless the table is upsert-eligible, the
+    /// the full `load_existing_pk_index`) unless the table is upsert-eligible, the
     /// sidecar exists and validates, AND its checkpoint snapshot still equals the
     /// current snapshot (guaranteeing the bloom covers the full current snapshot —
     /// upsert tables only add data after a checkpoint, never rewriting the current
@@ -7892,7 +7892,7 @@ impl CayenneTableProvider {
         }
         // Capture the mem-tier shards, the protected set, and the current snapshot
         // id COHERENTLY under the listing fence — identical to the full rebuild in
-        // `load_existing_keyset`. A compaction/checkpoint landing between these
+        // `load_existing_pk_index`. A compaction/checkpoint landing between these
         // reads must not leave a live key in NEITHER the durable delta
         // (protected/inline, extended below) NOR the RAM mem-tier fold, which would
         // drop it from the bloom and false-negative the next update (over-count).
@@ -7945,7 +7945,7 @@ impl CayenneTableProvider {
         // Fold the un-checkpointed RAM mem-tier too: in `cdc_durability: memory` it
         // is post-checkpoint delta just like the protected/inline layers, and a
         // RAM-only key omitted here would false-negative its next update and leak
-        // the prior copy (durable over-count). Mirrors `load_existing_keyset`.
+        // the prior copy (durable over-count). Mirrors `load_existing_pk_index`.
         Self::fold_mem_tier_keys_into_bloom(&mem_snapshots, pk_indices, converter, &mut bloom)?;
         tracing::debug!(
             table = self.table_metadata.table_name.as_str(),
@@ -8065,7 +8065,9 @@ impl CayenneTableProvider {
                         }
                     }
                     PkDeletionStrategyWithCache::PositionBased { .. } => {
-                        unreachable!("PositionBased strategy should not reach load_existing_keyset")
+                        unreachable!(
+                            "PositionBased strategy should not reach load_existing_pk_index"
+                        )
                     }
                 };
 
@@ -38831,7 +38833,7 @@ mod tests {
     /// Regression (SF-100 tuned-memory local over-count, `order_line`/`stock` +73K
     /// DURABLE): the PK keyset is invalidated by compaction/refresh
     /// (`clear_cached_pk_keyset`), and the cold rebuild reconstructs it via
-    /// `load_existing_keyset` from DURABLE SNAPSHOT FILES ONLY. Without folding the
+    /// `load_existing_pk_index` from DURABLE SNAPSHOT FILES ONLY. Without folding the
     /// un-checkpointed MEM-TIER keys back in, an UPDATE of an omitted-but-live key
     /// finds it absent in `apply_on_conflict_to_batch`, records NO tombstone, and the
     /// prior copy stays live => `COUNT(*)` > distinct keys — durably (compaction can't
@@ -41171,7 +41173,7 @@ mod tests {
 
     /// Regression: the persisted-bloom fast path (`try_load_persisted_pk_index`)
     /// must fold the un-checkpointed RAM mem-tier, exactly like the full
-    /// `load_existing_keyset` rebuild does. A key written to the mem tier AFTER the
+    /// `load_existing_pk_index` rebuild does. A key written to the mem tier AFTER the
     /// last checkpoint lives ONLY in RAM — it is in neither the persisted sidecar
     /// bloom (which covers the checkpointed snapshot) nor the protected/inline
     /// delta. Without the `fold_mem_tier_keys_into_bloom` fold, a rebuild through
@@ -44538,7 +44540,7 @@ mod tests {
         );
 
         // Faithfulness check: a REAL `clear_cached_pk_keyset` rebuild goes through
-        // `load_existing_keyset`, which floor-stamps every key to the end-of-scan
+        // `load_existing_pk_index`, which floor-stamps every key to the end-of-scan
         // high-water (`stamp_all_sequences_min(sequence_high_water())`). Model that
         // by floor-stamping id=1 to the high-water (7). The same transaction then
         // correctly CONFLICTS via the per-key stamp (7 > begin 5) — the production
@@ -44557,7 +44559,7 @@ mod tests {
                 &empty_write_set,
                 current_high_water,
             ),
-            "a floor-stamped rebuild (the production clear->load_existing_keyset \
+            "a floor-stamped rebuild (the production clear->load_existing_pk_index \
              path) must still conflict the stage_seq=5 txn against high-water 7"
         );
     }
