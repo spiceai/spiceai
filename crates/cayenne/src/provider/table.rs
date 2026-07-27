@@ -201,7 +201,11 @@ const MAX_PK_SELECTIVE_INLIST_VALUES: usize = 32;
 /// Upper bound on PK `BETWEEN` span (inclusive) for selective scan fan-out control.
 const MAX_PK_SELECTIVE_RANGE_SPAN: i64 = 32;
 /// Maximum tombstone keys pushed into the Vortex scan predicate as `NOT IN`.
-const MAX_VORTEX_KEY_DELETE_PUSHDOWN: usize = 256;
+///
+/// Sized so sparse-to-moderate key-delete sets still get Vortex chunk pruning
+/// (fewer rows decoded) without building an unbounded expression tree. Dense
+/// `MoR` exceeds the bound and falls through to the post-decode deletion filter.
+const MAX_VORTEX_KEY_DELETE_PUSHDOWN: usize = 2048;
 
 /// Result of a Cayenne CDC append write.
 ///
@@ -6112,6 +6116,22 @@ impl CayenneTableProvider {
         target_size_bytes: usize,
         estimated_bytes: Option<u64>,
     ) -> usize {
+        // A sorted write must go through ONE writer, or the global order is
+        // scattered across shard files and each file's zone maps span the whole
+        // range — forfeiting exactly the pruning the sort was for.
+        //
+        // KNOWN GAP (pre-existing, deliberately not fixed here): this asks the
+        // CONFIGURED list, but an adaptive (observed-filter) layout sorts the
+        // compaction rewrite too, with no configured columns — so that rewrite
+        // gets sharded and its clustering is diluted. The blunt fix (key off
+        // `effective_sort_columns_for_rewrite`) is wrong: this function also
+        // serves DELTA writes (`table.rs:5708`), which are NOT sorted, so it
+        // would serialize the CDC encode fan-out and regress ingest. The real fix
+        // threads `write_class` in so only maintenance writes force one shard.
+        // Until then the adaptive layout's clustering is per-shard-file rather
+        // than global — weaker pruning, but never a wrong `output_ordering`
+        // (the attestation in `rewrite_current_snapshot_for_compaction` declines
+        // to attest whenever the effective key is not the configured one).
         if self.context.has_sort_columns() {
             return 1;
         }
@@ -11539,9 +11559,17 @@ impl CayenneTableProvider {
 
     /// Effective sort columns for a snapshot rewrite under default settings.
     ///
-    /// Operator-configured `sort_columns` always win. When empty (the default),
-    /// returns the hottest filter columns observed on scans so compaction can
-    /// cluster cold files without spicepod setup (F4 adaptive layout).
+    /// Precedence: operator-configured `sort_columns` > hottest observed filter
+    /// columns > schema-inference-derived `sort_columns` > none.
+    ///
+    /// An *explicit* `cayenne_sort_columns` is a statement of intent and wins
+    /// outright. An *inference-derived* one is only a guess about what queries
+    /// will filter on — for a `PostgreSQL` CDC table it resolves to the primary
+    /// key, which is close to the worst clustering for range/date predicates —
+    /// so it must NOT shadow the filter columns actually observed on scans, or
+    /// the adaptive layout can never correct it. Inference-derived columns stay
+    /// as the last rung so a table that has not yet been queried still gets a
+    /// deterministic key instead of an unsorted rewrite.
     ///
     /// Public so integration tests can assert the default-on policy without
     /// reaching private compaction internals.
@@ -11586,7 +11614,8 @@ impl CayenneTableProvider {
             }
         }
 
-        if self.context.has_sort_columns() {
+        // Rung 1: an explicit operator sort order wins outright.
+        if self.context.sort_columns_are_authoritative() {
             return self.context.sort_columns().to_vec();
         }
         let schema = self.table_schema();
@@ -11595,9 +11624,12 @@ impl CayenneTableProvider {
             schema.as_ref(),
         );
         if observed.is_empty() {
-            // No filters observed yet — don't invent a sort key; the warm rewrite
-            // just compacts unsorted until a hot column is seen.
-            return Vec::new();
+            // Rung 3: nothing observed yet. Prefer an inference-derived key (the
+            // source's declared order) over an unsorted rewrite — it is a guess,
+            // but a deterministic one, and it keeps pre-observation behavior
+            // identical to what inference produced before the adaptive layout
+            // existed. Falls through to no clustering when inference gave none.
+            return self.context.inferred_sort_columns().to_vec();
         }
         let sortable: Vec<String> = observed
             .into_iter()
@@ -11609,9 +11641,14 @@ impl CayenneTableProvider {
             .collect();
         if sortable.is_empty() {
             // Hot columns were observed but none are row-sortable (e.g. all
-            // `Map`): fall back to the primary key so the rewrite still gets a
-            // safe, deterministic clustering key instead of no clustering at all
-            // (mirrors the cold-tier fallback in `resolve_cold_clustering_indices`).
+            // `Map`): fall back to an inference-derived key if there is one, else
+            // the primary key, so the rewrite still gets a safe, deterministic
+            // clustering key instead of no clustering at all (mirrors the
+            // cold-tier fallback in `resolve_cold_clustering_indices`).
+            let inferred = self.context.inferred_sort_columns();
+            if !inferred.is_empty() {
+                return inferred.to_vec();
+            }
             return self.table_metadata.primary_key.clone();
         }
         sortable
@@ -14717,15 +14754,28 @@ impl CayenneTableProvider {
                 }
             }
 
-            // [sound output_ordering attestation] When sort columns are
-            // configured this rewrite consolidated the entire snapshot into a
-            // single globally-sorted, non-overlapping run (the stream was
-            // sorted via `sort_stream` above and written by a single writer —
-            // see `snapshot_shard_count`). Attest THIS snapshot id as sorted so
-            // a subsequent `scan` may advertise `output_ordering` by the sort
-            // columns. MUST run AFTER `update_current_snapshot_id` (which
-            // clears the attestation) and under the held listing fence.
-            if self.context.has_sort_columns() {
+            // [sound output_ordering attestation] This rewrite consolidated the
+            // entire snapshot into a single globally-sorted, non-overlapping run
+            // (the stream was sorted via `sort_stream` above and written by a
+            // single writer — see `snapshot_shard_count`). Attest THIS snapshot
+            // id as sorted so a subsequent `scan` may advertise
+            // `output_ordering`. MUST run AFTER `update_current_snapshot_id`
+            // (which clears the attestation) and under the held listing fence.
+            //
+            // The scan advertises the ordering from `context.sort_columns()`
+            // (`create_snapshot_scan_plan_with_config`), so attest ONLY when the
+            // key this rewrite actually sorted by IS that list. When the adaptive
+            // layout overrode an inference-derived sort with observed filter
+            // columns, the physical order is the observed one — advertising the
+            // configured (primary-key) order would then be a FALSE ordering
+            // claim and DataFusion would elide a sort the data needs, returning
+            // mis-ordered results. Declining to attest costs only the ordering
+            // optimization on such snapshots; claiming a wrong order is a
+            // correctness bug. Recovering the optimization means storing the
+            // attested key alongside the id and advertising from it (follow-up).
+            if !rewrite_sort_columns.is_empty()
+                && rewrite_sort_columns == self.context.sort_columns()
+            {
                 self.current_sorted_snapshot
                     .store(Arc::new(Some(new_snapshot_id.clone())));
             }
@@ -14820,7 +14870,12 @@ impl CayenneTableProvider {
         let vc = &self.table_metadata.vortex_config;
         let names: Vec<String> = if !vc.cold_clustering_columns.is_empty() {
             vc.cold_clustering_columns.clone()
-        } else if !self.context.sort_columns().is_empty() {
+        } else if self.context.sort_columns_are_authoritative() {
+            // Only an EXPLICIT sort order outranks observed filters here. An
+            // inference-derived one (the primary key, for most CDC tables) drops
+            // below the observations and is picked up by the fallback chain
+            // further down, so the adaptive layout can cluster cold files for the
+            // workload instead of for a guess.
             self.context.sort_columns().to_vec()
         } else {
             // Auto-observed columns only cluster if the Z-order encoder can key on
@@ -14842,7 +14897,16 @@ impl CayenneTableProvider {
                 })
                 .collect();
             if observed.is_empty() {
-                self.table_metadata.primary_key.clone()
+                // Nothing observed yet: prefer an inference-derived order (the
+                // source's declared one) before falling back to the primary key,
+                // so a table that has not been queried yet still clusters the way
+                // the source suggests.
+                let inferred = self.context.inferred_sort_columns();
+                if inferred.is_empty() {
+                    self.table_metadata.primary_key.clone()
+                } else {
+                    inferred.to_vec()
+                }
             } else {
                 observed
             }
@@ -21534,6 +21598,14 @@ impl CayenneTableProvider {
         // background checkpointer can keep the RAM tier drained without throttling
         // ingest. The position-based strategy appends to the CURRENT snapshot and
         // therefore must keep encode+swap atomic under one held fence (unchanged).
+        //
+        // CDC memory mode never reaches the position arm: `is_cdc_memory_mode()`
+        // requires `!is_position_based()`. The arm remains for residual pure
+        // position tables; encode stays under the fence (CURRENT-dir semantics).
+        debug_assert!(
+            !self.is_cdc_memory_mode() || !self.pk_deletion_strategy.is_position_based(),
+            "CDC memory mode must not use the position-based mem-tier checkpoint arm"
+        );
         let stats = if self.pk_deletion_strategy.is_position_based() {
             let _fence = self.listing_fence.write().await;
             let target_size_bytes = self.context.target_file_size_bytes();
@@ -25322,11 +25394,16 @@ impl TableProvider for CayenneTableProvider {
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         // F4 default-on layout: record which columns this scan filters on so
         // background compaction can cluster cold files without spicepod setup.
-        // Cheap (mutex + HashMap bump); empty filters are a no-op. Skipped when
-        // `sort_columns` is configured: observations are never consulted then
-        // (warm rewrite and cold clustering both use the configured columns), so
-        // recording would be pure hot-path overhead.
-        if !self.context.has_sort_columns() {
+        // Cheap (mutex + HashMap bump); empty filters are a no-op.
+        //
+        // Skipped only when the sort order is AUTHORITATIVE (an explicit
+        // `cayenne_sort_columns`): observations are never consulted then, so
+        // recording would be pure hot-path overhead. An *inference-derived* sort
+        // order does NOT skip — observations outrank it, so they must be
+        // collected. Gating this on `has_sort_columns()` instead is what made the
+        // adaptive layout inert on every catalog-visible CDC deployment, since
+        // inference fills `cayenne_sort_columns` on all of them.
+        if !self.context.sort_columns_are_authoritative() {
             self.filter_column_observations.record_filters(filters);
         }
 
@@ -26310,6 +26387,7 @@ impl CayenneTableProvider {
             PkKeysetInvalidatingDeletionSink {
                 table: self.clone_for_write(),
                 inner: sink,
+                filters: filters.to_vec(),
             },
         ))))
     }
@@ -26331,6 +26409,7 @@ impl CayenneTableProvider {
             PkKeysetInvalidatingDeletionSink {
                 table: self.clone_for_write(),
                 inner: sink,
+                filters: filters.to_vec(),
             },
         ))))
     }
@@ -29717,6 +29796,137 @@ mod tests {
         assert!(
             provider.mem_tier.is_empty(),
             "the mem-tier must be fully purged after the delete-all"
+        );
+    }
+
+    /// A table with no primary key has `pk_deletion_strategy: PositionBased`, so
+    /// every delete leaves `delete_from` through the deletion-vector arm and never
+    /// reaches `InlineAwareDeletionSink`. Position deletes address
+    /// `(file, file-local position)` pairs and mem-tier rows live in no file, so
+    /// the delete-all must purge the tier from the other sink too — in
+    /// `mode: memory` the mem-tier is the permanent store, so otherwise the table
+    /// can never be emptied. Regression test for #12072.
+    #[tokio::test]
+    async fn truncate_purges_mem_tier_rows_on_a_table_without_a_primary_key() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        // `mode: memory` shape (see `apply_memory_mode_overrides`): the mem-tier is
+        // the permanent in-RAM store and nothing is ever encoded to Vortex.
+        let vortex_config = VortexConfig {
+            memory_mode: true,
+            cdc_mem_tier_shards: 1,
+            ..VortexConfig::default()
+        };
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "truncate_mem_tier_no_pk",
+            Arc::clone(&schema),
+            vortex_config,
+            // No primary key — this is what selects the position-based arm.
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+        assert!(
+            provider.pk_deletion_strategy.is_position_based(),
+            "precondition: a PK-less table must use the position-based strategy"
+        );
+
+        // Write through the real memory-mode path (`append` refresh).
+        let b1 = int64_id_batch(&[1, 2, 3]);
+        let bytes1 = b1.get_array_memory_size() as u64;
+        provider
+            .write_batches_memory_mode(vec![b1], bytes1, false)
+            .await
+            .expect("memory-mode append 1");
+        let b2 = int64_id_batch(&[4, 5]);
+        let bytes2 = b2.get_array_memory_size() as u64;
+        provider
+            .write_batches_memory_mode(vec![b2], bytes2, false)
+            .await
+            .expect("memory-mode append 2");
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1, 2, 3, 4, 5],
+            "precondition: the mem-tier rows are visible to scans"
+        );
+
+        let delete_plan = provider
+            .delete_from(&ctx.state(), vec![datafusion_expr::lit(true)])
+            .await
+            .expect("delete-all plan");
+        let results = datafusion::physical_plan::collect(delete_plan, ctx.task_ctx())
+            .await
+            .expect("delete-all executed");
+        let deleted = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .expect("uint64 count column")
+            .value(0);
+        assert_eq!(
+            deleted, 5,
+            "the delete-all count must include the 5 purged mem-tier rows"
+        );
+
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            Vec::<i64>::new(),
+            "no mem-tier row may survive a TRUNCATE / DELETE WHERE TRUE"
+        );
+        assert!(
+            provider.mem_tier.is_empty(),
+            "the mem-tier must be fully purged after the delete-all"
+        );
+    }
+
+    /// The purge is gated on the delete being a tautology: a filtered delete
+    /// through the same position-based sink must NOT discard the whole tier.
+    /// (Filtered deletes not reaching mem-tier rows is #12008; what matters here
+    /// is that the delete-all fix cannot over-delete.)
+    #[tokio::test]
+    async fn filtered_delete_does_not_purge_the_mem_tier_without_a_primary_key() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let vortex_config = VortexConfig {
+            memory_mode: true,
+            cdc_mem_tier_shards: 1,
+            ..VortexConfig::default()
+        };
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "filtered_delete_mem_tier_no_pk",
+            Arc::clone(&schema),
+            vortex_config,
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        let batch = int64_id_batch(&[1, 2, 3]);
+        let bytes = batch.get_array_memory_size() as u64;
+        provider
+            .write_batches_memory_mode(vec![batch], bytes, false)
+            .await
+            .expect("memory-mode append");
+
+        let delete_plan = provider
+            .delete_from(
+                &ctx.state(),
+                vec![datafusion_expr::col("id").eq(datafusion_expr::lit(2_i64))],
+            )
+            .await
+            .expect("filtered delete plan");
+        datafusion::physical_plan::collect(delete_plan, ctx.task_ctx())
+            .await
+            .expect("filtered delete executed");
+
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1, 2, 3],
+            "a filtered delete must not purge the whole mem-tier"
         );
     }
 

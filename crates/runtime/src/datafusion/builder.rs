@@ -1630,12 +1630,14 @@ const MEM_TIER_HEADROOM_FRACTION: u64 = 10;
 /// exactly. 1/4 = 25%, a modest bump above the 20% base ceiling — the fraction must
 /// stay SMALLER than `MEM_TIER_CEILING_FRACTION` so the float sits ABOVE the base.
 const MEM_TIER_FLOAT_CEILING_FRACTION: u64 = 4;
-/// Floor (1/N of host) so a global aggregate cap is ALWAYS installed — a tier
-/// budget of 0 disables the global cap entirely (per-table caps then sum unbounded
-/// across a fleet: the original no-global-cap OOM). Binds only when an operator
-/// pins an explicit, greedy `runtime.query.memory_limit` that leaves no
-/// coordinated room; memory mode then leans on the per-table caps + spill/durable
-/// backstops, and the caller warns.
+/// Lower clamp (1/N of host) that keeps a healthy deployment's tier off the ground,
+/// and the threshold below which [`coordinated_mem_tier_budget`] stops clamping up
+/// and yields to the coordinated remainder instead. When an operator pins an
+/// explicit, greedy `runtime.query.memory_limit` that leaves less than this floor,
+/// the budget follows the remainder down — but never to 0, because a 0 budget
+/// disables the global aggregate cap entirely (per-table caps then sum unbounded
+/// across a fleet: the original no-global-cap OOM). Memory mode then leans on the
+/// per-table caps + spill/durable backstops, and the caller warns.
 pub(crate) const MEM_TIER_FLOOR_FRACTION: u64 = 32;
 
 /// Coordinated aggregate byte budget for the off-pool Cayenne in-memory CDC tier.
@@ -1643,21 +1645,23 @@ pub(crate) const MEM_TIER_FLOOR_FRACTION: u64 = 32;
 /// The query pool, carved compaction pool, and this tier are otherwise each
 /// derived from total RAM IN ISOLATION (`builder.rs` query pool, compaction carve,
 /// and `mod.rs` `get_total_memory()/4`) and sum to >100% of host. Sizing the tier
-/// as the host RAM left AFTER the query pool, the compaction pool, and a headroom
-/// reserve is the missing cross-subsystem coordination. For the coordinated
-/// default inputs — a query pool sized to leave room (see
-/// [`effective_query_memory_limit`]) — it yields
-/// `query_pool + compaction + tier + headroom ≤ host`. The result is clamped to
-/// `[host/32, host/5]`: the `host/5` ceiling keeps the tier ≤ 1/5 of host when the
-/// pools are small, and the `host/32` floor guarantees a nonzero global aggregate
-/// cap is ALWAYS installed (a 0 budget would disable the cap — the original
-/// no-global-cap OOM).
+/// as the host RAM left AFTER the query pool, the compaction pool, any memory
+/// reserved outside both by another subsystem (`external_reservation_bytes` — today
+/// a co-resident `DuckDB` accelerator's ceiling), and a headroom reserve is the missing
+/// cross-subsystem coordination. For the coordinated default inputs — a query pool
+/// sized to leave room (see [`effective_query_memory_limit`]) — it yields
+/// `query_pool + compaction + external + tier + headroom ≤ host`. While that
+/// remainder reaches the `host/32` floor the result is clamped to `[host/32, host/5]`:
+/// the `host/5` ceiling keeps the tier ≤ 1/5 of host when the pools are small.
 ///
-/// PRECONDITION: the `≤ host` guarantee holds only while the inputs leave at least
-/// `floor + headroom` of room. An oversized explicit `runtime.query.memory_limit`
-/// makes the `host/32` floor win over the strict budget; the caller
-/// ([`DataFusionBuilder::build`]) detects that and warns, and memory mode then
-/// leans on the per-table caps + spill/durable backstops.
+/// A greedy explicit `runtime.query.memory_limit`, or a large external reservation,
+/// can leave a remainder BELOW the floor. The tier then yields to the remainder rather
+/// than clamping up to a floor that would overcommit the host — down to a 1-byte
+/// refuse-all gate, since a 0 budget would uninstall the global aggregate cap entirely
+/// (see [`MEM_TIER_FLOOR_FRACTION`]). So the inequality above holds exactly, except for
+/// that one reserved byte when the remainder is 0; every real append then refuses and
+/// CDC spills to the durable backstops. The caller ([`DataFusionBuilder::build`])
+/// detects the squeezed budget and warns.
 pub(crate) fn coordinated_mem_tier_budget(
     total_memory: u64,
     query_pool_bytes: u64,
@@ -1683,13 +1687,26 @@ pub(crate) fn coordinated_mem_tier_budget(
     // `runtime.query.memory_limit`), let the tier reclaim part of the freed RAM
     // above the base host/5 cap — up to `host / MEM_TIER_FLOAT_CEILING_FRACTION` —
     // but only the room left beyond a DOUBLED headroom reserve, so the off-pool
-    // caches/memtables the single headroom covers keep their slack. Raising only the
-    // ceiling never lifts the result above `remainder` (the ceiling caps from above,
-    // and `remainder` is computed with the single headroom), so the floating ceiling
-    // preserves the #11449 no-overcommit invariant `query_pool + compaction + tier +
-    // headroom <= host` for ANY ceiling — subject to the same `remainder >= floor`
-    // PRECONDITION above: when the floor wins (`remainder < floor`) the clamp returns
-    // `floor > remainder` and the caller warns instead.
+    // caches/memtables the single headroom covers keep their slack. `float_room`
+    // subtracts the external reservation just like `remainder`, so the float can
+    // never reclaim externally-reserved RAM. Raising only the ceiling never lifts
+    // the result above `remainder` (the ceiling caps from above, and `remainder` is
+    // computed with the single headroom), so the floating ceiling preserves the
+    // #11449 no-overcommit invariant `query_pool + compaction + external + tier +
+    // headroom <= host` for ANY ceiling.
+    //
+    // Honesty under a tight explicit `runtime.query.memory_limit`: when the remainder
+    // is below the floor, yield to the remainder instead of clamping up to a floor
+    // that would make `query + compaction + tier + headroom > host`. A refuse-all
+    // budget is the honest envelope there — mem-tier leans on the per-table caps +
+    // spill/durable backstops — and it must stay nonzero to keep the global cap
+    // installed, so the single reserved byte below is the one deliberate exception
+    // to the `<= host` invariant above.
+    if remainder < floor {
+        // Nonzero refuse-all gate: 1 byte means every real append refuses and
+        // CDC spills/falls back, without uninstalling the budget.
+        return remainder.max(1);
+    }
     let float_room = total_memory
         .saturating_sub(query_pool_bytes)
         .saturating_sub(compaction_pool_bytes)
@@ -2065,11 +2082,12 @@ mod tests {
         }
     }
 
-    /// The tier budget is always clamped to `[host/32, host/MEM_TIER_FLOAT_CEILING]`:
-    /// never 0 (a 0 budget disables the global aggregate cap, the original
-    /// no-global-cap OOM) and never above the float ceiling even when the pools are
-    /// tiny. The float (host/4) only engages on a query-light deployment and never
-    /// breaks the no-overcommit invariant.
+    /// While the coordinated remainder reaches the floor, the tier budget stays inside
+    /// `[host/32, host/MEM_TIER_FLOAT_CEILING]` — never above the float ceiling even
+    /// when the pools are tiny, and the float (host/4) only engages on a query-light
+    /// deployment without breaking the no-overcommit invariant. A greedy pool drives
+    /// the remainder under the floor and the budget follows it down, but never to 0 (a
+    /// 0 budget disables the global aggregate cap, the original no-global-cap OOM).
     #[test]
     fn coordinated_tier_budget_stays_within_clamp() {
         for gib in [16_u64, 64, 256, 1024] {
@@ -2093,21 +2111,35 @@ mod tests {
             );
 
             // A moderate query pool at the default 70% partition stays at/under the
-            // BASE ceiling (the float only helps when the pool is sized down).
+            // BASE ceiling (the float only helps when the pool is sized down) and
+            // at/above the floor (remainder still allows the lower clamp).
             let pre_carve = total.saturating_mul(CAYENNE_QUERY_MEMORY_PERCENT) / 100;
             let moderate = coordinated_mem_tier_budget(total, pre_carve, 0, 0);
             assert!(
                 moderate <= base_ceiling,
                 "the default partition does not float above the base ceiling"
             );
+            assert!(
+                moderate >= floor,
+                "when remainder allows, the tier budget stays at/above the floor"
+            );
 
-            // A greedy pool that consumes all of host → tier floored, never 0.
+            // A greedy pool that consumes all of host → tier yields to the
+            // remainder (honest, no forced overcommit). Remainder is 0 after
+            // headroom, but we still install a 1-byte always-refuse gate so the
+            // global cap is never disabled (try_reserve fails → spill). The
+            // meaningful claim here is the refuse-all gate, not "no host
+            // overcommit" via the floor — the pool already consumes `total`.
             let small = coordinated_mem_tier_budget(total, total, 0, 0);
             assert_eq!(
-                small, floor,
-                "a greedy pool floors the tier (still a nonzero cap)"
+                small, 1,
+                "a greedy pool installs a 1-byte refuse-all gate rather than the host/32 floor"
             );
             assert!(small > 0, "the global aggregate cap must never be disabled");
+            assert!(
+                small < floor,
+                "a greedy pool yields BELOW the floor rather than clamping up to it (floor={floor}, small={small})"
+            );
         }
     }
 
